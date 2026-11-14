@@ -25,6 +25,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+from _gym_prefix_recovery_parity import (
+    _assert_prefix_boundary,
+    _assert_retired_prefix_keys,
+    _rows_by_identity,
+    load_training_records,
+)
 from _gym_recovery_snapshot_helpers import (
     calendar_sentinel_count,
     ledger_episode_index,
@@ -122,14 +128,16 @@ def _require_every_active_call_cut(snapshot: Path, phase_log: str) -> None:
 
 def inspect_snapshot(
     snapshot: Path,
-    sentinel_event: str,
+    sentinel_event: str | None,
     *,
     min_cut_groups: int = 1,
 ) -> dict[str, Any]:
     """Return the post-mutation nonterminal prefixes in ``snapshot``.
 
     ``cuts`` lists every one, and the snapshot qualifies only if they span at
-    least ``min_cut_groups`` prompt groups.
+    least ``min_cut_groups`` prompt groups. A ``None`` ``sentinel_event``
+    selects a stateless resources server (e.g. CLEVR's string_match), whose
+    episodes export no resources state to check.
     """
 
     required = [
@@ -164,11 +172,15 @@ def inspect_snapshot(
         key = _episode_key(record)
         recovery = ledger.get(key)
         cut = _recoverable_cut(record)
-        resource_entry = resource_index.get(key)
-        if recovery is None or cut is None or resource_entry is None:
+        if recovery is None or cut is None:
             continue
-        _, resources_state = resource_entry
-        sentinel_count = calendar_sentinel_count(resources_state, sentinel_event)
+        if sentinel_event is not None:
+            resource_entry = resource_index.get(key)
+            if resource_entry is None:
+                continue
+            _, resources_state = resource_entry
+            if calendar_sentinel_count(resources_state, sentinel_event) != 1:
+                continue
         instance_id = recovery["gym_instance_id"]
         checkpointed_episodes = {
             (episode["rollout_id"], episode["attempt"])
@@ -178,7 +190,6 @@ def inspect_snapshot(
         if (
             key not in checkpointed_episodes
             or key not in agent_keys
-            or sentinel_count != 1
             or recovery["restore_level"] != "prefix"
             or recovery["status"] != "dispatched"
             or not set(cut["staging_keys"]).issubset(retained_keys)
@@ -222,7 +233,7 @@ def select_snapshot(args: argparse.Namespace) -> None:
             try:
                 selection = inspect_snapshot(
                     snapshot,
-                    args.sentinel_event,
+                    None if args.stateless_resources else args.sentinel_event,
                     min_cut_groups=args.min_cut_groups,
                 )
                 _require_every_active_call_cut(
@@ -346,6 +357,27 @@ def verify_restore(args: argparse.Namespace) -> None:
             raise AssertionError(f"train step {step} appeared {len(matches)} times")
 
 
+def verify_completion(args: argparse.Namespace) -> None:
+    """Without a reference run, require every restored prefix to finish and train.
+
+    Each restored call must complete once, close its trained row, and start
+    with the exact prefix the worker restored (``_assert_prefix_boundary``); no
+    row may be trained twice, and the restored prefix rows must outlive
+    training only until the next snapshot.
+    """
+    selection = read_json(Path(args.selection_file))
+    records = load_training_records(
+        Path(args.recovery_log_dir), staging_keys=Path(args.recovery_staging_keys)
+    )
+    starts = _assert_prefix_boundary(
+        selection, Path(args.phase2_log).read_text(), _rows_by_identity(records)
+    )
+    _assert_retired_prefix_keys(
+        selection, records, read_jsonl(Path(args.recovery_flush_keys))
+    )
+    print(f"restored prefixes completed and trained: {sorted(starts)!r}", flush=True)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -357,7 +389,10 @@ def _parser() -> argparse.ArgumentParser:
     select.add_argument("phase_log")
     select.add_argument("timeout_s", type=float)
     select.add_argument("backup_path")
-    select.add_argument("sentinel_event")
+    select.add_argument("sentinel_event", nargs="?")
+    # Explicit opt-out, so a Workplace caller that drops the sentinel fails
+    # instead of silently skipping the post-mutation resources check.
+    select.add_argument("--stateless-resources", action="store_true")
     select.add_argument("--min-cut-groups", type=int, default=1)
     select.set_defaults(func=select_snapshot)
 
@@ -369,9 +404,24 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("training_info")
     verify.add_argument("max_steps", type=int)
     verify.set_defaults(func=verify_restore)
+
+    completion = commands.add_parser("verify-completion")
+    completion.add_argument("selection_file")
+    completion.add_argument("recovery_log_dir")
+    completion.add_argument("recovery_staging_keys")
+    completion.add_argument("recovery_flush_keys")
+    completion.add_argument("phase2_log")
+    completion.set_defaults(func=verify_completion)
     return parser
 
 
 if __name__ == "__main__":
-    arguments = _parser().parse_args()
+    parser = _parser()
+    arguments = parser.parse_args()
+    if arguments.command == "select" and (
+        (arguments.sentinel_event is None) != arguments.stateless_resources
+    ):
+        parser.error(
+            "select needs exactly one of sentinel_event or --stateless-resources"
+        )
     arguments.func(arguments)

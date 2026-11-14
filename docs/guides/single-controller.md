@@ -58,9 +58,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
             gpus_per_node: 1  # inference GPUs; remainder go to training
     ```
 
-    For default non-colocated vLLM refit, the SingleController entrypoint uses the
-    same vLLM generation path as legacy GRPO/PPO, so you can opt into vLLM's
-    native reload API with:
+    For default non-colocated vLLM refit, the SingleController entrypoint uses the same vLLM generation path as legacy GRPO/PPO, so you can opt into vLLM's native reload API with:
 
     ```yaml
     policy:
@@ -107,8 +105,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 ## Reward penalties and effort shaping with token capture
 
-With NeMo-Gym and `token_capture.enabled: true`, the following existing settings
-work the same way as in non-capture rollouts:
+With NeMo-Gym and `token_capture.enabled: true`, the following existing settings work the same way as in non-capture rollouts:
 
 ```yaml
 reward_penalties:
@@ -127,55 +124,23 @@ env:
       low_string: "<budget>"
 ```
 
-The manager checks the scored `response.output` and classifies the original
-prompt using the last user message. The finalizer shapes the raw reward using
-**the terminal call's generated length**, then sets it to `0.0` if any enabled
-penalty matches, including when the shaped reward is negative. Unwanted IDs are
-checked across all selected generated spans, including terminal tokens; prompt,
-tool, and abandoned-branch tokens do not count. The final-function-call exception
-for empty answers is preserved. Token IDs, logprobs, and training masks keep their
-existing behavior.
+The manager checks the scored `response.output` and classifies the original prompt using the last user message. The finalizer shapes the raw reward using **the terminal call's generated length**, then sets it to `0.0` if any enabled penalty matches, including when the shaped reward is negative. Unwanted IDs are checked across all selected generated spans, including terminal tokens; prompt, tool, and abandoned-branch tokens do not count. The final-function-call exception for empty answers is preserved. Token IDs, logprobs, and training masks keep their existing behavior.
 
-The malformed think-tag check runs on each generated span. When think-tag IDs are
-configured or each tag is a single token, the tag counts must match the thinking mode
-set by the prompt; the decoded text must also contain no open tag and at most one
-close tag. Gym's message-level `has_malformed_thinking` flag is not used with
-capture. Non-finite generation logprobs are rejected at staging, and the rollout is
-masked as `capture_poisoned`.
+The malformed think-tag check runs on each generated span. When think-tag IDs are configured or each tag is a single token, the tag counts must match the thinking mode set by the prompt; the decoded text must also contain no open tag and at most one close tag. Gym's message-level `has_malformed_thinking` flag is not used with capture. Non-finite generation logprobs are rejected at staging, and the rollout is masked as `capture_poisoned`.
 
-Both paths share the classification, text checks, token membership check, and
-shaping formula. For low-effort prompts:
+Both paths share the classification, text checks, token membership check, and shaping formula. For low-effort prompts:
 
 ```text
 term = min(1, low_weight * (1 - terminal_generation_length / low_ub))
 reward = raw_reward + raw_reward * max(term, 0) + low_penalty * min(term, 0)
 ```
 
-Setting `low_weight <= 0` or an empty `low_string` disables shaping. Active
-shaping requires `low_ub > 0`. High-effort rewards remain unchanged. A 900-token
-call followed by a 100-token call uses 100 tokens for shaping in both paths.
+Setting `low_weight <= 0` or an empty `low_string` disables shaping. Active shaping requires `low_ub > 0`. High-effort rewards remain unchanged. A 900-token call followed by a 100-token call uses 100 tokens for shaping in both paths.
 
-Recovery saves raw rewards and three Boolean checks per unfinished rollout, and
-reward settings once per checkpoint. A versioned, validated projection compares
-the active reward rules: irrelevant config extras, inactive parameters and the
-order or duplication of unwanted IDs do not prevent resume. Changes to active
-rules fail before replay and identify the differing settings. Finalized rows
-retain their saved rewards. Recovery schema 3 also preserves pending reward
-observations and optional agent log context. Only the current schema is
-readable; a checkpoint saved with token capture disabled cannot be resumed with
-token capture enabled.
+Recovery saves raw rewards and three Boolean checks per unfinished rollout, and reward settings once per checkpoint. A versioned, validated projection compares the active reward rules: irrelevant config extras, inactive parameters and the order or duplication of unwanted IDs do not prevent resume. Changes to active rules fail before replay and identify the differing settings. Finalized rows retain their saved rewards. Recovery schema 3 also preserves pending reward observations and optional agent log context. Only the current schema is readable; a checkpoint saved with token capture disabled cannot be resumed with token capture enabled.
 
-Penalty rates and final reward statistics use valid finalized rows. Reward mean,
-standard deviation, minimum, maximum, exact median and histogram are pooled from
-individual final rewards for the groups consumed by each training step. Agent
-reward statistics use those same final values. When full-result table logging is
-enabled, agent results retain their context and sample identity with the final
-reward substituted after shaping and penalties. This retains one reward
-observation per valid row, plus optional table data, in pending checkpoint state.
-Existing low/high effort means and exact length medians are preserved; `mean_reward_low`
-measures the shaped reward before penalties. Pending statistics survive recovery
-and are consumed once. Message-level advantage overrides remain unsupported with
-capture and fail at setup.
+Penalty rates and final reward statistics use valid finalized rows. Reward mean, standard deviation, minimum, maximum, exact median and histogram are pooled from individual final rewards for the groups consumed by each training step. Agent reward statistics use those same final values. When full-result table logging is enabled, agent results retain their context and sample identity with the final reward substituted after shaping and penalties. This retains one reward observation per valid row, plus optional table data, in pending checkpoint state.
+Existing low/high effort means and exact length medians are preserved; `mean_reward_low` measures the shaped reward before penalties. Pending statistics survive recovery and are consumed once. Message-level advantage overrides remain unsupported with capture and fail at setup.
 
 ## Checkpointing and Replay Recovery
 
@@ -192,10 +157,7 @@ The TQ snapshot and replay index are captured under the same checkpoint barrier.
 
 On resume, Single-Controller validates the TQ snapshot against the trainer checkpoint, restores the replay index, and makes completed, committed, unconsumed groups available to the sampler before training resumes.
 
-Only the current `rollout_recovery.pt` schema is accepted, for every recovery
-level. Data-plane checkpoints written with an earlier schema, such as those from
-releases before turn-level recovery, cannot be resumed; start those runs in a
-new `checkpoint_dir`.
+Only the current `rollout_recovery.pt` schema is accepted, for every recovery level. Data-plane checkpoints written with an earlier schema, such as those from releases before turn-level recovery, cannot be resumed; start those runs in a new `checkpoint_dir`.
 
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
 
@@ -207,9 +169,7 @@ Every Megatron training resume (all algorithms, not only forest training) loads 
 
 ### Periodic rollout snapshots
 
-Normal trainer checkpoints are written at step boundaries. Periodic rollout
-snapshots preserve newer rollout progress between those trainer checkpoints,
-including while the train pump is accumulating a streamed step:
+Normal trainer checkpoints are written at step boundaries. Periodic rollout snapshots preserve newer rollout progress between those trainer checkpoints, including while the train pump is accumulating a streamed step:
 
 ```yaml
 checkpointing:
@@ -231,23 +191,9 @@ token_capture:
   enabled: true
 ```
 
-`snapshot_attempt_interval_s` is the cadence at which Single-Controller attempts
-a rollout snapshot. It is not a guarantee that a snapshot is written at every
-interval. An attempt after step N succeeds only when the immutable trainer
-checkpoint `step_N` is already durable. Consequently, `save_period: 1` is
-recommended for continuous post-step coverage; with a larger value, attempts
-are skipped until the matching trainer checkpoint exists. Before the first
-training step, snapshots are anchored to the initial model and a fingerprint of
-the rollout-semantic configuration.
+`snapshot_attempt_interval_s` is the cadence at which Single-Controller attempts a rollout snapshot. It is not a guarantee that a snapshot is written at every interval. An attempt after step N succeeds only when the immutable trainer checkpoint `step_N` is already durable. Consequently, `save_period: 1` is recommended for continuous post-step coverage; with a larger value, attempts are skipped until the matching trainer checkpoint exists. Before the first training step, snapshots are anchored to the initial model and a fingerprint of the rollout-semantic configuration.
 
-With `rollout_recovery.target_level: turn`, rollout snapshots are on even with
-`snapshot_attempt_interval_s: null`, because only a snapshot holds the
-environment's state. A snapshot also follows the trainer checkpoint that
-`checkpointing.checkpoint_must_save_by` triggers, before the run stops. The
-snapshot runs while the policy weights are still being written and is moved
-into `step_N` once it is published, so leave room in that deadline for the
-longer of the two saves. `step_N` never waits for the snapshot: if the job ends
-first, it restores from `step_N` and redoes the unfinished turns.
+With `rollout_recovery.target_level: turn`, rollout snapshots are on even with `snapshot_attempt_interval_s: null`, because only a snapshot holds the environment's state. A snapshot also follows the trainer checkpoint that `checkpointing.checkpoint_must_save_by` triggers, before the run stops. The snapshot runs while the policy weights are still being written and is moved into `step_N` once it is published, so leave room in that deadline for the longer of the two saves. `step_N` never waits for the snapshot: if the job ends first, it restores from `step_N` and redoes the unfinished turns.
 
 | Saves environment state | `snapshot_on_trainer_checkpoint` | `snapshot_attempt_interval_s` |
 |---|---|---|
@@ -255,32 +201,16 @@ first, it restores from `step_N` and redoes the unfinished turns.
 | Only at the deadline | `false` | `null` |
 | After every trainer checkpoint, at the deadline, and every 300 s | `true` | `300` |
 
-Setup rejects turn-level recovery that would never save: `false`, no interval,
-and no `checkpoint_must_save_by`.
+Setup rejects turn-level recovery that would never save: `false`, no interval, and no `checkpoint_must_save_by`.
 
-`telemetry_interval_s` controls an independent wall-clock sampler for rollout
-throughput and checkpoint pressure. It is `null` (disabled) by default; set it
-to a positive number such as `30` to emit one sample every 30 seconds. This does
-not change the checkpoint cadence. See the
-[Single-Controller rollout recovery metrics](../observability/metrics.md#single-controller-rollout-recovery-metrics)
-for the emitted fields.
+`telemetry_interval_s` controls an independent wall-clock sampler for rollout throughput and checkpoint pressure. It is `null` (disabled) by default; set it to a positive number such as `30` to emit one sample every 30 seconds. This does not change the checkpoint cadence. See the [Single-Controller rollout recovery metrics](../observability/metrics.md#single-controller-rollout-recovery-metrics) for the emitted fields.
 
-`max_consecutive_failures` is the number of consecutive retryable periodic-save
-failures tolerated before training aborts. A successful or skipped checkpoint
-attempt resets the count; checkpoint invariant failures still fail immediately.
+`max_consecutive_failures` is the number of consecutive retryable periodic-save failures tolerated before training aborts. A successful or skipped checkpoint attempt resets the count; checkpoint invariant failures still fail immediately.
 
-The bootstrap fingerprint is fail-closed: every configuration value affects
-compatibility unless NeMo-RL's built-in denylist identifies it as operational,
-such as logging, cluster placement, checkpoint location, runtime ports, or
-credentials. This means configuration added by an external algorithm is safe
-by default—a change prevents bootstrap recovery instead of silently mixing
-incompatible rollout state.
-The bootstrap manifest also stores this credential-redacted compatibility
-identity so a rejected restart can report the exact changed dotpaths instead of
-showing only two opaque digests.
+The bootstrap fingerprint is fail-closed: every configuration value affects compatibility unless NeMo-RL's built-in denylist identifies it as operational, such as logging, cluster placement, checkpoint location, runtime ports, or credentials. This means configuration added by an external algorithm is safe by default—a change prevents bootstrap recovery instead of silently mixing incompatible rollout state.
+The bootstrap manifest also stores this credential-redacted compatibility identity so a rejected restart can report the exact changed dotpaths instead of showing only two opaque digests.
 
-An integration may use `extra_fingerprint_excluded_paths` for additional
-runtime-only values that are not part of NeMo-RL's built-in configuration:
+An integration may use `extra_fingerprint_excluded_paths` for additional runtime-only values that are not part of NeMo-RL's built-in configuration:
 
 ```yaml
 rollout_checkpointing:
@@ -290,175 +220,58 @@ rollout_checkpointing:
     - env.private_agent.workers.*.log_dir
 ```
 
-Each dotpath removes that value and its children from the compatibility
-identity. `*` matches one mapping or list level and `**` matches any number of
-levels.
-Only exclude values that cannot affect prompts, generation, rewards, lineage,
-or the interpretation of persisted rollout data. These exclusions must be set
-on the original run as well as its restart.
+Each dotpath removes that value and its children from the compatibility identity. `*` matches one mapping or list level and `**` matches any number of levels.
+Only exclude values that cannot affect prompts, generation, rewards, lineage, or the interpretation of persisted rollout data. These exclusions must be set on the original run as well as its restart.
 
 Periodic snapshots currently require all of the following:
 
 - `checkpointing.enabled: true` and `checkpointing.save_data_plane: true`.
 - `data_plane.backend: simple`, `mooncake_cpu` or `nixl`, because native TQ save/load is required.
 - `token_capture.enabled: true`.
-- A replay-recoverable sampler with training-claim ownership. All built-in
-  samplers qualify. A custom sampler must explicitly declare both
-  `supports_buffer_checkpoint = True` and `supports_training_claims = True`.
+- A replay-recoverable sampler with training-claim ownership. All built-in samplers qualify. A custom sampler must explicitly declare both `supports_buffer_checkpoint = True` and `supports_training_claims = True`.
 
-Each trainer or bootstrap anchor has a `rollout_snapshots/` directory. A
-published `snapshot_NNNNNN/` contains the native TQ snapshot and matching
-replay, dataloader, controller, replacement-reserve, and unfinished-rollout
-metadata. `keep_latest_k` retains recent committed snapshots as fallbacks;
-temporary or interrupted directories are never selected for recovery.
+Each trainer or bootstrap anchor has a `rollout_snapshots/` directory. A published `snapshot_NNNNNN/` contains the native TQ snapshot and matching replay, dataloader, controller, replacement-reserve, and unfinished-rollout metadata. `keep_latest_k` retains recent committed snapshots as fallbacks; temporary or interrupted directories are never selected for recovery.
 
-With `restore_mode: latest`, startup selects the newest compatible committed
-snapshot under the latest trainer anchor. With `trainer_checkpoint`, it ignores
-newer periodic rollout progress and resumes from the trainer checkpoint bundle.
-Checkpoint selection is read-only: neither mode removes snapshots. If no trainer
-checkpoint exists, `trainer_checkpoint` cannot safely reuse an existing bootstrap
-namespace, so startup fails without modifying it. Recover that state with `latest`
-or choose a new `checkpoint_dir` to start a fresh bootstrap lineage. Obsolete
-bootstrap snapshots are removed only by retention after a durable trainer
-checkpoint exists.
+With `restore_mode: latest`, startup selects the newest compatible committed snapshot under the latest trainer anchor. With `trainer_checkpoint`, it ignores newer periodic rollout progress and resumes from the trainer checkpoint bundle.
+Checkpoint selection is read-only: neither mode removes snapshots. If no trainer checkpoint exists, `trainer_checkpoint` cannot safely reuse an existing bootstrap namespace, so startup fails without modifying it. Recover that state with `latest` or choose a new `checkpoint_dir` to start a fresh bootstrap lineage. Obsolete bootstrap snapshots are removed only by retention after a durable trainer checkpoint exists.
 
-> **Bootstrap-only `trainer_checkpoint` behavior:** A bootstrap rollout snapshot
-> has no corresponding model or optimizer checkpoint. Therefore
-> `restore_mode: trainer_checkpoint` deliberately fails when bootstrap state exists
-> but no trainer checkpoint does. It does not ignore or delete that state. Use
-> `latest` to recover it, or select a new `checkpoint_dir` to start from scratch.
+> **Bootstrap-only `trainer_checkpoint` behavior:** A bootstrap rollout snapshot has no corresponding model or optimizer checkpoint. Therefore `restore_mode: trainer_checkpoint` deliberately fails when bootstrap state exists but no trainer checkpoint does. It does not ignore or delete that state. Use `latest` to recover it, or select a new `checkpoint_dir` to start from scratch.
 
 :::{note}
-Completed groups are restored directly from the TQ snapshot. For unfinished
-token-capture groups, `rollout_recovery.target_level` selects the requested
-restart boundary:
+Completed groups are restored directly from the TQ snapshot. For unfinished token-capture groups, `rollout_recovery.target_level` selects the requested restart boundary:
 
 - `prefix` also keeps the tokens each active model call has decoded, and resumes the call from them.
 - `turn` requests coordinated Gym participant recovery from the last saved turn.
 - `sibling` preserves each sealed sibling and redispatches only unfinished ones.
 - `prompt_group` retries every sibling in the group when any sibling is unfinished.
 
-`sibling` is the default and avoids regenerating completed work. Use
-`prompt_group` when every generation in a recovered group must come from the
-policy weights live at redispatch.
+`sibling` is the default and avoids regenerating completed work. Use `prompt_group` when every generation in a recovered group must come from the policy weights live at redispatch.
 
-Turn recovery coordinates Gym and RL as one rollout-snapshot cut. Each prompt group
-is pinned to the Gym shard replica that accepted it. SC first closes its narrow
-`/run` dispatch admission gate; already-submitted requests, completion callbacks,
-finalization, and TQ writes remain live. Gym parks its participants and commits
-the subset of candidate episodes it still owns into the checkpoint's
-`gym-instances/` tree. Candidate replies already on the wire drain through the
-ordinary RL/TQ completion path. SC then acquires the exclusive data-plane
-barrier, verifies that the remaining Gym-owned episodes and their TQ staging
-keys match the Gym commit, and captures TQ plus the rollout ledger. Gym reports
-as restarts the episodes a participant cannot capture, such as rollouts on a
-restart-only resources server or on an agent without checkpoint support. SC
-leaves them out of the commit, does not wait for them, and records them in
-`gym_checkpoint.json`; they keep running, and after a crash they start over from
-their tasks. If any other candidate is neither exported by Gym nor drained before
-the deadline, the checkpoint aborts and every deployment is resumed.
+Turn recovery coordinates Gym and RL as one rollout-snapshot cut. Each prompt group is pinned to the Gym shard replica that accepted it. SC first closes its narrow `/run` dispatch admission gate; already-submitted requests, completion callbacks, finalization, and TQ writes remain live. Gym parks its participants and commits the subset of candidate episodes it still owns into the checkpoint's `gym-instances/` tree. Candidate replies already on the wire drain through the ordinary RL/TQ completion path. SC then acquires the exclusive data-plane barrier, verifies that the remaining Gym-owned episodes and their TQ staging keys match the Gym commit, and captures TQ plus the rollout ledger. Gym reports as restarts the episodes a participant cannot capture, such as rollouts on a restart-only resources server or on an agent without checkpoint support. SC leaves them out of the commit, does not wait for them, and records them in `gym_checkpoint.json`; they keep running, and after a crash they start over from their tasks. If any other candidate is neither exported by Gym nor drained before the deadline, the checkpoint aborts and every deployment is resumed.
 
-Because a restart-only server would make turn- or prefix-level recovery quietly
-restart its rollouts, SC reads every Gym participant's checkpoint `mode` from discovery
-before the first rollout. If any server's mode is `restart_only` (the default for
-agents and resources servers), setup fails and names it, unless
-`rollout_recovery.allow_restart_only_gym_servers` is true, which accepts it with
-a warning. Each saved snapshot logs `gym_restarted_episodes`, the episodes that
-would start over after a crash.
+Because a restart-only server would make turn- or prefix-level recovery quietly restart its rollouts, SC reads every Gym participant's checkpoint `mode` from discovery before the first rollout. If any server's mode is `restart_only` (the default for agents and resources servers), setup fails and names it, unless `rollout_recovery.allow_restart_only_gym_servers` is true, which accepts it with a warning. Each saved snapshot logs `gym_restarted_episodes`, the episodes that would start over after a crash.
 
-Gym leases are renewed throughout. Gym resumes as soon as the cut is captured,
-before SC writes its sidecars and publishes the snapshot, so new rollouts wait
-only for the Gym commit and the TQ capture, not for the publish. Gym's own
-coordination guide publishes first and resumes after; resuming first is safe
-because every Gym commit is already written and resume only reopens admission. A
-resume that still fails after a successful cut is logged as a warning instead of
-failing the snapshot: that deployment reopens on its own once its lease grace,
-`3 * token_capture.control_timeout_s`, runs out.
+Gym leases are renewed throughout. Gym resumes as soon as the cut is captured, before SC writes its sidecars and publishes the snapshot, so new rollouts wait only for the Gym commit and the TQ capture, not for the publish. Gym's own coordination guide publishes first and resumes after; resuming first is safe because every Gym commit is already written and resume only reopens admission. A resume that still fails after a successful cut is logged as a warning instead of failing the snapshot: that deployment reopens on its own once its lease grace, `3 * token_capture.control_timeout_s`, runs out.
 
-Gym keeps a rollout it retired, or continued through a restore, refused by ID
-on every participant until the controller forgets it. Before each prepare,
-while Gym is idle, SC retires the episodes it dropped since the last snapshot
-and then forgets them, together with restored rollouts whose continued attempt
-has since sealed; RL never sends those rollout IDs again. A deployment that
-refuses the forget gets the retire again and then the forget. Forgetting is
-best effort: a deployment that still refuses keeps its rollouts queued for the
-next snapshot, since each costs one small entry, and the snapshot goes ahead.
+Gym keeps a rollout it retired, or continued through a restore, refused by ID on every participant until the controller forgets it. Before each prepare, while Gym is idle, SC retires the episodes it dropped since the last snapshot and then forgets them, together with restored rollouts whose continued attempt has since sealed; RL never sends those rollout IDs again. A deployment that refuses the forget gets the retire again and then the forget. Forgetting is best effort: a deployment that still refuses keeps its rollouts queued for the next snapshot, since each costs one small entry, and the snapshot goes ahead.
 
-`rollout_recovery.gym_prepare_timeout_s` (default 300 seconds) bounds how long
-Gym gets to park its in-flight steps; raise it for long agent or environment
-steps. Every other Gym control call keeps `token_capture.control_timeout_s`. A
-snapshot whose Gym cannot park in time, or is unavailable, is skipped and
-retried under the `max_consecutive_failures` budget. The stall watchdog keeps
-counting while Gym is parked, so setup requires
-`async_rl.stall_watchdog.stall_timeout_s` to exceed `gym_prepare_timeout_s +
-2 * token_capture.control_timeout_s`; raise it together with the prepare
-timeout.
+`rollout_recovery.gym_prepare_timeout_s` (default 300 seconds) bounds how long Gym gets to park its in-flight steps; raise it for long agent or environment steps. Every other Gym control call keeps `token_capture.control_timeout_s`. A snapshot whose Gym cannot park in time, or is unavailable, is skipped and retried under the `max_consecutive_failures` budget. The stall watchdog keeps counting while Gym is parked, so setup requires `async_rl.stall_watchdog.stall_timeout_s` to exceed `gym_prepare_timeout_s + 2 * token_capture.control_timeout_s`; raise it together with the prepare timeout.
 
-Gym state is saved only in rollout snapshots. A trainer checkpoint never pauses
-Gym, so a slow or unavailable Gym cannot fail it. It wakes the snapshot loop,
-which captures Gym anchored to it as soon as the checkpoint is durable.
+Gym state is saved only in rollout snapshots. A trainer checkpoint never pauses Gym, so a slow or unavailable Gym cannot fail it. It wakes the snapshot loop, which captures Gym anchored to it as soon as the checkpoint is durable.
 
-On restart, SC validates that the episodes `gym_checkpoint.json` saves, together
-with those it records as restarts, are exactly the episodes owned by the rollout
-ledger, and that the saved Gym actor topology matches the live one. It restores
-Gym before starting rollout dispatch, advances each restored episode to its next
-attempt, and routes it back to the same Gym actor; recorded restarts start over
-from their tasks.
-If one shard replica fails restore, every replica conservatively retires its
-replacement attempts before the outer restore fails. This also covers a lost
-Ray reply where the remote restore may actually have succeeded, so a partially
-restored topology is never released for execution. A second checkpoint taken
-after restore but before redispatch includes the unclaimed restored attempt, so
-another crash does not lose the saved turn boundary.
+On restart, SC validates that the episodes `gym_checkpoint.json` saves, together with those it records as restarts, are exactly the episodes owned by the rollout ledger, and that the saved Gym actor topology matches the live one. It restores Gym before starting rollout dispatch, advances each restored episode to its next attempt, and routes it back to the same Gym actor; recorded restarts start over from their tasks.
+If one shard replica fails restore, every replica conservatively retires its replacement attempts before the outer restore fails. This also covers a lost Ray reply where the remote restore may actually have succeeded, so a partially restored topology is never released for execution. A second checkpoint taken after restore but before redispatch includes the unclaimed restored attempt, so another crash does not lose the saved turn boundary.
 
-If no rollout snapshot follows the newest trainer checkpoint, SC restores that
-checkpoint on its own: completed groups come back from TQ and unfinished
-turn- and prefix-level rollouts restart from their tasks. A rollout snapshot without its
-`gym_checkpoint.json` is refused.
+If no rollout snapshot follows the newest trainer checkpoint, SC restores that checkpoint on its own: completed groups come back from TQ and unfinished turn- and prefix-level rollouts restart from their tasks. A rollout snapshot without its `gym_checkpoint.json` is refused.
 
-The `prefix` target needs everything the `turn` target needs (listed below),
-and does not yet support multimodal capture, router replay, or
-`policy.generation.top_logprobs > 0`. Each cut must finish within
-`token_capture.control_timeout_s`; a call that is not cut in time restarts from
-its last saved turn. Some calls are never cut and also restart from their last
-saved turn:
+The `prefix` target needs everything the `turn` target needs (listed below), and does not yet support router replay or `policy.generation.top_logprobs > 0`. Each cut must finish within `token_capture.control_timeout_s`; a call that is not cut in time restarts from its last saved turn. Some calls are never cut and also restart from their last saved turn:
 
-- Calls using stop strings, multi-token `bad_words`, or a per-request `seed`
-  while sampling, because a resumed call could not apply them to the tokens it
-  already decoded.
-- Calls with structured output (a non-text `response_format`, `guided_*` or
-  `structured_outputs`) or a `tool_choice` other than `auto` or `none`, which
-  NeMo Gym leaves uncut.
+- Calls using stop strings, multi-token `bad_words`, or a per-request `seed` while sampling, because a resumed call could not apply them to the tokens it already decoded.
+- Calls with structured output (a non-text `response_format`, `guided_*` or `structured_outputs`) or a `tool_choice` other than `auto` or `none`, which NeMo Gym leaves uncut.
 
-The `turn` target currently requires vLLM generation, NeMo Gym, token capture,
-periodic rollout snapshots, `restore_mode: latest`, and the same named Gym
-shards and replica counts on restart. Only checkpoints using the current rollout
-recovery schema are accepted.
+The `turn` target currently requires vLLM generation, NeMo Gym, token capture, periodic rollout snapshots, `restore_mode: latest`, and the same named Gym shards and replica counts on restart. Only checkpoints using the current rollout recovery schema are accepted.
 
-`task_source_target_level_overrides` can coarsen the target using the Gym
-`task_source` embedded in the raw rollout row. Unlike `agent_ref`, this identity
-is available before Gym resolves the concrete agent and SC reserves the recovery
-group. When a row already carries an `agent_ref`, a matching
-`agent_target_level_overrides` entry wins over a matching task-source entry,
-mirroring Gym's concrete-route precedence. Otherwise the task-source override,
-then the global default, applies. A materialized Gym task row carries no agent,
-so its `task_id.taskset` is looked up in `task_source_granularity_overrides`
-instead, and `agent_granularity_overrides` does not apply. Set taskset keys in
-YAML: a command-line override cannot express a key that contains `:`, such as
-`weather:train`. The agent map also keeps datasets collated
-before Gym recorded `task_source` working, although re-collating them is
-recommended. Overrides may only select a coarser level than the global target,
-and are not supported with `turn` or `prefix` yet: a checkpointing Gym deployment exports
-every live episode, so a coarser route on it would fall outside the commit
-scope. Until Gym advertises group-scoring capabilities, configure group-scored routes
-such as GenRM explicitly as `prompt_group`. Non-default policies require
-`token_capture.enabled: true`. The task source and resolved policy are persisted
-in `rollout_recovery.pt`, so
-recovery does not reinterpret an existing group using changed configuration. A
-generation that already finished keeps its tokens in the token-capture staging
-area, so `sibling` reuses them unchanged; a redispatched sibling produces a new
-sample from the same prompt. Neither becomes a training row until every
-generation in the group has finished.
+`task_source_target_level_overrides` can coarsen the target using the Gym `task_source` embedded in the raw rollout row. Unlike `agent_ref`, this identity is available before Gym resolves the concrete agent and SC reserves the recovery group. When a row already carries an `agent_ref`, a matching `agent_target_level_overrides` entry wins over a matching task-source entry, mirroring Gym's concrete-route precedence. Otherwise the task-source override, then the global default, applies. A materialized Gym task row carries no agent, so its `task_id.taskset` is looked up in `task_source_granularity_overrides` instead, and `agent_granularity_overrides` does not apply. Set taskset keys in YAML: a command-line override cannot express a key that contains `:`, such as `weather:train`. The agent map also keeps datasets collated before Gym recorded `task_source` working, although re-collating them is recommended. Overrides may only select a coarser level than the global target, and are not supported with `turn` or `prefix` yet: a checkpointing Gym deployment exports every live episode, so a coarser route on it would fall outside the commit scope. Until Gym advertises group-scoring capabilities, configure group-scored routes such as GenRM explicitly as `prompt_group`. Non-default policies require `token_capture.enabled: true`. The task source and resolved policy are persisted in `rollout_recovery.pt`, so recovery does not reinterpret an existing group using changed configuration. A generation that already finished keeps its tokens in the token-capture staging area, so `sibling` reuses them unchanged; a redispatched sibling produces a new sample from the same prompt. Neither becomes a training row until every generation in the group has finished.
 :::
 
 When a sampler does not support replay recovery, a requested data-plane checkpoint is written in `shadow` mode. The TQ snapshot is retained, but no authoritative replay index is written and its rows are not restored into the training replay buffer.
@@ -509,7 +322,7 @@ Field definitions:
 - `min_groups_for_streaming_train` — minimum ready groups the trainer waits for before dispatching a chunk; the sampler may select more. Set to `num_prompts_per_step` for full-batch execution; lower for streaming. PPO streaming requires `ppo.ppo_epochs: 1`: value/policy/reference forwards, GAE and policy backward run per chunk, followed by one policy optimizer update and refit. Each critic epoch is one optimizer update over the same samples, assembled for `whole_batch` or replayed chunk by chunk for `split`. The minimum must be at least the setup-computed policy/value prompt-group multiple; static batching includes both training and inference microbatch sizes. Full-batch PPO also permits multiple policy epochs.
 - `sampler.warmup_lookahead_versions` (PPO, `in_order` only) — lookahead used while `ppo.policy_training_start_step` critic warmup is in progress, shrinking back to `max_lookahead_versions` afterwards. The SC equivalent of `ppo.async_ppo.warmup_generation_lead_steps`.
 - `num_advantage_workers` — CPU Ray actors that run the advantage stage. `0` (the default) keeps it in the controller process, which is correct but both holds a whole cohort's advantage inputs in the controller's heap and blocks the controller's event loop for the duration of the computation — long enough at Ultra scale to miss Ray's actor liveness ping. A positive value moves both costs onto dedicated actors, placed off the dedicated Ray head so their host-memory peak does not land beside the controller. Only `grpo` and `opd` are sharded across the pool: every other `adv_estimator` also reduces over the whole batch, which a shard is not, so those run as one call on one actor and a larger pool buys them nothing. Each stage logs `advantage stage: N row(s) over M shard(s), pool=P` with the reason whenever `M` is 1. Under `data_plane.backend: mooncake_cpu` each actor is its own TransferQueue client and mounts a full `global_segment_size + local_buffer_size`, like each token-capture finalizer, so budget it on top of `gpus_per_node × (segment + buffer)`.
-- `log_full_train_data` — writes every consumed sample to `train_data_step<N>.jsonl` in the log dir. The advantage stage is what holds the untruncated tensors, so the stage writes the dump wherever it runs: with a pool each shard writes its own `train_data_step<N>.jsonl.part-<shard>` and the controller merges them in shard order on a completed optimizer step, assigning `idx` across the merged file. That requires the pool to share a filesystem with the controller: the log dir was controller-only before this, so a node-local one worked and now would not. The controller checks the merged row count against what the shards reported and fails the step rather than publishing a dump that is short a shard. The JSON serialization is the expensive part and scales with batch size × sequence length, so a pool also moves that cost off the controller; it is reported back per call and still shows up under the `train_data_dump` timer. Debug-only — leave it `false` for production runs.
+- `log_full_train_data` — writes every consumed sample to `train_data_step<N>.jsonl` in the log dir. The advantage stage is what holds the untruncated tensors, so the stage writes the dump wherever it runs: with a pool each shard writes its own `train_data_step<N>.jsonl.part-<shard>` and the controller merges them in shard order on a completed optimizer step, assigning `idx` across the merged file. That requires the pool to share a filesystem with the controller: the log dir was controller-only before this, so a node-local one worked and now would not. The controller checks the merged row count against what the shards reported and fails the step rather than publishing a dump that is short a shard. JSON serialization runs in the background. The `train_data_dump` timer sums chunk preparation, submission and backpressure waits with the controller's remaining flush wait and final-file publication; serialization overlapped with computation is excluded. Debug-only — leave it `false` for production runs.
 - `defer_async_checkpoint_finalize` — with `policy.megatron_cfg.checkpoint.async_save: true`, finalizes an async policy checkpoint at a later step boundary, once every rank's background write is done, instead of from a background thread whose blocking finalize holds the policy workers until the write lands. The train pump polls at the top of each step, before the step's first policy-worker call; the next save and training exit still finalize blocking, and so does teardown after a failure. `tmp_step_N` is renamed to `step_N` only after that finalize, and resume reads only `step_N`, so a crash in that window — typically one step — resumes from the previous checkpoint. It cannot be combined with rollout snapshots taken while training continues (`rollout_checkpointing.snapshot_attempt_interval_s`, or `snapshot_on_trainer_checkpoint` with turn-level recovery), and setup rejects that combination: a snapshot anchors on `step_N`, which a deferred finalize publishes only after training has moved past step N. The snapshot at the `checkpoint_must_save_by` deadline is allowed: that save publishes `step_N` in the background right away, and the run then stops. Only non-colocated generation gains: a colocated refit, and PPO's per-chunk critic handoff, block on the finalize anyway. Time spent finalizing at a step boundary is reported as `timing/train/checkpoint_finalize`. Leave it `false` (the default) when `async_save` is off; setup rejects that combination.
 
 ## Dynamic sampling
@@ -630,86 +443,23 @@ Do not carry `max_num_epochs: -1` across either. [ppo.md](./ppo.md#asynchronous-
 
 The SC path is still under active development. Feature gaps are tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625). Notable items:
 
-- Multimodal/VLM GRPO is supported with Megatron generation. Set
-  `policy.is_vlm: true`; see the
-  [CLEVR Single-Controller recipe](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml).
-- NeMo-Gym token capture also supports Omni dynamic-resolution images and native video
-  rollouts with async vLLM generation and a Megatron learner, and with Megatron
-  Inference generation through the same media columns and finalizer (the
-  expanded-prefix splicing that backend adds is described in
-  [Token-capture ledger](../design-docs/token-capture-ledger.md#multimodal-rollouts-on-megatron-inference)).
-  With `token_capture.enabled: true` and the VLM processor configured, workers
-  capture the processed media used for inference together with each call's
-  token delta.
-  RL hands the owned tensors (`imgs`, `imgs_sizes`, and optional `num_frames`)
-  to Gym's `complete_call_from_response` as opaque attachments, and the TQ sink
-  writes them in the same `put` as the token columns, so `staged` coordinates
-  acknowledge tokens and pixels together and a failed write is `capture_failed`
-  at call time. Tensors keep their native shapes and dtypes on the wire; two
-  per-row flags (`media_present`, `media_has_frames`) mark which rows carry
-  pixels and whether they are video. Media-enabled staging partitions carry
-  these columns on every row; text-only runs register and read none of them.
-  vLLM pixels are rearranged losslessly into packed patches; the finalizer
-  reads the presence flags with the base columns, then issues one batched read
-  of the tensor columns for the terminal-chain calls that carry media, and
-  publishes `pixel_values`, `imgs_sizes`, and `num_frames` for the existing
-  Megatron learner without resampling or normalizing the media again.
-  Only newly introduced occurrences are staged. vLLM-specific `media_spans`
-  extras retain placeholder positions and token hashes for multi-turn prefix
-  replacement, including video's timestamp-separated visual-token spans.
-  Capture requests use vLLM's `skip_mm_cache=True` path to obtain concrete
-  processor tensors. vLLM can still reuse its processor-only cache; this does
-  not guarantee fresh preprocessing. vLLM tiles images from a dummy prompt, so
-  the request text never changes geometry, but the images of one request share
-  the token budget: adding an image under a tight budget can re-tile a retained
-  one, and a warm processor-only cache can keep a geometry a fresh processor
-  would not reproduce. If that changes retained geometry or placeholder tokens, the worker
-  rejects the continuation before inference with HTTP 400 and error code
-  `retained_media_changed` (other capture-time validation failures use
-  `media_capture_rejected`). Gym's current exception middleware wraps the
-  upstream error in HTTP 500, retaining the code in the response body. RL then
-  classifies it as an infrastructure `GymTransportError`, eligible for the
-  configured prompt retry policy; it is not a dedicated terminal rejection.
-  Text-call rows carry sentinels in each column's own dtype, because
-  TransferQueue keeps one dtype per field across live rows.
-  Media-enabled rows also store `media_metadata_digest`, a SHA-256 checksum of
-  the small route-less extras JSON. Sources check it before exposing media
-  descriptors, without reading pixels or routed-expert tensors. Missing or
-  changed checksums reject the row. This detects accidental metadata corruption;
-  it is independent of Gym's receipt and combined `extras_digest` commitment.
-  Media bundles are structurally validated before writing and after reading
-  (required tensors, patch geometry, frame grouping); malformed or missing
-  columns reject the rollout as `invalid_media_columns`, incompatible parts
-  along a chain as `media_chain_incompatible`. Tensor contents are not hashed;
-  retained occurrences are checked by geometry on both backends and
-  additionally by placeholder tokens on vLLM, the only engine that reports
-  them. Media
-  must remain immutable for the rollout's lifetime and preprocessing must be
-  deterministic. Same-shape pixel changes and corruption of stored pixel values
-  are outside this check's coverage. Call
-  rows share the existing checkpoint and cleanup lifecycle. TQ has no
-  transactional rollback: a failed combined write is discarded best-effort by
-  the sink, and a failed discard is logged at ERROR.
-  Upgrade the paired Gym and RL changes together. The GB200 functional shard
-  `L1_Functional_Tests_GB200_Vllm_Omni_Single_Controller.sh` smokes the vLLM
-  path end to end (CLEVR-style images through Gym `string_match`, native video
-  through Gym `mcqa`), and
-  `L1_Functional_Tests_GB200_Megatron_Omni_Single_Controller.sh` smokes the
-  Megatron Inference path on the same CLEVR-style images. Both gate on
-  `train/finalize/media_row_rate == 1`, the metric that reports the fraction
-  of learner rows built from captured media.
-  The Megatron Inference path relies on the pinned Megatron-LM carrying
-  `media_tensors` on the offloaded payload and expanded-prefix stitching
-  (NVIDIA/Megatron-LM#7598).
-  A group in which no rollout carried media (an all-text prompt in a mixed
-  dataset) is published with empty media rows in the partition's pinned pixel
-  dtype and patch width, so its keys can share a train fetch with media keys.
-  Compaction, mixed image/video conversations, native audio,
-  video token pruning, static tiling (`image_num_patches`), other processor families,
-  and `token_capture.defer_routed_experts_to_policy: true` are not supported.
-- Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo
-  Gym rollouts; multimodal/VLM MOPD is not yet supported. See
-  [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
+- Multimodal/VLM PPO is supported with vLLM generation and Megatron policy/value workers for Qwen2.5-VL-style wrappers. The critic must use the same VLM as the policy. The validated path uses TP=2, PP=1, CP=1, and no sequence packing; wrappers that self-pack or slice context-parallel inputs are not yet supported by the value worker. See the [multimodal PPO guide](./ppo.md#multimodal-ppo).
+- Multimodal/VLM GRPO is supported with Megatron generation. Set `policy.is_vlm: true`; see the [CLEVR Single-Controller recipe](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml).
+- NeMo-Gym token capture also supports Omni dynamic-resolution images and native video rollouts with async vLLM generation and a Megatron learner, and with Megatron Inference generation through the same media columns and finalizer (the expanded-prefix splicing that backend adds is described in [Token-capture ledger](../design-docs/token-capture-ledger.md#multimodal-rollouts-on-megatron-inference)).
+  With `token_capture.enabled: true` and the VLM processor configured, workers capture the processed media used for inference together with each call's token delta.
+  RL hands the owned tensors (`imgs`, `imgs_sizes`, and optional `num_frames`) to Gym's `complete_call_from_response` as opaque attachments, and the TQ sink writes them in the same `put` as the token columns, so `staged` coordinates acknowledge tokens and pixels together and a failed write is `capture_failed` at call time. Tensors keep their native shapes and dtypes on the wire; two per-row flags (`media_present`, `media_has_frames`) mark which rows carry pixels and whether they are video. Media-enabled staging partitions carry these columns on every row; text-only runs register and read none of them.
+  vLLM pixels are rearranged losslessly into packed patches; the finalizer reads the presence flags with the base columns, then issues one batched read of the tensor columns for the terminal-chain calls that carry media, and publishes `pixel_values`, `imgs_sizes`, and `num_frames` for the existing Megatron learner without resampling or normalizing the media again.
+  Only newly introduced occurrences are staged. vLLM-specific `media_spans` extras retain placeholder positions and token hashes for multi-turn prefix replacement, including video's timestamp-separated visual-token spans.
+  With `rollout_recovery.target_level: prefix`, the first durable prefix row for a model call carries that call's new media metadata and a SHA-256 digest of each packed tensor, not the pixels; later token chunks carry no media. The prefix digest covers that metadata, so a restore checks it with the prefix, then reprocesses the reissued request, checks its media against those tensor digests, and stages the reprocessed tensors in the canonical terminal row. A prefix that fails its digest check makes the call regenerate from its turn boundary, like any unusable prefix; reprocessed media that does not match the digests is rejected with `retained_media_changed`. The original image or video must therefore still be resolvable by vLLM when the request is reissued: this path does not provide source-free media prefill if the original media has disappeared.
+  Capture requests use vLLM's `skip_mm_cache=True` path to obtain concrete processor tensors. vLLM can still reuse its processor-only cache; this does not guarantee fresh preprocessing. vLLM tiles images from a dummy prompt, so the request text never changes geometry, but the images of one request share the token budget: adding an image under a tight budget can re-tile a retained one, and a warm processor-only cache can keep a geometry a fresh processor would not reproduce. If that changes retained geometry or placeholder tokens, the worker rejects the continuation before inference with HTTP 400 and error code `retained_media_changed` (other capture-time validation failures use `media_capture_rejected`). Gym's current exception middleware wraps the upstream error in HTTP 500, retaining the code in the response body. RL then classifies it as an infrastructure `GymTransportError`, eligible for the configured prompt retry policy; it is not a dedicated terminal rejection.
+  Text-call rows carry sentinels in each column's own dtype, because TransferQueue keeps one dtype per field across live rows.
+  Media-enabled rows also store `media_metadata_digest`, a SHA-256 checksum of the small route-less extras JSON. Sources check it before exposing media descriptors, without reading pixels or routed-expert tensors. Missing or changed checksums reject the row. This detects accidental metadata corruption; it is independent of Gym's receipt and combined `extras_digest` commitment.
+  Media bundles are structurally validated before writing and after reading (required tensors, patch geometry, frame grouping); malformed or missing columns reject the rollout as `invalid_media_columns`, incompatible parts along a chain as `media_chain_incompatible`. Tensor contents are not hashed; retained occurrences are checked by geometry on both backends and additionally by placeholder tokens on vLLM, the only engine that reports them. Media must remain immutable for the rollout's lifetime and preprocessing must be deterministic. Same-shape pixel changes and corruption of stored pixel values are outside this check's coverage. Call rows share the existing checkpoint and cleanup lifecycle. TQ has no transactional rollback: a failed combined write is discarded best-effort by the sink, and a failed discard is logged at ERROR.
+  Upgrade the paired Gym and RL changes together. The GB200 functional shard `L1_Functional_Tests_GB200_Vllm_Omni_Single_Controller.sh` smokes the vLLM path end to end (CLEVR-style images through Gym `string_match`, native video through Gym `mcqa`), and `L1_Functional_Tests_GB200_Megatron_Omni_Single_Controller.sh` smokes the Megatron Inference path on the same CLEVR-style images. Both gate on `train/finalize/media_row_rate == 1`, the metric that reports the fraction of learner rows built from captured media.
+  The Megatron Inference path relies on the pinned Megatron-LM carrying `media_tensors` on the offloaded payload and expanded-prefix stitching (NVIDIA/Megatron-LM#7598).
+  A group in which no rollout carried media (an all-text prompt in a mixed dataset) is published with empty media rows in the partition's pinned pixel dtype and patch width, so its keys can share a train fetch with media keys.
+  Compaction, mixed image/video conversations, native audio, video token pruning, static tiling (`image_num_patches`), other processor families, and `token_capture.defer_routed_experts_to_policy: true` are not supported.
+- Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo Gym rollouts; multimodal/VLM MOPD is not yet supported. See [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
 - Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). vLLM generation can also serve through Dynamo (`policy.generation.dynamo: true`); see [Dynamo serving](dynamo-generation.md). SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
@@ -725,27 +475,8 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 
 ### Full training-data dumps
 
-Set `async_rl.log_full_train_data: true` to stream every consumed sample to
-`train_data_step<N>.jsonl` in the logger directory. This is independent of
-`env.should_log_nemo_gym_responses` and OPD diagnostics. Dumps retain masked
-samples and include full token IDs, token/sample loss masks, final clipped
-advantages, rewards, sample IDs and metadata, generation logprobs, and the
-student/teacher logprobs when computed. Only padding beyond `input_lengths`
-is removed; response content is not capped. Values follow the legacy
-singleton-batch JSONL shape. Chunks stream through `.jsonl.partial` files;
-the final name is published only after the optimizer step completes. A
-partial file is not proof of a completed training step.
+Set `async_rl.log_full_train_data: true` to stream every consumed sample to `train_data_step<N>.jsonl` in the logger directory. This is independent of `env.should_log_nemo_gym_responses` and OPD diagnostics. Dumps retain masked samples and include full token IDs, token/sample loss masks, final clipped advantages, rewards, sample IDs and metadata, generation logprobs, and the student/teacher logprobs when computed. Only padding beyond `input_lengths` is removed; response content is not capped. Values follow the legacy singleton-batch JSONL shape. Chunks stream through `.jsonl.partial` files; the final name is published only after the optimizer step completes. A partial file is not proof of a completed training step.
 
-The files are written by `JsonDebugWriter`, which is what the default
-`async_rl.debug_writer.target: json` selects. To store the dump elsewhere, set
-`target` to the dotted import path of a `DebugWriter` subclass, for example
-`my_pkg.my_module.MyWriter`; any other keys under `async_rl.debug_writer` are
-passed to its constructor after `log_dir` and `shard_id`. The class implements
-`_write_chunk`, which receives each validated chunk as tensors, and
-`_publish_step`, and may override `close`, which the controller calls once at
-shutdown. It is built on the controller and on every advantage shard, so it
-must be importable in each of those processes.
+The files are written by `JsonDebugWriter`, which is what the default `async_rl.debug_writer.target: json` selects. To store the dump elsewhere, set `target` to the dotted import path of a `DebugWriter` subclass, for example `my_pkg.my_module.MyWriter`; any other keys under `async_rl.debug_writer` are passed to its constructor after `log_dir` and `shard_id`. The class implements `_write_chunk`, which receives each validated chunk as tensors, and `_publish_step`, and may override `close`, which the controller calls once at shutdown. It is built on the controller and on every advantage shard, so it must be importable in each of those processes.
 
-The per-step `timing/train/train_data_dump` metric reports wall-clock seconds
-summed across chunk preparation/writes and final-file publication. Chunk dump
-time is also included in `advantage_calculation`; these timings overlap.
+The per-step `timing/train/train_data_dump` metric reports wall-clock seconds summed across chunk preparation/writes and final-file publication. Chunk dump time is also included in `advantage_calculation`; these timings overlap.

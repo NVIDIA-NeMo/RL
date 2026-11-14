@@ -163,10 +163,8 @@ The delivery failure is real, mechanical, and fixable. Do not let it push you of
 
 So a nudge saying "report back" produces an idle notification with no content — the agent answered into the void. Phrase it as a tool instruction, verbatim:
 
-> Your report never reached me. When you are resumed by a message, your final assistant
-> text is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
-> `SendMessage(to="team-lead", summary="...", message="<your full findings>")`. Do NOT
-> just write the text as your answer — call the tool.
+> Your report never reached me. When you are resumed by a message, your final assistant text is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
+> `SendMessage(to="team-lead", summary="...", message="<your full findings>")`. Do NOT just write the text as your answer — call the tool.
 
 On PR #3292 all six teammates were silent through two rounds of ordinary nudging; after one message phrased that way, all six delivered within minutes.
 
@@ -1091,8 +1089,7 @@ This is the single most common way this skill produces churn. The failure mode i
 
 If devil-advocate has gone idle without reporting, do NOT interpret that as "no objections." Send the explicit-tool-call nudge — a resumed agent's final assistant text is not delivered to the leader, so a silent agent is usually one that never called the tool, not one with nothing to say:
 
-> Your verdicts never reached me. When you are resumed by a message, your final assistant text
-> is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
+> Your verdicts never reached me. When you are resumed by a message, your final assistant text is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
 > `SendMessage(to="team-lead", summary="devil-advocate verdicts", message="<full verdict list>")`.
 
 Only after that nudge has ALSO failed may you proceed, and then you MUST say so in the preview ("devil-advocate did not report; findings below carry only the leader's verification").
@@ -1138,10 +1135,7 @@ After all Wave 2 agents complete:
 
 ## Phase 4: Preview & Confirm
 
-> **Precondition check before you write a single line of this preview:** has `devil-advocate`
-> delivered its verdicts via SendMessage? If not, go back to the Phase 3 hard gate. Do not
-> present findings and do not offer staging. A preview built on un-challenged findings is how
-> a review gets staged, deleted, and re-staged.
+> **Precondition check before you write a single line of this preview:** has `devil-advocate` delivered its verdicts via SendMessage? If not, go back to the Phase 3 hard gate. Do not present findings and do not offer staging. A preview built on un-challenged findings is how a review gets staged, deleted, and re-staged.
 
 #### Comment IDs: C1, C2, C3 … — never reused
 
