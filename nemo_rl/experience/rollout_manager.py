@@ -2513,10 +2513,6 @@ class RolloutManager:
             overlong_filtering=self._overlong_filtering,
         )
 
-    def _is_zero_variance_group(self, record: PromptGroupRecord) -> bool:
-        """Whether this group's voters leave every row zero advantage."""
-        return rewards_carry_no_signal(self._voting_rewards(record))
-
     def _is_zero_variance_finalized(self, finalized: "FinalizedGroup") -> bool:
         """Whether a finalized capture group's voters leave every row zero advantage."""
         return rewards_carry_no_signal(

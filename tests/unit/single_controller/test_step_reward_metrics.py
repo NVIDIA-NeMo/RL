@@ -69,9 +69,9 @@ def _record(completions, *, loss_multiplier=1.0):
 
 def test_zero_variance_group_predicate_reads_completion_rewards():
     record = _record([_completion(1.0), _completion(1.0)])
-    assert _manager()._is_zero_variance_group(record) is True
+    assert rewards_carry_no_signal(_manager()._voting_rewards(record)) is True
     record.completions.append(_completion(0.0))
-    assert _manager()._is_zero_variance_group(record) is False
+    assert rewards_carry_no_signal(_manager()._voting_rewards(record)) is False
 
 
 def test_only_the_voting_rows_decide_whether_a_group_is_trivial():
@@ -88,15 +88,15 @@ def test_only_the_voting_rows_decide_whether_a_group_is_trivial():
     excluding = _manager("exclude", overlong_filtering=True)
     including = _manager("include", overlong_filtering=True)
 
-    assert excluding._is_zero_variance_group(record) is True
-    assert including._is_zero_variance_group(record) is False
+    assert rewards_carry_no_signal(excluding._voting_rewards(record)) is True
+    assert rewards_carry_no_signal(including._voting_rewards(record)) is False
 
 
 def test_a_flagged_row_only_votes_under_include():
     record = _record([_completion(0.0, mask_sample=True), _completion(1.0)])
 
-    assert _manager("exclude")._is_zero_variance_group(record) is True
-    assert _manager("include")._is_zero_variance_group(record) is False
+    assert rewards_carry_no_signal(_manager("exclude")._voting_rewards(record)) is True
+    assert rewards_carry_no_signal(_manager("include")._voting_rewards(record)) is False
 
 
 def test_a_zero_weight_group_is_trivial_under_either_policy():
@@ -105,7 +105,7 @@ def test_a_zero_weight_group_is_trivial_under_either_policy():
     record = _record([_completion(0.0), _completion(1.0)], loss_multiplier=0.0)
 
     for policy in ("include", "exclude", None):
-        assert _manager(policy)._is_zero_variance_group(record) is True
+        assert rewards_carry_no_signal(_manager(policy)._voting_rewards(record)) is True
 
 
 @pytest.mark.parametrize(

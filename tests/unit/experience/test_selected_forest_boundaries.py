@@ -1328,38 +1328,42 @@ def test_ordinary_finalize_carries_nondefault_voting_fields(
 ) -> None:
     """The finalizer ships the raw per-row voting fields the controller classifies on.
 
-    An ordinary (non-Forest) group with one masked and one truncated row and a
-    non-unit dataset loss weight must return those exact flags, the pre-shaping
-    Gym rewards, and the loss_multiplier -- all away from their defaults -- so the
-    controller's zero-variance filter reads real signal, not placeholders.
+    An ordinary (non-Forest) group with a masked valid row, an invalid row and a
+    truncated valid row, under a non-unit dataset loss weight, must return those exact
+    flags, the pre-shaping Gym rewards and the loss_multiplier for the valid rows only
+    -- all away from their defaults -- so the controller's zero-variance filter reads
+    real signal, not placeholders, and the invalid row never votes.
     """
     # Two independent single-call rollouts, each its own ordinary reward row.
     records_a, _ = forest.capture([None], owner="attempt")
     records_b, _ = forest.capture([None], owner="healthy")
 
-    # Ordinary truncation is "filled max_seq_len", which the gym tokens do not
-    # reach; force a mixed pattern so the second row counts as truncated.
+    # Keep truncation mixed across the two valid reward rows.
     monkeypatch.setattr(
         forest.finalizer,
         "_truncated_flags",
-        lambda rows, logical: [False, True],
+        lambda rows, logical: [False, False, True],
     )
 
     result = forest.finalizer.finalize_group(
         "group",
-        ["attempt", "healthy"],
+        ["attempt", "bad", "healthy"],
         [
             receipt(records_a, terminal=records_a[-1]),
-            receipt(records_b, terminal=records_b[-1]),
+            # An invalid row between the two valid ones: the voting lists must skip it.
+            None,
+            # capture_key must match the rollout_id "healthy" or finalize rejects the row.
+            {**receipt(records_b, terminal=records_b[-1]), "capture_key": "healthy"},
         ],
-        [0.25, 0.75],
-        mask_sample=[True, False],
+        [0.25, 7.0, 0.75],
+        mask_sample=[True, False, False],
         fallback_weight_version=7,
         prompt_idx=99,
         loss_multiplier=0.5,
-        canonical_sample_ids=["group_g0", "group_g1"],
+        canonical_sample_ids=["group_g0", "group_g1", "group_g2"],
     )
 
+    assert result.total_row_count == 3
     assert result.valid_row_count == 2
     assert len(result.reward_observations) == 2
     # The raw voting flags ride one-per-valid-row, in rollout order, not their

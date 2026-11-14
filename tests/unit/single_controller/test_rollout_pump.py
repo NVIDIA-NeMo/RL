@@ -1909,9 +1909,7 @@ def test_pump_claims_and_pops_a_filtered_spare_for_a_real_zero_variance_rejectio
         ctrl._rollout_manager = manager
         _init_pump_ledgers(ctrl)
 
-        # The real finalize path: a fake actor pool returning the pre-built
-        # group, a real checkpoint barrier, and a mocked buffer/ledger so the
-        # commit of the replacement does not need a live data plane.
+        # Run real controller finalization with fake actor and data-plane endpoints.
         ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         ctrl._available_finalizers = asyncio.Queue()
         ctrl._available_finalizers.put_nowait(actor)
@@ -1953,6 +1951,17 @@ def test_pump_claims_and_pops_a_filtered_spare_for_a_real_zero_variance_rejectio
         ctrl._trainer_version = 0
         ctrl._current_epoch = 0
 
+        # The pump must claim the spare before the finalize cut pops it, so record
+        # the claim count held inside finalization.
+        claims_during_finalize: list[int] = []
+        finalize = ctrl._finalize_with_actor
+
+        async def finalize_with_claim(*args: Any, **kwargs: Any) -> Any:
+            claims_during_finalize.append(ctrl._filtered_spares_claimed)
+            return await finalize(*args, **kwargs)
+
+        ctrl._finalize_with_actor = finalize_with_claim
+
         await ctrl._rollout_pump()
 
         # The zero-variance group was classified and rejected, its spare popped
@@ -1961,6 +1970,8 @@ def test_pump_claims_and_pops_a_filtered_spare_for_a_real_zero_variance_rejectio
         assert manager.stats.committed == 1
         assert not ctrl._rollout_runtime.filtered_reserve
         assert ctrl._filtered_prompts_by_step == {0: 1}
+        # The pump held the spare's claim across finalization, then released it.
+        assert claims_during_finalize[0] == 1
         assert ctrl._filtered_spares_claimed == 0
         # Two generations: the rejected group and its filtered replacement.
         assert len(manager.generated) == 2

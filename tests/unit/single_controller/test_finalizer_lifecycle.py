@@ -125,10 +125,7 @@ def _controller(actor: object) -> Any:
     ctrl._rollout_recovery_ledger = MagicMock()
     ctrl._rollout_recovery_ledger.__contains__.return_value = False
     ctrl._rollout_manager = MagicMock()
-    # The controller now asks the rollout manager (which owns the voting
-    # settings) to classify a finalized group. Mirror that classification off
-    # the controller's own config so the real-finalizer outcomes below stay
-    # driven by the group's rewards, not a truthy MagicMock.
+    # Classify with real reward helpers instead of a truthy MagicMock.
     ctrl._rollout_manager._is_zero_variance_finalized.side_effect = (
         lambda finalized: rewards_carry_no_signal(
             voting_rewards_from_finalized(
