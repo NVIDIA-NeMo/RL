@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 SCRIPT = Path(__file__).parents[3] / "nemo_rl/utils/cache_sync.sh"
+PROFILE = "inductor/dynamo/code_state_job_0_.pkl"
 
 
 def _run(*args: object, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -33,6 +34,13 @@ def _run(*args: object, env: dict | None = None) -> subprocess.CompletedProcess:
 def _set_age(path: Path, minutes: float) -> None:
     t = time.time() - minutes * 60
     os.utime(path, (t, t))
+
+
+def _put(path: Path, text: str, minutes: float = 0.0) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    if minutes:
+        _set_age(path, minutes)
 
 
 def _fake_rsync(tmp_path: Path, body: str) -> dict:
@@ -70,6 +78,41 @@ def test_writeback_publishes_new_settled_files_once(tmp_path: Path):
     _run("writeback", local, persistent, env={"NRL_COMPILE_CACHE_MIN_AGE_MIN": "0"})
     assert not (persistent / "a/new").exists()
     assert (persistent / "a/busy").read_text() == "being written"
+
+
+def test_writeback_replaces_only_shape_profiles_this_node_rewrote(tmp_path: Path):
+    persistent, local = tmp_path / "persistent/megatron", tmp_path / "local/megatron"
+    other_rank = "inductor/dynamo/code_state_job_1_.pkl"
+    raced_rank = "inductor/dynamo/code_state_job_2_.pkl"
+    # Published by earlier jobs; this node's seed copied them with the same mtimes.
+    for rel, text in [
+        (PROFILE, "old profile"),
+        (other_rank, "old profile"),
+        ("inductor/fxgraph/entry", "old graph"),
+    ]:
+        _put(persistent / rel, text, minutes=60)
+        _put(local / rel, text, minutes=60)
+    _put(Path(f"{local}.seeded"), "", minutes=30)
+    # Rank 0 rewrote its profile just now: profiles have no age rule.
+    _put(local / PROFILE, "new profile")
+    # Published entries are never replaced, even when the local copy changed.
+    _put(local / "inductor/fxgraph/entry", "new graph", minutes=10)
+    # A later job published rank 2's profile after this node rewrote it.
+    _put(local / raced_rank, "this job", minutes=5)
+    _put(persistent / raced_rank, "later job", minutes=1)
+    # New entries, one still inside the 1-minute age rule.
+    _put(local / "triton/kernel.cubin", "kernel", minutes=10)
+    _put(local / "triton/fresh.cubin", "fresh")
+
+    _run("writeback", local, persistent)
+
+    assert (persistent / PROFILE).read_text() == "new profile"
+    assert (persistent / other_rank).read_text() == "old profile"
+    assert (persistent / raced_rank).read_text() == "later job"
+    assert (persistent / "inductor/fxgraph/entry").read_text() == "old graph"
+    assert (persistent / "triton/kernel.cubin").read_text() == "kernel"
+    assert not (persistent / "triton/fresh.cubin").exists()
+    assert not (tmp_path / "persistent/megatron.lock").exists()
 
 
 def test_seed_marks_the_start_of_the_copy(tmp_path: Path):

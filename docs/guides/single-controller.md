@@ -361,6 +361,20 @@ The reward totals are kept in memory only, so after a checkpoint resume the in-f
 `train/reward` means different things on the two paths, so the curves are not comparable. With dynamic sampling on, v1 reports the **pre-filter** mean as `reward` and the kept rows as `filtered_reward`; SC keeps `reward` as the **trained-rows** mean and reports the pre-filter mean as `unfiltered_reward`. Comparing a v1 run against an SC run means lining up v1's `reward` with SC's `unfiltered_reward`, and v1's `filtered_reward` with SC's `reward`. SC's naming is the one to keep: every other metric on both paths describes the data actually trained on, and only v1's dynamic-sampling branch redefines `reward` to mean something else. Aligning v1 to this naming is tracked in [#5039](https://github.com/NVIDIA-NeMo/RL/issues/5039); it changes a metric existing dashboards already consume, so it lands on its own.
 ```
 
+## Opt-In Startup Optimizations
+
+These environment variables shorten the time from job start to the end of the first training step. Set them in the driver's environment, which `init_ray` passes to every Ray actor. All are off by default.
+
+| Variable | Effect | Needs |
+| -------- | ------ | ----- |
+| `NRL_EARLY_TRAINER_SUBMIT=1` | Builds the trainer while setup creates the vLLM generation workers, instead of after. | NeMo-Gym, non-colocated vLLM, no resume and `cluster.segment_size`; otherwise setup warns and ignores it. |
+| `NRL_OVERLAP_ROUTE_SCAN=1` | Reads the dataset's NeMo-Gym routes while the setup tasks run, instead of after they finish. | NeMo-Gym. Splits with taskset rows are still read after, since only the running Gym servers know their routes. |
+| `NRL_MEGATRON_TRITON_CACHE_AUTOTUNING=1`, `NRL_MEGATRON_TORCH_COMPILE_JOB_ID=<id>` | Keep Triton autotune results and torch.compile shape profiles in the Megatron compile cache between jobs. `NRL_MEGATRON_TRITON_PRINT_AUTOTUNING=1` logs each benchmark. | The [persistent JIT compile caches](persistent-jit-caches.md), and the same job id in every run. A job whose ranks start from shape profiles saved at different points of an earlier run can hang on its first step; unset the job id if it does. |
+| `NRL_TRAINER_WARMUP=1` | Runs a synthetic first training pass while the trainer waits for generation or the first rollouts. | A Megatron trainer and non-colocated generation. Setups it does not cover, such as PPO or router replay, skip it and log why. |
+| `NRL_TRAINER_WARMUP_SEQLENS=<a>,<b>,...` | Sets the warm-up's sequence lengths. The default fills two microbatches near the microbatch token budget. | `NRL_TRAINER_WARMUP=1`. |
+
+Building the trainer and vLLM actors at once adds load on the Ray GCS, so compare the vLLM reserve time with `NRL_EARLY_TRAINER_SUBMIT` on and off. Two jobs running at once with the same compile job id overwrite each other's shape profiles.
+
 ## Implementation Structure
 
 The SC path splits the async-GRPO loop across a rollout pump and a train pump that share a `TQReplayBuffer` and are orchestrated by the `SingleControllerActor`.

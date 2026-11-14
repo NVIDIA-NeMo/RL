@@ -39,6 +39,16 @@ COMPILER_DIRS = {
     "CUDA_CACHE_PATH": "cuda",
     "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": "fa4_cute",
 }
+# Compiler settings one cache type's workers take from NRL_<TYPE>_<VAR>.
+TUNING_VARS = (
+    # Stores Triton autotune results in TRITON_CACHE_DIR; kernels whose configs
+    # carry a pre_hook are still benchmarked in every process.
+    "TRITON_CACHE_AUTOTUNING",
+    "TRITON_PRINT_AUTOTUNING",
+    # A job id that is stable across runs makes torch.compile keep per-rank shape
+    # profiles under TORCHINDUCTOR_CACHE_DIR/dynamo.
+    "TORCH_COMPILE_JOB_ID",
+)
 
 
 def local_dir() -> str | None:
@@ -60,12 +70,19 @@ def script() -> str:
 
 
 def env_overrides(cache_type: str) -> dict[str, str]:
-    """Point the compilers at ``<local>/<cache_type>``; {} if persistent caches are off."""
+    """Point the compilers at ``<local>/<cache_type>``; {} if persistent caches are off.
+
+    A set ``NRL_<TYPE>_<VAR>`` passes one of ``TUNING_VARS`` to this type's workers.
+    """
     local = local_dir()
     if local is None:
         return {}
     env = {var: f"{local}/{cache_type}/{sub}" for var, sub in COMPILER_DIRS.items()}
     env["FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED"] = "1"
+    for var in TUNING_VARS:
+        value = os.environ.get(f"NRL_{cache_type.upper()}_{var}")
+        if value:
+            env[var] = value
     return env
 
 

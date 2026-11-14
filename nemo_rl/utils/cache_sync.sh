@@ -27,10 +27,13 @@
 # writeback only adds files that are not in <persistent_dir> yet, appeared after
 # the seed started or the last successful write-back, and have not changed for
 # NRL_COMPILE_CACHE_MIN_AGE_MIN minutes (default 1): existing files are never
-# replaced, so a file caught mid-write must never be published. Writers take
-# turns on <persistent_dir>.lock (stale after 10 min); a busy lock skips the pass,
-# except the last one, which waits up to 2 min. The cached files are content- or
-# hash-addressed, so merging entries from several nodes and jobs is safe.
+# replaced, so a file caught mid-write must never be published. The exception is
+# torch.compile's shape profiles (*/dynamo/code_state_*.pkl), which torch renames
+# into place whole: one this node rewrote replaces an older published copy
+# (rsync --update), with no age rule. Writers take turns on <persistent_dir>.lock
+# (stale after 10 min); a busy lock skips the pass, except the last one, which
+# waits up to 2 min. The cached files are content- or hash-addressed, so merging
+# entries from several nodes and jobs is safe.
 # sidecar runs writeback every interval_s seconds (default 60) and once more after
 # stop_file appears.
 #
@@ -66,7 +69,7 @@ seed() {
 
 # writeback <src> <dst> [wait_s]: publish new settled files; wait_s > 0 waits for the lock.
 writeback() {
-  local src="$1" dst="$2" wait_s="${3:-0}" lock="$2.lock" list mark rc waited=0
+  local src="$1" dst="$2" wait_s="${3:-0}" lock="$2.lock" list profiles mark rc waited=0
   local -a newer=()
   [[ -d "${src}" ]] || return 0
   if [[ -e "${src}.sent" ]]; then
@@ -79,10 +82,12 @@ writeback() {
   mark="$(mktemp "${src}.sending.XXXXXX")"
   touch -d "@$(( $(date +%s) - $(min_age) * 60 ))" "${mark}"
   list="$(mktemp)"
+  profiles="$(mktemp)"
   (cd "${src}" && find . -type f -mmin "+$(min_age)" "${newer[@]}") >"${list}"
-  if [[ ! -s "${list}" ]]; then
+  (cd "${src}" && find . -type f -path '*/dynamo/code_state_*.pkl' "${newer[@]}") >"${profiles}"
+  if [[ ! -s "${list}" && ! -s "${profiles}" ]]; then
     mv "${mark}" "${src}.sent"
-    rm -f "${list}"
+    rm -f "${list}" "${profiles}"
     return 0
   fi
   mkdir -p "${dst}"
@@ -94,7 +99,7 @@ writeback() {
     fi
     if (( waited >= wait_s )); then
       (( wait_s > 0 )) && log "WARNING: ${lock} busy for ${wait_s}s; $(wc -l <"${list}") new files in ${src} not published"
-      rm -f "${mark}" "${list}"
+      rm -f "${mark}" "${list}" "${profiles}"
       return 0
     fi
     sleep 5 || break
@@ -102,6 +107,10 @@ writeback() {
   done
   rsync -a --ignore-existing --files-from="${list}" "${src}/" "${dst}/"
   rc=$?
+  if (( rc == 0 || rc == 24 )); then
+    rsync -a --update --files-from="${profiles}" "${src}/" "${dst}/"
+    rc=$?
+  fi
   rmdir "${lock}"
   if (( rc == 0 || rc == 24 )); then
     mv "${mark}" "${src}.sent"
@@ -109,7 +118,7 @@ writeback() {
     log "WARNING: write-back ${src} -> ${dst} failed (rsync exit ${rc}); retried next pass"
     rm -f "${mark}"
   fi
-  rm -f "${list}"
+  rm -f "${list}" "${profiles}"
 }
 
 sidecar() {

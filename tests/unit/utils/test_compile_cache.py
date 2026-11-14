@@ -42,6 +42,22 @@ def test_env_overrides_default_under_the_local_dir(caches):
     assert compile_cache.vllm_engine_dir(3) == f"{caches}/local/vllm_engines/3"
 
 
+def test_autotune_and_job_id_reach_only_their_cache_type(caches, monkeypatch):
+    monkeypatch.setenv("NRL_MEGATRON_TRITON_CACHE_AUTOTUNING", "1")
+    monkeypatch.setenv("NRL_MEGATRON_TORCH_COMPILE_JOB_ID", "my-rl-run")
+    monkeypatch.setenv("NRL_MEGATRON_TRITON_PRINT_AUTOTUNING", "")
+    monkeypatch.delenv("NRL_VLLM_TRITON_CACHE_AUTOTUNING", raising=False)
+
+    megatron = compile_cache.env_overrides("megatron")
+    vllm = compile_cache.env_overrides("vllm")
+
+    assert megatron["TRITON_CACHE_AUTOTUNING"] == "1"
+    assert megatron["TORCH_COMPILE_JOB_ID"] == "my-rl-run"
+    # An empty value, as VAR="${VAR:-}" in a launch script exports, means unset.
+    assert "TRITON_PRINT_AUTOTUNING" not in megatron
+    assert "TRITON_CACHE_AUTOTUNING" not in vllm
+
+
 def test_missing_script_raises(caches, monkeypatch):
     monkeypatch.setenv(compile_cache.SCRIPT_VAR, str(caches / "missing.sh"))
     with pytest.raises(FileNotFoundError):
