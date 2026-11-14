@@ -325,13 +325,26 @@ class NemoRLChatEngine:
     ) -> dict[str, Any]:
         # Deferred: prompt_and_capture imports vLLM.
         from nemo_rl.models.generation.vllm.prompt_and_capture import prepare_prompt
-        from nemo_rl.models.generation.vllm.utils import on_policy_sampling
+        from nemo_rl.models.generation.vllm.utils import (
+            OffPolicySamplingError,
+            on_policy_sampling,
+        )
 
         body = _drop_none(
             {k: v for k, v in request.items() if k not in _DYNAMO_ONLY_FIELDS}
         )
         if request.get("chat_template_args"):
             body["chat_template_kwargs"] = request["chat_template_args"]
+        if (body.get("n") or 1) != 1:
+            # Capture stages one choice per call, and the trainer replays one.
+            raise OffPolicySamplingError(
+                f"request n={body['n']} is not supported; NeMo-Gym calls take n=1"
+            )
+        if body.get("stream"):
+            # vLLM's delta outputs would leave this path only the last piece.
+            raise OffPolicySamplingError(
+                "request stream=true is not supported; NeMo-Gym calls do not stream"
+            )
         body.update(
             on_policy_sampling(
                 temperature=body.get("temperature"),
@@ -342,11 +355,6 @@ class NemoRLChatEngine:
                 presence_penalty=body.get("presence_penalty"),
                 frequency_penalty=body.get("frequency_penalty"),
                 logit_bias=body.get("logit_bias"),
-                n=body.get("n"),
-                logprobs=body.get("logprobs"),
-                # From the raw request: _drop_none drops an explicit null.
-                top_logprobs=request.get("top_logprobs"),
-                stream=body.get("stream"),
                 generation_config=self._generation,
             )
         )

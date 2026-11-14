@@ -353,6 +353,7 @@ def test_a_measure_call_returns_the_prompt_length_without_generating() -> None:
         ({"temperature": 0.5}, {}, "matches neither"),
         ({"presence_penalty": 0.5}, {}, "presence_penalty=0.5"),
         ({"n": 2}, {}, "n=1"),
+        ({"stream": True}, {}, "stream=true"),
         # The echoed prefix, spliced in, leaves no room for output.
         (
             {},

@@ -58,10 +58,7 @@ The virtual environment location depends on your runtime environment:
 - **Container**: The container sets [`UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv`](https://github.com/NVIDIA-NeMo/RL/blob/main/docker/Dockerfile#L67), so the environment is synced to `/opt/nemo_rl_venv`. Note that this location is ephemeral to the container instance.
 
 > [!WARNING]
-> If you see a ray version or python version mismatch between the server and the client, it indicates
-> your container should be rebuilt since `ray` and/or `python` (and potentially several other packages)
-> have drifted between your container and code. Rebuilding the container will lead to faster startup
-> times since dependencies will not have to be synced on all the nodes simultaneously.
+> If you see a ray version or python version mismatch between the server and the client, it indicates your container should be rebuilt since `ray` and/or `python` (and potentially several other packages) have drifted between your container and code. Rebuilding the container will lead to faster startup times since dependencies will not have to be synced on all the nodes simultaneously.
 
 ### 3. `source .venv/bin/activate`
 
@@ -108,8 +105,7 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
 }
 ```
 
-This module is deliberately dependency-free: `docker/Dockerfile` runs it as a script
-from the dependency layer, where the rest of the source tree does not exist yet.
+This module is deliberately dependency-free: `docker/Dockerfile` runs it as a script from the dependency layer, where the rest of the source tree does not exist yet.
 
 > [!NOTE]
 > For more details on how workers define and use their Python executables, see the [UV Documentation](uv.md#worker-configuration).
@@ -286,10 +282,7 @@ NeMo RL containers enforce environment reproducibility by automatically checking
 
 - The **md5sum of `pyproject.toml`**
 - The **md5sum of `uv.lock`**
-- The **md5sum of `nemo_rl/distributed/actor_environments.py`** (the actor → uv extras
-  table). Worker virtual environments are reused rather than rebuilt, and nothing prunes
-  them, so changing an actor's extras has to invalidate the fingerprint the same way a
-  dependency change does.
+- The **md5sum of `nemo_rl/distributed/actor_environments.py`** (the actor → uv extras table). Worker virtual environments are reused rather than rebuilt, and nothing prunes them, so changing an actor's extras has to invalidate the fingerprint the same way a dependency change does.
 - The **commit hashes of relevant submodules**
 
 If any of these values differ between your code and the container image, NeMo RL will alert you and show exactly what has changed:

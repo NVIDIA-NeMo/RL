@@ -34,7 +34,8 @@ import pytest
 import ray
 import requests
 import torch
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
@@ -1123,7 +1124,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     # The server resolves the chat template through vLLM's own loader, so the
     # stub tree needs this leaf even though the test does not assert on it.
     make_module(
-        "vllm.entrypoints.chat_utils",
+        "vllm.renderers.chat_utils.chat_template",
         load_chat_template=MagicMock(return_value=None),
     )
     make_module(
@@ -1384,8 +1385,6 @@ def _fake_chat_request():
         return_tokens_as_token_ids=None,
         logprobs=False,
         top_logprobs=None,
-        # The fields the client set, as pydantic records them.
-        model_fields_set=set(),
         # NeMoRLChatCompletionRequest's private defaults for a call that
         # restores no generation prefix.
         _restored_generation_token_ids=(),
@@ -1461,6 +1460,29 @@ def _track_request_capture(worker, request):
     worker._capture_registry.add(request, _RequestCaptureState(call, []))
     worker.token_capture = MagicMock()
     return worker.token_capture, call
+
+
+def test_vllm_chat_endpoint_serves_a_streamed_call_and_fails_its_capture(
+    monkeypatch,
+) -> None:
+    """vLLM streams the reply, several choices included; capture cannot stage it."""
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+
+    async def chunks():
+        yield "data: [DONE]\n\n"  # pragma: no cover - never iterated
+
+    stream = chunks()
+    serving_chat.create_chat_completion = AsyncMock(return_value=stream)
+    request = _fake_chat_request()
+    request.stream = True
+    request.n = 2
+    token_capture, call = _track_request_capture(worker, request)
+
+    response = asyncio.run(chat_handler(request, MagicMock()))
+
+    assert isinstance(response, StreamingResponse)
+    assert response.body_iterator is stream
+    token_capture.fail_call.assert_called_once_with(call, reason="streaming_response")
 
 
 def _stalled_engine_generator(started: asyncio.Event, cancelled: asyncio.Event):
@@ -1566,6 +1588,30 @@ def test_clamp_max_tokens_sets_the_limit_the_request_uses(
     assert vars(request) == expected
 
 
+@pytest.mark.asyncio
+async def test_vllm_parser_does_not_see_parallel_tool_calls_false(monkeypatch):
+    """vLLM 0.33 turns the flag into a grammar that masks sampling."""
+    _, serving_chat, _ = _setup_fake_vllm_chat_handler(monkeypatch)
+    renderer = serving_chat.kwargs["online_renderer"]
+    seen_by_vllm = []
+
+    async def preprocess_chat(self, request, **kwargs):
+        seen_by_vllm.append(request.parallel_tool_calls)
+        return [], [{"prompt_token_ids": [1, 2]}]
+
+    vllm_online_renderer = sys.modules["vllm.renderers.online_renderer"].OnlineRenderer
+    monkeypatch.setattr(
+        vllm_online_renderer, "preprocess_chat", preprocess_chat, raising=False
+    )
+    request = types.SimpleNamespace(parallel_tool_calls=False)
+
+    await renderer._render_chat_call(request, [], {}, admission=None)
+
+    assert seen_by_vllm == [None]
+    # vLLM reads the flag again to trim the response to the first tool call.
+    assert request.parallel_tool_calls is False
+
+
 @pytest.mark.parametrize(
     ("stream", "expected_kind"), [(False, "final_only"), (True, "delta")]
 )
@@ -1631,6 +1677,7 @@ def _generation_cut_route(
                 control_token=token,
                 control_timeout_s=timeout_s,
                 progress_reader=None,
+                prefix_row_extras=lambda state: None,
             )
         )
         recovery.checkpoint_cut = checkpoint_cut
@@ -1914,7 +1961,6 @@ async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch, logpr
     request.logprobs = logprobs
     request.return_tokens_as_token_ids = True
     request.top_logprobs = 0
-    request.model_fields_set = {"top_logprobs"}
     token_capture, call = _track_request_capture(worker, request)
     task = asyncio.create_task(chat_handler(request, MagicMock()))
     try:
@@ -2056,9 +2102,11 @@ async def test_pinned_with_cancellation_aborts_chat_completion_on_http_disconnec
     await asyncio.wait_for(started.wait(), 1)
     await receive_queue.put({"type": "http.disconnect"})
 
-    # The wrapper returns None once the disconnect listener wins, as in vLLM's
-    # own routes; the handler task is cancelled behind it.
-    assert await asyncio.wait_for(task, 1) is None
+    # The wrapper returns an empty response once the disconnect listener wins, as
+    # in vLLM's own routes; the handler task is cancelled behind it.
+    response = await asyncio.wait_for(task, 1)
+    assert type(response) is Response
+    assert response.body == b""
     await asyncio.wait_for(released.wait(), 1)
     assert cancelled.is_set()
     token_capture.fail_call.assert_called_once_with(call, reason="client_disconnect")
@@ -4192,6 +4240,8 @@ def test_vllm_http_server(cluster, tokenizer):
                 "stop_reason": None,
                 "token_ids": None,
                 "routed_experts": None,
+                # Added in vLLM 0.33.
+                "weight_versions": None,
             }
         ],
         "service_tier": None,
@@ -4235,16 +4285,14 @@ def test_vllm_http_server(cluster, tokenizer):
     ]
     assert _standardize(expected_result) == _standardize(actual_result)
 
-    # The server default requests token IDs, so top_logprobs=None cannot provide
-    # the log probabilities required by the training response contract.
+    # vLLM 0.33 treats top_logprobs=None like 0, so the response still carries the
+    # log probabilities the training response contract needs.
     response = requests.post(
         url=f"{base_urls[0]}/chat/completions",
         json=body | {"top_logprobs": None},
     )
-    assert response.status_code == 400
-    error = response.json()["error"]
-    assert error["code"] == 400
-    assert "top_logprobs" in error["message"]
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["logprobs"]["content"]
 
     # Check that tokenization route works
     response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
@@ -5718,3 +5766,36 @@ def test_async_vllm_http_client_forwards_admission_checks() -> None:
         client.check_admission(3, request_id="req-3")
 
     assert calls == [(1, None), (2, "req-2"), (3, "req-3")]
+
+
+def test_sync_worker_finishes_queued_batches_before_resetting_the_prefix_cache():
+    events = []
+
+    class EngineCore:
+        def __init__(self):
+            self.batch_queue = ["batch left by generate()"]
+
+    class EngineClient:
+        def __init__(self):
+            self.engine_core = EngineCore()
+
+        def get_output(self):
+            events.append("step")
+            self.engine_core.batch_queue.pop()
+
+    class Engine:
+        def __init__(self):
+            self.engine_core = EngineClient()
+
+        def reset_prefix_cache(self):
+            events.append(
+                f"reset with {len(self.engine_core.engine_core.batch_queue)} queued"
+            )
+
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.llm = types.SimpleNamespace(llm_engine=Engine())
+    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+
+    worker.reset_prefix_cache()
+
+    assert events == ["step", "reset with 0 queued"]
