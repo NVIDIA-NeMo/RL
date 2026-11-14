@@ -601,7 +601,7 @@ def test_gdpo_discovers_components_and_matches_legacy(scaling: bool) -> None:
     if scaling:
         batch = {key: value.clamp(0, 1) * 2 - 1 for key, value in batch.items()}
     expected = estimator.compute_advantage(
-        prompt_ids=torch.arange(NUM_GROUPS).repeat_interleave(GROUP_SIZE),
+        prompt_ids=torch.arange(NUM_GROUPS).repeat_interleave(GROUP_SIZE).unsqueeze(-1),
         rewards=batch["total_reward"],
         mask=torch.ones(NUM_GROUPS * GROUP_SIZE, SEQ),
         repeated_batch=batch,
