@@ -207,7 +207,7 @@ WORKDIR /opt/nemo-rl
 ARG MAX_JOBS
 ARG NVTE_BUILD_MAX_JOBS=8
 ARG NVTE_BUILD_THREADS_PER_JOB=2
-ARG NVTE_CUDA_ARCHS=90;100
+ARG NVTE_CUDA_ARCHS=90;100;103
 ARG NVTE_FRAMEWORK=pytorch
 # TE 2.18 enables its experimental NCCL-EP backend by default on Hopper and
 # newer GPUs. Current recipes use Megatron Core's standard token dispatcher,
@@ -242,8 +242,8 @@ ARG STRIP_UV_CACHE
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
-# Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
-ARG TORCH_CUDA_ARCH_LIST="9.0 10.0"
+# Ensure DeepEP is built for H100, GB200 and GB300 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
+ARG TORCH_CUDA_ARCH_LIST="9.0 10.0 10.3"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 # Build-only knobs read by the flash-attn and FlashMLA source builds. Unset keeps
 # each package's own default.
