@@ -741,6 +741,76 @@ For the no-data-plane path use the legacy `nemo_rl.algorithms.grpo.grpo_train`; 
 
 ---
 
+## Two-phase data-plane checkpoints
+
+| Key | Default | Behavior |
+|---|---|---|
+| `data_plane.simple.async_checkpoint` | `false` | Enable the optional stable-view capture API for in-memory SimpleStorage. |
+| `data_plane.simple.checkpoint_io_timeout_s` | `600.0` | Positive, finite RPC wait budget per retained-view persist/release operation. Does not interrupt filesystem calls. |
+
+`DataPlaneClient.capture_checkpoint` returns a temporary handle or `None` when
+the adapter requests synchronous fallback. The caller must hold a global mutation
+barrier while capturing. After capture returns, it may resume live traffic,
+call `persist()`, and then `release()` after all writes settle, including on
+failure or cancellation. Publication remains the caller's responsibility. If a
+failed or cancelled capture cannot confirm its own release, it raises
+`CheckpointReleaseError` naming the capture token, even past repeated
+cancellation; the caller has no handle to retry with and must stop
+checkpointing.
+
+This API requires caller integration: setting the flag alone does not change
+the existing synchronous `save_checkpoint` calls. Other backends return `None`.
+SimpleStorage capture requires SSD offload disabled and writes the existing
+native TQ checkpoint format, so restore does not need a new format.
+
+Capture copies storage indexes, not tensor payloads. References retain the old
+values while live puts replace them and clears remove them, until `release()`.
+Persistence pickles each shard like the synchronous save, which holds a
+serialized copy of the shard in the storage actor until the write ends. Size a
+storage unit's host memory for live data plus twice its share of the cut: one
+copy retained and one being serialized. The synchronous save needs live data
+plus one copy. This contract
+is audited against the pinned TQ 0.1.11 implementation; a dependency update needs
+the same audit. Only one snapshot may be retained at a time.
+
+Controller capture serializes the native checkpoint layout into immutable bytes
+under a lock shared with the ZMQ request dispatcher. It avoids recursively
+copying the metadata before serialization. Unknown partition subclasses retain
+their native snapshot behavior. Controller and shard persistence run in parallel
+after the caller resumes traffic; neither serializes live controller state or
+returns checkpoint payloads through Ray. The controller bytes remain resident
+until the capture handle is released. File creation is exclusive, and the
+completion marker is written only after all persistence RPCs succeed.
+
+Use the capture as a context manager, or always call `release()` in `finally`.
+`persist()` is single-attempt, including after a partial failure. Reusing the
+handle raises a clear error; release it, discard the failed directory, and
+capture again. Exclusive file creation remains an overwrite guard.
+
+```python
+capture = client.capture_checkpoint(checkpoint_dir, metadata=metadata)
+if capture is not None:
+    with capture:
+        capture.persist()
+```
+
+A timeout raises `TimeoutError` but does not cancel remote RPCs. The handle
+retains their references, and `release()` waits for all persistence RPCs to
+settle before releasing any view. If release also times out, keep the handle
+and retry release, or terminate the job; do not delete/reuse the temporary
+directory or start another capture until release succeeds. Views have no lease
+expiry. The caller must wait for snapshot N's persistence and release before
+taking snapshot N+1's mutation barrier; the one-view error is an invariant,
+not scheduling flow control.
+
+CPU-only real Ray/ZMQ validation, including concurrent PUT/CLEAR requests,
+failure cleanup and restore into fresh actors, runs in
+`L1_Functional_Tests_SingleController_3`. To run it locally:
+
+```bash
+bash tests/functional/data_plane_simple_checkpoint_cpu.sh
+```
+
 ## Async path (proposed)
 
 The data-plane interface covers both sync and async, but the **sync trainer uses only half of it**. The task-mediated half (`claim_meta` / `get_data` / `check_consumption_status`) is reserved for the async trainer, which is not yet wired into production.
