@@ -17,6 +17,7 @@ import gc
 import inspect
 import logging
 import os
+from functools import cached_property
 from typing import Any, Optional, cast
 
 import ray
@@ -50,6 +51,10 @@ from nemo_rl.models.generation.vllm.config import (
     vllm_fp32_lm_head_enabled,
 )
 from nemo_rl.models.generation.vllm.lora_utils import make_native_lora_request
+from nemo_rl.models.generation.vllm.output_limits import (
+    _context_capped_max_new_tokens,
+    per_request_output_limits,
+)
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     FINISHED_REASON_LABEL,
@@ -89,17 +94,16 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 logger = logging.getLogger(__name__)
 
 
-def _context_capped_max_new_tokens(
-    *, configured_max_new_tokens: int, input_length: int, max_model_len: int
-) -> int:
-    """Cap generation so the training prompt and response fit the context."""
-    remaining_context = max_model_len - input_length
-    if remaining_context <= 0:
-        raise ValueError(
-            "Cannot generate from an input whose training length exhausts the "
-            f"model context: input_length={input_length}, max_model_len={max_model_len}."
-        )
-    return min(configured_max_new_tokens, remaining_context)
+def _set_mm_normalization_default(vllm_kwargs: dict[str, Any]) -> None:
+    """Keep CPU image normalization when the engine exposes the device option.
+
+    Older vLLM releases already normalize on the CPU and reject this keyword.
+    Preserve explicit caller options so unsupported requests still fail visibly.
+    """
+    from vllm.engine.arg_utils import EngineArgs
+
+    if "mm_device_do_normalize" in inspect.signature(EngineArgs).parameters:
+        vllm_kwargs.setdefault("mm_device_do_normalize", False)
 
 
 def _maybe_enable_vllm_native_tracing(llm_kwargs: dict[str, Any]) -> None:
@@ -595,7 +599,7 @@ class BaseVllmGenerationWorker:
         # already shipped one silent-corruption fix for the device path
         # (vllm-project/vllm#55370, encoder cudagraphs). Users can opt back in via
         # policy.generation.vllm_kwargs.mm_device_do_normalize=true.
-        vllm_kwargs.setdefault("mm_device_do_normalize", False)
+        _set_mm_normalization_default(vllm_kwargs)
         checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
         if checkpoint_engine_config is not None:
             from nemo_rl.models.generation.vllm.checkpoint_engine import (
@@ -849,6 +853,20 @@ class BaseVllmGenerationWorker:
     def is_alive(self):
         """Check if the worker is alive."""
         return True
+
+    @cached_property
+    def _expanded_placeholder_token_id(self) -> int | None:
+        """Resolve ``vllm_cfg.expanded_placeholder_token`` for prompt validation."""
+        token = self.cfg["vllm_cfg"].get("expanded_placeholder_token")
+        if token is None:
+            return None
+        vocab = self.llm.renderer.get_tokenizer().get_vocab()
+        if token not in vocab:
+            raise ValueError(
+                f"vllm_cfg.expanded_placeholder_token={token!r} is not a single "
+                "token in the generation tokenizer's vocabulary."
+            )
+        return vocab[token]
 
     def _tokenize_prompt_with_bos(
         self, prompt: str | dict[str, Any]
@@ -1197,14 +1215,26 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
         cap_to_context = bool(self.cfg["vllm_cfg"].get("cap_max_tokens_to_context"))
-        if cap_to_context or spec_lookahead > 0:
+        output_caps = data.get("max_output_tokens")
+        if cap_to_context or spec_lookahead > 0 or output_caps is not None:
             max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
             configured_max_new_tokens = int(self.cfg["max_new_tokens"])
+            row_input_lengths = input_lengths.tolist()
+            row_max_new_tokens = (
+                [configured_max_new_tokens] * len(row_input_lengths)
+                if output_caps is None
+                else per_request_output_limits(
+                    output_caps,
+                    row_input_lengths,
+                    configured_max_new_tokens=configured_max_new_tokens,
+                    max_model_len=max_model_len,
+                )
+            )
             per_request_max_new_tokens = []
-            for input_length in input_lengths.tolist():
+            for input_length, row_limit in zip(row_input_lengths, row_max_new_tokens):
                 per_request_max_new_tokens.append(
                     self._request_max_new_tokens(
-                        configured_max_new_tokens=configured_max_new_tokens,
+                        configured_max_new_tokens=row_limit,
                         input_length=int(input_length),
                         max_model_len=max_model_len,
                         cap_to_context=cap_to_context,
@@ -1258,7 +1288,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             # Extract generated tokens
             sequence_length = input_lengths[i]
             validate_rollout_prompt(
-                input_ids[i, :sequence_length].tolist(), output.prompt_token_ids
+                input_ids[i, :sequence_length].tolist(),
+                output.prompt_token_ids,
+                expanded_placeholder_token_id=self._expanded_placeholder_token_id,
             )
             generation = output.outputs[0]
             generated_tokens = list(generation.token_ids)
