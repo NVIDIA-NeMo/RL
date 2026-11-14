@@ -40,7 +40,7 @@ Step-5-Preview needs newer AutoModel and vLLM than NeMo RL `main` pins.
 | Component | Version |
 | --- | --- |
 | NeMo RL | the [`step5-support` branch](https://github.com/NVIDIA-NeMo/RL/tree/step5-support) |
-| AutoModel | submodule at branch `step5-rl-dev` (commit `c77d621`): upstream `main` at `3b355ab` plus two Step5 fixes for RL (router replay through `moe_overrides`; decoder compute dtype from the FSDP `param_dtype`) |
+| AutoModel | submodule at commit `c77d621` on the [`rl/step5-support` branch](https://github.com/NVIDIA-NeMo/Automodel/tree/rl/step5-support): AutoModel `main` at `3b355ab` plus two Step5 fixes for RL (router replay through `moe_overrides`; decoder compute dtype from the FSDP `param_dtype`) |
 | vLLM | `main` commit `0e7ce459` wheel: Step5 support ([vllm#61727](https://github.com/vllm-project/vllm/pull/61727)) and the CSA tail-ring fix ([vllm#65153](https://github.com/vllm-project/vllm/pull/65153)); no release has both yet |
 | PyTorch / Transformers | torch 2.14.0, transformers 5.18.0 (both training and generation, required for colocated refit) |
 
