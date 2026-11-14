@@ -74,6 +74,17 @@ def _get_glm_moe_layer_pattern(config: PretrainedConfig) -> list[int]:
     return [0 if layer_type == "dense" else 1 for layer_type in mlp_layer_types]
 
 
+def _get_deepseek_moe_layer_pattern(config: PretrainedConfig) -> list[int]:
+    """Return the DeepSeek-V3 dense/MoE layer pattern from the model config."""
+    first_k_dense = config.first_k_dense_replace or 0
+    if not 0 <= first_k_dense <= config.num_hidden_layers:
+        raise ValueError(
+            "DeepSeek first_k_dense_replace must be between zero and the number "
+            f"of hidden layers, got {first_k_dense}"
+        )
+    return [0] * first_k_dense + [1] * (config.num_hidden_layers - first_k_dense)
+
+
 def _get_glm_index_compute_layers(config: PretrainedConfig) -> int:
     """Return how many GLM layers compute, rather than reuse, DSA indices."""
     indexer_types = getattr(config, "indexer_types", None)
@@ -160,8 +171,12 @@ def convert_config_to_flops_config(
             qk_head_dim=config.qk_nope_head_dim,
             qk_pos_emb_head_dim=config.qk_rope_head_dim,
             v_head_dim=config.v_head_dim,
-            moe_layer_freq=1,
-            moe_shared_expert_intermediate_size=config.moe_intermediate_size,
+            # The first first_k_dense_replace layers are dense, and every MoE
+            # layer runs n_shared_experts shared experts (two for Moonlight).
+            moe_layer_freq=_get_deepseek_moe_layer_pattern(config),
+            moe_shared_expert_intermediate_size=(
+                config.moe_intermediate_size * (config.n_shared_experts or 0)
+            ),
             moe_ffn_hidden_size=config.moe_intermediate_size,
             mtp_num_layers=0,
             causal_self_attn=True,
