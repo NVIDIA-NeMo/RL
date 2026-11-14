@@ -26,7 +26,7 @@ request over the prefill and decode engines; nothing here knows about the
 split.
 
 Token capture is not served here yet: a capture admission travels to the
-engine as request metadata, which the completion request does not carry
+engine in ``offload_params``, which the completion request does not carry
 across the frontend, so such requests are refused before they are sent.
 """
 
@@ -58,13 +58,14 @@ if TYPE_CHECKING:
     from concurrent.futures import Future as ConcurrentFuture
 
     from megatron.core.inference.async_stream import AsyncStream
+    from megatron.core.inference.config import MultimodalPromptConfig
     from megatron.core.inference.sampling_params import SamplingParams
 
 LOGGER = logging.getLogger(__name__)
 
-# HTTP statuses the frontend answers a request it will never serve with; the
-# endpoint maps them to a 400, as it does an engine's non-transient failure.
-_NONTRANSIENT_HTTP_STATUS_CODES = range(400, 500)
+# The endpoints NeMo-Gym calls. Profile is left out: it drives the engine's CUDA
+# profiler, which the frontend client cannot reach.
+_GYM_PROXY_BLUEPRINTS = ("Completions", "ChatCompletions", "Health")
 
 
 def completion_request(
@@ -78,7 +79,9 @@ def completion_request(
     Megatron's ``SamplingParams`` disable ``top_p`` with ``0.0`` and ``top_k``
     with ``0``; the frontend takes ``1.0`` and ``-1`` for the same. Only the
     sampled tokens' log probabilities can come back (``logprobs: 0``), as the
-    Megatron Dynamo adapter serves no top-N or prompt log probabilities.
+    Megatron Dynamo adapter serves no top-N or prompt log probabilities. A
+    negative ``termination_id`` (the endpoints' ``ignore_eos``) becomes the
+    frontend's ``ignore_eos``.
 
     Raises:
         ValueError: For sampling the adapter cannot serve, or no token budget.
@@ -87,6 +90,12 @@ def completion_request(
         raise ValueError(
             "top_logprobs is not supported for Megatron engines behind Dynamo: the "
             "frontend returns the sampled tokens' log probabilities only"
+        )
+    if sampling_params.return_log_probs and not sampling_params.skip_prompt_log_probs:
+        raise ValueError(
+            "prompt log probabilities (echo with logprobs) are not supported for "
+            "Megatron engines behind Dynamo: the frontend returns the sampled "
+            "tokens' log probabilities only"
         )
     max_tokens = sampling_params.num_tokens_to_generate
     if max_tokens is None and sampling_params.num_tokens_total is not None:
@@ -113,14 +122,16 @@ def completion_request(
         payload["logprobs"] = 0
     if sampling_params.stop_words:
         payload["stop"] = list(sampling_params.stop_words)
-    stop_token_ids = list(getattr(sampling_params, "stop_token_ids", None) or [])
-    if sampling_params.termination_id is not None:
-        stop_token_ids.append(int(sampling_params.termination_id))
+    stop_token_ids = list(sampling_params.stop_token_ids or [])
+    termination_id = sampling_params.termination_id
+    if termination_id is not None and termination_id < 0:
+        payload["ignore_eos"] = True
+    elif termination_id is not None:
+        stop_token_ids.append(int(termination_id))
     if stop_token_ids:
         payload["stop_token_ids"] = sorted({int(t) for t in stop_token_ids})
-    seed = getattr(sampling_params, "seed", None)
-    if seed is not None:
-        payload["seed"] = int(seed)
+    if sampling_params.seed is not None:
+        payload["seed"] = int(sampling_params.seed)
     return payload
 
 
@@ -180,13 +191,15 @@ def completion_record(
 
     The keys are those of a serialized ``DynamicInferenceRequest`` that the
     chat and completions endpoints consume: generated tokens and their log
-    probabilities, the prompt, usage counts and the sampling budget the finish
-    reason is derived from. Fields the frontend has no counterpart for (top-N
-    log probabilities, routing indices, staged-payload metadata) are None.
+    probabilities, the prompt, usage counts, the frontend's finish reason and
+    the sampling budget the endpoints fall back to without one. Fields the
+    frontend has no counterpart for (top-N log probabilities, routing indices,
+    staged-payload metadata) are None.
     """
     generated, log_probs = parse_completion(
         response, want_log_probs="logprobs" in payload, request_url=request_url
     )
+    choice = response["choices"][0]
     usage = response.get("usage") or {}
     details = usage.get("prompt_tokens_details") or {}
     return {
@@ -204,6 +217,7 @@ def completion_record(
         "payload_offloaded": False,
         "payload_stage_metadata": None,
         "routing_indices": None,
+        "finish_reason": choice.get("finish_reason"),
         "sampling_params": {"num_tokens_to_generate": payload["max_tokens"]},
         "latency": latency_s,
     }
@@ -254,8 +268,8 @@ class FrontendInferenceClient:
     Streaming submissions deliver the whole completion as the one final item.
 
     Refused up front, as the frontend path cannot carry them: string prompts
-    (the endpoints always tokenize), multimodal data, and request metadata (a
-    token-capture admission).
+    (the endpoints always tokenize), multimodal data, and offload params (a
+    token-capture admission, an offloaded prefix or payload staging).
     """
 
     def __init__(
@@ -290,13 +304,13 @@ class FrontendInferenceClient:
         sampling_params: "SamplingParams",
         *,
         multi_modal_data: Any = None,
-        request_metadata: Optional[dict] = None,
+        offload_params: Optional[dict] = None,
     ) -> asyncio.Future:
         return self.add_request_with_id(
             prompt,
             sampling_params,
             multi_modal_data=multi_modal_data,
-            request_metadata=request_metadata,
+            offload_params=offload_params,
         )[1]
 
     def add_request_with_id(
@@ -305,13 +319,13 @@ class FrontendInferenceClient:
         sampling_params: "SamplingParams",
         *,
         multi_modal_data: Any = None,
-        request_metadata: Optional[dict] = None,
+        offload_params: Optional[dict] = None,
     ) -> tuple[int, asyncio.Future]:
         request_id, payload, prompt_token_ids = self._prepare(
             prompt,
             sampling_params,
             multi_modal_data=multi_modal_data,
-            request_metadata=request_metadata,
+            offload_params=offload_params,
         )
         task = asyncio.get_running_loop().create_task(
             self._complete(request_id, prompt_token_ids, payload)
@@ -325,7 +339,7 @@ class FrontendInferenceClient:
         sampling_params: "SamplingParams",
         *,
         multi_modal_data: Any = None,
-        request_metadata: Optional[dict] = None,
+        offload_params: Optional[dict] = None,
     ) -> "AsyncStream[dict]":
         # Deferred: the stream class is Megatron-LM's.
         from megatron.core.inference.async_stream import AsyncStream
@@ -334,7 +348,7 @@ class FrontendInferenceClient:
             prompt,
             sampling_params,
             multi_modal_data=multi_modal_data,
-            request_metadata=request_metadata,
+            offload_params=offload_params,
         )
         loop = asyncio.get_running_loop()
         stream: AsyncStream[dict] = AsyncStream(
@@ -365,13 +379,15 @@ class FrontendInferenceClient:
         sampling_params: "SamplingParams",
         *,
         multi_modal_data: Any,
-        request_metadata: Optional[dict],
+        offload_params: Optional[dict],
     ) -> tuple[int, dict[str, Any], list[int]]:
-        if request_metadata:
+        if offload_params is not None:
             raise NotImplementedError(
-                "token capture (the ng_capture admission) is not yet served for "
-                "Megatron engines behind Dynamo: request metadata does not travel "
-                "through the frontend. Set token_capture.enabled=false."
+                "offload_params are not served for Megatron engines behind Dynamo: "
+                "they do not travel through the frontend, so token capture (the "
+                "ng_capture admission), offloaded prefixes and payload staging are "
+                "unavailable. Set token_capture.enabled=false and send prior turns "
+                f"as prompt_token_ids (got keys {sorted(offload_params)})."
             )
         if multi_modal_data:
             raise NotImplementedError(
@@ -421,12 +437,11 @@ class FrontendInferenceClient:
             )
             await asyncio.sleep(dynamo_rollouts._HTTP_RETRY_DELAY_S)
         if isinstance(response, dict) and response.get("status") == "error":
-            status = response.get("http_status")
             return failed_record(
                 prompt_token_ids,
                 format_error(response),
                 request_id=request_id,
-                transient=status not in _NONTRANSIENT_HTTP_STATUS_CODES,
+                transient=is_retryable(response),
             )
         try:
             return completion_record(
@@ -450,7 +465,7 @@ def build_gym_proxy_app(
     *,
     tokenizer: Any,
     parsers: Optional[list[str]],
-    multimodal_prompt_config: Any,
+    multimodal_prompt_config: Optional["MultimodalPromptConfig"],
     default_temperature: float,
     default_top_p: float,
     default_top_k: int,
@@ -460,11 +475,23 @@ def build_gym_proxy_app(
     Assembled as Megatron-LM's own server assembles them, so the chat and
     completions endpoints behave as on the native path; only the client under
     them differs.
+
+    Raises:
+        ImportError: Megatron-LM's endpoints module has none of its blueprints,
+            which it leaves out when its own imports fail.
     """
-    # Deferred: Quart and the endpoints are Megatron-LM's server dependencies.
+    # Deferred: Megatron-LM and its server dependency Quart.
+    from megatron.core.inference.config import MultimodalPromptConfig
     from quart import Quart  # type: ignore[import-error]
 
     endpoints = importlib.import_module(_ENDPOINTS_MODULE)
+    missing = [name for name in _GYM_PROXY_BLUEPRINTS if not hasattr(endpoints, name)]
+    if missing:
+        raise ImportError(
+            f"{_ENDPOINTS_MODULE} does not provide the {missing} blueprints; its "
+            "imports failed (are Megatron-LM's server dependencies installed?)",
+            name=_ENDPOINTS_MODULE,
+        )
 
     app = Quart("nemo_rl.megatron_dynamo_gym_proxy")
     # Large prompts; the same limit Megatron-LM's server sets.
@@ -474,7 +501,9 @@ def build_gym_proxy_app(
     app.config["parsers"] = parsers
     app.config["verbose"] = False
     app.config["chat_template"] = None
-    app.config["multimodal_prompt_config"] = multimodal_prompt_config
+    app.config["multimodal_prompt_config"] = (
+        multimodal_prompt_config or MultimodalPromptConfig()
+    )
     app.config["default_temperature"] = default_temperature
     app.config["default_top_p"] = default_top_p
     app.config["default_top_k"] = default_top_k
@@ -485,8 +514,8 @@ def build_gym_proxy_app(
         max_workers=1, thread_name_prefix="gym-proxy-tokenize"
     )
     app.config["tokenizer_copy"] = copy.deepcopy(tokenizer)
-    for blueprint in endpoints.__all__:
-        app.register_blueprint(blueprint)
+    for name in _GYM_PROXY_BLUEPRINTS:
+        app.register_blueprint(getattr(endpoints, name))
     return app
 
 
@@ -509,20 +538,26 @@ def bind_server_socket(port: int) -> socket.socket:
 
 
 async def serve_app(app: Any, sock: socket.socket) -> None:
-    """Serve ``app`` on ``sock`` until cancelled; the socket is closed on exit."""
-    # Deferred: hypercorn is Megatron-LM's server dependency.
-    from hypercorn.asyncio import serve  # type: ignore[import-error]
-    from hypercorn.config import Config  # type: ignore[import-error]
+    """Serve ``app`` on ``sock`` until cancelled.
 
+    hypercorn takes ownership of the socket and closes it on exit; if serving
+    cannot start, the socket is closed here.
+    """
+    try:
+        # Deferred: hypercorn is Megatron-LM's server dependency.
+        from hypercorn.asyncio import serve  # type: ignore[import-error]
+        from hypercorn.config import Config  # type: ignore[import-error]
+    except ImportError:
+        sock.close()
+        raise
     config = Config()
     config.keep_alive_timeout = 30.0
     config.backlog = 2**14
     config.h2_max_concurrent_streams = 2**14
-    config.bind = [f"fd://{sock.fileno()}"]
-    try:
-        await serve(app, config)
-    finally:
-        sock.close()
+    config.bind = [f"fd://{sock.detach()}"]
+    # No signal handlers: they need the main thread, and this server runs on the
+    # engine's inference loop. It stops when its task is cancelled.
+    await serve(app, config, shutdown_trigger=asyncio.Event().wait)
 
 
 def wait_until_healthy(

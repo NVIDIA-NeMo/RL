@@ -32,6 +32,8 @@ from nemo_rl.models.generation.megatron.dynamo_gym_proxy import (
     failed_record,
 )
 
+pytestmark = pytest.mark.mcore
+
 URL = "http://10.0.0.1:3000/v1"
 COMPLETIONS = f"{URL}/completions"
 
@@ -43,6 +45,7 @@ def _params(**overrides) -> SimpleNamespace:
         top_k=0,
         top_p=0.0,
         return_log_probs=False,
+        skip_prompt_log_probs=True,
         num_tokens_to_generate=16,
         num_tokens_total=None,
         termination_id=None,
@@ -133,11 +136,28 @@ def test_completion_request_carries_every_set_sampling_field():
         ({"top_n_logprobs": 5}, "top_logprobs"),
         ({"num_tokens_to_generate": None}, "token budget"),
         ({"num_tokens_to_generate": 0}, "token budget"),
+        (
+            {"return_log_probs": True, "skip_prompt_log_probs": False},
+            "prompt log probabilities",
+        ),
     ],
 )
 def test_completion_request_refuses_what_the_adapter_cannot_serve(overrides, match):
     with pytest.raises(ValueError, match=match):
         completion_request([1, 2, 3], _params(**overrides), model_name="m")
+
+
+def test_completion_request_sends_a_negative_termination_id_as_ignore_eos():
+    # The endpoints set termination_id=-1 for ignore_eos; the frontend rejects
+    # a negative stop id, so it gets its own ignore_eos instead.
+    payload = completion_request(
+        [1, 2, 3], _params(termination_id=-1, stop_token_ids=[7]), model_name="m"
+    )
+    assert payload["ignore_eos"] is True
+    assert payload["stop_token_ids"] == [7]
+
+    payload = completion_request([1, 2, 3], _params(termination_id=-1), model_name="m")
+    assert payload["ignore_eos"] is True and "stop_token_ids" not in payload
 
 
 def test_completion_record_reads_like_a_coordinator_reply():
@@ -163,7 +183,8 @@ def test_completion_record_reads_like_a_coordinator_reply():
     assert record["payload_offloaded"] is False
     assert record["payload_stage_metadata"] is None
     assert record["routing_indices"] is None
-    # The finish reason is derived from the budget, as for an engine reply.
+    # The frontend's finish reason, and the budget the endpoints fall back to.
+    assert record["finish_reason"] == "stop"
     assert record["sampling_params"] == {"num_tokens_to_generate": 16}
     assert record["latency"] == 0.5
 
@@ -176,6 +197,22 @@ def test_completion_record_omits_log_probs_the_request_did_not_ask_for():
     assert record["generated_log_probs"] is None
     assert record["num_cached_tokens"] == 0
     assert record["uid"] == "cmpl-1"
+
+
+def test_completion_record_keeps_an_eos_on_the_last_budgeted_token_a_stop():
+    payload = completion_request([1], _params(num_tokens_to_generate=2), model_name="m")
+    record = completion_record(
+        [1],
+        payload,
+        _response([4, 2], finish="stop"),
+        request_id=0,
+        request_url=COMPLETIONS,
+        latency_s=0,
+    )
+    # Without the frontend's reason the endpoints would read a full budget as
+    # "length".
+    assert record["finish_reason"] == "stop"
+    assert len(record["generated_tokens"]) == payload["max_tokens"]
 
 
 def test_completion_record_with_log_probs_needs_them_in_the_reply():
@@ -263,7 +300,6 @@ def test_add_request_returns_the_future_alone(http):
 
 
 def test_streaming_delivers_the_whole_completion_as_the_final_item(http):
-    pytest.importorskip("megatron.core.inference.async_stream")
     http.replies = [_response([4, 5])]
 
     async def run():
@@ -288,10 +324,16 @@ def test_streaming_delivers_the_whole_completion_as_the_final_item(http):
             "ERROR_TRANSIENT",
             "HTTP 503: no engines",
         ),
+        (
+            {"status": "error", "http_status": 429, "raw": "too many requests"},
+            "ERROR_TRANSIENT",
+            "HTTP 429: too many requests",
+        ),
     ],
 )
 def test_frontend_errors_become_failed_replies(http, reply, kind, message):
-    # One attempt for a 400; the transient 503 is retried to the attempt cap.
+    # One attempt for a 400; a transient 503 or 429 is retried to the attempt
+    # cap and stays transient after it.
     http.replies = [reply] * dynamo_rollouts._HTTP_MAX_ATTEMPTS
 
     async def run():
@@ -377,10 +419,11 @@ def test_stop_cancels_every_request_in_flight(http):
             "text prompts only",
         ),
         (
-            {"prompt": [1], "request_metadata": {"ng_capture": {}}},
+            {"prompt": [1], "offload_params": {"ng_capture": {}}},
             NotImplementedError,
-            "token capture",
+            "offload_params",
         ),
+        ({"prompt": [1], "offload_params": {}}, NotImplementedError, "offload_params"),
     ],
 )
 def test_client_refuses_what_the_frontend_path_cannot_carry(http, kwargs, error, match):
@@ -417,7 +460,14 @@ def test_client_refusals_do_not_consume_request_ids_after_a_success(http):
 # ---------------------------------------------------------------------------
 
 
-def test_build_gym_proxy_app_assembles_the_endpoints_over_the_client(monkeypatch):
+_ENDPOINTS = (
+    "megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints"
+)
+
+
+@pytest.fixture
+def app_modules(monkeypatch):
+    """Stub Quart and Megatron-LM's endpoints package; returns the registered blueprints."""
     registered = []
 
     class Quart:
@@ -435,9 +485,30 @@ def test_build_gym_proxy_app_assembles_the_endpoints_over_the_client(monkeypatch
 
     module("quart", Quart=Quart)
     module(
-        "megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints",
-        __all__=["chat", "completions", "health"],
+        _ENDPOINTS,
+        Completions="completions",
+        ChatCompletions="chat",
+        Health="health",
+        Profile="profile",
+        __all__=["completions", "chat", "health", "profile"],
     )
+    return SimpleNamespace(registered=registered, module=module)
+
+
+def _build_app(**overrides):
+    kwargs = dict(
+        tokenizer=SimpleNamespace(name="tok"),
+        parsers=["nano_v3"],
+        multimodal_prompt_config="mm",
+        default_temperature=0.6,
+        default_top_p=0.95,
+        default_top_k=20,
+    )
+    kwargs.update(overrides)
+    return proxy.build_gym_proxy_app(_client(), **kwargs)
+
+
+def test_build_gym_proxy_app_assembles_the_endpoints_over_the_client(app_modules):
     client = _client()
     tokenizer = SimpleNamespace(name="tok")
 
@@ -451,7 +522,8 @@ def test_build_gym_proxy_app_assembles_the_endpoints_over_the_client(monkeypatch
         default_top_k=20,
     )
 
-    assert registered == ["chat", "completions", "health"]
+    # Profile drives the engine's CUDA profiler, which the client cannot reach.
+    assert app_modules.registered == ["completions", "chat", "health"]
     config = app.config
     assert config["client"] is client and config["tokenizer"] is tokenizer
     assert (
@@ -472,6 +544,25 @@ def test_build_gym_proxy_app_assembles_the_endpoints_over_the_client(monkeypatch
     assert config["tokenizer_copy"] is not tokenizer
     assert config["tokenizer_copy"].name == "tok"
     config["tokenize_executor"].shutdown()
+
+
+def test_build_gym_proxy_app_defaults_the_multimodal_prompt_config(app_modules):
+    from megatron.core.inference.config import MultimodalPromptConfig
+
+    # The chat endpoint reads it on every later turn, as on Megatron-LM's server.
+    app = _build_app(multimodal_prompt_config=None)
+    assert isinstance(app.config["multimodal_prompt_config"], MultimodalPromptConfig)
+    app.config["tokenize_executor"].shutdown()
+
+
+def test_build_gym_proxy_app_refuses_endpoints_that_failed_to_import(app_modules):
+    # Megatron-LM's endpoints package swallows its ImportError and exports nothing.
+    app_modules.module(_ENDPOINTS, __all__=[])
+
+    with pytest.raises(ImportError, match="blueprints") as info:
+        _build_app()
+    assert info.value.name == _ENDPOINTS
+    assert app_modules.registered == []
 
 
 def test_bind_server_socket_shares_the_port_with_a_reservation():

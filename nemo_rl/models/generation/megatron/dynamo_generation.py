@@ -1350,7 +1350,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         capture_media: bool = False,
         top_logprobs: int = 0,
     ) -> "Optional[MediaColumnSpec]":
-        """Not served yet: token capture rides on NeMo-Gym rollouts through the frontend."""
+        """Not served yet: the capture admission does not travel through the frontend."""
         raise NotImplementedError(
             "Token capture is not yet supported for Megatron engines behind Dynamo: "
             "the capture admission does not travel through the frontend to the "

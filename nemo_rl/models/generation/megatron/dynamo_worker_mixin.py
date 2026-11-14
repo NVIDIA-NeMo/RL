@@ -19,6 +19,7 @@ import os
 import uuid
 from concurrent.futures import CancelledError
 from concurrent.futures import Future as ConcurrentFuture
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
@@ -47,6 +48,20 @@ if TYPE_CHECKING:
     from megatron.inference.integrations.dynamo.telemetry import EngineEventReporter
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class GymProxyTarget:
+    """Where a rank's NeMo-Gym proxy server sends its completions.
+
+    Attributes:
+        frontend_url: The frontend's ``/v1`` URL.
+        request_timeout_s: Deadline for one completion through the frontend;
+            None waits as long as generation takes.
+    """
+
+    frontend_url: str
+    request_timeout_s: Optional[float]
 
 
 def require_megatron_dynamo_integration() -> None:
@@ -99,7 +114,7 @@ class MegatronDynamoGenerationMixin:
     # Where NeMo-Gym's proxy server sends completions, once the owner has
     # started the frontend (configure_dynamo_gym_proxy). Survives engine
     # rebuilds, so it is not reset with the engine state.
-    _dynamo_gym_frontend: Optional[dict[str, Any]] = None
+    _dynamo_gym_frontend: Optional[GymProxyTarget] = None
     # Rank zero only: the proxy server task on the inference loop.
     _dynamo_gym_proxy_future: Optional[ConcurrentFuture] = None
 
@@ -411,10 +426,9 @@ class MegatronDynamoGenerationMixin:
             request_timeout_s: Deadline for one completion through the
                 frontend; None waits as long as generation takes.
         """
-        self._dynamo_gym_frontend = {
-            "frontend_url": frontend_url,
-            "request_timeout_s": request_timeout_s,
-        }
+        self._dynamo_gym_frontend = GymProxyTarget(
+            frontend_url=frontend_url, request_timeout_s=request_timeout_s
+        )
 
     def _setup_openai_api_server(self) -> str:
         """Start NeMo-Gym's OpenAI server: Megatron-LM's endpoints over the frontend.
@@ -448,6 +462,21 @@ class MegatronDynamoGenerationMixin:
             )
         if self._inference_loop is None:
             raise RuntimeError("the inference loop must run before the proxy server")
+        generation_cfg = self.cfg["generation"]
+        mcore_cfg = generation_cfg["mcore_generation_config"]
+        client = FrontendInferenceClient(
+            frontend_url=frontend.frontend_url,
+            model_name=str(generation_cfg["model_name"]),
+            request_timeout_s=frontend.request_timeout_s,
+        )
+        # Built before the socket is bound, so a failure here leaves no socket open.
+        app = build_gym_proxy_app(
+            client,
+            tokenizer=self.megatron_tokenizer,
+            parsers=mcore_cfg["parsers"],
+            multimodal_prompt_config=self.inference_wrapped_model.multimodal_prompt_config,
+            **_http_sampling_defaults(generation_cfg),
+        )
         reserved_port = self._reserved_http_server_port
         if reserved_port is not None:
             # Adopt the driver's reservation: bind into its reuse group first,
@@ -458,20 +487,6 @@ class MegatronDynamoGenerationMixin:
         else:
             sock = bind_server_socket(0)
         port = sock.getsockname()[1]
-        generation_cfg = self.cfg["generation"]
-        mcore_cfg = generation_cfg["mcore_generation_config"]
-        client = FrontendInferenceClient(
-            frontend_url=frontend["frontend_url"],
-            model_name=str(generation_cfg["model_name"]),
-            request_timeout_s=frontend["request_timeout_s"],
-        )
-        app = build_gym_proxy_app(
-            client,
-            tokenizer=self.megatron_tokenizer,
-            parsers=mcore_cfg["parsers"],
-            multimodal_prompt_config=self.inference_wrapped_model.multimodal_prompt_config,
-            **_http_sampling_defaults(generation_cfg),
-        )
         self._dynamo_gym_proxy_future = asyncio.run_coroutine_threadsafe(
             serve_app(app, sock), self._inference_loop
         )
@@ -483,7 +498,7 @@ class MegatronDynamoGenerationMixin:
         )
         print(
             f"[Rank {self.rank}] NeMo-Gym proxy serving {base_url} over the Dynamo "
-            f"frontend {frontend['frontend_url']}",
+            f"frontend {frontend.frontend_url}",
             flush=True,
         )
         return base_url
