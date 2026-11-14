@@ -64,8 +64,6 @@ env:
   should_log_nemo_gym_responses: true
   should_mask_flagged_samples: true
   nemo_gym:
-    port_range_low: 10000
-    port_range_high: 10999
     is_trajectory_collection: false
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
