@@ -2139,7 +2139,8 @@ def test_length_penalty_published_rewards_match_shared_hook(
         observation.reward for observation in finalized.reward_observations
     ] == pytest.approx(expected)
     assert {
-        key: finalized.token_metrics[key] for key in expected_metrics
+        key: finalized.metrics[f"finalize/{key}_sum"] / len(results)
+        for key in expected_metrics
     } == pytest.approx(expected_metrics)
     assert finalized.valid_row_count == 2
     assert finalized.total_row_count == 3

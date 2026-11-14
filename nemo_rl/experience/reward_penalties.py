@@ -159,39 +159,6 @@ class RewardChecks:
     low_effort: bool
     length_penalty: LengthPenaltyInput | None = None
 
-    def __post_init__(self) -> None:
-        if any(
-            type(value) is not bool
-            for value in (
-                self.duplicated_reasoning,
-                self.empty_final_answer,
-                self.low_effort,
-            )
-        ):
-            raise ValueError("reward checks must be booleans")
-        if self.length_penalty is not None and not isinstance(
-            self.length_penalty, LengthPenaltyInput
-        ):
-            raise ValueError("invalid length penalty input")
-
-    @classmethod
-    def from_state(cls, value: object) -> RewardChecks:
-        """Restore scalar reward evidence from a saved rollout attempt."""
-        required = {"duplicated_reasoning", "empty_final_answer", "low_effort"}
-        if not isinstance(value, dict) or not required <= set(value) <= required | {
-            "length_penalty"
-        }:
-            raise ValueError("invalid reward_checks record")
-        data = dict(value)
-        if data.get("length_penalty") is not None:
-            if not isinstance(data["length_penalty"], dict):
-                raise ValueError("invalid length penalty input")
-            try:
-                data["length_penalty"] = LengthPenaltyInput(**data["length_penalty"])
-            except TypeError as error:
-                raise ValueError(f"invalid length penalty input: {error}") from error
-        return cls(**data)
-
 
 @dataclass(frozen=True)
 class CapturePenalty:
@@ -247,6 +214,30 @@ class EffortRewardSettings:
 
 
 @dataclass(frozen=True)
+class LengthRewardSettings:
+    """Checkpoint projection of grpo.length_penalty.
+
+    Mirrors how effort is stored: the reward-affecting rules only, excluding the
+    logging-only ``verbose`` flag, so a logging change does not block resume.
+    ``rules`` is the config's ``exclude_unset`` dump, so an omitted agent-override
+    field keeps its inherited value rather than this model's default.
+    """
+
+    rules: dict[str, Any]
+
+
+def _length_reward_settings(
+    length_penalty: LengthPenaltyConfig | None,
+) -> LengthRewardSettings | None:
+    """Project live length-penalty config to its checkpoint settings."""
+    if length_penalty is None:
+        return None
+    rules = length_penalty.model_dump(mode="json", exclude_unset=True)
+    rules.pop("verbose", None)
+    return LengthRewardSettings(rules)
+
+
+@dataclass(frozen=True)
 class CaptureRewardSettings:
     """Semantic checkpoint identity; user-config extras are never persisted."""
 
@@ -257,7 +248,7 @@ class CaptureRewardSettings:
     # configured ones (None = inferred from the tokenizer, which is fixed per run).
     think_tag_ids: tuple[int | None, int | None] | None
     thinking_tags: tuple[str, ...] | None
-    length_penalty: LengthPenaltyConfig | None = None
+    length_penalty: LengthRewardSettings | None = None
 
     @classmethod
     def from_configs(
@@ -265,8 +256,19 @@ class CaptureRewardSettings:
         penalties: RewardPenaltyConfig,
         effort: EffortLevelsConfig | None,
         thinking_tags: Sequence[str] | None,
-        length_penalty: LengthPenaltyConfig | None = None,
+        length_penalty: LengthPenaltyConfig | LengthRewardSettings | None = None,
     ) -> CaptureRewardSettings:
+        """Build the capture reward rules saved for checkpoint compatibility.
+
+        Args:
+            penalties: Configured token and text reward penalties.
+            effort: Optional low-effort shaping configuration.
+            thinking_tags: Resolved tag strings for the malformed-think-tag penalty.
+            length_penalty: Optional group length-adjustment configuration.
+
+        Returns:
+            Capture reward settings to persist and compare when restoring a run.
+        """
         unwanted: tuple[int, ...] = ()
         if penalties.penalize_unwanted_tokens:
             assert penalties.token_ids is not None
@@ -282,6 +284,11 @@ class CaptureRewardSettings:
             think_tag_ids = (
                 (ids.think_open, ids.think_close) if ids is not None else (None, None)
             )
+        length_settings = (
+            length_penalty
+            if isinstance(length_penalty, LengthRewardSettings)
+            else _length_reward_settings(length_penalty)
+        )
         return cls(
             tuple(spec.flag for spec in CAPTURE_PENALTIES if spec.enabled(penalties)),
             unwanted,
@@ -294,11 +301,15 @@ class CaptureRewardSettings:
             tuple(thinking_tags)
             if penalties.penalize_malformed_think_tag and thinking_tags
             else None,
-            length_penalty,
+            length_settings,
         )
 
     def to_state(self) -> dict[str, Any]:
-        """Serialize reward rules, including length penalties in version 2."""
+        """Serialize capture reward rules to their checkpoint representation.
+
+        Returns:
+            A versioned dictionary containing the saved reward settings.
+        """
         penalties: dict[str, Any] = {flag: True for flag in self.enabled_penalties}
         token_ids: dict[str, Any] = {}
         if self.unwanted_tokens:
@@ -309,20 +320,25 @@ class CaptureRewardSettings:
             penalties["token_ids"] = token_ids
         if self.thinking_tags is not None:
             penalties["thinking_tags"] = list(self.thinking_tags)
-        state = {
-            "version": 2 if self.length_penalty is not None else 1,
+        return {
+            "version": 2,
             "penalties": penalties,
             "effort": asdict(self.effort) if self.effort is not None else None,
+            "length_penalty": asdict(self.length_penalty)
+            if self.length_penalty is not None
+            else None,
         }
-        if self.length_penalty is not None:
-            state["length_penalty"] = self.length_penalty.model_dump(
-                mode="json", exclude_unset=True
-            )
-        return state
 
     @classmethod
     def from_state(cls, value: object) -> CaptureRewardSettings:
-        """Validate saved reward rules while accepting version-1 checkpoints."""
+        """Validate saved reward rules while accepting version-1 checkpoints.
+
+        Args:
+            value: A versioned capture reward-settings dictionary.
+
+        Returns:
+            Restored and validated capture reward settings.
+        """
         # Config modules import this module for the shared calculations.
         from nemo_rl.algorithms.grpo import RewardPenaltyConfig
         from nemo_rl.experience.rollouts import EffortLevelsConfig
@@ -348,27 +364,24 @@ class CaptureRewardSettings:
         expected = required | ({"length_penalty"} if value["version"] == 2 else set())
         if set(value) != expected:
             raise ValueError("invalid capture reward_settings fields for version")
-        length_penalty = (
-            LengthPenaltyConfig.model_validate(value["length_penalty"])
-            if value.get("length_penalty") is not None
-            else None
-        )
+        length_penalty = None
+        saved_length = value.get("length_penalty")
+        if saved_length is not None:
+            if (
+                not isinstance(saved_length, dict)
+                or set(saved_length) != {"rules"}
+                or not isinstance(saved_length["rules"], dict)
+            ):
+                raise ValueError("invalid length penalty reward settings")
+            length_penalty = LengthRewardSettings(saved_length["rules"])
         return cls.from_configs(penalties, effort, thinking_tags, length_penalty)
 
     def require_compatible(self, current: CaptureRewardSettings) -> None:
         """Reject changed reward rules with actionable field names."""
         differences = []
-        saved_length = (
-            self.length_penalty.model_dump(exclude_unset=True)
-            if self.length_penalty is not None
-            else None
-        )
-        current_length = (
-            current.length_penalty.model_dump(exclude_unset=True)
-            if current.length_penalty is not None
-            else None
-        )
-        if saved_length != current_length:
+        # Both are the reward-only projection (logging excluded), so a verbose-only
+        # change compares equal and does not block resume.
+        if self.length_penalty != current.length_penalty:
             differences.append("grpo.length_penalty")
         for spec in CAPTURE_PENALTIES:
             if (spec.flag in self.enabled_penalties) != (

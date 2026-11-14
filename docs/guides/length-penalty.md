@@ -6,7 +6,7 @@ They apply to NeMo-Gym GRPO **training** rollouts on the legacy driver (`grpo_tr
 
 Configure `grpo.length_penalty`. The block is typed (`LengthPenaltyConfig` in `nemo_rl/utils/length_penalty.py`): unknown keys, misspelled `length_type` / gate values, a `profile_band` channel with `b <= a` or `f` outside `[0, 1]` are all rejected when the config is loaded, before the first rollout. The length adjustments mutate `full_result["reward"]` in place during rollout postprocessing; the reward as handed to the hook is kept on the batch as `env_reward` (see [Metrics](#metrics)).
 
-SingleController uses the same algorithms for ordinary and token-capture rollouts. Capture applies adjustments to verified rollouts before publishing the group for training; rejected capture placeholders do not participate in group length statistics. Saved attempts retain scalar length/profile metadata, and checkpoint restore rejects changed length-penalty settings.
+SingleController uses the same algorithms for ordinary and non-Forest token-capture rollouts. Capture applies adjustments to verified rollouts before publishing the group for training; rejected capture placeholders do not participate in group length statistics. Forest training does not support length penalties: configuring both `token_capture.forest_training: true` and `grpo.length_penalty` is rejected at setup. Saved attempts retain scalar length/profile metadata, and checkpoint restore rejects changed length-penalty settings.
 
 All algorithms are resolved per prompt group. Unless otherwise stated, only rollouts with `reward > 0` participate in length comparisons and receive length-based adjustments.
 

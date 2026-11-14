@@ -623,15 +623,40 @@ def test_final_reward_distribution_and_agent_tables_are_pooled_exactly(attributi
 def test_length_penalty_reward_settings_roundtrip_and_detect_changes():
     from nemo_rl.utils.length_penalty import LengthPenaltyConfig, LengthPenaltyParams
 
+    def settings_for(length_penalty):
+        return CaptureRewardSettings.from_configs(
+            RewardPenaltyConfig(), None, None, length_penalty
+        )
+
     config = LengthPenaltyConfig(
         default=LengthPenaltyParams(length_type="chars", total_bonus=0.2)
     )
-    settings = CaptureRewardSettings.from_configs(
-        RewardPenaltyConfig(), None, None, config
-    )
+    settings = settings_for(config)
+    assert settings.to_state()["version"] == 2
     restored = CaptureRewardSettings.from_state(settings.to_state())
     assert restored == settings
     restored.require_compatible(settings)
+
+    # A logging-only change (verbose) is excluded from the saved rules, so resume
+    # is allowed.
+    restored.require_compatible(
+        settings_for(
+            LengthPenaltyConfig(
+                verbose=True,
+                default=LengthPenaltyParams(length_type="chars", total_bonus=0.2),
+            )
+        )
+    )
+
+    # A changed coefficient, or enabling the penalty where it was absent, is rejected.
+    with pytest.raises(ValueError, match="grpo.length_penalty"):
+        restored.require_compatible(
+            settings_for(
+                LengthPenaltyConfig(
+                    default=LengthPenaltyParams(length_type="chars", total_bonus=0.3)
+                )
+            )
+        )
     with pytest.raises(ValueError, match="grpo.length_penalty"):
         restored.require_compatible(
             CaptureRewardSettings.from_configs(RewardPenaltyConfig(), None, None)
@@ -639,11 +664,7 @@ def test_length_penalty_reward_settings_roundtrip_and_detect_changes():
 
 
 def test_length_penalty_settings_preserve_partial_agent_overrides():
-    from nemo_rl.utils.length_penalty import (
-        LengthPenaltyConfig,
-        LengthPenaltyParams,
-        prepare_length_penalty_input,
-    )
+    from nemo_rl.utils.length_penalty import LengthPenaltyConfig, LengthPenaltyParams
 
     config = LengthPenaltyConfig(
         default=LengthPenaltyParams(
@@ -655,17 +676,11 @@ def test_length_penalty_settings_preserve_partial_agent_overrides():
         RewardPenaltyConfig(), None, None, config
     )
     restored = CaptureRewardSettings.from_state(settings.to_state())
-    result = {
-        "full_result": {
-            "reward": 1.0,
-            "response": {"output": [{"type": "message", "content": "hello"}]},
-        },
-        "agent_ref": {"name": "agent"},
-    }
-    sample = prepare_length_penalty_input(result, result, restored.length_penalty, None)
-    assert sample.answer_length == 5
-    assert restored.length_penalty.agent_overrides["agent"].model_fields_set == {
-        "total_bonus"
+    assert restored == settings
+    # The exclude_unset projection keeps only the override field the user set, not
+    # the model defaults, so a partial override still inherits the rest on restore.
+    assert restored.length_penalty.rules["agent_overrides"]["agent"] == {
+        "total_bonus": 0.1
     }
 
 
@@ -707,6 +722,8 @@ def test_checkpoint_inventory_retains_length_penalty_settings():
         env={},
     )
     saved = capture_reward_settings(master)
-    assert saved.length_penalty is config
+    assert saved.length_penalty.rules == {
+        "default": {"length_type": "chars", "total_bonus": 0.2}
+    }
     restored = CaptureRewardSettings.from_state(saved.to_state())
     restored.require_compatible(saved)

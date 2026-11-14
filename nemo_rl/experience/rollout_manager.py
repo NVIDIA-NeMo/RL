@@ -1818,9 +1818,7 @@ class AsyncNemoGymRolloutImpl:
             # All N rollouts share the same input prompt; tensorize one copy.
             prompt_message_log = completed_results[0]["input_message_log"]
             _tensorize_by_key(prompt_message_log, "token_ids")
-            # _results_to_completions applies the per-row reward penalties before
-            # each Completion captures its reward, preserving the batch-level counts
-            # used by legacy Gym metrics; the group length penalty is applied below.
+            # Apply per-row penalties before conversion, then group length adjustments below.
             completions, penalty_counts = self._results_to_completions(
                 completed_results
             )

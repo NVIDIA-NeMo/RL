@@ -253,6 +253,12 @@ def generated_token_count(result: dict[str, Any]) -> int:
     generated token ids of each turn (think tags, end-of-turn and tool-call
     tokens included); prompt, chat-template and environment-observation tokens
     are in its user messages.
+
+    Args:
+        result: Gym rollout result containing tokenized assistant messages.
+
+    Returns:
+        The total number of tokens in all assistant messages.
     """
     return sum(
         len(message["token_ids"])
@@ -361,30 +367,25 @@ class LengthPenaltyInput:
     profiled_output_lengths: list[float] | None
     profile_band: dict[str, Any] | None
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.agent_name, str) or not self.agent_name:
-            raise ValueError("length penalty agent_name must be nonempty")
-        if any(
-            type(value) is not int or value < 0
-            for value in (self.reasoning_length, self.answer_length)
-        ):
-            raise ValueError("length penalty lengths must be nonnegative integers")
-        if any(
-            type(value) is not bool
-            for value in (self.all_generated_tokens, self.has_reward_components)
-        ):
-            raise ValueError("length penalty flags must be booleans")
-        for name in ("profiled_rewards", "profiled_output_lengths"):
-            value = getattr(self, name)
-            if value is not None and (
-                not isinstance(value, list)
-                or any(type(item) not in (int, float) for item in value)
-            ):
-                raise ValueError(
-                    f"length penalty {name} must be a list of numbers or None"
-                )
-        if self.profile_band is not None and not isinstance(self.profile_band, dict):
-            raise ValueError("length penalty profile_band must be a dict or None")
+
+def length_profile_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Return the per-row profile fields used by length adjustments.
+
+    Args:
+        row: Original Gym task row, including any nested task_data.
+
+    Returns:
+        Profile values with outer task-input fields overriding nested task_data.
+    """
+    task_input = get_nemo_gym_task_input(row)
+    if is_nemo_gym_task(row):
+        task_data = task_input.get("task_data")
+        if isinstance(task_data, dict):
+            task_input = {**task_data, **task_input}
+    return {
+        key: task_input.get(key)
+        for key in ("profiled_rewards", "profiled_output_lengths", "profile_band")
+    }
 
 
 def prepare_length_penalty_input(
@@ -393,19 +394,25 @@ def prepare_length_penalty_input(
     config: LengthPenaltyConfig,
     tokenizer: Any,
 ) -> LengthPenaltyInput:
-    """Measure scored text before capture discards the response envelope."""
+    """Measure scored text before discarding the response envelope.
+
+    Args:
+        result: Gym rollout result containing the scored response and reward components.
+        row: Original task row carrying attribution and profile metadata.
+        config: Length settings used to resolve the agent's measurement unit.
+        tokenizer: Policy tokenizer for text token counts; None uses character counts.
+
+    Returns:
+        Token-free text lengths and profile data. All-generated-token totals are
+        supplied separately when the group is adjusted.
+    """
     agent_name = get_nemo_gym_attribution_key(row)
     if agent_name is None:
         raise ValueError("Length penalties require a NeMo-Gym attribution key")
-    task_input = get_nemo_gym_task_input(row)
-    if is_nemo_gym_task(row):
-        task_data = task_input.get("task_data")
-        if isinstance(task_data, dict):
-            task_input = {**task_data, **task_input}
     params = _resolve_agent_params(
         agent_name, config.agent_overrides, config.resolved_defaults()
     )
-    length_type = params["length_type"] if params is not None else "chars"
+    length_type = params["length_type"]
     if length_type == "all_generated_tokens":
         reasoning_length, answer_length = 0, 0
     else:
@@ -420,9 +427,7 @@ def prepare_length_penalty_input(
         answer_length=answer_length,
         all_generated_tokens=length_type == "all_generated_tokens",
         has_reward_components=bool(result["full_result"].get("reward_components")),
-        profiled_rewards=task_input.get("profiled_rewards"),
-        profiled_output_lengths=task_input.get("profiled_output_lengths"),
-        profile_band=task_input.get("profile_band"),
+        **length_profile_fields(row),
     )
 
 
@@ -434,7 +439,19 @@ def apply_group_length_penalties_from_inputs(
     low_effort: list[bool],
     config: LengthPenaltyConfig,
 ) -> tuple[list[float], dict[str, float]]:
-    """Apply the shared algorithm to one complete group without token transport."""
+    """Apply shared length adjustments to one complete prompt group.
+
+    Args:
+        inputs: Saved length and profile metadata in rollout order.
+        rewards: Rewards after effort shaping and reward penalties, in the same order.
+        generated_lengths: Verified generated-token totals in rollout order.
+        low_effort: Per-rollout flags that bypass the group's length adjustments.
+        config: Shared length-adjustment settings.
+
+    Returns:
+        A tuple of adjusted rewards in input order and the shared per-rollout metrics.
+        The input rewards are unchanged.
+    """
     results = []
     lengths = []
     for sample, reward, generated, bypass in zip(
@@ -1221,7 +1238,7 @@ def _resolve_agent_params(
     agent_name: str,
     agents_cfg: dict[str, LengthPenaltyParams | None] | None,
     defaults: dict[str, Any],
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     """Resolve length bonus parameters for a given agent."""
     if agents_cfg is None:
         return dict(defaults)

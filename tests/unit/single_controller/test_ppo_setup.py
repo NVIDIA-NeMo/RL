@@ -674,6 +674,23 @@ class TestPPOValidation:
         with pytest.raises(NotImplementedError, match="length_penalty"):
             validate_single_controller_config(mc)
 
+    def test_forest_rejects_length_penalty(self):
+        # Forest discards the scored response before length is measured, so
+        # grpo.length_penalty is deferred to a follow-up and rejected at setup.
+        mc = _make_master_config()
+        mc.env = {"should_use_nemo_gym": True}
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
+        mc.grpo.length_penalty = LengthPenaltyConfig()
+        mc.token_capture.enabled = True
+        mc.token_capture.forest_training = True
+        with pytest.raises(
+            ValueError, match="Forest training does not support grpo.length_penalty"
+        ):
+            validate_single_controller_config(mc)
+
     @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
     def test_accepts_overlong_filtering(self, algorithm: str):
         mc = _make_master_config() if algorithm == "grpo" else _ppo_master_config()

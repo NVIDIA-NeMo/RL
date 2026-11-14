@@ -953,7 +953,7 @@ class RolloutReassembler:
             )
             mask_sample = logical.mask_sample
         _rollouts_ms = (time.perf_counter() - _group_t0) * 1000.0
-        length_metrics = self._apply_length_penalty(rows, logical, checks_by_rollout)
+        length_metrics = self._apply_length_penalty(rows, checks_by_rollout)
         valid_rows = [row for row in rows if row.valid]
         staging_keys = (
             logical.staging_keys
@@ -1159,41 +1159,37 @@ class RolloutReassembler:
             canonical_sample_ids=canonical_sample_ids,
             loss_multiplier=loss_multiplier,
         )
+        # Length metrics are already pooled in finalize/length_penalty/*_sum.
+        # Keep them separate from token metrics.
         finalized.token_metrics = token_metrics
-        finalized.token_metrics.update(length_metrics)
         return finalized
 
     def _apply_length_penalty(
         self,
         rows: list[FinalizedRollout],
-        logical: _LogicalRows | None,
         checks: tuple[RewardChecks | None, ...],
     ) -> dict[str, float]:
-        """Adjust each verified logical rollout once before publishing any rows."""
+        """Adjust each verified rollout once before publishing any rows.
+
+        Ordinary and non-Forest token capture only: Forest training together with
+        grpo.length_penalty is rejected at config validation.
+        """
         config = self._length_penalty_config
         if config is None:
             return {}
-        owner_indices: dict[int, list[int]] = {}
-        for index, row in enumerate(rows):
-            if row.valid:
-                slot = (
-                    logical.tags[index]["logical_slot"]
-                    if logical is not None
-                    else index
-                )
-                owner_indices.setdefault(slot, []).append(index)
-        if not owner_indices:
+        valid_indices = [index for index, row in enumerate(rows) if row.valid]
+        if not valid_indices:
             return {}
         inputs, rewards, generated, bypass = [], [], [], []
-        for slot, indices in owner_indices.items():
-            evidence = checks[slot]
+        for index in valid_indices:
+            evidence = checks[index]
             if evidence is None or evidence.length_penalty is None:
                 raise ValueError(
                     "length penalty requires saved rollout length metadata; restart rollouts"
                 )
             inputs.append(evidence.length_penalty)
-            rewards.append(rows[indices[0]].reward)
-            generated.append(sum(sum(rows[index].token_mask) for index in indices))
+            rewards.append(rows[index].reward)
+            generated.append(sum(rows[index].token_mask))
             bypass.append(evidence.low_effort)
         adjusted, metrics = apply_group_length_penalties_from_inputs(
             inputs,
@@ -1202,9 +1198,8 @@ class RolloutReassembler:
             low_effort=bypass,
             config=config,
         )
-        for indices, reward in zip(owner_indices.values(), adjusted, strict=True):
-            for index in indices:
-                rows[index] = replace(rows[index], reward=reward)
+        for index, reward in zip(valid_indices, adjusted, strict=True):
+            rows[index] = replace(rows[index], reward=reward)
         return metrics
 
     def _truncated_flags(

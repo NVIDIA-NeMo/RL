@@ -2318,10 +2318,6 @@ def test_reward_checks_seals_and_survives_checkpoint(granularity):
     assert restored.finalization_inputs("g7")[3] == [-2.0]
     assert restored.finalization_inputs("g7")[5] == [evidence]
     assert restored.finalization_inputs("g7")[6] == [context]
-    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
-    attempt["reward_checks"]["low_effort"] = "false"
-    with pytest.raises(ValueError, match="reward checks must be booleans"):
-        RolloutRecoveryLedger.from_state_dict(state)
 
 
 def test_checkpoint_preserves_pending_finalizer_metrics_independently_of_sealed_groups():
