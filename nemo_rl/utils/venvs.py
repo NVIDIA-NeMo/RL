@@ -169,6 +169,11 @@ def _env_builder(
     # Sleep to stagger node startup
     time.sleep(1 * node_idx)
 
+    # In the image this path links to a venv other actors share. Drop the link first,
+    # so the build marker and the rebuild land in this actor's own folder.
+    if force_rebuild and venv_path.is_symlink():
+        venv_path.unlink(missing_ok=True)
+
     if started_file.exists():
         # Another node is already building, wait for completion
         logger.info(
