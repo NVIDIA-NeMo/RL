@@ -1144,15 +1144,17 @@ class TestTakeReplacement:
         ctrl = self._controller(spares=1)
         assert ctrl._take_replacement(0) is not None
 
-    def test_a_custom_sampler_without_the_hooks_is_treated_as_gated(self):
-        """It predates DropAccountingSampler, so it must not lose the spare pool."""
+    def test_a_custom_sampler_without_the_hooks_is_rejected(self):
+        """The capability is required and read directly, so a sampler that omits it
+        fails loudly rather than silently getting a gated default."""
 
         class _PlainSampler:
             pass
 
         ctrl = self._controller(spares=1)
         ctrl._sampler = _PlainSampler()
-        assert ctrl._take_replacement(0) is not None
+        with pytest.raises(AttributeError, match="uses_pooled_replacements"):
+            ctrl._take_replacement(0)
 
     def test_the_per_slot_budget_stops_substituting(self):
         ctrl = self._controller(max_replacement_attempts=2, spares=5)
@@ -1208,14 +1210,16 @@ class TestChargeShortfall:
         ctrl._accountant.credit_shortfall(3)
         assert ctrl._rollout_runtime.batch_shortfall == {}
 
-    def test_a_custom_sampler_without_the_hooks_is_charged_like_a_gated_one(self):
+    def test_a_custom_sampler_without_the_hooks_is_rejected(self):
+        """charge_step_for_lost_group is required and called directly, so a sampler
+        that omits it fails loudly instead of falling back to a gated default."""
+
         class _PlainSampler:
             pass
 
         ctrl = self._controller(_PlainSampler(), assembling_version=2)
-        ctrl._accountant.credit_shortfall(None)
-        ctrl._accountant.credit_shortfall(7)
-        assert ctrl._rollout_runtime.batch_shortfall == {2: 1, 7: 1}
+        with pytest.raises(AttributeError, match="charge_step_for_lost_group"):
+            ctrl._accountant.credit_shortfall(None)
 
     def test_a_loss_after_selection_closed_counts_toward_the_next_step(self):
         """The train pump advances the version when it stops selecting for a step."""

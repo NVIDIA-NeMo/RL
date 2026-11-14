@@ -2116,6 +2116,13 @@ def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None
 
 
 class _EmptySampler:
+    # Matches BaseSampler's gated defaults: the controller reads these directly off
+    # the sampler, so every pump-driving stub must declare them. Specialized stubs
+    # override individual flags to stand in for a different policy.
+    uses_pooled_replacements = True
+    closes_short_at_exhaustion = False
+    requires_shortfall_reconciliation = True
+
     async def evict(self, *, current_train_weight: int) -> int:
         del current_train_weight
         return 0
@@ -2655,6 +2662,10 @@ def test_the_closes_short_stub_declares_what_the_windowed_sampler_does() -> None
 
     assert stub.uses_pooled_replacements == windowed.uses_pooled_replacements
     assert stub.closes_short_at_exhaustion == windowed.closes_short_at_exhaustion
+    assert (
+        stub.requires_shortfall_reconciliation
+        == windowed.requires_shortfall_reconciliation
+    )
     for target_step in (None, 3):
         assert stub.charge_step_for_lost_group(
             target_step=target_step, assembling_version=7

@@ -26,8 +26,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-from nemo_rl.algorithms.async_utils.staleness_sampler import DropAccountingSampler
-
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.staleness_sampler import PromptGroupSampler
     from nemo_rl.algorithms.rollout_checkpointing.state import RolloutRuntimeState
@@ -108,11 +106,9 @@ class StepAssemblyAccountant:
 
     def _charge_step_for_lost_group(self, target_step: Optional[int]) -> Optional[int]:
         """The step a permanently lost group is charged to, or None for no step."""
-        if isinstance(self._sampler, DropAccountingSampler):
-            return self._sampler.charge_step_for_lost_group(
-                target_step=target_step, assembling_version=self._assembling_version
-            )
-        return self.accounting_step(target_step)
+        return self._sampler.charge_step_for_lost_group(
+            target_step=target_step, assembling_version=self._assembling_version
+        )
 
     def advance_assembling_version(self) -> None:
         """Move past steps whose selected groups and losses fill their batch."""
@@ -158,7 +154,11 @@ class StepAssemblyAccountant:
         if allow_short:
             self._runtime.steps_allowed_short.add(charged_step)
         assembly = self._step_assembly
-        if assembly is not None and assembly.selection_credits is not None:
+        if (
+            self._sampler.requires_shortfall_reconciliation
+            and assembly is not None
+            and assembly.selection_credits is not None
+        ):
             assembly.selection_credits.append(
                 ShortfallCredit(target_step, charged_step, allow_short)
             )

@@ -47,10 +47,10 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayBuffer,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    require_drop_accounting_members,
     sampler_supports_buffer_checkpoint,
     sampler_supports_training_claims,
     sampler_supports_transactional_admission,
-    warn_if_custom_sampler_lacks_drop_accounting,
 )
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
@@ -1189,7 +1189,7 @@ def setup_single_controller(
             "SingleController path is built on the TransferQueue data plane."
         )
     if algo_cfg.use_dynamic_sampling:
-        warn_if_custom_sampler_lacks_drop_accounting(master_config.async_rl.sampler)
+        require_drop_accounting_members(master_config.async_rl.sampler)
         if not sampler_supports_transactional_admission(master_config.async_rl.sampler):
             raise ValueError(
                 "Dynamic sampling requires TransactionalAdmissionSampler: the admission "

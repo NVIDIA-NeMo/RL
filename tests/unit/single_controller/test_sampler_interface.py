@@ -23,7 +23,6 @@ and FQN loading of an out-of-repo sampler.
 from __future__ import annotations
 
 import asyncio
-import warnings
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -44,11 +43,11 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     WindowedSampler,
     WindowedSamplerConfig,
     create_sampler,
+    require_drop_accounting_members,
     required_buffer_capacity_for_config,
     sampler_supports_buffer_checkpoint,
     sampler_supports_training_claims,
     sampler_supports_transactional_admission,
-    warn_if_custom_sampler_lacks_drop_accounting,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
@@ -625,23 +624,22 @@ def test_filter_refill_requires_separate_admission_wait(cfg, expected):
     assert sampler_supports_transactional_admission(cfg) is expected
 
 
-class TestWarnIfCustomSamplerLacksDropAccounting:
-    def test_warns_when_no_member_is_defined(self):
-        with pytest.warns(
-            UserWarning, match="does not implement DropAccountingSampler"
-        ):
-            warn_if_custom_sampler_lacks_drop_accounting(_custom("NoDropAccounting"))
+class TestRequireDropAccountingMembers:
+    def test_raises_when_no_member_is_defined(self):
+        with pytest.raises(ValueError, match="missing the required"):
+            require_drop_accounting_members(_custom("NoDropAccounting"))
 
     def test_names_the_missing_members_of_a_partial_implementation(self):
-        with pytest.warns(UserWarning) as record:
-            warn_if_custom_sampler_lacks_drop_accounting(
-                _custom("PartialDropAccounting")
-            )
-        text = str(record[0].message)
-        assert "only ['uses_pooled_replacements']" in text
-        assert "closes_short_at_exhaustion" in text
-        assert "charge_step_for_lost_group" in text
-        assert "partial implementation is ignored" in text
+        with pytest.raises(ValueError) as excinfo:
+            require_drop_accounting_members(_custom("PartialDropAccounting"))
+        text = str(excinfo.value)
+        # The reported list names the three members this class omits and not the one
+        # it declares (``uses_pooled_replacements``).
+        reported = text.split("attribute(s) ", 1)[1].split("]", 1)[0]
+        assert "closes_short_at_exhaustion" in reported
+        assert "requires_shortfall_reconciliation" in reported
+        assert "charge_step_for_lost_group" in reported
+        assert "uses_pooled_replacements" not in reported
 
     @pytest.mark.parametrize(
         "cfg",
@@ -653,28 +651,22 @@ class TestWarnIfCustomSamplerLacksDropAccounting:
         ],
         ids=["full-protocol", "base-sampler-subclass", "windowed", "in_order"],
     )
-    def test_silent_when_the_protocol_is_implemented_or_sampler_is_built_in(self, cfg):
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            warn_if_custom_sampler_lacks_drop_accounting(cfg)
+    def test_silent_when_the_members_are_declared_or_sampler_is_built_in(self, cfg):
+        # A fully-declared custom class, or any built-in, passes without raising.
+        assert require_drop_accounting_members(cfg) is None
 
-    def test_flags_assigned_in_init_are_warned_about_but_honoured_at_runtime(self):
-        """Setup inspects the class; the controller inspects the instance.
-
-        The two predicates disagree for this shape, so the warning is a false alarm.
-        The protocol asks for class attributes to keep them in step, and the warning
-        says so -- it must not claim the members are simply absent.
+    def test_flags_assigned_in_init_are_rejected(self):
+        """Setup inspects the class, before __init__ runs, so instance-only flags
+        are invisible here and the check must reject the sampler.
         """
-        with pytest.warns(UserWarning) as record:
-            warn_if_custom_sampler_lacks_drop_accounting(
-                _custom("InstanceAttrDropAccounting")
-            )
+        with pytest.raises(ValueError) as excinfo:
+            require_drop_accounting_members(_custom("InstanceAttrDropAccounting"))
 
-        text = str(record[0].message)
-        assert "class defines only ['charge_step_for_lost_group']" in text
-        assert "Declare the flags as class attributes" in text
-        # What the controller actually does with it, which is honour the flags.
-        assert isinstance(InstanceAttrDropAccounting(), DropAccountingSampler)
+        text = str(excinfo.value)
+        assert "Declare them as class" in text
+        # The flags set in __init__ are not visible to the pre-construction check,
+        # so they are reported missing.
+        assert "uses_pooled_replacements" in text
 
 
 class TestWindowedSelect:
@@ -1306,6 +1298,7 @@ class InstanceAttrDropAccounting:
 class FullDropAccounting:
     uses_pooled_replacements = False
     closes_short_at_exhaustion = True
+    requires_shortfall_reconciliation = False
 
     def charge_step_for_lost_group(self, *, target_step, assembling_version):
         return None
