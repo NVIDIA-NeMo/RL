@@ -254,7 +254,7 @@ mcore = [
   # flash-attn, mamba-ssm and causal-conv1d (built from source here) do not use.
   "torch==2.13.0",
   "torchvision==0.28.0",
-  # Megatron-Bridge accepts >=5.15,<5.21, but ModelOpt (cc4b76d7) is tested only below 5.19.
+  # Matches main and the vllm extra; Megatron-Bridge accepts >=5.15,<5.21.
   "transformers==5.16.1",
   "tilelang==0.1.13; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
