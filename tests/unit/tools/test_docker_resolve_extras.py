@@ -62,6 +62,14 @@ def test_wanted_and_skipped_extras(
     assert _run("nrl_skipped_extras", **env).stdout.strip() == skipped
 
 
+@pytest.mark.parametrize(
+    ("nrl_extras", "wanted"),
+    [(" ", ALL_EXTRAS), ("mcore\tvllm", "vllm mcore"), ("mcore\nvllm", "vllm mcore")],
+)
+def test_any_whitespace_separates_extras(nrl_extras: str, wanted: str) -> None:
+    assert _run("nrl_wanted_extras", NRL_EXTRAS=nrl_extras).stdout.strip() == wanted
+
+
 def test_unknown_extra_fails() -> None:
     result = _run("nrl_wanted_extras", NRL_EXTRAS="mcore megatron")
     assert result.returncode != 0

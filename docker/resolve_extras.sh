@@ -21,7 +21,11 @@ NRL_ALL_EXTRAS="vllm sglang mcore automodel modelopt nemo_gym trtllm"
 # Print the extras to build, space-separated, in NRL_ALL_EXTRAS order: NRL_EXTRAS,
 # or all of them when it is empty.
 nrl_wanted_extras() {
-    local wanted="${NRL_EXTRAS:-$NRL_ALL_EXTRAS}" extra out="" removed
+    local wanted extra out="" removed
+    # Re-join on single spaces, so a tab or newline also separates names; blank means all.
+    wanted=$(printf '%s ' ${NRL_EXTRAS:-})
+    wanted=${wanted% }
+    wanted=${wanted:-$NRL_ALL_EXTRAS}
     # NRL_EXTRAS replaced these args. Docker only warns about a build arg nothing
     # declares, so without this check a stale one would quietly build every backend.
     for removed in SKIP_VLLM_BUILD SKIP_SGLANG_BUILD SKIP_TRTLLM_BUILD; do
