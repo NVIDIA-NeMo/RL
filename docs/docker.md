@@ -87,16 +87,19 @@ The Rust toolchain is only installed when `sglang` is built.
 
 ## Compiling for Fewer GPU Types
 
-Several dependencies compile CUDA code once per GPU architecture, and that is most of a cold build. By default the image compiles for Hopper (`9.0`), GB200 (`10.0`) and GB300 (`10.3`). To compile for one GPU type only, narrow the lists:
+Several dependencies compile CUDA code once per GPU architecture, and that is most of a cold build. By default the image compiles for Hopper (`9.0`), GB200 (`10.0`) and GB300 (`10.3`). To compile for one GPU type only, narrow the lists. This builds for GB300 only:
 
 ```sh
 docker buildx build -f docker/Dockerfile \
-    --build-arg TORCH_CUDA_ARCH_LIST=10.0 \
-    --build-arg NVTE_CUDA_ARCHS=100 \
+    --build-arg TORCH_CUDA_ARCH_LIST=10.3 \
+    --build-arg NVTE_CUDA_ARCHS=103 \
     --build-arg FLASH_ATTN_CUDA_ARCHS=100 \
+    --build-arg FLASH_MLA_DISABLE_SM90=1 \
     --tag <registry>/nemo-rl:latest \
     .
 ```
+
+flash-attn has no separate GB300 target, so it stays at `100`.
 
 | Build argument | Default | Read by |
 |---|---|---|
