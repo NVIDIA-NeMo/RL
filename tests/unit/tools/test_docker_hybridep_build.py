@@ -182,6 +182,15 @@ def test_uv_cache_mount_id_matches_build_container_workflow() -> None:
     assert len(ids) == 1, ids
     # the workflow takes arch from PLATFORM, not a Dockerfile-resolved ARG
     df_vars = set(re.findall(r"\$\{(\w+)\}", ids.pop())) - {"TARGETARCH"}
+    # uv does not key a built wheel on these env vars, so the cache must, or a
+    # wheel compiled for one GPU list is reused for another.
+    gpu_type_args = {
+        "TORCH_CUDA_ARCH_LIST",
+        "NVTE_CUDA_ARCHS",
+        "FLASH_ATTN_CUDA_ARCHS",
+        "FLASH_MLA_DISABLE_SM90",
+    }
+    assert gpu_type_args <= df_vars, gpu_type_args - df_vars
 
     step = workflow_text.split("id: uv_cache\n", 1)[1].split("- name:", 1)[0]
     wf_vars = set(re.findall(r"=\$\(resolve_arg (\w+)\)", step))

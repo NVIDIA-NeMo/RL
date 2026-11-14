@@ -106,8 +106,7 @@ docker buildx build -f docker/Dockerfile \
 | `FLASH_MLA_DISABLE_SM90` | unset | FlashMLA. Set to `1` to skip its Hopper kernels. |
 | `NVCC_THREADS` | flash-attn's own default | flash-attn (threads per `nvcc` call). |
 
-> [!WARNING]
-> `uv` does not know these settings went into a wheel it built. On a builder that keeps the BuildKit cache mount, a wheel compiled for the old list is reused after you change the list. Reset the mount first with `docker buildx prune --filter type=exec.cachemount`.
+Each combination of the first four settings gets its own uv cache, so a wheel compiled for one list is never reused for another. `NVCC_THREADS` does not change the wheel and is not part of that cache key.
 
 ## Stripping the uv Cache
 
@@ -123,7 +122,7 @@ docker buildx build -f docker/Dockerfile \
 ```
 
 > [!NOTE]
-> On a long-lived local builder, BuildKit's cache mount (keyed by base image, uv version, and the HybridEP setting) persists across builds regardless of `STRIP_UV_CACHE` -- it just controls whether a copy also ships in the image layers. To reset that mount, run `docker buildx prune --filter type=exec.cachemount`.
+> On a long-lived local builder, BuildKit's cache mount (keyed by base image, uv version, the HybridEP setting, and the GPU-type build args) persists across builds regardless of `STRIP_UV_CACHE` -- it just controls whether a copy also ships in the image layers. To reset that mount, run `docker buildx prune --filter type=exec.cachemount`.
 
 ## Custom Setup Commands
 
