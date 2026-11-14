@@ -68,7 +68,11 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
         ),
         policy={
             "train_global_batch_size": num_prompts_per_step * 4,
-            "generation": {"backend": "vllm", "colocated": {"enabled": False}},
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {"http_api_server_count": 1},
+                "colocated": {"enabled": False},
+            },
         },
         loss_fn=ClippedPGLossConfig(
             reference_policy_kl_penalty=0,
@@ -332,7 +336,11 @@ class TestWrongPathFaultToleranceIsRejected:
             ),
             policy={
                 "train_global_batch_size": 8,
-                "generation": {"backend": "vllm", "colocated": {"enabled": False}},
+                "generation": {
+                    "backend": "vllm",
+                    "vllm_cfg": {"http_api_server_count": 1},
+                    "colocated": {"enabled": False},
+                },
             },
             loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0),
             env={"should_use_nemo_gym": use_nemo_gym},

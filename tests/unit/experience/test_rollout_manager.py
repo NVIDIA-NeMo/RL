@@ -1468,10 +1468,13 @@ def test_nemo_gym_reward_penalties_match_legacy_rewards_counts_and_metrics(
 ):
     impl = _nemo_gym_impl(True, reward_penalty_config)
     result = _reward_penalty_result(output, assistant_overrides, assistant_tokens)
+    result["reward_original"] = 1.0
 
     completions, penalty_counts = impl._results_to_completions([result])
 
     assert completions[0].reward == 0.0
+    # Dynamic sampling still sees the reward the penalty overwrote.
+    assert completions[0].reward_original == 1.0
     assert penalty_counts[count_key] == 1
     assert sum(penalty_counts.values()) == 1
     assert impl._compute_reward_penalty_metrics(penalty_counts, 1) == {metric_name: 1.0}
@@ -2061,12 +2064,11 @@ def test_async_nemo_gym_rollout_manager(
             None,
         )
         assert last_assistant is not None, f"Completion {i}: no assistant message found"
-        assert torch.equal(
-            last_assistant["token_ids"],
-            torch.tensor([151667, 198, 32313, 11, 1077]),
-        ), (
-            f"Completion {i}: last assistant token_ids {last_assistant['token_ids'].tolist()} "
-            f"!= [151667, 198, 32313, 11, 1077]"
+        # Sampling runs at temperature 1.0. On vLLM 0.33 the fifth token varies between
+        # requests for the same prompt (279 or 1077), so only the first four ids are fixed.
+        token_ids = last_assistant["token_ids"].tolist()
+        assert len(token_ids) == 5 and token_ids[:4] == [151667, 198, 32313, 11], (
+            f"Completion {i}: last assistant token_ids {token_ids}"
         )
 
         # 3. reward
@@ -2191,7 +2193,11 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         assert new_token_ids is not None, (
             f"Completion {i}: no assistant message in manager"
         )
-        assert torch.equal(orig_token_ids, new_token_ids), (
+        # Sampling runs at temperature 1.0. On vLLM 0.33 the fifth token varies between
+        # requests for the same prompt, so only the first four ids are compared.
+        assert len(orig_token_ids) == len(new_token_ids) and torch.equal(
+            orig_token_ids[:4], new_token_ids[:4]
+        ), (
             f"Completion {i}: last assistant token_ids mismatch\n"
             f"  original:  {orig_token_ids.tolist()}\n"
             f"  manager:   {new_token_ids.tolist()}"
@@ -2956,7 +2962,12 @@ def _scored_record(*rewards: float) -> PromptGroupRecord:
         prompt=[],
         extra_env_info=None,
         metadata={},
-        completions=[SimpleNamespace(reward=reward) for reward in rewards],
+        completions=[
+            SimpleNamespace(
+                reward=reward, reward_original=None, env_extras=None, truncated=False
+            )
+            for reward in rewards
+        ],
         rollout_metrics={},
     )
 

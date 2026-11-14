@@ -2044,9 +2044,9 @@ def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) 
     Args:
         batch: Batch with ``[B, S]`` ``input_ids``.
         media_token_id: Media placeholder token ID, or None if the model does not
-            accept the mask, in which case any existing mask is removed. The
-            Megatron policy worker passes None when
-            ``_model_accepts_media_token_validity_mask`` is False.
+            accept the mask, in which case any existing mask is removed.
+            ``model_media_placeholder_token_id`` performs that capability check
+            for Megatron policy and value workers.
     """
     if media_token_id is None:
         batch.pop("media_token_validity_mask", None)
