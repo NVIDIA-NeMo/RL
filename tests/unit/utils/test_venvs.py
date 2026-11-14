@@ -120,6 +120,46 @@ def test_force_rebuild_on_each_node_replaces_every_link_to_a_shared_venv(
     assert not (shared / "STARTED_ENV_BUILDER").exists()
 
 
+def test_force_rebuild_tolerates_another_node_replacing_the_link_first(
+    tmp_path: Path,
+) -> None:
+    """On a shared venv dir, node 1 may see the link, then node 0 replaces it first.
+
+    Node 1's unlink then hits node 0's new real folder. It must not fail; it waits
+    for node 0's build like any other node that finds the build marker.
+    """
+    shared = tmp_path / "extras-vllm"
+    (shared / "bin").mkdir(parents=True)
+    (shared / "bin" / "python").touch()
+    actor = tmp_path / "a.Worker"
+    actor.symlink_to("extras-vllm")
+    real_unlink = Path.unlink
+
+    def node_0_wins_then_unlink(self: Path, missing_ok: bool = False) -> None:
+        if self == actor and self.is_symlink():
+            # Node 0 drops the link, starts its own build and finishes it.
+            real_unlink(self)
+            (actor / "bin").mkdir(parents=True)
+            (actor / "STARTED_ENV_BUILDER").touch()
+            (actor / "bin" / "python").touch()
+        real_unlink(self, missing_ok=missing_ok)
+
+    with (
+        patch.dict(os.environ, {"NEMO_RL_VENV_DIR": str(tmp_path)}),
+        patch.object(venv_module.subprocess, "run") as run,
+        patch.object(venv_module.time, "sleep"),
+        patch.object(Path, "unlink", node_0_wins_then_unlink),
+    ):
+        python = venv_module._env_builder._function(
+            "uv run --extra vllm", "a.Worker", 1, True
+        )
+
+    assert python == str(actor / "bin" / "python")
+    run.assert_not_called()
+    assert not actor.is_symlink()
+    assert (shared / "bin" / "python").exists()
+
+
 def test_add_hf_modules_cache_to_pythonpath():
     result = add_hf_modules_cache_to_pythonpath(
         {
