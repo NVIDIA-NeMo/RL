@@ -41,6 +41,7 @@ uv run python "${REPO_ROOT}/examples/run_grpo_single_controller.py" \
     policy.megatron_cfg.enabled=true \
     policy.megatron_cfg.tensor_model_parallel_size=1 \
     policy.megatron_cfg.sequence_parallel=false \
+    ++policy.megatron_cfg.moe_per_layer_logging=false \
     policy.generation.vllm_cfg.tensor_parallel_size=1 \
     policy.generation.vllm_cfg.http_server_serving_chat_kwargs.tool_parser=hermes \
     policy.generation.colocated.enabled=false \
@@ -63,6 +64,7 @@ uv run python "${REPO_ROOT}/examples/run_grpo_single_controller.py" \
     ++data_plane.enabled=true ++data_plane.impl=transfer_queue \
     ++data_plane.backend=simple ++data_plane.simple.storage_capacity=1000000 \
     ++data_plane.simple.num_storage_units=2 \
+    ++data_plane.claim_meta_poll_interval_s=0.5 \
     ++async_rl.sampler.name=in_order ++async_rl.sampler.max_lookahead_versions=0 \
     ++async_rl.min_groups_for_streaming_train=2 \
     ++async_rl.max_inflight_prompts=2 ++async_rl.max_buffered_rollouts=2 \
