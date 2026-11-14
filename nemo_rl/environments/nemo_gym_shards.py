@@ -38,7 +38,11 @@ from omegaconf import OmegaConf
 # Dict-shaped NeMo RL integration settings that are not Gym server entries.
 # The actor factory or rollout code consumes these separately.
 NEMO_RL_DICT_CONFIG_KEYS = frozenset(
-    {"effort_levels", "external_service_readiness", "tokenizer_config"}
+    {
+        "effort_levels",
+        "external_service_readiness",
+        "tokenizer_config",
+    }
 )
 
 # Gym settings that contain mappings but are not server-instance overlays.

@@ -1541,6 +1541,22 @@ def test_generation_cut_past_its_deadline_fails_uncut_calls_without_staging(capl
     assert _uncut_reasons(caplog) == {"control_deadline": 1}
 
 
+def test_a_cut_runs_to_the_deadline_its_caller_gives_it():
+    """The Dynamo frontend hands every engine the deadline it waits to itself."""
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    _live_call(worker, [11, 12], [-0.1, -0.2], prompt_token_ids=(10,))
+    inventory = _single_call_inventory()
+
+    # This worker sets no control timeout of its own.
+    receipt = asyncio.run(
+        _cuts(worker).run_cut(inventory, deadline=time.monotonic() - 1.0)
+    )
+
+    assert [ack.disposition for ack in receipt.prefixes] == ["durable_failure"]
+    assert sink.generation_prefix_records == []
+
+
 def _active_call_inventory(
     worker, *calls: tuple[str, list[int]], output_limit: int | None = 16
 ) -> tuple[GenerationCutInventory, list]:
@@ -2460,9 +2476,12 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
     )
     # vLLM's processed tail: EOS and any matched stop string already stripped.
     output = SimpleNamespace(token_ids=[14, 151645], text=" tail")
-    resumed_worker._prefix_recovery.restore_reply_text(
+    resumed = resumed_worker._capture_registry.get(request)
+    restore_reply_text(
         request,
         SimpleNamespace(outputs=[output]),
+        prefix_token_ids=resumed.resumed_generation_token_ids,
+        engine_prompt_token_ids=resumed.prompt_token_ids,
         tokenizer=_ByteTokenizer(),
     )
     (replay_kwargs,) = replays
@@ -2474,7 +2493,6 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
     # A second checkpoint taken before the resumed call finishes must retain
     # the original cut key and append the newly generated tail. Gym v2 stores
     # this complete key list in the replacement attempt's model record.
-    resumed = resumed_worker._capture_registry.get(request)
     resumed.record([14], [-0.3])
     second_receipt = _cuts(resumed_worker).checkpoint_cut(
         _single_call_inventory("c2", checkpoint_id="checkpoint-2", attempt=1)
@@ -2593,7 +2611,7 @@ def _staging_chain_request(prev_len: int = 3) -> _FakeRequest:
 
 
 def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
-    """The resolved prefix reaches both the engine request and capture admission."""
+    """The prefix resolved from the staging chain is the one begin_call checks."""
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": [12]})
@@ -2603,7 +2621,6 @@ def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
 
     admission = worker._capture_admission(request)
     prefix = worker._resolve_admission_prefix(admission)
-    worker._enter_request_prefix(request, prefix)
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
         worker,
         request,
@@ -2617,8 +2634,6 @@ def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
     # Never patched back into the wire context.
     assert request.ng_capture == context_before
     assert admission.required_prefix_token_ids == []
-    # enter_prefix is the production writer of the request field.
-    assert request.required_prefix_token_ids == prefix
     state = worker._capture_registry.get(request)
     assert state.call.prefix_token_ids == prefix
     assert state.prompt_token_ids == [10, 11, 12, 20]

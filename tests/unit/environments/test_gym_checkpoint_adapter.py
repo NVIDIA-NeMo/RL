@@ -162,7 +162,7 @@ _CONTROL_TOKEN = "control-token"
 class _NoResourceSessions:
     """Resources server hooks with no per-session state to save."""
 
-    async def export_session_states(self, session_ids):
+    async def export_session_states(self, session_ids, *, checkpoint_id):
         return {}
 
     async def restore_session_states(self, states):
@@ -233,7 +233,7 @@ def _in_process_gym(
         def __init__(self) -> None:
             self.restored: list[Any] = []
 
-        async def export_agent_sessions(self, session_keys):
+        async def export_agent_sessions(self, session_keys, *, checkpoint_id):
             return {key: {"turns": 1} for key in session_keys}
 
         async def restore_agent_sessions(self, sessions):

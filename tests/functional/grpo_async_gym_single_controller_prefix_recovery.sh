@@ -204,6 +204,7 @@ setsid env \
         logger.log_dir="$PHASE1_LOG_DIR" \
         "$@" &
 PHASE1_PID=$!
+PHASE1_RUN_LOG=$BASE_RUN_LOG
 
 uv run --directory "$PROJECT_ROOT" --no-sync python "$SNAPSHOT_HELPER" select \
     "$CHECKPOINT_DIR/bootstrap/rollout_snapshots" \

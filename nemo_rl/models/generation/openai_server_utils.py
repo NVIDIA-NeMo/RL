@@ -27,6 +27,19 @@ from dataclasses import dataclass
 from typing import Any
 
 
+def turn_end_token_ids(
+    stop_token_ids: Collection[int], tokenizer: Any
+) -> frozenset[int]:
+    """Every id a turn can end on, for :func:`splice_prefix_tokens`.
+
+    vLLM stops on the generation config's EOS as well as the configured stops,
+    and the chat template closes turns with the tokenizer's EOS, so a turn can
+    end on any of them. ``stop_token_ids`` is vLLM's
+    :func:`nemo_rl.models.generation.vllm.utils.model_stop_token_ids`.
+    """
+    return frozenset(stop_token_ids) | {tokenizer.eos_token_id}
+
+
 @dataclass(frozen=True)
 class PrefixSplice:
     """Exact token splice and its source coordinates for multimodal ranges."""
@@ -42,7 +55,7 @@ def replace_prefix_tokens(
     template_prefix_token_ids: list[int],
     template_token_ids: list[int],
     *,
-    eos_token_id: int | Collection[int] | None = None,
+    eos_token_id: int | Collection[int],
 ) -> list[int]:
     """Replace a rendered history with the exact previously generated tokens.
 
@@ -64,7 +77,7 @@ def splice_prefix_tokens(
     model_prefix_token_ids: list[int],
     template_prefix_token_ids: list[int],
     template_token_ids: list[int],
-    eos_token_id: int | Collection[int] | None = None,
+    eos_token_id: int | Collection[int],
 ) -> PrefixSplice:
     """This is a subroutine used inside the OpenAI-compatible Chat Completion server.
 
@@ -124,21 +137,18 @@ def splice_prefix_tokens(
         resumes from the template after that EOS:
             output => [11,12,13,40,41,220,17,2,21,22,40,41]
 
-    ``eos_token_id`` overrides ``tokenizer.eos_token_id``; with it, ``tokenizer``
-    may be ``None`` (callers that only hold token ids, e.g. the Megatron prompt
-    preparer) and the failure message skips the detokenized reprs. It may also
-    be a collection of ids for models that declare several EOS tokens (the
-    Megatron chat endpoint ships the model's full EOS set): any of them counts
-    toward the boundary, and when the model's prefix ends on one of them that
-    exact id is kept in place of the template's, so the spliced prompt still
-    starts with the model's tokens verbatim.
+    ``eos_token_id`` is every id a turn can end on (:func:`turn_end_token_ids`
+    for vLLM); the tokenizer's own EOS alone misses a turn that ended on another
+    stop (gpt-oss ``<|call|>``). ``tokenizer`` may be ``None`` (callers that only
+    hold token ids, e.g. the Megatron prompt preparer); the failure message then
+    skips the detokenized reprs. Any id in the set counts toward the boundary,
+    and when the model's prefix ends on one of them that exact id is kept in
+    place of the template's, so the spliced prompt still starts with the
+    model's tokens verbatim.
     """
     if not model_prefix_token_ids:
         return PrefixSplice(template_token_ids, 0, 0)
 
-    if eos_token_id is None:
-        eos_token_id = tokenizer.eos_token_id
-    assert eos_token_id is not None, "Tokenizer must have an EOS token ID"
     eos_token_ids = (
         frozenset([eos_token_id])
         if isinstance(eos_token_id, int)

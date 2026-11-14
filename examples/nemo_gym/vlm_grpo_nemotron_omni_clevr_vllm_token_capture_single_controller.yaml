@@ -62,6 +62,7 @@ env:
     - resources_servers/string_match/configs/string_match.yaml
     string_match_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
