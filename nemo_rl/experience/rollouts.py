@@ -78,6 +78,7 @@ from nemo_rl.experience.failures import GymRowFailure
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
 )
@@ -2408,7 +2409,12 @@ def _prepare_nemo_gym_rows(
     sampling_params: GenerationSamplingParams,
     num_generations: int,
 ) -> None:
-    """Apply NeMo-RL sampling parameters and stable row indices in place."""
+    """Stamp NeMo-RL sampling values and stable row indices onto rows in place.
+
+    The values go beside the task, under ``_ng_model_sampling``, and the task is
+    left unchanged. Gym applies them to the model calls that the trained agent
+    makes through Gym's model servers.
+    """
     if num_generations <= 0 or len(rows) % num_generations != 0:
         raise ValueError("NeMo-Gym rows must contain complete prompt groups")
 
@@ -2453,23 +2459,13 @@ def _prepare_nemo_gym_rows(
     for row_index, row in enumerate(rows):
         group_index = row_index // num_generations
         rollout_index = row_index % num_generations
-        responses_create_params = get_nemo_gym_task_input(row).get(
-            "responses_create_params"
-        )
-        if not isinstance(responses_create_params, dict):
-            raise TypeError(
-                "Each NeMo-Gym task input must contain a responses_create_params dict"
-            )
-
-        responses_create_params["temperature"] = sampling_params.temperature
-        responses_create_params["top_p"] = sampling_params.top_p
-        configured_max_tokens = generation_config["max_new_tokens"]
-        row_max_tokens = responses_create_params.get("max_output_tokens")
-        responses_create_params["max_output_tokens"] = (
-            min(row_max_tokens, configured_max_tokens)
-            if row_max_tokens is not None
-            else configured_max_tokens
-        )
+        # Gym's model server caps each call at the smaller of its own limit and
+        # max_new_tokens, so a task's smaller max_output_tokens is kept.
+        row[NEMO_GYM_MODEL_SAMPLING_KEY] = {
+            "temperature": sampling_params.temperature,
+            "top_p": sampling_params.top_p,
+            "max_output_tokens": generation_config["max_new_tokens"],
+        }
         row["_rowidx"] = row_index
         row[NEMO_GYM_GROUP_ID_KEY] = group_ids[group_index]
         row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempts[group_index]
@@ -2745,8 +2741,7 @@ async def run_async_nemo_gym_rollout(
 
     Raises:
         AssertionError: If an unsupported generation option is requested.
-        TypeError: If a row lacks a valid ``responses_create_params`` dictionary or
-            the actor returns a non-integer row index.
+        TypeError: If the actor returns a non-integer row index.
         ValueError: If either generation count is not positive, the batch is empty
             or not divisible by the relevant generation count,
             ``returns_entire_batch`` has an incompatible size, a streamed row index
@@ -3000,7 +2995,7 @@ def run_nemo_gym_rollout_sync(
 
     Raises:
         AssertionError: If an unsupported generation option is requested.
-        TypeError: If a NeMo-Gym row or streamed row index has an invalid type.
+        TypeError: If the actor returns a non-integer row index.
         ValueError: If streamed rows violate the ordering, uniqueness, grouping,
             or task-index invariants documented by
             :func:`run_async_nemo_gym_rollout`.

@@ -18,6 +18,7 @@ collector/adapter integration without starting an agent or a policy model.
 """
 
 import asyncio
+import sys
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
@@ -243,8 +244,12 @@ def test_real_collector_streams_episode_and_flat_http_results(
                 gym_config.NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME,
                 OmegaConf.to_yaml(global_config),
             )
-            monkeypatch.setattr(gym_config, "_GLOBAL_CONFIG_DICT", global_config)
-            monkeypatch.setattr(gym_server, "_GLOBAL_AIOHTTP_CLIENT", http_client)
+            # Patch the modules that define these globals: on current Gym the old
+            # paths are re-export shims, where setattr would only shadow them.
+            config_module = sys.modules[gym_config.get_global_config_dict.__module__]
+            client_module = sys.modules[gym_server.get_global_aiohttp_client.__module__]
+            monkeypatch.setattr(config_module, "_GLOBAL_CONFIG_DICT", global_config)
+            monkeypatch.setattr(client_module, "_GLOBAL_AIOHTTP_CLIENT", http_client)
 
             materialized_task = {
                 "task_id": {"taskset": "weather:train", "task_id": "weather-17"},
@@ -270,6 +275,7 @@ def test_real_collector_streams_episode_and_flat_http_results(
                 }
             )
             expected_task = deepcopy(materialized_task)
+            expected_sampling = None
             if token_capture:
                 for index, row in enumerate(rows[:2]):
                     row.update(
@@ -301,7 +307,13 @@ def test_real_collector_streams_episode_and_flat_http_results(
                     num_generations=2,
                 )
                 assert all("_ng_rollout_id" not in row for row in rows)
-                expected_task["task_input"]["responses_create_params"]["top_p"] = 0.9
+                # The task reaches the Environment Server unchanged; the values
+                # ride beside it in the episode request.
+                expected_sampling = {
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "max_output_tokens": 64,
+                }
                 expected_episode_ids = [
                     {
                         "rollout_id": f"{row['_ng_group_id']}-g{index}-t{group_attempt}",
@@ -384,9 +396,12 @@ def test_real_collector_streams_episode_and_flat_http_results(
             episode_id["rollout_id"] for episode_id in expected_episode_ids
         }
         for body in received_episode:
-            assert set(body) == {"episode_id", "task"}
+            assert set(body) == {"episode_id", "task"} | (
+                {"model_sampling"} if expected_sampling else set()
+            )
             assert body["episode_id"] in expected_episode_ids
             assert body["task"] == expected_task
+            assert body.get("model_sampling") == expected_sampling
         for body in received_flat:
             assert "episode_id" not in body
             assert body["agent_ref"]["name"] == "legacy_agent"

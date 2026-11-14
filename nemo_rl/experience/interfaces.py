@@ -21,6 +21,12 @@ NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_GROUP_ID_KEY = "_ng_group_id"
 NEMO_GYM_GROUP_ATTEMPT_KEY = "_ng_group_attempt"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
+# Names owned by Gym (MODEL_SAMPLING_KEY_NAME, MODEL_SAMPLING_HEADER, MODEL_SAMPLING_NULL), copied because their
+# readers cannot import nemo_gym: the driver and vLLM-only actors set the row key, and the vLLM chat route also
+# serves workers built without nemo_gym (the ModelOpt workers). A test checks they still match.
+NEMO_GYM_MODEL_SAMPLING_KEY = "_ng_model_sampling"
+NEMO_GYM_MODEL_SAMPLING_HEADER = "x-ng-sampling"
+NEMO_GYM_MODEL_SAMPLING_NULL = "null"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 # Unconsumed suffix of a gap-fill dataloader batch, carried in the async
 # collector's rollouts state so a checkpoint cannot strand yielded prompts.
