@@ -67,7 +67,8 @@ def test_validate_accepts_the_supported_config():
         ({"generation.refit_transport": None}, MPS, "refit_transport=ipc"),
         ({}, {}, "MPS control daemon"),
         ({"generation.mcore_generation_config.expert_model_parallel_size": 6}, MPS, "not built yet"),
-        ({"generation.mcore_generation_config.tensor_model_parallel_size": 2}, MPS, "not built yet"),
+        ({"megatron_cfg.tensor_model_parallel_size": 2,
+          "generation.mcore_generation_config.tensor_model_parallel_size": 4}, MPS, "not built yet"),
         ({"megatron_cfg.tensor_model_parallel_size": 2,  # an EP multiple is placed for TP = 1 only
           "generation.mcore_generation_config.tensor_model_parallel_size": 2,
           "generation.mcore_generation_config.expert_model_parallel_size": 8}, MPS, "TP = ETP = 1"),
@@ -78,6 +79,24 @@ def test_validate_accepts_the_supported_config():
 def test_validate_rejects(over, env, match):
     with pytest.raises(ValueError, match=match):
         smp.validate(_cfg(**over), env=env)
+
+
+
+@pytest.mark.parametrize("engine_tp", [2, 4])
+def test_validate_accepts_local_tp_refinement(engine_tp: int) -> None:
+    smp.validate(_cfg(**{"generation.mcore_generation_config.tensor_model_parallel_size": engine_tp}), env=MPS)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"generation.mcore_generation_config.expert_model_parallel_size": 8},
+    {"megatron_cfg.expert_tensor_parallel_size": 2, "generation.mcore_generation_config.expert_tensor_parallel_size": 2},
+    {"megatron_cfg.context_parallel_size": 2},
+    {"generation.mcore_generation_config.context_parallel_size": 2},
+])
+def test_validate_rejects_unplaced_tp_refinement(overrides: dict) -> None:
+    config = _cfg(**{"generation.mcore_generation_config.tensor_model_parallel_size": 2, **overrides})
+    with pytest.raises(ValueError, match="not built yet"):
+        smp.validate(config, env=MPS)
 
 
 def test_validate_rejects_unsupported_features():
@@ -387,10 +406,10 @@ def test_coresident_refit_publishes_only_in_sync_weights(monkeypatch, weights):
     log = []
     policy = SimpleNamespace(
         cfg=_cfg(**{"generation.colocated.engine_weights": weights}),
-        worker_group=_Group(log, "learner", {"export_coresident_refit_handles": ("gpu0", {}, "fp", {}),
+        worker_group=_Group(log, "learner", {"export_coresident_refit_handles": ("gpu0", {}, "fp", {}, []),
                                              "coresident_refit_source_ready": "fp"}),
     )
-    generation = SimpleNamespace(worker_group=_Group(log, "engine", {
+    generation = SimpleNamespace(refresh_dp_openai_server_base_urls=lambda **kwargs: None, worker_group=_Group(log, "engine", {
         "open_coresident_refit_handles": {}, "coresident_refit_copy": {"seconds": 0.0, "bytes": 1.0, "bytes_shared": 0.0}}))
     refit = mws.CoresidentRefit(policy=policy, generation=generation)
     refit.init_communicator()
@@ -470,11 +489,11 @@ def test_coresident_copy_failure_keeps_engine_paused(monkeypatch: pytest.MonkeyP
     log = []
     policy = SimpleNamespace(
         cfg=_cfg(), worker_group=_Group(log, "learner", {
-            "export_coresident_refit_handles": ("gpu0", {}, "fp", {}),
+            "export_coresident_refit_handles": ("gpu0", {}, "fp", {}, []),
             "coresident_refit_source_ready": "fp",
         })
     )
-    generation = SimpleNamespace(worker_group=_Group(log, "engine", {
+    generation = SimpleNamespace(refresh_dp_openai_server_base_urls=lambda **kwargs: None, worker_group=_Group(log, "engine", {
         "open_coresident_refit_handles": {},
         "coresident_refit_copy": {"seconds": 0.0, "bytes": 1.0, "bytes_shared": 0.0},
     }))

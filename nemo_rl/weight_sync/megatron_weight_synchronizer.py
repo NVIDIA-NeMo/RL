@@ -289,10 +289,10 @@ class CoresidentRefit:
             self._policy.worker_group.run_all_workers_single_data("export_coresident_refit_handles"),
             timeout_s=self._control_timeout_s,
         )
-        by_device = {dev: (handles, coords) for dev, handles, _, coords in exported}
+        by_device = {dev: (handles, coords, metadata) for dev, handles, _, coords, metadata in exported}
         if len(by_device) != len(exported):
             raise RuntimeError("co-resident refit: two learner ranks report the same GPU")
-        self._fingerprints = [fp for _, _, fp, _ in exported]
+        self._fingerprints = [fp for _, _, fp, _, _ in exported]
         bound = _get_fail_fast(
             self._generation.worker_group.run_all_workers_single_data(
                 "open_coresident_refit_handles", handles_by_device=by_device, share=self._shared

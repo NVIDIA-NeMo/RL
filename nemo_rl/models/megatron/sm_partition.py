@@ -31,10 +31,11 @@ it, including while the learner is idle (measured: capping the engine at 42 % co
 SM set, and the driver rounds it
 (58 % -> 88 of 152 SMs); ``check_worker`` logs the allocated count.
 
-Layouts: TP / PP / ETP equal on both sides; the engine's EP may be m x the learner's (TP = ETP = 1), with each engine rank
-placed on the GPU whose learner rank holds its experts (``engine_rank_gpus``). Tensors are matched by Megatron's refit
-metadata (``refit_names``: the resolved name, with global expert indices), and every engine rank checks at setup that
-its TP / PP coordinates equal the learner rank's on its GPU.
+Layouts: matching TP / PP / ETP, or learner TP1 to engine TP>1 with unchanged EP and ETP=CP=PP=1.
+At TP = ETP = 1, engine EP may be a multiple of learner EP; ``engine_rank_gpus`` places each engine rank beside
+its learner experts. Native refit metadata resolves global expert names and logical TP shard coordinates.
+For differing TP, contiguous source slices can be shared; strided and packed fragments are copied into private
+inference storage at publication. Shards requiring a different GPU are rejected.
 
 Refit (``refit_transport = ipc``):
 - Once, at setup: each learner rank exports CUDA IPC handles of its local refit tensors (parameters and persistent
@@ -57,19 +58,22 @@ Refit (``refit_transport = ipc``):
 Per-rank cost: one extra process and CUDA context per GPU, plus the engine's weight copy ("copy") or only its non-shared
 tensors ("shared"). Nothing grows with TP / PP / EP or the node count.
 
-Not built yet: PP > 1, engine TP != learner TP, distillation teachers, cluster segments, or reference-policy weight
-swapping with shared engine weights (setup rejects them).
+Differing TP supports learner TP1 to engine TP>1 with unchanged EP and ETP=CP=PP=1. Other TP changes,
+PP > 1, distillation teachers, cluster segments, and reference-policy weight swapping with shared engine
+weights are not supported; setup rejects them.
 """
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional
 
 import torch
 
 if TYPE_CHECKING:
     from megatron.bridge.training.config import CheckpointConfig
+    from megatron.core.resharding.utils import ParameterMetadata
 
 Role = Literal["engine", "learner"]
 MPS_PCT_ENV = "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"
@@ -80,6 +84,17 @@ _LAYOUT_KEYS = (
     "expert_model_parallel_size",
     "expert_tensor_parallel_size",
 )
+
+
+@dataclass(frozen=True)
+class RefitSlices:
+    """Local learner views that populate one private inference weight."""
+
+    shape: tuple[int, ...]
+    parts: tuple[tuple[torch.Tensor, tuple[slice, ...]], ...]
+
+
+RefitSource = torch.Tensor | RefitSlices
 
 
 def engine_sm_fraction(policy_cfg: Any) -> Optional[float]:
@@ -135,6 +150,17 @@ def validate(
         ev = engine.get(k) or lv
         if lv != ev:
             mismatch[k] = (lv, ev)
+    tp_change = mismatch.get("tensor_model_parallel_size")
+    if tp_change is not None and (
+        tp_change[0] == 1
+        and tp_change[1] > 1
+        and "expert_model_parallel_size" not in mismatch
+        and "expert_tensor_parallel_size" not in mismatch
+        and (learner.get("expert_tensor_parallel_size") or 1) == 1
+        and (learner.get("context_parallel_size") or 1) == 1
+        and (engine.get("context_parallel_size") or 1) == 1
+    ):
+        mismatch.pop("tensor_model_parallel_size")
     ep_l, ep_e = mismatch.pop("expert_model_parallel_size", (None, None))
     # engine_rank_gpus places an EP-multiple engine for TP = ETP = 1 only.
     if ep_l is not None and (
@@ -145,7 +171,8 @@ def validate(
         mismatch["expert_model_parallel_size"] = (ep_l, ep_e)
     if mismatch:
         raise ValueError(
-            "engine_sm_fraction: one engine rank and one learner rank per GPU need the same TP / PP / ETP, and an "
+            "engine_sm_fraction: require matching TP / PP / ETP, or learner TP1 to engine TP>1 "
+            "with unchanged EP and ETP=CP=PP=1. An "
             "engine EP that differs from the learner's must be a multiple of it at TP = ETP = 1 (each engine rank's "
             f"experts are a block of its GPU's learner experts); other mixed layouts are not built yet. "
             f"(learner, engine): {mismatch}"
@@ -330,16 +357,67 @@ def engine_rank_gpus(world: int, learner_ep: int, engine_ep: int) -> list[int]:
     return gpus
 
 
-def refit_names(core: torch.nn.Module) -> dict[str, str]:
-    """Resolve local refit tensor names through Megatron layout metadata.
-
-    {local refit tensor name: Megatron's resolved name} of this process's model: the name Megatron's own refit
-    planner matches tensors by across layouts (per-expert tensors carry their global expert index).
-    """
+def refit_metadata(core: torch.nn.Module) -> list[ParameterMetadata]:
+    """Extract native logical shard coordinates for this rank's refit tensors."""
+    # Megatron is optional outside policy and generation workers.
     from megatron.core.resharding.planner import _extract_module_metadata
 
-    metadata = _extract_module_metadata(core, torch.distributed.get_rank(), core.config.num_moe_experts, 0, {})
-    return {m.name: m.resolved_name for m in metadata}
+    return _extract_module_metadata(core, torch.distributed.get_rank(), core.config.num_moe_experts, 0, {})
+
+
+def refit_names(core: torch.nn.Module) -> dict[str, str]:
+    """Map local refit names to Megatron's globally resolved tensor names."""
+    return {metadata.name: metadata.resolved_name for metadata in refit_metadata(core)}
+
+
+def map_tp_sources(
+    src: dict[str, torch.Tensor],
+    src_metadata: list[ParameterMetadata],
+    dst_metadata: list[ParameterMetadata],
+) -> dict[str, RefitSource]:
+    """Map complete inference shards to local learner views using native layouts.
+
+    Contiguous single views can be bound by ``bind_shared``. Strided views and
+    packed fragments retain private inference storage updated by ``copy_refit``.
+    Native coverage checks reject shards requiring weights on another GPU.
+    """
+    # Native layout handling is only needed for differing TP worker pairs.
+    from megatron.core.resharding.shard_planner import plan_sharded_transfer
+
+    sources = {metadata.resolved_name: metadata for metadata in src_metadata}
+    if len(sources) != len(src_metadata) or sources.keys() != src.keys():
+        raise ValueError("co-resident TP refit: source metadata must cover each resolved tensor once")
+    if len({metadata.name for metadata in dst_metadata}) != len(dst_metadata):
+        raise ValueError("co-resident TP refit: duplicate destination tensor names")
+    mapped: dict[str, RefitSource] = {}
+    for destination in dst_metadata:
+        resolved = destination.resolved_name
+        if resolved not in sources:
+            raise ValueError(f"co-resident TP refit: {resolved} is absent on the local learner GPU")
+        metadata = sources[resolved]
+        source = src[resolved]
+        if metadata.is_gtp or destination.is_gtp:
+            raise ValueError("co-resident TP refit does not support GTP rematerialized weights")
+        if (
+            type(source) not in (torch.Tensor, torch.nn.Parameter)
+            or source.dtype not in (torch.float32, torch.float16, torch.bfloat16)
+            or destination.dtype not in (torch.float32, torch.float16, torch.bfloat16)
+            or tuple(source.shape) != metadata.shape
+            or source.dtype != metadata.dtype
+        ):
+            raise ValueError(f"co-resident TP refit: unsupported storage or stale metadata for {resolved}")
+        operations = plan_sharded_transfer(resolved, [metadata], metadata, destination)
+        if any(owner != metadata.owner_rank for owner, _, _ in operations):
+            raise ValueError(f"co-resident TP refit: {resolved} requires a remote learner shard")
+        parts = tuple((source[source_slice], target_slice) for _, source_slice, target_slice in operations)
+        if len(parts) == 1 and all(
+            part.start == 0 and part.stop == extent
+            for part, extent in zip(parts[0][1], destination.shape)
+        ):
+            mapped[destination.name] = parts[0][0]
+        else:
+            mapped[destination.name] = RefitSlices(destination.shape, parts)
+    return mapped
 
 
 def rank_coordinates() -> dict[str, tuple[int, int]]:
@@ -385,7 +463,7 @@ def open_refit_handles(handles: dict[str, tuple]) -> dict[str, torch.Tensor]:
 
 
 def bind_shared(
-    src: dict[str, torch.Tensor], named_dst: Iterable[tuple[str, torch.Tensor]], leaf_ids: set[int]
+    src: dict[str, RefitSource], named_dst: Iterable[tuple[str, torch.Tensor]], leaf_ids: set[int]
 ) -> dict[str, float]:
     """Bind compatible inference parameters to learner CUDA IPC storage.
 
@@ -404,13 +482,19 @@ def bind_shared(
             raise ValueError(f"co-resident refit: {name} has shape {tuple(s.shape)} (learner) vs {tuple(d.shape)} (engine)")
         # A strided view is never bound: TE GEMMs read weights as dense (TE 2.15 is silently wrong on strided ones).
         # Persistent buffers can change during backward, before the optimizer pause.
-        if isinstance(d, torch.nn.Parameter) and s.dtype == d.dtype and s.is_contiguous() and id(d) in leaf_ids:
+        if (
+            isinstance(s, torch.Tensor)
+            and isinstance(d, torch.nn.Parameter)
+            and s.dtype == d.dtype
+            and s.is_contiguous()
+            and id(d) in leaf_ids
+        ):
             d.data = s
             bound += 1
     return {"tensors_bound": bound, "tensors": len(dst)}
 
 
-def _check_names(src: dict[str, torch.Tensor], dst: dict[str, torch.Tensor]) -> None:
+def _check_names(src: dict[str, RefitSource], dst: dict[str, torch.Tensor]) -> None:
     if dst.keys() != src.keys():
         missing, extra = sorted(set(dst) - set(src)), sorted(set(src) - set(dst))
         raise ValueError(
@@ -527,7 +611,7 @@ def prepare_shared_expert_layout(models: list[torch.nn.Module]) -> list[torch.nn
     return models
 
 
-def bind_shared_expert_stacks(core: torch.nn.Module, src: dict[str, torch.Tensor]) -> dict[str, float]:
+def bind_shared_expert_stacks(core: torch.nn.Module, src: dict[str, RefitSource]) -> dict[str, float]:
     """Keep compatible BF16/FP16 expert stacks in learner storage through inference initialization.
 
     Both projections must already alias their corresponding source parameters and be packed in expert order.
@@ -550,7 +634,11 @@ def bind_shared_expert_stacks(core: torch.nn.Module, src: dict[str, torch.Tensor
                 name = f"{prefix + '.' if prefix else ''}{linear_name}.weight{index}"
                 weight = getattr(linear, f"weight{index}")
                 source = src[name]
-                if not isinstance(weight, torch.nn.Parameter) or not _aliases(weight, source):
+                if (
+                    not isinstance(source, torch.Tensor)
+                    or not isinstance(weight, torch.nn.Parameter)
+                    or not _aliases(weight, source)
+                ):
                     break
                 weights.append(source)
             if len(weights) != module.num_local_experts:
@@ -574,7 +662,7 @@ def _aliases(d: torch.Tensor, s: torch.Tensor) -> bool:
     return d.data_ptr() == s.data_ptr() and d.shape == s.shape and d.stride() == s.stride() and d.dtype == s.dtype
 
 
-def copy_refit(src: dict[str, torch.Tensor], named_dst: Iterable[tuple[str, torch.Tensor]]) -> dict[str, float]:
+def copy_refit(src: dict[str, RefitSource], named_dst: Iterable[tuple[str, torch.Tensor]]) -> dict[str, float]:
     """Copy private inference tensors and account for shared storage.
 
     Engine side, per step (engine paused, learner idle): copy every learner tensor into the engine tensor of the
@@ -593,6 +681,11 @@ def copy_refit(src: dict[str, torch.Tensor], named_dst: Iterable[tuple[str, torc
                 raise ValueError(
                     f"co-resident refit: {name} has shape {tuple(s.shape)} (learner) vs {tuple(d.shape)} (engine)"
                 )
+            if isinstance(s, RefitSlices):
+                for source_view, target_slice in s.parts:
+                    d[target_slice].copy_(source_view)
+                    copied += source_view.numel() * source_view.element_size()
+                continue
             nbytes = s.numel() * s.element_size()
             if _aliases(d, s):
                 shared += nbytes

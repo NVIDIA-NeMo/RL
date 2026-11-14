@@ -22,7 +22,7 @@ import time
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
@@ -4903,22 +4903,24 @@ class MegatronPolicyWorkerImpl(
         # Ensure exporters cannot observe a partially gathered buffer.
         torch.cuda.synchronize()
 
-    def export_coresident_refit_handles(self) -> tuple[str, dict, str, dict]:
+    def export_coresident_refit_handles(self) -> tuple[str, dict, str, dict, list]:
         """Export stable CUDA IPC handles for this rank local refit tensors.
 
         Co-resident learner, once: CUDA IPC handles of this rank's local refit tensors by Megatron's resolved name,
-        keyed by its GPU, the storage fingerprint they were taken at, and its TP / PP coordinates.
+        keyed by its GPU, with storage identity, TP / PP coordinates, and native shard metadata.
         """
         from megatron.core.resharding.utils import named_refit_tensors
 
         core = sm_partition.refit_core(self.model)
         named = list(named_refit_tensors(core))
-        resolved = sm_partition.refit_names(core)
+        metadata = sm_partition.refit_metadata(core)
+        resolved = {item.name: item.resolved_name for item in metadata}
         return (
             self.report_device_id(),
             sm_partition.export_refit_handles((resolved[n], t) for n, t in named),
             sm_partition.storage_fingerprint(named),
             sm_partition.rank_coordinates(),
+            [asdict(item) for item in metadata],
         )
 
     def coresident_refit_source_ready(self) -> str:

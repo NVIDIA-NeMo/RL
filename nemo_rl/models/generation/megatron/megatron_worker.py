@@ -2495,16 +2495,22 @@ class MegatronGenerationRefitMixin:
         Matching engine tensors are bound before their first forward. Returns
         the bound tensor counts and storage sizes.
         """
-        from megatron.core.resharding.utils import named_refit_tensors
+        from megatron.core.resharding.utils import ParameterMetadata, named_refit_tensors
 
-        handles, learner_coords = handles_by_device[self.report_device_id()]
+        handles, learner_coords, learner_metadata = handles_by_device[self.report_device_id()]
         core = sm_partition.refit_core(self._gen_model())
-        self._coresident_src = sm_partition.map_sources(
-            sm_partition.open_refit_handles(handles),
-            learner_coords,
-            sm_partition.refit_names(core),
-            sm_partition.rank_coordinates(),
-        )
+        sources = sm_partition.open_refit_handles(handles)
+        engine_coords = sm_partition.rank_coordinates()
+        if learner_coords == engine_coords:
+            self._coresident_src = sm_partition.map_sources(
+                sources, learner_coords, sm_partition.refit_names(core), engine_coords
+            )
+        else:
+            if learner_coords["pp"] != engine_coords["pp"] or learner_coords["tp"] != (0, 1):
+                raise ValueError("co-resident TP refit requires learner TP1 and matching PP coordinates")
+            self._coresident_src = sm_partition.map_tp_sources(
+                sources, [ParameterMetadata(**item) for item in learner_metadata], sm_partition.refit_metadata(core)
+            )
         if not share:
             return {"tensors_bound": 0, "tensors": len(self._coresident_src)}
         if self._inference_engine_initialized:
