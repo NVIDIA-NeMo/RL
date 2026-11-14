@@ -35,6 +35,7 @@ import ray
 import requests
 import torch
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
@@ -1384,8 +1385,6 @@ def _fake_chat_request():
         return_tokens_as_token_ids=None,
         logprobs=False,
         top_logprobs=None,
-        # The fields the client set, as pydantic records them.
-        model_fields_set=set(),
         # NeMoRLChatCompletionRequest's private defaults for a call that
         # restores no generation prefix.
         _restored_generation_token_ids=(),
@@ -1461,6 +1460,29 @@ def _track_request_capture(worker, request):
     worker._capture_registry.add(request, _RequestCaptureState(call, []))
     worker.token_capture = MagicMock()
     return worker.token_capture, call
+
+
+def test_vllm_chat_endpoint_serves_a_streamed_call_and_fails_its_capture(
+    monkeypatch,
+) -> None:
+    """vLLM streams the reply, several choices included; capture cannot stage it."""
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+
+    async def chunks():
+        yield "data: [DONE]\n\n"  # pragma: no cover - never iterated
+
+    stream = chunks()
+    serving_chat.create_chat_completion = AsyncMock(return_value=stream)
+    request = _fake_chat_request()
+    request.stream = True
+    request.n = 2
+    token_capture, call = _track_request_capture(worker, request)
+
+    response = asyncio.run(chat_handler(request, MagicMock()))
+
+    assert isinstance(response, StreamingResponse)
+    assert response.body_iterator is stream
+    token_capture.fail_call.assert_called_once_with(call, reason="streaming_response")
 
 
 def _stalled_engine_generator(started: asyncio.Event, cancelled: asyncio.Event):
@@ -1938,7 +1960,6 @@ async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch, logpr
     request.logprobs = logprobs
     request.return_tokens_as_token_ids = True
     request.top_logprobs = 0
-    request.model_fields_set = {"top_logprobs"}
     token_capture, call = _track_request_capture(worker, request)
     task = asyncio.create_task(chat_handler(request, MagicMock()))
     try:

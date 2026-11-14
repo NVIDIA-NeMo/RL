@@ -32,7 +32,7 @@ from typing import Any, Literal, Optional, Union
 
 import torch
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import PrivateAttr
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -913,15 +913,6 @@ def register_routes(
                 presence_penalty=request.presence_penalty,
                 frequency_penalty=request.frequency_penalty,
                 logit_bias=request.logit_bias,
-                n=request.n,
-                logprobs=request.logprobs,
-                # vLLM defaults an unset top_logprobs to 0; Gym must set it.
-                top_logprobs=(
-                    request.top_logprobs
-                    if "top_logprobs" in request.model_fields_set
-                    else None
-                ),
-                stream=request.stream,
                 generation_config=generation_config,
             )
             for field, value in sampling.items():
@@ -947,13 +938,15 @@ def register_routes(
                 content=generator.model_dump(), status_code=generator.error.code
             )
 
-        # on_policy_sampling refused stream: true, so the reply is whole.
-        assert isinstance(generator, ChatCompletionResponse)
-        content = model_dump_chat_response_with_dynamic_message_fields(generator)
-        # Token capture: stage the delta and ride the coords on the
-        # response; strips logprobs/ids (no-op when capture is off).
-        content = await save_capture(host, request, content)
-        return JSONResponse(content=content)
+        if isinstance(generator, ChatCompletionResponse):
+            content = model_dump_chat_response_with_dynamic_message_fields(generator)
+            # Token capture: stage the delta and ride the coords on the
+            # response; strips logprobs/ids (no-op when capture is off).
+            content = await save_capture(host, request, content)
+            return JSONResponse(content=content)
+
+        await abort_request_capture(host, request, "streaming_response")
+        return StreamingResponse(content=generator, media_type="text/event-stream")
 
     @app.post("/tokenize")
     async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):

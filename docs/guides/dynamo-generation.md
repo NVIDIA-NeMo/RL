@@ -64,12 +64,11 @@ The frontend serves chat with NeMo RL's chat engine instead of Dynamo's own rend
 
 `tests/unit/models/generation/test_gym_chat_path.py` sends the same calls down both paths and checks they run the same prompt and `SamplingParams`, stage the same record and return the same reply.
 
-Both paths refuse, with HTTP 400 and before anything runs, a call that streams (`stream: true`), asks for more than one choice (`n`), or sets `logprobs` without `top_logprobs`. NeMo-Gym sends none of these.
-
 Where the behavior differs from the native endpoint:
 
 - The frontend refuses more than 32 `stop` strings, and vLLM request fields its own request type lacks (for example `structured_outputs`, `return_token_ids`, `truncate_prompt_tokens`, `priority`, `chat_template`), with HTTP 400.
 - gpt-oss (Harmony) chat calls are refused with HTTP 400.
+- A call that streams (`stream: true`) or asks for more than one choice (`n`) is refused with HTTP 400. The native endpoint serves both, and fails the capture of a streamed token-capture call. NeMo-Gym sends neither.
 - A token-capture call refused for its context length acknowledges the refusal at the end of the error message instead of in the native endpoint's `x-ng-capture-refused` header, which Dynamo's errors cannot carry. Gym's dialect moves it back to the header, so the harness sees the native error.
 - A call's processed media travels to the engine inside the request.
 

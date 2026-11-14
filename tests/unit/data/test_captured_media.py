@@ -1455,7 +1455,6 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
         n=1,
         logprobs=False,
         top_logprobs=None,
-        model_fields_set=set(),
         stream=False,
         ng_capture=admission.model_dump(),
         required_prefix_token_ids=None,
