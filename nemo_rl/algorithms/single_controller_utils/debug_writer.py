@@ -47,8 +47,8 @@ class TrainChunk:
         sample_ids: One id per sample in the chunk.
         tags: Per-sample metadata dicts, or None for empty metadata.
         input_lengths: Valid token count per sample, used to trim sequence columns.
-        sequences: Per-sample columns trimmed to input_lengths, such as token ids
-            and advantages.
+        sequences: Per-sample columns, dense or jagged, that the writer trims to
+            input_lengths, such as token ids and advantages.
         scalars: Per-sample columns written as given; variable-length values must
             be jagged tensors rather than padded.
 

@@ -714,9 +714,7 @@ class AdvantageComputer:
                 "generation_logprobs": data[adv_cfg.generation_logprobs_field],
             }
             if cfg.policy_logprobs_required:
-                sequences["prev_logprobs"] = tensor_field(
-                    data, adv_cfg.policy_logprobs_field
-                )
+                sequences["prev_logprobs"] = data[adv_cfg.policy_logprobs_field]
             if cfg.teacher_logprobs_required:
                 sequences["teacher_logprobs"] = kwargs["teacher_logprobs"]
             train_data_dump_receipt = await asyncio.to_thread(
