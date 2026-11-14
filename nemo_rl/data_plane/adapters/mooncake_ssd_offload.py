@@ -33,7 +33,7 @@ import threading
 import time
 import urllib.request
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 from nemo_rl.data_plane.interfaces import MooncakeCpuConfig
 from nemo_rl.data_plane.local_disk import require_disk_backed
@@ -65,14 +65,56 @@ _lock_fd: int | None = None
 # client in one process reuses the first client's store.
 _offloading_store_set_up = False
 
-# Mooncake's ErrorCode::NO_AVAILABLE_HANDLE: no segment had room for the put.
+# Mooncake answers one status per key: 0 (put) or the byte count (get) on
+# success, a negative ErrorCode on failure. With offload on, two codes mean
+# "wait, the resource frees itself", not "error":
+# NO_AVAILABLE_HANDLE: no segment had room for the put; offload frees memory
+# in the background.
 NO_AVAILABLE_HANDLE = -200
-# With offload on, a full segment is a wait, not an error: offload frees
-# memory in the background. The bound only turns a stuck offload (disk full,
-# SSD writes failing) into an error instead of a hang.
-PUT_WAIT_S = 600.0
+# BUFFER_OVERFLOW on a read of an offloaded object: the owner's read buffer
+# (MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES, 1.25 GB by default) is leased out
+# to reads in flight; a lease ends with its read, or after 5 s.
+BUFFER_OVERFLOW = -10
 _FIRST_BACKOFF_S = 0.05
-PUT_BACKOFF_MAX_S = 1.0
+
+
+class _Wait(NamedTuple):
+    """How a TQ client call waits for a Mooncake resource that frees itself."""
+
+    code: int  # the per-key status that means "wait"
+    wait_s: float  # give up after this long
+    backoff_max_s: float
+    waiting: str  # %-formatted with (count, first key, wait_s)
+    gave_up: str  # %-formatted with (wait_s, count, first key)
+
+
+# The bound only turns a stuck offload (disk full, SSD writes failing) into an
+# error instead of a hang.
+MEMORY_FULL = _Wait(
+    code=NO_AVAILABLE_HANDLE,
+    wait_s=600.0,
+    backoff_max_s=1.0,
+    waiting="Mooncake memory is full; %d key(s) (e.g. %r) waiting for SSD "
+    "offload to free memory (up to %.0f s).",
+    gave_up="Mooncake memory stayed full for %.0f s with SSD offload on; %d "
+    "key(s) not stored, e.g. %r. Either offload is not freeing memory (check "
+    "the disk under data_plane.mooncake_cpu.ssd_offload.path and the "
+    "mooncake_master log) or one object is larger than any Mooncake segment.",
+)
+# A lease is held for one read (tens to hundreds of ms), so a short cap keeps
+# the waiting reader close behind the one that frees the region.
+BUFFER_FULL = _Wait(
+    code=BUFFER_OVERFLOW,
+    wait_s=120.0,
+    backoff_max_s=0.25,
+    waiting="A Mooncake owner's read buffer for offloaded objects is full; %d "
+    "key(s) (e.g. %r) waiting for reads in flight to release it (up to %.0f s). "
+    "More room: MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES in the owners' "
+    "environment.",
+    gave_up="A Mooncake owner's read buffer stayed full for %.0f s; %d key(s) "
+    "not read, e.g. %r. Raise MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES for the "
+    "segment owners, or read with fewer concurrent consumers.",
+)
 
 # The master counts every report of SSD copies its owners deleted for space
 # (FileStorage::NotifyEvictedDiskReplicas -> BatchEvictDiskReplica). NeMo-RL
@@ -160,7 +202,9 @@ def install(cfg: MooncakeCpuConfig, segment_size: int | None) -> None:
 
     from nemo_rl.data_plane.adapters.transfer_queue import _tq_shape_drift_error
 
-    wait_for_memory_on_put(getattr(mooncake_client, "MooncakeStoreClient", None))
+    client_cls = getattr(mooncake_client, "MooncakeStoreClient", None)
+    wait_for_memory_on_put(client_cls)
+    wait_for_buffer_on_get(client_cls)
     if _dir is not None or not cfg.owned_segment_size(segment_size):
         return
 
@@ -213,31 +257,70 @@ def wait_for_memory_on_put(client_cls: Any) -> None:
     ``MAX_RETRIES`` instead would also retry permanent errors, logging each
     at ERROR. Patches ``client_cls`` once.
     """
-    if getattr(client_cls, "_nrl_waits_for_memory", False):
+    _patch_tq_retry(
+        client_cls,
+        "_batch_upsert_with_retry",
+        lambda self, k, p, s: self._store.batch_upsert_from(
+            k, p, s, config=self.replica_config
+        ),
+        MEMORY_FULL,
+        flag="_nrl_waits_for_memory",
+        harm="puts would fail instead of waiting while SSD offload frees memory",
+        what="put retry",
+    )
+
+
+def wait_for_buffer_on_get(client_cls: Any) -> None:
+    """Make TQ's reads wait for the owner's read buffer instead of failing.
+
+    See ``BUFFER_OVERFLOW``. Patches ``client_cls`` once.
+    """
+    _patch_tq_retry(
+        client_cls,
+        "_batch_get_into_with_retry",
+        lambda self, k, p, s: self._store.batch_get_into(k, p, s),
+        BUFFER_FULL,
+        flag="_nrl_waits_for_buffer",
+        harm="reads of offloaded objects would fail instead of waiting for the "
+        "owner's read buffer",
+        what="get retry",
+    )
+
+
+def _patch_tq_retry(
+    client_cls: Any,
+    method: str,
+    store_call: Callable[[Any, list[str], list[int], list[int]], Any],
+    wait: _Wait,
+    *,
+    flag: str,
+    harm: str,
+    what: str,
+) -> None:
+    """Wrap TQ's ``client_cls.<method>`` so ``wait.code`` waits; other codes
+    still go through TQ's own retry."""
+    if getattr(client_cls, flag, False):
         return
-    if not hasattr(client_cls, "_batch_upsert_with_retry"):
+    if not hasattr(client_cls, method):
         from nemo_rl.data_plane.adapters.transfer_queue import _tq_shape_drift_error
 
         raise _tq_shape_drift_error(
-            "MooncakeStoreClient._batch_upsert_with_retry is gone",
-            "puts would fail instead of waiting while SSD offload frees memory",
-            "put retry",
+            f"MooncakeStoreClient.{method} is gone", harm, what
         )
-    tq_upsert = client_cls._batch_upsert_with_retry
+    tq_retry = getattr(client_cls, method)
 
-    def _batch_upsert_with_retry(self, keys, ptrs, sizes):  # type: ignore[no-untyped-def]
-        upsert_waiting_for_memory(
-            lambda k, p, s: self._store.batch_upsert_from(
-                k, p, s, config=self.replica_config
-            ),
+    def patched(self, keys, ptrs, sizes):  # type: ignore[no-untyped-def]
+        _call_waiting(
+            lambda k, p, s: store_call(self, k, p, s),
             keys,
             ptrs,
             sizes,
-            on_error=lambda k, p, s, _: tq_upsert(self, k, p, s),
+            on_error=lambda k, p, s, _: tq_retry(self, k, p, s),
+            wait=wait,
         )
 
-    client_cls._batch_upsert_with_retry = _batch_upsert_with_retry
-    client_cls._nrl_waits_for_memory = True
+    setattr(client_cls, method, patched)
+    setattr(client_cls, flag, True)
 
 
 def upsert_waiting_for_memory(
@@ -250,46 +333,50 @@ def upsert_waiting_for_memory(
 ) -> None:
     """Upsert, putting keys that find every segment full again until they fit.
 
-    Mooncake admits a put only into free segment memory, while offload frees
-    memory later, in the background. ``upsert`` returns one status per key;
-    keys answered ``NO_AVAILABLE_HANDLE`` are put again with capped backoff
-    for up to ``PUT_WAIT_S``, with one warning. ``on_error(keys, ptrs, sizes,
-    statuses)`` gets the keys that failed any other way.
+    ``on_error(keys, ptrs, sizes, statuses)`` gets the keys that failed any
+    other way.
     """
-    deadline = time.monotonic() + PUT_WAIT_S
+    _call_waiting(upsert, keys, ptrs, sizes, on_error=on_error, wait=MEMORY_FULL)
+
+
+def _call_waiting(
+    op_fn: Callable[[list[str], list[int], list[int]], Any],
+    keys: list[str],
+    ptrs: list[int],
+    sizes: list[int],
+    *,
+    on_error: Callable[[list[str], list[int], list[int], list[int]], None],
+    wait: _Wait,
+) -> None:
+    """Run ``op_fn`` and repeat it for the keys that answered ``wait.code``.
+
+    ``op_fn`` returns one status per key (see the status comment above
+    ``NO_AVAILABLE_HANDLE``). Keys with any other negative status go to
+    ``on_error(keys, ptrs, sizes, statuses)`` at once; keys with ``wait.code``
+    are tried again with capped backoff until ``wait.wait_s`` has passed,
+    logging ``wait.waiting`` once and raising ``wait.gave_up`` at the deadline.
+    """
+    deadline = time.monotonic() + wait.wait_s
     backoff = _FIRST_BACKOFF_S
     while True:
-        results = upsert(keys, ptrs, sizes)
+        results = op_fn(keys, ptrs, sizes)
         if not isinstance(results, (list, tuple)) or len(results) != len(keys):
-            raise RuntimeError(
-                f"batch_upsert_from returned {results!r} for {len(keys)} keys"
-            )
-        failed = [i for i, r in enumerate(results) if r not in (0, NO_AVAILABLE_HANDLE)]
+            raise RuntimeError(f"Mooncake returned {results!r} for {len(keys)} keys")
+        if min(results, default=0) >= 0:  # the common case: every key succeeded
+            return
+        failed = [i for i, r in enumerate(results) if r < 0 and r != wait.code]
         if failed:
             on_error(*_pick((keys, ptrs, sizes, list(results)), failed))
-        full = [i for i, r in enumerate(results) if r == NO_AVAILABLE_HANDLE]
-        if not full:
+        again = [i for i, r in enumerate(results) if r == wait.code]
+        if not again:
             return
         if time.monotonic() >= deadline:
-            raise RuntimeError(
-                f"Mooncake memory stayed full for {PUT_WAIT_S:.0f} s with SSD "
-                f"offload on; {len(full)} key(s) not stored, e.g. "
-                f"{keys[full[0]]!r}. Either offload is not freeing memory "
-                "(check the disk under data_plane.mooncake_cpu.ssd_offload.path "
-                "and the mooncake_master log) or one object is larger than any "
-                "Mooncake segment."
-            )
+            raise RuntimeError(wait.gave_up % (wait.wait_s, len(again), keys[again[0]]))
         if backoff == _FIRST_BACKOFF_S:
-            LOGGER.warning(
-                "Mooncake memory is full; %d key(s) (e.g. %r) waiting for SSD "
-                "offload to free memory (up to %.0f s).",
-                len(full),
-                keys[full[0]],
-                PUT_WAIT_S,
-            )
-        keys, ptrs, sizes = _pick((keys, ptrs, sizes), full)
+            LOGGER.warning(wait.waiting, len(again), keys[again[0]], wait.wait_s)
+        keys, ptrs, sizes = _pick((keys, ptrs, sizes), again)
         time.sleep(backoff)
-        backoff = min(PUT_BACKOFF_MAX_S, 2 * backoff)
+        backoff = min(wait.backoff_max_s, 2 * backoff)
 
 
 def _pick(columns: tuple[list[Any], ...], indexes: list[int]) -> list[list[Any]]:
