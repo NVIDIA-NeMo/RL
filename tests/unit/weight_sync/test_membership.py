@@ -29,12 +29,15 @@ from nemo_rl.weight_sync.membership import (
 )
 
 
-def _plan(surviving, *, dp_size=4, total_gen_workers=4, train_world_size=8):
+def _plan(
+    surviving, *, dp_size=4, total_gen_workers=4, train_world_size=8, shard_widths=None
+):
     return plan_refit_membership(
         surviving_shards=surviving,
         dp_size=dp_size,
         total_gen_workers=total_gen_workers,
         train_world_size=train_world_size,
+        shard_widths=shard_widths,
     )
 
 
@@ -73,11 +76,8 @@ class TestSurvivorsAreCompacted:
     def test_prefixes_are_always_a_contiguous_range_from_zero(self):
         for surviving in ([0, 2], [1, 3], [3], [0, 1, 2, 3], [2, 3]):
             plan = _plan(surviving)
-            expected = list(
-                range(
-                    0, len(surviving) * plan.workers_per_shard, plan.workers_per_shard
-                )
-            )
+            width = plan.workers_per_shard[0]
+            expected = list(range(0, len(surviving) * width, width))
             assert sorted(plan.shard_prefixes.values()) == expected, surviving
 
     def test_input_order_does_not_change_the_layout(self):
@@ -94,7 +94,7 @@ class TestMultiWorkerShards:
     def test_prefixes_step_by_the_shard_width(self):
         plan = _plan([0, 1, 2, 3], dp_size=4, total_gen_workers=8)
 
-        assert plan.workers_per_shard == 2
+        assert plan.workers_per_shard == (2, 2, 2, 2)
         assert plan.shard_prefixes == {0: 0, 1: 2, 2: 4, 3: 6}
         assert plan.world_size == 8 + 8
 
@@ -107,9 +107,74 @@ class TestMultiWorkerShards:
     def test_a_tp4_fleet_of_two_shards(self):
         plan = _plan([1], dp_size=2, total_gen_workers=8, train_world_size=16)
 
-        assert plan.workers_per_shard == 4
+        assert plan.workers_per_shard == (4, 4)
         assert plan.shard_prefixes == {1: 0}
         assert plan.world_size == 20
+
+
+class TestHeterogeneousShards:
+    """Shards of different widths: a prefill shard at TP 4 next to decode shards at TP 2.
+
+    Prefixes are cumulative over the survivors rather than ``position * width``, and
+    ``worker_offset`` counts every lower-indexed shard, dead or alive, because the
+    worker list never shrinks.
+    """
+
+    @pytest.mark.parametrize(
+        ("surviving", "prefixes", "world_size"),
+        [
+            ([0, 1, 2], {0: 0, 1: 4, 2: 6}, 8 + 8),
+            ([0, 2], {0: 0, 2: 4}, 8 + 6),
+            ([1, 2], {1: 0, 2: 2}, 8 + 4),
+            ([2, 0, 1], {0: 0, 1: 4, 2: 6}, 8 + 8),
+        ],
+        ids=["all", "middle_absent", "first_absent", "discovery_order"],
+    )
+    def test_prefixes_accumulate_over_the_survivors(
+        self, surviving, prefixes, world_size
+    ):
+        plan = _plan(surviving, dp_size=3, total_gen_workers=8, shard_widths=(4, 2, 2))
+
+        assert plan.shard_prefixes == prefixes
+        assert plan.world_size == world_size
+        assert plan.workers_per_shard == (4, 2, 2)
+        assert [plan.worker_offset(shard) for shard in range(3)] == [0, 4, 6]
+
+    def test_equal_widths_match_the_evenly_sharded_plan(self):
+        """Given explicitly, equal widths lay ranks out exactly as the even split does."""
+        plan = _plan([0, 2, 3], total_gen_workers=8, shard_widths=(2, 2, 2, 2))
+        even = _plan([0, 2, 3], total_gen_workers=8)
+
+        assert plan.shard_prefixes == even.shard_prefixes
+        assert plan.world_size == even.world_size
+        assert plan.workers_per_shard == even.workers_per_shard == (2, 2, 2, 2)
+        assert plan.worker_offset(3) == even.worker_offset(3) == 6
+
+    @pytest.mark.parametrize(
+        ("shard_widths", "match"),
+        [
+            ((4, 2), "2 entries for dp_size=3"),
+            ((4, 2, 1), "sum to 7, not total_gen_workers=8"),
+            ((4, 4, 0), "must be positive"),
+        ],
+        ids=["count", "sum", "zero"],
+    )
+    def test_inconsistent_widths_are_refused(self, shard_widths, match):
+        with pytest.raises(ValueError, match=match):
+            _plan([0, 1, 2], dp_size=3, total_gen_workers=8, shard_widths=shard_widths)
+
+    def test_desired_membership_forwards_the_widths(self):
+        desired = desired_membership(
+            absent_shards=[1],
+            dp_size=3,
+            total_gen_workers=8,
+            train_world_size=8,
+            shard_widths=(4, 2, 2),
+        )
+
+        assert desired == _plan(
+            [0, 2], dp_size=3, total_gen_workers=8, shard_widths=(4, 2, 2)
+        )
 
 
 class TestTrainersAreNeverExcluded:

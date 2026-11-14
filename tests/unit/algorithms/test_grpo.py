@@ -4511,6 +4511,34 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
         setup(master_config, tokenizer, dataset, None)
 
 
+def test_megatron_engines_behind_dynamo_are_refused_outside_the_single_controller(
+    mock_grpo_components,
+):
+    """Legacy GRPO names the entrypoint to use before touching the config or cluster."""
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"] = {
+        "backend": "megatron",
+        "dynamo": True,
+        "mcore_generation_config": {},
+    }
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(
+            NotImplementedError, match="runs only under the SingleController"
+        ),
+    ):
+        setup(
+            master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+    mock_logger.assert_not_called()
+
+
 def test_setup_hands_the_vllm_http_server_api_key_to_nemo_gym(monkeypatch) -> None:
     """The deferred-vLLM branch is the one path that forwards a real key: the
     workers enforce it, so Gym's model server must send the same one."""

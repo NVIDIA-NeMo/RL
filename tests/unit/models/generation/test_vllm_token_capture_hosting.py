@@ -103,6 +103,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
 from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
     routed_experts_tensor_metadata,
 )
+from nemo_rl.weight_sync.membership import RefitMembership  # noqa: E402
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -1172,7 +1173,12 @@ def test_generation_set_rollout_weight_version_fans_out(monkeypatch):
 
 def test_set_rollout_weight_version_skips_shards_outside_the_refit(monkeypatch):
     # Shard 1 is dead or still restarting: the rebuilt refit left it out.
-    membership = SimpleNamespace(workers_per_shard=1, shard_prefixes={0: 0})
+    membership = RefitMembership(
+        world_size=2,
+        train_world_size=1,
+        shard_prefixes={0: 0},
+        workers_per_shard=(1, 1),
+    )
     gen, leaders = _generation_with_leaders(2, membership=membership)
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_generation.ray.get", lambda ref: ref

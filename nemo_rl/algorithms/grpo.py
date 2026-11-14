@@ -136,6 +136,7 @@ from nemo_rl.models.generation.interfaces import (
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.megatron.dynamo_config import dynamo_enabled
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
@@ -793,6 +794,14 @@ def setup(
             "SingleController token-capture path"
         )
     configure_lora_refit(policy_config)
+    if dynamo_enabled(generation_config) and generation_config["backend"] == "megatron":
+        # Megatron engines behind Dynamo are built by the SingleController
+        # setup only; refuse before any side effect on the config or cluster.
+        raise NotImplementedError(
+            "policy.generation.dynamo=true with backend=megatron runs only under "
+            "the SingleController (examples/run_grpo_single_controller.py); use "
+            "that entrypoint or remove policy.generation.dynamo"
+        )
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
