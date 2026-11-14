@@ -628,7 +628,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
         async with self._save_lock:
             if self._rollout_runtime.shortfall_reconciliation_pending:
                 return RolloutCheckpointSaveResult(
-                    saved=False, reason="trainer_state_changed"
+                    saved=False, reason="shortfall_reconciliation_pending"
                 )
             if self._optimizer_commit_in_progress:
                 return RolloutCheckpointSaveResult(
@@ -707,7 +707,6 @@ class RolloutSnapshotter(_UsesRolloutParts):
                         cut_wall_time = time.time()
                         if (
                             self._optimizer_commit_in_progress
-                            or self._rollout_runtime.shortfall_reconciliation_pending
                             or self._read_progress().train_steps != expected_train_step
                             or self._read_progress().trainer_version
                             != expected_trainer_version
@@ -716,6 +715,12 @@ class RolloutSnapshotter(_UsesRolloutParts):
                             return RolloutCheckpointSaveResult(
                                 saved=False,
                                 reason="trainer_state_changed",
+                            )
+                        if self._rollout_runtime.shortfall_reconciliation_pending:
+                            await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
+                            return RolloutCheckpointSaveResult(
+                                saved=False,
+                                reason="shortfall_reconciliation_pending",
                             )
                         snapshot_epoch = self._read_progress().current_epoch
                         environment_staging_keys: frozenset[str] = frozenset()

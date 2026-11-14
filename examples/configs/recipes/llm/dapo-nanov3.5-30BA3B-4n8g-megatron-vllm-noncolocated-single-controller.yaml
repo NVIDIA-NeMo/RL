@@ -64,7 +64,7 @@ data_plane:
 token_capture:
   enabled: false
 async_rl:
-  # Dynamic sampling requires the in_order sampler to stamp each target step.
+  # Match each admitted batch to a training step.
   sampler:
     name: in_order
     max_lookahead_versions: 1

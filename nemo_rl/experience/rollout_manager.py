@@ -2544,7 +2544,7 @@ class RolloutManager:
         replacement_index: int,
         zero_variance: bool,
     ) -> None:
-        """Record a finished group's rewards for its original target step."""
+        """Record group rewards under its stamp or the supplied tally step."""
         if target_step is None and self._tally_step_provider is not None:
             target_step = self._tally_step_provider()
         record_group_rewards(

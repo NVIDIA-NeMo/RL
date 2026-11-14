@@ -975,6 +975,17 @@ def sampler_requires_single_weight_batch(cfg: SamplerConfig) -> bool:
     return capability
 
 
+def sampler_uses_pooled_replacements(cfg: SamplerConfig) -> bool:
+    """Whether the configured sampler replaces lost groups from a spare pool.
+
+    Reads the resolved class without constructing it. A sampler that does not
+    declare the capability gets the gated default, matching the controller's
+    fallback for a custom sampler that omits ``DropAccountingSampler``.
+    """
+    sampler_cls = _sampler_class_for_config(cfg)
+    return bool(getattr(sampler_cls, "uses_pooled_replacements", True))
+
+
 def sampler_supports_buffer_checkpoint(cfg: SamplerConfig) -> bool:
     """Return a sampler class's static replay-checkpoint capability.
 
