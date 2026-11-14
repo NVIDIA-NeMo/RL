@@ -44,7 +44,6 @@ from __future__ import annotations
 import abc
 import asyncio
 import importlib
-import warnings
 from typing import (
     Annotated,
     Callable,
@@ -153,6 +152,25 @@ class PromptGroupSampler(Protocol):
     supports_training_claims: ClassVar[bool]
     """Whether selected groups remain owned until the train step commits."""
 
+    uses_pooled_replacements: ClassVar[bool]
+    """Whether dropped groups are replaced from a dedicated spare pool."""
+
+    closes_short_at_exhaustion: ClassVar[bool]
+    """Whether the last step may close on the groups left once the data runs out."""
+
+    requires_shortfall_reconciliation: ClassVar[bool]
+    """Whether a loss charged during an awaited selection must be reconciled.
+
+    True for policies that charge against the assembling cursor (it can move while
+    selection awaits its claim); False for policies that stamp a fixed target step.
+    """
+
+    def charge_step_for_lost_group(
+        self, *, target_step: Optional[int], assembling_version: int
+    ) -> Optional[int]:
+        """Return the step a permanently lost group is charged to, or None."""
+        ...
+
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         """Buffer-capacity the policy needs, or ``None`` if unconstrained."""
         ...
@@ -191,14 +209,13 @@ class DropAccountingSampler(Protocol):
     """Sampler that says what it costs to lose a prompt group for good.
 
     A group is lost when its rollout is dropped (a failure, or dynamic sampling
-    filtering a zero-variance group) and no replacement is available. Optional: for a
-    sampler without these members the controller uses the gated defaults: the spare
-    pool is on, the last step cannot close short, and the group is charged to its own
-    ``target_step`` (or to the step being assembled if the sampler stamps none).
+    filtering a zero-variance group) and no replacement is available. The controller
+    reads these members directly off the sampler, so a custom sampler used with dynamic
+    sampling must declare all of them.
 
-    Declare the two flags as class attributes, not in ``__init__``. Setup validates the
+    Declare the flags as class attributes, not in ``__init__``. Setup validates the
     sampler class before it is constructed, so flags that exist only on an instance are
-    invisible there and draw a warning even though the controller -- which checks the
+    invisible there and are rejected even though the controller -- which checks the
     instance -- would honour them.
     """
 
@@ -211,6 +228,9 @@ class DropAccountingSampler(Protocol):
 
     closes_short_at_exhaustion: ClassVar[bool]
     """Whether the last step may close on the groups that exist once the data runs out."""
+
+    requires_shortfall_reconciliation: ClassVar[bool]
+    """Whether a loss charged during an awaited selection must be reconciled."""
 
     def charge_step_for_lost_group(
         self, *, target_step: Optional[int], assembling_version: int
@@ -246,6 +266,10 @@ class BaseSampler(abc.ABC):
     # Defaults for DropAccountingSampler, right for a gated sampler that does not stamp.
     uses_pooled_replacements: ClassVar[bool] = True
     closes_short_at_exhaustion: ClassVar[bool] = False
+
+    # Streaming/gated policies charge against the moving assembling cursor, so a loss
+    # that raced an awaited selection is reconciled once the result is known.
+    requires_shortfall_reconciliation: ClassVar[bool] = True
 
     def __init__(self, buffer: TQReplayBuffer) -> None:
         self._buffer = buffer
@@ -749,6 +773,9 @@ class InOrderSampler(_GatedSampler):
     uses_pooled_replacements: ClassVar[bool] = True
     closes_short_at_exhaustion: ClassVar[bool] = False
 
+    # in_order stamps each group's fixed target step, so a loss needs no reconciliation.
+    requires_shortfall_reconciliation: ClassVar[bool] = False
+
     def __init__(
         self,
         buffer: TQReplayBuffer,
@@ -1032,49 +1059,34 @@ def sampler_supports_training_claims(cfg: SamplerConfig) -> bool:
 _DROP_ACCOUNTING_MEMBERS = (
     "uses_pooled_replacements",
     "closes_short_at_exhaustion",
+    "requires_shortfall_reconciliation",
     "charge_step_for_lost_group",
 )
 
 
-def warn_if_custom_sampler_lacks_drop_accounting(cfg: SamplerConfig) -> None:
-    """Warn when a custom sampler gets the gated drop defaults by omission.
+def require_drop_accounting_members(cfg: SamplerConfig) -> None:
+    """Reject a custom sampler that omits a drop-accounting class attribute.
 
-    Imports the class but does not construct it, so it can run during setup. Built-in
-    samplers are skipped. ``DropAccountingSampler`` is all-or-nothing under
-    ``isinstance``, so a class with only some of the members is treated as having none.
-    That is easy to do by accident and changes behaviour silently, so name the members
-    that are missing.
-
-    Checks the class, while the controller checks the constructed instance. A sampler
-    that assigns the flags in ``__init__`` is therefore warned about here and then
-    honoured at runtime. The protocol asks for class attributes precisely so the two
-    agree; the warning says so rather than pretending the members do not exist.
+    Dynamic sampling (and nonzero drop budgets) read these members directly off the
+    sampler. A custom class that leaves any out — or sets them only in ``__init__``,
+    which is invisible to this pre-construction check — fails here rather than silently
+    getting gated defaults. Built-in samplers are skipped.
     """
     if not isinstance(cfg, CustomSamplerConfig):
         return
     sampler_cls = _custom_sampler_class(cfg)
-    if isinstance(sampler_cls, DropAccountingSampler):
+    missing = [m for m in _DROP_ACCOUNTING_MEMBERS if not hasattr(sampler_cls, m)]
+    if not missing:
         return
-    present = [m for m in _DROP_ACCOUNTING_MEMBERS if hasattr(sampler_cls, m)]
-    missing = [m for m in _DROP_ACCOUNTING_MEMBERS if m not in present]
-    detail = (
-        f"its class defines only {present} and is missing {missing}, and a partial "
-        "implementation is ignored"
-        if present
-        else "its class does not implement DropAccountingSampler"
-    )
-    warnings.warn(
-        f"{sampler_cls.__name__} is used with dynamic sampling but {detail}. "
-        "Dropped groups are handled with the gated defaults: a spare pool is used, "
-        "the last step cannot close short at data exhaustion, and a lost group is "
-        "charged to its own target_step (or the step being assembled if the sampler "
-        "stamps none). That is right for a gated sampler. A sampler that keeps "
-        "producing without a gate, like windowed, should implement "
-        "DropAccountingSampler with uses_pooled_replacements = False and "
-        "closes_short_at_exhaustion = True. Declare the flags as class attributes: "
-        "this check runs before the sampler is constructed, so flags assigned in "
-        "__init__ are not visible here even though the controller would honour them.",
-        stacklevel=2,
+    raise ValueError(
+        f"{sampler_cls.__name__} is used with dynamic sampling but is missing the "
+        f"required drop-accounting class attribute(s) {missing}. Declare them as class "
+        "attributes (not in __init__, which runs after this check): "
+        "uses_pooled_replacements and closes_short_at_exhaustion (bool), "
+        "requires_shortfall_reconciliation (bool), and charge_step_for_lost_group "
+        "(method). A gated sampler that stamps no step typically uses "
+        "uses_pooled_replacements=True, closes_short_at_exhaustion=False; a "
+        "windowed-style producer uses False/True."
     )
 
 

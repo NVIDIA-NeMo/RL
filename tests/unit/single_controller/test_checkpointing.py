@@ -362,6 +362,11 @@ class _FailingFinalizeTrainer(_FakeTrainer):
 class _FakeSampler:
     """PromptGroupSampler stand-in: always returns a full, fresh batch."""
 
+    # BaseSampler's gated defaults; the controller reads these directly off the sampler.
+    uses_pooled_replacements = True
+    closes_short_at_exhaustion = False
+    requires_shortfall_reconciliation = True
+
     def __init__(self, supports_buffer_checkpoint: bool = True) -> None:
         self._supports_buffer_checkpoint = supports_buffer_checkpoint
         self._step = 0

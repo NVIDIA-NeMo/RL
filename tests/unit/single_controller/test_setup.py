@@ -1039,16 +1039,16 @@ class TestSetup:
         with (
             patch.object(sc_setup_mod, "validate_single_controller_config"),
             patch.object(
-                sc_setup_mod, "warn_if_custom_sampler_lacks_drop_accounting"
-            ) as warn_if_lacking,
+                sc_setup_mod, "require_drop_accounting_members"
+            ) as require_members,
             patch.object(sc_setup_mod, "RolloutManager"),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         if use_dynamic_sampling:
-            warn_if_lacking.assert_called_once_with(mc.async_rl.sampler)
+            require_members.assert_called_once_with(mc.async_rl.sampler)
         else:
-            warn_if_lacking.assert_not_called()
+            require_members.assert_not_called()
 
     def test_raises_when_data_plane_disabled(self):
         mc = _make_master_config(dp_enabled=False)

@@ -79,7 +79,6 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     BaseSampler,
-    DropAccountingSampler,
     ReadyFirstSamplerConfig,
     TransactionalAdmissionSampler,
     create_sampler,
@@ -2027,7 +2026,7 @@ class SingleControllerActor:
 
                         # Filtered groups spend only the dynamic-sampling budget.
                         filtered = outcome is RolloutOutcome.FILTERED
-                        if filtered and not self._sampler_uses_pooled_replacements():
+                        if filtered and not self._sampler.uses_pooled_replacements:
                             async with self._dispatch_reservation(
                                 "prompt_reservations"
                             ) as cut:
@@ -2129,7 +2128,7 @@ class SingleControllerActor:
         async def maybe_refill() -> None:
             if (
                 not self._dynamic_sampling_enabled
-                or not self._sampler_uses_pooled_replacements()
+                or not self._sampler.uses_pooled_replacements
                 or self._dataloader_exhausted
                 or len(self._rollout_runtime.filtered_reserve)
                 >= self._algo_cfg.num_prompts_per_step
@@ -2323,7 +2322,7 @@ class SingleControllerActor:
             and not self._dynamic_sampling_enabled
         ):
             return False
-        if not self._sampler_uses_pooled_replacements():
+        if not self._sampler.uses_pooled_replacements:
             return False
         if not self._rollout_runtime.sampler_stamps_target_steps:
             return False
@@ -2452,7 +2451,7 @@ class SingleControllerActor:
         failure_cfg = self._async_cfg.rollout_failure
         if failure_cfg.on_dropped_prompt != "replace":
             return None
-        if not self._sampler_uses_pooled_replacements():
+        if not self._sampler.uses_pooled_replacements:
             return None
         if replacements_used >= failure_cfg.max_replacement_attempts:
             return None
@@ -2643,22 +2642,6 @@ class SingleControllerActor:
                 cut, replacement, target_step=target_step
             )
         return lineage_group_id, target_step
-
-    def _sampler_uses_pooled_replacements(self) -> bool:
-        """Whether the sampler replaces dropped groups using dedicated prompt pools.
-
-        A custom sampler without ``DropAccountingSampler`` is treated like the built-in
-        gated samplers, which a drop would otherwise stall.
-        """
-        if isinstance(self._sampler, DropAccountingSampler):
-            return self._sampler.uses_pooled_replacements
-        return True
-
-    def _sampler_closes_short_at_exhaustion(self) -> bool:
-        """Whether the last step may close on the groups left once the data runs out."""
-        if isinstance(self._sampler, DropAccountingSampler):
-            return self._sampler.closes_short_at_exhaustion
-        return False
 
     def _target_groups_for_step(self, step: int) -> int:
         """How many prompt groups this step should train on, after dropped prompts.
@@ -2874,7 +2857,7 @@ class SingleControllerActor:
                         )
                         if (
                             self._rollout_exhausted.is_set()
-                            and self._sampler_closes_short_at_exhaustion()
+                            and self._sampler.closes_short_at_exhaustion
                         ):
                             # Nothing more will arrive, so take what is left instead of
                             # waiting for a full chunk.
@@ -2945,7 +2928,7 @@ class SingleControllerActor:
                                         flush=True,
                                     )
                                     return
-                                if self._sampler_closes_short_at_exhaustion():
+                                if self._sampler.closes_short_at_exhaustion:
                                     # At EOF, later groups cannot fill these slots.
                                     missing = target_groups - groups_dispatched
                                     if self._dynamic_sampling_enabled:
@@ -2986,7 +2969,7 @@ class SingleControllerActor:
                             # here, so EOF never trips the budget.
                             if (
                                 self._dynamic_sampling_enabled
-                                and not self._sampler_uses_pooled_replacements()
+                                and not self._sampler.uses_pooled_replacements
                             ):
                                 self._check_filtered_budget(
                                     self._accountant.assembling_version
