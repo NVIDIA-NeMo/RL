@@ -2581,6 +2581,10 @@ class SingleControllerActor:
         )
 
         while self._train_steps < self._algo_cfg.max_num_steps:
+            # A save in progress flushes finalization itself. No await between
+            # the check and the poll, so a save cannot start in between.
+            if not self._rollout_snapshots.save_in_progress:
+                self._checkpointer.raise_if_finalization_failed()
             maybe_gpu_profile_step(self._trainer, self._train_steps + 1)
             if self._gen is not self._trainer and isinstance(
                 self._gen, (VllmGeneration, MegatronGeneration)

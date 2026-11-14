@@ -3693,6 +3693,7 @@ def _grpo_train_impl(
 
         # Run grpo/dapo training loop (single-turn)
         for batch in wrapped_dataloader:
+            checkpointer.raise_if_finalization_failed()
             refit_metrics: dict[str, float] = {}
             # A central place to store logging data that won't be deleted until the loop ends
             metrics_logging_data = dict()
@@ -5752,6 +5753,7 @@ def async_grpo_train(
     try:
         while step < max_num_steps:
             ray.get(trajectory_collector.check_health.remote())
+            checkpointer.raise_if_finalization_failed()
             refit_metrics: dict[str, float] = {}
             early_stop_message: Optional[str] = None
             print(f"\n{'=' * 25} Step {step + 1}/{max_num_steps} {'=' * 25}")

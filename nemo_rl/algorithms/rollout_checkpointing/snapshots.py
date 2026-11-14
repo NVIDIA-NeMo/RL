@@ -217,6 +217,15 @@ class RolloutSnapshotter(_UsesRolloutParts):
         """Whether the pump stopped the run after the pre-step deadline snapshot."""
         return self._stop_event.is_set()
 
+    @property
+    def save_in_progress(self) -> bool:
+        """Whether a trainer checkpoint or rollout snapshot holds the save lock.
+
+        Such a save may be flushing checkpoint finalization from a worker
+        thread, so the train pump skips its per-step finalization poll then.
+        """
+        return self._save_lock.locked()
+
     async def begin_optimizer_commit(self, *, drain_snapshot: bool) -> None:
         """Open the window rollout snapshots skip, until ``end_optimizer_commit``.
 

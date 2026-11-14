@@ -382,6 +382,29 @@ def test_configured_stop_already_reached_does_not_retrain(mock_dpo_components, c
     assert "Configured stop-after step 3 was already reached" in capsys.readouterr().out
 
 
+def test_failed_checkpoint_finalization_stops_before_training(mock_dpo_components):
+    """A failed background checkpoint finalization stops the loop before it trains."""
+    checkpointer = mock_dpo_components["checkpointer"]
+    checkpointer.raise_if_finalization_failed.side_effect = RuntimeError(
+        "Background checkpoint finalization failed"
+    )
+
+    with pytest.raises(RuntimeError, match="Background checkpoint finalization failed"):
+        dpo_train(
+            mock_dpo_components["policy"],
+            mock_dpo_components["train_dataloader"],
+            mock_dpo_components["val_dataloader"],
+            mock_dpo_components["tokenizer"],
+            mock_dpo_components["loss_fn"],
+            mock_dpo_components["master_config"],
+            mock_dpo_components["logger"],
+            checkpointer,
+            _initial_dpo_save_state(),
+        )
+
+    mock_dpo_components["policy"].train.assert_not_called()
+
+
 def test_exit_on_max_epochs(mock_dpo_components):
     """Test that training loop exits when max_num_epochs is reached"""
     # Set max epochs to 2 and max steps to a large number

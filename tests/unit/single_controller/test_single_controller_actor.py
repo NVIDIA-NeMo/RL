@@ -2458,6 +2458,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
     ctrl._train_steps = 0
+    ctrl._checkpointer = MagicMock()
     attach_rollout_checkpointing(ctrl)
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._batch_replacements = {}
@@ -2488,6 +2489,20 @@ def test_train_pump_stops_after_rollout_exhaustion_and_buffer_drain() -> None:
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert ctrl._train_steps == 0
+
+
+def test_train_pump_polls_finalization_only_while_no_save_holds_the_lock() -> None:
+    ctrl = _train_pump_controller(sampler=_EmptySampler())
+
+    async def run_while_a_save_holds_the_lock() -> None:
+        async with ctrl._rollout_snapshots.trainer_checkpoint():
+            await ctrl._train_pump()
+
+    asyncio.run(asyncio.wait_for(run_while_a_save_holds_the_lock(), timeout=1.0))
+    ctrl._checkpointer.raise_if_finalization_failed.assert_not_called()
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+    ctrl._checkpointer.raise_if_finalization_failed.assert_called_once_with()
 
 
 def test_train_pump_fails_if_rollout_exhausts_during_partial_step() -> None:
