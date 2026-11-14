@@ -226,12 +226,14 @@ def test_registry_import_rejects_an_undeclared_extra(monkeypatch):
         _import_registry_fresh("_registry_typo")
 
 
-def test_script_emits_the_stage_and_extra_flags_each_actor_needs():
+def test_script_emits_the_stage_extra_flags_and_actors_of_each_venv():
     """The script lists exactly the venvs the runtime expects, with the right columns.
 
-    The Dockerfile builds each venv from all three columns. Column 3 is what
-    `uv sync $extras` consumes, and column 2 is what the deps layer branches on to
-    leave the TRT-LLM venv base-only until its wheel exists. Comparing the whole
+    Actors that need the same extras share one venv, so there is one row per distinct
+    set of extras. The Dockerfile builds each venv from all four columns. Column 3 is
+    what `uv sync $extras` consumes, column 2 is what the deps layer branches on to
+    leave the TRT-LLM venv base-only until its wheel exists, and column 4 lists the
+    actors whose venv path becomes a link to the shared venv. Comparing the whole
     dict covers the actor list too, since dict equality requires the same keys.
     """
     proc = subprocess.run(
@@ -246,18 +248,21 @@ def test_script_emits_the_stage_and_extra_flags_each_actor_needs():
         for line in proc.stdout.splitlines()
         if line.strip()
     }
-    expected = {
-        fqn: [_build_stage(extras), " ".join(f"--extra {e}" for e in extras)]
-        for fqn, extras in ACTOR_ENVIRONMENTS.items()
-        if extras is not None
-    }
+    expected: dict[str, list[str]] = {}
+    uv_managed = 0
+    for fqn, extras in sorted(ACTOR_ENVIRONMENTS.items()):
+        if extras is None:
+            continue
+        uv_managed += 1
+        ordered = sorted(extras)
+        row = expected.setdefault(
+            "extras-" + "-".join(ordered),
+            [_build_stage(extras), " ".join(f"--extra {e}" for e in ordered), ""],
+        )
+        row[2] = f"{row[2]} {fqn}".strip()
     assert rows == expected
-    assert (
-        rows[
-            "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker"
-        ][0]
-        == "trtllm"
-    )
+    assert rows["extras-trtllm"][0] == "trtllm"
+    assert len(rows) < uv_managed
 
 
 def test_fingerprint_covers_the_actor_table():
@@ -295,7 +300,12 @@ def test_script_skips_by_extra_not_by_name():
         check=True,
         cwd=git_root,
     )
-    listed = {line.split("\t")[0] for line in proc.stdout.splitlines() if line.strip()}
+    listed = {
+        actor_fqn
+        for line in proc.stdout.splitlines()
+        if line.strip()
+        for actor_fqn in line.split("\t")[3].split()
+    }
     assert "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector" not in listed
     assert "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor" not in listed
     assert (

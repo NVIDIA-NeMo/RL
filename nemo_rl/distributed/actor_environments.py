@@ -18,7 +18,8 @@ Two readers:
 * ``nemo_rl.distributed.ray_actor_environment_registry`` imports
   ``ACTOR_ENVIRONMENTS`` and turns it into ``py_executable`` strings at runtime.
 * ``docker/Dockerfile`` runs this file **as a script** to list the venvs it must
-  pre-build, so the image ships one venv per actor.
+  pre-build, so the image ships one venv per distinct set of extras, and every
+  actor that needs that set points at it.
 
 DO NOT IMPORT ANYTHING FROM ``nemo_rl`` HERE, AND KEEP IT STDLIB-ONLY.
 The Dockerfile runs this from the dependency layer, where ``pyproject.toml``,
@@ -139,8 +140,16 @@ def _build_stage(extras: list[str]) -> str:
     return "trtllm" if "trtllm" in extras else "deps"
 
 
+def shared_venv_name(extras: list[str]) -> str:
+    """Name of the image venv shared by every actor that needs exactly ``extras``."""
+    return "extras-" + "-".join(sorted(extras))
+
+
 def main(argv: list[str]) -> int:
-    r"""Print "<actor FQN>\t<stage>\t<uv sync extra flags>" for uv-managed actors.
+    r"""Print one row per venv the image builds, for uv-managed actors.
+
+    Actors that need the same set of extras share one venv, so a row is
+    "<venv name>\t<stage>\t<uv sync extra flags>\t<actor FQNs, space-separated>".
 
     Usage: actor_environments.py [<stage>] [<skip extra> ...]
 
@@ -159,14 +168,23 @@ def main(argv: list[str]) -> int:
     if unknown:
         print(f"unknown extras: {sorted(unknown)}", file=sys.stderr)
         return 2
+    actors_by_extras: dict[tuple[str, ...], list[str]] = {}
     for actor_fqn, extras in sorted(ACTOR_ENVIRONMENTS.items()):
         if extras is None or skip & set(extras):
             continue
-        actor_stage = _build_stage(extras)
-        if stage is not None and actor_stage != stage:
+        actors_by_extras.setdefault(tuple(sorted(extras)), []).append(actor_fqn)
+    for extras, actor_fqns in sorted(actors_by_extras.items()):
+        venv_stage = _build_stage(list(extras))
+        if stage is not None and venv_stage != stage:
             continue
         flags = " ".join(f"--extra {extra}" for extra in extras)
-        print(actor_fqn, actor_stage, flags, sep="\t")
+        print(
+            shared_venv_name(list(extras)),
+            venv_stage,
+            flags,
+            " ".join(actor_fqns),
+            sep="\t",
+        )
     return 0
 
 
