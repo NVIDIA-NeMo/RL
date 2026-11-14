@@ -60,6 +60,7 @@ from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
     validate_fp32_lm_head_config,
+    validate_lora_refit_policy_config,
 )
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
@@ -160,6 +161,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         megatron_enabled = bool(config.get("megatron_cfg", {}).get("enabled", False))
         automodel_enabled = bool(config.get("automodel_cfg", {}).get("enabled", False))
+        validate_lora_refit_policy_config(config)
         # Normalize in place: every downstream reader (workers, setup, train)
         # accesses draft config by attribute, so a hand-built PolicyConfig has
         # to be validated here rather than only inside MasterConfig.
@@ -193,22 +195,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             megatron_enabled=megatron_enabled,
             automodel_enabled=automodel_enabled,
         )
-        hf_config = None
-        hf_config_overrides = config.get("hf_config_overrides") or {}
-        generation_config = config.get("generation")
-        if generation_config is not None and generation_config["backend"] == "vllm":
-            vllm_cfg = generation_config.get("vllm_cfg")
-            if vllm_cfg is not None and vllm_cfg.get("fp32_lm_head"):
-                hf_config = get_hf_config(
-                    config["model_name"],
-                    **hf_config_overrides,
-                )
-                validate_fp32_lm_head_config(
-                    config,
-                    megatron_enabled=megatron_enabled,
-                    automodel_enabled=automodel_enabled,
-                    model_config=hf_config,
-                )
         if reserved_http_server_ports is not None and not megatron_enabled:
             raise ValueError(
                 "reserved_http_server_ports is only supported by the Megatron "
@@ -508,14 +494,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         # initialize FLOPs tracker
         try:
-            if hf_config is None:
-                hf_config = get_hf_config(
-                    config["model_name"],
-                    **hf_config_overrides,
-                )
             self.flops_tracker = FLOPTracker.from_config(
                 config["model_name"],
-                hf_config,
+                get_hf_config(
+                    config["model_name"],
+                    **(config.get("hf_config_overrides") or {}),
+                ),
             )
         except ValueError as e:
             self.flops_tracker = None
@@ -1443,6 +1427,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         pp_stages: list[int],
         sub_world_size: int,
         ranks_in_group: list[int],
+        layout_index: int = 0,
     ) -> list[ray.ObjectRef]:
         """Initialize the nccl_reshard bulk-path comm group on all train workers."""
         futures = self.worker_group.run_all_workers_multiple_data(
@@ -1454,6 +1439,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "pp_ports": pp_ports,
                 "pp_size": pp_size,
                 "sub_world_size": sub_world_size,
+                "layout_index": layout_index,
             },
         )
         # co-works with vllm; wait for all futures to complete outside
@@ -1465,6 +1451,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         gen_parallelism: dict[str, Any],
         train_world_size: int,
         gen_world_size: int,
+        layout_index: int = 0,
     ) -> dict[str, Any]:
         """Prepare per-layer param metadata for nccl_reshard refit."""
         futures = self.worker_group.run_all_workers_single_data(
@@ -1473,6 +1460,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             gen_parallelism=gen_parallelism,
             train_world_size=train_world_size,
             gen_world_size=gen_world_size,
+            layout_index=layout_index,
         )
         results = ray.get(futures)
         return results[0]
@@ -1550,6 +1538,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """
         futures = self.worker_group.run_all_workers_single_data("finalize_async_save")
         ray.get(futures)
+
+    def poll_async_save(self) -> bool:
+        """Finalize the in-flight async checkpoint write if every worker finished it.
+
+        Does not wait for the write. Returns True when no async save is pending,
+        after which the checkpoint directory may be renamed from tmp_step_N/ to
+        step_N/.
+        """
+        futures = self.worker_group.run_all_workers_single_data("poll_async_save")
+        results = ray.get(futures)
+        if len(set(results)) != 1:
+            raise RuntimeError(
+                f"Workers disagree on async checkpoint completion: {results}"
+            )
+        return results[0]
 
     def shutdown(self) -> bool:
         """Shut down all HF workers and clean up resources."""

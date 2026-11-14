@@ -104,10 +104,14 @@ class TestGetValuesPresharded:
             w.get_values_presharded(meta=_meta(["s0", "s1"]))
 
 
-def _make_tq_value() -> tuple[TQValue, MagicMock]:
+def _make_tq_value(*, megatron_enabled: bool = True) -> tuple[TQValue, MagicMock]:
     """Bare TQValue with the attributes the fan-out touches."""
     v = object.__new__(TQValue)
-    v.cfg = {"train_global_batch_size": 8, "train_micro_batch_size": 2}
+    v.cfg = {
+        "train_global_batch_size": 8,
+        "train_micro_batch_size": 2,
+        "megatron_cfg": {"enabled": megatron_enabled},
+    }
     wg = MagicMock()
     v.worker_group = wg
     v.sharding_annotations = MagicMock()
@@ -142,6 +146,63 @@ class TestTQValueFanout:
         # The forward pass is inference-shaped, so it sizes microbatches off
         # logprob_mb_tokens rather than the (larger) train budget.
         assert mock_packing.call_args.args[0] == "logprob_mb_tokens"
+
+    @pytest.mark.parametrize("dispatch", ["get_values", "train", "split"])
+    @pytest.mark.parametrize(
+        ("megatron_enabled", "expects_media"),
+        [(True, True), (False, False)],
+        ids=["megatron_critic", "automodel_critic"],
+    )
+    def test_multimodal_fields_follow_value_backend(
+        self, dispatch, megatron_enabled, expects_media
+    ):
+        v, wg = _make_tq_value(megatron_enabled=megatron_enabled)
+        meta = _meta()
+        meta.fields = [
+            *VALUE_SEED_FIELDS,
+            *DP_VALUE_TRAIN_FIELDS,
+            "pixel_values",
+            "image_grid_thw",
+            "content",
+        ]
+        wg.get_all_worker_results.return_value = [
+            {
+                "global_loss": 1.0,
+                "grad_norm": 0.5,
+                "all_mb_metrics": {},
+            }
+        ]
+
+        with (
+            patch.object(TQValue, "_stamp_pad_seqlen"),
+            patch.object(TQValue, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            if dispatch == "get_values":
+                v.get_values_from_meta(meta)
+                static_fields = set(VALUE_SEED_FIELDS)
+                expected_worker_call = "get_values_presharded"
+            elif dispatch == "train":
+                v.train_from_meta(meta, loss_fn="LF")
+                static_fields = set(DP_VALUE_TRAIN_FIELDS)
+                expected_worker_call = "train_presharded"
+            else:
+                v.train_microbatches_from_meta(meta)
+                static_fields = set(DP_VALUE_TRAIN_FIELDS)
+                expected_worker_call = "train_microbatch_presharded"
+
+        dispatched_fields = set(mock_shard.call_args.args[0].fields)
+        media_fields = {"pixel_values", "image_grid_thw"}
+        if expects_media:
+            assert media_fields <= dispatched_fields
+        else:
+            assert media_fields.isdisjoint(dispatched_fields)
+        assert static_fields <= dispatched_fields
+        assert "content" not in dispatched_fields
+        assert wg.run_all_workers_sharded_data.call_args.args[0] == expected_worker_call
 
     def test_train_from_meta_requests_the_value_train_columns(self):
         v, wg = _make_tq_value()
@@ -251,3 +312,70 @@ class TestPadTargetIsolation:
         assert dispatched.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] != 4096
         # The caller's value survives for whoever minted it.
         assert meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] == 4096
+
+
+class TestTQValueSplitFanout:
+    def test_lifecycle_and_replica_dedup(self):
+        value, wg = _make_tq_value()
+        loss_fn = object()
+        leader = {
+            "global_loss": 2.0,
+            "grad_norm": 0.5,
+            "all_mb_metrics": {"loss": [1.0]},
+            "is_replica_leader": True,
+        }
+        twin = {**leader, "is_replica_leader": False}
+        trace_kwargs = {"_otel_carrier": {"traceparent": "test"}}
+        with (
+            patch(
+                "nemo_rl.models.value.tq_value.ray.get",
+                return_value=[leader, twin, leader],
+            ),
+            patch(
+                "nemo_rl.models.value.tq_value.trace_context_kwargs",
+                return_value=trace_kwargs,
+            ),
+        ):
+            value.begin_train_step(loss_fn, gbs=16, mbs=1)
+            wg.run_all_workers_single_data.assert_called_with(
+                "begin_train_step_presharded",
+                loss_fn=loss_fn,
+                gbs=16,
+                mbs=1,
+                **trace_kwargs,
+            )
+            result = value.finish_train_step()
+            assert result["all_mb_metrics"]["loss"] == [1.0, 1.0]
+            wg.run_all_workers_single_data.assert_called_with(
+                "finish_train_step_presharded", **trace_kwargs
+            )
+            value.abort_train_step()
+            wg.run_all_workers_single_data.assert_called_with(
+                "abort_train_step_presharded", **trace_kwargs
+            )
+
+    def test_chunk_sharding_has_no_global_batch_constraint(self):
+        value, wg = _make_tq_value()
+        meta = _meta()
+        with (
+            patch.object(TQValue, "_stamp_pad_seqlen"),
+            patch.object(TQValue, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as shard,
+            patch(
+                "nemo_rl.models.value.tq_value.trace_context_kwargs",
+                return_value={"_otel_carrier": {"traceparent": "test"}},
+            ),
+        ):
+            value.train_microbatches_from_meta(meta)
+        assert shard.call_args.kwargs["batch_size"] is None
+        assert shard.call_args.args[0].fields == list(DP_VALUE_TRAIN_FIELDS)
+        assert wg.run_all_workers_sharded_data.call_args.args == (
+            "train_microbatch_presharded",
+        )
+        assert wg.run_all_workers_sharded_data.call_args.kwargs["common_kwargs"] == {
+            "_otel_carrier": {"traceparent": "test"}
+        }
+        wg.get_all_worker_results.assert_called_once()

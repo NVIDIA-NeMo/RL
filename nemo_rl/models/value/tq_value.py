@@ -54,9 +54,12 @@ class TQValue(TQDriverMixin, Value):
     built alongside this critic already did that. Partition lifecycle stays
     with the caller.
 
-    The value workers have no split begin/microbatch/finish train API, so one
-    train_from_meta call is one optimizer step. Streaming PPO retains every
-    chunk's rows and trains the critic on the complete batch after policy refit.
+    The split API accumulates chunks into one optimizer step. Keep the model
+    resident between begin and finish/abort so gradient buffers survive.
+    Across calls the chunks must contain exactly ``gbs`` samples. Each chunk
+    must be shardable over critic DP ranks and contain complete microbatches
+    unless packing or dynamic batching is enabled. Failed steps require abort
+    before reuse.
     """
 
     def __init__(
@@ -115,10 +118,9 @@ class TQValue(TQDriverMixin, Value):
             meta,
             fields=list(VALUE_SEED_FIELDS),
             task_name="value_fwd",
-            # A value model consumes tokens only; unioning the rollout's
-            # multimodal columns in would fetch and broadcast pixels this
-            # forward discards.
-            include_multimodal=False,
+            # Only the Megatron critic supports VLM inputs. AutoModel critics
+            # must not receive media because their packing path is text-only.
+            include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )
         with timer.time("get_values/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(
@@ -173,8 +175,7 @@ class TQValue(TQDriverMixin, Value):
             meta,
             fields=list(DP_VALUE_TRAIN_FIELDS),
             task_name="value_train",
-            # See get_values: token-only inputs, so no multimodal union.
-            include_multimodal=False,
+            include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )
         with timer.time("value_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(
@@ -206,4 +207,68 @@ class TQValue(TQDriverMixin, Value):
             )
         return _aggregate_train_results(
             self.worker_group.get_all_worker_results(futures)
+        )
+
+    def begin_train_step(
+        self,
+        loss_fn: LossFunction,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> None:
+        """Open one logical value update on all workers."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "begin_train_step_presharded",
+                loss_fn=loss_fn,
+                gbs=self.cfg["train_global_batch_size"] if gbs is None else gbs,
+                mbs=self.cfg["train_micro_batch_size"] if mbs is None else mbs,
+                **trace_context_kwargs(),
+            )
+        )
+
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, timer: Optional[Timer] = None
+    ) -> None:
+        """Accumulate a training chunk using the existing presharded worker API."""
+        spa, dba = self._packing_args("train_mb_tokens")
+        train_meta = self._isolated_meta(
+            meta,
+            fields=list(DP_VALUE_TRAIN_FIELDS),
+            task_name="value_train",
+            include_multimodal=self.cfg["megatron_cfg"]["enabled"],
+        )
+        with timer.time("value_training/shard_meta") if timer else nullcontext():
+            metas, _ = shard_meta_for_dp(
+                train_meta,
+                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                batch_size=None,
+                sequence_packing_args=spa,
+                dynamic_batching_args=dba,
+            )
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "train_microbatch_presharded",
+            meta=metas,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=_REPLICATED_AXES,
+            output_is_replicated=_REPLICATED_AXES,
+            common_kwargs=trace_context_kwargs(),
+        )
+        self.worker_group.get_all_worker_results(futures)
+
+    def finish_train_step(self) -> dict[str, Any]:
+        """Commit one update; deduplicate metrics from TP/CP/PP replicas."""
+        results = ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "finish_train_step_presharded",
+                **trace_context_kwargs(),
+            )
+        )
+        return _aggregate_train_results([r for r in results if r["is_replica_leader"]])
+
+    def abort_train_step(self) -> None:
+        """Discard the open update on every worker without stepping."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "abort_train_step_presharded", **trace_context_kwargs()
+            )
         )

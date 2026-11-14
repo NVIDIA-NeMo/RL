@@ -119,6 +119,37 @@ def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
     check_nccl_reshard_refit_support(_valid_nccl_reshard_config())
 
 
+@pytest.mark.parametrize("tensor_parallel_size,expert_parallel_size", [(1, 4), (2, 16)])
+def test_check_nccl_reshard_refit_support_accepts_vllm_native_dp(
+    tensor_parallel_size: int, expert_parallel_size: int
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update(
+        {
+            "tensor_parallel_size": tensor_parallel_size,
+            "expert_parallel_size": expert_parallel_size,
+        }
+    )
+
+    check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("tensor_parallel_size,expert_parallel_size", [(2, 3), (4, 2)])
+def test_check_nccl_reshard_refit_support_rejects_invalid_vllm_native_dp(
+    tensor_parallel_size: int, expert_parallel_size: int
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update(
+        {
+            "tensor_parallel_size": tensor_parallel_size,
+            "expert_parallel_size": expert_parallel_size,
+        }
+    )
+
+    with pytest.raises(ValueError, match="expert_parallel_size must be a multiple"):
+        check_nccl_reshard_refit_support(config)
+
+
 def test_check_nccl_reshard_refit_support_rejects_megatron_etp_with_vllm() -> None:
     config = _valid_nccl_reshard_config()
     config.policy["megatron_cfg"]["expert_tensor_parallel_size"] = 2
@@ -133,6 +164,51 @@ def test_check_nccl_reshard_refit_support_rejects_reload_api() -> None:
 
     with pytest.raises(ValueError, match="explicitly unsupported"):
         check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize(
+    "speculative_config",
+    [
+        {"method": "eagle3"},
+        {"method": "dflash"},
+        {"method": "dspark"},
+        {"method": "dflash", "num_speculative_tokens": 4},
+        {"model": "draft-checkpoint", "num_speculative_tokens": 3},
+    ],
+    ids=["eagle3", "dflash", "dspark", "dflash-k4", "model-without-method"],
+)
+def test_check_nccl_reshard_refit_support_rejects_draft_speculators(
+    speculative_config: dict,
+) -> None:
+    """Co-trained drafters never reach process_weights_after_loading here."""
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_kwargs"] = {
+        "speculative_config": speculative_config
+    }
+
+    with pytest.raises(ValueError, match="speculative_config.method"):
+        check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize(
+    "speculative_config",
+    [
+        {"method": "mtp"},
+        {"method": "eagle3", "num_speculative_tokens": 0},
+        {"num_speculative_tokens": 3},
+    ],
+    ids=["mtp", "disabled-eagle3", "no-method-no-model"],
+)
+def test_check_nccl_reshard_refit_support_accepts_non_draft_speculators(
+    speculative_config: dict,
+) -> None:
+    """MTP finalizes outside the draft manifest; K=0 disables speculation."""
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_kwargs"] = {
+        "speculative_config": speculative_config
+    }
+
+    check_nccl_reshard_refit_support(config)
 
 
 def test_check_nccl_reshard_refit_support_collects_without_vllm_cfg() -> None:
@@ -221,7 +297,7 @@ def test_blockwise_compute_without_fp8_storage_keeps_logical_misc(gen_precision,
         ),
         (
             {"backend": "sglang"},
-            "policy.generation.backend must be 'vllm' or 'megatron' (got 'sglang')",
+            "policy.generation.backend must be 'vllm', 'megatron' or 'trtllm' (got 'sglang')",
         ),
     ],
 )
@@ -900,6 +976,41 @@ def test_build_refit_info_groups_experts_and_tags_them():
         for layer in info["layer_names"]
         for p in info["per_layer_params"][layer]
     )
+
+
+@pytest.mark.parametrize(
+    "gen_world_size,gen_tp_size,gen_ep_size,train_world_size",
+    [(8, 1, 4, 8), (32, 2, 16, 16)],
+)
+def test_build_refit_info_places_native_dp_experts_across_instances(
+    gen_world_size: int,
+    gen_tp_size: int,
+    gen_ep_size: int,
+    train_world_size: int,
+) -> None:
+    info = build_nccl_reshard_refit_info(
+        _moe_metadata(num_experts=16),
+        train_parallelism={"tp_size": 1, "ep_size": 4, "pp_size": 1},
+        gen_parallelism={
+            "tp_size": gen_tp_size,
+            "ep_size": gen_ep_size,
+            "etp_size": 1,
+            "pp_size": 1,
+        },
+        train_world_size=train_world_size,
+        gen_world_size=gen_world_size,
+    )
+    expert = _find(info, "model.layers.0.mlp.experts.gate_proj.weight")
+
+    assert tuple(expert["dst_mesh_info"].mesh.shape) == (
+        gen_world_size // gen_ep_size,
+        gen_ep_size,
+    )
+    assert expert["dst_mesh_info"].mesh.flatten().tolist() == list(
+        range(train_world_size, train_world_size + gen_world_size)
+    )
+    assert isinstance(expert["dst_placements"][1], Shard)
+    assert expert["dst_placements"][1].dim == 0
 
 
 def test_build_refit_info_replicates_megatron_experts_when_etp_is_one():

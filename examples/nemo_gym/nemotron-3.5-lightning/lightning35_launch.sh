@@ -697,11 +697,9 @@ if [[ ! -x "\$NRL_VLLM_PY" ]]; then
   patch_status=1
 else
   PYTHONPATH=/opt/nemo-rl "\$NRL_VLLM_PY" - <<'PY' || patch_status=1
-import sys
-
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 
-_apply_vllm_patches(sys.executable)
+_apply_vllm_patches()
 
 # Verify the import that previously failed before Ray or Gym starts.
 import vllm.entrypoints.openai.api_server  # noqa: F401, E402
@@ -810,7 +808,6 @@ ${GENRM_OVERRIDE:+${GENRM_OVERRIDE}} \
 ${NL2BASH_OVERRIDE:+${NL2BASH_OVERRIDE}} \
 ${EXTERNAL_SERVICE_READINESS_ARG} \
 ${SAFETY_JUDGE_MODEL:+env.nemo_gym.safety_judge_model.responses_api_models.local_vllm_model.model=${SAFETY_JUDGE_MODEL}} \
-env.nemo_gym.nemo_gym_log_dir=${LOG_DIR}/nemo_gym \
 logger.log_dir=${LOG_DIR} \
 logger.wandb_enabled=${WANDB_ENABLED} \
 logger.wandb.name=${WANDB_NAME} \

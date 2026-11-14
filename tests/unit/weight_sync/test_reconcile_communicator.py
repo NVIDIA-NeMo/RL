@@ -131,6 +131,8 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
             workers.append(_FakeWorker(len(workers), dead=shard in set(dead_shards)))
     generation = SimpleNamespace(
         cfg={"vllm_cfg": {"async_engine": True}},
+        dp_size=dp_size,
+        vllm_dp_size=1,
         worker_group=SimpleNamespace(
             workers=workers,
             dp_size=dp_size,
@@ -253,6 +255,17 @@ class TestRebuildDispatch:
 
         prefixes = {w.idx: w.calls[0]["rank_prefix"] for w in workers if w.calls}
         assert prefixes == {0: 0, 2: 1, 3: 2}, "survivors must be contiguous, not holed"
+
+    def test_vllm_dp_rebuild_rejects_partial_shards(self, monkeypatch):
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, workers, _ = _rebuildable(dead_shards=(1,))
+        sync._generation.vllm_dp_size = 2
+
+        with pytest.raises(
+            RuntimeError, match="Partial-shard rebuild is not supported"
+        ):
+            sync.reconcile_communicator([1])
+        assert all(not worker.calls for worker in workers)
 
     def test_world_size_shrinks_by_the_lost_shard(self, monkeypatch):
         monkeypatch.setattr("ray.get", lambda futures: futures)
@@ -642,14 +655,8 @@ class TestStragglersAreWaitedForBeforeARebuild:
 class TestBackendsWithoutAWorkerGroup:
     """CollectiveWeightSynchronizer holds a GenerationInterface, not a VllmGeneration.
 
-    Only some implementations own a Ray worker group with DP shards -- vLLM and TRT-LLM do;
-    Dynamo, Megatron and SGLang do not, and the interface declares nothing either way. Of
-    those, Dynamo reaches this synchronizer through the ordinary non-colocated branch of
-    the factory, so reading self._generation.worker_group broke it on the plain grpo.py
-    path:
-
-        grpo.py:1747  policy_generation.weight_synchronizer.init_communicator()
-        AttributeError: 'DynamoGeneration' object has no attribute 'worker_group'
+    Not every implementation owns a Ray worker group with DP shards, and the interface
+    declares nothing either way.
 
     Membership tracking is only meaningful where shards exist, so a backend without one
     records None and every reconcile falls through to "nothing to do" -- which is exactly

@@ -15,6 +15,7 @@
 """Tests for vLLM generation log probabilities."""
 
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,7 +25,54 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 @pytest.mark.vllm
-def test_worker_generate_records_sampled_token_logprob(monkeypatch):
+@pytest.mark.parametrize("mode", ["native", "merged"])
+def test_native_lora_request_uses_stable_identity(mode):
+    from nemo_rl.models.generation.vllm.lora_utils import (
+        NATIVE_LORA_ADAPTER_ID,
+        NATIVE_LORA_ADAPTER_NAME,
+        NATIVE_LORA_ADAPTER_PATH,
+        NATIVE_LORA_CONFIG_KEY,
+        make_native_lora_request,
+    )
+
+    request = make_native_lora_request(
+        cast(
+            Any,
+            {
+                "lora_refit_mode": mode,
+                "vllm_kwargs": {
+                    "enable_lora": True,
+                    "additional_config": {
+                        NATIVE_LORA_CONFIG_KEY: {"rank": 2, "alpha": 8}
+                    },
+                },
+            },
+        )
+    )
+
+    if mode == "merged":
+        assert request is None
+    else:
+        assert request.lora_int_id == NATIVE_LORA_ADAPTER_ID
+        assert request.lora_name == NATIVE_LORA_ADAPTER_NAME
+        assert request.lora_path == NATIVE_LORA_ADAPTER_PATH
+        assert request.lora_path
+
+
+@pytest.mark.vllm
+def test_native_default_without_lora_does_not_create_request():
+    from nemo_rl.models.generation.vllm.lora_utils import make_native_lora_request
+
+    assert make_native_lora_request(cast(Any, {"lora_refit_mode": "native"})) is None
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "native_lora_request", [None, pytest.param(object(), id="native")]
+)
+def test_worker_generate_records_sampled_token_logprob(
+    monkeypatch, native_lora_request
+):
     from nemo_rl.models.generation.vllm import vllm_worker
 
     monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
@@ -52,6 +100,7 @@ def test_worker_generate_records_sampled_token_logprob(monkeypatch):
         "vllm_kwargs": {},
     }
     worker.routed_experts_dtype = torch.int32
+    worker._native_lora_request = native_lora_request
     worker.llm = SimpleNamespace(
         generate=MagicMock(return_value=[raw_output]),
         renderer=SimpleNamespace(get_tokenizer=lambda: SimpleNamespace(bos_token=None)),
@@ -90,6 +139,43 @@ def test_worker_generate_records_sampled_token_logprob(monkeypatch):
 
     assert result["output_ids"][0].tolist() == [101, 102, sampled_token_id, 0]
     assert result["logprobs"][0].tolist() == pytest.approx([0.0, 0.0, -2.30, 0.0])
+    assert worker.llm.generate.call_args.kwargs["lora_request"] is native_lora_request
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "native_lora_request", [None, pytest.param(object(), id="native")]
+)
+def test_worker_generate_text_passes_lora_request(native_lora_request):
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    worker = vllm_worker.VllmGenerationWorkerImpl.__new__(
+        vllm_worker.VllmGenerationWorkerImpl
+    )
+    worker.cfg = cast(
+        Any,
+        {
+            "vllm_cfg": {"async_engine": False, "use_tqdm": False},
+            "top_k": None,
+            "top_p": 1.0,
+            "temperature": 1.0,
+            "max_new_tokens": 8,
+            "stop_token_ids": [],
+        },
+    )
+    worker.SamplingParams = MagicMock(return_value=object())
+    worker._native_lora_request = native_lora_request
+    output = SimpleNamespace(outputs=[SimpleNamespace(text="response")])
+    tokenizer = SimpleNamespace(bos_token=None)
+    worker.llm = SimpleNamespace(
+        generate=MagicMock(return_value=[output]),
+        renderer=SimpleNamespace(get_tokenizer=MagicMock(return_value=tokenizer)),
+    )
+
+    result = worker.generate_text(BatchedDataDict({"prompts": ["prompt"]}))
+
+    assert result["texts"] == ["response"]
+    assert worker.llm.generate.call_args.kwargs["lora_request"] is native_lora_request
 
 
 @pytest.mark.vllm
@@ -339,25 +425,28 @@ def test_apply_top_k_top_p_matches_vllm_upstream(top_k, top_p, test_name):
     our_result, _ = apply_top_k_top_p(logits_3d.clone(), top_k=top_k, top_p=top_p)
 
     # vLLM upstream: expects [batch, vocab], takes tensor k/p with shape [batch]
-    # Process each sequence position separately (vLLM doesn't batch over seq_len)
+    # Process each sequence position separately (vLLM doesn't batch over seq_len).
+    # vLLM filters with a Triton kernel whenever Triton is installed, so its
+    # inputs must be on the GPU.
+    device = torch.device("cuda")
     vllm_results = []
     for seq_idx in range(seq_len):
-        logits_2d = logits_3d[:, seq_idx, :].clone()  # [batch, vocab]
+        logits_2d = logits_3d[:, seq_idx, :].clone().to(device)  # [batch, vocab]
 
         # Convert scalar parameters to tensors for vLLM
         k_tensor = (
             None
             if top_k is None
-            else torch.full((batch_size,), top_k, dtype=torch.long)
+            else torch.full((batch_size,), top_k, dtype=torch.long, device=device)
         )
         p_tensor = (
             None
             if top_p is None
-            else torch.full((batch_size,), top_p, dtype=torch.float32)
+            else torch.full((batch_size,), top_p, dtype=torch.float32, device=device)
         )
 
         vllm_result = vllm_apply_top_k_top_p(logits_2d, k=k_tensor, p=p_tensor)
-        vllm_results.append(vllm_result)
+        vllm_results.append(vllm_result.cpu())
 
     vllm_result_3d = torch.stack(vllm_results, dim=1)  # [batch, seq, vocab]
 

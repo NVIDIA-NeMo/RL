@@ -14,7 +14,7 @@ uv run examples/run_ppo.py --config <PATH TO YAML CONFIG> {overrides}
 
 If not specified, `config` will default to [examples/configs/ppo_math_1B.yaml](../../examples/configs/ppo_math_1B.yaml).
 
-**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for gated models.
+**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `hf auth login` as well for gated models.
 
 In this guide, we'll walk through how we handle:
 
@@ -36,7 +36,17 @@ The value model is the key addition in PPO compared to GRPO. It is a language mo
 
 We define a [ValueInterface](../../nemo_rl/models/value/interfaces.py) that contains everything needed to run a Value model. Similar to the policy, the Value object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_groups.py) of SPMD (1 proc/GPU) processes coordinated so it appears like 1 GPU.
 
-The value model supports the **Megatron-Core backend** (`value.megatron_cfg.enabled: true`) and the **Automodel backend** (`value.automodel_cfg.enabled: true`). It uses the same architecture and tokenizer as the policy (configured via `value.model_name`), but is trained with a separate MSE loss on GAE returns.
+The value model supports the **Megatron-Core backend** (`value.megatron_cfg.enabled: true`) and the **Automodel backend** (`value.automodel_cfg.enabled: true`). It uses an architecture and tokenizer compatible with the policy (configured via `value.model_name`), but is trained with a separate MSE loss on GAE returns.
+
+### Multimodal PPO
+
+Multimodal PPO requires `examples/run_grpo_single_controller.py`; the legacy `examples/run_ppo.py` entrypoint does not support it.
+
+The Single-Controller path supports multimodal PPO with vLLM generation and Megatron policy/value workers. The critic must use a compatible VLM architecture and tokenizer so both workers consume the same packed media representation; its checkpoint path may differ from the policy's. Using `value.model_name: ${policy.model_name}` is the simplest compatible configuration.
+
+The validated configuration uses a Qwen2.5-VL-style wrapper with TP=2, PP=1, CP=1, and sequence packing disabled. Wrappers that self-pack inputs or slice context-parallel inputs, such as Qwen3-VL, are not yet supported by this value-worker path. See the [Qwen2.5-VL-3B Geometry3K recipe](../../examples/configs/recipes/vlm/vlm_ppo-qwen2.5-vl-3b-geometry3k-1n8g-megatron-single-controller.v1.yaml) for a complete configuration.
+
+![CLEVR-CoGenT 100-step and MMPR-Tiny 300-step PPO versus GRPO fixed-set accuracy](../assets/vlm-ppo-vs-grpo-fixed-accuracy.png)
 
 ### Deployment Architectures
 
@@ -102,7 +112,7 @@ value:
       data_parallel_sharding_strategy: "optim_grads_params"
 ```
 
-For an Automodel PPO recipe, see [ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.yaml](../../examples/configs/recipes/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.yaml).
+For an Automodel PPO recipe, see [ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-dynbatch.yaml](../../examples/configs/recipes/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-dynbatch.yaml).
 
 ## Generalized Advantage Estimation (GAE)
 
@@ -190,10 +200,7 @@ ppo:
   critic_ppo_epochs: ${ppo.ppo_epochs}  # critic passes; follows actor by default
 ```
 
-Each pass uses the same returns and advantage estimates computed from the initial
-rollout. Both epoch counts must be at least 1 and can be configured independently;
-the exemplar uses interpolation so the critic follows the actor unless explicitly
-overridden.
+Each pass uses the same returns and advantage estimates computed from the initial rollout. Both epoch counts must be at least 1 and can be configured independently; the exemplar uses interpolation so the critic follows the actor unless explicitly overridden.
 
 ### Critic Warmup
 
@@ -318,6 +325,7 @@ value_loss_fn:
 **PPO-specific parameters:**
 - **`ppo.ppo_epochs`**: Number of actor training updates per rollout batch
 - **`ppo.critic_ppo_epochs`**: Number of critic training updates per rollout batch. It can differ from `ppo_epochs`; the exemplar defaults it to `${ppo.ppo_epochs}`.
+- **`ppo.value_training_mode`**: SingleController critic execution: `whole_batch` (default) trains each epoch on the assembled batch; `split` replays its chunks and performs one optimizer update per epoch. Split mode does not currently overlap critic training with policy work.
 - **`ppo.policy_training_start_step`**: Number of critic-only warmup steps before policy training begins
 - **`ppo.warm_start_value_checkpoint`**: Checkpoint step directory whose `value/` seeds the critic on a fresh run. See [Warm-Starting the Critic](#warm-starting-the-critic)
 - **`ppo.seq_logprob_error_threshold`**: Nullable sequence-level multiplicative probability-error threshold. PPO always logs sequence-level train/generation mismatch metrics; when this is set, sequences above the threshold are excluded from advantage and loss computation.

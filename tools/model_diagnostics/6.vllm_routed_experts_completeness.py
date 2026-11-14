@@ -14,8 +14,9 @@
 """Check whether vLLM returns routed experts for every generated route.
 
 This is a standalone diagnostic for MoE models and vLLM builds that support
-``enable_return_routed_experts``. It is intended to reproduce rare omissions
-seen with prefix caching plus chunked prefill.
+``enable_return_routed_experts``. Prefix caching is always on, because vLLM
+refuses to return routed experts without it. The prompts share a long prefix,
+so most prompt routes come from cached blocks.
 """
 
 import argparse
@@ -50,7 +51,6 @@ def main() -> None:
     parser.add_argument("--pipeline-parallel-size", type=int, default=1)
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
-    parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument("--enable-chunked-prefill", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument(
@@ -64,7 +64,7 @@ def main() -> None:
 
     from nemo_rl.models.generation.vllm.patches import ensure_vllm_source_compat
 
-    # Must run before vLLM pulls in tool_parsers (openai<2.25 NamespaceTool compat).
+    # Must run before vLLM imports the model files these patches edit.
     ensure_vllm_source_compat()
 
     from vllm import LLM, SamplingParams
@@ -78,7 +78,7 @@ def main() -> None:
         "max_model_len": args.max_model_len,
         "trust_remote_code": True,
         "enforce_eager": args.enforce_eager,
-        "enable_prefix_caching": args.enable_prefix_caching,
+        "enable_prefix_caching": True,
         "enable_return_routed_experts": True,
     }
     if args.enable_chunked_prefill:
@@ -137,7 +137,6 @@ def main() -> None:
         "model": args.model,
         "num_outputs": len(outputs),
         "num_failures": len(failures),
-        "enable_prefix_caching": args.enable_prefix_caching,
         "enable_chunked_prefill": args.enable_chunked_prefill,
         "failures": failures[:20],
     }

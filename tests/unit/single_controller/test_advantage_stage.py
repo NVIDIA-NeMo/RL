@@ -27,11 +27,20 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    GeneralizedAdvantageEstimator,
     GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
-from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
+    RewardScalingConfig,
+    add_grpo_token_loss_masks_and_generation_logprobs,
+)
+from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig
+from nemo_rl.algorithms.metric_utils import REWARD_KEY
+from nemo_rl.algorithms.ppo import PPOConfig
+from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     SHARD_INVARIANT_ESTIMATORS,
@@ -44,17 +53,22 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     split_meta_by_prompt_group,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    DebugWriterConfig,
+    JsonDebugWriter,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
     reduce_advantage_pump_metrics,
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+from nemo_rl.data.llm_message_utils import decompose_message_log
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
-from nemo_rl.utils.train_data_dump import TrainDataDump
 
 
 def _config(**overrides) -> AdvantageStageConfig:
@@ -72,6 +86,30 @@ def _config(**overrides) -> AdvantageStageConfig:
     )
     base.update(overrides)
     return AdvantageStageConfig(**base)
+
+
+@pytest.mark.parametrize("log_full_train_data", [False, True])
+def test_from_master_config_uses_typed_logger(
+    tmp_path: Path, log_full_train_data: bool
+) -> None:
+    master_config = SimpleNamespace(
+        grpo=GRPOConfig(num_generations_per_prompt=2),
+        ppo=None,
+        loss_fn=ClippedPGLossConfig(),
+        on_policy_distillation=None,
+        policy={"generation": {"top_k": None, "top_p": 1.0}},
+        logger=LoggerConfig(log_dir=str(tmp_path)),
+        async_rl=SimpleNamespace(
+            log_full_train_data=log_full_train_data,
+            debug_writer=DebugWriterConfig(),
+        ),
+    )
+
+    config = AdvantageStageConfig.from_master_config(master_config)
+
+    assert config.train_data_dump_dir == (
+        str(tmp_path) if log_full_train_data else None
+    )
 
 
 class TestInputFields:
@@ -465,6 +503,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         # A bare step number, not a payload: the stage writes the training
         # dump and has no other way to learn which step it is writing.
         "train_step",
+        # A single bool: whether this call ran the policy-logprob pass.
+        "policy_logprobs_required",
     }
     assert {f.name for f in fields(AdvantageOutcome)} == {
         "meta",
@@ -474,15 +514,17 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "reward_partial",
         "advantage_partial",
         "seq_logprob_error_metrics",
+        # A few per-reason masked-row counts, not the masks themselves.
+        "sample_mask_metrics",
         # OPD's moments, as this call's contribution rather than a total.
         "opd_stat_sum",
         "opd_stat_sumsq",
         "opd_stat_count",
         "opd_gap_sum",
-        # A duration and a count, not the rows: the dump itself went to
+        # A duration and a receipt, not the rows: the dump itself went to
         # disk shard-side.
         "train_data_dump_s",
-        "train_data_dump_rows",
+        "train_data_dump_receipt",
     }
 
 
@@ -581,6 +623,7 @@ class _InlineActor:
             return outcome
 
         self.run = SimpleNamespace(remote=_run)
+        self.computer = computer
 
 
 def _controller(
@@ -592,6 +635,8 @@ def _controller(
     dump_dir: str | None = None,
     opd_full_enabled: bool = False,
     seq_logprob_error_threshold: float | None = None,
+    reward_scaling: RewardScalingConfig | None = None,
+    reward_shaping: RewardShapingConfig | None = None,
 ):
     """Build the controller stub _advantage_stage needs, and nothing more.
 
@@ -603,6 +648,8 @@ def _controller(
         num_generations_per_prompt=GROUP_SIZE,
         adv_estimator=AdvEstimatorConfig(name=estimator_name),
         seq_logprob_error_threshold=seq_logprob_error_threshold,
+        **({} if reward_scaling is None else {"reward_scaling": reward_scaling}),
+        **({} if reward_shaping is None else {"reward_shaping": reward_shaping}),
     )
     is_opd = estimator_name == "opd"
     estimator = (
@@ -631,9 +678,9 @@ def _controller(
     ctrl._advantage_computer = AdvantageComputer(
         store, config=config, advantage_estimator=estimator
     )
-    ctrl._train_data_dump = TrainDataDump(dump_dir) if dump_dir is not None else None
+    ctrl._train_data_dump = JsonDebugWriter(dump_dir) if dump_dir is not None else None
     ctrl._timer = Timer()
-    ctrl._train_data_dump_rows = 0
+    ctrl._train_data_dump_receipts = []
     ctrl._train_steps = 0
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._advantage_actors = [
@@ -766,7 +813,12 @@ def test_training_dump_is_complete_however_the_stage_was_split(
     store = _RowStore(_rows())
     ctrl = _controller("grpo", num_actors, store, dump_dir=str(tmp_path))
     asyncio.run(ctrl._advantage_stage(_pool_meta()))
-    ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_rows)
+    # The stage writes in the background; the controller flushes before merging.
+    for computer in [ctrl._advantage_computer] + [
+        actor.computer for actor in ctrl._advantage_actors
+    ]:
+        computer.flush_train_data_dump()
+    ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_receipts)
 
     rows = [
         json.loads(line)
@@ -789,6 +841,307 @@ def test_training_dump_is_complete_however_the_stage_was_split(
     assert len(ctrl._timer.get_elapsed("train_data_dump")) == max(num_actors, 1)
 
 
+def _rows_with_response_lengths(
+    lengths: Sequence[int],
+) -> dict[str, dict[str, torch.Tensor]]:
+    """``_rows`` with a per-row token_mask of ``lengths[i]`` ones, then zeros.
+
+    The stock fixture masks every token of every row, so a length-dependent
+    penalty would be the same constant for every row, cancel in the group
+    baseline, and leave the advantages untouched -- the test would pass whether
+    or not the shaping ran. Varying the length is what makes it observable.
+    """
+    rows = _rows()
+    for index, length in enumerate(lengths):
+        mask = torch.zeros(SEQ)
+        mask[:length] = 1.0
+        rows[f"s{index}"]["token_mask"] = mask
+    return rows
+
+
+def _run_with_shaping(
+    reward_shaping: RewardShapingConfig | None,
+    num_actors: int,
+    lengths: Sequence[int] | None = None,
+    scaling: RewardScalingConfig | None = None,
+) -> tuple[_RowStore, torch.Tensor, dict[str, float]]:
+    """One advantage stage under a reward_shaping block, local or sharded."""
+    store = _RowStore(
+        _rows() if lengths is None else _rows_with_response_lengths(lengths)
+    )
+    ctrl = _controller(
+        "grpo",
+        num_actors,
+        store,
+        reward_shaping=reward_shaping,
+        reward_scaling=scaling,
+    )
+    asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    advantages = torch.stack(
+        [store.rows[f"s{i}"]["advantages"] for i in range(NUM_GROUPS * GROUP_SIZE)]
+    )
+    metrics = reduce_advantage_pump_metrics(
+        reward_partials=ctrl._step_log_dict["reward_partials"],
+        advantage_partials=ctrl._step_log_dict["advantage_partials"],
+        sequence_lengths=[],
+        num_mask_sample_filtered=ctrl._step_log_dict["num_mask_sample_filtered"],
+        seq_logprob_error_metrics=ctrl._step_log_dict["seq_logprob_error_metrics"],
+    )
+    return store, advantages, metrics
+
+
+def test_token_mask_sum_is_the_response_token_length() -> None:
+    """The invariant the SC path's reward shaping rests on.
+
+    v1 reads ``response_token_lengths`` off a column that only the TQ-sync
+    producer writes; the SC stage derives the same number from ``token_mask``,
+    which it already fetches. Both mark the same predicate -- an assistant turn
+    carrying generation_logprobs -- so this pins the two definitions together.
+    A change to either function that breaks it would otherwise surface as
+    silently wrong penalties, with no column and no error to point at.
+    """
+    # One prompt-history assistant turn (no generation_logprobs, must NOT
+    # count), one user turn, and two generated turns of 3 and 2 tokens.
+    message_log = [
+        {"role": "user", "content": "q", "token_ids": torch.arange(4)},
+        {"role": "assistant", "content": "history", "token_ids": torch.arange(5)},
+        {
+            "role": "assistant",
+            "content": "gen",
+            "token_ids": torch.arange(3),
+            "generation_logprobs": torch.zeros(3),
+        },
+        {"role": "user", "content": "follow up", "token_ids": torch.arange(2)},
+        {
+            "role": "assistant",
+            "content": "gen2",
+            "token_ids": torch.arange(2),
+            "generation_logprobs": torch.zeros(2),
+        },
+    ]
+    batch = [message_log]
+    decomposed = decompose_message_log(batch)
+    # Mutates in place, and must run after decompose: its generation_logprobs
+    # backfill is what the decompose docstring warns about.
+    add_grpo_token_loss_masks_and_generation_logprobs(batch)
+
+    token_loss_mask_total = sum(
+        int(message["token_loss_mask"].sum()) for message in message_log
+    )
+    assert int(decomposed["response_token_lengths"][0]) == 5
+    assert token_loss_mask_total == 5
+
+
+def _run_ppo_stage(store: _RowStore, algo: PPOConfig) -> dict[str, torch.Tensor]:
+    """Run the shared advantage stage with PPO's real GAE estimator."""
+    computer = AdvantageComputer(
+        store,
+        config=_config(algo=algo, is_ppo=True, shardable=False),
+        advantage_estimator=GeneralizedAdvantageEstimator(
+            algo.adv_estimator, ClippedPGLossConfig()
+        ),
+    )
+    asyncio.run(computer.run(AdvantageRequest(meta=_pool_meta())))
+    return {
+        name: torch.stack(
+            [store.rows[f"s{i}"][name] for i in range(NUM_GROUPS * GROUP_SIZE)]
+        )
+        for name in ("advantages", "returns")
+    }
+
+
+def _ppo_rows(lengths: Sequence[int]) -> dict[str, dict[str, torch.Tensor]]:
+    """Give every comparison arm the same response lengths and critic values."""
+    rows = _rows_with_response_lengths(lengths)
+    generator = torch.Generator().manual_seed(1)
+    for row in rows.values():
+        row["values"] = torch.rand(SEQ, generator=generator)
+    return rows
+
+
+class TestRewardShaping:
+    """DAPO overlong shaping on the SC path, and where it is applied.
+
+    Lengths come from ``token_mask``; see
+    test_token_mask_sum_is_the_response_token_length for why that is the same
+    number v1 reads off ``response_token_lengths``.
+    """
+
+    # expected_response_length = 4 - 2 = 2, penalty = 1 over a 2-token buffer,
+    # so a row of length L is penalised by min(-(L - 2) / 2, 0):
+    #   L=2 -> 0.0   L=3 -> -0.5   L=4 -> -1.0   L=5 -> -1.5
+    DAPO = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_length=2,
+        overlong_buffer_penalty=1,
+        max_response_length=4,
+    )
+    LENGTHS = [2, 3, 4, 5] * (NUM_GROUPS * GROUP_SIZE // 4)
+
+    def _expected_penalty(self) -> torch.Tensor:
+        return torch.tensor(
+            [min(-(length - 2) / 2 * 1, 0) for length in self.LENGTHS],
+            dtype=torch.float32,
+        )
+
+    @pytest.mark.parametrize("scaling_enabled", [False, True])
+    def test_ppo_gae_sees_the_shaped_reward(self, scaling_enabled: bool) -> None:
+        scaling = RewardScalingConfig(
+            enabled=scaling_enabled, target_min=-1.0, target_max=1.0
+        )
+        on = _run_ppo_stage(
+            _RowStore(_ppo_rows(self.LENGTHS)),
+            PPOConfig(
+                num_generations_per_prompt=GROUP_SIZE,
+                reward_scaling=scaling,
+                reward_shaping=self.DAPO,
+            ),
+        )
+        pre_rows = _ppo_rows(self.LENGTHS)
+        penalty = self._expected_penalty()
+        for index in range(NUM_GROUPS * GROUP_SIZE):
+            row = pre_rows[f"s{index}"]
+            reward = row["total_reward"].float()
+            if scaling_enabled:
+                reward = 2 * reward - 1
+            row["total_reward"] = reward + penalty[index]
+        pre = _run_ppo_stage(
+            _RowStore(pre_rows), PPOConfig(num_generations_per_prompt=GROUP_SIZE)
+        )
+        off = _run_ppo_stage(
+            _RowStore(_ppo_rows(self.LENGTHS)),
+            PPOConfig(num_generations_per_prompt=GROUP_SIZE, reward_scaling=scaling),
+        )
+
+        for field in ("advantages", "returns"):
+            torch.testing.assert_close(on[field], pre[field])
+            assert not torch.allclose(on[field], off[field])
+
+    def test_disabled_leaves_rewards_and_advantages_alone(self) -> None:
+        _, advantages, metrics = _run_with_shaping(None, 0, self.LENGTHS)
+        _, off_adv, off_metrics = _run_with_shaping(
+            RewardShapingConfig(enabled=False, overlong_buffer_length=2),
+            0,
+            self.LENGTHS,
+        )
+        torch.testing.assert_close(advantages, off_adv)
+        assert metrics[REWARD_KEY] == pytest.approx(off_metrics[REWARD_KEY])
+
+    def test_the_penalty_is_the_dapo_formula_on_the_token_mask_length(self) -> None:
+        # The mean reward must move by the mean per-row penalty.
+        _, _, unshaped = _run_with_shaping(None, 0, self.LENGTHS)
+        _, _, shaped = _run_with_shaping(self.DAPO, 0, self.LENGTHS)
+        assert shaped[REWARD_KEY] == pytest.approx(
+            unshaped[REWARD_KEY] + float(self._expected_penalty().mean())
+        )
+
+    def test_shaping_runs_before_the_baseline(self) -> None:
+        # Pre-shaped rewards must reproduce shaping before baseline/std computation.
+        _, by_stage, _ = _run_with_shaping(self.DAPO, 0, self.LENGTHS)
+
+        store = _RowStore(_rows_with_response_lengths(self.LENGTHS))
+        penalty = self._expected_penalty()
+        for index in range(NUM_GROUPS * GROUP_SIZE):
+            row = store.rows[f"s{index}"]
+            row["total_reward"] = row["total_reward"].float() + penalty[index]
+        ctrl = _controller("grpo", 0, store)
+        asyncio.run(ctrl._advantage_stage(_pool_meta()))
+        pre_shaped = torch.stack(
+            [store.rows[f"s{i}"]["advantages"] for i in range(NUM_GROUPS * GROUP_SIZE)]
+        )
+
+        torch.testing.assert_close(by_stage, pre_shaped)
+        # And the penalty really did move them: it varies within each group, so
+        # it cannot cancel in the baseline the way a uniform shift would.
+        _, unshaped, _ = _run_with_shaping(None, 0, self.LENGTHS)
+        assert not torch.allclose(by_stage, unshaped)
+
+    def test_stop_properly_penalty_scales_truncated_rows(self) -> None:
+        # The other, mutually exclusive mode: it short-circuits before the DAPO
+        # block and keys on `truncated`, not on length.
+        store = _RowStore(_rows())
+        for index in range(0, NUM_GROUPS * GROUP_SIZE, 2):
+            store.rows[f"s{index}"]["truncated"] = torch.tensor(True)
+        ctrl = _controller(
+            "grpo",
+            0,
+            store,
+            reward_shaping=RewardShapingConfig(
+                enabled=True, stop_properly_penalty_coef=0.0
+            ),
+        )
+        asyncio.run(ctrl._advantage_stage(_pool_meta()))
+        metrics = reduce_advantage_pump_metrics(
+            reward_partials=ctrl._step_log_dict["reward_partials"],
+            advantage_partials=ctrl._step_log_dict["advantage_partials"],
+            sequence_lengths=[],
+            num_mask_sample_filtered=ctrl._step_log_dict["num_mask_sample_filtered"],
+            seq_logprob_error_metrics=ctrl._step_log_dict["seq_logprob_error_metrics"],
+        )
+        raw = _rows()
+        kept = [
+            float(raw[f"s{i}"]["total_reward"])
+            for i in range(NUM_GROUPS * GROUP_SIZE)
+            if i % 2
+        ]
+        # Truncated rows contribute 0; the rest are unchanged.
+        assert metrics[REWARD_KEY] == pytest.approx(
+            sum(kept) / (NUM_GROUPS * GROUP_SIZE)
+        )
+
+    def test_the_raw_reward_column_is_not_rewritten(self) -> None:
+        # The stage shapes its own view. DataPlane keeps the env's reward, so a
+        # re-read row is not penalised twice.
+        store, _, _ = _run_with_shaping(self.DAPO, 0, self.LENGTHS)
+        raw = torch.stack(
+            [
+                store.rows[f"s{i}"]["total_reward"]
+                for i in range(NUM_GROUPS * GROUP_SIZE)
+            ]
+        )
+        expected = _rows_with_response_lengths(self.LENGTHS)
+        torch.testing.assert_close(
+            raw,
+            torch.stack(
+                [
+                    expected[f"s{i}"]["total_reward"]
+                    for i in range(NUM_GROUPS * GROUP_SIZE)
+                ]
+            ),
+        )
+
+    def test_scaling_is_applied_before_shaping(self) -> None:
+        # Reversing the scale/shape order changes this mean.
+        scaling = RewardScalingConfig(
+            enabled=True,
+            source_min=0.0,
+            source_max=1.0,
+            target_min=0.0,
+            target_max=10.0,
+        )
+        _, _, metrics = _run_with_shaping(self.DAPO, 0, self.LENGTHS, scaling)
+
+        raw = torch.stack(
+            [
+                _rows_with_response_lengths(self.LENGTHS)[f"s{i}"]["total_reward"]
+                for i in range(NUM_GROUPS * GROUP_SIZE)
+            ]
+        ).float()
+        penalty = self._expected_penalty()
+        scale_then_shape = float((raw * 10.0 + penalty).mean())
+        shape_then_scale = float(((raw + penalty).clamp(0.0, 1.0) * 10.0).mean())
+
+        assert scale_then_shape != pytest.approx(shape_then_scale)
+        assert metrics[REWARD_KEY] == pytest.approx(scale_then_shape)
+
+    def test_sharding_is_unaffected(self) -> None:
+        # Per-row, so it must not make the stage shard-dependent.
+        _, adv_local, metrics_local = _run_with_shaping(self.DAPO, 0, self.LENGTHS)
+        _, adv_pool, metrics_pool = _run_with_shaping(self.DAPO, 3, self.LENGTHS)
+        torch.testing.assert_close(adv_pool, adv_local)
+        assert metrics_pool == pytest.approx(metrics_local)
+
+
 def test_unshardable_estimator_sends_the_whole_batch_to_one_actor() -> None:
     """A pool buys concurrency across calls, never a split, when shardable is False."""
     store = _RowStore(_rows())
@@ -798,6 +1151,101 @@ def test_unshardable_estimator_sends_the_whole_batch_to_one_actor() -> None:
     assert [call for actor in ctrl._advantage_actors for call in actor.calls] == [
         NUM_GROUPS * GROUP_SIZE
     ]
+
+
+def _run_with_scaling(
+    reward_scaling: RewardScalingConfig | None, num_actors: int
+) -> tuple[_RowStore, torch.Tensor, dict[str, float]]:
+    """One advantage stage under a reward_scaling block, local or sharded."""
+    store = _RowStore(_rows())
+    ctrl = _controller("grpo", num_actors, store, reward_scaling=reward_scaling)
+    asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    advantages = torch.stack(
+        [store.rows[f"s{i}"]["advantages"] for i in range(NUM_GROUPS * GROUP_SIZE)]
+    )
+    metrics = reduce_advantage_pump_metrics(
+        reward_partials=ctrl._step_log_dict["reward_partials"],
+        advantage_partials=ctrl._step_log_dict["advantage_partials"],
+        sequence_lengths=[],
+        num_mask_sample_filtered=ctrl._step_log_dict["num_mask_sample_filtered"],
+        seq_logprob_error_metrics=ctrl._step_log_dict["seq_logprob_error_metrics"],
+    )
+    return store, advantages, metrics
+
+
+class TestRewardScaling:
+    """Reward scaling on the stage path, and where it is applied.
+
+    ``_rows`` rewards are 0/1 and GRPO normalizes by the group std, so an
+    affine remap leaves the advantages untouched and a test written on, say,
+    target_min=-1 would pass whether or not the scale ran. These use a source
+    interval that *clamps* -- the part of the map that is observable.
+    """
+
+    # Clamps every reward to source_max, so the batch collapses onto one value.
+    COLLAPSING = RewardScalingConfig(
+        enabled=True,
+        source_min=-5.0,
+        source_max=-4.0,
+        target_min=0.0,
+        target_max=1.0,
+    )
+
+    def test_disabled_leaves_rewards_and_advantages_alone(self) -> None:
+        _, advantages, metrics = _run_with_scaling(None, 0)
+        _, off_adv, off_metrics = _run_with_scaling(
+            RewardScalingConfig(enabled=False, source_min=-5.0, source_max=-4.0), 0
+        )
+        torch.testing.assert_close(advantages, off_adv)
+        assert metrics[REWARD_KEY] == pytest.approx(off_metrics[REWARD_KEY])
+        # Sanity: unscaled really is the fixture's 0/1, so the cases below
+        # measure a change.
+        assert metrics[REWARD_KEY] != pytest.approx(1.0)
+
+    def test_scale_runs_before_the_baseline(self) -> None:
+        # Collapsed rewards make each group's baseline equal its rows. Scaling
+        # after the baseline, or not at all, leaves the 0/1 spread.
+        _, advantages, _ = _run_with_scaling(self.COLLAPSING, 0)
+        torch.testing.assert_close(advantages, torch.zeros_like(advantages))
+
+    def test_the_logged_reward_is_the_scaled_one(self) -> None:
+        # v1 logs metrics["reward"] off the post-scale total_reward.
+        _, _, metrics = _run_with_scaling(self.COLLAPSING, 0)
+        assert metrics[REWARD_KEY] == pytest.approx(1.0)
+
+    def test_the_raw_reward_column_is_not_rewritten(self) -> None:
+        # DataPlane keeps the env's reward, so a re-read row is not scaled twice.
+        store, _, _ = _run_with_scaling(self.COLLAPSING, 0)
+        raw = torch.stack(
+            [
+                store.rows[f"s{i}"]["total_reward"]
+                for i in range(NUM_GROUPS * GROUP_SIZE)
+            ]
+        )
+        torch.testing.assert_close(raw, torch.stack(list(_raw_rewards())))
+
+    def test_sharding_is_unaffected(self) -> None:
+        # Per-row, so it must not make the stage shard-dependent.
+        recipe = RewardScalingConfig(
+            enabled=True,
+            source_min=0.0,
+            source_max=1.0,
+            target_min=-1.0,
+            target_max=1.0,
+        )
+        _, _, unscaled = _run_with_scaling(None, 0)
+        _, adv_local, metrics_local = _run_with_scaling(recipe, 0)
+        _, adv_pool, metrics_pool = _run_with_scaling(recipe, 3)
+        # The remap moves the logged reward, so the comparison below depends on the scale.
+        assert metrics_local[REWARD_KEY] != pytest.approx(unscaled[REWARD_KEY])
+        torch.testing.assert_close(adv_pool, adv_local)
+        assert metrics_pool == pytest.approx(metrics_local)
+
+
+def _raw_rewards() -> list[torch.Tensor]:
+    """The fixture's unscaled rewards, in sample-id order."""
+    rows = _rows()
+    return [rows[f"s{i}"]["total_reward"] for i in range(NUM_GROUPS * GROUP_SIZE)]
 
 
 def test_failed_actor_rpc_raises_and_retires_the_actor(capsys) -> None:
@@ -812,3 +1260,27 @@ def test_failed_actor_rpc_raises_and_retires_the_actor(capsys) -> None:
     assert ctrl._available_advantage_actors.qsize() == 0
     # The mutation cut is released even on failure.
     assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
+
+
+@pytest.mark.parametrize("override", [None, True])
+def test_request_override_applies_the_threshold_like_the_separate_pass(override):
+    """A PPO critic-warmup step runs the policy-logprob pass under in-loss
+    filtering; the override makes the stage mask rejected rows as with the flag off."""
+    rows = _rows()
+    for row in rows.values():
+        row["generation_logprobs"] = row["prev_logprobs"].clone()
+    rows["s1"]["generation_logprobs"] = rows["s1"]["prev_logprobs"] - 5.0
+    store = _RowStore(rows)
+    ctrl = _controller("grpo", 1, store, seq_logprob_error_threshold=2.0)
+    assert not ctrl._advantage_stage_config.policy_logprobs_required
+
+    asyncio.run(ctrl._advantage_stage(_pool_meta(), policy_logprobs_required=override))
+
+    masks = [
+        store.rows[f"s{i}"]["sample_mask"].item()
+        for i in range(NUM_GROUPS * GROUP_SIZE)
+    ]
+    expected = [1.0] * (NUM_GROUPS * GROUP_SIZE)
+    if override:
+        expected[1] = 0.0
+    assert masks == expected

@@ -4,19 +4,11 @@ NeMo RL provides two checkpoint formats for Hugging Face models: Torch distribut
 
 ## Automodel consolidated checkpoints
 
-Automodel-backed policies accept three canonical values for
-`policy.automodel_cfg.checkpoint.save_consolidated`: quoted `"false"`, `"final"`, and
-`"every"`.
-`"final"` exports Hugging Face weights only after a completed training run;
-timeout checkpoints remain resumable distributed checkpoints and are not treated as
-final saves.
+Automodel-backed policies accept three canonical values for `policy.automodel_cfg.checkpoint.save_consolidated`: quoted `"false"`, `"final"`, and `"every"`.
+`"final"` exports Hugging Face weights only after a completed training run; timeout checkpoints remain resumable distributed checkpoints and are not treated as final saves.
 
 > [!IMPORTANT]
-> NeMo RL no longer accepts YAML booleans for `save_consolidated`. Migrate
-> `checkpointing.save_consolidated: false` to
-> `policy.automodel_cfg.checkpoint.save_consolidated: "false"`, and migrate
-> `checkpointing.save_consolidated: true` to
-> `policy.automodel_cfg.checkpoint.save_consolidated: "every"`.
+> NeMo RL no longer accepts YAML booleans for `save_consolidated`. Migrate `checkpointing.save_consolidated: false` to `policy.automodel_cfg.checkpoint.save_consolidated: "false"`, and migrate `checkpointing.save_consolidated: true` to `policy.automodel_cfg.checkpoint.save_consolidated: "every"`.
 > PPO value models use the corresponding `value.automodel_cfg.checkpoint` fields.
 
 ## Converting Torch Distributed Checkpoints to Hugging Face Format
@@ -106,11 +98,7 @@ uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
 
 ## Object-storage checkpoints (MSC / S3)
 
-`checkpointing.checkpoint_dir` (and `policy.pretrained_checkpoint.path`) may be an
-`msc://<profile>/<prefix>` URL instead of a filesystem path. Checkpoints are then
-written to and resumed from object storage through
-[Multi-Storage Client](https://github.com/NVIDIA/multi-storage-client) (MSC), for
-example S3. Ordinary paths are unaffected.
+`checkpointing.checkpoint_dir` (and `policy.pretrained_checkpoint.path`) may be an `msc://<profile>/<prefix>` URL instead of a filesystem path. Checkpoints are then written to and resumed from object storage through [Multi-Storage Client](https://github.com/NVIDIA/multi-storage-client) (MSC), for example S3. Ordinary paths are unaffected.
 
 ```yaml
 checkpointing:
@@ -118,24 +106,10 @@ checkpointing:
   save_data_plane: false                           # required for msc:// (no data-plane snapshots yet)
 ```
 
-- **Profile:** point `MSC_CONFIG` at an MSC JSON/YAML config on every Ray process,
-  e.g. `{"profiles": {"my-s3": {"storage_provider": {"type": "s3", "options":
-  {"base_path": "<bucket>/<prefix>", "region_name": "us-east-2"}}}}}`. Credentials come
-  from the usual AWS environment/role chain; keep them out of the config file.
-- **Publish marker:** a step is written directly under `step_N/` and only becomes
-  visible to resume and retention after an `_SUCCESS` object is written once every
-  shard (including async writes) has finished. An unfinished step is never resumed.
-- **No overwrite:** saving into an existing `step_N` raises `FileExistsError`; use a
-  fresh `checkpoint_dir` prefix for a new run.
-- **Resuming:** use the same `max_num_steps` (or compatible LR-scheduler settings) as
-  the run that wrote the checkpoint; Megatron validates the scheduler state on load.
-- **Support:** Megatron policy backend; dataloader state for all algorithms
-  (`save_dataloader_state`); async GRPO, including its replay buffer and rollout
-  state (`replay_buffer.pt`, `rollouts.pt`), as long as `save_data_plane=false`;
-  SingleController (async) with `checkpointing.metric_name=null` and
-  `save_data_plane=false`. SingleController cannot snapshot its data plane to
-  `msc://`, so a resume restores weights and the dataloader cursor and regenerates
-  the buffered rollouts (a warning says so at setup).
-- **Trust:** resume deserializes `torch` pickles (`train_dataloader*.pt`) from the
-  bucket; only point `msc://` at storage you control.
+- **Profile:** point `MSC_CONFIG` at an MSC JSON/YAML config on every Ray process, e.g. `{"profiles": {"my-s3": {"storage_provider": {"type": "s3", "options": {"base_path": "<bucket>/<prefix>", "region_name": "us-east-2"}}}}}`. Credentials come from the usual AWS environment/role chain; keep them out of the config file.
+- **Publish marker:** a step is written directly under `step_N/` and only becomes visible to resume and retention after an `_SUCCESS` object is written once every shard (including async writes) has finished. An unfinished step is never resumed.
+- **No overwrite:** saving into an existing `step_N` raises `FileExistsError`; use a fresh `checkpoint_dir` prefix for a new run.
+- **Resuming:** use the same `max_num_steps` (or compatible LR-scheduler settings) as the run that wrote the checkpoint; Megatron validates the scheduler state on load.
+- **Support:** Megatron policy backend; dataloader state for all algorithms (`save_dataloader_state`); async GRPO, including its replay buffer and rollout state (`replay_buffer.pt`, `rollouts.pt`), as long as `save_data_plane=false`; SingleController (async) with `checkpointing.metric_name=null` and `save_data_plane=false`. SingleController cannot snapshot its data plane to `msc://`, so a resume restores weights and the dataloader cursor and regenerates the buffered rollouts (a warning says so at setup).
+- **Trust:** resume deserializes `torch` pickles (`train_dataloader*.pt`) from the bucket; only point `msc://` at storage you control.
 
