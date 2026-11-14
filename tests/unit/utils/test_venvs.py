@@ -84,6 +84,42 @@ def test_force_rebuild_replaces_a_link_to_a_shared_venv(tmp_path: Path) -> None:
     assert (shared / "bin" / "python").exists()
 
 
+def test_force_rebuild_on_each_node_replaces_every_link_to_a_shared_venv(
+    tmp_path: Path,
+) -> None:
+    """Two actors that link to one shared venv must each get their own on force rebuild.
+
+    Drives the Ray task body, not just create_local_venv, because the task touches its
+    STARTED_ENV_BUILDER marker through the actor's path before create_local_venv runs.
+    """
+    shared = tmp_path / "extras-vllm"
+    (shared / "bin").mkdir(parents=True)
+    (shared / "bin" / "python").touch()
+    for actor in ("a.Worker", "b.Worker"):
+        (tmp_path / actor).symlink_to("extras-vllm")
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> None:
+        if cmd[:2] == ["uv", "venv"]:
+            os.makedirs(cmd[-1], exist_ok=True)
+
+    with (
+        patch.dict(os.environ, {"NEMO_RL_VENV_DIR": str(tmp_path)}),
+        patch.object(venv_module.subprocess, "run", side_effect=fake_run),
+        patch.object(venv_module.time, "sleep"),
+        patch.object(
+            venv_module, "create_local_venv", venv_module.create_local_venv.__wrapped__
+        ),
+    ):
+        for actor in ("a.Worker", "b.Worker"):
+            venv_module._env_builder._function("uv run --extra vllm", actor, 0, True)
+
+    for actor in ("a.Worker", "b.Worker"):
+        assert not (tmp_path / actor).is_symlink(), actor
+        assert (tmp_path / actor).is_dir(), actor
+    assert (shared / "bin" / "python").exists()
+    assert not (shared / "STARTED_ENV_BUILDER").exists()
+
+
 def test_add_hf_modules_cache_to_pythonpath():
     result = add_hf_modules_cache_to_pythonpath(
         {
