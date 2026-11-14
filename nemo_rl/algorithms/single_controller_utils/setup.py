@@ -624,7 +624,8 @@ def _build_generation(
         master_config: SC MasterConfig.
         defer_model_load: If True (for the NeMo-Gym flow), reserve OpenAI server URLs without loading weights; caller runs gen.load_and_start() later (vLLM only).
         reserved_http_server_ports: OpenAI server ports pre-published to NeMo-Gym,
-            keyed by the distributed rank that adopts each one (Megatron only).
+            keyed by the distributed rank that adopts each one, or by engine
+            index with policy.generation.dynamo=true (Megatron only).
         tokenizer: Tokenizer for the dedicated Megatron inference policy (Megatron only).
         processor: Optional AutoProcessor for VLM paths (Megatron only).
 

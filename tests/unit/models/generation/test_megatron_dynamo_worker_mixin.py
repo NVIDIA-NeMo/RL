@@ -599,3 +599,126 @@ def test_confirm_decode_terminated_attests_to_every_prefill_coordinator(
     env = dynamo_endpoint_env
     assert env.worker.confirm_decode_terminated(addresses, "owner-1", 3.0) is confirmed
     assert env.records.attested == [(address, "owner-1", 3.0) for address in addresses]
+
+
+# ---------------------------------------------------------------------------
+# Rank zero serves NeMo-Gym from Megatron-LM's endpoints over the frontend
+# ---------------------------------------------------------------------------
+
+
+def test_setup_openai_api_server_needs_the_frontend_url():
+    worker = _bare_worker(role="prefill")
+    worker._inference_loop = object()
+
+    with pytest.raises(RuntimeError, match="configure_dynamo_gym_proxy"):
+        worker._setup_openai_api_server()
+
+
+@pytest.mark.parametrize("reserved_port", [5000, None])
+def test_setup_openai_api_server_serves_gym_over_the_frontend(
+    monkeypatch, reserved_port
+):
+    import asyncio
+
+    from nemo_rl.distributed import held_port
+    from nemo_rl.models.generation.megatron import dynamo_gym_proxy as proxy
+
+    records = SimpleNamespace(received=[], bound=[], apps=[], served=[], healthy=[])
+
+    class _Sock:
+        def __init__(self, port):
+            self.port = port or 6000
+            self.closed = False
+
+        def getsockname(self):
+            return ("0.0.0.0", self.port)
+
+        def close(self):
+            self.closed = True
+
+    def receive_held_socket(port):
+        records.received.append(port)
+        return _Sock(port)
+
+    def bind_server_socket(port):
+        records.bound.append(port)
+        return _Sock(port)
+
+    def build_gym_proxy_app(client, **kwargs):
+        records.apps.append((client, kwargs))
+        return "app"
+
+    async def serve_app(app, sock):
+        records.served.append((app, sock, asyncio.get_running_loop()))
+        await asyncio.Event().wait()
+
+    def wait_until_healthy(base_url, *, server, timeout_s):
+        records.healthy.append((base_url, server, timeout_s))
+
+    monkeypatch.setattr(held_port, "receive_held_socket", receive_held_socket)
+    monkeypatch.setattr(proxy, "bind_server_socket", bind_server_socket)
+    monkeypatch.setattr(proxy, "build_gym_proxy_app", build_gym_proxy_app)
+    monkeypatch.setattr(proxy, "serve_app", serve_app)
+    monkeypatch.setattr(proxy, "wait_until_healthy", wait_until_healthy)
+    monkeypatch.setattr(dynamo_worker_mixin, "_get_node_ip_local", lambda: "10.0.0.5")
+
+    loop_thread = _LoopThread()
+    worker = _bare_worker(role="decode")
+    worker.rank = 0
+    worker.cfg["generation"].update(
+        model_name="Qwen/Qwen3-0.6B",
+        temperature=0.6,
+        top_p=0.95,
+        top_k=None,
+        mcore_generation_config={"parsers": ["nano_v3"], "expose_http_server": True},
+    )
+    worker.megatron_tokenizer = "tok"
+    worker.inference_wrapped_model = SimpleNamespace(multimodal_prompt_config="mm")
+    worker._reserved_http_server_port = reserved_port
+    worker._inference_loop = loop_thread.loop
+    worker._dynamo_endpoint_future = None
+    worker._dynamo_event_reporter = None
+    try:
+        worker.configure_dynamo_gym_proxy(
+            frontend_url="http://10.0.0.1:3000/v1", request_timeout_s=120.0
+        )
+        base_url = worker._setup_openai_api_server()
+
+        if reserved_port is not None:
+            # The driver's reservation is adopted: its socket is taken (and
+            # released), and the server binds the same port.
+            assert records.received == [5000] and records.bound == [5000]
+            assert base_url == "http://10.0.0.5:5000/v1"
+        else:
+            assert records.received == [] and records.bound == [0]
+            assert base_url == "http://10.0.0.5:6000/v1"
+        ((client, app_kwargs),) = records.apps
+        assert client.completions_url == "http://10.0.0.1:3000/v1/completions"
+        assert client._request_timeout_s == 120.0
+        assert client._model_name == "Qwen/Qwen3-0.6B"
+        assert app_kwargs == {
+            "tokenizer": "tok",
+            "parsers": ["nano_v3"],
+            "multimodal_prompt_config": "mm",
+            "default_temperature": 0.6,
+            "default_top_p": 0.95,
+            "default_top_k": 0,
+        }
+        _wait_until(lambda: records.served)
+        ((app, sock, loop),) = records.served
+        assert app == "app" and loop is loop_thread.loop
+        assert sock.port == (reserved_port or 6000)
+        ((healthy_url, server, timeout_s),) = records.healthy
+        assert healthy_url == base_url
+        assert server is worker._dynamo_gym_proxy_future
+        assert timeout_s == dynamo_worker_mixin.GYM_PROXY_START_TIMEOUT_S
+        assert not server.done()
+
+        # Stopping the endpoint stops the proxy server with it.
+        worker.stop_dynamo_endpoint()
+        _wait_until(lambda: server.done())
+        assert server.cancelled()
+        # Let the cancelled server task unwind before the loop closes.
+        asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop_thread.loop).result()
+    finally:
+        loop_thread.close()

@@ -272,8 +272,3 @@ def validate_megatron_dynamo_generation(generation_cfg: Mapping[str, Any]) -> No
             "for Megatron prefill/decode engines; offload and recompute "
             "invalidate the registered KV transfer buffers"
         )
-    if mcore["expose_http_server"]:
-        raise ValueError(
-            "mcore_generation_config.expose_http_server must be false when "
-            "policy.generation.dynamo=true; the Dynamo frontend is the HTTP surface"
-        )

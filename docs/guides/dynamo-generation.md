@@ -254,8 +254,16 @@ Limits:
 
 - Prefill/decode only: aggregated Megatron engines behind Dynamo are rejected
   (leave `dynamo` false for that).
-- Native rollouts only; NeMo-Gym through the frontend is follow-up work, so
-  `env.should_use_nemo_gym` must be false.
+- NeMo-Gym is served from each engine's rank zero, as without Dynamo: with
+  `mcore_generation_config.expose_http_server: true`, that rank runs
+  Megatron-LM's OpenAI endpoints (chat template, reasoning and tool parsers,
+  exact-prefix splicing) over a client that posts token-id completions to the
+  Dynamo frontend, which routes them across the prefill and decode engines.
+  One server address per engine is reserved before the engines exist, on the
+  node each engine is pinned to, so the inference cluster must carry node
+  pins (the SingleController's dedicated inference nodes do). Token capture
+  (`token_capture.enabled`) is not yet supported on this path: the capture
+  admission does not travel through the frontend to the engines.
 - Text prompts only (`policy.is_vlm` false); no router replay.
 - Each engine fits on one node; `refit_transport` must be null;
   `recompute_kv_cache_after_weight_updates` must be false (the engines keep
