@@ -1,27 +1,13 @@
-# SingleController Gym run with grpo.length_penalty on and token capture OFF.
-# length_penalty requires env.should_use_nemo_gym=true on SC (config.py), but it
-# does not need capture: the penalty is applied on the no-receipt rollout path
-# (rollout_manager.py). vLLM generates, Megatron trains. This is the nightly that
-# exercises the group length penalty end to end over the workplace_assistant Gym
-# env. Launch with:
-#   uv run examples/run_grpo_single_controller.py \
-#     --config examples/configs/recipes/llm/grpo-qwen3-1.7b-1n8g-megatron-vllm-gym-single-controller-length_penalty.yaml
 defaults: ../../grpo_math_1B_megatron_single_controller.yaml
-
 grpo:
-  # SC requires one optimizer step per RL step:
-  # num_prompts_per_step * num_generations_per_prompt == policy.train_global_batch_size
   num_prompts_per_step: 8
   num_generations_per_prompt: 4
   max_num_steps: 100
   max_num_epochs: 10
-  val_period: 0
-  use_dynamic_sampling: false
   length_penalty:
     default:
       length_type: all_generated_tokens
       group_total_length_penalty_coeff: 0.2
-
 policy:
   model_name: Qwen/Qwen3-1.7B
   tokenizer:
@@ -30,74 +16,38 @@ policy:
       enable_thinking: false
   train_global_batch_size: 32
   train_micro_batch_size: 1
-  # The driver trims each prompt to a single tool, so a 1024 budget fits.
   max_total_sequence_length: 1024
   megatron_cfg:
-    enabled: true
-    tensor_model_parallel_size: 1
-    pipeline_model_parallel_size: 1
     optimizer:
-      lr: 2.0e-6
-      min_lr: 2.0e-6
+      lr: 2.0e-06
+      min_lr: 2.0e-06
       weight_decay: 0.0
   generation:
-    backend: vllm
     max_new_tokens: 256
     colocated:
-      enabled: false
       resources:
-        num_nodes: 1
         gpus_per_node: 4
     vllm_cfg:
-      async_engine: true
       expose_http_server: true
-      tensor_parallel_size: 1
       max_model_len: 1024
-      gpu_memory_utilization: 0.6
       enforce_eager: true
       skip_tokenizer_init: false
       http_server_serving_chat_kwargs:
         tool_parser: hermes
-
 loss_fn:
   reference_policy_kl_penalty: 0.0
-  use_importance_sampling_correction: false
-
 async_rl:
-  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
-  max_inflight_prompts: ${grpo.num_prompts_per_step}
   max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 2}
-  num_advantage_workers: 0
-
-# length_penalty does not need capture; the no-receipt rollout path applies it.
-token_capture:
-  enabled: false
-
-data_plane:
-  enabled: true
-  impl: transfer_queue
-  backend: simple
-  claim_meta_poll_interval_s: 0.5
-  simple:
-    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
-
 checkpointing:
-  enabled: false
   checkpoint_dir: results/grpo-qwen3-1.7b-1n8g-megatron-vllm-gym-single-controller-length_penalty
-  metric_name: null
-
 cluster:
-  num_nodes: 1
   gpus_per_node: 8
-
 data:
   _override_: true
   max_input_seq_length: 512
   shuffle: false
   num_workers: 0
   use_multiple_dataloader: false
-  # The driver replaces these at runtime with the prepared workplace_assistant
-  # rows; the shipped example rows resolve so test_shipped_config can load it.
   train:
     data_path: 3rdparty/Gym-workspace/Gym/resources_servers/workplace_assistant/data/example.jsonl
   validation:
@@ -108,7 +58,6 @@ data:
     prompt_file: null
     system_prompt_file: null
     dataset_name: NemoGymDataset
-
 env:
   _override_: true
   should_use_nemo_gym: true
@@ -128,7 +77,6 @@ env:
           extra_body:
             chat_template_kwargs:
               enable_thinking: false
-
 logger:
   log_dir: logs/grpo-qwen3-1.7b-1n8g-megatron-vllm-gym-single-controller-length_penalty
   wandb:
