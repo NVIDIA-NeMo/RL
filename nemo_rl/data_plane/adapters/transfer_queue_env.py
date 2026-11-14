@@ -77,6 +77,44 @@ def rail_link_layers() -> dict[str, str]:
     return layers
 
 
+def _netdevs_of(device: str) -> set[str]:
+    """Network interfaces that share an RDMA device (sysfs ``device/net``)."""
+    try:
+        return set(os.listdir(f"/sys/class/infiniband/{device}/device/net"))
+    except OSError:
+        return set()
+
+
+def _default_route_netdev() -> str:
+    """The interface that carries the IPv4 default route, or ``""``."""
+    try:
+        for line in Path("/proc/net/route").read_text().splitlines()[1:]:
+            fields = line.split()
+            if len(fields) > 1 and fields[1] == "00000000":
+                return fields[0]
+    except OSError:
+        pass
+    return ""
+
+
+def rdma_rails() -> list[str]:
+    """This host's RDMA rails for the data plane, in sysfs order.
+
+    The one device finder for every backend. InfiniBand is preferred and never
+    mixed with RoCE. The RDMA function of the management interface (the one
+    with the default route; ``eth0`` on GB300, where it is ``mlx5_8``) is left
+    out: it is the cluster's TCP network, not a fabric rail. If it is the only
+    RDMA device it is kept, since RDMA over it still beats no RDMA.
+    """
+    layers = rail_link_layers()
+    ib = [n for n, layer in layers.items() if layer == "InfiniBand"]
+    roce = [n for n, layer in layers.items() if layer == "Ethernet"]
+    rails = ib or roce
+    mgmt = _default_route_netdev()
+    fabric = [n for n in rails if mgmt not in _netdevs_of(n)]
+    return fabric or rails
+
+
 def fabric_is_roce_only() -> bool:
     """True when the host has RoCE rails and no InfiniBand.
 
@@ -115,9 +153,13 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
     ``cuda_ipc`` to move GPU memory. Neither carries the data plane's CPU
     bytes off the node, so its cross-node traffic stays on ``rc``. RDMA is
     required, with no opt-out: an unset or non-RDMA ``UCX_TLS`` becomes that
-    list and netdevs such as ``eth0`` are dropped from ``UCX_NET_DEVICES``, so
-    a launcher never has to set them (some clusters inject ``UCX_TLS=tcp`` and
-    an ``eth0`` into every job). Replacing a set value logs a warning.
+    list and netdevs such as ``eth0`` are dropped from ``UCX_NET_DEVICES``
+    (when only netdevs were named, it becomes this host's ``rdma_rails()``),
+    so a launcher never has to set them (some clusters inject ``UCX_TLS=tcp``
+    and an ``eth0`` into every job). Replacing a set value logs a warning.
+    An unset ``UCX_MODULES`` becomes ``^fuse``, which keeps HPC-X's UCX (loaded
+    by NCCL's net plugin) from hijacking NIXL's; see "Images with HPC-X" in
+    docs/design-docs/nixl-data-plane.md.
     ``mooncake_cpu``: the MC_* knobs
     below. ``simple`` has no engine.
     MC_* values already present in the environment are left alone, so a launcher can
@@ -130,8 +172,10 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
     the driver before ``init_ray``, and Ray hands the result to every worker.
 
     Raises:
-        TransportPolicyError: nixl, only if the UCX swap failed to make the
-            env RDMA-only (an internal invariant, not a launcher error).
+        TransportPolicyError: nixl, when ``UCX_NET_DEVICES`` names only
+            netdevs and this host has no active RDMA rail (a launcher or host
+            problem: the data plane has no RDMA device to run on), or if the
+            UCX swap failed to make the env RDMA-only (an internal invariant).
         RuntimeError: if a variable still needs setting but the engine is
             already imported, i.e. the value can no longer reach it. Fatal on
             purpose — the alternative is a run that looks configured and is not.
@@ -140,6 +184,9 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
         from nemo_rl.data_plane.nixl.errors import TransportPolicyError
         from nemo_rl.data_plane.nixl.nixl_io import check_rdma_only
 
+        # Before any UCX loads: HPC-X's libucs_fuse is dlopen'ed RTLD_GLOBAL
+        # and would capture NIXL's bundled UCX (design doc, "Images with HPC-X").
+        os.environ.setdefault("UCX_MODULES", "^fuse")
         tls = os.environ.get("UCX_TLS", "")
         try:
             check_rdma_only({"UCX_TLS": tls})
@@ -152,11 +199,22 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
             log.warning(
                 "Dropping network interfaces from UCX_NET_DEVICES=%s", ",".join(devs)
             )
-            rdma_devs = [d for d in devs if ":" in d]
-            if rdma_devs:
-                os.environ["UCX_NET_DEVICES"] = ",".join(rdma_devs)
-            else:
-                del os.environ["UCX_NET_DEVICES"]
+            # The RDMA devices the job named, else this host's rails (GB300 jobs
+            # name only eth0). Not ``all``: that lets UCX pick the management
+            # interface's RDMA function, the one device rdma_rails() leaves out.
+            rdma_devs = [d for d in devs if ":" in d] or [
+                f"{dev}:1" for dev in rdma_rails()
+            ]
+            if not rdma_devs:
+                raise TransportPolicyError(
+                    f"UCX_NET_DEVICES={','.join(devs)} names no RDMA device and "
+                    "this host has no active RDMA rail; the NIXL data plane is "
+                    "RDMA-only."
+                )
+            # Set, never delete: init_ray() copies os.environ into the Ray
+            # runtime_env, and a deleted key is not in that copy, so workers
+            # would keep the node's value (eth0) and refuse to start.
+            os.environ["UCX_NET_DEVICES"] = ",".join(rdma_devs)
         check_rdma_only()  # asserts the swap above left UCX RDMA-only
         return
     if cfg["backend"] != "mooncake_cpu":
