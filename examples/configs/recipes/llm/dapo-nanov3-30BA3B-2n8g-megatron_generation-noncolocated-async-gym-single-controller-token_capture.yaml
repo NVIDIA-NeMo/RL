@@ -1,6 +1,6 @@
 # DAPO-style sibling of the SingleController token-capture Gym nightly: dynamic
-# sampling drops a group whose rollouts all score the same before it is
-# finalized and replaces it from the filtering pool, and the reward is shaped
+# sampling drops a group whose rollouts all score the same before it becomes
+# selectable and replaces it from the filtering pool, and the reward is shaped
 # and scaled as in the DAPO recipes. This is the nightly that exercises that
 # rejection with real captured rows, including the cleanup of the staged rows and
 # the spare's ledger reservation.

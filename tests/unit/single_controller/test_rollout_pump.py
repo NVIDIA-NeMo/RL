@@ -87,6 +87,11 @@ from tests.unit.single_controller._dp_fakes import (
 from tests.unit.single_controller._rollout_checkpoints import (
     attach_rollout_checkpointing,
 )
+from tests.unit.single_controller.test_finalizer_lifecycle import (
+    _DataPlaneClient,
+    _request,
+    _signal_result,
+)
 
 
 def _failure_cfg(
@@ -1830,6 +1835,138 @@ def test_claiming_does_nothing_without_dynamic_sampling() -> None:
 
         async with ctrl._claim_filtered_spare():
             assert ctrl._filtered_spares_claimed == 0
+
+    asyncio.run(run())
+
+
+def test_pump_claims_and_pops_a_filtered_spare_for_a_real_zero_variance_rejection() -> (
+    None
+):
+    """The pump drives a real finalize that classifies and pops the filtered spare.
+
+    This covers the ``_claim_filtered_spare`` wrapper around the real
+    ``_finalize_with_actor``: a finalized group whose voting rewards carry no signal
+    is classified (not mocked) inside the finalize cut, rejected, its spare popped
+    from the filtered pool, and the step refilled by the committed replacement.
+    """
+    # The first group is uniform (zero variance -> rejected); its filtered spare is
+    # the second group, which has reward spread and commits.
+    results = iter([_signal_result([1.0, 1.0]), _signal_result([1.0, 0.0])])
+
+    class _ClassifyingRolloutManager:
+        """Owns the voting settings and classifies finalized capture groups."""
+
+        def __init__(self) -> None:
+            self._masked_reward_policy = "include"
+            self._overlong_filtering = False
+            self.stats = SimpleNamespace(committed=0, zero_variance_groups=0)
+            self.record_group_rewards = MagicMock()
+            self.record_finalizer_dropped_prompt = MagicMock()
+            self.record_canonical_publication = MagicMock()
+            self.generated: list[Any] = []
+
+        def _is_zero_variance_finalized(self, finalized: FinalizedGroup) -> bool:
+            return RolloutManager._is_zero_variance_finalized(self, finalized)
+
+        async def generate_for_finalization(
+            self, prompt: Any, *, target_step: int | None = None, **kwargs: Any
+        ) -> Any:
+            del target_step, kwargs
+            self.generated.append(prompt)
+            return _request(), {}
+
+    manager = _ClassifyingRolloutManager()
+
+    class _ResultActor:
+        """Finalizer actor returning the next pre-built result each call."""
+
+        def __init__(self) -> None:
+            self.finalize = SimpleNamespace(remote=self._remote)
+
+        async def _remote(self, request: Any) -> FinalizedGroup:
+            del request
+            return next(results)
+
+    actor = _ResultActor()
+
+    async def run() -> None:
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1, diagnostics=False, rollout_failure=_failure_cfg()
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1, num_prompts_per_step=1),
+            token_capture=SimpleNamespace(
+                min_valid_fraction_per_group=None,
+                forest_training=False,
+                staging_partition="staging",
+            ),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        ctrl._is_ppo = False
+        ctrl._partition_id = "canonical"
+        ctrl._dp_client = _DataPlaneClient()
+        ctrl._rollout_manager = manager
+        _init_pump_ledgers(ctrl)
+
+        # The real finalize path: a fake actor pool returning the pre-built
+        # group, a real checkpoint barrier, and a mocked buffer/ledger so the
+        # commit of the replacement does not need a live data plane.
+        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        ctrl._available_finalizers = asyncio.Queue()
+        ctrl._available_finalizers.put_nowait(actor)
+        ctrl._active_finalizers = 0
+        ctrl._finalizer_waiters = 0
+        ctrl._finalizer_unknown_outcomes = 0
+        ctrl._rollout_recovery_ledger = MagicMock()
+        ctrl._rollout_recovery_ledger.__contains__.return_value = False
+        ctrl._rollout_recovery_enabled = False
+        ctrl._refit_cuts = SimpleNamespace(tokens_by_version=lambda _: {})
+
+        # Dynamic sampling on, with one spare in the filtered pool for the
+        # zero-variance rejection to consume.
+        ctrl._dynamic_sampling_enabled = True
+        ctrl._dataloader_exhausted = False
+        ctrl._filtered_spares_claimed = 0
+        ctrl._filtered_prompt_budget = 10
+        ctrl._filtered_prompts_by_step = {}
+        ctrl._rollout_runtime.filtered_reserve = deque(
+            [{"message_log": [[{"role": "user", "content": "spare"}]], "idx": 1}]
+        )
+        ctrl._rollout_runtime.steps_allowed_short = set()
+
+        ctrl._buffer = _RecordingBuffer()
+        ctrl._buffer.commit_finalized = AsyncMock()
+        ctrl._buffer.abort = MagicMock()
+        ctrl._sampler = InOrderSampler(ctrl._buffer, max_lookahead_versions=1)
+        ctrl._finalizer_actors = [actor]
+        ctrl._dataloader = [
+            BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(1)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        await ctrl._rollout_pump()
+
+        # The zero-variance group was classified and rejected, its spare popped
+        # from the filtered pool and charged, and the replacement committed.
+        assert manager.stats.zero_variance_groups == 1
+        assert manager.stats.committed == 1
+        assert not ctrl._rollout_runtime.filtered_reserve
+        assert ctrl._filtered_prompts_by_step == {0: 1}
+        assert ctrl._filtered_spares_claimed == 0
+        # Two generations: the rejected group and its filtered replacement.
+        assert len(manager.generated) == 2
+        # Both tallies recorded; the rejection carried the zero-variance verdict.
+        tallies = manager.record_group_rewards.call_args_list
+        assert [call.kwargs["zero_variance"] for call in tallies] == [True, False]
 
     asyncio.run(run())
 

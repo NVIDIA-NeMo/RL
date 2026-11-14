@@ -1323,6 +1323,55 @@ def test_forest_shaping_and_observations_are_per_owner(
     )
 
 
+def test_ordinary_finalize_carries_nondefault_voting_fields(
+    forest: ForestCapture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The finalizer ships the raw per-row voting fields the controller classifies on.
+
+    An ordinary (non-Forest) group with one masked and one truncated row and a
+    non-unit dataset loss weight must return those exact flags, the pre-shaping
+    Gym rewards, and the loss_multiplier -- all away from their defaults -- so the
+    controller's zero-variance filter reads real signal, not placeholders.
+    """
+    # Two independent single-call rollouts, each its own ordinary reward row.
+    records_a, _ = forest.capture([None], owner="attempt")
+    records_b, _ = forest.capture([None], owner="healthy")
+
+    # Ordinary truncation is "filled max_seq_len", which the gym tokens do not
+    # reach; force a mixed pattern so the second row counts as truncated.
+    monkeypatch.setattr(
+        forest.finalizer,
+        "_truncated_flags",
+        lambda rows, logical: [False, True],
+    )
+
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt", "healthy"],
+        [
+            receipt(records_a, terminal=records_a[-1]),
+            receipt(records_b, terminal=records_b[-1]),
+        ],
+        [0.25, 0.75],
+        mask_sample=[True, False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        loss_multiplier=0.5,
+        canonical_sample_ids=["group_g0", "group_g1"],
+    )
+
+    assert result.valid_row_count == 2
+    assert len(result.reward_observations) == 2
+    # The raw voting flags ride one-per-valid-row, in rollout order, not their
+    # defaults, so the controller classifies the real group.
+    assert result.reward_mask_sample == [True, False]
+    assert result.reward_truncated == [False, True]
+    # The Gym rewards, before any effort shaping or penalties.
+    assert result.reward_original == [0.25, 0.75]
+    # The dataset-level weight is carried through unchanged (non-unit).
+    assert result.loss_multiplier == 0.5
+
+
 def test_publication_identity_drift_preserves_staging(forest, monkeypatch):
     records, _ = forest.capture([None, 0, None])
     original = forest.finalizer._finalize_logical_rows

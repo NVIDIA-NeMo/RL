@@ -223,6 +223,12 @@ class FinalizedGroup:
     # Each trained call's (model call ID, weight version it began on, tokens it
     # generated), across the group's verified rollouts; empty when dropped.
     call_versions: list[tuple[str, int, int]] = field(default_factory=list)
+    # The controller-set zero-variance verdict. The reassembler ships the raw
+    # reward flags above; the controller classifies the group once (via
+    # RolloutManager, which owns the voting settings) and fills this in before
+    # returning the committed group, so the dispatch loop reads it instead of
+    # reclassifying.
+    zero_variance: bool = False
 
 
 def _capture_token_metrics(

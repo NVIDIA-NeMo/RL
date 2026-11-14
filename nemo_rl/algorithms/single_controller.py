@@ -182,10 +182,6 @@ from nemo_rl.environments.checkpointing.interfaces import (
     EnvironmentCheckpoint,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
-from nemo_rl.experience.dynamic_sampling import (
-    rewards_carry_no_signal,
-    voting_rewards_from_finalized,
-)
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.reward_penalties import (
@@ -1360,18 +1356,6 @@ class SingleControllerActor:
             return valid_count, total_count
         return None
 
-    def _voting_rewards(self, finalized: "FinalizedGroup") -> list[float]:
-        """The group's rewards that vote in its baseline under the masking policy."""
-        return voting_rewards_from_finalized(
-            finalized,
-            masked_reward_policy=(
-                None
-                if self._is_ppo
-                else cast(GRPOConfig, self._algo_cfg).masked_reward_policy
-            ),
-            overlong_filtering=self._algo_cfg.overlong_filtering,
-        )
-
     @contextlib.asynccontextmanager
     async def _claim_filtered_spare(self) -> AsyncIterator[None]:
         """Promise a finalizing group a filtered spare, in case it is rejected.
@@ -1381,8 +1365,8 @@ class SingleControllerActor:
         holds a spare no other finalizing group has claimed. A claim only counts
         against the pool; the spare is popped inside the cut, and only on rejection.
 
-        No claim is made once the dataloader is exhausted: nothing will refill the
-        pool, so a rejected group takes whatever is left or closes its step short.
+        Once the dataloader is exhausted, no group waits for another spare:
+        rejection takes whatever remains or closes its step short.
         """
         if not self._dynamic_sampling_enabled:
             yield
@@ -1481,9 +1465,13 @@ class SingleControllerActor:
                 else:
                     actor_reusable = True
 
-                zero_variance = not finalized.dropped and rewards_carry_no_signal(
-                    self._voting_rewards(finalized)
+                zero_variance = (
+                    not finalized.dropped
+                    and self._rollout_manager._is_zero_variance_finalized(finalized)
                 )
+                # The committed FinalizedGroup carries the verdict back to the
+                # dispatch loop so it is classified once, not recomputed there.
+                finalized.zero_variance = zero_variance
                 if finalized.dropped:
                     try:
                         await self._cleanup_known_finalization_request_unlocked(
@@ -1888,13 +1876,7 @@ class SingleControllerActor:
                                 target_step,
                                 [row.reward for row in finalized.reward_observations],
                                 replacement_index=replacements + filtered_replacements,
-                                zero_variance=(
-                                    finalized.zero_variance
-                                    if isinstance(finalized, RejectedGroup)
-                                    else rewards_carry_no_signal(
-                                        self._voting_rewards(finalized)
-                                    )
-                                ),
+                                zero_variance=finalized.zero_variance,
                             )
                             if not isinstance(finalized, RejectedGroup):
                                 self._rollout_manager.stats.committed += 1

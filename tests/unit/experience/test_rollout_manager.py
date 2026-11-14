@@ -1458,7 +1458,7 @@ def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=No
         ),
     ],
 )
-def test_nemo_reward_original_penalties_match_legacy_rewards_counts_and_metrics(
+def test_nemo_gym_reward_penalties_match_legacy_rewards_counts_and_metrics(
     reward_penalty_config,
     output,
     assistant_overrides,
@@ -1480,7 +1480,7 @@ def test_nemo_reward_original_penalties_match_legacy_rewards_counts_and_metrics(
     assert impl._compute_reward_penalty_metrics(penalty_counts, 1) == {metric_name: 1.0}
 
 
-def test_nemo_reward_original_penalty_metrics_compute_fractional_rate():
+def test_nemo_gym_reward_penalty_metrics_compute_fractional_rate():
     impl = _nemo_gym_impl(True, {"penalize_empty_final_answer": True})
 
     metrics = impl._compute_reward_penalty_metrics(

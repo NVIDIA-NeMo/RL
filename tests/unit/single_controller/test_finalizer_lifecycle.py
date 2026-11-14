@@ -41,6 +41,10 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
+from nemo_rl.experience.dynamic_sampling import (
+    rewards_carry_no_signal,
+    voting_rewards_from_finalized,
+)
 from nemo_rl.experience.reward_penalties import FinalizedReward
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
@@ -121,6 +125,21 @@ def _controller(actor: object) -> Any:
     ctrl._rollout_recovery_ledger = MagicMock()
     ctrl._rollout_recovery_ledger.__contains__.return_value = False
     ctrl._rollout_manager = MagicMock()
+    # The controller now asks the rollout manager (which owns the voting
+    # settings) to classify a finalized group. Mirror that classification off
+    # the controller's own config so the real-finalizer outcomes below stay
+    # driven by the group's rewards, not a truthy MagicMock.
+    ctrl._rollout_manager._is_zero_variance_finalized.side_effect = (
+        lambda finalized: rewards_carry_no_signal(
+            voting_rewards_from_finalized(
+                finalized,
+                masked_reward_policy=(
+                    None if ctrl._is_ppo else ctrl._algo_cfg.masked_reward_policy
+                ),
+                overlong_filtering=ctrl._algo_cfg.overlong_filtering,
+            )
+        )
+    )
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()

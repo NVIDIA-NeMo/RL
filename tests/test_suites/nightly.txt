@@ -153,7 +153,7 @@ tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-a
 # flight, the chained-prefix cache under load) and gates on finalizer health.
 tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture.sh
 # The DAPO variant of the capture nightly above: dynamic sampling, reward shaping and
-# reward scaling on, so zero-variance groups are rejected before they are finalized.
+# reward scaling on, so zero-variance groups are rejected before they become selectable.
 tests/test_suites/llm/dapo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture.sh
 tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-noncolocated-async-gym-single-controller-token_capture-r3-defer.sh
 
