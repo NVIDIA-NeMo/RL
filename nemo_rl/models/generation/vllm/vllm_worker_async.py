@@ -29,7 +29,7 @@ import uuid
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Literal, Optional, cast
 
@@ -41,13 +41,16 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from nemo_rl.data.captured_media import (
+    MEDIA_TENSOR_DIGESTS_FIELD,
     CapturedMedia,
     CapturedMediaItem,
     MediaCaptureRejected,
     MediaColumnSpec,
     capture_processed_media,
+    media_tensor_digests,
     verified_media_items,
     verify_media_geometry,
+    verify_restored_media,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.tq_token_sink import MediaMetadataIntegrityError
@@ -136,6 +139,32 @@ LOGGER = logging.getLogger(__name__)
 _CAPTURED_MODEL_CALL: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "nemo_rl_captured_model_call", default=None
 )
+
+
+def _media_items_from_extras(
+    extras: dict[str, Any] | None,
+    snapshot: Any,
+    *,
+    missing_message: str,
+) -> tuple[CapturedMediaItem, ...]:
+    """Parse a staged row's media spans and verify them against its own tokens.
+
+    Raises:
+        MediaCaptureRejected: ``missing_message`` when the row has no spans, or
+            when the spans are malformed or do not match the row's tokens.
+    """
+    # Optional Gym dependency: only captured media calls reach here.
+    from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+
+    if not isinstance(extras, dict) or MEDIA_SPANS_FIELD not in extras:
+        raise MediaCaptureRejected(missing_message)
+    raw_items = extras[MEDIA_SPANS_FIELD]
+    if not isinstance(raw_items, list):
+        raise MediaCaptureRejected("Media spans are malformed")
+    items = tuple(CapturedMediaItem.from_dict(value) for value in raw_items)
+    for item in items:
+        item.verify_tokens(snapshot.token_ids_delta, origin=snapshot.prev_len)
+    return items
 
 
 # Paths the bearer-token check protects: the OpenAI-compatible routes this module
@@ -438,6 +467,7 @@ class VllmAsyncGenerationWorkerImpl(
         # Built once per engine: it wraps vLLM's output processor.
         self._progress_reader: Any | None = None
         self._capture_media = False
+        self._hash_captured_media = False
         self._capture_patch_size: int | None = None
         self._capture_image_token_id: int | None = None
         # TQTokenSource installed by setup_token_capture. The media path reads
@@ -893,6 +923,7 @@ class VllmAsyncGenerationWorkerImpl(
             self._capture_image_token_id = int(context_ids[0])
             self._capture_patch_size = int(info.get_hf_config().patch_size)
         self._capture_media = capture_media
+        self._hash_captured_media = capture_media and generation_prefix_cuts_enabled
         self._capture_sink = sink
         if generation_prefix_cuts_enabled and self._http_engine_client is None:
             raise RuntimeError(
@@ -927,6 +958,7 @@ class VllmAsyncGenerationWorkerImpl(
                     control_token=generation_cut_control_token,
                     control_timeout_s=generation_cut_control_timeout_s,
                     progress_reader=self._progress_reader,
+                    prefix_row_extras=self._generation_cut_record_payload,
                 )
             )
         if not capture_media:
@@ -1053,6 +1085,7 @@ class VllmAsyncGenerationWorkerImpl(
         admission: Any | None,
         splice: PrefixSplice | None = None,
         verify_retained_media: bool = False,
+        restored: CapturedMedia | None = None,
     ) -> CapturedMedia | None:
         """Run off-loop: resolve retained geometry and snapshot processed pixels."""
         if admission is None:
@@ -1067,8 +1100,6 @@ class VllmAsyncGenerationWorkerImpl(
         retained_tensors = () if verify_retained_media else None
         if admission.parent_call_id is not None:
             # Optional Gym dependency: this method only runs on captured calls.
-            # Gym owns the media_spans key its adapter copies into the extras.
-            from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
             from nemo_gym.token_id_capture.staging.digest import compute_chain_hash
             from nemo_gym.token_id_capture.staging.records import staging_key
 
@@ -1129,19 +1160,11 @@ class VllmAsyncGenerationWorkerImpl(
                 if verify_retained_media:
                     items = verified_media_items(call)
                 else:
-                    extras = call.extras or {}
-                    if MEDIA_SPANS_FIELD not in extras:
-                        raise MediaCaptureRejected(
-                            "Retained vLLM media spans are missing"
-                        )
-                    items = tuple(
-                        CapturedMediaItem.from_dict(value)
-                        for value in extras[MEDIA_SPANS_FIELD]
+                    items = _media_items_from_extras(
+                        call.extras,
+                        call.snapshot,
+                        missing_message="Retained vLLM media spans are missing",
                     )
-                    for item in items:
-                        item.verify_tokens(
-                            call.snapshot.token_ids_delta, origin=call.snapshot.prev_len
-                        )
                 descriptors[call.snapshot.model_call_id] = items
             retained = tuple(item for items in descriptors.values() for item in items)
             if verify_retained_media:
@@ -1153,7 +1176,7 @@ class VllmAsyncGenerationWorkerImpl(
                     verify_media_geometry(
                         descriptors[call.snapshot.model_call_id], tensors
                     )
-        return capture_processed_media(
+        captured = capture_processed_media(
             engine_prompt,
             prev_len=admission.prev_len,
             retained=retained,
@@ -1161,6 +1184,74 @@ class VllmAsyncGenerationWorkerImpl(
             image_token_id=self._capture_image_token_id,
             patch_size=self._capture_patch_size,
             retained_tensors=retained_tensors,
+        )
+        if self._hash_captured_media:
+            # Hash once per call here, off the event loop, so a prefix cut can
+            # write the digests without hashing pixels under its deadline.
+            captured = replace(
+                captured, tensor_digests=media_tensor_digests(captured.tensors)
+            )
+        if restored is not None:
+            verify_restored_media(captured, restored)
+        return captured
+
+    def _generation_cut_record_payload(
+        self, state: _RequestCaptureState
+    ) -> dict[str, Any] | None:
+        """Return the media extras for a call's first generation-prefix row.
+
+        The row stores the call's tensor digests instead of its pixels: a
+        restore reprocesses the media and only checks it against them, and the
+        terminal row still stages the pixels for training.
+        """
+        media = state.media
+        if media is None:
+            return None
+        if media.tensor_digests is None:
+            raise RuntimeError(
+                "media was captured without tensor digests; generation-prefix "
+                "cuts must be enabled before the call is admitted"
+            )
+        from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+
+        return {
+            MEDIA_SPANS_FIELD: [item.to_dict() for item in media.items],
+            MEDIA_TENSOR_DIGESTS_FIELD: media.tensor_digests,
+        }
+
+    def _restore_generation_cut_media(self, snapshot: Any) -> CapturedMedia:
+        """Read a restored call's media items and tensor digests from its verified prefix.
+
+        The prefix digest Gym checked covers these extras, so only a bug in our
+        own writer can leave them unreadable.
+        """
+        items = _media_items_from_extras(
+            snapshot.extras,
+            snapshot,
+            missing_message="Generation-prefix media metadata is missing",
+        )
+        return CapturedMedia(
+            items=items,
+            tensors=None,
+            tensor_digests=snapshot.extras[MEDIA_TENSOR_DIGESTS_FIELD],
+        )
+
+    def _capture_restored_media(
+        self,
+        engine_prompt: dict[str, Any],
+        *,
+        admission: Any,
+        splice: PrefixSplice,
+        snapshot: Any,
+    ) -> CapturedMedia | None:
+        """Reprocess a restored call's media and check it against the digests its cut saved."""
+        if not self._capture_media:
+            return None
+        return self._capture_request_media(
+            engine_prompt,
+            admission=admission,
+            splice=splice,
+            restored=self._restore_generation_cut_media(snapshot),
         )
 
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
@@ -1822,8 +1913,6 @@ class VllmAsyncGenerationWorkerImpl(
                         final_prompt_token_ids,
                     )
 
-                # Generation-prefix cuts are text-only (setup refuses them with
-                # media capture), so a restored prompt has no media to capture.
                 media = None
                 if generation_cut is None:
                     media = await asyncio.to_thread(
@@ -1832,6 +1921,22 @@ class VllmAsyncGenerationWorkerImpl(
                         admission=serving_admission,
                         splice=splice,
                         verify_retained_media=verify_retained_media,
+                    )
+                elif worker_self._capture_media:
+                    # A restored prompt is the durable prefix itself, so splice
+                    # the template only to locate its media placeholders.
+                    media_splice = splice_prefix_tokens(
+                        tokenizer=self.renderer.tokenizer,
+                        model_prefix_token_ids=list(capture_prefix_token_ids or ()),
+                        template_prefix_token_ids=actual_corresponding_token_ids,
+                        template_token_ids=engine_prompt["prompt_token_ids"],
+                    )
+                    media = await asyncio.to_thread(
+                        worker_self._capture_restored_media,
+                        engine_prompt,
+                        admission=admission,
+                        splice=media_splice,
+                        snapshot=generation_cut,
                     )
                 # Must precede the reassignment below: the remap reads the
                 # current value of prompt_token_ids as the template-coordinate
