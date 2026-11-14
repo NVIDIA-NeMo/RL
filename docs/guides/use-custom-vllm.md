@@ -154,3 +154,131 @@ The container already has vLLM built and cached in the frozen environments. Usin
 
 > [!TIP]
 > For more details on frozen environments and how they differ from `uv run`, see the [Dependency Management](../design-docs/dependency-management.md#frozen-environments) documentation.
+
+## NIXL prefill KV lease verification backport
+
+A prefill KV lease can expire while decode is waiting to fetch KV. Prefill may
+then reuse those blocks for another request. The backport of
+[vLLM PR #62065](https://github.com/vllm-project/vllm/pull/62065), pinned to
+`03b2648165d24128611cd15818f4ecf51c0a0205`, adds lease-slot nonce verification so
+that decode rejects an expired handoff before using its KV for generation.
+
+This is an opt-in backport for the qualified build
+`0.30.0+g116da885561b.cu132`. NeMo RL's default vLLM dependency is not changed.
+The tool checks exact source SHA-256 values and rejects other builds, including
+unqualified 0.29 builds. The checked-in manifest records the upstream revision,
+original and patched file hashes, and backport wire version `15062066`.
+
+NeMo RL's runtime monkey patches live in
+`nemo_rl/models/generation/vllm/patches.py`. This backport instead belongs in the
+image build, after installing the custom vLLM package and creating frozen worker
+environments, but before importing vLLM or starting any worker. It changes seven
+source files spanning scheduler, worker, metadata, and lease handling; rewriting
+files after imports would leave cached modules using different implementations.
+For a different vLLM revision, use the custom build workflow above and validate
+the matching upstream fix instead of bypassing these source checks.
+
+Identify the installed `vllm` package directory using each actual worker
+interpreter (this query does not import vLLM):
+
+```sh
+/path/to/worker/venv/bin/python -c 'import importlib.util; print(next(iter(importlib.util.find_spec("vllm").submodule_search_locations)))'
+```
+
+During image construction, check and apply to **every distinct package root**
+used by P, D, TP ranks, and Ray workers. Replace the example paths with those
+reported by the worker interpreters. The installer uses only Python's standard
+library and requires Git; it does not install or resolve dependencies.
+
+```sh
+python tools/apply_vllm_nixl_lease_patch.py --check \
+  --vllm-package-root /path/to/prefill/venv/lib/python3.13/site-packages/vllm \
+  --vllm-package-root /path/to/decode/venv/lib/python3.13/site-packages/vllm
+
+python tools/apply_vllm_nixl_lease_patch.py --apply \
+  --vllm-package-root /path/to/prefill/venv/lib/python3.13/site-packages/vllm \
+  --vllm-package-root /path/to/decode/venv/lib/python3.13/site-packages/vllm
+```
+
+The check reports `original` or `applied`; rerun it after applying and require
+`applied` for every root. Applying twice is safe. Unsupported or partially
+patched packages fail before source writes; rebuild a partially patched image.
+The installer stages and hashes all resulting files, then prepares every
+replacement and same-filesystem rollback hardlink before replacing any source.
+It preserves existing UID, GID, and permission bits; new modules inherit their
+parent directory's UID/GID and are readable with mode `0644`. Failure to preserve
+ownership aborts before publication. Package filesystems must support hardlinks
+and atomic renames. The installer never rewrites the contents of linked uv cache files.
+
+Run it offline: individual replacements are atomic, but the complete multi-file
+installation is not atomic against running readers or process kills. Ordinary
+write failures restore original inodes by renaming backups and remove newly
+added modules; restoration does not allocate another copy of their contents.
+If restoration itself fails, the tool attempts all remaining restores, reports
+the failure, and retains staging directories for recovery. Rebuild the image
+or restore those backups before starting workers. A killed installer also
+requires rebuilding or rechecking the image. All P/D processes must restart with the same patched
+package; mixed wire versions are unsupported. Rebuilding frozen environments
+can discard the fix and requires applying and checking it again.
+
+After the patch, lease verification is enabled by default through
+`kv_connector_extra_config.kv_lease_verification`. The qualified backport also
+enables **job-level fail-stop** by default. Its native worker checks apply to
+both direct vLLM and Dynamo-managed vLLM P/D workers using the patched package.
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| `kv_connector_extra_config.kv_failure_action` | `"stop_job"` | Log a node report, request cancellation of the current Slurm allocation, and raise on a KV transfer error, producer/consumer lease expiry, missing lease metadata, or failed nonce verification. |
+| `kv_connector_extra_config.kv_failure_action` | Explicit `"fail_request"` | Retain request-level fail/recompute behavior for controlled diagnostics. Does not cancel the job. |
+
+For AGA training, retain `"stop_job"`, `kv_lease_verification=true`, and
+`kv_transfer_config.kv_load_failure_policy="fail"`. Startup rejects recompute or
+disabled verification in stop-job mode. Increasing the lease does not replace
+validity checking. The check does not wait for NaN logprobs or garbled output.
+
+Every actual P/D worker, including TP processes inside containers and frozen
+Ray environments, must inherit the current numeric `SLURM_JOB_ID` and have a
+working Slurm `scancel` client in `PATH`, with access to the cluster controller
+and permission to cancel that job. Ensure the Slurm client and its runtime
+configuration/libraries are available in the container. The worker checks the
+job ID and client availability at initialization and refuses to start if either
+is missing; it never falls back to request-level recovery. Retain
+`SLURM_JOB_NODELIST` for allocation context. Reports use the actual hostname
+and separately record `SLURMD_NODENAME` when present. Outside
+Slurm, explicitly select `"fail_request"` for diagnostics.
+
+Before calling `scancel <current-job-id>`, the worker logs a critical report
+containing UTC time, job ID, allocation node list, local node/engine/TP rank,
+request ID, available remote host/engine/request IDs, peer node names from the
+handshake, and the failure reason. It says:
+
+```text
+please report to AGA support team (#oci-aga-slurm-1-support)
+```
+
+The report identifies implicated endpoints; the cluster team determines the
+faulty node or fabric component. Preserve the report and preceding NIXL errors,
+then report them manually in the support channel. No Slack credentials or
+outbound Slack messages are used. Cancellation is requested for the whole
+current Slurm job, not only a request or worker. If the cancellation command
+fails or times out after ten seconds, the worker still raises and explicitly
+instructs the operator to terminate the allocation manually; cancellation is
+not reported as successful. No automatic retry or resubmission is performed.
+
+For controlled request-level recovery experiments only, set
+`kv_connector_extra_config.kv_failure_action="fail_request"`. Then the decode
+engine's `kv_transfer_config.kv_load_failure_policy="recompute"` can recover by
+locally recomputing prompt KV. The policy alone does not add lease verification
+to an unpatched package. If a lease-check handle cannot be released, its landing
+cells remain quarantined; checks wait for temporary occupancy but fail if no
+active read or prepared batch can return enough capacity.
+
+Historical two-node, TP=2 GPU qualification covered normal handoff, expiry,
+block reuse, a longer-lease control, and decode recomputation using the earlier
+request-level bundle. Those runs validated lease rejection before model
+execution, not the job-level fail-stop added here. Installer transaction and
+ownership hardening, landing-cell exhaustion, and the new stop/report paths
+have CPU coverage. The stop/report tests use a fake Slurm client and never
+cancel live jobs. The latest bundle has not been rerun on GPUs or on a live
+Slurm allocation. Full SWE training correctness, scaling performance, and other
+NIXL topologies remain unvalidated.
