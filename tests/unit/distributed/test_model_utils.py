@@ -44,6 +44,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
     gather_logits_at_global_indices,
     get_policy_logprobs_at_sampler_topk,
+    get_student_topk_logprobs,
     sampler_support_ids,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -442,6 +443,21 @@ def test_get_policy_logprobs_at_sampler_topk_single_device():
     torch.testing.assert_close(actual, expected)
     actual.sum().backward()
     assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
+@pytest.mark.parametrize(("k", "chunk_size"), [(3, None), (3, 2), (50, 4)])
+def test_get_student_topk_logprobs_single_device(k, chunk_size):
+    """The unsharded path is the top-k of the full log-softmax, trimmed to seq_len."""
+    torch.manual_seed(0)
+    logits = torch.randn(2, 7, 11)
+
+    logprobs, token_ids = get_student_topk_logprobs(
+        logits, k=k, seq_len=6, chunk_size=chunk_size
+    )
+
+    expected = torch.log_softmax(logits, dim=-1)[:, :5].topk(min(k, 11), dim=-1)
+    torch.testing.assert_close(logprobs, expected.values)
+    torch.testing.assert_close(token_ids, expected.indices)
 
 
 @pytest.mark.parametrize(
@@ -1768,6 +1784,36 @@ class DistributedVocabTopkOpsTestActor:
         torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
         return {"success": True, "error": None}
 
+    def test_get_student_topk_logprobs(self):
+        """TP-sharded student top-k matches the top-k of the full log-softmax."""
+        tp_rank = torch.distributed.get_rank(self.tp_group)
+        batch_size = 2
+        seq_len = 16
+        vocab_size = 256
+        vocab_part_size = vocab_size // self.tp_size
+
+        torch.manual_seed(7)
+        full_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
+        full_logprobs = torch.log_softmax(full_logits, dim=-1)[:, :-1]
+
+        logprobs, token_ids = get_student_topk_logprobs(
+            full_logits[
+                :, :, tp_rank * vocab_part_size : (tp_rank + 1) * vocab_part_size
+            ],
+            k=5,
+            seq_len=seq_len,
+            vocab_parallel_rank=tp_rank,
+            vocab_parallel_group=self.tp_group,
+            chunk_size=self.chunk_size,
+        )
+
+        expected = full_logprobs.topk(5, dim=-1).values
+        torch.testing.assert_close(logprobs, expected, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(
+            full_logprobs.gather(-1, token_ids), logprobs, rtol=1e-5, atol=1e-5
+        )
+        return {"success": True, "error": None}
+
 
 DISTRIBUTED_VOCAB_TOPK_OPS_TEST_ACTOR_FQN = (
     f"{DistributedVocabTopkOpsTestActor.__module__}.DistributedVocabTopkOpsTestActor"
@@ -1799,7 +1845,11 @@ def register_distributed_vocab_topk_ops_test_actor():
 @pytest.mark.parametrize("tp_size, chunk_size", [(1, 5), (2, 4), (2, None)])
 @pytest.mark.parametrize(
     "method_name",
-    ["test_distributed_vocab_topk", "test_gather_logits_at_global_indices"],
+    [
+        "test_distributed_vocab_topk",
+        "test_gather_logits_at_global_indices",
+        "test_get_student_topk_logprobs",
+    ],
 )
 def test_distributed_vocab_topk_ops(
     register_distributed_vocab_topk_ops_test_actor, method_name, tp_size, chunk_size

@@ -57,4 +57,16 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-  'data["train/loss"]["3"] < 1.0'
+  'data["train/loss"]["3"] < 1.0' \
+  'all_finite(data["train/topk_overlap_ratio"])' \
+  'all_finite(data["train/topk_overlap_token_advantage"])' \
+  'all_finite(data["train/topk_entropy_gap"])' \
+  'min(data["train/topk_overlap_ratio"]) >= 0' \
+  'max(data["train/topk_overlap_ratio"]) <= 1.0001' \
+  'max(data["train/topk_overlap_token_advantage"]) <= 1e-6' \
+  'min(data["train/topk_overlap_student_mass"]) > 0' \
+  'max(data["train/topk_overlap_student_mass"]) <= 1.0001' \
+  'min(data["train/topk_overlap_teacher_mass"]) > 0' \
+  'max(data["train/topk_overlap_teacher_mass"]) <= 1.0001' \
+  'min(data["train/topk_student_entropy"]) >= 0' \
+  'min(data["train/topk_teacher_entropy"]) >= 0'

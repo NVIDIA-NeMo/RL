@@ -30,6 +30,7 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
+from nemo_rl.algorithms.loss.topk_overlap import compute_topk_overlap_diagnostics
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     build_exact_token_map,
@@ -2614,6 +2615,68 @@ def test_distillation_loss_fn_call():
     expected_fields = ["loss"]
     for field in expected_fields:
         assert field in metrics
+
+
+def _distillation_overlap_metrics(
+    student_logits: torch.Tensor, data: dict[str, torch.Tensor]
+) -> tuple[torch.Tensor, dict]:
+    loss_fn = DistillationLossFn(DistillationLossConfig(kl_type="reverse"))
+    loss_input, data = prepare_loss_input(student_logits, dict(data), loss_fn)
+    return loss_fn(
+        data=data,
+        global_valid_seqs=data["sample_mask"].sum(),
+        global_valid_toks=(data["sample_mask"].unsqueeze(-1) * data["token_mask"])[
+            :, 1:
+        ].sum(),
+        **loss_input,
+    )
+
+
+def test_distillation_loss_logs_topk_overlap_diagnostics():
+    """The overlap diagnostics are token means over the loss mask; masked positions do not count."""
+    torch.manual_seed(3)
+    batch_size, seq_len, vocab_size, k = 2, 6, 10, 4
+    student_logits = torch.randn(batch_size, seq_len, vocab_size)
+    teacher_topk_logits, teacher_topk_indices = (
+        student_logits + torch.randn(batch_size, seq_len, vocab_size)
+    ).topk(k, dim=-1)
+    token_mask = torch.ones(batch_size, seq_len)
+    token_mask[0, 3] = 0
+    data = {
+        "input_ids": torch.randint(0, vocab_size, (batch_size, seq_len)),
+        "input_lengths": torch.full((batch_size,), seq_len),
+        "token_mask": token_mask,
+        "sample_mask": torch.ones(batch_size),
+        "teacher_topk_logits": teacher_topk_logits,
+        "teacher_topk_indices": teacher_topk_indices,
+    }
+
+    _, metrics = _distillation_overlap_metrics(student_logits, data)
+
+    student_topk = torch.log_softmax(student_logits, dim=-1)[:, :-1].topk(k, dim=-1)
+    expected = compute_topk_overlap_diagnostics(
+        student_topk.values,
+        student_topk.indices,
+        teacher_topk_logprobs=torch.log_softmax(teacher_topk_logits, dim=-1)[:, :-1],
+        teacher_topk_ids=teacher_topk_indices[:, :-1],
+    )
+    mask = token_mask[:, 1:]
+    for name, per_token in expected._asdict().items():
+        assert metrics[f"topk_{name}"] == pytest.approx(
+            masked_mean(per_token, mask).item(), abs=1e-6
+        ), name
+    assert 0 < metrics["topk_overlap_ratio"] <= 1
+    assert metrics["topk_overlap_token_advantage"] <= 0
+
+    # Position 2 predicts the masked token 3: whatever the teacher says there
+    # must not move any metric.
+    garbled = dict(data)
+    garbled["teacher_topk_logits"] = teacher_topk_logits.clone()
+    garbled["teacher_topk_indices"] = teacher_topk_indices.clone()
+    garbled["teacher_topk_logits"][0, 2] = torch.tensor([9.0, -9.0, 0.0, 3.0])
+    garbled["teacher_topk_indices"][0, 2] = torch.tensor([9, 8, 7, 6])
+    _, garbled_metrics = _distillation_overlap_metrics(student_logits, garbled)
+    assert garbled_metrics == pytest.approx(metrics)
 
 
 # ---------------------------------------------------------------------------

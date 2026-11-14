@@ -2231,6 +2231,127 @@ def gather_logits_at_global_indices(
     return gathered_logits
 
 
+def _resolve_vocab_shard(
+    logits: torch.Tensor,
+    vocab_parallel_rank: Optional[int],
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup],
+) -> tuple[torch.Tensor, Optional[torch.distributed.ProcessGroup], int, int]:
+    """Return local logits, their vocabulary group and global vocabulary range.
+
+    Megatron passes the vocabulary-parallel group explicitly, Automodel TP
+    hands over a DTensor, and unsharded logits own the whole vocabulary.
+
+    Returns:
+        ``(local_logits, group, vocab_start_index, vocab_end_index)``, with
+        ``group`` None for unsharded logits.
+    """
+    if vocab_parallel_group is not None:
+        assert vocab_parallel_rank is not None, (
+            "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+        )
+        V_local = int(logits.shape[-1])
+        return (
+            logits,
+            vocab_parallel_group,
+            vocab_parallel_rank * V_local,
+            (vocab_parallel_rank + 1) * V_local,
+        )
+    if isinstance(logits, torch.distributed.tensor.DTensor):
+        tp_group = logits.device_mesh.get_group("tp")
+        local_logits = logits.to_local()
+        tp_rank = tp_group.rank()
+        V_local = int(local_logits.shape[-1])
+        return local_logits, tp_group, tp_rank * V_local, (tp_rank + 1) * V_local
+    return logits, None, 0, int(logits.shape[-1])
+
+
+@torch.no_grad()
+def get_student_topk_logprobs(
+    student_logits: torch.Tensor,
+    *,
+    k: int,
+    seq_len: int,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
+    chunk_size: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The student's own top-k token ids and their full-vocabulary log-probs.
+
+    Diagnostics only: no gradient flows. The top-k is global across the
+    vocabulary-parallel group, and the log-probs are normalized over the whole
+    vocabulary, so they hold the student's true mass on its top-k.
+
+    Args:
+        student_logits: Student logits ``[B, S_local, V_local]``, sharded like
+            the ones passed to ``get_distillation_topk_logprobs_from_logits``.
+        k: Number of tokens to keep; capped at the vocabulary size.
+        seq_len: Canonical sequence length of the microbatch; CP and sequence
+            padding beyond it is dropped.
+        vocab_parallel_rank: Vocabulary-parallel rank.
+        vocab_parallel_group: Vocabulary-parallel process group.
+        context_parallel_group: Megatron context-parallel process group.
+        cp_sharder: Automodel sequence-layout owner; when set, it restores the
+            canonical order instead of ``context_parallel_group``.
+        chunk_size: Sequence-dim chunk bounding the fp32 working set.
+
+    Returns:
+        ``(logprobs, token_ids)``, both ``[B, seq_len - 1, min(k, V)]`` and
+        aligned to next-token positions, in descending log-prob order.
+    """
+    local_logits, parallel_group, vocab_start_index, vocab_end_index = (
+        _resolve_vocab_shard(student_logits, vocab_parallel_rank, vocab_parallel_group)
+    )
+    num_positions = int(local_logits.shape[1])
+    chunk_size = max(1, min(num_positions, chunk_size or 1024))
+
+    if parallel_group is not None:
+        _, token_ids = distributed_vocab_topk(
+            local_logits,
+            k,
+            parallel_group,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+            chunk_size=chunk_size,
+        )
+        logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
+            local_logits,
+            token_ids,
+            vocab_start_index,
+            vocab_end_index,
+            chunk_size,
+            parallel_group,
+            True,
+        )
+    else:
+        k_eff = min(k, int(local_logits.shape[-1]))
+        logprob_chunks, id_chunks = [], []
+        for start in range(0, num_positions, chunk_size):
+            logits = local_logits[:, start : start + chunk_size].float()
+            top_logits, top_ids = logits.topk(k_eff, dim=-1)
+            logprob_chunks.append(top_logits - logits.logsumexp(dim=-1, keepdim=True))
+            id_chunks.append(top_ids)
+        logprobs = torch.cat(logprob_chunks, dim=1)
+        token_ids = torch.cat(id_chunks, dim=1)
+
+    if cp_sharder is not None:
+        logprobs = cp_sharder.gather_token_tensor(logprobs, seq_dim=1, trim=True)
+        token_ids = cp_sharder.gather_token_tensor(token_ids, seq_dim=1, trim=True)
+    elif (
+        context_parallel_group is not None
+        and torch.distributed.get_world_size(context_parallel_group) > 1
+    ):
+        logprobs = allgather_cp_sharded_tensor(
+            logprobs, context_parallel_group, seq_dim=1
+        )
+        token_ids = allgather_cp_sharded_tensor(
+            token_ids, context_parallel_group, seq_dim=1
+        )
+
+    return logprobs[:, : seq_len - 1], token_ids[:, : seq_len - 1]
+
+
 def get_distillation_topk_logprobs_from_logits(
     student_logits: torch.Tensor,
     teacher_topk_logits: torch.Tensor,
@@ -2259,33 +2380,9 @@ def get_distillation_topk_logprobs_from_logits(
     cp_group = None if cp_sharder is not None else context_parallel_group
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
 
-    # Process based on the student logits type
-    if vocab_parallel_group is not None:
-        assert vocab_parallel_rank is not None, (
-            "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
-        )
-        student_logits = student_logits
-        parallel_group = vocab_parallel_group
-
-        V_local = int(student_logits.shape[-1])
-        vocab_start_index = vocab_parallel_rank * V_local
-        vocab_end_index = (vocab_parallel_rank + 1) * V_local
-
-    elif isinstance(student_logits, torch.distributed.tensor.DTensor):
-        device_mesh = student_logits.device_mesh
-        tp_group = device_mesh.get_group("tp")
-
-        student_logits = student_logits.to_local()
-        parallel_group = tp_group
-
-        tp_rank = tp_group.rank()
-        V_local = int(student_logits.shape[-1])
-        vocab_start_index = tp_rank * V_local
-        vocab_end_index = (tp_rank + 1) * V_local
-
-    else:
-        student_logits = student_logits
-        parallel_group = None
+    student_logits, parallel_group, vocab_start_index, vocab_end_index = (
+        _resolve_vocab_shard(student_logits, vocab_parallel_rank, vocab_parallel_group)
+    )
 
     # Automodel owns the sequence layout: shard the teacher indices into the model's
     # local layout, then gather back to canonical order through the sharder once the
@@ -2359,10 +2456,6 @@ def get_distillation_topk_logprobs_from_logits(
     else:
         # Distributed processing
         if parallel_group is not None or cp_size > 1:
-            if parallel_group is None:
-                vocab_start_index = 0
-                vocab_end_index = int(student_logits.shape[-1])
-
             student_topk_logits = gather_logits_at_global_indices(
                 student_logits,
                 indices_for_logits,
