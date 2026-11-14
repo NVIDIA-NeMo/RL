@@ -125,8 +125,8 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
     ctrl._rollout_runtime.sampler_stamps_target_steps = False
-    ctrl._assembling_version = 0
-    ctrl._step_assembly = None
+    ctrl._accountant._assembling_version = 0
+    ctrl._accountant._step_assembly = None
     # Empty means the legacy (non-token-capture) dispatch path.
     ctrl._finalizer_actors = []
     ctrl._rollout_runtime.replacement_reserve = deque()
@@ -1173,8 +1173,8 @@ class TestChargeShortfall:
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
         ctrl._sampler = sampler
-        ctrl._assembling_version = assembling_version
-        ctrl._step_assembly = None
+        ctrl._accountant._assembling_version = assembling_version
+        ctrl._accountant._step_assembly = None
         ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=4)
         ctrl._rollout_runtime = RolloutRuntimeState()
         return ctrl
@@ -1182,7 +1182,7 @@ class TestChargeShortfall:
     def test_a_stamped_group_is_charged_to_its_own_step(self):
         sampler = InOrderSampler(_RecordingBuffer(), max_lookahead_versions=1)
         ctrl = self._controller(sampler)
-        ctrl._credit_shortfall(3)
+        ctrl._accountant.credit_shortfall(3)
         assert ctrl._rollout_runtime.batch_shortfall == {3: 1}
 
     @pytest.mark.parametrize(
@@ -1197,15 +1197,15 @@ class TestChargeShortfall:
         self, make_sampler
     ):
         ctrl = self._controller(make_sampler(_RecordingBuffer()), assembling_version=5)
-        ctrl._credit_shortfall(None)
-        ctrl._credit_shortfall(None)
+        ctrl._accountant.credit_shortfall(None)
+        ctrl._accountant.credit_shortfall(None)
         assert ctrl._rollout_runtime.batch_shortfall == {5: 2}
 
     def test_windowed_charges_nothing(self):
         sampler = WindowedSampler(_RecordingBuffer(), max_staleness_versions=1)
         ctrl = self._controller(sampler)
-        ctrl._credit_shortfall(None)
-        ctrl._credit_shortfall(3)
+        ctrl._accountant.credit_shortfall(None)
+        ctrl._accountant.credit_shortfall(3)
         assert ctrl._rollout_runtime.batch_shortfall == {}
 
     def test_a_custom_sampler_without_the_hooks_is_charged_like_a_gated_one(self):
@@ -1213,8 +1213,8 @@ class TestChargeShortfall:
             pass
 
         ctrl = self._controller(_PlainSampler(), assembling_version=2)
-        ctrl._credit_shortfall(None)
-        ctrl._credit_shortfall(7)
+        ctrl._accountant.credit_shortfall(None)
+        ctrl._accountant.credit_shortfall(7)
         assert ctrl._rollout_runtime.batch_shortfall == {2: 1, 7: 1}
 
     def test_a_loss_after_selection_closed_counts_toward_the_next_step(self):
@@ -1223,9 +1223,9 @@ class TestChargeShortfall:
             ReadyFirstSampler(_RecordingBuffer(), max_staleness_versions=1),
             assembling_version=5,
         )
-        ctrl._credit_shortfall(None)
-        ctrl._assembling_version = 6
-        ctrl._credit_shortfall(None)
+        ctrl._accountant.credit_shortfall(None)
+        ctrl._accountant._assembling_version = 6
+        ctrl._accountant.credit_shortfall(None)
         assert ctrl._rollout_runtime.batch_shortfall == {5: 1, 6: 1}
 
 
@@ -1242,8 +1242,8 @@ class TestALostGroupDoesNotStallTheGate:
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
         ctrl._sampler = sampler
-        ctrl._assembling_version = 0
-        ctrl._step_assembly = None
+        ctrl._accountant._assembling_version = 0
+        ctrl._accountant._step_assembly = None
         ctrl._rollout_runtime = RolloutRuntimeState()
         ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=2)
         ctrl._async_cfg = SimpleNamespace(
@@ -1272,7 +1272,7 @@ class TestALostGroupDoesNotStallTheGate:
                 await asyncio.wait_for(admit(), timeout=0.05)
 
             # One group of step 0 is given up on, so the step can only ever hold one.
-            ctrl._credit_shortfall(None)
+            ctrl._accountant.credit_shortfall(None)
             assert ctrl._target_groups_for_step(0) == 1
 
             # The train pump closes the step on what it has, and the version moves on.
@@ -1290,7 +1290,7 @@ class TestALostGroupDoesNotStallTheGate:
                 await asyncio.wait_for(
                     ctrl._sampler.admit(trainer_version_fn=lambda: 0), timeout=1.0
                 )
-            ctrl._credit_shortfall(None)
+            ctrl._accountant.credit_shortfall(None)
             assert ctrl._target_groups_for_step(0) == 2, "the step keeps its size"
 
         asyncio.run(exercise())

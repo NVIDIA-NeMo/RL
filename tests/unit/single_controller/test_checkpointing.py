@@ -102,7 +102,6 @@ from nemo_rl.algorithms.rollout_checkpointing.state import (
 from nemo_rl.algorithms.single_controller import (
     RolloutRuntimeState,
     SingleControllerActor,
-    _StepAssembly,
 )
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
@@ -115,6 +114,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.algorithms.single_controller_utils.step_assembly import (
+    StepAssembly as _StepAssembly,
+)
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTE_PLAN_TAG
@@ -1406,7 +1408,7 @@ class TestCounterRestore:
         assert actor._trainer_version == 11
         # A group with no step of its own is charged to the step being assembled, so a
         # resume that left this at 0 would charge the first loss to a long-closed step.
-        assert actor._assembling_version == 11
+        assert actor._accountant._assembling_version == 11
         assert actor._sampler.dispatch_index == 10
 
     def test_restores_exact_sampler_dispatch_index(self, tmp_path):
@@ -1431,7 +1433,7 @@ class TestCounterRestore:
 
         assert actor._train_steps == 0
         assert actor._trainer_version == 0
-        assert actor._assembling_version == 0
+        assert actor._accountant._assembling_version == 0
         assert actor._sampler.dispatch_index == -1
         assert actor._consumed_samples == 0
         assert actor._current_epoch == 0
@@ -2871,12 +2873,12 @@ class TestPeriodicRolloutCheckpoint:
             max_staleness_versions=1
         )
         actor._sampler = ReadyFirstSampler(actor._buffer, max_staleness_versions=1)
-        actor._step_assembly = _StepAssembly(0, 0, [])
+        actor._accountant._step_assembly = _StepAssembly(0, 0, [])
         attach_rollout_checkpointing(actor)
 
         def lose() -> None:
             for _ in range(3):
-                actor._credit_shortfall(None)
+                actor._accountant.credit_shortfall(None)
             assert actor._rollout_runtime.batch_shortfall == {0: 3}
 
         async def exercise() -> None:
@@ -2902,10 +2904,10 @@ class TestPeriodicRolloutCheckpoint:
                     await actor._rollout_snapshots.capture(
                         cut, tmp_path / "unsafe", "rollout_snapshot"
                     )
-            credits = actor._step_assembly.selection_credits
-            actor._step_assembly.selection_credits = None
-            actor._step_assembly.selected_groups = 3
-            actor._reconcile_selection_credits(0, credits)
+            credits = actor._accountant._step_assembly.selection_credits
+            actor._accountant._step_assembly.selection_credits = None
+            actor._accountant._step_assembly.selected_groups = 3
+            actor._accountant.reconcile_selection_credits(0, credits)
             assert actor._target_groups_for_step(0) == 3
             assert actor._target_groups_for_step(1) == 2
             saved = await actor._rollout_snapshots.save_snapshot(force=True)
