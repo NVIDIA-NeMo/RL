@@ -16,6 +16,7 @@ import pickle
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import (
@@ -815,6 +816,15 @@ def test_clipped_pg_loss_force_on_policy_ratio_ignores_prev_logprobs():
     # Both should produce identical loss and ratios since prev_logprobs is ignored
     torch.testing.assert_close(loss_1, loss_2)
     assert metrics_1["probs_ratio"] == metrics_2["probs_ratio"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "setting", ["reference_policy_kl_type", "truncated_importance_sampling_type"]
+)
+def test_clipped_pg_loss_config_rejects_unknown_types(setting):
+    """An unknown KL or truncated-IS type fails when the config is built."""
+    with pytest.raises(ValidationError, match="literal_error"):
+        ClippedPGLossConfig(**{setting: "unknown"})
 
 
 @pytest.mark.parametrize(

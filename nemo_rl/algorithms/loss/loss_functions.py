@@ -191,7 +191,7 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     reference_policy_kl_penalty: float = Field(default=0.01, ge=0, allow_inf_nan=False)
     # Can be set to k1, k2, k3
     # For more details, see http://joschu.net/blog/kl-approx.html
-    reference_policy_kl_type: str = "k3"
+    reference_policy_kl_type: Literal["k1", "k2", "k3"] = "k3"
     kl_input_clamp_value: Optional[float] = 20.0
     kl_output_clamp_value: Optional[float] = 10.0
     # If True, add KL penalty to reward instead of loss (used by Reinforce++)
@@ -208,7 +208,9 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     #   "adaptive-ppo-clip" – advantage-aware token filtering with an
     #                         entropy-adaptive upper bound
     #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
-    truncated_importance_sampling_type: Optional[str] = None
+    truncated_importance_sampling_type: Optional[
+        Literal["tis", "icepop", "adaptive-ppo-clip", "seq-mask-tis"]
+    ] = None
     truncated_importance_sampling_ratio: Optional[float] = None
     # Lower bound for TIS clipping, or ICE-POP / adaptive-ppo-clip /
     # seq-mask-tis filtering
