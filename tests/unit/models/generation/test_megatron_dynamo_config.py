@@ -335,19 +335,12 @@ def _master_config(generation: dict) -> SimpleNamespace:
     """The fields MegatronGeneration.validate_settings reads, at accepted values."""
     return SimpleNamespace(
         policy=_policy(generation),
+        env={"should_use_nemo_gym": False},
         async_rl=SimpleNamespace(
             recompute_kv_cache_after_weight_updates=False,
             generation_fleet_health=SimpleNamespace(enabled=False),
         ),
     )
-
-
-def test_megatron_generation_refuses_the_switch_until_rollouts_are_served() -> None:
-    generation = _megatron_config()
-    with pytest.raises(NotImplementedError, match="not served by MegatronGeneration"):
-        resolve_generation_class(generation).validate_settings(
-            _master_config(generation)
-        )
 
 
 def test_megatron_generation_names_an_unservable_shape_first() -> None:

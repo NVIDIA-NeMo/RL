@@ -37,6 +37,7 @@ run_test() {
 # Each keeps the native test's checks and adds check_dynamo_overlay.sh's.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh ++policy.generation.dynamo=true
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_reload_refit.sh ++policy.generation.dynamo=true
+# grpo_dynamo_pd_megatron_single_controller.sh joins once the Megatron-LM pin includes megatron/inference/integrations/dynamo.
 
 cd "${PROJECT_ROOT}/tests"
 if compgen -G ".coverage*" > /dev/null; then
