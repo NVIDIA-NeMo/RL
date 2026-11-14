@@ -300,6 +300,10 @@ class _RecordingParser:
     def count_reasoning_tokens(self, token_ids) -> int:
         return 0
 
+    def set_prompt_token_ids(self, prompt_token_ids) -> None:
+        # vLLM hands the parser the prompt before it parses the reply.
+        pass
+
 
 @pytest.fixture(scope="module")
 def reply_worker(tiny_qwen3_model_path) -> _Worker:

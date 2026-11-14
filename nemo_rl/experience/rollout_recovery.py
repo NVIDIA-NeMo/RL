@@ -547,6 +547,38 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
     return list(dict.fromkeys(staging_keys))
 
 
+def _owned_staging_key(
+    owner: str, model_call_id: str, source_capture_key: str | None
+) -> str | None:
+    """Return the staging key one manifest call of ``owner``'s receipt must have.
+
+    A call ``owner`` made is staged under ``owner``. A restore that continued
+    the episode as ``owner`` carries earlier calls over, each stamped with the
+    attempt that staged it in ``source_capture_key``. Gym's rebuild owns that
+    rule (``_staging_owner``); this calls it so the two cannot drift. The
+    ledger checks raw dicts, so plain namespaces stand in for Gym's models.
+    Returns None when Gym refuses the stamp.
+    """
+    from types import SimpleNamespace
+
+    from nemo_gym.token_id_capture.staging.rebuild import (
+        ReceiptVerificationError,
+        _staging_owner,
+    )
+    from nemo_gym.token_id_capture.staging.records import staging_key
+
+    try:
+        source = _staging_owner(
+            SimpleNamespace(capture_key=owner),
+            SimpleNamespace(
+                source_capture_key=source_capture_key, model_call_id=model_call_id
+            ),
+        )
+    except ReceiptVerificationError:
+        return None
+    return staging_key(source, model_call_id)
+
+
 def _attempt_staging_keys(
     gate_id: str,
     receipt: dict[str, Any] | None,
@@ -576,7 +608,8 @@ def _attempt_staging_keys(
                 not isinstance(call_id, str)
                 or not call_id
                 or "/" in call_id
-                or entry["staging_key"] != f"{gate_id}/{call_id}"
+                or entry["staging_key"]
+                != _owned_staging_key(gate_id, call_id, entry.get("source_capture_key"))
             ):
                 raise ValueError(
                     "Forest recovery has foreign staging ownership: "

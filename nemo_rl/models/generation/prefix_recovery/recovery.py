@@ -509,6 +509,7 @@ class PrefixRecovery:
                     prompt_token_ids=state.prompt_token_ids,
                     generated_token_ids=generated_token_ids,
                     generated_logprobs=frozen.generated_logprobs,
+                    extras=self._parts.prefix_row_extras(state),
                 )
                 if frozen.chunk_token_ids:
                     chunk_record = (
@@ -660,9 +661,19 @@ class PrefixRecovery:
         continuation = admission.generation_cut
         # Gym requires at least one staging key per continuation.
         staging_keys = list(continuation.staging_keys)
-        snapshots = self._parts.staging_source.fetch(staging_keys)
-        if len(snapshots) != len(staging_keys):
+        # The finalization read also returns each row's extras, which carry a
+        # media call's spans and tensor digests; plain ``fetch`` does not.
+        chunks = self._parts.staging_source.fetch_for_finalization(staging_keys)
+        if len(chunks) != len(staging_keys):
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
+        snapshots = [chunk.snapshot for chunk in chunks]
+        # A media call's spans and tensor digests ride the first chunk's extras,
+        # and the advertised prefix digest covers them.
+        if any(chunk.extras is not None for chunk in chunks[1:]):
+            raise RuntimeError(
+                "only the first generation-cut chunk may carry call extras"
+            )
+        extras = chunks[0].extras
         weight_versions = [snapshot.weight_version for snapshot in snapshots]
         if weight_versions != sorted(weight_versions):
             raise RuntimeError(
@@ -722,8 +733,8 @@ class PrefixRecovery:
             token_ids_delta=token_ids_delta,
             token_mask_delta=token_mask_delta,
             generation_log_probs_delta=generation_logprobs_delta,
-            extras=None,
-            extras_digest=compute_extras_digest(None),
+            extras=extras,
+            extras_digest=compute_extras_digest(extras),
             chain_hash=compute_chain_hash(admission.parent_chain_hash, token_ids_delta),
             cumulative_hash=hash_token_ids(prefix_token_ids + token_ids_delta),
         )

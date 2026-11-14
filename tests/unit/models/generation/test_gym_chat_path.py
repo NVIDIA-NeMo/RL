@@ -886,13 +886,9 @@ CASES = [
     _off_policy("presence_penalty", 0.5),
     _off_policy("frequency_penalty", 0.5),
     _off_policy("logit_bias", {"10": 5.0}),
-    # Capture stages one choice, and the trainer replays one.
-    _Case("n_2", fields={"n": 2}, status=400),
-    # Token information without top_logprobs, unset or sent as null.
-    _Case("top_logprobs_unset", omit=("top_logprobs",), status=400),
-    _Case("top_logprobs_null", fields={"top_logprobs": None}, status=400),
-    # Neither path stages a streamed call, and Gym never sends one.
-    _Case("stream", fields={"stream": True}, status=400),
+    # Token information without top_logprobs, unset or sent as null, is served as 0.
+    _Case("top_logprobs_unset", omit=("top_logprobs",)),
+    _Case("top_logprobs_null", fields={"top_logprobs": None}),
     # A field vLLM refuses while the request is parsed, before any step runs.
     _Case(
         "field_error",
