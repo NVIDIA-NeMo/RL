@@ -2460,8 +2460,8 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
-    ctrl._assembling_version = 0
-    ctrl._step_assembly = None
+    ctrl._accountant._assembling_version = 0
+    ctrl._accountant._step_assembly = None
     ctrl._train_steps = 0
     attach_rollout_checkpointing(ctrl)
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
@@ -2630,7 +2630,9 @@ def test_train_pump_closes_the_last_step_short_when_a_windowed_sampler_runs_out(
     assert ctrl._train_steps == 1
     assert ctrl._consumed_samples == 1, "the step is what shrank, not the run"
     assert ctrl._rollout_runtime.batch_shortfall == {}, "pruned once the step closed"
-    assert ctrl._assembling_version == 1, "a later loss counts toward the next step"
+    assert ctrl._accountant._assembling_version == 1, (
+        "a later loss counts toward the next step"
+    )
     assert set(sampler.min_prompt_groups_asked) == {1}, (
         "with no more data coming, it takes whatever is left instead of waiting for "
         "a full chunk"
@@ -2690,7 +2692,7 @@ class _ReadyFirstFilteringSampler(_OneThenEmptySampler):
         meta, num_groups = await super().select(**kwargs)
         if meta is None:
             # The pool is empty, so the filtered group is lost for good.
-            self.ctrl._credit_shortfall(None)
+            self.ctrl._accountant.credit_shortfall(None)
         return meta, num_groups
 
 
@@ -2743,11 +2745,11 @@ def test_ready_first_replaces_a_filtered_group_then_shrinks_the_assembling_step(
     )
     ctrl._rollout_runtime.replacement_reserve = deque(["spare0"])
     ctrl._rollout_runtime.batch_shortfall = {}
-    ctrl._assembling_version = 4
+    ctrl._accountant._assembling_version = 4
 
     assert ctrl._take_replacement(0) == "spare0"
     assert ctrl._take_replacement(0) is None, "the pool is now empty"
-    ctrl._credit_shortfall(None)
+    ctrl._accountant.credit_shortfall(None)
 
     assert ctrl._rollout_runtime.batch_shortfall == {4: 1}
     assert ctrl._target_groups_for_step(4) == 1, "2 prompts per step, one lost"
@@ -2776,7 +2778,7 @@ class _LosingTrainer(_NoOpTrainer):
         self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
     ) -> None:
         del meta, train_fields
-        self.ctrl._credit_shortfall(None)
+        self.ctrl._accountant.credit_shortfall(None)
 
 
 @pytest.mark.parametrize("when", ["training", "selection"])
@@ -2796,7 +2798,7 @@ def test_unstamped_losses_preserve_selected_groups(
 
         def lose() -> None:
             for _ in range(drops):
-                ctrl._credit_shortfall(None, allow_short=exhausted)
+                ctrl._accountant.credit_shortfall(None, allow_short=exhausted)
             provisional_shortfalls.append(dict(ctrl._rollout_runtime.batch_shortfall))
 
         class Sampler(_EmptySampler):
@@ -2915,7 +2917,9 @@ def test_selection_reconciliation_preserves_sampler_charge_policy(
             if self._remaining == 2:
                 await asyncio.sleep(0)
                 for _ in range(2):
-                    ctrl._credit_shortfall(7 if policy == "stamped" else None)
+                    ctrl._accountant.credit_shortfall(
+                        7 if policy == "stamped" else None
+                    )
             return await super().select(**kwargs)
 
     ctrl = _train_pump_controller(sampler=Sampler(meta, chunks=2))

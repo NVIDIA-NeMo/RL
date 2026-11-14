@@ -52,7 +52,7 @@ import uuid
 import warnings
 from collections import deque
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -146,6 +146,10 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerActorArgs,
     _maybe_restore_native_data_plane_checkpoint,
     _register_single_controller_partitions,
+)
+from nemo_rl.algorithms.single_controller_utils.step_assembly import (
+    ShortfallCredit,
+    StepAssemblyAccountant,
 )
 from nemo_rl.algorithms.single_controller_utils.utils import (
     BelowValidFractionGroup,
@@ -327,20 +331,6 @@ def _worker_group_snapshots(worker_group: Any) -> Callable[[], list[dict[str, An
         return [s for s in ray.get(futures) if s]
 
     return fan_out
-
-
-@dataclass(frozen=True)
-class _ShortfallCredit:
-    target_step: Optional[int]
-    charged_step: int
-    allow_short: bool
-
-
-@dataclass
-class _StepAssembly:
-    version: int
-    selected_groups: int
-    selection_credits: Optional[list[_ShortfallCredit]]
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -825,9 +815,9 @@ class SingleControllerActor:
         self._trainer_version: int = restored_trainer_version
         # The step the train pump is selecting groups for, or will select for next once
         # the current step has finished selecting. A lost group with no step of its own
-        # is charged here.
-        self._assembling_version: int = restored_trainer_version
-        self._step_assembly: Optional[_StepAssembly] = None
+        # is charged here. Built lazily (see ``_accountant``) so it is available even on
+        # controller instances that unit tests construct past ``__init__``.
+        self._accountant_obj: Optional[StepAssemblyAccountant] = None
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
@@ -865,6 +855,23 @@ class SingleControllerActor:
             flush=True,
         )
 
+    @property
+    def _accountant(self) -> StepAssemblyAccountant:
+        """Step-assembly accountant, built lazily on first access.
+
+        Lazy so it is also available on controller instances that unit tests
+        build via ``object.__new__`` past ``__init__``. The cursor seeds from the
+        current ``_trainer_version`` (set to the restored version in ``__init__``).
+        """
+        obj = getattr(self, "_accountant_obj", None)
+        if obj is None:
+            obj = StepAssemblyAccountant(
+                controller=self,
+                initial_version=getattr(self, "_trainer_version", 0),
+            )
+            self._accountant_obj = obj
+        return obj
+
     # ── public API ─────────────────────────────────────────────────────────
     async def run(self) -> dict[str, Any]:
         """Main entry point. Runs until max_train_steps is reached."""
@@ -896,7 +903,9 @@ class SingleControllerActor:
         if self._weight_synchronizer.is_stale:
             await self._sync_weights()
         self._rollout_manager.set_weight_version(self._trainer_version)
-        self._rollout_manager.set_tally_step_provider(lambda: self._assembling_version)
+        self._rollout_manager.set_tally_step_provider(
+            lambda: self._accountant.assembling_version
+        )
 
         if await self._rollout_restorer.restore():
             self._rollout_recovery_enabled = True
@@ -1868,7 +1877,7 @@ class SingleControllerActor:
                                             cut, lineage_group_id
                                         )
                                 self._buffer_capacity.release()
-                                self._credit_shortfall(target_step)
+                                self._accountant.credit_shortfall(target_step)
                                 return
                             request, rollout_metrics = captured
                             async with self._claim_filtered_spare():
@@ -1886,7 +1895,7 @@ class SingleControllerActor:
                                 # train pump will never release this permit
                                 # and the step must be allowed to close short.
                                 self._buffer_capacity.release()
-                                self._credit_shortfall(target_step)
+                                self._accountant.credit_shortfall(target_step)
                                 return
                             self._rollout_manager.record_group_rewards(
                                 target_step,
@@ -2055,7 +2064,7 @@ class SingleControllerActor:
                         if filtered:
                             filtered_replacements += 1
                             drawn = self._filtered_prompts_by_step.get(
-                                self._accounting_step(target_step), 0
+                                self._accountant.accounting_step(target_step), 0
                             )
                             spent = (
                                 f"{drawn}/"
@@ -2088,7 +2097,7 @@ class SingleControllerActor:
 
             if replacements or filtered_replacements:
                 # Count each recovered slot once, against its stamp or assembling step.
-                replaced_step = self._accounting_step(target_step)
+                replaced_step = self._accountant.accounting_step(target_step)
                 self._batch_replacements[replaced_step] = (
                     self._batch_replacements.get(replaced_step, 0) + 1
                 )
@@ -2459,7 +2468,7 @@ class SingleControllerActor:
         step; windowed draws none and relies on later dispatches, so the train pump
         checks after selection instead (see ``_check_filtered_budget``).
         """
-        step = self._accounting_step(target_step)
+        step = self._accountant.accounting_step(target_step)
         self._filtered_prompts_by_step[step] = (
             self._filtered_prompts_by_step.get(step, 0) + 1
         )
@@ -2500,7 +2509,7 @@ class SingleControllerActor:
         same step the prompt is drawn.
         """
         self._record_filtered_prompt(target_step)
-        self._check_filtered_budget(self._accounting_step(target_step))
+        self._check_filtered_budget(self._accountant.accounting_step(target_step))
 
     async def _wait_for_filtered_reserve(self) -> None:
         """Wait for pump refill without holding a checkpoint mutation cut."""
@@ -2520,7 +2529,7 @@ class SingleControllerActor:
         if not self._dataloader_exhausted:
             raise RuntimeError("filtered replacement pool emptied before consumption")
         self._rollout_runtime.steps_allowed_short.add(
-            self._accounting_step(target_step)
+            self._accountant.accounting_step(target_step)
         )
         return None
 
@@ -2619,7 +2628,7 @@ class SingleControllerActor:
             or without a spare) and the step the spare is generated for.
         """
         if replacement is None:
-            self._credit_shortfall(target_step, allow_short=filtered)
+            self._accountant.credit_shortfall(target_step, allow_short=filtered)
             return None, target_step
         # Attempted only now that a spare is in hand, because the borrow is a debt
         # and the spare is what repays it. Borrowing without one would leave the
@@ -2650,77 +2659,6 @@ class SingleControllerActor:
         if isinstance(self._sampler, DropAccountingSampler):
             return self._sampler.closes_short_at_exhaustion
         return False
-
-    def _accounting_step(self, target_step: Optional[int]) -> int:
-        """The step a group counts toward: its own, or the one being assembled."""
-        return self._assembling_version if target_step is None else target_step
-
-    def _charge_step_for_lost_group(self, target_step: Optional[int]) -> Optional[int]:
-        """The step a permanently lost group is charged to, or None for no step."""
-        if isinstance(self._sampler, DropAccountingSampler):
-            return self._sampler.charge_step_for_lost_group(
-                target_step=target_step, assembling_version=self._assembling_version
-            )
-        return self._accounting_step(target_step)
-
-    def _advance_assembling_version(self) -> None:
-        """Move past steps whose selected groups and losses fill their batch."""
-        assembly = self._step_assembly
-        while True:
-            selected = (
-                assembly.selected_groups
-                if assembly is not None and assembly.version == self._assembling_version
-                else 0
-            )
-            lost = self._rollout_runtime.batch_shortfall.get(
-                self._assembling_version, 0
-            )
-            if selected + lost < self._algo_cfg.num_prompts_per_step:
-                return
-            self._assembling_version += 1
-
-    def _reconcile_selection_credits(
-        self, assembling_version: int, credits: list[_ShortfallCredit]
-    ) -> None:
-        """Reapply only losses that raced an awaited selection, using its result."""
-        for credit in credits:
-            remaining = self._rollout_runtime.batch_shortfall[credit.charged_step] - 1
-            if remaining:
-                self._rollout_runtime.batch_shortfall[credit.charged_step] = remaining
-            else:
-                del self._rollout_runtime.batch_shortfall[credit.charged_step]
-        self._assembling_version = assembling_version
-        self._advance_assembling_version()
-        for credit in credits:
-            self._credit_shortfall(credit.target_step, allow_short=credit.allow_short)
-        self._rollout_runtime.shortfall_reconciliation_pending = False
-
-    def _credit_shortfall(
-        self, target_step: Optional[int], *, allow_short: bool = False
-    ) -> None:
-        """Record that a step will never receive a group it is waiting for."""
-        self._advance_assembling_version()
-        charged_step = self._charge_step_for_lost_group(target_step)
-        if charged_step is None:
-            return
-        self._rollout_runtime.batch_shortfall[charged_step] = (
-            self._rollout_runtime.batch_shortfall.get(charged_step, 0) + 1
-        )
-        if allow_short:
-            self._rollout_runtime.steps_allowed_short.add(charged_step)
-        assembly = self._step_assembly
-        if assembly is not None and assembly.selection_credits is not None:
-            assembly.selection_credits.append(
-                _ShortfallCredit(target_step, charged_step, allow_short)
-            )
-            self._rollout_runtime.shortfall_reconciliation_pending = True
-        self._advance_assembling_version()
-        print(
-            f"  target_step={charged_step} is one group short "
-            f"({self._rollout_runtime.batch_shortfall[charged_step]} total); the train pump "
-            "will close that step early",
-            flush=True,
-        )
 
     def _target_groups_for_step(self, step: int) -> int:
         """How many prompt groups this step should train on, after dropped prompts.
@@ -2834,7 +2772,7 @@ class SingleControllerActor:
             ):
                 maybe_gpu_profile_step(self._gen, self._train_steps + 1)
             version_during_step = self._trainer_version
-            self._step_assembly = _StepAssembly(version_during_step, 0, None)
+            self._accountant.begin_step(version_during_step)
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
             min_sample_version = None
@@ -2946,10 +2884,10 @@ class SingleControllerActor:
                         training_claim_ids_before = (
                             self._buffer.training_owned_group_ids()
                         )
-                        assembly = self._step_assembly
+                        assembly = self._accountant.step_assembly
                         assert assembly is not None
-                        cursor_before_selection = self._assembling_version
-                        selection_credits: list[_ShortfallCredit] = []
+                        cursor_before_selection = self._accountant.assembling_version
+                        selection_credits: list[ShortfallCredit] = []
                         assembly.selection_credits = selection_credits
                         train_meta, num_groups = await self._sampler.select(
                             current_train_weight=self._trainer_version,
@@ -2960,7 +2898,7 @@ class SingleControllerActor:
                         assembly.selection_credits = None
                         assembly.selected_groups = groups_dispatched + num_groups
                         # Credits remain checkpoint-visible while the claim waits.
-                        self._reconcile_selection_credits(
+                        self._accountant.reconcile_selection_credits(
                             cursor_before_selection, selection_credits
                         )
                         training_claim_ids_after = (
@@ -3050,7 +2988,9 @@ class SingleControllerActor:
                                 self._dynamic_sampling_enabled
                                 and not self._sampler_uses_pooled_replacements()
                             ):
-                                self._check_filtered_budget(self._assembling_version)
+                                self._check_filtered_budget(
+                                    self._accountant.assembling_version
+                                )
                             # Safe to span the select: a starved poll never
                             # reaches the data plane, so nothing below is
                             # counted twice.
@@ -3421,10 +3361,7 @@ class SingleControllerActor:
                         value_inference_prepared = True
 
                 # No await separates the final target check from this advance.
-                self._assembling_version = max(
-                    self._assembling_version, version_during_step + 1
-                )
-                self._step_assembly = None
+                self._accountant.finish_step(version_during_step)
 
                 # The loop can leave a wait open on two exits that continue
                 # the run, where an unended span would stay open over the
