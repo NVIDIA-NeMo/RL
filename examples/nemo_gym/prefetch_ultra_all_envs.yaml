@@ -11,8 +11,16 @@ defaults: legacy_environment_servers/ultra_rlvr.yaml
 env:
   should_use_nemo_gym: true
   nemo_gym:
+    # code_gen requires sandbox_config.image, and the dry run validates it. The dry run starts no
+    # sandbox, so any string works here.
+    code_gen:
+      resources_servers:
+        code_gen:
+          sandbox_config:
+            image: prefetch-placeholder
     swe_pivot_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -20,6 +28,7 @@ env:
             name: swe_pivot_tool_simulation_agent
     terminal_multi_harness_stirrup_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -27,6 +36,7 @@ env:
             name: terminal_multi_harness_stirrup_agent
     terminal_multi_harness_agent006_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -34,6 +44,7 @@ env:
             name: terminal_multi_harness_agent006_agent
     terminal_multi_harness_opencode_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -41,6 +52,7 @@ env:
             name: terminal_multi_harness_opencode_agent
     terminal_multi_harness_codex_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -62,6 +74,7 @@ env:
             name: swe_agents_val
     litmus_agent_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:

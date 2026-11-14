@@ -9,6 +9,7 @@ STEPS_PER_RUN=3
 MAX_STEPS=3
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=60
+USES_OPENSANDBOX=1
 # ===== END CONFIG =====
 
 # Same driver and gates as the token_capture nightly, run on this recipe.

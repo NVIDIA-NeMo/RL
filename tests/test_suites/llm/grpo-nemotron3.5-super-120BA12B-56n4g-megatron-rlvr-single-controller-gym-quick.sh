@@ -30,6 +30,7 @@ NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=120
 USE_GYM_CONTAINER=true
 USES_SANDBOX=1
+USES_OPENSANDBOX=1
 JOB_REAPER_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"Super 3.5 GRPO with external judge pools idles GPUs during model loading"}}'
 # ===== END CONFIG =====
 

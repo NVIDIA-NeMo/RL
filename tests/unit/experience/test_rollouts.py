@@ -55,6 +55,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_manager import (
@@ -3032,6 +3033,83 @@ def test_prepare_nemo_gym_rows_stamps_distinct_legacy_prompt_groups():
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0, 0]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 0, 1]
     assert [row["_rowidx"] for row in rows] == [0, 1, 2, 3]
+
+
+def test_prepare_nemo_gym_rows_stamps_one_task_index_per_prompt_group():
+    first_call = [{"responses_create_params": {}} for _ in range(4)]
+    second_call = [{"responses_create_params": {}} for _ in range(2)]
+    for rows in (first_call, second_call):
+        rollouts_mod._prepare_nemo_gym_rows(
+            rows,
+            generation_config={"max_new_tokens": 64},
+            sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+            num_generations=2,
+        )
+
+    # Gym builds a flat row's task from its task index and names the episode "{task}-{rollout}": a prompt group
+    # shares one index, and no index repeats across groups or calls, as with the async collector's run-wide counter.
+    indices = [row[NEMO_GYM_TASK_INDEX_KEY] for row in first_call + second_call]
+    assert (
+        indices[0] == indices[1]
+        and indices[2] == indices[3]
+        and indices[4] == indices[5]
+    )
+    assert len({indices[0], indices[2], indices[4]}) == 3
+
+
+def test_prepare_nemo_gym_rows_leaves_materialized_rows_without_a_task_index():
+    # Materialized rows carry their own task ID; the NeMo-Gym actor names their
+    # synchronous episodes by prompt group, which a task index would override.
+    row = {
+        "task_id": {"taskset": "workplace:train", "task_id": "17"},
+        "task_input": {"responses_create_params": {}},
+    }
+    rows = [deepcopy(row), deepcopy(row)]
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config={"max_new_tokens": 64},
+        sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+        num_generations=2,
+    )
+    assert all(NEMO_GYM_TASK_INDEX_KEY not in row for row in rows)
+
+
+def test_prepare_nemo_gym_rows_keeps_a_stamped_task_index():
+    rows = [
+        {"responses_create_params": {}, NEMO_GYM_TASK_INDEX_KEY: 7},
+        {"responses_create_params": {}},
+    ]
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config={"max_new_tokens": 64},
+        sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+        num_generations=2,
+    )
+    assert [row[NEMO_GYM_TASK_INDEX_KEY] for row in rows] == [7, 7]
+
+    mixed = [
+        {"responses_create_params": {}, NEMO_GYM_TASK_INDEX_KEY: task_index}
+        for task_index in (7, 8)
+    ]
+    with pytest.raises(ValueError, match="inconsistent or negative"):
+        rollouts_mod._prepare_nemo_gym_rows(
+            mixed,
+            generation_config={"max_new_tokens": 64},
+            sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+            num_generations=2,
+        )
+
+
+def test_nemo_gym_group_task_index_checks_each_prompt_group():
+    rows = [{NEMO_GYM_TASK_INDEX_KEY: task_index} for task_index in (3, 3, 9, 9)]
+
+    # A synchronous batch of two prompt groups is valid but carries no single task index.
+    assert rollouts_mod._nemo_gym_group_task_index(rows, group_size=2) is None
+    assert rollouts_mod._nemo_gym_group_task_index(rows[:2], group_size=2) == 3
+    assert rollouts_mod._nemo_gym_group_task_index(rows[:2], group_size=None) == 3
+    assert rollouts_mod._nemo_gym_group_task_index([{}, {}], group_size=2) is None
+    with pytest.raises(ValueError, match="one _ng_task_index per prompt group"):
+        rollouts_mod._nemo_gym_group_task_index(rows, group_size=4)
 
 
 def test_prepare_nemo_gym_rows_updates_mixed_materialized_and_flat_inputs():
