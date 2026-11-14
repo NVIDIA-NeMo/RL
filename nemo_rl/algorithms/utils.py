@@ -855,7 +855,10 @@ def print_performance_metrics(
 
     number_of_samples_per_step = num_prompts_per_step * num_generations_per_prompt
 
-    if colocated_inference:
+    if master_config.policy["generation"]["backend"] == "coreweave":
+        training_num_gpus = total_num_gpus
+        generation_num_gpus = 0
+    elif colocated_inference:
         training_num_gpus = total_num_gpus
         generation_num_gpus = total_num_gpus
     else:
@@ -902,7 +905,7 @@ def print_performance_metrics(
     )
     generation_tokens_per_sec_per_gpu = (
         total_num_tokens / generation_time / generation_num_gpus
-        if generation_time > 0
+        if generation_time > 0 and generation_num_gpus > 0
         else 0
     )
 

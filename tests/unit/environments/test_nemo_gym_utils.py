@@ -81,6 +81,19 @@ def test_setup_nemo_gym_config_rejects_unsupported_backend() -> None:
         setup_nemo_gym_config(config, tokenizer=None)
 
 
+def test_coreweave_gym_does_not_require_a_local_async_engine() -> None:
+    config = SimpleNamespace(
+        policy={"generation": {"backend": "coreweave"}},
+        env={"should_use_nemo_gym": True},
+    )
+    with patch.object(
+        nemo_gym_mod,
+        "should_use_async_rollouts",
+        side_effect=AssertionError("external endpoint must not create a local engine"),
+    ):
+        assert nemo_gym_mod.should_use_nemo_gym(config)
+
+
 @pytest.mark.parametrize("capture_enabled", [False, True])
 @pytest.mark.parametrize("tile_cap", [0, 4])
 @pytest.mark.parametrize(
@@ -1206,6 +1219,34 @@ def test_build_nemo_gym_actors_hands_every_actor_the_policy_api_key(
 
     assert cluster.actor_configs
     assert all(cfg["policy_api_key"] == "per-job-key" for cfg in cluster.actor_configs)
+
+
+@pytest.mark.parametrize(
+    "env_configs", [_env_configs, _shard_env_configs], ids=["unsharded", "sharded"]
+)
+def test_gym_actors_use_the_explicit_file_credential_runtime(
+    detected_uv_dirs, env_configs
+):
+    cluster = _FakeGymCluster()
+    runtime_env = {
+        "py_executable": "/gym/bin/python",
+        "env_vars": {"CWTRAIN_ROLLOUT_API_KEY_FILE": "/mounted/gateway-key"},
+    }
+    with _patched_cluster(cluster):
+        build_nemo_gym_actors(
+            env_configs(),
+            base_urls=["https://gateway.example/v1"],
+            model_name="policy",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+            runtime_env=runtime_env,
+        )
+    assert cluster.actor_options
+    assert all(
+        options["runtime_env"] == runtime_env for options in cluster.actor_options
+    )
 
 
 def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs):

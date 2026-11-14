@@ -107,6 +107,18 @@ def create_weight_synchronizer(
         NotImplementedError: If the requested configuration is not supported.
         ValueError: If required arguments are missing.
     """
+    if generation_backend == "coreweave":
+        # cwtrain is optional and is imported only for this backend.
+        from nemo_rl.weight_sync.coreweave_weight_synchronizer import (
+            CoreWeaveHotLoadWeightSynchronizer,
+        )
+
+        if colocated or policy.cfg["offload_policy_before_refit"]:
+            raise ValueError(
+                "CoreWeave requires dedicated trainer GPUs without offload_policy_before_refit"
+            )
+        return CoreWeaveHotLoadWeightSynchronizer(policy, generation)
+
     _SUPPORTED_BACKENDS = {
         VLLM_BACKEND,
         SGLANG_BACKEND,

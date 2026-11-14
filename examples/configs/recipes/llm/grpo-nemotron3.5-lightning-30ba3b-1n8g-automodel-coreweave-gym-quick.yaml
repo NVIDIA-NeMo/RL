@@ -1,0 +1,118 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_num_steps: 2
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: null
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2.0
+checkpointing:
+  enabled: false
+policy:
+  model_name: ${oc.env:CWTRAIN_MODEL_DIR}
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: false
+  precision: bfloat16
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 3072
+  offload_policy_before_refit: false
+  automodel_cfg:
+    enabled: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    expert_parallel_size: 8
+    activation_checkpointing: true
+    moe_parallelizer:
+      ignore_router_for_ac: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: te
+        rms_norm: torch_fp32
+        experts: gmm
+        dispatcher: deepep
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+  megatron_cfg:
+    enabled: false
+  hf_config_overrides:
+    router_aux_loss_coef: 0.0
+  sequence_packing:
+    enabled: false
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 1.0e-6
+      weight_decay: 0.1
+      betas: [0.9, 0.98]
+      eps: 1.0e-8
+  generation:
+    backend: coreweave
+    max_new_tokens: 2048
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    refit_transport: null
+    use_async_rollouts: false
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: null
+        gpus_per_node: null
+    coreweave_cfg:
+      base_url: ${oc.env:CWTRAIN_ROLLOUT_BASE_URL}
+      model: ${oc.env:CWTRAIN_ROLLOUT_MODEL}
+      deployment_id: ${oc.env:CWTRAIN_HOTLOAD_DEPLOYMENT_ID}
+      run_id: ${oc.env:CWTRAIN_HOTLOAD_RUN_ID}
+      state_dir: ${oc.env:CWTRAIN_HOTLOAD_STATE_DIR}
+      max_model_len: ${policy.max_total_sequence_length}
+      api_key_file: ${oc.env:CWTRAIN_ROLLOUT_API_KEY_FILE}
+      full_every: 20
+      concurrency: 8
+data:
+  max_input_seq_length: null
+  train:
+    dataset_name: NemoGymDataset
+    data_path: ${oc.env:CWTRAIN_GYM_DATA_PATH}
+  validation: null
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    system_prompt_file: null
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    config_paths:
+      - responses_api_models/external_model/configs/external_model_for_training.yaml
+      - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    num_gpu_nodes: 1
+    policy_tokenizer_path: ${policy.tokenizer.name}
+    policy_max_model_len: ${policy.max_total_sequence_length}
+    policy_served_identity_file: ${policy.generation.coreweave_cfg.state_dir}/served_identity
+    policy_api_key_file: ${policy.generation.coreweave_cfg.api_key_file}
+    policy_model:
+      responses_api_models:
+        external_model:
+          chat_template_kwargs: ${policy.tokenizer.chat_template_kwargs}
+logger:
+  wandb_enabled: false
+  tensorboard_enabled: true
+  log_dir: logs/coreweave-gym-quick
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
