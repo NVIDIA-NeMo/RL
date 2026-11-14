@@ -25,6 +25,7 @@ from pydantic import (
     PositiveInt,
 )
 
+from nemo_rl.models.generation.dynamo.config import DynamoCfg
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     get_num_routed_experts,
@@ -36,6 +37,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     NvFp4PerTokenRolloutConfig,
     resolve_boundary_ignore_patterns,
 )
+from nemo_rl.models.generation.vllm.worker_utils import resolve_vllm_dp_size
 
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
@@ -68,10 +70,11 @@ class VllmSpecificArgs(TypedDict):
     video: NotRequired[VllmVideoConfig]
     load_format: NotRequired[str]
     precision: NotRequired[str]
-    # Whether vLLM returns logprobs before or after generation-time logit
-    # processors. RL policy recomputation uses raw model logits, so recipes
-    # with generation-time processors should request ``raw_logprobs`` when
-    # comparing generation and policy logprobs.
+    # Whether vLLM returns logprobs before or after temperature, top-k/top-p
+    # filtering and other generation-time logit processors. The trainer replays
+    # top-k/top-p (not penalties, logit bias or bad words) on its
+    # temperature-scaled logits, so training with a filter requires
+    # ``processed_logprobs``.
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
     # Compute the logits with an fp32 LM head: bf16 operands, fp32 GEMM output,
     # via vLLM's head_dtype="float32" hf_override (any model whose lm_head is
@@ -94,7 +97,10 @@ class VllmSpecificArgs(TypedDict):
     # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
     # Supports exact names, substrings, and fnmatch wildcards.
     quantization_ignore_patterns: NotRequired[list[str]]
-    kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]
+    # Dynamic per-(token, head) scales require FP8 precision and Triton attention.
+    kv_cache_dtype: Literal[
+        "auto", "fp8", "fp8_e4m3", "fp8_ds_mla", "fp8_per_token_head"
+    ]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
     # Collect vLLM request, cache, and cumulative token counters in a model-owner
@@ -121,6 +127,9 @@ class VllmSpecificArgs(TypedDict):
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
     expose_http_server: NotRequired[bool]
+    # Positive frontend process count sharing one engine and socket; 1
+    # keeps a single frontend. Multiple processes require async HTTP serving.
+    http_api_server_count: NotRequired[int]
     # Require `Authorization: Bearer <key>` on the exposed server's OpenAI routes
     # (/v1/* and /tokenize). VllmGeneration generates one random key per job, hands
     # it to the workers, and exposes it as `http_server_api_key` for the NeMo-Gym
@@ -269,12 +278,55 @@ class VllmConfig(GenerationConfig):
     # ACTOR_ENVIRONMENT_REGISTRY.
     worker_extension_cls_fqn: NotRequired[str | None]
 
+    # Serve these same workers behind Dynamo's frontend (OpenAI API and KV-aware
+    # router). Every other vLLM setting keeps its meaning. Implies
+    # vllm_cfg.async_engine, since Dynamo drives the engine's AsyncLLM.
+    dynamo: NotRequired[bool]
+    # Optional frontend and registration settings; DynamoCfg holds the defaults.
+    dynamo_cfg: NotRequired[DynamoCfg]
+
+
+def resolve_vllm_logprobs_mode(config: VllmConfig) -> str | None:
+    """The engine's logprobs_mode; vllm_cfg overrides vllm_kwargs as in the worker.
+
+    None means vLLM's default, raw_logprobs.
+    """
+    logprobs_mode = (config.get("vllm_cfg") or {}).get("logprobs_mode")
+    if logprobs_mode is None:
+        logprobs_mode = (config.get("vllm_kwargs") or {}).get("logprobs_mode")
+    return logprobs_mode
+
+
+def resolve_vllm_kv_cache_dtype(vllm_cfg: VllmSpecificArgs) -> str:
+    """Return the selected cache format and validate dynamic FP8 precision."""
+    kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
+    if kv_cache_dtype == "fp8_per_token_head" and vllm_cfg.get("precision") != "fp8":
+        raise ValueError("fp8_per_token_head requires precision='fp8'")
+    return kv_cache_dtype
+
 
 def validate_vllm_quantization_config(config: VllmConfig) -> None:
     """Reject quantization options that would otherwise be silently ignored."""
     vllm_cfg = config.get("vllm_cfg")
     if vllm_cfg is None:
         return
+    if vllm_cfg.get("kv_cache_dtype") == "fp8_per_token_head":
+        resolve_vllm_kv_cache_dtype(vllm_cfg)
+        if config.get("real_quant"):
+            raise ValueError("fp8_per_token_head does not support real_quant")
+        vllm_kwargs = config.get("vllm_kwargs") or {}
+        attention_config = vllm_kwargs.get("attention_config") or {}
+        for backend in (
+            vllm_kwargs.get("attention_backend"),
+            attention_config.get("backend"),
+        ):
+            if backend is not None and backend != "TRITON_ATTN":
+                raise ValueError(
+                    "kv_cache_dtype='fp8_per_token_head' requires TRITON_ATTN; "
+                    "set vllm_kwargs.attention_backend or "
+                    "vllm_kwargs.attention_config.backend to 'TRITON_ATTN'. "
+                    f"Got {backend!r}."
+                )
     refit_prequantize = vllm_cfg.get("refit_prequantize")
     if refit_prequantize is not None and not isinstance(refit_prequantize, bool):
         raise ValueError(
@@ -305,6 +357,33 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
     vllm_cfg = config.get("vllm_cfg")
     if vllm_cfg is None:
         return
+    api_server_count = vllm_cfg.get("http_api_server_count", 1)
+    if api_server_count < 1:
+        raise ValueError("http_api_server_count must be a positive integer")
+    if api_server_count > 1:
+        if not (vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")):
+            raise ValueError(
+                "Multiple API servers require async_engine=true and expose_http_server=true"
+            )
+        if config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS:
+            raise ValueError("Multiple HTTP API servers do not support sparse refit")
+        vllm_kwargs = config.get("vllm_kwargs") or {}
+        data_parallel_size = vllm_kwargs.get("data_parallel_size")
+        tp_size = vllm_cfg.get("tensor_parallel_size")
+        ep_size = vllm_cfg.get("expert_parallel_size")
+        if (
+            (data_parallel_size is not None and data_parallel_size != 1)
+            or vllm_kwargs.get("data_parallel_backend") == "ray"
+            or (
+                tp_size is not None
+                and ep_size is not None
+                and resolve_vllm_dp_size(tp_size, ep_size) != 1
+            )
+        ):
+            raise ValueError(
+                "Multiple HTTP API servers require local vLLM DP=1 and "
+                "data_parallel_backend other than 'ray'"
+            )
     if vllm_cfg.get("flat_logprobs") and not (
         vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
     ):
@@ -571,6 +650,40 @@ def validate_nvfp4_pertoken_model(hf_config: Any) -> None:
         )
 
 
+NATIVE_MXFP8_LINEAR_KERNELS = {
+    "flashinfer_cutedsl": "FlashInferCutedslMxfp8LinearKernel",
+    "flashinfer_trtllm": "FlashInferTrtllmMxfp8LinearKernel",
+}
+
+
+def _requested_linear_backend(config: VllmConfig) -> str | None:
+    vllm_kwargs = config.get("vllm_kwargs") or {}
+    kernel_config = vllm_kwargs.get("kernel_config") or {}
+    backend = vllm_kwargs.get("linear_backend")
+    if isinstance(backend, str):
+        backend = backend.lower().replace("-", "_")
+    if backend in (None, "auto") and isinstance(kernel_config, Mapping):
+        backend = kernel_config.get("linear_backend") or backend
+    return backend.lower().replace("-", "_") if isinstance(backend, str) else None
+
+
+def _reject_native_mxfp8_linear_refit_transport(
+    config: VllmConfig, transport: str
+) -> None:
+    """Reject native MXFP8 linear kernels on refit transports that bypass reload."""
+    vllm_cfg = config.get("vllm_cfg") or {}
+    if not (vllm_cfg.get("precision") == "fp8" and vllm_cfg.get("is_mx") is True):
+        return
+    linear_backend = _requested_linear_backend(config)
+    if linear_backend not in NATIVE_MXFP8_LINEAR_KERNELS:
+        return
+    raise ValueError(
+        f"refit_transport={transport!r} does not support native MXFP8 linear "
+        f"kernels (linear_backend={linear_backend!r}). Use refit_transport=null "
+        "(collective/IPC) or a non-native linear_backend."
+    )
+
+
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     """Validate the selected refit transport and resolve its scoped defaults."""
     validate_vllm_quantization_config(config)
@@ -588,6 +701,7 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
         )
     if transport is None:
         return None
+    _reject_native_mxfp8_linear_refit_transport(config, transport)
     if transport == "nccl_reshard":
         # nccl_reshard doesn't takes refit_cfg.
         return None

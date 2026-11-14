@@ -1,7 +1,6 @@
 # Heterogeneous-job external Gym vLLM pools
 
-These helpers run arbitrary fixed-model vLLM pools beside NeMo RL in one
-two-component Slurm heterogeneous job:
+These helpers run arbitrary fixed-model vLLM pools beside NeMo RL in one two-component Slurm heterogeneous job:
 
 ```text
 one Slurm heterogeneous job
@@ -9,40 +8,25 @@ one Slurm heterogeneous job
 └── hetgroup 1: independent private Ray/vLLM replicas
 ```
 
-`run_in_allocation.sh` is service-agnostic. A recipe launcher defines named
-pools such as GenRM, NL2Bash, or safety, including each model's environment and
-vLLM arguments. The wrapper then:
+`run_in_allocation.sh` is service-agnostic. A recipe launcher defines named pools such as GenRM, NL2Bash, or safety, including each model's environment and vLLM arguments. The wrapper then:
 
 1. validates every pool and splits hetgroup 1 into disjoint node slices;
 2. starts every replica in its own private Ray cluster;
 3. starts one OpenAI-compatible load balancer per pool;
-4. replaces each pool's URL placeholder, and replaces
-   `__EXTERNAL_SERVICE_READINESS__` with an explicit backend-count readiness
-   contract for the NeMo Gym config;
+4. replaces each pool's URL placeholder, and replaces `__EXTERNAL_SERVICE_READINESS__` with an explicit backend-count readiness contract for the NeMo Gym config;
 5. starts `ray.sub` on hetgroup 0 while the external models are still loading;
-6. lets the NeMo Gym actor start its local servers, then waits for every
-   external load balancer to report the required healthy backend count; and
+6. lets the NeMo Gym actor start its local servers, then waits for every external load balancer to report the required healthy backend count; and
 7. stops training if any required external service exits.
 
-This overlaps Ray, policy/trainer, and local Gym initialization with external
-model loading without letting rollout setup complete early. The load
-balancer's `/health` response must report `status: ok` and both
-`healthy_backends` and `total_backends` at or above the registered replica
-count. The Gym actor applies one shared, bounded deadline across all pools and
-shuts down its local servers if that deadline expires.
+This overlaps Ray, policy/trainer, and local Gym initialization with external model loading without letting rollout setup complete early. The load balancer's `/health` response must report `status: ok` and both `healthy_backends` and `total_backends` at or above the registered replica count. The Gym actor applies one shared, bounded deadline across all pools and shuts down its local servers if that deadline expires.
 
-Recipe launchers keep their concrete model and serving settings outside these
-helpers. A launcher can add another service without adding another server body
-or lifecycle path to this wrapper.
+Recipe launchers keep their concrete model and serving settings outside these helpers. A launcher can add another service without adding another server body or lifecycle path to this wrapper.
 
-The same pools can instead run as their own long-lived job that training jobs
-attach to; see [Persistent pools (serve mode)](#persistent-pools-serve-mode).
+The same pools can instead run as their own long-lived job that training jobs attach to; see [Persistent pools (serve mode)](#persistent-pools-serve-mode).
 
 ## Pool registration interface
 
-Launchers source `pool_config.sh` and use the same three functions for every
-model. `register_external_vllm_pool` declares topology and endpoint metadata;
-the other functions append environment assignments and argv entries:
+Launchers source `pool_config.sh` and use the same three functions for every model. `register_external_vllm_pool` declares topology and endpoint metadata; the other functions append environment assignments and argv entries:
 
 ```bash
 source "$PROJECT_ROOT/tools/external_gym_vllm/pool_config.sh"
@@ -73,9 +57,7 @@ external_vllm_pool_args SAFETY \
 validate_external_vllm_submission "$COMMAND" "$NUM_EXTERNAL_SERVICE_NODES"
 ```
 
-Registration appends `SAFETY` to `EXTERNAL_VLLM_POOLS` and exports the
-normalized `SAFETY_*` contract inherited by `sbatch`. Adding this pool requires
-no change to `run_in_allocation.sh`.
+Registration appends `SAFETY` to `EXTERNAL_VLLM_POOLS` and exports the normalized `SAFETY_*` contract inherited by `sbatch`. Adding this pool requires no change to `run_in_allocation.sh`.
 
 The generated fields are:
 
@@ -95,23 +77,14 @@ The generated fields are:
 | `POOL_STARTUP_TIMEOUT` | no | `3600` | Seconds allowed for startup. |
 | `POOL_SHARED_PATHS` | no | empty | Newline-separated absolute paths under `EXTERNAL_VLLM_SHARED_ROOT` that the pool container must access. |
 | `POOL_ENV_VARS` | no | empty | Newline-separated `NAME=value` assignments applied before vLLM starts. |
+| `POOL_CACHE_DIR` | no | empty | Persistent JIT compile cache under `EXTERNAL_VLLM_SHARED_ROOT` (vLLM, TorchInductor, Triton, FlashInfer). Each node copies it to local disk before Ray starts and writes new entries back in the background (`cache_sync.sh`), so later jobs skip recompiling. `NRL_COMPILE_CACHE_FORCE_FRESH=1` starts empty but still writes back. The script is `nemo_rl/utils/cache_sync.sh` in the checkout these tools are in, or `NRL_COMPILE_CACHE_SYNC_SCRIPT`. |
 | `POOL_VLLM_ARGS` | no | empty | Newline-separated vLLM CLI arguments, one argv entry per line. |
 
-Registration validates required fields, positive topology values, TCP port
-ranges, TP divisibility, and duplicate ports/placeholders before `sbatch`.
-`EXTERNAL_VLLM_NUM_NODES` is exported as the node total computed from all
-registered pools. Call `validate_external_vllm_submission` after constructing
-`COMMAND` to check its placeholders, shared paths, tool files, and requested
-external node count before submitting the allocation.
+Registration validates required fields, positive topology values, TCP port ranges, TP divisibility, and duplicate ports/placeholders before `sbatch`.
+`EXTERNAL_VLLM_NUM_NODES` is exported as the node total computed from all registered pools. Call `validate_external_vllm_submission` after constructing `COMMAND` to check its placeholders, shared paths, tool files, and requested external node count before submitting the allocation.
 
-The interface uses one-argument-per-line encoding internally, preserving JSON
-configs and paths containing spaces without `eval`. The wrapper itself supplies `--tensor-parallel-size`,
-`--distributed-executor-backend ray`, `--port`, and `--served-model-name`.
-Everything model-specific—including attention, reasoning/tool parsers, expert
-parallelism, MoE backend, cache settings, and loader settings—belongs in the
-launcher's pool definition. A pool's reasoning-parser setting must also agree
-with the consuming Gym server's `uses_reasoning_parser` setting; in particular,
-do not pass `--reasoning-parser` when Gym explicitly disables it.
+The interface uses one-argument-per-line encoding internally, preserving JSON configs and paths containing spaces without `eval`. The wrapper itself supplies `--tensor-parallel-size`, `--distributed-executor-backend ray`, `--port`, and `--served-model-name`.
+Everything model-specific—including attention, reasoning/tool parsers, expert parallelism, MoE backend, cache settings, and loader settings—belongs in the launcher's pool definition. A pool's reasoning-parser setting must also agree with the consuming Gym server's `uses_reasoning_parser` setting; in particular, do not pass `--reasoning-parser` when Gym explicitly disables it.
 
 ## Global contract
 
@@ -147,16 +120,11 @@ The number of nodes in hetgroup 1 must equal:
 sum(POOL_REPLICAS * POOL_TENSOR_PARALLEL_SIZE / GPUS_PER_NODE)
 ```
 
-Every TP value must be divisible by `GPUS_PER_NODE`. The wrapper records the
-actual split in `$BASE_LOG_DIR/<job-id>[-<restart-count>]-logs/node-allocation.txt`
-and writes each resolved URL to `<pool-name-lowercase>_url` in the same
-directory.
+Every TP value must be divisible by `GPUS_PER_NODE`. The wrapper records the actual split in `$BASE_LOG_DIR/<job-id>[-<restart-count>]-logs/node-allocation.txt` and writes each resolved URL to `<pool-name-lowercase>_url` in the same directory.
 
 ### Private-cluster port layout
 
-Each replica uses the same fixed port layout on its disjoint node set. This
-matches `ray.sub` and stays below the `9000` ephemeral-port floor observed on
-GB200 nodes:
+Each replica uses the same fixed port layout on its disjoint node set. This matches `ray.sub` and stays below the `9000` ephemeral-port floor observed on GB200 nodes:
 
 | Range | Purpose |
 |---|---|
@@ -166,39 +134,29 @@ GB200 nodes:
 | `7000-7999` | vLLM engine rendezvous, anchored by `VLLM_PORT=7000`. |
 | `8000` by default | Per-pool vLLM HTTP endpoint (`POOL_VLLM_PORT`). |
 
-The old `10002-19999` Ray worker default overlaps the `9000-65000` ephemeral
-range on these nodes. A vLLM TCPStore probe could therefore select a Ray worker
-port and later fail with `EADDRINUSE`. Keeping both Ray and vLLM internal ports
-in disjoint sub-ephemeral bands removes that race; ports above `19999` are not
-reserved for this helper.
+The old `10002-19999` Ray worker default overlaps the `9000-65000` ephemeral range on these nodes. A vLLM TCPStore probe could therefore select a Ray worker port and later fail with `EADDRINUSE`. Keeping both Ray and vLLM internal ports in disjoint sub-ephemeral bands removes that race; ports above `19999` are not reserved for this helper.
 
 ## Filesystem and container requirements
 
-External replicas mount `EXTERNAL_VLLM_SHARED_ROOT` at the same path inside the
-container. Therefore `BASE_LOG_DIR`, `EXTERNAL_VLLM_TOOLS_DIR_HOST`, and
-absolute local model paths must be under that root. A Hugging Face model ID is
-also accepted.
+External replicas mount `EXTERNAL_VLLM_SHARED_ROOT` at the same path inside the container. Therefore `BASE_LOG_DIR`, `EXTERNAL_VLLM_TOOLS_DIR_HOST`, and absolute local model paths must be under that root. A Hugging Face model ID is also accepted.
 
 Each pool container must provide:
 
 - its configured `POOL_VLLM_PYTHON`;
 - importable `ray` and `vllm` packages in that environment;
-- access to the matching NeMo RL source checkout, or an importable `nemo_rl`
-  package as a fallback; and
+- access to the matching NeMo RL source checkout, or an importable `nemo_rl` package as a fallback; and
 - the `ray` command on `PATH`.
 
-`serve_vllm_on_ray.py` loads NeMo RL's vLLM compatibility patch module directly
-from the matching source checkout and applies it before importing the vLLM API
-server. This avoids importing NeMo RL's policy modules and training dependency
-stack into a purpose-built serving container. If the source checkout is not
-available, the wrapper falls back to the installed `nemo_rl` package.
-`CONTAINER` must provide
-`EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
+`serve_vllm_on_ray.py` loads NeMo RL's vLLM compatibility patch module directly from the matching source checkout and applies it before importing the vLLM API server. This avoids importing NeMo RL's policy modules and training dependency stack into a purpose-built serving container. If the source checkout is not available, the wrapper falls back to the installed `nemo_rl` package.
+`CONTAINER` must provide `EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
+
+### Persistent compile caches for NeMo RL workers
+
+The vLLM and Megatron workers can keep their JIT caches the same way; see [Persistent JIT Compile Caches](../../docs/guides/persistent-jit-caches.md).
 
 ## Slurm submission
 
-The wrapper requires exactly two hetgroups. Submit the NeMo RL nodes first and
-the sum of all external-pool nodes second:
+The wrapper requires exactly two hetgroups. Submit the NeMo RL nodes first and the sum of all external-pool nodes second:
 
 ```bash
 sbatch \
@@ -219,18 +177,14 @@ sbatch \
   tools/external_gym_vllm/run_in_allocation.sh
 ```
 
-Slurm gang-schedules the two components. Replica `srun` steps explicitly use
-hetgroup 1 and load-balancer steps explicitly use hetgroup 0. When starting
-`ray.sub`, the wrapper scopes its unsuffixed Slurm nodelist and node-count
-variables to component 0; Slurm then uses component 0 by default for its steps.
+Test-suite scripts submit this way through `tools/launch` when their CONFIG section sets `NUM_EXTERNAL_SERVICE_NODES`; see "External vLLM pools" in `tests/test_suites/README.md`.
+
+Slurm gang-schedules the two components. Replica `srun` steps explicitly use hetgroup 1 and load-balancer steps explicitly use hetgroup 0. When starting `ray.sub`, the wrapper scopes its unsuffixed Slurm nodelist and node-count variables to component 0; Slurm then uses component 0 by default for its steps.
 External nodes therefore cannot accidentally join the training Ray cluster.
 
 ## Persistent pools (serve mode)
 
-With `EXTERNAL_VLLM_MODE=serve`, the wrapper runs only the pools, as a plain
-(single-component) job that outlives any training job. Training jobs attach to
-it, so a training job that crashes, is preempted, or is resubmitted after a
-change does not reload the judges, and several jobs can share one set of pools.
+With `EXTERNAL_VLLM_MODE=serve`, the wrapper runs only the pools, as a plain (single-component) job that outlives any training job. Training jobs attach to it, so a training job that crashes, is preempted, or is resubmitted after a change does not reload the judges, and several jobs can share one set of pools.
 
 ```text
 pool job (EXTERNAL_VLLM_MODE=serve)       training job (attach_and_run.sh)
@@ -240,8 +194,7 @@ pool job (EXTERNAL_VLLM_MODE=serve)       training job (attach_and_run.sh)
 
 ### Submitting
 
-Register the pools exactly as for a heterogeneous job, then use the two
-`pool_config.sh` helpers instead of one heterogeneous `sbatch`:
+Register the pools exactly as for a heterogeneous job, then use the two `pool_config.sh` helpers instead of one heterogeneous `sbatch`:
 
 ```bash
 source tools/external_gym_vllm/pool_config.sh
@@ -253,22 +206,11 @@ submit_external_vllm_attached_job "${POOL_DIR}" "${pool_job}" "${COMMAND}" \
   --exclusive --gres=gpu:4 --time=04:00:00
 ```
 
-`submit_external_vllm_pool_job` submits a pool job only when no live job owns or
-was submitted for `POOL_DIR`, and prints the job id either way, so the same
-launcher starts a cold pool and reattaches to a warm one.
-`submit_external_vllm_attached_job` submits `attach_and_run.sh` with `COMMAND`
-(it must contain every pool's URL placeholder and
-`__EXTERNAL_SERVICE_READINESS__`). While the pool is not `READY` yet, the job
-also depends on `after:<pool-job>+EXTERNAL_VLLM_ATTACH_AFTER_MIN` (default 15),
-so it does not hold its nodes idle through the pool's queue wait and model load.
-`POOL_DIR` must be under `EXTERNAL_VLLM_SHARED_ROOT`; the training job needs
-`EXTERNAL_VLLM_TOOLS_DIR_HOST`, `BASE_LOG_DIR` and `RAY_SUB` in its environment.
+`submit_external_vllm_pool_job` submits a pool job only when no live job owns or was submitted for `POOL_DIR`, and prints the job id either way, so the same launcher starts a cold pool and reattaches to a warm one.
+`submit_external_vllm_attached_job` submits `attach_and_run.sh` with `COMMAND` (it must contain every pool's URL placeholder and `__EXTERNAL_SERVICE_READINESS__`). While the pool is not `READY` yet, the job also depends on `after:<pool-job>`, so it does not hold its nodes idle through the pool's queue wait. With `EXTERNAL_VLLM_ATTACH_EARLY=0` the dependency adds `+EXTERNAL_VLLM_ATTACH_AFTER_MIN` (default 15) to cover the model load too.
+`POOL_DIR` must be under `EXTERNAL_VLLM_SHARED_ROOT`; the training job needs `EXTERNAL_VLLM_TOOLS_DIR_HOST`, `BASE_LOG_DIR` and `RAY_SUB` in its environment.
 
-`attach_and_run.sh` resolves everything at job start, never at submission: it
-waits for `READY` from the expected pool job, replaces each URL placeholder, and
-replaces `__EXTERNAL_SERVICE_READINESS__` with the same backend-count readiness
-gate a heterogeneous job uses, built from the pool's manifest. Then it runs
-`ray.sub`.
+`attach_and_run.sh` resolves everything at job start, never at submission: it waits for the expected pool job's manifest (for `READY` with `EXTERNAL_VLLM_ATTACH_EARLY=0`), replaces each URL placeholder, and replaces `__EXTERNAL_SERVICE_READINESS__` with the same backend-count readiness gate a heterogeneous job uses, built from the pool's manifest. Then it runs `ray.sub`.
 
 ### Pool directory
 
@@ -285,32 +227,19 @@ gate a heterogeneous job uses, built from the pool's manifest. Then it runs
 
 ### Failure handling
 
-- **A replica or load balancer exits.** The pool job relaunches it on the same
-  nodes; the load balancer drops the dead backend and adds the relaunched one
-  from the registry, so the URLs never change. A step that ran for
-  `EXTERNAL_VLLM_RESTART_RESET_S` before failing has its relaunch count reset;
-  only a step that keeps failing soon after starting exhausts
-  `EXTERNAL_VLLM_MAX_RESTARTS` and ends the pool job.
-- **A pool is below full strength** (a relaunch loading weights, or a replica
-  that is alive but failing health checks). `READY` is withdrawn until every
-  load balancer counts every replica again, so no job attaches to a degraded
-  pool. Jobs already attached keep running against the remaining backends; a
-  wedged replica is not restarted automatically.
-- **The pool job ends, is replaced, or dies without cleanup.** An attached
-  training job stops itself when `STOPPED` appears for its generation, when
-  `generation` changes (a requeued or replaced pool serves from other nodes),
-  or when `heartbeat` is older than `EXTERNAL_VLLM_HEARTBEAT_STALE_S`. Inline
-  mode gets the same guarantee by stopping NeMo RL when a judge exits; without
-  it a run could keep training against dead judges with failing rewards.
-- **Slurm cannot be queried.** While waiting for `READY`, a failed `squeue` is
-  only logged; the pool job counts as gone after
-  `EXTERNAL_VLLM_POOL_GONE_CHECKS` consecutive "finished or unknown" answers.
-- **The pool ends before the training job.** `attach_and_run.sh` warns when the
-  pool's `end_time` is earlier than its own time limit, or refuses to start with
-  `EXTERNAL_VLLM_ATTACH_REQUIRE_LIFETIME=1`.
+- **A replica or load balancer exits.** The pool job relaunches it on the same nodes; the load balancer drops the dead backend and adds the relaunched one from the registry, so the URLs never change. A step that ran for `EXTERNAL_VLLM_RESTART_RESET_S` before failing has its relaunch count reset; only a step that keeps failing soon after starting exhausts `EXTERNAL_VLLM_MAX_RESTARTS` and ends the pool job.
+- **A pool is below full strength** (a relaunch loading weights, or a replica that is alive but failing health checks). `READY` is withdrawn until every load balancer counts every replica again, so no job attaches to a degraded pool. Jobs already attached keep running against the remaining backends; a wedged replica is not restarted automatically.
+- **The pool job ends, is replaced, or dies without cleanup.** An attached training job stops itself when `STOPPED` appears for its generation, when `generation` changes (a requeued or replaced pool serves from other nodes), or when `heartbeat` is older than `EXTERNAL_VLLM_HEARTBEAT_STALE_S`. Inline mode gets the same guarantee by stopping NeMo RL when a judge exits; without it a run could keep training against dead judges with failing rewards.
+- **Slurm cannot be queried.** While waiting for the pool, a failed `squeue` is only logged; the pool job counts as gone after `EXTERNAL_VLLM_POOL_GONE_CHECKS` consecutive "finished or unknown" answers.
+- **The pool ends before the training job.** `attach_and_run.sh` warns when the pool's `end_time` is earlier than its own time limit, or refuses to start with `EXTERNAL_VLLM_ATTACH_REQUIRE_LIFETIME=1`.
 
-Restarting the pool job always changes its URLs; resubmit attached training jobs
-afterwards (a queued one resolves the new URLs when it starts).
+Restarting the pool job always changes its URLs; resubmit attached training jobs afterwards (a queued one resolves the new URLs when it starts).
+
+### Starting before the pool is READY
+
+A pool job publishes `manifest.tsv` (and `pools.env`) as soon as its load balancers are placed, which fixes every URL, and writes `READY` only once every load balancer counts all its replicas healthy. By default `attach_and_run.sh` waits for the manifest (the same pool job generation, a fresh heartbeat and no `STOPPED` marker are still required) and starts `ray.sub` immediately. The readiness gate that replaces `__EXTERNAL_SERVICE_READINESS__` still holds rollout setup until every pool reports its full backend count, so this overlaps initialization with model loading, as an inline heterogeneous job does, without letting rollouts start early. `EXTERNAL_VLLM_ATTACH_EARLY=0` waits for `READY` before it runs `ray.sub`, so Ray, the trainer and Gym initialization start only after the judges have loaded.
+
+To start the training allocation together with a pool that is still queued, submit the pool job held (`--hold`), submit the training job through `submit_external_vllm_attached_job` (it depends on `after:<pool-job>`), then release the pool job: the training job becomes eligible once the pool job starts.
 
 ### Settings
 
@@ -322,10 +251,11 @@ afterwards (a queued one resolves the new URLs when it starts).
 | `EXTERNAL_VLLM_MAX_RESTARTS` | `5` | Relaunches per replica or load balancer before the pool job gives up. |
 | `EXTERNAL_VLLM_RESTART_RESET_S` | `1800` | Uptime after which a step's relaunch count resets. |
 | `EXTERNAL_VLLM_POOL_JOB` | set by `submit_external_vllm_attached_job` | Pool job a training job attaches to. |
-| `EXTERNAL_VLLM_ATTACH_TIMEOUT` | `3600` | How long a training job waits for `READY`. |
+| `EXTERNAL_VLLM_ATTACH_TIMEOUT` | `3600` | How long a training job waits for the pool's manifest (`READY` with `EXTERNAL_VLLM_ATTACH_EARLY=0`). |
 | `EXTERNAL_VLLM_ATTACH_POLL_S` | `15` | How often it checks while waiting. |
 | `EXTERNAL_VLLM_ATTACH_WATCH_S` | `30` | How often it checks the pool while training. |
 | `EXTERNAL_VLLM_HEARTBEAT_STALE_S` | `300` | Heartbeat age at which the pool job counts as dead. |
 | `EXTERNAL_VLLM_POOL_GONE_CHECKS` | `3` | Consecutive "finished or unknown" Slurm answers before the pool job counts as gone. |
 | `EXTERNAL_VLLM_ATTACH_REQUIRE_LIFETIME` | `0` | `1` refuses to start a training job that would outlive the pool job. |
-| `EXTERNAL_VLLM_ATTACH_AFTER_MIN` | `15` | Minutes after the pool job starts before a training job submitted against a loading pool may start. |
+| `EXTERNAL_VLLM_ATTACH_AFTER_MIN` | `15` | Minutes after the pool job starts before a training job submitted against a loading pool may start. Ignored with `EXTERNAL_VLLM_ATTACH_EARLY=1`. |
+| `EXTERNAL_VLLM_ATTACH_EARLY` | `1` | `1` starts `ray.sub` as soon as the pool job has published its URLs; `0` waits until every replica is healthy (`READY`). See [Starting before the pool is READY](#starting-before-the-pool-is-ready). |

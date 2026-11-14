@@ -380,6 +380,12 @@ def _make_manager(
     mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
+    mgr._filter_zero_variance_groups = False
+    # Participation rules for the zero-variance predicate. None means no
+    # group-relative baseline, so every row votes -- the shape these tests assert on.
+    mgr._masked_reward_policy = None
+    mgr._overlong_filtering = False
+    mgr._step_rewards = {}
     return mgr
 
 
@@ -1004,6 +1010,30 @@ def test_rollout_manager_forwards_log_full_result_tables():
     assert RolloutManager(**common)._impl._log_full_result_tables is False
     manager = RolloutManager(**common, log_full_result_tables=True)
     assert manager._impl._log_full_result_tables is True
+
+
+@pytest.mark.parametrize("backend,accepted", [("vllm", True), ("megatron", False)])
+def test_nemo_gym_rollout_accepts_top_k_only_with_vllm(backend, accepted):
+    """NeMo-Gym requests leave top_k unset; only NeMo-RL's vLLM server pins it."""
+    kwargs = {
+        "tokenizer": None,
+        "task_to_env": {},
+        "num_generations_per_prompt": 1,
+        "max_seq_len": 1,
+        "rollout_recovery_config": RolloutRecoveryConfig(),
+        "generation_config": {
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": 20,
+            "backend": backend,
+        },
+        "use_nemo_gym": True,
+    }
+    if accepted:
+        RolloutManager(**kwargs)
+    else:
+        with pytest.raises(AssertionError, match="top_k"):
+            RolloutManager(**kwargs)
 
 
 def _nemo_gym_impl(
@@ -2031,12 +2061,11 @@ def test_async_nemo_gym_rollout_manager(
             None,
         )
         assert last_assistant is not None, f"Completion {i}: no assistant message found"
-        assert torch.equal(
-            last_assistant["token_ids"],
-            torch.tensor([151667, 198, 32313, 11, 1077]),
-        ), (
-            f"Completion {i}: last assistant token_ids {last_assistant['token_ids'].tolist()} "
-            f"!= [151667, 198, 32313, 11, 1077]"
+        # Sampling runs at temperature 1.0. On vLLM 0.33 the fifth token varies between
+        # requests for the same prompt (279 or 1077), so only the first four ids are fixed.
+        token_ids = last_assistant["token_ids"].tolist()
+        assert len(token_ids) == 5 and token_ids[:4] == [151667, 198, 32313, 11], (
+            f"Completion {i}: last assistant token_ids {token_ids}"
         )
 
         # 3. reward
@@ -2161,7 +2190,11 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         assert new_token_ids is not None, (
             f"Completion {i}: no assistant message in manager"
         )
-        assert torch.equal(orig_token_ids, new_token_ids), (
+        # Sampling runs at temperature 1.0. On vLLM 0.33 the fifth token varies between
+        # requests for the same prompt, so only the first four ids are compared.
+        assert len(orig_token_ids) == len(new_token_ids) and torch.equal(
+            orig_token_ids[:4], new_token_ids[:4]
+        ), (
             f"Completion {i}: last assistant token_ids mismatch\n"
             f"  original:  {orig_token_ids.tolist()}\n"
             f"  manager:   {new_token_ids.tolist()}"
@@ -2296,6 +2329,8 @@ def _make_capture_manager(
     mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
+    mgr._filter_zero_variance_groups = False
+    mgr._step_rewards = {}
     mgr._recovery_ledger = RolloutRecoveryLedger()
     mgr._data_plane_checkpoint_barrier = buf.data_plane_checkpoint_barrier
 
@@ -2313,7 +2348,7 @@ def _make_capture_manager(
             generation_indices=None,
             on_completion=None,
             recovery_granularity=RecoveryGranularity.SIBLING,
-            gym_instance_id=None,
+            environment_instance_id=None,
             dispatch_recorder=None,
         ):
             self.seen_rollout_ids = rollout_ids
@@ -2539,9 +2574,14 @@ class TestGenerateForFinalizationFlow:
             raise RuntimeError("rollout exploded")
 
         mgr = _make_capture_manager(buf, on_run=_boom)
+        events = []
+        mgr.recovery_ledger.set_event_sink(
+            lambda event, **fields: events.append((event, fields.get("reason")))
+        )
         with pytest.raises(RuntimeError, match="rollout exploded"):
             _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
         assert len(buf.abort_calls) == 1
+        assert ("attempt_abandoned", "failed") in events
 
     def test_failure_after_rollout_aborts_the_reservation(self, monkeypatch):
         buf = _FakeCaptureBuffer()
@@ -2571,7 +2611,7 @@ class TestGenerateForFinalizationFlow:
                 generation_indices=None,
                 on_completion=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
-                gym_instance_id=None,
+                environment_instance_id=None,
                 dispatch_recorder=None,
             ):
                 del _sample, recovery_granularity
@@ -2685,7 +2725,7 @@ class TestGenerateForFinalizationFlow:
                 generation_indices=None,
                 on_completion=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
-                gym_instance_id=None,
+                environment_instance_id=None,
                 dispatch_recorder=None,
             ):
                 indices = list(generation_indices)
@@ -2911,3 +2951,88 @@ def test_receipt_raw_metrics_preserve_mask_but_defer_reward(honor_mask: bool) ->
         "ng_receipt" in key or "ng_logical_selection" in key for key in metrics
     )
     assert ("mask_sample" in completions[0].env_extras) is honor_mask
+
+
+def _scored_record(*rewards: float) -> PromptGroupRecord:
+    return PromptGroupRecord(
+        prompt_idx=0,
+        prompt=[],
+        extra_env_info=None,
+        metadata={},
+        completions=[SimpleNamespace(reward=reward) for reward in rewards],
+        rollout_metrics={},
+    )
+
+
+class TestStepRewardMetrics:
+    def test_committed_group_is_tallied_under_its_target_step(self):
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(record=_scored_record(1.0, 0.0, 1.0, 0.0)))
+
+        outcome = _run(mgr.generate_and_push({"idx": 0}, target_step=3))
+
+        assert outcome is RolloutOutcome.COMMITTED
+        metrics = mgr.drain_step_reward_metrics(3)
+        assert metrics["generated_prompt_groups"] == 1.0
+        assert metrics["zero_variance_prompt_groups"] == 0.0
+        assert metrics["unfiltered_reward"] == pytest.approx(0.5)
+        assert metrics["first_attempt_reward"] == pytest.approx(0.5)
+
+    def test_dropped_zero_variance_group_still_counts_toward_the_reward(self):
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(record=_scored_record(0.0, 0.0, 0.0, 0.0)))
+        mgr._filter_zero_variance_groups = True
+
+        outcome = _run(mgr.generate_and_push({"idx": 0}, target_step=2))
+
+        # FILTERED, not SKIPPED: the rollout succeeded, so the caller replaces it out
+        # of the dynamic-sampling budget rather than the fault-tolerance one.
+        assert outcome is RolloutOutcome.FILTERED
+        assert len(buf.remove_calls) == 1
+        metrics = mgr.drain_step_reward_metrics(2)
+        assert metrics["generated_prompt_groups"] == 1.0
+        assert metrics["zero_variance_prompt_groups"] == 1.0
+        assert metrics["zero_variance_fraction"] == 1.0
+        assert metrics["unfiltered_reward"] == 0.0
+
+    def test_zero_variance_drop_clears_the_consecutive_drop_run(self):
+        # Healthy filtered rollouts must reset consecutive infrastructure failures.
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(record=_scored_record(0.0, 0.0, 0.0, 0.0)))
+        mgr._filter_zero_variance_groups = True
+        mgr._consecutive_infra_drops = 3
+
+        outcome = _run(mgr.generate_and_push({"idx": 0}, target_step=2))
+
+        assert outcome is RolloutOutcome.FILTERED
+        assert mgr._consecutive_infra_drops == 0
+
+    def test_zero_variance_is_counted_even_when_the_filter_is_off(self):
+        mgr = _make_manager(
+            _FakeBuffer(), _FakeImpl(record=_scored_record(1.0, 1.0, 1.0, 1.0))
+        )
+
+        outcome = _run(mgr.generate_and_push({"idx": 0}, target_step=0))
+
+        assert outcome is RolloutOutcome.COMMITTED
+        assert mgr.drain_step_reward_metrics(0)["zero_variance_prompt_groups"] == 1.0
+
+    def test_replacement_is_excluded_from_the_first_attempt_reward(self):
+        mgr = _make_manager(
+            _FakeBuffer(), _FakeImpl(record=_scored_record(1.0, 1.0, 0.0, 0.0))
+        )
+
+        _run(mgr.generate_and_push({"idx": 0}, target_step=0, replacement_index=1))
+
+        metrics = mgr.drain_step_reward_metrics(0)
+        assert metrics["unfiltered_reward"] == pytest.approx(0.5)
+        assert "first_attempt_reward" not in metrics
+
+    def test_unstamped_prompt_is_not_tallied(self):
+        mgr = _make_manager(
+            _FakeBuffer(), _FakeImpl(record=_scored_record(1.0, 0.0, 1.0, 0.0))
+        )
+
+        _run(mgr.generate_and_push({"idx": 0}))
+
+        assert mgr._step_rewards == {}

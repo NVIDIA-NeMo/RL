@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import cast
 
@@ -21,9 +22,90 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
+    resolve_vllm_kv_cache_dtype,
     validate_vllm_async_actor_settings,
     validate_vllm_quantization_config,
 )
+
+
+@pytest.mark.parametrize(
+    "cache_dtype", ["auto", "fp8", "fp8_e4m3", "fp8_ds_mla", "fp8_per_token_head"]
+)
+def test_kv_cache_dtype_is_preserved(cache_dtype: str) -> None:
+    cfg = {"precision": "fp8", "kv_cache_dtype": cache_dtype}
+    assert resolve_vllm_kv_cache_dtype(cfg) == cache_dtype
+    validate_vllm_quantization_config({"vllm_cfg": cfg})
+
+
+def test_fp8_per_token_head_requires_fp8_precision() -> None:
+    with pytest.raises(ValueError, match="requires precision"):
+        validate_vllm_quantization_config(
+            {
+                "vllm_cfg": {
+                    "precision": "bfloat16",
+                    "kv_cache_dtype": "fp8_per_token_head",
+                }
+            }
+        )
+
+
+def test_fp8_per_token_head_rejects_real_quant() -> None:
+    with pytest.raises(ValueError, match="does not support real_quant"):
+        validate_vllm_quantization_config(
+            {
+                "real_quant": True,
+                "vllm_cfg": {
+                    "precision": "fp8",
+                    "kv_cache_dtype": "fp8_per_token_head",
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"attention_backend": "FLASH_ATTN"},
+        {"attention_config": {"backend": "FLASH_ATTN"}},
+        {
+            "attention_backend": "TRITON_ATTN",
+            "attention_config": {"backend": "FLASH_ATTN"},
+        },
+        {
+            "attention_backend": "FLASH_ATTN",
+            "attention_config": {"backend": "TRITON_ATTN"},
+        },
+    ],
+)
+def test_fp8_per_token_head_rejects_incompatible_backend(kwargs: dict) -> None:
+    with pytest.raises(ValueError, match="requires TRITON_ATTN"):
+        validate_vllm_quantization_config(
+            {
+                "vllm_cfg": {
+                    "precision": "fp8",
+                    "kv_cache_dtype": "fp8_per_token_head",
+                },
+                "vllm_kwargs": kwargs,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"attention_backend": "TRITON_ATTN"},
+        {"attention_config": {"backend": "TRITON_ATTN"}},
+    ],
+)
+def test_fp8_per_token_head_preserves_backend(kwargs: dict) -> None:
+    config = {
+        "vllm_cfg": {"precision": "fp8", "kv_cache_dtype": "fp8_per_token_head"},
+        "vllm_kwargs": kwargs,
+    }
+    original = deepcopy(config)
+    validate_vllm_quantization_config(config)
+    assert config == original
 
 
 @pytest.mark.parametrize(
@@ -178,10 +260,43 @@ def test_async_actor_settings_reject_ignored_options(
         validate_vllm_async_actor_settings(cast(VllmConfig, {"vllm_cfg": vllm_cfg}))
 
 
+@pytest.mark.parametrize("count", [0, -1])
+def test_async_actor_settings_reject_invalid_api_server_count(count: int) -> None:
+    with pytest.raises(
+        ValueError, match="http_api_server_count must be a positive integer"
+    ):
+        validate_vllm_async_actor_settings(
+            cast(VllmConfig, {"vllm_cfg": {"http_api_server_count": count}})
+        )
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {},
+        {"async_engine": False, "expose_http_server": True},
+        {"async_engine": True, "expose_http_server": False},
+    ],
+)
+def test_async_actor_settings_require_async_http_for_multiple_frontends(
+    settings: dict,
+) -> None:
+    with pytest.raises(ValueError, match="Multiple API servers require"):
+        validate_vllm_async_actor_settings(
+            cast(VllmConfig, {"vllm_cfg": {"http_api_server_count": 8, **settings}})
+        )
+
+
 @pytest.mark.parametrize(
     "vllm_cfg",
     [
         {},
+        {"http_api_server_count": 1},
+        {
+            "http_api_server_count": 8,
+            "async_engine": True,
+            "expose_http_server": True,
+        },
         {"flat_logprobs": False, "output_loop_yield_budget_ms": None},
         {
             "flat_logprobs": True,

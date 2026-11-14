@@ -29,14 +29,15 @@ from pydantic import ValidationError
 from nemo_rl.algorithms.async_utils.staleness_sampler import SamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
-from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     FleetHealthConfig,
     GenerationRouterConfig,
     MasterConfig,
     RolloutFailureConfig,
+    TokenCaptureConfig,
     WatchdogConfig,
+    logprob_passes_required,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
@@ -67,7 +68,11 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
         ),
         policy={
             "train_global_batch_size": num_prompts_per_step * 4,
-            "generation": {"backend": "vllm", "colocated": {"enabled": False}},
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {"http_api_server_count": 1},
+                "colocated": {"enabled": False},
+            },
         },
         loss_fn=ClippedPGLossConfig(
             reference_policy_kl_penalty=0,
@@ -79,19 +84,38 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
     )
 
 
-@pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
-def test_single_forward_threshold_rejected_before_streaming_setup(
-    algorithm: str,
-) -> None:
+def _single_forward_config() -> MasterConfig:
     cfg = _master_config()
     cfg.loss_fn.seq_logprob_error_in_loss = True
-    cfg.grpo.seq_logprob_error_threshold = 2.0
     cfg.loss_fn.force_on_policy_ratio = True
-    if algorithm == "ppo":
-        # The loss flag must be rejected even without a GRPO block.
-        cfg.ppo = PPOConfig.model_construct()
-        cfg.grpo = None
-    with pytest.raises(ValueError, match="advantage baselines"):
+    cfg.grpo.seq_logprob_error_threshold = 2.0
+    cfg.policy["megatron_cfg"] = {"enabled": True}
+    return cfg
+
+
+def test_single_forward_threshold_accepted_and_skips_policy_logprobs() -> None:
+    cfg = _single_forward_config()
+    validate_single_controller_config(cfg)
+    assert logprob_passes_required(cfg, cfg.grpo) == (False, False)
+    cfg.loss_fn.seq_logprob_error_in_loss = False
+    assert logprob_passes_required(cfg, cfg.grpo) == (True, False)
+
+
+def test_single_forward_threshold_rejected_for_forest_training() -> None:
+    cfg = _single_forward_config()
+    # enabled=True so the "forest_training requires token_capture.enabled"
+    # check cannot stand in for the in-loss rejection.
+    cfg.token_capture = TokenCaptureConfig.model_construct(
+        enabled=True, forest_training=True
+    )
+    with pytest.raises(ValueError, match="seq_logprob_error_in_loss"):
+        validate_single_controller_config(cfg)
+
+
+def test_single_forward_threshold_requires_a_threshold() -> None:
+    cfg = _single_forward_config()
+    cfg.grpo.seq_logprob_error_threshold = None
+    with pytest.raises(ValueError, match="requires seq_logprob_error_threshold"):
         validate_single_controller_config(cfg)
 
 
@@ -312,7 +336,11 @@ class TestWrongPathFaultToleranceIsRejected:
             ),
             policy={
                 "train_global_batch_size": 8,
-                "generation": {"backend": "vllm", "colocated": {"enabled": False}},
+                "generation": {
+                    "backend": "vllm",
+                    "vllm_cfg": {"http_api_server_count": 1},
+                    "colocated": {"enabled": False},
+                },
             },
             loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0),
             env={"should_use_nemo_gym": use_nemo_gym},

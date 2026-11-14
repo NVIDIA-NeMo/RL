@@ -1,45 +1,22 @@
 # nemo_rl.data_plane
 
-Stable boundary between NeMo-RL and the underlying data-plane backend
-(currently `transfer_queue`; future: `nv-dataplane`). Every call site in
-`nemo_rl/algorithms`, `nemo_rl/experience`, `nemo_rl/models` goes through
-`DataPlaneClient`. No code imports `transfer_queue` directly outside the
-adapter.
+Stable boundary between NeMo-RL and the underlying data-plane backend (currently `transfer_queue`). Every call site in `nemo_rl/algorithms`, `nemo_rl/experience`, `nemo_rl/models` goes through `DataPlaneClient`. No code imports `transfer_queue` directly outside the adapter.
 
 ---
 
 ## Vocabulary
 
-- **partition** — a named data-flow scope in TQ (e.g. `"train"`,
-  `"val"`). Each partition owns its own field schema, consumer task
-  set, and per-sample production-status matrix. Sync GRPO uses one
-  stable partition (`"train"`) that is cleared and reused across
-  steps — different partitions are for different data flows
-  (training vs validation vs replay buffer), not for different steps.
-- **sample** — one row in a partition, identified by a per-sample **key**
-  (e.g. `"<uid>_g0"`). Lives in TQ until `kv_clear`.
-- **field** — a named column (e.g. `input_ids`, `advantages`). Producers
-  write fields; consumers select them on read. Each `(sample, field)`
-  pair has an independent "produced?" bit on the TQ controller.
-- **task** — a *consumer* name (e.g. `"prev_lp"`, `"train"`). Each task
-  has its own consumption cursor, used by the task-mediated API only.
-- **`KVBatchMeta`** — the receipt returned by writes. Carries the keys,
-  partition id, sequence lengths, and the **fields written in this
-  put**. NOT a partition-wide schema view — see the cheat-sheet below.
+- **partition** — a named data-flow scope in TQ (e.g. `"train"`, `"val"`). Each partition owns its own field schema, consumer task set, and per-sample production-status matrix. Sync GRPO uses one stable partition (`"train"`) that is cleared and reused across steps — different partitions are for different data flows (training vs validation vs replay buffer), not for different steps.
+- **sample** — one row in a partition, identified by a per-sample **key** (e.g. `"<uid>_g0"`). Lives in TQ until `kv_clear`.
+- **field** — a named column (e.g. `input_ids`, `advantages`). Producers write fields; consumers select them on read. Each `(sample, field)` pair has an independent "produced?" bit on the TQ controller.
+- **task** — a *consumer* name (e.g. `"prev_lp"`, `"train"`). Each task has its own consumption cursor, used by the task-mediated API only.
+- **`KVBatchMeta`** — the receipt returned by writes. Carries the keys, partition id, sequence lengths, and the **fields written in this put**. NOT a partition-wide schema view — see the cheat-sheet below.
 
 ---
 
 ## Mental model
 
-**TQ is a distributed storage and transfer engine.** It holds bulk
-tensors (input_ids, logprobs, masks) addressed by per-sample keys,
-moves them between producer and consumer Ray actors over the wire,
-and tracks per-`(sample, field)` production status so consumers know
-when their inputs are ready. Storage is transient: data lives in TQ
-for the duration of one GRPO step and `kv_clear` drops it at step
-end. The driver never holds bulk between rollout and training — only
-small per-sample slices (rewards, advantages) and metadata
-(`KVBatchMeta`) cross the driver.
+**TQ is a distributed storage and transfer engine.** It holds bulk tensors (input_ids, logprobs, masks) addressed by per-sample keys, moves them between producer and consumer Ray actors over the wire, and tracks per-`(sample, field)` production status so consumers know when their inputs are ready. Storage is transient: data lives in TQ for the duration of one GRPO step and `kv_clear` drops it at step end. The driver never holds bulk between rollout and training — only small per-sample slices (rewards, advantages) and metadata (`KVBatchMeta`) cross the driver.
 
 **Three layers, one-way dependency:**
 
@@ -53,17 +30,14 @@ data_plane/{column_io, preshard}   ← producer/consumer helpers
 data_plane/interfaces.py           ← stable boundary (DataPlaneClient)
         │
         ▼
-data_plane/adapters/               ← TransferQueue / NoOp / future nv-dataplane
+data_plane/adapters/               ← TransferQueue / NoOp
 ```
 
 ---
 
 ## Legacy vs TQ-mediated — same algorithm, encapsulated I/O
 
-The TQ-mediated trainer (`grpo_train_sync`) is meant to read like the
-legacy in-memory trainer (`grpo_train`). The algorithm is identical;
-only the data-fetch and lifecycle calls move behind `TQPolicy` / `meta`
-methods. Per-step side-by-side:
+The TQ-mediated trainer (`grpo_train_sync`) is meant to read like the legacy in-memory trainer (`grpo_train`). The algorithm is identical; only the data-fetch and lifecycle calls move behind `TQPolicy` / `meta` methods. Per-step side-by-side:
 
 | Step | Legacy (`grpo.py: grpo_train`) | TQ-mediated (`grpo_sync.py: grpo_train_sync`) |
 |---|---|---|
@@ -80,15 +54,9 @@ methods. Per-step side-by-side:
 | Train | `policy.train(repeated_batch, loss_fn)` | `policy.train_from_meta(meta, loss_fn)` |
 | Step end | (Python GC) | `policy.finish_step(meta)` |
 
-**The shape of the algorithm is unchanged.** Each TQ-mediated step has
-a one-to-one counterpart in legacy; the only difference is where data
-lives (Python memory vs TQ) and which method moves it.
+**The shape of the algorithm is unchanged.** Each TQ-mediated step has a one-to-one counterpart in legacy; the only difference is where data lives (Python memory vs TQ) and which method moves it.
 
-Per-stage audit grade after the encapsulation refactor: **A**. The
-trainer body never references `policy.dp_client` directly — only meta
-and policy methods. `_apply_dynamic_sampling` still takes a raw
-`dp_client` argument by design so unit tests can inject
-`NoOpDataPlaneClient`.
+Per-stage audit grade after the encapsulation refactor: **A**. The trainer body never references `policy.dp_client` directly — only meta and policy methods. `_apply_dynamic_sampling` still takes a raw `dp_client` argument by design so unit tests can inject `NoOpDataPlaneClient`.
 
 ---
 
@@ -139,9 +107,7 @@ and policy methods. `_apply_dynamic_sampling` still takes a raw
                                                   → next step → ①
 ```
 
-Bulk tensors live in TQ; the driver only holds `meta` + the small
-`driver_carry` slice. On-wire layout is jagged
-(`codec.pack_jagged_fields` ↔ `codec.materialize` at every put / get).
+Bulk tensors live in TQ; the driver only holds `meta` + the small `driver_carry` slice. On-wire layout is jagged (`codec.pack_jagged_fields` ↔ `codec.materialize` at every put / get).
 
 ---
 
@@ -159,19 +125,13 @@ every rank  per microbatch (bins = driver's micro_batch_indices):
               ─► keep this CP rank's slice ─► forward / backward
 ```
 
-Only the replica-group leader reads from TQ; it broadcasts the batch unpadded,
-one field at a time, and every rank pads it afterwards to
-`GLOBAL_FORWARD_PAD_SEQLEN`. Fields in `schema.MICROBATCH_PADDED_FIELDS`
-(today: routes) stay per-row and are padded one microbatch at a time, right
-before the move to GPU; `NRL_ROUTE_BCAST=dense` instead builds and broadcasts
-the padded routes table on the leader.
+Only the replica-group leader reads from TQ; it broadcasts the batch unpadded, one field at a time, and every rank pads it afterwards to `GLOBAL_FORWARD_PAD_SEQLEN`. Fields in `schema.MICROBATCH_PADDED_FIELDS` (today: routes) stay per-row and are padded one microbatch at a time, right before the move to GPU; `NRL_ROUTE_BCAST=dense` instead builds and broadcasts the padded routes table on the leader.
 
 ---
 
 ## `KVBatchMeta`
 
-The receipt for a put. `meta.fields` is only what was written by *this*
-put, not the partition-wide schema. See `interfaces.py` for the ABC.
+The receipt for a put. `meta.fields` is only what was written by *this* put, not the partition-wide schema. See `interfaces.py` for the ABC.
 
 | Attribute | Meaning |
 |---|---|
@@ -183,9 +143,7 @@ put, not the partition-wide schema. See `interfaces.py` for the ABC.
 | `extra_info` | Batch-level bag (`rollout_metrics`, `pad_to_multiple`, `global_forward_pad_seqlen`, packing metadata) |
 | `task_name` | Optional consumer tag, carried through |
 
-**Hard rules** — `kv_batch_put` fields must be `TensorDict` of tensors
-(or `np.ndarray(dtype=object)`); primitives go on `tags`. `select_fields`
-is required on every `kv_batch_get` — no implicit "fetch all".
+**Hard rules** — `kv_batch_put` fields must be `TensorDict` of tensors (or `np.ndarray(dtype=object)`); primitives go on `tags`. `select_fields` is required on every `kv_batch_get` — no implicit "fetch all".
 
 ---
 
@@ -204,8 +162,7 @@ is required on every `kv_batch_get` — no implicit "fetch all".
 
 ## Per-sample key invariant
 
-Keys are minted **once** at rollout (`key_i = f"{uid}_g{i}"`) and reused
-for every subsequent `kv_batch_put` / `kv_batch_get` on that sample.
+Keys are minted **once** at rollout (`key_i = f"{uid}_g{i}"`) and reused for every subsequent `kv_batch_put` / `kv_batch_get` on that sample.
 Worker write-backs append new columns under the same keys.
 
 ---
@@ -214,10 +171,7 @@ Worker write-backs append new columns under the same keys.
 
 ### Call shapes
 
-A real step at production scale —
-`num_prompts_per_step=128, num_generations_per_prompt=4`, DP world = 8,
-prompt ≈ 512 tok, response ≤ 1024 tok. Final batch is `128 × 4 = 512`
-rows.
+A real step at production scale — `num_prompts_per_step=128, num_generations_per_prompt=4`, DP world = 8, prompt ≈ 512 tok, response ≤ 1024 tok. Final batch is `128 × 4 = 512` rows.
 
 **1. Step prepare + rollout** (driver — `grpo_train_sync` body):
 
@@ -350,9 +304,7 @@ policy.finish_step(meta)
 
 ### Sequence-length flow (seqpack / dynbatch)
 
-How `meta.sequence_lengths` routes samples to DP ranks. Worked example
-sized to one production microbatch — 4 prompts × 2 generations = 8
-samples, DP world = 4, lengths typical of math/code rollouts.
+How `meta.sequence_lengths` routes samples to DP ranks. Worked example sized to one production microbatch — 4 prompts × 2 generations = 8 samples, DP world = 4, lengths typical of math/code rollouts.
 
 ```
 # Rollout actor flattens prompt + response per sample.
@@ -386,9 +338,7 @@ data = self._fetch(shard)  # kv_batch_get(shard.keys, select_fields=…)
 ```
 
 **Gotcha — `make_sequence_length_divisible_by` (TP×CP alignment)**:
-`input_ids` is padded to a multiple of TP×CP at write time (e.g. 8 for
-TP=4, CP=2), but `input_lengths` is the actual content length. Seqpack
-balances on actual lengths; padding is reapplied per shard.
+`input_ids` is padded to a multiple of TP×CP at write time (e.g. 8 for TP=4, CP=2), but `input_lengths` is the actual content length. Seqpack balances on actual lengths; padding is reapplied per shard.
 
 ```
 # row with input_lengths=1204, TP×CP=8 → input_ids padded to 1208:
@@ -398,27 +348,15 @@ meta.sequence_lengths:                           1204     # what seqpack uses �
 ```
 
 **Gotcha — DP-rank seq-dim alignment (`global_forward_pad_seqlen`)**:
-Each DP rank's `_fetch` would otherwise pad to its slice's local max,
-so two ranks in the same step could forward at different seq dims.
-That breaks any collective that assumes cross-rank shape uniformity
-(mcore MoE all-to-all, CP, etc.). The data plane handles this with a
-single per-batch cap minted on the driver:
+Each DP rank's `_fetch` would otherwise pad to its slice's local max, so two ranks in the same step could forward at different seq dims.
+That breaks any collective that assumes cross-rank shape uniformity (mcore MoE all-to-all, CP, etc.). The data plane handles this with a single per-batch cap minted on the driver:
 
-* `TQPolicy._stamp_pad_seqlen(meta)` runs before every fan-out
-  (`train_from_meta`, `_logprob_dispatch`, `read_from_dataplane`).
-  Idempotent — sets `meta.extra_info["global_forward_pad_seqlen"]`
-  to `round_up(max(meta.sequence_lengths), max(pad_to_multiple,
-  sequence_length_round))` on first call, no-op on subsequent calls.
-* `shard_meta_for_dp` propagates `extra_info` to every per-rank meta
-  via `dict(meta.extra_info)` — so all ranks see the same target.
-* Worker `_fetch` and driver `read_columns` both pass
-  `pad_to_seqlen = meta.extra_info["global_forward_pad_seqlen"]`
-  into `codec.materialize`, which right-pads the seq dim to that
-  absolute target. All DP ranks within a step therefore return
-  columns at one identical seq dim.
+* `TQPolicy._stamp_pad_seqlen(meta)` runs before every fan-out (`train_from_meta`, `_logprob_dispatch`, `read_from_dataplane`).
+  Idempotent — sets `meta.extra_info["global_forward_pad_seqlen"]` to `round_up(max(meta.sequence_lengths), max(pad_to_multiple, sequence_length_round))` on first call, no-op on subsequent calls.
+* `shard_meta_for_dp` propagates `extra_info` to every per-rank meta via `dict(meta.extra_info)` — so all ranks see the same target.
+* Worker `_fetch` and driver `read_columns` both pass `pad_to_seqlen = meta.extra_info["global_forward_pad_seqlen"]` into `codec.materialize`, which right-pads the seq dim to that absolute target. All DP ranks within a step therefore return columns at one identical seq dim.
 
-Opt out in tests with `_fetch(..., dp_aligned_seq_len=False)` to
-observe per-rank local-pad behavior.
+Opt out in tests with `_fetch(..., dp_aligned_seq_len=False)` to observe per-rank local-pad behavior.
 
 ```
 # 4 DP ranks, slice maxes: [1208, 1320, 944, 1080]; sequence_length_round=64
@@ -430,15 +368,9 @@ global_forward_pad_seqlen = round_up(1320, 64) = 1344
 
 ## Configuration
 
-The data plane is configured via a `data_plane:` block in the master
-YAML (`examples/configs/...`). **YAML is the single source of truth
-for defaults** — the adapter has no hidden `cfg.get(key, default)`
-fallbacks. The canonical exemplar is
-`examples/configs/grpo_math_1B.yaml`.
+The data plane is configured via a `data_plane:` block in the master YAML (`examples/configs/...`). **YAML is the single source of truth for defaults** — the adapter has no hidden `cfg.get(key, default)` fallbacks. The canonical exemplar is `examples/configs/grpo_math_1B.yaml`.
 
-All eight keys below are **required** when `enabled=true`. Recipes
-under `examples/configs/recipes/**/*.yaml` inherit them via
-`defaults:` from the exemplar.
+All eight keys below are **required** when `enabled=true`. Recipes under `examples/configs/recipes/**/*.yaml` inherit them via `defaults:` from the exemplar.
 
 ```yaml
 data_plane:
@@ -478,31 +410,14 @@ data_plane:
 
 ### Observability
 
-`enabled: true` wraps the adapter in `MetricsDataPlaneClient`, which records
-per-op wall time, latency percentiles (fixed-bucket histogram, so per-rank
-counts sum into one cluster-wide distribution) and byte volume. `snapshot()`
-returns the cumulative view; `get_step_metrics(step_time_s)` returns the
-per-step delta already flattened for the logger.
+`enabled: true` wraps the adapter in `MetricsDataPlaneClient`, which records per-op wall time, latency percentiles (fixed-bucket histogram, so per-rank counts sum into one cluster-wide distribution) and byte volume. `snapshot()` returns the cumulative view; `get_step_metrics(step_time_s)` returns the per-step delta already flattened for the logger.
 
-**Scope: one process, not the cluster.** Every process builds its own
-client with its own counters — the driver, each policy worker, the rollout
-actor. `grpo_train_sync` logs the *driver's*, under `data_plane/driver/`.
-The driver issues about one op of each kind per step, so `calls` is small
-by construction; the bulk traffic is the rollout actor's `kv_first_write`
-and the workers' per-DP-rank `get_samples`, and neither appears in these
-series. Do not read `comm_volume_mb` as cluster-wide volume.
+**Scope: one process, not the cluster.** Every process builds its own client with its own counters — the driver, each policy worker, the rollout actor. `grpo_train_sync` logs the *driver's*, under `data_plane/driver/`.
+The driver issues about one op of each kind per step, so `calls` is small by construction; the bulk traffic is the rollout actor's `kv_first_write` and the workers' per-DP-rank `get_samples`, and neither appears in these series. Do not read `comm_volume_mb` as cluster-wide volume.
 
-`OpStats` is additive on purpose, and `merge_snapshots()` uses it: the
-histogram buckets and the byte and wall-time totals from every rank
-*sum* into one cluster-wide view. Everything derived — percentiles, the
-throughput — is recomputed from the merged totals, never
-averaged across ranks (averaging per-rank percentiles does not give a
-cluster percentile).
+`OpStats` is additive on purpose, and `merge_snapshots()` uses it: the histogram buckets and the byte and wall-time totals from every rank *sum* into one cluster-wide view. Everything derived — percentiles, the throughput — is recomputed from the merged totals, never averaged across ranks (averaging per-rank percentiles does not give a cluster percentile).
 
-**What gets charted is the bottleneck, not the detail.** Four ops times
-eight fields is 32 series saying one thing, and a dashboard of 32 lines
-does not answer "where is my time going". So the emitted series are the
-totals and `percent_of_dataplane`, with the per-op detail in a table beside them:
+**What gets charted is the bottleneck, not the detail.** Four ops times eight fields is 32 series saying one thing, and a dashboard of 32 lines does not answer "where is my time going". So the emitted series are the totals and `percent_of_dataplane`, with the per-op detail in a table beside them:
 
 | series | what it answers |
 |---|---|
@@ -515,15 +430,9 @@ totals and `percent_of_dataplane`, with the per-op detail in a table beside them
 | `step/self/{overhead_ms,frac}` | what measuring cost |
 | `step/hash/*` | only with `verify_tensor_hash` on |
 
-Per-op detail is published under `step/by_op/<op>/<field>` and feeds the
-breakdown table rather than a chart.
+Per-op detail is published under `step/by_op/<op>/<field>` and feeds the breakdown table rather than a chart.
 
-**`percent_of_dataplane` is a percentage of data-plane time, not of the step.** The
-denominator is `sum(wall_ms)` over the ops that ran, so
-`by_op/put = 43` reads "43% of the time spent inside the data plane went to
-put". Whether that time mattered against compute is the *other* metric:
-`frac_of_step` divides by the step's own wall clock. Read them together —
-a workload can be 43% put and still not be worth touching.
+**`percent_of_dataplane` is a percentage of data-plane time, not of the step.** The denominator is `sum(wall_ms)` over the ops that ran, so `by_op/put = 43` reads "43% of the time spent inside the data plane went to put". Whether that time mattered against compute is the *other* metric: `frac_of_step` divides by the step's own wall clock. Read them together — a workload can be 43% put and still not be worth touching.
 
 Reading a real TransferQueue step:
 
@@ -534,54 +443,22 @@ step/percent_of_dataplane/by_op/put                 42.1   within it, put is the
 
 `by_op` sums to 100 by construction.
 
-**`frac_of_step` and `wall_s` report the slowest process's data-plane time,
-which the collective makes everyone wait for.** The denominator is one step's
-wall clock, so the numerator has to be wall time too. The DP ranks fetch in
-parallel and then meet at the gradient all-reduce, so no rank passes the
-barrier until the straggler has its shard: the phase costs what the *slowest*
-rank paid. Summing the ranks gives process-time, which exceeded the step
-itself (measured 1.054 across ten processes); averaging them reports a cost no
-rank ever paid. `by_op` percentages still sum, because "where did the time go"
-is a process-time question, not an elapsed one.
+**`frac_of_step` and `wall_s` report the slowest process's data-plane time, which the collective makes everyone wait for.** The denominator is one step's wall clock, so the numerator has to be wall time too. The DP ranks fetch in parallel and then meet at the gradient all-reduce, so no rank passes the barrier until the straggler has its shard: the phase costs what the *slowest* rank paid. Summing the ranks gives process-time, which exceeded the step itself (measured 1.054 across ten processes); averaging them reports a cost no rank ever paid. `by_op` percentages still sum, because "where did the time go" is a process-time question, not an elapsed one.
 
 Two things it still understates, both independent of the reduction:
 
-- The driver's ops and the workers' fetches are *serial* with each other, so
-  the exposed total is `driver + max(workers)` and a max over all processes
-  keeps only the larger. The driver issues about one op of each kind per step
-  against the workers' bulk fetches, so the dropped term is small.
-- The rollout actor's `kv_first_write` -- the largest write in the step -- is
-  in the fan-out (see below) but is also serial with the workers' fetches, so
-  the max keeps only the larger of the two. On the sync path that write is on
-  the critical path.
+- The driver's ops and the workers' fetches are *serial* with each other, so the exposed total is `driver + max(workers)` and a max over all processes keeps only the larger. The driver issues about one op of each kind per step against the workers' bulk fetches, so the dropped term is small.
+- The rollout actor's `kv_first_write` -- the largest write in the step -- is in the fan-out (see below) but is also serial with the workers' fetches, so the max keeps only the larger of the two. On the sync path that write is on the critical path.
 
-The barrier is also at the all-reduce rather than at the end of the fetch: a
-fast rank can start forward while a slow one is still fetching, so what leaks
-through is the straggler's *excess*. `max` is therefore a slight
-over-statement of the fetch phase and an under-statement overall.
+The barrier is also at the all-reduce rather than at the end of the fetch: a fast rank can start forward while a slow one is still fetching, so what leaks through is the straggler's *excess*. `max` is therefore a slight over-statement of the fetch phase and an under-statement overall.
 
-`volume_mb` counts *transfers*, not data size, and two things follow from
-that. A byte written and later read is counted on both sides. And every
-reporting process is summed, so four ranks each fetching their own shard
-count four times. Both are correct for "what crossed the wire" -- every DP
-rank fetches its shard once for the logprob pass and again for the train
-pass, so get counts the batch twice. Neither is correct for "how big was the
-batch", which these series cannot answer.
+`volume_mb` counts *transfers*, not data size, and two things follow from that. A byte written and later read is counted on both sides. And every reporting process is summed, so four ranks each fetching their own shard count four times. Both are correct for "what crossed the wire" -- every DP rank fetches its shard once for the logprob pass and again for the train pass, so get counts the batch twice. Neither is correct for "how big was the batch", which these series cannot answer.
 
-The rollout actor is in the fan-out (`grpo_train_sync` registers it via
-`TQPolicy.add_data_plane_snapshot_source`), so `kv_first_write` -- the write
-of the entire rollout batch -- counts in `volume_mb/by_op/put` and
-`comm_volume_mb`.
+The rollout actor is in the fan-out (`grpo_train_sync` registers it via `TQPolicy.add_data_plane_snapshot_source`), so `kv_first_write` -- the write of the entire rollout batch -- counts in `volume_mb/by_op/put` and `comm_volume_mb`.
 
-On the cluster path the per-op `wall_ms` is summed over processes that ran
-concurrently, so the **`by_op` percentages** are shares of aggregate
-process-time, not of elapsed time. That is the right denominator for "what
-should I optimise" and the wrong one for "what blocked the step" -- which is
-what `frac_of_step` answers, and why it takes a max instead.
+On the cluster path the per-op `wall_ms` is summed over processes that ran concurrently, so the **`by_op` percentages** are shares of aggregate process-time, not of elapsed time. That is the right denominator for "what should I optimise" and the wrong one for "what blocked the step" -- which is what `frac_of_step` answers, and why it takes a max instead.
 
-**A per-op breakdown table** carries the detail, under
-`data_plane/{cluster,driver}/breakdown` — one row per op, ordered by
-`percent_of_dataplane` so the bottleneck is the first line read:
+**A per-op breakdown table** carries the detail, under `data_plane/{cluster,driver}/breakdown` — one row per op, ordered by `percent_of_dataplane` so the bottleneck is the first line read:
 
 | op | percent_of_dataplane | calls | wall_ms | mean_ms | max_ms | p50_ms | p90_ms | mb |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -590,160 +467,56 @@ what `frac_of_step` answers, and why it takes a max instead.
 | register | 17.1 | 1 | 21.4 | 21.4 | 21.4 | — | — | 0 |
 | clear | 8.93 | 1 | 11.2 | 11.2 | 11.2 | — | — | 0 |
 
-Everything in ms on that row is **per call** except `wall_ms`: that `put`
-row reads "each call cost 26.9 ms". `calls`, `wall_ms` and `mb` are the
-only extensive columns.
+Everything in ms on that row is **per call** except `wall_ms`: that `put` row reads "each call cost 26.9 ms". `calls`, `wall_ms` and `mb` are the only extensive columns.
 
-**Per-call figures describe the wire; sums describe the run.** `wall_ms` on the cluster
-path is summed over processes that ran concurrently, so it is process-time
-and scales with DP degree — 200 gets of 11 ms across 8 ranks reads 2232
-while the wall clock was 279. Dividing by the process count only trades one
-arbitrary denominator for another. Per call is invariant to both DP degree
-and batch size: the same workload at 8 and at 32 ranks reports 11.16 and
-11.06 ms while `wall_ms` quadruples. Use `mean_ms` to compare runs and
-cluster sizes, `percent_of_dataplane` to attribute cost across ops within one step.
+**Per-call figures describe the wire; sums describe the run.** `wall_ms` on the cluster path is summed over processes that ran concurrently, so it is process-time and scales with DP degree — 200 gets of 11 ms across 8 ranks reads 2232 while the wall clock was 279. Dividing by the process count only trades one arbitrary denominator for another. Per call is invariant to both DP degree and batch size: the same workload at 8 and at 32 ranks reports 11.16 and 11.06 ms while `wall_ms` quadruples. Use `mean_ms` to compare runs and cluster sizes, `percent_of_dataplane` to attribute cost across ops within one step.
 
-A stack of line charts answers "how did put's wall time trend"; this
-answers "where did the step go", which is a table. Cells are empty rather
-than zero where a series was withheld (a percentile below the sample
-gate) — a zero would read as a measurement. It is
-built from the same metrics dict that is logged, so the table and the
-series cannot disagree. Only wandb renders it; other backends skip it.
+A stack of line charts answers "how did put's wall time trend"; this answers "where did the step go", which is a table. Cells are empty rather than zero where a series was withheld (a percentile below the sample gate) — a zero would read as a measurement. It is built from the same metrics dict that is logged, so the table and the series cannot disagree. Only wandb renders it; other backends skip it.
 
-**Every series says what kind of number it is.** A per-step delta and an
-instantaneous level shared the `_mb` suffix and a chart, with nothing to
-tell them apart:
+**Every series says what kind of number it is.** A per-step delta and an instantaneous level shared the `_mb` suffix and a chart, with nothing to tell them apart:
 
 | namespace | meaning | example |
 |---|---|---|
 | `step/` | what happened during this step; resets | `step/comm_volume_mb` |
 | `now/` | what is true at this instant; persists | `now/bytes_outstanding_mb` |
 
-A rising `now/bytes_outstanding_mb` is not an accumulation bug — it is the
-leak signal the metric exists for: bytes put and never cleared. Expect a
-saw-tooth rather than a straight line on a process that never clears its
-own writes: the accounting reconciles itself against the store's live uids
-once every 16384 rows put, and the cluster view sums those per-process
-levels.
+A rising `now/bytes_outstanding_mb` is not an accumulation bug — it is the leak signal the metric exists for: bytes put and never cleared. Expect a saw-tooth rather than a straight line on a process that never clears its own writes: the accounting reconciles itself against the store's live uids once every 16384 rows put, and the cluster view sums those per-process levels.
 
 Two more read differently in the cluster view and are named to say so:
 
-- **`step/frac_of_step` is the slowest process.** `wall_ms` sums processes
-  that ran concurrently, so dividing it by one step's wall clock exceeded 1
-  whenever they overlapped (measured 1.054 across ten processes) and read as
-  "105% of the step". Reduced with a max instead, it is the share of the step
-  the slowest process spent in the data plane — the cost the step actually
-  waited on, which is what the name claims.
-- **`step/by_op/{op}/max_ms` is scoped to the step by being reset**, not by being
-  differenced. A maximum cannot be recovered from two cumulative readings
-  the way `calls` and `wall_ms` can, so the reader that consumes it zeroes
-  it — `snapshot(reset_step_window=True)`, which the once-per-step
-  collector passes and an inspection snapshot does not. Without that the
-  cluster path reported the lifetime max: after one 50 ms call every later
-  step still read 50 ms.
+- **`step/frac_of_step` is the slowest process.** `wall_ms` sums processes that ran concurrently, so dividing it by one step's wall clock exceeded 1 whenever they overlapped (measured 1.054 across ten processes) and read as "105% of the step". Reduced with a max instead, it is the share of the step the slowest process spent in the data plane — the cost the step actually waited on, which is what the name claims.
+- **`step/by_op/{op}/max_ms` is scoped to the step by being reset**, not by being differenced. A maximum cannot be recovered from two cumulative readings the way `calls` and `wall_ms` can, so the reader that consumes it zeroes it — `snapshot(reset_step_window=True)`, which the once-per-step collector passes and an inspection snapshot does not. Without that the cluster path reported the lifetime max: after one 50 ms call every later step still read 50 ms.
 
-`grpo_train_sync` fans out to the driver, every policy worker, and the
-rollout actor (registered via `TQPolicy.add_data_plane_snapshot_source`,
-since it builds its own client off the worker group), and logs the combined
-result under `data_plane/cluster/` instead of the driver's own, so
-`kv_first_write` is in these totals. It falls back to `data_plane/driver/` when the fan-out finds only one
-process. Measured: **~2.4 ms and ~1 kB per process per step** for 10
-processes, against a 6x wider view of the traffic. The fan-out is
-best-effort — a rank that cannot answer is dropped rather than failing the
-step.
+`grpo_train_sync` fans out to the driver, every policy worker, and the rollout actor (registered via `TQPolicy.add_data_plane_snapshot_source`, since it builds its own client off the worker group), and logs the combined result under `data_plane/cluster/` instead of the driver's own, so `kv_first_write` is in these totals. It falls back to `data_plane/driver/` when the fan-out finds only one process. The single controller logs the same `data_plane/cluster/` series and adds the processes that do its I/O: the trainer's workers and own client, the finalizer and advantage actors, the vLLM token-capture clients, and the PPO critic and OPD/MOPD teacher workers. Without these, a run with token capture and advantage workers reported `0.0 MB moved`. Measured: **~2.4 ms and ~1 kB per process per step** for 10 processes, against a 6x wider view of the traffic. The fan-out is best-effort — a rank that cannot answer is dropped rather than failing the step.
 
-**`step/self/frac` is a share of process-time, not of `wall_s`.** Both its
-terms are summed across processes, so it answers "what fraction of the data
-plane's process-time was the wrapper". It deliberately does **not** divide by
-`step/wall_s`, which is a max: a sum over a max is a ratio of nothing. So
-`self/frac` will not equal `self/overhead_ms / (step/wall_s * 1000)`, and the
-difference is the DP degree, not an error.
+**`step/self/frac` is a share of process-time, not of `wall_s`.** Both its terms are summed across processes, so it answers "what fraction of the data plane's process-time was the wrapper". It deliberately does **not** divide by `step/wall_s`, which is a max: a sum over a max is a ratio of nothing. So `self/frac` will not equal `self/overhead_ms / (step/wall_s * 1000)`, and the difference is the DP degree, not an error.
 
-`step/self/overhead_ms` reports what the measurement itself cost — the
-whole bill, both halves:
+`step/self/overhead_ms` reports what the measurement itself cost — the whole bill, both halves:
 
-- every process's wrapper time (its wall time minus the time its inner
-  client was working), and
+- every process's wrapper time (its wall time minus the time its inner client was working), and
 - the fan-out that gathered and merged the snapshots.
 
-The second is the larger. In the cross-process e2e the wrapper cost 0.13 ms
-and the fan-out 2.31 ms, so a figure covering only the first understated by
-19x. Measured whole: **~2.4 ms, about 0.9% of data-plane time** for 10
-processes.
+The second is the larger. In the cross-process e2e the wrapper cost 0.13 ms and the fan-out 2.31 ms, so a figure covering only the first understated by 19x. Measured whole: **~2.4 ms, about 0.9% of data-plane time** for 10 processes.
 
-It is deliberately not clamped to 100%. Against a fast backend the ratio
-can exceed 1, meaning measuring cost more than the operation measured — a
-signal worth seeing rather than hiding.
+It is deliberately not clamped to 100%. Against a fast backend the ratio can exceed 1, meaning measuring cost more than the operation measured — a signal worth seeing rather than hiding.
 
-**Units:** charted *durations* are seconds — `step/wall_s`,
-`step/codec/{pack_s,unpack_s}` — so they sit beside
-`timing/train/total_step_time`. The one charted duration that is not is
-`step/self/overhead_ms`: it is a cost-of-measurement figure, read against the
-breakdown table rather than against the step clock. The table itself is ms
-throughout (`wall_ms`, `mean_ms`, `max_ms`, `p50_ms`, `p90_ms`), where
-sub-second per-call figures stay legible. Volumes are always `_mb`. What is not
-allowed is mixing units *within one chart*: `step/wall_s` on the same axis as
-`p90_ms` puts a 0.008 next to a 24.85 and reads as a data-plane bug rather than
-an axis one.
+**Units:** charted *durations* are seconds — `step/wall_s`, `step/codec/{pack_s,unpack_s}` — so they sit beside `timing/train/total_step_time`. The one charted duration that is not is `step/self/overhead_ms`: it is a cost-of-measurement figure, read against the breakdown table rather than against the step clock. The table itself is ms throughout (`wall_ms`, `mean_ms`, `max_ms`, `p50_ms`, `p90_ms`), where sub-second per-call figures stay legible. Volumes are always `_mb`. What is not allowed is mixing units *within one chart*: `step/wall_s` on the same axis as `p90_ms` puts a 0.008 next to a 24.85 and reads as a data-plane bug rather than an axis one.
 
-**Per step you get, per op tag:** `calls`, `wall_ms`, `max_ms`. Percentiles come off the *step's* histogram delta, not the
-cumulative one -- a per-step p50 off a histogram that is never reset goes
-flat -- and each is emitted only when the step holds enough calls to
-resolve it: **p50 at 20, p90 at 40**, roughly four observations above the
-rank (`n >= 4 / (1 - q)`). Below that the key is absent.
+**Per step you get, per op tag:** `calls`, `wall_ms`, `max_ms`. Percentiles come off the *step's* histogram delta, not the cumulative one -- a per-step p50 off a histogram that is never reset goes flat -- and each is emitted only when the step holds enough calls to resolve it: **p50 at 20, p90 at 40**, roughly four observations above the rank (`n >= 4 / (1 - q)`). Below that the key is absent.
 
-The tail quantile is **p90, not p99**, because a step holds tens of calls,
-not thousands. A p99 needs ~100 samples before any observation lies above
-its rank at all; below that it collapses onto the largest one. Over a
-lognormal-with-tail draw at 58 calls -- what a DP-8 run actually puts per
-step -- the p99 equalled the maximum **80% of the time**, which is
-`max_ms` under a more precise-sounding name. The p90 off the same 58 never
-did on a smooth tail and 12% of the time on a bimodal one. A coarser
-quantile that is resolved beats a finer one that is not.
+The tail quantile is **p90, not p99**, because a step holds tens of calls, not thousands. A p99 needs ~100 samples before any observation lies above its rank at all; below that it collapses onto the largest one. Over a lognormal-with-tail draw at 58 calls -- what a DP-8 run actually puts per step -- the p99 equalled the maximum **80% of the time**, which is `max_ms` under a more precise-sounding name. The p90 off the same 58 never did on a smooth tail and 12% of the time on a bimodal one. A coarser quantile that is resolved beats a finer one that is not.
 
-`max_ms` stays alongside, exact and scoped to the step: it answers "did
-anything go wrong this step", where p90 answers "what does the tail look
-like". If the two diverge sharply, the op is bimodal -- a straggler rank
-or a cold buffer -- and the max is the number to chase.
+`max_ms` stays alongside, exact and scoped to the step: it answers "did anything go wrong this step", where p90 answers "what does the tail look like". If the two diverge sharply, the op is bimodal -- a straggler rank or a cold buffer -- and the max is the number to chase.
 
-Measured against a no-op inner client on the payload the wire actually
-carries — 256 ragged rows, 12 MB, jagged per-token fields as
-`pack_jagged_fields` leaves them: **~37 µs per put, ~15 µs per get**, under
-0.1% of a 59 ms operation. What is left is dominated by the per-key
-attribution `clear_samples` needs to undo.
+Measured against a no-op inner client on the payload the wire actually carries — 256 ragged rows, 12 MB, jagged per-token fields as `pack_jagged_fields` leaves them: **~37 µs per put, ~15 µs per get**, under 0.1% of a 59 ms operation. What is left is dominated by the per-key attribution `clear_samples` needs to undo.
 
-This is **on in the exemplar config**, which is where a v1 `TypedDict`
-default lives — so recipes inheriting `grpo_math_1B.yaml` get it, and a
-config with no `observability:` block still falls back to `False` at the
-factory. It only engages when `data_plane.enabled` is true either way, so
-it costs nothing for runs that don't use the data plane. There is
-no default per-op sink: `get_step_metrics()` is the surface, and
-`grpo_train_sync` logs it once a step under the `data_plane/` prefix — so
-the series reach whatever backends the run has enabled (wandb, TensorBoard,
-MLflow). Roughly 5-8 series per distinct op tag. Set
-`observability.callback` if you additionally want a hook on every transfer;
-`log_event` is exported for that.
+This is **on in the exemplar config**, which is where a v1 `TypedDict` default lives — so recipes inheriting `grpo_math_1B.yaml` get it, and a config with no `observability:` block still falls back to `False` at the factory. It only engages when `data_plane.enabled` is true either way, so it costs nothing for runs that don't use the data plane. There is no default per-op sink: `get_step_metrics()` is the surface, and `grpo_train_sync` logs it once a step under the `data_plane/` prefix — so the series reach whatever backends the run has enabled (wandb, TensorBoard, MLflow). Roughly 5-8 series per distinct op tag. Set `observability.callback` if you additionally want a hook on every transfer; `log_event` is exported for that.
 
-`verify_tensor_hash: true` additionally records a fingerprint of every row
-on every put and re-checks it on every get, so a tensor that changes between
-wire-in and wire-out is reported (`hash/mismatches`) instead of being trained
-on silently.
+`verify_tensor_hash: true` additionally records a fingerprint of every row on every put and re-checks it on every get, so a tensor that changes between wire-in and wire-out is reported (`hash/mismatches`) instead of being trained on silently.
 
-**The reading travels with the row.** Each field is mirrored by a
-`<field>_hash` column -- one `int64` per row, written by the same put and
-declared alongside the field by `register_partition`, which is why the
-partition's field list is twice what the caller passed. The reader fetches
-the mirror with the field, re-folds, compares, and strips the mirror before
-the caller sees it. Holding the reading in the putting process instead would
-only ever verify a same-process round trip, and the transfer worth checking
-is not one: the rollout actor writes what the policy workers read.
+**The reading travels with the row.** Each field is mirrored by a `<field>_hash` column -- one `int64` per row, written by the same put and declared alongside the field by `register_partition`, which is why the partition's field list is twice what the caller passed. The reader fetches the mirror with the field, re-folds, compares, and strips the mirror before the caller sees it. Holding the reading in the putting process instead would only ever verify a same-process round trip, and the transfer worth checking is not one: the rollout actor writes what the policy workers read.
 
-A mirror is per *top-level field*, not per leaf, because `select_fields`
-names top-level fields -- a multimodal `images` reduces its leaves to a
-single `images_hash`, folded in sorted leaf order with `* 31 +` so two
-identical leaves cannot cancel. A column of `0` is the writer saying it could
-not fold that field; the reader counts those rows `hash/rows_unverified`
-rather than comparing against it.
+A mirror is per *top-level field*, not per leaf, because `select_fields` names top-level fields -- a multimodal `images` reduces its leaves to a single `images_hash`, folded in sorted leaf order with `* 31 +` so two identical leaves cannot cancel. A column of `0` is the writer saying it could not fold that field; the reader counts those rows `hash/rows_unverified` rather than comparing against it.
 
 One granularity: every row carries its own digest, formed from two parts.
 
@@ -761,32 +534,13 @@ One granularity: every row carries its own digest, formed from two parts.
 | — | a permutation *within* one row | **no** — see below |
 | — | one or two rows of a constant-valued column, at even row length | **no** — see below |
 
-The shape never travels and is never compared: one integer per row per field
-is stored, and that is the whole reading. A shape change makes the seed
-differ, which makes the digest differ, which surfaces as an ordinary
-mismatch.
+The shape never travels and is never compared: one integer per row per field is stored, and that is the whole reading. A shape change makes the seed differ, which makes the digest differ, which surfaces as an ordinary mismatch.
 
-The seed's shape is the *row's*, not the leaf's, and both layouts must agree
-on it — a dense `(N, L, D)` and the jagged form whose values are `(total, D)`
-both report a row of `(L, D)`. That is what lets a field packed jagged and
-read back densified (`_from_wire` stacks uniform nested rows) reconcile
-instead of reporting a mismatch on every round trip. Deriving the dense row's
-length from its offsets instead would say `(1, L, D)` and break exactly that.
+The seed's shape is the *row's*, not the leaf's, and both layouts must agree on it — a dense `(N, L, D)` and the jagged form whose values are `(total, D)` both report a row of `(L, D)`. That is what lets a field packed jagged and read back densified (`_from_wire` stacks uniform nested rows) reconcile instead of reporting a mismatch on every round trip. Deriving the dense row's length from its offsets instead would say `(1, L, D)` and break exactly that.
 
-Because the digest covers one row and nothing else, it reconciles against any
-later grouping of the same rows: a shard read is *checked*, not abstained on,
-and a delta write that touches one field leaves the others' fingerprints
-alone. This is also why there is no longer a second, coarser granularity for
-ragged leaves. `hash_tensor` has no ragged kernel, so a ragged leaf folds one
-row at a time — but the fold is an XOR, which is associative and elementwise,
-so `hash_tensor(row)` equals `hash_tensor(rect, dim=1)[i]`. The vectorized and
-per-row paths produce identical values, and the `_WriteScheme` bookkeeping
-that used to record which granularity a put had used, so a get could replay
-it, is gone with them.
+Because the digest covers one row and nothing else, it reconciles against any later grouping of the same rows: a shard read is *checked*, not abstained on, and a delta write that touches one field leaves the others' fingerprints alone. This is also why there is no longer a second, coarser granularity for ragged leaves. `hash_tensor` has no ragged kernel, so a ragged leaf folds one row at a time — but the fold is an XOR, which is associative and elementwise, so `hash_tensor(row)` equals `hash_tensor(rect, dim=1)[i]`. The vectorized and per-row paths produce identical values, and the `_WriteScheme` bookkeeping that used to record which granularity a put had used, so a get could replay it, is gone with them.
 
-Measured cost, from a same-node interleaved A/B (`off/on/off/on`, 20 steps
-each, Llama-3.2-1B, 1 node x 4 GB300, TQ `simple`, 24 MB/step), differing only
-in `verify_tensor_hash`:
+Measured cost, from a same-node interleaved A/B (`off/on/off/on`, 20 steps each, Llama-3.2-1B, 1 node x 4 GB300, TQ `simple`, 24 MB/step), differing only in `verify_tensor_hash`:
 
 | | guard off | guard on |
 |---|---|---|
@@ -796,20 +550,11 @@ in `verify_tensor_hash`:
 | `step/hash/rows_checked` | — | 2560 |
 | `total_step_time` | 13.9 s | 13.8 s |
 
-**The guard costs ~180 ms/step by the counters, and its effect on step time is
-not measurable.** Step time has a standard deviation of 3-4 s and a run-to-run
-floor of 0.6-0.9 s on identical config; across the two pairs the guard-on runs
-were 0.15 s *faster*. Any end-to-end figure quoted from a single pair -- and
-especially from two different nodes -- is reading noise.
+**The guard costs ~180 ms/step by the counters, and its effect on step time is not measurable.** Step time has a standard deviation of 3-4 s and a run-to-run floor of 0.6-0.9 s on identical config; across the two pairs the guard-on runs were 0.15 s *faster*. Any end-to-end figure quoted from a single pair -- and especially from two different nodes -- is reading noise.
 
-That the accounted 180 ms sits inside that floor is also the check that the
-counters are not under-reporting: there is no cost appearing in the step that
-the instrument fails to bill.
+That the accounted 180 ms sits inside that floor is also the check that the counters are not under-reporting: there is no cost appearing in the step that the instrument fails to bill.
 
-**The accepted limit: a within-row permutation is not detected.** XOR cannot
-see its own operands reordered, and no seed fixes it — the seed covers dtype
-and shape, which a reordering leaves alone. This was taken deliberately, for
-cost. Measured on a 107 MB batch of 1536 rows × 4 fields:
+**The accepted limit: a within-row permutation is not detected.** XOR cannot see its own operands reordered, and no seed fixes it — the seed covers dtype and shape, which a reordering leaves alone. This was taken deliberately, for cost. Measured on a 107 MB batch of 1536 rows × 4 fields:
 
 | digest | cost | pad / reshape / dtype | permutation |
 |---|---|---|---|
@@ -818,83 +563,26 @@ cost. Measured on a 107 MB batch of 1536 rows × 4 fields:
 | `blake2b` over the row's bytes | 146 ms | caught | caught |
 | bare `hash_tensor` (what this replaced) | 94 ms | blind | blind |
 
-The two sequential hashes cost ~7-18x because they read every byte on the
-host, one row at a time; the fold reduces a whole rectangular leaf in one
-on-device call. If a reordering bug is ever suspected — the jagged
-pack/unpack offsets are where one would live — swapping `_leaf_digests` for
-the `crc32` form is a one-function change.
+The two sequential hashes cost ~7-18x because they read every byte on the host, one row at a time; the fold reduces a whole rectangular leaf in one on-device call. If a reordering bug is ever suspected — the jagged pack/unpack offsets are where one would live — swapping `_leaf_digests` for the `crc32` form is a one-function change.
 
-Verified by injecting corruption into the round trip. Caught: a
-single-element change in every dtype, a truncated row, a zeroed row (unless
-the row was constant and of even length — see below), a bf16→fp32 precision
-change, a zero pad, a trailing-dim reshape, and a row served from the wrong
-sample — with **zero false alarms** over a 500-row randomized soak, every
-shard grouping from 1 to 256, reversed id order, field subsets and delta
-writes. Not caught, by the deliberate choice above: a reordering of elements
-*within* one row. Note the row-swap and the within-row cases differ — two
-rows exchanged between wire-in and wire-out land against the wrong sample
-ids and are caught, because each row carries its own digest, unless both
-rows are constant and of the same even length. Known limits, measured rather
-than assumed:
+Verified by injecting corruption into the round trip. Caught: a single-element change in every dtype, a truncated row, a zeroed row (unless the row was constant and of even length — see below), a bf16→fp32 precision change, a zero pad, a trailing-dim reshape, and a row served from the wrong sample — with **zero false alarms** over a 500-row randomized soak, every shard grouping from 1 to 256, reversed id order, field subsets and delta writes. Not caught, by the deliberate choice above: a reordering of elements *within* one row. Note the row-swap and the within-row cases differ — two rows exchanged between wire-in and wire-out land against the wrong sample ids and are caught, because each row carries its own digest, unless both rows are constant and of the same even length. Known limits, measured rather than assumed:
 
-- **A constant-valued row of even length folds to zero**, so its digest is
-  the `dtype|row shape` seed alone and is the same for every value. GRPO's
-  `advantages` is exactly that — one scalar expanded across the row — so at
-  an even row length two samples' advantages are indistinguishable and a
-  swap between them is not reported (missed 1/2 to 1/4 of the time for a
-  corruption confined to one or two such rows; a whole corrupted column is
-  still caught with probability 1 − 2⁻ᴺ, since every row would have to be
-  even-length at once). Odd lengths leave one unpaired element and are
-  caught. 0/1 columns such as `token_mask` are exposed the same way. Pinned
-  by `test_a_constant_row_of_even_length_collides_across_values`.
+- **A constant-valued row of even length folds to zero**, so its digest is the `dtype|row shape` seed alone and is the same for every value. GRPO's `advantages` is exactly that — one scalar expanded across the row — so at an even row length two samples' advantages are indistinguishable and a swap between them is not reported (missed 1/2 to 1/4 of the time for a corruption confined to one or two such rows; a whole corrupted column is still caught with probability 1 − 2⁻ᴺ, since every row would have to be even-length at once). Odd lengths leave one unpaired element and are caught. 0/1 columns such as `token_mask` are exposed the same way. Pinned by `test_a_constant_row_of_even_length_collides_across_values`.
 
-- It compares digests, so it detects divergence, not its cause. A mismatch
-  names the sample, the field, the row index and the row length; what
-  changed between the two reads is still yours to find.
+- It compares digests, so it detects divergence, not its cause. A mismatch names the sample, the field, the row index and the row length; what changed between the two reads is still yours to find.
 - **A mismatch count at or above `rows_checked` is reported as suspect.**
-  Every row of every field wrong, identically, every step is not what a
-  broken wire looks like; it is what a broken guard looks like. Both false
-  alarms this check has produced had exactly that shape, and both were its
-  own bookkeeping. Per-sample lines carry the row index and the row length
-  so the next one is adjudicable from a single log line.
-- Rows written before the guard was switched on carry no mirror, and a read
-  whose batch contains one falls back to a plain fetch and abstains on the
-  whole batch — `hash/rows_unverified` and `hash/guard_failures` both move.
-  Within a run every writer shares one `verify_tensor_hash`, so this is the
-  resume-across-a-config-change case, not a steady-state one.
-- `hash/fields_skipped` reports any leaf the fold could not attribute per
-  row — watch that one, since a guard that quietly stops covering a field
-  still reports zero mismatches.
+  Every row of every field wrong, identically, every step is not what a broken wire looks like; it is what a broken guard looks like. Both false alarms this check has produced had exactly that shape, and both were its own bookkeeping. Per-sample lines carry the row index and the row length so the next one is adjudicable from a single log line.
+- Rows written before the guard was switched on carry no mirror, and a read whose batch contains one falls back to a plain fetch and abstains on the whole batch — `hash/rows_unverified` and `hash/guard_failures` both move.
+  Within a run every writer shares one `verify_tensor_hash`, so this is the resume-across-a-config-change case, not a steady-state one.
+- `hash/fields_skipped` reports any leaf the fold could not attribute per row — watch that one, since a guard that quietly stops covering a field still reports zero mismatches.
 
 Backend choice:
-- **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
-  and small runs.
-- **`mooncake_cpu`** — Mooncake's RDMA-only transfer engine. By default,
-  tensors transfer through registered CPU staging. Set
-  `mooncake_cpu.use_gdr: true` to let CUDA-initialized clients use
-  TransferQueue's GDR staging path. CPU-only clients, such as a
-  SingleController producer, continue to use CPU RDMA. GDR changes the
-  client-side tensor transfer and staging path; queued objects still reside in
-  Mooncake-managed host-memory segments.
+- **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests and small runs.
+- **`mooncake_cpu`** — Mooncake's RDMA-only transfer engine. By default, tensors transfer through registered CPU staging. Set `mooncake_cpu.use_gdr: true` to let CUDA-initialized clients use TransferQueue's GDR staging path. CPU-only clients, such as a SingleController producer, continue to use CPU RDMA. GDR changes the client-side tensor transfer and staging path; queued objects still reside in Mooncake-managed host-memory segments.
 
-The CPU host staging pool's `staging_buffer_size` is independent of the GDR
-buffer. `gdr_staging_buffer_mb` is the persistent GPU staging capacity per
-active CUDA client and defaults to 1024 MiB. Transfers through that per-client
-buffer are serialized. Aggregate fetches may exceed the buffer and are split
-into groups. In the mixed CPU-producer/GDR-receiver flow used by
-SingleController, however, each individual tensor must currently fit because
-the CPU PUT path does not create the chunk metadata required by an oversized
-GDR GET.
+The CPU host staging pool's `staging_buffer_size` is independent of the GDR buffer. `gdr_staging_buffer_mb` is the persistent GPU staging capacity per active CUDA client and defaults to 1024 MiB. Transfers through that per-client buffer are serialized. Aggregate fetches may exceed the buffer and are split into groups. In the mixed CPU-producer/GDR-receiver flow used by SingleController, however, each individual tensor must currently fit because the CPU PUT path does not create the chunk metadata required by an oversized GDR GET.
 
-`mooncake_cpu.gdr_keep_teacher_payload_on_gpu` only matters for MOPD with
-`use_gdr: true`; every other run ignores it. When it is on (the default), the
-MOPD teacher keeps what it writes on the GPU until the PUT: its logprobs and,
-with full-vocabulary MOPD, its hidden-state or logits payload. The PUT then
-copies them GPU to GPU into the GDR staging buffer instead of going
-GPU → CPU → GPU. The cost is teacher GPU memory: each last-stage teacher GPU
-holds its data-parallel share of one prompt group's payload until the PUT, and
-briefly about twice that while it is joined and packed. Set it to `false` to
-copy them to CPU first, as without GDR.
+`mooncake_cpu.gdr_keep_teacher_payload_on_gpu` only matters for MOPD with `use_gdr: true`; every other run ignores it. When it is on (the default), the MOPD teacher keeps what it writes on the GPU until the PUT: its logprobs and, with full-vocabulary MOPD, its hidden-state or logits payload. The PUT then copies them GPU to GPU into the GDR staging buffer instead of going GPU → CPU → GPU. The cost is teacher GPU memory: each last-stage teacher GPU holds its data-parallel share of one prompt group's payload until the PUT, and briefly about twice that while it is joined and packed. Set it to `false` to copy them to CPU first, as without GDR.
 
 ### Mooncake storage layout: clients vs storage units
 
@@ -903,9 +591,7 @@ Every Mooncake process plays one or both of two roles:
 - **client** — puts and gets data.
 - **storage** — its RAM holds the data (a *segment*).
 
-A checkpoint save has to call every storage process, because the data lives
-in its memory. Which processes are storage therefore decides both **where
-memory pressure lands** and **who sits on the save path**.
+A checkpoint save has to call every storage process, because the data lives in its memory. Which processes are storage therefore decides both **where memory pressure lands** and **who sits on the save path**.
 
 ```
 co-located (default, storage_unit_segment_size: 0)
@@ -920,12 +606,9 @@ separated (storage_unit_segment_size > 0)
   save calls the units only      ← GPU processes never on the save path
 ```
 
-Puts and gets are one-sided RDMA, so a unit's process never runs on the data
-path; it only does work during a checkpoint save or load. One CPU per unit is
-enough.
+Puts and gets are one-sided RDMA, so a unit's process never runs on the data path; it only does work during a checkpoint save or load. One CPU per unit is enough.
 
-The `simple` backend is always separated: TQ's `SimpleStorageUnit` actors are
-the only storage, and every other process is a client.
+The `simple` backend is always separated: TQ's `SimpleStorageUnit` actors are the only storage, and every other process is a client.
 
 | | `mooncake_cpu` units | `simple` units |
 |---|---|---|
@@ -936,11 +619,7 @@ the only storage, and every other process is a client.
 | count | `num_storage_units` (`null`: 2 per node) | `num_storage_units` |
 | placement | `storage_unit_placement` (default `all`) | `storage_unit_placement` (default `null`: TQ SPREAD) |
 
-**Placement** — `storage_unit_placement` names the clusters whose nodes host
-units (`num_storage_units` in total, round-robin over those nodes; `null`
-means 2 per node). `simple.storage_unit_placement` uses the same node picker
-to pin TQ's `SimpleStorageUnit`s; there `null` keeps TQ's SPREAD placement
-over every Ray node, trainer nodes included.
+**Placement** — `storage_unit_placement` names the clusters whose nodes host units (`num_storage_units` in total, round-robin over those nodes; `null` means 2 per node). `simple.storage_unit_placement` uses the same node picker to pin TQ's `SimpleStorageUnit`s; there `null` keeps TQ's SPREAD placement over every Ray node, trainer nodes included.
 
 | option | units on | memory pressure |
 |---|---|---|
@@ -949,19 +628,9 @@ over every Ray node, trainer nodes included.
 | `[train]` | trainer nodes only | generation nodes hold no storage |
 | `[inference, teacher:<name>]` | any combination of cluster names | — |
 
-Writes carry no placement preference: Mooncake scans the units from a random
-start, so data spreads evenly over all of them and no unit fills ahead of the
-others. Writes may cross nodes; they are RDMA either way. Trainer nodes are
-usually the host-memory-heavy ones (model state, optimizer, dataloaders), so
-`[inference]` is the choice when they are tight; the trade is memory
-placement, not correctness. (Mooncake's `prefer_alloc_in_same_node` would keep
-writes local, but its Python put/upsert paths, which TQ uses, reject it.)
+Writes carry no placement preference: Mooncake scans the units from a random start, so data spreads evenly over all of them and no unit fills ahead of the others. Writes may cross nodes; they are RDMA either way. Trainer nodes are usually the host-memory-heavy ones (model state, optimizer, dataloaders), so `[inference]` is the choice when they are tight; the trade is memory placement, not correctness. (Mooncake's `prefer_alloc_in_same_node` would keep writes local, but its Python put/upsert paths, which TQ uses, reject it.)
 
-On a colocated run train and inference are the same cluster, so every option
-picks the same nodes (setup logs a warning when a name you left out shares
-nodes with one you chose). Storage units are only started by the
-SingleController entrypoint; other entrypoints reject both settings at
-bootstrap.
+On a colocated run train and inference are the same cluster, so every option picks the same nodes (setup logs a warning when a name you left out shares nodes with one you chose). Storage units are only started by the SingleController entrypoint; other entrypoints reject both settings at bootstrap.
 
 **Sizing**
 
@@ -972,191 +641,65 @@ bootstrap.
 | `local_buffer_size` | client transfer memory | the staging pool lives inside it: one `staging_buffer_size` slot per TQ transfer thread (`MAX_BATCH_WORKER_THREADS`, 4 at the pin; per process, not per GPU), so it must be ≥ `4 × staging_buffer_size` (checked at the first transfer). |
 | `staging_buffer_size` | largest pooled transfer | ≥ 2 × the largest single object. An object bigger than the whole pool is registered for that one transfer instead. |
 
-Registered memory is pinned once per RDMA NIC, so per-process buffers add up
-quickly across many GPU processes — another reason to keep segments in a few
-CPU units rather than in every client.
+Registered memory is pinned once per RDMA NIC, so per-process buffers add up quickly across many GPU processes — another reason to keep segments in a few CPU units rather than in every client.
 
-**Capacity is a hard limit when separated.** A put scans the units from a
-random start (at most 100 of them), and once the units are full puts fail — there are no client segments to fall
-back on.
+**Capacity is a hard limit when separated.** A put scans the units from a random start (at most 100 of them), and once the units are full puts fail — there are no client segments to fall back on.
 
 ### Mooncake SSD offload
 
-`mooncake_cpu.ssd_offload.enabled: true` lets Mooncake move objects from
-memory to node-local SSD. Once memory use across all segments passes
-`offload_threshold`, Mooncake's master writes objects to the SSD of the
-process owning their segment and drops them from memory, 10% of the memory
-per round. Reads of an offloaded object go through that owner transparently.
+`mooncake_cpu.ssd_offload.enabled: true` lets Mooncake move objects from memory to node-local SSD. Once memory use across all segments passes `offload_threshold`, Mooncake's master writes objects to the SSD of the process owning their segment and drops them from memory, 10% of the memory per round. Reads of an offloaded object go through that owner transparently.
 
 ```
 memory > offload_threshold ──> SSD copy written ──> memory copy dropped
                                  (fails? object stays in memory)
 ```
 
-- **Every segment owner runs offload**, since Mooncake offloads an object
-  only to its owner's SSD:
+- **Every segment owner runs offload**, since Mooncake offloads an object only to its owner's SSD:
 
   | `storage_unit_segment_size` | segment owners (each gets an SSD dir) |
   |---|---|
   | `> 0` | the storage units only |
   | `0` | every client mounting `global_segment_size`: driver, trainers, rollout actors (generation workers mount none) |
 
-- **Data-plane checkpoints work.** Offload needs evictable replicas, so a
-  save copies each object through Mooncake's normal read (`batch_get_into`)
-  instead of reading pinned memory in place. That read also fetches objects
-  already on SSD. A restore retries a write that finds memory full while
-  eviction frees space. See "Experimental Mooncake storage checkpoints".
-- **A put that finds memory full waits; it does not fail.** Mooncake
-  accepts a put only into free segment memory, and offload frees memory in
-  the background, so a burst of writes can briefly fill every segment. Each
-  client then retries the keys that did not fit (`NO_AVAILABLE_HANDLE`) with
-  backoff, logging one warning per waiting put, for up to 600 s. Sustained
-  writes therefore run at most as fast as offload frees memory; bursts
-  become stalls, not crashes. A new object can be evicted once its 1 s
-  lease expires; that lease must cover one whole batch read (up to
-  `staging_buffer_size`), or the read fails with `LEASE_EXPIRED`. The
-  0.5 default `offload_threshold` leaves room for a
-  burst while offload catches up.
-- **Directories:** each owner writes to
-  `<path>/nemo_rl_mooncake_offload/<ray job>-<pid>-<random>` (mode 0700).
-  At the end of a run the SingleController asks each storage unit to delete
-  its directory, and every client deletes its own in `close()`. Mooncake's
-  SIGTERM handler exits without running Python cleanup, so an owner that
-  crashes or is killed before that leaves its directory behind. Each owner
-  holds a lock on its directory while it lives, and the next run's owners
-  on that node delete any directory whose lock is free.
-- **Cleared data:** Mooncake's remove drops only the master's record, so
-  each owner deletes the SSD files of cleared keys itself, every 30 s.
-  Mooncake still counts those files toward its 90% disk quota until the
-  key is offloaded again; see the warning below.
+- **Data-plane checkpoints work.** Offload needs evictable replicas, so a save copies each object through Mooncake's normal read (`batch_get_into`) instead of reading pinned memory in place. That read also fetches objects already on SSD. A restore retries a write that finds memory full while eviction frees space. See "Experimental Mooncake storage checkpoints".
+- **A put that finds memory full waits; it does not fail.** Mooncake accepts a put only into free segment memory, and offload frees memory in the background, so a burst of writes can briefly fill every segment. Each client then retries the keys that did not fit (`NO_AVAILABLE_HANDLE`) with backoff, logging one warning per waiting put, for up to 600 s. Sustained writes therefore run at most as fast as offload frees memory; bursts become stalls, not crashes. A new object can be evicted once its 1 s lease expires; that lease must cover one whole batch read (up to `staging_buffer_size`), or the read fails with `LEASE_EXPIRED`. The 0.5 default `offload_threshold` leaves room for a burst while offload catches up.
+- **Directories:** each owner writes to `<path>/nemo_rl_mooncake_offload/<ray job>-<pid>-<random>` (mode 0700).
+  At the end of a run the SingleController asks each storage unit to delete its directory, and every client deletes its own in `close()`. Mooncake's SIGTERM handler exits without running Python cleanup, so an owner that crashes or is killed before that leaves its directory behind. Each owner holds a lock on its directory while it lives, and the next run's owners on that node delete any directory whose lock is free.
+- **Cleared data:** Mooncake's remove drops only the master's record, so each owner deletes the SSD files of cleared keys itself, every 30 s.
+  Mooncake still counts those files toward its 90% disk quota until the key is offloaded again; see the warning below.
 
-> **Warning: a full disk stops the run.** Offloaded files are deleted only
-> by the 30 s sweep of cleared keys or at shutdown. When a process's own
-> offload files pass 90% of the disk holding `path`, Mooncake's per-key
-> backend deletes its oldest offloaded files, and Mooncake 0.3.13 cannot
-> turn this off. A deleted file can be the only copy of an object. The
-> master counts these eviction requests
-> (`master_evict_disk_replica_requests_total`). With offload on, the process
-> that started the master checks that counter every 30 s and stops the run
-> at the first deletion. If instead free space falls below one object plus
-> 256 MiB, Mooncake fails the SSD write and keeps the object in memory;
-> memory then stops being freed, and a put that has waited 600 s for it
-> fails with an error naming `path`. Either way, give `path` enough free
-> disk: about (segment owners on the node) x (peak data offloaded at once).
-> Mooncake's own quota count still includes swept files (it has no per-key
-> delete), so its 90% eviction can fire on files already gone and stop the
-> run although nothing live was lost.
+> **Warning: a full disk stops the run.** Offloaded files are deleted only by the 30 s sweep of cleared keys or at shutdown. When a process's own offload files pass 90% of the disk holding `path`, Mooncake's per-key backend deletes its oldest offloaded files, and Mooncake 0.3.13 cannot turn this off. A deleted file can be the only copy of an object. The master counts these eviction requests (`master_evict_disk_replica_requests_total`). With offload on, the process that started the master checks that counter every 30 s and stops the run at the first deletion. If instead free space falls below one object plus 256 MiB, Mooncake fails the SSD write and keeps the object in memory; memory then stops being freed, and a put that has waited 600 s for it fails with an error naming `path`. Either way, give `path` enough free disk: about (segment owners on the node) x (peak data offloaded at once).
+> Mooncake's own quota count still includes swept files (it has no per-key delete), so its 90% eviction can fire on files already gone and stop the run although nothing live was lost.
 
 ### Experimental Mooncake storage checkpoints
 
-With storage units on, the `MooncakeStorageUnit` actors are the only
-checkpoint participants. Otherwise the participants are the actors that hold a
-segment, as described below.
+With storage units on, the `MooncakeStorageUnit` actors are the only checkpoint participants. Otherwise the participants are the actors that hold a segment, as described below.
 
 
-The existing `checkpointing.enabled=true` and
-`checkpointing.save_data_plane=true` settings enable Mooncake storage save/load
-support through TQ's existing explicit checkpoint API. Resuming a checkpoint
-also prepares this storage mode, even when saving new checkpoints is disabled.
-No additional Mooncake-specific checkpoint setting is needed. Ordinary PUTs
-remain in Mooncake memory and perform no checkpoint-related filesystem I/O.
+The existing `checkpointing.enabled=true` and `checkpointing.save_data_plane=true` settings enable Mooncake storage save/load support through TQ's existing explicit checkpoint API. Resuming a checkpoint also prepares this storage mode, even when saving new checkpoints is disabled.
+No additional Mooncake-specific checkpoint setting is needed. Ordinary PUTs remain in Mooncake memory and perform no checkpoint-related filesystem I/O.
 
-On `tq.save_checkpoint(...)`, existing workers query disjoint slices of the
-controller's object keys and group their location metadata by destination.
-Ray object references route those groups directly to the storage processes;
-the coordinator forwards references, not per-object addresses or sizes. Each
-storage process writes its objects into one packed shard and an
-offset/size index. With hard-pinned replicas (the default) it writes directly
-from its own CPU memory: no native GET, staging-buffer copy, or buffer
-registration. With `mooncake_cpu.ssd_offload` the replicas are evictable, so
-a borrowed address could be freed mid-write. Each storage process instead
-copies its objects through native `batch_get_into` into one registered
-buffer. The read holds a lease per object and also serves objects already
-offloaded to SSD. Python cannot see which process holds an SSD-only object,
-so the process that discovered it saves it. Payload bytes then cross
-processes over Mooncake's own transfers (never through Ray); with pinned
-replicas only metadata moves between processes. For multiple
-complete replicas, a canonical live storage process is selected; this prioritizes
-locality, not global byte balancing. The coordinator publishes the small shard
-manifest after every storage process has flushed, fsynced, and acknowledged its shard.
+On `tq.save_checkpoint(...)`, existing workers query disjoint slices of the controller's object keys and group their location metadata by destination.
+Ray object references route those groups directly to the storage processes; the coordinator forwards references, not per-object addresses or sizes. Each storage process writes its objects into one packed shard and an offset/size index. With hard-pinned replicas (the default) it writes directly from its own CPU memory: no native GET, staging-buffer copy, or buffer registration. With `mooncake_cpu.ssd_offload` the replicas are evictable, so a borrowed address could be freed mid-write. Each storage process instead copies its objects through native `batch_get_into` into one registered buffer. The read holds a lease per object and also serves objects already offloaded to SSD. Python cannot see which process holds an SSD-only object, so the process that discovered it saves it. Payload bytes then cross processes over Mooncake's own transfers (never through Ray); with pinned replicas only metadata moves between processes. For multiple complete replicas, a canonical live storage process is selected; this prioritizes locality, not global byte balancing. The coordinator publishes the small shard manifest after every storage process has flushed, fsynced, and acknowledged its shard.
 
-SingleController supplies its candidate actor handles: policy/value/teacher
-workers, finalizer and advantage actors, and the `MooncakeStorageUnit` actors
-when storage units are on. Only candidates that hold a segment take part, so
-generation workers (which attach with segment 0) never do. Their Ray methods
-carry checkpoint commands and completion metadata only; each method uses its
-process's existing Mooncake store. No registry, listener threads, or
-additional socket protocol are created; the storage units are the only actors
-added for checkpointing. The calling actor handles its own shard directly, so
-constructor-time restore never waits for an RPC back to itself.
+SingleController supplies its candidate actor handles: policy/value/teacher workers, finalizer and advantage actors, and the `MooncakeStorageUnit` actors when storage units are on. Only candidates that hold a segment take part, so generation workers (which attach with segment 0) never do. Their Ray methods carry checkpoint commands and completion metadata only; each method uses its process's existing Mooncake store. No registry, listener threads, or additional socket protocol are created; the storage units are the only actors added for checkpointing. The calling actor handles its own shard directly, so constructor-time restore never waits for an RPC back to itself.
 
-For runs that save or resume checkpoints, non-actor clients (including the driver) mount
-zero storage capacity: they can still PUT/GET through Mooncake, but cannot own
-payload that the controller has no actor endpoint to command. Actors retain
-their configured segment sizes (0 for every client when storage units are on).
-This removes the driver's segment from the available capacity. Other callers of the
-plugin must supply their existing storage actor handles with
-`configure_checkpoint_workers(...)` before save/load. Unreachable storage actors fail
-the checkpoint rather than silently falling back to centralized copying.
+For runs that save or resume checkpoints, non-actor clients (including the driver) mount zero storage capacity: they can still PUT/GET through Mooncake, but cannot own payload that the controller has no actor endpoint to command. Actors retain their configured segment sizes (0 for every client when storage units are on).
+This removes the driver's segment from the available capacity. Other callers of the plugin must supply their existing storage actor handles with `configure_checkpoint_workers(...)` before save/load. Unreachable storage actors fail the checkpoint rather than silently falling back to centralized copying.
 
-On `tq.load_checkpoint(...)`, the plugin balances saved shards over currently
-connected clients. In one restore round, each client reads its indexes, checks
-its destination keys are absent, and loads its slices from the shared
-filesystem. There is no separate preflight round or extra controller-key scan.
-Each client requests its own Mooncake segment as the preferred
-destination, but Mooncake may place an object on another current participant
-when that segment lacks capacity. Saved process and segment identities are
-provenance only and are not reused after restart. TQ restores controller
-metadata only after every object has a complete, correctly sized memory replica
-on a current checkpoint participant. With SSD offload, an object may already
-be evicted by then, so a COMPLETE SSD replica is also accepted. Its owner and
-size are not visible from Python, so that check is weaker: it relies on only
-current participants owning segments. No separate Mooncake `storage_root` is
-configured; the explicit TQ checkpoint destination is the persistent location.
+On `tq.load_checkpoint(...)`, the plugin balances saved shards over currently connected clients. In one restore round, each client reads its indexes, checks its destination keys are absent, and loads its slices from the shared filesystem. There is no separate preflight round or extra controller-key scan.
+Each client requests its own Mooncake segment as the preferred destination, but Mooncake may place an object on another current participant when that segment lacks capacity. Saved process and segment identities are provenance only and are not reused after restart. TQ restores controller metadata only after every object has a complete, correctly sized memory replica on a current checkpoint participant. With SSD offload, an object may already be evicted by then, so a COMPLETE SSD replica is also accepted. Its owner and size are not visible from Python, so that check is weaker: it relies on only current participants owning segments. No separate Mooncake `storage_root` is configured; the explicit TQ checkpoint destination is the persistent location.
 
-Checkpoints use checksum-free format v3: no payload or index hashes are computed
-or verified. Earlier development formats are not supported. File/size and
-native-operation errors still fail the checkpoint.
-Each control-plane Ray wait uses a 200-second timeout, matching TQ Simple's
-default storage-request timeout. This is not a deadline for the whole checkpoint.
+Checkpoints use checksum-free format v3: no payload or index hashes are computed or verified. Earlier development formats are not supported. File/size and native-operation errors still fail the checkpoint.
+Each control-plane Ray wait uses a 200-second timeout, matching TQ Simple's default storage-request timeout. This is not a deadline for the whole checkpoint.
 
-This module supplies storage capability only. A caller such as Single
-Controller remains responsible for choosing the checkpoint boundary. Objects
-selected by the controller snapshot must remain unchanged until all SAVE
-acknowledgements complete. Generation may keep writing unrelated fresh keys,
-while commits and destructive clears wait at the existing checkpoint barrier.
-Direct SAVE supports the TCP/RDMA CPU segments created by TQ's Mooncake client,
-including when GDR staging is enabled. Overwrites, replica movement, segment
-unmount and store close
-affecting selected objects must also wait until SAVE finishes. With pinned
-replicas, hard pinning prevents eviction, not explicit mutation, and the
-writer borrows local addresses rather than acquiring a new native memory
-lease. With SSD offload, eviction is allowed, and each native read takes its
-own lease. Same-host peer addresses are
-not local process addresses. The checkpoint contains every controller-referenced
-TQ field as encoded raw objects, including log probabilities, router indices,
-non-tensor values, and GDR chunks. It does
-not contain model weights, unfinished generations, vLLM KV cache, or Gym state.
+This module supplies storage capability only. A caller such as Single Controller remains responsible for choosing the checkpoint boundary. Objects selected by the controller snapshot must remain unchanged until all SAVE acknowledgements complete. Generation may keep writing unrelated fresh keys, while commits and destructive clears wait at the existing checkpoint barrier.
+Direct SAVE supports the TCP/RDMA CPU segments created by TQ's Mooncake client, including when GDR staging is enabled. Overwrites, replica movement, segment unmount and store close affecting selected objects must also wait until SAVE finishes. With pinned replicas, hard pinning prevents eviction, not explicit mutation, and the writer borrows local addresses rather than acquiring a new native memory lease. With SSD offload, eviction is allowed, and each native read takes its own lease. Same-host peer addresses are not local process addresses. The checkpoint contains every controller-referenced TQ field as encoded raw objects, including log probabilities, router indices, non-tensor values, and GDR chunks. It does not contain model weights, unfinished generations, vLLM KV cache, or Gym state.
 
-Restore requires a fresh, empty Mooncake/TQ system. Attach every client that
-contributes Mooncake memory capacity first, keep the saved GDR mode and staging
-size unchanged, call `tq.load_checkpoint` before starting producers, and restart
-from an empty master before retrying a failed load. Multi-node validation must
-exercise save, process restart, load, and read on the intended training topology.
-For runs that save or resume checkpoints, the adapter pins memory replicas
-(or leaves them evictable when `mooncake_cpu.ssd_offload` is on) and keeps TQ's
-own Mooncake offload client off. These are not additional user
-configuration knobs. With SSD offload, restore waits on a write that finds
-memory full (`NO_AVAILABLE_HANDLE`) like any put, for up to 600 s, while
-eviction moves older objects to SSD. Verification then accepts an object that is
-already on SSD. Workers inherit this storage mode from TQ's controller.
-Other jobs keep TQ's storage defaults. A checkpoint saved with
-`simple.ssd_offload.enabled: true` must be resumed with it enabled (TQ raises
-at load otherwise); `path` and `threshold_bytes` may change.
-This version supports NeMo-RL's HTTP
-metadata mode and rejects `P2PHANDSHAKE`,
-whose public Mooncake API does not expose the local transfer endpoint needed for
-exact storage-process matching.
+Restore requires a fresh, empty Mooncake/TQ system. Attach every client that contributes Mooncake memory capacity first, keep the saved GDR mode and staging size unchanged, call `tq.load_checkpoint` before starting producers, and restart from an empty master before retrying a failed load. Multi-node validation must exercise save, process restart, load, and read on the intended training topology.
+For runs that save or resume checkpoints, the adapter pins memory replicas (or leaves them evictable when `mooncake_cpu.ssd_offload` is on) and keeps TQ's own Mooncake offload client off. These are not additional user configuration knobs. With SSD offload, restore waits on a write that finds memory full (`NO_AVAILABLE_HANDLE`) like any put, for up to 600 s, while eviction moves older objects to SSD. Verification then accepts an object that is already on SSD. Workers inherit this storage mode from TQ's controller.
+Other jobs keep TQ's storage defaults. A checkpoint saved with `simple.ssd_offload.enabled: true` must be resumed with it enabled (TQ raises at load otherwise); `path` and `threshold_bytes` may change.
+This version supports NeMo-RL's HTTP metadata mode and rejects `P2PHANDSHAKE`, whose public Mooncake API does not expose the local transfer endpoint needed for exact storage-process matching.
 
 Capacity rule of thumb (any backend):
 
@@ -1165,20 +708,16 @@ storage_capacity ≥ 2 × num_prompts × n_gens × max_seq_len
                    × bytes_per_token × num_active_fields
 ```
 
-The `2 ×` headroom covers dynamic sampling overflow and one step of
-pipelining between rollout and training.
+The `2 ×` headroom covers dynamic sampling overflow and one step of pipelining between rollout and training.
 
 ---
 
 ## When `data_plane.enabled=False`
 
 `build_data_plane_client` raises — there is no NoOp prod fallback.
-For the no-data-plane path use the legacy
-`nemo_rl.algorithms.grpo.grpo_train`; the sync trainer
-`grpo_train_sync` requires `enabled=True` and a `TQPolicy`.
+For the no-data-plane path use the legacy `nemo_rl.algorithms.grpo.grpo_train`; the sync trainer `grpo_train_sync` requires `enabled=True` and a `TQPolicy`.
 
-`NoOpDataPlaneClient` (`adapters/noop.py`) exists only as a unit-test
-fixture for the ABC contract tests.
+`NoOpDataPlaneClient` (`adapters/noop.py`) exists only as a unit-test fixture for the ABC contract tests.
 
 ---
 
@@ -1204,10 +743,6 @@ fixture for the ABC contract tests.
 
 ## Async path (proposed)
 
-The data-plane interface covers both sync and async, but the **sync
-trainer uses only half of it**. The task-mediated half
-(`claim_meta` / `get_data` / `check_consumption_status`) is reserved
-for the async trainer, which is not yet wired into production.
+The data-plane interface covers both sync and async, but the **sync trainer uses only half of it**. The task-mediated half (`claim_meta` / `get_data` / `check_consumption_status`) is reserved for the async trainer, which is not yet wired into production.
 
-Design proposal, filtering / staleness strategies, and open questions:
-see [`docs/data-plane-async-proposal.md`](docs/data-plane-async-proposal.md).
+Design proposal, filtering / staleness strategies, and open questions: see [`docs/data-plane-async-proposal.md`](docs/data-plane-async-proposal.md).

@@ -18,6 +18,4 @@ NeMo RL supports multiple generation/rollout backends to accommodate different m
 
 For detailed information on backend selection, configuration, and examples, see the [Generation Backends documentation](../design-docs/generation.md).
 
-See [Weight Refit: Choosing a Transport](../guides/refit.md) to select colocated
-IPC, NCCL, sparse delta, or NIXL checkpoint-engine refit for the configured
-training and generation backends.
+See [Weight Refit: Choosing a Transport](../guides/refit.md) to select colocated IPC, NCCL, sparse delta, or NIXL checkpoint-engine refit for the configured training and generation backends.
