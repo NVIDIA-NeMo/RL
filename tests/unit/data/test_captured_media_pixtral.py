@@ -109,6 +109,81 @@ def test_embedding_count_must_match_the_geometry():
         capture(prompt)
 
 
+def test_embedding_positions_must_be_image_tokens():
+    # The mask's count matches the geometry, but it marks another token.
+    other = 99
+    pixels = torch.rand(3, 56, 84)
+    prompt = prompt_with_image(pixels)
+    image = [other if t == IMG else t for t in pixtral_tokens(56, 84)]
+    prompt["prompt_token_ids"] = [1, 2, 3, *image, 4]
+    prompt["mm_placeholders"]["image"][0] = Span(
+        3, len(image), torch.tensor([t == other for t in image])
+    )
+    with pytest.raises(MediaCaptureRejected, match="Invalid media embedding tokens"):
+        capture(prompt)
+
+
+def test_image_size_must_be_whole_merge_cells():
+    # 42 pixels is 3 patches but 1.5 merge cells; the row and column counts
+    # (1 x 3) still match the 3 image tokens.
+    pixels = torch.rand(3, 42, 84)
+    with pytest.raises(MediaCaptureRejected, match="geometry"):
+        capture(prompt_with_image(pixels))
+
+
+@pytest.mark.parametrize(
+    ("dtype", "cast_dtype"),
+    [(torch.float64, None), (torch.uint8, torch.bfloat16)],
+)
+def test_pixel_dtype_outside_the_allow_list_is_rejected(dtype, cast_dtype):
+    # Checked before the cast, so a cast does not launder an integer image.
+    pixels = (torch.rand(3, 28, 56) * 255).to(dtype)
+    with pytest.raises(MediaCaptureRejected, match="pixel dtype"):
+        capture(prompt_with_image(pixels), cast_pixel_dtype=cast_dtype)
+
+
+@pytest.mark.parametrize("channels", [1, 4])
+def test_pixels_must_have_three_channels(channels):
+    pixels = torch.rand(channels, 28, 56)
+    with pytest.raises(MediaCaptureRejected, match=r"\[3, H, W\]"):
+        capture(prompt_with_image(pixels))
+
+
+def test_two_images_in_one_prompt():
+    first, second = torch.rand(3, 56, 84), torch.rand(3, 28, 56)
+    image_a, image_b = pixtral_tokens(56, 84), pixtral_tokens(28, 56)
+    b_offset = 3 + len(image_a) + 2
+    prompt = {
+        "prompt_token_ids": [1, 2, 3, *image_a, 5, 6, *image_b, 4],
+        "mm_placeholders": {
+            "image": [
+                Span(3, len(image_a), torch.tensor([t == IMG for t in image_a])),
+                Span(b_offset, len(image_b), torch.tensor([t == IMG for t in image_b])),
+            ]
+        },
+        "mm_kwargs": {
+            "image": [
+                SimpleNamespace(get_data=lambda: {"pixel_values": first}),
+                SimpleNamespace(get_data=lambda: {"pixel_values": second}),
+            ]
+        },
+    }
+    media = capture(prompt)
+    item_a, item_b = media.items
+    assert item_a.placeholder_offset == 3
+    assert item_a.embedding_spans == ((3, 3), (7, 3))
+    assert item_a.imgs_sizes == ((56, 84),)
+    assert item_b.placeholder_offset == b_offset
+    assert item_b.embedding_spans == ((b_offset, 2),)
+    assert item_b.imgs_sizes == ((28, 56),)
+    # Both images packed in prompt order, as the learner packs them.
+    assert media.tensors["imgs_sizes"].tolist() == [[56, 84], [28, 56]]
+    expected = _patchify_segments(
+        [first.unsqueeze(0), second.unsqueeze(0)], patch_dim=PATCH
+    )
+    torch.testing.assert_close(media.tensors["imgs"], expected, rtol=0, atol=0)
+
+
 def test_wrong_pixel_layout_is_rejected():
     pixels = torch.rand(1, 3, 28, 28)
     prompt = prompt_with_image(pixels[0])

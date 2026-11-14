@@ -870,6 +870,8 @@ class VllmAsyncGenerationWorkerImpl(
             # imgs / imgs_sizes columns, so tq_token_sink.py and
             # rollout_reassembler.py are shared; another processor family must
             # also change setup.py (driver checks) and captured_media.py.
+            # Those driver checks still reject Pixtral, so the Pixtral branch
+            # below is not reachable from a run yet.
             # Optional engine/Gym capabilities are checked only on VLM workers.
             from vllm.model_executor.models.mistral3 import Mistral3ProcessingInfo
             from vllm.model_executor.models.nano_nemotron_vl import (
@@ -881,19 +883,10 @@ class VllmAsyncGenerationWorkerImpl(
                 # Pixtral vision tower: the same packed patches and imgs_sizes as
                 # Omni (captured_media._processed_pixtral_tensors).
                 hf_config = info.get_hf_config()
-                token_id = getattr(hf_config, "image_token_index", None)
-                if token_id is None:
-                    token_id = getattr(hf_config, "image_token_id", None)
-                if token_id is None:
-                    raise ValueError(
-                        "Pixtral media capture requires the image token ID"
-                    )
                 self._capture_media_family = "pixtral"
-                self._capture_image_token_id = int(token_id)
+                self._capture_image_token_id = int(hf_config.image_token_index)
                 self._capture_patch_size = int(hf_config.vision_config.patch_size)
-                self._capture_spatial_merge_size = int(
-                    getattr(hf_config, "spatial_merge_size", None) or 1
-                )
+                self._capture_spatial_merge_size = int(hf_config.spatial_merge_size)
             else:
                 if (
                     not isinstance(info, NanoNemotronVLProcessingInfo)

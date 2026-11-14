@@ -29,7 +29,7 @@ import threading
 import time
 from collections import Counter
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -53,7 +53,10 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StageResult,
 )
 
-from nemo_rl.data.captured_media import MediaColumnSpec  # noqa: E402
+from nemo_rl.data.captured_media import (  # noqa: E402
+    MediaCaptureRejected,
+    MediaColumnSpec,
+)
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     StagedPrefix,
     TQTokenSink,
@@ -2620,6 +2623,91 @@ def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
         # The engine's model dtype and the HF patch size, as pinned on the sink.
         assert spec == MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=2)
         assert worker._capture_image_token_id == 18
+
+
+@pytest.mark.vllm
+def test_pixtral_capture_setup_reads_the_mistral3_config(monkeypatch):
+    # Both dependency markers select the combined vLLM + Gym lane.
+    pytest.importorskip("vllm")
+    from vllm.model_executor.models.mistral3 import Mistral3ProcessingInfo
+
+    info = object.__new__(Mistral3ProcessingInfo)
+    # Values other than Mistral3Config's defaults, so each one is read.
+    monkeypatch.setattr(
+        Mistral3ProcessingInfo,
+        "get_hf_config",
+        lambda self: SimpleNamespace(
+            image_token_index=11,
+            spatial_merge_size=3,
+            vision_config=SimpleNamespace(patch_size=7),
+        ),
+    )
+    worker = _fake_worker()
+    worker.llm = SimpleNamespace(
+        renderer=SimpleNamespace(get_mm_processor=lambda: SimpleNamespace(info=info)),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client",
+        lambda dp_cfg, bootstrap, segment_size=None: MagicMock(),
+    )
+    spec = asyncio.run(
+        VllmAsyncGenerationWorkerImpl.setup_token_capture(
+            worker, {}, staging_partition="staging", capture_media=True
+        )
+    )
+    # The engine's model dtype and the vision tower's patch size, as pinned on the sink.
+    assert spec == MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=7)
+    assert worker._capture_media_family == "pixtral"
+    assert worker._capture_image_token_id == 11
+    assert worker._capture_spatial_merge_size == 3
+
+
+@dataclass(frozen=True)
+class _ImageSpan:
+    """The fields capture_processed_media reads from vLLM's PlaceholderRange."""
+
+    offset: int
+    length: int
+    is_embed: torch.Tensor | None = None
+
+
+def test_pixtral_request_media_forwards_family_dtype_and_merge_size():
+    img, brk, end = 18, 12, 13
+    worker = _fake_worker()
+    worker._capture_media = True
+    worker._capture_media_family = "pixtral"
+    worker._capture_image_token_id = img
+    worker._capture_patch_size = 14
+    worker._capture_spatial_merge_size = 2
+    worker.llm = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16))
+    admission = SimpleNamespace(parent_call_id=None, prev_len=0)
+    pixels = torch.rand(3, 56, 84)  # 2 rows x 3 columns of 28-pixel merge cells
+
+    def prompt(drop_first_embedding=False):
+        image = [img, img, img, brk, img, img, img, end]
+        mask = torch.tensor([t == img for t in image])
+        mask[0] = not drop_first_embedding
+        item = SimpleNamespace(get_data=lambda: {"pixel_values": pixels})
+        return {
+            "prompt_token_ids": [1, 2, 3, *image, 4],
+            "mm_placeholders": {"image": [_ImageSpan(3, len(image), mask)]},
+            "mm_kwargs": {"image": [item]},
+        }
+
+    media = VllmAsyncGenerationWorkerImpl._capture_request_media(
+        worker, prompt(), admission=admission
+    )
+    (item,) = media.items
+    # One embedding run per row: the Omni family would reject this image.
+    assert item.embedding_spans == ((3, 3), (7, 3))
+    # Cast to the engine's model dtype, which setup pinned on the staging column.
+    assert media.tensors["imgs"].dtype == torch.bfloat16
+    # The merge size reaches the embedding-count geometry check.
+    with pytest.raises(MediaCaptureRejected, match="geometry"):
+        VllmAsyncGenerationWorkerImpl._capture_request_media(
+            worker, prompt(drop_first_embedding=True), admission=admission
+        )
 
 
 def test_request_capture_text_call_in_media_run_stages_without_attachments():
