@@ -42,7 +42,7 @@ def _cfg(**mooncake_cpu) -> MooncakeCpuConfig:
 
 
 def test_master_args_are_empty_when_offload_is_off() -> None:
-    assert offload.master_args(_cfg()) == ()
+    assert offload.master_args(_cfg(ssd_offload={"enabled": False})) == ()
 
 
 def test_master_args_turn_eviction_into_offload() -> None:
@@ -116,7 +116,7 @@ def fake_store(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     ("mooncake_cpu", "segment_size"),
     [
-        ({}, None),  # offload off
+        ({"ssd_offload": {"enabled": False}}, None),  # offload off
         ({"ssd_offload": _SSD, "storage_unit_segment_size": UNIT}, None),  # client
         ({"ssd_offload": _SSD}, 0),  # generation worker
     ],
@@ -129,7 +129,7 @@ def test_install_is_a_noop_unless_this_process_owns_memory(
     assert fake_store.exit_hooks == []
     # Every client writes, so every client waits for memory when offload is on.
     waits = getattr(fake_store.client_cls, "_nrl_waits_for_memory", False)
-    assert waits == ("ssd_offload" in mooncake_cpu)
+    assert waits == mooncake_cpu["ssd_offload"]["enabled"]
 
 
 def test_install_gives_each_owner_its_own_dir(fake_store, tmp_path) -> None:
@@ -308,6 +308,45 @@ def test_disk_evictions_reads_the_master_counter(text, count) -> None:
     assert offload.disk_evictions(text) == count
 
 
+_MASTER = """\
+master_allocated_bytes 1073741824
+master_total_capacity_bytes 4294967296
+master_key_count 10
+master_successful_evictions_mem {rounds}
+master_evicted_key_count_mem 5
+master_evicted_size_bytes_mem 2097152
+master_evict_disk_replica_requests_total 0
+"""
+
+
+def test_master_metrics_are_in_mib_with_a_memory_ratio() -> None:
+    assert offload.master_metrics(_MASTER.format(rounds=3)) == {
+        "mem_used_mb": 1024.0,
+        "mem_capacity_mb": 4096.0,
+        "keys": 10.0,
+        "offload_rounds_total": 3.0,
+        "mem_evicted_keys_total": 5.0,
+        "mem_evicted_mb_total": 2.0,
+        "disk_evictions_total": 0.0,
+        "mem_used_ratio": 0.25,
+    }
+    assert offload.master_metrics("")["mem_used_ratio"] == 0.0  # no capacity yet
+
+
+def test_the_first_offload_round_warns_once(monkeypatch, caplog) -> None:
+    monkeypatch.setattr(offload, "_warned_offload", False)
+    with caplog.at_level("WARNING", logger=offload.LOGGER.name):
+        for rounds in (0, 3, 9):
+            offload._warn_on_first_offload(offload.master_metrics(_MASTER.format(rounds=rounds)))
+    (msg,) = [r.getMessage() for r in caplog.records]
+    assert "3 SSD offload round(s)" in msg and "25% of 4.0 GiB" in msg
+    assert "5 object(s), 2.0 MiB" in msg and "offload_threshold" in msg
+
+
+def test_step_metrics_without_a_mooncake_client_is_empty() -> None:
+    assert offload.step_metrics() == {}  # this process has no TQ client
+
+
 def _watch(reads, **kwargs):
     """Run the watcher over scripted counter reads until it stops."""
     script = iter(reads)
@@ -415,6 +454,21 @@ def test_watch_master_disk_evictions_reads_the_real_endpoint(
     assert not fired.wait(0.2)  # counter at 0: keep watching
     metrics_server.body = "master_evict_disk_replica_requests_total 1\n"
     assert fired.wait(5)
+
+
+def test_step_metrics_read_the_real_endpoint_and_warn_once(
+    monkeypatch, caplog, metrics_server
+) -> None:
+    url = f"http://127.0.0.1:{metrics_server.server_port}/metrics"
+    monkeypatch.setattr(offload, "_master_metrics_url", lambda: url)
+    monkeypatch.setattr(offload, "_warned_offload", False)
+    metrics_server.body = _MASTER.format(rounds=0)
+    with caplog.at_level("WARNING", logger=offload.LOGGER.name):
+        assert offload.step_metrics()["offload_rounds_total"] == 0
+        metrics_server.body = _MASTER.format(rounds=7)
+        assert offload.step_metrics()["offload_rounds_total"] == 7
+        assert offload.step_metrics()["mem_used_ratio"] == 0.25
+    assert len(caplog.records) == 1
 
 
 def test_a_reinit_replaces_the_old_watcher(monkeypatch) -> None:
@@ -555,11 +609,11 @@ def test_sweep_deletes_only_the_files_of_cleared_keys(tmp_path) -> None:
     (tmp_path / "foreign").write_bytes(b"not mooncake's")
     answers = {"1@x": 1, "2@x": 0, "3@x": -1}  # exists, absent, RPC error
 
-    removed = offload.sweep_cleared_files(
+    sweep = offload.sweep_cleared_files(
         str(tmp_path), lambda keys: [answers[k] for k in keys]
     )
 
-    assert removed == 1
+    assert sweep == 1
     assert not cleared.exists()
     assert live.exists() and unknown.exists()
     assert (tmp_path / ".lock").exists() and (tmp_path / "foreign").exists()

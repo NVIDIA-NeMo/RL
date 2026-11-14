@@ -45,6 +45,7 @@ from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.allocator import SlabAllocator, align_up
 from nemo_rl.data_plane.nixl.control import UnitServer
 from nemo_rl.data_plane.nixl.errors import DataPlaneBusy, UnitFull
+from nemo_rl.data_plane.local_disk import require_disk_backed
 from nemo_rl.data_plane.nixl.nixl_io import NixlEndpoint
 from nemo_rl.distributed import numa_utils
 
@@ -306,6 +307,7 @@ class NixlStorageUnit:  # pragma: no cover
         self.alloc_ = SlabAllocator(main)
         self.staging_ = SlabAllocator(slab_bytes - main)
         self.staging_base = main
+        require_disk_backed(ssd_dir, setting="data_plane.nixl.ssd.path")
         self.ssd_dir = os.path.join(
             ssd_dir, f"nixl-unit-{self.unit_id}-{uuid.uuid4().hex[:6]}"
         )

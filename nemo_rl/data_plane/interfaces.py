@@ -43,7 +43,12 @@ from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, Typ
 from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt, model_validator
 from tensordict import TensorDict
 
+from nemo_rl.data_plane.local_disk import default_ssd_dir
+
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
+# Default SSD-tier directories, under the node's NVMe (local_disk.default_ssd_dir).
+MOONCAKE_SSD_DIRNAME = "nrl_mooncake_ssd_offload"
+NIXL_SSD_DIRNAME = "nrl_nixl_ssd"
 
 
 class SsdOffloadConfig(BaseModel, extra="allow"):
@@ -110,21 +115,32 @@ class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
     offloaded at once): owners delete the files of cleared keys every 30 s.
     Operation, cleanup and the full-disk data-loss risk are described under
     "Mooncake SSD offload" in nemo_rl/data_plane/README.md.
+
+    On by default: data stays in memory while there is room and spills only
+    past ``offload_threshold``. The first spill logs a warning, since reads of
+    spilled objects go through the SSD. ``path: null`` (the default) is the
+    node's NVMe: ``/raid/nrl_mooncake_ssd_offload`` when the node mounts
+    ``/raid``, else ``/tmp/nrl_mooncake_ssd_offload``
+    (``local_disk.default_ssd_dir``). Either must be a disk, not a RAM-backed
+    tmpfs.
     """
 
-    enabled: bool = False
-    path: str | None = None  # absolute; required when enabled
+    enabled: bool = True
+    path: str | None = None  # absolute; null: the node's NVMe (dir())
     offload_threshold: Annotated[float, Field(gt=0, le=1)] = 0.5
 
     @model_validator(mode="after")
-    def _require_absolute_path_when_enabled(self) -> "MooncakeSsdOffloadConfig":
-        if self.enabled and not (self.path and Path(self.path).is_absolute()):
+    def _require_absolute_path(self) -> "MooncakeSsdOffloadConfig":
+        if self.path is not None and not Path(self.path).is_absolute():
             raise ValueError(
-                "data_plane.mooncake_cpu.ssd_offload.enabled=true requires "
-                "data_plane.mooncake_cpu.ssd_offload.path to be an absolute "
-                f"node-local SSD directory, got {self.path!r}."
+                "data_plane.mooncake_cpu.ssd_offload.path must be an absolute "
+                f"node-local SSD directory, or null for the node's NVMe; got {self.path!r}."
             )
         return self
+
+    def dir(self) -> str:
+        """The offload directory on this node: ``path``, or the NVMe default."""
+        return self.path or default_ssd_dir(MOONCAKE_SSD_DIRNAME)
 
 
 class MooncakeCpuConfig(BaseModel, extra="allow"):
@@ -214,22 +230,33 @@ class NixlSsdConfig(BaseModel, extra="forbid"):
     spilled blobs back; one thread moves about 2.5 GB/s on NVMe, and a spilled
     put is acknowledged only once its file is written, so a workload that
     spills a large share of every step needs several.
+
+    On by default: a put spills only when the unit's put area is full, and the
+    driver logs a warning at the first spill of a run (reads of spilled blobs
+    wait for the SSD). ``path: null`` (the default) is the node's NVMe:
+    ``/raid/nrl_nixl_ssd`` when the node mounts ``/raid``, else
+    ``/tmp/nrl_nixl_ssd`` (``local_disk.default_ssd_dir``). Either must be a
+    disk, not a RAM-backed tmpfs.
     """
 
-    enabled: bool = False
-    path: str | None = None  # absolute; required when enabled
+    enabled: bool = True
+    path: str | None = None  # absolute; null: the node's NVMe (dir())
     staging_bytes: PositiveInt | None = None  # None: unit_slab_bytes // 4
     pickup_s: float = 10.0
     io_threads: PositiveInt = 4
 
     @model_validator(mode="after")
-    def _require_absolute_path_when_enabled(self) -> "NixlSsdConfig":
-        if self.enabled and not (self.path and Path(self.path).is_absolute()):
+    def _require_absolute_path(self) -> "NixlSsdConfig":
+        if self.path is not None and not Path(self.path).is_absolute():
             raise ValueError(
-                "data_plane.nixl.ssd.enabled=true requires data_plane.nixl.ssd.path "
-                f"to be an absolute node-local SSD directory, got {self.path!r}."
+                "data_plane.nixl.ssd.path must be an absolute node-local SSD "
+                f"directory, or null for the node's NVMe; got {self.path!r}."
             )
         return self
+
+    def dir(self) -> str:
+        """The spill directory on this node: ``path``, or the NVMe default."""
+        return self.path or default_ssd_dir(NIXL_SSD_DIRNAME)
 
 
 class NixlAgentConfig(BaseModel, extra="forbid"):

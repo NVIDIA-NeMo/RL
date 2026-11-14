@@ -49,7 +49,7 @@ def test_factory_passes_checkpoint_runtime_mode_to_bootstrap(
         "impl": "transfer_queue",
         "backend": backend,
         "claim_meta_poll_interval_s": 0.5,
-        "mooncake_cpu": {"reuse_registered_buffers": False},
+        "mooncake_cpu": {"reuse_registered_buffers": False, "ssd_offload": {"enabled": False}},
     }
 
     plan = ["a" * 56, "b" * 56]
@@ -82,7 +82,7 @@ def test_worker_attach_carries_its_segment_size(monkeypatch) -> None:
         "impl": "transfer_queue",
         "backend": "mooncake_cpu",
         "claim_meta_poll_interval_s": 0.5,
-        "mooncake_cpu": {"reuse_registered_buffers": False},
+        "mooncake_cpu": {"reuse_registered_buffers": False, "ssd_offload": {"enabled": False}},
     }
 
     build_data_plane_client(cfg, bootstrap=False, segment_size=0)
@@ -112,7 +112,7 @@ def test_every_mooncake_client_offers_its_segment_to_ssd_offload(
         "impl": "transfer_queue",
         "backend": "mooncake_cpu",
         "claim_meta_poll_interval_s": 0.5,
-        "mooncake_cpu": {"reuse_registered_buffers": False},
+        "mooncake_cpu": {"reuse_registered_buffers": False, "ssd_offload": {"enabled": False}},
     }
 
     build_data_plane_client(cfg, bootstrap=bootstrap, segment_size=segment_size)

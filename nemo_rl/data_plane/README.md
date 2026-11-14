@@ -400,8 +400,8 @@ data_plane:
     num_storage_units: null            # total units; null = 2 per selected node
     storage_unit_placement: all        # all, or cluster names: [inference], [train, teacher:<name>]
     ssd_offload:                       # see "Mooncake SSD offload"
-      enabled: false                   # true: spill memory to local SSD
-      path: null                       # absolute node-local dir; required if enabled
+      enabled: true                    # spill memory to local SSD above the threshold
+      path: null                       # null: node NVMe (/raid if mounted, else /tmp); or an absolute dir
       offload_threshold: 0.5           # offload above this share of segment memory
   observability:                       # NotRequired
     enabled: true                      # per-op timing / latency percentiles / volume
@@ -647,7 +647,37 @@ Registered memory is pinned once per RDMA NIC, so per-process buffers add up qui
 
 ### Mooncake SSD offload
 
-`mooncake_cpu.ssd_offload.enabled: true` lets Mooncake move objects from memory to node-local SSD. Once memory use across all segments passes `offload_threshold`, Mooncake's master writes objects to the SSD of the process owning their segment and drops them from memory, 10% of the memory per round. Reads of an offloaded object go through that owner transparently.
+`mooncake_cpu.ssd_offload.enabled: true` (the default) lets Mooncake move objects from memory to node-local SSD. Once memory use across all segments passes `offload_threshold`, Mooncake's master writes objects to the SSD of the process owning their segment and drops them from memory, 10% of the memory per round. Reads of an offloaded object go through that owner transparently.
+
+While memory suffices nothing is written, so the default costs nothing. With
+`path: null` each owner writes under its node's NVMe: `/raid` (where DGX nodes
+mount the NVMe RAID) when it is mounted, a disk and writable, else `/tmp`.
+`ray.sub` mounts a per-user NVMe directory at the container's `/raid` by
+itself: `NRL_NVME_DIR` when set (for example `/raid/scratch/$USER` on a
+cluster whose RAID root is root-owned), else `/raid/$USER` (created when the
+user owns `/raid`). Nothing is mounted otherwise, and the driver logs one
+note saying the tiers use `/tmp` and what `/tmp` is (in an enroot container
+`/tmp` is often the node's NVMe already). Other launchers mount the directory
+at `/raid` the same way, or set `path`. The directory must be on a disk: an owner
+refuses to start when it is on a RAM-backed filesystem (tmpfs), since spilling
+there would consume the memory it is meant to relieve.
+
+The single controller reads the master's `/metrics` every step and logs, under
+`data_plane/mooncake/`: `mem_used_mb`, `mem_capacity_mb`, `mem_used_ratio`
+(compare with `offload_threshold`), `keys`, `offload_rounds_total` (eviction
+rounds the master ran; each wrote objects to the owners' SSD),
+`mem_evicted_keys_total`, `mem_evicted_mb_total` (objects whose memory copy was
+dropped, so their reads go through the SSD) and `disk_evictions_total` (always
+0 in a healthy run, see below). Mooncake 0.3.x has no per-object offload
+counter: past the threshold with memory to spare it writes SSD copies and
+keeps the memory copies, so `offload_rounds_total` rises while
+`mem_evicted_*` stay 0; under memory pressure both rise. The first step with
+`offload_rounds_total > 0` logs one warning: the workload's data-plane
+footprint passed the threshold. Raise `storage_unit_segment_size` (or
+`global_segment_size`), or `offload_threshold`, if that trade-off is not
+wanted. The nixl backend's SSD tier (`nixl.ssd`, also on by default) spills
+only when a unit's put area is full and logs the same kind of warning when
+`data_plane/nixl/ssd_spills_sum` first rises above 0.
 
 ```
 memory > offload_threshold ──> SSD copy written ──> memory copy dropped

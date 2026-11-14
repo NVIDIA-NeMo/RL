@@ -235,6 +235,25 @@ if [[ -n "${UV_CACHE_DIR_OVERRIDE:-}" ]]; then
   fi
 fi
 
+# The node's NVMe for the data plane's SSD tiers: they default to /raid/<name>
+# inside the container when /raid is mounted there, and to /tmp otherwise
+# (nemo_rl/data_plane/local_disk.py; the driver logs which one it took). The
+# mount source is a per-user directory, never the shared RAID root, so users on
+# one node cannot collide: NRL_NVME_DIR when set, else /raid/$USER (created when
+# this user owns /raid, as on a bare-metal DGX; or provided by the site). No
+# writable directory: no mount, and the tiers use /tmp.
+_nvme_dir=${NRL_NVME_DIR:-/raid/$USER}
+# A node-local disk: the directory must exist on every node before pyxis binds
+# it, or the container fails to start there. Create it where its parent lets us.
+srun --nodes="$SLURM_JOB_NUM_NODES" --ntasks-per-node=1 --overlap \
+  bash -c "[[ -w '$(dirname "$_nvme_dir")' ]] && mkdir -p '$_nvme_dir'" 2>/dev/null || true
+if [[ -d "$_nvme_dir" && -w "$_nvme_dir" ]]; then
+  MOUNTS="${MOUNTS:+$MOUNTS,}$_nvme_dir:/raid"
+  echo "[INFO] data-plane SSD tiers: $_nvme_dir mounted at /raid"
+elif [[ -n "${NRL_NVME_DIR:-}" ]]; then
+  echo "WARNING: NRL_NVME_DIR=$NRL_NVME_DIR is not a writable directory on $(hostname); the data plane's SSD tiers will use /tmp." >&2
+fi
+
 # Create logs directory
 # NOTE: LOG_DIR must be on a shared filesystem visible to both the submit host and
 # all compute nodes. File-based signaling between the submit host and the containers

@@ -9,9 +9,12 @@ BASE_TEST=$SCRIPT_DIR/grpo_dp_single_controller.sh
 # simple / mooncake_cpu / nixl, or a variant of one:
 #   simple_placed   simple with SimpleStorageUnits pinned (storage_unit_placement=all)
 #   mooncake_units  mooncake_cpu with CPU storage units as the only memory owners
-#   nixl_ssd        nixl with its units' SSD tier on
-# mooncake_cpu and nixl_ssd save and restore with values on SSD (a run holds
-# up to ~400 KB, so each sets a limit below that) and fail unless SSD was used.
+#   nixl_ssd        nixl with its units' SSD tier under memory pressure
+# The mooncake_cpu and nixl SSD tiers are on by default and spill only under
+# memory pressure. mooncake_units and nixl run the defaults (path: null, the
+# node's NVMe) and fail if anything was spilled; mooncake_cpu and nixl_ssd set
+# a memory limit below the ~400 KB a run holds, with an explicit path under the
+# test dir, and fail unless SSD was used across save and restore.
 VARIANT=${1:-simple}
 VARIANT_OVERRIDES=()
 # check_metrics.py expressions run on both phases' metrics.
@@ -24,9 +27,15 @@ case "$VARIANT" in
         SSD_DIR=$SCRIPT_DIR/$TEST_NAME/ssd
         # Offload past 1e-6 of the clients' 4 GiB segments: a few KB each.
         VARIANT_OVERRIDES=(
-            data_plane.mooncake_cpu.ssd_offload.enabled=true
             data_plane.mooncake_cpu.ssd_offload.path="$SSD_DIR"
             data_plane.mooncake_cpu.ssd_offload.offload_threshold=0.000001
+        )
+        # The master's counters the single controller logs every step
+        # (mooncake_ssd_offload.step_metrics): offload rounds ran, and no
+        # SSD copy was deleted for space.
+        VARIANT_CHECKS=(
+            'max(data["data_plane/mooncake/offload_rounds_total"]) > 0'
+            'max(data["data_plane/mooncake/disk_evictions_total"]) == 0'
         )
         ;;
     simple_placed)
@@ -38,12 +47,21 @@ case "$VARIANT" in
         BACKEND=mooncake_cpu
         TEST_NAME=grpo_dp_mooncake_units_tq_recovery
         VARIANT_OVERRIDES=(data_plane.mooncake_cpu.storage_unit_segment_size=4294967296)
+        # Default SSD offload, memory not under pressure: nothing moves to SSD.
+        VARIANT_CHECKS=(
+            'max(data["data_plane/mooncake/offload_rounds_total"]) == 0'
+            'max(data["data_plane/mooncake/disk_evictions_total"]) == 0'
+        )
         ;;
     nixl)
         BACKEND=nixl
         TEST_NAME=grpo_dp_nixl_tq_recovery
-        # Per-step unit metrics the driver logs (tq_nixl.unit_metrics).
-        VARIANT_CHECKS=('max(data["data_plane/nixl/retired_mb_sum"]) == 0')
+        # Per-step unit metrics the driver logs (tq_nixl.unit_metrics). The
+        # default SSD tier is on but the put area is not full: no spill.
+        VARIANT_CHECKS=(
+            'max(data["data_plane/nixl/retired_mb_sum"]) == 0'
+            'max(data["data_plane/nixl/ssd_spills_sum"]) == 0'
+        )
         ;;
     nixl_ssd)
         BACKEND=nixl
@@ -52,7 +70,6 @@ case "$VARIANT" in
         # 256 KiB slab per unit: a 128 KiB put area and a 128 KiB SSD IO area.
         VARIANT_OVERRIDES=(
             data_plane.nixl.unit_slab_bytes=262144
-            data_plane.nixl.ssd.enabled=true
             data_plane.nixl.ssd.path="$SSD_DIR"
             data_plane.nixl.ssd.staging_bytes=131072
         )
@@ -178,6 +195,17 @@ if [[ "$VARIANT" == "mooncake_cpu" ]]; then
         exit 1
     fi
     echo "✓ Mooncake SSD offload held up to $PEAK file(s) across save and restore"
+fi
+
+if [[ "$VARIANT" == "mooncake_units" ]]; then
+    # path: null -> each owner writes under the node's NVMe default
+    # (local_disk.default_ssd_dir: /raid when mounted and writable, else /tmp).
+    # The owners' lines reach the run log through Ray.
+    if ! grep -Eq "SSD offload for this process under /(raid|tmp)/nrl_mooncake_ssd_offload/" "$PHASE1_LOG"; then
+        echo "FAIL: no Mooncake owner used the default offload directory" >&2
+        exit 1
+    fi
+    echo "✓ Mooncake owners use the default NVMe offload directory"
 fi
 
 # Hash guard: rows were checked, and no process logged a mismatch or a guard
