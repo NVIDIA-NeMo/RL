@@ -24,6 +24,8 @@ For the full list of supported models, see
 - **[Qwen](qwen/index.md)** — Qwen3.5 and Qwen3.8 LLM and VLM recipes (dense and
   MoE), with backend availability documented per version and thinking-mode
   generation-length guidance.
+- **[StepFun](stepfun/index.md)** — Step-5-Preview early-access GRPO with AutoModel
+  training and BF16 vLLM generation on 16 H100 nodes.
 
 Other model-specific guides currently live directly under
 [Guides](../../index.md) and are migrated into this hub as their guidance grows.
@@ -37,4 +39,5 @@ gemma/index.md
 minimax/index.md
 nemotron/index.md
 qwen/index.md
+stepfun/index.md
 ```
