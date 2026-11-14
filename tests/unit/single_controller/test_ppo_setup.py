@@ -37,6 +37,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     GeneralizedAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    CustomSamplerConfig,
     ReadyFirstSamplerConfig,
     WeightFifoSamplerConfig,
     WindowedSamplerConfig,
@@ -774,10 +775,16 @@ def _dynamic_sampling_config(
     mc.policy["train_global_batch_size"] = (
         _NUM_PROMPTS_PER_STEP * num_generations_per_prompt
     )
+    if sampler == "ready_first":
+        # ready_first trains on groups from older policies, so it needs the correction.
+        mc.loss_fn = ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0, use_importance_sampling_correction=True
+        )
     sampler_cfg = {"name": sampler}
     if sampler == "custom":
-        # A custom sampler config requires a target; the validator does not import it.
-        sampler_cfg["target"] = "my_pkg.samplers:MySampler"
+        sampler_cfg["target"] = (
+            "nemo_rl.algorithms.async_utils.staleness_sampler:InOrderSampler"
+        )
     mc.async_rl = AsyncRLConfig(
         min_groups_for_streaming_train=_NUM_PROMPTS_PER_STEP,
         max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
@@ -827,14 +834,50 @@ class TestDynamicSamplingValidation:
     def test_accepts_replace_with_a_stamping_sampler(self):
         validate_single_controller_config(_dynamic_sampling_config())
 
-    def test_rejects_a_custom_sampler(self):
-        # Narrowed to in_order: a custom class cannot declare at setup that it stamps
-        # a target step or that its admission wait can be interrupted for a refill.
-        # #4784 reopens this through a capability protocol.
-        mc = _dynamic_sampling_config(sampler="custom")
+    def test_accepts_a_custom_sampler(self):
+        validate_single_controller_config(_dynamic_sampling_config(sampler="custom"))
 
-        with pytest.raises(ValueError, match="sampler.name='in_order'"):
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "nemo_rl.algorithms.async_utils.staleness_sampler:WeightFifoSampler",
+            "tests.unit.single_controller.test_sampler_interface:InheritedWeightFifoSampler",
+        ],
+    )
+    def test_rejects_custom_fixed_weight_selection(self, target):
+        mc = _dynamic_sampling_config()
+        mc.async_rl.sampler = CustomSamplerConfig(
+            target=target, max_staleness_versions=0
+        )
+
+        with pytest.raises(
+            ValueError, match="requires a complete batch from one weight"
+        ):
             validate_single_controller_config(mc)
+
+    def test_rejects_custom_without_selection_declaration(self):
+        mc = _dynamic_sampling_config()
+        mc.async_rl.sampler = CustomSamplerConfig(
+            target="tests.unit.single_controller.test_sampler_interface:NoDropAccounting"
+        )
+
+        with pytest.raises(TypeError, match="requires_single_weight_batch"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_custom_fixed_weight_policy_before_cluster_allocation(self):
+        mc = _dynamic_sampling_config()
+        mc.async_rl.sampler = CustomSamplerConfig(
+            target="nemo_rl.algorithms.async_utils.staleness_sampler:WeightFifoSampler",
+            max_staleness_versions=0,
+        )
+
+        with patch.object(sc_setup_mod, "_build_clusters") as build_clusters:
+            with pytest.raises(
+                ValueError, match="requires a complete batch from one weight"
+            ):
+                setup_single_controller(mc, MagicMock())
+
+        build_clusters.assert_not_called()
 
     def test_accepts_shrink_because_filtering_replaces_regardless(self):
         # Filtering replaces uniform groups even when rollout failures shrink.
@@ -875,17 +918,9 @@ class TestDynamicSamplingValidation:
             warnings.simplefilter("error", UserWarning)
             validate_single_controller_config(mc)
 
-    def test_rejects_a_sampler_that_stamps_no_target_step(self):
-        mc = _dynamic_sampling_config(sampler="ready_first")
-
-        with pytest.raises(ValueError, match="sampler.name='in_order'"):
-            validate_single_controller_config(mc)
-
-    def test_rejects_a_single_generation_per_prompt(self):
-        mc = _dynamic_sampling_config(num_generations_per_prompt=1)
-
-        with pytest.raises(ValueError, match="num_generations_per_prompt >= 2"):
-            validate_single_controller_config(mc)
+    @pytest.mark.parametrize("sampler", ["windowed", "ready_first"])
+    def test_accepts_the_samplers_that_stamp_no_target_step(self, sampler):
+        validate_single_controller_config(_dynamic_sampling_config(sampler=sampler))
 
     def test_ppo_rejects_dynamic_sampling_outright(self):
         # Removed from the SC `unsupported` list, PPO dynamic sampling is now rejected
@@ -1335,3 +1370,10 @@ class TestInLossSeqFilterForPPO:
 
         with pytest.raises(ValueError, match="without use_kl_in_reward"):
             validate_single_controller_config(mc)
+
+
+def test_dynamic_sampling_rejects_weight_fifo():
+    with pytest.raises(ValueError, match="cannot be combined with.*weight_fifo"):
+        validate_single_controller_config(
+            _dynamic_sampling_config(sampler="weight_fifo")
+        )

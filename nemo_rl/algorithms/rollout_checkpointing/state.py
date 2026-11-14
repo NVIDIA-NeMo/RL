@@ -62,7 +62,7 @@ class RolloutCheckpointSaveResult:
 
 @dataclass
 class RolloutRuntimeState:
-    """Rollout state that the pumps change and every checkpoint saves.
+    """Rollout state shared by the pumps and checkpoint coordination.
 
     The controller owns the one instance; restore fills it before the pumps
     start, and checkpoints read it under the exclusive data-plane cut.
@@ -76,18 +76,11 @@ class RolloutRuntimeState:
     filtered_reserve: deque[DatumSpec] = field(default_factory=deque)
     # Exhausted steps use the final train-or-skip floor instead of failing early.
     steps_allowed_short: set[int] = field(default_factory=set)
-    # Prompts dropped from each stamped target step. A stamping sampler will
-    # only ever select num_prompts_per_step groups carrying that stamp, so a
-    # dropped prompt leaves that step permanently one short and the train pump
-    # waits on a group no one is generating. The pump subtracts these to close
-    # the step short. With an unstamped sampler the batch fills from whatever
-    # is ready, so a drop costs throughput but strands nothing.
+    # Lost groups charged to each step according to DropAccountingSampler.
     batch_shortfall: dict[int, int] = field(default_factory=dict)
-    # Whether the sampler has ever handed back a target step. Only stamped
-    # prompts can strand a step, so this gates the spare pool: filling it for a
-    # sampler that never stamps would divert prompts nothing can draw on.
-    # Learned from admit rather than the sampler's type, because a custom
-    # sampler's stamping is not knowable until it answers.
+    # Transient: snapshots must wait until an awaited selection's losses are reconciled.
+    shortfall_reconciliation_pending: bool = False
+    # Whether any batch was admitted. Retain the serialized field name for compatibility.
     sampler_stamps_target_steps: bool = False
     # Finalizer results kept per group until the group is trained or dropped.
     finalizer_metrics_by_group: dict[str, dict[str, float]] = field(

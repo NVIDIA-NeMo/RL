@@ -30,6 +30,7 @@ from pydantic import TypeAdapter, ValidationError
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     CustomSamplerConfig,
+    DropAccountingSampler,
     InOrderSampler,
     InOrderSamplerConfig,
     PromptGroupSampler,
@@ -42,9 +43,11 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     WindowedSampler,
     WindowedSamplerConfig,
     create_sampler,
+    require_drop_accounting_members,
     required_buffer_capacity_for_config,
     sampler_supports_buffer_checkpoint,
     sampler_supports_training_claims,
+    sampler_supports_transactional_admission,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
@@ -120,6 +123,83 @@ class TestBuiltinsImplementInterface:
     def test_isinstance_protocol(self, sampler):
         assert isinstance(sampler, PromptGroupSampler)
         assert isinstance(sampler, TransactionalAdmissionSampler)
+
+
+class TestDropAccounting:
+    """What each built-in says losing a prompt group for good costs."""
+
+    @pytest.mark.parametrize(
+        "sampler",
+        [
+            WindowedSampler(FakeBuffer(), max_staleness_versions=1),
+            ReadyFirstSampler(FakeBuffer(), max_staleness_versions=1),
+            WeightFifoSampler(FakeBuffer(), max_staleness_versions=1),
+            InOrderSampler(FakeBuffer(), max_lookahead_versions=1),
+        ],
+        ids=["windowed", "ready_first", "weight_fifo", "in_order"],
+    )
+    def test_builtins_implement_the_optional_protocol(self, sampler):
+        assert isinstance(sampler, DropAccountingSampler)
+
+    def test_a_sampler_without_the_members_is_not_an_instance(self):
+        assert not isinstance(object(), DropAccountingSampler)
+
+    def test_in_order_charges_the_stamped_step_and_uses_the_pool(self):
+        sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+        charged = sampler.charge_step_for_lost_group(
+            target_step=3, assembling_version=7
+        )
+        assert charged == 3
+        assert sampler.uses_pooled_replacements is True
+        assert sampler.closes_short_at_exhaustion is False
+
+    @pytest.mark.parametrize(
+        "sampler",
+        [
+            ReadyFirstSampler(FakeBuffer(), max_staleness_versions=1),
+            WeightFifoSampler(FakeBuffer(), max_staleness_versions=1),
+        ],
+        ids=["ready_first", "weight_fifo"],
+    )
+    def test_gated_samplers_charge_the_step_being_assembled(self, sampler):
+        unstamped = sampler.charge_step_for_lost_group(
+            target_step=None, assembling_version=7
+        )
+        assert unstamped == 7
+        assert sampler.closes_short_at_exhaustion is False
+
+    def test_weight_fifo_has_no_spare_pool_but_ready_first_does(self):
+        """A weight_fifo replacement lands in a newer weight bucket, so it has no pool."""
+        buf = FakeBuffer()
+        assert (
+            WeightFifoSampler(buf, max_staleness_versions=1).uses_pooled_replacements
+            is False
+        )
+        assert (
+            ReadyFirstSampler(buf, max_staleness_versions=1).uses_pooled_replacements
+            is True
+        )
+
+    def test_windowed_charges_nothing_and_closes_short_at_the_end(self):
+        sampler = WindowedSampler(FakeBuffer(), max_staleness_versions=1)
+        assert (
+            sampler.charge_step_for_lost_group(target_step=None, assembling_version=7)
+            is None
+        )
+        assert (
+            sampler.charge_step_for_lost_group(target_step=3, assembling_version=7)
+            is None
+        )
+        assert sampler.uses_pooled_replacements is False
+        assert sampler.closes_short_at_exhaustion is True
+
+    def test_a_custom_subclass_of_a_builtin_keeps_that_policy(self):
+        sampler = EchoSampler(FakeBuffer(), max_lookahead_versions=1)
+        assert isinstance(sampler, DropAccountingSampler)
+        charged = sampler.charge_step_for_lost_group(
+            target_step=2, assembling_version=9
+        )
+        assert charged == 2
 
 
 class TestAdmission:
@@ -524,6 +604,69 @@ class TestCustomFqnSampler:
         assert isinstance(s, EchoSampler)
         assert isinstance(s, PromptGroupSampler)
         assert s.max_lookahead_versions == 1
+
+
+def _custom(cls_name: str) -> CustomSamplerConfig:
+    return CustomSamplerConfig(target=f"{__name__}:{cls_name}")
+
+
+@pytest.mark.parametrize(
+    ("cfg", "expected"),
+    [
+        (InOrderSamplerConfig(max_lookahead_versions=1), True),
+        (ReadyFirstSamplerConfig(max_staleness_versions=1), True),
+        (WindowedSamplerConfig(max_staleness_versions=1), True),
+        (_custom("EchoSampler"), True),
+        (_custom("NoDropAccounting"), False),
+    ],
+)
+def test_filter_refill_requires_separate_admission_wait(cfg, expected):
+    assert sampler_supports_transactional_admission(cfg) is expected
+
+
+class TestRequireDropAccountingMembers:
+    def test_raises_when_no_member_is_defined(self):
+        with pytest.raises(ValueError, match="missing the required"):
+            require_drop_accounting_members(_custom("NoDropAccounting"))
+
+    def test_names_the_missing_members_of_a_partial_implementation(self):
+        with pytest.raises(ValueError) as excinfo:
+            require_drop_accounting_members(_custom("PartialDropAccounting"))
+        text = str(excinfo.value)
+        # The reported list names the three members this class omits and not the one
+        # it declares (``uses_pooled_replacements``).
+        reported = text.split("attribute(s) ", 1)[1].split("]", 1)[0]
+        assert "closes_short_at_exhaustion" in reported
+        assert "requires_shortfall_reconciliation" in reported
+        assert "charge_step_for_lost_group" in reported
+        assert "uses_pooled_replacements" not in reported
+
+    @pytest.mark.parametrize(
+        "cfg",
+        [
+            _custom("FullDropAccounting"),
+            _custom("EchoSampler"),
+            WindowedSamplerConfig(max_staleness_versions=1),
+            InOrderSamplerConfig(max_lookahead_versions=1),
+        ],
+        ids=["full-protocol", "base-sampler-subclass", "windowed", "in_order"],
+    )
+    def test_silent_when_the_members_are_declared_or_sampler_is_built_in(self, cfg):
+        # A fully-declared custom class, or any built-in, passes without raising.
+        assert require_drop_accounting_members(cfg) is None
+
+    def test_flags_assigned_in_init_are_rejected(self):
+        """Setup inspects the class, before __init__ runs, so instance-only flags
+        are invisible here and the check must reject the sampler.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            require_drop_accounting_members(_custom("InstanceAttrDropAccounting"))
+
+        text = str(excinfo.value)
+        assert "Declare them as class" in text
+        # The flags set in __init__ are not visible to the pre-construction check,
+        # so they are reported missing.
+        assert "uses_pooled_replacements" in text
 
 
 class TestWindowedSelect:
@@ -1131,8 +1274,42 @@ class TestInflightAbortPolicy:
         )
 
 
+class NoDropAccounting:
+    """Defines none of the DropAccountingSampler members."""
+
+
+class PartialDropAccounting:
+    """Defines one member, which isinstance ignores because the rest are missing."""
+
+    uses_pooled_replacements = False
+
+
+class InstanceAttrDropAccounting:
+    """Assigns the flags in __init__, where the setup check cannot see them."""
+
+    def __init__(self) -> None:
+        self.uses_pooled_replacements = False
+        self.closes_short_at_exhaustion = True
+
+    def charge_step_for_lost_group(self, *, target_step, assembling_version):
+        return None
+
+
+class FullDropAccounting:
+    uses_pooled_replacements = False
+    closes_short_at_exhaustion = True
+    requires_shortfall_reconciliation = False
+
+    def charge_step_for_lost_group(self, *, target_step, assembling_version):
+        return None
+
+
 class EchoSampler(InOrderSampler):
     """Stand-in for a user-defined sampler loaded by FQN."""
+
+
+class InheritedWeightFifoSampler(WeightFifoSampler):
+    """Custom policy retaining strict single-weight selection."""
 
 
 class CheckpointingEchoSampler(EchoSampler):

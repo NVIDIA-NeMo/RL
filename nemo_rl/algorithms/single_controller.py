@@ -146,6 +146,10 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
     _maybe_restore_native_data_plane_checkpoint,
     _register_single_controller_partitions,
 )
+from nemo_rl.algorithms.single_controller_utils.step_assembly import (
+    ShortfallCredit,
+    StepAssemblyAccountant,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     BelowValidFractionGroup,
     FinalizeOutcome,
@@ -746,9 +750,6 @@ class SingleControllerActor:
 
         self._inflight_by_group_id: dict[str, tuple[asyncio.Task[None], int]] = {}
 
-        # Groups that will never arrive, keyed by the training step they were stamped
-        # for. A sampler that matches batches to steps exactly (InOrderSampler) can only
-
         # Per-step counts of how each step got made whole with spare prompts (logged
         # so a step's batch size stays explainable after the fact).
         #
@@ -811,6 +812,11 @@ class SingleControllerActor:
         )
 
         self._trainer_version: int = restored_trainer_version
+        # The step the train pump is selecting groups for, or will select for next once
+        # the current step has finished selecting. A lost group with no step of its own
+        # is charged here. Built lazily (see ``_accountant``) so it is available even on
+        # controller instances that unit tests construct past ``__init__``.
+        self._accountant_obj: Optional[StepAssemblyAccountant] = None
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
@@ -848,6 +854,23 @@ class SingleControllerActor:
             flush=True,
         )
 
+    @property
+    def _accountant(self) -> StepAssemblyAccountant:
+        """Step-assembly accountant, built lazily on first access.
+
+        Lazy so it is also available on controller instances that unit tests
+        build via ``object.__new__`` past ``__init__``. The cursor seeds from the
+        current ``_trainer_version`` (set to the restored version in ``__init__``).
+        """
+        obj = getattr(self, "_accountant_obj", None)
+        if obj is None:
+            obj = StepAssemblyAccountant(
+                controller=self,
+                initial_version=getattr(self, "_trainer_version", 0),
+            )
+            self._accountant_obj = obj
+        return obj
+
     # ── public API ─────────────────────────────────────────────────────────
     async def run(self) -> dict[str, Any]:
         """Main entry point. Runs until max_train_steps is reached."""
@@ -879,6 +902,9 @@ class SingleControllerActor:
         if self._weight_synchronizer.is_stale:
             await self._sync_weights()
         self._rollout_manager.set_weight_version(self._trainer_version)
+        self._rollout_manager.set_tally_step_provider(
+            lambda: self._accountant.assembling_version
+        )
 
         if await self._rollout_restorer.restore():
             self._rollout_recovery_enabled = True
@@ -1181,8 +1207,7 @@ class SingleControllerActor:
         target_step = await self._sampler.admit(
             trainer_version_fn=lambda: self._trainer_version
         )
-        if target_step is not None:
-            self._rollout_runtime.sampler_stamps_target_steps = True
+        self._rollout_runtime.sampler_stamps_target_steps = True
         self._require_unoccupied_target_step(target_step)
         return target_step
 
@@ -1209,8 +1234,7 @@ class SingleControllerActor:
             cut: DataPlaneMutationCut,
             target_step: Optional[int],
         ) -> Optional[int]:
-            if target_step is not None:
-                self._rollout_runtime.sampler_stamps_target_steps = True
+            self._rollout_runtime.sampler_stamps_target_steps = True
             self._require_unoccupied_target_step(target_step)
             for group_id in group_ids:
                 self._rollout_manager.mark_prompt_group_admitted(
@@ -1852,7 +1876,7 @@ class SingleControllerActor:
                                             cut, lineage_group_id
                                         )
                                 self._buffer_capacity.release()
-                                self._credit_shortfall(target_step)
+                                self._accountant.credit_shortfall(target_step)
                                 return
                             request, rollout_metrics = captured
                             async with self._claim_filtered_spare():
@@ -1870,7 +1894,7 @@ class SingleControllerActor:
                                 # train pump will never release this permit
                                 # and the step must be allowed to close short.
                                 self._buffer_capacity.release()
-                                self._credit_shortfall(target_step)
+                                self._accountant.credit_shortfall(target_step)
                                 return
                             self._rollout_manager.record_group_rewards(
                                 target_step,
@@ -2002,6 +2026,18 @@ class SingleControllerActor:
 
                         # Filtered groups spend only the dynamic-sampling budget.
                         filtered = outcome is RolloutOutcome.FILTERED
+                        if filtered and not self._sampler.uses_pooled_replacements:
+                            async with self._dispatch_reservation(
+                                "prompt_reservations"
+                            ) as cut:
+                                self._discard_prompt_group(cut, lineage_group_id)
+                                # Record only: windowed draws no replacement here, so a
+                                # filtered group at EOF must close the step short rather
+                                # than fail an allowance it never spent. The train pump
+                                # enforces the budget after selection instead.
+                                self._record_filtered_prompt(target_step)
+                            self._buffer_capacity.release()
+                            return
                         async with self._replacement_mutation(filtered=filtered) as cut:
                             replacement = (
                                 self._pop_filtered_replacement(target_step)
@@ -2015,7 +2051,7 @@ class SingleControllerActor:
                             self._discard_prompt_group(cut, lineage_group_id)
                             lineage_group_id, target_step = (
                                 self._substitute_dropped_group(
-                                    cut, replacement, target_step
+                                    cut, replacement, target_step, filtered=filtered
                                 )
                             )
                         if replacement is None:
@@ -2026,10 +2062,8 @@ class SingleControllerActor:
 
                         if filtered:
                             filtered_replacements += 1
-                            drawn = (
-                                self._filtered_prompts_by_step.get(target_step, 0)
-                                if target_step is not None
-                                else 0
+                            drawn = self._filtered_prompts_by_step.get(
+                                self._accountant.accounting_step(target_step), 0
                             )
                             spent = (
                                 f"{drawn}/"
@@ -2060,13 +2094,11 @@ class SingleControllerActor:
                 if not generation_permit_released:
                     sem.release()
 
-            if (replacements or filtered_replacements) and target_step is not None:
-                # Counted per slot, not per attempt: a step got its group back, which is
-                # the fact that explains why its batch is full despite a drop. Recorded
-                # against the step the spare actually committed to, which after a borrow
-                # is the lender rather than the step that was dropped from.
-                self._batch_replacements[target_step] = (
-                    self._batch_replacements.get(target_step, 0) + 1
+            if replacements or filtered_replacements:
+                # Count each recovered slot once, against its stamp or assembling step.
+                replaced_step = self._accountant.accounting_step(target_step)
+                self._batch_replacements[replaced_step] = (
+                    self._batch_replacements.get(replaced_step, 0) + 1
                 )
 
             self._record_rollout_timing(
@@ -2096,6 +2128,7 @@ class SingleControllerActor:
         async def maybe_refill() -> None:
             if (
                 not self._dynamic_sampling_enabled
+                or not self._sampler.uses_pooled_replacements
                 or self._dataloader_exhausted
                 or len(self._rollout_runtime.filtered_reserve)
                 >= self._algo_cfg.num_prompts_per_step
@@ -2124,9 +2157,18 @@ class SingleControllerActor:
             await lock.acquire()
 
         async def wait_for_admission() -> None:
-            while not self._sampler.can_admit(trainer_version=self._trainer_version):
+            # Setup rejects dynamic sampling unless the sampler is transactional.
+            sampler = cast(TransactionalAdmissionSampler, self._sampler)
+            admission = rollout_tasks.create_task(
+                sampler.wait_until_admissible(
+                    trainer_version_fn=lambda: self._trainer_version
+                )
+            )
+            await asyncio.sleep(0)
+            while not admission.done():
                 await maybe_refill()
                 await asyncio.sleep(0.1)
+            await admission
 
         async def _launch(
             prompt: DatumSpec,
@@ -2267,11 +2309,11 @@ class SingleControllerActor:
         that go unused are not wasted work -- nothing has been generated for them -- and
         they stay in the pool for later steps.
 
-        Nothing is diverted until the sampler has actually stamped a batch, so a run
-        whose sampler never stamps does not lose a batch of prompts to a pool it can
-        never draw on. The cost is that the first batch is always admitted rather than
-        diverted; in practice the pool is filled while that first batch's rollouts are
-        still running, so it is available by the time any of them can be given up on.
+        Nothing is diverted for a sampler that does not use the pool, or before the first
+        batch has been admitted. The cost of the latter is that the first batch is always
+        admitted rather than diverted; in practice the pool is filled while that first
+        batch's rollouts are still running, so it is available by the time any of them
+        can be given up on.
         """
         failure_cfg = self._async_cfg.rollout_failure
         # Cheapest gate first, and the one a run that pools nothing never looks past.
@@ -2279,6 +2321,8 @@ class SingleControllerActor:
             failure_cfg.on_dropped_prompt != "replace"
             and not self._dynamic_sampling_enabled
         ):
+            return False
+        if not self._sampler.uses_pooled_replacements:
             return False
         if not self._rollout_runtime.sampler_stamps_target_steps:
             return False
@@ -2397,21 +2441,17 @@ class SingleControllerActor:
         ``_pop_filtered_replacement``, which spends a different budget.
 
         None covers the four ways a replacement can be unavailable: it was not asked
-        for, the sampler does not stamp target steps so no step is ever waiting on a
-        replacement, the per-slot budget is spent, or the pool is empty because the
-        dataloader is exhausted. Every one of them falls back to
-        ``on_dropped_prompt="shrink"`` rather than waiting, because a step whose
+        for, the sampler does not use a spare pool, the per-slot budget is spent, or the
+        pool is empty because the dataloader is exhausted. Every one of them falls back
+        to ``on_dropped_prompt="shrink"`` rather than waiting, because a step whose
         replacements keep failing still has to close.
 
-        Whether a step can be waiting on a replacement is the sampler's capability,
-        read from ``_sampler_stamps_target_steps``. It is deliberately not inferred
-        from a per-call ``target_step``, which would make the answer depend on which
-        prompt happened to ask.
+        The sampler's DropAccountingSampler capability decides whether it uses a pool.
         """
         failure_cfg = self._async_cfg.rollout_failure
         if failure_cfg.on_dropped_prompt != "replace":
             return None
-        if not self._rollout_runtime.sampler_stamps_target_steps:
+        if not self._sampler.uses_pooled_replacements:
             return None
         if replacements_used >= failure_cfg.max_replacement_attempts:
             return None
@@ -2419,8 +2459,21 @@ class SingleControllerActor:
             return None
         return self._rollout_runtime.replacement_reserve.popleft()
 
-    def _charge_filtered_prompt(self, target_step: Optional[int]) -> None:
-        """Charge one resampled prompt to its step, failing the run past the allowance.
+    def _record_filtered_prompt(self, target_step: Optional[int]) -> None:
+        """Count one resampled prompt against its step, without enforcing the budget.
+
+        Unstamped prompts are charged to the step currently being assembled. A pooled
+        sampler draws a replacement synchronously, so it checks the budget in the same
+        step; windowed draws none and relies on later dispatches, so the train pump
+        checks after selection instead (see ``_check_filtered_budget``).
+        """
+        step = self._accountant.accounting_step(target_step)
+        self._filtered_prompts_by_step[step] = (
+            self._filtered_prompts_by_step.get(step, 0) + 1
+        )
+
+    def _check_filtered_budget(self, step: int) -> None:
+        """Fail the run once a step has drawn past its generation-batch allowance.
 
         v1 bounds a step by ``dynamic_sampling_max_gen_batches`` generation batches.
         SC resamples per slot rather than per batch, so the same allowance is counted
@@ -2428,23 +2481,16 @@ class SingleControllerActor:
         admitted with included. A step that cannot be filled within it means the filter
         is rejecting faster than the data can refill it, which v1 also ends the run on.
 
-        Unstamped prompts are not charged: with no step to attribute them to there is
-        no per-step total to bound. Setup requires a stamping sampler, so this only
-        covers a prompt whose step has already closed.
-
         Raises:
             RuntimeError: The step has spent its whole generation-batch allowance.
         """
-        if target_step is None:
-            return
-        drawn = self._filtered_prompts_by_step.get(target_step, 0) + 1
+        drawn = self._filtered_prompts_by_step.get(step, 0)
         allowance = self._filtered_prompt_budget - self._algo_cfg.num_prompts_per_step
         if drawn <= allowance:
-            self._filtered_prompts_by_step[target_step] = drawn
             return
         raise RuntimeError(
             f"dynamic sampling drew {drawn} replacement prompt(s) for target_step="
-            f"{target_step}, past the "
+            f"{step}, past the "
             f"grpo.dynamic_sampling_max_gen_batches="
             f"{cast(GRPOConfig, self._algo_cfg).dynamic_sampling_max_gen_batches} "
             f"generation batches that step is allowed "
@@ -2454,6 +2500,15 @@ class SingleControllerActor:
             "zero_variance_fraction, then raise the allowance or revisit the "
             "reward/prompt mix."
         )
+
+    def _charge_filtered_prompt(self, target_step: Optional[int]) -> None:
+        """Record a pooled resample and fail the run past the allowance.
+
+        A pooled sampler has the replacement in hand, so it enforces the budget in the
+        same step the prompt is drawn.
+        """
+        self._record_filtered_prompt(target_step)
+        self._check_filtered_budget(self._accountant.accounting_step(target_step))
 
     async def _wait_for_filtered_reserve(self) -> None:
         """Wait for pump refill without holding a checkpoint mutation cut."""
@@ -2472,8 +2527,9 @@ class SingleControllerActor:
             return self._rollout_runtime.filtered_reserve.popleft()
         if not self._dataloader_exhausted:
             raise RuntimeError("filtered replacement pool emptied before consumption")
-        if target_step is not None:
-            self._rollout_runtime.steps_allowed_short.add(target_step)
+        self._rollout_runtime.steps_allowed_short.add(
+            self._accountant.accounting_step(target_step)
+        )
         return None
 
     @contextlib.asynccontextmanager
@@ -2547,6 +2603,8 @@ class SingleControllerActor:
         cut: Optional[DataPlaneMutationCut],
         replacement: Optional[DatumSpec],
         target_step: Optional[int],
+        *,
+        filtered: bool = False,
     ) -> tuple[Optional[str], Optional[int]]:
         """Stand a spare prompt in for a dropped group, or close its step short.
 
@@ -2560,13 +2618,16 @@ class SingleControllerActor:
             replacement: The spare already taken from its pool, or ``None`` if there
                 was none, which credits ``target_step`` short.
             target_step: The step the dropped group was stamped for.
+            filtered: Whether the group was dropped by dynamic-sampling filtering
+                rather than a rollout failure. A filtered group that closes its step
+                short is allowed below the floor; a failed one is not.
 
         Returns:
             The ledger ID reserved for the spare (``None`` without rollout recovery
             or without a spare) and the step the spare is generated for.
         """
         if replacement is None:
-            self._credit_shortfall(target_step)
+            self._accountant.credit_shortfall(target_step, allow_short=filtered)
             return None, target_step
         # Attempted only now that a spare is in hand, because the borrow is a debt
         # and the spare is what repays it. Borrowing without one would leave the
@@ -2582,31 +2643,19 @@ class SingleControllerActor:
             )
         return lineage_group_id, target_step
 
-    def _credit_shortfall(self, target_step: Optional[int]) -> None:
-        """Record that a stamped step will never receive a group it is waiting for."""
-        if target_step is None:
-            return
-        self._rollout_runtime.batch_shortfall[target_step] = (
-            self._rollout_runtime.batch_shortfall.get(target_step, 0) + 1
-        )
-        print(
-            f"  target_step={target_step} is one group short "
-            f"({self._rollout_runtime.batch_shortfall[target_step]} total); the train pump "
-            "will close that step early",
-            flush=True,
-        )
-
     def _target_groups_for_step(self, step: int) -> int:
         """How many prompt groups this step should train on, after dropped prompts.
 
-        ``num_prompts_per_step`` is the target; groups stamped for this step that were
-        given up on are subtracted, because they are never arriving and a sampler that
-        matches batches to steps exactly cannot substitute another step's groups for
-        them. Without this the pump waits on a group no one is generating.
+        ``num_prompts_per_step`` is the target; groups charged to this step that were
+        given up on are subtracted, because they are never arriving. Which step a lost
+        group is charged to is the sampler's call (see ``DropAccountingSampler``): the
+        step it was stamped for, the step being assembled, or none. Without this the
+        pump waits on a group no one is generating.
 
-        A data-exhausted step returns its remaining target even below the floor,
-        allowing the train pump to drain its groups and abort accumulated gradients.
-        The final floor check then decides whether to train or skip that step.
+        Steps explicitly allowed to close short return their remaining target even
+        below the floor, letting the train pump drain their groups and abort
+        accumulated gradients. The final floor check decides whether to train or
+        skip. Data exhaustion alone does not grant this permission.
 
         How much smaller is bounded by ``min_step_batch_fraction``, and that bound has
         to live here because neither drop budget provides it. Both budgets are
@@ -2615,10 +2664,8 @@ class SingleControllerActor:
         succeed can shrink it without ever tripping them.
 
         Raises:
-            RuntimeError: A step without data exhaustion fell below
-                ``min_step_batch_fraction`` of
-                ``num_prompts_per_step``. Training a fraction of a batch is a silent
-                change to the gradient estimate, so it is refused rather than absorbed.
+            RuntimeError: A step not permitted to close below the floor fell below
+                ``min_step_batch_fraction`` of ``num_prompts_per_step``.
         """
         num_prompts_per_step = self._algo_cfg.num_prompts_per_step
         dropped = self._rollout_runtime.batch_shortfall.get(step, 0)
@@ -2708,6 +2755,7 @@ class SingleControllerActor:
             ):
                 maybe_gpu_profile_step(self._gen, self._train_steps + 1)
             version_during_step = self._trainer_version
+            self._accountant.begin_step(version_during_step)
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
             min_sample_version = None
@@ -2807,16 +2855,34 @@ class SingleControllerActor:
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
+                        if (
+                            self._rollout_exhausted.is_set()
+                            and self._sampler.closes_short_at_exhaustion
+                        ):
+                            # Nothing more will arrive, so take what is left instead of
+                            # waiting for a full chunk.
+                            min_prompt_groups = 1
                         selected_group_ids: list[str] = []
                         selected_training_claim_ids: list[str] = []
                         training_claim_ids_before = (
                             self._buffer.training_owned_group_ids()
                         )
+                        assembly = self._accountant.step_assembly
+                        assert assembly is not None
+                        cursor_before_selection = self._accountant.assembling_version
+                        selection_credits: list[ShortfallCredit] = []
+                        assembly.selection_credits = selection_credits
                         train_meta, num_groups = await self._sampler.select(
                             current_train_weight=self._trainer_version,
                             min_prompt_groups=min_prompt_groups,
                             max_prompt_groups=max_prompt_groups,
                             **selection_kwargs,
+                        )
+                        assembly.selection_credits = None
+                        assembly.selected_groups = groups_dispatched + num_groups
+                        # Credits remain checkpoint-visible while the claim waits.
+                        self._accountant.reconcile_selection_credits(
+                            cursor_before_selection, selection_credits
                         )
                         training_claim_ids_after = (
                             self._buffer.training_owned_group_ids()
@@ -2862,6 +2928,28 @@ class SingleControllerActor:
                                         flush=True,
                                     )
                                     return
+                                if self._sampler.closes_short_at_exhaustion:
+                                    # At EOF, later groups cannot fill these slots.
+                                    missing = target_groups - groups_dispatched
+                                    if self._dynamic_sampling_enabled:
+                                        self._rollout_runtime.steps_allowed_short.add(
+                                            version_during_step
+                                        )
+                                    self._rollout_runtime.batch_shortfall[
+                                        version_during_step
+                                    ] = (
+                                        self._rollout_runtime.batch_shortfall.get(
+                                            version_during_step, 0
+                                        )
+                                        + missing
+                                    )
+                                    print(
+                                        f"  rollout exhausted: step "
+                                        f"{version_during_step} closes {missing} "
+                                        "group(s) short",
+                                        flush=True,
+                                    )
+                                    continue
                                 # Against the step's own target, not the configured
                                 # batch size: a step that legitimately shrank would
                                 # otherwise be reported as missing groups it was
@@ -2872,6 +2960,19 @@ class SingleControllerActor:
                                     f"{groups_dispatched}/{target_groups} prompt "
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
+                                )
+                            # windowed spends no pool, so this is the only place its
+                            # generation budget is enforced: a step still starved while
+                            # data flows means the filter rejects faster than the data
+                            # refills it, which v1 ends the run on. The exhaustion branch
+                            # above closes a data-exhausted step short before reaching
+                            # here, so EOF never trips the budget.
+                            if (
+                                self._dynamic_sampling_enabled
+                                and not self._sampler.uses_pooled_replacements
+                            ):
+                                self._check_filtered_budget(
+                                    self._accountant.assembling_version
                                 )
                             # Safe to span the select: a starved poll never
                             # reaches the data plane, so nothing below is
@@ -3241,6 +3342,9 @@ class SingleControllerActor:
                                 await asyncio.to_thread(self._trainer.offload_to_cpu)
                             await asyncio.to_thread(self._value.prepare_for_inference)
                         value_inference_prepared = True
+
+                # No await separates the final target check from this advance.
+                self._accountant.finish_step(version_during_step)
 
                 # The loop can leave a wait open on two exits that continue
                 # the run, where an unended span would stay open over the

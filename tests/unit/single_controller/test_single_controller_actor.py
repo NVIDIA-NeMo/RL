@@ -18,6 +18,7 @@ import asyncio
 import json
 import math
 import threading
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -44,7 +45,9 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     BaseSampler,
     InOrderSampler,
+    ReadyFirstSampler,
     ReadyFirstSamplerConfig,
+    WindowedSampler,
 )
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
@@ -2113,6 +2116,13 @@ def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None
 
 
 class _EmptySampler:
+    # Matches BaseSampler's gated defaults: the controller reads these directly off
+    # the sampler, so every pump-driving stub must declare them. Specialized stubs
+    # override individual flags to stand in for a different policy.
+    uses_pooled_replacements = True
+    closes_short_at_exhaustion = False
+    requires_shortfall_reconciliation = True
+
     async def evict(self, *, current_train_weight: int) -> int:
         del current_train_weight
         return 0
@@ -2457,6 +2467,8 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
+    ctrl._accountant._assembling_version = 0
+    ctrl._accountant._step_assembly = None
     ctrl._train_steps = 0
     attach_rollout_checkpointing(ctrl)
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
@@ -2570,6 +2582,397 @@ def _dropping_controller(*, credit_in_evict: bool):
     ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
     return ctrl
+
+
+class _ClosesShortSampler(_OneThenEmptySampler):
+    """Yields one group, then nothing: a windowed-style sampler at the end of the data."""
+
+    uses_pooled_replacements = False
+    closes_short_at_exhaustion = True
+
+    def __init__(self, meta: KVBatchMeta) -> None:
+        super().__init__(meta)
+        self.min_prompt_groups_asked: list[int] = []
+
+    def charge_step_for_lost_group(
+        self, *, target_step: int | None, assembling_version: int
+    ) -> int | None:
+        del target_step, assembling_version
+        return None
+
+    async def select(self, **kwargs):
+        self.min_prompt_groups_asked.append(kwargs["min_prompt_groups"])
+        return await super().select(**kwargs)
+
+
+def _closes_short_controller(*, min_step_batch_fraction: float):
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=_one_group_tags(1),
+    )
+    sampler = _ClosesShortSampler(meta)
+    ctrl = _train_pump_controller(sampler=sampler)
+    ctrl._async_cfg.rollout_failure.min_step_batch_fraction = min_step_batch_fraction
+    # A full chunk is the whole step, so the first request would ask for 2 groups.
+    ctrl._async_cfg.min_groups_for_streaming_train = 2
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    return ctrl, sampler
+
+
+def test_train_pump_closes_the_last_step_short_when_a_windowed_sampler_runs_out(
+    monkeypatch,
+) -> None:
+    """Nothing is charged to a step mid-run, so only the tail can leave one short."""
+    # ceil(0.5 * 2) is 1, so closing on the one group it got is legal.
+    ctrl, sampler = _closes_short_controller(min_step_batch_fraction=0.5)
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._train_steps == 1
+    assert ctrl._consumed_samples == 1, "the step is what shrank, not the run"
+    assert ctrl._rollout_runtime.batch_shortfall == {}, "pruned once the step closed"
+    assert ctrl._accountant._assembling_version == 1, (
+        "a later loss counts toward the next step"
+    )
+    assert set(sampler.min_prompt_groups_asked) == {1}, (
+        "with no more data coming, it takes whatever is left instead of waiting for "
+        "a full chunk"
+    )
+
+
+def test_train_pump_still_fails_a_windowed_tail_below_the_floor() -> None:
+    """The shortfall at the end of the data is held to min_step_batch_fraction too."""
+    # ceil(0.9 * 2) is 2, so a step with only one group is below the floor.
+    ctrl, _ = _closes_short_controller(min_step_batch_fraction=0.9)
+
+    with pytest.raises(RuntimeError, match="below the floor"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+
+def test_the_closes_short_stub_declares_what_the_windowed_sampler_does() -> None:
+    """The stub drives the pump tests above, so it must not drift from the real one."""
+    windowed = WindowedSampler(MagicMock(), max_staleness_versions=1)
+    stub = _ClosesShortSampler(MagicMock())
+
+    assert stub.uses_pooled_replacements == windowed.uses_pooled_replacements
+    assert stub.closes_short_at_exhaustion == windowed.closes_short_at_exhaustion
+    assert (
+        stub.requires_shortfall_reconciliation
+        == windowed.requires_shortfall_reconciliation
+    )
+    for target_step in (None, 3):
+        assert stub.charge_step_for_lost_group(
+            target_step=target_step, assembling_version=7
+        ) == windowed.charge_step_for_lost_group(
+            target_step=target_step, assembling_version=7
+        )
+
+
+class _ReadyFirstFilteringSampler(_OneThenEmptySampler):
+    """One group, then a filtered group reported through the real ready_first policy.
+
+    Stands in for a dynamic-sampling drop under ready_first: the group is filtered
+    after it finishes generating, so it carries no target_step and the pump is already
+    waiting on it. The credit goes through _credit_shortfall rather than writing the
+    dict, so the real ReadyFirstSampler.charge_step_for_lost_group decides the step.
+    """
+
+    def __init__(self, meta: KVBatchMeta) -> None:
+        super().__init__(meta)
+        self._real = ReadyFirstSampler(MagicMock(), max_staleness_versions=1)
+        self.ctrl = None
+
+    uses_pooled_replacements = True
+    closes_short_at_exhaustion = False
+
+    def charge_step_for_lost_group(self, *, target_step, assembling_version):
+        return self._real.charge_step_for_lost_group(
+            target_step=target_step, assembling_version=assembling_version
+        )
+
+    async def select(self, **kwargs):
+        BaseSampler._validate_group_bounds(
+            kwargs["min_prompt_groups"], kwargs["max_prompt_groups"]
+        )
+        meta, num_groups = await super().select(**kwargs)
+        if meta is None:
+            # The pool is empty, so the filtered group is lost for good.
+            self.ctrl._accountant.credit_shortfall(None)
+        return meta, num_groups
+
+
+def test_train_pump_closes_a_ready_first_step_short_on_a_filtered_group(
+    monkeypatch,
+) -> None:
+    """End to end: an unstamped loss shrinks the step being assembled, not a later one."""
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=_one_group_tags(1),
+    )
+    sampler = _ReadyFirstFilteringSampler(meta)
+    ctrl = _train_pump_controller(sampler=sampler)
+    sampler.ctrl = ctrl
+    # ceil(0.5 * 2) is 1, so closing on the one group it got is legal.
+    ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
+    # Rollouts are still running, so the pump cannot fall back to the exhausted path:
+    # it has to act on the credit or wait on a group nobody is generating.
+    ctrl._rollout_exhausted.clear()
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._train_steps == 1
+    assert ctrl._consumed_samples == 1, "the step is what shrank, not the run"
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert train_metrics["dropped_prompt_groups"] == 1
+    assert ctrl._rollout_runtime.batch_shortfall == {}, (
+        "pruned once the step it was charged to closed"
+    )
+
+
+def test_ready_first_replaces_a_filtered_group_then_shrinks_the_assembling_step() -> (
+    None
+):
+    """Dynamic sampling under ready_first: spare first, then the step being assembled."""
+    ctrl = _train_pump_controller(
+        sampler=ReadyFirstSampler(MagicMock(), max_staleness_versions=1)
+    )
+    ctrl._async_cfg.rollout_failure = SimpleNamespace(
+        min_step_batch_fraction=0.5,
+        on_dropped_prompt="replace",
+        max_replacement_attempts=1,
+    )
+    ctrl._rollout_runtime.replacement_reserve = deque(["spare0"])
+    ctrl._rollout_runtime.batch_shortfall = {}
+    ctrl._accountant._assembling_version = 4
+
+    assert ctrl._take_replacement(0) == "spare0"
+    assert ctrl._take_replacement(0) is None, "the pool is now empty"
+    ctrl._accountant.credit_shortfall(None)
+
+    assert ctrl._rollout_runtime.batch_shortfall == {4: 1}
+    assert ctrl._target_groups_for_step(4) == 1, "2 prompts per step, one lost"
+    assert ctrl._target_groups_for_step(5) == 2, "the next step is untouched"
+
+
+class _GatedUnstampedSampler(_FullStepSampler):
+    """A whole step in one chunk, from a gated sampler that stamps no step."""
+
+    uses_pooled_replacements = True
+    closes_short_at_exhaustion = False
+
+    def charge_step_for_lost_group(
+        self, *, target_step: int | None, assembling_version: int
+    ) -> int | None:
+        return assembling_version if target_step is None else target_step
+
+
+class _LosingTrainer(_NoOpTrainer):
+    """Loses a group of some later step while the chunk trains."""
+
+    def __init__(self) -> None:
+        self.ctrl = None
+
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
+        del meta, train_fields
+        self.ctrl._accountant.credit_shortfall(None)
+
+
+@pytest.mark.parametrize("when", ["training", "selection"])
+@pytest.mark.parametrize(
+    ("drops", "exhausted"),
+    [(1, False), (2, False), (3, False), (1, True), (2, True), (5, True)],
+)
+def test_unstamped_losses_preserve_selected_groups(
+    monkeypatch, when: str, drops: int, exhausted: bool
+) -> None:
+    """Concurrent losses fill unselected slots, including across an awaited claim."""
+
+    async def exercise() -> None:
+        loop = asyncio.get_running_loop()
+        first_optimizer_shortfalls = []
+        provisional_shortfalls = []
+
+        def lose() -> None:
+            for _ in range(drops):
+                ctrl._accountant.credit_shortfall(None, allow_short=exhausted)
+            provisional_shortfalls.append(dict(ctrl._rollout_runtime.batch_shortfall))
+
+        class Sampler(_EmptySampler):
+            uses_pooled_replacements = True
+            closes_short_at_exhaustion = False
+
+            def __init__(self) -> None:
+                self.policy = ReadyFirstSampler(MagicMock(), max_staleness_versions=1)
+                self.sizes = [3] + ([5 - drops] if drops < 5 else [])
+                self.index = 0
+
+            def charge_step_for_lost_group(self, *, target_step, assembling_version):
+                return self.policy.charge_step_for_lost_group(
+                    target_step=target_step, assembling_version=assembling_version
+                )
+
+            async def select(self, *, min_prompt_groups, max_prompt_groups, **kwargs):
+                if self.index == len(self.sizes):
+                    return None, 0
+                index = self.index
+                size = self.sizes[index]
+                assert min_prompt_groups <= size <= max_prompt_groups
+                self.index += 1
+                if index == 0 and when == "selection":
+                    await asyncio.sleep(0)
+                    lose()
+                    await asyncio.sleep(0)
+                return KVBatchMeta(
+                    partition_id="rollout_data",
+                    task_name="train",
+                    sample_ids=[f"{index}-{i}" for i in range(size)],
+                    fields=[],
+                    sequence_lengths=[1] * size,
+                    tags=[
+                        {GROUP_ID_TAG: f"{index}-{i}", "weight_version": 0}
+                        for i in range(size)
+                    ],
+                ), size
+
+        class Trainer(_NoOpTrainer):
+            def __init__(self) -> None:
+                self.chunks = 0
+
+            def train_microbatches_from_meta(self, meta, *, train_fields) -> None:
+                self.chunks += 1
+                if self.chunks == 1 and when == "training":
+                    credited = threading.Event()
+
+                    def apply() -> None:
+                        lose()
+                        credited.set()
+
+                    loop.call_soon_threadsafe(apply)
+                    assert credited.wait(timeout=3)
+
+            def finish_train_step(self) -> dict:
+                first_optimizer_shortfalls.append(
+                    dict(ctrl._rollout_runtime.batch_shortfall)
+                )
+                return {}
+
+        ctrl = _train_pump_controller(sampler=Sampler())
+        ctrl._trainer = Trainer()
+        ctrl._algo_cfg.num_prompts_per_step = 4
+        ctrl._algo_cfg.max_num_steps = 2
+        ctrl._async_cfg.min_groups_for_streaming_train = 3
+        ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
+        ctrl._sync_weights = AsyncMock(return_value=0)
+        ctrl._logger = MagicMock()
+
+        await asyncio.wait_for(ctrl._train_pump(), timeout=3)
+
+        expected = {0: 1}
+        if drops > 1:
+            expected[1] = drops - 1
+        assert first_optimizer_shortfalls[0] == expected
+        assert sum(provisional_shortfalls[0].values()) == drops
+        assert ctrl._train_steps == 2
+        assert ctrl._consumed_samples == 8 - drops
+        assert len(first_optimizer_shortfalls) == (1 if drops == 5 else 2)
+        assert ctrl._rollout_runtime.batch_shortfall == {}
+        assert not ctrl._rollout_runtime.shortfall_reconciliation_pending
+        if exhausted and drops > 1:
+            assert {0, 1} <= ctrl._rollout_runtime.steps_allowed_short
+
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("policy", ["stamped", "windowed", "custom"])
+def test_selection_reconciliation_preserves_sampler_charge_policy(
+    monkeypatch, policy: str
+) -> None:
+    """Only the sampler's accounting cursor changes; explicit destinations remain."""
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=_one_group_tags(1),
+    )
+
+    class Sampler(_ChunkedSampler):
+        uses_pooled_replacements = True
+        closes_short_at_exhaustion = False
+
+        def charge_step_for_lost_group(self, *, target_step, assembling_version):
+            if policy == "windowed":
+                return None
+            if policy == "stamped":
+                return target_step
+            return 7
+
+        async def select(self, **kwargs):
+            if self._remaining == 2:
+                await asyncio.sleep(0)
+                for _ in range(2):
+                    ctrl._accountant.credit_shortfall(
+                        7 if policy == "stamped" else None
+                    )
+            return await super().select(**kwargs)
+
+    ctrl = _train_pump_controller(sampler=Sampler(meta, chunks=2))
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+
+    assert ctrl._train_steps == 1
+    assert ctrl._consumed_samples == 2
+    assert ctrl._rollout_runtime.batch_shortfall == (
+        {} if policy == "windowed" else {7: 2}
+    )
+
+
+def test_a_group_lost_while_the_last_chunk_trains_counts_toward_the_next_step(
+    monkeypatch,
+) -> None:
+    """Charged to this step it would be pruned with it, and the next would stall."""
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0", "sample-1"],
+        fields=[],
+        sequence_lengths=[1, 1],
+        tags=_one_group_tags(2),
+    )
+    ctrl = _train_pump_controller(sampler=_GatedUnstampedSampler(meta))
+    trainer = _LosingTrainer()
+    trainer.ctrl = ctrl
+    ctrl._trainer = trainer
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._train_steps == 1
+    assert ctrl._rollout_runtime.batch_shortfall == {1: 1}, (
+        "step 1 is the one now short a group"
+    )
 
 
 @pytest.mark.parametrize("credit_in_evict", [False, True])
@@ -2957,7 +3360,9 @@ def test_run_pumps_snapshots_generation_before_dispatch(
     ctrl = controller_cls.__new__(controller_cls)
     ctrl._environment_checkpoint = SimpleNamespace(check_startup=AsyncMock())
     ctrl._weight_synchronizer = SimpleNamespace(is_stale=False)
-    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(
+        set_weight_version=MagicMock(), set_tally_step_provider=MagicMock()
+    )
     ctrl._trainer_version = 0
     ctrl._rollout_restorer = SimpleNamespace(restore=AsyncMock(return_value=False))
     events = []
