@@ -265,7 +265,7 @@ mcore = [
   # zero_train_gen_mismatch / batch_invariant_mode pins on both train and generation.
   # b27 supports QuACK's current packed-subtraction API and CUTLASS >=4.6.2.
   "flash-attn-4==4.0.0b27 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  # FA4 requires TVM-FFI >=0.1.12; TileLang 0.1.13 requires <0.1.13.
+  # FA4 requires apache-tvm-ffi >=0.1.12; TileLang 0.1.13 requires apache-tvm-ffi <0.1.13.
   "apache-tvm-ffi==0.1.12",
   # Core's tool.uv constraint is not inherited by downstream projects. Older
   # Quack releases use CuTe APIs moved by the required CUTLASS 4.8 runtime.

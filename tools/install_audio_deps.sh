@@ -22,8 +22,8 @@ assert Version(version("torchcodec")) >= Version("0.17.0")
 
     # torchaudio 2.11+ routes torchaudio.load through torchcodec, so both are needed.
     # torchaudio 2.11.0 is the final torchaudio release and carries no torch pin.
-    # TorchCodec 0.17 fixes the palette-PNG buffer overflow exposed by newer
-    # Transformers image loading; it supports the container's torch 2.13.
+    # TorchCodec 0.17 fixes a palette-PNG buffer overflow in image decoding;
+    # it supports the container's torch 2.13.
     # --no-config prevents the project's [tool.uv] overrides from interfering.
     echo "[audio-deps] Installing torchaudio==2.11.0 and torchcodec==0.17.0..."
     uv run --no-sync uv pip install --no-config \
