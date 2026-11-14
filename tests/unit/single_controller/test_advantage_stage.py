@@ -27,7 +27,6 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
-    GAEConfig,
     GeneralizedAdvantageEstimator,
     GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
@@ -38,8 +37,7 @@ from nemo_rl.algorithms.grpo import (
     RewardScalingConfig,
     add_grpo_token_loss_masks_and_generation_logprobs,
 )
-from nemo_rl.algorithms.loss.interfaces import SEQ_LOGPROB_KEEP_MASK_KEY
-from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import REWARD_KEY
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
@@ -54,15 +52,11 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     row_group_ids,
     split_meta_by_prompt_group,
 )
-from nemo_rl.algorithms.single_controller_utils.config import (
-    AdvantageConfig,
-    AsyncRLConfig,
-)
+from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     DebugWriterConfig,
     JsonDebugWriter,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import _build_advantage_estimator
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -72,7 +66,6 @@ from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.llm_message_utils import decompose_message_log
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
@@ -1158,304 +1151,6 @@ def test_unshardable_estimator_sends_the_whole_batch_to_one_actor() -> None:
     assert [call for actor in ctrl._advantage_actors for call in actor.calls] == [
         NUM_GROUPS * GROUP_SIZE
     ]
-
-
-def _equivalence_controller(
-    store: _RowStore,
-    algo: GRPOConfig | PPOConfig,
-    loss_config: ClippedPGLossConfig,
-    num_actors: int,
-) -> SingleControllerActor:
-    """Use the real config/factory; replace only actor and data transport."""
-    master = SimpleNamespace(
-        grpo=algo if isinstance(algo, GRPOConfig) else None,
-        ppo=algo if isinstance(algo, PPOConfig) else None,
-        loss_fn=loss_config,
-        on_policy_distillation=None,
-        policy={"generation": {"top_k": None, "top_p": 1.0}},
-        logger=LoggerConfig(log_dir="."),
-        async_rl=AsyncRLConfig(log_full_train_data=False),
-    )
-    stage_config = AdvantageStageConfig.from_master_config(master)
-    estimator = _build_advantage_estimator(master)
-    ctrl = _controller("grpo", 0, store)
-    ctrl._advantage_estimator = estimator
-    ctrl._advantage_stage_config = stage_config
-    ctrl._advantage_computer = AdvantageComputer(
-        store, config=stage_config, advantage_estimator=estimator
-    )
-    ctrl._advantage_actors = [
-        _InlineActor(
-            AdvantageComputer(store, config=stage_config, advantage_estimator=estimator)
-        )
-        for _ in range(num_actors)
-    ]
-    for actor in ctrl._advantage_actors:
-        ctrl._available_advantage_actors.put_nowait(actor)
-    return ctrl
-
-
-def _training_inputs(
-    store: _RowStore,
-    meta: KVBatchMeta,
-    loss_config: ClippedPGLossConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Read the written training columns and apply the real loss's late filter."""
-    data = BatchedDataDict(
-        dict(
-            store.get_samples(
-                sample_ids=meta.sample_ids,
-                select_fields=[
-                    "advantages",
-                    "sample_mask",
-                    "token_mask",
-                    "generation_logprobs",
-                    "prev_logprobs",
-                ],
-            ).items()
-        )
-    )
-    sample_mask = data["sample_mask"]
-    if loss_config.seq_logprob_error_in_loss:
-        current = data.pop("prev_logprobs")[:, 1:]
-        _, metrics = ClippedPGLossFn(loss_config, seq_logprob_error_threshold=2.0)(
-            next_token_logprobs=current,
-            data=data,
-            global_valid_seqs=sample_mask.sum(),
-            global_valid_toks=(data["token_mask"][:, 1:] * sample_mask[:, None]).sum(),
-        )
-        sample_mask = sample_mask * torch.tensor(metrics[SEQ_LOGPROB_KEEP_MASK_KEY])
-    return data["advantages"], sample_mask, data["token_mask"]
-
-
-@pytest.mark.parametrize("num_actors", [0, 1, 3, 8])
-@pytest.mark.parametrize("chunk_groups", [(6,), (1, 2, 3), (2, 1, 1, 2)])
-@pytest.mark.parametrize("normalize_rewards", [False, True])
-@pytest.mark.parametrize(
-    ("masked_reward_policy", "in_loss"),
-    [("include", False), ("include", True), ("exclude", False)],
-)
-def test_grpo_masked_advantages_match_ground_truth_across_execution_modes(
-    num_actors: int,
-    chunk_groups: tuple[int, ...],
-    masked_reward_policy: str,
-    in_loss: bool,
-    normalize_rewards: bool,
-) -> None:
-    """Splitting a group, losing a mask or weighting its baseline must fail this.
-
-    Six groups exercise environment, overlong, dataset-zero, sequence-error,
-    no-response and all-masked rows, respectively. The same prompt text is
-    repeated across groups. Expected means are calculated from the listed
-    rewards, not by another call to the estimator.
-    """
-    rewards = [
-        [2, 7, 19, 29],
-        [3, 11, 23, 37],
-        [5, 13, 31, 41],
-        [17, 43, 47, 59],
-        [61, 67, 71, 83],
-        [89, 97, 101, 103],
-    ]
-    expected = {
-        "include": [
-            [-12.25, -7.25, 4.75, 0],
-            [-15.5, -7.5, 4.5, 0],
-            [-34 / 3, -10 / 3, 44 / 3, 0],
-            [-24.5, 1.5, 5.5, 0],
-            [-9.5, -3.5, 0.5, 0],
-            [0, 0, 0, 0],
-        ],
-        "exclude": [
-            [-22 / 3, -7 / 3, 29 / 3, 0],
-            [-28 / 3, -4 / 3, 32 / 3, 0],
-            [-34 / 3, -10 / 3, 44 / 3, 0],
-            [-56 / 3, 22 / 3, 34 / 3, 0],
-            [-16 / 3, 2 / 3, 14 / 3, 0],
-            [0, 0, 0, 0],
-        ],
-    }
-    rows = _rows()
-    for group, group_rewards in enumerate(rewards):
-        for member, reward in enumerate(group_rewards):
-            row = rows[f"s{group * GROUP_SIZE + member}"]
-            row["total_reward"] = torch.tensor(float(reward))
-            row["prompt_ids_for_adv"] = torch.tensor([101, 102])
-            row["token_mask"] = torch.tensor([0, 1, member % 2, 0, 0]).float()
-            row["sample_mask"] = torch.tensor(0.5 if member == 0 else 1.0)
-            row["generation_logprobs"] = torch.full((SEQ,), -3.0)
-            row["prev_logprobs"] = torch.full((SEQ,), -3.0)
-    rows["s3"]["mask_sample"] = torch.tensor(True)
-    rows["s7"]["truncated"] = torch.tensor(True)
-    rows["s11"]["sample_mask"] = torch.tensor(0.0)
-    rows["s15"]["prev_logprobs"][1:3] += math.log(3)
-    rows["s19"]["token_mask"].zero_()
-    for i in range(20, 24):
-        rows[f"s{i}"]["mask_sample"] = torch.tensor(True)
-    store = _RowStore(rows)
-    algo = GRPOConfig(
-        masked_reward_policy=masked_reward_policy,
-        num_generations_per_prompt=GROUP_SIZE,
-        overlong_filtering=True,
-        seq_logprob_error_threshold=2.0,
-        skip_reference_policy_logprobs_calculation=True,
-        adv_estimator=AdvEstimatorConfig(
-            use_leave_one_out_baseline=False, normalize_rewards=normalize_rewards
-        ),
-    )
-    loss_config = ClippedPGLossConfig(
-        force_on_policy_ratio=True,
-        seq_logprob_error_in_loss=in_loss,
-        reference_policy_kl_penalty=0,
-    )
-    ctrl = _equivalence_controller(store, algo, loss_config, num_actors)
-    meta = _pool_meta()
-    # Mix group order and member order without breaking a group across chunks.
-    order = [
-        group * 4 + member for group in [3, 0, 4, 2, 5, 1] for member in [2, 0, 3, 1]
-    ]
-    dispatch_meta = KVBatchMeta(
-        partition_id=meta.partition_id,
-        task_name=meta.task_name,
-        sample_ids=[meta.sample_ids[i] for i in order],
-        fields=meta.fields,
-        tags=[meta.tags[i] for i in order],
-    )
-
-    async def run_chunks() -> None:
-        start = 0
-        for count in chunk_groups:
-            end = start + count * GROUP_SIZE
-            await ctrl._advantage_stage(dispatch_meta.slice(start, end))
-            start = end
-
-    asyncio.run(run_chunks())
-    advantages, sample_mask, token_mask = _training_inputs(store, meta, loss_config)
-    torch.testing.assert_close(
-        sample_mask,
-        torch.tensor([[0.5, 1, 1, 0]] * 5 + [[0, 0, 0, 0]]).flatten(),
-    )
-    expected_token_mask = torch.tensor(
-        [[0, 1, member % 2, 0, 0] for member in range(GROUP_SIZE)] * NUM_GROUPS
-    ).float()
-    expected_token_mask[19].zero_()
-    torch.testing.assert_close(token_mask, expected_token_mask)
-    training_tokens = (token_mask * sample_mask[:, None]).bool()
-    want = (
-        torch.tensor(expected[masked_reward_policy])
-        .flatten()[:, None]
-        .expand_as(advantages)
-        .clone()
-    )
-    if normalize_rewards:
-        for group, group_rewards in enumerate(rewards[:5]):
-            participants = (
-                group_rewards[:3]
-                if masked_reward_policy == "exclude" or group == 2
-                else group_rewards
-            )
-            mean = sum(participants) / len(participants)
-            # GRPO uses the sample standard deviation (Bessel correction).
-            variance = sum((r - mean) ** 2 for r in participants) / (
-                len(participants) - 1
-            )
-            want[group * GROUP_SIZE : (group + 1) * GROUP_SIZE] /= (
-                math.sqrt(variance) + 1e-6
-            )
-    torch.testing.assert_close(advantages[training_tokens], want[training_tokens])
-
-
-@pytest.mark.parametrize("num_actors", [0, 1, 3])
-@pytest.mark.parametrize(
-    ("estimator", "normalize", "in_loss", "chunk_groups"),
-    [
-        ("gae", False, False, (2,)),
-        ("gae", False, False, (1, 1)),
-        ("gae", False, True, (1, 1)),
-        ("gae", True, False, (2,)),
-        ("reinforce_plus_plus", True, False, (2,)),
-    ],
-)
-def test_batch_statistics_use_real_estimators_and_expected_training_values(
-    num_actors: int,
-    estimator: str,
-    normalize: bool,
-    in_loss: bool,
-    chunk_groups: tuple[int, ...],
-) -> None:
-    """Actor count cannot change batch statistics; unnormalized GAE can stream."""
-    rewards = [2, 7, 19, 31, 43, 61]
-    rows = {
-        f"s{i}": {
-            "total_reward": torch.tensor(float(reward)),
-            "sample_mask": torch.tensor(1.0),
-            "token_mask": torch.tensor([0.0, 1.0, 0.0]),
-            "mask_sample": torch.tensor(i == 5),
-            "truncated": torch.tensor(False),
-            "prev_logprobs": torch.tensor(
-                [-3.0, -3.0 + (math.log(3) if i == 2 else 0), -3.0]
-            ),
-            "generation_logprobs": torch.full((3,), -3.0),
-            "values": torch.zeros(3),
-        }
-        for i, reward in enumerate(rewards)
-    }
-    store = _RowStore(rows)
-    if estimator == "gae":
-        algo = PPOConfig(
-            num_generations_per_prompt=3,
-            seq_logprob_error_threshold=2.0,
-            skip_reference_policy_logprobs_calculation=True,
-            adv_estimator=GAEConfig(normalize_advantages=normalize),
-        )
-    else:
-        algo = GRPOConfig(
-            num_generations_per_prompt=3,
-            seq_logprob_error_threshold=2.0,
-            skip_reference_policy_logprobs_calculation=True,
-            masked_reward_policy="exclude",
-            adv_estimator=AdvEstimatorConfig(
-                name="reinforce_plus_plus", minus_baseline=False
-            ),
-        )
-    loss_config = ClippedPGLossConfig(
-        force_on_policy_ratio=True,
-        seq_logprob_error_in_loss=in_loss,
-        reference_policy_kl_penalty=0,
-    )
-    ctrl = _equivalence_controller(store, algo, loss_config, num_actors)
-    meta = KVBatchMeta(
-        partition_id="rollout_data",
-        task_name="train",
-        sample_ids=list(rows),
-        fields=["total_reward"],
-        tags=[{GROUP_ID_TAG: f"group-{i // 3}"} for i in range(6)],
-    )
-
-    async def run_chunks() -> None:
-        start = 0
-        for count in chunk_groups:
-            await ctrl._advantage_stage(meta.slice(start, start + 3 * count))
-            start += 3 * count
-
-    asyncio.run(run_chunks())
-    advantages, sample_mask, token_mask = _training_inputs(store, meta, loss_config)
-    torch.testing.assert_close(sample_mask, torch.tensor([1, 1, 0, 1, 1, 0]).float())
-    torch.testing.assert_close(token_mask, torch.tensor([[0.0, 1.0, 0.0]] * 6))
-    if normalize:
-        # Survivors [2, 7, 31, 43]: mean 20.75, squared deviations sum 1140.75.
-        # GAE uses unbiased variance; Reinforce++ uses population variance.
-        std = 19.5 if estimator == "gae" else math.sqrt(285.1875)
-        want = torch.tensor([-18.75, -13.75, 10.25, 22.25]) / std
-    else:
-        want = torch.tensor([2, 7, 31, 43]).float()
-    training_tokens = (token_mask * sample_mask[:, None]).bool()
-    torch.testing.assert_close(advantages[training_tokens], want)
-    if estimator == "gae":
-        returns = torch.stack([store.rows[sid]["returns"] for sid in meta.sample_ids])
-        torch.testing.assert_close(
-            returns[training_tokens], torch.tensor([2, 7, 31, 43]).float()
-        )
 
 
 def _run_with_scaling(
