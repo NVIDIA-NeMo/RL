@@ -2790,6 +2790,7 @@ def test_checkpoint_requires_short_step_permissions_for_new_schema() -> None:
     assert parse_rollout_recovery_state(state).steps_allowed_short == set()
 
 
+@pytest.mark.nemo_gym
 def test_length_penalty_metadata_survives_sealed_attempt_restore():
     from nemo_rl.experience.reward_penalties import RewardChecks
     from nemo_rl.utils.length_penalty import LengthPenaltyInput
