@@ -84,6 +84,10 @@ class TrtllmSpecificArgs(TrtllmEngineKnobs):
     model_name: NotRequired[str]
     max_model_len: int
     precision: str
+    # "auto" | "dummy", mirroring vllm_cfg.load_format. Defaults to "dummy" for
+    # training and "auto" for evaluation; an explicit value is kept. Shared by
+    # both engine roles, so it is not a per-role override.
+    load_format: NotRequired[str]
     # With precision="fp8", use MXFP8 (UE8M0 1x32 scales) instead of 128x128 block-FP8.
     is_mx: NotRequired[bool]
     expose_http_server: NotRequired[bool]
@@ -118,6 +122,8 @@ class TrtllmSpecificArgs(TrtllmEngineKnobs):
 
 
 class TrtllmConfig(GenerationConfig):
+    # None uses the topology default; nccl_reshard refits routed experts with pure EP.
+    refit_transport: NotRequired[Literal["nccl_reshard"] | None]
     trtllm_cfg: TrtllmSpecificArgs
     # Escape hatch for arbitrary TRT-LLM LLM/AsyncLLM constructor kwargs not
     # covered by TrtllmSpecificArgs (e.g. sampler_type, enable_attention_dp).

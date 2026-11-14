@@ -15,10 +15,9 @@
 """Driver-owned Dynamo services: etcd, NATS and the OpenAI frontend.
 
 The engines are NeMo RL's own workers; each registers itself with these
-services from inside its worker (``MegatronDynamoPolicyWorker.start_dynamo_endpoint``),
-so the runtime only launches the services and waits to see the engines. The
-``dynamo.vllm`` subprocess fleet keeps
-``legacy_managed_runtime.LegacyManagedDynamoRuntime``.
+services from inside its worker (vLLM: see ``engine_adapter``; Megatron:
+``MegatronDynamoGenerationMixin.start_dynamo_endpoint``), so the runtime only
+launches the services and waits to see the engines.
 """
 
 import atexit
@@ -115,34 +114,27 @@ def frontend_argv(
 
 
 def _service_executable(name: str) -> str:
-    """The etcd or nats-server binary.
-
-    Looked up in ``NEMO_RL_DYNAMO_BIN_DIR`` when set, else on ``PATH``, else in
-    the image's Dynamo virtual environment when one is present.
-    """
+    """The etcd or nats-server binary: in NEMO_RL_DYNAMO_BIN_DIR when set, else on PATH."""
     bin_dir = os.environ.get("NEMO_RL_DYNAMO_BIN_DIR")
     found = shutil.which(name, path=os.path.expanduser(bin_dir) if bin_dir else None)
-    if found is None and not bin_dir:
-        try:
-            # The image's separate Dynamo venv, when the build still ships one.
-            from nemo_rl.models.generation.dynamo.venv import get_dynamo_venv_dir
-
-            found = shutil.which(name, path=os.path.join(get_dynamo_venv_dir(), "bin"))
-        except (ImportError, RuntimeError):
-            found = None
     if found is None:
         where = f"NEMO_RL_DYNAMO_BIN_DIR={bin_dir}" if bin_dir else "PATH"
         raise FileNotFoundError(
-            f"{name} is not an executable on {where}. Install etcd and nats-server "
-            "and set NEMO_RL_DYNAMO_BIN_DIR to their directory."
+            f"{name} is not an executable on {where}. Build the image with "
+            "--build-arg BUILD_DYNAMO=1, or install etcd and nats-server with "
+            "docker/dynamo/install.sh and set NEMO_RL_DYNAMO_BIN_DIR to their "
+            "directory."
         )
     return found
 
 
 # The KV router's applied-event counter (Dynamo's kvrouter.KV_CACHE_EVENTS_APPLIED),
-# one sample per label set.
+# one sample per label set. Stored-block events only: every prefix-cache reset
+# emits a payload-free "cleared" event, which applies even when the router
+# decodes none of vLLM's block events.
 _KV_EVENTS_APPLIED = re.compile(
-    r'^\w*kv_cache_events_applied(?:_total)?\{(?=[^}]*status="(?P<status>[^"]*)")'
+    r'^\w*kv_cache_events_applied(?:_total)?\{(?=[^}]*event_type="stored")'
+    r'(?=[^}]*status="(?P<status>[^"]*)")'
     r"[^}]*\}\s+(?P<value>\S+)$",
     re.MULTILINE,
 )
@@ -505,7 +497,7 @@ class ManagedDynamoRuntime:
                 )
 
     def _log_router_kv_events(self) -> None:
-        """Log how many engine KV-cache events the KV router applied, by status.
+        """Log how many stored-block KV events the KV router applied, by status.
 
         Read from the frontend's metrics before it stops. A KV router that never
         applied one routed on load alone.

@@ -232,6 +232,53 @@ def test_not_applied_to_simple_backend(clean_env, fake_fabric):
     assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
 
 
+@pytest.mark.parametrize("preset", [None, "rc_x,self"])
+def test_nixl_defaults_ucx_to_rdma_only(clean_env, monkeypatch, preset):
+    """nixl refuses an unset UCX_TLS; fill an RDMA-only default, keep a launcher's."""
+    monkeypatch.delenv("UCX_TLS", raising=False)
+    monkeypatch.delenv("UCX_NET_DEVICES", raising=False)
+    if preset:
+        monkeypatch.setenv("UCX_TLS", preset)
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_TLS"] == (preset or "rc,cuda_copy,cuda_ipc,self,sm")
+    assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
+
+
+@pytest.mark.parametrize("injected", ["rc,tcp,self", "all"])
+def test_nixl_replaces_a_tcp_ucx_tls_on_the_driver(clean_env, monkeypatch, injected):
+    """A tcp-capable UCX_TLS is replaced, so no launcher setup is needed."""
+    monkeypatch.setenv("UCX_TLS", injected)
+    monkeypatch.delenv("UCX_NET_DEVICES", raising=False)
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_TLS"] == "rc,cuda_copy,cuda_ipc,self,sm"
+
+
+def test_nixl_drops_eth0_from_a_cluster_ucx_net_devices(clean_env, monkeypatch):
+    """The GB200 job env is UCX_TLS=tcp + the rails + eth0; only the rails survive."""
+    monkeypatch.setenv("UCX_TLS", "tcp")
+    monkeypatch.setenv("UCX_NET_DEVICES", "mlx5_0:1,mlx5_1:1,eth0")
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_TLS"] == "rc,cuda_copy,cuda_ipc,self,sm"
+    assert os.environ["UCX_NET_DEVICES"] == "mlx5_0:1,mlx5_1:1"
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [_mooncake_cfg(), {**_mooncake_cfg(), "backend": "nixl", "enabled": False}],
+    ids=["mooncake_cpu", "nixl-disabled"],
+)
+def test_ucx_swap_is_nixl_only(clean_env, fake_fabric, monkeypatch, cfg):
+    """Only an enabled nixl data plane rewrites UCX; nothing else touches it."""
+    from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
+
+    fake_fabric({"mlx5_0": "InfiniBand"})
+    monkeypatch.setenv("UCX_TLS", "tcp")
+    monkeypatch.setenv("UCX_NET_DEVICES", "mlx5_0:1,eth0")
+    maybe_configure_data_plane_env(cfg)
+    assert os.environ["UCX_TLS"] == "tcp"
+    assert os.environ["UCX_NET_DEVICES"] == "mlx5_0:1,eth0"
+
+
 def test_raises_when_the_engine_was_already_imported(engine_imported, fake_fabric):
     """The whole point of the split: too-late must be loud, not silent.
 
