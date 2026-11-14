@@ -7454,6 +7454,34 @@ def test_reinforce_plus_plus_global_normalization():
     assert result[0, 0] < result[1, 0] < result[2, 0] < result[3, 0]
 
 
+@pytest.mark.parametrize("name", ["grpo", "gdpo", "opd"])
+def test_create_advantage_estimator_rejects_kl_in_reward_it_would_drop(name):
+    """The loss zeroes its KL under use_kl_in_reward; these estimators never add it."""
+    master_config = SimpleNamespace(
+        grpo=SimpleNamespace(adv_estimator=AdvEstimatorConfig(name=name)),
+        loss_fn=ClippedPGLossConfig(
+            use_kl_in_reward=True, reference_policy_kl_penalty=0.01
+        ),
+    )
+    with pytest.raises(ValueError, match="use_kl_in_reward"):
+        grpo_mod._create_advantage_estimator(master_config)
+
+
+@pytest.mark.parametrize(
+    ("name", "kl_penalty"), [("reinforce_plus_plus", 0.01), ("grpo", 0.0)]
+)
+def test_create_advantage_estimator_allows_applied_or_zero_kl_in_reward(
+    name, kl_penalty
+):
+    master_config = SimpleNamespace(
+        grpo=SimpleNamespace(adv_estimator=AdvEstimatorConfig(name=name)),
+        loss_fn=ClippedPGLossConfig(
+            use_kl_in_reward=True, reference_policy_kl_penalty=kl_penalty
+        ),
+    )
+    grpo_mod._create_advantage_estimator(master_config)
+
+
 # ============================================================================
 
 # Tests for validate function
