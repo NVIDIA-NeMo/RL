@@ -49,6 +49,9 @@ class Completion:
     env_extras: Optional[dict[str, Any]]
     truncated: bool
     reward: float
+    # The environment's reward before effort shaping and reward penalties, which
+    # dynamic sampling filters on. ``None`` means nothing rewrote ``reward``.
+    reward_original: Optional[float] = None
 
 
 @dataclass
