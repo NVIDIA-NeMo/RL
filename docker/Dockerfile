@@ -12,6 +12,9 @@
 #   Local NeMo RL source override:
 #     docker buildx build --build-context nemo-rl=. -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
 #
+#   NeMo Gym source from another directory (default: the one inside the NeMo RL source):
+#     docker buildx build --build-context nemo-gym=<gym-dir> -f docker/Dockerfile ...
+#
 #   Custom setup:
 #     docker buildx build --build-context custom-setup=my-setup-dir/ --build-arg CUSTOM_SETUP_FNAME=my_script.sh -f docker/Dockerfile ...
 #
@@ -49,6 +52,12 @@ ARG STRIP_UV_CACHE
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
+
+# The NeMo Gym source tree, installed from 3rdparty/Gym-workspace/Gym. Default: the copy
+# inside the nemo-rl source. Override with --build-context nemo-gym=<dir> to build with a
+# Gym tree that lives somewhere else.
+FROM scratch AS nemo-gym
+COPY --from=nemo-rl 3rdparty/Gym-workspace/Gym /
 
 # Empty default; CI overrides with --build-context to inject pre-compiled wheels
 FROM scratch AS uv-cache-seed
@@ -309,7 +318,10 @@ COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link \
     --exclude=TensorRT-LLM-workspace \
     --exclude=TensorRT-LLM-workspace/** \
+    --exclude=Gym-workspace/Gym \
+    --exclude=Gym-workspace/Gym/** \
     3rdparty/ ./3rdparty/
+COPY --from=nemo-gym --link . ./3rdparty/Gym-workspace/Gym/
 
 RUN --mount=type=ssh \
     --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
@@ -817,7 +829,10 @@ USER root
 
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
-COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
+COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock \
+    --exclude=3rdparty/Gym-workspace/Gym --exclude=3rdparty/Gym-workspace/Gym/** \
+    . /opt/nemo-rl
+COPY --from=nemo-gym . /opt/nemo-rl/3rdparty/Gym-workspace/Gym/
 
 # The steps that have to read the source. Each one re-runs on every source change.
 RUN <<"EOF" bash -exu
