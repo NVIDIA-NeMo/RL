@@ -41,7 +41,10 @@ from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
     GenerationCutPrefix,
 )
 from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD  # noqa: E402
-from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter  # noqa: E402
+from nemo_gym.token_id_capture.adapters.vllm import (  # noqa: E402
+    MEDIA_SPANS_FIELD,
+    VLLMCaptureAdapter,
+)
 from nemo_gym.token_id_capture.replay import (  # noqa: E402
     replay_context,
     summarize_replay,
@@ -52,7 +55,10 @@ from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
 from nemo_gym.token_id_capture.staging.records import CaptureAdmission  # noqa: E402
 from vllm.multimodal.inputs import PlaceholderRange  # noqa: E402
 
-from nemo_rl.data.captured_media import CapturedMedia  # noqa: E402
+from nemo_rl.data.captured_media import (  # noqa: E402
+    MEDIA_TENSOR_DIGESTS_FIELD,
+    CapturedMedia,
+)
 from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm import (  # noqa: E402
     adapter as vllm_adapter,
@@ -85,8 +91,12 @@ from tests.unit.models.generation.test_dynamo_vllm_adapter import (  # noqa: E40
 )
 from tests.unit.models.generation.test_vllm_token_capture_hosting import (  # noqa: E402
     _active_call_inventory,
+    _assert_stages_captured_tensors,
+    _captured_image_media,
     _cuts,
+    _live_image_call,
     _MemorySink,
+    _single_call_inventory,
 )
 
 COORDS = {"staging_key": "rollout-1/c2"}
@@ -403,7 +413,8 @@ def test_a_captured_media_call_stages_the_media_the_engine_ran_on() -> None:
     assert chunk["engine_data"]["result"] == {NG_COMMIT_COORDS_FIELD: COORDS}
 
 
-def test_an_engine_answers_a_cut_with_the_calls_it_cut() -> None:
+def _cutting_host():
+    """A host whose checkpoint cuts stage their rows in memory."""
     sink = _MemorySink()
     host = _host(_FakeLLM())
     host._capture_sink = sink
@@ -411,6 +422,26 @@ def test_an_engine_answers_a_cut_with_the_calls_it_cut() -> None:
         sink=sink, weight_version_fn=lambda: 0, adapter=VLLMCaptureAdapter()
     )
     _cuts(host)
+    return host, sink
+
+
+def _cut(host, inventory: GenerationCutInventory) -> list[dict]:
+    """The frontend's cut of ``inventory``, sent to the engine."""
+    return _collect(
+        vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0),
+        {
+            "token_ids": [],
+            "annotations": [GENERATION_CUT_ANNOTATION],
+            "extra_args": {
+                INVENTORY_KEY: inventory.model_dump(mode="json"),
+                DEADLINE_KEY: time.time() + 30,
+            },
+        },
+    )
+
+
+def test_an_engine_answers_a_cut_with_the_calls_it_cut() -> None:
+    host, sink = _cutting_host()
     inventory, _ = _active_call_inventory(host, ("held", [12, 13]))
     # The frontend sends every engine the whole inventory: one call here,
     # one that another engine holds.
@@ -438,17 +469,7 @@ def test_an_engine_answers_a_cut_with_the_calls_it_cut() -> None:
 
     host._prefix_recovery.run_cut = record_deadline
 
-    (chunk,) = _collect(
-        vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0),
-        {
-            "token_ids": [],
-            "annotations": [GENERATION_CUT_ANNOTATION],
-            "extra_args": {
-                INVENTORY_KEY: inventory.model_dump(mode="json"),
-                DEADLINE_KEY: time.time() + 30,
-            },
-        },
-    )
+    (chunk,) = _cut(host, inventory)
 
     # The cut ran to the frontend's deadline, less the margin for the answer.
     (remaining,) = deadlines
@@ -458,6 +479,85 @@ def test_an_engine_answers_a_cut_with_the_calls_it_cut() -> None:
     assert ack["prefix_token_count"] == 2
     # The cut's rows are in TQ before the engine answers.
     assert ack["staging_keys"] == sink.generation_prefix_keys
+
+
+def test_a_cut_saves_a_media_calls_tensor_digests_in_its_first_row() -> None:
+    host, sink = _cutting_host()
+    _, _, media = _live_image_call(host)
+
+    _cut(host, _single_call_inventory())
+
+    ((_, row),) = sink.generation_prefix_records
+    assert row.extras[MEDIA_TENSOR_DIGESTS_FIELD] == media.tensor_digests
+
+
+@pytest.mark.parametrize(
+    "changed", [False, True], ids=["same_pixels", "changed_pixels"]
+)
+def test_a_restored_media_call_is_checked_against_its_cuts_tensor_digests(
+    changed: bool, monkeypatch
+) -> None:
+    saved_media = _captured_image_media()
+    image = [18, 18]
+    # The cut's first row: the prompt, one generated token and the media digests.
+    saved = SimpleNamespace(
+        model_call_id="c2",
+        token_ids_delta=[*image, 20],
+        token_mask_delta=[0.0, 0.0, 1.0],
+        prev_len=0,
+        extras={
+            MEDIA_SPANS_FIELD: [item.to_dict() for item in saved_media.items],
+            MEDIA_TENSOR_DIGESTS_FIELD: saved_media.tensor_digests,
+        },
+    )
+    admission = CaptureAdmission(
+        capture_key="rollout-1-a1",
+        model_call_id="c3",
+        mode="text",
+        generation_cut={
+            "source_capture_key": "rollout-1",
+            "source_model_call_id": "c2",
+            "staging_keys": ["active/checkpoint-1/rollout-1/c2/0"],
+            "prefix_token_count": 1,
+            "prefix_digest": "0" * 64,
+            "effective_output_limit": 8,
+        },
+    )
+    llm = _FakeLLM([_output([*image, 20], _completion([21], "stop"))])
+    host = _capturing_host(llm)
+    host._capture_media = host._hash_captured_media = True
+    monkeypatch.setattr(
+        host._prefix_recovery,
+        "resolve_restore",
+        lambda admission, prefix_token_ids: (admission, saved),
+    )
+    # What vLLM's processor made of the image the re-sent call carries.
+    tensors = dict(saved_media.tensors)
+    if changed:
+        tensors["imgs"] = tensors["imgs"] + 1
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.capture_processed_media",
+        lambda *args, **kwargs: CapturedMedia(saved_media.items, tensors),
+    )
+
+    (chunk,) = _collect(
+        vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0),
+        _captured_call(
+            image, admission, multimodal=_multimodal([PlaceholderRange(0, 2)])
+        ),
+    )
+
+    if changed:
+        # Refused before the call begins or generates.
+        refusal = chunk["engine_data"]["refusal"]
+        assert refusal["status"] == 400
+        assert "(retained_media_changed)" in refusal["message"]
+        assert (llm.calls, host.token_capture.begun) == ([], [])
+        return
+    # The engine resumes from the saved rows; the final row stages the pixels.
+    ((engine_input, _, _, _),) = llm.calls
+    assert engine_input["prompt_token_ids"] == [*image, 20]
+    _assert_stages_captured_tensors(host.token_capture.attachments[0], tensors)
 
 
 def test_a_captured_call_records_what_a_cut_needs() -> None:

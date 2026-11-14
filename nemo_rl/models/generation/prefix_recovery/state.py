@@ -109,9 +109,8 @@ class _RequestCaptureState:
         self._call = call
         self._prompt_token_ids = list(prompt_token_ids)
         # Backend-owned opaque state that must survive until the terminal row
-        # is staged. vLLM uses this for its processed-media snapshot; prefix
-        # recovery is setup-guarded to text-only, but ordinary terminal capture
-        # still shares this lifecycle container.
+        # is staged. vLLM uses this for its processed-media snapshot; the first
+        # generation-prefix row carries its tensor digests across recovery.
         self._media = media
         self._resumed_generation_token_ids = list(resumed_generation_token_ids)
         self._lock = threading.Lock()

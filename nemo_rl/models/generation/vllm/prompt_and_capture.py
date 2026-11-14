@@ -474,8 +474,6 @@ async def start_capture(
         set_max_tokens(request, max_tokens)
     media = None
     media_admission = admission if splice is None else serving_admission
-    # Generation-prefix cuts are text-only (setup refuses them with media
-    # capture), so a restored prompt has no media to capture.
     if restored is None and media_admission is not None:
         # Off-loop: a retained-media check reads staged calls.
         media = await asyncio.to_thread(
@@ -484,6 +482,16 @@ async def start_capture(
             admission=media_admission,
             splice=splice,
             verify_retained_media=plan.verify_retained_media,
+        )
+    elif restored is not None:
+        # The saved rows are the prompt, but its media still sits where the
+        # prepared prompt's splice puts it. Off-loop: it hashes the pixels.
+        media = await asyncio.to_thread(
+            host._capture_restored_media,
+            engine_prompt,
+            admission=admission,
+            splice=plan.splice,
+            snapshot=restored.saved,
         )
     if splice is not None or restored is not None:
         # Successful media capture already remapped these ranges. The remap
