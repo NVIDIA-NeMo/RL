@@ -172,7 +172,13 @@ def _env_builder(
     # In the image this path links to a venv other actors share. Drop the link first,
     # so the build marker and the rebuild land in this actor's own folder.
     if force_rebuild and venv_path.is_symlink():
-        venv_path.unlink(missing_ok=True)
+        try:
+            venv_path.unlink()
+        except OSError:
+            # On a shared venv dir another node may have already replaced the link
+            # with its own folder; the marker check below then waits for that build.
+            if venv_path.is_symlink():
+                raise
 
     if started_file.exists():
         # Another node is already building, wait for completion
