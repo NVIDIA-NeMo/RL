@@ -314,7 +314,13 @@ The Qwen3.5 LA1 curve comes from the fresh HF-base run with both native-FP32
 Its LA0 curve is the existing SC reference, available through update 500, which
 predates those two precision fixes. Both Lightning arms include the fixes.
 The Qwen3.5 comparison therefore includes the precision-fix difference as well
-as lookahead; it does not isolate their individual effects.
+as lookahead; it does not isolate their individual effects. The FP32
+prefill-convolution change is a vLLM patch that this branch does not ship. A
+150-update LA0 ablation on the Qwen3.5 EP=16 recipe (same seed, `A_log` fix in
+both arms, patch on versus off) found no measurable `train/gen_kl_error`
+difference: mean 8.7e-4 without the patch versus 9.3e-4 with it, and matching
+token-multiplier medians. The curves above are therefore representative of the
+shipped code with respect to that patch.
 
 ### Curve and timing methodology
 
