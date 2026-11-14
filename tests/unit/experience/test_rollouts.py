@@ -2960,7 +2960,14 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
         def __init__(self):
             self.values = iter(
                 [
-                    _ReadyRef((0, {"name": "agent"}, {"value": "first"}, None)),
+                    _ReadyRef(
+                        (
+                            0,
+                            {"name": "agent"},
+                            {"value": "first", "full_result": {"reward": 1.0}},
+                            None,
+                        )
+                    ),
                     _ReadyRef((0, {"name": "agent"}, {"value": "duplicate"}, None)),
                 ]
             )

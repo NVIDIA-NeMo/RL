@@ -1,7 +1,6 @@
 # Loss functions in NeMo RL
 
-Loss functions in NeMo RL are specially designed to ensure that full batch training is equivalent to training with gradient accumulation. To understand
-why special care needs to be taken here, consider the following example of a simple loss function that takes the average of some per-token loss over all tokens in a microbatch, and then averages loss over the microbatches.
+Loss functions in NeMo RL are specially designed to ensure that full batch training is equivalent to training with gradient accumulation. To understand why special care needs to be taken here, consider the following example of a simple loss function that takes the average of some per-token loss over all tokens in a microbatch, and then averages loss over the microbatches.
 
 Suppose we have a global batch with 16 unmasked tokens. The first 10 unmasked tokens come from the first half of the samples in the batch, and the last 6 come from the second half. If training with one global batch,
 
