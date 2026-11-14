@@ -224,16 +224,24 @@ def apply_reward_shaping(
         "The number of messages in the batch must match the number of rewards"
     )
 
-    updated_rewards = torch.zeros_like(rewards)
-    for i, message_response_length in enumerate(response_lengths):
-        # Calculate the exceed length and the corresponding reward penalty
-        exceed_length = message_response_length - expected_response_length
-        overlong_reward = min(
-            -exceed_length / overlong_buffer_length * overlong_buffer_penalty, 0
+    penalties = [
+        min(
+            (expected_response_length - length)
+            / overlong_buffer_length
+            * overlong_buffer_penalty,
+            0,
         )
-        updated_rewards[i] = rewards[i] + overlong_reward
-
-    # Update the rewards in the batch
-    batch["total_reward"] = updated_rewards
+        for length in response_lengths
+    ]
+    if rewards.dtype in (torch.float32, torch.float64):
+        penalty_tensor = rewards.new_tensor(penalties)
+        reward_shape = (len(rewards),) + (1,) * (rewards.ndim - 1)
+        batch["total_reward"] = rewards + penalty_tensor.reshape(reward_shape)
+    else:
+        # Keep scalar promotion and assignment for low-precision and non-floating rewards.
+        updated_rewards = torch.zeros_like(rewards)
+        for i, penalty in enumerate(penalties):
+            updated_rewards[i] = rewards[i] + penalty
+        batch["total_reward"] = updated_rewards
 
     return batch
