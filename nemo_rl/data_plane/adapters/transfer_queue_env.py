@@ -111,7 +111,7 @@ def rdma_rails() -> list[str]:
     roce = [n for n, layer in layers.items() if layer == "Ethernet"]
     rails = ib or roce
     mgmt = _default_route_netdev()
-    fabric = [n for n in rails if mgmt not in _netdevs_of(n)] if mgmt else rails
+    fabric = [n for n in rails if mgmt not in _netdevs_of(n)]
     return fabric or rails
 
 
@@ -157,11 +157,9 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
     (when only netdevs were named, it becomes this host's ``rdma_rails()``),
     so a launcher never has to set them (some clusters inject ``UCX_TLS=tcp``
     and an ``eth0`` into every job). Replacing a set value logs a warning.
-    An unset ``UCX_MODULES`` becomes ``^fuse``: HPC-X's NCCL net plugin loads
-    HPC-X's UCX into every NCCL process, and its ``fuse`` module, loaded
-    ``RTLD_GLOBAL``, makes NIXL's bundled UCX bind into HPC-X's ``libucs`` and
-    lose its ``rc`` and CUDA transports (``NIXL_ERR_BACKEND``). NCCL keeps its
-    plugin; only UCX's monitoring filesystem is off.
+    An unset ``UCX_MODULES`` becomes ``^fuse``, which keeps HPC-X's UCX (loaded
+    by NCCL's net plugin) from hijacking NIXL's; see "Images with HPC-X" in
+    docs/design-docs/nixl-data-plane.md.
     ``mooncake_cpu``: the MC_* knobs
     below. ``simple`` has no engine.
     MC_* values already present in the environment are left alone, so a launcher can
@@ -186,8 +184,8 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
         from nemo_rl.data_plane.nixl.errors import TransportPolicyError
         from nemo_rl.data_plane.nixl.nixl_io import check_rdma_only
 
-        # Before any UCX loads: a libucs_fuse dlopen'ed RTLD_GLOBAL by the
-        # HPC-X UCX that NCCL's net plugin pulls in hijacks NIXL's bundled UCX.
+        # Before any UCX loads: HPC-X's libucs_fuse is dlopen'ed RTLD_GLOBAL
+        # and would capture NIXL's bundled UCX (design doc, "Images with HPC-X").
         os.environ.setdefault("UCX_MODULES", "^fuse")
         tls = os.environ.get("UCX_TLS", "")
         try:
@@ -201,9 +199,12 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
             log.warning(
                 "Dropping network interfaces from UCX_NET_DEVICES=%s", ",".join(devs)
             )
-            named = [d for d in devs if ":" in d]  # RDMA devices the job named
-            rails = [f"{dev}:1" for dev in rdma_rails()]  # this host's rails
-            rdma_devs = named or rails  # GB300 jobs name only eth0: use the rails
+            # The RDMA devices the job named, else this host's rails (GB300 jobs
+            # name only eth0). Not ``all``: that lets UCX pick the management
+            # interface's RDMA function, the one device rdma_rails() leaves out.
+            rdma_devs = [d for d in devs if ":" in d] or [
+                f"{dev}:1" for dev in rdma_rails()
+            ]
             if not rdma_devs:
                 raise TransportPolicyError(
                     f"UCX_NET_DEVICES={','.join(devs)} names no RDMA device and "
