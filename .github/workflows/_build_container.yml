@@ -156,11 +156,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Match Dockerfile semantics: any non-empty value skips TRT-LLM.
-          SKIP_VALUE=$(printf '%s\n' "$BUILD_ARGS" | sed -nE 's/^[[:space:]]*SKIP_TRTLLM_BUILD[[:space:]]*=(.*)$/\1/p' | tail -1)
-          SKIP_VALUE=$(printf '%s' "$SKIP_VALUE" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
-          if [[ -n "$SKIP_VALUE" ]]; then
-            echo "TRT-LLM build is disabled by SKIP_TRTLLM_BUILD"
+          # Match Dockerfile semantics: an empty NRL_EXTRAS builds every extra;
+          # otherwise TRT-LLM is built only when the list names trtllm.
+          EXTRAS=$(printf '%s\n' "$BUILD_ARGS" | sed -nE 's/^[[:space:]]*NRL_EXTRAS[[:space:]]*=(.*)$/\1/p' | tail -1)
+          if [[ "$EXTRAS" =~ [^[:space:]] && " $EXTRAS " != *" trtllm "* ]]; then
+            echo "TRT-LLM build is disabled: NRL_EXTRAS does not list trtllm"
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -594,7 +594,7 @@ jobs:
         # scratch image — the uv/pip download cache never enters the release
         # image itself. Replaces the old post-build docker-cp extraction, which
         # was also main-only; keep that restriction so PR builds don't refresh
-        # the shared cache from build-arg variations (SKIP_*_BUILD, etc.).
+        # the shared cache from build-arg variations (NRL_EXTRAS, etc.).
         if: ${{ always() && !cancelled() && steps.uv_cache.outputs.tag != '' && github.ref == 'refs/heads/main' }}
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:

@@ -23,14 +23,12 @@ docker buildx build -f docker/Dockerfile \
     https://github.com/NVIDIA-NeMo/RL.git
 ```
 
-Skip optional backends to reduce build time:
+Build only the backends you use to reduce build time:
 
 ```bash
-# Skip vLLM, SGLang, and TRT-LLM
+# Megatron, vLLM and NeMo Gym only
 docker buildx build -f docker/Dockerfile \
-    --build-arg SKIP_VLLM_BUILD=1 \
-    --build-arg SKIP_SGLANG_BUILD=1 \
-    --build-arg SKIP_TRTLLM_BUILD=1 \
+    --build-arg NRL_EXTRAS="mcore vllm nemo_gym" \
     --tag nemo-rl:latest .
 ```
 
@@ -117,4 +115,4 @@ uv lock
 |---------|-------|-----|
 | `uv sync --locked` fails | Dependency conflict or stale lockfile | Re-run `uv lock` and commit updated lock |
 | `ModuleNotFoundError` after pip install | pip installed outside uv-managed venv | Use `uv add` + `uv sync`, never bare `pip install` |
-| Docker build fails at vLLM | vLLM build time overhead | Pass `--build-arg SKIP_VLLM_BUILD=1` |
+| Docker build fails at vLLM | vLLM build time overhead | Leave `vllm` out of `--build-arg NRL_EXTRAS="..."` |

@@ -287,7 +287,7 @@ def test_fingerprint_covers_the_actor_table():
 
 
 def test_script_skips_by_extra_not_by_name():
-    """SKIP_VLLM_BUILD must drop actors that need vllm even without 'vllm' in the name."""
+    """Skipping vllm must drop actors that need vllm even without 'vllm' in the name."""
     proc = subprocess.run(
         [sys.executable, str(MODULE_PATH), "all", "vllm"],
         capture_output=True,

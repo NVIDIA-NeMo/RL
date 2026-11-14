@@ -18,10 +18,8 @@
 #   To skip custom setup:
 #     docker buildx build --build-arg CUSTOM_SETUP_FNAME= -f docker/Dockerfile ...
 #
-# Optional build args to skip vLLM or SGLang dependencies:
-#   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
-#   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
-#   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
+# Optional: build only some backends (uv extras); empty builds all of them:
+#   --build-arg NRL_EXTRAS="mcore vllm nemo_gym"
 # Optional etcd and nats-server binaries for Dynamo serving
 # (policy.generation.dynamo=true; ai-dynamo itself ships in the vLLM venvs):
 #   --build-arg BUILD_DYNAMO=1
@@ -75,8 +73,9 @@ COPY docker/install_apptainer.sh /
 # Shared helper for the uv cache mount's materialize/sync-back/strip dance
 # (docker/uv_cache_mount.sh), bind-mounted into every uv-writing RUN below so
 # the logic lives in one place instead of being pasted into each RUN body.
+# docker/resolve_extras.sh rides along: it decides which extras this image builds.
 FROM scratch AS uv-cache-helper
-COPY docker/uv_cache_mount.sh /
+COPY docker/uv_cache_mount.sh docker/resolve_extras.sh /
 
 FROM ${BASE_IMAGE} AS base
 # An environment variable to indicate that we are in a container.
@@ -150,12 +149,25 @@ RUN GITHUB_ARTIFACTORY=github.com \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
-# Rust toolchain for setuptools-rust extensions in SGLang.
+# Rust toolchain for setuptools-rust extensions in SGLang. Skipped when SGLang is not built.
+ARG NRL_EXTRAS
+# Removed in favor of NRL_EXTRAS. Declared only so that resolve_extras.sh can see
+# one that is still passed and fail the build.
+ARG SKIP_VLLM_BUILD
+ARG SKIP_SGLANG_BUILD
+ARG SKIP_TRTLLM_BUILD
 ENV PATH="/root/.cargo/bin:$PATH"
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --profile minimal \
-    && rustc --version \
-    && cargo --version
+RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper <<"EOF" bash -exu -o pipefail
+source /tmp/uv-cache-helper/resolve_extras.sh
+case " $(nrl_wanted_extras) " in
+    *" sglang "*) ;;
+    *) echo "SGLang is not built; skipping the Rust toolchain"; exit 0 ;;
+esac
+curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal
+rustc --version
+cargo --version
+EOF
 
 # Install uv and python outside /root so an unprivileged runtime UID (for example
 # 65532) can execute them: /root is not traversable by other users, and the project
@@ -213,16 +225,17 @@ ARG BUILD_CUSTOM_FLASHINFER
 ARG BUILD_CUSTOM_FLASHINFER_URL
 ARG BUILD_CUSTOM_FLASHINFER_REF
 
-# Skip building vLLM, SGLang, or TRT-LLM dependencies (set to any non-empty value to skip)
-ARG SKIP_VLLM_BUILD
-ARG SKIP_SGLANG_BUILD
-ARG SKIP_TRTLLM_BUILD
 ARG BASE_IMAGE
 ARG UV_VERSION
 ARG HYBRID_EP_MULTINODE
 ARG TARGETARCH
 ARG TRTLLM_CCACHE_MAXSIZE=20G
 ARG TRTLLM_BUILD_JOBS=24
+# Space-separated extras to build; empty builds all of them. docker/resolve_extras.sh
+# has the full list and rejects unknown names.
+ARG NRL_EXTRAS
+# Space-separated dependency groups to install; empty installs all of them.
+ARG NRL_GROUPS
 ARG RUNTIME_UID
 ARG RUNTIME_GID
 ARG STRIP_UV_CACHE
@@ -306,6 +319,19 @@ source /tmp/uv-cache-helper/uv_cache_mount.sh
 uv_cache_restore force
 trap 'uv_cache_persist prune' EXIT
 
+source /tmp/uv-cache-helper/resolve_extras.sh
+WANTED_EXTRAS=$(nrl_wanted_extras)
+SKIP_EXTRAS=$(nrl_skipped_extras)
+# The TRT-LLM layer reads this to decide whether to build tensorrt_llm.
+printf '%s\n' $WANTED_EXTRAS > /opt/nrl_extras.txt
+GROUP_FLAGS="--all-groups"
+if [[ -n "${NRL_GROUPS:-}" ]]; then
+    GROUP_FLAGS="--no-default-groups"
+    for group in $NRL_GROUPS; do
+        GROUP_FLAGS="$GROUP_FLAGS --group $group"
+    done
+fi
+
 uv venv --seed
 # Drop what the restored cache carried in that uv.lock no longer pins -- versions from
 # older locks, which neither the seed export's `uv cache prune --ci` (it keeps every
@@ -340,16 +366,15 @@ apt-get update
 apt-get install -y --no-install-recommends libnvidia-ml-dev
 # Everything is hardlinked against the uv cache; this layer holds exactly one real copy of every wheel.
 UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
-if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
-    UV_LINK_MODE=hardlink uv sync --frozen --extra vllm --no-install-project
-fi
-if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
-    UV_LINK_MODE=hardlink uv sync --frozen --extra sglang --no-install-project
-fi
-UV_LINK_MODE=hardlink uv sync --frozen --extra mcore --no-install-project
-UV_LINK_MODE=hardlink uv sync --frozen --extra automodel --no-install-project
-UV_LINK_MODE=hardlink uv sync --frozen --extra modelopt --no-install-project
-UV_LINK_MODE=hardlink uv sync --frozen --all-groups --no-install-project
+for extra in $WANTED_EXTRAS; do
+    # nemo_gym is only ever installed into worker venvs, and tensorrt_llm is built
+    # in its own layer below.
+    case "$extra" in
+        nemo_gym | trtllm) continue ;;
+    esac
+    UV_LINK_MODE=hardlink uv sync --frozen --extra "$extra" --no-install-project
+done
+UV_LINK_MODE=hardlink uv sync --frozen $GROUP_FLAGS --no-install-project
 
 # Worker-venv prefetch, phase 1: third-party packages only.
 #
@@ -373,16 +398,7 @@ UV_LINK_MODE=hardlink uv sync --frozen --all-groups --no-install-project
 # each actor needs; the runtime registry imports the same dict. It is run as a script rather
 # than imported, because importing it would execute nemo_rl/__init__.py, which does real work
 # (fingerprint check, sys.path setup) that cannot run in this layer.
-SKIP_EXTRAS=""
-if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
-    SKIP_EXTRAS="$SKIP_EXTRAS vllm"
-fi
-if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
-    SKIP_EXTRAS="$SKIP_EXTRAS sglang"
-fi
-if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
-    SKIP_EXTRAS="$SKIP_EXTRAS trtllm"
-fi
+# SKIP_EXTRAS (every extra this image does not build) drops the actors that need one.
 # Write the list once, in a plain redirect so `set -e` catches a failure here
 # instead of silently prefetching nothing.
 "${UV_PROJECT_ENVIRONMENT}/bin/python" nemo_rl/distributed/actor_environments.py all $SKIP_EXTRAS \
@@ -431,7 +447,7 @@ COPY --from=nemo-rl --link 3rdparty/TensorRT-LLM-workspace/ ./3rdparty/TensorRT-
 # Declared here rather than with the other ARGs: BuildKit puts ARG and ENV into
 # the environment of every later RUN, so declaring it above the dependency RUN
 # would make a NIXL bump bust that hour-long layer for every image, including
-# SKIP_TRTLLM_BUILD=1 ones.
+# ones that do not build trtllm.
 ARG NIXL_VERSION=v1.4.0
 # The NGC base image sets ENV NIXL_VERSION=1.0.1, and an ARG only changes the
 # build-time environment. Re-export so the image -- and _backend.py's wheel
@@ -464,8 +480,8 @@ trap 'uv_cache_persist' EXIT
 # above would let an out-of-date lock ship silently. Keep it before the SKIP exit.
 uv lock --check
 
-if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
-    echo "SKIP_TRTLLM_BUILD is set; skipping the isolated TRT-LLM build"
+if ! grep -qx trtllm /opt/nrl_extras.txt; then
+    echo "The trtllm extra is not built (NRL_EXTRAS); skipping the isolated TRT-LLM build"
     exit 0
 fi
 
@@ -477,7 +493,7 @@ fi
 # inside its ENABLE_UCX block). backend=DEFAULT resolves to NIXL, so an image
 # without NIXL can only serve an explicit backend=UCX.
 #
-# Built here rather than in `base` so SKIP_TRTLLM_BUILD images don't pay for it:
+# Built here rather than in `base` so images without trtllm don't pay for it:
 # nothing outside the wheel build below consumes NIXL, and build_wheel.py
 # vendors both UCX and NIXL into the wheel with $ORIGIN rpaths, so the runtime
 # image needs neither on LD_LIBRARY_PATH.
@@ -537,7 +553,7 @@ cd /tmp && rm -rf /tmp/nixl /tmp/nixl-build-venv
 
 test -f /opt/nvidia/nvda_nixl/include/nixl.h
 # ldconfig rather than ENV: this runs inside a conditional block, so the arch
-# dir is discovered rather than hardcoded, and SKIP_TRTLLM_BUILD images get
+# dir is discovered rather than hardcoded, and images without trtllm get
 # neither the libraries nor the loader entry.
 NIXL_LIB=$(dirname "$(find /opt/nvidia/nvda_nixl -name libnixl.so -print -quit)")
 printf '%s\n' "${NIXL_LIB}" "${NIXL_LIB}/plugins" > /etc/ld.so.conf.d/nixl.conf
@@ -736,7 +752,7 @@ export TRTLLM_REQUIRE_CACHED_WHEEL=1
 # dependency layer's cache from this layer would make overlayfs copy every wheel up.
 # Build exactly the venvs phase 1 built, by name. Re-deriving the list here would
 # mean filtering on the actor name again, which cannot tell that e.g.
-# AsyncTrajectoryCollector needs the vLLM extra -- so under SKIP_VLLM_BUILD the two
+# AsyncTrajectoryCollector needs the vLLM extra -- so without vllm the two
 # passes would disagree and this layer would build three venvs the dependency layer
 # deliberately skipped. prefetch_venvs.py matches these positionally as substrings,
 # and a full FQN matches only itself.

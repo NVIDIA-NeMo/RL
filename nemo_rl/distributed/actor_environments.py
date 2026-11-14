@@ -145,9 +145,9 @@ def main(argv: list[str]) -> int:
     Usage: actor_environments.py [<stage>] [<skip extra> ...]
 
     ``<stage>`` is "deps" or "trtllm" (omit for all). Any extras listed after it
-    are skipped, which is how the Dockerfile honors SKIP_VLLM_BUILD and friends.
+    are skipped, which is how the Dockerfile leaves out the extras NRL_EXTRAS does not list.
     Filtering on the declared extras -- rather than on a substring of the actor
-    name -- is what makes SKIP_VLLM_BUILD also skip actors like
+    name -- is what makes leaving out vllm also skip actors like
     AsyncTrajectoryCollector, whose name contains no "vllm".
     """
     stage = argv[1] if len(argv) > 1 and argv[1] != "all" else None

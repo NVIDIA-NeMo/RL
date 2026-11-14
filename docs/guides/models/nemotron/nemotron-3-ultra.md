@@ -63,16 +63,14 @@ docker buildx build \
   --push \
   --build-context nemo-rl=. \
   --build-arg MAX_JOBS=8 \
-  --build-arg SKIP_SGLANG_BUILD=1 \
-  --build-arg SKIP_TRTLLM_BUILD=1 \
+  --build-arg NRL_EXTRAS="vllm mcore automodel modelopt nemo_gym" \
   --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/prefetch_ultra_all_envs.yaml" \
   .
 ```
 
 Build args:
 - `NEMO_GYM_PREFETCH_CONFIGS` — space-separated union configs whose Gym virtual environments are baked into the image.
-- `SKIP_SGLANG_BUILD=1` — Ultra runs on vLLM; skip the SGLang build.
-- `SKIP_TRTLLM_BUILD=1` — Ultra does not use TensorRT-LLM; skip its build.
+- `NRL_EXTRAS` — the backends to build. Ultra runs on vLLM and does not use TensorRT-LLM, so the list leaves out `sglang` and `trtllm`.
 - `MAX_JOBS` — parallel build jobs; tune to your machine.
 - `--build-context nemo-rl=.` — build from your local checkout (otherwise the Dockerfile pulls `NVIDIA-NeMo/RL.git#main`).
 
