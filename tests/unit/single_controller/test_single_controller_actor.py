@@ -2756,6 +2756,7 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
     if single_forward_cispo:
         cfg = _grpo_master_config(tmp_path)
         cfg.policy["generation"]["backend"] = "vllm"
+        cfg.policy["generation"]["vllm_cfg"] = {"http_api_server_count": 1}
         cfg.async_rl.sampler = ReadyFirstSamplerConfig()
         cfg.loss_fn = ClippedPGLossConfig(
             use_cispo=True,

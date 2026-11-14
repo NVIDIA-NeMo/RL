@@ -4294,6 +4294,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             "megatron_cfg": {"enabled": False},
             "generation": {
                 "backend": "vllm",
+                "vllm_cfg": {"http_api_server_count": 1},
                 "colocated": {"enabled": False, "resources": {}},
             },
         },

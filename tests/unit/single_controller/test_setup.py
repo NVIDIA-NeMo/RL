@@ -160,6 +160,7 @@ def _make_master_config(
     """
     generation_config: dict = {
         "backend": backend,
+        "vllm_cfg": {"http_api_server_count": 1},
         "top_logprobs": 0,
         "colocated": {"enabled": colocated, "resources": {}},
     }
