@@ -807,5 +807,6 @@ class PolicyConfig(TypedDict):
     # ACTOR_ENVIRONMENT_REGISTRY.
     worker_extension_cls_fqn: NotRequired[str | None]
 
-    # Runs the model through Megatron-Bridge's TrainingEngine (TrainingEnginePolicy).
+    # Runs the model through Megatron-Bridge's TrainingEngine: the policy builds
+    # TrainingEnginePolicyWorker instead of the Megatron worker.
     training_engine: NotRequired[TrainingEngineConfig]

@@ -38,7 +38,6 @@ from nemo_rl.models.generation import (
     draft_full_refit_enabled,
 )
 from nemo_rl.models.policy.draft_config import draft_refit_enabled
-from nemo_rl.models.policy.training_engine_policy import TrainingEnginePolicy
 from nemo_rl.telemetry.instrumentation import setup_span, startup_span
 from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
@@ -152,15 +151,6 @@ def main() -> None:
                     setup_response_data(tokenizer, config.data, config.env)
                 )
 
-            policy_factory = make_policy_factory(config.data_plane)
-            if "training_engine" in config.policy:
-                if policy_factory is not None:
-                    raise ValueError(
-                        "policy.training_engine cannot be combined with "
-                        "data_plane.enabled=true."
-                    )
-                policy_factory = TrainingEnginePolicy
-
             # No child spans here: parallel init runs in threads, which do not
             # carry the OTel context. The breakdown comes from the
             # rl.setup.duration metric instead.
@@ -184,7 +174,7 @@ def main() -> None:
                     tokenizer,
                     dataset,
                     val_dataset,
-                    policy_factory=policy_factory,
+                    policy_factory=make_policy_factory(config.data_plane),
                 )
 
             rl_init_timer.record("total", time.perf_counter() - main_start)

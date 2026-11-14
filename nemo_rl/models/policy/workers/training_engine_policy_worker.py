@@ -17,43 +17,37 @@
 import math
 import os
 from collections import defaultdict
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Optional
 
-import megatron.bridge.engine.recipes as engine_recipes
 import ray
 import torch
 from megatron.bridge.engine import AdamParams, TrainingEngine
 from megatron.core.transformer.moe.router import Router
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+from nemo_rl.distributed.refit_watchdog import RefitAborted, RefitAbortWatchdog
 from nemo_rl.models.megatron.setup import setup_distributed
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
-from nemo_rl.models.policy.training_engine_adapter.data import (
-    padded_scores,
-    scoring_datums,
-    training_datums,
+from nemo_rl.models.policy.training_engine_adapter.engine import (
+    NeMoRLTrainingEngine,
+    build_recipe,
+    check_supported_loss,
 )
-from nemo_rl.models.policy.training_engine_adapter.losses import NeMoRLTrainingEngine
 from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
     stream_weights_via_ipc_zmq_impl,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
-
-# Engine topology key for each axis of the policy's sharding annotations.
-_TOPOLOGY_AXES = {
-    "tensor_parallel": "tp_size",
-    "context_parallel": "cp_size",
-    "pipeline_parallel": "pp_size",
-    "data_parallel": "dp_size",
-}
+from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
 def _freeze_moe_routers(model: list[Any]) -> list[Any]:
@@ -66,14 +60,28 @@ def _freeze_moe_routers(model: list[Any]) -> list[Any]:
     return model
 
 
+@dataclass
+class _TrainState:
+    """The loss function and running totals of one optimizer update while its chunks arrive."""
+
+    loss_fn: LossFunction
+    # Totals over all ranks.
+    loss_sum: float = 0.0
+    num_loss_tokens: int = 0
+    metric_sums: dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    # Samples with at least one loss token on this data-parallel replica.
+    num_local_loss_seqs: int = 0
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
-class TrainingEnginePolicyWorkerImpl(AbstractPolicyWorker):
+class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
     """Owns a trainable policy engine and a frozen reference engine on one GPU.
 
-    Every worker receives the same global batch for every call. The engines pack it,
-    assign it to data-parallel replicas and split it across context-parallel ranks, so
-    all workers must enter each call together. Results are identical on every rank;
-    rank 0 returns them and the others return None.
+    The driver plans the packed microbatches and sends each data-parallel replica its
+    own samples with that plan; every rank of a replica receives the same samples. The
+    worker hands them to the engines as they are; the engines pack each planned
+    microbatch with NeMo RL's microbatch processing.
+    All workers must enter each call together: the engines' collectives span all ranks.
     """
 
     def __repr__(self) -> str:
@@ -109,12 +117,8 @@ class TrainingEnginePolicyWorkerImpl(AbstractPolicyWorker):
         **kwargs: Any,
     ):
         """Build the engines from ``policy.training_engine``."""
-        del tokenizer, processor, kwargs
-        if weights_path is not None or optimizer_path is not None:
-            # TODO: resume through engine.load_state.
-            raise NotImplementedError(
-                "Resuming a TrainingEngine policy from a checkpoint is not implemented yet."
-            )
+        # optimizer_path is not used: an engine checkpoint always holds the optimizer state.
+        del tokenizer, processor, optimizer_path, worker_sharding_annotations, kwargs
         if not init_optimizer:
             # TODO: an inference-only policy is one frozen engine.
             raise NotImplementedError(
@@ -163,87 +167,109 @@ class TrainingEnginePolicyWorkerImpl(AbstractPolicyWorker):
 
         self.cfg = config
         self.rank = int(os.environ["RANK"])
-        # Triton's kernel cache defaults to the home directory, which is shared storage:
+        # [WAR] Triton's kernel cache defaults to the home directory, which is shared storage:
         # ranks compiling the same kernel at once race on its files. One local cache per rank.
         os.environ.setdefault("TRITON_CACHE_DIR", f"/tmp/triton-cache-rank{self.rank}")
         # The engine attaches to this process group instead of creating its own.
         setup_distributed(config)
 
+        # The policy config was aligned with the recipe on the driver
+        # (align_policy_config_with_recipe), so nothing is checked against it here.
         engine_config = config["training_engine"]
-        recipe = getattr(engine_recipes, engine_config["recipe"])(
-            seq_length=engine_config["seq_length"], **engine_config["recipe_kwargs"]
-        )
-        engine_recipes.apply_recipe_overrides(recipe, engine_config["overrides"])
+        recipe = build_recipe(engine_config)
         checkpoint_path = engine_config["checkpoint_path"]
+        sample_pad_multiple = config["make_sequence_length_divisible_by"]
         hooks = [_freeze_moe_routers] if megatron_cfg["freeze_moe_router"] else []
         self.engine = NeMoRLTrainingEngine.from_recipe(
             recipe,
+            sample_pad_multiple=sample_pad_multiple,
             checkpoint_path=checkpoint_path,
             hooks=hooks,
             spawn_async_save_worker=False,
         )
-        self._check_topology(worker_sharding_annotations)
         self.reference_engine: Optional[TrainingEngine] = None
         if init_reference_model:
-            self.reference_engine = TrainingEngine.from_recipe(
-                recipe, checkpoint_path=checkpoint_path, trainable=False
+            self.reference_engine = NeMoRLTrainingEngine.from_recipe(
+                recipe,
+                sample_pad_multiple=sample_pad_multiple,
+                checkpoint_path=checkpoint_path,
+                trainable=False,
             )
-        # train() calls so far; the learning-rate schedule advances once per call.
+        # train() and finish_train_step() calls so far; the learning-rate schedule
+        # advances once per call.
         self._train_calls = 0
+        self._train_state: Optional[_TrainState] = None
+        if weights_path is not None:
+            # Resume: the reference engine keeps the initial weights loaded above.
+            saved = self.engine.load_state(str(weights_path))
+            self._train_calls = saved["train_calls"]
 
-    def _check_topology(self, annotations: NamedSharding) -> None:
-        """The driver lays workers out from the policy config; the engine from its recipe."""
+    # ---- position among the workers, for the data-plane entry points ----
+
+    def _local_coords(self) -> dict[str, int]:
+        """This worker's position on the axes that share one replica's samples."""
         info = self.engine.parallel_info
-        for axis, key in _TOPOLOGY_AXES.items():
-            if annotations.get_axis_size(axis) != info[key]:
-                raise ValueError(
-                    f"The policy config gives {axis} size "
-                    f"{annotations.get_axis_size(axis)}, but the engine recipe "
-                    f"resolves to {info[key]}. Set policy.megatron_cfg to the "
-                    "recipe's topology."
-                )
+        return {
+            "tensor_parallel": info["tp_rank"],
+            "context_parallel": info["cp_rank"],
+            "pipeline_parallel": info["pp_rank"],
+        }
+
+    def _get_replica_group(self) -> Any:
+        """The ranks that receive the same samples as this worker.
+
+        Pipeline parallelism is rejected by the config check, so these are the
+        worker's tensor-parallel and context-parallel partners.
+        """
+        return self.engine.process_groups.tp_cp
 
     # ---- scoring ----
 
     def _score(
         self, engine: TrainingEngine, data: BatchedDataDict[Any]
-    ) -> Optional[torch.Tensor]:
-        """Target logprobs as ``[B, S]`` on rank 0."""
-        output = engine.forward_only(scoring_datums(data), gather_output=True)
-        if self.rank != 0:
-            return None
-        return padded_scores(output.logprobs, data["input_ids"].shape[1])
+    ) -> torch.Tensor:
+        """Target logprobs of this replica's samples as ``[B, S]``, in the order received."""
+        return engine.forward_only(data, gather_output=True).cpu()
 
     # 'data' is keyword-only like the other policy workers (a Ray argument-passing quirk).
     def get_logprobs(
-        self, *, data: BatchedDataDict[Any]
-    ) -> Optional[BatchedDataDict[LogprobOutputSpec]]:
-        """Score the global batch with the policy.
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[LogprobOutputSpec]:
+        """Score this replica's samples with the policy.
+
+        ``micro_batch_size`` is not used: the microbatches follow the packing plan
+        on ``data``.
 
         Returns:
-          On rank 0, a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length],
+          a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length],
           where position i holds the logprob of input token i and the first token's is 0.
         """
-        logprobs = self._score(self.engine, data)
-        if logprobs is None:
-            return None
-        return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs)
+        del micro_batch_size
+        return BatchedDataDict[LogprobOutputSpec](
+            logprobs=self._score(self.engine, data)
+        )
 
     def get_reference_policy_logprobs(
-        self, *, data: BatchedDataDict[Any]
-    ) -> Optional[BatchedDataDict[ReferenceLogprobOutputSpec]]:
-        """Score the global batch with the frozen reference model.
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
+        """Score this replica's samples with the frozen reference model.
 
         Returns: as get_logprobs, under the key "reference_logprobs".
         """
+        del micro_batch_size
         if self.reference_engine is None:
             raise RuntimeError(
                 "The reference model was not built (init_reference_model=False)."
             )
-        logprobs = self._score(self.reference_engine, data)
-        if logprobs is None:
-            return None
-        return BatchedDataDict[ReferenceLogprobOutputSpec](reference_logprobs=logprobs)
+        return BatchedDataDict[ReferenceLogprobOutputSpec](
+            reference_logprobs=self._score(self.reference_engine, data)
+        )
 
     # ---- training ----
 
@@ -287,55 +313,148 @@ class TrainingEnginePolicyWorkerImpl(AbstractPolicyWorker):
 
     def train(
         self,
-        *,
         data: BatchedDataDict[Any],
         loss_fn: LossFunction,
-        gbs: int,
-    ) -> Optional[dict[str, Any]]:
-        """Run one optimizer update per ``gbs`` samples of the global batch.
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        check_dim_skip_keys: Optional[Iterable[str]] = None,
+    ) -> dict[str, Any]:
+        """Run one optimizer update per global batch of the driver's plan.
+
+        ``data`` holds this replica's share of every global batch. ``mbs`` is not used:
+        the microbatches follow the packing plan on ``data``.
 
         Returns:
-          On rank 0: "global_loss" (mean loss per loss token, averaged over the updates),
-          "grad_norm", and "all_mb_metrics" with one entry per update for each metric.
-          Token-level metrics are per-token means of the update.
+          "global_loss" (mean loss per loss token, averaged over the updates), "grad_norm",
+          and "all_mb_metrics" with one entry per update for each metric. Token-level
+          metrics are per-token means of the update over all replicas.
         """
-        if data.size % gbs != 0:
+        del mbs
+        if eval_mode:
+            # TODO: a forward with the loss and no gradient accumulation.
+            raise NotImplementedError(
+                "eval_mode is not implemented for the TrainingEngine policy yet."
+            )
+        if check_dim_skip_keys is not None:
             raise ValueError(
-                f"The batch has {data.size} samples, not a multiple of the global "
-                f"batch size {gbs}."
+                "check_dim_skip_keys is only supported by the Automodel worker."
             )
+        if gbs is None:
+            gbs = self.cfg["train_global_batch_size"]
+        local_gbs = gbs // self.engine.parallel_info["dp_size"]
+        # Every update of one train() call uses the same schedule position.
         adam_params = self._adam_params()
-        metrics: dict[str, list[float]] = defaultdict(list)
-        grad_norms = []
-        for start in range(0, data.size, gbs):
-            update = data.slice(start, start + gbs)
-            output = self.engine.forward_backward(
-                training_datums(update),
-                loss_fn="clipped_pg_loss",
-                loss_kwargs={"loss_fn": loss_fn},
-            )
-            step = self.engine.optim_step(adam_params)
-            tokens = max(output.num_loss_tokens, 1)
-            metrics["loss"].append(output.loss_sum / tokens)
-            for name, total in output.metrics.items():
-                metrics[name].append(total / tokens)
-            metrics["lr"].append(adam_params.learning_rate)
-            metrics["wd"].append(adam_params.weight_decay)
-            metrics["global_valid_toks"].append(output.num_loss_tokens)
-            loss_mask = update["token_mask"] * update["sample_mask"].unsqueeze(-1)
-            metrics["global_valid_seqs"].append(
-                int(loss_mask[:, 1:].bool().any(dim=-1).sum())
-            )
-            metrics["update_successful"].append(step["update_successful"])
-            grad_norms.append(step["grad_norm"])
+        updates = []
+        for index in range(len(data.micro_batch_indices)):
+            self.begin_train_step(loss_fn)
+            self.train_microbatch(data=data.get_batch(index, local_gbs))
+            updates.append(self._apply_update(adam_params))
         self._train_calls += 1
-        if self.rank != 0:
-            return None
+        return self._train_result(updates)
+
+    # ---- streaming train step ----
+    # One optimizer update fed in several chunks: begin_train_step, train_microbatch once
+    # per chunk, then finish_train_step. Gradients add up in the engine across the chunks
+    # and are normalized once, by the loss tokens of the whole update.
+
+    def begin_train_step(
+        self,
+        loss_fn: LossFunction,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> None:
+        """Open an update. ``gbs`` and ``mbs`` are not used: each chunk brings its plan."""
+        del gbs, mbs
+        check_supported_loss(loss_fn)
+        if self._train_state is not None:
+            raise RuntimeError(
+                "A train step is already open; call finish_train_step or "
+                "abort_train_step first."
+            )
+        self._train_state = _TrainState(loss_fn=loss_fn)
+
+    def train_microbatch(self, *, data: BatchedDataDict[Any]) -> None:
+        """Add this replica's share of one chunk to the open update (forward and backward only)."""
+        state = self._open_train_state("train_microbatch")
+        output = self.engine.forward_backward(
+            data,
+            loss_fn="clipped_pg_loss",
+            loss_kwargs={"loss_fn": state.loss_fn},
+        )
+        state.loss_sum += output.loss_sum
+        state.num_loss_tokens += output.num_loss_tokens
+        for name, total in output.metrics.items():
+            state.metric_sums[name] += total
+        loss_mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+        state.num_local_loss_seqs += int(loss_mask[:, 1:].bool().any(dim=-1).sum())
+
+    def finish_train_step(self) -> dict[str, Any]:
+        """Apply the open update and advance the learning-rate schedule by one.
+
+        Returns: as train(), for the one update.
+        """
+        update = self._apply_update(self._adam_params())
+        self._train_calls += 1
+        return self._train_result([update])
+
+    def abort_train_step(self) -> None:
+        """Discard the open update, if any, without touching the weights."""
+        if self._train_state is None:
+            return
+        self._train_state = None
+        self.engine.zero_grad()
+
+    def pause_train_step_with_offloading(self) -> None:
+        """Move the policy engine, with the open update's gradients, to host memory.
+
+        prepare_for_training brings it back.
+        """
+        self._open_train_state("pause_train_step_with_offloading")
+        self.engine.cpu()
+
+    def _open_train_state(self, caller: str) -> "_TrainState":
+        if self._train_state is None:
+            raise RuntimeError(f"{caller} needs an open train step.")
+        return self._train_state
+
+    def _apply_update(self, adam_params: AdamParams) -> dict[str, float]:
+        """Step the optimizer on the open update; return its metrics and grad norm."""
+        state = self._open_train_state("finish_train_step")
+        step = self.engine.optim_step(adam_params)
+        self._train_state = None
+        tokens = max(state.num_loss_tokens, 1)
+        update = {name: total / tokens for name, total in state.metric_sums.items()}
+        update["loss"] = state.loss_sum / tokens
+        update["lr"] = adam_params.learning_rate
+        update["wd"] = adam_params.weight_decay
+        update["global_valid_toks"] = state.num_loss_tokens
+        update["global_valid_seqs"] = self._sum_over_replicas(state.num_local_loss_seqs)
+        update["update_successful"] = step["update_successful"]
+        update["grad_norm"] = step["grad_norm"]
+        return update
+
+    def _sum_over_replicas(self, count: int) -> int:
+        """Add up a per-replica count over the data-parallel replicas."""
+        total = torch.tensor([count], device="cuda")
+        torch.distributed.all_reduce(total, group=self.engine.process_groups.dp)
+        return int(total.item())
+
+    def _train_result(self, updates: list[dict[str, float]]) -> dict[str, Any]:
+        """The worker's training result for a list of updates."""
+        metrics: dict[str, list[float]] = defaultdict(list)
+        for update in updates:
+            for name, value in update.items():
+                metrics[name].append(value)
+        grad_norms = metrics.pop("grad_norm")
         losses = metrics["loss"]
+        # The metrics are already totals over all ranks, and the driver adds up what the
+        # replicas report, so only the first replica reports them.
+        is_first_replica = self.engine.parallel_info["dp_rank"] == 0
         return {
             "global_loss": torch.tensor(sum(losses) / len(losses)),
             "grad_norm": torch.tensor(grad_norms),
-            "all_mb_metrics": dict(metrics),
+            "all_mb_metrics": dict(metrics) if is_first_replica else {},
         }
 
     # ---- model residency ----
@@ -395,13 +514,71 @@ class TrainingEnginePolicyWorkerImpl(AbstractPolicyWorker):
             worker_name=str(self),
         )
 
-    def save_checkpoint(self, *args: Any, **kwargs: Any) -> None:
-        """Save a training checkpoint."""
-        # TODO: engine.save_state plus the train() call count, and the matching resume.
-        raise NotImplementedError(
-            "Checkpointing a TrainingEngine policy is not implemented yet; run with "
-            "checkpointing.enabled=false."
+    @torch.no_grad()
+    def broadcast_weights_for_collective(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
+    ) -> None:
+        """Broadcast the policy's HF weights to generation workers on other GPUs.
+
+        Every training rank runs the export and joins the broadcast; rank 0 is the source.
+        The watchdog aborts a broadcast that a dead generation rank would block forever.
+        """
+        if kv_scales is not None:
+            # TODO: append the FP8 KV-cache scales to the stream.
+            raise NotImplementedError(
+                "FP8 KV-cache scales are not supported by the TrainingEngine policy yet."
+            )
+        # The export reads the weights on the GPU.
+        self.engine.cuda()
+        with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
+            packed_broadcast_producer(
+                iterator=self.engine.export(streaming=True),
+                group=self.model_update_group,
+                src=0,
+                post_iter_func=lambda item: item[1],
+                buffer_size_bytes=buffer_size_bytes,
+                num_buffers=num_buffers,
+                use_legacy_packing=use_legacy_packing,
+            )
+        if guard.fired:
+            raise RefitAborted(
+                f"refit broadcast exceeded {refit_timeout_s}s and was aborted; "
+                "a generation rank most likely stopped participating"
+            )
+
+    # ---- checkpointing ----
+
+    def save_checkpoint(
+        self,
+        weights_path: str,
+        optimizer_path: Optional[str] = None,
+        tokenizer_path: Optional[str] = None,
+    ) -> None:
+        """Save weights, optimizer state and the schedule position under ``weights_path``.
+
+        Blocks until the checkpoint is on disk. The tokenizer is not saved.
+        """
+        del tokenizer_path
+        if optimizer_path is None:
+            # TODO: a weights-only engine checkpoint.
+            raise NotImplementedError(
+                "The TrainingEngine policy always saves the optimizer state; set "
+                "checkpointing.save_optimizer=true."
+            )
+        # Generation may have left the engine in host memory; the save reads it on the GPU.
+        was_offloaded = self.engine.device == "cpu"
+        self.engine.cuda()
+        self.engine.save_state(
+            str(weights_path), user_state={"train_calls": self._train_calls}
         )
+        if was_offloaded:
+            self.engine.cpu()
 
 
 @ray.remote(
