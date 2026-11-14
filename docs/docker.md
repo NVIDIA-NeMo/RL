@@ -159,6 +159,8 @@ docker buildx build -f docker/Dockerfile \
     --build-arg NRL_EXTRAS="mcore vllm nemo_gym" \
     --build-arg TORCH_CUDA_ARCH_LIST=10.3 \
     --build-arg NVTE_CUDA_ARCHS=103 \
+    --build-arg FLASH_ATTN_CUDA_ARCHS=100 \
+    --build-arg FLASH_MLA_DISABLE_SM90=1 \
     --build-arg ROOT_ONLY=1 \
     --build-arg STRIP_UV_CACHE=1 \
     --build-context nemo-gym=<path-to-gym> \
