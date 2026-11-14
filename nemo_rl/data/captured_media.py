@@ -391,6 +391,38 @@ def _processed_omni_tensors(
     return pack_images(pixels, sizes, patch_size=patch_size), sizes
 
 
+def _processed_pixtral_tensors(
+    data: dict[str, Any],
+    modality: str,
+    *,
+    patch_size: int,
+    pixel_dtype: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack one Pixtral image (vLLM's Mistral3 processor) in Omni's patch layout.
+
+    vLLM's Mistral3 processor keeps one ``pixel_values`` tensor per image,
+    already cropped to the image's processed size, so the geometry is the
+    tensor's own ``[H, W]``. The processor emits float32 and the engine casts
+    to the model dtype inside the vision tower, so the pixels are cast to
+    ``pixel_dtype`` (the staging column's pinned dtype) here instead of being
+    staged in a second dtype. The packed layout is the one
+    ``nemo_rl.data.multimodal_utils._patchify_segments`` produces.
+    """
+    if modality != "image":
+        raise MediaCaptureRejected("Pixtral token capture supports images only")
+    pixels = data.get("pixel_values")
+    if not isinstance(pixels, torch.Tensor) or pixels.ndim != 3 or pixels.shape[0] != 3:
+        raise MediaCaptureRejected(
+            "Pixtral image capture requires processed [3, H, W] pixels"
+        )
+    if pixels.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise MediaCaptureRejected("Unsupported processed pixel dtype")
+    if pixel_dtype is not None and pixels.dtype != pixel_dtype:
+        pixels = pixels.to(pixel_dtype)
+    sizes = torch.tensor([list(pixels.shape[-2:])], dtype=torch.int32)
+    return pack_images(pixels.unsqueeze(0), sizes, patch_size=patch_size), sizes
+
+
 def capture_processed_media(
     engine_prompt: dict[str, Any],
     *,
@@ -400,12 +432,25 @@ def capture_processed_media(
     image_token_id: int | None = None,
     patch_size: int | None = None,
     retained_tensors: tuple[StagedMediaTensors, ...] | None = None,
+    media_family: str = "omni",
+    cast_pixel_dtype: torch.dtype | None = None,
+    spatial_merge_size: int | None = None,
 ) -> CapturedMedia:
     """Validate retained media and capture only newly appended occurrences.
 
     Framework-owned continuations also compare processed tensors with their
     staged predecessors before reusing them in a shared training segment.
+
+    ``media_family`` is ``"omni"`` (Nemotron Omni dynamic tiler) or
+    ``"pixtral"`` (vLLM's Mistral3 / Pixtral processor). Pixtral images are
+    rows of image tokens, each row ended by a break token and the last by an
+    end token, so an image has one embedding run per row;
+    ``spatial_merge_size`` lets the embedding count be checked against the
+    image geometry. ``cast_pixel_dtype`` (Pixtral only) is the staging
+    column's pinned pixel dtype.
     """
+    if media_family not in ("omni", "pixtral"):
+        raise MediaCaptureRejected(f"Unsupported media family {media_family!r}")
     tokens = engine_prompt["prompt_token_ids"]
     placeholders = engine_prompt.get("mm_placeholders") or {}
     kwargs = engine_prompt.get("mm_kwargs") or {}
@@ -453,7 +498,14 @@ def capture_processed_media(
         previous_end = span.offset + span.length
         data = item.get_data()
         assert patch_size is not None
-        patches, sizes = _processed_omni_tensors(data, modality, patch_size=patch_size)
+        if media_family == "pixtral":
+            patches, sizes = _processed_pixtral_tensors(
+                data, modality, patch_size=patch_size, pixel_dtype=cast_pixel_dtype
+            )
+        else:
+            patches, sizes = _processed_omni_tensors(
+                data, modality, patch_size=patch_size
+            )
         if pixel_dtype is not None and pixel_dtype != patches.dtype:
             raise MediaCaptureRejected("Media tensor dtypes changed within a call")
         pixel_dtype = patches.dtype
@@ -476,7 +528,31 @@ def capture_processed_media(
                 ):
                     raise MediaCaptureRejected("Invalid image embedding mask")
                 positions = span.is_embed.nonzero().flatten().tolist()
-            if not positions or positions != list(
+            if media_family == "pixtral":
+                if image_token_id is None:
+                    raise MediaCaptureRejected(
+                        "Pixtral image capture requires the image token ID"
+                    )
+                if span.is_embed is None:
+                    positions = [
+                        i
+                        for i, token in enumerate(local_tokens)
+                        if token == image_token_id
+                    ]
+                if not positions or local_tokens[positions[0]] != image_token_id:
+                    raise MediaCaptureRejected("Invalid media embedding tokens")
+                if spatial_merge_size is not None:
+                    height, width = (int(v) for v in sizes.reshape(-1, 2)[0].tolist())
+                    cell = patch_size * spatial_merge_size
+                    if (
+                        height % cell
+                        or width % cell
+                        or len(positions) != (height // cell) * (width // cell)
+                    ):
+                        raise MediaCaptureRejected(
+                            "Image embedding count disagrees with the image geometry"
+                        )
+            elif not positions or positions != list(
                 range(positions[0], positions[-1] + 1)
             ):
                 raise MediaCaptureRejected(
