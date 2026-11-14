@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from unittest.mock import MagicMock
 
 import pytest
@@ -90,6 +91,15 @@ def test_create_teacher_configs_deduplicates():
     assert len(configs) == 2
 
 
+@pytest.mark.parametrize("quant_cfg", [None, "NVFP4"])
+@pytest.mark.parametrize(
+    "extension_fqn",
+    [
+        None,
+        "tests.extensions.CustomPolicyWorker",
+        "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
+    ],
+)
 @pytest.mark.parametrize("student_mtp_layers", [0, 5])
 @pytest.mark.parametrize(
     "teacher_overrides,expected_mtp_layers",
@@ -101,9 +111,14 @@ def test_create_teacher_configs_deduplicates():
     ],
 )
 def test_teacher_worker_group_isolates_student_inference_settings(
-    monkeypatch, student_mtp_layers, teacher_overrides, expected_mtp_layers
+    monkeypatch,
+    quant_cfg,
+    extension_fqn,
+    student_mtp_layers,
+    teacher_overrides,
+    expected_mtp_layers,
 ):
-    """Scoring disables router replay and defaults MTP off independently of training."""
+    """Teachers isolate student worker settings and apply their own MTP overrides."""
     import nemo_rl.distributed.worker_groups as worker_groups
     from nemo_rl.models.policy.teacher_worker_group import (
         TeacherConfig,
@@ -114,12 +129,16 @@ def test_teacher_worker_group_isolates_student_inference_settings(
 
     class FakeWorkerBuilder:
         def __init__(self, worker_path, cfg, **kwargs):
-            del worker_path, kwargs
+            del kwargs
+            captured["worker_path"] = worker_path
             captured["cfg"] = cfg
 
     class FakeWorkerGroup:
         def __init__(self, cluster, worker_builder, **kwargs):
             del cluster, worker_builder, kwargs
+
+        def shutdown(self, *, cleanup_method: str) -> bool:
+            return True
 
     monkeypatch.setattr(worker_groups, "RayWorkerBuilder", FakeWorkerBuilder)
     monkeypatch.setattr(worker_groups, "RayWorkerGroup", FakeWorkerGroup)
@@ -137,6 +156,8 @@ def test_teacher_worker_group_isolates_student_inference_settings(
         "sequence_packing": {"enabled": False},
         "dynamic_batching": {"enabled": False},
         "router_replay": {"enabled": True},
+        "quant_cfg": quant_cfg,
+        "worker_extension_cls_fqn": extension_fqn,
     }
     teacher_config = TeacherConfig(
         alias="teacher",
@@ -152,17 +173,30 @@ def test_teacher_worker_group_isolates_student_inference_settings(
         megatron_cfg_overrides=teacher_overrides,
     )
 
-    teacher = TeacherWorkerGroup(
-        teacher_config,
-        cluster,
-        policy_config,
-        MagicMock(),
-        teacher_index=0,
-    )
+    with (
+        pytest.warns(UserWarning, match="quantization is not supported")
+        if quant_cfg
+        else nullcontext()
+    ):
+        teacher = TeacherWorkerGroup(
+            teacher_config,
+            cluster,
+            policy_config,
+            MagicMock(),
+            teacher_index=0,
+        )
 
     assert captured["cfg"]["router_replay"]["enabled"] is False
     assert teacher.cfg["router_replay"]["enabled"] is False
     assert policy_config["router_replay"]["enabled"] is True
+    assert (
+        captured["worker_path"]
+        == "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
+    )
+    assert captured["cfg"]["quant_cfg"] is None
+    assert "worker_extension_cls_fqn" not in captured["cfg"]
+    assert policy_config["quant_cfg"] == quant_cfg
+    assert policy_config["worker_extension_cls_fqn"] == extension_fqn
     megatron_cfg = captured["cfg"]["megatron_cfg"]
     assert megatron_cfg["mtp_num_layers"] == expected_mtp_layers
     assert megatron_cfg["_provider_override_allowlist"] == sorted(
