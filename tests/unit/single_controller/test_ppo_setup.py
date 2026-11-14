@@ -457,12 +457,12 @@ class TestPPOValidation:
         validate_single_controller_config(mc)
 
     @pytest.mark.parametrize(
-        ("min_groups", "normalize_advantages", "expect_warning"),
+        ("min_groups", "normalize_advantages", "expect_error"),
         [(1, True, True), (1, False, False), (_NUM_PROMPTS_PER_STEP, True, False)],
         ids=["streaming-normalized", "streaming-unnormalized", "full-batch"],
     )
-    def test_chunk_normalization_warning(
-        self, min_groups: int, normalize_advantages: bool, expect_warning: bool
+    def test_chunk_normalization_requires_full_batch(
+        self, min_groups: int, normalize_advantages: bool, expect_error: bool
     ) -> None:
         mc = _ppo_master_config(
             min_groups_for_streaming_train=min_groups, megatron_enabled=True
@@ -470,15 +470,11 @@ class TestPPOValidation:
         mc.ppo.ppo_epochs = 1
         mc.ppo.adv_estimator.normalize_advantages = normalize_advantages
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        if expect_error:
+            with pytest.raises(ValueError, match="normalize_advantages.*min_groups"):
+                validate_single_controller_config(mc)
+        else:
             validate_single_controller_config(mc)
-
-        assert len(caught) == int(expect_warning)
-        if expect_warning:
-            assert caught[0].category is UserWarning
-            assert "normalizes GAE advantages per chunk" in str(caught[0].message)
-            assert "instead of across the full batch" in str(caught[0].message)
 
     def test_rejects_streaming_without_megatron_policy(self):
         mc = _ppo_master_config(min_groups_for_streaming_train=1)
@@ -1310,10 +1306,22 @@ def _in_loss_ppo_config(*, streaming: bool = False) -> MasterConfig:
     mc.loss_fn.seq_logprob_error_in_loss = True
     mc.loss_fn.force_on_policy_ratio = True
     mc.loss_fn.token_level_loss = True
+    mc.ppo.adv_estimator.normalize_advantages = False
     return mc
 
 
 class TestInLossSeqFilterForPPO:
+    def test_rejects_normalization_before_in_loss_filtering(self) -> None:
+        mc = _in_loss_ppo_config()
+        mc.ppo.adv_estimator.normalize_advantages = True
+
+        with pytest.raises(ValueError, match="normalize_advantages"):
+            validate_single_controller_config(mc)
+
+        mc.loss_fn.seq_logprob_error_in_loss = False
+        validate_single_controller_config(mc)
+        assert logprob_passes_required(mc, mc.ppo)[0]
+
     @pytest.mark.parametrize("streaming", [False, True])
     def test_accepts_one_policy_epoch_and_skips_policy_logprobs(
         self, streaming: bool

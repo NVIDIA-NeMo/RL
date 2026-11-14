@@ -26,6 +26,7 @@ from typing import get_args
 import pytest
 from pydantic import ValidationError
 
+from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.async_utils.staleness_sampler import SamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -113,6 +114,55 @@ def test_single_forward_threshold_requires_a_threshold() -> None:
     cfg.grpo.seq_logprob_error_threshold = None
     with pytest.raises(ValueError, match="requires seq_logprob_error_threshold"):
         validate_single_controller_config(cfg)
+
+
+@pytest.mark.parametrize("min_groups", [1, 8])
+def test_in_loss_filter_rejects_excluded_reward_statistics(min_groups: int) -> None:
+    cfg = _single_forward_config()
+    cfg.async_rl.min_groups_for_streaming_train = min_groups
+    cfg.grpo.masked_reward_policy = "exclude"
+
+    with pytest.raises(ValueError, match="masked_reward_policy.*exclude"):
+        validate_single_controller_config(cfg)
+
+
+@pytest.mark.parametrize("masked_reward_policy", ["include", "exclude"])
+def test_separate_filter_preserves_reward_policy(masked_reward_policy: str) -> None:
+    cfg = _single_forward_config()
+    cfg.loss_fn.seq_logprob_error_in_loss = False
+    cfg.grpo.masked_reward_policy = masked_reward_policy
+
+    validate_single_controller_config(cfg)
+    assert logprob_passes_required(cfg, cfg.grpo) == (True, False)
+
+
+def test_reinforce_plus_plus_requires_full_batch_statistics() -> None:
+    cfg = _master_config()
+    cfg.grpo.adv_estimator.name = "reinforce_plus_plus"
+    cfg.async_rl.min_groups_for_streaming_train = 2
+
+    with pytest.raises(ValueError, match="reinforce_plus_plus.*min_groups"):
+        validate_single_controller_config(cfg)
+
+    cfg.async_rl.min_groups_for_streaming_train = cfg.grpo.num_prompts_per_step
+    validate_single_controller_config(cfg)
+
+
+def test_streaming_uses_the_estimator_batch_requirement(monkeypatch) -> None:
+    """Changing an estimator's requirement must not need a new name check."""
+    monkeypatch.setattr(
+        GRPOAdvantageEstimator,
+        "requires_global_batch",
+        property(lambda self: True),
+        raising=False,
+    )
+    cfg = _master_config()
+    cfg.async_rl.min_groups_for_streaming_train = 2
+    with pytest.raises(ValueError, match="requires.*min_groups"):
+        validate_single_controller_config(cfg)
+
+    cfg.async_rl.min_groups_for_streaming_train = cfg.grpo.num_prompts_per_step
+    validate_single_controller_config(cfg)
 
 
 class TestRolloutFailureValidation:

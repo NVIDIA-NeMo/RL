@@ -39,7 +39,7 @@ grpo:
 
 `on_policy_distillation/teacher_student_logprob_gap_mean` always reports the raw `log π_teacher − log π_student` gap, so it stays comparable across α; `on_policy_distillation/adv_mean` and `adv_std` describe the advantage after TROPD and the global baseline, before `grpo.advantage_clip_low/high`.
 
-On the Single-Controller runtime the advantage stage runs once per streaming chunk, so `subtract_global_baseline: true` requires `async_rl.min_groups_for_streaming_train` to equal `grpo.num_prompts_per_step` (one chunk per step); setup rejects other values rather than centering each chunk on its own mean.
+On the Single-Controller runtime the advantage stage runs once per streaming chunk, so `subtract_global_baseline: true` requires `async_rl.min_groups_for_streaming_train` to equal `grpo.num_prompts_per_step` (one chunk per step); setup rejects other values rather than centering each chunk on its own mean. With advantage actors enabled, the entire batch goes to one actor when the global baseline is enabled. Without that baseline, OPD can stream and shard across actors.
 
 ## Configuration
 

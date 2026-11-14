@@ -5076,7 +5076,7 @@ class SingleControllerActor:
             return meta, True
 
         # Split on prompt-group boundaries so the pool works a chunk in
-        # parallel. SHARD_INVARIANT_ESTIMATORS says which estimators allow it.
+        # parallel when the estimator does not require the global batch.
         stage_cfg = self._advantage_stage_config
         num_actors = len(self._advantage_actors)
         shards = (
