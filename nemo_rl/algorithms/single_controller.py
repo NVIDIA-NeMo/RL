@@ -2023,7 +2023,11 @@ class SingleControllerActor:
                                 "prompt_reservations"
                             ) as cut:
                                 self._discard_prompt_group(cut, lineage_group_id)
-                                self._charge_filtered_prompt(target_step)
+                                # Record only: windowed draws no replacement here, so a
+                                # filtered group at EOF must close the step short rather
+                                # than fail an allowance it never spent. The train pump
+                                # enforces the budget after selection instead.
+                                self._record_filtered_prompt(target_step)
                             self._buffer_capacity.release()
                             return
                         async with self._replacement_mutation(filtered=filtered) as cut:
@@ -2447,8 +2451,21 @@ class SingleControllerActor:
             return None
         return self._rollout_runtime.replacement_reserve.popleft()
 
-    def _charge_filtered_prompt(self, target_step: Optional[int]) -> None:
-        """Charge one resampled prompt to its step, failing the run past the allowance.
+    def _record_filtered_prompt(self, target_step: Optional[int]) -> None:
+        """Count one resampled prompt against its step, without enforcing the budget.
+
+        Unstamped prompts are charged to the step currently being assembled. A pooled
+        sampler draws a replacement synchronously, so it checks the budget in the same
+        step; windowed draws none and relies on later dispatches, so the train pump
+        checks after selection instead (see ``_check_filtered_budget``).
+        """
+        step = self._accounting_step(target_step)
+        self._filtered_prompts_by_step[step] = (
+            self._filtered_prompts_by_step.get(step, 0) + 1
+        )
+
+    def _check_filtered_budget(self, step: int) -> None:
+        """Fail the run once a step has drawn past its generation-batch allowance.
 
         v1 bounds a step by ``dynamic_sampling_max_gen_batches`` generation batches.
         SC resamples per slot rather than per batch, so the same allowance is counted
@@ -2456,20 +2473,16 @@ class SingleControllerActor:
         admitted with included. A step that cannot be filled within it means the filter
         is rejecting faster than the data can refill it, which v1 also ends the run on.
 
-        Unstamped prompts are charged to the step currently being assembled.
-
         Raises:
             RuntimeError: The step has spent its whole generation-batch allowance.
         """
-        target_step = self._accounting_step(target_step)
-        drawn = self._filtered_prompts_by_step.get(target_step, 0) + 1
+        drawn = self._filtered_prompts_by_step.get(step, 0)
         allowance = self._filtered_prompt_budget - self._algo_cfg.num_prompts_per_step
         if drawn <= allowance:
-            self._filtered_prompts_by_step[target_step] = drawn
             return
         raise RuntimeError(
             f"dynamic sampling drew {drawn} replacement prompt(s) for target_step="
-            f"{target_step}, past the "
+            f"{step}, past the "
             f"grpo.dynamic_sampling_max_gen_batches="
             f"{cast(GRPOConfig, self._algo_cfg).dynamic_sampling_max_gen_batches} "
             f"generation batches that step is allowed "
@@ -2479,6 +2492,15 @@ class SingleControllerActor:
             "zero_variance_fraction, then raise the allowance or revisit the "
             "reward/prompt mix."
         )
+
+    def _charge_filtered_prompt(self, target_step: Optional[int]) -> None:
+        """Record a pooled resample and fail the run past the allowance.
+
+        A pooled sampler has the replacement in hand, so it enforces the budget in the
+        same step the prompt is drawn.
+        """
+        self._record_filtered_prompt(target_step)
+        self._check_filtered_budget(self._accounting_step(target_step))
 
     async def _wait_for_filtered_reserve(self) -> None:
         """Wait for pump refill without holding a checkpoint mutation cut."""
@@ -3018,6 +3040,17 @@ class SingleControllerActor:
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
+                            # windowed spends no pool, so this is the only place its
+                            # generation budget is enforced: a step still starved while
+                            # data flows means the filter rejects faster than the data
+                            # refills it, which v1 ends the run on. The exhaustion branch
+                            # above closes a data-exhausted step short before reaching
+                            # here, so EOF never trips the budget.
+                            if (
+                                self._dynamic_sampling_enabled
+                                and not self._sampler_uses_pooled_replacements()
+                            ):
+                                self._check_filtered_budget(self._assembling_version)
                             # Safe to span the select: a starved poll never
                             # reaches the data plane, so nothing below is
                             # counted twice.

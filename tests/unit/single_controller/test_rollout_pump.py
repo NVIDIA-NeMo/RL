@@ -827,6 +827,27 @@ class TestDynamicSamplingReplacement:
 
         assert ctrl._filtered_prompts_by_step == {}
 
+    @pytest.mark.parametrize("max_batches", [1, 10])
+    def test_windowed_last_step_closes_short_without_failing_the_budget(
+        self, max_batches
+    ):
+        # windowed draws no spare pool, so a filtered group at EOF cannot be refilled
+        # by a later dispatch. The run must close the step short instead of charging a
+        # replacement it never drew against an exhausted generation allowance.
+        manager = _ScriptedRolloutManager([RolloutOutcome.FILTERED])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0")],
+            dynamic_sampling_max_replacements=max_batches,
+        )
+        ctrl._sampler = WindowedSampler(ctrl._buffer, max_staleness_versions=1)
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["step0"]
+        # Recorded but never raised: the train pump closes the short final step.
+        assert ctrl._filtered_prompts_by_step == {0: 1}
+
 
 class TestReplaceDroppedPrompt:
     """on_dropped_prompt="replace": hold the batch size by substituting a spare."""
