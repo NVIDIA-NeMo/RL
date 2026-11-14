@@ -131,26 +131,34 @@ def xferdtensor(
     """Public XferDTensor entry point used by all external callers."""
     global _XFERDTENSOR_PATH_LOGGED
     use_golden = _use_golden_api()
-    use_python = _use_python_api()
+    force_python = _use_python_api()
+    # nccl-extensions 0.1.0 supports at most two mesh axes and one shard axis.
+    # Both endpoints select from the same global layout before transfer starts.
+    use_python = (
+        force_python
+        or _reshard is None
+        or src_mesh.mesh.ndim > 2
+        or dst_mesh.mesh.ndim > 2
+        or sum(isinstance(p, Shard) for p in src_placement) > 1
+        or sum(isinstance(p, Shard) for p in dst_placement) > 1
+    )
     if not _XFERDTENSOR_PATH_LOGGED:
         if use_golden:
             path = "golden (broadcast)"
-        elif use_python or _reshard is None:
+        elif use_python:
             path = "xferdtensor_python (exact-transfer)"
         else:
             path = "real nccl.m2n.reshard"
         print(
             f"[xferdtensor] reshard path: {path} "
             f"(real_op_available={_reshard is not None}, "
-            f"force_golden={use_golden}, force_python={use_python})",
+            f"force_golden={use_golden}, force_python={force_python})",
             flush=True,
         )
         _XFERDTENSOR_PATH_LOGGED = True
 
-    if not use_golden and (use_python or _reshard is None):
-        # Default when the real op is absent: Python exact-transfer reshard
-        # (per-overlap P2P + cached split-comm replica broadcast); same
-        # 7-arg contract.
+    if not use_golden and use_python:
+        # Use exact transfers for layouts outside native M2N's mesh contract.
         from nemo_rl.weight_sync.xferdtensor_python import (
             xferdtensor_python_impl,
         )
@@ -182,9 +190,6 @@ def xferdtensor(
     src_local = src_tensor._local_tensor if src_tensor is not None else None
     dst_local = dst_tensor._local_tensor if dst_tensor is not None else None
 
-    reshard_kwargs = {}
-    if stream is not None:
-        reshard_kwargs["stream"] = int(stream.cuda_stream)
     _reshard(  # pyrefly: ignore[not-callable]
         src_local,
         dst_local,
@@ -193,7 +198,7 @@ def xferdtensor(
         src_placements=src_placement,
         dst_mesh=dst_mesh.mesh.tolist(),
         dst_placements=dst_placement,
-        **reshard_kwargs,
+        stream=int(stream.cuda_stream) if stream is not None else None,
     )
 
 

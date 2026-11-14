@@ -45,6 +45,11 @@ NVFP4RealQuantMode = Literal["w4a4", "w4a16"]
 _NVFP4_REAL_QUANT_MODES = frozenset({"w4a4", "w4a16"})
 
 
+def nvfp4_quant_algo(mode: NVFP4RealQuantMode) -> str:
+    """ModelOpt ``quant_algo`` that the vLLM rollout expects for ``mode``."""
+    return "NVFP4" if mode == "w4a4" else "W4A16_NVFP4"
+
+
 def _iter_quant_ignore_suffix_variants(name: str) -> Iterator[str]:
     """Yield ``name`` and, if it ends in a known quant suffix, the stripped form."""
     yield name
@@ -99,7 +104,7 @@ def build_vllm_modelopt_nvfp4_config(
         {
             "producer": {"name": "modelopt"},
             "quantization": {
-                "quant_algo": "NVFP4" if mode == "w4a4" else "W4A16_NVFP4",
+                "quant_algo": nvfp4_quant_algo(mode),
                 "group_size": 16,
                 "exclude_modules": (
                     ignore if ignore is not None else list(DEFAULT_NVFP4_IGNORE)

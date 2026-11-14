@@ -214,6 +214,7 @@ def test_megatron_fp8_refit_tasks_preserve_backend_export(
 
     worker.cfg = {"generation": {"backend": "megatron"}}
     assert worker._build_refit_conversion_tasks() == logical_tasks[1:]
+    worker.megatron_bridge.get_conversion_tasks.assert_called_once_with([worker.model])
     worker.megatron_bridge.get_export_fp8_tasks.assert_not_called()
 
     worker.cfg = {"generation": {"backend": "vllm"}}

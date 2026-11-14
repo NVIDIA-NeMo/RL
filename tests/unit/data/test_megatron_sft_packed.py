@@ -86,6 +86,7 @@ class _MegatronConfig:
         self.sequence_length = sequence_length
         self.context_parallel_size = context_parallel_size
         self.hybrid_context_parallel = False
+        self.dynamic_context_parallel = False
         self.data_parallel_size = 1
         self.sequence_parallel_size = 0
         self.reset_position_ids = False
