@@ -430,6 +430,8 @@ project-includes = [
   "tools/model_diagnostics/4.vllm_precision_compilation_test.py",
   "tools/model_diagnostics/5.prefix_caching_nan.py",
   "tools/model_diagnostics/6.vllm_routed_experts_completeness.py",
+  "tools/model_diagnostics/prefix_checkpoint_benchmark.py",
+  "tools/model_diagnostics/prefix_checkpoint_benchmark_worker.py",
   "tools/refit_bandwidth_calculator.py",
   "tools/verify_tq_data_plane_checkpoint.py",
   "tools/x_token/__init__.py",
