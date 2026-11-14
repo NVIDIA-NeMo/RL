@@ -623,7 +623,7 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(
             max_num_epochs=1,
             data_plane_checkpoint=True,
         )
-        config.checkpointing["metric_name"] = "train:loss"
+        config.checkpointing.metric_name = "train:loss"
         actor_args = _make_actor_args(
             save_state=save_state,
             dataloader=dataloader,

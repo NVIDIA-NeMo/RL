@@ -377,7 +377,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
         training_owned_groups: list[TQReplayGroupMetadata] = []
         staging_row_count = 0
         tq_save_seconds = 0.0
-        if snapshot or self._master_config.checkpointing.get("save_data_plane"):
+        if snapshot or self._master_config.checkpointing.save_data_plane:
             training_owned_groups = self._buffer.training_owned_replay_groups()
             if training_owned_groups and not snapshot:
                 raise RuntimeError(
