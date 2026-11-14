@@ -18,7 +18,4 @@ if ! rdma_device_available; then
     exit 0
 fi
 
-# HPC-X's NCCL net plugin breaks NIXL's UCX (docs/design-docs/nixl-data-plane.md).
-export NCCL_NET_PLUGIN=${NCCL_NET_PLUGIN:-none}
-
 exec bash "$SCRIPT_DIR/grpo_dp_single_controller_tq_recovery.sh" "${1:-nixl}"
