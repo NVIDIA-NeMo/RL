@@ -128,6 +128,17 @@ docker buildx build -f docker/Dockerfile \
 > [!NOTE]
 > On a long-lived local builder, BuildKit's cache mount (keyed by base image, uv version, and the HybridEP setting) persists across builds regardless of `STRIP_UV_CACHE` -- it just controls whether a copy also ships in the image layers. To reset that mount, run `docker buildx prune --filter type=exec.cachemount`.
 
+## Root-Only Image
+
+The image runs as root by default, but it is also prepared for an unprivileged user (`RUNTIME_UID`/`RUNTIME_GID`, default `65532`): that user is created, and the uv cache and the virtual environments are handed to it. If the image will only ever run as root, skip that work with `ROOT_ONLY`:
+
+```sh
+docker buildx build -f docker/Dockerfile \
+    --build-arg ROOT_ONLY=1 \
+    --tag <registry>/nemo-rl:latest \
+    .
+```
+
 ## Custom Setup Commands
 
 By default, the Docker image installs [apptainer](https://apptainer.org/) (with a `singularity` symlink) via a pluggable `custom-setup` build stage. The default script is `docker/install_apptainer.sh`. You can override or skip this step at build time.
