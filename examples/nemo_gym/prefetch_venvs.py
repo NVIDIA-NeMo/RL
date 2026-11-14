@@ -12,51 +12,110 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prefetch NeMo Gym internal venvs by doing a dry run of NemoGym initialization.
+"""Prefetch NeMo Gym internal venvs with a NeMo Gym dry run.
 
 This complements nemo_rl/utils/prefetch_venvs.py (which prefetches Ray actor venvs)
 by also triggering NeMo Gym's own internal venv creation for its servers (code_gen,
-math, etc.). It reuses the real code path (NemoGym -> _spinup) with dry_run=True
-so no actual policy model is needed.
+math, etc.). A dry run builds each server's venv and exits, so no policy model is needed.
+
+Run it with an interpreter that has the nemo_gym extra installed. It imports only NeMo
+Gym and nemo_rl/utils/config.py, so docker/Dockerfile can run it before the rest of the
+NeMo RL source is copied into the image.
 """
 
 import argparse
+import multiprocessing
 import os
+import subprocess
 import sys
+from pathlib import Path
+from typing import Any
 
-import ray
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
-from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
-from nemo_rl.environments.nemo_gym import (
-    NemoGym,
-    NemoGymConfig,
-    get_nemo_gym_uv_cache_dir,
-    get_nemo_gym_venv_dir,
-)
-from nemo_rl.utils.config import load_config
-from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
-OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
+# Keys under env.nemo_gym that NeMo RL reads itself and does not forward to NeMo Gym.
+_NEMO_RL_ONLY_KEYS = ("effort_levels", "pad_dynamic_image_shapes")
+
+
+def build_dry_run_config(
+    nemo_gym_section: dict[str, Any],
+    uv_cache_dir: str | None,
+    uv_venv_dir: str | None,
+) -> dict[str, Any]:
+    """Turn a recipe's env.nemo_gym section into a NeMo Gym dry-run config.
+
+    Args:
+        nemo_gym_section: The resolved env.nemo_gym section of a NeMo RL config.
+        uv_cache_dir: uv cache directory for NeMo Gym, or None for NeMo Gym's default.
+        uv_venv_dir: Directory for the server venvs, or None for NeMo Gym's default.
+
+    Returns:
+        The initial global config for a NeMo Gym dry run.
+    """
+    config = dict(nemo_gym_section)
+    for key in _NEMO_RL_ONLY_KEYS:
+        config.pop(key, None)
+    config["dry_run"] = True
+    # A dry run talks to no model. NeMo Gym still needs these to resolve the config.
+    config["policy_model_name"] = "dummy-model"
+    config["policy_api_key"] = "dummy_key"
+    config["policy_base_url"] = ["http://localhost:8000"]
+    if uv_cache_dir is not None:
+        config.setdefault("uv_cache_dir", uv_cache_dir)
+    if uv_venv_dir is not None:
+        config.setdefault("uv_venv_dir", uv_venv_dir)
+    return config
+
+
+def _uv_cache_dir() -> str | None:
+    """Return uv's cache directory inside the container, or None outside one."""
+    if not os.environ.get("NRL_CONTAINER"):
+        return None
+    return subprocess.check_output(["uv", "cache", "dir"]).decode().strip()
+
+
+def _prefetch_one(config_path: str) -> None:
+    """Build the NeMo Gym server venvs for one config."""
+    from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
+
+    register_omegaconf_resolvers()
+    config = OmegaConf.to_container(load_config(config_path), resolve=True)
+    dry_run_config = build_dry_run_config(
+        config["env"]["nemo_gym"],
+        uv_cache_dir=_uv_cache_dir(),
+        uv_venv_dir=os.environ.get("NEMO_GYM_VENV_DIR"),
+    )
+
+    # NeMo Gym's server setup scripts inherit this environment. They shell out to
+    # `uv pip install --no-cache` (e.g. swe_agents' r2e_gym.sh), which uv refuses to
+    # combine with symlink installs, so pin hardlink whatever the caller set.
+    os.environ["UV_LINK_MODE"] = "hardlink"
+    os.environ["VIRTUAL_ENV"] = sys.prefix
+    os.environ["UV_PROJECT_ENVIRONMENT"] = sys.prefix
+
+    run_helper = RunHelper()
+    # Returns once every server's venv is built, and raises if any setup failed.
+    run_helper.start(
+        global_config_dict_parser_config=GlobalConfigDictParserConfig(
+            dotenv_path=Path(__file__).absolute().parents[2] / "nemo_gym_env.yaml",
+            initial_global_config_dict=DictConfig(dry_run_config),
+            skip_load_from_cli=True,
+        )
+    )
+    run_helper.shutdown()
 
 
 def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
-    """Prefetch NeMo Gym venvs for each config by doing a dry-run initialization.
+    """Prefetch NeMo Gym venvs for each config with a NeMo Gym dry run.
 
     Args:
         config_paths: List of paths to NeMo RL config files that contain
             an env.nemo_gym section.
     """
-    init_ray()
-
-    nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
-    if nemo_gym_py_exec.startswith("uv"):
-        nemo_gym_py_exec = create_local_venv_on_each_node(
-            nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
-        )
-
+    # One process per config: NeMo Gym keeps its global config and head server per process.
+    spawn = multiprocessing.get_context("spawn")
     succeeded = []
     failed = []
 
@@ -65,77 +124,15 @@ def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
         print(f"Processing config: {config_path}")
         print("=" * 60)
 
-        try:
-            config = load_config(config_path)
-            config = OmegaConf.to_container(config, resolve=True)
-
-            nemo_gym_dict = dict(config["env"]["nemo_gym"])
-            nemo_gym_dict["dry_run"] = True
-            uv_cache_dir = get_nemo_gym_uv_cache_dir()
-            if uv_cache_dir is not None:
-                nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)
-            uv_venv_dir = get_nemo_gym_venv_dir()
-            if uv_venv_dir is not None:
-                nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
-
-            nemo_gym_cfg = NemoGymConfig(
-                model_name="dummy-model",
-                base_urls=["http://localhost:8000"],
-                ray_gpu_nodes=[],
-                ray_gpu_pgs=[],
-                ray_num_gpus_per_node=0,
-                ray_namespace=None,
-                initial_global_config_dict=nemo_gym_dict,
-                invalid_tool_call_patterns=None,
-                checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
-                turn_checkpointing_enabled=False,
-            )
-
-            nemo_gym_opts = {
-                # Don't restart to surface any issue from a failed build.
-                "max_restarts": 0,
-                "max_task_retries": 0,
-                "runtime_env": {
-                    "py_executable": nemo_gym_py_exec,
-                    "env_vars": {
-                        **os.environ,
-                        "VIRTUAL_ENV": nemo_gym_py_exec,
-                        "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
-                        # Gym server setup scripts shell out to `uv pip install --no-cache`
-                        # (e.g. swe_agents' r2e_gym.sh), and uv rejects --no-cache combined
-                        # with symlink installs: "Symlink-based installation is not supported
-                        # with `--no-cache`". docker/Dockerfile exports UV_LINK_MODE=symlink
-                        # for this prefetch (as does the nemotron-3-super guide), and
-                        # os.environ above propagates it into every server's setup
-                        # subprocess. Pin hardlink for the Gym actor only, so
-                        # the outer prefetch keeps symlink semantics. hardlink survives uv
-                        # cache pruning where symlink does not. Note it is as space-efficient
-                        # as copy, but not as symlink: across Docker layers, linking out of
-                        # the lower-layer uv cache makes overlayfs copy the bytes up.
-                        # The override is required rather than redundant next to os.environ --
-                        # Ray merges runtime_env env_vars per key over the inherited
-                        # environment, so deleting this key leaves the raylet's symlink.
-                        "UV_LINK_MODE": "hardlink",
-                    },
-                },
-            }
-
-            print("Creating NeMo Gym environment (dry_run=True)...")
-            nemo_gym = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
-
-            print("Waiting for NeMo Gym to finish initialization...")
-            ray.get(nemo_gym._spinup.remote())
-            print("NeMo Gym initialized successfully.")
-
-            print("Killing NeMo Gym actor...")
-            ray.kill(nemo_gym)
-
+        process = spawn.Process(target=_prefetch_one, args=(config_path,))
+        process.start()
+        process.join()
+        if process.exitcode == 0:
             succeeded.append(config_path)
             print(f"Done with config: {config_path}")
-
-        except Exception as e:
-            print(f"Error processing {config_path}: {e}")
-            failed.append((config_path, str(e)))
+        else:
+            print(f"Error processing {config_path}: exit code {process.exitcode}")
+            failed.append((config_path, f"exit code {process.exitcode}"))
 
     print(f"\n{'=' * 60}")
     print("NeMo Gym venv prefetch summary")
@@ -154,16 +151,16 @@ def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Prefetch NeMo Gym internal venvs via dry-run initialization.",
+        description="Prefetch NeMo Gym internal venvs with a NeMo Gym dry run.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
   # Prefetch venvs for a single config
-  uv run python examples/nemo_gym/prefetch_venvs.py \\
+  uv run --extra nemo_gym python examples/nemo_gym/prefetch_venvs.py \\
     examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
 
   # Prefetch venvs for multiple configs sequentially
-  uv run python examples/nemo_gym/prefetch_venvs.py \\
+  uv run --extra nemo_gym python examples/nemo_gym/prefetch_venvs.py \\
     examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml \\
     examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml
 """,
