@@ -623,7 +623,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 chunk_seqlens = self.data[dynamic_batching_args["input_lengths_key"]][
                     chunk_start:chunk_end
                 ]
-                # sort the indices by sequence lengths
+                # Use Python lengths so sort comparisons do not invoke PyTorch.
+                if isinstance(chunk_seqlens, torch.Tensor):
+                    chunk_seqlens = chunk_seqlens.tolist()
                 chunk_idx_indices = sorted(
                     range(batch_size), key=lambda i: chunk_seqlens[i]
                 )
