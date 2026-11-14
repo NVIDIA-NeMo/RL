@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -842,7 +843,7 @@ def test_training_dump_is_complete_however_the_stage_was_split(
 
 
 class _JaggedRowStore(_RowStore):
-    """A store whose sequence columns come back jagged, as the data plane returns mixed lengths."""
+    """A store that returns the sequence columns jagged, as the data plane does for mixed lengths."""
 
     def get_samples(self, *, sample_ids, select_fields, **kwargs) -> TensorDict:
         data = super().get_samples(
@@ -865,20 +866,15 @@ def test_training_dump_takes_jagged_columns_without_padding(tmp_path: Path) -> N
         rows[sid]["input_lengths"] = torch.tensor(length)
     store = _JaggedRowStore(rows)
     ctrl = _controller("grpo", 0, store, dump_dir=str(tmp_path))
-    chunks = []
-    add_chunk = ctrl._advantage_computer._train_data_dump.add_chunk
-
-    def record_chunk(chunk):
-        chunks.append(chunk)
-        return add_chunk(chunk)
-
-    ctrl._advantage_computer._train_data_dump.add_chunk = record_chunk
-    asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    writer = ctrl._advantage_computer._train_data_dump
+    with patch.object(writer, "add_chunk", wraps=writer.add_chunk) as add_chunk:
+        asyncio.run(ctrl._advantage_stage(_pool_meta()))
     ctrl._advantage_computer.flush_train_data_dump()
     ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_receipts)
 
-    assert chunks[0].sequences["token_ids"].is_nested
-    assert chunks[0].sequences["generation_logprobs"].is_nested
+    chunk = add_chunk.call_args.args[0]
+    assert chunk.sequences["token_ids"].is_nested
+    assert chunk.sequences["generation_logprobs"].is_nested
     dumped = [
         json.loads(line)
         for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()

@@ -706,8 +706,7 @@ class AdvantageComputer:
         if self._train_data_dump is not None:
             assert request.train_step is not None
             dump_started = time.perf_counter()
-            # Raw columns stay jagged: the writer trims rows to input_lengths, so
-            # padding them here only for the writer to strip it costs 3x the data.
+            # Jagged on purpose: the writer trims each row to input_lengths itself.
             sequences = {
                 "token_ids": data[INPUT_IDS],
                 "token_loss_mask": token_mask,
