@@ -44,6 +44,7 @@ def fake_fabric(monkeypatch):
         netdevs: dict[str, set[str]] | None = None,
     ):
         netdevs = netdevs or {}
+
         def fake_glob(pattern: str):
             if pattern.startswith("/dev/infiniband/uverbs"):
                 return ["/dev/infiniband/uverbs0"] if uverbs else []
@@ -58,12 +59,10 @@ def fake_fabric(monkeypatch):
 
         monkeypatch.setattr(tq_env.glob, "glob", fake_glob)
         monkeypatch.setattr(tq_env.Path, "read_text", fake_read_text)
-        # Each device's netdev is its own name unless the test says otherwise;
-        # the default route sits on `mgmt` (no management RDMA port by default).
+        # The default route sits on `mgmt`; a device owns no netdev unless the
+        # test says so (no management RDMA port by default).
         monkeypatch.setattr(tq_env, "_default_route_netdev", lambda: mgmt)
-        monkeypatch.setattr(
-            tq_env, "_netdevs_of", lambda dev: netdevs.get(dev, {dev})
-        )
+        monkeypatch.setattr(tq_env, "_netdevs_of", lambda dev: netdevs.get(dev, set()))
         monkeypatch.setattr(os, "environ", dict(os.environ))
         monkeypatch.delenv("MC_MOONCAKE_DEVICE", raising=False)
 
