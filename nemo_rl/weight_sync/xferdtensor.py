@@ -95,6 +95,29 @@ def _use_python_api() -> bool:
     )
 
 
+def uses_real_reshard_op() -> bool:
+    """Whether this process transfers with ``nccl.m2n.reshard``."""
+    return _reshard is not None and not _use_golden_api() and not _use_python_api()
+
+
+def follow_source_reshard_path(source_uses_real_op: bool) -> None:
+    """Make this refit destination transfer the way its source does.
+
+    The two ends run in separate venvs, so ``nccl.m2n`` can be installed on one
+    end only. Mixing the real op with the Python transfer deadlocks in NCCL.
+    """
+    global _reshard
+    if not source_uses_real_op:
+        _reshard = None
+    elif not uses_real_reshard_op():
+        raise RuntimeError(
+            "The refit source transfers with nccl.m2n.reshard, but this destination "
+            "cannot: install nccl-extensions in its venv and unset "
+            "NRL_XFERDTENSOR_PYTHON / NRL_XFERDTENSOR_GOLDEN, or set "
+            "NRL_XFERDTENSOR_PYTHON=1 for the source."
+        )
+
+
 def xferdtensor(
     src_tensor,
     src_mesh,

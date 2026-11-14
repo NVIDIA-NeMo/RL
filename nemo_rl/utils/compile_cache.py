@@ -22,9 +22,7 @@ launcher's job (``cache_sync.sh sidecar-types``). See
 docs/guides/persistent-jit-caches.md.
 """
 
-import logging
 import os
-import runpy
 import shutil
 import subprocess
 import sys
@@ -93,19 +91,7 @@ def vllm_engine_dir(seed: int) -> str | None:
     return None if local is None else f"{local}/vllm_engines/{seed}"
 
 
-def _vllm_patches() -> dict:
-    # By path, as tools/external_gym_vllm/serve_vllm_on_ray.py does: importing the
-    # package would pull in NeMo RL's generation stack on every node.
-    return runpy.run_path(
-        str(Path(__file__).parents[1] / "models/generation/vllm/patches.py")
-    )
-
-
 def _prepare_vllm_engine_on_this_node(engine_dir: str) -> None:
-    # The engine's GPU workers on this node load artifacts another engine wrote.
-    _vllm_patches()["_patch_vllm_compile_cache_relative_artifacts"](
-        logging.getLogger(__name__)
-    )
     seed("vllm")
     shared = Path(os.environ[LOCAL_VAR]) / "vllm" / "vllm"
     if shared.is_dir() and not os.path.exists(engine_dir):
