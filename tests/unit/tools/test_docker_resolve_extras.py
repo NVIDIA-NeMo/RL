@@ -49,12 +49,7 @@ def test_all_extras_matches_actor_environments() -> None:
             "sglang automodel modelopt trtllm",
         ),
         (
-            {"SKIP_VLLM_BUILD": "1", "SKIP_TRTLLM_BUILD": "1"},
-            "sglang mcore automodel modelopt nemo_gym",
-            "vllm trtllm",
-        ),
-        (
-            {"NRL_EXTRAS": "mcore vllm", "SKIP_VLLM_BUILD": "1"},
+            {"NRL_EXTRAS": "mcore"},
             "mcore",
             "vllm sglang automodel modelopt nemo_gym trtllm",
         ),
@@ -72,3 +67,14 @@ def test_unknown_extra_fails() -> None:
     assert result.returncode != 0
     assert "unknown extra: 'megatron'" in result.stderr
     assert _run("nrl_skipped_extras", NRL_EXTRAS="mcore megatron").returncode != 0
+
+
+@pytest.mark.parametrize(
+    "removed", ["SKIP_VLLM_BUILD", "SKIP_SGLANG_BUILD", "SKIP_TRTLLM_BUILD"]
+)
+def test_removed_skip_arg_fails(removed: str) -> None:
+    result = _run("nrl_wanted_extras", **{removed: "1"})
+    assert result.returncode != 0
+    assert f"{removed} was removed" in result.stderr
+    assert "NRL_EXTRAS" in result.stderr
+    assert _run("nrl_skipped_extras", **{removed: "1"}).returncode != 0

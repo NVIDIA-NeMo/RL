@@ -156,11 +156,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Match Dockerfile semantics: any non-empty value skips TRT-LLM.
-          SKIP_VALUE=$(printf '%s\n' "$BUILD_ARGS" | sed -nE 's/^[[:space:]]*SKIP_TRTLLM_BUILD[[:space:]]*=(.*)$/\1/p' | tail -1)
-          SKIP_VALUE=$(printf '%s' "$SKIP_VALUE" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
-          if [[ -n "$SKIP_VALUE" ]]; then
-            echo "TRT-LLM build is disabled by SKIP_TRTLLM_BUILD"
+          # Match Dockerfile semantics: an empty NRL_EXTRAS builds every extra;
+          # otherwise TRT-LLM is built only when the list names trtllm.
+          EXTRAS=$(printf '%s\n' "$BUILD_ARGS" | sed -nE 's/^[[:space:]]*NRL_EXTRAS[[:space:]]*=(.*)$/\1/p' | tail -1)
+          if [[ "$EXTRAS" =~ [^[:space:]] && " $EXTRAS " != *" trtllm "* ]]; then
+            echo "TRT-LLM build is disabled: NRL_EXTRAS does not list trtllm"
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi

@@ -18,10 +18,18 @@
 # Every extra the image can build, in the order the main venv warms them.
 NRL_ALL_EXTRAS="vllm sglang mcore automodel modelopt nemo_gym trtllm"
 
-# Print the extras to build, space-separated: NRL_EXTRAS (default: all of them)
-# minus any that a SKIP_<NAME>_BUILD arg turns off.
+# Print the extras to build, space-separated, in NRL_ALL_EXTRAS order: NRL_EXTRAS,
+# or all of them when it is empty.
 nrl_wanted_extras() {
-    local wanted="${NRL_EXTRAS:-$NRL_ALL_EXTRAS}" extra out=""
+    local wanted="${NRL_EXTRAS:-$NRL_ALL_EXTRAS}" extra out="" removed
+    # NRL_EXTRAS replaced these args. Docker only warns about a build arg nothing
+    # declares, so without this check a stale one would quietly build every backend.
+    for removed in SKIP_VLLM_BUILD SKIP_SGLANG_BUILD SKIP_TRTLLM_BUILD; do
+        if [ -n "${!removed:-}" ]; then
+            echo "$removed was removed. List the extras to build in NRL_EXTRAS instead (all: $NRL_ALL_EXTRAS)" >&2
+            return 1
+        fi
+    done
     for extra in $wanted; do
         case " $NRL_ALL_EXTRAS " in
             *" $extra "*) ;;
@@ -36,9 +44,6 @@ nrl_wanted_extras() {
             *" $extra "*) ;;
             *) continue ;;
         esac
-        if [ "$extra" = vllm ] && [ -n "${SKIP_VLLM_BUILD:-}" ]; then continue; fi
-        if [ "$extra" = sglang ] && [ -n "${SKIP_SGLANG_BUILD:-}" ]; then continue; fi
-        if [ "$extra" = trtllm ] && [ -n "${SKIP_TRTLLM_BUILD:-}" ]; then continue; fi
         out="$out $extra"
     done
     echo "${out# }"

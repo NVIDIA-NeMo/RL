@@ -18,10 +18,8 @@
 #   To skip custom setup:
 #     docker buildx build --build-arg CUSTOM_SETUP_FNAME= -f docker/Dockerfile ...
 #
-# Optional build args to skip vLLM or SGLang dependencies:
-#   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
-#   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
-#   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
+# Optional: build only some backends (uv extras); empty builds all of them:
+#   --build-arg NRL_EXTRAS="mcore vllm nemo_gym"
 # Optional etcd and nats-server binaries for Dynamo serving
 # (policy.generation.dynamo=true; ai-dynamo itself ships in the vLLM venvs):
 #   --build-arg BUILD_DYNAMO=1
@@ -153,7 +151,11 @@ RUN GITHUB_ARTIFACTORY=github.com \
 
 # Rust toolchain for setuptools-rust extensions in SGLang. Skipped when SGLang is not built.
 ARG NRL_EXTRAS
+# Removed in favor of NRL_EXTRAS. Declared only so that resolve_extras.sh can see
+# one that is still passed and fail the build.
+ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
+ARG SKIP_TRTLLM_BUILD
 ENV PATH="/root/.cargo/bin:$PATH"
 RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper <<"EOF" bash -exu -o pipefail
 source /tmp/uv-cache-helper/resolve_extras.sh
@@ -223,10 +225,6 @@ ARG BUILD_CUSTOM_FLASHINFER
 ARG BUILD_CUSTOM_FLASHINFER_URL
 ARG BUILD_CUSTOM_FLASHINFER_REF
 
-# Skip building vLLM, SGLang, or TRT-LLM dependencies (set to any non-empty value to skip)
-ARG SKIP_VLLM_BUILD
-ARG SKIP_SGLANG_BUILD
-ARG SKIP_TRTLLM_BUILD
 ARG BASE_IMAGE
 ARG UV_VERSION
 ARG HYBRID_EP_MULTINODE
@@ -449,7 +447,7 @@ COPY --from=nemo-rl --link 3rdparty/TensorRT-LLM-workspace/ ./3rdparty/TensorRT-
 # Declared here rather than with the other ARGs: BuildKit puts ARG and ENV into
 # the environment of every later RUN, so declaring it above the dependency RUN
 # would make a NIXL bump bust that hour-long layer for every image, including
-# SKIP_TRTLLM_BUILD=1 ones.
+# ones that do not build trtllm.
 ARG NIXL_VERSION=v1.4.0
 # The NGC base image sets ENV NIXL_VERSION=1.0.1, and an ARG only changes the
 # build-time environment. Re-export so the image -- and _backend.py's wheel
@@ -483,7 +481,7 @@ trap 'uv_cache_persist' EXIT
 uv lock --check
 
 if ! grep -qx trtllm /opt/nrl_extras.txt; then
-    echo "The trtllm extra is not built (NRL_EXTRAS / SKIP_TRTLLM_BUILD); skipping the isolated TRT-LLM build"
+    echo "The trtllm extra is not built (NRL_EXTRAS); skipping the isolated TRT-LLM build"
     exit 0
 fi
 
@@ -495,7 +493,7 @@ fi
 # inside its ENABLE_UCX block). backend=DEFAULT resolves to NIXL, so an image
 # without NIXL can only serve an explicit backend=UCX.
 #
-# Built here rather than in `base` so SKIP_TRTLLM_BUILD images don't pay for it:
+# Built here rather than in `base` so images without trtllm don't pay for it:
 # nothing outside the wheel build below consumes NIXL, and build_wheel.py
 # vendors both UCX and NIXL into the wheel with $ORIGIN rpaths, so the runtime
 # image needs neither on LD_LIBRARY_PATH.
@@ -555,7 +553,7 @@ cd /tmp && rm -rf /tmp/nixl /tmp/nixl-build-venv
 
 test -f /opt/nvidia/nvda_nixl/include/nixl.h
 # ldconfig rather than ENV: this runs inside a conditional block, so the arch
-# dir is discovered rather than hardcoded, and SKIP_TRTLLM_BUILD images get
+# dir is discovered rather than hardcoded, and images without trtllm get
 # neither the libraries nor the loader entry.
 NIXL_LIB=$(dirname "$(find /opt/nvidia/nvda_nixl -name libnixl.so -print -quit)")
 printf '%s\n' "${NIXL_LIB}" "${NIXL_LIB}/plugins" > /etc/ld.so.conf.d/nixl.conf
@@ -754,7 +752,7 @@ export TRTLLM_REQUIRE_CACHED_WHEEL=1
 # dependency layer's cache from this layer would make overlayfs copy every wheel up.
 # Build exactly the venvs phase 1 built, by name. Re-deriving the list here would
 # mean filtering on the actor name again, which cannot tell that e.g.
-# AsyncTrajectoryCollector needs the vLLM extra -- so under SKIP_VLLM_BUILD the two
+# AsyncTrajectoryCollector needs the vLLM extra -- so without vllm the two
 # passes would disagree and this layer would build three venvs the dependency layer
 # deliberately skipped. prefetch_venvs.py matches these positionally as substrings,
 # and a full FQN matches only itself.
