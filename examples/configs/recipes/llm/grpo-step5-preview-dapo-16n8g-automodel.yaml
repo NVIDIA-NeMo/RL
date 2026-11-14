@@ -1,11 +1,14 @@
 # Step-5-Preview (600B MoE, 27B active) GRPO/DAPO on AutoModel (FSDP2 + EP) with vLLM rollout.
-# DRAFT during bring-up: topology (num_nodes, EP, vLLM TP) is set by the full-model stage and the
-# file will be renamed to the validated <N>n8g form.
+# Validated on 16 x 8 H100 80GB: 120 GRPO steps, AIME 2024 validation accuracy 0.215 -> 0.586
+# (docs/guides/models/stepfun/step5-preview.md). Settings equal the validated run apart from
+# max_num_steps and the checkpoint/model paths.
 defaults: ../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 32
-  num_generations_per_prompt: 16
+  num_generations_per_prompt: 8
   max_num_steps: 1000
+  val_at_start: true
+  val_period: 10
   normalize_rewards: false
   use_leave_one_out_baseline: false
   adv_estimator:
@@ -28,14 +31,17 @@ loss_fn:
   ratio_clip_max: 0.28
   ratio_clip_c: 10
 checkpointing:
-  checkpoint_dir: results/grpo-step5-preview-dapo-automodel
+  checkpoint_dir: results/grpo-step5-preview-dapo-16n8g-automodel
+  # A checkpoint is ~4.4 TB (BF16 weights + FusedAdam state); keep only the latest.
   keep_top_k: 1
+  metric_name: null
   save_period: 5
 policy:
   model_name: stepfun-ai/Step-5-Preview-BF16
   hf_config_overrides:
     # MTP heads are not trained by RL and speculative decoding is out of scope.
     num_nextn_predict_layers: 0
+  train_global_batch_size: 256   # = 32 prompts x 8 generations: one optimizer step per GRPO step
   train_micro_batch_size: 1
   logprob_batch_size: 1
   # 1K prompt + 2K response. Note: below 4,104 tokens CSA region selection (512 regions x 8 tokens)
@@ -108,7 +114,8 @@ policy:
       # 40 GB of weights per GPU; 4 engines on 16 nodes.
       tensor_parallel_size: 8
       expert_parallel_size: 32
-      gpu_memory_utilization: 0.75
+      # 0.75 peaked at 78.9 of 79.1 GiB per GPU around the refit; 0.70 leaves headroom.
+      gpu_memory_utilization: 0.70
       enable_expert_parallel: true
       enforce_eager: false   # CUDA graphs on; eager only to debug hard failures
       # R3: vLLM >= the AuxOutput connector (in 0e7ce459) returns routed experts per KV block,
@@ -132,7 +139,7 @@ logger:
   tensorboard_enabled: true
   wandb:
     project: nemo-rl-step5
-    name: grpo-step5-preview-dapo-automodel
+    name: grpo-step5-preview-dapo-16n8g-automodel
 cluster:
   gpus_per_node: 8
   num_nodes: 16
