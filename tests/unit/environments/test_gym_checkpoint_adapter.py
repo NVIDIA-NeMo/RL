@@ -70,8 +70,8 @@ def test_rollout_capture_key_matches_gym_episode_identity(gym_attempt: int) -> N
                     RolloutAttemptRecord(
                         attempt_uuid=uuid.UUID(int=1),
                         status=RolloutAttemptStatus.DISPATCHED,
-                        gym_instance_id="tools/replica-0",
-                        gym_attempt=gym_attempt,
+                        environment_instance_id="tools/replica-0",
+                        environment_attempt=gym_attempt,
                     )
                 ],
             )
@@ -80,7 +80,7 @@ def test_rollout_capture_key_matches_gym_episode_identity(gym_attempt: int) -> N
         status=PromptGroupStatus.GENERATING,
     )
 
-    episode = group.gym_episode(0)
+    episode = group.environment_episode(0)
     rollout_id, attempt = episode.rollout_id, episode.attempt
     gym_episode = EpisodeId(rollout_id=rollout_id, attempt=attempt)
     capture_key = group.gate_rollout_id(0)
@@ -428,6 +428,34 @@ def test_a_rollout_gym_cannot_capture_is_reported_as_a_restart(tmp_path: Path) -
         assert committed.exported_episodes == ()
 
     asyncio.run(exercise())
+
+
+def test_prepare_summary_sums_gym_generation_cut_counts() -> None:
+    from nemo_gym._checkpoint.coordination import PrepareResult
+
+    def reply(counts: dict[str, int]) -> dict:
+        return {"phase": "prepared", "report": {"ready": True, "counts": counts}}
+
+    summary = GymCheckpointPrepareSummary.from_result(
+        PrepareResult(
+            prepared=True,
+            replies={
+                "policy_model": reply(
+                    {"inflight": 4, "cut": 2, "cut_failed": 1, "cut_skipped": 1}
+                ),
+                "judge_model": reply({"inflight": 1, "cut": 1}),
+                # Agents and environments report no cut counts.
+                "tools_agent": reply({"inflight": 4}),
+                "tools_env": {"phase": "prepared"},
+            },
+        )
+    )
+
+    assert summary.generation_cut_counts == {
+        "cut": 3,
+        "cut_failed": 1,
+        "cut_skipped": 1,
+    }
 
 
 def test_two_adapters_keep_their_clients_and_participants_isolated(monkeypatch) -> None:

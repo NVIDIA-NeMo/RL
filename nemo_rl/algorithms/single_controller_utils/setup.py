@@ -25,6 +25,7 @@ import os
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -50,6 +51,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_training_claims,
 )
 from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
     GRPOSaveState,
     RewardPenaltyConfig,
     _get_effort_config,
@@ -65,6 +67,13 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.rollout_checkpointing.manifest import (
+    BOOTSTRAP_DIRNAME,
+    BootstrapCompatibilityIdentity,
+    bootstrap_compatibility_identity,
+    resolve_latest_snapshot,
+    validate_bootstrap_anchor,
+)
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageStageConfig,
 )
@@ -75,14 +84,8 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     is_ppo_run,
     logprob_passes_required,
     resolve_ppo_chunk_alignment,
+    rollout_snapshots_enabled,
     validate_single_controller_config,
-)
-from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
-    BOOTSTRAP_DIRNAME,
-    BootstrapCompatibilityIdentity,
-    bootstrap_compatibility_identity,
-    resolve_latest_snapshot,
-    validate_bootstrap_anchor,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -128,7 +131,6 @@ from nemo_rl.experience.rollouts import (
     should_mask_flagged_samples,
 )
 from nemo_rl.models.generation import resolve_generation_class
-from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetHealth,
@@ -138,7 +140,6 @@ from nemo_rl.models.generation.generation_router import (
     GenerationRouterActor,
     GenerationRouterImpl,
 )
-from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.megatron import megatron_generation_cls
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
@@ -542,10 +543,6 @@ def _build_clusters(
                 gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
                     "pipeline_parallel_size", 1
                 )
-            elif backend == "dynamo":
-                gpus_per_instance = DynamoConfig.model_validate(
-                    generation_config_dict
-                ).engine_world_size
             elif backend == "sglang":
                 gpus_per_instance = generation_config_dict["sglang_cfg"].get(
                     "gpus_per_server", 1
@@ -557,7 +554,7 @@ def _build_clusters(
             else:
                 raise ValueError(
                     "single_controller_utils.setup only supports vllm, sglang, "
-                    f"megatron, or dynamo generation; got {backend!r}"
+                    f"or megatron generation; got {backend!r}"
                 )
             nodes_per_instance = (
                 gpus_per_instance + inference_gpus_per_node - 1
@@ -620,7 +617,7 @@ def _build_generation(
     tokenizer: Optional[PreTrainedTokenizerBase] = None,
     processor: Optional[AutoProcessor] = None,
 ) -> tuple[Any, float]:
-    """Spin up the generation backend (vLLM, SGLang, Megatron, or managed Dynamo).
+    """Spin up the generation backend (vLLM, SGLang, or Megatron).
 
     Args:
         inference_cluster: Ray virtual cluster the generation workers run on.
@@ -633,8 +630,8 @@ def _build_generation(
 
     Returns:
         A tuple of (generation object, wall time spent in this call). The
-        generation object is a VllmGeneration, SGLangGeneration, MegatronGeneration,
-        or DynamoGeneration.
+        generation object is a VllmGeneration, SGLangGeneration, or
+        MegatronGeneration.
     """
     t0 = time.perf_counter()
     generation_config = master_config.policy["generation"]
@@ -686,21 +683,10 @@ def _build_generation(
             skip_weight_load=True,
         )
 
-    elif backend == "dynamo":
-        assert not defer_model_load, (
-            "defer_model_load is only supported for the vllm backend"
-        )
-        # setup_single_controller validated and normalized this config through
-        # DynamoConfig before allocating clusters.
-        gen = DynamoGeneration(
-            cluster=inference_cluster,
-            config=cast(dict[str, Any], generation_config),
-        )
-
     else:
         raise ValueError(
-            "single_controller_utils.setup only supports vllm, sglang, megatron, or "
-            f"dynamo generation; got {backend!r}"
+            "single_controller_utils.setup only supports vllm, sglang, or megatron "
+            f"generation; got {backend!r}"
         )
 
     if not defer_model_load:
@@ -845,6 +831,9 @@ def _spinup_gym(
         turn_checkpointing_enabled=(
             master_config.rollout_recovery.turn_checkpointing_enabled
         ),
+        generation_prefix_cuts_enabled=(
+            master_config.rollout_recovery.generation_prefix_cuts_enabled
+        ),
         # Capture transport config includes the generation request's candidate count.
         token_capture=(
             {
@@ -861,18 +850,25 @@ def _spinup_gym(
 def _generation_max_seq_len(generation_config) -> int:
     """Return the per-backend max sequence length.
 
-    vllm and dynamo (which manages vLLM workers) use vllm_cfg.max_model_len;
+    vllm uses vllm_cfg.max_model_len;
     sglang uses sglang_cfg.context_length; megatron uses
     mcore_generation_config.max_model_len.
     """
     backend = generation_config["backend"]
-    if backend in ("vllm", "dynamo"):
+    if backend == "vllm":
         return generation_config["vllm_cfg"]["max_model_len"]
     if backend == "sglang":
         return generation_config["sglang_cfg"]["context_length"]
     if backend == "megatron":
         return generation_config["mcore_generation_config"]["max_model_len"]
     raise ValueError(f"Unknown generation backend: {backend!r}")
+
+
+# On the overlapped path the trainer build waits up to this long for the dataset. Within it, the trainer is built once
+# for the clamped step count; past it, the trainer starts with the unclamped count and is rebuilt if the clamp changes
+# train_iters. A rebuild costs a full second trainer build, while a fast load costs the trainer only its own duration,
+# so the wait is cheap insurance; a slow load loses at most this much.
+_TRAINER_BUILD_DATASET_WAIT_S = 20.0
 
 
 def _clamp_max_num_steps(
@@ -1195,57 +1191,52 @@ def setup_single_controller(
         )
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
+    snapshots_enabled = rollout_snapshots_enabled(master_config)
     if master_config.rollout_recovery.turn_checkpointing_enabled:
+        recovery_target = master_config.rollout_recovery.target_level.value
         if generation_config["backend"] != "vllm":
             raise NotImplementedError(
-                "rollout_recovery.target_level='turn' currently supports only "
+                f"rollout_recovery.target_level={recovery_target!r} currently "
+                "supports only "
                 "the vllm generation backend; "
                 f"got {generation_config['backend']!r}"
             )
         if not should_use_nemo_gym(master_config):
             raise ValueError(
-                "rollout_recovery.target_level='turn' requires the NeMo-Gym "
+                f"rollout_recovery.target_level={recovery_target!r} requires "
+                "the NeMo-Gym "
                 "rollout path (env.should_use_nemo_gym=true)"
             )
-        if rollout_checkpoint_cfg.snapshot_attempt_interval_s is None:
+        if (
+            rollout_checkpoint_cfg.snapshot_attempt_interval_s is None
+            and not rollout_checkpoint_cfg.snapshot_on_trainer_checkpoint
+            and master_config.checkpointing.get("checkpoint_must_save_by") is None
+        ):
             raise ValueError(
-                "rollout_recovery.target_level='turn' requires "
-                "rollout_checkpointing.snapshot_attempt_interval_s"
+                f"rollout_recovery.target_level={recovery_target!r} would never save "
+                "environment state: set "
+                "rollout_checkpointing.snapshot_on_trainer_checkpoint=true, "
+                "rollout_checkpointing.snapshot_attempt_interval_s, or "
+                "checkpointing.checkpoint_must_save_by"
             )
         if not master_config.token_capture.enabled:
             raise ValueError(
-                "rollout_recovery.target_level='turn' requires "
+                f"rollout_recovery.target_level={recovery_target!r} requires "
                 "token_capture.enabled=true"
             )
         if rollout_checkpoint_cfg.restore_mode != "latest":
             raise ValueError(
-                "rollout_recovery.target_level='turn' requires "
+                f"rollout_recovery.target_level={recovery_target!r} requires "
                 "rollout_checkpointing.restore_mode='latest'"
             )
     if (
-        master_config.checkpointing.get("save_data_plane")
-        or rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
+        master_config.checkpointing.get("save_data_plane") or snapshots_enabled
     ) and not data_plane_checkpointing_supported:
         raise NotImplementedError(
             "SingleController data-plane checkpointing is not supported for "
             f"data_plane.backend={dp_config['backend']!r}."
         )
     if master_config.checkpointing["enabled"]:
-        if (
-            master_config.checkpointing.get("save_data_plane")
-            and dp_config["backend"] == "mooncake_cpu"
-            and master_config.async_rl.generation_fleet_health.restart_dead_shards
-        ):
-            raise ValueError(
-                "Mooncake data-plane checkpointing does not support "
-                "async_rl.generation_fleet_health.restart_dead_shards=true: "
-                "replacing generation workers can lose their owned payload "
-                "and leave stale checkpoint worker handles. Set "
-                "async_rl.generation_fleet_health.restart_dead_shards=false "
-                "when checkpointing.enabled=true, "
-                "checkpointing.save_data_plane=true, and "
-                "data_plane.backend='mooncake_cpu'."
-            )
         sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
             master_config.async_rl.sampler
         )
@@ -1289,7 +1280,7 @@ def setup_single_controller(
     telemetry_interval_s = master_config.rollout_checkpointing.telemetry_interval_s
     if telemetry_interval_s is not None:
         generation_backend = generation_config["backend"]
-        if generation_backend not in ("vllm", "dynamo"):
+        if generation_backend != "vllm":
             warnings.warn(
                 "rollout_checkpointing.telemetry_interval_s is enabled with "
                 f"policy.generation.backend={generation_backend!r}. Canonical "
@@ -1307,7 +1298,7 @@ def setup_single_controller(
                     "vLLM token, request, and KV-cache signals will be absent.",
                     stacklevel=2,
                 )
-            elif generation_backend == "vllm" and not vllm_cfg["async_engine"]:
+            elif not vllm_cfg["async_engine"]:
                 warnings.warn(
                     "rollout_checkpointing.telemetry_interval_s and "
                     "policy.generation.vllm_cfg.enable_vllm_metrics_logger are "
@@ -1337,18 +1328,6 @@ def setup_single_controller(
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
-    if generation_config["backend"] == "dynamo":
-        # Validate the complete managed-Dynamo boundary before allocating Ray
-        # placement groups or starting any external services, as grpo.setup does.
-        dynamo_config = cast(dict[str, Any], generation_config)
-        dynamo_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
-            policy_config.get("hf_config_overrides") or {}
-        )
-        generation_config = cast(
-            GenerationConfig, DynamoConfig.model_validate(dynamo_config).model_dump()
-        )
-        policy_config["generation"] = generation_config
-
     # Token capture: validate the supported combination loudly at setup
     # (NeMo-Gym rollout path; vLLM with async_engine=true, or Megatron with
     # expose_http_server=true). The serving worker's venv already carries
@@ -1366,6 +1345,19 @@ def setup_single_controller(
             "MInf routing indices can be joined with Gym lineage"
         )
     capture_media = token_capture_cfg.enabled and processor is not None
+    generation_prefix_cuts_enabled = (
+        master_config.rollout_recovery.generation_prefix_cuts_enabled
+    )
+    if generation_prefix_cuts_enabled:
+        # The vLLM-only check ran above with the other turn/prefix checks.
+        if capture_media:
+            raise NotImplementedError(
+                "generation-prefix recovery does not yet support multimodal capture"
+            )
+        if router_replay_enabled(master_config.policy):
+            raise NotImplementedError(
+                "generation-prefix recovery does not yet support router replay"
+            )
     if capture_media:
         if not uses_image_placeholder(processor):
             raise ValueError(
@@ -1377,7 +1369,7 @@ def setup_single_controller(
             )
         if token_capture_cfg.defer_routed_experts_to_policy:
             raise ValueError("VLM token capture requires direct router replay assembly")
-    if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
+    if snapshots_enabled:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(
                 "rollout checkpointing requires checkpointing.enabled=true"
@@ -1400,7 +1392,10 @@ def setup_single_controller(
                 "rollout checkpointing requires a sampler that explicitly "
                 "supports training-claim ownership"
             )
-        if master_config.checkpointing["save_period"] != 1:
+        if (
+            rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
+            and master_config.checkpointing["save_period"] != 1
+        ):
             warnings.warn(
                 "rollout checkpointing is enabled with "
                 f"checkpointing.save_period={master_config.checkpointing['save_period']}; "
@@ -1534,10 +1529,7 @@ def setup_single_controller(
     restore_mode = rollout_checkpoint_cfg.restore_mode
     recovery_checkpoint_path = trainer_checkpoint_path
     bootstrap_anchor = checkpointer.checkpoint_dir / BOOTSTRAP_DIRNAME
-    needs_bootstrap_identity = (
-        trainer_checkpoint_path is None
-        and rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
-    )
+    needs_bootstrap_identity = trainer_checkpoint_path is None and snapshots_enabled
     bootstrap_identity = (
         bootstrap_compatibility_identity(master_config)
         if needs_bootstrap_identity
@@ -1555,7 +1547,7 @@ def setup_single_controller(
     snapshot_resolution_started = time.monotonic()
     if (
         trainer_checkpoint_path is not None
-        and rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
+        and snapshots_enabled
         and restore_mode == "latest"
     ):
         resolved_snapshot = resolve_latest_snapshot(
@@ -1565,7 +1557,7 @@ def setup_single_controller(
             expected_bootstrap_fingerprint=None,
         )
     elif trainer_checkpoint_path is None:
-        if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
+        if snapshots_enabled:
             assert bootstrap_digest is not None
             assert bootstrap_identity is not None
             if bootstrap_anchor.is_dir():
@@ -1581,11 +1573,7 @@ def setup_single_controller(
                         "restore_mode='latest' to recover it or choose a new "
                         "checkpoint_dir. Existing checkpoint state was not modified."
                     )
-        if (
-            rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
-            and restore_mode == "latest"
-            and bootstrap_anchor.is_dir()
-        ):
+        if snapshots_enabled and restore_mode == "latest" and bootstrap_anchor.is_dir():
             resolved_snapshot = resolve_latest_snapshot(
                 bootstrap_anchor,
                 expected_train_step=0,
@@ -1706,8 +1694,8 @@ def setup_single_controller(
     # len(dataloader), and the clamp only binds when a run asks for more steps than
     # its data holds. So on that path the trainer is built with the unclamped value,
     # the dataset loads while all three build, and the trainer is rebuilt if the
-    # clamp changed train_iters. Every other path, and every resume, keeps the
-    # original order.
+    # clamp changed train_iters (unless the load beats _TRAINER_BUILD_DATASET_WAIT_S).
+    # Every other path, and every resume, keeps the original order.
     overlap_dataset_load = (
         use_nemo_gym
         and generation_config["backend"] == "vllm"
@@ -1757,6 +1745,18 @@ def setup_single_controller(
             teacher_segment_topology=teacher_segment_topology,
         )
         setup_timing_metrics.teacher_reservation_time_s = time.perf_counter() - t0
+
+    # NIXL units with storage_unit_placement=inference read the inference
+    # placement groups when TQ bootstraps inside the trainer build, which runs
+    # in parallel with the generation build: reserve them first.
+    from nemo_rl.data_plane.interfaces import backend_config
+
+    if (
+        not colocated
+        and dp_config["backend"] == "nixl"
+        and backend_config(dp_config).storage_unit_placement == "inference"
+    ):
+        inference_cluster.get_placement_groups()
 
     # Storage-unit plan, one Ray node ID per unit (None: units off). Made once,
     # after the train/teacher claims above, and used twice: TQ's bootstrap in
@@ -2024,18 +2024,54 @@ def setup_single_controller(
     nemo_gym_shards = None
     try:
         with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
-            submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
+            # A Megatron trainer waits for the dataset; see _TRAINER_BUILD_DATASET_WAIT_S.
+            defer_trainer = (
+                overlap_dataset_load
+                and "trainer" in build_tasks
+                and speculative_train_iters is not None
+                and any(iters is not None for iters in speculative_train_iters)
+            )
+            submitted = {
+                k: executor.submit(fn)
+                for k, fn in build_tasks.items()
+                if not (defer_trainer and k == "trainer")
+            }
             if preloaded_training_data is not None:
                 dataset, _val_dataset, env_handles, dataloader = preloaded_training_data
             else:
-                # Generation, Gym and the trainer are building; load the dataset
-                # meanwhile. train_iters is not written here: the trainer build is
-                # reading that config.
+                # Generation and Gym build meanwhile; the load does not write train_iters,
+                # which a trainer already building would be reading.
                 t0 = time.perf_counter()
-                dataset, _val_dataset, env_handles, dataloader = _load_training_data()
+                with ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="training-data-load"
+                ) as load_executor:
+                    load_future = load_executor.submit(_load_training_data)
+                    if defer_trainer:
+                        try:
+                            load_future.result(timeout=_TRAINER_BUILD_DATASET_WAIT_S)
+                        except FuturesTimeoutError:
+                            # Slow load: start the trainer on the unclamped count
+                            # (already in the config) and rebuild it below if needed.
+                            pass
+                        else:
+                            # The clamp is known, so the trainer is built once, for it.
+                            _maybe_inject_megatron_train_iters(master_config)
+                            speculative_train_iters = _megatron_train_iters(
+                                master_config
+                            )
+                            print(
+                                f"  ✓ Dataset ready in {time.perf_counter() - t0:.1f}s; "
+                                f"building the trainer for max_num_steps="
+                                f"{algo_cfg.max_num_steps}",
+                                flush=True,
+                            )
+                        submitted["trainer"] = executor.submit(build_tasks["trainer"])
+                    dataset, _val_dataset, env_handles, dataloader = (
+                        load_future.result()
+                    )
                 print(
                     f"  ✓ Dataset and dataloader ready in {time.perf_counter() - t0:.1f}s "
-                    "(overlapped with generation, NeMo-Gym and trainer spin-up)",
+                    "(overlapped with generation and NeMo-Gym spin-up)",
                     flush=True,
                 )
                 final_train_iters = _megatron_train_iters(master_config)
@@ -2055,7 +2091,7 @@ def setup_single_controller(
                         stale_value.shutdown()
                     stale_trainer.shutdown()
                     _maybe_inject_megatron_train_iters(master_config)
-                    submitted["trainer"] = executor.submit(_build_trainer_and_value)
+                    submitted["trainer"] = executor.submit(build_tasks["trainer"])
             if "generation_trainer" in submitted:
                 generation, trainer, value, time_metrics = submitted[
                     "generation_trainer"
@@ -2224,6 +2260,9 @@ def setup_single_controller(
             token_capture_cfg.staging_partition,
             capture_media=capture_media,
             top_logprobs=master_config.policy["generation"]["top_logprobs"],
+            generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+            generation_cut_control_token=token_capture_cfg.control_auth_token,
+            generation_cut_control_timeout_s=token_capture_cfg.control_timeout_s,
         )
         if capture_media and media_columns is None:
             raise RuntimeError(
@@ -2255,6 +2294,7 @@ def setup_single_controller(
     loss_fn = ClippedPGLossFn(
         master_config.loss_fn,
         opd_full=opd_module.get_opd_full_config(master_config),
+        seq_logprob_error_threshold=algo_cfg.seq_logprob_error_threshold,
     )
     _restore_adaptive_loss_state(loss_fn, save_state)
     value_loss_fn: Optional[LossFunction] = (
@@ -2379,6 +2419,14 @@ def setup_single_controller(
             else 1
         ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
+        filter_zero_variance_groups=algo_cfg.use_dynamic_sampling,
+        # The advantage stage's participation knobs; None on PPO, which has no group baseline.
+        masked_reward_policy=(
+            None
+            if is_ppo_run(master_config)
+            else cast(GRPOConfig, algo_cfg).masked_reward_policy
+        ),
+        overlong_filtering=algo_cfg.overlong_filtering,
     )
 
     # Print setup timing metrics

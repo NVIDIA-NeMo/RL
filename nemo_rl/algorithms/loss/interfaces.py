@@ -19,6 +19,10 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
+# Per-row result of in-loss sequence filtering: a list of 0/1 floats, one per row
+# in the loss's batch order. It is not a metric; workers pop it before reduction.
+SEQ_LOGPROB_KEEP_MASK_KEY = "seq_logprob_error_keep_mask"
+
 
 class LossType(enum.Enum):
     TOKEN_LEVEL = "token_level"
@@ -41,8 +45,8 @@ class MetricNormalizer(enum.Enum):
     from the same flags that pick the denominators, so it lives next to the
     metric definitions instead of in a consumer-side table. Metrics absent
     from the mapping fall back to the gradient normalization (the
-    ``loss_type`` denominator) in split-API trainers. Survivor rescaling only
-    changes advertised denominators and leaves unadvertised metrics unchanged.
+    ``loss_type`` denominator) in split-API trainers. Survivor rescaling
+    requires every returned metric to be listed.
     """
 
     TOKENS = "tokens"  # divided by global_valid_toks
@@ -69,8 +73,8 @@ class LossFunction(Protocol):
     dict[str, MetricNormalizer]`` attribute advertising the global denominator
     each returned metric was normalized by (see ``MetricNormalizer``). It is
     optional: split-API trainers fall back to the ``loss_type`` denominator for
-    metrics (or losses) that do not advertise. Survivor rescaling instead
-    leaves metrics absent from the mapping unchanged.
+    metrics (or losses) that do not advertise. Survivor rescaling requires
+    every returned metric to be listed.
     """
 
     loss_type: LossType
