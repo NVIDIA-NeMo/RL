@@ -101,6 +101,14 @@ def test_flat_row_preparation_and_result_are_opaque():
     assert _normalize_nemo_gym_episode_result(row, reply) is reply
 
 
+def test_materialized_task_without_identity_uses_rl_group_coordinates():
+    row = _row()
+    del row["_ng_rollout_id"]
+    row["_ng_group_attempt"] = 1
+    _prepare([row])
+    assert row["_ng_rollout_id"] == "group-123-g0-t1"
+
+
 def test_materialized_task_keeps_flat_compatibility_results_opaque() -> None:
     row = _row()
     _prepare([row])

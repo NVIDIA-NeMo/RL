@@ -60,8 +60,10 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 from nemo_rl.environments.nemo_gym import (
+    _NG_ROLLOUT_ID_BODY_KEY,
     DEFAULT_THINKING_TAGS,
     NemoGymShardSet,
+    _rollout_id_from_rl_group,
     as_nemo_gym_shard_set,
     get_pad_dynamic_image_shapes,
 )
@@ -2407,10 +2409,26 @@ def _prepare_nemo_gym_rows(
     generation_config: GenerationConfig,
     sampling_params: GenerationSamplingParams,
     num_generations: int,
+    *,
+    dataset_indices: Optional[Sequence[int]] = None,
 ) -> None:
-    """Apply NeMo-RL sampling parameters and stable row indices in place."""
+    """Apply NeMo-RL sampling parameters and stable row indices in place.
+
+    With ``dataset_indices`` (the batch's ``idx``, one per row), a flat row that
+    has neither ``_ng_rollout_id`` nor ``_ng_task_index``, as sync training and
+    validation send, gets both: a rollout id from its RL group coordinates and
+    the prompt's dataset index as its task index. ``single_agent_turn_legacy``
+    needs a task index when the row has no ``task_id``, ``problem_id`` or
+    ``instance_id``. Gym builds the episode id and capture key from the explicit
+    rollout id, so episodes stay distinct across validation passes. Other rows
+    keep their Gym identity.
+    """
     if num_generations <= 0 or len(rows) % num_generations != 0:
         raise ValueError("NeMo-Gym rows must contain complete prompt groups")
+    if dataset_indices is not None and len(dataset_indices) != len(rows):
+        raise ValueError(
+            f"NeMo-Gym rows ({len(rows)}) and dataset indices ({len(dataset_indices)}) must match"
+        )
 
     group_ids: dict[int, str] = {}
     group_attempts: dict[int, int] = {}
@@ -2474,6 +2492,14 @@ def _prepare_nemo_gym_rows(
         row[NEMO_GYM_GROUP_ID_KEY] = group_ids[group_index]
         row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempts[group_index]
         row[NEMO_GYM_ROLLOUT_INDEX_KEY] = rollout_index
+        if (
+            dataset_indices is not None
+            and not is_nemo_gym_task(row)
+            and NEMO_GYM_TASK_INDEX_KEY not in row
+            and _NG_ROLLOUT_ID_BODY_KEY not in row
+        ):
+            row[_NG_ROLLOUT_ID_BODY_KEY] = _rollout_id_from_rl_group(row)
+            row[NEMO_GYM_TASK_INDEX_KEY] = int(dataset_indices[row_index])
 
 
 def _bucket_nemo_gym_rows_by_instance(
@@ -2843,6 +2869,7 @@ async def run_async_nemo_gym_rollout(
             generation_config,
             sampling_params,
             identity_num_generations,
+            dataset_indices=input_batch.get("idx"),
         )
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
@@ -3521,17 +3548,23 @@ def _postprocess_single_nemo_gym_group(
         # contract instead and fail fast on a real mismatch.
         validate_reward_components_match_scalar([r["full_result"] for r in results])
 
+    # A group of materialized task rows has no task index and skips the check.
     group_task_index = None
-    if nemo_gym_rows and NEMO_GYM_TASK_INDEX_KEY in nemo_gym_rows[0]:
-        group_task_index = int(nemo_gym_rows[0][NEMO_GYM_TASK_INDEX_KEY])
-        task_indices = [row.get(NEMO_GYM_TASK_INDEX_KEY) for row in nemo_gym_rows]
-        if any(
-            task_index is None or int(task_index) != group_task_index
-            for task_index in task_indices
-        ):
-            raise ValueError(
-                f"Expected one _ng_task_index per prompt group, got {task_indices}"
-            )
+    if any(NEMO_GYM_TASK_INDEX_KEY in row for row in nemo_gym_rows):
+        identity_size = group_size if group_size is not None else len(nemo_gym_rows)
+        for group_start in range(0, len(nemo_gym_rows), identity_size):
+            group_rows = nemo_gym_rows[group_start : group_start + identity_size]
+            if all(NEMO_GYM_TASK_INDEX_KEY not in row for row in group_rows):
+                continue
+            if any(row.get(NEMO_GYM_TASK_INDEX_KEY) is None for row in group_rows) or (
+                len({int(row[NEMO_GYM_TASK_INDEX_KEY]) for row in group_rows}) != 1
+            ):
+                raise ValueError(
+                    "Expected one _ng_task_index per prompt group, got "
+                    f"{[row.get(NEMO_GYM_TASK_INDEX_KEY) for row in group_rows]}"
+                )
+        if identity_size == len(nemo_gym_rows):
+            group_task_index = int(nemo_gym_rows[0][NEMO_GYM_TASK_INDEX_KEY])
 
     return NemoGymRolloutResult(
         input_ids=input_ids,
