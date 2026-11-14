@@ -3401,6 +3401,9 @@ class SingleControllerActor:
 
                 if self._train_data_dump is not None:
                     with self._timer.time("train_data_dump"):
+                        # The stage writes its chunks in the background: every
+                        # writer finishes this step's parts before the merge.
+                        await self._flush_advantage_dumps()
                         await asyncio.to_thread(
                             self._train_data_dump.finish_step,
                             self._train_steps,
@@ -5134,6 +5137,15 @@ class SingleControllerActor:
         # Shards only ever add field names, never touch per-sample rows, so the
         # full-batch meta carrying the union of those names is the whole result.
         return meta.with_fields(new_fields), has_valid_training_tokens
+
+    async def _flush_advantage_dumps(self) -> None:
+        """Wait until every advantage writer has stored this step's dump chunks."""
+        if not self._advantage_actors:
+            await asyncio.to_thread(self._advantage_computer.flush_train_data_dump)
+            return
+        await asyncio.gather(
+            *(actor.flush_train_data_dump.remote() for actor in self._advantage_actors)
+        )
 
     async def _run_advantage_stage(self, request: AdvantageRequest) -> AdvantageOutcome:
         """Run one advantage stage on the pool, or in-process without one."""

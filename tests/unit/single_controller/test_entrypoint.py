@@ -14,8 +14,10 @@
 
 import io
 import sys
+import time
 from argparse import Namespace
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,6 +27,7 @@ from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
+    WatchdogConfig,
 )
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -110,11 +113,22 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         "setup_single_controller",
         setup_single_controller,
     )
+    actor_remote = MagicMock(return_value=actor)
     monkeypatch.setattr(
         run_grpo_single_controller.SingleControllerActor,
         "remote",
-        MagicMock(return_value=actor),
+        actor_remote,
     )
+    # .options() returns a fresh actor class on the real thing, so route it back
+    # to the same remote or the patch above is bypassed.
+    actor_options = MagicMock(return_value=SimpleNamespace(remote=actor_remote))
+    monkeypatch.setattr(
+        run_grpo_single_controller.SingleControllerActor,
+        "options",
+        actor_options,
+    )
+    # No dedicated head in these tests, so the driver takes the unpinned path.
+    monkeypatch.setattr(run_grpo_single_controller.ray, "cluster_resources", lambda: {})
     monkeypatch.setattr(run_grpo_single_controller.ray, "get", ray_get)
     monkeypatch.setattr(run_grpo_single_controller.ray, "wait", ray_wait)
     monkeypatch.setattr(
@@ -125,6 +139,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
     return SimpleNamespace(
         actor_args=actor_args,
+        actor_options=actor_options,
         config=config,
         configure_generation=configure_generation,
         configured_generation=configured_generation,
@@ -169,6 +184,118 @@ def test_cleanup_is_best_effort_and_preserves_run_error(
     trainer.shutdown.assert_called_once_with()
     output = capsys.readouterr().out
     assert "Generation shutdown failed: generation cleanup failed" in output
+
+
+def test_a_dedicated_ray_head_claims_the_whole_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        run_grpo_single_controller.ray,
+        "cluster_resources",
+        lambda: {"ray_head": 1.0, "GPU": 8.0},
+    )
+
+    assert run_grpo_single_controller._controller_placement() == {
+        "resources": {"ray_head": 1}
+    }
+
+
+def test_no_dedicated_head_leaves_the_controller_unpinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ray.sub advertises ray_head only under DEDICATED_RAY_HEAD=1.
+
+    Read from the live cluster rather than the env var, so a launcher that asked
+    for a head it did not get falls back instead of pinning to nothing.
+    """
+    monkeypatch.setattr(
+        run_grpo_single_controller.ray,
+        "cluster_resources",
+        lambda: {"GPU": 8.0},
+    )
+
+    assert run_grpo_single_controller._controller_placement() == {}
+
+
+def test_main_applies_the_placement_when_launching_the_controller(
+    main_context: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Overrides the fixture's headless cluster.
+    monkeypatch.setattr(
+        run_grpo_single_controller.ray,
+        "cluster_resources",
+        lambda: {"ray_head": 1.0},
+    )
+
+    run_grpo_single_controller.main()
+
+    main_context.actor_options.assert_called_once_with(resources={"ray_head": 1})
+
+
+def test_main_requests_no_resource_without_a_dedicated_head(
+    main_context: SimpleNamespace,
+) -> None:
+    """The fixture's cluster has no head, which is every non-ray.sub run."""
+    run_grpo_single_controller.main()
+
+    main_context.actor_options.assert_called_once_with()
+
+
+def _watch_a_controller_that_never_finishes(
+    monkeypatch: pytest.MonkeyPatch, pongs: int
+) -> None:
+    """Drive the liveness watch with a run that never completes and ``pongs`` replies."""
+    remaining = pongs
+
+    def never_ready(refs: Any, timeout: float | None = None) -> tuple[list, list]:
+        # Real ray.wait blocks for the interval; without that the watch spins hot
+        # and never reaches stall_timeout_s.
+        time.sleep(timeout or 0)
+        return [], list(refs)
+
+    def ping(_ref: Any, timeout: float | None = None) -> None:
+        nonlocal remaining
+        if remaining <= 0:
+            raise TimeoutError("ping timed out")
+        remaining -= 1
+
+    monkeypatch.setattr(run_grpo_single_controller.ray, "wait", never_ready)
+    monkeypatch.setattr(run_grpo_single_controller.ray, "get", ping)
+
+
+def test_a_controller_that_never_answers_is_reported_as_unstarted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pin to a full head leaves the actor PENDING, which is not a stalled loop."""
+    _watch_a_controller_that_never_finishes(monkeypatch, pongs=0)
+    sc = SimpleNamespace(
+        run=SimpleNamespace(remote=MagicMock(return_value="run")),
+        ping=SimpleNamespace(remote=MagicMock(return_value="ping")),
+    )
+
+    with pytest.raises(RuntimeError, match="has not started") as excinfo:
+        run_grpo_single_controller._run_with_controller_liveness_watch(
+            sc, WatchdogConfig(interval_s=0.01, stall_timeout_s=0.02)
+        )
+
+    assert "the head has a free CPU" in str(excinfo.value)
+
+
+def test_a_controller_that_answered_once_is_reported_as_stalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once it has replied it was schedulable, so a later silence is the event loop."""
+    _watch_a_controller_that_never_finishes(monkeypatch, pongs=1)
+    sc = SimpleNamespace(
+        run=SimpleNamespace(remote=MagicMock(return_value="run")),
+        ping=SimpleNamespace(remote=MagicMock(return_value="ping")),
+    )
+
+    with pytest.raises(RuntimeError, match="event loop has been unresponsive"):
+        run_grpo_single_controller._run_with_controller_liveness_watch(
+            sc, WatchdogConfig(interval_s=0.01, stall_timeout_s=0.02)
+        )
 
 
 def test_main_configures_generation_for_trained_mtp(

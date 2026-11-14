@@ -195,49 +195,28 @@ def _process_mxfp8_modules_after_native_reload(
     model: torch.nn.Module, reloaded_module_ids: set[int]
 ) -> None:
     """Rebuild MXFP8 layouts outside the partial native reload."""
-    try:
-        from vllm.model_executor.layers.quantization.modelopt import (
-            ModelOptMxFp8FusedMoE,
-            ModelOptMxFp8LinearMethod,
-        )
-    except ImportError:
-        return
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptLinearMethod,
+        ModelOptMxFp8FusedMoE,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kMxfp8Static,
+    )
 
-    mxfp8_methods = (ModelOptMxFp8FusedMoE, ModelOptMxFp8LinearMethod)
     for module in model.modules():
         if id(module) in reloaded_module_ids:
             continue
         quant_method = getattr(module, "quant_method", None)
-        if isinstance(quant_method, mxfp8_methods):
+        if isinstance(quant_method, ModelOptMxFp8FusedMoE) or (
+            isinstance(quant_method, ModelOptLinearMethod)
+            and quant_method.spec.weight == kMxfp8Static
+        ):
             quant_method.process_weights_after_loading(module)
 
 
 def _model_uses_unquantized_flashinfer_trtllm(model: torch.nn.Module) -> bool:
     """Return whether a model realized the unquantized TRTLLM MoE backend."""
     return bool(_unquantized_flashinfer_trtllm_modules(model))
-
-
-def _local_shard_slices(param_info: dict[str, Any], rank: int) -> tuple[slice, ...]:
-    """Return this destination rank's slices in an HF-global tensor."""
-    from nemo_rl.weight_sync.xferdtensor_python import _compute_shard_slices
-
-    dst_mesh = param_info["dst_mesh_info"]
-    mesh_tensor = getattr(dst_mesh, "mesh", None)
-    if mesh_tensor is None:
-        mesh_tensor = getattr(dst_mesh, "_mesh", None)
-    if mesh_tensor is None:
-        raise ValueError("Destination DeviceMesh does not expose mesh ranks.")
-    coordinates = (mesh_tensor == rank).nonzero(as_tuple=False)
-    if coordinates.numel() == 0:
-        raise ValueError(f"Rank {rank} is absent from the destination mesh")
-    return tuple(
-        _compute_shard_slices(
-            param_info["global_shape"],
-            list(mesh_tensor.shape),
-            coordinates[0].tolist(),
-            param_info["dst_placements"],
-        )
-    )
 
 
 class _IPCWeightManifest:
@@ -534,7 +513,9 @@ class VllmReshardParamSpecCollection:
                 "BF16 FlashInfer TRTLLM nccl_reshard refit resolved an "
                 f"unregistered vLLM parameter for {param_info['name']!r}"
             )
-        local_slices = _local_shard_slices(param_info, rank)
+        from nemo_rl.weight_sync.xferdtensor_python import local_shard_slices
+
+        local_slices = local_shard_slices(param_info, rank)
         local_shape = tuple(
             global_size
             if shard_slice.start is None
@@ -2463,7 +2444,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         from nemo_rl.weight_sync.nccl_reshard_utils import (
             restore_refit_info_placements,
         )
+        from nemo_rl.weight_sync.xferdtensor import follow_source_reshard_path
 
+        follow_source_reshard_path(refit_info["source_uses_real_reshard_op"])
         self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
             restore_refit_info_placements(refit_info)
         )

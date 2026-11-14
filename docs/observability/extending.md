@@ -4,9 +4,7 @@ To add new spans or metrics to NeMo-RL code, use the instrumentation primitives 
 
 ## The import pattern
 
-Every algorithm instrumentation import should go through
-`nemo_rl.telemetry.instrumentation`, which re-exports the lens primitives with
-`rl.bucket` tagging applied to leaf spans:
+Every algorithm instrumentation import should go through `nemo_rl.telemetry.instrumentation`, which re-exports the lens primitives with `rl.bucket` tagging applied to leaf spans:
 
 ```python
 from nemo_rl.telemetry.instrumentation import (
@@ -21,25 +19,15 @@ from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 ```
 
-Never import from `nemo.lens.*` directly in algorithm code — that is how a span
-ends up with no bucket and invisible to the goodput rollup.
+Never import from `nemo.lens.*` directly in algorithm code — that is how a span ends up with no bucket and invisible to the goodput rollup.
 
 ### Goodput tagging
 
-`managed_span` / `trace_fn` from `instrumentation` attach ``rl.bucket`` ∈
-``{productive, overhead, idle, wasted}`` for leaf groups (see
-`nemo_rl/telemetry/instrumentation.py`). Umbrella groups (`job`, `step`, `rollout`,
-…) are **not** tagged. Apps do **not** emit rolled-up ``rl.goodput`` /
-``rl.bucket.*`` metrics — the offline monitor SUMs tagged phase / span
-durations by bucket.
+`managed_span` / `trace_fn` from `instrumentation` attach ``rl.bucket`` ∈ ``{productive, overhead, idle, wasted}`` for leaf groups (see `nemo_rl/telemetry/instrumentation.py`). Umbrella groups (`job`, `step`, `rollout`, …) are **not** tagged. Apps do **not** emit rolled-up ``rl.goodput`` / ``rl.bucket.*`` metrics — the offline monitor SUMs tagged phase / span durations by bucket.
 
 ### Umbrella spans say so at the call site
 
-Whether a span carries a bucket is decided by its group, which used to make the
-two cases indistinguishable where it matters most: `GENERATION` and `ROLLOUT`
-are both plausible for a generation span, and only one of them enters the
-rollup. So umbrella spans are opened through their own helper, with the group
-spelled using its `U_` alias:
+Whether a span carries a bucket is decided by its group, which used to make the two cases indistinguishable where it matters most: `GENERATION` and `ROLLOUT` are both plausible for a generation span, and only one of them enters the rollup. So umbrella spans are opened through their own helper, with the group spelled using its `U_` alias:
 
 ```python
 from nemo_rl.telemetry.instrumentation import umbrella_span, umbrella_trace_fn
@@ -50,21 +38,12 @@ with umbrella_span(
     ...
 ```
 
-The `U_` names are aliases — `RLSpanGroup.U_ROLLOUT == RLSpanGroup.ROLLOUT ==
-"rollout"` — so presets, the `span_groups` spec and every config are unchanged.
-The seven are `U_JOB`, `U_STEP`, `U_ROLLOUT`, `U_MODEL_INIT`, `U_EVALUATE`,
-`U_SETUP` and `U_PER_PROMPT`.
+The `U_` names are aliases — `RLSpanGroup.U_ROLLOUT == RLSpanGroup.ROLLOUT == "rollout"` — so presets, the `span_groups` spec and every config are unchanged.
+The seven are `U_JOB`, `U_STEP`, `U_ROLLOUT`, `U_MODEL_INIT`, `U_EVALUATE`, `U_SETUP` and `U_PER_PROMPT`.
 
-Reach for an umbrella whenever a span can overlap **another instance of
-itself**: concurrent spans sum past the wall clock they happened in, so a bucket
-on them multiplies rather than measures. The work is still counted by the leaf
-spans nested inside.
+Reach for an umbrella whenever a span can overlap **another instance of itself**: concurrent spans sum past the wall clock they happened in, so a bucket on them multiplies rather than measures. The work is still counted by the leaf spans nested inside.
 
-Neither mistake raises — telemetry does not end a training run. Passing a leaf
-group to `umbrella_span` warns once and emits the span as a leaf, so the phase
-keeps the bucket it actually has; the reverse, `managed_span` on an umbrella
-group, is already correct output. Both are rejected by a drift test, which
-catches them at review time rather than partway through a run.
+Neither mistake raises — telemetry does not end a training run. Passing a leaf group to `umbrella_span` warns once and emits the span as a leaf, so the phase keeps the bucket it actually has; the reverse, `managed_span` on an umbrella group, is already correct output. Both are rejected by a drift test, which catches them at review time rather than partway through a run.
 
 To override classification for one site, pass the attribute explicitly:
 
@@ -77,9 +56,7 @@ with managed_span(
     ...
 ```
 
-To reclassify spans opened *below* you — where the callee cannot tell why it was
-called — wrap the region in `bucket_scope` instead. Validation uses this so its
-generation counts as `overhead` rather than goodput:
+To reclassify spans opened *below* you — where the callee cannot tell why it was called — wrap the region in `bucket_scope` instead. Validation uses this so its generation counts as `overhead` rather than goodput:
 
 ```python
 from nemo_rl.telemetry.instrumentation import Bucket, bucket_scope
@@ -88,28 +65,17 @@ with bucket_scope(Bucket.OVERHEAD):
     ...  # every leaf span in here is tagged overhead
 ```
 
-Umbrellas stay unbucketed inside a scope, and an explicit `rl.bucket=` still
-wins, so a scope cannot make a parent double-count its children. See
-[span groups](span-groups.md).
+Umbrellas stay unbucketed inside a scope, and an explicit `rl.bucket=` still wins, so a scope cannot make a parent double-count its children. See [span groups](span-groups.md).
 
-When adding a **new** span group, update `_DEFAULT_GROUP_BUCKET` /
-`UMBRELLA_GROUPS` in `instrumentation.py` and extend `test_instrumentation.py`.
+When adding a **new** span group, update `_DEFAULT_GROUP_BUCKET` / `UMBRELLA_GROUPS` in `instrumentation.py` and extend `test_instrumentation.py`.
 
 ## Instrumenting inside a Ray actor
 
-Two things that are easy to get wrong, because both fail silently as no-ops
-rather than as errors.
+Two things that are easy to get wrong, because both fail silently as no-ops rather than as errors.
 
-The actor needs its own providers: call `init_telemetry_worker()` in its
-`__init__` (not `post_init`, which some fan-outs run on one rank per group), and
-flush before it dies. An actor reaped with `ray.kill` runs no `atexit` handler,
-so expose a method that calls `shutdown_telemetry()` and have the driver call it
-first — `AsyncTrajectoryCollector.flush_telemetry` is the worked example.
+The actor needs its own providers: call `init_telemetry_worker()` in its `__init__` (not `post_init`, which some fan-outs run on one rank per group), and flush before it dies. An actor reaped with `ray.kill` runs no `atexit` handler, so expose a method that calls `shutdown_telemetry()` and have the driver call it first — `AsyncTrajectoryCollector.flush_telemetry` is the worked example.
 
-Ray does not propagate OTel context, so the actor's spans form their own trace
-unless you carry the parent across. For a per-call actor method, use the
-dispatch/receive pair rather than moving the carrier by hand — decorate the
-method with `@accepts_trace_context` and dispatch it with one of:
+Ray does not propagate OTel context, so the actor's spans form their own trace unless you carry the parent across. For a per-call actor method, use the dispatch/receive pair rather than moving the carrier by hand — decorate the method with `@accepts_trace_context` and dispatch it with one of:
 
 ```python
 # A direct remote() call.
@@ -121,19 +87,9 @@ self.worker_group.run_all_workers_sharded_data(
 )
 ```
 
-Both halves are required and only the decorator is visible at the definition, so
-a method decorated but dispatched without a carrier still emits root spans while
-looking wired. `test_every_context_accepting_method_is_dispatched_with_a_carrier`
-fails the build in that case; when you add a new decorated method, expect that
-test to tell you if you forgot the sender.
+Both halves are required and only the decorator is visible at the definition, so a method decorated but dispatched without a carrier still emits root spans while looking wired. `test_every_context_accepting_method_is_dispatched_with_a_carrier` fails the build in that case; when you add a new decorated method, expect that test to tell you if you forgot the sender.
 
-Reach for `current_trace_carrier()` / `remote_trace_context()` directly only
-when the context has to outlive a single call — the async trajectory collector
-takes its carrier once at construction and reattaches it in **every thread** it
-spawns, because OTel context is a `ContextVar` and threads inherit none. The
-carrier is empty (a harmless no-op) whenever the driver's enclosing group is
-disabled. See
-[span groups](span-groups.md#getting-the-collector-into-one-waterfall).
+Reach for `current_trace_carrier()` / `remote_trace_context()` directly only when the context has to outlive a single call — the async trajectory collector takes its carrier once at construction and reattaches it in **every thread** it spawns, because OTel context is a `ContextVar` and threads inherit none. The carrier is empty (a harmless no-op) whenever the driver's enclosing group is disabled. See [span groups](span-groups.md#getting-the-collector-into-one-waterfall).
 
 ## Adding a span
 
@@ -169,9 +125,7 @@ with umbrella_span(RLSpanGroup.U_ROLLOUT, "rl.grpo.generation",
 
 Both yield `None` when the group is disabled; the body still runs, so guard attribute-setting with `if span is not None`.
 
-Do not pass `rl.iteration` here. The training loops set it once per step with
-`iteration_scope`, so any span opened inside a step already carries it — see
-[`rl.iteration` is set once per step](span-groups.md#rliteration-is-set-once-per-step).
+Do not pass `rl.iteration` here. The training loops set it once per step with `iteration_scope`, so any span opened inside a step already carries it — see [`rl.iteration` is set once per step](span-groups.md#rliteration-is-set-once-per-step).
 
 ### Always-on block — `span_cm`
 
@@ -212,18 +166,9 @@ Pick from `RLSpanGroup` before inventing a new one:
 - Checkpoint / eval? → `checkpoint` / `evaluate`
 - Transfer-queue op? → `data_plane`
 
-One question cuts across all of those: **how many of these spans will a run
-emit?** If the answer scales with the prompt or sample count rather than with
-the step count, the span belongs in `per_prompt` regardless of which phase it
-measures, so that a user picking `per_step` does not get dataset-sized volume
-they did not ask for. `per_prompt` is an umbrella, so such spans carry no
-`rl.bucket` — which is usually right anyway, since per-prompt work on the async
-paths overlaps itself.
+One question cuts across all of those: **how many of these spans will a run emit?** If the answer scales with the prompt or sample count rather than with the step count, the span belongs in `per_prompt` regardless of which phase it measures, so that a user picking `per_step` does not get dataset-sized volume they did not ask for. `per_prompt` is an umbrella, so such spans carry no `rl.bucket` — which is usually right anyway, since per-prompt work on the async paths overlaps itself.
 
-If the span is opened somewhere that cannot see whether its caller is
-per-prompt — as `MetricsDataPlaneClient` cannot — wrap the caller's region in
-`per_prompt_scope()` and consult `in_per_prompt_scope()` at the span site,
-rather than threading a flag through the signatures.
+If the span is opened somewhere that cannot see whether its caller is per-prompt — as `MetricsDataPlaneClient` cannot — wrap the caller's region in `per_prompt_scope()` and consult `in_per_prompt_scope()` at the span site, rather than threading a flag through the signatures.
 
 ## Adding a new span group
 

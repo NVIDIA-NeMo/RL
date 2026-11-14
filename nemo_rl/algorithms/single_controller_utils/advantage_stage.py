@@ -304,9 +304,7 @@ class AdvantageOutcome:
     opd_stat_sumsq: float = 0.0
     opd_stat_count: int = 0
     opd_gap_sum: float = 0.0
-    # Seconds this call spent serializing the training dump. Reported back
-    # because the writing moved off the controller with the rest of the
-    # stage, and the controller still owns the timer the metric lands in.
+    # Seconds spent preparing and submitting this chunk, including backpressure.
     train_data_dump_s: float = 0.0
     # What this call stored in the dump, so the controller's publish can tell a
     # missing chunk from an empty one.
@@ -334,15 +332,23 @@ class AdvantageComputer:
         self._dp_client = dp_client
         self._config = config
         self._advantage_estimator = advantage_estimator
-        # One writer per shard: the pool runs these concurrently, so they must
-        # not share a file. The controller merges them on publish.
+        # One writer per shard, so concurrent shards never share a file; the
+        # controller merges them after flush_train_data_dump.
         self._train_data_dump = (
             make_debug_writer(
-                config.debug_writer, config.train_data_dump_dir, shard_id=shard_id
+                config.debug_writer,
+                config.train_data_dump_dir,
+                shard_id=shard_id,
+                background=True,
             )
             if config.train_data_dump_dir is not None
             else None
         )
+
+    def flush_train_data_dump(self) -> None:
+        """Wait until this process's dump chunks are written (before the merge)."""
+        if self._train_data_dump is not None:
+            self._train_data_dump.flush()
 
     async def run(self, request: AdvantageRequest) -> AdvantageOutcome:
         """Run one call's advantage stage and return its reduced results."""
@@ -663,7 +669,6 @@ class AdvantageComputer:
                 malformed_thinking_advantage=cfg.algo.malformed_thinking_advantage,
             )
 
-        response_advantages = torch.masked_select(advantages, mask.bool())
         metric_rows = (
             owner_batch.representative_rows if owner_batch is not None else slice(None)
         )
@@ -676,7 +681,7 @@ class AdvantageComputer:
         opd_stat_count = 0
         opd_gap_sum = 0.0
         if cfg.teacher_logprobs_required:
-            valid = response_advantages.detach().double()
+            valid = torch.masked_select(advantages, mask.bool()).detach().double()
             opd_stat_sum = float(valid.sum())
             opd_stat_sumsq = float((valid * valid).sum())
             opd_stat_count = int(valid.numel())
@@ -693,7 +698,7 @@ class AdvantageComputer:
         if not cfg.is_ppo and owner_batch is None:
             assert isinstance(cfg.algo, GRPOConfig)
             advantages = _clip_grpo_advantages(advantages, cfg.algo)
-            response_advantages = torch.masked_select(advantages, mask.bool())
+        response_advantages = torch.masked_select(advantages, mask.bool())
         advantage_partial = AdvantagePartial.from_values(response_advantages)
 
         train_data_dump_s = 0.0

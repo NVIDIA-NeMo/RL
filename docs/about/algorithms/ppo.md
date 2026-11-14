@@ -22,8 +22,7 @@ uv run examples/run_ppo.py \
 ```
 
 > [!NOTE]
-> `ppo_math_1B.yaml` runs the Automodel backend because it sets
-> `policy.automodel_cfg.enabled=true` (and `policy.megatron_cfg.enabled=false`).
+> `ppo_math_1B.yaml` runs the Automodel backend because it sets `policy.automodel_cfg.enabled=true` (and `policy.megatron_cfg.enabled=false`).
 > To use the Megatron-Core backend, pass `--config examples/configs/ppo_math_1B_megatron.yaml` instead.
 
 ## PPO Multi-node
@@ -80,9 +79,7 @@ value:
   model_name: "Qwen/Qwen2.5-1.5B"
 ```
 
-`ppo_epochs` and `critic_ppo_epochs` are independent positive integers. The
-example uses interpolation so the critic follows the actor epoch count unless
-you explicitly override it.
+`ppo_epochs` and `critic_ppo_epochs` are independent positive integers. The example uses interpolation so the critic follows the actor epoch count unless you explicitly override it.
 
 ## Additional Resources
 
