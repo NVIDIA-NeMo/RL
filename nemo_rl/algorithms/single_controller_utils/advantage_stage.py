@@ -427,6 +427,24 @@ class AdvantageComputer:
             cfg.algo.reward_shaping,
         )["total_reward"]
 
+        # A Forest segment with a Gym segment reward trains on it in place of its
+        # rollout's reward. Forest rejects reward shaping, so scaling is the only transform.
+        row_rewards = rewards
+        if logical:
+            assert meta.tags is not None
+            has_segment_reward = torch.tensor(
+                ["segment_reward" in tag for tag in meta.tags], device=rewards.device
+            )
+            if has_segment_reward.any():
+                segment_rewards = rewards.new_tensor(
+                    [float(tag.get("segment_reward", 0.0)) for tag in meta.tags]
+                )
+                segment_rewards = scale_rewards(
+                    BatchedDataDict({"total_reward": segment_rewards}),
+                    cfg.algo.reward_scaling,
+                )["total_reward"]
+                row_rewards = torch.where(has_segment_reward, segment_rewards, rewards)
+
         has_response_tokens = token_mask[:, 1:].bool().any(dim=-1)
         # A context-only segment has no physical loss row, but its empty mask
         # must not invalidate an owner whose other segments have training tokens.
@@ -610,27 +628,22 @@ class AdvantageComputer:
                 advantage_valid_mask[owned_rows],
                 reduce="amax",
             )
-            owner_advantages = self._advantage_estimator.compute_advantage(
-                prompt_ids=owner_batch.group_ids,
-                rewards=rewards[rows],
-                mask=owner_batch.valid_mask.unsqueeze(-1),
-                valid_mask=owner_participation,
+            # Group statistics come from one reward per rollout. Each row's
+            # advantage applies its owner's baseline and divisor to the row's reward.
+            baseline, divisor = self._advantage_estimator.baseline_and_divisor(
+                owner_batch.group_ids, rewards[rows], owner_participation
             )
-            if (
-                owner_advantages.shape != (len(rows), 1)
-                or not torch.isfinite(owner_advantages).all()
-            ):
-                raise ValueError(
-                    "GRPO must return one finite advantage per Forest owner"
-                )
-            # Clip one value per rollout before fanout, preserving zero values
-            # for filtered owners and ownerless execution padding.
+            owner = owner_batch.row_owner.clamp_min(0)
+            row_advantages = (row_rewards - baseline[owner]) / divisor[owner]
+            if not torch.isfinite(row_advantages).all():
+                raise ValueError("GRPO must return finite advantages for Forest rows")
+            # Zero values remain for filtered owners and ownerless execution padding.
             assert isinstance(cfg.algo, GRPOConfig)
-            owner_advantages = _clip_grpo_advantages(owner_advantages, cfg.algo)
-            owner_advantages = owner_advantages * owner_batch.valid_mask.unsqueeze(-1)
-            advantages = owner_batch.fanout(owner_advantages[:, 0]).unsqueeze(
-                -1
-            ).expand_as(mask) * final_sample_mask.unsqueeze(-1)
+            row_advantages = _clip_grpo_advantages(row_advantages, cfg.algo)
+            row_advantages = row_advantages * owner_batch.fanout(owner_batch.valid_mask)
+            advantages = row_advantages.unsqueeze(-1).expand_as(
+                mask
+            ) * final_sample_mask.unsqueeze(-1)
         elif has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,

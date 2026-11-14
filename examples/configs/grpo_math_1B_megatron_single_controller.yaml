@@ -235,7 +235,7 @@ data_plane:
 # single-controller recovery options require it.
 token_capture:
   enabled: false
-  # Optional multi-path reconstruction; keeps one reward/advantage per rollout.
+  # Optional multi-path reconstruction; one reward per rollout unless Gym returns segment_rewards.
   forest_training: false
   # returned_history (default) or all_captured, including discarded attempts.
   selection_policy: returned_history

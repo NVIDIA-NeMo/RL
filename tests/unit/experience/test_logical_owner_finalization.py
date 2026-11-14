@@ -418,6 +418,66 @@ def test_gym_adapter_returns_one_real_receipt_and_rl_selection(monkeypatch, tmp_
     assert_metadata_only(processed["logical_selection"])
 
 
+@pytest.mark.parametrize("unresolved", [False, True])
+def test_gym_adapter_puts_segment_rewards_on_the_selection(
+    monkeypatch, tmp_path, unresolved
+):
+    import asyncio
+    import sys
+    import types
+    from unittest.mock import AsyncMock
+
+    from nemo_rl.environments.nemo_gym import NemoGym
+
+    harness = gym_harness.make_capture_harness(
+        monkeypatch, tmp_path, root_prompt=[10, 11]
+    )
+    captured = capture_segment(harness, "attempt", child=True)
+    env = object.__new__(NemoGym.__ray_metadata__.modified_class)
+    env._forest_training = True
+    env._selection_policy = "returned_history"
+    env.cfg = {}
+
+    async def control(method, path):
+        if method == "POST":
+            return await harness.ledger.close_admissions("attempt")
+        return await harness.ledger.manifest("attempt")
+
+    def resolve(records, result):
+        # Gym's resolver is tested in Gym; this pins what RL does with its answer.
+        assert result["segment_rewards"] == [{"output_index": 0, "reward": 0.5}]
+        if unresolved:
+            raise ValueError("output_index 0 matches 0 captured calls")
+        return {records[0].model_call_id: 0.5}
+
+    # Stand in for Gym's resolver, which the pinned Gym may predate.
+    resolver = types.ModuleType("nemo_gym.rollouts")
+    resolver.resolve_segment_rewards = resolve
+    monkeypatch.setitem(sys.modules, "nemo_gym.rollouts", resolver)
+    env._control = AsyncMock(side_effect=control)
+    result = dict(
+        reward=1.0,
+        response={"id": captured["ids"][-1], "output": captured["output"]},
+        instance_config={"mask_sample": False},
+        segment_rewards=[{"output_index": 0, "reward": 0.5}],
+    )
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+    )
+    selection = processed["logical_selection"]
+    assert selection.response_ids == tuple(captured["ids"])
+    if unresolved:
+        assert processed["receipt"]["capture_poisoned"] is True
+        assert processed["receipt"]["failure_reason"] == "segment_rewards_unresolved"
+        assert selection.call_rewards is None
+    else:
+        assert (
+            "failure_reason" not in processed["receipt"]
+            or not processed["receipt"]["failure_reason"]
+        )
+        assert selection.call_rewards == (0.5, None)
+
+
 @pytest.mark.parametrize("compact_after", [None, 10])
 def test_twenty_calls_have_one_trace_per_context(monkeypatch, tmp_path, compact_after):
     import asyncio
@@ -525,6 +585,97 @@ def test_twenty_calls_have_one_trace_per_context(monkeypatch, tmp_path, compact_
         assert actions == list(range(1001, 1021))
         assert result.canonical_output_tokens == 20
         assert not any(partition == "staged" for partition, _ in plane.rows)
+    finally:
+        harness.client.close()
+        asyncio.run(harness.ledger.close())
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_segments_train_on_the_segment_rewards_of_the_calls_they_own(
+    monkeypatch, tmp_path, conflict
+):
+    import asyncio
+
+    from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+    from nemo_rl.experience.rollout_reassembler import RolloutReassembler
+
+    plane = PublicationDataPlane()
+    source = TQTokenSource(plane, staging_partition="staged")
+    harness = gym_harness.make_capture_harness(
+        monkeypatch,
+        tmp_path,
+        sink=TQTokenSink(plane, staging_partition="staged"),
+        fetch_prefix=lambda keys: source.fetch_prefix_chains(keys).expanded,
+        root_prompt=[10, 11],
+        decide_input=decide_capture_input,
+    )
+    try:
+        # A compaction before call 3 splits one agent into segments [0-2] and [3-5].
+        messages = list(gym_harness.HISTORY)
+        ids = []
+        for turn in range(6):
+            if turn == 3:
+                messages = [{"role": "user", "content": "summary of previous work"}]
+            response = gym_harness.assert_clean(harness.post("attempt", messages))
+            ids.append(response["id"])
+            messages = (
+                messages
+                + response["output"]
+                + [{"role": "user", "content": f"observation {turn + 1}"}]
+            )
+        sibling = capture_segment(harness, "sibling")
+        receipts, selections = [], []
+        call_rewards = (None, 0.25, 0.5 if conflict else None, None, None, None)
+        for scope, owner_ids, rewards in (
+            ("attempt", ids, call_rewards),
+            ("sibling", sibling["ids"], None),
+        ):
+            manifest = harness.manifest(scope)
+            receipts.append(
+                dict(
+                    capture_key=scope,
+                    manifest=[record.model_dump() for record in manifest.records],
+                    terminal_model_call_id=manifest.records[-1].model_call_id,
+                    terminal_selection="declared",
+                    attempted_call_ids=manifest.attempted_call_ids,
+                )
+            )
+            selections.append(
+                RolloutSelection(
+                    tuple(owner_ids),
+                    (ActionOutputFlags(False, False),) * len(owner_ids),
+                    call_rewards=rewards,
+                )
+            )
+        result = RolloutReassembler(
+            plane,
+            partition_id="canonical",
+            staging_partition="staged",
+            pad_token_id=0,
+            max_seq_len=1024,
+        ).finalize_group(
+            "group",
+            ["attempt", "sibling"],
+            receipts,
+            [1.0, 0.0],
+            mask_sample=[False, False],
+            fallback_weight_version=7,
+            prompt_idx=99,
+            canonical_sample_ids=["group_g0", "group_g1"],
+            logical_selections=selections,
+        )
+        segment_rewards = [tag.get("segment_reward") for tag in result.meta.tags]
+        if conflict:
+            # One segment cannot train on two rewards, so its whole rollout is masked.
+            assert result.valid_row_count == 1
+            assert segment_rewards == [None, None, None]
+            assert result.metrics["finalize/segment_reward_conflict_owners"] == 1
+            assert result.metrics["finalize/segment_reward_rows"] == 0
+        else:
+            assert result.valid_row_count == 3
+            assert segment_rewards == [0.25, None, None]
+            assert result.metrics["finalize/segment_reward_conflict_owners"] == 0
+            assert result.metrics["finalize/segment_reward_rows"] == 1
     finally:
         harness.client.close()
         asyncio.run(harness.ledger.close())

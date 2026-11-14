@@ -662,6 +662,49 @@ def test_preserves_existing_grpo_normalization_and_leave_one_out(
     torch.testing.assert_close(data["advantages"], expected[[0, 0, 1, 1, 1, 2]])
 
 
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("leave_one_out", [False, True])
+def test_a_segment_reward_moves_only_its_row_against_the_owner_baseline(
+    normalize, leave_one_out
+):
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 3), (3.0, 1)])])
+    # The second segment of the first rollout trains on a Gym segment reward.
+    meta.tags[1]["segment_reward"] = 2.0
+    ctrl = _controller(
+        meta,
+        data,
+        grpo={
+            "adv_estimator": {
+                "normalize_rewards": normalize,
+                "use_leave_one_out_baseline": leave_one_out,
+            }
+        },
+    )
+    owner_rewards = torch.tensor([0.0, 1.0, 3.0])
+    owner_advantages = ctrl._advantage_estimator.compute_advantage(
+        prompt_ids=torch.tensor([[17, 42]] * 3),
+        rewards=owner_rewards,
+        mask=torch.ones(3, 3),
+        valid_mask=torch.ones(3),
+    )
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    # Other rows keep their rollout's advantage, and the group statistics stay
+    # those of the rollout rewards, so the segment row moves by its reward gap.
+    expected = owner_advantages[[0, 0, 1, 1, 1, 2]].clone()
+    baseline, divisor = ctrl._advantage_estimator.baseline_and_divisor(
+        torch.tensor([[0]] * 3), owner_rewards, torch.ones(3)
+    )
+    expected[1] = (2.0 - baseline[0]) / divisor[0]
+    torch.testing.assert_close(data["advantages"], expected)
+    if not normalize and not leave_one_out:
+        torch.testing.assert_close(data["advantages"][1], torch.full((3,), 2.0 - 4 / 3))
+    # Metrics and stored rewards stay per rollout.
+    torch.testing.assert_close(
+        data["total_reward"], torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0, 3.0])
+    )
+
+
 @pytest.mark.parametrize("filtering", [False, True])
 def test_overlong_filter_flag_is_respected_for_all_owner_segments(filtering):
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])])

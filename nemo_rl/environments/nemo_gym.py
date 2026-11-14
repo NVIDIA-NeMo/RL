@@ -2194,6 +2194,21 @@ Depending on your data shape, you may want to change these values."""
             reward=float(reward),
         )
         selected_call_ids = {r.model_call_id for r in selected}
+        # Gym segment rewards target captured calls; each selected call carries its entry.
+        call_rewards = segment_reward_error = None
+        if selected and result.get("segment_rewards"):
+            from nemo_gym.rollouts import resolve_segment_rewards
+
+            try:
+                targeted = resolve_segment_rewards(parsed.records, result)
+            except ValueError as error:
+                segment_reward_error = error
+                print(
+                    f"Rollout {owner!r}: unresolved segment rewards: {error}",
+                    flush=True,
+                )
+            else:
+                call_rewards = tuple(targeted.get(r.model_call_id) for r in selected)
         if capture_failed:
             receipt.update(capture_poisoned=True, failure_reason="capture_incomplete")
         elif any(
@@ -2213,6 +2228,10 @@ Depending on your data shape, you may want to change these values."""
         ):
             # Preserve selection membership; reject this owner before row planning.
             receipt.update(capture_poisoned=True, failure_reason="selection_not_closed")
+        elif segment_reward_error is not None:
+            receipt.update(
+                capture_poisoned=True, failure_reason="segment_rewards_unresolved"
+            )
         selection = RolloutSelection(
             response_ids=tuple(r.response_id for r in selected),
             action_flags=tuple(
@@ -2228,6 +2247,7 @@ Depending on your data shape, you may want to change these values."""
                 for r in selected
             ),
             truncated=truncated,
+            call_rewards=call_rewards,
         )
         full_result: dict[str, Any] = {
             key: value

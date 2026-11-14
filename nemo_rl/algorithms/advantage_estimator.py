@@ -122,6 +122,15 @@ class GRPOAdvantageEstimator:
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
+        baseline, divisor = self.baseline_and_divisor(prompt_ids, rewards, valid_mask)
+        return ((rewards - baseline) / divisor).unsqueeze(-1).expand(mask.shape)
+
+    def baseline_and_divisor(self, prompt_ids, rewards, valid_mask=None):
+        """Return each sample's baseline and the divisor of its advantage.
+
+        The advantage of a reward ``r`` in a sample's group is ``(r - baseline) / divisor``.
+        The divisor is 1 where rewards are not normalized.
+        """
         (
             baseline,
             std,
@@ -132,17 +141,13 @@ class GRPOAdvantageEstimator:
             torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),
             leave_one_out_baseline=self.use_leave_one_out_baseline,
         )
-        advantages = (rewards - baseline).unsqueeze(-1)
-
+        divisor = torch.ones_like(rewards)
         if self.normalize_rewards:
             # don't sharpen the ones with no variation
             epsilon = 1e-6
             normalize_mask = (std > 0) & ~is_trivial_distribution
-            advantages[normalize_mask] = advantages[normalize_mask] / (
-                std.unsqueeze(-1)[normalize_mask] + epsilon
-            )
-
-        return advantages.expand(mask.shape)
+            divisor[normalize_mask] = std[normalize_mask] + epsilon
+        return baseline, divisor
 
 
 class GDPOAdvantageEstimator:

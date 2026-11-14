@@ -18,8 +18,10 @@ from pydantic import ValidationError
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
 )
+from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 
 
 def _make_estimator(alpha=1.0, subtract_global_baseline=False):
@@ -267,3 +269,34 @@ def test_tropd_all_masked_batch_is_finite_zero():
     assert all(
         torch.isfinite(torch.tensor(value)) for value in estimator.last_metrics.values()
     )
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("leave_one_out", [False, True])
+def test_grpo_advantage_is_unchanged_and_matches_its_baseline_and_divisor(
+    normalize, leave_one_out
+):
+    estimator = GRPOAdvantageEstimator(
+        AdvEstimatorConfig(
+            normalize_rewards=normalize, use_leave_one_out_baseline=leave_one_out
+        ),
+        {},
+    )
+    # Two groups, the second with identical rewards (no normalization there).
+    prompt_ids = torch.tensor([[0], [0], [0], [0], [1], [1], [1]])
+    rewards = torch.tensor([0.0, 1.0, 3.0, 0.5, 2.0, 2.0, 2.0])
+    valid_mask = torch.tensor([1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0])
+    advantages = estimator.compute_advantage(
+        prompt_ids, rewards, torch.ones(7, 2), valid_mask=valid_mask
+    )
+    # The estimator's formula before baseline_and_divisor was split out.
+    baseline, std, trivial = calculate_baseline_and_std_per_prompt(
+        prompt_ids, rewards, valid_mask, leave_one_out_baseline=leave_one_out
+    )
+    expected = rewards - baseline
+    if normalize:
+        keep = (std > 0) & ~trivial
+        expected[keep] = expected[keep] / (std[keep] + 1e-6)
+    assert torch.equal(advantages, expected.unsqueeze(-1).expand(7, 2))
+    baseline, divisor = estimator.baseline_and_divisor(prompt_ids, rewards, valid_mask)
+    assert torch.equal((rewards - baseline) / divisor, expected)
