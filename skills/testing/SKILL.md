@@ -95,8 +95,5 @@ tests/test_suites/
 
 Research unit and functional tests are discovered under `research/*/tests/`.
 CI syncs each project's runtime dependencies and `test` group before executing them.
-Research suite scripts belong under `research/<project>/tests/test_suites/`,
-with matching recipes under `research/<project>/configs/recipes/`.
-List scripts by their repository-relative paths in the root suite lists
-(`nightly.txt`, `disabled.txt`, etc.). Script/recipe accounting includes both
-core and research directories, preserving each research project's identity.
+Research suite scripts belong under `research/<project>/tests/test_suites/`, with matching recipes under `research/<project>/configs/recipes/`.
+List scripts by their repository-relative paths in the root suite lists (`nightly.txt`, `disabled.txt`, etc.). Script/recipe accounting includes both core and research directories, preserving each research project's identity.

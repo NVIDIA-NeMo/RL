@@ -112,7 +112,7 @@ env:
 - **`shuffle_moves`**: Controls the initial difficulty by randomly moving tiles to scramble the puzzle.
 - **`max_moves`**: Sets an upper limit on the number of actions the agent can take in one episode.
 
-Grids are generated with sizes ranging from 2 to game_config.size. Each grid starts with a solved state and is shuffled by moving random tiles to the empty space n times, where n is a random number between 1 and `shuffle_moves`. The grid is shuffled using only valid moves. 
+Grids are generated with sizes ranging from 2 to game_config.size. Each grid starts with a solved state and is shuffled by moving random tiles to the empty space n times, where n is a random number between 1 and `shuffle_moves`. The grid is shuffled using only valid moves.
 The `generate_puzzle_datum()` function in [run_grpo_sliding_puzzle.py](../../examples/run_grpo_sliding_puzzle.py) is responsible for generating the dataset. [sliding_puzzle.py](../../nemo_rl/environments/games/sliding_puzzle.py) contains the `SlidingPuzzleGameLogic` class, responsible for puzzle generation and initialization logic. The number of shuffle moves and size of the grid will control puzzle difficulty.
 
 #### Generation Algorithm

@@ -26,12 +26,6 @@ grpo:
   async_grpo: null
   # SC samples replacement groups itself.
   batch_multiplier: 1
-  reward_scaling:
-    # Enable after https://github.com/NVIDIA-NeMo/RL/pull/4878 is merged.
-    enabled: false
-  reward_shaping:
-    # Enable after https://github.com/NVIDIA-NeMo/RL/pull/4882 is merged.
-    enabled: false
 policy:
   train_global_batch_size: 64
   offload_policy_before_refit: true

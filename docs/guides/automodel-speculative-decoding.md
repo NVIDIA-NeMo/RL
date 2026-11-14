@@ -1,16 +1,8 @@
 # Speculative Decoding Draft Co-Training on Automodel Backend
 
-This guide covers draft-model co-training on the Automodel
-backend: training a speculative-decoding drafter alongside the policy so it
-tracks the policy's drift during RL, then refitting both into vLLM for
-faster rollout generation.
+This guide covers draft-model co-training on the Automodel backend: training a speculative-decoding drafter alongside the policy so it tracks the policy's drift during RL, then refitting both into vLLM for faster rollout generation.
 
-This is the Automodel counterpart to the
-[Eagle3 Speculative Decoding](eagle3-speculative-decoding.md) guide, which
-covers the Megatron backend. Concepts (teacher signal, refit, why co-train at
-all) are shared between the two guides; this one is specific to the
-Automodel drafters and their config surface. For GRPO fundamentals, see the
-[GRPO guide](grpo.md).
+This is the Automodel counterpart to the [Eagle3 Speculative Decoding](eagle3-speculative-decoding.md) guide, which covers the Megatron backend. Concepts (teacher signal, refit, why co-train at all) are shared between the two guides; this one is specific to the Automodel drafters and their config surface. For GRPO fundamentals, see the [GRPO guide](grpo.md).
 
 ## Supported Drafters
 
@@ -20,10 +12,7 @@ Automodel drafters and their config surface. For GRPO fundamentals, see the
 | `"dflash"` | DFlash block drafter (markov-free, confidence-free variant of DSpark) | `RedHatAI/*-speculator.dflash` | same as `dspark` |
 | `"eagle3"` | EAGLE3 TTT (test-time-training) drafter | `RedHatAI/*-speculator.eagle3`, SGLang SpecForge native-flat checkpoints (e.g. `lmsys/SGLang-EAGLE3-*`) | Automodel (this guide) **or** Megatron (see the [Eagle3 guide](eagle3-speculative-decoding.md)) |
 
-All three algorithms train alongside the policy on the same rollout batch,
-using the policy's own in-flight logits/hidden states as the distillation
-teacher (not a separate frozen verifier), and stream `draft.*` weights into
-vLLM on every refit so the next rollout speculates with the freshest drafter.
+All three algorithms train alongside the policy on the same rollout batch, using the policy's own in-flight logits/hidden states as the distillation teacher (not a separate frozen verifier), and stream `draft.*` weights into vLLM on every refit so the next rollout speculates with the freshest drafter.
 
 ## Get Started
 
@@ -65,8 +54,7 @@ policy:
 
 #### DFlash
 
-Same fields as DSpark, but DFlash checkpoints have no confidence head, so
-`confidence_loss_alpha` defaults to `0.0` for `speculator_type: "dflash"`:
+Same fields as DSpark, but DFlash checkpoints have no confidence head, so `confidence_loss_alpha` defaults to `0.0` for `speculator_type: "dflash"`:
 
 ```yaml
 policy:
@@ -112,13 +100,11 @@ policy:
         num_speculative_tokens: 3
 ```
 
-`speculator_type` defaults to `"eagle3"` when omitted, so it can be left out
-(as in the snippet above) unless you want it explicit for readability.
+`speculator_type` defaults to `"eagle3"` when omitted, so it can be left out (as in the snippet above) unless you want it explicit for readability.
 
 ### Config Reference
 
-`policy.draft` is a discriminated union keyed on `speculator_type`, with each
-family's fields declared directly on `policy.draft` (no nested sub-blocks).
+`policy.draft` is a discriminated union keyed on `speculator_type`, with each family's fields declared directly on `policy.draft` (no nested sub-blocks).
 
 Shared across all three:
 
@@ -150,25 +136,15 @@ Shared across all three:
 | `ttt_step_loss_decay` | `1.0` | Per-unroll-step loss decay factor. |
 | `train_embed_and_head` | `true` | Train the draft's `embed_tokens`/`lm_head`. |
 
-Architecture fields (block size, target layer ids, mask token id, aux capture
-layers, `draft_vocab_size`, d2t/t2d vocab maps, markov/confidence head
-layout, `norm_before_residual`) are always read from the draft checkpoint's
-`config.json` -- only training options are set in the recipe.
+Architecture fields (block size, target layer ids, mask token id, aux capture layers, `draft_vocab_size`, d2t/t2d vocab maps, markov/confidence head layout, `norm_before_residual`) are always read from the draft checkpoint's `config.json` -- only training options are set in the recipe.
 
 ### Limitations
 
-- Not compatible with `policy.automodel_cfg.sequence_parallel`,
-  `policy.automodel_cfg.lora_cfg.enabled`, or `policy.sequence_packing.enabled`.
+- Not compatible with `policy.automodel_cfg.sequence_parallel`, `policy.automodel_cfg.lora_cfg.enabled`, or `policy.sequence_packing.enabled`.
 
 ## How It Works
 
-Speculative decoding needs a small drafter that stays well-aligned with the
-serving policy to get useful acceptance rates. A drafter trained once and
-never updated drifts out of sync as RL moves the policy's distribution,
-degrading acceptance length over training. Co-training closes that loop:
-the drafter is trained every step on the same data the policy trains on, and
-refit alongside the policy so rollout always speculates with an
-up-to-date drafter.
+Speculative decoding needs a small drafter that stays well-aligned with the serving policy to get useful acceptance rates. A drafter trained once and never updated drifts out of sync as RL moves the policy's distribution, degrading acceptance length over training. Co-training closes that loop: the drafter is trained every step on the same data the policy trains on, and refit alongside the policy so rollout always speculates with an up-to-date drafter.
 
 ```text
 rollout (policy samples responses)
@@ -184,52 +160,26 @@ rollout (policy samples responses)
   -> next rollout speculates with the updated drafter
 ```
 
-The policy loss path is unaffected -- draft co-training only adds a second
-term and captures already-computed intermediate policy tensors along the way.
+The policy loss path is unaffected -- draft co-training only adds a second term and captures already-computed intermediate policy tensors along the way.
 
 ### Automodel Reuse Boundary
 
-`nemo_rl/models/automodel/draft/` is a thin extension layer over
-`nemo_automodel.components.speculative.*` (Automodel r0.6.0). Attention masks
-and the unchanged helpers are imported from there; the DSpark/DFlash model and
-loss are local copies whose RL deltas are listed in each file's header, and
-EAGLE3's per-position KL, loss mask and accuracy counting follow speculators'
-`kl_div_loss` / `align_for_step`.
-EAGLE3's network (attention, decoder layer, embedding, `fc`, `lm_head`) is a
-direct subclass of Automodel's `LlamaEagle3DraftModel`; NeMo RL does not
-reimplement the attention math.
+`nemo_rl/models/automodel/draft/` is a thin extension layer over `nemo_automodel.components.speculative.*` (Automodel r0.6.0). Attention masks and the unchanged helpers are imported from there; the DSpark/DFlash model and loss are local copies whose RL deltas are listed in each file's header, and EAGLE3's per-position KL, loss mask and accuracy counting follow speculators' `kl_div_loss` / `align_for_step`.
+EAGLE3's network (attention, decoder layer, embedding, `fc`, `lm_head`) is a direct subclass of Automodel's `LlamaEagle3DraftModel`; NeMo RL does not reimplement the attention math.
 
 What stays local to NeMo RL, and why:
 
-- **RL-shaped teacher signal and normalization.** The teacher is the
-  policy's own live logits/hidden states (not a frozen verifier), anchor
-  sampling respects RL rollout response boundaries instead of
-  pretraining-corpus document boundaries, and loss normalization matches
-  NeMo RL's gradient-accumulation/context-parallel conventions.
-- **Training-loop and distributed-topology glue** (`draft/{setup,hidden_capture,
-  runtime,checkpoint}.py`): hooking into the policy's own forward pass to
-  capture teacher hidden states/logits, keeping gradient scaling consistent
-  across microbatches and context parallelism, deterministic anchor sampling
-  across TP replicas, coupled policy+draft checkpointing, and adapting
-  third-party checkpoint formats (speculators, SGLang SpecForge).
-- **Wiring the RL main loop** (`nemo_rl/models/automodel/{setup,train}.py`,
-  `nemo_rl/algorithms/loss/wrapper.py`,
-  `nemo_rl/models/policy/{lm_policy,workers/automodel_policy_worker}.py`):
-  building the draft optimizer param group, capturing teacher logits at the
-  right point in the forward pass, combining the loss terms, config
-  validation, and streaming `draft.*` weights through the same refit path
-  as the policy weights.
+- **RL-shaped teacher signal and normalization.** The teacher is the policy's own live logits/hidden states (not a frozen verifier), anchor sampling respects RL rollout response boundaries instead of pretraining-corpus document boundaries, and loss normalization matches NeMo RL's gradient-accumulation/context-parallel conventions.
+- **Training-loop and distributed-topology glue** (`draft/{setup,hidden_capture, runtime,checkpoint}.py`): hooking into the policy's own forward pass to capture teacher hidden states/logits, keeping gradient scaling consistent across microbatches and context parallelism, deterministic anchor sampling across TP replicas, coupled policy+draft checkpointing, and adapting third-party checkpoint formats (speculators, SGLang SpecForge).
+- **Wiring the RL main loop** (`nemo_rl/models/automodel/{setup,train}.py`, `nemo_rl/algorithms/loss/wrapper.py`, `nemo_rl/models/policy/{lm_policy,workers/automodel_policy_worker}.py`): building the draft optimizer param group, capturing teacher logits at the right point in the forward pass, combining the loss terms, config validation, and streaming `draft.*` weights through the same refit path as the policy weights.
 
-None of this is available in Automodel's own `Eagle3TrainerModule`, which is
-built for standalone offline SFT of a drafter, not RL co-training.
+None of this is available in Automodel's own `Eagle3TrainerModule`, which is built for standalone offline SFT of a drafter, not RL co-training.
 
 ## Evidence
 
 ### Recipe Coverage
 
-Recipes for the Qwen3-8B control arm plus its three drafter siblings, and a
-Qwen3-30B-A3B-2507-Instruct (EP32) EAGLE3 example, live under
-`examples/configs/recipes/llm/`:
+Recipes for the Qwen3-8B control arm plus its three drafter siblings, and a Qwen3-30B-A3B-2507-Instruct (EP32) EAGLE3 example, live under `examples/configs/recipes/llm/`:
 
 | Recipe | Drafter |
 | --- | --- |
@@ -240,9 +190,7 @@ Qwen3-30B-A3B-2507-Instruct (EP32) EAGLE3 example, live under
 | `grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel.yaml` | none |
 | `grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel-eagle3.yaml` | EAGLE3 |
 
-The Qwen3-8B dspark/dflash/eagle3 recipes run nightly
-(`tests/test_suites/llm/grpo-qwen3-8b-4n8g-automodel-{dspark,dflash,eagle3}.sh`,
-registered in `tests/test_suites/nightly.txt`).
+The Qwen3-8B dspark/dflash/eagle3 recipes run nightly (`tests/test_suites/llm/grpo-qwen3-8b-4n8g-automodel-{dspark,dflash,eagle3}.sh`, registered in `tests/test_suites/nightly.txt`).
 
 ### Results
 
@@ -250,20 +198,10 @@ registered in `tests/test_suites/nightly.txt`).
 
 ![Qwen3-8B draft co-training curves](../assets/qwen3-8b-automodel-speculative-decoding.png)
 
-`train/reward` and `validation/accuracy` are basically the same across all
-four runs, so training a draft alongside the policy isn't costing any policy
-quality here. The baseline has no drafter, so its `spec_acceptance_length`
-just sits at 1; dspark and dflash land around 3.5-4, eagle3 around 2. The
-speedup shows up in `timing/train/generation`: the more of the end-to-end
-step time that rollout generation accounts for, the bigger the win from
-speculative decoding.
+`train/reward` and `validation/accuracy` are basically the same across all four runs, so training a draft alongside the policy isn't costing any policy quality here. The baseline has no drafter, so its `spec_acceptance_length` just sits at 1; dspark and dflash land around 3.5-4, eagle3 around 2. The speedup shows up in `timing/train/generation`: the more of the end-to-end step time that rollout generation accounts for, the bigger the win from speculative decoding.
 
 #### Qwen3-30B-A3B-2507-Instruct (MoE, EP32): eagle3 vs. no-draft baseline
 
 ![Qwen3-30B-A3B-2507-Instruct draft co-training curves](../assets/qwen3-30ba3b-2507-automodel-speculative-decoding.png)
 
-Same story on the bigger MoE model. Reward and validation accuracy track the
-baseline, eagle3's acceptance length settles around 2.3-2.7 against the
-baseline's flat 1, and generation time is lower for the eagle3 run -- same
-pattern, the speedup comes from generation, and matters more the longer the
-response gets.
+Same story on the bigger MoE model. Reward and validation accuracy track the baseline, eagle3's acceptance length settles around 2.3-2.7 against the baseline's flat 1, and generation time is lower for the eagle3 run -- same pattern, the speedup comes from generation, and matters more the longer the response gets.

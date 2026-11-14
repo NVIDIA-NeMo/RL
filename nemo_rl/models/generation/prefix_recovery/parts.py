@@ -21,7 +21,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from nemo_rl.models.generation.prefix_recovery.progress import ProgressReader
-from nemo_rl.models.generation.prefix_recovery.state import CaptureRegistry
+from nemo_rl.models.generation.prefix_recovery.state import (
+    CaptureRegistry,
+    _RequestCaptureState,
+)
 
 if TYPE_CHECKING:
     from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
@@ -49,3 +52,6 @@ class PrefixRecoveryParts:
     # Bound on one cut, measured from its arrival; None waits indefinitely.
     control_timeout_s: float | None
     progress_reader: ProgressReader
+    # Extras for a call's first prefix row, from the media its capture state
+    # holds; None for a call without media.
+    prefix_row_extras: Callable[[_RequestCaptureState], dict[str, Any] | None]
