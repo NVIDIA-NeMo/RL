@@ -28,8 +28,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
     GAEConfig,
-    GeneralizedAdvantageEstimator,
-    RawRewardAdvantageEstimator,
+    create_advantage_estimator,
 )
 from nemo_rl.algorithms.grpo import (
     RewardScalingConfig,
@@ -1264,20 +1263,13 @@ def _create_advantage_estimator(master_config: MasterConfig):
     adv_estimator_config = ppo_config.adv_estimator
 
     adv_estimator_name = adv_estimator_config.name
+    adv_estimator = create_advantage_estimator(adv_estimator_config, loss_config)
     if adv_estimator_name == "gae":
-        adv_estimator = GeneralizedAdvantageEstimator(adv_estimator_config, loss_config)
         gae_lambda = adv_estimator_config.gae_lambda
         gae_gamma = adv_estimator_config.gae_gamma
         print(f"  ✓ Using GAE advantage estimator (λ={gae_lambda}, γ={gae_gamma})")
     elif adv_estimator_name == "raw_reward":
-        adv_estimator = RawRewardAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using raw reward advantage estimator (no value model, no baselines)")
-    else:
-        raise ValueError(
-            f"Invalid adv_estimator name for PPO: {adv_estimator_name!r}. "
-            f"PPO only supports 'gae' or 'raw_reward'."
-        )
-
     return adv_estimator
 
 
