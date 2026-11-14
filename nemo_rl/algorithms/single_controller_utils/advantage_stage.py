@@ -38,7 +38,10 @@ from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+from nemo_rl.algorithms.advantage_estimator import (
+    GRPOAdvantageEstimator,
+    create_advantage_estimator,
+)
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     _apply_async_sample_masks,
@@ -84,20 +87,6 @@ if TYPE_CHECKING:
     # Annotation-only: importing ppo at runtime here would close a cycle
     # back through the controller.
     from nemo_rl.algorithms.ppo import PPOConfig
-
-
-# Estimators whose advantages for a row depend only on that row and the rest
-# of its prompt group, so a whole-group shard produces the same numbers as the
-# whole batch. That holds because the baseline keys on GROUP_ID_TAG: while it
-# keyed on prompt tokens, two groups sharing prompt text merged into one
-# baseline when they landed in the same call and separated when a shard split
-# them, which made grpo's advantages a function of num_advantage_workers.
-# Everything else reachable from _build_advantage_estimator reduces over the
-# entire batch -- gdpo and reinforce_plus_plus always, gae and raw_reward
-# whenever normalize_advantages is set -- and a shard is not that batch.
-# Membership is opt-in for exactly that reason: a new estimator counts as
-# unshardable until someone checks it.
-SHARD_INVARIANT_ESTIMATORS = frozenset({"grpo", "opd"})
 
 
 @dataclass(frozen=True)
@@ -163,7 +152,9 @@ class AdvantageStageConfig:
                 algo_cfg.invalid_tool_call_advantage is not None
                 or algo_cfg.malformed_thinking_advantage is not None
             ),
-            shardable=algo_cfg.adv_estimator.name in SHARD_INVARIANT_ESTIMATORS,
+            shardable=not create_advantage_estimator(
+                algo_cfg.adv_estimator, loss_cfg
+            ).requires_global_batch,
             # Use the resolved logger config shared by controller and pool.
             train_data_dump_dir=(
                 master_config.logger.log_dir

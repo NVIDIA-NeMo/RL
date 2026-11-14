@@ -30,6 +30,7 @@ from pydantic import (
 )
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.advantage_estimator import create_advantage_estimator
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
@@ -1586,14 +1587,20 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 f"(got {algo_cfg.num_generations_per_prompt})."
             )
 
+    estimator = create_advantage_estimator(
+        algo_cfg.adv_estimator, master_config.loss_fn
+    )
     if (
-        algo_cfg.adv_estimator.name == "reinforce_plus_plus"
+        estimator.requires_global_batch
         and async_config.min_groups_for_streaming_train < algo_cfg.num_prompts_per_step
     ):
+        algo_prefix = "ppo" if is_ppo_run(master_config) else "grpo"
         raise ValueError(
-            "reinforce_plus_plus requires async_rl.min_groups_for_streaming_train "
-            "== grpo.num_prompts_per_step: its advantage normalization needs the "
-            "full batch. Use full-batch chunks or the grpo advantage estimator."
+            f"{algo_prefix}.adv_estimator={algo_cfg.adv_estimator} requires "
+            "async_rl.min_groups_for_streaming_train == "
+            f"{algo_prefix}.num_prompts_per_step: this estimator needs the global "
+            "batch. Use full-batch chunks or an estimator configuration without "
+            "global batch statistics."
         )
 
     if not is_ppo_run(master_config):
@@ -1672,12 +1679,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "the distributed optimizer: parameters and accumulated gradients "
                 "share storage even when overlap_param_gather=false. Disable "
                 "policy.megatron_cfg.fp8_cfg.fp8_param or use full-batch PPO."
-            )
-        if algo_cfg.adv_estimator.normalize_advantages:
-            raise ValueError(
-                "ppo.adv_estimator.normalize_advantages=true requires "
-                "async_rl.min_groups_for_streaming_train == ppo.num_prompts_per_step. "
-                "Set normalize_advantages=false to use streaming chunks."
             )
 
     # A forced ratio equals the true one only on the first optimizer step taken
@@ -2203,20 +2204,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         opd_module.assert_prev_logprobs_available(master_config)
         opd_module.assert_trust_region_supported(master_config)
         _validate_opd_full_config(master_config, opd_config)
-        if (
-            algo_cfg.adv_estimator.subtract_global_baseline
-            and async_config.min_groups_for_streaming_train
-            != algo_cfg.num_prompts_per_step
-        ):
-            # The advantage stage runs once per streaming chunk, so a smaller
-            # chunk would center each chunk on its own mean, not the step's.
-            raise ValueError(
-                "grpo.adv_estimator.subtract_global_baseline=true requires "
-                "async_rl.min_groups_for_streaming_train "
-                f"({async_config.min_groups_for_streaming_train}) == "
-                f"grpo.num_prompts_per_step ({algo_cfg.num_prompts_per_step}) "
-                "so the baseline covers the whole step."
-            )
 
     if (
         reference_policy_kl_penalty == 0

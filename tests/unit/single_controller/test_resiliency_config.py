@@ -26,6 +26,7 @@ from typing import get_args
 import pytest
 from pydantic import ValidationError
 
+from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.async_utils.staleness_sampler import SamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -141,6 +142,23 @@ def test_reinforce_plus_plus_requires_full_batch_statistics() -> None:
     cfg.async_rl.min_groups_for_streaming_train = 2
 
     with pytest.raises(ValueError, match="reinforce_plus_plus.*min_groups"):
+        validate_single_controller_config(cfg)
+
+    cfg.async_rl.min_groups_for_streaming_train = cfg.grpo.num_prompts_per_step
+    validate_single_controller_config(cfg)
+
+
+def test_streaming_uses_the_estimator_batch_requirement(monkeypatch) -> None:
+    """Changing an estimator's requirement must not need a new name check."""
+    monkeypatch.setattr(
+        GRPOAdvantageEstimator,
+        "requires_global_batch",
+        property(lambda self: True),
+        raising=False,
+    )
+    cfg = _master_config()
+    cfg.async_rl.min_groups_for_streaming_train = 2
+    with pytest.raises(ValueError, match="requires.*min_groups"):
         validate_single_controller_config(cfg)
 
     cfg.async_rl.min_groups_for_streaming_train = cfg.grpo.num_prompts_per_step
