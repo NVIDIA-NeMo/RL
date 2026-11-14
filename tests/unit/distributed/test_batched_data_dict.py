@@ -245,6 +245,7 @@ def test_shard_by_batch_size_dynamic():
             "sequence_lengths": torch.tensor(
                 (2, 8, 4, 16, 28, 32, 2, 32), dtype=torch.int
             ),
+            "row_ids": torch.arange(8),
         }
     )
     dynamic_batching_args: DynamicBatchingArgs = {
@@ -254,12 +255,17 @@ def test_shard_by_batch_size_dynamic():
         "max_tokens_per_microbatch": 32,
     }
 
-    shards, _ = batch.shard_by_batch_size(
+    shards, sorted_indices = batch.shard_by_batch_size(
         shards=2, dynamic_batching_args=dynamic_batching_args
     )
+    assert sorted_indices == [0, 2, 3, 5, 6, 1, 4, 7]
+    assert [shard["row_ids"].tolist() for shard in shards] == [
+        [0, 2, 3, 5],
+        [6, 1, 4, 7],
+    ]
     # Expected Output: 3 microbatches per shard, of sizes 2, 1, 1
     for shard in shards:
-        shard.micro_batch_indices == [[[0, 2], [2, 3], [3, 4]]]
+        assert shard.micro_batch_indices == [[[0, 2], [2, 3], [3, 4]]]
 
     # test creating dynamic micro_batch iterators
     for shard in shards:
