@@ -36,6 +36,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     SamplerConfig,
     required_buffer_capacity_for_config,
     sampler_requires_single_weight_batch,
+    sampler_uses_pooled_replacements,
 )
 from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
@@ -1226,11 +1227,10 @@ def _validate_failure_settings(
     ``on_dropped_prompt="replace"`` unable to ever produce a replacement. These are the
     combinations it cannot see, because each depends on a field outside that block.
 
-    All of them are warnings rather than errors, deliberately: a strict "never train a
-    short batch" run, one base YAML whose sampler is overridden per experiment, a
-    deliberately deep spare pool are all coherent things to have typed, so rejecting
-    them would forbid configurations somebody wants. What is not acceptable is finding
-    out hours into a run, or not at all.
+    Most checks warn rather than raise: strict full batches, per-experiment sampler
+    overrides, and deep spare pools can be intentional. A nonzero drop budget
+    requires a boolean class declaration of the sampler's single-weight requirement
+    and rejects policies that need a complete single-weight batch.
     """
     failure_config = async_config.rollout_failure
     drop_budget = (
@@ -1238,19 +1238,11 @@ def _validate_failure_settings(
         + failure_config.max_consecutive_dropped_prompts
     )
     floor = math.ceil(num_prompts_per_step * failure_config.min_step_batch_fraction)
-    # A lost group shrinks a step under every built-in sampler but windowed, whose
-    # rollout keeps producing and only comes up short at the end of the data. A "custom"
-    # sampler is in neither group -- a warning nobody can act on is noise.
+    # Only built-in step-charging policies get the floor warning below.
     sampler_name = async_config.sampler.name
     sampler_shrinks_steps = sampler_name in ("in_order", "ready_first", "weight_fifo")
 
-    # weight_fifo builds a step only from groups sharing one start_weight, so a lost
-    # group cannot be charged to a step: it is never substituted (a replacement would be
-    # dispatched later, usually under a newer weight, and land in another bucket) and
-    # shrinking the
-    # assembling step leaves the bucket it came from short. The step waits on a group
-    # nobody is generating and the run stalls with no error. A zero budget is exempt:
-    # no drop is tolerated then, so nothing reaches that path.
+    # Replacements may use newer weights, leaving the original weight bucket short.
     if drop_budget and sampler_requires_single_weight_batch(async_config.sampler):
         raise ValueError(
             f"async_rl.sampler.name={sampler_name!r} cannot honour the drop budget "
@@ -1285,21 +1277,13 @@ def _validate_failure_settings(
             stacklevel=2,
         )
 
-    if failure_config.on_dropped_prompt == "replace" and sampler_name in (
-        "windowed",
-        "weight_fifo",
+    if (
+        failure_config.on_dropped_prompt == "replace"
+        and not sampler_uses_pooled_replacements(async_config.sampler)
     ):
-        why = (
-            "its rollout never stops producing, so a dropped group is made up by later "
-            "ones"
-            if sampler_name == "windowed"
-            else "a replacement is dispatched later and, unless the trainer has not "
-            "moved since, lands in a newer weight version's bucket than the step it is "
-            "meant to fill"
-        )
         warnings.warn(
-            f"async_rl.rollout_failure.on_dropped_prompt='replace' does nothing with "
-            f"the {sampler_name} sampler: {why}, so no spare pool is filled. "
+            "async_rl.rollout_failure.on_dropped_prompt='replace' does nothing "
+            "with this sampler: it does not use a spare pool. "
             "replaced_prompt_groups will stay at 0 whether or not anything failed.",
             stacklevel=2,
         )

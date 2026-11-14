@@ -2892,7 +2892,7 @@ class TestPeriodicRolloutCheckpoint:
                 actor._rollout_snapshots._resolve_anchor = lose_after_anchor
             skipped = await actor._rollout_snapshots.save_snapshot(force=True)
             assert not skipped.saved
-            assert skipped.reason == "trainer_state_changed"
+            assert skipped.reason == "shortfall_reconciliation_pending"
             assert actor._dp_client.save_calls == []
             if when == "after_anchor":
                 actor._rollout_snapshots._resolve_anchor = resolve_anchor

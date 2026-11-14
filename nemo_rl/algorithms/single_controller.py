@@ -2083,11 +2083,7 @@ class SingleControllerActor:
                     sem.release()
 
             if replacements or filtered_replacements:
-                # Counted per slot, not per attempt: a step got its group back, which is
-                # the fact that explains why its batch is full despite a drop. Recorded
-                # against the step the spare actually committed to, which after a borrow
-                # is the lender rather than the step that was dropped from. An unstamped
-                # group counts toward the step being assembled.
+                # Count each recovered slot once, against its stamp or assembling step.
                 replaced_step = self._accounting_step(target_step)
                 self._batch_replacements[replaced_step] = (
                     self._batch_replacements.get(replaced_step, 0) + 1
@@ -2149,25 +2145,18 @@ class SingleControllerActor:
             await lock.acquire()
 
         async def wait_for_admission() -> None:
-            if not isinstance(self._sampler, TransactionalAdmissionSampler):
-                raise RuntimeError(
-                    "dynamic sampling requires TransactionalAdmissionSampler"
-                )
-            admission = asyncio.create_task(
-                self._sampler.wait_until_admissible(
+            # Setup rejects dynamic sampling unless the sampler is transactional.
+            sampler = cast(TransactionalAdmissionSampler, self._sampler)
+            admission = rollout_tasks.create_task(
+                sampler.wait_until_admissible(
                     trainer_version_fn=lambda: self._trainer_version
                 )
             )
-            try:
-                await asyncio.sleep(0)
-                while not admission.done():
-                    await maybe_refill()
-                    await asyncio.sleep(0.1)
-                await admission
-            finally:
-                if not admission.done():
-                    admission.cancel()
-                    await asyncio.gather(admission, return_exceptions=True)
+            await asyncio.sleep(0)
+            while not admission.done():
+                await maybe_refill()
+                await asyncio.sleep(0.1)
+            await admission
 
         async def _launch(
             prompt: DatumSpec,
@@ -2720,9 +2709,10 @@ class SingleControllerActor:
         step it was stamped for, the step being assembled, or none. Without this the
         pump waits on a group no one is generating.
 
-        A data-exhausted step returns its remaining target even below the floor,
-        allowing the train pump to drain its groups and abort accumulated gradients.
-        The final floor check then decides whether to train or skip that step.
+        Steps explicitly allowed to close short return their remaining target even
+        below the floor, letting the train pump drain their groups and abort
+        accumulated gradients. The final floor check decides whether to train or
+        skip. Data exhaustion alone does not grant this permission.
 
         How much smaller is bounded by ``min_step_batch_fraction``, and that bound has
         to live here because neither drop budget provides it. Both budgets are
@@ -2731,10 +2721,8 @@ class SingleControllerActor:
         succeed can shrink it without ever tripping them.
 
         Raises:
-            RuntimeError: A step without data exhaustion fell below
-                ``min_step_batch_fraction`` of
-                ``num_prompts_per_step``. Training a fraction of a batch is a silent
-                change to the gradient estimate, so it is refused rather than absorbed.
+            RuntimeError: A step not permitted to close below the floor fell below
+                ``min_step_batch_fraction`` of ``num_prompts_per_step``.
         """
         num_prompts_per_step = self._algo_cfg.num_prompts_per_step
         dropped = self._rollout_runtime.batch_shortfall.get(step, 0)
@@ -2941,15 +2929,13 @@ class SingleControllerActor:
                         cursor_before_selection = self._assembling_version
                         selection_credits: list[_ShortfallCredit] = []
                         assembly.selection_credits = selection_credits
-                        try:
-                            train_meta, num_groups = await self._sampler.select(
-                                current_train_weight=self._trainer_version,
-                                min_prompt_groups=min_prompt_groups,
-                                max_prompt_groups=max_prompt_groups,
-                                **selection_kwargs,
-                            )
-                        finally:
-                            assembly.selection_credits = None
+                        train_meta, num_groups = await self._sampler.select(
+                            current_train_weight=self._trainer_version,
+                            min_prompt_groups=min_prompt_groups,
+                            max_prompt_groups=max_prompt_groups,
+                            **selection_kwargs,
+                        )
+                        assembly.selection_credits = None
                         assembly.selected_groups = groups_dispatched + num_groups
                         # Credits remain checkpoint-visible while the claim waits.
                         self._reconcile_selection_credits(
@@ -3000,11 +2986,7 @@ class SingleControllerActor:
                                     )
                                     return
                                 if self._sampler_closes_short_at_exhaustion():
-                                    # Such a sampler takes any ready group, so a lost
-                                    # group was never charged to a step. With the data
-                                    # gone, the rest of this step is missing for good.
-                                    # The loop condition re-reads the target and applies
-                                    # min_step_batch_fraction.
+                                    # At EOF, later groups cannot fill these slots.
                                     missing = target_groups - groups_dispatched
                                     if self._dynamic_sampling_enabled:
                                         self._rollout_runtime.steps_allowed_short.add(
@@ -3405,9 +3387,7 @@ class SingleControllerActor:
                             await asyncio.to_thread(self._value.prepare_for_inference)
                         value_inference_prepared = True
 
-                # Selection is over, so a group lost from here on counts toward the next
-                # step. Nothing awaits between the loop's last target read and here, so
-                # no loss can be charged to this step after it stopped reading.
+                # No await separates the final target check from this advance.
                 self._assembling_version = max(
                     self._assembling_version, version_during_step + 1
                 )
