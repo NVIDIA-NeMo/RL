@@ -142,6 +142,7 @@ def main() -> None:
             master_config,
             teacher_worker_groups,
             alias_to_group_alias,
+            _validation_engine_pool,
         ) = setup(
             config,
             tokenizer,

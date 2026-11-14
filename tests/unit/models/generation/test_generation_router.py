@@ -27,6 +27,7 @@ misbehave over an actual socket.
 import asyncio
 from concurrent.futures import Future
 from typing import Any
+import json
 
 import pytest
 from aiohttp import ClientConnectionResetError, ClientSession, web
@@ -155,6 +156,25 @@ class TestEndpointSurface:
                 payload = b'{"model":"x","messages":[{"role":"user"}]}'
                 await harness.call("/v1/chat/completions", body=payload)
                 assert backend.requests[0][2] == payload
+
+        asyncio.run(_main())
+
+    def test_request_priority_is_set_on_generation_calls_only(self):
+        backend = _Backend("b0")
+
+        async def _main():
+            async with _Harness([backend], request_priority=-1) as harness:
+                await harness.call(
+                    "/v1/chat/completions", body=b'{"model":"x","priority":5}'
+                )
+                await harness.call("/tokenize", body=b'{"model":"x"}')
+                await harness.call("/v1/responses", body=b"not json")
+                assert json.loads(backend.requests[0][2]) == {
+                    "model": "x",
+                    "priority": -1,
+                }
+                assert backend.requests[1][2] == b'{"model":"x"}'
+                assert backend.requests[2][2] == b"not json"
 
         asyncio.run(_main())
 
