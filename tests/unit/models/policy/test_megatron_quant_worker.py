@@ -470,7 +470,13 @@ def test_iter_real_quant_refit_params_rejects_calibrated_format_mismatch() -> No
     worker = _make_real_quant_worker()
     worker.megatron_bridge.quant_algo = "NVFP4"
 
-    with pytest.raises(ValueError, match="Calibrated ModelOpt export must use"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Calibrated ModelOpt export must use W4A16_NVFP4 to match rollout "
+            "mode 'w4a16', but calibration produced NVFP4"
+        ),
+    ):
         list(worker._iter_real_quant_refit_params())
 
     assert not worker.megatron_bridge.calls

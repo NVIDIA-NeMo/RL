@@ -516,6 +516,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         from nemo_rl.modelopt.utils import (
             DEFAULT_NVFP4_IGNORE,
             matches_quant_ignore_pattern,
+            nvfp4_quant_algo,
         )
 
         generation_cfg = self.cfg["generation"]
@@ -526,10 +527,12 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         mode = self._get_real_quant_mode()
         export_cpu_offload = generation_cfg["real_quant_export_cpu_offload"]
         plan = self._get_modelopt_export_plan()
-        expected_algo = "NVFP4" if mode == "w4a4" else "W4A16_NVFP4"
-        if plan.quantization_config["quant_algo"] != expected_algo:
+        expected_algo = nvfp4_quant_algo(mode)
+        actual_algo = plan.quantization_config["quant_algo"]
+        if actual_algo != expected_algo:
             raise ValueError(
-                f"Calibrated ModelOpt export must use {expected_algo} to match rollout."
+                f"Calibrated ModelOpt export must use {expected_algo} to match "
+                f"rollout mode {mode!r}, but calibration produced {actual_algo}."
             )
         ignored_weights: list[str] = []
         for task in plan.conversion_tasks:
