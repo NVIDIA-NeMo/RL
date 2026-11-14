@@ -26,7 +26,7 @@ import math
 import re
 from dataclasses import dataclass, field, fields, replace
 from pathlib import PurePosixPath
-from typing import Any, Mapping
+from typing import Any, Collection, Mapping
 
 from omegaconf import OmegaConf
 
@@ -38,7 +38,7 @@ from omegaconf import OmegaConf
 # Dict-shaped NeMo RL integration settings that are not Gym server entries.
 # The actor factory or rollout code consumes these separately.
 NEMO_RL_DICT_CONFIG_KEYS = frozenset(
-    {"effort_levels", "external_service_readiness", "tokenizer_config"}
+    {"effort_levels", "external_service_readiness", "multi_harness", "tokenizer_config"}
 )
 
 # Gym settings that contain mappings but are not server-instance overlays.
@@ -503,6 +503,7 @@ def build_route_shard_map(
     allowed_duplicate_entries: frozenset[str] | set[str] = frozenset(),
     *,
     environment_server_routes: Mapping[str, str] | None = None,
+    multi_harness_servers: Collection[str] = (),
 ) -> dict[str, str]:
     """Map each routable entry to its shard, rejecting ambiguous routes.
 
@@ -511,8 +512,9 @@ def build_route_shard_map(
     rows route either by ``agent_ref.name`` or by ``task_source``. The
     latter names the agent or resources-server entry that declared the dataset,
     so both entry types must be included. Materialized task rows resolve to an
-    Environment Server entry selected by ``environment_server_routes`` instead.
-    Environment-only entries not selected by those routes are local to Gym and
+    Environment Server entry selected by ``environment_server_routes``, or by
+    the multi-harness routes for the servers in ``multi_harness_servers``.
+    Environment-only entries selected by neither are local to Gym and
     excluded from both routing and cross-shard duplicate checks.
 
     Two failures are caught here rather than at first dispatch. A routable
@@ -525,6 +527,7 @@ def build_route_shard_map(
     Only names are compared. What an entry means is Gym's business.
     """
     routed_environment_servers = set((environment_server_routes or {}).values())
+    routed_environment_servers.update(multi_harness_servers)
     entries_by_shard = {
         shard_name: {
             entry: types

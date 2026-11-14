@@ -360,8 +360,9 @@ class CaptureRewardSettings:
 class RewardLogContext:
     """Attribution and optional full-result table data, without raw reward.
 
-    ``agent_name`` retains its checkpoint field name and holds the taskset for
-    materialized tasks or the resolved agent name for flat rows.
+    ``agent_name`` retains its checkpoint field name and holds the metric
+    namespace: the taskset for materialized tasks (``<taskset>/<agent>`` in a
+    multi-harness taskset) or the resolved agent name for flat rows.
     """
 
     agent_name: str

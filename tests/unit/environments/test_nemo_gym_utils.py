@@ -43,6 +43,11 @@ from nemo_rl.environments.nemo_gym import (
     setup_nemo_gym_config,
     spinup_nemo_gym_actor,
 )
+from nemo_rl.environments.nemo_gym_multi_harness import (
+    describe_environment_server,
+    parse_multi_harness,
+    resolve_multi_harness,
+)
 
 
 @pytest.mark.parametrize("backend", ["vllm", "megatron", "trtllm"])
@@ -992,6 +997,7 @@ class _FakeGymCluster:
         *,
         entries_by_index=None,
         environment_routes_by_index=None,
+        gym_configs_by_index=None,
         spinup_failures=None,
         spinup_timeouts=None,
         wedged_spinups=None,
@@ -1001,6 +1007,9 @@ class _FakeGymCluster:
     ):
         self.entries_by_index = entries_by_index or {}
         self.environment_routes_by_index = environment_routes_by_index or {}
+        # Each actor's resolved Gym config, which it describes its servers from.
+        self.gym_configs_by_index = gym_configs_by_index or {}
+        self.installed_routes = {}
         self.spinup_failures = spinup_failures or {}
         self.spinup_timeouts = set(spinup_timeouts or ())
         self.wedged_spinups = set(wedged_spinups or ())
@@ -1050,6 +1059,12 @@ class _FakeGymCluster:
                     "environment_routes",
                     index,
                 )
+                actor.describe_environment_servers.remote.side_effect = (
+                    lambda names, index=index: ("describe", index, tuple(names))
+                )
+                actor.set_multi_harness_routes.remote.side_effect = (
+                    lambda routes, index=index: ("install", index, routes)
+                )
                 self.actors.append(actor)
                 self.actor_options.append(option_kwargs)
                 self.actor_configs.append(config)
@@ -1068,6 +1083,17 @@ class _FakeGymCluster:
         if reference == "pg-ready":
             if self.pg_ready_error is not None:
                 raise self.pg_ready_error
+            return None
+        if reference[0] == "describe":
+            _, index, names = reference
+            config = self.gym_configs_by_index.get(index, {})
+            descriptions = {
+                name: describe_environment_server(name, config) for name in names
+            }
+            return {name: info for name, info in descriptions.items() if info}
+        if reference[0] == "install":
+            _, index, routes = reference
+            self.installed_routes[index] = routes
             return None
         kind, index = reference
         if kind == "spinup":
@@ -2292,3 +2318,289 @@ def test_shard_set_shutdown_releases_the_placement_group_once():
     assert kill.call_count == 4
     # Releasing a group twice raises; the second shutdown must not try.
     remove.assert_called_once_with(pg)
+
+
+_MULTI_HARNESS = {
+    "routes": {"swe": ["swe_opencode", "swe_pi"]},
+    "weights": {"opencode_agent": 2, "pi_agent": 1},
+}
+_SWE_AGENTS = {"swe_opencode": ("oc", "opencode_agent"), "swe_pi": ("pi", "pi_agent")}
+
+
+def _swe_gym_config(*servers, pi_resources="swe_rebench"):
+    """A resolved Gym config holding the named swe servers and their agents."""
+    config = {}
+    for server in servers:
+        agent_name, agent_type = _SWE_AGENTS[server]
+        resources = pi_resources if server == "swe_pi" else "swe_rebench"
+        config[server] = {
+            "environment_servers": {
+                "single_agent_turn": {
+                    "entrypoint": "app.py",
+                    "agent_server": {
+                        "type": "responses_api_agents",
+                        "name": agent_name,
+                    },
+                    "resources_server": {
+                        "type": "resources_servers",
+                        "name": resources,
+                    },
+                }
+            }
+        }
+        config[agent_name] = {
+            "responses_api_agents": {agent_type: {"entrypoint": "app.py"}}
+        }
+    return config
+
+
+def _resolved_routes(multi_harness=_MULTI_HARNESS):
+    gym_config = _swe_gym_config("swe_opencode", "swe_pi")
+    return resolve_multi_harness(
+        parse_multi_harness(multi_harness),
+        {name: describe_environment_server(name, gym_config) for name in _SWE_AGENTS},
+    )
+
+
+def _mixed_rows(group_id, generations=4):
+    return [
+        {
+            "task_id": {"taskset": "swe", "task_id": "1"},
+            "task_input": {},
+            "_ng_group_id": group_id,
+            "_ng_rollout_index": index,
+        }
+        for index in range(generations)
+    ]
+
+
+def _build(config):
+    return nemo_gym_mod.build_nemo_gym_actors(
+        config,
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        tokenizer=_TOKENIZER,
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=False,
+    )
+
+
+def test_build_nemo_gym_config_keeps_multi_harness_out_of_gyms_config(
+    detected_uv_dirs,
+):
+    cfg = build_nemo_gym_config(
+        _env_configs(multi_harness=_MULTI_HARNESS),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=False,
+    )
+
+    # Gym would read an unknown mapping as a server instance config.
+    assert "multi_harness" not in cfg["initial_global_config_dict"]
+
+
+def test_route_name_gives_every_generation_of_a_group_one_server():
+    routes = _resolved_routes()
+    gym_routes = {"math": "math_environment"}
+
+    chosen = set()
+    for i in range(50):
+        servers = {
+            nemo_gym_mod.get_nemo_gym_route_name(row, gym_routes, routes)
+            for row in _mixed_rows(f"group-{i}")
+        }
+        assert len(servers) == 1
+        chosen |= servers
+    assert chosen == {"swe_opencode", "swe_pi"}
+    math_row = {"task_id": {"taskset": "math", "task_id": "1"}, "task_input": {}}
+    assert (
+        nemo_gym_mod.get_nemo_gym_route_name(math_row, gym_routes, routes)
+        == "math_environment"
+    )
+    with pytest.raises(ValueError, match="prompt-group ID"):
+        nemo_gym_mod.get_nemo_gym_route_name(
+            {"task_id": {"taskset": "swe", "task_id": "1"}, "task_input": {}},
+            gym_routes,
+            routes,
+        )
+
+
+def test_pick_handle_for_group_sends_a_group_to_its_servers_shard():
+    routes = _resolved_routes()
+    shard_set = _sharded_set({"swe_opencode": "left", "swe_pi": "right"})
+    shard_set.multi_harness = routes
+
+    picked_shards = set()
+    for i in range(20):
+        group_id = f"group-{i}"
+        server = routes.select("swe", group_id).environment_server
+        expected = shard_set.route_to_shard[server]
+        assert (
+            shard_set.pick_handle_for_group(_mixed_rows(group_id))
+            is (shard_set.handles[expected][0])
+        )
+        picked_shards.add(expected)
+    assert picked_shards == {"left", "right"}
+
+
+def test_coverage_requires_every_server_a_group_can_use():
+    rows = [{"extra_env_info": json.dumps(_mixed_rows("group-0", 1)[0])}]
+    shard_set = _sharded_set({"swe_opencode": "left"})
+    shard_set.multi_harness = _resolved_routes()
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="swe_pi"):
+        nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": rows})
+
+    # Groups never go to a weight-0 agent's server.
+    shard_set.multi_harness = _resolved_routes(
+        {**_MULTI_HARNESS, "weights": {"opencode_agent": 1, "pi_agent": 0}}
+    )
+    nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": rows})
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+def test_actor_factory_installs_multi_harness_routes_on_every_actor(
+    detected_uv_dirs, sharded
+):
+    if sharded:
+        # Shard "judged" is actor 0; shard "tools" has replicas, actors 1 and 2.
+        entries = {
+            0: {"swe_opencode": ["environment_servers"]},
+            1: {"swe_pi": ["environment_servers"]},
+        }
+        gym_configs = {
+            0: _swe_gym_config("swe_opencode"),
+            1: _swe_gym_config("swe_pi"),
+        }
+        config = _shard_env_configs(multi_harness=_MULTI_HARNESS)
+    else:
+        entries = {
+            0: {
+                "swe_opencode": ["environment_servers"],
+                "swe_pi": ["environment_servers"],
+            }
+        }
+        gym_configs = {0: _swe_gym_config("swe_opencode", "swe_pi")}
+        config = _env_configs(multi_harness=_MULTI_HARNESS)
+    cluster = _FakeGymCluster(
+        entries_by_index=entries, gym_configs_by_index=gym_configs
+    )
+    with _patched_cluster(cluster):
+        shard_set = _build(config)
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            shard_set,
+            {"train": [{"extra_env_info": json.dumps(_mixed_rows("group-0", 1)[0])}]},
+        )
+
+    expected = _resolved_routes()
+    assert shard_set.multi_harness == expected
+    assert cluster.installed_routes == dict.fromkeys(
+        range(len(cluster.actors)), expected
+    )
+    assert all(
+        "multi_harness" not in actor_config["initial_global_config_dict"]
+        for actor_config in cluster.actor_configs
+    )
+    if sharded:
+        assert shard_set.route_to_shard == {"swe_opencode": "judged", "swe_pi": "tools"}
+
+
+@pytest.mark.parametrize(
+    ("entries", "gym_config", "gym_routes", "weights", "error", "message"),
+    [
+        (
+            ["swe_opencode", "swe_pi"],
+            _swe_gym_config("swe_opencode", "swe_pi"),
+            {"swe": "swe_opencode"},
+            None,
+            nemo_gym_mod.ShardConfigError,
+            "in both environment_server_routes",
+        ),
+        (
+            ["swe_opencode"],
+            _swe_gym_config("swe_opencode"),
+            {},
+            None,
+            nemo_gym_mod.ShardSetupError,
+            r"not Environment Servers any Gym actor runs: \['swe_pi'\]",
+        ),
+        (
+            ["swe_opencode"],
+            _swe_gym_config("swe_opencode"),
+            {},
+            {"opencode_agent": 1, "pi_agent": 0},
+            nemo_gym_mod.ShardSetupError,
+            r"not Environment Servers any Gym actor runs: \['swe_pi'\]",
+        ),
+        (
+            ["swe_opencode", "swe_pi"],
+            _swe_gym_config("swe_opencode", "swe_pi", pi_resources="scale_swe"),
+            {},
+            None,
+            ValueError,
+            "different resources servers",
+        ),
+    ],
+    ids=["in-both", "not-running", "weight-0-not-running", "different-verifiers"],
+)
+def test_actor_factory_cleans_up_after_refusing_multi_harness(
+    detected_uv_dirs, entries, gym_config, gym_routes, weights, error, message
+):
+    multi_harness = {**_MULTI_HARNESS, **({"weights": weights} if weights else {})}
+    cluster = _FakeGymCluster(
+        entries_by_index={0: dict.fromkeys(entries, ["environment_servers"])},
+        environment_routes_by_index={0: gym_routes},
+        gym_configs_by_index={0: gym_config},
+    )
+    with _patched_cluster(cluster):
+        with pytest.raises(error, match=message):
+            _build(_env_configs(multi_harness=multi_harness))
+
+    cluster.ray.kill.assert_called_once_with(cluster.actors[0])
+
+
+def test_sharded_factory_rejects_a_shard_override_of_multi_harness(detected_uv_dirs):
+    config = _shard_env_configs(
+        multi_harness=_MULTI_HARNESS,
+        shards=[
+            {"name": "judged", "config_paths": ["judge.yaml"]},
+            {
+                "name": "tools",
+                "config_paths": ["tools.yaml"],
+                "overrides": {
+                    "multi_harness": {"weights": {"opencode_agent": 1, "pi_agent": 3}}
+                },
+            },
+        ],
+    )
+    cluster = _FakeGymCluster()
+    with _patched_cluster(cluster):
+        with pytest.raises(nemo_gym_mod.ShardConfigError, match="'tools' overrides"):
+            _build(config)
+
+    assert cluster.actors == []
+
+
+def test_actor_describes_its_servers_and_labels_rows_once_routes_are_installed():
+    routes = _resolved_routes()
+    actor = _spun_up_actor()
+    row = _mixed_rows("group-7", 1)[0]
+
+    with _stub_gym_resolved_config(
+        DictConfig(_swe_gym_config("swe_opencode", "swe_pi"))
+    ):
+        descriptions = actor.describe_environment_servers(
+            ["swe_opencode", "swe_pi", "oc", "missing"]
+        )
+
+    assert set(descriptions) == {"swe_opencode", "swe_pi"}
+    assert descriptions["swe_pi"].agent == "pi_agent"
+    assert actor._selected_harness(row) is None
+    actor.set_multi_harness_routes(routes)
+    assert actor._selected_harness(row) == routes.select("swe", "group-7").harness
+    math_row = {"task_id": {"taskset": "math", "task_id": "1"}, "task_input": {}}
+    assert actor._selected_harness(math_row) is None
+    assert actor._selected_harness({"agent_ref": {"name": "agent"}}) is None

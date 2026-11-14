@@ -30,7 +30,7 @@ import tempfile
 import uuid
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -48,9 +48,11 @@ from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.environments.nemo_gym_multi_harness import MultiHarnessRoutes
 from nemo_rl.experience.failures import (
     GenerationUnavailable,
     GymTerminalEpisodeFailure,
+    RestoredHarnessChanged,
 )
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -60,6 +62,7 @@ from nemo_rl.experience.interfaces import (
     Completion,
     PromptGroupRecord,
 )
+from nemo_rl.experience.reward_penalties import RewardLogContext
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     AsyncRolloutImpl,
@@ -70,8 +73,10 @@ from nemo_rl.experience.rollout_manager import (
     _nemo_gym_metric_namespace,
 )
 from nemo_rl.experience.rollout_recovery import (
+    PromptGroupPhase,
     RecoveryGranularity,
     RecoveryTargetLevel,
+    RolloutAttemptStatus,
     RolloutRecoveryLedger,
 )
 from nemo_rl.experience.rollouts import (
@@ -1277,6 +1282,181 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
     assert (context.full_result_json is not None) is log_full_result_tables
     if log_full_result_tables:
         assert "reward" not in json.loads(context.full_result_json)
+
+
+def test_streamed_receipt_names_a_mixed_taskset_reward_by_harness():
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, pending, timer_prefix, per_prompt=False):
+            del pending, timer_prefix, per_prompt
+
+            async def result_ref():
+                result = _mask_gate_receipt_result()
+                result["full_result"]["_ng_harness"] = "pi_agent"
+                return (0, None, {**result, "attribution_key": "swe"}, None)
+
+            async def stream():
+                yield result_ref()
+
+            return stream()
+
+    impl = _nemo_gym_impl(False)
+    env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    streamed = []
+    pending_row = {"_rowidx": 0, "task_id": {"taskset": "swe"}, "task_input": {}}
+
+    async def on_completion(generation_index, completion):
+        streamed.append(completion)
+
+    _run(
+        impl._stream_rows(
+            env,
+            [pending_row],
+            [None],
+            [None],
+            1,
+            "timing/test",
+            on_completion=on_completion,
+        )
+    )
+
+    (completion,) = streamed
+    # The finalizer names reward metrics after this context, per harness;
+    # attribution stays the taskset.
+    assert completion.env_extras["ng_reward_log_context"].agent_name == ("swe/pi_agent")
+    assert completion.env_extras["attribution_key"] == "swe"
+
+
+_SWE_ROUTES = MultiHarnessRoutes(
+    candidates=(
+        (
+            "swe",
+            (
+                ("opencode_agent", "swe_opencode", 1.0),
+                ("pi_agent", "swe_pi", 1.0),
+            ),
+        ),
+    )
+)
+
+
+def _swe_impl(routes):
+    impl = _nemo_gym_impl(True)
+    impl._task_to_env = {
+        "nemo_gym": NemoGymShardSet(handles={"only": [Mock()]}, multi_harness=routes)
+    }
+    return impl
+
+
+def _swe_sample():
+    return {
+        "extra_env_info": {
+            "task_id": {"taskset": "swe", "task_id": "1"},
+            "task_input": {},
+        }
+    }
+
+
+def _restored_group(*recorded):
+    """Group g-17: finished rows that recorded these names, then one unfinished row."""
+    finished = [
+        SimpleNamespace(
+            current_attempt=SimpleNamespace(
+                status=RolloutAttemptStatus.SEALED,
+                reward_log_context=None
+                if name is None
+                else RewardLogContext(name, None),
+            )
+        )
+        for name in recorded
+    ]
+    unfinished = SimpleNamespace(
+        current_attempt=SimpleNamespace(
+            status=RolloutAttemptStatus.DISPATCHED, reward_log_context=None
+        )
+    )
+    return SimpleNamespace(group_id="g-17", siblings=[*finished, unfinished])
+
+
+def _check_restored_group(routes, *recorded):
+    """Run the resume check on group g-17 whose finished rows recorded these names."""
+    RolloutManager._require_unchanged_harness(
+        SimpleNamespace(_impl=_swe_impl(routes)),
+        _swe_sample(),
+        _restored_group(*recorded),
+    )
+
+
+def test_restored_group_continues_on_the_harness_its_rows_recorded():
+    harness = _SWE_ROUTES.select("swe", "g-17").harness
+    _check_restored_group(_SWE_ROUTES, f"swe/{harness}", f"swe/{harness}")
+    # Single-harness tasksets, including ledgers that recorded no context.
+    _check_restored_group(None, "swe", None)
+
+
+def test_restored_group_that_would_change_harness_stops_the_run():
+    harness = _SWE_ROUTES.select("swe", "g-17").harness
+    other = "pi_agent" if harness == "opencode_agent" else "opencode_agent"
+    for routes, recorded in (
+        (_SWE_ROUTES, f"swe/{other}"),  # edited weights or routes
+        (_SWE_ROUTES, "swe"),  # taskset moved into multi_harness
+        (None, f"swe/{harness}"),  # taskset moved out of multi_harness
+        (_SWE_ROUTES, None),  # nothing recorded to verify against
+    ):
+        with pytest.raises(RestoredHarnessChanged, match="'g-17'"):
+            _check_restored_group(routes, recorded)
+
+
+def test_harness_change_stops_a_restored_group_before_any_state_changes():
+    harness = _SWE_ROUTES.select("swe", "g-17").harness
+    other = "pi_agent" if harness == "opencode_agent" else "opencode_agent"
+    manager = object.__new__(RolloutManager)
+    manager._impl = _swe_impl(_SWE_ROUTES)
+    manager._recovery_ledger = Mock()
+    manager._recovery_ledger.get_group.return_value = _restored_group(f"swe/{other}")
+    manager._recovery_mutation = Mock()
+    manager._tq_buffer = Mock()
+
+    with pytest.raises(RestoredHarnessChanged, match="'g-17'"):
+        _run(
+            manager._generate_for_finalization_attempt(
+                _swe_sample(), recovery_group_id="g-17", inflight_registry=None
+            )
+        )
+    # Raised before the ledger is rewritten or buffer slots are reserved.
+    manager._recovery_mutation.assert_not_called()
+    manager._tq_buffer.reserve.assert_not_called()
+
+
+def test_harness_change_on_resume_is_not_retried():
+    manager = SimpleNamespace(
+        _tq_buffer=object(),
+        _forest_training=False,
+        _num_generations_per_prompt=2,
+        _recovery_ledger=SimpleNamespace(
+            get_group=lambda _: SimpleNamespace(
+                phase=PromptGroupPhase.ADMITTED, expected_generations=2
+            )
+        ),
+        _retry_policy=RolloutRetryPolicy(
+            max_infra_attempts=3, max_data_attempts=3, max_gym_row_attempts=1
+        ),
+        _generate_for_finalization_attempt=AsyncMock(
+            side_effect=RestoredHarnessChanged("moved")
+        ),
+    )
+
+    with pytest.raises(RestoredHarnessChanged):
+        _run(
+            RolloutManager.generate_for_finalization(
+                manager, {"idx": 0}, lineage_group_id="g-17"
+            )
+        )
+
+    assert manager._generate_for_finalization_attempt.await_count == 1
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
