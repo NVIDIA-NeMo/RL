@@ -459,7 +459,7 @@ find "${UV_CACHE_DIR}" -type d \
 # Hand the cache and the venvs built from it to the runtime UID in the layer that creates
 # them. The venvs are hardlinked against the cache, so each inode changes owner once and
 # nothing is copied. A later layer could not do this without copying every file up, so this
-# stays unconditional even when STRIP_UV_CACHE is set -- the cache still exists at this
+# still runs under STRIP_UV_CACHE (only ROOT_ONLY skips it) -- the cache still exists at this
 # point (the trap above deletes it only on EXIT, after this chown has already run), and
 # skipping it here would force the final ownership sweep to copy up the whole venv instead.
 if [[ -z "${ROOT_ONLY:-}" ]]; then
@@ -678,7 +678,7 @@ find "${UV_CACHE_DIR}" -type d \
 
 # Hand this layer's new cache and venv entries to the runtime UID. Entries from the
 # dependency layer already belong to it, so only files created here change owner and none
-# is copied up. Stays unconditional even when STRIP_UV_CACHE is set -- see the dependency
+# is copied up. Runs under STRIP_UV_CACHE too (only ROOT_ONLY skips it) -- see the dependency
 # layer's chown above for why.
 if [[ -z "${ROOT_ONLY:-}" ]]; then
     find "${UV_CACHE_DIR}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
@@ -800,8 +800,8 @@ export TRTLLM_REQUIRE_CACHED_WHEEL=1
 UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py \
     $(awk -F'\t' '{ print ($4 == "" ? $1 : $4) }' /opt/actor_venvs.tsv)
 # The editable installs, wrapper metadata, and build-backend wheels added above are new in
-# this layer; hand only those to the runtime UID so it can re-sync the venvs offline. Stays
-# unconditional even when STRIP_UV_CACHE is set -- see the dependency layer's chown above
+# this layer; hand only those to the runtime UID so it can re-sync the venvs offline. Runs
+# under STRIP_UV_CACHE too (only ROOT_ONLY skips it) -- see the dependency layer's chown above
 # for why.
 if [[ -z "${ROOT_ONLY:-}" ]]; then
     find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
