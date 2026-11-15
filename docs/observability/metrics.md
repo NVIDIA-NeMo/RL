@@ -1,6 +1,6 @@
 # Metrics
 
-NeMo-RL emits seven namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), per-host memory (`rl.host.memory.*`), and rollout checkpoint metrics (`rl.checkpoint.*`).
+NeMo-RL emits eight namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), per-host memory (`rl.host.memory.*`), rollout checkpoint metrics (`rl.checkpoint.*`), and the opt-in per-rank device memory split (`rl.memory.device.bytes`).
 
 Metrics are emitted **only when telemetry is exporting**. Most pass through the metrics logger of the process that logs them, via its process-local telemetry handle: the driver in the v1 loops, and the Single-Controller actor in v2, which owns the Logger there and so emits the training scalars, `rl.setup.duration` and `rl.checkpoint.*`. `rl.host.memory.*` is scraped from every node by a driver-side monitor on its own timer. Resource attributes identify the producing process.
 
@@ -204,6 +204,39 @@ One known gap follows from the same property. `RewardModelEnvironment` is a Ray 
 - No worker group owns the raylet, the Ray **object store** (often tens of GB, and frequently the thing that actually ran a node out of memory) or — on the head node — the driver, yet all of them are in the number.
 
 Group on it to decide *which* hosts to look at; read `host.name` for the number itself. There is no breakdown inside `ray_node_mem_used`: getting one means per-process sampling (`psutil` RSS from inside each worker, where `rl.worker_group` and `nv.dl.rank` are already on the resource and nothing has to be inferred), and attributing a single process's RSS to tensors versus pinned buffers versus allocator arenas is a profiler's job, not a metric's.
+
+## Device memory (`rl.memory.device.bytes`)
+
+**Opt-in**, via `telemetry.device_memory_enabled` or `NEMO_RL_OTEL_DEVICE_MEMORY`. Off by default, and alone among the `rl.*` series in costing anything that scales with the model rather than with the run.
+
+Where `rl.host.memory.*` answers "how much memory is in use on this box", this answers "what is using the GPU memory on this rank". `torch.cuda.memory_allocated()` is a single number and the caching allocator has no idea what any block is for, so the split cannot be read out — `nemo_rl/telemetry/device_memory.py` attributes it instead, walking the parameters and the optimizer's state once per step and asking each tensor's storage how large it is.
+
+One series, labelled by `rl.memory.category`:
+
+| Category | What it covers |
+|---|---|
+| `parameters` | weights, in whatever dtype they are stored in — MXFP8 storage makes this smaller than a parameter count implies |
+| `gradients` | `.grad`, and mcore DDP's `main_grad` bucket, which is where a Megatron run actually keeps them |
+| `optimizer_state` | moments, and the fp32 main copy a mixed-precision optimizer keeps beside the model's |
+| `other` | the residual: `allocated` minus everything walked |
+
+The four **sum to `torch.cuda.memory_allocated()`** by construction, which is the property that makes them readable as a stacked chart. Bytes are counted per *storage* and deduplicated, so a gradient bucket sliced into one view per parameter is billed once, and a storage reachable from two categories is charged to the first that reaches it (parameters, then gradients, then optimizer state).
+
+Per rank falls out of the resource attributes: lens neither filters nor samples on rank, so every worker exports its own points tagged with `nv.dl.rank`. Filter to one rank to read a model's shape; sum across ranks to read the cluster's consumption.
+
+### How far to trust the numbers
+
+- `other` is arithmetic, not measurement. Activations dominate it during backward and are most of why it moves, but every allocation the walk does not reach lands there too.
+- It partitions *allocated*, not what the process holds. The allocator's free blocks (`reserved - allocated`, where fragmentation lives) are outside all four, as is anything allocated outside the caching allocator — NCCL's buffers among it.
+- Under a distributed optimizer the state is sharded, so a rank's point is its shard; under CP and DP the weights are *replicated*, so summing across ranks counts them once per replica. Both are the true physical footprint and neither is the model's logical size.
+- Above a virtual-pipeline size of 1 only the first model chunk is reachable (NeMo-RL keeps `model[0]`), so parameters and gradients are undercounted and the rest shows up in `other`. Logged once per process when it applies.
+- `optimizer_cpu_offload` reports near-zero optimizer state, correctly: host-paged state is not device memory.
+
+### Cost
+
+A rank visits roughly five or six tensors per parameter tensor it owns, at a few hundred nanoseconds each, on the worker's own thread inline in the step — order a millisecond for a rank holding 500 parameter tensors, against a step measured in seconds. The walk touches only tensor metadata, never data; it allocates nothing on the device, performs no collective, and does not synchronize, so it cannot perturb stream timing or desynchronize ranks. Host memory is transient: one integer per distinct storage, freed when the call returns.
+
+The gate is checked before the walk, so a run that leaves it off pays one environment lookup per step. Everything after the gate is wrapped so that a model or optimizer shaped unexpectedly, or a dead exporter, costs one warning rather than a failed training step.
 
 ## Metric vs span tag vs resource attribute
 

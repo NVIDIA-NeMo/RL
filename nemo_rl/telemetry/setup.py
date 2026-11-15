@@ -116,6 +116,8 @@ _ENV_FIELD_MAP = {
     "exporter": f"{_OTEL_PREFIX}_EXPORTER",
     # RL-owned flag consumed by the vLLM generation worker (not a lens field).
     "vllm_native_tracing": f"{_OTEL_PREFIX}_VLLM_NATIVE_TRACING",
+    # RL-owned flag consumed by the policy workers (not a lens field).
+    "device_memory_enabled": f"{_OTEL_PREFIX}_DEVICE_MEMORY",
 }
 
 # Standard-OTel env var that also propagates to workers via the Ray runtime_env.
@@ -148,6 +150,19 @@ def vllm_native_tracing_requested() -> bool:
     the one field.
     """
     return _is_env_truthy(f"{_OTEL_PREFIX}_VLLM_NATIVE_TRACING")
+
+
+def device_memory_requested() -> bool:
+    """Whether ``telemetry.device_memory_enabled`` reached this process as truthy.
+
+    Read on every step from the policy worker, so it is a plain env lookup
+    rather than anything cached: the cost of asking is far below the cost of
+    the walk it gates.
+
+    Callers must also honour :func:`telemetry_enabled_in_env`; this reports only
+    the one field.
+    """
+    return _is_env_truthy(f"{_OTEL_PREFIX}_DEVICE_MEMORY")
 
 
 def _config_to_env(tel: Any) -> None:

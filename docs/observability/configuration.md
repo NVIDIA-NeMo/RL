@@ -18,6 +18,7 @@ telemetry:
   logs_enabled: false         # bridge Python logging to OTel logs (trace-correlated)
   exporter: otlp              # otlp | console
   vllm_native_tracing: false  # opt in to vLLM's own OTLP tracing (gRPC by default, one span per request — see vllm-tracing.md)
+  device_memory_enabled: false # opt in to the per-rank memory split (walks the model each step — see metrics.md)
 ```
 
 The defaults above are the field defaults of `TelemetryConfig` (`nemo_rl/telemetry/config.py`). The endpoint, headers, and protocol are **not** in this block — they come from the standard `OTEL_EXPORTER_OTLP_*` env vars (see below).
