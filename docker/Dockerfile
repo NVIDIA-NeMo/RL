@@ -335,8 +335,8 @@ RUN --mount=type=ssh \
 # downloads persist for the next build. This is the first uv-writing RUN in
 # the stage, so it force-copies the whole store in and prunes on sync-back
 # (see docker/uv_cache_mount.sh). Every later RUN in this stage that also
-# invokes uv (TRT-LLM build, worker-venv prefetch phase 2,
-# Gym prefetch) sources the same helper but only tops up what it adds,
+# invokes uv (TRT-LLM build, Gym prefetch) sources the same helper but only
+# tops up what it adds,
 # instead of re-shipping the whole store again in its own layer.
 # Whether the materialized copy also ships in the final image (for the
 # RUNTIME_UID's offline `uv run --extra <backend>`, see base) or is stripped
@@ -626,7 +626,7 @@ rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ "${CCACHE_DIR}/"
 # stage cannot rely on it -- when this RUN is served from the BuildKit layer
 # cache the mount stays empty. The build below therefore also mirrors the
 # current content-addressed wheel into /opt/trtllm_wheels, which IS part of this
-# layer; the release stage and runtime `uv run --extra trtllm` read it from there.
+# layer; a runtime `uv run --extra trtllm` reads it from there.
 echo "TRT-LLM cache state before build:"
 du -sh "${UV_CACHE_DIR}" /root/.cache/trtllm-wheels
 
@@ -638,11 +638,8 @@ set +e
 # The throwaway venv must be symlink-mode: hardlinks to files in the dependency layer's uv
 # cache make overlayfs copy them up into this layer, and the copies outlive the rm -rf below.
 # TRTLLM_WHEEL_CACHE_MIRROR_DIR keeps a copy of the wheel in this image layer.
-# CI creates a fresh buildx builder for every job, so the cache mount above only
-# lives for the duration of one build: when a later build reuses this layer from
-# the registry cache and re-executes the release stage (any NeMo-RL source
-# change does that), the mount is empty there. The release stage reads the
-# wheel from this mirror instead of failing on TRTLLM_REQUIRE_CACHED_WHEEL.
+# The cache mount above is builder-local and not part of the image, so a runtime
+# `uv run --extra trtllm` reads the wheel from this mirror instead.
 TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
     TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels \
     UV_PROJECT_ENVIRONMENT=/tmp/trtllm-build-venv \
