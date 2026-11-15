@@ -847,10 +847,11 @@ USER root
 
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
+# NeMo Gym is left out: the hermetic stage already copied it from the nemo-gym build
+# context, and copying the in-source tree here would replace an external Gym.
 COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock \
     --exclude=3rdparty/Gym-workspace/Gym --exclude=3rdparty/Gym-workspace/Gym/** \
     . /opt/nemo-rl
-COPY --from=nemo-gym . /opt/nemo-rl/3rdparty/Gym-workspace/Gym/
 
 # The steps that have to read the source. Each one re-runs on every source change.
 RUN <<"EOF" bash -exu
