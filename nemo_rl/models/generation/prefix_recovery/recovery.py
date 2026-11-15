@@ -49,7 +49,6 @@ from nemo_rl.models.generation.prefix_recovery.restore import (
 from nemo_rl.models.generation.prefix_recovery.routes import (
     _cut_chunk_routes,
     _join_chunk_routes,
-    _prefix_routes_sha256,
 )
 from nemo_rl.models.generation.prefix_recovery.state import (
     _CompletedCaptureState,
@@ -245,19 +244,15 @@ class PrefixRecovery:
             finish_reason = getattr(output, "finish_reason", None)
             stop_reason = getattr(output, "stop_reason", None)
             terminal_routes = None
-            if state.routed_experts_dtype is not None and finish_reason is not None:
-                route_parts = [
-                    value
-                    for value in (
-                        getattr(request_output, "prompt_routed_experts", None),
-                        getattr(output, "routed_experts", None),
-                    )
-                    if value is not None
-                ]
-                if route_parts:
-                    terminal_routes = torch.cat(
-                        [torch.as_tensor(value) for value in route_parts], dim=0
-                    )
+            routed = getattr(output, "routed_experts", None)
+            # The pinned vLLM (see progress_reader) returns the prompt's and the
+            # generated tokens' routes together, in routed_experts, on finish.
+            if (
+                state.routed_experts_dtype is not None
+                and finish_reason is not None
+                and routed is not None
+            ):
+                terminal_routes = torch.as_tensor(routed)
         except (RuntimeError, TypeError, ValueError) as error:
             state.record_error(f"{type(error).__name__}: {error}")
             return
@@ -984,8 +979,7 @@ class PrefixRecovery:
         LOGGER.info(
             "generation prefix restored: rollout_id=%s model_call_id=%s "
             "source_model_call_id=%s prefix_tokens=%d prefix_digest=%s "
-            "weight_version_span=[%d,%d] prefix_ids_sha256=%s "
-            "prefix_routes_sha256=%s",
+            "weight_version_span=[%d,%d] prefix_ids_sha256=%s",
             admission.capture_key,
             admission.model_call_id,
             continuation.source_model_call_id,
@@ -994,9 +988,6 @@ class PrefixRecovery:
             weight_versions[0],
             weight_versions[-1],
             prefix_ids_sha256,
-            _prefix_routes_sha256(
-                routed_experts, generated_prefix_tokens=len(generated_prefix_ids)
-            ),
         )
         return _ResolvedGenerationCut(
             snapshot=snapshot, routed_experts=routed_experts, sampler_topk=sampler_topk

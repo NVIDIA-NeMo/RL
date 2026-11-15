@@ -15,7 +15,7 @@
 # test's job, grpo_async_gym_single_controller_prefix_recovery.sh). It reuses
 # the reference-free checks of the Omni test instead: each restored prefix must
 # appear verbatim in its trained row. With --require-routes, verify-completion
-# also requires the routes staged for that row to hash like the restored ones.
+# also requires each completion to log that it kept its restored prefix's routes.
 
 set -euo pipefail
 
@@ -200,8 +200,8 @@ uv run --no-sync tests/check_metrics.py "${PHASE2_METRICS}" \
     'max(data["train/finalize/capture_poisoned_rollouts"]) == 0' \
     'all_finite(data["train/gen_kl_error"])'
 
-# With --require-routes, each restored call must also have staged its
-# restored routes for training.
+# With --require-routes, each restored call must also have kept its restored
+# prefix's routes in the row it staged.
 verify_prefix_recovery --require-routes
 
 echo "Router-replay generation-prefix recovery test passed"

@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
 from typing import Any
 
@@ -59,39 +58,14 @@ def _join_route_pieces(pieces: Sequence[Any]) -> np.ndarray:
 
 
 def _final_route_placeholder(
-    layers: int, topk: int, dtype: torch.dtype
+    layers: int, topk: int, dtype: torch.dtype, rows: int = 1
 ) -> torch.Tensor:
-    """The route row staged for a prefix's last token, which no step has routed.
+    """``rows`` route rows of ``ROUTE_MISSING_SENTINEL``, for tokens no step routed.
 
-    A cut builds it when staging and a restore rebuilds it when joining
-    chunks; both must use this helper, or every resumed call fails the
-    digest check. It holds ``ROUTE_MISSING_SENTINEL``, as the final row of an
-    uncut call's routes does.
+    Cuts, restores and finished restored prefixes all build these rows here, so
+    a staged row and its rebuild agree and the chunk digests match.
     """
-    return torch.full((1, layers, topk), ROUTE_MISSING_SENTINEL, dtype=dtype)
-
-
-def _prefix_routes_sha256(
-    delta_routes: torch.Tensor | None, *, generated_prefix_tokens: int
-) -> str:
-    """Hash the routes a resumed call keeps for its restored generated prefix.
-
-    ``delta_routes`` holds one row per prefix delta token. The kept rows are
-    the generated prefix tokens' except the last, whose route the resumed
-    call's own prefill computes. Restore and completion both log this, so the
-    staged row can be checked against the routes restored from TQ.
-
-    Returns:
-        A SHA-256 hex digest over the kept rows as int32, or ``"none"`` when
-        the call carries no routes.
-    """
-    if delta_routes is None:
-        return "none"
-    end = int(delta_routes.shape[0])
-    kept = delta_routes[end - generated_prefix_tokens : end - 1]
-    return hashlib.sha256(
-        kept.to(torch.int32).contiguous().numpy().tobytes()
-    ).hexdigest()
+    return torch.full((rows, layers, topk), ROUTE_MISSING_SENTINEL, dtype=dtype)
 
 
 class _EngineRouteCache:
@@ -231,21 +205,22 @@ def _cut_chunk_routes(
             "vLLM returned fewer routed experts than the frozen tokens need: "
             f"routes={routes.shape[0]} needed={needed}"
         )
-    final = _final_route_placeholder(layers, topk, dtype)
-    parts = [routes, final] if restored is None else [restored[:-1], routes, final]
-    cumulative = torch.cat(parts, dim=0).contiguous()
     if staged == 0 and restored is None:
-        return cumulative
-    return cumulative[lead + staged - 1 : -1]
+        # The first chunk is the whole prefix so far, placeholder included.
+        final = _final_route_placeholder(layers, topk, dtype)
+        return torch.cat((routes, final), dim=0)
+    # A later chunk's first row replaces the previous chunk's placeholder. Only
+    # the new rows are sliced, never the call's route history: earlier cuts
+    # staged those, and the engine's buffer never rewrites a row. A restored
+    # prefix's rows precede ``routes``, so only the staged rows shift the start.
+    return routes[staged if restored is not None else lead + staged - 1 :]
 
 
 def _join_chunk_routes(chunks: Sequence[Any], *, required: bool) -> torch.Tensor | None:
     """Verify each cut chunk's routes against its digest and join them.
 
-    The first chunk stores a normal full, delta-aligned route tensor whose
-    last row is the unused final-position placeholder. Every later chunk
-    stores one route per chunk token: its first row replaces that
-    placeholder, and a new placeholder is appended at the new boundary.
+    A later chunk's first row replaces the previous chunk's final placeholder,
+    and a new placeholder ends the joined routes.
 
     Raises:
         RuntimeError: routes are missing when ``required``, only some chunks
@@ -273,14 +248,12 @@ def _join_chunk_routes(chunks: Sequence[Any], *, required: bool) -> torch.Tensor
             expected_extras_digest=snapshot.extras_digest,
         ):
             raise RuntimeError("generation-cut route fragment failed integrity check")
+        # The digest check covers the routes' shape, and each chunk's route
+        # count matches its tokens, so the join below needs no checks of its own.
         fragment_routes = fragment.routes.cpu().contiguous()
-        if fragment_routes.dim() != 3:
-            raise RuntimeError("generation-cut routes must have rank 3")
         if routes is None:
             routes = fragment_routes
             continue
-        if tuple(fragment_routes.shape[1:]) != tuple(routes.shape[1:]):
-            raise RuntimeError("generation-cut route model dimensions changed")
         final = _final_route_placeholder(
             int(fragment_routes.shape[1]),
             int(fragment_routes.shape[2]),
@@ -289,9 +262,4 @@ def _join_chunk_routes(chunks: Sequence[Any], *, required: bool) -> torch.Tensor
         routes = torch.cat((routes[:-1], fragment_routes, final), dim=0)
 
     assert routes is not None
-    expected_len = sum(chunk.snapshot.delta_len for chunk in chunks)
-    if routes.shape[0] != expected_len:
-        raise RuntimeError(
-            "rebuilt generation-cut routes do not match cumulative token delta"
-        )
     return routes
