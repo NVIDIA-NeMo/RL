@@ -147,6 +147,10 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
     _register_single_controller_partitions,
 )
 from nemo_rl.algorithms.single_controller_utils.utils import (
+    BelowValidFractionGroup,
+    FinalizeOutcome,
+    RejectedGroup,
+    ZeroVarianceGroup,
     aggregate_step_metrics,
     reduce_advantage_pump_metrics,
 )
@@ -178,7 +182,6 @@ from nemo_rl.environments.checkpointing.interfaces import (
     EnvironmentCheckpoint,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
-from nemo_rl.experience.dynamic_sampling import rewards_carry_no_signal
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.reward_penalties import (
@@ -769,6 +772,8 @@ class SingleControllerActor:
         )
         # Prompts a step has drawn beyond the batch it was admitted with.
         self._filtered_prompts_by_step: dict[int, int] = {}
+        # Filtered spares promised to groups that are still finalizing.
+        self._filtered_spares_claimed: int = 0
         # Set once the dataloader has nothing left, so waiters stop waiting.
         self._dataloader_exhausted: bool = False
 
@@ -1330,43 +1335,86 @@ class SingleControllerActor:
         ) as cut:
             await self._cleanup_known_finalization_request_unlocked(cut, request)
 
-    async def _discard_committed_group(self, request: "ReassemblyRequest") -> bool:
-        """Release a committed group the controller declines to train on.
+    def _valid_fraction_counts(
+        self, finalized: "FinalizedGroup"
+    ) -> Optional[tuple[int, int]]:
+        """Return (valid, total) when the group falls below the valid-fraction bar."""
+        min_valid_fraction = (
+            self._master_config.token_capture.min_valid_fraction_per_group
+        )
+        if min_valid_fraction is None:
+            return None
+        if self._master_config.token_capture.forest_training:
+            # Compaction expands owners into unequal row counts; use the
+            # finalizer's owner totals.
+            valid_count = int(finalized.metrics["finalize/valid_logical_owner_count"])
+            total_count = int(finalized.metrics["finalize/logical_owner_count"])
+        else:
+            valid_count = finalized.valid_row_count
+            total_count = finalized.total_row_count
+        if total_count > 0 and valid_count / total_count < min_valid_fraction:
+            return valid_count, total_count
+        return None
 
-        Returns:
-            True when the group was removed and its rows cleared. False when the train
-            pump claimed it for training before this ran, in which case the step is not
-            short and nothing was cleared.
+    @contextlib.asynccontextmanager
+    async def _claim_filtered_spare(self) -> AsyncIterator[None]:
+        """Promise a finalizing group a filtered spare, in case it is rejected.
+
+        A rejected group's spare is taken inside the finalize cut, which cannot wait
+        for the pump to refill an empty pool. Claiming first waits until the pool
+        holds a spare no other finalizing group has claimed. A claim only counts
+        against the pool; the spare is popped inside the cut, and only on rejection.
+
+        Once the dataloader is exhausted, no group waits for another spare:
+        rejection takes whatever remains or closes its step short.
         """
-        # Remove the ready slot before clearing rows; a missing slot means training owns it.
+        if not self._dynamic_sampling_enabled:
+            yield
+            return
+        claimed = False
+        while True:
+            # No await between the check and the claim, so two groups cannot claim one spare.
+            if len(self._rollout_runtime.filtered_reserve) > (
+                self._filtered_spares_claimed
+            ):
+                self._filtered_spares_claimed += 1
+                claimed = True
+                break
+            if self._dataloader_exhausted:
+                break
+            await asyncio.sleep(0.1)
         try:
-            await self._buffer.remove_group(request.group_id)
-        except ValueError:
-            print(
-                f"  finalize: group {request.group_id} was claimed for training "
-                "before it could be discarded; its rows belong to that step now",
-                flush=True,
-            )
-            return False
-        await self._cleanup_known_finalization_request(request)
-        # The group left the buffer unconsumed, so the post-step release for
-        # consumed groups never reaches its pending metrics and observations.
-        self._rollout_runtime.finalizer_metrics_by_group.pop(request.group_id, None)
-        self._rollout_runtime.finalizer_rewards_by_group.pop(request.group_id, None)
-        return True
+            yield
+        finally:
+            if claimed:
+                self._filtered_spares_claimed -= 1
 
     async def _finalize_with_actor(
-        self, request: "ReassemblyRequest", rollout_metrics: dict[str, Any]
-    ) -> Optional["FinalizedGroup"]:
+        self,
+        request: "ReassemblyRequest",
+        rollout_metrics: dict[str, Any],
+        *,
+        target_step: Optional[int],
+        replacements_used: int,
+    ) -> FinalizeOutcome:
         """Finalize and index one group atomically with respect to TQ saves.
 
         Returns the committed FinalizedGroup once the group is committed to
-        the replay buffer (callers use logical-owner counts for forests, or row
-        counts for ordinary capture, to decide whether to keep it), or None when
-        the finalizer itself dropped it as a structural outcome (ownership
-        already cleaned up; the caller credits the step short). A low
-        valid-rollout fraction is no longer a finalizer-side drop -- the caller
-        decides that, since only the caller can source a replacement.
+        the replay buffer, or None when the finalizer itself dropped it as a
+        structural outcome (ownership already cleaned up; the caller credits
+        the step short).
+
+        A group below ``token_capture.min_valid_fraction_per_group``, or with
+        dynamic sampling on one whose voting rewards carry no signal, is
+        rejected before ``commit_finalized`` marks its slot ready, so the
+        sampler can never select it. Its cleanup, the spare prompt that
+        replaces it (or the step's shortfall credit), and that spare's ledger
+        reservation share the commit's mutation cut, so no snapshot sees the
+        group gone without its replacement. Returns a ``BelowValidFractionGroup``
+        or ``ZeroVarianceGroup`` in that case. A zero-variance group takes its
+        spare from the filtered pool, which cannot be waited on inside the cut:
+        the caller holds ``_claim_filtered_spare`` across this call so the pool
+        is not empty when the group is rejected.
         """
         self._finalizer_waiters += 1
         queue_depth = max(
@@ -1387,6 +1435,7 @@ class SingleControllerActor:
         finalize_start = time.perf_counter()
         rpc_submitted = False
         actor_reusable = False
+        rejected: Optional[RejectedGroup] = None
         try:
             # The actor publishes canonical rows before returning metadata. Keep
             # the remote write, local replay-index update, and lineage hand-off in
@@ -1416,6 +1465,13 @@ class SingleControllerActor:
                 else:
                     actor_reusable = True
 
+                zero_variance = (
+                    not finalized.dropped
+                    and self._rollout_manager._is_zero_variance_finalized(finalized)
+                )
+                # The committed FinalizedGroup carries the verdict back to the
+                # dispatch loop so it is classified once, not recomputed there.
+                finalized.zero_variance = zero_variance
                 if finalized.dropped:
                     try:
                         await self._cleanup_known_finalization_request_unlocked(
@@ -1446,6 +1502,53 @@ class SingleControllerActor:
                         "finalizer returned no metadata for non-dropped group "
                         f"{request.group_id}"
                     )
+                elif (counts := self._valid_fraction_counts(finalized)) is not None:
+                    try:
+                        await self._cleanup_known_finalization_request_unlocked(
+                            cut, request
+                        )
+                    except BaseException as cleanup_error:
+                        raise RuntimeError(
+                            "finalizer group fell below "
+                            "min_valid_fraction_per_group and known-key cleanup "
+                            f"failed for group {request.group_id}"
+                        ) from cleanup_error
+                    replacement = self._take_replacement(replacements_used)
+                    lineage_group_id, replacement_step = self._substitute_dropped_group(
+                        cut, replacement, target_step
+                    )
+                    rejected = BelowValidFractionGroup(
+                        replacement=replacement,
+                        lineage_group_id=lineage_group_id,
+                        target_step=replacement_step,
+                        reward_observations=list(finalized.reward_observations),
+                        zero_variance=zero_variance,
+                        valid_count=counts[0],
+                        total_count=counts[1],
+                    )
+                    committed = False
+                elif self._dynamic_sampling_enabled and zero_variance:
+                    try:
+                        await self._cleanup_known_finalization_request_unlocked(
+                            cut, request
+                        )
+                    except BaseException as cleanup_error:
+                        raise RuntimeError(
+                            "finalizer group carried no reward signal and known-key "
+                            f"cleanup failed for group {request.group_id}"
+                        ) from cleanup_error
+                    replacement = self._pop_filtered_replacement(target_step)
+                    lineage_group_id, replacement_step = self._substitute_dropped_group(
+                        cut, replacement, target_step
+                    )
+                    rejected = ZeroVarianceGroup(
+                        replacement=replacement,
+                        lineage_group_id=lineage_group_id,
+                        target_step=replacement_step,
+                        reward_observations=list(finalized.reward_observations),
+                        zero_variance=True,
+                    )
+                    committed = False
                 else:
                     extra_env_info: dict[str, Any] = {}
                     if request.attribution_key is not None:
@@ -1532,7 +1635,7 @@ class SingleControllerActor:
                 self._available_finalizers.put_nowait(actor)
         finalize_total_ms = (time.perf_counter() - finalize_start) * 1000.0
         if not committed:
-            return None
+            return rejected
         finalized.metrics.update(
             {
                 "finalize/queue_wait_ms": queue_wait_ms,
@@ -1752,9 +1855,13 @@ class SingleControllerActor:
                                 self._credit_shortfall(target_step)
                                 return
                             request, rollout_metrics = captured
-                            finalized = await self._finalize_with_actor(
-                                request, rollout_metrics
-                            )
+                            async with self._claim_filtered_spare():
+                                finalized = await self._finalize_with_actor(
+                                    request,
+                                    rollout_metrics,
+                                    target_step=target_step,
+                                    replacements_used=replacements,
+                                )
                             if finalized is None:
                                 # Finalizer dropped the group as a structural
                                 # outcome (e.g. router replay with no routed
@@ -1765,75 +1872,57 @@ class SingleControllerActor:
                                 self._buffer_capacity.release()
                                 self._credit_shortfall(target_step)
                                 return
-                            # No per-row masking flags here, so this count is metric-only.
-                            capture_rewards = [
-                                row.reward for row in finalized.reward_observations
-                            ]
                             self._rollout_manager.record_group_rewards(
                                 target_step,
-                                capture_rewards,
-                                replacement_index=replacements,
-                                zero_variance=rewards_carry_no_signal(capture_rewards),
+                                [row.reward for row in finalized.reward_observations],
+                                replacement_index=replacements + filtered_replacements,
+                                zero_variance=finalized.zero_variance,
                             )
-                            min_valid_fraction = self._master_config.token_capture.min_valid_fraction_per_group
-                            valid_count = total_count = 0
-                            below_threshold = False
-                            if min_valid_fraction is not None:
-                                if self._master_config.token_capture.forest_training:
-                                    # Compaction expands owners into unequal row
-                                    # counts; use the finalizer's owner totals.
-                                    valid_count = int(
-                                        finalized.metrics[
-                                            "finalize/valid_logical_owner_count"
-                                        ]
-                                    )
-                                    total_count = int(
-                                        finalized.metrics[
-                                            "finalize/logical_owner_count"
-                                        ]
-                                    )
-                                else:
-                                    valid_count = finalized.valid_row_count
-                                    total_count = finalized.total_row_count
-                                below_threshold = (
-                                    total_count > 0
-                                    and valid_count / total_count < min_valid_fraction
+                            if not isinstance(finalized, RejectedGroup):
+                                self._rollout_manager.stats.committed += 1
+                                ownership_transferred = True
+                                break
+                            # The finalize cut already cleaned the group up and
+                            # took its replacement (or credited the step short).
+                            if isinstance(finalized, ZeroVarianceGroup):
+                                self._rollout_manager.stats.zero_variance_groups += 1
+                                print(
+                                    f"  dynamic sampling: dropped group "
+                                    f"{request.group_id} (target_step={target_step}), "
+                                    "its voting rewards carry no signal; "
+                                    + (
+                                        "substituting a spare prompt"
+                                        if finalized.replacement is not None
+                                        else "no replacement; closing the step short"
+                                    ),
+                                    flush=True,
                                 )
-                            if not below_threshold:
-                                self._rollout_manager.stats.committed += 1
-                                ownership_transferred = True
-                                break
-                            # Only the controller can replace a published group below the training threshold.
-                            try:
-                                discarded = await self._discard_committed_group(request)
-                            except BaseException as cleanup_error:
-                                raise RuntimeError(
-                                    "finalizer group fell below "
-                                    "min_valid_fraction_per_group and "
-                                    "known-key cleanup failed for group "
-                                    f"{request.group_id}"
-                                ) from cleanup_error
-                            if not discarded:
-                                # Training already owns the group and its permit; do not replace it.
-                                self._rollout_manager.stats.committed += 1
-                                ownership_transferred = True
-                                break
-                            print(
-                                f"  finalize: group {request.group_id} below "
-                                "min_valid_fraction_per_group "
-                                f"({valid_count}/{total_count} < "
-                                f"{min_valid_fraction}); seeking a replacement",
-                                flush=True,
-                            )
-                            replacement = self._take_replacement(replacements)
-                            if replacement is None:
-                                self._rollout_manager.record_finalizer_dropped_prompt()
-                                self._buffer_capacity.release()
-                                self._credit_shortfall(target_step)
-                                return
-                            replacements += 1
-                            prompt = replacement
-                            lineage_group_id = None
+                                if finalized.replacement is None:
+                                    self._buffer_capacity.release()
+                                    return
+                                filtered_replacements += 1
+                            else:
+                                # Too few rollouts verified to be worth training on.
+                                print(
+                                    f"  finalize: group {request.group_id} below "
+                                    "min_valid_fraction_per_group "
+                                    f"({finalized.valid_count}/{finalized.total_count} < "
+                                    f"{self._master_config.token_capture.min_valid_fraction_per_group}); "
+                                    + (
+                                        "substituting a spare prompt"
+                                        if finalized.replacement is not None
+                                        else "no replacement; dropping the group"
+                                    ),
+                                    flush=True,
+                                )
+                                if finalized.replacement is None:
+                                    self._rollout_manager.record_finalizer_dropped_prompt()
+                                    self._buffer_capacity.release()
+                                    return
+                                replacements += 1
+                            prompt = finalized.replacement
+                            lineage_group_id = finalized.lineage_group_id
+                            target_step = finalized.target_step
                             # A substitution is a fresh rollout, not a
                             # continuation of the one that fell short, so it
                             # observes the same pause a first dispatch does
@@ -1924,19 +2013,11 @@ class SingleControllerActor:
                             # a replacement, or crediting the target step short must be
                             # one checkpoint-atomic decision.
                             self._discard_prompt_group(cut, lineage_group_id)
-                            if replacement is not None:
-                                # Attempted only now that a spare is in hand, because
-                                # the borrow is a debt and the spare is what repays it.
-                                # Borrowing without one would leave the lender short
-                                # instead: the same hole, one step later.
-                                lender_step = self._promote_into_step(target_step)
-                                if lender_step is not None:
-                                    target_step = lender_step
-                                lineage_group_id = self._reserve_prompt_group(
-                                    cut, replacement, target_step=target_step
+                            lineage_group_id, target_step = (
+                                self._substitute_dropped_group(
+                                    cut, replacement, target_step
                                 )
-                            else:
-                                self._credit_shortfall(target_step)
+                            )
                         if replacement is None:
                             # Nothing was committed, so the train pump will never see this
                             # group and never release its permit on our behalf.
@@ -2460,6 +2541,46 @@ class SingleControllerActor:
             flush=True,
         )
         return lender_step
+
+    def _substitute_dropped_group(
+        self,
+        cut: Optional[DataPlaneMutationCut],
+        replacement: Optional[DatumSpec],
+        target_step: Optional[int],
+    ) -> tuple[Optional[str], Optional[int]]:
+        """Stand a spare prompt in for a dropped group, or close its step short.
+
+        Call inside the cut that removed the dropped group, so no snapshot sees the
+        group gone without its replacement. A finished group from a later step fills
+        the dropped step when one exists, and the spare is then generated for that
+        lender.
+
+        Args:
+            cut: The cut the group was removed in; ``None`` when nothing is recorded.
+            replacement: The spare already taken from its pool, or ``None`` if there
+                was none, which credits ``target_step`` short.
+            target_step: The step the dropped group was stamped for.
+
+        Returns:
+            The ledger ID reserved for the spare (``None`` without rollout recovery
+            or without a spare) and the step the spare is generated for.
+        """
+        if replacement is None:
+            self._credit_shortfall(target_step)
+            return None, target_step
+        # Attempted only now that a spare is in hand, because the borrow is a debt
+        # and the spare is what repays it. Borrowing without one would leave the
+        # lender short instead: the same hole, one step later.
+        lender_step = self._promote_into_step(target_step)
+        if lender_step is not None:
+            target_step = lender_step
+        lineage_group_id = None
+        if self._rollout_recovery_enabled:
+            assert cut is not None
+            lineage_group_id = self._rollout_manager.reserve_prompt_group(
+                cut, replacement, target_step=target_step
+            )
+        return lineage_group_id, target_step
 
     def _credit_shortfall(self, target_step: Optional[int]) -> None:
         """Record that a stamped step will never receive a group it is waiting for."""

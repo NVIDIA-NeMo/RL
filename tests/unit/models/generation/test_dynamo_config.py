@@ -97,6 +97,21 @@ def test_dynamo_true_alone_is_a_complete_config(dynamo: bool) -> None:
             ),
             "checks no bearer token",
         ),
+        # Gym's calls go through the Dynamo frontend, not vLLM's HTTP frontends.
+        (
+            _vllm_config(
+                dynamo=True,
+                vllm_cfg={
+                    "async_engine": True,
+                    "expose_http_server": True,
+                    "max_model_len": 512,
+                    "tensor_parallel_size": 1,
+                    "expert_parallel_size": 1,
+                    "http_api_server_count": 2,
+                },
+            ),
+            "would serve none of them",
+        ),
         # Direct routing needs a worker ID that rollouts never carry.
         (
             _vllm_config(

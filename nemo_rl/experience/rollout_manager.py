@@ -52,9 +52,10 @@ from nemo_rl.experience.dynamic_sampling import (
     StepRewardStats,
     drain_step_reward_metrics,
     mask_sample_flagged,
-    participating_rewards,
     record_group_rewards,
     rewards_carry_no_signal,
+    voting_rewards_from_finalized,
+    voting_rewards_from_record,
 )
 from nemo_rl.experience.failures import (
     FailureClass,
@@ -123,6 +124,7 @@ RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
+    from nemo_rl.experience.rollout_reassembler import FinalizedGroup
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
 
@@ -1534,6 +1536,8 @@ class AsyncNemoGymRolloutImpl:
                         else None,
                     )
                 else:
+                    # Effort shaping and the penalties rewrite this reward in place.
+                    result["reward_original"] = float(result["full_result"]["reward"])
                     shaping_by_rowidx[rowidx] = _apply_effort_shaping(
                         [result], [inputs_by_rowidx[rowidx]], self._effort_config
                     )
@@ -1926,6 +1930,7 @@ class AsyncNemoGymRolloutImpl:
                     env_extras=env_extras,
                     truncated=truncated,
                     reward=float(result["full_result"]["reward"]),
+                    reward_original=result.get("reward_original"),
                 )
             )
         return completions, penalty_counts
@@ -2500,17 +2505,23 @@ class RolloutManager:
             dispatch_recorder=dispatch_recorder,
         )
 
-    def _participating_rewards(self, record: PromptGroupRecord) -> list[float]:
+    def _voting_rewards(self, record: PromptGroupRecord) -> list[float]:
         """This group's voting rewards under the run's masking policy."""
-        return participating_rewards(
+        return voting_rewards_from_record(
             record,
             masked_reward_policy=self._masked_reward_policy,
             overlong_filtering=self._overlong_filtering,
         )
 
-    def _is_zero_variance_group(self, record: PromptGroupRecord) -> bool:
-        """Whether this group's voters leave every row zero advantage."""
-        return rewards_carry_no_signal(self._participating_rewards(record))
+    def _is_zero_variance_finalized(self, finalized: "FinalizedGroup") -> bool:
+        """Whether a finalized capture group's voters leave every row zero advantage."""
+        return rewards_carry_no_signal(
+            voting_rewards_from_finalized(
+                finalized,
+                masked_reward_policy=self._masked_reward_policy,
+                overlong_filtering=self._overlong_filtering,
+            )
+        )
 
     def record_group_rewards(
         self,
@@ -2667,16 +2678,15 @@ class RolloutManager:
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(tq_group_id, None)
-                if self._filter_zero_variance_groups and self._is_zero_variance_group(
-                    record
-                ):
+                voting = self._voting_rewards(record)
+                is_zero_variance = rewards_carry_no_signal(voting)
+                if self._filter_zero_variance_groups and is_zero_variance:
                     # Filtering happens before commit, so removing the reservation writes no rows.
                     await self._tq_buffer.remove_group(tq_group_id)
                     # A filtered group is a healthy rollout and breaks a consecutive infrastructure-failure run.
                     self._consecutive_infra_drops = 0
                     self._stats.zero_variance_groups += 1
                     rewards = [c.reward for c in record.completions]
-                    voting = self._participating_rewards(record)
                     self.record_group_rewards(
                         target_step,
                         rewards,
@@ -2706,7 +2716,7 @@ class RolloutManager:
                     target_step,
                     [c.reward for c in record.completions],
                     replacement_index=replacement_index,
-                    zero_variance=self._is_zero_variance_group(record),
+                    zero_variance=is_zero_variance,
                 )
             except Exception as error:
                 # A failed rollout must not leave an unready slot that can block an
