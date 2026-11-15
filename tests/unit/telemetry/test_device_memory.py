@@ -8,6 +8,7 @@ tensors for their storage, so CPU tensors standing in for CUDA ones exercise
 every rule except the device filter, which gets its own test.
 """
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -22,9 +23,12 @@ from nemo_rl.telemetry.device_memory import (
     DEVICE_MEMORY_KEY,
     RL_MEMORY_CATEGORY_ATTR,
     _gradients,
+    _local_tensor,
+    _optimizer_state_tensors,
     _parameters,
     _warn_if_chunks_are_unreachable,
     attribute_device_memory,
+    device_memory_bytes,
     record_device_memory,
 )
 
@@ -135,13 +139,55 @@ def test_residual_never_goes_negative():
     assert totals[CATEGORY_OTHER] == 0
 
 
-def test_real_tensors_report_their_own_bytes():
-    """Against torch itself, so the storage API is not only mocked."""
+def test_host_tensors_are_filtered_before_anything_is_charged():
+    """A CPU tensor is real and has a storage; the device filter still skips it."""
     weight = torch.zeros(256, dtype=torch.float32)
     totals = attribute_device_memory(((CATEGORY_PARAMETERS, [weight]),), allocated=0)
-    # CPU tensors are skipped by the device filter, which is the point: the
-    # walk never charges host memory to a device series.
     assert totals[CATEGORY_PARAMETERS] == 0
+
+
+def test_the_real_storage_api_reports_the_real_byte_count():
+    """Against torch itself: _local_tensor feeds the storage calls the walk makes.
+
+    The filter in _storages means no CPU tensor can exercise this end of it, so
+    the storage read is tested on its own rather than only through a stand-in.
+    """
+    weight = torch.zeros(256, dtype=torch.float32)
+    storage = _local_tensor(weight).untyped_storage()
+    assert storage.nbytes() == 256 * 4
+    assert storage.data_ptr() == weight.untyped_storage().data_ptr()
+
+
+def test_a_real_dtensor_is_measured_as_its_local_shard():
+    """FSDP2's parameters are DTensors, whose outer storage cannot be read.
+
+    Reproduces the real failure rather than a stand-in: ``nbytes()`` answers
+    plausibly but ``data_ptr()`` raises, so the walk's except clause would skip
+    the tensor and charge every FSDP2 parameter to ``other``.
+    """
+    dist = pytest.importorskip("torch.distributed")
+    if not dist.is_available():
+        pytest.skip("torch.distributed unavailable")
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    already_up = dist.is_initialized()
+    if not already_up:
+        dist.init_process_group("gloo", store=dist.HashStore(), rank=0, world_size=1)
+    try:
+        dtensor = distribute_tensor(
+            torch.zeros(64, 64), init_device_mesh("cpu", (1,)), [Shard(0)]
+        )
+        with pytest.raises(RuntimeError):
+            dtensor.untyped_storage().data_ptr()
+
+        local = _local_tensor(dtensor)
+        assert local is not dtensor
+        assert local.untyped_storage().nbytes() == 64 * 64 * 4
+        assert local.untyped_storage().data_ptr() > 0
+    finally:
+        if not already_up:
+            dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("size", [None, 1])
@@ -207,14 +253,152 @@ def test_a_parameter_holding_both_grad_forms_is_billed_once():
     assert totals[CATEGORY_GRADIENTS] == 256
 
 
+class _ProxyDict:
+    """mcore's ChainedOptimizer.state: items(), but deliberately no values()."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def items(self):
+        for index, dict_ in enumerate(self._inner):
+            for key, value in dict_.items():
+                yield (index, key), value
+
+
+def _optimizer(state=None, groups=None, chained=None):
+    kwargs = {"state": state or {}, "param_groups": groups or []}
+    if chained is not None:
+        kwargs["chained_optimizers"] = chained
+    return SimpleNamespace(**kwargs)
+
+
+def test_optimizer_moments_are_collected():
+    moments = {"exp_avg": _Tensor(1, 64), "exp_avg_sq": _Tensor(2, 64), "step": 7}
+    found = list(_optimizer_state_tensors(_optimizer(state={"p": moments})))
+    assert found.count(moments["exp_avg"]) == 1
+    assert moments["exp_avg_sq"] in found
+
+
+def test_the_fp32_main_copy_is_collected_from_param_groups():
+    """mcore's distributed optimizer swaps main params into param_groups.
+
+    Only the moments live in .state; the sharded fp32 copy they are moments of
+    is in the group, so reading .state alone misses it entirely.
+    """
+    main_param = _Tensor(9, 4096)
+    opt = _optimizer(
+        state={"main": {"exp_avg": _Tensor(1, 2048)}},
+        groups=[{"params": [main_param], "lr": 0.1}],
+    )
+    assert main_param in list(_optimizer_state_tensors(opt))
+
+
+def test_a_plain_optimizers_groups_do_not_double_count_the_model():
+    """For torch optimizers param_groups hold the model's own parameters."""
+    weight = _Tensor(3, 512)
+    opt = _optimizer(groups=[{"params": [weight]}])
+    totals = attribute_device_memory(
+        (
+            (CATEGORY_PARAMETERS, [weight]),
+            (CATEGORY_OPTIMIZER_STATE, _optimizer_state_tensors(opt)),
+        ),
+        allocated=512,
+    )
+    assert totals[CATEGORY_PARAMETERS] == 512
+    assert totals[CATEGORY_OPTIMIZER_STATE] == 0
+
+
+def test_chained_optimizers_are_walked_through_their_links():
+    first, second = _Tensor(1, 32), _Tensor(2, 32)
+    chained = _optimizer(
+        chained=[
+            _optimizer(state={"a": {"exp_avg": first}}),
+            _optimizer(groups=[{"params": [second]}]),
+        ]
+    )
+    found = list(_optimizer_state_tensors(chained))
+    assert first in found and second in found
+
+
+def test_an_empty_chained_optimizer_reports_nothing_rather_than_raising():
+    """A rank with no trainable parameters gets an empty chain from mcore.
+
+    Treating empty as "not chained" would fall back to the chained optimizer
+    itself, whose .state is a ProxyDict with no values() -- losing the whole
+    measurement on exactly the ranks with the least to report.
+    """
+    empty = SimpleNamespace(
+        chained_optimizers=[],
+        state=_ProxyDict([{"a": {"exp_avg": _Tensor(1, 8)}}]),
+    )
+    assert list(_optimizer_state_tensors(empty)) == []
+
+
+def test_a_state_map_without_values_is_skipped_not_raised():
+    proxy = SimpleNamespace(state=_ProxyDict([{"a": {"exp_avg": _Tensor(1, 8)}}]))
+    assert list(_optimizer_state_tensors(proxy)) == []
+
+
+def test_device_memory_bytes_partitions_what_torch_reports(monkeypatch):
+    """The three walks and the residual, assembled, without a GPU."""
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 1000)
+    weight = _Tensor(1, 400)
+    parameter = SimpleNamespace(grad=_Tensor(2, 300), main_grad=None)
+    monkeypatch.setattr(
+        "nemo_rl.telemetry.device_memory._parameters",
+        lambda model: [weight, parameter],
+    )
+    totals = device_memory_bytes(
+        object(), _optimizer(state={"p": {"exp_avg": _Tensor(3, 200)}})
+    )
+    assert totals == {
+        CATEGORY_PARAMETERS: 400,
+        CATEGORY_GRADIENTS: 300,
+        CATEGORY_OPTIMIZER_STATE: 200,
+        CATEGORY_OTHER: 100,
+    }
+
+
+def test_the_config_field_reaches_a_worker_as_an_env_var():
+    """The flag only matters if _config_to_env carries it across the Ray gap."""
+    from nemo_rl.telemetry.config import TelemetryConfig
+    from nemo_rl.telemetry.setup import _config_to_env, device_memory_requested
+
+    assert TelemetryConfig().device_memory_enabled is False
+    _config_to_env(TelemetryConfig(enabled=True, device_memory_enabled=True))
+    assert os.environ["NEMO_RL_OTEL_DEVICE_MEMORY"] == "1"
+    assert device_memory_requested() is True
+
+
+def test_the_master_switch_turns_the_walk_off(monkeypatch):
+    """telemetry.enabled=false must stop it, not merely drop its points.
+
+    _config_to_env exports every field before init_telemetry_driver checks
+    `enabled`, so the opt-in survives a disabled run; without this gate the
+    model would be walked every step for points the recording path discards.
+    """
+    monkeypatch.setenv("NEMO_RL_OTEL_DEVICE_MEMORY", "1")
+    monkeypatch.delenv("NEMO_RL_OTEL_ENABLED", raising=False)
+    monkeypatch.setattr(
+        "nemo_rl.telemetry.device_memory.device_memory_bytes",
+        lambda model, optimizer: pytest.fail("walked while telemetry was off"),
+    )
+    record_device_memory(object(), object())
+
+
 @pytest.fixture
 def opted_in(monkeypatch):
-    """Switch the collection on, as a run config or a raw env var would."""
+    """Switch the collection on, as a run config or a raw env var would.
+
+    Both switches: the collector honours the master switch as well as its own.
+    """
+    monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "1")
     monkeypatch.setenv("NEMO_RL_OTEL_DEVICE_MEMORY", "1")
 
 
 def test_collection_is_off_until_asked_for(monkeypatch):
     """Default off, and the gate comes before the walk, not after it."""
+    monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "1")
     monkeypatch.delenv("NEMO_RL_OTEL_DEVICE_MEMORY", raising=False)
     walked = []
     monkeypatch.setattr(
@@ -232,6 +416,7 @@ def test_collection_is_off_until_asked_for(monkeypatch):
 @pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
 def test_the_env_var_alone_is_enough_to_switch_it_on(value, monkeypatch):
     """A worker only ever sees the setting as an env var."""
+    monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "1")
     monkeypatch.setenv("NEMO_RL_OTEL_DEVICE_MEMORY", value)
     recorded = []
     monkeypatch.setattr(

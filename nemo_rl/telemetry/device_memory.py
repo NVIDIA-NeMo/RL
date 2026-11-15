@@ -24,10 +24,16 @@ Per rank falls out of lens: it neither filters nor samples on rank, so every
 worker that has telemetry on exports its own points, each tagged with
 ``nv.dl.rank`` from its resource. Select or sum across ranks downstream.
 
-Opt-in, via ``telemetry.device_memory_enabled`` or ``NEMO_RL_OTEL_DEVICE_MEMORY``.
-Alone among the ``rl.*`` series its cost scales with the model rather than the
-run, and its numbers need the caveats below to read correctly, so it is a tool
-for a memory question rather than something to leave running.
+Opt-in: telemetry must be enabled *and* ``telemetry.device_memory_enabled`` set
+(or ``NEMO_RL_OTEL_DEVICE_MEMORY``). Alone among the ``rl.*`` series its cost
+scales with the model rather than the run, and its numbers need the caveats
+below to read correctly, so it is a tool for a memory question rather than
+something to leave running.
+
+Importing this module declares its row, and declaration closes when telemetry
+registers the metric group at startup (see ``freeze_metrics``). A worker that
+imports it lazily, inside the training loop, therefore raises rather than
+quietly exporting nothing -- so import it at module scope, as its callers do.
 
 What the categories mean, and how far to trust them:
 
@@ -57,7 +63,7 @@ import logging
 from typing import Any, Iterable, Iterator, Optional
 
 from nemo_rl.telemetry.metrics import record_rl_metrics, warn_once
-from nemo_rl.telemetry.setup import device_memory_requested
+from nemo_rl.telemetry.setup import device_memory_requested, telemetry_enabled_in_env
 from nemo_rl.telemetry.vocabulary import RecordedMetric, register_recorded_metrics
 
 logger = logging.getLogger(__name__)
@@ -116,6 +122,22 @@ register_recorded_metrics(DEVICE_MEMORY_RECORDED_METRICS)
 DEVICE_MEMORY_KEY = DEVICE_MEMORY_RECORDED_METRICS[0].key
 
 
+def _local_tensor(tensor: Any) -> Any:
+    """The tensor actually holding bytes on this rank.
+
+    A ``DTensor`` -- what Automodel's FSDP2 path gives for every parameter --
+    is a wrapper whose outer storage reports a plausible ``nbytes()`` but
+    raises ``RuntimeError`` from ``data_ptr()``. Reading it directly therefore
+    looks like a tensor with no storage and is skipped, which would quietly
+    put every FSDP2 parameter, gradient and optimizer state in ``other``.
+    ``to_local()`` gives the shard this rank really holds, which is also the
+    right thing to measure. Only DTensor defines it, so its presence is the
+    test.
+    """
+    to_local = getattr(tensor, "to_local", None)
+    return to_local() if callable(to_local) else tensor
+
+
 def _storages(tensors: Iterable[Any]) -> Iterator[tuple[int, int]]:
     """Yield ``(address, size)`` for the CUDA storage behind each tensor.
 
@@ -128,9 +150,10 @@ def _storages(tensors: Iterable[Any]) -> Iterator[tuple[int, int]]:
         if tensor is None or not hasattr(tensor, "untyped_storage"):
             continue
         try:
-            if tensor.device.type != "cuda":
+            local = _local_tensor(tensor)
+            if local.device.type != "cuda":
                 continue
-            storage = tensor.untyped_storage()
+            storage = local.untyped_storage()
             yield storage.data_ptr(), storage.nbytes()
         except (AttributeError, RuntimeError):
             # A tensor with no storage to ask about -- meta, or already freed.
@@ -233,19 +256,48 @@ def _gradients(parameters: Iterable[Any]) -> Iterator[Any]:
         yield getattr(parameter, "main_grad", None)
 
 
-def _optimizer_state_tensors(optimizer: Any) -> Iterator[Any]:
-    """Tensors held in *optimizer*'s state, across a chained optimizer's links.
+def _optimizer_links(optimizer: Any) -> list[Any]:
+    """*optimizer*, or the links of a ``ChainedOptimizer``.
 
-    ``ChainedOptimizer`` keeps one optimizer per parameter group rather than
-    one ``state`` covering all of them, so reading ``.state`` alone on those
-    runs reports nothing and the category silently reads zero.
+    Tested for presence rather than truth. mcore builds an empty
+    ``ChainedOptimizer`` on a rank with no trainable parameters, and treating
+    that as "not chained" would fall back to the chained optimizer itself,
+    whose ``.state`` is a ``ProxyDict`` -- which offers ``items()`` but no
+    ``values()``, so the walk would raise and lose the whole measurement on
+    exactly the ranks that have the least to report. An empty chain owns
+    nothing, which is what it should report.
     """
-    links = getattr(optimizer, "chained_optimizers", None) or [optimizer]
-    for link in links:
-        for state in getattr(link, "state", {}).values():
-            if not hasattr(state, "values"):
-                continue
-            yield from state.values()
+    links = getattr(optimizer, "chained_optimizers", None)
+    return [optimizer] if links is None else list(links)
+
+
+def _optimizer_state_tensors(optimizer: Any) -> Iterator[Any]:
+    """Tensors *optimizer* holds, across a chained optimizer's links.
+
+    Two places, because mcore's distributed optimizer splits them. The moments
+    are in ``.state`` as usual, but the sharded fp32 main copy of each weight
+    is swapped into ``param_groups[*]["params"]`` -- ``distrib_optimizer.py``
+    replaces the inner optimizer's groups with the main params and keys
+    ``.state`` by them -- so reading ``.state`` alone counts the moments and
+    misses the copy they are moments of.
+
+    For a plain torch optimizer the groups hold the model's own parameters,
+    already counted; the dedup in :func:`attribute_device_memory` charges them
+    to ``parameters`` and nothing is double-billed.
+    """
+    for link in _optimizer_links(optimizer):
+        state = getattr(link, "state", None)
+        # ProxyDict and friends: anything without values() is not a state map
+        # this knows how to read, and is skipped rather than raised over.
+        per_param_states = getattr(state, "values", None)
+        if callable(per_param_states):
+            for per_param_state in per_param_states():
+                values = getattr(per_param_state, "values", None)
+                if callable(values):
+                    yield from values()
+        for group in getattr(link, "param_groups", None) or ():
+            if isinstance(group, dict):
+                yield from group.get("params") or ()
 
 
 def device_memory_bytes(model: Any, optimizer: Any) -> dict[str, int]:
@@ -275,12 +327,12 @@ def record_device_memory(
 ) -> None:
     """Record this rank's memory split. Opt-in; never raises.
 
-    Does nothing unless ``telemetry.device_memory_enabled`` is set (or
+    Does nothing unless telemetry is enabled *and*
+    ``telemetry.device_memory_enabled`` is set (or ``NEMO_RL_OTEL_ENABLED`` and
     ``NEMO_RL_OTEL_DEVICE_MEMORY`` in the environment). The gate is checked
     before the walk, not after, so a run that leaves it off pays one env lookup
     per step and nothing else -- see the field's docstring in
     :mod:`nemo_rl.telemetry.config` for why it is not on by default.
-
 
     Call once per step, from the worker that owns *model* and *optimizer*. The
     walk is one pass over the parameters and the optimizer's state, which is
@@ -292,7 +344,11 @@ def record_device_memory(
     that does not answer the way this expects costs one warning and nothing
     else.
     """
-    if not device_memory_requested():
+    # Both switches, as the vLLM worker does: _config_to_env exports every
+    # field before init_telemetry_driver looks at `enabled`, so the opt-in
+    # survives telemetry.enabled=false and would walk the model every step for
+    # points that the recording path then drops.
+    if not (telemetry_enabled_in_env() and device_memory_requested()):
         return
     # The recording is inside the guard as well as the walk: lens promises only
     # that ``record_metrics`` itself never raises, which says nothing about

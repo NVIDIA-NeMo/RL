@@ -207,7 +207,11 @@ Group on it to decide *which* hosts to look at; read `host.name` for the number 
 
 ## Device memory (`rl.memory.device.bytes`)
 
-**Opt-in**, via `telemetry.device_memory_enabled` or `NEMO_RL_OTEL_DEVICE_MEMORY`. Off by default, and alone among the `rl.*` series in costing anything that scales with the model rather than with the run.
+**Opt-in**, via `telemetry.device_memory_enabled` *and* `telemetry.enabled` (or `NEMO_RL_OTEL_DEVICE_MEMORY` and `NEMO_RL_OTEL_ENABLED`). Off by default, and alone among the `rl.*` series in costing anything that scales with the model rather than with the run.
+
+```{note}
+No worker calls the collector yet. `nemo_rl/telemetry/device_memory.py` and the config field are in place, but nothing is wired into a training step, so enabling the flag today emits nothing. This section describes the series the collector produces once a call site lands.
+```
 
 Where `rl.host.memory.*` answers "how much memory is in use on this box", this answers "what is using the GPU memory on this rank". `torch.cuda.memory_allocated()` is a single number and the caching allocator has no idea what any block is for, so the split cannot be read out — `nemo_rl/telemetry/device_memory.py` attributes it instead, walking the parameters and the optimizer's state once per step and asking each tensor's storage how large it is.
 
