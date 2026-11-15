@@ -35,6 +35,7 @@ from nemo_rl.algorithms.single_controller import (
     RolloutRuntimeState,
     SingleControllerActor,
 )
+from nemo_rl.algorithms.single_controller_utils.step_assembly import StepAssembler
 from nemo_rl.algorithms.single_controller_utils.utils import (
     BelowValidFractionGroup,
     ZeroVarianceGroup,
@@ -116,6 +117,10 @@ def _request(
 def _controller(actor: object) -> Any:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._step_assembler = StepAssembler(
+        controller=ctrl,
+        initial_version=getattr(ctrl, "_trainer_version", 0),
+    )
     ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._available_finalizers = asyncio.Queue()
     ctrl._available_finalizers.put_nowait(actor)

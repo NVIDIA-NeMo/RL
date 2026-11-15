@@ -40,6 +40,7 @@ from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
+from nemo_rl.algorithms.single_controller_utils.step_assembly import StepAssembler
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.failures import RolloutDataFailure
@@ -206,6 +207,10 @@ def _controller(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
+    controller._step_assembler = StepAssembler(
+        controller=controller,
+        initial_version=getattr(controller, "_trainer_version", 0),
+    )
     controller._rollout_runtime = RolloutRuntimeState()
     controller._data_plane_checkpoint_barrier = barrier
     controller._buffer = buffer
