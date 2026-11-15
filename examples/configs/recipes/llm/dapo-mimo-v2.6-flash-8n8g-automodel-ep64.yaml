@@ -104,7 +104,7 @@ policy:
       language_model_only: true
       # Roll out in BF16 with split QKV. The released config declares block-FP8 and fused QKV.
       hf_overrides:
-        quantization_config: null
+        quantization_config: {}
         attention_projection_layout: split
 data:
   max_input_seq_length: 1024
