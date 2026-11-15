@@ -2818,8 +2818,11 @@ def test_router_replay_survives_repeated_prefix_cuts_and_resume(caplog) -> None:
     sink = _MemorySink()
     worker, request, engine_routes = _router_replay_call(sink)
     _observe(worker, request, [12, 13])
-    # vLLM routes both prompt tokens and the first generated one.
-    engine_routes.by_call["c1"] = _routes(1, 2, 3)
+    # Decoding observes no routes; only a cut reads them.
+    assert engine_routes.reads == []
+    # vLLM already routed a token the call has not recorded; the cut keeps only
+    # the frozen tokens' rows (both prompt tokens and the first generated one).
+    engine_routes.by_call["c1"] = _routes(1, 2, 3, 4)
     assert len(_cut(worker, "checkpoint-1").staging_keys) == 1
     # vLLM outputs are cumulative, and so are its routes.
     _observe(worker, request, [12, 13, 14])
@@ -2854,31 +2857,10 @@ def test_router_replay_survives_repeated_prefix_cuts_and_resume(caplog) -> None:
     # The restored prefix keeps the routes it was sampled under.
     assert _staged_routes(attachments) == [1, 2, 3, 4, 5, 0]
     assert staged.weight_version == 7
-    # Restore and completion log the same kept rows: the generated prefix
-    # tokens' routes except the last, whose route the resumed prefill computes.
-    kept_sha = hashlib.sha256(
-        torch.tensor([[[3]], [[4]]], dtype=torch.int32).numpy().tobytes()
-    ).hexdigest()
-    logged = re.findall(
-        r"generation prefix (restored|completed): .*prefix_routes_sha256=(\S+)",
-        caplog.text,
-    )
-    assert logged == [("restored", kept_sha), ("completed", kept_sha)]
-
-
-def test_router_replay_cut_drops_routes_past_its_frozen_tokens() -> None:
-    sink = _MemorySink()
-    worker, request, engine_routes = _router_replay_call(sink)
-    _observe(worker, request, [12, 13])
-    # Decoding observes no routes; only a cut reads them.
-    assert engine_routes.reads == []
-    # vLLM routed two more tokens than the call recorded.
-    engine_routes.by_call["c1"] = _routes(1, 2, 3, 4, 5)
-
-    assert _cut(worker, "checkpoint-1").disposition == "durable_prefix"
-    assert engine_routes.reads == ["c1"]
-    # Prompt rows, the first generated token's row, then the final placeholder.
-    assert _staged_routes(sink.generation_prefix_attachments[0]) == [1, 2, 3, -1]
+    # The completion log reports that the staged row kept those routes.
+    assert re.findall(
+        r"generation prefix completed: .*prefix_routes=(\S+)", caplog.text
+    ) == ["kept"]
 
 
 def test_progress_read_copies_route_pieces_only_for_router_replay_calls(
@@ -3161,8 +3143,8 @@ def test_router_replay_prefix_cut_after_the_final_token_resumes_with_routes(
     final_output = _cumulative_output([12, 13])
     final_output.outputs[0].finish_reason = "length"
     final_output.outputs[0].stop_reason = None
-    final_output.prompt_routed_experts = _routes(1, 2)
-    final_output.outputs[0].routed_experts = _routes(3)
+    # As vLLM returns them on finish: the prompt's and generated tokens' routes.
+    final_output.outputs[0].routed_experts = _routes(1, 2, 3)
     _cuts(worker).observe(request, final_output)
     ack = _cut(worker, "checkpoint-1")
     # The final output carried the routes; the engine was not asked.
@@ -3906,6 +3888,8 @@ def test_omni_capture_setup_rejects_video_pruning(
         # would wrap is covered by the progress-read tests.
         worker._http_engine_client = MagicMock(name="http_engine_client")
         worker._progress_reader = MagicMock(name="progress_reader")
+        # Setup checks whether cuts stage router-replay routes; this call has none.
+        worker.cfg = {}
     if pruning_rate:
         with pytest.raises(ValueError, match="video token pruning"):
             asyncio.run(

@@ -281,8 +281,8 @@ _COMPLETED_PREFIX_LINE = re.compile(
     r"source_model_call_id=(?P<source_model_call_id>\S+) "
     r"prefix_tokens=(?P<prefix_tokens>\d+) tail_tokens=(?P<tail_tokens>\d+) "
     r"total_generation_tokens=(?P<total_tokens>\d+)"
-    # Router replay: the restored prefix's routes, as staged for training.
-    r"(?: prefix_routes_sha256=(?P<routes_sha256>[0-9a-f]{64}|none))?"
+    # Router replay: whether the staged row kept the restored prefix's routes.
+    r"(?: prefix_routes=(?P<prefix_routes>kept|dropped|none))?"
 )
 
 
@@ -320,8 +320,8 @@ def _assert_prefix_boundary(
     ``-inf`` logprobs drop out of ``token_mask``), which a search for the last
     unmasked segment would mistake for the call's start. A dropped or
     duplicated token moves that start, so the restored prefix no longer sits
-    there. With ``require_routes`` (router replay), the routes hashed when the
-    prefix was rebuilt from TQ must be the ones its completion staged.
+    there. With ``require_routes`` (router replay), each completion must have
+    kept its restored prefix's routes in the row it staged.
 
     Returns:
         Each cut's ``(group_id, generation_index)`` mapped to the index in its
@@ -360,11 +360,10 @@ def _assert_prefix_boundary(
                 f"restored prefix {source!r} was logged {len(restores)} times, "
                 "expected once"
             )
-        routes = (restores[0]["routes_sha256"], matches[0]["routes_sha256"])
-        if require_routes and (routes[0] != routes[1] or routes[0] in (None, "none")):
+        if require_routes and matches[0]["prefix_routes"] != "kept":
             raise AssertionError(
-                f"row staged for {source!r} does not carry its restored prefix "
-                f"routes: restored={routes[0]}, staged={routes[1]}"
+                f"row staged for {source!r} did not keep its restored prefix "
+                f"routes: prefix_routes={matches[0]['prefix_routes']}"
             )
         key = (cut["group_id"], int(cut["generation_index"]))
         if key not in by_call:

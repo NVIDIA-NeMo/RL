@@ -31,7 +31,7 @@ from typing import Any, Literal, Optional
 
 import torch
 
-from nemo_rl.experience.route_assembly import ROUTE_MISSING_SENTINEL
+from nemo_rl.models.generation.prefix_recovery.routes import _final_route_placeholder
 
 
 def _remaining_generation_limits_after_prefix(
@@ -220,19 +220,19 @@ def _restored_prefix_terminal_routes(
 ) -> torch.Tensor:
     """Full-sequence routes for a restored prefix that needs no more decoding.
 
-    ``restored`` is the cut's delta-aligned routes, ending with its final
-    placeholder row. The engine never runs, so no prefill routes the
-    positions before the delta, including the parent's last token, and
-    nothing routes the final token: those rows are ``ROUTE_MISSING_SENTINEL``,
-    as an uninterrupted call's final row is.
+    The engine never runs, so nothing routes the positions before the restored
+    delta (the parent's last token included) or the final token: those rows
+    are missing-route placeholders.
     """
-
-    def missing(rows: int) -> torch.Tensor:
-        return torch.full(
-            (rows, *restored.shape[1:]), ROUTE_MISSING_SENTINEL, dtype=restored.dtype
-        )
-
-    return torch.cat((missing(prev_len), restored[:-1], missing(1)), dim=0)
+    layers, topk = int(restored.shape[1]), int(restored.shape[2])
+    return torch.cat(
+        (
+            _final_route_placeholder(layers, topk, restored.dtype, rows=prev_len),
+            restored[:-1],
+            _final_route_placeholder(layers, topk, restored.dtype),
+        ),
+        dim=0,
+    )
 
 
 def _build_restored_prefix_terminal_output(

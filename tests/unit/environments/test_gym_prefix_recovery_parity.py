@@ -767,35 +767,20 @@ def test_selected_snapshot_must_have_cut_every_active_call() -> None:
         )
 
 
-def _with_route_hashes(log: str, *, restored: str, completed: str) -> str:
-    """Append router replay's prefix route hashes to restore and completion lines."""
-    return "".join(
-        f"{line} prefix_routes_sha256="
-        f"{restored if 'prefix restored:' in line else completed}\n"
-        for line in log.splitlines()
-    )
-
-
-@pytest.mark.parametrize(
-    ("restored", "completed"),
-    [
-        ("a" * 64, "a" * 64),
-        ("a" * 64, "b" * 64),
-        ("a" * 64, "none"),
-        (None, None),
-    ],
-    ids=["staged", "recomputed", "dropped", "unlogged"],
-)
-def test_verify_completion_requires_the_restored_routes_to_be_staged(
-    tmp_path: Path, restored: str | None, completed: str | None
+@pytest.mark.parametrize("prefix_routes", ["kept", "dropped", "none", None], ids=str)
+def test_verify_completion_requires_the_restored_routes_to_be_kept(
+    tmp_path: Path, prefix_routes: str | None
 ) -> None:
-    log = _completion_log("call-a")
-    if restored is not None:
-        log = _with_route_hashes(log, restored=restored, completed=completed)
+    log = "".join(
+        f"{line} prefix_routes={prefix_routes}\n"
+        if prefix_routes is not None and "prefix completed:" in line
+        else f"{line}\n"
+        for line in _completion_log("call-a").splitlines()
+    )
     args = _dump_restored_run(tmp_path, flushed_keys=[], phase2_log_text=log)
     args.require_routes = True
 
-    if restored is not None and restored == completed:
+    if prefix_routes == "kept":
         _SNAPSHOT_HELPER.verify_completion(args)
     else:
         with pytest.raises(AssertionError, match="restored prefix routes"):

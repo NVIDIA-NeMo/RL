@@ -364,7 +364,7 @@ def verify_completion(args: argparse.Namespace) -> None:
     with the exact prefix the worker restored (``_assert_prefix_boundary``); no
     row may be trained twice, and the restored prefix rows must outlive
     training only until the next snapshot. With ``--require-routes``, each
-    must also stage for training the routes it restored.
+    must also have kept its restored prefix's routes in the row it staged.
     """
     selection = read_json(Path(args.selection_file))
     records = load_training_records(

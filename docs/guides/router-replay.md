@@ -151,4 +151,4 @@ The generation backend also computes `r3/routed_experts_fallback_token_route_fra
 
 ### Prefix-Level Rollout Recovery
 
-With the Single-Controller `prefix` recovery target, each generation cut also saves the routes of the tokens it cuts. A resumed row trains with those saved routes for its restored prefix, and with the resumed call's own routes for the token at the cut and the new tail. A cut never fills missing routes with the sentinel: a call whose routes do not cover every token it would save is not cut and restarts from its last saved turn. See [Periodic rollout snapshots](./single-controller.md#periodic-rollout-snapshots) in the Single-Controller guide for the full rules.
+Router replay works with the Single-Controller `prefix` recovery target; no extra setting is needed. A resumed rollout trains its restored prefix with the expert routes it was sampled with. See [Periodic rollout snapshots](./single-controller.md#periodic-rollout-snapshots) in the Single-Controller guide for the full rules.

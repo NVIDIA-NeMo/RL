@@ -85,7 +85,6 @@ from nemo_rl.models.generation.prefix_recovery.restore import (
 from nemo_rl.models.generation.prefix_recovery.restore import (
     _build_restored_prefix_terminal_output,
 )
-from nemo_rl.models.generation.prefix_recovery.routes import _prefix_routes_sha256
 from nemo_rl.models.generation.prefix_recovery.state import _RequestCaptureState
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -1371,9 +1370,19 @@ class VllmAsyncGenerationWorkerImpl(
 
     @staticmethod
     def _delta_align_routed_experts(
-        payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
+        payload: dict[str, Any],
+        *,
+        prev_len: int,
+        prompt_len: int,
+        generated_len: int,
+        restored: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
-        """Slice native routes for the delta plus boundary row and bind metadata."""
+        """Slice native routes for the delta plus boundary row and bind metadata.
+
+        A resumed call's ``restored`` routes replace this call's rows for its
+        restored prefix; the boundary row, the row at the cut and the tail keep
+        this call's routes. Routes that do not fit are logged and dropped.
+        """
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
             return None
@@ -1381,6 +1390,11 @@ class VllmAsyncGenerationWorkerImpl(
         message = dict(choice.get("message") or {})
         routed = message.get("routed_experts")
         if routed is None:
+            if restored is not None:
+                LOGGER.warning(
+                    "resumed generation staged no routed_experts to restore its "
+                    "prefix's routes into"
+                )
             return None
         try:
             if not isinstance(routed, torch.Tensor):
@@ -1391,88 +1405,39 @@ class VllmAsyncGenerationWorkerImpl(
                     f"route shape {tuple(routed.shape)} does not match engine sequence "
                     f"length {expected_full_len}"
                 )
-            start = prev_len - boundary_route_rows(prev_len)
+            boundary_rows = boundary_route_rows(prev_len)
             # Keep this as a view: capture uses a local client, and SimpleStorage
             # serializes only the slice's bytes. Message routes sent through
             # Ray/pickle use slice_routed_experts() to copy only their token span.
-            routed = routed[start:]
+            routed = routed[prev_len - boundary_rows :]
+            if restored is not None:
+                restored = restored.to(dtype=routed.dtype)
+                if tuple(routed.shape[1:]) != tuple(restored.shape[1:]):
+                    raise ValueError("restored routed experts changed model dimensions")
+                if routed.shape[0] != boundary_rows + restored.shape[0] + generated_len:
+                    raise ValueError(
+                        "resumed routed experts do not match prefix plus generated tail"
+                    )
+                # A copy: the view above is the response's own routes. The
+                # restored final row is a placeholder; the current one is kept.
+                routed = routed.clone()
+                replace_len = restored.shape[0] - 1
+                routed[boundary_rows : boundary_rows + replace_len] = restored[
+                    :replace_len
+                ]
             message["routed_experts"] = routed_experts_tensor_metadata(routed)
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
-                "dropping invalid routed_experts from staged capture: %s", error
+                "dropping routed_experts the restored prefix does not fit: %s"
+                if restored is not None
+                else "dropping invalid routed_experts from staged capture: %s",
+                error,
             )
             message.pop("routed_experts", None)
             routed = None
         choice["message"] = message
         payload["choices"] = [choice]
         return routed
-
-    @staticmethod
-    def _merge_generation_cut_routed_experts(
-        payload: dict[str, Any],
-        routed: torch.Tensor | None,
-        *,
-        restored: torch.Tensor | None,
-        prev_len: int,
-        generated_len: int,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Keep old prefix routes and current-policy boundary/suffix routes.
-
-        A resumed row trains with the saved routes for the restored prefix, and
-        with this call's routes for the row at the cut and the new tail. This
-        matches an uninterrupted run when
-        ``async_rl.recompute_kv_cache_after_weight_updates`` is False, so an
-        in-flight request keeps the KV, and routes, it sampled its prefix with.
-
-        After a parent call, the delta-aligned routes lead with the parent's
-        last-token row (``boundary_route_rows``); it comes from this call's
-        prefill, exactly as it would without a cut, and is kept.
-
-        Like ``_delta_align_routed_experts``, routes that do not fit are logged
-        and dropped rather than failing the call: the current routes alone
-        would describe the restored prefix under a policy that did not sample
-        it.
-
-        Returns:
-            The routes to stage, and the restored prefix's rows of them (one
-            per prefix delta token); the latter is ``None`` when no routes
-            were merged.
-        """
-        if restored is None:
-            return routed, None
-        if routed is None:
-            # vLLM returned none, or _delta_align_routed_experts dropped them.
-            LOGGER.warning(
-                "resumed generation staged no routed_experts to restore its "
-                "prefix's routes into"
-            )
-            return None, None
-        choice = dict(payload["choices"][0])
-        message = dict(choice["message"])
-        try:
-            restored = restored.to(dtype=routed.dtype)
-            if tuple(routed.shape[1:]) != tuple(restored.shape[1:]):
-                raise ValueError("restored routed experts changed model dimensions")
-            boundary_rows = boundary_route_rows(prev_len)
-            if routed.shape[0] != boundary_rows + restored.shape[0] + generated_len:
-                raise ValueError(
-                    "resumed routed experts do not match prefix plus generated tail"
-                )
-            merged = routed.clone()
-            # The restored final row is a placeholder; the current one is kept.
-            replace_len = restored.shape[0] - 1
-            merged[boundary_rows : boundary_rows + replace_len] = restored[:replace_len]
-            message["routed_experts"] = routed_experts_tensor_metadata(merged)
-            prefix_routes = merged[boundary_rows : boundary_rows + restored.shape[0]]
-        except (IndexError, TypeError, ValueError) as error:
-            LOGGER.warning(
-                "dropping routed_experts the restored prefix does not fit: %s", error
-            )
-            message.pop("routed_experts", None)
-            merged = prefix_routes = None
-        choice["message"] = message
-        payload["choices"] = [choice]
-        return merged, prefix_routes
 
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Stage one canonical terminal row and retire its prefix chunks.
@@ -1561,7 +1526,6 @@ class VllmAsyncGenerationWorkerImpl(
             payload[MEDIA_SPANS_FIELD] = [item.to_dict() for item in state.media.items]
         adapter = self.token_capture.adapter
         routed_experts = None
-        staged_prefix_routes = None
         generated_token_ids: list[int] = []
         if adapter is not None:
             try:
@@ -1573,15 +1537,7 @@ class VllmAsyncGenerationWorkerImpl(
                 prev_len=call.admission.prev_len,
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
-            )
-            routed_experts, staged_prefix_routes = (
-                self._merge_generation_cut_routed_experts(
-                    payload,
-                    routed_experts,
-                    restored=state.restored_routed_experts,
-                    prev_len=call.admission.prev_len,
-                    generated_len=len(generated_token_ids),
-                )
+                restored=state.restored_routed_experts,
             )
         attachments = dict(state.media.tensors or {}) if state.media is not None else {}
         if routed_experts is not None:
@@ -1617,16 +1573,20 @@ class VllmAsyncGenerationWorkerImpl(
             LOGGER.info(
                 "generation prefix completed: rollout_id=%s model_call_id=%s "
                 "source_model_call_id=%s prefix_tokens=%d tail_tokens=%d "
-                "total_generation_tokens=%d prefix_routes_sha256=%s",
+                "total_generation_tokens=%d prefix_routes=%s",
                 call.capture_key,
                 call.model_call_id,
                 call.generation_cut.model_call_id,
                 prefix_tokens,
                 len(generated_token_ids),
                 total_generation_token_count,
-                _prefix_routes_sha256(
-                    staged_prefix_routes, generated_prefix_tokens=prefix_tokens
-                ),
+                # Router replay: whether the staged row kept the restored
+                # prefix's routes, or dropped them as unfit.
+                "none"
+                if state.restored_routed_experts is None
+                else "kept"
+                if routed_experts is not None
+                else "dropped",
             )
         progress = state.snapshot()
         effective_output_limit = progress.effective_output_limit
