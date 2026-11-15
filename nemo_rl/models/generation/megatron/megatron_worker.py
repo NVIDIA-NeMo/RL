@@ -21,7 +21,7 @@ import threading
 import time
 import warnings
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Mapping, Optional
 
 import ray
@@ -1635,6 +1635,14 @@ class MegatronGenerationRefitMixin:
         # Native MCore copy service, built by init_collective_mcore_generation.
         self.refit_copy_service = None
         self.refit_execution_batch_bytes: int | None = None
+        self._coresident_src: Optional[dict[str, sm_partition.RefitSource]] = None
+        self._coresident_residual_metadata = None
+        self._coresident_destination_fingerprint: Optional[str] = None
+        self._coresident_reshard_plan = None
+        self._coresident_reshard_service = None
+        self._coresident_receive_module = None
+        self._coresident_receive_metadata = None
+        self._coresident_receive_fingerprint: Optional[str] = None
 
     def init_collective_mcore_generation(
         self,
@@ -2489,37 +2497,113 @@ class MegatronGenerationRefitMixin:
         # TODO: Optimize away the full synchronization.
         torch.cuda.synchronize()
 
-    def open_coresident_refit_handles(self, handles_by_device: dict[str, dict], share: bool = False) -> dict:
-        """Map local learner refit tensors through CUDA IPC and optionally share them.
+    def coresident_refit_placement(self) -> sm_partition.RefitPlacement:
+        """Identify the inference worker before installing shared storage."""
+        return sm_partition.RefitPlacement(
+            device_id=self.report_device_id(),
+            rank=torch.distributed.get_rank(),
+        )
 
-        Matching engine tensors are bound before their first forward. Returns
-        the bound tensor counts and storage sizes.
-        """
+    def open_coresident_refit_handles(
+        self,
+        *,
+        exports_by_device: dict[str, sm_partition.RefitExport],
+        source_metadata: list[dict],
+        engine_to_learner: dict[int, int],
+        share: bool,
+    ) -> sm_partition.RefitBinding:
+        """Bind local shards and identify inference tensors needing remote shards."""
         from megatron.core.resharding.utils import ParameterMetadata, named_refit_tensors
 
-        handles, learner_coords, learner_metadata = handles_by_device[self.report_device_id()]
+        from nemo_rl.models.megatron.coresident_reshard import (
+            plan_local_sources,
+            remap_metadata,
+        )
+
+        if self._inference_engine_initialized or self._coresident_src is not None:
+            raise RuntimeError(
+                "co-resident storage must be installed once, before inference initialization"
+            )
+        exported = exports_by_device[self.report_device_id()]
         core = sm_partition.refit_core(self._gen_model())
-        sources = sm_partition.open_refit_handles(handles)
-        engine_coords = sm_partition.rank_coordinates()
-        if learner_coords == engine_coords:
-            self._coresident_src = sm_partition.map_sources(
-                sources, learner_coords, sm_partition.refit_names(core), engine_coords
+        plan = plan_local_sources(
+            sm_partition.open_refit_handles(exported.handles),
+            [ParameterMetadata(**item) for item in source_metadata],
+            remap_metadata(sm_partition.refit_metadata(core), engine_to_learner),
+            learner_rank=exported.placement.rank,
+        )
+        self._coresident_src = plan.local_sources
+        self._coresident_residual_metadata = plan.residual
+        local_tensors = [
+            (name, tensor)
+            for name, tensor in named_refit_tensors(core)
+            if name in plan.local_sources
+        ]
+        stats = {"tensors_bound": 0, "tensors": len(local_tensors)}
+        if share:
+            stats = sm_partition.bind_shared(
+                plan.local_sources, local_tensors, {id(p) for p in core.parameters()}
             )
-        else:
-            if learner_coords["pp"] != engine_coords["pp"] or learner_coords["tp"] != (0, 1):
-                raise ValueError("co-resident TP refit requires learner TP1 and matching PP coordinates")
-            self._coresident_src = sm_partition.map_tp_sources(
-                sources, [ParameterMetadata(**item) for item in learner_metadata], sm_partition.refit_metadata(core)
+            stats.update(
+                sm_partition.bind_shared_expert_stacks(core, plan.local_sources)
             )
-        if not share:
-            return {"tensors_bound": 0, "tensors": len(self._coresident_src)}
+        stats["residual_tensors"] = len(plan.residual)
+        stats["tensors"] += len(plan.residual)
+        return sm_partition.RefitBinding(
+            [asdict(item) for item in plan.residual], stats
+        )
+
+    def export_coresident_refit_destinations(self) -> sm_partition.RefitDestination:
+        """Export current receive buffers after all admitted inference work finishes."""
         if self._inference_engine_initialized:
-            raise RuntimeError("shared engine weights must be bound before the engine's first forward")
-        leaf_ids = {id(p) for p in core.parameters()}
-        stats = sm_partition.bind_shared(self._coresident_src, named_refit_tensors(core), leaf_ids)
-        expert_stats = sm_partition.bind_shared_expert_stacks(core, self._coresident_src)
-        print(f"[sm_partition] expert storage: {expert_stats}", flush=True)
-        return {**stats, **expert_stats}
+            return asyncio.run_coroutine_threadsafe(
+                self._coresident_export_destinations_on_loop(), self._inference_loop
+            ).result()
+        return self._coresident_export_destinations()
+
+    async def _coresident_export_destinations_on_loop(
+        self,
+    ) -> sm_partition.RefitDestination:
+        if self.dynamic_inference_engine.state != EngineState.PAUSED:
+            raise RuntimeError(
+                "co-resident receive buffers can only be exported while inference is paused"
+            )
+        torch.cuda.synchronize()
+        return self._coresident_export_destinations()
+
+    def _coresident_export_destinations(self) -> sm_partition.RefitDestination:
+        from megatron.core.resharding.utils import named_refit_tensors
+
+        if self._coresident_src is None or self._coresident_residual_metadata is None:
+            raise RuntimeError("co-resident refit has not been planned")
+        tensors = dict(named_refit_tensors(sm_partition.refit_core(self._gen_model())))
+        residual = {
+            metadata.name: metadata for metadata in self._coresident_residual_metadata
+        }
+        if tensors.keys() != self._coresident_src.keys() | residual.keys():
+            raise RuntimeError(
+                "co-resident inference tensor names changed after planning"
+            )
+        targets = {}
+        for name, metadata in residual.items():
+            tensor = tensors[name]
+            if (
+                type(tensor) not in (torch.Tensor, torch.nn.Parameter)
+                or tensor.shape != metadata.shape
+                or tensor.dtype != metadata.dtype
+            ):
+                raise RuntimeError(
+                    f"co-resident receive storage changed layout or dtype: {name}"
+                )
+            targets[name] = tensor
+        fingerprint = sm_partition.storage_fingerprint(targets.items())
+        handles = None
+        if fingerprint != self._coresident_destination_fingerprint:
+            handles = sm_partition.export_refit_handles(targets.items())
+            self._coresident_destination_fingerprint = fingerprint
+        return sm_partition.RefitDestination(
+            self.report_device_id(), fingerprint, handles
+        )
 
     def coresident_refit_copy(self) -> dict[str, float]:
         """Copy private weights and refresh derived caches while every rank is paused.
@@ -2552,8 +2636,19 @@ class MegatronGenerationRefitMixin:
 
         t0 = time.perf_counter()
         core = sm_partition.refit_core(self._gen_model())
+        if self._coresident_src is None or self._coresident_residual_metadata is None:
+            raise RuntimeError("co-resident refit has not been planned")
+        tensors = dict(named_refit_tensors(core))
+        residual_names = {
+            metadata.name for metadata in self._coresident_residual_metadata
+        }
+        if tensors.keys() != self._coresident_src.keys() | residual_names:
+            raise RuntimeError(
+                "co-resident inference tensor names changed after planning"
+            )
         stats = sm_partition.copy_refit(
-            self._coresident_src, named_refit_tensors(core)
+            self._coresident_src,
+            ((name, tensors[name]) for name in self._coresident_src),
         )
         with torch.inference_mode():
             refresh_module_caches(core)

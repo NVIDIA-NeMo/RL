@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import time
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Optional
@@ -168,8 +169,7 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
             return {}
 
         if isinstance(self._transport, CoresidentRefit):
-            # Co-resident engine: pause at a step boundary, same-GPU copy, epoch bump, unpause (no suspend, no
-            # conversion, no collectives).
+            # Publish local views and residual transfers while inference is paused.
             with timed_phase("prepare_for_generation/transfer_and_update_weights"):
                 stats = self._transport.sync_weights(kv_scales=kv_scales)
             self._stale = False
@@ -283,24 +283,83 @@ class CoresidentRefit:
         self._paused_at: Optional[float] = None
         self._pause_s = 0.0
         self._control_timeout_s = 360.0 if refit_timeout_s is None else refit_timeout_s
+        self._has_residual_transfers = False
+        self._residual_bytes = 0
+        self._devices: set[str] = set()
+        self._closed = False
 
     def init_communicator(self) -> None:
+        if self._closed:
+            raise RuntimeError("co-resident refit is closed")
         exported = _get_fail_fast(
             self._policy.worker_group.run_all_workers_single_data("export_coresident_refit_handles"),
             timeout_s=self._control_timeout_s,
         )
-        by_device = {dev: (handles, coords, metadata) for dev, handles, _, coords, metadata in exported}
+        by_device = {item.placement.device_id: item for item in exported}
         if len(by_device) != len(exported):
             raise RuntimeError("co-resident refit: two learner ranks report the same GPU")
-        self._fingerprints = [fp for _, _, fp, _, _ in exported]
-        bound = _get_fail_fast(
+        self._devices = set(by_device)
+        layouts = _get_fail_fast(
             self._generation.worker_group.run_all_workers_single_data(
-                "open_coresident_refit_handles", handles_by_device=by_device, share=self._shared
+                "coresident_refit_placement"
             ),
             timeout_s=self._control_timeout_s,
         )
-        print(f"[sm_partition] co-resident engine weights ({'shared' if self._shared else 'copy'}) bound: {bound[0]}",
-              flush=True)
+        if (
+            len(layouts) != len(exported)
+            or {layout.device_id for layout in layouts} != self._devices
+        ):
+            raise ValueError(
+                "co-resident refit requires one learner and one inference worker on each GPU"
+            )
+        ranks = set(range(len(exported)))
+        if {item.placement.rank for item in exported} != ranks or {
+            layout.rank for layout in layouts
+        } != ranks:
+            raise ValueError(
+                "co-resident refit workers must report complete native rank worlds"
+            )
+        engine_to_learner = {
+            layout.rank: by_device[layout.device_id].placement.rank
+            for layout in layouts
+        }
+        source_metadata = [metadata for item in exported for metadata in item.metadata]
+        self._fingerprints = [item.fingerprint for item in exported]
+        bound = _get_fail_fast(
+            self._generation.worker_group.run_all_workers_single_data(
+                "open_coresident_refit_handles",
+                exports_by_device=by_device,
+                source_metadata=source_metadata,
+                engine_to_learner=engine_to_learner,
+                share=self._shared,
+            ),
+            timeout_s=self._control_timeout_s,
+        )
+        residual_metadata = [
+            metadata for item in bound for metadata in item.residual_metadata
+        ]
+        self._has_residual_transfers = bool(residual_metadata)
+        self._residual_bytes = sum(
+            math.prod(item["shape"]) * item["element_size"]
+            for item in residual_metadata
+        )
+        if self._has_residual_transfers:
+            _get_fail_fast(
+                self._policy.worker_group.run_all_workers_single_data(
+                    "init_coresident_reshard",
+                    source_metadata=source_metadata,
+                    residual_metadata=residual_metadata,
+                ),
+                timeout_s=self._control_timeout_s,
+            )
+        totals = {
+            key: sum(item.stats.get(key, 0) for item in bound)
+            for key in {key for item in bound for key in item.stats}
+        }
+        print(
+            f"[sm_partition] co-resident engine weights ({'shared' if self._shared else 'copy'}) bound: {totals}",
+            flush=True,
+        )
 
     def _pause(self) -> float:
         t0 = time.perf_counter()
@@ -312,10 +371,14 @@ class CoresidentRefit:
         return time.perf_counter() - t0
 
     def before_learner_write(self) -> None:
+        if self._closed:
+            raise RuntimeError("co-resident refit is closed")
         if self._shared and self._engine_running:
             self._pause_s = self._pause()
 
     def sync_weights(self, *, kv_scales: Optional[dict[str, float]] = None) -> dict[str, float]:
+        if self._closed:
+            raise RuntimeError("co-resident refit is closed")
         if kv_scales:
             raise NotImplementedError("co-resident refit with FP8 KV scales is not built yet")
         if self._paused_at is None:
@@ -332,6 +395,23 @@ class CoresidentRefit:
                 "(offload / reload / buffer rebuild); the engine would read freed memory"
             )
         t1 = time.perf_counter()
+        if self._has_residual_transfers:
+            targets = _get_fail_fast(
+                gen.run_all_workers_single_data("export_coresident_refit_destinations"),
+                timeout_s=self._control_timeout_s,
+            )
+            by_device = {item.device_id: item for item in targets}
+            if len(by_device) != len(targets) or set(by_device) != self._devices:
+                raise RuntimeError(
+                    "co-resident receive workers changed physical placement"
+                )
+            _get_fail_fast(
+                self._policy.worker_group.run_all_workers_single_data(
+                    "coresident_reshard", destinations=by_device
+                ),
+                timeout_s=self._control_timeout_s,
+            )
+        residual_done = time.perf_counter()
         copies = _get_fail_fast(
             gen.run_all_workers_single_data("coresident_refit_copy"), timeout_s=self._control_timeout_s
         )
@@ -345,12 +425,25 @@ class CoresidentRefit:
         stats = {
             "coresident_pause_s": self._pause_s,
             "coresident_source_check_s": t1 - t0,
+            "coresident_reshard_s": residual_done - t1,
             "coresident_copy_s": t2 - t1,
             "coresident_copy_s_max_rank": max(c["seconds"] for c in copies),
             "coresident_unpause_s": t3 - t2,
             "coresident_engine_paused_s": t3 - self._paused_at,
-            "coresident_copy_bytes_per_rank": copies[0]["bytes"],
-            "coresident_shared_bytes_per_rank": copies[0]["bytes_shared"],
+            "coresident_copy_bytes_per_rank": (
+                sum(copy["bytes"] for copy in copies) + self._residual_bytes
+            )
+            / len(copies),
+            "coresident_shared_bytes_per_rank": sum(
+                copy["bytes_shared"] for copy in copies
+            )
+            / len(copies),
+            "coresident_copy_bytes_total": sum(copy["bytes"] for copy in copies)
+            + self._residual_bytes,
+            "coresident_residual_destination_bytes": self._residual_bytes,
+            "coresident_shared_bytes_total": sum(
+                copy["bytes_shared"] for copy in copies
+            ),
         }
         print(f"[sm_partition] refit: {stats}", flush=True)
         self._paused_at = None
@@ -358,4 +451,14 @@ class CoresidentRefit:
         return stats
 
     def shutdown(self) -> None:
-        pass
+        """Drop reverse IPC imports while their inference owners are still alive."""
+        if self._closed:
+            return
+        if self._has_residual_transfers:
+            _get_fail_fast(
+                self._policy.worker_group.run_all_workers_single_data(
+                    "release_coresident_receives"
+                ),
+                timeout_s=self._control_timeout_s,
+            )
+        self._closed = True

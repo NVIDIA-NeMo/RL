@@ -11,61 +11,42 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Run Megatron training and inference concurrently on shared GPUs with CUDA MPS.
+"""Concurrent Megatron training and inference with shared GPU weight storage.
 
-Co-resident generation: the Megatron engine and the learner on the same GPUs, as two processes per GPU, each on its
-own share of the SMs. This module is the one owner of the mechanism.
+Each GPU runs one learner and one inference process under MPS. The default
+percentage backend caps the learner at ``100 - round(100 * engine_sm_fraction)``
+and leaves inference uncapped. This is a scheduling ceiling, not a reservation
+of disjoint SMs; the driver determines which ready kernels execute.
 
-The knob: ``policy.generation.colocated.engine_sm_fraction = f`` (with ``colocated.enabled = false`` and
-``refit_transport = ipc``). The generation fleet is the stock non-colocated Megatron engine (its own processes, process
-groups and CUDA graphs), placed on the training GPUs: one learner rank and one engine rank per GPU. The training loop is
-stock async: the engine never stands down.
+With ``engine_weights=shared``, compatible contiguous parameter views alias
+learner storage through same-GPU CUDA IPC. Strided/packed weights and persistent
+buffers retain inference storage. Native logical shard metadata identifies local
+sources across different TP, EP, ETP and training CP/PP layouts. When a destination
+needs another GPU's shard, the native reshard executor runs among learner ranks
+and writes directly into the paired inference process's exported receive buffers.
+There is no additional persistent shadow weight model.
 
-SM split (``sm_partition_backend``, see BACKENDS): every process on a node is a client of one MPS daemon started by the
-job before Ray. Under the default ``mps_percentage`` only the learner is capped: it runs with
-``CUDA_MPS_ACTIVE_THREAD_PERCENTAGE = 100 - round(100 f)``, fixed at CUDA initialization for every kernel, CUDA graph and
-NCCL kernel of the process. The engine is not capped and may use all SMs while the learner waits; during concurrent
-work MPS schedules both clients without reserving a minimum SM share for the engine. A cap on the engine only slows
-it, including while the learner is idle (measured: capping the engine at 42 % costs x1.23-1.56 per decode step at
-32-95 rows, and uncapping it gave -10.5 % s/step at K2, tw-cobn coresident-bottlenecks.md F1). The cap is not a disjoint
-SM set, and the driver rounds it
-(58 % -> 88 of 152 SMs); ``check_worker`` logs the allocated count.
+Inference pauses and drains admitted CUDA work before the optimizer can write
+shared weights. Publication verifies learner storage, refreshes receive handles
+when inference rehomes private tensors, completes residual and local copies,
+refreshes derived caches, and advances the inference weight epoch before resume.
+The same publication protocol serves ``engine_weights=copy``.
 
-Layouts: matching TP / PP / ETP, or learner TP1 to engine TP>1 with unchanged EP and ETP=CP=PP=1.
-At TP = ETP = 1, engine EP may be a multiple of learner EP; ``engine_rank_gpus`` places each engine rank beside
-its learner experts. Native refit metadata resolves global expert names and logical TP shard coordinates.
-For differing TP, contiguous source slices can be shared; strided and packed fragments are copied into private
-inference storage at publication. Shards requiring a different GPU are rejected.
+Native DDP learners can pack expert projections in inference order before buffer
+allocation. Compatible full expert stacks remain shared; other layouts use
+Megatron's own packing. Optimizer checkpoints for reordered parameters must use
+model-space names rather than bucket positions.
 
-Refit (``refit_transport = ipc``):
-- Once, at setup: each learner rank exports CUDA IPC handles of its local refit tensors (parameters and persistent
-  buffers; DDP-owned storage, stable for the run). The engine rank on the same GPU maps them.
-- ``colocated.engine_weights = "copy"``: the engine keeps its own weights. Per step, inside the loop's refit: pause at a
-  step boundary (no suspend), copy every local tensor device to device, refresh derived weights, bump the prefix-cache
-  weight epoch, unpause. Cost per rank per step: the local shard's bytes over HBM.
-- ``"shared"``: every eligible engine parameter whose local shard equals the learner's (same shape and dtype) is bound to the
-    learner's memory before the engine's first forward (``bind_shared``). Persistent buffers stay private because
-    training may update them before the optimizer pause. Each refit copies whatever does not alias its
-  source (``copy_refit``), so it stays correct if the engine re-homes a tensor. Native DDP learners prepare ordinary
-  expert parameter order before buffer allocation; compatible packed expert projections become shared [E, N, K]
-  inference views. Other storage layouts retain Megatron's lazy expert packing and per-refit copies.
-  These learners save optimizer state by model name. Optimizer resume requires a model-space checkpoint;
-  bucket-position checkpoints must be converted first or loaded with a fresh optimizer.
-  The engine pauses before the optimizer step writes the weights and stays paused through the
-  loop's refit (parameter all-gather, copy, epoch bump), which resumes it: the refit stays the one point where a new
-  version is published. Saves the shared bytes per GPU (logged per step); the engine idles for the optimizer step.
-
-Per-rank cost: one extra process and CUDA context per GPU, plus the engine's weight copy ("copy") or only its non-shared
-tensors ("shared"). Nothing grows with TP / PP / EP or the node count.
-
-Differing TP supports learner TP1 to engine TP>1 with unchanged EP and ETP=CP=PP=1. Other TP changes,
-PP > 1, distillation teachers, cluster segments, and reference-policy weight swapping with shared engine
-weights are not supported; setup rejects them.
+Both worker worlds use the same GPUs. Inference remains subject to its backend's
+CP1/PP1 and expert-TP constraints. Virtual pipeline chunks, GTP rematerialization
+and quantized refit storage are unsupported. New layouts require distributed GPU
+and full-model validation before performance or deployment claims.
 """
 
 from __future__ import annotations
 
 import os
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional
 
@@ -78,12 +59,6 @@ if TYPE_CHECKING:
 Role = Literal["engine", "learner"]
 MPS_PCT_ENV = "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"
 _FOREACH_COPY_MAX_BYTES = 512 * 1024
-_LAYOUT_KEYS = (
-    "tensor_model_parallel_size",
-    "pipeline_model_parallel_size",
-    "expert_model_parallel_size",
-    "expert_tensor_parallel_size",
-)
 
 
 @dataclass(frozen=True)
@@ -95,6 +70,41 @@ class RefitSlices:
 
 
 RefitSource = torch.Tensor | RefitSlices
+
+
+@dataclass(frozen=True)
+class RefitPlacement:
+    """Physical GPU identity and native distributed rank of one worker."""
+
+    device_id: str
+    rank: int
+
+
+@dataclass(frozen=True)
+class RefitExport:
+    """Stable learner storage exported to its colocated inference process."""
+
+    placement: RefitPlacement
+    metadata: list[dict[str, Any]]
+    handles: dict[str, tuple]
+    fingerprint: str
+
+
+@dataclass(frozen=True)
+class RefitBinding:
+    """Local bindings and remaining destinations in learner rank coordinates."""
+
+    residual_metadata: list[dict[str, Any]]
+    stats: dict[str, float]
+
+
+@dataclass(frozen=True)
+class RefitDestination:
+    """Inference-owned receive storage; handles change only when storage moves."""
+
+    device_id: str
+    fingerprint: str
+    handles: Optional[dict[str, tuple]]
 
 
 def engine_sm_fraction(policy_cfg: Any) -> Optional[float]:
@@ -142,43 +152,14 @@ def validate(
             "engine_sm_fraction needs an MPS control daemon on every node, started before Ray, with "
             "CUDA_MPS_PIPE_DIRECTORY exported (without MPS, two processes on one GPU time-slice)"
         )
-    learner = policy_cfg["megatron_cfg"]
-    engine = gen.get("mcore_generation_config") or {}
-    mismatch = {}
-    for k in _LAYOUT_KEYS:
-        lv = learner.get(k) or 1
-        ev = engine.get(k) or lv
-        if lv != ev:
-            mismatch[k] = (lv, ev)
-    tp_change = mismatch.get("tensor_model_parallel_size")
-    if tp_change is not None and (
-        tp_change[0] == 1
-        and tp_change[1] > 1
-        and "expert_model_parallel_size" not in mismatch
-        and "expert_tensor_parallel_size" not in mismatch
-        and (learner.get("expert_tensor_parallel_size") or 1) == 1
-        and (learner.get("context_parallel_size") or 1) == 1
-        and (engine.get("context_parallel_size") or 1) == 1
-    ):
-        mismatch.pop("tensor_model_parallel_size")
-    ep_l, ep_e = mismatch.pop("expert_model_parallel_size", (None, None))
-    # engine_rank_gpus places an EP-multiple engine for TP = ETP = 1 only.
-    if ep_l is not None and (
-        ep_e % ep_l != 0
-        or (learner.get("expert_tensor_parallel_size") or 1) != 1
-        or (learner.get("tensor_model_parallel_size") or 1) != 1
-    ):
-        mismatch["expert_model_parallel_size"] = (ep_l, ep_e)
-    if mismatch:
+    # Use the same CP/ETP resolution as the actual inference model.
+    from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
+
+    engine = merged_inference_megatron_cfg(policy_cfg)
+    if engine["pipeline_model_parallel_size"] != 1:
         raise ValueError(
-            "engine_sm_fraction: require matching TP / PP / ETP, or learner TP1 to engine TP>1 "
-            "with unchanged EP and ETP=CP=PP=1. An "
-            "engine EP that differs from the learner's must be a multiple of it at TP = ETP = 1 (each engine rank's "
-            f"experts are a block of its GPU's learner experts); other mixed layouts are not built yet. "
-            f"(learner, engine): {mismatch}"
+            "engine_sm_fraction requires inference pipeline parallelism PP1"
         )
-    if (learner.get("pipeline_model_parallel_size") or 1) > 1:
-        raise ValueError("engine_sm_fraction with pipeline parallelism is not built yet")
     for what, on in (unsupported or {}).items():
         if on:
             raise ValueError(f"engine_sm_fraction with {what} is not built yet")
@@ -323,7 +304,13 @@ def refit_core(model: Any) -> torch.nn.Module:
     """The module whose ``named_refit_tensors`` a refit walks (the unwrapped model)."""
     from megatron.core.utils import unwrap_model
 
-    return unwrap_model(model[0] if isinstance(model, (list, tuple)) else model)
+    if isinstance(model, (list, tuple)):
+        if len(model) != 1:
+            raise ValueError(
+                "co-resident refit requires one model chunk per worker; virtual pipeline is unsupported"
+            )
+        model = model[0]
+    return unwrap_model(model)
 
 
 def export_refit_handles(named: Iterable[tuple[str, torch.Tensor]]) -> dict[str, tuple]:
@@ -339,22 +326,86 @@ def storage_fingerprint(named: Iterable[tuple[str, torch.Tensor]]) -> str:
 
     h = hashlib.sha1()
     for name, t in named:
-        h.update(f"{name}:{t.data_ptr()}:{t.numel()};".encode())
+        h.update(
+            f"{name}:{t.data_ptr()}:{tuple(t.shape)}:{t.stride()}:{t.dtype}:{t.device};".encode()
+        )
     return h.hexdigest()
 
 
-def engine_rank_gpus(world: int, learner_ep: int, engine_ep: int) -> list[int]:
-    """Map engine ranks to the GPUs that hold their expert weights.
+@dataclass(frozen=True)
+class ParallelismLayout:
+    """Resolved parameter ownership dimensions used for worker placement."""
 
-    GPU of each engine rank when the engine's EP is m x the learner's: engine rank r (EP rank ep = r % engine_ep,
-    expert-DP rank d = r // engine_ep) goes to the GPU whose learner rank holds its experts (learner EP rank
-    ep // m) as a contiguous block, so its experts are views of that GPU's learner tensors. Identity when m == 1.
-    Learner rank g is on GPU g; EP ranks are the fastest-varying expert-group coordinate (TP = ETP = 1).
+    tp: int
+    ep: int
+    etp: int
+    pp: int
+    cp: int
+
+    @classmethod
+    def from_config(cls, config: dict) -> "ParallelismLayout":
+        tp = config["tensor_model_parallel_size"]
+        # Megatron resolves an omitted expert TP size to the dense TP size.
+        etp = config.get("expert_tensor_parallel_size")
+        return cls(
+            tp,
+            config["expert_model_parallel_size"],
+            tp if etp is None else etp,
+            config["pipeline_model_parallel_size"],
+            config["context_parallel_size"],
+        )
+
+
+def engine_rank_gpus(
+    world: int, *, learner: ParallelismLayout, engine: ParallelismLayout
+) -> list[int]:
+    """Match joint dense/expert ownership when all shards can remain local.
+
+    Megatron uses TP-fastest and PP-last ordering. CP changes sequence ownership,
+    while dense parameters repeat across CP ranks. Expert TP/EP coordinates use
+    their independent rank lattice. Unaligned layouts retain normal placement
+    and use the residual transfer plan for missing local weights.
     """
-    m = engine_ep // learner_ep
-    gpus = [learner_ep * (m * (r // engine_ep) + (r % engine_ep) % m) + (r % engine_ep) // m for r in range(world)]
-    assert sorted(gpus) == list(range(world)), gpus
-    return gpus
+    if type(world) is not int or world < 1:
+        raise ValueError("co-resident placement needs a positive integer world size")
+    for layout in (learner, engine):
+        if any(
+            type(size) is not int or size < 1
+            for size in (layout.tp, layout.ep, layout.etp, layout.pp, layout.cp)
+        ):
+            raise ValueError("co-resident parallelism sizes must be positive integers")
+        if world % (layout.tp * layout.cp * layout.pp) or world % (
+            layout.etp * layout.ep * layout.pp
+        ):
+            raise ValueError(
+                "co-resident world size must divide both dense and expert rank lattices"
+            )
+    identity = list(range(world))
+    if learner.pp != 1 or engine.pp != 1:
+        return identity
+    if engine.tp % learner.tp or engine.etp % learner.etp or engine.ep % learner.ep:
+        return identity
+    tp_ratio, etp_ratio, ep_ratio = (
+        engine.tp // learner.tp,
+        engine.etp // learner.etp,
+        engine.ep // learner.ep,
+    )
+    owners: dict[tuple[int, int, int], deque[int]] = defaultdict(deque)
+    for rank in range(world):
+        owners[
+            (rank % learner.tp, rank % learner.etp, (rank // learner.etp) % learner.ep)
+        ].append(rank)
+    placement = []
+    for rank in range(world):
+        needed = (
+            (rank % engine.tp) // tp_ratio,
+            (rank % engine.etp) // etp_ratio,
+            ((rank // engine.etp) % engine.ep) // ep_ratio,
+        )
+        if not owners[needed]:
+            return identity
+        placement.append(owners[needed].popleft())
+    return placement
 
 
 def refit_metadata(core: torch.nn.Module) -> list[ParameterMetadata]:
@@ -363,98 +414,6 @@ def refit_metadata(core: torch.nn.Module) -> list[ParameterMetadata]:
     from megatron.core.resharding.planner import _extract_module_metadata
 
     return _extract_module_metadata(core, torch.distributed.get_rank(), core.config.num_moe_experts, 0, {})
-
-
-def refit_names(core: torch.nn.Module) -> dict[str, str]:
-    """Map local refit names to Megatron's globally resolved tensor names."""
-    return {metadata.name: metadata.resolved_name for metadata in refit_metadata(core)}
-
-
-def map_tp_sources(
-    src: dict[str, torch.Tensor],
-    src_metadata: list[ParameterMetadata],
-    dst_metadata: list[ParameterMetadata],
-) -> dict[str, RefitSource]:
-    """Map complete inference shards to local learner views using native layouts.
-
-    Contiguous single views can be bound by ``bind_shared``. Strided views and
-    packed fragments retain private inference storage updated by ``copy_refit``.
-    Native coverage checks reject shards requiring weights on another GPU.
-    """
-    # Native layout handling is only needed for differing TP worker pairs.
-    from megatron.core.resharding.shard_planner import plan_sharded_transfer
-
-    sources = {metadata.resolved_name: metadata for metadata in src_metadata}
-    if len(sources) != len(src_metadata) or sources.keys() != src.keys():
-        raise ValueError("co-resident TP refit: source metadata must cover each resolved tensor once")
-    if len({metadata.name for metadata in dst_metadata}) != len(dst_metadata):
-        raise ValueError("co-resident TP refit: duplicate destination tensor names")
-    mapped: dict[str, RefitSource] = {}
-    for destination in dst_metadata:
-        resolved = destination.resolved_name
-        if resolved not in sources:
-            raise ValueError(f"co-resident TP refit: {resolved} is absent on the local learner GPU")
-        metadata = sources[resolved]
-        source = src[resolved]
-        if metadata.is_gtp or destination.is_gtp:
-            raise ValueError("co-resident TP refit does not support GTP rematerialized weights")
-        if (
-            type(source) not in (torch.Tensor, torch.nn.Parameter)
-            or source.dtype not in (torch.float32, torch.float16, torch.bfloat16)
-            or destination.dtype not in (torch.float32, torch.float16, torch.bfloat16)
-            or tuple(source.shape) != metadata.shape
-            or source.dtype != metadata.dtype
-        ):
-            raise ValueError(f"co-resident TP refit: unsupported storage or stale metadata for {resolved}")
-        operations = plan_sharded_transfer(resolved, [metadata], metadata, destination)
-        if any(owner != metadata.owner_rank for owner, _, _ in operations):
-            raise ValueError(f"co-resident TP refit: {resolved} requires a remote learner shard")
-        parts = tuple((source[source_slice], target_slice) for _, source_slice, target_slice in operations)
-        if len(parts) == 1 and all(
-            part.start == 0 and part.stop == extent
-            for part, extent in zip(parts[0][1], destination.shape)
-        ):
-            mapped[destination.name] = parts[0][0]
-        else:
-            mapped[destination.name] = RefitSlices(destination.shape, parts)
-    return mapped
-
-
-def rank_coordinates() -> dict[str, tuple[int, int]]:
-    """(rank, size) of this process in its TP and PP groups."""
-    from megatron.core import parallel_state as ps
-
-    return {
-        "tp": (ps.get_tensor_model_parallel_rank(), ps.get_tensor_model_parallel_world_size()),
-        "pp": (ps.get_pipeline_model_parallel_rank(), ps.get_pipeline_model_parallel_world_size()),
-    }
-
-
-def map_sources(
-    src: dict[str, torch.Tensor],
-    src_coords: dict[str, tuple[int, int]],
-    dst_names: dict[str, str],
-    dst_coords: dict[str, tuple[int, int]],
-) -> dict[str, torch.Tensor]:
-    """Map inference tensors to compatible learner shards on the same GPU.
-
-    The learner tensor behind each engine tensor. ``src``: the learner's tensors on this GPU by resolved name;
-    ``dst_names``: the engine's {local name: resolved name}. The two ranks must hold the same TP / PP shard (else a
-    dense tensor of equal name and shape would be another rank's shard), and every engine tensor, each expert by its
-    global index, must be on this GPU's learner rank.
-    """
-    if src_coords != dst_coords:
-        raise ValueError(
-            f"co-resident refit: the engine rank on this GPU is at {dst_coords} but the learner rank at {src_coords} "
-            "(TP / PP (rank, size)): engine ranks are misplaced"
-        )
-    missing = sorted(r for r in dst_names.values() if r not in src)
-    if missing:
-        raise ValueError(
-            f"co-resident refit: {len(missing)} engine tensors are not on this GPU's learner rank, e.g. {missing[:8]} "
-            "(engine ranks not placed by engine_rank_gpus, or the layouts differ)"
-        )
-    return {name: src[resolved] for name, resolved in dst_names.items()}
 
 
 def open_refit_handles(handles: dict[str, tuple]) -> dict[str, torch.Tensor]:
@@ -498,7 +457,7 @@ def _check_names(src: dict[str, RefitSource], dst: dict[str, torch.Tensor]) -> N
     if dst.keys() != src.keys():
         missing, extra = sorted(set(dst) - set(src)), sorted(set(src) - set(dst))
         raise ValueError(
-            "co-resident refit: engine and learner refit tensors differ by name (layouts must match): "
+            "co-resident refit: engine tensors differ by name from the planned local sources: "
             f"engine-only {missing[:8]} ({len(missing)}), learner-only {extra[:8]} ({len(extra)})"
         )
 
@@ -633,7 +592,7 @@ def bind_shared_expert_stacks(core: torch.nn.Module, src: dict[str, RefitSource]
             for index in range(module.num_local_experts):
                 name = f"{prefix + '.' if prefix else ''}{linear_name}.weight{index}"
                 weight = getattr(linear, f"weight{index}")
-                source = src[name]
+                source = src.get(name)
                 if (
                     not isinstance(source, torch.Tensor)
                     or not isinstance(weight, torch.nn.Parameter)

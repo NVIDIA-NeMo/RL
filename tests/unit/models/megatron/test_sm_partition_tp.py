@@ -24,6 +24,17 @@ import torch
 from megatron.core.resharding.utils import ParameterMetadata
 
 from nemo_rl.models.megatron import sm_partition as smp
+from nemo_rl.models.megatron.coresident_reshard import plan_local_sources
+
+
+def _local_sources(
+    tensors: dict[str, torch.Tensor],
+    sources: list[ParameterMetadata],
+    destinations: list[ParameterMetadata],
+) -> dict[str, smp.RefitSource]:
+    return plan_local_sources(
+        tensors, sources, destinations, learner_rank=sources[0].owner_rank
+    ).local_sources
 
 
 def _metadata(
@@ -86,7 +97,7 @@ def test_dense_tp1_to_larger_tp_matches_independent_row_column_slices(
             dim=dim,
             resolved="weight",
         )
-        mapped = smp.map_tp_sources({"weight": full}, [source], [destination])[
+        mapped = _local_sources({"weight": full}, [source], [destination])[
             "engine.weight"
         ]
         assert isinstance(mapped, torch.Tensor)
@@ -113,7 +124,7 @@ def test_glu_stride_two_fragments_copy_and_follow_next_publication(
         destination = _metadata(
             "weight", expected, rank=rank, group=list(range(tp)), stride=2
         )
-        mapped = smp.map_tp_sources({"weight": full}, [source], [destination])
+        mapped = _local_sources({"weight": full}, [source], [destination])
         assert isinstance(mapped["weight"], smp.RefitSlices)
         assert len(mapped["weight"].parts) == 2
         assert tuple(mapped["weight"].shape) == tuple(expected.shape)
@@ -162,7 +173,7 @@ def test_unequal_packed_mamba_components_match_per_component_golden(
             group=list(range(tp)),
             sizes=[size // tp for size in component_sizes],
         )
-        mapped = smp.map_tp_sources({"weight": full}, [source], [destination])
+        mapped = _local_sources({"weight": full}, [source], [destination])
         assert isinstance(mapped["weight"], smp.RefitSlices)
         assert len(mapped["weight"].parts) == len(component_sizes)
         private = torch.nn.Parameter(torch.zeros_like(expected), requires_grad=False)
@@ -197,7 +208,7 @@ def test_replicated_and_resolved_individual_expert_remain_unchanged() -> None:
         ),
         _metadata(local, expert, rank=3, group=[3], is_tp=False, resolved=resolved),
     ]
-    mapped = smp.map_tp_sources(sources, source_metadata, destination_metadata)
+    mapped = _local_sources(sources, source_metadata, destination_metadata)
     for name, expected in [("engine.bias", bias), (local, expert)]:
         assert isinstance(mapped[name], torch.Tensor)
         assert mapped[name].data_ptr() == expected.data_ptr()
@@ -219,7 +230,7 @@ def test_contiguous_alias_and_strided_private_copy_update_at_refit(
         _metadata("row", expected_row, rank=1, group=[0, 1]),
         _metadata("column", expected_column, rank=1, group=[0, 1], dim=1),
     ]
-    mapped = smp.map_tp_sources(
+    mapped = _local_sources(
         {"row": full_row, "column": full_column}, source_metadata, destination_metadata
     )
     row = torch.nn.Parameter(torch.zeros_like(expected_row), requires_grad=False)
@@ -248,7 +259,7 @@ def test_missing_remote_source_coverage_is_rejected() -> None:
     source = _metadata("weight", local, rank=0, group=[0, 1])
     destination = _metadata("weight", whole, rank=0, group=[0])
     with pytest.raises((ValueError, RuntimeError), match="cover|remote|local"):
-        smp.map_tp_sources({"weight": local}, [source], [destination])
+        _local_sources({"weight": local}, [source], [destination])
 
 
 @pytest.mark.parametrize("stale_source", [False, True])
@@ -259,7 +270,7 @@ def test_logical_shape_or_stale_source_metadata_is_rejected(stale_source: bool) 
         "weight", torch.empty(4 if stale_source else 5, 12), rank=0, group=[0, 1]
     )
     with pytest.raises((ValueError, RuntimeError), match="shape|metadata"):
-        smp.map_tp_sources({"weight": full}, [source], [destination])
+        _local_sources({"weight": full}, [source], [destination])
 
 
 _IPC_HANDSHAKE_TIMEOUT_S = 120
@@ -337,7 +348,7 @@ def _tp_ipc_consume(from_learner: Queue, to_learner: Queue) -> dict[str, int | b
         )
         for name, weight in initial.items()
     ]
-    mapped = smp.map_tp_sources(source, source_metadata, destination_metadata)
+    mapped = _local_sources(source, source_metadata, destination_metadata)
     assert isinstance(mapped["row"], torch.Tensor) and mapped["row"].is_contiguous()
     assert (
         isinstance(mapped["column"], torch.Tensor)

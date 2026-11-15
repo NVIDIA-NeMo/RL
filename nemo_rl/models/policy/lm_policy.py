@@ -454,13 +454,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             **worker_kwargs,
         )
 
+        if worker_gpu_order is not None and sorted(worker_gpu_order) != list(
+            range(actual_world_size)
+        ):
+            raise ValueError(
+                "worker_gpu_order must be a permutation of all cluster GPUs"
+            )
         if cluster._sorted_bundle_indices is not None:
             # The cluster has initialized a unified placemenet group across nodes
             # In this case, we need to create workers based on sorted bundle indices
             group_size = cluster.num_gpus_per_node
+            physical_order = (
+                range(actual_world_size)
+                if worker_gpu_order is None
+                else worker_gpu_order
+            )
             tied_groups = [
-                (i // group_size, [bundle_idx])
-                for i, bundle_idx in enumerate(cluster._sorted_bundle_indices)
+                (gpu // group_size, [cluster._sorted_bundle_indices[gpu]])
+                for gpu in physical_order
             ]
 
             self.worker_group = RayWorkerGroup(
