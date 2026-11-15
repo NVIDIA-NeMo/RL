@@ -2726,6 +2726,40 @@ def test_train_pump_still_fails_a_windowed_tail_below_the_floor() -> None:
         asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
 
+@pytest.mark.parametrize(
+    "min_step_batch_fraction, skipped",
+    [(0.5, False), (1.0, True)],
+    ids=["trainable_tail", "below_floor_tail"],
+)
+def test_windowed_tail_under_dynamic_sampling_trains_or_skips_by_the_floor(
+    monkeypatch, min_step_batch_fraction: float, skipped: bool
+) -> None:
+    """A windowed EOF tail is allowed to close short, so the floor decides, not a raise.
+
+    With dynamic sampling on, the exhausted windowed step is marked allowed-short, so
+    the final floor check trains it or skips it instead of failing. One group of two:
+    a 50% floor (ceil is 1) trains it; a 100% floor (ceil is 2) skips it without an
+    optimizer update. The dynamic-sampling-off counterparts above instead raise, since
+    a short step is an error when nothing is being filtered.
+    """
+    ctrl, _ = _closes_short_controller(min_step_batch_fraction=min_step_batch_fraction)
+    ctrl._dynamic_sampling_enabled = True
+    ctrl._trainer.abort_train_step = MagicMock()
+    ctrl._trainer.finish_train_step = MagicMock(return_value={})
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert 0 in ctrl._rollout_runtime.steps_allowed_short, (
+        "the exhausted windowed step must reach the train-or-skip check, not raise"
+    )
+    assert ctrl._trainer.abort_train_step.call_count == int(skipped)
+    assert ctrl._trainer.finish_train_step.call_count == int(not skipped)
+    assert ctrl._consumed_samples == int(not skipped)
+    metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert metrics["skipped_step"] == int(skipped)
+
+
 def test_the_closes_short_stub_declares_what_the_windowed_sampler_does() -> None:
     """The stub drives the pump tests above, so it must not drift from the real one."""
     windowed = WindowedSampler(MagicMock(), max_staleness_versions=1)

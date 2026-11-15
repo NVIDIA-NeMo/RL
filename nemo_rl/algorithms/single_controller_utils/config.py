@@ -1238,10 +1238,7 @@ def _validate_failure_settings(
         + failure_config.max_consecutive_dropped_prompts
     )
     floor = math.ceil(num_prompts_per_step * failure_config.min_step_batch_fraction)
-    # The floor warning below applies only to the built-in samplers that charge a
-    # dropped group to a step, so a drop shrinks that step up against the floor. A
-    # windowed sampler charges nothing (charge_step_for_lost_group returns None) and
-    # backfills the slot from a later ordinary dispatch, so the floor cannot bite it.
+    # Only samplers that charge a drop to a step get the floor warning below.
     sampler_name = async_config.sampler.name
     sampler_charges_drops_to_steps = sampler_name in (
         "in_order",
