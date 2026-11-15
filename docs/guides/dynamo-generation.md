@@ -95,6 +95,7 @@ Startup rejects these with `dynamo: true`:
 - `vllm_cfg.skip_tokenizer_init: true` with NeMo-Gym: the engine detokenizes the replies Gym's calls get through the frontend.
 - `vllm_cfg.expert_parallel_size > tensor_parallel_size`: that runs data parallelism inside vLLM, which Dynamo does not serve yet. Above data-parallel rank 0, vLLM rejects each engine's `ipc://` KV-event endpoint.
 - `vllm_cfg.http_server_api_key_required`: the frontend serves the same engines on 0.0.0.0 and checks no bearer token.
+- `vllm_cfg.http_api_server_count` above 1: NeMo-Gym's calls go through the Dynamo frontend, so the extra vLLM HTTP frontends would serve none of them. `frontend_args.render_workers` sets how many processes render chat calls behind Dynamo.
 - `frontend_args.router_mode: direct`: it needs a worker ID on every request, and NeMo RL's rollouts name none.
 - `dynamo: true` on a backend other than vLLM, and a `dynamo_cfg` block without `dynamo: true`.
 

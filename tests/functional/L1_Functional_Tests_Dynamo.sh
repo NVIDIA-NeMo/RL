@@ -47,8 +47,7 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # Turn recovery: Gym checkpoint + TQ snapshot, kill, restore, re-sent calls.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_turn_recovery.sh ++policy.generation.dynamo=true
 # Prefix recovery: a checkpoint cuts running calls; restore resumes them from the saved tokens.
-# Full tier, as in the native list.
-run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh ++policy.generation.dynamo=true
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh ++policy.generation.dynamo=true
 
 cd "${PROJECT_ROOT}/tests"
 if compgen -G ".coverage*" > /dev/null; then

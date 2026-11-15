@@ -5,11 +5,6 @@
 # No NeMo-Gym: the filter is a property of the rollout pump, not of the
 # environment, so the cheaper built-in math env exercises it just as well and
 # needs no dataset preparation step in CI.
-#
-# Non-capture on purpose. Setup rejects dynamic sampling together with
-# token_capture.enabled, because the capture path cannot borrow a finished
-# group from a later step and every drop would stall its step for a fresh
-# rollout.
 # Launch with:
 #   uv run examples/run_grpo_single_controller.py \
 #     --config examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-megatron-vllm-noncolocated-single-controller.yaml
