@@ -48,26 +48,35 @@ policy:
   logprob_chunk_size: 1024
   offload_optimizer_for_logprob: true
   make_sequence_length_divisible_by: 64
+  # BF16 parameters with FP32 master values kept as int16 remainders and BF16 Adam moments: the
+  # default AdamW would load the 310B parameters in FP32 (19 GB per GPU at EP64).
   optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     kwargs:
       lr: 1.0e-06
       weight_decay: 0.1
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
-      start_factor: 0.01
+      start_factor: 1.0e-08
       end_factor: 1.0
-      total_iters: 5
+      total_iters: 10
   - name: torch.optim.lr_scheduler.ConstantLR
     kwargs:
       factor: 1.0
       total_iters: 10000000000
   - milestones:
-    - 5
+    - 10
   # Rollout routing replay: training replays vLLM's expert choices. Needs CP=1 and no sequence packing.
   router_replay:
     enabled: true
   automodel_cfg:
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     context_parallel_size: 1
     expert_parallel_size: 64
     activation_checkpointing: true
