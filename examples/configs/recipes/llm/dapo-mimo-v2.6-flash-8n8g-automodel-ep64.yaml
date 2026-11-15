@@ -101,12 +101,15 @@ policy:
       enable_prefix_caching: true
       enforce_eager: false
     vllm_kwargs:
-      # Text-only RL: skip the vision and audio towers and their processors.
-      language_model_only: true
+      # Text-only RL. vLLM routes any config with a vision_config to the Omni wrapper, which always
+      # builds the vision tower (its 8 KV heads cap TP at 8), so vLLM is given a config without one.
+      # The trainer keeps the full multimodal config.
       # Roll out in BF16 with split QKV. The released config declares block-FP8 and fused QKV.
       hf_overrides:
         quantization_config: {}
         attention_projection_layout: split
+        vision_config: null
+        audio_config: null
 data:
   max_input_seq_length: 1024
   train:
