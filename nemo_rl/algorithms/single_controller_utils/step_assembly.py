@@ -66,6 +66,13 @@ class StepAssemblyAccountant:
         self._controller = controller
         self._assembling_version = initial_version
         self._step_assembly: Optional[StepAssembly] = None
+        # How many allow-short reasons the accountant itself has charged to each
+        # step, so reconciliation can undo only its own racing contribution.
+        # ``steps_allowed_short`` is otherwise append-only and written by several
+        # paths (drained pooled steps, exhausted closes) plus checkpoint restore;
+        # those are treated as a standing reason (see ``_allow_short_reasons``), so
+        # a racing credit's release can never drop a permission another path owns.
+        self._allow_short_charges: dict[int, int] = {}
 
     @property
     def _sampler(self) -> "PromptGroupSampler":
@@ -124,6 +131,36 @@ class StepAssemblyAccountant:
                 return
             self._assembling_version += 1
 
+    def _mark_step_allowed_short(self, charged_step: int) -> None:
+        """Record one allow-short reason the accountant charged to ``charged_step``.
+
+        A step already permitted by another path -- a drained pooled step, an
+        exhausted close, or a checkpoint restore -- has no tracked count, so its
+        standing permission counts as one reason the accountant will not release
+        (see ``_allow_short_reasons``). The accountant's own charge then stacks on
+        top, so reconciliation can undo it without dropping the other path's.
+        """
+        self._allow_short_charges[charged_step] = (
+            self._allow_short_reasons(charged_step) + 1
+        )
+        self._runtime.steps_allowed_short.add(charged_step)
+
+    def _release_step_allowed_short(self, charged_step: int) -> None:
+        """Undo one allow-short reason the accountant charged; drop at the last."""
+        remaining = self._allow_short_reasons(charged_step) - 1
+        if remaining > 0:
+            self._allow_short_charges[charged_step] = remaining
+        else:
+            self._allow_short_charges.pop(charged_step, None)
+            self._runtime.steps_allowed_short.discard(charged_step)
+
+    def _allow_short_reasons(self, charged_step: int) -> int:
+        """Reasons the step may close short: tracked charges, or 1 if premarked."""
+        tracked = self._allow_short_charges.get(charged_step)
+        if tracked is not None:
+            return tracked
+        return 1 if charged_step in self._runtime.steps_allowed_short else 0
+
     def reconcile_selection_credits(
         self, assembling_version: int, credits: list[ShortfallCredit]
     ) -> None:
@@ -134,6 +171,16 @@ class StepAssemblyAccountant:
                 self._runtime.batch_shortfall[credit.charged_step] = remaining
             else:
                 del self._runtime.batch_shortfall[credit.charged_step]
+            # Undo the allow-short permission the racing credit added so the
+            # reapplication below can re-add it at whatever step the settled
+            # selection actually charges. Reference-counted so a permission another
+            # path (a drained pooled step, an exhausted close, a restore) owns is
+            # never dropped: without this, a racing allow-short credit whose charged
+            # step moves on reconciliation would strand a stale permission on the set
+            # -- which is otherwise append-only -- silently skipping a later
+            # legitimate shortfall on that step instead of tripping the batch floor.
+            if credit.allow_short:
+                self._release_step_allowed_short(credit.charged_step)
         self._assembling_version = assembling_version
         self.advance_assembling_version()
         for credit in credits:
@@ -152,7 +199,7 @@ class StepAssemblyAccountant:
             self._runtime.batch_shortfall.get(charged_step, 0) + 1
         )
         if allow_short:
-            self._runtime.steps_allowed_short.add(charged_step)
+            self._mark_step_allowed_short(charged_step)
         assembly = self._step_assembly
         if (
             self._sampler.requires_shortfall_reconciliation

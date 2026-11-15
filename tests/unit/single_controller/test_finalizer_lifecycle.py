@@ -158,6 +158,16 @@ def _controller(actor: object) -> Any:
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._is_ppo = False
     ctrl._dynamic_sampling_enabled = False
+    # Replacement, filtered-spare and shortfall-crediting paths read the live sampler.
+    # Default to a stamped, pooled sampler: filtered drops draw a spare, and a lost
+    # group is charged to its own stamped step (matching these tests' expectations).
+    ctrl._sampler = SimpleNamespace(
+        uses_pooled_replacements=True,
+        requires_shortfall_reconciliation=False,
+        charge_step_for_lost_group=(
+            lambda *, target_step, assembling_version: target_step
+        ),
+    )
     ctrl._trainer_version = 3
     ctrl._train_steps = 3
     return ctrl

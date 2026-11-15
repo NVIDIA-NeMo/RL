@@ -2014,6 +2014,9 @@ def test_a_group_rejected_for_both_reasons_tallies_each_attempt_once(
 def _claiming_controller(*, spares: int, exhausted: bool = False) -> Any:
     ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
     ctrl._dynamic_sampling_enabled = True
+    # Claiming a filtered spare only applies to a sampler that pools replacements;
+    # a non-pooled sampler (windowed) refills from later dispatches and never waits.
+    ctrl._sampler = SimpleNamespace(uses_pooled_replacements=True)
     ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._rollout_runtime.filtered_reserve = deque({"idx": i} for i in range(spares))
     ctrl._filtered_spares_claimed = 0

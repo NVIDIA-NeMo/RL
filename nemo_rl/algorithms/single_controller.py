@@ -1392,7 +1392,14 @@ class SingleControllerActor:
         Once the dataloader is exhausted, no group waits for another spare:
         rejection takes whatever remains or closes its step short.
         """
-        if not self._dynamic_sampling_enabled:
+        if (
+            not self._dynamic_sampling_enabled
+            or not self._sampler.uses_pooled_replacements
+        ):
+            # A sampler without a spare pool (windowed) never has a filtered spare to
+            # claim -- its pool is never refilled -- and refills filtered slots from
+            # later ordinary dispatches instead. Waiting here would block every
+            # token-capture finalization on a pool that never fills.
             yield
             return
         claimed = False
@@ -1561,10 +1568,23 @@ class SingleControllerActor:
                             "finalizer group carried no reward signal and known-key "
                             f"cleanup failed for group {request.group_id}"
                         ) from cleanup_error
-                    replacement = self._pop_filtered_replacement(target_step)
-                    lineage_group_id, replacement_step = self._substitute_dropped_group(
-                        cut, replacement, target_step
-                    )
+                    if self._sampler.uses_pooled_replacements:
+                        replacement = self._pop_filtered_replacement(target_step)
+                        lineage_group_id, replacement_step = (
+                            self._substitute_dropped_group(
+                                cut, replacement, target_step
+                            )
+                        )
+                    else:
+                        # No spare pool (windowed): record the filtered prompt against
+                        # the dynamic-sampling budget and leave the slot for a later
+                        # ordinary dispatch to refill, mirroring the non-capture path.
+                        # Popping would raise on the never-refilled pool, and crediting
+                        # the step short would fail an allowance it never spent.
+                        self._record_filtered_prompt(target_step)
+                        replacement = None
+                        lineage_group_id = None
+                        replacement_step = target_step
                     rejected = ZeroVarianceGroup(
                         replacement=replacement,
                         lineage_group_id=lineage_group_id,
