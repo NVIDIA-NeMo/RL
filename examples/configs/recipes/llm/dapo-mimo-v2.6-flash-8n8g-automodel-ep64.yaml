@@ -100,6 +100,8 @@ policy:
       enable_prefix_caching: true
       enforce_eager: false
     vllm_kwargs:
+      # Text-only RL: skip the vision and audio towers and their processors.
+      language_model_only: true
       # Roll out in BF16 with split QKV. The released config declares block-FP8 and fused QKV.
       hf_overrides:
         quantization_config: null
