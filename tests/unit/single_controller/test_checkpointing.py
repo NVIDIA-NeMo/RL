@@ -115,6 +115,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.step_assembly import (
+    StepAssembler,
+)
+from nemo_rl.algorithms.single_controller_utils.step_assembly import (
     StepAssembly as _StepAssembly,
 )
 from nemo_rl.data.utils import load_dataloader_state
@@ -1343,6 +1346,10 @@ class TestCounterRestore:
         recovery_target_steps: list[int],
     ) -> None:
         actor = object.__new__(_ACTOR_CLS)
+        actor._step_assembler = StepAssembler(
+            controller=actor,
+            initial_version=getattr(actor, "_trainer_version", 0),
+        )
         actor._buffer = SimpleNamespace(target_step_list=buffer_target_steps)
         actor._rollout_manager = SimpleNamespace(
             recovery_ledger=SimpleNamespace(
@@ -1363,6 +1370,10 @@ class TestCounterRestore:
 
     def test_accepts_sampler_cursor_covering_restored_work(self) -> None:
         actor = object.__new__(_ACTOR_CLS)
+        actor._step_assembler = StepAssembler(
+            controller=actor,
+            initial_version=getattr(actor, "_trainer_version", 0),
+        )
         actor._buffer = SimpleNamespace(target_step_list=[None, 7])
         actor._rollout_manager = SimpleNamespace(
             recovery_ledger=SimpleNamespace(
@@ -1413,7 +1424,7 @@ class TestCounterRestore:
         assert actor._trainer_version == 11
         # A group with no step of its own is charged to the step being assembled, so a
         # resume that left this at 0 would charge the first loss to a long-closed step.
-        assert actor._accountant._assembling_version == 11
+        assert actor._step_assembler._assembling_version == 11
         assert actor._sampler.dispatch_index == 10
 
     def test_restores_exact_sampler_dispatch_index(self, tmp_path):
@@ -1438,7 +1449,7 @@ class TestCounterRestore:
 
         assert actor._train_steps == 0
         assert actor._trainer_version == 0
-        assert actor._accountant._assembling_version == 0
+        assert actor._step_assembler._assembling_version == 0
         assert actor._sampler.dispatch_index == -1
         assert actor._consumed_samples == 0
         assert actor._current_epoch == 0
@@ -2878,12 +2889,12 @@ class TestPeriodicRolloutCheckpoint:
             max_staleness_versions=1
         )
         actor._sampler = ReadyFirstSampler(actor._buffer, max_staleness_versions=1)
-        actor._accountant._step_assembly = _StepAssembly(0, 0, [])
+        actor._step_assembler._step_assembly = _StepAssembly(0, 0, [])
         attach_rollout_checkpointing(actor)
 
         def lose() -> None:
             for _ in range(3):
-                actor._accountant.credit_shortfall(None)
+                actor._step_assembler.credit_shortfall(None)
             assert actor._rollout_runtime.batch_shortfall == {0: 3}
 
         async def exercise() -> None:
@@ -2909,10 +2920,10 @@ class TestPeriodicRolloutCheckpoint:
                     await actor._rollout_snapshots.capture(
                         cut, tmp_path / "unsafe", "rollout_snapshot"
                     )
-            credits = actor._accountant._step_assembly.selection_credits
-            actor._accountant._step_assembly.selection_credits = None
-            actor._accountant._step_assembly.selected_groups = 3
-            actor._accountant.reconcile_selection_credits(0, credits)
+            credits = actor._step_assembler._step_assembly.selection_credits
+            actor._step_assembler._step_assembly.selection_credits = None
+            actor._step_assembler._step_assembly.selected_groups = 3
+            actor._step_assembler.reconcile_selection_credits(0, credits)
             assert actor._target_groups_for_step(0) == 3
             assert actor._target_groups_for_step(1) == 2
             saved = await actor._rollout_snapshots.save_snapshot(force=True)
@@ -4017,6 +4028,10 @@ class _OrderRecordingCritic:
 def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     """Bare actor carrying only what _save_checkpoint reads."""
     actor = object.__new__(_ACTOR_CLS)
+    actor._step_assembler = StepAssembler(
+        controller=actor,
+        initial_version=getattr(actor, "_trainer_version", 0),
+    )
     actor._rollout_runtime = RolloutRuntimeState()
     checkpoint_path = tmp_path / "tmp_step_1"
     checkpoint_path.mkdir(parents=True, exist_ok=True)
@@ -4949,6 +4964,10 @@ class TestReplayBufferPersistence:
     @pytest.mark.parametrize("dataset_idx", [99, True])
     def test_replay_free_restore_rejects_changed_prompt_identity(self, dataset_idx):
         actor = object.__new__(_ACTOR_CLS)
+        actor._step_assembler = StepAssembler(
+            controller=actor,
+            initial_version=getattr(actor, "_trainer_version", 0),
+        )
         actor._dataloader = _FakeDataloader(dataset=[{"idx": 0}, {"idx": dataset_idx}])
         actor._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         actor._rollout_manager = _FakeRolloutManager()

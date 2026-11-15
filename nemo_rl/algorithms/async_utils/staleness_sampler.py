@@ -1101,7 +1101,7 @@ def create_sampler(
     Args:
         buffer: Shared TQReplayBuffer holding the candidate slots.
         cfg: Discriminated sampler config selecting the policy.
-        min_groups_for_streaming_train: Streaming floor used by the windoweds sampler.
+        min_groups_for_streaming_train: Streaming floor used by the windowed sampler.
     """
     sampler_cls = _sampler_class_for_config(cfg)
     sampler: PromptGroupSampler

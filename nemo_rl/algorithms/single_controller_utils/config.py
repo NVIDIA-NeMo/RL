@@ -1238,9 +1238,16 @@ def _validate_failure_settings(
         + failure_config.max_consecutive_dropped_prompts
     )
     floor = math.ceil(num_prompts_per_step * failure_config.min_step_batch_fraction)
-    # Only built-in step-charging policies get the floor warning below.
+    # The floor warning below applies only to the built-in samplers that charge a
+    # dropped group to a step, so a drop shrinks that step up against the floor. A
+    # windowed sampler charges nothing (charge_step_for_lost_group returns None) and
+    # backfills the slot from a later ordinary dispatch, so the floor cannot bite it.
     sampler_name = async_config.sampler.name
-    sampler_shrinks_steps = sampler_name in ("in_order", "ready_first", "weight_fifo")
+    sampler_charges_drops_to_steps = sampler_name in (
+        "in_order",
+        "ready_first",
+        "weight_fifo",
+    )
 
     # Replacements may use newer weights, leaving the original weight bucket short.
     if drop_budget and sampler_requires_single_weight_batch(async_config.sampler):
@@ -1259,7 +1266,7 @@ def _validate_failure_settings(
         )
 
     if (
-        sampler_shrinks_steps
+        sampler_charges_drops_to_steps
         and drop_budget
         and floor >= num_prompts_per_step
         and failure_config.on_dropped_prompt == "shrink"

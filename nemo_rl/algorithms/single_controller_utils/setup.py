@@ -1188,8 +1188,13 @@ def setup_single_controller(
             "master_config.data_plane.enabled=True. The async-RL "
             "SingleController path is built on the TransferQueue data plane."
         )
+    # A lost group is accounted off the sampler on the async SC path regardless of
+    # dynamic sampling -- credit_shortfall reads charge_step_for_lost_group and
+    # requires_shortfall_reconciliation, EOF reads closes_short_at_exhaustion, and the
+    # fault-tolerance replacement reads uses_pooled_replacements. Require the members
+    # here so a custom sampler missing one fails at setup, not mid-run.
+    require_drop_accounting_members(master_config.async_rl.sampler)
     if algo_cfg.use_dynamic_sampling:
-        require_drop_accounting_members(master_config.async_rl.sampler)
         if not sampler_supports_transactional_admission(master_config.async_rl.sampler):
             raise ValueError(
                 "Dynamic sampling requires TransactionalAdmissionSampler: the admission "

@@ -46,14 +46,14 @@ class StepAssembly:
     selection_credits: Optional[list[ShortfallCredit]]
 
 
-class StepAssemblyAccountant:
+class StepAssembler:
     """Track the step being assembled and charge lost groups to it.
 
     The controller injects itself as the backref; the sampler, the shared
     ``RolloutRuntimeState`` (read for its current ``batch_shortfall`` /
     ``steps_allowed_short`` / ``shortfall_reconciliation_pending``) and the
     per-step prompt-group target are read live off it rather than cached, so
-    the accountant tracks the controller's current state. The cursor starts
+    the assembler tracks the controller's current state. The cursor starts
     from the restored trainer version so step ``0`` stays valid after a restore.
     """
 
@@ -66,7 +66,7 @@ class StepAssemblyAccountant:
         self._controller = controller
         self._assembling_version = initial_version
         self._step_assembly: Optional[StepAssembly] = None
-        # How many allow-short reasons the accountant itself has charged to each
+        # How many allow-short reasons the assembler itself has charged to each
         # step, so reconciliation can undo only its own racing contribution.
         # ``steps_allowed_short`` is otherwise append-only and written by several
         # paths (drained pooled steps, exhausted closes) plus checkpoint restore;
@@ -132,12 +132,12 @@ class StepAssemblyAccountant:
             self._assembling_version += 1
 
     def _mark_step_allowed_short(self, charged_step: int) -> None:
-        """Record one allow-short reason the accountant charged to ``charged_step``.
+        """Record one allow-short reason the assembler charged to ``charged_step``.
 
         A step already permitted by another path -- a drained pooled step, an
         exhausted close, or a checkpoint restore -- has no tracked count, so its
-        standing permission counts as one reason the accountant will not release
-        (see ``_allow_short_reasons``). The accountant's own charge then stacks on
+        standing permission counts as one reason the assembler will not release
+        (see ``_allow_short_reasons``). The assembler's own charge then stacks on
         top, so reconciliation can undo it without dropping the other path's.
         """
         self._allow_short_charges[charged_step] = (
@@ -146,7 +146,7 @@ class StepAssemblyAccountant:
         self._runtime.steps_allowed_short.add(charged_step)
 
     def _release_step_allowed_short(self, charged_step: int) -> None:
-        """Undo one allow-short reason the accountant charged; drop at the last."""
+        """Undo one allow-short reason the assembler charged; drop at the last."""
         remaining = self._allow_short_reasons(charged_step) - 1
         if remaining > 0:
             self._allow_short_charges[charged_step] = remaining
