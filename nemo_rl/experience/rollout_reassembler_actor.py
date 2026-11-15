@@ -149,6 +149,7 @@ class RolloutReassemblerActorConfig:
     # media rows in this geometry for groups without media), ``None`` otherwise.
     media_columns: Optional[MediaColumnSpec]
     top_logprobs: int
+    include_shared_prefix_metadata: bool = False
     reward_penalty_config: RewardPenaltyConfig | None = None
     length_penalty_config: LengthPenaltyConfig | None = None
     effort_config: EffortLevelsConfig | None = None
@@ -190,6 +191,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             max_seq_len=config.max_seq_len,
             capture_media=config.capture_media,
             media_columns=config.media_columns,
+            include_shared_prefix_metadata=config.include_shared_prefix_metadata,
             reward_penalty_config=config.reward_penalty_config,
             length_penalty_config=config.length_penalty_config,
             effort_config=config.effort_config,

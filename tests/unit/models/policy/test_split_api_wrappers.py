@@ -67,8 +67,8 @@ class _SplitStubWorker(TQWorkerMixin):
         self.calls.append(("fetch", meta))
         return {"data_from": meta} if self._fetched is None else self._fetched
 
-    def _attach_or_repack_with_order(self, data, meta):
-        self.calls.append(("attach", meta))
+    def _attach_or_repack_with_order(self, data, meta, *, stage):
+        self.calls.append(("attach", meta, stage))
         return data, self._row_order
 
     def _write_back(self, meta, fields):
@@ -118,6 +118,7 @@ class TestPreshardedWrappers:
         out = w.train_microbatch_presharded(meta=meta)
         assert out is None  # metrics accumulate in the open-step state
         assert [c[0] for c in w.calls] == ["fetch", "attach", "train_microbatch"]
+        assert w.calls[1][2] == "train"
         assert w.calls[-1][1] == {"data_from": meta}
 
     def test_in_loss_rejections_land_in_sample_mask_in_meta_order(self):

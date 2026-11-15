@@ -133,6 +133,18 @@ def pytest_collection_modifyitems(config, items):
                 "Cannot run mcore tests: megatron.core is not available.\n"
                 "Please run tests with: uv run --extra mcore --group test pytest ..."
             )
+        # Once the pinned Megatron-LM ships the shared-prefix library, CI sets this so
+        # the shared-prefix suites cannot pass by skipping.
+        if os.environ.get("NRL_REQUIRE_MEGATRON_RL_SHARED_PREFIX") == "1":
+            try:
+                import megatron.core.models.hybrid.shared_prefix  # noqa: F401
+                import megatron.rl.shared_prefix_execution  # noqa: F401
+            except ImportError as error:
+                raise ImportError(
+                    "NRL_REQUIRE_MEGATRON_RL_SHARED_PREFIX=1 but the installed Megatron-LM "
+                    "lacks the shared-prefix stack (megatron.rl.shared_prefix_execution and "
+                    "megatron.core.models.hybrid.shared_prefix)."
+                ) from error
         # Include only mcore tests
         new_items = [item for item in new_items if item.get_closest_marker("mcore")]
     else:

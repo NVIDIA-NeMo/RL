@@ -886,6 +886,8 @@ class TQWorkerMixin:
         self,
         data: BatchedDataDict[Any],
         meta: "KVBatchMeta",
+        *,
+        stage: Optional[Literal["train", "logprobs"]],
     ) -> BatchedDataDict[Any]:
         """Trust driver-supplied packing metadata or re-derive locally.
 
@@ -895,13 +897,20 @@ class TQWorkerMixin:
         re-packing produces variable bin counts across DP groups and
         desyncs Megatron's per-microbatch collectives — trust the driver
         when it provided the metadata.
+
+        ``stage`` names the policy stage the fetched rows feed, or ``None``
+        for a consumer without one (the value forward). This implementation
+        ignores it; the Megatron policy worker attaches shared-prefix row
+        metadata when sharing is enabled for that stage.
         """
-        return self._attach_or_repack_with_order(data, meta)[0]
+        return self._attach_or_repack_with_order(data, meta, stage=stage)[0]
 
     def _attach_or_repack_with_order(
         self,
         data: BatchedDataDict[Any],
         meta: "KVBatchMeta",
+        *,
+        stage: Optional[Literal["train", "logprobs"]],
     ) -> tuple[BatchedDataDict[Any], Optional[list[int]]]:
         """:meth:`_attach_or_repack_pack_metadata` plus the local row permutation."""
         extra = meta.extra_info or {}
@@ -1061,7 +1070,7 @@ class TQWorkerMixin:
     ) -> dict[str, Any]:
         """Per-rank training entrypoint. Fetch → packing prep → delegate."""
         data = self._fetch(meta)
-        data = self._attach_or_repack_pack_metadata(data, meta)
+        data = self._attach_or_repack_pack_metadata(data, meta, stage="train")
         return self.train(  # type: ignore[attr-defined]
             data,
             loss_fn=loss_fn,
@@ -1087,7 +1096,7 @@ class TQWorkerMixin:
         worker doesn't carry the tensor into the next dispatch.
         """
         data = self._fetch(meta)
-        data = self._attach_or_repack_pack_metadata(data, meta)
+        data = self._attach_or_repack_pack_metadata(data, meta, stage="logprobs")
         result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
             data=data,
             micro_batch_size=micro_batch_size,
@@ -1113,7 +1122,7 @@ class TQWorkerMixin:
         lives in TQ under ``reference_policy_logprobs``.
         """
         data = self._fetch(meta)
-        data = self._attach_or_repack_pack_metadata(data, meta)
+        data = self._attach_or_repack_pack_metadata(data, meta, stage="logprobs")
         result: BatchedDataDict[Any] = self.get_reference_policy_logprobs(  # type: ignore[attr-defined]
             data=data,
             micro_batch_size=micro_batch_size,
@@ -1179,7 +1188,7 @@ class TQWorkerMixin:
                 "micro_batch_indices and micro_batch_lengths; local worker planning "
                 "can desynchronize data-parallel collectives."
             )
-        data = self._attach_or_repack_pack_metadata(data, meta)
+        data = self._attach_or_repack_pack_metadata(data, meta, stage="logprobs")
         if opd_full_payload is None:
             result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
                 data=data,
@@ -1262,7 +1271,7 @@ class TQWorkerMixin:
         mix it in: only the PPO critic implements get_values.
         """
         data = self._fetch(meta)
-        data = self._attach_or_repack_pack_metadata(data, meta)
+        data = self._attach_or_repack_pack_metadata(data, meta, stage=None)
         result: BatchedDataDict[Any] = self.get_values(  # type: ignore[attr-defined]
             data=data,
             micro_batch_size=micro_batch_size,
@@ -1321,7 +1330,7 @@ class TQWorkerMixin:
         ``finish_train_step_presharded``.
         """
         data = self._fetch(meta)
-        data, row_order = self._attach_or_repack_with_order(data, meta)
+        data, row_order = self._attach_or_repack_with_order(data, meta, stage="train")
         keep_mask = self.train_microbatch(  # type: ignore[attr-defined]
             data=data,
         )
