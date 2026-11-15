@@ -332,7 +332,13 @@ COPY --from=nemo-rl --link \
     --exclude=Gym-workspace/Gym \
     --exclude=Gym-workspace/Gym/** \
     3rdparty/ ./3rdparty/
-COPY --from=nemo-gym --link . ./3rdparty/Gym-workspace/Gym/
+# A --build-context nemo-gym=<dir> does not get the Gym rules in the repo's .dockerignore
+# (BuildKit reads only that context's own .dockerignore), so repeat them here.
+COPY --from=nemo-gym --link \
+    --exclude=.venv --exclude=.venv/** \
+    --exclude=cache/uv --exclude=cache/uv/** \
+    --exclude=res*/*/.venv --exclude=res*/*/.venv/** \
+    . ./3rdparty/Gym-workspace/Gym/
 
 RUN --mount=type=ssh \
     --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
