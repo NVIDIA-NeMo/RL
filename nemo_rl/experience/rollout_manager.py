@@ -22,7 +22,7 @@ import math
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Optional, Protocol
 
 import ray.exceptions
@@ -114,6 +114,12 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.telemetry.instrumentation import (
     dispatch_with_trace_context,
     in_per_prompt_scope,
+)
+from nemo_rl.utils.length_penalty import (
+    LengthPenaltyConfig,
+    apply_group_length_penalties_from_inputs,
+    generated_token_count,
+    prepare_length_penalty_input,
 )
 from nemo_rl.utils.routed_experts_codec import slice_routed_experts
 from nemo_rl.utils.rpc_guard import assert_metadata_only
@@ -1067,6 +1073,7 @@ class AsyncNemoGymRolloutImpl:
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
         forest_training: bool = False,
+        length_penalty_config: LengthPenaltyConfig | None = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -1079,6 +1086,7 @@ class AsyncNemoGymRolloutImpl:
         self._log_full_result_tables = log_full_result_tables
         self._reward_penalty_config = reward_penalty_config
         self._forest_training = forest_training
+        self._length_penalty_config = length_penalty_config
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._deadline_registry = deadline_registry
         self._max_gym_row_attempts = (
@@ -1522,6 +1530,16 @@ class AsyncNemoGymRolloutImpl:
                         inputs_by_rowidx[rowidx],
                         self._effort_config,
                     )
+                    if self._length_penalty_config is not None:
+                        result["reward_checks"] = replace(
+                            result["reward_checks"],
+                            length_penalty=prepare_length_penalty_input(
+                                result,
+                                inputs_by_rowidx[rowidx],
+                                self._length_penalty_config,
+                                self._tokenizer,
+                            ),
+                        )
                     result["reward_log_context"] = RewardLogContext(
                         agent_name=_nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
                         full_result_json=json.dumps(
@@ -1800,11 +1818,41 @@ class AsyncNemoGymRolloutImpl:
             # All N rollouts share the same input prompt; tensorize one copy.
             prompt_message_log = completed_results[0]["input_message_log"]
             _tensorize_by_key(prompt_message_log, "token_ids")
-            # Apply penalties before Completion captures each result's reward, while
-            # preserving the batch-level counts used by legacy Gym metrics.
+            # Apply per-row penalties before conversion, then group length adjustments below.
             completions, penalty_counts = self._results_to_completions(
                 completed_results
             )
+            length_metrics: dict[str, float] = {}
+            if (
+                self._length_penalty_config is not None
+                and "receipt" not in completed_results[0]
+            ):
+                length_inputs = [
+                    prepare_length_penalty_input(
+                        result,
+                        inputs[index],
+                        self._length_penalty_config,
+                        self._tokenizer,
+                    )
+                    for index, result in enumerate(completed_results)
+                ]
+                adjusted, length_metrics = apply_group_length_penalties_from_inputs(
+                    length_inputs,
+                    [completion.reward for completion in completions],
+                    generated_lengths=[
+                        generated_token_count(result) for result in completed_results
+                    ],
+                    low_effort=[
+                        bool(result.get("low_effort_applied"))
+                        for result in completed_results
+                    ],
+                    config=self._length_penalty_config,
+                )
+                for completion, result, reward in zip(
+                    completions, completed_results, adjusted, strict=True
+                ):
+                    completion.reward = reward
+                    result["full_result"]["reward"] = reward
 
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):
@@ -1821,6 +1869,7 @@ class AsyncNemoGymRolloutImpl:
                 rollout_metrics.update(_nemo_gym_group_metrics(completed_results))
             # Same helper the batched path uses, so the two cannot drift apart.
             rollout_metrics.update(_effort_shaping_metrics(shaping))
+            rollout_metrics.update(length_metrics)
             rollout_metrics.update(
                 self._compute_reward_penalty_metrics(
                     penalty_counts,
@@ -2224,6 +2273,7 @@ class RolloutManager:
         # own grpo values, so these are not a second home for those defaults.
         masked_reward_policy: Optional[str] = None,
         overlong_filtering: bool = False,
+        length_penalty_config: LengthPenaltyConfig | None = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -2284,6 +2334,7 @@ class RolloutManager:
             stats=self._stats,
             effort_config=effort_config,
             forest_training=forest_training,
+            length_penalty_config=length_penalty_config,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
