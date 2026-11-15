@@ -937,6 +937,7 @@ def test_generation_cut_rebuild_rejects_extras_after_the_first_chunk(dp):
                 fetch_for_finalization=lambda keys, **include: [chunk, later]
             ),
             router_replay=False,
+            sampler_top_k=0,
         )
     )
     admission = SimpleNamespace(

@@ -1810,6 +1810,7 @@ def _generation_cut_route(
                 progress_reader=None,
                 prefix_row_extras=lambda state: None,
                 router_replay=False,
+                sampler_top_k=0,
             )
         )
         recovery.checkpoint_cut = checkpoint_cut

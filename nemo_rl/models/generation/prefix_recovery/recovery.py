@@ -37,7 +37,11 @@ from typing import Any, Literal
 
 import torch
 
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import (
+    ROUTED_EXPERTS_FIELD,
+    SAMPLER_TOPK_LOGPROBS_FIELD,
+    SAMPLER_TOPK_TOKEN_IDS_FIELD,
+)
 from nemo_rl.models.generation.prefix_recovery.parts import PrefixRecoveryParts
 from nemo_rl.models.generation.prefix_recovery.restore import (
     _generation_cut_blockers,
@@ -51,6 +55,7 @@ from nemo_rl.models.generation.prefix_recovery.state import (
     _CompletedCaptureState,
     _RequestCaptureState,
 )
+from nemo_rl.models.generation.score_centering import extract_score_centering_slice
 from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
 
 LOGGER = logging.getLogger(__name__)
@@ -102,10 +107,42 @@ def _require_inventory_identity(
 
 @dataclass(frozen=True)
 class _ResolvedGenerationCut:
-    """A verified restored prefix, with its call's router-replay routes."""
+    """A verified restored prefix, with its call's routes and sampler top-k."""
 
     snapshot: Any
     routed_experts: torch.Tensor | None = None
+    # Score centering: the prefix's sampler top-k ``(ids, logprobs)``, one row
+    # per generated prefix token.
+    sampler_topk: tuple[torch.Tensor, torch.Tensor] | None = None
+
+
+def _join_chunk_sampler_topk(
+    chunks: Sequence[Any], top_k: int
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Join the fetched chunks' sampler top-k, or None when score centering is off.
+
+    Raises:
+        RuntimeError: a chunk carries no top-k, or not one row per generated
+            token, e.g. it was cut before score centering was on.
+    """
+    if top_k == 0:
+        return None
+    ids_parts, logprob_parts = [], []
+    for chunk in chunks:
+        generated = sum(mask == 1.0 for mask in chunk.snapshot.token_mask_delta)
+        if chunk.sampler_topk is None:
+            raise RuntimeError(
+                f"generation-cut chunk {chunk.staging_key!r} has no sampler top-k"
+            )
+        ids, logprobs = chunk.sampler_topk
+        if tuple(ids.shape) != (generated, top_k) or ids.shape != logprobs.shape:
+            raise RuntimeError(
+                f"generation-cut chunk {chunk.staging_key!r} has sampler top-k "
+                f"{tuple(ids.shape)} for {generated} generated tokens at top_k={top_k}"
+            )
+        ids_parts.append(ids)
+        logprob_parts.append(logprobs)
+    return torch.cat(ids_parts), torch.cat(logprob_parts)
 
 
 def _ends_inside_character(tokenizer: Any, generated_token_ids: list[int]) -> bool:
@@ -232,6 +269,7 @@ class PrefixRecovery:
             start=observed,
             finish_reason=finish_reason,
             stop_reason=stop_reason,
+            logprobs_container=getattr(output, "logprobs", None),
         )
 
     def retire(self, staging_keys: Sequence[str]) -> None:
@@ -390,6 +428,7 @@ class PrefixRecovery:
                 start=start,
                 finish_reason=progress.finish_reason,
                 stop_reason=progress.stop_reason,
+                logprobs_container=progress.logprobs,
             )
         return route_pieces
 
@@ -575,6 +614,19 @@ class PrefixRecovery:
                 return self._failed_ack(
                     prefix, reason="routed_experts_unavailable", uncut=uncut
                 )
+            try:
+                chunk_sampler_topk = self._chunk_sampler_topk(state, frozen)
+            except (RuntimeError, ValueError) as error:
+                owned.rollback(checkpoint_id)
+                LOGGER.warning(
+                    "cannot cut model call %s: sampler top-k: %s: %s",
+                    prefix.model_call_id,
+                    type(error).__name__,
+                    error,
+                )
+                return self._failed_ack(
+                    prefix, reason="sampler_topk_unavailable", uncut=uncut
+                )
             staged_key = None
             try:
                 # The advertised prefix digest covers tokens and call extras,
@@ -590,14 +642,19 @@ class PrefixRecovery:
                 )
                 if frozen.chunk_token_ids:
                     route_extras = None
-                    attachments = None
+                    attachments: dict[str, torch.Tensor] = {}
                     if chunk_routes is not None:
                         route_extras = {
                             ROUTED_EXPERTS_FIELD: routed_experts_tensor_metadata(
                                 chunk_routes
                             )
                         }
-                        attachments = {ROUTED_EXPERTS_FIELD: chunk_routes}
+                        attachments[ROUTED_EXPERTS_FIELD] = chunk_routes
+                    if chunk_sampler_topk is not None:
+                        attachments[SAMPLER_TOPK_TOKEN_IDS_FIELD] = chunk_sampler_topk[
+                            0
+                        ]
+                        attachments[SAMPLER_TOPK_LOGPROBS_FIELD] = chunk_sampler_topk[1]
                     if progress.staging_keys:
                         chunk_record = capture.build_generation_chunk_record(
                             state.call,
@@ -621,7 +678,7 @@ class PrefixRecovery:
                         chunk_record,
                         checkpoint_id=checkpoint_id,
                         chunk_sequence=frozen.chunk_sequence,
-                        attachments=attachments,
+                        attachments=attachments or None,
                     )
                     staged_key = result.staging_key
                     if not result.ok:
@@ -697,6 +754,29 @@ class PrefixRecovery:
             restored=state.restored_routed_experts,
             staged=staged,
             frozen=frozen_count,
+        )
+
+    def _chunk_sampler_topk(
+        self, state: _RequestCaptureState, frozen: Any
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Score centering's sampler top-k for the tokens a cut stages, or None.
+
+        Read from the engine container the call's tokens were recorded from, so
+        the chunk carries what the call's final response would have.
+
+        Raises:
+            RuntimeError, ValueError: the container lacks a staged position, or
+                its candidates are malformed.
+        """
+        top_k = self._parts.sampler_top_k
+        if top_k == 0 or not frozen.chunk_token_ids:
+            return None
+        staged = len(frozen.generated_token_ids) - len(frozen.chunk_token_ids)
+        return extract_score_centering_slice(
+            frozen.chunk_token_ids,
+            state.sampler_logprobs,
+            start=staged,
+            num_candidates=top_k,
         )
 
     def checkpoint_cut(self, inventory: Any, *, deadline: float | None = None) -> Any:
@@ -807,7 +887,9 @@ class PrefixRecovery:
         # media call's spans and tensor digests, and its route fragment when
         # router replay is on; plain ``fetch`` returns neither.
         chunks = self._parts.staging_source.fetch_for_finalization(
-            staging_keys, include_route_fragments=self._parts.router_replay
+            staging_keys,
+            include_route_fragments=self._parts.router_replay,
+            include_sampler_topk=self._parts.sampler_top_k > 0,
         )
         if len(chunks) != len(staging_keys):
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
@@ -824,6 +906,7 @@ class PrefixRecovery:
         extras = chunks[0].extras or None
         # Routes are checked per chunk and stay out of the prefix digest.
         routed_experts = _join_chunk_routes(chunks, required=self._parts.router_replay)
+        sampler_topk = _join_chunk_sampler_topk(chunks, self._parts.sampler_top_k)
         weight_versions = [snapshot.weight_version for snapshot in snapshots]
         if weight_versions != sorted(weight_versions):
             raise RuntimeError(
@@ -915,7 +998,9 @@ class PrefixRecovery:
                 routed_experts, generated_prefix_tokens=len(generated_prefix_ids)
             ),
         )
-        return _ResolvedGenerationCut(snapshot=snapshot, routed_experts=routed_experts)
+        return _ResolvedGenerationCut(
+            snapshot=snapshot, routed_experts=routed_experts, sampler_topk=sampler_topk
+        )
 
     def resolve_restore(
         self, admission: Any, prefix_token_ids: list[int]

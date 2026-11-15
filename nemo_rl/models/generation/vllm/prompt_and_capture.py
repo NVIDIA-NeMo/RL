@@ -118,6 +118,9 @@ class RestoredCall:
     max_tokens: Optional[int]
     # Router replay: the saved prefix's routes; None when cuts stage no routes.
     routed_experts: Optional[torch.Tensor] = None
+    # Score centering: the saved prefix's sampler top-k (token ids, logprobs);
+    # None when cuts stage none.
+    sampler_topk: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
 
 async def resolve_restored_call(
@@ -158,6 +161,7 @@ async def resolve_restored_call(
         output_limit=plan.output_limit,
         max_tokens=plan.max_tokens,
         routed_experts=resolved.routed_experts,
+        sampler_topk=resolved.sampler_topk,
     )
 
 
@@ -529,6 +533,7 @@ async def start_capture(
         generation_cut_routed_experts=(
             None if restored is None else restored.routed_experts
         ),
+        generation_cut_sampler_topk=None if restored is None else restored.sampler_topk,
         resumed_generation_token_ids=(
             None if restored is None else restored.resumed_generation_token_ids
         ),

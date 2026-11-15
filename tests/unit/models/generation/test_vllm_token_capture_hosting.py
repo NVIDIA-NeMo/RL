@@ -225,6 +225,7 @@ def _cuts(
             progress_reader=progress_reader or _NoCallsInVllm(),
             prefix_row_extras=worker._generation_cut_record_payload,
             router_replay=worker._cut_routes_dtype is not None,
+            sampler_top_k=worker._capture_top_logprobs,
         )
     )
     worker._prefix_recovery = recovery
@@ -1370,9 +1371,11 @@ class _MemoryPrefixSource:
         deltas: dict[str, list[int]],
         *,
         records: dict[str, StagedCallRecord] | None = None,
+        sampler_topk: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> None:
         self.deltas = deltas
         self.records = records or {}
+        self.sampler_topk = sampler_topk or {}
         self.calls: list[list[str]] = []
 
     def fetch_prefix_chains(self, staging_keys: list[str]) -> StagedPrefix:
@@ -1383,7 +1386,11 @@ class _MemoryPrefixSource:
         )
 
     def fetch_for_finalization(
-        self, staging_keys: list[str], *, include_route_fragments: bool = False
+        self,
+        staging_keys: list[str],
+        *,
+        include_route_fragments: bool = False,
+        include_sampler_topk: bool = False,
     ) -> list[FetchedStagedCall]:
         assert not include_route_fragments
         self.calls.append(list(staging_keys))
@@ -1393,6 +1400,9 @@ class _MemoryPrefixSource:
                 snapshot=self.records[key],
                 routed_len=0,
                 extras=self.records[key].extras,
+                sampler_topk=(
+                    self.sampler_topk.get(key) if include_sampler_topk else None
+                ),
             )
             for key in staging_keys
         ]
@@ -1828,6 +1838,7 @@ def _record_cut_constraints(state, sampling_params) -> None:
             progress_reader=_NoCallsInVllm(),
             prefix_row_extras=lambda state: None,
             router_replay=False,
+            sampler_top_k=0,
         )
     ).on_sampling_params(object(), sampling_params)
 
@@ -3633,6 +3644,181 @@ def test_request_capture_topk_partial_write_returns_capture_failed():
     assert "sampler_topk_token_ids" not in content["choices"][0]["message"]
     assert "sampler_topk_logprobs" not in content["choices"][0]["message"]
     assert len(worker._capture_registry) == 0
+
+
+def _score_centering_worker(
+    sink: _MemorySink, *, weight_version: int, staging_source=None
+) -> VllmAsyncGenerationWorkerImpl:
+    worker = _worker_with_capture(sink)
+    worker._capture_top_logprobs = 2
+    worker._rollout_weight_version = weight_version
+    _cuts(worker, staging_source=staging_source)
+    return worker
+
+
+def _score_centering_request(ng_capture: dict[str, Any]) -> _FakeRequest:
+    return _FakeRequest(
+        ng_capture=ng_capture, stream=False, logprobs=True, top_logprobs=2
+    )
+
+
+def _sampler_rows(token_ids: list[int]) -> list[dict[int, SimpleNamespace]]:
+    """vLLM's logprobs for sampled ``token_ids``, each heading its top-2."""
+    return [
+        {
+            token_id: SimpleNamespace(rank=1, logprob=-0.1),
+            token_id + 100: SimpleNamespace(rank=2, logprob=-3.0),
+        }
+        for token_id in token_ids
+    ]
+
+
+def _observe_decoding(
+    worker: VllmAsyncGenerationWorkerImpl,
+    request: _FakeRequest,
+    token_ids: list[int],
+    live_logprobs: list[dict[int, SimpleNamespace]],
+) -> None:
+    """Observe a call's output while vLLM keeps appending to its logprobs."""
+    output = SimpleNamespace(token_ids=token_ids, logprobs=live_logprobs)
+    _cuts(worker).observe(request, SimpleNamespace(outputs=[output]))
+
+
+def _staged_topk_ids(attachments: dict[str, torch.Tensor] | None) -> list:
+    assert attachments is not None
+    return attachments["sampler_topk_token_ids"].tolist()
+
+
+def test_score_centering_survives_prefix_cuts_and_resume():
+    sink = _MemorySink()
+    worker = _score_centering_worker(sink, weight_version=7)
+    request = _score_centering_request(
+        {"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    worker._capture_registry.get(request).set_effective_output_limit(128)
+    live = _sampler_rows([12, 13])
+    _observe_decoding(worker, request, [12, 13], live)
+    _cut(worker, "checkpoint-1")
+    live.extend(_sampler_rows([14]))
+    _observe_decoding(worker, request, [12, 13, 14], live)
+    ack = _cut(worker, "checkpoint-2")
+    # Each chunk stages the top-k of only the tokens it adds.
+    assert [
+        _staged_topk_ids(attachments)
+        for attachments in sink.generation_prefix_attachments
+    ] == [[[12, 112], [13, 113]], [[14, 114]]]
+
+    records, sampler_topk = {}, {}
+    for key, (_, record), attachments in zip(
+        sink.generation_prefix_keys,
+        sink.generation_prefix_records,
+        sink.generation_prefix_attachments,
+        strict=True,
+    ):
+        records[key] = record
+        sampler_topk[key] = (
+            attachments["sampler_topk_token_ids"],
+            attachments["sampler_topk_logprobs"],
+        )
+    resumed = _score_centering_worker(
+        sink,
+        weight_version=9,
+        staging_source=_MemoryPrefixSource(
+            {}, records=records, sampler_topk=sampler_topk
+        ),
+    )
+    resumed_request = _score_centering_request(
+        {
+            "rollout_id": "r0-a1",
+            "model_call_id": "c2",
+            "mode": "text",
+            "generation_cut": {
+                "source_capture_key": "r0",
+                "source_model_call_id": "c1",
+                "staging_keys": list(ack.staging_keys),
+                "prefix_token_count": ack.prefix_token_count,
+                "prefix_digest": ack.prefix_digest,
+                "effective_output_limit": ack.effective_output_limit,
+            },
+        }
+    )
+    admission = resumed._capture_admission(resumed_request)
+    served, resolved = _cuts(resumed).resolve_restore(admission, [])
+    assert served is admission
+    assert resolved.sampler_topk[0].tolist() == [[12, 112], [13, 113], [14, 114]]
+
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        resumed,
+        resumed_request,
+        list(resolved.snapshot.token_ids_delta),
+        admission=admission,
+        prefix_token_ids=[],
+        generation_cut=resolved.snapshot,
+        generation_cut_sampler_topk=resolved.sampler_topk,
+        resumed_generation_token_ids=[12, 13, 14],
+    )
+    VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        resumed, resumed_request, _content_with_topk([15], [-0.4])
+    )
+    # The trained row's top-k covers the restored prefix, then the tail.
+    attachments = sink.attachments[-1]
+    assert _staged_topk_ids(attachments) == [[12, 112], [13, 113], [14, 114], [15, 1]]
+    assert attachments["sampler_topk_logprobs"][:, 1].tolist() == [
+        -3.0,
+        -3.0,
+        -3.0,
+        -5.0,
+    ]
+
+
+def test_score_centering_cut_without_the_tokens_top_k_fails_that_call():
+    sink = _MemorySink()
+    worker = _score_centering_worker(sink, weight_version=7)
+    request = _score_centering_request(
+        {"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    state = worker._capture_registry.get(request)
+    state.set_effective_output_limit(128)
+    # vLLM published the token, but the cut never saw the container holding
+    # its top-k.
+    state.record([12], [-0.1])
+
+    assert _cut(worker, "checkpoint-1").disposition == "durable_failure"
+    assert sink.generation_prefix_records == []
+    progress = state.snapshot()
+    assert (progress.cut_in_progress, progress.staged_token_count) == (False, 0)
+
+
+@pytest.mark.parametrize("chunk_topk", ["missing", "wrong_rows"])
+def test_restored_prefix_without_each_chunks_top_k_regenerates(chunk_topk, caplog):
+    sink = _MemorySink()
+    cut_key, cut_record, request = _restorable_cut(sink)
+    request.logprobs, request.top_logprobs = True, 2
+    sampler_topk = {}
+    if chunk_topk == "wrong_rows":
+        # The chunk staged two generated tokens; one row cannot cover them.
+        sampler_topk[cut_key] = (
+            torch.zeros(1, 2, dtype=torch.int32),
+            torch.zeros(1, 2),
+        )
+    worker = _score_centering_worker(
+        sink,
+        weight_version=9,
+        staging_source=_MemoryPrefixSource(
+            {}, records={cut_key: cut_record}, sampler_topk=sampler_topk
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        served, resolved = _cuts(worker).resolve_restore(
+            worker._capture_admission(request), []
+        )
+
+    assert resolved is None
+    assert served.generation_cut is None
+    assert "sampler top-k" in caplog.text
 
 
 def _cut_active_call(worker, sink, model_call_id: str = "c1", **call):

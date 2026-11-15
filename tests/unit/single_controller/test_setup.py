@@ -649,8 +649,11 @@ def test_token_capture_top_logprobs_rejects_megatron_generation():
         validate_single_controller_config(mc)
 
 
-def test_prefix_recovery_rejects_sampler_top_k_capture():
-    # A restored prefix has no sampler top-k for its spliced tokens.
+@pytest.mark.parametrize(
+    "target_level", [RecoveryTargetLevel.PREFIX, RecoveryTargetLevel.TURN]
+)
+def test_rollout_recovery_accepts_sampler_top_k_capture(target_level):
+    # Each prefix cut stages its tokens' sampler top-k with them.
     mc = _make_master_config(
         env={"should_use_nemo_gym": True},
         loss_cfg=ClippedPGLossConfig(score_centering=True),
@@ -659,13 +662,7 @@ def test_prefix_recovery_rejects_sampler_top_k_capture():
     mc.policy["generation"].update(
         top_logprobs=4, temperature=1.0, top_p=1.0, top_k=None
     )
-    mc.rollout_recovery.target_level = RecoveryTargetLevel.PREFIX
-    with pytest.raises(
-        ValueError, match="does not support policy.generation.top_logprobs"
-    ):
-        validate_single_controller_config(mc)
-
-    mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+    mc.rollout_recovery.target_level = target_level
     validate_single_controller_config(mc)
 
 
