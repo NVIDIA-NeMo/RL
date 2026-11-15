@@ -96,6 +96,9 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 8
       pipeline_parallel_size: 2
+      # vLLM pipeline parallelism needs the async engine. BF16 weights (~620 GB) do not fit one
+      # 8-GPU engine, so each engine spans two nodes.
+      async_engine: true
       enable_expert_parallel: true
       enable_prefix_caching: true
       enforce_eager: false
