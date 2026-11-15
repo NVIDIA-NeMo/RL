@@ -1,0 +1,129 @@
+defaults: ../../grpo_math_1B.yaml
+# MiMo-V2.6-Flash-RL (310B total, 15B active; 48 layers, 256 routed experts, hybrid full / sliding-window
+# attention) trained by AutoModel (EP64) and rolled out by vLLM in BF16 on 8 H100 nodes, colocated.
+# The released checkpoint (block-FP8 attention, MXFP4 experts) is loaded by AutoModel and dequantized;
+# vLLM starts from dummy BF16 weights (split QKV) and receives the real weights through refit.
+grpo:
+  batch_multiplier: 4
+  max_num_epochs: 100
+  max_num_steps: 1000
+  normalize_rewards: false
+  use_leave_one_out_baseline: false
+  adv_estimator:
+    normalize_rewards: false
+    use_leave_one_out_baseline: false
+  max_val_samples: 960
+  val_batch_size: 960
+  use_dynamic_sampling: true
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 1024
+    max_response_length: 2048
+loss_fn:
+  token_level_loss: false
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  checkpoint_dir: results/dapo-mimo-v2.6-flash-8n8g-automodel-ep64
+  keep_top_k: 1
+  save_period: 2
+  checkpoint_must_save_by: 00:03:45:00
+policy:
+  model_name: XiaomiMiMo/MiMo-V2.6-Flash-RL
+  refit_buffer_size_gb: 1
+  dequantize_base_checkpoint: true
+  hf_config_overrides:
+    # The RL path does not train or run the MTP heads.
+    num_nextn_predict_layers: 0
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 3072
+  logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: true
+  make_sequence_length_divisible_by: 64
+  optimizer:
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.01
+      end_factor: 1.0
+      total_iters: 5
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 5
+  # Rollout routing replay: training replays vLLM's expert choices. Needs CP=1 and no sequence packing.
+  router_replay:
+    enabled: true
+  automodel_cfg:
+    context_parallel_size: 1
+    expert_parallel_size: 64
+    activation_checkpointing: true
+    moe_parallelizer:
+      ignore_router_for_ac: true
+      reshard_after_forward: true
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.BackendConfig
+        attn: te
+        linear: torch
+        rms_norm: torch_fp32
+        experts: torch_mm
+        dispatcher: hybridep
+        gate_precision: float32
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: true
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  generation:
+    max_new_tokens: 2048
+    vllm_cfg:
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 2
+      enable_expert_parallel: true
+      enable_prefix_caching: true
+      enforce_eager: false
+    vllm_kwargs:
+      # Roll out in BF16 with split QKV. The released config declares block-FP8 and fused QKV.
+      hf_overrides:
+        quantization_config: null
+        attention_projection_layout: split
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  num_val_samples_to_print: 2
+  num_train_samples_to_print: 2
+  wandb:
+    project: nemo-rl
+    name: dapo-mimo-v2.6-flash-8n8g-automodel-ep64
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8
