@@ -1006,6 +1006,7 @@ class VllmAsyncGenerationWorkerImpl(
                     control_timeout_s=generation_cut_control_timeout_s,
                     progress_reader=self._progress_reader,
                     router_replay=self._cut_routes_dtype is not None,
+                    sampler_top_k=self._capture_top_logprobs,
                     prefix_row_extras=self._generation_cut_record_payload,
                 )
             )
@@ -1108,6 +1109,7 @@ class VllmAsyncGenerationWorkerImpl(
         media: CapturedMedia | None = None,
         generation_cut: Any | None = None,
         generation_cut_routed_experts: torch.Tensor | None = None,
+        generation_cut_sampler_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
         resumed_generation_token_ids: list[int] | None = None,
     ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
@@ -1162,6 +1164,7 @@ class VllmAsyncGenerationWorkerImpl(
             ),
             routed_experts_dtype=self._cut_routes_dtype,
             restored_routed_experts=generation_cut_routed_experts,
+            restored_sampler_topk=generation_cut_sampler_topk,
         )
         self._capture_registry.add(request, state)
         # Counted once Gym's begin_call has accepted a restored cut.
@@ -1584,6 +1587,13 @@ class VllmAsyncGenerationWorkerImpl(
         if routed_experts is not None:
             attachments["routed_experts"] = routed_experts
         if sampler_topk is not None:
+            restored_topk = state.restored_sampler_topk
+            if restored_topk is not None:
+                # A resumed call's row covers its restored prefix, then its tail.
+                sampler_topk = (
+                    torch.cat([restored_topk[0], torch.as_tensor(sampler_topk[0])]),
+                    torch.cat([restored_topk[1], torch.as_tensor(sampler_topk[1])]),
+                )
             attachments.update(
                 sampler_topk_token_ids=sampler_topk[0],
                 sampler_topk_logprobs=sampler_topk[1],
@@ -1912,6 +1922,7 @@ class VllmAsyncGenerationWorkerImpl(
                 capture_prefix_token_ids: list[int] | None = None
                 generation_cut = None
                 generation_cut_routed_experts = None
+                generation_cut_sampler_topk = None
                 resumed_generation_token_ids: list[int] = []
                 restored_request_output_tokens: int | None = None
                 if serving_admission is not None:
@@ -1931,6 +1942,7 @@ class VllmAsyncGenerationWorkerImpl(
                     if resolved_cut is not None:
                         generation_cut = resolved_cut.snapshot
                         generation_cut_routed_experts = resolved_cut.routed_experts
+                        generation_cut_sampler_topk = resolved_cut.sampler_topk
                     engine_prefix_token_ids = list(capture_prefix_token_ids)
                     if generation_cut is not None:
                         plan = plan_restore(
@@ -1986,6 +1998,7 @@ class VllmAsyncGenerationWorkerImpl(
                         media=media,
                         generation_cut=generation_cut,
                         generation_cut_routed_experts=generation_cut_routed_experts,
+                        generation_cut_sampler_topk=generation_cut_sampler_topk,
                         resumed_generation_token_ids=resumed_generation_token_ids,
                     )
                     return res
@@ -2157,6 +2170,7 @@ class VllmAsyncGenerationWorkerImpl(
                     media=media,
                     generation_cut=generation_cut,
                     generation_cut_routed_experts=generation_cut_routed_experts,
+                    generation_cut_sampler_topk=generation_cut_sampler_topk,
                     resumed_generation_token_ids=resumed_generation_token_ids,
                 )
 

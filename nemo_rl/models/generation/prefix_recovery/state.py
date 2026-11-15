@@ -90,6 +90,8 @@ class _RequestCaptureState:
         "_restored_routed_experts",
         "_terminal_routed_experts",
         "_engine_routes",
+        "_restored_sampler_topk",
+        "_sampler_logprobs",
         "_lock",
         "_lifecycle_lock",
         "_generated_token_ids",
@@ -117,6 +119,7 @@ class _RequestCaptureState:
         staging_keys: Sequence[str] = (),
         routed_experts_dtype: torch.dtype | None = None,
         restored_routed_experts: torch.Tensor | None = None,
+        restored_sampler_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         self._call = call
         self._prompt_token_ids = list(prompt_token_ids)
@@ -136,6 +139,12 @@ class _RequestCaptureState:
             if routed_experts_dtype is None
             else _EngineRouteCache(routed_experts_dtype)
         )
+        # Score centering: a resumed call's sampler top-k for its restored
+        # prefix, one row per prefix token.
+        self._restored_sampler_topk = restored_sampler_topk
+        # vLLM's append-only logprobs container, which holds each position's
+        # sampler top-k; a cut slices the positions it stages.
+        self._sampler_logprobs: Any = None
         self._lock = threading.Lock()
         # Serializes lifecycle-changing TQ operations for this call. Token
         # recording uses ``_lock`` instead, so a finished output can be
@@ -181,6 +190,16 @@ class _RequestCaptureState:
         return self._restored_routed_experts
 
     @property
+    def restored_sampler_topk(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        return self._restored_sampler_topk
+
+    @property
+    def sampler_logprobs(self) -> Any:
+        """The logprobs container the call's recorded tokens were read from."""
+        with self._lock:
+            return self._sampler_logprobs
+
+    @property
     def recorded_token_count(self) -> int:
         with self._lock:
             return len(self._generated_token_ids)
@@ -193,6 +212,7 @@ class _RequestCaptureState:
         start: int | None = None,
         finish_reason: Any = None,
         stop_reason: Any = None,
+        logprobs_container: Any = None,
     ) -> None:
         """Record tokens read at position ``start`` (default: the end).
 
@@ -200,9 +220,12 @@ class _RequestCaptureState:
         recorded by the other are skipped rather than appended twice. Callers
         read ``start`` from ``recorded_token_count``, and tokens are never
         removed, so it never lies past the recorded end. ``finish_reason`` is
-        how vLLM finished the call, if it has.
+        how vLLM finished the call, if it has. ``logprobs_container`` is the
+        engine container the tokens were read from, kept for ``sampler_logprobs``.
         """
         with self._lock:
+            if logprobs_container is not None:
+                self._sampler_logprobs = logprobs_container
             skip = 0 if start is None else len(self._generated_token_ids) - start
             self._generated_token_ids.extend(generated_token_ids[skip:])
             self._generated_logprobs.extend(generated_logprobs[skip:])
