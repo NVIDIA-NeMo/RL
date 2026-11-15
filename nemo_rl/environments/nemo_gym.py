@@ -19,7 +19,6 @@ import math
 import os
 import secrets
 import signal
-import subprocess
 import sys
 import threading
 import urllib.parse
@@ -77,6 +76,11 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointPrepareSummary,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym_config_prep import (
+    NEMO_RL_ONLY_GYM_KEYS,
+    get_nemo_gym_uv_cache_dir,
+    get_nemo_gym_venv_dir,
+)
 from nemo_rl.environments.nemo_gym_multimodal import (
     _has_image_before_first_trainable_output,
     _index_per_turn_images,
@@ -665,30 +669,6 @@ def _gym_failure_row_error(
     return GymTransportError(detail)
 
 
-def get_nemo_gym_uv_cache_dir() -> str | None:
-    """Return the uv cache directory inside a container, or None outside one.
-
-    Inside a container (NRL_CONTAINER=1), returns the uv cache location so Gym
-    stores its caches in the expected shared path. Returns None outside a
-    container, meaning the caller should omit this arg and let Gym create the
-    cache locally (the default when you may not be able to write to /opt).
-    """
-    if not os.environ.get("NRL_CONTAINER"):
-        return None
-    return subprocess.check_output(["uv", "cache", "dir"]).decode().strip()
-
-
-def get_nemo_gym_venv_dir() -> str | None:
-    """Return the NeMo Gym venv directory from NEMO_GYM_VENV_DIR, or None.
-
-    Returns the value of NEMO_GYM_VENV_DIR if set, otherwise None. When None
-    the caller should omit this arg and let Gym create venvs locally (the
-    default when a container is not used since you may not be able to write
-    to /opt).
-    """
-    return os.environ.get("NEMO_GYM_VENV_DIR")
-
-
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
@@ -1251,8 +1231,8 @@ class NemoGym(EnvironmentInterface):
         )
         # Strip NeMo-RL-only training knobs that must not be forwarded to the
         # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
-        initial_global_config_dict.pop("effort_levels", None)
-        initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
+        for key in NEMO_RL_ONLY_GYM_KEYS:
+            initial_global_config_dict.pop(key, None)
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         # The Gym model server sends this as the bearer token of every request to

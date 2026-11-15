@@ -852,6 +852,7 @@ USER root
 # in the dependency layer.
 COPY --from=nemo-rl examples /opt/nemo-rl/examples
 COPY --from=nemo-rl nemo_rl/utils/__init__.py nemo_rl/utils/config.py /opt/nemo-rl/nemo_rl/utils/
+COPY --from=nemo-rl nemo_rl/environments/__init__.py nemo_rl/environments/nemo_gym_config_prep.py /opt/nemo-rl/nemo_rl/environments/
 # The gym server venvs are built in hardlink mode: examples/nemo_gym/prefetch_venvs.py pins
 # UV_LINK_MODE=hardlink, because Gym's setup scripts shell out to
 # `uv pip install --no-cache`, which uv refuses to combine with symlink installs.

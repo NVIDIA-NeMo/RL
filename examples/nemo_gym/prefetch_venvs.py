@@ -19,24 +19,26 @@ by also triggering NeMo Gym's own internal venv creation for its servers (code_g
 math, etc.). A dry run builds each server's venv and exits, so no policy model is needed.
 
 Run it with an interpreter that has the nemo_gym extra installed. It imports only NeMo
-Gym and nemo_rl/utils/config.py, so docker/Dockerfile can run it before the rest of the
-NeMo RL source is copied into the image.
+Gym, nemo_rl/utils/config.py and nemo_rl/environments/nemo_gym_config_prep.py, so
+docker/Dockerfile can run it before the rest of the NeMo RL source is copied into the
+image.
 """
 
 import argparse
 import multiprocessing
 import os
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
+from nemo_rl.environments.nemo_gym_config_prep import (
+    NEMO_RL_ONLY_GYM_KEYS,
+    get_nemo_gym_uv_cache_dir,
+    get_nemo_gym_venv_dir,
+)
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
-
-# Keys under env.nemo_gym that NeMo RL reads itself and does not forward to NeMo Gym.
-_NEMO_RL_ONLY_KEYS = ("effort_levels", "pad_dynamic_image_shapes")
 
 
 def build_dry_run_config(
@@ -55,7 +57,7 @@ def build_dry_run_config(
         The initial global config for a NeMo Gym dry run.
     """
     config = dict(nemo_gym_section)
-    for key in _NEMO_RL_ONLY_KEYS:
+    for key in NEMO_RL_ONLY_GYM_KEYS:
         config.pop(key, None)
     config["dry_run"] = True
     # A dry run talks to no model. NeMo Gym still needs these to resolve the config.
@@ -69,13 +71,6 @@ def build_dry_run_config(
     return config
 
 
-def _uv_cache_dir() -> str | None:
-    """Return uv's cache directory inside the container, or None outside one."""
-    if not os.environ.get("NRL_CONTAINER"):
-        return None
-    return subprocess.check_output(["uv", "cache", "dir"]).decode().strip()
-
-
 def _prefetch_one(config_path: str) -> None:
     """Build the NeMo Gym server venvs for one config."""
     from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
@@ -84,8 +79,8 @@ def _prefetch_one(config_path: str) -> None:
     config = OmegaConf.to_container(load_config(config_path), resolve=True)
     dry_run_config = build_dry_run_config(
         config["env"]["nemo_gym"],
-        uv_cache_dir=_uv_cache_dir(),
-        uv_venv_dir=os.environ.get("NEMO_GYM_VENV_DIR"),
+        uv_cache_dir=get_nemo_gym_uv_cache_dir(),
+        uv_venv_dir=get_nemo_gym_venv_dir(),
     )
 
     # NeMo Gym's server setup scripts inherit this environment. They shell out to

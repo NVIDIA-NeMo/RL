@@ -31,6 +31,7 @@ import pytest
 from omegaconf import DictConfig
 
 from nemo_rl.environments import nemo_gym as nemo_gym_mod
+from nemo_rl.environments import nemo_gym_config_prep
 from nemo_rl.environments.nemo_gym import (
     NEMO_GYM_ACTOR_FQN,
     NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
@@ -192,14 +193,14 @@ def test_get_nemo_gym_uv_cache_dir_none_outside_container(monkeypatch):
     def _fail(*args, **kwargs):
         raise AssertionError("uv should not be invoked outside a container")
 
-    monkeypatch.setattr(nemo_gym_mod.subprocess, "check_output", _fail)
+    monkeypatch.setattr(nemo_gym_config_prep.subprocess, "check_output", _fail)
     assert get_nemo_gym_uv_cache_dir() is None
 
 
 def test_get_nemo_gym_uv_cache_dir_uses_uv_inside_container(monkeypatch):
     monkeypatch.setenv("NRL_CONTAINER", "1")
     monkeypatch.setattr(
-        nemo_gym_mod.subprocess,
+        nemo_gym_config_prep.subprocess,
         "check_output",
         lambda *args, **kwargs: b"  /root/.cache/uv\n",
     )
