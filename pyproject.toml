@@ -683,8 +683,6 @@ name = "deep_ep"
 version = "1.2.1+17cfb81"
 requires-dist = ["torch", "packaging", "ninja"]
 
-[[tool.uv.dependency-metadata]]
-
 # Override logsage metadata to:
 # 1. Remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds
 #    (numpy cap conflicts with onnx>=1.21.0rc4 CVE fix via nvidia-resiliency-ext)
