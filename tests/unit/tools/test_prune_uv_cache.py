@@ -14,6 +14,7 @@
 
 import importlib.util
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -310,6 +311,37 @@ def test_dockerfile_prunes_the_seed_before_any_sync() -> None:
     )
     dynamo_run = max(i for i, l in code if i < dynamo and l.startswith("RUN"))
     assert "uv-cache" not in "\n".join(lines[dynamo_run:dynamo])
+
+
+def test_root_uv_writes_after_the_runtime_sweep_hand_over_their_files() -> None:
+    # The user-setup RUN hands root-owned cache and venv entries to the runtime UID.
+    # A later root RUN that writes with uv must hand over its own new entries too.
+    lines = (REPO_ROOT / "docker" / "Dockerfile").read_text().splitlines()
+    code = [(i, l) for i, l in enumerate(lines) if not l.lstrip().startswith("#")]
+    release = next(i for i, l in code if l.startswith("FROM") and "AS release" in l)
+    to_runtime = next(
+        i for i, l in code if i > release and l.startswith("USER ${RUNTIME_UID}")
+    )
+    sweep = max(i for i, l in code if release < i < to_runtime and "-uid 0" in l)
+
+    user = "root"
+    not_handed_over = []
+    for start, head in code:
+        if start <= sweep or not head.startswith(("RUN", "FROM", "USER")):
+            continue
+        if head.startswith("FROM"):
+            break
+        if head.startswith("USER"):
+            user = head.split()[1]
+            continue
+        end = next((i for i, l in code if i > start and l == "EOF"), start)
+        body = "\n".join(l for i, l in code if start <= i <= end)
+        writes_uv = "uv_cache_restore" in body or re.search(
+            r"\buv (sync|run|pip)\b", body
+        )
+        if user == "root" and writes_uv and not ("-uid 0" in body and "chown" in body):
+            not_handed_over.append(start + 1)
+    assert not_handed_over == [], f"Dockerfile lines {not_handed_over}"
 
 
 @pytest.mark.parametrize("suffix", [".http", ".msgpack", ".lock", ".rev"])

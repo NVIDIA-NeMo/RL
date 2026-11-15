@@ -420,8 +420,8 @@ UV_LINK_MODE=hardlink uv sync --frozen $GROUP_FLAGS
 # nemo_rl is an editable install: it only records that the package lives in
 # /opt/nemo-rl/nemo_rl, and the files show up there when the source is copied in.
 # The python-<ClassName> wrapper scripts are written here too, the same way
-# nemo_rl/utils/prefetch_venvs.py writes them. Nothing after the source COPY touches a venv,
-# so a source-only change rebuilds no venv layer.
+# nemo_rl/utils/prefetch_venvs.py writes them. Unless NEMO_GYM_PREFETCH_CONFIGS is set,
+# nothing after the source COPY touches a venv, so a source-only change rebuilds no venv layer.
 #
 # nemo_rl/distributed/actor_environments.py is the single source of truth for which extras
 # each actor needs; the runtime registry imports the same dict. It is run as a script rather
@@ -893,6 +893,12 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     rm -f "${GYM_VLLM_OVERRIDE}"
     # Same CVE cleanup as the sweep above, for the Gym venvs this step just created.
     find "${NEMO_GYM_VENV_DIR}" "${UV_CACHE_DIR}" -name ray_dist.jar -delete
+    # This step runs after the runtime-user sweep above, so hand over what it added.
+    # -uid 0 matches only entries still owned by root, so nothing else is copied up.
+    if [[ -z "${ROOT_ONLY:-}" ]]; then
+        find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
+            -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
+    fi
 fi
 EOF
 
