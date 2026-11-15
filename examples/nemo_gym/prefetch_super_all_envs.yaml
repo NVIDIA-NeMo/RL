@@ -2,7 +2,7 @@
 # (RLVR + SWE + RLHF). Pass to the docker build to bake every gym server venv into the image:
 #   docker buildx build -f docker/Dockerfile \
 #     --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/prefetch_super_all_envs.yaml" .
-# Only env.nemo_gym is read (dry-run NemoGym._spinup); the dummy values below satisfy the bundled
+# Only env.nemo_gym is read (NeMo Gym dry run); the dummy values below satisfy the bundled
 # configs' interpolations during the dry run. terminal_pivot is omitted (absent at our Gym pin).
 defaults: legacy_environment_servers/super_rlvr.yaml
 

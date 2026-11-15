@@ -4,7 +4,7 @@
 # create its venv at job start:
 #   docker buildx build -f docker/Dockerfile \
 #     --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/prefetch_super35_all_envs.yaml" .
-# Only env.nemo_gym is read (dry-run NemoGym._spinup); the dummy values below satisfy the bundled
+# Only env.nemo_gym is read (NeMo Gym dry run); the dummy values below satisfy the bundled
 # configs' interpolations and mandatory fields during the dry run. Venvs are created per server
 # directory and skipped when already present, so this file can be combined with
 # prefetch_ultra_all_envs.yaml (adds swe_agents) at no extra cost for the shared servers.

@@ -2,7 +2,7 @@
 # Docker build to bake the required Gym server venvs into the image:
 #   docker buildx build -f docker/Dockerfile \
 #     --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/prefetch_omni_envs.yaml" .
-# Only env.nemo_gym is read (dry-run NemoGym._spinup); the dummy policy values below satisfy
+# Only env.nemo_gym is read (NeMo Gym dry run); the dummy policy values below satisfy
 # the bundled configs' interpolations during the dry run.
 env:
   should_use_nemo_gym: true
