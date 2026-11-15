@@ -1555,14 +1555,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                     f"grpo.use_dynamic_sampling requires grpo.{key} to be 0 or null: "
                     "nonzero message-level overrides can train constant-reward groups."
                 )
-        # Capture cannot borrow future groups, so routine filtering would stall training.
-        if master_config.token_capture.enabled:
-            raise ValueError(
-                f"{algo_prefix}.use_dynamic_sampling is not supported together with "
-                "token_capture.enabled: on the capture path a replacement cannot borrow "
-                "a finished group from a later step, so every dropped group stalls its "
-                "step for a full fresh rollout. Disable one of the two."
-            )
         if grpo_cfg.dynamic_sampling_max_gen_batches < 1:
             raise ValueError(
                 f"{algo_prefix}.dynamic_sampling_max_gen_batches must be >= 1 when "
@@ -1834,6 +1826,17 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
 
     generation_cfg = master_config.policy["generation"]
+    if (
+        generation_cfg["backend"] == "vllm"
+        and cast(VllmConfig, generation_cfg)["vllm_cfg"].get("http_api_server_count", 1)
+        > 1
+        and async_config.generation_fleet_health.enabled
+    ):
+        raise ValueError(
+            "Multiple HTTP API servers do not support fault tolerance with "
+            "async_rl.generation_fleet_health.enabled=true. "
+            "See https://github.com/NVIDIA-NeMo/RL/pull/5075."
+        )
     top_logprobs = generation_cfg.get("top_logprobs", 0)
     if (
         isinstance(top_logprobs, bool)
