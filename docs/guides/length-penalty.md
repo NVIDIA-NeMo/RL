@@ -2,9 +2,11 @@
 
 This guide documents the length-penalty and length-bonus algorithms implemented in `nemo_rl/utils/length_penalty.py`.
 
-They apply to NeMo-Gym GRPO **training** rollouts on the legacy driver (`grpo_train`), the data-plane driver (`grpo_train_sync`, `data_plane.enabled: true`) and the async `AsyncTrajectoryCollector`. Validation rollouts never apply them, so validation metrics stay on the raw environment reward. The SingleController path does not apply length penalties yet: until that follow-up lands, a SingleController run with `grpo.length_penalty` set fails at startup with `NotImplementedError` (alongside the other unsupported shapers) rather than training on unadjusted rewards. Likewise the block requires the NeMo-Gym path: a run with `grpo.length_penalty` set and `env.should_use_nemo_gym` false is rejected at setup.
+They apply to NeMo-Gym GRPO **training** rollouts on the legacy driver (`grpo_train`), the data-plane driver (`grpo_train_sync`, `data_plane.enabled: true`), the async `AsyncTrajectoryCollector`, and SingleController. Validation rollouts never apply them, so validation metrics stay on the raw environment reward. The block requires the NeMo-Gym path: a run with `grpo.length_penalty` set and `env.should_use_nemo_gym` false is rejected at setup.
 
 Configure `grpo.length_penalty`. The block is typed (`LengthPenaltyConfig` in `nemo_rl/utils/length_penalty.py`): unknown keys, misspelled `length_type` / gate values, a `profile_band` channel with `b <= a` or `f` outside `[0, 1]` are all rejected when the config is loaded, before the first rollout. The length adjustments mutate `full_result["reward"]` in place during rollout postprocessing; the reward as handed to the hook is kept on the batch as `env_reward` (see [Metrics](#metrics)).
+
+SingleController uses the same algorithms for ordinary and non-Forest token-capture rollouts. Capture applies adjustments to verified rollouts before publishing the group for training; rejected capture placeholders do not participate in group length statistics. Forest training does not support length penalties: configuring both `token_capture.forest_training: true` and `grpo.length_penalty` is rejected at setup. Saved attempts retain scalar length/profile metadata, and checkpoint restore rejects changed length-penalty settings.
 
 All algorithms are resolved per prompt group. Unless otherwise stated, only rollouts with `reward > 0` participate in length comparisons and receive length-based adjustments.
 
@@ -568,9 +570,12 @@ When `grpo.length_penalty` is set, the rollout postprocessor reports, next to th
 | `length_penalty/adjusted_frac` | Fraction of rollouts whose reward changed. |
 | `length_penalty/skipped_non_binary_frac` | Fraction of rollouts in groups skipped for non-binary or multi-component rewards. |
 
-All five are per-rollout means, so they read the same whether the hook sees the whole batch at once (legacy and data-plane drivers) or one prompt group at a time (async collector, whose per-group values are averaged).
+All five are per-rollout means, so they read the same whether the hook sees the whole batch at once (legacy and data-plane drivers) or one prompt group at a time. Async collectors average per-group values; SingleController pools capture metrics over verified logical rollouts so groups with different valid counts are weighted by their valid population.
 
-`total_reward` and the per-agent `<agent>/reward/*` metrics (`<taskset>/reward/*` for materialized task rows) carry the adjusted reward. The reward as handed to the length hook (after effort shaping and reward penalties) is kept on the rollout batch as `env_reward`, and the `baseline_reward/pct_0` / `pct_1` / `pct_mixed` diagnostics are computed from it so they keep reporting the environment's all-wrong / all-correct / mixed prompt fractions.
+`total_reward` and the per-agent `<agent>/reward/*` metrics (`<taskset>/reward/*` for materialized task rows) carry the adjusted reward. The reward as handed to the length hook (after effort shaping and reward penalties) is kept on the legacy, sync data-plane, and async collector rollout batch as `env_reward`, and their `baseline_reward/pct_0` / `pct_1` / `pct_mixed` diagnostics are computed from it so they keep reporting the environment's all-wrong / all-correct / mixed prompt fractions.
+
+SingleController reports the pre-adjustment mean through `length_penalty/env_reward_mean`;
+its stored `total_reward` and training advantages use the adjusted reward.
 
 ## Practical Notes
 
