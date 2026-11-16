@@ -14,6 +14,7 @@
 
 """Contract of score-centering request preparation and sampler extraction."""
 
+from itertools import accumulate
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,7 @@ import torch
 
 from nemo_rl.models.generation.score_centering import (
     build_score_centering_request_overrides,
+    extract_flat_score_centering_samples,
     extract_score_centering_samples,
     validate_score_centering_request,
 )
@@ -182,3 +184,76 @@ def test_score_centering_rejects_missing_logprob_rows():
         extract_score_centering_samples(
             SimpleNamespace(index=0, token_ids=[1], logprobs=None), num_candidates=1
         )
+
+
+def _flat_output(token_ids, rows):
+    """Lay out per-position ``(token_id, logprob)`` rows like vLLM FlatLogprobs."""
+    ends = list(accumulate(len(row) for row in rows))
+    return SimpleNamespace(
+        index=0,
+        token_ids=token_ids,
+        logprobs=SimpleNamespace(
+            start_indices=[end - len(row) for end, row in zip(ends, rows)],
+            end_indices=ends,
+            token_ids=[token_id for row in rows for token_id, _ in row],
+            logprobs=[logprob for row in rows for _, logprob in row],
+        ),
+    )
+
+
+def test_flat_score_centering_matches_per_position_extraction():
+    # Each flat row holds the sampled token, then the head by rank.
+    flat = _flat_output(
+        [9, 3, 5],
+        [
+            [(9, -3.0), (1, -0.3), (2, -1.8)],
+            # A sampled token inside the head appears twice.
+            [(3, -0.1), (3, -0.1), (4, -10000.0)],
+            # Top-k/top-p sampling gives filtered candidates -inf.
+            [(5, 0.0), (5, 0.0), (6, -float("inf"))],
+        ],
+    )
+    nested = SimpleNamespace(
+        index=0,
+        token_ids=[9, 3, 5],
+        logprobs=[
+            {
+                9: SimpleNamespace(rank=7, logprob=-3.0),
+                1: SimpleNamespace(rank=1, logprob=-0.3),
+                2: SimpleNamespace(rank=2, logprob=-1.8),
+            },
+            {
+                3: SimpleNamespace(rank=1, logprob=-0.1),
+                4: SimpleNamespace(rank=2, logprob=-10000.0),
+            },
+            {
+                5: SimpleNamespace(rank=1, logprob=0.0),
+                6: SimpleNamespace(rank=2, logprob=-float("inf")),
+            },
+        ],
+    )
+    with torch.device("meta"):
+        flat_ids, flat_logprobs = extract_flat_score_centering_samples(
+            flat, num_candidates=2
+        )
+    sampler_ids, sampler_logprobs = extract_score_centering_samples(
+        nested, num_candidates=2
+    )
+
+    assert flat_ids.dtype == torch.int32
+    assert flat_logprobs.dtype == torch.float32
+    assert flat_ids.device.type == flat_logprobs.device.type == "cpu"
+    assert torch.equal(flat_ids, sampler_ids)
+    assert torch.equal(flat_logprobs, sampler_logprobs)
+
+
+@pytest.mark.parametrize(
+    ("rows", "error_match"),
+    [
+        ([[(9, -3.0), (1, -0.3)]], "sampled token plus top_k"),
+        ([[(8, -3.0), (1, -0.3), (2, -1.8)]], "start with the sampled tokens"),
+    ],
+)
+def test_flat_score_centering_rejects_malformed_rows(rows, error_match):
+    with pytest.raises(RuntimeError, match=error_match):
+        extract_flat_score_centering_samples(_flat_output([9], rows), num_candidates=2)

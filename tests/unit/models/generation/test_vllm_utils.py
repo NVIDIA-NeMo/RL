@@ -14,6 +14,7 @@
 
 import contextlib
 import math
+import random
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -31,6 +32,7 @@ from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
+    _as_routed_experts_tensor,
     aggregate_spec_decode_counters,
     attach_routed_experts_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
@@ -39,6 +41,7 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_engine_step_metrics,
     compute_spec_decode_metrics,
     encode_counter_key,
+    extract_generation_logprobs,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
@@ -736,6 +739,47 @@ def test_attach_sampler_topk_logprobs_to_chat_response_choices():
     assert tuple(empty["sampler_topk_logprobs"].shape) == (0, 2)
 
 
+def test_attach_sampler_topk_logprobs_to_chat_response_choices_reads_flat_logprobs():
+    final_res = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[9],
+                logprobs=SimpleNamespace(
+                    start_indices=[0],
+                    end_indices=[3],
+                    token_ids=[9, 1, 2],
+                    logprobs=[-3.0, -0.3, -1.8],
+                ),
+            ),
+            SimpleNamespace(
+                index=1,
+                token_ids=[],
+                logprobs=SimpleNamespace(
+                    start_indices=[], end_indices=[], token_ids=[], logprobs=[]
+                ),
+            ),
+        ]
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=0, message=SimpleNamespace()),
+            SimpleNamespace(index=1, message=SimpleNamespace()),
+        ]
+    )
+
+    attach_sampler_topk_logprobs_to_chat_response_choices(response, final_res, top_k=2)
+
+    message = response.choices[0].message
+    assert message.sampler_topk_token_ids.tolist() == [[1, 2]]
+    torch.testing.assert_close(
+        message.sampler_topk_logprobs, torch.tensor([[-0.3, -1.8]])
+    )
+    empty = response.choices[1].message
+    assert tuple(empty.sampler_topk_token_ids.shape) == (0, 2)
+    assert tuple(empty.sampler_topk_logprobs.shape) == (0, 2)
+
+
 def test_attach_sampler_topk_logprobs_to_chat_response_choices_requires_k_entries():
     final_res = SimpleNamespace(
         outputs=[
@@ -837,6 +881,130 @@ def test_attach_token_information_to_chat_response_choices_rejects_invalid_struc
 
     with pytest.raises(RuntimeError, match=error_match):
         attach_token_information_to_chat_response_choices(response, final_res)
+
+
+def _position(token_id: int, logprob: float) -> dict:
+    return {token_id: SimpleNamespace(logprob=logprob)}
+
+
+def test_extract_generation_logprobs_reads_only_the_positions_asked_for():
+    # A live container may already hold a later step; it is left unread.
+    logprobs = [_position(12, -0.1), _position(13, -0.2), _position(14, -0.3)]
+
+    assert extract_generation_logprobs([12, 13], logprobs, start=0) == [-0.1, -0.2]
+    assert extract_generation_logprobs([13], logprobs, start=1) == [-0.2]
+    assert extract_generation_logprobs([], None, start=3) == []
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "logprobs", "error_match"),
+    [
+        ([12], None, "did not include logprobs"),
+        ([12, 13], [_position(12, -0.1)], "token_count=2, logprob_count=1"),
+        ([12], [_position(99, -0.1)], "did not include the selected token"),
+    ],
+)
+def test_extract_generation_logprobs_rejects_inconsistent_outputs(
+    token_ids, logprobs, error_match
+):
+    with pytest.raises(RuntimeError, match=error_match):
+        extract_generation_logprobs(token_ids, logprobs, start=0)
+
+
+class _FlatLogprobs:
+    """vLLM ``FlatLogprobs``' arrays; per-position indexing must not be used."""
+
+    def __init__(self, positions: list[list[tuple[int, float]]]) -> None:
+        self.start_indices: list[int] = []
+        self.end_indices: list[int] = []
+        self.token_ids: list[int] = []
+        self.logprobs: list[float] = []
+        for candidates in positions:
+            self.start_indices.append(len(self.token_ids))
+            for token_id, logprob in candidates:
+                self.token_ids.append(token_id)
+                self.logprobs.append(logprob)
+            self.end_indices.append(len(self.token_ids))
+
+    def __len__(self) -> int:
+        return len(self.start_indices)
+
+    def __getitem__(self, position: int):
+        raise AssertionError("flat logprobs must be read through their arrays")
+
+
+def test_extract_generation_logprobs_reads_flat_arrays_without_mappings():
+    # vLLM's layout: the sampled token first, then the top-k, which may
+    # repeat the sampled token with the same log probability.
+    logprobs = _FlatLogprobs(
+        [
+            [(12, -0.1), (7, -2.0)],
+            [(13, -0.2), (5, -1.0), (13, -0.2)],
+            [(14, -1e9)],
+            [(15, -0.4)],
+        ]
+    )
+
+    assert extract_generation_logprobs([12, 13, 14], logprobs, start=0) == [
+        -0.1,
+        -0.2,
+        vllm_utils.VLLM_LOGPROB_FLOOR,
+    ]
+    assert extract_generation_logprobs([15], logprobs, start=3) == [-0.4]
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "error_match"),
+    [
+        ([12, 13], "token_count=2, logprob_count=1"),
+        ([99], "did not include the selected token first"),
+        # Present only among the top-k: not the layout this read relies on.
+        ([7], "did not include the selected token first"),
+    ],
+)
+def test_extract_generation_logprobs_rejects_inconsistent_flat_arrays(
+    token_ids, error_match
+):
+    logprobs = _FlatLogprobs([[(12, -0.1), (7, -2.0)]])
+    # A position whose end index is not yet appended is not published.
+    logprobs.start_indices.append(len(logprobs.token_ids))
+
+    with pytest.raises(RuntimeError, match=error_match):
+        extract_generation_logprobs(token_ids, logprobs, start=0)
+
+
+@pytest.mark.vllm
+def test_flat_logprob_read_matches_vllm_mappings():
+    """Both of vLLM's containers, filled the way its sampler fills them."""
+    from vllm.logprobs import FlatLogprobs, append_logprobs_for_next_position
+
+    generator = random.Random(0)
+    flat, mappings = FlatLogprobs(), []
+    sampled = []
+    for _ in range(64):
+        top_k = generator.sample(range(1000), 4)
+        values = {token_id: -generator.random() * 5 for token_id in top_k}
+        # The sampler writes the sampled token first; it is often also top-k.
+        token_id = generator.choice([*top_k, generator.randrange(1000, 2000)])
+        values.setdefault(token_id, -generator.random() * 5)
+        row = [token_id, *top_k]
+        for container in (flat, mappings):
+            append_logprobs_for_next_position(
+                container,
+                row,
+                [values[candidate] for candidate in row],
+                [None] * len(row),
+                rank=1,
+                num_logprobs=len(top_k),
+            )
+        sampled.append(token_id)
+
+    expected = extract_generation_logprobs(sampled[10:], mappings, start=10)
+    assert extract_generation_logprobs(sampled[10:], flat, start=10) == expected
+    assert expected == [
+        max(mappings[position][token_id].logprob, vllm_utils.VLLM_LOGPROB_FLOOR)
+        for position, token_id in enumerate(sampled[10:], 10)
+    ]
 
 
 @pytest.mark.parametrize("encode_for_wire", [False, True])
@@ -1277,6 +1445,46 @@ def test_step_metrics_are_returned_when_the_snapshot_reads_cleanly():
     assert stub._step_metrics_snapshot is None
 
 
+def test_step_metrics_reuse_the_end_snapshot_without_gaps():
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    stub = _generation_stub({"vllm:generation_tokens": 10.0})
+    stub._get_raw_spec_counters = MagicMock(
+        side_effect=[
+            {"vllm:generation_tokens": 30.0},
+            {"vllm:generation_tokens": 65.0},
+        ]
+    )
+
+    first = VllmGeneration.get_step_metrics(stub, keep_snapshot=True)
+    second = VllmGeneration.get_step_metrics(stub, keep_snapshot=True)
+
+    assert first["vllm/generation_tokens"] == 20.0
+    assert second["vllm/generation_tokens"] == 35.0
+    assert stub._get_raw_spec_counters.call_count == 2
+    assert stub._step_metrics_snapshot == {"vllm:generation_tokens": 65.0}
+
+
+def test_continuous_step_metrics_recover_after_a_failed_read():
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    stub = _generation_stub({"vllm:generation_tokens": 10.0})
+    stub._get_raw_spec_counters = MagicMock(
+        side_effect=[
+            RuntimeError("reader gone"),
+            {"vllm:generation_tokens": 30.0},
+            {"vllm:generation_tokens": 65.0},
+        ]
+    )
+
+    assert VllmGeneration.get_step_metrics(stub, keep_snapshot=True) == {}
+    assert stub._step_metrics_snapshot is None
+    assert VllmGeneration.get_step_metrics(stub, keep_snapshot=True) == {}
+    assert stub._step_metrics_snapshot == {"vllm:generation_tokens": 30.0}
+    metrics = VllmGeneration.get_step_metrics(stub, keep_snapshot=True)
+    assert metrics["vllm/generation_tokens"] == 35.0
+
+
 @dataclass(frozen=True)
 class _PlaceholderRange:
     offset: int
@@ -1578,3 +1786,52 @@ def test_check_sampling_param(temperature, top_p, top_k, error) -> None:
             top_k=top_k,
             generation_config=generation_config,
         )
+
+
+class TestRoutedExpertsTensorDtype:
+    """The narrow-unsigned crash the carry-dtype conversion has to survive.
+
+    vLLM can hand back expert ids as ``uint16``. ``Tensor.max()`` is not implemented
+    for that dtype, so the range check widens before reducing. The dtype in these
+    tests is load-bearing: ``uint8`` and every signed type implement ``max()``, so a
+    test written with one of those passes against the unwidened code and pins nothing.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _rearm_range_check(self):
+        """The range check runs once per process; re-arm it around every test."""
+        previous = vllm_utils.G_ROUTED_EXPERTS_RANGE_CHECKED
+        vllm_utils.G_ROUTED_EXPERTS_RANGE_CHECKED = False
+        yield
+        vllm_utils.G_ROUTED_EXPERTS_RANGE_CHECKED = previous
+
+    def test_uint16_ids_convert_without_a_narrow_dtype_reduction(self):
+        """The regression: max() on uint16 raises NotImplementedError("max_all")."""
+        value = torch.tensor([1, 2, 3], dtype=torch.uint16)
+
+        out = _as_routed_experts_tensor(
+            value, device=torch.device("cpu"), dtype=torch.int32
+        )
+
+        assert out.dtype == torch.int32
+        assert out.tolist() == [1, 2, 3]
+
+    def test_the_dtype_this_guards_really_cannot_be_reduced_directly(self):
+        """Pins the premise, so the test above cannot quietly stop testing anything.
+
+        If a future torch implements max_all for uint16 this fails, which is the
+        signal to drop the widening rather than keep carrying it untested.
+        """
+        with pytest.raises(NotImplementedError, match="max_all"):
+            torch.tensor([1], dtype=torch.uint16).max()
+
+    def test_an_out_of_range_uint16_id_is_rejected_rather_than_wrapped(self):
+        """The widening must not cost the overflow check it exists to serve."""
+        # Above int8's max of 127, so the guard fires. 200 also wraps to -56 in
+        # int8, which is the silent corruption the check exists to prevent.
+        value = torch.tensor([200], dtype=torch.uint16)
+
+        with pytest.raises(ValueError, match="exceeds the resolved carry dtype"):
+            _as_routed_experts_tensor(
+                value, device=torch.device("cpu"), dtype=torch.int8
+            )

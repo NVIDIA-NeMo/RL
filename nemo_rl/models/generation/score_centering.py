@@ -143,3 +143,65 @@ def extract_score_centering_samples(
         device="cpu",
     ).reshape(-1, num_candidates)
     return sampler_ids, sampler_logprobs
+
+
+def extract_flat_score_centering_samples(
+    output: Any, *, num_candidates: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Vectorized ``extract_score_centering_samples`` for vLLM ``FlatLogprobs``.
+
+    With flat logprobs vLLM stores ``num_candidates + 1`` entries per generated
+    position: the sampled token first, then the top-k head by rank (a sampled
+    token inside the head appears twice). Reshaping the flat lists replaces the
+    per-position dict walk and applies the same checks to whole tensors.
+
+    Args:
+        output: One engine CompletionOutput whose ``logprobs`` is a
+            ``vllm.logprobs.FlatLogprobs``.
+        num_candidates: Number of sampler candidates to retain per position.
+
+    Returns:
+        CPU ``(sampler_ids, sampler_logprobs)`` tensors, both shaped
+        ``[generated_len, num_candidates]``, with int32 IDs and float32
+        logprobs, matching ``extract_score_centering_samples``.
+    """
+    if num_candidates <= 0:
+        raise ValueError("Score-centering candidate count must be positive")
+    flat = output.logprobs
+    num_generated = len(output.token_ids)
+    width = num_candidates + 1
+    if (
+        len(flat.start_indices) != num_generated
+        or len(flat.token_ids) != num_generated * width
+    ):
+        raise RuntimeError(
+            "vLLM returned a log-prob row other than the sampled token plus top_k "
+            "while extracting score-centering samples: "
+            f"choice_idx={output.index}, top_k={num_candidates}."
+        )
+    token_ids = torch.tensor(flat.token_ids, dtype=torch.int64, device="cpu").view(
+        num_generated, width
+    )
+    logprobs = torch.tensor(flat.logprobs, dtype=torch.float32, device="cpu").view(
+        num_generated, width
+    )
+    if (
+        (token_ids < 0).any()
+        or (token_ids > torch.iinfo(torch.int32).max).any()
+        or logprobs.isnan().any()
+        or (logprobs > 1e-5).any()
+    ):
+        raise ValueError("Invalid sampler top-k token id or log probability")
+    if not torch.equal(
+        token_ids[:, 0],
+        torch.tensor(output.token_ids, dtype=torch.int64, device="cpu"),
+    ):
+        raise RuntimeError("vLLM flat logprobs do not start with the sampled tokens")
+    head_ids = token_ids[:, 1:]
+    head_logprobs = logprobs[:, 1:]
+    sorted_ids = head_ids.sort(dim=1).values
+    if (sorted_ids[:, 1:] == sorted_ids[:, :-1]).any():
+        raise ValueError("Sampler top-k token ids must be unique")
+    if (head_logprobs.exp().sum(dim=1) > 1.0001).any():
+        raise ValueError("Sampler top-k probabilities exceed unit mass")
+    return head_ids.to(torch.int32), head_logprobs

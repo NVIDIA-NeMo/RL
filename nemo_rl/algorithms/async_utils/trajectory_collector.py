@@ -1048,10 +1048,10 @@ class AsyncTrajectoryCollector:
     def prepare_for_refit(self) -> None:
         """Pause new generation starts and optionally wait for pending generations.
 
-        Every async backend configured for in-flight weight updates, except managed
-        Dynamo, is asked to pause generation. vLLM preserves in-flight request state
-        with its native keep-mode pause. Backends without pause support warn and
-        retain their existing behavior. Managed Dynamo drains active trajectories.
+        Every async backend configured for in-flight weight updates is asked to
+        pause generation. vLLM preserves in-flight request state with its native
+        keep-mode pause. Backends without pause support warn and retain their
+        existing behavior.
 
         For non-async engines, waits for all pending generations to complete before refit.
         """
@@ -1067,16 +1067,7 @@ class AsyncTrajectoryCollector:
         # Check if we're using async engine
         generation_cfg = self.master_config.policy["generation"]
         backend = generation_cfg["backend"]
-        if backend == "dynamo":
-            # Dynamo's native layerwise reload temporarily materializes model
-            # parameters while the NCCL update is in progress.  It is not safe
-            # to execute an already-issued vLLM request concurrently with that
-            # reload (in particular for NemotronH/Mamba parameters), even when
-            # the update route accepts allow_unpaused=True.  Stop new trajectory
-            # starts above and drain every active trajectory before refitting.
-            is_async_engine = False
-        else:
-            is_async_engine = should_use_async_rollouts(generation_cfg)
+        is_async_engine = should_use_async_rollouts(generation_cfg)
         in_flight_weight_updates = self.async_config.in_flight_weight_updates
 
         if is_async_engine and in_flight_weight_updates:
@@ -1144,10 +1135,6 @@ class AsyncTrajectoryCollector:
                     )
             except Exception as e:
                 print(f"⚠️ Failed to invalidate generation backend KV caches: {e}")
-                if self.master_config.policy["generation"]["backend"] == "dynamo":
-                    raise RuntimeError(
-                        "Managed Dynamo KV cache invalidation failed after refit"
-                    ) from e
             finally:
                 self._generation_pause_requested_for_refit = False
                 self._generation_paused_for_refit = False
