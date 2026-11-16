@@ -2,6 +2,10 @@ defaults: ./grpo-qwen3-30ba3b-base-8n4g-nvfp4-vpg-lag1.yaml
 policy:
   megatron_cfg:
     bias_activation_fusion: true
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    recompute_modules: null
     model_overrides:
       moe_use_grouped_tensor: true
       inference_moe_nvfp4_recipe: null
@@ -14,3 +18,5 @@ policy:
       inference_flashinfer_mxfp8_token_capacity: null
       model_overrides:
         inference_moe_nvfp4_recipe: null
+cluster:
+  num_nodes: 5
