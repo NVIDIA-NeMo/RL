@@ -54,9 +54,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutRecoveryConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
-from nemo_rl.algorithms.single_controller_utils.step_assembly import (
-    StepAssembler,
-)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     BelowValidFractionGroup,
     ZeroVarianceGroup,
@@ -232,10 +229,6 @@ def test_rollout_pump_stamps_target_steps(
     buffer = _RecordingBuffer()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._buffer = buffer
     ctrl._async_cfg = SimpleNamespace(
@@ -302,10 +295,6 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._async_cfg = SimpleNamespace(
         max_inflight_prompts=2, diagnostics=False, rollout_failure=_failure_cfg()
@@ -343,10 +332,6 @@ def test_reserved_admission_rejects_an_occupied_target_step() -> None:
     buffer = _RecordingBuffer([0])
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._buffer = buffer
     ctrl._rollout_manager = SimpleNamespace(
@@ -370,10 +355,6 @@ def test_non_recovery_reserve_drain_rejects_an_occupied_target_step() -> None:
     buffer = _RecordingBuffer([0])
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=1)
     ctrl._buffer = buffer
@@ -415,10 +396,6 @@ def test_unrecorded_dispatch_takes_no_mutation_slot() -> None:
     buffer = _RecordingBuffer([])
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._rollout_runtime = RolloutRuntimeState(
         replacement_reserve=deque([{"idx": 0}, {"idx": 1}])
     )
@@ -489,10 +466,6 @@ def test_rollout_pump_charges_shortfall_as_the_sampler_decides(
     buffer = _RecordingBuffer()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._buffer = buffer
     ctrl._async_cfg = SimpleNamespace(
@@ -574,10 +547,6 @@ def _pump_controller(
     buffer = _RecordingBuffer() if buffer is None else buffer
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._buffer = buffer
     ctrl._async_cfg = SimpleNamespace(
@@ -1131,10 +1100,6 @@ class TestTakeReplacement:
     ):
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._rollout_runtime = RolloutRuntimeState()
         ctrl._async_cfg = SimpleNamespace(
             rollout_failure=_failure_cfg(
@@ -1209,10 +1174,6 @@ class TestChargeShortfall:
     def _controller(sampler: Any, *, assembling_version: int = 5):
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._sampler = sampler
         ctrl._step_assembler._assembling_version = assembling_version
         ctrl._step_assembler._step_assembly = None
@@ -1284,10 +1245,6 @@ class TestALostGroupDoesNotStallTheGate:
     def _controller(sampler: Any) -> Any:
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._sampler = sampler
         ctrl._step_assembler._assembling_version = 0
         ctrl._step_assembler._step_assembly = None
@@ -1354,10 +1311,6 @@ class TestTargetGroupsForStep:
     ):
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._rollout_runtime = RolloutRuntimeState()
         # No step is exempt: these cases are about the floor, not about data running out.
         ctrl._rollout_runtime.steps_allowed_short = set()
@@ -1448,10 +1401,6 @@ def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"fresh": (fresh, 5), "stale": (stale, 1)}
@@ -1498,10 +1447,6 @@ def test_abort_stale_inflight_rechecks_registry_after_checkpoint_wait() -> None:
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"completed": (completed, 1)}
@@ -1551,10 +1496,6 @@ def test_checkpoint_observes_stale_abort_ledger_discard() -> None:
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"stale": (stale, 1)}
@@ -1601,10 +1542,6 @@ def test_abort_stale_inflight_aggregates_cleanup_failures() -> None:
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=0)
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"g": (task, 0)}
@@ -1652,10 +1589,6 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         manager = _FailingRolloutManager()
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._rollout_runtime = RolloutRuntimeState()
         ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=2,
@@ -1748,10 +1681,6 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
     async def _main() -> None:
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._rollout_runtime = RolloutRuntimeState()
         ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=1,
@@ -1822,10 +1751,6 @@ def test_min_valid_fraction_counts_rollouts_independently_of_segments(
     counts = (3, 4) if forest_training else row_counts
     dropped = threshold is not None and counts[0] / counts[1] < threshold
     ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._master_config = SimpleNamespace(
         token_capture=SimpleNamespace(
             min_valid_fraction_per_group=threshold, forest_training=forest_training
@@ -1856,10 +1781,6 @@ def test_below_valid_fraction_outcome_substitutes_or_closes_short(
 
     async def run() -> None:
         ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=1, diagnostics=False, rollout_failure=_failure_cfg()
         )
@@ -1947,10 +1868,6 @@ def test_zero_variance_outcome_substitutes_from_the_filtered_pool_or_closes_shor
 
     async def run() -> None:
         ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=1, diagnostics=False, rollout_failure=_failure_cfg()
         )
@@ -2041,10 +1958,6 @@ def test_a_group_rejected_for_both_reasons_tallies_each_attempt_once(
 
     async def run() -> None:
         ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=1, diagnostics=False, rollout_failure=_failure_cfg()
         )
@@ -2100,10 +2013,6 @@ def test_a_group_rejected_for_both_reasons_tallies_each_attempt_once(
 
 def _claiming_controller(*, spares: int, exhausted: bool = False) -> Any:
     ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._dynamic_sampling_enabled = True
     # Claiming a filtered spare only applies to a sampler that pools replacements;
     # a non-pooled sampler (windowed) refills from later dispatches and never waits.
@@ -2226,10 +2135,6 @@ def test_pump_claims_and_pops_a_filtered_spare_for_a_real_zero_variance_rejectio
 
     async def run() -> None:
         ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=1, diagnostics=False, rollout_failure=_failure_cfg()
         )
@@ -2371,10 +2276,6 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._rollout_runtime = RolloutRuntimeState()
         ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=1,
@@ -2495,10 +2396,6 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         manager = _RecoveryCaptureManager()
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._rollout_runtime = RolloutRuntimeState()
         ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=1,

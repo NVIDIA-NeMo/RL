@@ -53,7 +53,7 @@ import warnings
 from collections import deque
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import replace
-from functools import partial
+from functools import cached_property, partial
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -812,14 +812,6 @@ class SingleControllerActor:
         )
 
         self._trainer_version: int = restored_trainer_version
-        # Owns the cursor over the step the train pump is assembling and charges a
-        # permanently lost prompt group to the step that will close short for it. The
-        # cursor seeds from _trainer_version (the restored step on resume, set just
-        # above), so step 0 stays valid after a restore.
-        self._step_assembler = StepAssembler(
-            controller=self,
-            initial_version=self._trainer_version,
-        )
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
@@ -1036,6 +1028,19 @@ class SingleControllerActor:
             "finalizer_queue_depth": self._available_finalizers.qsize(),
             "finalizer_unknown_outcomes": self._finalizer_unknown_outcomes,
         }
+
+    @cached_property
+    def _step_assembler(self) -> StepAssembler:
+        """Track the step the train pump is assembling and charge lost groups to it.
+
+        Built on first use so the cursor seeds from the current ``_trainer_version``
+        (the restored step on resume) and so controller instances that unit tests
+        construct via ``object.__new__`` get it without a hand-written assignment.
+        """
+        return StepAssembler(
+            controller=self,
+            initial_version=getattr(self, "_trainer_version", 0),
+        )
 
     def _training_progress(self) -> TrainingProgress:
         """Return the training counters a checkpoint reads."""

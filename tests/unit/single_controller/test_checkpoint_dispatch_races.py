@@ -57,9 +57,6 @@ from nemo_rl.algorithms.single_controller import (
     RolloutRuntimeState,
     SingleControllerActor,
 )
-from nemo_rl.algorithms.single_controller_utils.step_assembly import (
-    StepAssembler,
-)
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
@@ -502,10 +499,6 @@ def _rehydration_controller(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
-    controller._step_assembler = StepAssembler(
-        controller=controller,
-        initial_version=getattr(controller, "_trainer_version", 0),
-    )
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     controller._rollout_manager = SimpleNamespace(recovery_ledger=restored_ledger)
     controller._dataloader = SimpleNamespace(
@@ -563,10 +556,6 @@ def test_recovery_rehydration_rejects_invalid_collator_results(
 def _reserve_controller() -> Any:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
-    controller._step_assembler = StepAssembler(
-        controller=controller,
-        initial_version=getattr(controller, "_trainer_version", 0),
-    )
     controller._rollout_runtime = RolloutRuntimeState()
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     controller._rollout_runtime.sampler_stamps_target_steps = True
@@ -1188,10 +1177,6 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
-        controller._step_assembler = StepAssembler(
-            controller=controller,
-            initial_version=getattr(controller, "_trainer_version", 0),
-        )
         controller._rollout_runtime = RolloutRuntimeState()
         _init_recovery_telemetry(controller, train_steps=7)
         controller._sampler = sampler
@@ -1319,10 +1304,6 @@ async def _turn_recovery_restart(
     gym_actor = gym_actor if gym_actor is not None else FakeGymActor()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
-    controller._step_assembler = StepAssembler(
-        controller=controller,
-        initial_version=getattr(controller, "_trainer_version", 0),
-    )
     controller._rollout_runtime = RolloutRuntimeState()
     _init_recovery_telemetry(controller, train_steps=7)
     controller._sampler = _CountingInOrderSampler()
@@ -1619,10 +1600,6 @@ def test_recovery_rejects_an_unhandled_phase_before_redispatch() -> None:
         )
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
-        controller._step_assembler = StepAssembler(
-            controller=controller,
-            initial_version=getattr(controller, "_trainer_version", 0),
-        )
         _init_recovery_telemetry(controller)
         controller._rollout_manager = SimpleNamespace(recovery_ledger=recovery_ledger)
         launched = False
@@ -1675,10 +1652,6 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
         rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
-        controller._step_assembler = StepAssembler(
-            controller=controller,
-            initial_version=getattr(controller, "_trainer_version", 0),
-        )
         controller._rollout_runtime = RolloutRuntimeState()
         _init_recovery_telemetry(controller, train_steps=7)
         controller._sampler = sampler
@@ -1781,10 +1754,6 @@ def test_recovery_launches_admitted_groups_before_waiting_to_readmit() -> None:
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
-        controller._step_assembler = StepAssembler(
-            controller=controller,
-            initial_version=getattr(controller, "_trainer_version", 0),
-        )
         controller._rollout_runtime = RolloutRuntimeState()
         _init_recovery_telemetry(controller, train_steps=6)
         controller._sampler = sampler
@@ -1855,10 +1824,6 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
         rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
-        controller._step_assembler = StepAssembler(
-            controller=controller,
-            initial_version=getattr(controller, "_trainer_version", 0),
-        )
         controller._rollout_runtime = RolloutRuntimeState()
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         controller._rollout_manager = rollout_manager
@@ -2227,10 +2192,6 @@ def test_recovery_rejects_a_corrupt_ledger_sidecar(tmp_path) -> None:
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
-    controller._step_assembler = StepAssembler(
-        controller=controller,
-        initial_version=getattr(controller, "_trainer_version", 0),
-    )
     controller._master_config = SimpleNamespace(
         token_capture=SimpleNamespace(forest_training=False)
     )
@@ -2259,10 +2220,6 @@ def test_recovery_rejects_a_missing_advertised_ledger_sidecar(tmp_path) -> None:
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
-    controller._step_assembler = StepAssembler(
-        controller=controller,
-        initial_version=getattr(controller, "_trainer_version", 0),
-    )
     controller._master_config = SimpleNamespace(
         token_capture=SimpleNamespace(forest_training=False)
     )

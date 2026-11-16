@@ -80,9 +80,6 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     JsonDebugWriter,
     TrainChunk,
 )
-from nemo_rl.algorithms.single_controller_utils.step_assembly import (
-    StepAssembler,
-)
 from nemo_rl.algorithms.single_controller_utils.utils import tensor_field
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
@@ -797,10 +794,6 @@ def _lookahead_controller(
     """Bare actor carrying only what the lookahead schedule reads."""
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._is_ppo = is_ppo
     ctrl._trainer_version = trainer_version
     ctrl._algo_cfg = SimpleNamespace(
@@ -926,10 +919,6 @@ async def test_sync_weights_honors_recompute_kv_cache_config(
     events: list[str] = []
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._async_cfg = AsyncRLConfig(
         recompute_kv_cache_after_weight_updates=recompute_kv_cache
     )
@@ -1082,10 +1071,6 @@ def test_sync_weights_sglang_flushes_only_while_paused(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._async_cfg = AsyncRLConfig(
         recompute_kv_cache_after_weight_updates=recompute_kv_cache
     )
@@ -1115,10 +1100,6 @@ def test_sync_weights_sglang_flushes_only_while_paused(
 def test_sync_weights_rejects_unconfirmed_inflight_kv_recomputation() -> None:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._async_cfg = AsyncRLConfig(recompute_kv_cache_after_weight_updates=True)
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
@@ -1146,10 +1127,6 @@ def test_sync_weights_rejects_unconfirmed_inflight_kv_recomputation() -> None:
 def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._async_cfg = AsyncRLConfig()
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
@@ -1199,10 +1176,6 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
 def test_sync_weights_keeps_dispatch_paused_when_generation_resume_fails() -> None:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._async_cfg = AsyncRLConfig()
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
@@ -1231,10 +1204,6 @@ def test_sync_weights_keeps_dispatch_paused_when_generation_resume_fails() -> No
 def test_sync_weights_keeps_dispatch_paused_when_generation_pause_fails() -> None:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._async_cfg = AsyncRLConfig()
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
@@ -1264,10 +1233,6 @@ def test_sync_weights_keeps_dispatch_paused_when_generation_pause_fails() -> Non
 def test_sync_weights_does_not_resume_generation_after_failed_refit() -> None:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._async_cfg = AsyncRLConfig()
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
@@ -1363,10 +1328,6 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -1488,10 +1449,6 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -1566,10 +1523,6 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -1670,10 +1623,6 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -1746,10 +1695,6 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -1814,10 +1759,6 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -1880,10 +1821,6 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
     """SC passes the TQ teacher column under OPD's estimator contract."""
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     captured_kwargs = {}
 
     class FakeEstimator:
@@ -2058,10 +1995,6 @@ def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
     """TROPD and the global baseline reshape the advantage, not the gap metric."""
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     token_mask = torch.tensor([[1.0, 1.0, 1.0], [0.0, 1.0, 0.0]])
     prev_logprobs = torch.tensor([[-1.0, -2.0, -0.5], [-1.5, -1.5, -3.0]])
     teacher_logprobs = torch.tensor([[-0.5, -0.5, -2.0], [-1.0, -1.0, -1.0]])
@@ -2464,10 +2397,6 @@ class _NoOpDataPlane:
 def _train_pump_controller(*, sampler) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._master_config = SimpleNamespace(
         token_capture=TokenCaptureConfig(),
@@ -5111,10 +5040,6 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     estimator = _GaeLikeEstimator()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -5190,10 +5115,6 @@ def test_advantage_stage_scales_rewards_off_the_ppo_block_before_gae() -> None:
     )
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = GeneralizedAdvantageEstimator(
@@ -5482,10 +5403,6 @@ def test_advantage_stage_statistics_participation_is_binary(policy: str) -> None
     data_plane = _AdvantageDataPlane(data)
     estimator = _MaskRecordingAdvantageEstimator()
     ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -5564,10 +5481,6 @@ def test_advantage_stage_in_loss_seq_filter_keeps_legacy_participation(
     data_plane = _AdvantageDataPlane(data)
     estimator = _MaskRecordingAdvantageEstimator()
     ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -5667,10 +5580,6 @@ def test_advantage_stage_over_length_prompts_never_vote(policy: str) -> None:
     plane = _AdvantageDataPlane(data)
     estimator = _Recording(_create_advantage_estimator(master))
     ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._dp_client = plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -5766,10 +5675,6 @@ def test_advantage_stage_placeholders_never_vote(
         )
         plane = _AdvantageDataPlane(data)
         ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-        ctrl._step_assembler = StepAssembler(
-            controller=ctrl,
-            initial_version=getattr(ctrl, "_trainer_version", 0),
-        )
         ctrl._dp_client = plane
         ctrl._advantage_cfg = AdvantageConfig(
             repeated_batch_fields=["reward/a", "reward/b"]

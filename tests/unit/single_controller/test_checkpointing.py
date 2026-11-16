@@ -115,9 +115,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.step_assembly import (
-    StepAssembler,
-)
-from nemo_rl.algorithms.single_controller_utils.step_assembly import (
     StepAssembly as _StepAssembly,
 )
 from nemo_rl.data.utils import load_dataloader_state
@@ -1346,10 +1343,6 @@ class TestCounterRestore:
         recovery_target_steps: list[int],
     ) -> None:
         actor = object.__new__(_ACTOR_CLS)
-        actor._step_assembler = StepAssembler(
-            controller=actor,
-            initial_version=getattr(actor, "_trainer_version", 0),
-        )
         actor._buffer = SimpleNamespace(target_step_list=buffer_target_steps)
         actor._rollout_manager = SimpleNamespace(
             recovery_ledger=SimpleNamespace(
@@ -1370,10 +1363,6 @@ class TestCounterRestore:
 
     def test_accepts_sampler_cursor_covering_restored_work(self) -> None:
         actor = object.__new__(_ACTOR_CLS)
-        actor._step_assembler = StepAssembler(
-            controller=actor,
-            initial_version=getattr(actor, "_trainer_version", 0),
-        )
         actor._buffer = SimpleNamespace(target_step_list=[None, 7])
         actor._rollout_manager = SimpleNamespace(
             recovery_ledger=SimpleNamespace(
@@ -4028,10 +4017,6 @@ class _OrderRecordingCritic:
 def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     """Bare actor carrying only what _save_checkpoint reads."""
     actor = object.__new__(_ACTOR_CLS)
-    actor._step_assembler = StepAssembler(
-        controller=actor,
-        initial_version=getattr(actor, "_trainer_version", 0),
-    )
     actor._rollout_runtime = RolloutRuntimeState()
     checkpoint_path = tmp_path / "tmp_step_1"
     checkpoint_path.mkdir(parents=True, exist_ok=True)
@@ -4964,10 +4949,6 @@ class TestReplayBufferPersistence:
     @pytest.mark.parametrize("dataset_idx", [99, True])
     def test_replay_free_restore_rejects_changed_prompt_identity(self, dataset_idx):
         actor = object.__new__(_ACTOR_CLS)
-        actor._step_assembler = StepAssembler(
-            controller=actor,
-            initial_version=getattr(actor, "_trainer_version", 0),
-        )
         actor._dataloader = _FakeDataloader(dataset=[{"idx": 0}, {"idx": dataset_idx}])
         actor._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         actor._rollout_manager = _FakeRolloutManager()

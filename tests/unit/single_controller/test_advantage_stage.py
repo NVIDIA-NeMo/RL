@@ -57,9 +57,6 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     DebugWriterConfig,
     JsonDebugWriter,
 )
-from nemo_rl.algorithms.single_controller_utils.step_assembly import (
-    StepAssembler,
-)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -676,10 +673,6 @@ def _controller(
         train_data_dump_dir=dump_dir,
     )
     ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-    ctrl._step_assembler = StepAssembler(
-        controller=ctrl,
-        initial_version=getattr(ctrl, "_trainer_version", 0),
-    )
     ctrl._advantage_estimator = estimator
     ctrl._advantage_stage_config = config
     ctrl._advantage_computer = AdvantageComputer(
