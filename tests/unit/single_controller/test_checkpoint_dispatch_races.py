@@ -559,7 +559,8 @@ def _reserve_controller() -> Any:
     controller._rollout_runtime = RolloutRuntimeState()
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     controller._rollout_runtime.sampler_stamps_target_steps = True
-    controller._sampler = SimpleNamespace()
+    # Pooled replacements: the fault-tolerance reserve path reads this directly.
+    controller._sampler = SimpleNamespace(uses_pooled_replacements=True)
     controller._rollout_recovery_enabled = True
     # Dynamic sampling off: these fixtures exercise the fault-tolerance path.
     controller._dynamic_sampling_enabled = False
