@@ -1,7 +1,7 @@
 {
   "base_repository": "https://github.com/NVIDIA/Megatron-LM",
   "base_commit": "3e95097b4a9ab6ea6b2a39eb2b2b24e4a6dfa54a",
-  "patch_sha256": "077ca42414c25e612a3af16809be30bebb95dcd72f1bae3ad153057420ebd8d4",
+  "patch_sha256": "763d28978e3a6452183094c880976cea9b792e4d6a0699bbdd2b43921e488980",
   "files": {
     "megatron/core/inference/text_generation_controllers/mtp_utils_pytorch.py": {
       "base_sha256": "9c98a26a0274f71fd57362074da53ca87d85012dd2ac87c32ae062d55cf7394e",

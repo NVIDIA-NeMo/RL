@@ -1,36 +1,21 @@
 --- a/megatron/core/inference/text_generation_controllers/mtp_utils_pytorch.py
 +++ b/megatron/core/inference/text_generation_controllers/mtp_utils_pytorch.py
-@@ -249,6 +249,9 @@
-                 if accepted_tokens_per_request[pid, s].item() != -1:
-                     count += 1
-             accepted_token_counts[pid] = count
+@@ -251,0 +252,3 @@
 +        else:
 +            accepted_tokens_per_request[pid].fill_(-1)
 +            accepted_token_counts[pid] = 0
- 
- 
- def mamba_state_selective_copy(
 --- a/megatron/core/inference/text_generation_controllers/mtp_utils_triton.py
 +++ b/megatron/core/inference/text_generation_controllers/mtp_utils_triton.py
-@@ -305,6 +305,12 @@
- 
-         count = tl.sum((accepted & spec_valid).to(tl.int64))
-         tl.store(ACCEPTED_COUNTS_OUT_PTR + pid, count)
+@@ -307,0 +308,6 @@
 +    else:
 +        spec_offsets = tl.arange(0, SPEC_BLOCK_SIZE)
 +        spec_valid = spec_offsets < NUM_SPEC_TOKENS
 +        out_base = pid.to(tl.int64) * accepted_tokens_out_stride
 +        tl.store(ACCEPTED_TOKENS_OUT_PTR + out_base + spec_offsets, -1, mask=spec_valid)
 +        tl.store(ACCEPTED_COUNTS_OUT_PTR + pid, 0)
- 
- 
- def prepare_next_forward_pass(
 --- a/megatron/core/inference/utils.py
 +++ b/megatron/core/inference/utils.py
-@@ -219,19 +219,34 @@
- def set_moe_metadata_sync(model) -> None:
-     """Set _runs_metadata_sync on inference dispatchers.
- 
+@@ -222,2 +222,6 @@
 -    Exactly one dispatcher per model — the first MoE layer — fires update_metadata
 -    each step. All subsequent layers skip it to avoid redundant collective calls.
 +    The dispatcher metadata (the valid-token count the experts read and, at EP > 1, the
@@ -39,15 +24,10 @@
 +    forward, and of each MTP layer. Speculative decoding runs every MTP layer as a forward
 +    of its own (`forward_single_position`) on request-shaped rows, without the decoder's MoE
 +    layers. All other layers skip it to avoid redundant collective calls.
-     Must be called once after the model is built and put into eval mode.
-     """
+@@ -225,0 +230,2 @@
 +    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 +
-     global moe_layer_cache, _moe_metadata_sync_initialized
-     if _moe_metadata_sync_initialized:
-         return
-     if moe_layer_cache is None:
-         _init_moe_expert_cache(model)
+@@ -231 +237,9 @@
 -    for i, moe_layer in enumerate(moe_layer_cache):
 +    # The forward each MoE layer runs in: its MTP layer, or None for the main forward.
 +    forward_of = {}
@@ -58,11 +38,7 @@
 +    synced_forwards = set()
 +    for moe_layer in moe_layer_cache:
 +        forward = forward_of.get(id(moe_layer))
-         dispatcher = getattr(moe_layer, '_inference_token_dispatcher', None)
-         if dispatcher is not None:
+@@ -234 +248,2 @@
 -            dispatcher._runs_metadata_sync = i == 0
 +            dispatcher._runs_metadata_sync = forward not in synced_forwards
 +            synced_forwards.add(forward)
-     _moe_metadata_sync_initialized = True
- 
- 

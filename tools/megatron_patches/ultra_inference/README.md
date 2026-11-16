@@ -18,8 +18,8 @@ Use a separate, clean Megatron checkout. Set `NRL_ROOT` to this repository and
 PATCH_ROOT="$NRL_ROOT/tools/megatron_patches/ultra_inference"
 test "$(git -C "$MCORE_ROOT" rev-parse HEAD)" = 3e95097b4a9ab6ea6b2a39eb2b2b24e4a6dfa54a
 (cd "$MCORE_ROOT" && sha256sum --check "$PATCH_ROOT/BASE.sha256")
-git -C "$MCORE_ROOT" apply --check "$PATCH_ROOT/ultra-inference.patch"
-git -C "$MCORE_ROOT" apply "$PATCH_ROOT/ultra-inference.patch"
+git -C "$MCORE_ROOT" apply --unidiff-zero --check "$PATCH_ROOT/ultra-inference.patch"
+git -C "$MCORE_ROOT" apply --unidiff-zero "$PATCH_ROOT/ultra-inference.patch"
 (cd "$MCORE_ROOT" && sha256sum --check "$PATCH_ROOT/PATCHED.sha256")
 ```
 
@@ -27,7 +27,9 @@ Install/build the policy environment using this patched checkout through the
 existing Megatron-Bridge workspace dependency, or put the checkout on the actual
 policy interpreter's `PYTHONPATH`. Verify the imported module paths in that
 environment; changing a host checkout alone does not update an installed image.
-Apply these patches once, before model processes start. A hash or apply failure
+The patch has zero context so whitespace fixers preserve it. The exact base-file
+hash check is required before using `--unidiff-zero`. Apply these patches once,
+before model processes start. A hash or apply failure
 requires reviewing the dependency revision; do not force-apply to another version.
 No runtime monkeypatch or model-worker overlay is required.
 

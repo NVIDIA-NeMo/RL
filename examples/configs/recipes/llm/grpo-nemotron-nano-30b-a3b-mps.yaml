@@ -1,5 +1,6 @@
 # Nemotron Nano MPS: shared-weight Megatron training and inference on eight GPUs.
 # Run with: bash examples/run_nemotron_nano_mps.sh
+# Dependency fixes: tools/megatron_patches/ultra_inference/README.md
 defaults: ../../grpo_math_1B_megatron_single_controller.yaml
 grpo:
   num_generations_per_prompt: 8
