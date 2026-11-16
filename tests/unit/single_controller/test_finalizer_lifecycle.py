@@ -35,6 +35,7 @@ from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.offload import OffloadPool
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.experience.reward_penalties import FinalizedReward
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -108,8 +109,7 @@ def _controller(actor: object) -> Any:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._rollout_runtime = RolloutRuntimeState()
-    ctrl._available_finalizers = asyncio.Queue()
-    ctrl._available_finalizers.put_nowait(actor)
+    ctrl._finalizer_pool = OffloadPool([actor])
     ctrl._active_finalizers = 0
     ctrl._finalizer_waiters = 0
     ctrl._finalizer_unknown_outcomes = 0
@@ -166,7 +166,7 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership(
         metrics={"finalize/group_ms": 1.0},
     )
     finalize = _RemoteFinalize(result=result)
-    actor = SimpleNamespace(finalize=finalize)
+    actor = SimpleNamespace(process=finalize)
     ctrl = _controller(actor)
     request = _request(resolved_agent_name, attribution_key=attribution_key)
 
@@ -174,7 +174,7 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership(
 
     assert committed is result
     assert finalize.calls == [request]
-    assert ctrl._available_finalizers.get_nowait() is actor
+    assert ctrl._finalizer_pool.free == 1
     assert ctrl._active_finalizers == 0
     assert ctrl._finalizer_unknown_outcomes == 0
     ctrl._buffer.commit_finalized.assert_awaited_once_with(
@@ -210,7 +210,7 @@ def test_capture_rollout_metrics_ride_on_the_committed_meta() -> None:
         staging_keys=["group_g0/call"],
         metrics={},
     )
-    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    ctrl = _controller(SimpleNamespace(process=_RemoteFinalize(result=result)))
     metrics = {"agent/rollout_time_taken/mean": 12.5}
 
     asyncio.run(ctrl._finalize_with_actor(_request(), metrics))
@@ -246,7 +246,7 @@ def test_finalizer_token_metrics_and_rollout_metrics_share_one_sidecar(
     """Neither source overwrites the other, including on partial-retry groups."""
     token_metrics = {"gen_tokens_per_sample/mean": 7.0}
     result = _token_metrics_result(token_metrics)
-    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    ctrl = _controller(SimpleNamespace(process=_RemoteFinalize(result=result)))
 
     asyncio.run(ctrl._finalize_with_actor(_request(), rollout_metrics))
 
@@ -258,7 +258,7 @@ def test_finalizer_token_metrics_and_rollout_metrics_share_one_sidecar(
 
 def test_overlapping_finalizer_and_rollout_metrics_fail_the_commit() -> None:
     result = _token_metrics_result({"gen_tokens_per_sample/mean": 7.0})
-    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    ctrl = _controller(SimpleNamespace(process=_RemoteFinalize(result=result)))
 
     with pytest.raises(RuntimeError, match="both report"):
         asyncio.run(
@@ -288,7 +288,7 @@ def test_captured_group_waits_for_teacher_before_readiness_or_cleanup(
             group_max_wv=3,
             staging_keys=["group_g0/call"],
         )
-        actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+        actor = SimpleNamespace(process=_RemoteFinalize(result=result))
         ctrl = _controller(actor)
         ctrl._buffer = TQReplayBuffer(
             ctrl._dp_client,
@@ -389,7 +389,7 @@ def test_captured_group_waits_for_teacher_before_readiness_or_cleanup(
                     [] if outcome == "missing_route" else ["group_g0"]
                 )
                 ctrl._rollout_manager.record_canonical_publication.assert_not_called()
-            assert ctrl._available_finalizers.get_nowait() is actor
+            assert ctrl._finalizer_pool.free == 1
             assert ctrl._active_finalizers == 0
             assert ctrl._finalizer_unknown_outcomes == 0
         finally:
@@ -419,7 +419,7 @@ def test_below_threshold_group_releases_pending_finalizer_state() -> None:
         metrics={"finalize/invalid_row_rate": 0.0},
         reward_observations=[FinalizedReward("group_g0", "group_g0", 1.0, None)],
     )
-    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    ctrl = _controller(SimpleNamespace(process=_RemoteFinalize(result=result)))
     request = _request()
 
     async def _below_threshold_branch() -> None:
@@ -440,7 +440,7 @@ def test_below_threshold_group_releases_pending_finalizer_state() -> None:
 
 def test_discarded_committed_group_leaves_no_ready_slot_in_the_buffer() -> None:
     """abort() skips ready slots, so discarding must remove the committed slot itself."""
-    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize()))
+    ctrl = _controller(SimpleNamespace(process=_RemoteFinalize()))
     buffer = TQReplayBuffer(
         ctrl._dp_client,
         partition_id="canonical",
@@ -482,7 +482,7 @@ def test_discard_yields_to_a_group_the_train_pump_already_claimed() -> None:
     failure would turn a benign race into a fatal RuntimeError, and clearing the rows
     anyway would pull them out from under a step that is already running.
     """
-    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize()))
+    ctrl = _controller(SimpleNamespace(process=_RemoteFinalize()))
     ctrl._buffer.remove_group = AsyncMock(
         side_effect=ValueError("unknown group_ids=['group']")
     )
@@ -504,7 +504,7 @@ def test_discard_yields_to_a_group_the_train_pump_already_claimed() -> None:
 
 def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:
     finalize = _RemoteFinalize(error=RuntimeError("actor died after submission"))
-    actor = SimpleNamespace(finalize=finalize)
+    actor = SimpleNamespace(process=finalize)
     ctrl = _controller(actor)
     request = _request()
 
@@ -512,7 +512,7 @@ def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> Non
         asyncio.run(ctrl._finalize_with_actor(request, {}))
 
     assert finalize.calls == [request]
-    assert ctrl._available_finalizers.empty()
+    assert ctrl._finalizer_pool.free == 0
     assert ctrl._active_finalizers == 0
     assert ctrl._finalizer_unknown_outcomes == 1
     ctrl._buffer.commit_finalized.assert_not_awaited()
@@ -528,7 +528,7 @@ def test_missing_actor_metadata_cleans_known_canonical_and_staging_ownership() -
         staging_keys=["group_g0/call"],
         metrics={},
     )
-    actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+    actor = SimpleNamespace(process=_RemoteFinalize(result=result))
     ctrl = _controller(actor)
 
     with pytest.raises(RuntimeError, match="no metadata for non-dropped group"):
@@ -539,7 +539,7 @@ def test_missing_actor_metadata_cleans_known_canonical_and_staging_ownership() -
         {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
     ]
     ctrl._buffer.abort.assert_called_once_with("group")
-    assert ctrl._available_finalizers.get_nowait() is actor
+    assert ctrl._finalizer_pool.free == 1
 
 
 def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
@@ -559,7 +559,7 @@ def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
             "and (L, K) is unknown yet"
         ),
     )
-    actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+    actor = SimpleNamespace(process=_RemoteFinalize(result=result))
     ctrl = _controller(actor)
 
     committed = asyncio.run(ctrl._finalize_with_actor(_request(), {}))
@@ -572,7 +572,7 @@ def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
     ctrl._buffer.abort.assert_called_once_with("group")
     ctrl._buffer.commit_finalized.assert_not_awaited()
     assert "group" not in ctrl._rollout_runtime.finalizer_metrics_by_group
-    assert ctrl._available_finalizers.get_nowait() is actor
+    assert ctrl._finalizer_pool.free == 1
 
 
 def test_post_train_cleanup_clears_canonical_rows_and_route_plan_staging_keys() -> None:

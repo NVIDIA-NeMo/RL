@@ -25,6 +25,8 @@ import pytest
 import ray
 import torch
 
+import nemo_rl.data_plane as data_plane_module
+import nemo_rl.data_plane.offload as offload_module
 import nemo_rl.experience.rollout_reassembler_actor as actor_module
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import KVBatchMeta
@@ -104,7 +106,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
     actor._finalizer.finalize_group.return_value = result
     request = replace(_request(), loss_multiplier=0.25)
 
-    assert actor.finalize(request) is result
+    assert actor.process(request) is result
     actor._finalizer.finalize_group.assert_called_once_with(
         "group",
         ["group_g0"],
@@ -130,7 +132,7 @@ def test_finalizer_forwards_mooncake_checkpoint_commands(
     command = {"operation": "INFO"}
     response = {"participant_id": "finalizer"}
     dispatch = MagicMock(return_value=response)
-    monkeypatch.setattr(actor_module, "run_checkpoint_command", dispatch)
+    monkeypatch.setattr(offload_module, "run_checkpoint_command", dispatch)
 
     assert actor.mooncake_checkpoint(command) is response
     dispatch.assert_called_once_with(command)
@@ -144,7 +146,9 @@ def test_actor_forwards_capture_media_to_the_reassembler(
     setup -> actor config -> RolloutReassembler -> its TQ source/sink."""
     actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
     monkeypatch.setattr(
-        actor_module, "build_data_plane_client", lambda cfg, bootstrap: MagicMock()
+        data_plane_module,
+        "build_data_plane_client",
+        lambda cfg, bootstrap, segment_size: MagicMock(),
     )
     config = RolloutReassemblerActorConfig(
         partition_id="canonical",
@@ -333,10 +337,12 @@ def test_factory_selects_compatible_environment_and_waits_for_dependencies(
                     num_workers=2,
                 )
             assert exc_info.value is startup_error
-            assert kill.call_args_list == [call(actor) for actor in actors]
+            assert kill.call_args_list == [
+                call(actor, no_restart=True) for actor in actors
+            ]
             if cleanup_fails:
                 assert (
-                    "finalizer actor termination failed: kill failed"
+                    "offload actor cleanup failed: kill failed"
                     in capsys.readouterr().out
                 )
         else:
@@ -352,14 +358,28 @@ def test_factory_selects_compatible_environment_and_waits_for_dependencies(
 
         make_env.assert_called_once_with(gym_fqn if reuse_gym_env else actor_fqn)
         expected_runtime = prepared_gym_env if reuse_gym_env else runtime_env
-        assert options.call_args_list == [call(runtime_env=expected_runtime)] * 2
         assert (
-            options.return_value.remote.call_args_list == [call(dp_config, config)] * 2
+            options.call_args_list
+            == [
+                call(
+                    num_cpus=1,
+                    num_gpus=0,
+                    max_restarts=0,
+                    max_task_retries=0,
+                    runtime_env=expected_runtime,
+                )
+            ]
+            * 2
         )
+        assert options.return_value.remote.call_args_list == [
+            call(dp_config, config, label="0"),
+            call(dp_config, config, label="1"),
+        ]
         for actor in actors:
             actor.check_dependencies.remote.assert_called_once_with()
         get.assert_called_once_with(
-            [actor.check_dependencies.remote.return_value for actor in actors]
+            [actor.check_dependencies.remote.return_value for actor in actors],
+            timeout=None,
         )
 
 
@@ -392,5 +412,5 @@ def test_reward_checks_remain_metadata_only_and_reach_finalizer():
     actor._finalizer.finalize_group.return_value = FinalizedGroup(
         None, 4, 4, [], dropped=True
     )
-    actor.finalize(request)
+    actor.process(request)
     assert actor._finalizer.finalize_group.call_args.kwargs["reward_checks"] == [checks]

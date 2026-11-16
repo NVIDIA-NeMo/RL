@@ -462,7 +462,7 @@ def test_forest_retry_and_restart_reuse_durable_selection(
     assert manager.recovery_ledger.expected_staging_keys() == expected_keys
     actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
     actor._finalizer = finalizer
-    result = actor.finalize(request)
+    result = actor.process(request)
     assert result.valid_row_count == result.total_row_count == 3
     assert [tag["logical_slot"] for tag in result.meta.tags] == [0, 0, 1]
     assert not any(

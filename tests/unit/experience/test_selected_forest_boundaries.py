@@ -974,7 +974,7 @@ def test_incomplete_history_masks_only_its_owner(
     cleanup_ids = request.cleanup_sample_ids
     actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
     actor._finalizer = forest.finalizer
-    result = actor.finalize(request)
+    result = actor.process(request)
     assert result.meta is not None and not result.dropped
     assert result.meta.size == 4
     assert tuple(result.meta.sample_ids) == cleanup_ids

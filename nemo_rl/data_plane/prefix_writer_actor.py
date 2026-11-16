@@ -20,7 +20,6 @@ TQ acknowledges the write. Terminal writes use their original local client.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
 import os
@@ -33,10 +32,10 @@ from typing import Any
 import numpy as np
 import ray
 import torch
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
+from nemo_rl.data_plane.offload import OffloadClient, OffloadPool, on_this_node
 
 G_LOGGER = logging.getLogger(__name__)
 G_DTYPES = {
@@ -260,18 +259,21 @@ class PrefixWriterService:
         )
 
 
-class PrefixWriterActor(PrefixWriterService):
-    """Own the process-local TQ client, with no engine or GPU allocation."""
+class PrefixWriterActor(OffloadClient):
+    """Run ``PrefixWriterService`` on its own TQ client, with no engine or GPU."""
 
-    def __init__(self, config: DataPlaneConfig, partition_id: str) -> None:
-        # TQ is optional outside a live data-plane deployment.
-        from nemo_rl.data_plane import build_data_plane_client
-
+    def __init__(
+        self, config: DataPlaneConfig, partition_id: str, *, label: str = "0"
+    ) -> None:
         torch.set_num_threads(1)
-        super().__init__(
-            build_data_plane_client(config, bootstrap=False, segment_size=0),
-            partition_id,
-        )
+        super().__init__(config, label=label)
+        self._service = PrefixWriterService(self.dp_client, partition_id)
+
+    def process(self, batch: PrefixPut) -> PrefixWriteReply:
+        return self._service.put(batch)
+
+    def clear(self, partition_id: str, sample_ids: tuple[str, ...]) -> None:
+        self._service.clear(partition_id, sample_ids)
 
     def ready(self) -> dict[str, Any]:
         return {"pid": os.getpid(), "node_id": ray.get_runtime_context().get_node_id()}
@@ -284,8 +286,11 @@ class RayPrefixWriterClient:
     a stalled PUT. Outstanding callers fail; they must not publish receipts.
     """
 
-    def __init__(self, actor: Any, *, writer_pid: int) -> None:
-        self._actor = actor
+    def __init__(self, pool: OffloadPool, *, writer_pid: int) -> None:
+        if pool.size != 1:
+            raise ValueError(f"the prefix writer is one actor, got {pool.size}")
+        self._pool = pool
+        self._actor = pool.actors[0]
         self._writer_pid = writer_pid
         self._write_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -322,7 +327,7 @@ class RayPrefixWriterClient:
                 time.thread_time() - cpu,
             )
             started, cpu = time.perf_counter(), time.thread_time()
-            reply = ray.get(self._actor.put.remote(reference))
+            reply = ray.get(self._actor.process.remote(reference))
             wait_s, wait_cpu_s = time.perf_counter() - started, time.thread_time() - cpu
             self._require_open()
             if (
@@ -369,7 +374,7 @@ class RayPrefixWriterClient:
             if self._closed:
                 return
             self._closed = True
-        ray.kill(self._actor, no_restart=True)
+        self._pool.kill()
         G_LOGGER.info("prefix_writer event=closed metrics=%s", self.snapshot())
 
 
@@ -378,27 +383,20 @@ async def create_prefix_writer(
 ) -> RayPrefixWriterClient:
     """Create one non-restarting, serial CPU writer on the generation node."""
     node_id = ray.get_runtime_context().get_node_id()
-    actor = (
-        ray.remote(PrefixWriterActor)
-        .options(
-            num_cpus=1,
-            num_gpus=0,
-            max_concurrency=1,
-            max_restarts=0,
-            max_task_retries=0,
-            runtime_env={"py_executable": sys.executable},
-            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False),
-        )
-        .remote(config, partition_id)
+    pool = OffloadPool.start(
+        PrefixWriterActor,
+        config,
+        partition_id,
+        n=1,
+        placement=on_this_node(),
+        max_concurrency=1,
+        runtime_env={"py_executable": sys.executable},
     )
-    try:
-        ready = await asyncio.wait_for(actor.ready.remote(), timeout=180)
-        if ready["node_id"] != node_id:
-            raise RuntimeError("Prefix writer was scheduled off its generation node")
-    except BaseException:
-        ray.kill(actor, no_restart=True)
-        raise
+    (ready,) = await pool.wait_ready_async("ready", timeout_s=180)
+    if ready["node_id"] != node_id:
+        pool.kill()
+        raise RuntimeError("Prefix writer was scheduled off its generation node")
     G_LOGGER.info(
         "prefix_writer event=ready writer_pid=%d node_id=%s", ready["pid"], node_id
     )
-    return RayPrefixWriterClient(actor, writer_pid=ready["pid"])
+    return RayPrefixWriterClient(pool, writer_pid=ready["pid"])

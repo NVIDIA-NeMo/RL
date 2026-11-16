@@ -21,9 +21,8 @@ from typing import TYPE_CHECKING, Any, Optional
 import ray
 
 from nemo_rl.data.captured_media import MediaColumnSpec
-from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
-from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
-from nemo_rl.data_plane.observability import is_metrics_client
+from nemo_rl.data_plane import DataPlaneConfig
+from nemo_rl.data_plane.offload import OffloadClient, OffloadPool
 from nemo_rl.data_plane.schema import forest_row_ids
 from nemo_rl.distributed.actor_environments import (
     NEMO_GYM_ACTOR_FQN,
@@ -153,21 +152,22 @@ class RolloutReassemblerActorConfig:
     thinking_tags: tuple[str, ...] | None = None
 
 
-@ray.remote(
-    num_cpus=1,
-    num_gpus=0,
-    max_restarts=0,
-    max_task_retries=0,
-)
-class RolloutReassemblerActor:  # pragma: no cover
-    """Own a connect-only TQ client and lightweight finalizer in one process."""
+@ray.remote
+class RolloutReassemblerActor(OffloadClient):  # pragma: no cover
+    """Run one lightweight finalizer on its own connect-only TQ client."""
+
+    # Finalized rows are written through this client, so its local store holds
+    # rows a data-plane snapshot must see.
+    owns_storage = True
 
     def __init__(
         self,
         dp_config: DataPlaneConfig,
         config: RolloutReassemblerActorConfig,
+        *,
+        label: str = "0",
     ) -> None:
-        self._dp_client = build_data_plane_client(dp_config, bootstrap=False)
+        super().__init__(dp_config, label=label)
         tokenizer = None
         if config.tokenizer_config is not None:
             # Deferred: loading a tokenizer pulls in transformers, which only
@@ -176,7 +176,7 @@ class RolloutReassemblerActor:  # pragma: no cover
 
             tokenizer = get_tokenizer(config.tokenizer_config)
         self._finalizer = RolloutReassembler(
-            self._dp_client,
+            self.dp_client,
             partition_id=config.partition_id,
             staging_partition=config.staging_partition,
             pad_token_id=config.pad_token_id,
@@ -192,15 +192,6 @@ class RolloutReassemblerActor:  # pragma: no cover
             top_logprobs=config.top_logprobs,
         )
 
-    def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
-        """Run an owner-local checkpoint command; return metadata, never payloads."""
-        return run_checkpoint_command(body)
-
-    def get_data_plane_snapshot(self) -> dict[str, Any] | None:
-        if not is_metrics_client(self._dp_client):
-            return None
-        return self._dp_client.snapshot(reset_step_window=True)
-
     def check_dependencies(self) -> None:
         """Import the finalization API before the controller starts rollouts."""
         # Deferred: only the actor's environment needs the optional Gym extra.
@@ -213,7 +204,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             RolloutReceipt,  # noqa: F401
         )
 
-    def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:
+    def process(self, request: ReassemblyRequest) -> FinalizedGroup:
         """Finalize one request without allowing tensor payloads across Ray RPC."""
         assert_metadata_only(request)
         if not (
@@ -260,9 +251,7 @@ def create_rollout_reassembler_actors(
     *,
     num_workers: int,
 ) -> list[Any]:
-    """Construct and validate the pool after TQ partitions are registered."""
-    if num_workers <= 0:
-        raise ValueError(f"num_reassembler_workers must be positive, got {num_workers}")
+    """Start the pool and check its Python env, after TQ partitions are registered."""
     # Deferred: the registry loads driver-only virtual-cluster dependencies.
     from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 
@@ -272,20 +261,12 @@ def create_rollout_reassembler_actors(
     runtime_env = make_actor_runtime_env(
         NEMO_GYM_ACTOR_FQN if same_env else ROLLOUT_REASSEMBLER_ACTOR_FQN
     )
-    actors = [
-        RolloutReassemblerActor.options(runtime_env=runtime_env).remote(
-            dp_config, config
-        )
-        for _ in range(num_workers)
-    ]
-    try:
-        ray.get([actor.check_dependencies.remote() for actor in actors])
-    except ray.exceptions.RayError:
-        # Cleanup errors must not hide the startup failure or skip other actors.
-        for actor in actors:
-            try:
-                ray.kill(actor)
-            except Exception as error:
-                print(f"finalizer actor termination failed: {error}", flush=True)
-        raise
-    return actors
+    pool = OffloadPool.start(
+        RolloutReassemblerActor,
+        dp_config,
+        config,
+        n=num_workers,
+        runtime_env=runtime_env,
+    )
+    pool.wait_ready("check_dependencies")
+    return pool.actors

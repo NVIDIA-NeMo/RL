@@ -554,7 +554,7 @@ def test_mooncake_checkpoint_workers_configured_before_restore(
         (TQWorkerMixin, "nemo_rl.data_plane.worker_mixin"),
         (
             RolloutReassemblerActor.__ray_metadata__.modified_class,
-            "nemo_rl.experience.rollout_reassembler_actor",
+            "nemo_rl.data_plane.offload",
         ),
     ],
 )

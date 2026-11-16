@@ -57,6 +57,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.offload import OffloadPool
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.rpc_guard import assert_metadata_only
@@ -592,7 +593,7 @@ def _pool_meta() -> KVBatchMeta:
 
 
 class _InlineActor:
-    """Stands in for an AdvantageActor handle: ``run.remote`` returns an awaitable.
+    """Stands in for an AdvantageActor handle: ``process.remote`` returns an awaitable.
 
     Runs the computer in this process rather than mocking it, so the shard
     really does read and write its own rows through the shared store.
@@ -612,7 +613,7 @@ class _InlineActor:
             assert_metadata_only(outcome)
             return outcome
 
-        self.run = SimpleNamespace(remote=_run)
+        self.process = SimpleNamespace(remote=_run)
 
 
 def _controller(
@@ -684,9 +685,7 @@ def _controller(
         )
         for index in range(num_actors)
     ]
-    ctrl._available_advantage_actors = asyncio.Queue()
-    for actor in ctrl._advantage_actors:
-        ctrl._available_advantage_actors.put_nowait(actor)
+    ctrl._advantage_pool = OffloadPool(ctrl._advantage_actors)
     ctrl._opd_stat_sum = ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
     ctrl._opd_gap_sum = 0.0
@@ -938,6 +937,6 @@ def test_failed_actor_rpc_raises_and_retires_the_actor(capsys) -> None:
     assert "FATAL: advantage actor RPC failed" in capsys.readouterr().out
     # Not handed back: a later step must not reuse an actor whose writeback is
     # unknown.
-    assert ctrl._available_advantage_actors.qsize() == 0
+    assert ctrl._advantage_pool.free == 0
     # The mutation cut is released even on failure.
     assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1

@@ -11,33 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Where the advantage actor pool is allowed to land."""
+"""Where create_advantage_actors puts the pool, and that it waits for it."""
 
 import nemo_rl.algorithms.advantage_actor as advantage_actor
-from nemo_rl.algorithms.advantage_actor import _placement_node_ids
 
 # NodeAffinitySchedulingStrategy validates node_id on construction: it decodes
-# as a 28-byte hex string and rejects a nil result. Short labels parse to nil,
-# so the pinning test cannot use them.
+# as a 28-byte hex string and rejects a nil result.
 HEAD_ID = "11" * 28
 COMPUTE_A_ID = "aa" * 28
 COMPUTE_B_ID = "bb" * 28
 
-HEAD = {
-    "NodeID": HEAD_ID,
-    "Alive": True,
-    "Resources": {"CPU": 144.0, "ray_head": 1.0},
-}
-COMPUTE_A = {
-    "NodeID": COMPUTE_A_ID,
-    "Alive": True,
-    "Resources": {"CPU": 144.0, "GPU": 4.0, "worker_units": 4.0},
-}
-COMPUTE_B = {
-    "NodeID": COMPUTE_B_ID,
-    "Alive": True,
-    "Resources": {"CPU": 144.0, "GPU": 4.0, "worker_units": 4.0},
-}
+HEAD = {"NodeID": HEAD_ID, "Alive": True, "Resources": {"CPU": 144.0, "ray_head": 1.0}}
+COMPUTE_A = {"NodeID": COMPUTE_A_ID, "Alive": True, "Resources": {"CPU": 144.0}}
+COMPUTE_B = {"NodeID": COMPUTE_B_ID, "Alive": True, "Resources": {"CPU": 144.0}}
 
 
 def _patch_cluster(monkeypatch, nodes) -> None:
@@ -47,25 +33,6 @@ def _patch_cluster(monkeypatch, nodes) -> None:
             resources[key] = resources.get(key, 0.0) + value
     monkeypatch.setattr(advantage_actor.ray, "nodes", lambda: nodes)
     monkeypatch.setattr(advantage_actor.ray, "cluster_resources", lambda: resources)
-
-
-class TestPlacementNodeIds:
-    def test_dedicated_head_is_excluded(self, monkeypatch) -> None:
-        _patch_cluster(monkeypatch, [HEAD, COMPUTE_A, COMPUTE_B])
-        # The regression this guards: plain CPU actors have nothing stopping
-        # them from packing onto the head, which still advertises all its CPUs.
-        assert _placement_node_ids() == [COMPUTE_A_ID, COMPUTE_B_ID]
-
-    def test_dead_nodes_are_excluded(self, monkeypatch) -> None:
-        dead = {**COMPUTE_B, "Alive": False}
-        _patch_cluster(monkeypatch, [HEAD, COMPUTE_A, dead])
-        assert _placement_node_ids() == [COMPUTE_A_ID]
-
-    def test_no_dedicated_head_returns_empty(self, monkeypatch) -> None:
-        # Without a dedicated head there is no single node to steer away from,
-        # so the pin list is empty and the caller spreads instead.
-        _patch_cluster(monkeypatch, [COMPUTE_A, COMPUTE_B])
-        assert _placement_node_ids() == []
 
 
 class _FakeHandle:
@@ -82,37 +49,41 @@ class _RecordingActorClass:
 
     def __init__(self) -> None:
         self.options_seen: list[dict] = []
+        self.labels: list[str] = []
 
     def options(self, **kwargs):
         self.options_seen.append(kwargs)
         return self
 
-    def remote(self, *args, **kwargs) -> _FakeHandle:
+    def remote(self, *args, label: str) -> _FakeHandle:
+        self.labels.append(label)
         return _FakeHandle()
 
 
-def _patch_actor(monkeypatch) -> _RecordingActorClass:
+def _patch_actor(monkeypatch) -> tuple[_RecordingActorClass, list]:
     recorder = _RecordingActorClass()
+    waited: list = []
     monkeypatch.setattr(advantage_actor, "AdvantageActor", recorder)
-    monkeypatch.setattr(advantage_actor.ray, "get", lambda refs: None)
-    return recorder
+    monkeypatch.setattr(
+        advantage_actor.ray, "get", lambda refs, timeout=None: waited.append(refs)
+    )
+    return recorder, waited
 
 
-class TestActorPlacementStrategy:
-    def test_spreads_when_there_is_no_dedicated_head(self, monkeypatch) -> None:
-        _patch_cluster(monkeypatch, [COMPUTE_A, COMPUTE_B])
-        recorder = _patch_actor(monkeypatch)
-        advantage_actor.create_advantage_actors(None, None, None, num_workers=3)
-        # The regression this guards: Ray's hybrid default packs to 50% of a
-        # node before spreading, and a CPU-only actor is far below that, so all
-        # three would land on the driver's node next to the controller.
-        assert [o["scheduling_strategy"] for o in recorder.options_seen] == [
-            "SPREAD"
-        ] * 3
+def test_pins_round_robin_off_the_head_and_waits(monkeypatch) -> None:
+    _patch_cluster(monkeypatch, [HEAD, COMPUTE_A, COMPUTE_B])
+    recorder, waited = _patch_actor(monkeypatch)
+    actors = advantage_actor.create_advantage_actors(None, None, None, num_workers=3)
+    pinned = [o["scheduling_strategy"].node_id for o in recorder.options_seen]
+    assert pinned == [COMPUTE_A_ID, COMPUTE_B_ID, COMPUTE_A_ID]
+    # Each actor's label is its shard id: shared ids would overwrite each
+    # other's training dumps.
+    assert recorder.labels == ["0", "1", "2"]
+    assert len(actors) == 3 and len(waited) == 1 and len(waited[0]) == 3
 
-    def test_pins_round_robin_off_the_head_when_one_exists(self, monkeypatch) -> None:
-        _patch_cluster(monkeypatch, [HEAD, COMPUTE_A, COMPUTE_B])
-        recorder = _patch_actor(monkeypatch)
-        advantage_actor.create_advantage_actors(None, None, None, num_workers=3)
-        pinned = [o["scheduling_strategy"].node_id for o in recorder.options_seen]
-        assert pinned == [COMPUTE_A_ID, COMPUTE_B_ID, COMPUTE_A_ID]
+
+def test_spreads_when_there_is_no_dedicated_head(monkeypatch) -> None:
+    _patch_cluster(monkeypatch, [COMPUTE_A, COMPUTE_B])
+    recorder, _ = _patch_actor(monkeypatch)
+    advantage_actor.create_advantage_actors(None, None, None, num_workers=3)
+    assert [o["scheduling_strategy"] for o in recorder.options_seen] == ["SPREAD"] * 3
