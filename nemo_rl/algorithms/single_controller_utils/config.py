@@ -700,6 +700,11 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         return self
 
 
+# Node-local parent of the capture directories setup derives when token_capture.capture_dir is unset.
+# Ledger traffic is many small-file metadata operations, which must stay off shared filesystems.
+DEFAULT_TOKEN_CAPTURE_ROOT = "/tmp/nemo_rl/token_capture"
+
+
 class TokenCaptureConfig(BaseModel, extra="allow"):
     """Ledger-authoritative token capture (token-in/token-out via NeMo-Gym).
 
@@ -722,10 +727,15 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Hard deadline per control-plane call (S5 finding: control-plane death must
     # surface as a failed dispatch, not a silent retry stall).
     control_timeout_s: float = 60.0
-    # Root for Gym's per-rollout capture ledgers and base capture layer. None =
-    # derived at setup
-    # under the run's log dir.
+    # Root for Gym's per-rollout capture ledgers and base capture layer.
+    # None = derived at setup as a fresh directory under DEFAULT_TOKEN_CAPTURE_ROOT on each Gym node's local disk.
+    # Each Gym shard runs all of its servers on one node,
+    # and a checkpoint copies the ledger rows it needs into the checkpoint directory,
+    # so nothing reads the ledgers from another node or after the run.
     capture_dir: Optional[str] = None
+    # Derived at setup; users should not set it.
+    # True when setup chose capture_dir, in which case each Gym actor removes its ledgers on shutdown.
+    capture_dir_derived: bool = False
     # Generation backend hosting token capture. This is derived from
     # policy.generation.backend during setup; users should not set it separately.
     generation_backend: Optional[Literal["vllm", "megatron"]] = None

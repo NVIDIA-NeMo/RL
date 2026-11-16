@@ -1213,6 +1213,7 @@ def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs
     token_capture = {
         "enabled": True,
         "capture_dir": "/capture",
+        "capture_dir_derived": True,
         "control_auth_token": "secret",
     }
 
@@ -1248,6 +1249,8 @@ def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs
         is True
     )
     assert token_capture["capture_dir"] == "/capture"
+    # The actor needs the run's root to clean up a setup-derived directory.
+    assert config["token_capture"]["capture_root"] == "/capture"
 
 
 @pytest.mark.nemo_gym

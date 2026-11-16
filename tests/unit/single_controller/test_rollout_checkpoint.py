@@ -240,6 +240,7 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
         "token_capture": {
             **base["token_capture"],
             "capture_dir": "/run/two/capture",
+            "capture_dir_derived": True,
             "control_auth_token": "secret-two",
             "control_timeout_s": 15.0,
             "num_reassembler_workers": 8,
