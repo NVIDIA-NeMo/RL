@@ -14,6 +14,7 @@
 
 import asyncio
 import gc
+import itertools
 import json
 import tempfile
 from copy import deepcopy
@@ -3048,8 +3049,8 @@ def test_prepare_nemo_gym_rows_stamps_one_task_index_per_prompt_group():
             num_generations=2,
         )
 
-    # Gym builds a flat row's task from its task index and names the episode "{task}-{rollout}": a prompt group
-    # shares one index, and no index repeats across groups or calls, as with the async collector's run-wide counter.
+    # Gym builds a flat row's task from its task index: a prompt group shares one index, and no index repeats
+    # across groups or calls within a process.
     indices = [row[NEMO_GYM_TASK_INDEX_KEY] for row in first_call + second_call]
     assert (
         indices[0] == indices[1]
@@ -3057,6 +3058,32 @@ def test_prepare_nemo_gym_rows_stamps_one_task_index_per_prompt_group():
         and indices[4] == indices[5]
     )
     assert len({indices[0], indices[2], indices[4]}) == 3
+    # The counter restarts with each process, so these rows also name their episodes by prompt group.
+    for row in first_call + second_call:
+        assert row["_ng_rollout_id"] == (
+            f"{row[NEMO_GYM_GROUP_ID_KEY]}-g{row[NEMO_GYM_ROLLOUT_INDEX_KEY]}"
+            f"-t{row[NEMO_GYM_GROUP_ATTEMPT_KEY]}"
+        )
+
+
+def test_prepare_nemo_gym_rows_names_episodes_apart_after_a_restart(monkeypatch):
+    names = []
+    for _ in range(2):
+        # A new process, or validation counting apart from the async collector, starts the counter again.
+        monkeypatch.setattr(
+            rollouts_mod, "_unstamped_nemo_gym_task_indices", itertools.count()
+        )
+        rows = [{"responses_create_params": {}} for _ in range(2)]
+        rollouts_mod._prepare_nemo_gym_rows(
+            rows,
+            generation_config={"max_new_tokens": 64},
+            sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+            num_generations=2,
+        )
+        assert [row[NEMO_GYM_TASK_INDEX_KEY] for row in rows] == [0, 0]
+        names.extend(row["_ng_rollout_id"] for row in rows)
+
+    assert len(set(names)) == 4
 
 
 def test_prepare_nemo_gym_rows_leaves_materialized_rows_without_a_task_index():
@@ -3074,6 +3101,7 @@ def test_prepare_nemo_gym_rows_leaves_materialized_rows_without_a_task_index():
         num_generations=2,
     )
     assert all(NEMO_GYM_TASK_INDEX_KEY not in row for row in rows)
+    assert all("_ng_rollout_id" not in row for row in rows)
 
 
 def test_prepare_nemo_gym_rows_keeps_a_stamped_task_index():
@@ -3088,6 +3116,8 @@ def test_prepare_nemo_gym_rows_keeps_a_stamped_task_index():
         num_generations=2,
     )
     assert [row[NEMO_GYM_TASK_INDEX_KEY] for row in rows] == [7, 7]
+    # The async collector's run-wide index already names the episodes.
+    assert all("_ng_rollout_id" not in row for row in rows)
 
     mixed = [
         {"responses_create_params": {}, NEMO_GYM_TASK_INDEX_KEY: task_index}

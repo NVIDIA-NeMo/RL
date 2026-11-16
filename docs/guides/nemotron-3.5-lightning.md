@@ -184,7 +184,7 @@ Optional knobs:
 
 ### Launch RLVR
 
-The following command launches the complete 86-node reference topology. Run it from a NeMo RL checkout located under the shared filesystem root:
+The following command launches the complete 86-node reference topology. Run it from a NeMo RL checkout located under the shared filesystem root. The recipe's `code_gen` environment grades in OpenSandbox, so the command also sets `CODE_GEN_SANDBOX_IMAGE` (the verifier image), `OPENSANDBOX_DOMAIN` (the OpenSandbox endpoint) and `OPENSANDBOX_API_KEY` (your key); see [NeMo Gym Code Generation Sandbox](environments.md#nemo-gym-code-generation-sandbox), which also covers running without OpenSandbox:
 
 ```bash
 export SHARED_ROOT=/shared
@@ -199,6 +199,9 @@ NL2BASH_JUDGE_MODEL=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \
 SAFETY_JUDGE_MODEL=nvidia/Nemotron-Content-Safety-Reasoning-4B \
 CONTAINER=$SHARED_ROOT/containers/nemo-rl-lightning35.sqsh \
 SANDBOX_CONTAINER=$SHARED_ROOT/containers/nemo-skills-sandbox.sqsh \
+CODE_GEN_SANDBOX_IMAGE=your-registry/code-gen-verifier:tag \
+OPENSANDBOX_DOMAIN=https://opensandbox.example.com \
+OPENSANDBOX_API_KEY=$OPENSANDBOX_API_KEY \
 PERSISTENT_CACHE=$SHARED_ROOT/cache/lightning35-rlvr \
 HF_HOME=$SHARED_ROOT/cache/huggingface \
 HF_TOKEN=$HF_TOKEN \

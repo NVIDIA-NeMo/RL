@@ -2409,9 +2409,10 @@ def apply_reward_penalties(
 
 
 # Task indices for flat prompt groups that arrive without one, as on the synchronous path. Gym builds a flat row's task
-# from ``_ng_task_index`` and names its episode "{_ng_task_index}-{_ng_rollout_index}"; the async collector stamps a
-# run-wide counter, and this process-wide one keeps synchronous names unique across steps as well. Materialized rows
-# carry their own task ID, and the NeMo-Gym actor names their synchronous episodes by prompt group instead.
+# from ``_ng_task_index``. This counter restarts with each process and counts apart from the async collector's, so the
+# rows it numbers also name their episode with ``_ng_rollout_id``: unless a row sets it, Gym names the episode
+# "{_ng_task_index}-{_ng_rollout_index}" and keys its captures and exports on that name. Materialized rows carry their
+# own task ID, and the NeMo-Gym actor names their synchronous episodes by prompt group in the same format.
 _unstamped_nemo_gym_task_indices = itertools.count()
 
 
@@ -2428,6 +2429,7 @@ def _prepare_nemo_gym_rows(
     group_ids: dict[int, str] = {}
     group_attempts: dict[int, int] = {}
     group_task_indices: dict[int, int | None] = {}
+    counter_groups: set[int] = set()
     for group_index, group_start in enumerate(range(0, len(rows), num_generations)):
         group_rows = rows[group_start : group_start + num_generations]
         existing_group_ids = {
@@ -2479,6 +2481,7 @@ def _prepare_nemo_gym_rows(
             group_task_indices[group_index] = existing_task_indices.pop()
         elif any(not is_nemo_gym_task(row) for row in group_rows):
             group_task_indices[group_index] = next(_unstamped_nemo_gym_task_indices)
+            counter_groups.add(group_index)
         else:
             group_task_indices[group_index] = None
 
@@ -2507,6 +2510,11 @@ def _prepare_nemo_gym_rows(
         row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempts[group_index]
         if group_task_indices[group_index] is not None:
             row[NEMO_GYM_TASK_INDEX_KEY] = group_task_indices[group_index]
+        if group_index in counter_groups:
+            row.setdefault(
+                "_ng_rollout_id",
+                f"{group_ids[group_index]}-g{rollout_index}-t{group_attempts[group_index]}",
+            )
         row[NEMO_GYM_ROLLOUT_INDEX_KEY] = rollout_index
 
 
