@@ -853,16 +853,20 @@ def shutdown_telemetry(timeout_ms: int = 5000) -> None:
     spans an unreachable collector was going to lose anyway, and being a daemon
     it never holds up process exit.
     """
-    # Looked up rather than imported, for two reasons. The deferral breaks a
-    # cycle -- host_memory reads get_telemetry_handle from this module -- and
-    # the module is only ever imported by the driver's monitor startup, so its
-    # absence here means no monitor was started and there is nothing to stop.
+    # Looked up rather than imported. The deferral breaks a cycle --
+    # host_memory reads get_telemetry_handle from this module -- but the
+    # lookup is not just a cheaper import: it must not *cause* one.
+    # host_memory declares its rows at import, declaration closes once the
+    # metric group is registered, and a worker registers that group the first
+    # time it records anything, so importing here would raise out of a
+    # `finally` in any process that had not already pulled it in.
     #
-    # Importing it anyway would not merely be wasted work: host_memory declares
-    # its rows at import, declaration closes once the metric group is
-    # registered, and a worker registers that group the first time it records
-    # anything. Shutting a worker down would then raise out of this function
-    # over a monitor it never ran.
+    # Plenty have: worker_groups and logger both import it at module scope, so
+    # presence here says nothing about whether a monitor is running -- only
+    # start_host_memory_monitoring does, and stopping one that never started is
+    # a no-op. Absence is the decisive case, and it is unambiguous: the starter
+    # lives in that module, so if it was never imported there is nothing to
+    # stop.
     host_memory = sys.modules.get("nemo_rl.telemetry.host_memory")
 
     # Called before the early return below, and before the flush: the monitor

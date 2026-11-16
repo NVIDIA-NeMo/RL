@@ -336,6 +336,9 @@ def device_memory_bytes(model: Any, optimizer: Any) -> dict[str, int]:
     # main_param.grad = model_param.main_grad.float(), which against a bf16
     # grad buffer is a whole extra shard that lives until zero_grad.
     optimizer_params = _optimizer_params(optimizer)
+    # Order is load-bearing, not cosmetic: a plain torch optimizer's groups
+    # hold the model's own weights, so parameters must come first or every
+    # weight in the run is billed to optimizer_state instead. See CATEGORIES.
     return attribute_device_memory(
         (
             (CATEGORY_PARAMETERS, parameters),

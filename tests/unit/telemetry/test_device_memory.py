@@ -171,11 +171,18 @@ def test_real_views_share_one_storage_and_report_the_whole_buffer():
     # What summing tensors instead of storages would have billed.
     assert sum(t.numel() * t.element_size() for t in slices) == 4096
 
-    # And through the dedup: three views of one 4 KiB buffer cost 4 KiB.
-    totals = attribute_device_memory(
-        ((CATEGORY_GRADIENTS, [_Tensor(a, s) for a in addresses for s in sizes]),),
-        allocated=4096,
-    )
+    # And through the dedup: one stand-in per real view, so the assertion
+    # fails at 12288 if the dedup stops working rather than passing on a
+    # single tensor that never needed it.
+    stand_ins = [
+        _Tensor(
+            _local_tensor(t).untyped_storage().data_ptr(),
+            _local_tensor(t).untyped_storage().nbytes(),
+        )
+        for t in slices
+    ]
+    assert len(stand_ins) == 3
+    totals = attribute_device_memory(((CATEGORY_GRADIENTS, stand_ins),), allocated=4096)
     assert totals[CATEGORY_GRADIENTS] == 4096
 
 
@@ -437,6 +444,28 @@ def test_the_mcore_shape_lands_in_the_right_categories(monkeypatch):
     assert totals[CATEGORY_OPTIMIZER_STATE] == 128 + 1024  # moment + main copy
     assert totals[CATEGORY_OTHER] == 2500 - 2176
     assert sum(totals.values()) == 2500
+
+
+def test_weights_beat_the_optimizers_claim_on_them(monkeypatch):
+    """Attribution order, pinned where it actually matters.
+
+    A plain torch optimizer's param_groups *are* the model's parameters, so the
+    only thing keeping every weight in the run out of optimizer_state is that
+    parameters is walked first. Swap the two entries in device_memory_bytes and
+    this reports 400 bytes of optimizer_state and no parameters.
+    """
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 400)
+    weight = _Tensor(1, 400)
+    weight.grad = None
+    weight.main_grad = None
+    monkeypatch.setattr(
+        "nemo_rl.telemetry.device_memory._parameters", lambda model: [weight]
+    )
+    totals = device_memory_bytes(object(), _optimizer(groups=[{"params": [weight]}]))
+
+    assert totals[CATEGORY_PARAMETERS] == 400
+    assert totals[CATEGORY_OPTIMIZER_STATE] == 0
+    assert totals[CATEGORY_OTHER] == 0
 
 
 def test_the_config_field_reaches_a_worker_as_an_env_var():

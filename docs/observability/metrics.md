@@ -220,7 +220,7 @@ One series, labelled by `rl.memory.category`:
 | Category | What it covers |
 |---|---|
 | `parameters` | weights, in whatever dtype they are stored in — MXFP8 storage makes this smaller than a parameter count implies |
-| `gradients` | `.grad`, mcore DDP's `main_grad` bucket (where a Megatron run actually keeps them), and the precision-aware optimizer's `decoupled_grad` — on the model's parameters and on the optimizer's, which under mcore are a second fp32 set |
+| `gradients` | `.grad`, mcore DDP's `main_grad` bucket (where a Megatron run actually keeps them), and the precision-aware optimizer's `decoupled_grad` — on the model's parameters and on the optimizer's. mcore assigns `main_param.grad = model_param.main_grad.float()`, which is a *second*, fp32 allocation only when the grad buffer is not already fp32; against an fp32 buffer `.float()` returns the same tensor and the dedup bills it once |
 | `optimizer_state` | moments, and the fp32 main copy a mixed-precision optimizer keeps beside the model's |
 | `other` | the residual: `allocated` minus everything walked |
 
