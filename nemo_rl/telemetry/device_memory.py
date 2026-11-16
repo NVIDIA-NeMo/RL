@@ -302,6 +302,19 @@ def _optimizer_params(optimizer: Any) -> list[Any]:
     return params
 
 
+def _values(mapping: Any) -> Iterator[Any]:
+    """``mapping.values()``, or nothing when there is no ``values()`` to call.
+
+    ProxyDict and friends: anything without ``values()`` is not a mapping this
+    knows how to read, and is skipped rather than raised over. Calling through
+    *mapping* rather than through the ``getattr`` result is deliberate -- a
+    checker reads the latter as returning ``object``, which is not iterable.
+    """
+    if not callable(getattr(mapping, "values", None)):
+        return
+    yield from mapping.values()
+
+
 def _optimizer_state_tensors(optimizer: Any) -> Iterator[Any]:
     """Tensors in *optimizer*'s state, across a chained optimizer's links.
 
@@ -309,16 +322,8 @@ def _optimizer_state_tensors(optimizer: Any) -> Iterator[Any]:
     copies they are moments of are :func:`_optimizer_params`.
     """
     for link in _optimizer_links(optimizer):
-        state = getattr(link, "state", None)
-        # ProxyDict and friends: anything without values() is not a state map
-        # this knows how to read, and is skipped rather than raised over.
-        per_param_states = getattr(state, "values", None)
-        if not callable(per_param_states):
-            continue
-        for per_param_state in per_param_states():
-            values = getattr(per_param_state, "values", None)
-            if callable(values):
-                yield from values()
+        for per_param_state in _values(getattr(link, "state", None)):
+            yield from _values(per_param_state)
 
 
 def device_memory_bytes(model: Any, optimizer: Any) -> dict[str, int]:
