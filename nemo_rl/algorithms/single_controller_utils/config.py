@@ -1876,20 +1876,38 @@ def resolve_ppo_chunk_alignment(
     return group_multiple, min_remaining_groups
 
 
+def resolve_grpo_group_multiple(master_config: MasterConfig, policy_dp: int) -> int:
+    """Return the prompt groups a GRPO chunk must be a multiple of to shard evenly.
+
+    The training dispatch shards a chunk without ``allow_uneven_shards``, so its
+    samples must be a multiple of the policy's ``sample_multiple``. Forest is
+    exempt: its producer pads each group to the execution row multiple, so the
+    logical group count is not the physical row count.
+
+    Args:
+        master_config: The run configuration.
+        policy_dp: Data-parallel size of the policy trainer.
+
+    Returns:
+        The group multiple to pass to the sampler; 1 imposes no alignment.
+    """
+    if master_config.token_capture.forest_training:
+        return 1
+    chunk_multiple = sample_multiple(master_config.policy, policy_dp)
+    return chunk_multiple // math.gcd(
+        chunk_multiple, algo_config(master_config).num_generations_per_prompt
+    )
+
+
 def validate_grpo_chunk_cap_alignment(
     master_config: MasterConfig, policy_dp: int
 ) -> None:
     """Reject a GRPO chunk cap whose samples cannot split across the policy.
 
-    GRPO passes no ``group_multiple`` to the sampler, so a chunk can be any size
-    from the floor up to the cap, and the training dispatch shards it without
-    ``allow_uneven_shards``. The chunk therefore has to satisfy the same
-    ``sample_multiple`` PPO aligns to: the DP split, and under static batching the
-    microbatch split inside each rank as well. This guards the full-cap chunk
-    only: a cap of 3 at 2 generations per prompt is 6 samples, which fails on a
-    DP of 4. An unaligned chunk below the cap stays reachable, as it already is
-    from an unaligned ``min_groups_for_streaming_train``, which no validator
-    covers today.
+    The sampler claims whole multiples of :func:`resolve_grpo_group_multiple`
+    groups, so a cap that is not a multiple would be shortened silently. Reject
+    it instead: a cap of 3 at 2 generations per prompt is 6 samples, which fails
+    on a DP of 4.
 
     Only a cap below ``num_prompts_per_step`` can bind, and Forest is exempt: its
     producer pads each group to the policy execution row multiple, so the logical

@@ -73,6 +73,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     TokenCaptureConfig,
     logprob_passes_required,
+    resolve_grpo_group_multiple,
     resolve_ppo_chunk_alignment,
     validate_grpo_chunk_cap_alignment,
     validate_single_controller_config,
@@ -252,6 +253,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         restored_from_rollout_snapshot=False,
         ppo_group_multiple=1,
         ppo_min_remaining_groups=0,
+        grpo_group_multiple=1,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -425,8 +427,36 @@ def _grpo_chunk_cap_config(
     )
 
 
+@pytest.mark.parametrize(
+    ("policy_dp", "generations", "dynamic_batching", "forest", "expected_groups"),
+    [
+        # 21 ready groups are 336 samples, which DP 32 cannot split.
+        (32, 16, True, False, 2),
+        # Static batching also needs whole microbatches of 4 on each rank.
+        (2, 4, False, False, 2),
+        # Forest pads each group, so its group count needs no alignment.
+        (32, 16, True, True, 1),
+    ],
+)
+def test_grpo_group_multiple_aligns_chunks_to_policy_shards(
+    policy_dp: int,
+    generations: int,
+    dynamic_batching: bool,
+    forest: bool,
+    expected_groups: int,
+) -> None:
+    config = _grpo_chunk_cap_config(
+        None,
+        num_generations_per_prompt=generations,
+        forest_training=forest,
+        train_micro_batch_size=4,
+        dynamic_batching=dynamic_batching,
+    )
+    assert resolve_grpo_group_multiple(config, policy_dp) == expected_groups
+
+
 def test_grpo_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp() -> None:
-    """GRPO passes no group_multiple, so the cap alone decides the chunk size.
+    """A cap that is not a group multiple would be shortened, so it is rejected.
 
     Three groups at two generations each is six samples, and the training
     dispatch shards without allow_uneven_shards, so six cannot split four ways.
@@ -2637,6 +2667,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._is_ppo = False
     ctrl._streaming_ppo = False
     ctrl._value_dedicated = False
+    ctrl._grpo_group_multiple = 1
     ctrl._ppo_epochs = 1
     ctrl._critic_ppo_epochs = 1
     ctrl._value = None

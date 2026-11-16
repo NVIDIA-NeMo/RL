@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dataclasses
 import json
@@ -45,6 +46,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     CustomSamplerConfig,
+    InOrderSampler,
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
     SamplerConfig,
@@ -94,6 +96,7 @@ from nemo_rl.data_plane.schema import (
     SC_ROLLOUT_SCHEMA_FIELDS,
 )
 from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.nemo_gym import validate_dataset_agent_coverage
 from nemo_rl.experience.rollout_recovery import RecoveryTargetLevel
@@ -106,6 +109,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import LoggerConfig, WandbConfig
+from tests.unit.single_controller._dp_fakes import _ReadyGroupBuffer
 
 # Captured at import, before the patched_factories fixture swaps it for a mock.
 _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
@@ -168,6 +172,7 @@ def _make_master_config(
     policy_config: dict = {
         "train_global_batch_size": num_prompts_per_step * 2,
         "max_total_sequence_length": 32,
+        "dynamic_batching": {"enabled": True},
         "tokenizer": {"use_fastokens": False},
         "megatron_cfg": {"enabled": megatron_enabled},
         "generation": generation_config,
@@ -1661,6 +1666,30 @@ class TestSetup:
             actor_args.dp_client
             is patched_factories["build_data_plane_client"].return_value
         )
+
+    def test_grpo_streaming_chunk_shards_across_policy_dp(self, patched_factories):
+        """21 ready groups of 16 samples on policy DP 32 must not reach training as 336."""
+        patched_factories[
+            "fake_policy"
+        ].sharding_annotations.get_axis_size.return_value = 32
+        mc = _make_master_config(num_prompts_per_step=32)
+        mc.grpo.num_generations_per_prompt = 16
+        mc.policy["train_global_batch_size"] = 512
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+        buffer = _ReadyGroupBuffer(generations=16)
+        buffer.add_groups(21)
+
+        chunk, _ = asyncio.run(
+            InOrderSampler(buffer, max_lookahead_versions=1).select(
+                current_train_weight=0,
+                min_prompt_groups=1,
+                max_prompt_groups=32,
+                group_multiple=actor_args.grpo_group_multiple,
+            )
+        )
+
+        batch = BatchedDataDict({"x": torch.zeros(len(chunk.sample_ids))})
+        assert len(batch.shard_by_batch_size(32)) == 32
 
     def test_rejects_windowed_checkpointing_without_native_tq(self):
         mc = _make_master_config()
