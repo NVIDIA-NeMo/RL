@@ -35,9 +35,9 @@ A key the schema does not know is rejected.
 The recipe is used as-is and must be an SC recipe (`data_plane.enabled: true`, `async_rl:`, `grpo.async_grpo: null`). The launcher overrides only what a rollout-only run owns:
 
 - `num_steps` sets `max_num_steps`, and widens `max_num_epochs` so a short dataset cannot clamp it.
-- `num_nodes` sets the generation node count and `cluster.num_nodes`.
+- `num_nodes` sets the generation node count and `cluster.num_nodes`. With SGLang it also sets `sglang_server_config.num_gpus` to the GPUs of those nodes, because SGLang counts its engines from that key.
 - `data.validation` is dropped.
-- `vllm_cfg.load_format` defaults to `auto`, so the engine loads the real checkpoint instead of dummy weights plus a first refit. An explicit `dummy` is rejected.
+- With vLLM, `vllm_cfg.load_format` defaults to `auto`, so the engine loads the real checkpoint instead of dummy weights plus a first refit. An explicit `dummy` is rejected. SGLang always loads `model_path`.
 
 Everything else about the engine is configured exactly as `run_grpo_single_controller.py` configures it, including the `skip_tokenizer_init` rule, so it does the same per-token work as an engine beside a trainer.
 
@@ -50,7 +50,11 @@ Per step:
 - After all chunks of the step are accepted, the controller holds `train_time_s` once, where the optimizer step would run. Generation keeps serving during the hold, but forward and backward work that overlaps later rollout chunks of the same step is not modeled. The hold ends early once no rollout is in flight.
 - `_sync_weights` runs its full lifecycle (dispatch gate, `pause_generation_for_refit(clear_cache=recompute_kv_cache_after_weight_updates)`, resume) around a `NoOpWeightSynchronizer` that moves nothing and holds `refit_time_s`. The trainer version advances, which releases the sampler's next target.
 
-Everything on the rollout side is available: `generation_router`, `generation_fleet_health` (probes and shard restarts), the stall watchdog, token capture, and the `NRL_NSYS_*` profiling hooks.
+Everything on the rollout side is available: `generation_router`, `generation_fleet_health` (probes and shard restarts; vLLM only), the stall watchdog, token capture, and the `NRL_NSYS_*` profiling hooks.
+
+### Refit pause with SGLang
+
+With vLLM the SingleController pauses the engine around the no-op synchronizer, as in a training run. With SGLang the pause lives inside the synchronizer: the SGLang weight synchronizers pause, clear the KV cache, transfer and resume as one lifecycle. The stand-in for SGLang, `SGLangNoOpWeightSynchronizer`, keeps the pause and the KV flush and skips only the transfer, so `timing/train/weight_sync` still covers the pause and the `refit_time_s` hold.
 
 ### Timing metrics
 
@@ -67,18 +71,21 @@ There is no training cluster. The inference cluster is sized from the recipe's g
 
 The controller and the generation router are placed as in a training run. The `SingleControllerActor` is pinned to the dedicated Ray head when the cluster has one (`DEDICATED_RAY_HEAD=1` in `ray.sub`, see [cluster setup](../cluster.md)); set `num_nodes` to the GPU nodes left after the head. The generation router, when enabled, is pinned to the driver's node.
 
-Without a dedicated head, the Ray head node has GPUs and hosts a vLLM rank next to the driver and possibly the `SingleControllerActor`. On a training run that node may be a train node instead. Use a dedicated head, or expect the head's rollout rank to share CPUs with those processes, when comparing against a training run.
+Without a dedicated head, the Ray head node has GPUs and hosts a generation rank next to the driver and possibly the `SingleControllerActor`. On a training run that node may be a train node instead. Use a dedicated head, or expect the head's rollout rank to share CPUs with those processes, when comparing against a training run.
 
 ## Smoke Test
 
-`tests/functional/grpo_async_gym_single_controller_rollout_only.sh` is the smoke for this path: the recipe and overrides of `tests/functional/grpo_async_gym_single_controller.sh` (`examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml` on Qwen3-0.6B with a 1-GPU vLLM split) with the trainer stubbed out, gated on a scored rollout and on the stand-in's metrics.
+`tests/functional/grpo_async_gym_single_controller_rollout_only.sh` is the smoke for this path: the recipe and overrides of `tests/functional/grpo_async_gym_single_controller.sh` (`examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml` on Qwen3-0.6B with a 1-GPU vLLM split) with the trainer stubbed out, gated on a scored rollout and on the stand-in's metrics. `tests/functional/grpo_dp_single_controller_rollout_only_sglang.sh` is the SGLang counterpart on the native math env (`examples/configs/grpo_math_1B_sglang_single_controller.yaml`), gated the same way.
 
 ## Limitations
 
 `rollout_only` does not support the following. Setup rejects each before any engine starts.
 
 - PPO.
-- Generation backends other than vLLM. Megatron generation serves the trainer's own weights; TRT-LLM and SGLang are not validated under the SC refit lifecycle.
+- Generation backends other than vLLM and SGLang. Megatron generation serves the trainer's own weights; TRT-LLM is not validated under the SC refit lifecycle.
+- With SGLang, `sglang_server_config.pause_generation_mode: in_place`: the refit pause must clear the KV cache, as the SGLang weight synchronizers require.
+- With SGLang, `sglang_server_config.needs_offload: true`: setup releases the engine memory after building the engines, and only a real refit restores it.
+- With SGLang, NeMo-Gym environments and the other settings every SC run rejects with this backend; see [Known Missing Features](single-controller.md#known-missing-features).
 - Dynamo serving (`policy.generation.dynamo: true`), which is not validated under the simulator's refit lifecycle yet.
 - Checkpointing and on-policy distillation.
 - `token_capture.defer_routed_experts_to_policy` and `token_capture.forest_training`.

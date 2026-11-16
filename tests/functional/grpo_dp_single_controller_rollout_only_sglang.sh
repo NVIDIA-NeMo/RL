@@ -4,7 +4,7 @@
 # examples/configs/grpo_math_1B_sglang_single_controller.yaml with the trainer stubbed
 # out (cpu train backend) and a no-op refit. With SGLang the pause lives inside the
 # synchronizer, so each simulated refit still pauses the engine, flushes its KV cache
-# and holds for --refit-time-s before resuming; the gate on timing/train/weight_sync
+# and holds for refit_time_s before resuming; the gate on timing/train/weight_sync
 # checks that hold happened. Same data and overrides as grpo_dp_single_controller_sglang.sh.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
@@ -28,9 +28,10 @@ cd $PROJECT_ROOT
 uv run --group test coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_single_controller_simulator.py \
     --config $PROJECT_ROOT/examples/configs/grpo_math_1B_sglang_single_controller.yaml \
-    --num-steps 4 \
-    --train-time-s 10 \
-    --refit-time-s 3 \
+    --simulator-config $PROJECT_ROOT/examples/configs/simulator/rollout_only.yaml \
+    simulator.num_steps=4 \
+    simulator.train_time_s=10 \
+    simulator.refit_time_s=3 \
     policy.model_name=Qwen/Qwen3-0.6B \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
@@ -57,13 +58,14 @@ uv run --group test coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --
 if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
     uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-    # Liveness: the math env scored at least one rollout. Fidelity: the cpu trainer
-    # publishes generation_logprobs as prev_logprobs, so the ratio is exactly 1. Refit:
-    # the SGLang no-op synchronizer pauses, flushes and holds --refit-time-s every step.
+    # Liveness: the math env scored a rollout and all four steps ran. Fidelity: the cpu
+    # trainer publishes generation_logprobs as prev_logprobs, so the ratio is exactly 1.
+    # Refit: the SGLang no-op synchronizer pauses, flushes and holds refit_time_s every step.
     uv run tests/check_metrics.py $JSON_METRICS \
         'max(data["train/reward"]) > 0' \
         'abs(max(data["train/max_seq_mult_prob_error"]) - 1.0) < 1e-6' \
         'min(data["timing/train/weight_sync"]) >= 3' \
         'min(data["train/simulated_train_time_s"]) >= 0' \
-        'max(data["train/simulated_train_idle_skipped_s"]) <= 10'
+        'max(data["train/simulated_train_idle_skipped_s"]) <= 10' \
+        'len(data["train/simulated_train_time_s"]) == 4'
 fi
