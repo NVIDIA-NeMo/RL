@@ -44,8 +44,10 @@ from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.models.generation import (
     configure_generation_config,
+    draft_full_refit_enabled,
     maybe_configure_engine_reaping_env,
 )
+from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
 from nemo_rl.models.policy.draft_config import draft_refit_enabled
 from nemo_rl.telemetry.instrumentation import setup_span, startup_span
 from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
@@ -76,6 +78,17 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return args, overrides
 
 
+def _controller_placement() -> dict[str, Any]:
+    """Pin the controller to ray.sub's dedicated head (the ``ray_head`` resource) when the cluster has one.
+
+    Returns:
+        ``SingleControllerActor.options`` kwargs; empty when there is no ``ray_head``.
+    """
+    if ray.cluster_resources().get("ray_head", 0) >= 1:
+        return {"resources": {"ray_head": 1}}
+    return {}
+
+
 def main() -> None:
     """Main entry point."""
     # The training loop runs in SingleControllerActor, whose flush=True prints only
@@ -104,6 +117,10 @@ def main() -> None:
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
     config = MasterConfig(**config)
+    # Keep the processor, dataset and vLLM MediaIO on one frame-count contract.
+    # Without this, vLLM's VideoMediaIO silently falls back to 32 frames even
+    # when a video recipe requests (and caches) 64 frames.
+    materialize_vllm_video_config(config.policy, config.data)
     print("Applied CLI overrides")
 
     if is_ppo_run(config):
@@ -177,6 +194,9 @@ def main() -> None:
                     tokenizer,
                     has_refit_draft_weights=has_refit_draft_weights,
                     trains_mtp=trains_mtp,
+                    # Only used by Automodel draft co-training; SC supports only the
+                    # Megatron train backend today, so this is always False here.
+                    draft_full_refit=draft_full_refit_enabled(config.policy),
                 )
 
             # Its own phase rather than part of the tokenizer block: it resolves
@@ -194,8 +214,11 @@ def main() -> None:
                     config, tokenizer, processor=processor
                 )
 
-        print("🚀 Launching SingleControllerActor")
-        sc = SingleControllerActor.remote(
+        placement = _controller_placement()
+        print(
+            f"🚀 Launching SingleControllerActor (placement={placement or 'default'})"
+        )
+        sc = SingleControllerActor.options(**placement).remote(
             master_config=config,
             actor_args=actor_args,
             setup_timing_metrics=setup_timing_metrics,
@@ -249,10 +272,13 @@ def _run_with_controller_liveness_watch(
 
     ping() returning is the liveness signal. A slow reply is not a freeze, so the check
     only escalates once the loop has been unresponsive for the same budget the in-actor
-    watchdog uses to call a stall.
+    watchdog uses to call a stall. A controller that never answered a ping is reported
+    as unstarted rather than stalled: an unschedulable actor and a wedged loop look the
+    same from here, but they are fixed in different places.
     """
     run_ref = sc.run.remote()
     last_pong_at = time.monotonic()
+    started = False
 
     while True:
         ready, _ = ray.wait([run_ref], timeout=watchdog_config.interval_s)
@@ -269,6 +295,12 @@ def _run_with_controller_liveness_watch(
                 flush=True,
             )
             if unresponsive_s > watchdog_config.stall_timeout_s:
+                if not started:
+                    raise RuntimeError(
+                        f"SingleController has not started after {unresponsive_s:.0f}s. "
+                        "With a dedicated Ray head it can only run there; check that "
+                        "the head has a free CPU (`ray status`)."
+                    ) from error
                 raise RuntimeError(
                     "SingleController event loop has been unresponsive for "
                     f"{unresponsive_s:.0f}s (stall_timeout_s="
@@ -276,6 +308,7 @@ def _run_with_controller_liveness_watch(
                     "on that loop and cannot report this."
                 ) from error
         else:
+            started = True
             last_pong_at = time.monotonic()
 
 

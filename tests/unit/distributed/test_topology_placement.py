@@ -18,9 +18,11 @@ All tests are pure Python — no Ray cluster required.
 
 import pytest
 
+from nemo_rl.distributed import virtual_cluster
 from nemo_rl.distributed.virtual_cluster import (
     NVLINK_DOMAIN_UNKNOWN,
     TOPO_RANK_UNKNOWN,
+    RayVirtualCluster,
     ResourceInsufficientError,
     _sort_bundle_indices_by_topology,
     select_segment_nodes,
@@ -491,3 +493,79 @@ class TestSegmentTrimming:
             bundle_data, segment_size=8, gpus_per_node=8
         )
         assert len(result) == 64
+
+
+# ---------------------------------------------------------------------------
+# Per-node placement groups ordered by topology
+# ---------------------------------------------------------------------------
+
+
+def _per_node_pg_cluster(
+    monkeypatch,
+    pg_nodes: list[str],
+    topology: dict[str, tuple[str, int]],
+    *,
+    use_gpus: bool = True,
+) -> RayVirtualCluster:
+    """A cluster whose i-th placement group sits on ``pg_nodes[i]``."""
+    cluster = object.__new__(RayVirtualCluster)
+    cluster.use_gpus = use_gpus
+    pgs = [f"pg{i}" for i in range(len(pg_nodes))]
+    node_of = dict(zip(pgs, pg_nodes))
+    monkeypatch.setattr(cluster, "get_placement_groups", lambda: pgs)
+    monkeypatch.setattr(virtual_cluster, "get_ray_cluster_topology", lambda: topology)
+    monkeypatch.setattr(
+        virtual_cluster,
+        "placement_group_table",
+        lambda pg: {"bundles_to_node_id": {0: node_of[pg]} if node_of[pg] else {}},
+    )
+    return cluster
+
+
+class TestTopologySortedPgIndices:
+    def test_pgs_of_one_domain_become_adjacent(self, monkeypatch):
+        # Creation order interleaves the domains; B's smallest rank is lower.
+        topology = {
+            "a0": ("A", 10),
+            "b0": ("B", 1),
+            "a1": ("A", 11),
+            "b1": ("B", 2),
+        }
+        cluster = _per_node_pg_cluster(monkeypatch, ["a0", "b0", "a1", "b1"], topology)
+
+        assert cluster.get_topology_sorted_pg_indices() == [1, 3, 0, 2]
+
+    def test_nodes_within_a_domain_follow_topo_rank(self, monkeypatch):
+        topology = {"n0": ("A", 7), "n1": ("A", 3), "n2": ("A", 5)}
+        cluster = _per_node_pg_cluster(monkeypatch, ["n0", "n1", "n2"], topology)
+
+        assert cluster.get_topology_sorted_pg_indices() == [1, 2, 0]
+
+    def test_unknown_domains_keep_creation_order(self, monkeypatch):
+        topology = {
+            "n0": (NVLINK_DOMAIN_UNKNOWN, 2),
+            "n1": (NVLINK_DOMAIN_UNKNOWN, 1),
+        }
+        cluster = _per_node_pg_cluster(monkeypatch, ["n0", "n1"], topology)
+
+        assert cluster.get_topology_sorted_pg_indices() == [0, 1]
+
+    def test_a_pg_without_a_bundle_mapping_keeps_creation_order(self, monkeypatch):
+        topology = {"n0": ("A", 2), "n1": ("A", 1)}
+        cluster = _per_node_pg_cluster(monkeypatch, ["n0", ""], topology)
+
+        assert cluster.get_topology_sorted_pg_indices() == [0, 1]
+
+    def test_a_node_missing_from_the_topology_keeps_creation_order(self, monkeypatch):
+        topology = {"n0": ("A", 2)}
+        cluster = _per_node_pg_cluster(monkeypatch, ["n0", "n1"], topology)
+
+        assert cluster.get_topology_sorted_pg_indices() == [0, 1]
+
+    def test_a_cpu_only_cluster_keeps_creation_order(self, monkeypatch):
+        topology = {"n0": ("A", 2), "n1": ("A", 1)}
+        cluster = _per_node_pg_cluster(
+            monkeypatch, ["n0", "n1"], topology, use_gpus=False
+        )
+
+        assert cluster.get_topology_sorted_pg_indices() == [0, 1]

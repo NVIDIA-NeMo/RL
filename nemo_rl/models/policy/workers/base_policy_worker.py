@@ -18,7 +18,6 @@ import torch
 import zmq
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.interfaces import RefitPayloadMode
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.telemetry.setup import shutdown_telemetry
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -30,12 +29,12 @@ class AbstractPolicyWorker:
     # None until init_collective builds it. Declared so a rebuild can release the
     # previous group without probing for the attribute's existence.
     model_update_group: Optional[Any] = None
-    # Same, for the per-PP-stage group the nccl_reshard transport builds.
-    pp_comm_group: Optional[Any] = None
+    # Bulk communicator for each generation layout in this worker's PP stage.
+    pp_comm_group: dict[int, Any]
 
     def sync_params_before_refit(self) -> None:
         """Materialize optimizer updates before refit when the backend requires it."""
-        # DTensor policy parameters already contain the latest optimizer update.
+        # Automodel policy parameters already contain the latest optimizer update.
         # Megatron overrides this whenever the distributed optimizer overlaps the
         # parameter all-gather (MXFP8 shared-buffer and plain BF16 alike).
         pass
@@ -112,6 +111,7 @@ class AbstractPolicyWorker:
         my_pp_stage: int,
         sub_world_size: int,
         my_rank_in_group: int,
+        layout_index: int = 0,
     ) -> None:
         """Bootstrap this train worker's nccl_reshard comm group.
 
@@ -122,11 +122,10 @@ class AbstractPolicyWorker:
         from nemo_rl.distributed.refit_watchdog import RELEASE_GRACE_S, release_within
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
-        # Released for the same reason init_collective releases model_update_group:
-        # _build re-runs both communicator families on every reconcile, so without this
-        # each recovery strands a NCCL communicator and a bound TCPStore per PP stage for
-        # the life of the worker. Deferred past the rendezvous and bounded, same as there.
-        stale_group, self.pp_comm_group = self.pp_comm_group, None
+        # Replace only this layout's group; bound cleanup after rendezvous to avoid leaks.
+        groups_by_layout = dict(self.pp_comm_group)
+        stale_group = groups_by_layout.pop(layout_index, None)
+        self.pp_comm_group = groups_by_layout
 
         # Printed on both sides of this rendezvous, because a mismatch here is invisible
         # otherwise: the party that got it wrong just waits, and the other reports a 300s
@@ -140,7 +139,7 @@ class AbstractPolicyWorker:
             f"rank={my_rank_in_group} world_size={sub_world_size}",
             flush=True,
         )
-        self.pp_comm_group = StatelessProcessGroup(
+        group = StatelessProcessGroup(
             master_address=pp_ips[my_pp_stage],
             port=pp_ports[my_pp_stage],
             rank=my_rank_in_group,
@@ -149,7 +148,8 @@ class AbstractPolicyWorker:
         device = torch.cuda.current_device()
         # Free cached blocks so NCCL P2P buffers have headroom (see init_collective).
         torch.cuda.empty_cache()
-        self.pp_comm_group.init_nccl_communicator(device=device)
+        group.init_nccl_communicator(device=device)
+        self.pp_comm_group[layout_index] = group
         self.my_pp_stage = my_pp_stage
 
         if stale_group is not None:
@@ -165,8 +165,7 @@ class AbstractPolicyWorker:
         gen_parallelism: dict[str, int],
         train_world_size: int,
         gen_world_size: int,
-        *,
-        refit_payload_mode: Optional[RefitPayloadMode] = None,
+        layout_index: int = 0,
     ) -> dict[str, Any]:
         """Prepare parameter metadata for NCCL reshard refit."""
         # This is a placeholder implementation.
@@ -350,8 +349,11 @@ class AbstractPolicyWorker:
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
         with self.use_reference_model():
+            # Rollout routes (R3) belong to the policy, never to the reference model.
             reference_logprobs = self.get_logprobs(
-                data=data, micro_batch_size=micro_batch_size
+                data=data,
+                micro_batch_size=micro_batch_size,
+                require_router_replay=False,
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
@@ -361,6 +363,16 @@ class AbstractPolicyWorker:
     def finalize_async_save(self) -> None:
         """Block until any in-flight async checkpoint write completes. No-op by default."""
         pass
+
+    def poll_async_save(self) -> bool:
+        """Finalize a completed async checkpoint write without waiting; True when none is pending.
+
+        Not implemented by default: answering True for a backend that writes in the
+        background would let the caller publish a checkpoint whose write hasn't landed.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support polling async checkpoint saves."
+        )
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation

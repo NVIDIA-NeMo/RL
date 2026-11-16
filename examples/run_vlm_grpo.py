@@ -29,6 +29,7 @@ from nemo_rl.data_plane.factory import (
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -75,6 +76,16 @@ def main() -> None:
         config = OmegaConf.to_container(config, resolve=True)
         check_outdated_config(config)
         config = MasterConfig(**config)
+        # Materialize the video sampling contract before constructing the
+        # processor or vLLM workers.  In particular, this overrides vLLM
+        # VideoMediaIO's independent 32-frame default for 64-frame recipes.
+        materialize_vllm_video_config(config.policy, config.data)
+        if config.env.get("should_use_nemo_gym"):
+            raise ValueError(
+                "env.should_use_nemo_gym=true: run this config with "
+                "examples/nemo_gym/run_grpo_nemo_gym.py, which prepares the "
+                "NeMo-Gym config and binds the Gym actor. This launcher does neither."
+            )
         print("Applied CLI overrides")
 
     # Print config

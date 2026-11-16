@@ -6,9 +6,68 @@
 # Only env.nemo_gym is read (dry-run NemoGym._spinup); the dummy values below satisfy the bundled
 # configs' interpolations during the dry run. swerl_gen is omitted because it is disabled in the
 # Ultra recipes.
+defaults: legacy_environment_servers/ultra_rlvr.yaml
+
 env:
   should_use_nemo_gym: true
   nemo_gym:
+    swe_pivot_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_pivot_tool_simulation_agent
+    terminal_multi_harness_stirrup_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: terminal_multi_harness_stirrup_agent
+    terminal_multi_harness_agent006_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: terminal_multi_harness_agent006_agent
+    terminal_multi_harness_opencode_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: terminal_multi_harness_opencode_agent
+    terminal_multi_harness_codex_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: terminal_multi_harness_codex_agent
+    swe_agents_train_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_train
+    swe_agents_val_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_val
+    litmus_agent_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: rdkit_chemistry_agent
+
     skip_venv_if_present: true
     port_range_low: 5000
     port_range_high: 5999

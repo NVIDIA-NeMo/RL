@@ -66,9 +66,16 @@ def _clear_telemetry_env() -> None:
 def _reset_rl_telemetry() -> None:
     import nemo_rl.telemetry.metrics as metrics_mod
     import nemo_rl.telemetry.setup as setup_mod
+    import nemo_rl.telemetry.vocabulary as vocabulary_mod
 
     setup_mod._TELEMETRY_HANDLE = None
     setup_mod._TELEMETRY_INITIALISED = False
+
+    # Any test that brings telemetry up closes the vocabulary for the rest of
+    # the process, and a module whose rows are declared by an import inside a
+    # later test then raises on registering them -- a failure that reads as a
+    # missing series in whichever test runs next, not as leaked state here.
+    vocabulary_mod._FROZEN = False
 
     # The lens metric registry is process-global, so a group declared by one
     # test would otherwise satisfy the next test's registration guard and hide

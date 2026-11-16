@@ -25,9 +25,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nemo_rl.models.generation.vllm.patches import (
-    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
-)
+from nemo_rl.models.generation.vllm.config import LEGACY_VLLM_FP32_LM_HEAD_ENV_VAR
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
@@ -37,6 +35,30 @@ def test_shutdown_succeeds_before_worker_group_is_initialized(capsys) -> None:
 
     assert policy.shutdown()
     assert capsys.readouterr().out == ""
+
+
+def test_enable_refit_prequantize_forwards_names_and_returns_metadata(
+    monkeypatch,
+) -> None:
+    policy = Policy.__new__(Policy)
+    futures = [object()]
+    updated_info = {
+        "model.weight": ((2, 2), "float8_e4m3fn"),
+        "model.weight_scale_from_checkpoint": ((2, 1), "uint8"),
+    }
+    policy.worker_group = MagicMock()
+    policy.worker_group.run_all_workers_single_data.return_value = futures
+    ray_get = MagicMock(return_value=[updated_info])
+    monkeypatch.setattr("nemo_rl.models.policy.lm_policy.ray.get", ray_get)
+
+    result = policy.enable_refit_prequantize(["model.weight"])
+
+    assert result is updated_info
+    policy.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "enable_refit_prequantize",
+        param_names=["model.weight"],
+    )
+    ray_get.assert_called_once_with(futures)
 
 
 def create_mock_cluster(world_size: int):
@@ -208,20 +230,15 @@ def set_vllm_generation(
     return config
 
 
-def construct_policy_with_mocks(
-    config: PolicyConfig, model_config: object | None = None
-) -> Policy:
-    if model_config is None:
-        model_config = SimpleNamespace(
-            architectures=["NemotronHForCausalLM"], model_type="nemotron_h"
-        )
+def construct_policy_with_mocks(config: PolicyConfig) -> Policy:
     with (
         patch.dict("os.environ", {"TORCH_CUDA_ARCH_LIST": "9.0"}),
         patch("nemo_rl.models.policy.lm_policy.RayQueue"),
         patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder"),
         patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
         patch(
-            "nemo_rl.models.policy.lm_policy.get_hf_config", return_value=model_config
+            "nemo_rl.models.policy.lm_policy.get_hf_config",
+            return_value=SimpleNamespace(),
         ),
         patch("nemo_rl.models.policy.lm_policy.FLOPTracker.from_config"),
     ):
@@ -238,42 +255,6 @@ def test_policy_accepts_matched_vllm_and_megatron_fp32_lm_head():
     set_vllm_generation(config, {"fp32_lm_head": True})
 
     policy = construct_policy_with_mocks(config)
-
-    assert policy.worker_group is not None
-
-
-def test_policy_warns_when_vllm_fp32_lm_head_model_is_not_nemotron_h():
-    config = create_megatron_config("test-model", tp=1)
-    config["megatron_cfg"]["fp32_lm_head"] = True
-    set_vllm_generation(config, {"fp32_lm_head": True})
-
-    with pytest.warns(UserWarning, match="Nemotron-H"):
-        policy = construct_policy_with_mocks(
-            config,
-            model_config=SimpleNamespace(
-                architectures=["Qwen2ForCausalLM"], model_type="qwen2"
-            ),
-        )
-
-    assert policy.worker_group is not None
-
-
-def test_policy_accepts_nested_nemotron_h_model_config():
-    config = create_megatron_config("test-model", tp=1)
-    config["megatron_cfg"]["fp32_lm_head"] = True
-    set_vllm_generation(config, {"fp32_lm_head": True})
-
-    policy = construct_policy_with_mocks(
-        config,
-        model_config=SimpleNamespace(
-            architectures=["NemotronH_Nano_VL_V2"],
-            model_type="NemotronH_Nano_VL_V2",
-            llm_config=SimpleNamespace(
-                architectures=["NemotronHForCausalLM"],
-                model_type="nemotron_h",
-            ),
-        ),
-    )
 
     assert policy.worker_group is not None
 
@@ -305,13 +286,13 @@ def test_policy_rejects_mismatched_vllm_and_megatron_fp32_lm_head(
     worker_group.assert_not_called()
 
 
-def test_policy_rejects_vllm_fp32_lm_head_with_dtensor_trainer():
+def test_policy_rejects_vllm_fp32_lm_head_with_automodel_trainer():
     config = create_automodel_config("test-model", tp=1)
     set_vllm_generation(config, {"fp32_lm_head": True})
 
     with (
         patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
-        pytest.raises(ValueError, match="DTensor has no matching"),
+        pytest.raises(ValueError, match="Automodel has no matching"),
     ):
         Policy(
             cluster=create_mock_cluster(world_size=1),
@@ -322,7 +303,7 @@ def test_policy_rejects_vllm_fp32_lm_head_with_dtensor_trainer():
     worker_group.assert_not_called()
 
 
-def test_policy_accepts_vllm_fp32_lm_head_disabled_with_dtensor_trainer():
+def test_policy_accepts_vllm_fp32_lm_head_disabled_with_automodel_trainer():
     config = create_automodel_config("test-model", tp=1)
     set_vllm_generation(config, {})
 
@@ -331,15 +312,37 @@ def test_policy_accepts_vllm_fp32_lm_head_disabled_with_dtensor_trainer():
     assert policy.worker_group is not None
 
 
-def test_policy_rejects_fp32_lm_head_env_var_toggle():
+def test_policy_rejects_legacy_fp32_lm_head_env_var():
     config = create_automodel_config("test-model", tp=1)
-    set_vllm_generation(
-        config, {"env_vars": {VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "1"}}
-    )
+    set_vllm_generation(config, {"env_vars": {LEGACY_VLLM_FP32_LM_HEAD_ENV_VAR: "1"}})
 
     with (
         patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
-        pytest.raises(ValueError, match="policy.generation.vllm_cfg.fp32_lm_head"),
+        pytest.raises(ValueError, match="no longer read"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    worker_group.assert_not_called()
+
+
+@pytest.mark.parametrize("where", ["hf_config_overrides", "vllm_kwargs"])
+def test_policy_rejects_head_dtype_hf_override(where):
+    config = create_megatron_config("test-model", tp=1)
+    set_vllm_generation(config, {})
+    if where == "hf_config_overrides":
+        config["hf_config_overrides"] = {"head_dtype": "float32"}
+    else:
+        config["generation"]["vllm_kwargs"] = {
+            "hf_overrides": {"head_dtype": "float32"}
+        }
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+        pytest.raises(ValueError, match="head_dtype is not supported"),
     ):
         Policy(
             cluster=create_mock_cluster(world_size=1),
@@ -436,7 +439,7 @@ def test_policy_flops_tracker_uses_hf_config_overrides() -> None:
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_nvfp4_pertoken_rejects_dtensor_training_backend(
+def test_nvfp4_pertoken_rejects_automodel_training_backend(
     mock_ray_worker_group,
     tiny_llama_model_path,
 ):
@@ -580,7 +583,7 @@ def test_policy_rejects_unregistered_worker_extension(from_config: bool) -> None
 @pytest.mark.parametrize(
     "world_size,tp,cp,should_pass,expected_error_type,description",
     [
-        # Valid cases - DTensor backend (PP is always 1 for DTensor)
+        # Valid cases - Automodel backend (PP is always 1 for Automodel)
         (8, 8, 1, True, None, "Valid: DP=1, TP=8, PP=1, CP=1"),
         (16, 8, 1, True, None, "Valid: DP=2, TP=8, PP=1, CP=1"),
         (8, 4, 2, True, None, "Valid: DP=1, TP=4, PP=1, CP=2"),
@@ -597,7 +600,7 @@ def test_policy_rejects_unregistered_worker_extension(from_config: bool) -> None
     ],
 )
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_world_size_validation_dtensor(
+def test_world_size_validation_automodel(
     mock_ray_worker_group,
     tiny_llama_model_path,
     world_size,
@@ -607,16 +610,16 @@ def test_world_size_validation_dtensor(
     expected_error_type,
     description,
 ):
-    """Test world_size validation with DTensor backend.
+    """Test world_size validation with Automodel backend.
 
-    Note: DTensor backend always uses PP=1 (no pipeline parallelism support).
+    Note: Automodel backend always uses PP=1 (no pipeline parallelism support).
     Tests the constraint: world_size = DP * PP * CP * TP where DP >= 1 and DP must be integer.
     """
     cluster = create_mock_cluster(world_size)
     tokenizer = create_mock_tokenizer()
     config = create_automodel_config(
         tiny_llama_model_path, tp, pp=1, cp=cp
-    )  # DTensor always has PP=1
+    )  # Automodel always has PP=1
 
     # Mock RayWorkerGroup to prevent actual worker creation
     mock_worker_group_instance = MagicMock()
@@ -627,7 +630,7 @@ def test_world_size_validation_dtensor(
         try:
             policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
             # Verify the calculated DP makes sense
-            expected_dp = world_size // (1 * cp * tp)  # PP=1 for DTensor
+            expected_dp = world_size // (1 * cp * tp)  # PP=1 for Automodel
             assert expected_dp >= 1, f"Expected DP should be >= 1, got {expected_dp}"
             # Verify that worker group was created (validation passed)
             mock_ray_worker_group.assert_called_once()
@@ -658,7 +661,7 @@ def test_world_size_validation_dtensor(
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_dtensor_dp_replicate_size_sets_batching_dp(
+def test_automodel_dp_replicate_size_sets_batching_dp(
     mock_ray_worker_group,
     tiny_llama_model_path,
 ):
@@ -676,7 +679,7 @@ def test_dtensor_dp_replicate_size_sets_batching_dp(
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_dtensor_hsdp_dispatches_distinct_batches(
+def test_automodel_hsdp_dispatches_distinct_batches(
     mock_ray_worker_group,
     tiny_llama_model_path,
 ):
@@ -788,7 +791,7 @@ def test_world_size_validation_megatron(
 ):
     """Test world_size validation with Megatron backend.
 
-    Megatron backend supports pipeline parallelism (PP > 1) unlike DTensor.
+    Megatron backend supports pipeline parallelism (PP > 1) unlike Automodel.
     Tests the constraint: world_size = DP * PP * CP * TP where DP >= 1 and DP must be integer.
     Note: Expert Parallelism (EP) is handled internally by Megatron-Core, not at the worker level.
     """

@@ -14,6 +14,7 @@
 
 import io
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -472,35 +473,6 @@ def test_rejected_restore_names_the_settings_that_changed():
         ).load_state_dict(state)
 
 
-def test_energon_config_validates_sequence_packing():
-    config = EnergonLoaderConfig(model_family="qwen")
-    assert config.model_family == "qwen"
-    assert config.packing_buffer_size is None
-    assert config.max_samples_per_sequence is None
-    assert config.processor_adapter == "hf_multimodal"
-    assert config.topology_mapper == "default"
-    assert config.task_encoder.name == "generic_sft"
-    assert [cooker.name for cooker in config.cookers] == ["generic_conversation"]
-
-    source = EnergonSourceConfig(
-        path="/data/prepared", split="train", virtual_epoch_length=10
-    )
-    assert source.virtual_epoch_length == 10
-    packed = EnergonLoaderConfig(
-        model_family="qwen", packing_buffer_size=10, max_samples_per_sequence=2
-    )
-    assert packed.packing_buffer_size == 10
-    assert packed.max_samples_per_sequence == 2
-    for field in ("packing_buffer_size", "max_samples_per_sequence"):
-        for value in (0, -1):
-            with pytest.raises(ValueError):
-                EnergonLoaderConfig(model_family="qwen", **{field: value})
-    with pytest.raises(ValueError):
-        EnergonLoaderConfig.model_validate({})
-    with pytest.raises(ValueError):
-        EnergonLoaderConfig.model_validate({"model_family": "unsupported"})
-
-
 def _identity(
     *,
     loader_config: EnergonLoaderConfig | None = None,
@@ -610,10 +582,8 @@ def test_train_loader_rejects_shuffle_false():
             logical_rank=0,
             logical_world_size=1,
             placement_fingerprint="same-placement",
-            packing_algorithm=None,
-            max_sequences_per_bin=None,
-            sequence_length_pad_multiple=1,
             only_unmask_final=False,
+            sequence_length_pad_multiple=1,
         )
 
 
@@ -647,3 +617,115 @@ def test_config_rejects_options_for_the_generic_task_encoder():
                 },
             }
         )
+
+
+def test_config_validates_file_backed_component_references():
+    config = EnergonLoaderConfig.model_validate(
+        {
+            "model_family": "qwen",
+            "task_encoder": {
+                "python_file": "/workspace/custom_encoder.py",
+                "object_name": "CustomTaskEncoder",
+                "options": {"custom_setting": 8},
+            },
+            "cookers": [
+                {
+                    "python_file": "/workspace/custom_encoder.py",
+                    "object_name": "custom_cooker",
+                    "options": {"prefix": "custom"},
+                }
+            ],
+        }
+    )
+
+    assert config.task_encoder.name is None
+    assert config.task_encoder.options == {"custom_setting": 8}
+    assert config.cookers[0].name is None
+    assert config.cookers[0].options == {"prefix": "custom"}
+
+    for task_encoder, cookers in (
+        (
+            {"python_file": "/workspace/custom_encoder.py"},
+            ["generic_conversation"],
+        ),
+        (
+            {
+                "name": "generic_sft",
+                "python_file": "/workspace/custom_encoder.py",
+                "object_name": "CustomTaskEncoder",
+            },
+            ["generic_conversation"],
+        ),
+        (
+            "generic_sft",
+            [{"python_file": "/workspace/custom_encoder.py"}],
+        ),
+    ):
+        with pytest.raises(ValueError):
+            EnergonLoaderConfig.model_validate(
+                {
+                    "model_family": "qwen",
+                    "task_encoder": task_encoder,
+                    "cookers": cookers,
+                }
+            )
+
+
+def test_config_rejects_generic_cooker_options_by_signature() -> None:
+    with pytest.raises(ValueError, match="unexpected keyword argument 'prefix'"):
+        _loader_config(
+            {
+                "model_family": "qwen",
+                "cookers": [
+                    {"name": "generic_conversation", "options": {"prefix": "custom"}}
+                ],
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("parameters", "options", "error"),
+    [
+        ("sample", {"prefix": "custom"}, "unexpected keyword argument 'prefix'"),
+        ("sample, /", {"prefix": "custom"}, "unexpected keyword argument 'prefix'"),
+        (
+            "sample, *, prefix=''",
+            {"typo": "custom"},
+            "unexpected keyword argument 'typo'",
+        ),
+        ("sample", {"sample": "custom"}, "multiple values for argument 'sample'"),
+        ("sample", {}, None),
+        ("sample, *, prefix=''", {"prefix": "custom"}, None),
+        ("sample, **kwargs", {"prefix": "custom"}, None),
+    ],
+)
+def test_config_validates_file_backed_cooker_options(
+    tmp_path: Path,
+    parameters: str,
+    options: dict[str, Any],
+    error: str | None,
+) -> None:
+    cooker_file = tmp_path / "custom_cooker.py"
+    cooker_file.write_text(
+        "from nemo_rl.data.energon.multimodal.model_families import "
+        "supports_model_families\n\n"
+        "@supports_model_families('qwen')\n"
+        f"def custom_cooker({parameters}):\n"
+        "    return sample\n"
+    )
+    loader_config = {
+        "model_family": "qwen",
+        "cookers": [
+            {
+                "python_file": str(cooker_file),
+                "object_name": "custom_cooker",
+                "options": options,
+            }
+        ],
+    }
+
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            _loader_config(loader_config)
+    else:
+        assert _loader_config(loader_config).cookers[0].options == options

@@ -128,11 +128,18 @@ def cook_conversation(sample: CrudeSample) -> CanonicalSFTSample:
     tools = payload.get("tools")
     if tools is not None and not isinstance(tools, list):
         raise ValueError("The tools field must be a list when present.")
+    # Keep Megatron-LM's blend subflavor name at the dataset boundary.
+    chat_template_preapplied = (sample.get("__subflavors__") or {}).get(
+        "skip_chat_template", False
+    )
+    if not isinstance(chat_template_preapplied, bool):
+        raise ValueError("The skip_chat_template subflavor must be a boolean.")
     return CanonicalSFTSample(
         **basic_sample_keys(sample),
         messages=deepcopy(messages),
         media=media,
         tools=deepcopy(tools),
+        chat_template_preapplied=chat_template_preapplied,
     )
 
 

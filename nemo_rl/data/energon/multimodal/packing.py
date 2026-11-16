@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -26,6 +26,7 @@ from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
     message_log_to_flat_messages,
+    validate_precomputed_loss_masks,
 )
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.packing import SequencePacker
@@ -91,10 +92,17 @@ def prepare_packed_sft_batch(
     *,
     tokenizer: PreTrainedTokenizerBase,
     only_unmask_final: bool,
+    loss_mask_mode: Literal["precomputed"] | None = None,
 ) -> BatchedDataDict[Any]:
     """Create model tensors for a batch of physical Energon packs."""
     if not packs or tokenizer.pad_token_id is None:
         raise ValueError("Packed SFT requires packs and a tokenizer pad token.")
+    if loss_mask_mode not in (None, "precomputed"):
+        raise ValueError(f"Unsupported packed SFT loss_mask_mode={loss_mask_mode!r}.")
+    if loss_mask_mode == "precomputed" and only_unmask_final:
+        raise ValueError(
+            "only_unmask_final cannot override precomputed packed SFT loss masks."
+        )
     capacities = {pack.pack_capacity for pack in packs}
     if len(capacities) != 1:
         raise ValueError("All physical packs in a batch need one capacity.")
@@ -116,9 +124,14 @@ def prepare_packed_sft_batch(
         logs = [
             [dict(message) for message in sample.message_log] for sample in pack.samples
         ]
-        add_loss_mask_to_message_log(
-            logs, roles_to_train_on=["assistant"], only_unmask_final=only_unmask_final
-        )
+        if loss_mask_mode == "precomputed":
+            validate_precomputed_loss_masks(logs)
+        else:
+            add_loss_mask_to_message_log(
+                logs,
+                roles_to_train_on=["assistant"],
+                only_unmask_final=only_unmask_final,
+            )
         lengths: list[int] = []
         combined: list[dict[str, Any]] = []
         token_dtype = torch.long

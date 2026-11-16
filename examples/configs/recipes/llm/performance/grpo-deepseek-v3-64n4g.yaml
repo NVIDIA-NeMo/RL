@@ -7,6 +7,10 @@ logger:
     name: grpo-deepseek-v3-64n4g
 policy:
   megatron_cfg:
+    # The 32-node parent disables asynchronous saves to reduce its host-memory
+    # peak. Preserve the established asynchronous behavior for 64-node runs.
+    checkpoint:
+      async_save: true
     expert_model_parallel_size: 32
     env_vars:
       NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "32"

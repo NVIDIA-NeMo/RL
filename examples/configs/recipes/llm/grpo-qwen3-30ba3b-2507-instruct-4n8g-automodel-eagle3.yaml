@@ -1,0 +1,28 @@
+defaults: grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel.yaml
+# EAGLE3 draft co-training sibling of the 30B baseline above -- same model,
+# parallelism, and MoE dispatch; only the draft block, its vLLM speculative
+# config, and the run name/checkpoint dir differ.
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel-eagle3
+policy:
+  draft:
+    enabled: true
+    # Fork of lmsys/SGLang-EAGLE3-Qwen3-30B-A3B-Instruct-2507-SpecForge-Nex:
+    # raises max_position_embeddings 2048 -> 40960 so vLLM does not clamp
+    # the drafter RoPE.
+    model_name: yuekai/SGLang-EAGLE3-Qwen3-30B-A3B-Instruct-2507-SpecForge-Nex
+    loss_weight: 1.0
+    # speculator_type/learning_rate/ttt_steps/ttt_step_loss_decay/
+    # train_embed_and_head all match the exemplar's eagle3 defaults, so
+    # they're inherited rather than repeated here (config_cli.py minimize).
+  generation:
+    vllm_kwargs:
+      speculative_config:
+        method: "eagle3"
+        model: ${policy.draft.model_name}
+        # One proposal per TTT step the drafter is trained to unroll
+        # (checkpoint config.json: proposal_methods[0].speculative_tokens=3).
+        num_speculative_tokens: 3
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel-eagle3

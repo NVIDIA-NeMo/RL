@@ -100,6 +100,52 @@ class TestProcessedMicrobatchDataclass:
 class TestGetAndValidateSeqlen:
     """Tests for get_and_validate_seqlen function."""
 
+    def test_deferred_router_padding_preserves_real_routes(self):
+        from nemo_rl.data_plane.codec import pad_batch, pad_field
+        from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+        routes = torch.arange(577 * 2 * 6).reshape(1, 577, 2, 6)
+        data = BatchedDataDict(
+            input_ids=torch.zeros(1, 577, dtype=torch.long),
+            input_lengths=torch.tensor([577]),
+            routed_experts=routes,
+        )
+        data = pad_batch(data, {}, 918, skip=MICROBATCH_PADDED_FIELDS)
+        assert data["routed_experts"].shape[1] == 577
+        assert get_and_validate_seqlen(data) == (1, 918)
+        # Use the same deferred padding operation as process_microbatches.
+        padded = pad_field("routed_experts", data["routed_experts"], -1, 918)
+        assert torch.equal(padded[:, :577], routes)
+        assert (padded[:, 577:] == -1).all()
+
+    @pytest.mark.parametrize("route_width", [576, 919])
+    def test_deferred_router_padding_rejects_invalid_coverage(self, route_width: int):
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+        data = BatchedDataDict(
+            input_ids=torch.zeros(1, 918, dtype=torch.long),
+            input_lengths=torch.tensor([577]),
+            routed_experts=torch.zeros(1, route_width, 2, 6, dtype=torch.int16),
+        )
+        with pytest.raises(AssertionError, match="must cover every real token"):
+            get_and_validate_seqlen(data)
+
+    @pytest.mark.parametrize("lengths", [None, torch.tensor([577, 577])])
+    def test_deferred_router_padding_requires_aligned_lengths(
+        self, lengths: torch.Tensor | None
+    ):
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+        data = BatchedDataDict(
+            input_ids=torch.zeros(1, 918, dtype=torch.long),
+            routed_experts=torch.zeros(1, 577, 2, 6, dtype=torch.int16),
+        )
+        if lengths is not None:
+            data["input_lengths"] = lengths
+        with pytest.raises(AssertionError, match="requires input_lengths"):
+            get_and_validate_seqlen(data)
+
     def test_get_and_validate_seqlen_valid(self):
         """Test get_and_validate_seqlen with valid data."""
         from nemo_rl.models.megatron.data import get_and_validate_seqlen
@@ -1508,6 +1554,41 @@ class TestProcessMicrobatch:
             result.mtp_loss_mask,
             torch.tensor([[0, 0, 1, 0], [0, 1, 0, 0]]),
         )
+
+    @pytest.mark.parametrize(
+        "pack_sequences, delegate_pack_to_model",
+        [
+            # Qwen2.5-VL: its forward has no media_token_validity_mask kwarg.
+            (False, False),
+            # Qwen3-VL: packs internally, which rejects a caller-side mask.
+            (True, True),
+        ],
+    )
+    def test_process_microbatch_drops_grpo_mask_for_unsupported_models(
+        self, pack_sequences, delegate_pack_to_model
+    ):
+        """A GRPO-attached mask must not reach a model that cannot consume it."""
+        from nemo_rl.data.multimodal_utils import attach_media_token_validity_mask
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        input_ids = torch.tensor([[1, 2, 3, 0, 0], [4, 5, 0, 0, 0]])
+        data = {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([3, 2]),
+            "media_token_validity_mask": torch.ones_like(input_ids, dtype=torch.bool),
+        }
+        # Unsupported models resolve no media placeholder id at worker setup.
+        attach_media_token_validity_mask(data, None)
+
+        result = process_microbatch(
+            data,
+            seq_length_key="input_lengths",
+            pack_sequences=pack_sequences,
+            delegate_pack_to_model=delegate_pack_to_model,
+            straggler_timer=MagicMock(),
+        )
+
+        assert result.media_token_validity_mask is None
 
 
 @pytest.mark.mcore

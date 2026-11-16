@@ -24,11 +24,11 @@ never branches on backend type.
 
 Colocated transports (IPC, SGLang colocated) own GPU phase transitions
 internally (offload, prepare_for_generation, restore) as part of their
-sync_weights() implementation. The NCCL collective transport is a pure data
-mover; the orchestrator handles phase transitions externally since policy and
-generation run on separate GPU clusters. The SGLang disaggregated transport
-sits in between: it drives the generation-side phases but leaves the policy
-resident on its own GPUs.
+sync_weights() implementation. The NCCL collective transport normally leaves
+the policy resident because policy and generation run on separate GPU clusters,
+but it can release trainer memory before exports that need additional headroom.
+The SGLang disaggregated transport sits in between: it drives the
+generation-side phases but leaves the policy resident on its own GPUs.
 
 This interface assumes **global weight updates**: all generation workers
 are updated atomically and are always at the same weight version. Per-worker
@@ -40,9 +40,38 @@ at the synchronizer level.
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from nemo_rl.utils.timer import Timer
+
+if TYPE_CHECKING:
+    from nemo_rl.models.generation.interfaces import GenerationInterface
+    from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
+
+
+def initialize_refit_metadata(
+    policy: "ColocatablePolicyInterface", generation: "GenerationInterface"
+) -> None:
+    """Negotiate the wire-format metadata used by policy-to-generation refit."""
+    state_dict_info = policy.prepare_refit_info()
+    prequant_names = generation.prepare_refit_info(state_dict_info)
+    if not prequant_names:
+        return
+
+    megatron_cfg = policy.cfg.get("megatron_cfg")
+    if megatron_cfg is None or not megatron_cfg["enabled"]:
+        raise ValueError(
+            "vllm_cfg.refit_prequantize requires the Megatron policy backend "
+            "(policy.megatron_cfg.enabled=true); the Automodel workers do not "
+            "implement trainer-side pre-quantized refit."
+        )
+
+    updated_info = policy.enable_refit_prequantize(prequant_names)
+    if updated_info is None:
+        raise RuntimeError(
+            "Trainer-side refit prequantization did not return updated metadata."
+        )
+    generation.prepare_refit_info(updated_info)
 
 
 class WeightSynchronizer(ABC):
@@ -56,8 +85,8 @@ class WeightSynchronizer(ABC):
 
     Colocated transports own phase transitions internally
     (offload_before_refit, prepare_for_generation, offload_after_refit).
-    Non-colocated collective and checkpoint-engine transports are pure data movers;
-    the orchestrator handles phases externally.
+    Non-colocated checkpoint-engine transports are pure data movers. Collective
+    transport can optionally run the policy offload phase before export.
     """
 
     @abstractmethod
@@ -76,9 +105,9 @@ class WeightSynchronizer(ABC):
         4. Verify the transfer succeeded
         5. Restore both sides to their ready state
 
-        Step 1 is skipped by every transport whose policy keeps its own GPUs:
-        the NCCL collective, checkpoint-engine, and SGLang disaggregated
-        transports. Steps 2 and 5 are skipped by the NCCL collective and
+        Step 1 is skipped by default when the policy keeps its own GPUs. NCCL
+        collective refit can opt in when export needs additional trainer GPU
+        headroom. Steps 2 and 5 are skipped by the NCCL collective and
         checkpoint-engine transports.
 
         Step 4 (verification) is performed explicitly by the IPC and NCCL

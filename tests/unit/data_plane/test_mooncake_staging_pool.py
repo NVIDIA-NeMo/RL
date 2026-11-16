@@ -77,8 +77,6 @@ def test_register_checked_accepts_success_statuses(status) -> None:
     tq_adapter._register_checked(store, 0x1000, 4096)
 
 
-# Comfortably above every payload these tests stage, so the ceiling only
-# matters in the test that sets it explicitly.
 _MAX = 1 << 24
 
 
@@ -112,68 +110,6 @@ def test_register_all_buffers_patch_checks_upstream_call_site(monkeypatch) -> No
         client._register_all_buffers([0x1000, 0x2000], [4096, 4096])
 
 
-# ── pool slot bookkeeping ────────────────────────────────────────────────────
-
-
-def test_growing_a_slot_unregisters_before_dropping_the_old_buffer() -> None:
-    store = _FakeStore()
-    pool = tq_adapter._StagingPool(store, n_slots=1, max_bytes=_MAX)
-
-    with pool.buffer(1024) as small:
-        small_ptr = small.data_ptr()
-    assert store.registered == {small_ptr: 1024}
-
-    with pool.buffer(8 * 1024 * 1024) as big:
-        big_ptr = big.data_ptr()
-
-    assert small_ptr in store.unregistered
-    assert store.registered == {big_ptr: 8 * 1024 * 1024}
-
-
-def test_failed_growth_leaves_the_slot_empty_not_poisoned() -> None:
-    """A slot must never come back holding an unregistered buffer.
-
-    Reusing one is the silent variant of this bug: every later transfer
-    through that slot writes into memory the NIC never mapped and returns
-    -800, which retrying cannot fix.
-    """
-    store = _FakeStore(fail_after=0)
-    pool = tq_adapter._StagingPool(store, n_slots=1, max_bytes=_MAX)
-
-    with pytest.raises(RuntimeError, match="register_buffer"):
-        with pool.buffer(1024):
-            pass
-    assert store.registered == {}
-
-    store.fail_after = None
-    with pool.buffer(1024) as buf:
-        assert store.registered == {buf.data_ptr(): 1024}
-
-
-def test_oversized_transfer_bypasses_the_pool_and_unregisters() -> None:
-    """Outliers get a transient registration; it must not outlive the call."""
-    store = _FakeStore()
-    pool = tq_adapter._StagingPool(store, n_slots=1, max_bytes=4096)
-
-    with pool.buffer(8192) as buf:
-        assert store.registered == {buf.data_ptr(): 8192}
-        oversized_ptr = buf.data_ptr()
-
-    assert store.unregistered == [oversized_ptr]
-    assert store.registered == {}
-
-
-def test_slot_exhaustion_fails_loudly_instead_of_hanging(monkeypatch) -> None:
-    """More concurrent transfers than slots must raise, not block forever."""
-    monkeypatch.setattr(tq_adapter, "_STAGING_SLOT_TIMEOUT_S", 0.05)
-    pool = tq_adapter._StagingPool(_FakeStore(), n_slots=1, max_bytes=_MAX)
-
-    with pool.buffer(1024):
-        with pytest.raises(RuntimeError, match="No mooncake staging slot free"):
-            with pool.buffer(1024):
-                pass
-
-
 # ── lazy construction under concurrency ──────────────────────────────────────
 
 
@@ -192,14 +128,14 @@ def test_pool_is_constructed_once_under_concurrent_first_use(monkeypatch) -> Non
     relying on winning a race a fixed number of times.
     """
     constructed: list[object] = []
-    original_init = tq_adapter._StagingPool.__init__
 
-    def slow_init(self, store, n_slots, max_bytes):  # type: ignore[no-untyped-def]
+    def slow_build(self, client):  # type: ignore[no-untyped-def]
         time.sleep(0.05)  # widen the check-then-set window
-        original_init(self, store, n_slots, max_bytes)
-        constructed.append(self)
+        pool = object()  # the invariant is the registry's, not the pool's
+        constructed.append(pool)
+        return pool
 
-    monkeypatch.setattr(tq_adapter._StagingPool, "__init__", slow_init)
+    monkeypatch.setattr(tq_adapter._StagingPoolRegistry, "_build", slow_build)
 
     # The production registry is a local of _patch_mooncake_staging_buffers, so
     # build one here rather than reaching into the patch closure.
@@ -224,3 +160,56 @@ def test_pool_is_constructed_once_under_concurrent_first_use(monkeypatch) -> Non
     # Identity, not storage location: every caller must get the one pool that
     # was actually constructed.
     assert seen == [constructed[0]] * n_threads
+
+
+# ── native BufferPool wrapper ────────────────────────────────────────────────
+
+
+class _NoPool:
+    """A BufferPool that must not be asked: the request is over its budget."""
+
+    def buffer(self, nbytes: int):  # type: ignore[no-untyped-def]
+        raise AssertionError("an over-budget request must bypass the pool")
+
+
+def test_payload_bigger_than_the_pool_gets_a_one_off_registration() -> None:
+    """One tensor over the whole pool still transfers, as before the native pool."""
+    store = _FakeStore()
+    pool = tq_adapter._NativeStagingPool(_NoPool(), store, budget=1024)
+
+    with pool.buffer(4096) as tmp:
+        assert tmp.numel() == 4096
+        assert store.registered == {tmp.data_ptr(): 4096}
+    assert store.registered == {}
+    assert store.unregistered == [tmp.data_ptr()]
+
+
+def test_pool_errors_name_the_settings_to_change() -> None:
+    class _TimedOut:
+        def buffer(self, nbytes: int):  # type: ignore[no-untyped-def]
+            raise RuntimeError("timed out waiting for buffer")
+
+    pool = tq_adapter._NativeStagingPool(_TimedOut(), _FakeStore(), budget=1 << 20)
+    with pytest.raises(RuntimeError, match="local_buffer_size.*staging_buffer_size"):
+        with pool.buffer(4096):
+            pass
+
+
+def test_local_buffer_smaller_than_the_pool_is_rejected(monkeypatch) -> None:
+    """The pool is carved out of the local buffer; below 4 slots it re-registers."""
+    import sys
+    from types import ModuleType
+
+    store_mod = ModuleType("mooncake.store")
+    store_mod.BufferPool = lambda *a, **k: object()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mooncake", ModuleType("mooncake"))
+    monkeypatch.setitem(sys.modules, "mooncake.store", store_mod)
+
+    client = _FakeClient(_FakeStore())
+    client.local_buffer_size = 3 * _MAX  # type: ignore[attr-defined]
+    registry = tq_adapter._StagingPoolRegistry(4, _MAX)
+    with pytest.raises(ValueError, match="local_buffer_size .* must be >= 4 x"):
+        registry.pool_for(client)
+
+    client.local_buffer_size = 4 * _MAX  # type: ignore[attr-defined]
+    assert registry.pool_for(client) is not None

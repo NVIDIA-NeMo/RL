@@ -20,7 +20,7 @@ type-check time -- it fails at the Ray boundary, at refit, as
 ``TypeError: got an unexpected keyword argument``, several frames from the cause.
 
 That is not hypothetical. ``refit_timeout_s`` was added to ``Policy`` and to the Megatron
-worker; both DTensor workers were missed, which broke every non-colocated DTensor refit
+worker; both Automodel workers were missed, which broke every non-colocated Automodel refit
 until a GPU test caught it. Nothing in between could: there is no shared declaration to
 diverge from, since ``broadcast_weights_for_collective`` is defined independently on each
 worker.
@@ -50,6 +50,14 @@ FANOUT_METHODS = [
     ),
     (
         "nccl_reshard_refit",
+        [
+            "workers/base_policy_worker.py",
+            "workers/megatron_policy_worker.py",
+            "interfaces.py",
+        ],
+    ),
+    (
+        "prepare_nccl_reshard_refit_info",
         [
             "workers/base_policy_worker.py",
             "workers/megatron_policy_worker.py",
@@ -99,7 +107,6 @@ GENERATION = REPO_ROOT / "nemo_rl" / "models" / "generation"
 GENERATION_BACKENDS = [
     "interfaces.py",
     "vllm/vllm_generation.py",
-    "dynamo/dynamo_generation.py",
     "trtllm/trtllm_generation.py",
     "megatron/megatron_generation.py",
     "sglang/sglang_generation.py",

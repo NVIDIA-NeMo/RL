@@ -26,6 +26,7 @@ from transformers import (
 )
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.checkpoint import (
     AutomodelCheckpointManager,
@@ -54,24 +55,13 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
+from nemo_rl.models.value.utils import right_shift_values
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.tensor_ops import pad_and_concat
-
-
-def right_shift_values(values: torch.Tensor) -> torch.Tensor:
-    """Shift values right by 1 along the sequence dim (V(s_{t+1}) -> V(s_t)).
-
-    Aligns value predictions with the Megatron value worker convention so GAE
-    (rewards, returns), value targets, and value clipping all see the same
-    V(s_t) semantics across backends. Preserves the input tensor shape: the
-    first column becomes zeros and column t (t>=1) takes the value from
-    column t-1.
-    """
-    return torch.cat([torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1)
 
 
 class RightShiftLossWrapper:
@@ -109,6 +99,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         self,
         config: ValueConfig,
         tokenizer: AutoTokenizer,
+        seed: int,
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
@@ -118,14 +109,6 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
 
         Note: Value models don't need a reference model since they don't compute KL divergence.
         """
-        if config["automodel_cfg"]["context_parallel_size"] > 1:
-            raise NotImplementedError(
-                "AutomodelValueWorker cannot be initialized with "
-                "context_parallel_size > 1 because its get_values() scoring path "
-                "does not support context parallelism. Set "
-                "value.automodel_cfg.context_parallel_size=1."
-            )
-
         # Apply patches
         apply_transformer_engine_patch()
 
@@ -152,7 +135,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
             config["reward_model_cfg"]["enabled"]
             and config["reward_model_cfg"]["reward_model_type"] == "regression"
         ), (
-            "DTensor value models require reward_model_cfg.enabled=true and reward_model_cfg.reward_model_type='regression'."
+            "Automodel value models require reward_model_cfg.enabled=true and reward_model_cfg.reward_model_type='regression'."
         )
 
         print("Initializing AutomodelValueWorker")
@@ -188,6 +171,15 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         self.tp_size = distributed_manager.tp_size
         self.cp_size = distributed_manager.cp_size
 
+        # Value workers run in separate Ray processes, so the controller's PPO
+        # seed does not cover model construction here. Seed before creating the
+        # model so a missing HF regression head is initialized reproducibly.
+        set_seed(seed)
+        print(
+            f"[Rank {self.rank}] Set Automodel value-model initialization seed "
+            f"to {seed}"
+        )
+
         # Initialize checkpoint manager
         automodel_cfg = config["automodel_cfg"]
         checkpoint_config = build_checkpoint_config(
@@ -216,19 +208,20 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
             optimizer_path=optimizer_path,
         )
 
-        # Set instance attributes from model and optimizer state.
-        (
-            self.model,
-            self.optimizer,
-            self.scheduler,
-            self.is_hf_model,
-            self.is_moe_model,
-            self._is_reward_model,
-            self.model_class,
-            self.model_config,
-            self.peft_config,
-            self.autocast_enabled,
-        ) = model_and_optimizer_state
+        # Set instance attributes from model and optimizer state. Access by
+        # field name (not positional unpacking) so optional fields appended to
+        # ModelAndOptimizerState (e.g. the DSpark draft state) don't break
+        # value workers.
+        self.model = model_and_optimizer_state.model
+        self.optimizer = model_and_optimizer_state.optimizer
+        self.scheduler = model_and_optimizer_state.scheduler
+        self.is_hf_model = model_and_optimizer_state.is_hf_model
+        self.is_moe_model = model_and_optimizer_state.is_moe_model
+        self._is_reward_model = model_and_optimizer_state.is_reward_model
+        self.model_class = model_and_optimizer_state.model_class
+        self.model_config = model_and_optimizer_state.model_config
+        self.peft_config = model_and_optimizer_state.peft_config
+        self.autocast_enabled = model_and_optimizer_state.autocast_enabled
 
         # Set instance attributes from runtime config. Value workers do not use
         # sampling parameters, but RuntimeConfig still carries the field.
@@ -352,8 +345,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
                     padding_token_id=self.tokenizer.pad_token_id or 0,
                     autocast_context_factory=self._autocast_context,
                     forward_only=eval_mode,
-                    is_reward_model=True,  # Value models use reward model architecture
-                    allow_flash_attn_args=False,  # Typically False for value models
+                    allow_flash_attn_args=self.allow_flash_attn_args,
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
                     sequence_dim=sequence_dim,
@@ -443,6 +435,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         # Create value post-processor
         value_post_processor = ScorePostProcessor(
             cfg=self.cfg,
+            enable_seq_packing=self.enable_seq_packing,
         )
 
         with torch.no_grad():
@@ -464,8 +457,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
                     device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
                     padding_token_id=self.tokenizer.pad_token_id or 0,
-                    is_reward_model=True,
-                    allow_flash_attn_args=False,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
                 )
 
                 with prepared.model_context_factory(), self._autocast_context():
@@ -477,8 +469,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
                         processed_mb=processed_mb,
                         sequence_dim=sequence_dim,
                     )
-                    # Mirror train()'s right-shift so GAE / value clipping /
-                    # value targets all see V(s_t) semantics (megatron parity).
+                    # Shift after restoring global CP order.
                     values = right_shift_values(values)
 
                 # Skip dummy batches

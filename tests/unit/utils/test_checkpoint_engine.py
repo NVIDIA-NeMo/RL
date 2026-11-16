@@ -278,7 +278,7 @@ def _run_nixl_roundtrip_process(
             device=transfer_device,
         )
         metadata_queue.put((role, engine.prepare()))
-        metadata = peer_metadata_queue.get(timeout=30)
+        metadata = peer_metadata_queue.get(timeout=180)
 
         if role == "policy":
             engine.init_policy_process_group(
@@ -351,7 +351,9 @@ def _run_nixl_subprocess_roundtrip(
     try:
         for process in processes:
             process.start()
-        metadata = dict(metadata_queue.get(timeout=30) for _ in processes)
+        # Spawned workers import PyTorch and initialize CUDA/UCX before publishing
+        # metadata. Cold startup can exceed 30s; keep transfer timeouts separate.
+        metadata = dict(metadata_queue.get(timeout=180) for _ in processes)
         ordered_metadata = [metadata["policy"], metadata["rollout"]]
         for queue in peer_metadata_queues.values():
             queue.put(ordered_metadata)

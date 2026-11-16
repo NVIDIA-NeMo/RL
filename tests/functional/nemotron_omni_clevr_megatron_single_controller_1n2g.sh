@@ -158,9 +158,11 @@ uv run --no-sync python examples/run_grpo_single_controller.py \
     ++async_rl.sampler.name=in_order \
     ++async_rl.sampler.max_lookahead_versions=1 \
     ++async_rl.recompute_kv_cache_after_weight_updates=false \
+    policy.generation.mcore_generation_config.kv_cache_management_mode=persist \
     ++async_rl.min_groups_for_streaming_train=1 \
     ++async_rl.max_inflight_prompts=2 \
     ++async_rl.max_buffered_rollouts=2 \
+    ++async_rl.generation_fleet_health.refit_timeout_s=null \
     logger.tensorboard_enabled=true \
     logger.log_dir="${LOG_DIR}" \
     logger.wandb_enabled=false \

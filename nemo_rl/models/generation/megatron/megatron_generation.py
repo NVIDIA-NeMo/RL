@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
@@ -27,7 +28,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
-    RefitPayloadMode,
+    agreed_media_columns,
     reject_unenforceable_refit_deadline,
 )
 from nemo_rl.models.generation.megatron.config import (
@@ -40,6 +41,7 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data.captured_media import MediaColumnSpec
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
     from nemo_rl.distributed.worker_groups import RayWorkerGroup
     from nemo_rl.models.policy.lm_policy import Policy
@@ -224,6 +226,7 @@ class MegatronGeneration(GenerationInterface):
         mcore_cfg = cast(MCoreGenerationConfig, policy_config["generation"])[
             "mcore_generation_config"
         ]
+
         # Recompute-after-refit is implemented engine-side (kv_cache_management_mode="recompute");
         # the loop-level flag must agree with that mode, and setup errors on a mismatch.
         kv_cache_mode = mcore_cfg["kv_cache_management_mode"]
@@ -388,10 +391,6 @@ class MegatronGeneration(GenerationInterface):
         """Whether non-colocated refit uses Megatron Core's native mechanism."""
         return self.cfg.get("refit_transport") == "mcore"
 
-    def get_refit_payload_mode(self) -> RefitPayloadMode:
-        """Megatron inference receives logical weights on every refit path."""
-        return "logical_weights"
-
     @property
     def worker_group(self) -> "RayWorkerGroup":
         """The underlying policy's worker group (fleet-health probes read dp_size)."""
@@ -533,8 +532,10 @@ class MegatronGeneration(GenerationInterface):
         pp_size: int,
         train_ranks_per_stage: int,
         sub_world_size: int,
+        layout_index: int = 0,
     ) -> list[ray.ObjectRef]:
         """Build bulk communicators over the selected Megatron ranks."""
+        assert layout_index == 0, "Megatron generation has a single reshard layout"
         return [
             worker.init_nccl_reshard_comm_groups_generation.remote(
                 pp_ips=pp_ips,
@@ -547,8 +548,12 @@ class MegatronGeneration(GenerationInterface):
             for worker, rank, _original_rank in self._refit_ranked_workers(membership)
         ]
 
-    def prepare_nccl_reshard_refit_info(self, refit_info: dict[str, Any]) -> None:
+    def prepare_nccl_reshard_refit_info(
+        self, refit_infos: list[dict[str, Any]]
+    ) -> None:
         """Build each inference worker's HF-to-Megatron M-to-N receive map."""
+        assert len(refit_infos) == 1, "Megatron generation has a single reshard layout"
+        refit_info = refit_infos[0]
         futures = [
             worker.prepare_nccl_reshard_refit_info.remote(refit_info=refit_info)
             for worker, _rank, _original_rank in self._refit_ranked_workers()
@@ -601,10 +606,14 @@ class MegatronGeneration(GenerationInterface):
         futures = worker.generate_async._remote(
             kwargs={"data": data, "greedy": greedy}, num_returns="streaming"
         )
-        async for result_ref in futures:
-            index, result_batch = await result_ref
-            result_batch["gen_leader_worker_idx"] = [0]
-            yield index, result_batch
+        try:
+            async for result_ref in futures:
+                index, result_batch = await result_ref
+                result_batch["gen_leader_worker_idx"] = [0]
+                yield index, result_batch
+        except (asyncio.CancelledError, GeneratorExit):
+            ray.cancel(futures)
+            raise
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Initialize / re-enter inference mode on every worker.
@@ -645,12 +654,23 @@ class MegatronGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
-    ) -> None:
-        """Install MInf's canonical prompt and completion capture hooks."""
-        if capture_media:
+        top_logprobs: int = 0,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
+        generation_cut_control_timeout_s: float | None = None,
+    ) -> "Optional[MediaColumnSpec]":
+        """Install MInf's canonical prompt and completion capture hooks.
+
+        Returns the media column spec the coordinators pinned (``None`` for
+        text-only capture).
+        """
+        if top_logprobs != 0:
             raise NotImplementedError(
-                "Media token capture is only implemented for the vLLM generation "
-                "backend; the MInf stager writes text-only rows"
+                "Megatron generation does not capture sampler top-k"
+            )
+        if generation_prefix_cuts_enabled:
+            raise NotImplementedError(
+                "generation-prefix recovery is not implemented for Megatron inference"
             )
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(
@@ -661,8 +681,9 @@ class MegatronGeneration(GenerationInterface):
             "setup_token_capture",
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
+            capture_media=capture_media,
         )
-        ray.get(futures)
+        return agreed_media_columns(ray.get(futures))
 
     def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the policy epoch stamped by MInf on subsequent requests."""
@@ -720,7 +741,9 @@ class MegatronGeneration(GenerationInterface):
             self._policy.worker_group.run_all_workers_single_data("resume_after_refit")
         )
 
-    def prepare_refit_info(self, state_dict_info: Optional[dict[str, Any]]) -> None:
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
         """Prepare Bridge conversion tasks on every dedicated inference worker."""
         if not self._owns_policy or self.uses_native_refit:
             return

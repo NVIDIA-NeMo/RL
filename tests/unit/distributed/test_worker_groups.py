@@ -28,8 +28,24 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import (
     RayWorkerBuilder,
     RayWorkerGroup,
+    _check_dp_leader_worker_indices,
     _get_initializer_env_vars,
 )
+
+
+def test_dp_leaders_may_be_an_ascending_subset_of_the_group_leaders():
+    # A disaggregated replica routes through its first engine only.
+    _check_dp_leader_worker_indices([0, 6], tied_group_leaders=[0, 2, 4, 6, 8])
+
+
+@pytest.mark.parametrize(
+    "requested",
+    [[0, 3], [6, 0]],
+    ids=["not-a-group-leader", "out-of-order"],
+)
+def test_dp_leaders_outside_the_group_leaders_are_rejected(requested):
+    with pytest.raises(ValueError, match="ascending subset"):
+        _check_dp_leader_worker_indices(requested, tied_group_leaders=[0, 2, 4, 6])
 
 
 def test_initializer_env_adds_hf_modules_cache_to_pythonpath(monkeypatch):
@@ -1358,3 +1374,28 @@ def test_environment_variable_precedence_full(
                 os.environ[key] = original_env[key]
             else:
                 os.environ.pop(key, None)
+
+
+def test_large_init_args_reach_every_worker_through_the_object_store(
+    register_test_actor, virtual_cluster_4_bundles
+):
+    """Constructor arguments are shared through the object store and still arrive as values."""
+    big_arg = b"a" * (2 << 20)
+    big_kwarg = "k" * (2 << 20)
+    builder = RayWorkerBuilder(register_test_actor, big_arg, small=1, big=big_kwarg)
+    sharding = NamedSharding(layout=[[0, 1], [2, 3]], names=["dp", "tp"])
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster_4_bundles,
+        remote_worker_builder=builder,
+        workers_per_node=None,
+        sharding_annotations=sharding,
+    )
+    try:
+        assert len(worker_group._initializer_pool) == 2
+        for worker in worker_group.workers:
+            args, kwargs = ray.get(worker.get_init_args_kwargs.remote())
+            assert args == (big_arg,)
+            assert kwargs["big"] == big_kwarg
+            assert kwargs["small"] == 1
+    finally:
+        worker_group.shutdown(force=True)

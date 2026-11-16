@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any, Literal, Optional, get_args
 
 from nemo_rl.telemetry.vocabulary import (
     TeedMetric,
@@ -25,6 +25,38 @@ from nemo_rl.telemetry.vocabulary import (
 
 #: Prefix every algorithm logs its setup timings under.
 SETUP_TIMING_PREFIX = "timing/setup"
+
+#: Single-Controller snapshot-attempt dict names, shared with the OTel tee; not in
+#: ``rollout_checkpoint.py``, which imports the GRPO stack.
+ROLLOUT_CHECKPOINT_OUTCOME_PREFIX = "rollout/checkpoint_outcome"
+ROLLOUT_CHECKPOINT_ATTEMPT_DURATION_KEY = "attempt_duration_seconds"
+ROLLOUT_CHECKPOINT_SECONDS_SINCE_LAST_SUCCESS_KEY = "seconds_since_last_success"
+
+RolloutCheckpointAttemptOutcome = Literal["completed", "failed", "skipped"]
+ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES: tuple[RolloutCheckpointAttemptOutcome, ...] = (
+    get_args(RolloutCheckpointAttemptOutcome)
+)
+
+RolloutCheckpointAttemptReason = Literal[
+    "completed",
+    "gym_unavailable",
+    "invariant_error",
+    "io_error",
+    "missing_trainer_anchor",
+    "no_data_plane_mutations",
+    "optimizer_commit_in_progress",
+    "timeout",
+    "trainer_state_changed",
+]
+ROLLOUT_CHECKPOINT_ATTEMPT_REASONS: tuple[RolloutCheckpointAttemptReason, ...] = (
+    get_args(RolloutCheckpointAttemptReason)
+)
+
+
+def rollout_checkpoint_reason_key(reason: RolloutCheckpointAttemptReason) -> str:
+    """The one-hot flag key an attempt logs its *reason* under."""
+    return f"reason_{reason}"
+
 
 # Keys several training loops log under the "train" prefix. Shared constants
 # rather than a literal per call site so a rename reaches every producer and
@@ -65,6 +97,8 @@ class SetupTimingMetrics:
     generation_init_reserve_time_s: Optional[float] = None
     generation_init_load_time_s: Optional[float] = None
 
+    # sft_v2 only: elsewhere the placement wait falls inside policy_init.
+    cluster_init_time_s: Optional[float] = None
     policy_init_time_s: Optional[float] = None
     # PPO only: the critic shares the training GPUs, so it is built after the policy.
     value_init_time_s: Optional[float] = None

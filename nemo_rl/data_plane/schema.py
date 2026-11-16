@@ -13,6 +13,7 @@
 # limitations under the License.
 """Shared constants and type aliases for the data-plane meta contract."""
 
+from dataclasses import dataclass
 from typing import Literal, Optional, Sequence
 
 # Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
@@ -59,8 +60,7 @@ MALFORMED_THINKING_MASK = "malformed_thinking_mask"
 
 # Tensor fields in the train partition. Rollout writes the input
 # subset on first put; later stages add prev_logprobs /
-# reference_policy_logprobs (workers) and advantages (driver);
-# under top-k/top-p the prev-logprob stage also rewrites token_mask.
+# reference_policy_logprobs (workers) and advantages (driver).
 DP_TRAIN_FIELDS = (
     "input_ids",
     "input_lengths",
@@ -145,6 +145,8 @@ VALUE_SEED_FIELDS = LP_SEED_FIELDS
 DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS)
 
 ROUTED_EXPERTS_FIELD = "routed_experts"
+# Per-token fields padded per microbatch instead of per batch: field -> pad value.
+MICROBATCH_PADDED_FIELDS: dict[str, int | float] = {ROUTED_EXPERTS_FIELD: -1}
 ROUTED_LEN_FIELD = "routed_len"
 ROUTED_EXPERTS_ENCODING_FIELD = "routed_experts_encoding"
 ROUTED_EXTRAS_METADATA_FIELD = "extras_metadata_json"
@@ -155,12 +157,21 @@ ROUTED_EXTRAS_METADATA_FIELD = "extras_metadata_json"
 ROUTE_ENCODING_NONE = 0
 ROUTE_ENCODING_ENVELOPE = 1
 ROUTE_ENCODING_LIST = 2
+ROUTE_ENCODING_TENSOR = 3
 
 # Deferred route storage. Canonical rows carry one strict encoded route plan
 # per tag; policy workers omit the absent canonical route column and assemble
 # it from staging immediately before previous-policy logprob or training.
 ROUTE_PLAN_TAG = "route_assembly_plan"
 ROUTE_PASSTHROUGH_FLAG = "route_passthrough"
+
+# Sampler top-k per generated token (policy.generation.top_logprobs > 0), consumed
+# by loss_fn.score_centering: int32 ids and float32 log-probs, both ``[..., k]``.
+# Staging rows hold one call's generated positions; canonical rows are
+# token-aligned with zeros on prompt and tool tokens.
+SAMPLER_TOPK_TOKEN_IDS_FIELD = "sampler_topk_token_ids"
+SAMPLER_TOPK_LOGPROBS_FIELD = "sampler_topk_logprobs"
+SAMPLER_TOPK_FIELDS = (SAMPLER_TOPK_TOKEN_IDS_FIELD, SAMPLER_TOPK_LOGPROBS_FIELD)
 
 
 def fields_with_optional_routed_experts(
@@ -202,3 +213,42 @@ def fields_with_optional_opd_full(
     if teacher_index_field is not None and teacher_index_field not in out:
         out.append(teacher_index_field)
     return out
+
+
+@dataclass(frozen=True)
+class LogicalRowTag:
+    """Required ownership metadata on real and execution-padding forest rows."""
+
+    dispatch_group_id: str
+    logical_rollout_id: str | None
+    logical_slot: int | None
+    logical_group_size: int
+    segment_index: int | None
+    segment_count: int
+    is_execution_padding: bool
+
+
+def forest_segment_id(owner_id: str, segment_index: int) -> str:
+    """Canonical identity of a physical row owned by one logical rollout."""
+    return f"{owner_id}_s{segment_index}"
+
+
+def forest_row_ids(
+    group_id: str,
+    owner_ids: Sequence[str],
+    segment_counts: Sequence[int],
+    *,
+    execution_row_multiple: int,
+) -> tuple[str, ...]:
+    """One publication/cleanup plan: owner segments followed by execution padding."""
+    if type(execution_row_multiple) is not int or execution_row_multiple < 1:
+        raise ValueError("execution_row_multiple must be a positive integer")
+    real_ids = tuple(
+        forest_segment_id(owner, index)
+        for owner, count in zip(owner_ids, segment_counts, strict=True)
+        for index in range(count)
+    )
+    return real_ids + tuple(
+        f"{group_id}_pad{index}"
+        for index in range(-len(real_ids) % execution_row_multiple)
+    )

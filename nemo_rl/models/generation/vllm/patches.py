@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib.util import find_spec
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import torch
@@ -24,8 +26,6 @@ if TYPE_CHECKING:
 # Keep this module free of NeMo RL imports, including lazy ones inside
 # functions: tools/external_gym_vllm/serve_vllm_on_ray.py loads it by path and
 # calls _apply_vllm_patches in serving containers that do not install NeMo RL.
-
-VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
 
 
 def _get_vllm_file(relative_path: str) -> str:
@@ -80,68 +80,24 @@ def _locked_file_patch(file_path: str):
         lock_fd.close()
 
 
-def _patch_vllm_init_workers_ray(
-    py_executable: str, extra_env_vars: list[str] | None
-) -> bool:
-    """Patch vLLM's Ray executor env propagation and worker runtime_env.
+def _forward_env_vars_to_ray_workers(extra_env_vars: list[str] | None) -> None:
+    """Forward extra env vars to vLLM's Ray workers.
 
-    1. Pass custom runtime_env in _init_workers_ray call (file patch).
-        - This allows passing custom py_executable to worker initialization.
-    2. Forward extra env vars to the Ray workers via vLLM's additive
-       VLLM_RAY_EXTRA_ENV_VARS_TO_COPY hook (vLLM >= 0.25). NCCL_*, HF_*, and
-       HUGGING_FACE_* vars are already copied by vLLM's default prefix list
-       (this includes the NCCL_CUMEM_ENABLE/NCCL_NVLS_ENABLE workaround from
-       https://github.com/NVIDIA-NeMo/RL/pull/898).
+    Uses vLLM's additive VLLM_RAY_EXTRA_ENV_VARS_TO_COPY hook. NCCL_*, HF_*, and
+    HUGGING_FACE_* vars are already copied by vLLM's default prefix list (this
+    includes the NCCL_CUMEM_ENABLE/NCCL_NVLS_ENABLE workaround from
+    https://github.com/NVIDIA-NeMo/RL/pull/898).
 
-    .. note::
-        Step 1 patches the **v1 Ray executor**, which vLLM 0.25 no longer
-        selects by default: ``VLLM_USE_RAY_V2_EXECUTOR_BACKEND`` flipped from
-        ``"0"`` (0.20) to ``"1"`` (0.25), so ``Executor.get_class`` returns
-        ``RayExecutorV2`` for ray-backed engines. ``RayExecutorV2`` has no
-        ``_init_workers_ray`` at all -- it creates workers inline, and its
-        ``_build_runtime_env`` never sets ``py_executable``.
-
-        The patch is kept because it is still load-bearing when
-        ``VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0`` selects the v1 executor. Under
-        the 0.25 default it is inert, and workers get the right interpreter
-        from Ray's per-field ``runtime_env`` inheritance instead: the parent
-        NeMo-RL actor sets ``py_executable``, and a child created with a
-        ``runtime_env`` that omits it inherits the parent's value.
-
-        So a ``True`` return means "the anchor is in place", not "this is what
-        put the workers on the right interpreter". The caller logs
-        accordingly.
-
-    Returns:
-        Whether the v1 runtime_env source patch is in place. The env-var merge
-        in step 2 cannot fail, but step 1 is anchored on a call-site string; if
-        that moves upstream the py_executable injection silently stops
-        happening, so the caller must not report success unconditionally.
+    The workers' interpreter needs no patch: RayExecutorV2 creates them with a
+    ``runtime_env`` that omits ``py_executable``, so they inherit the value the
+    parent NeMo-RL actor set.
     """
-    file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
-
-    old_line = "self._init_workers_ray(placement_group)"
-    new_line = (
-        "self._init_workers_ray(placement_group, "
-        f'runtime_env={{"py_executable": "{py_executable}"}})'
-    )
-
-    applied = False
-    with _locked_file_patch(file_to_patch) as (content, write_back):
-        if new_line in content:
-            applied = True  # already patched by another worker on this node
-        elif old_line in content:
-            write_back(content.replace(old_line, new_line))
-            applied = True
-
     env_vars_to_copy = ["RAY_ENABLE_UV_RUN_RUNTIME_ENV", *(extra_env_vars or [])]
     existing = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
     merged = {
         var.strip() for var in (*existing.split(","), *env_vars_to_copy) if var.strip()
     }
     os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(sorted(merged))
-
-    return applied
 
 
 def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
@@ -193,68 +149,6 @@ def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
         write_back(content)
 
     logger.info("Successfully patched llama_eagle3 lm_head ownership.")
-
-
-def _patch_vllm_tool_parser_namespace_tool(logger) -> None:
-    """Guard vLLM's NamespaceTool import for openai < 2.25.
-
-    vLLM 0.25 imports ``openai.types.responses.NamespaceTool`` (added in
-    openai 2.25.0) at the top of ``tool_parsers/utils.py``, but nemo-gym pins
-    ``openai<=2.7.2`` and its child server venvs must match the parent's
-    openai version exactly. NamespaceTool is only used in isinstance checks
-    for Responses-API namespace tools, which cannot be constructed by an
-    openai client that predates the feature, so a never-matching stub is a
-    faithful fallback.
-    """
-    try:
-        file_to_patch = _get_vllm_file("tool_parsers/utils.py")
-    except RuntimeError:
-        logger.warning(
-            "Could not locate tool_parsers/utils.py for openai compat patch."
-        )
-        return
-
-    old_snippet = (
-        "from openai.types.responses import (\n"
-        "    FunctionTool,\n"
-        "    NamespaceTool,\n"
-        "    ToolChoiceFunction,\n"
-        ")\n"
-    )
-
-    new_snippet = (
-        "from openai.types.responses import (\n"
-        "    FunctionTool,\n"
-        "    ToolChoiceFunction,\n"
-        ")\n"
-        "\n"
-        "try:\n"
-        "    from openai.types.responses import NamespaceTool\n"
-        "except ImportError:  # openai < 2.25.0 predates namespace tools\n"
-        "\n"
-        "    class NamespaceTool:  # type: ignore[no-redef]\n"
-        '        """Stub: openai<2.25 clients cannot construct namespace tools."""\n'
-        "\n"
-    )
-
-    with _locked_file_patch(file_to_patch) as (content, write_back):
-        if "except ImportError:  # openai < 2.25.0 predates namespace tools" in content:
-            logger.info("vLLM NamespaceTool openai compat patch already applied.")
-            return
-
-        if old_snippet not in content:
-            logger.warning(
-                "Could not apply NamespaceTool openai compat patch: "
-                "expected import block not found in %s. "
-                "The vLLM version may have changed.",
-                file_to_patch,
-            )
-            return
-
-        content = content.replace(old_snippet, new_snippet, 1)
-        write_back(content)
-
-    logger.info("Successfully patched vLLM NamespaceTool import for openai compat.")
 
 
 def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
@@ -525,11 +419,25 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
 def _patch_vllm_radio_layerscale_loader(logger) -> None:
     """Load explicit RADIO LayerScale weights and initialize folded weights.
 
-    vLLM 0.25.1 uses ``ls1`` and ``ls2`` in ``RadioVisionEncoderLayer`` but
-    skips them in ``RadioModel.load_weights``. Explicit checkpoint values are
-    therefore ignored, while folded checkpoints leave the parameters at dummy
-    initialization. Patch the loader so explicit values are loaded and absent
-    values are initialized to RADIO's configured identity factor.
+    ``RadioVisionEncoderLayer`` scales each residual branch by ``ls1``/``ls2``
+    (``... + self.attn(...) * self.ls1``), but ``RadioModel.load_weights``
+    discards those entries for legacy ``radio_model.*`` checkpoints, and folded
+    checkpoints ship no LayerScale tensors at all. NeMo-RL forces
+    ``load_format=dummy`` because weights arrive by refit, so anything the
+    loader does not populate keeps its random initialization: the vision tower
+    then multiplies every residual branch by noise. The failure is silent --
+    unchanged step time, a collapsed reward, and a large
+    train/token_mult_prob_error.
+
+    Applied as two INDEPENDENT edits rather than one block replacement, each
+    anchored on text that is stable across loader variants. Both anchors are
+    verified against stock vLLM 0.25.1 and 0.29.0. Custom vLLM builds that
+    reshape the surrounding loader body (for example by gating the legacy
+    branch or adding a native-name mapping branch) still take the required
+    edit, where matching the whole body as one snippet would silently no-op.
+
+    Refit calls ``load_weights`` once per size-limited batch, so names loaded
+    by any earlier call are remembered on the module and never re-filled.
     """
     try:
         file_to_patch = _get_vllm_file("model_executor/models/radio.py")
@@ -537,64 +445,387 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
         logger.warning("Could not locate radio.py for the LayerScale loader patch.")
         return
 
-    old_snippet = """            elif sub.startswith("model.blocks."):
-                # Encoder blocks: HF 'model.blocks.{i}.' ->
-                # vLLM 'model.encoder.layers.{i}.'
-                parts = sub.split(".")
-                if len(parts) >= 4:
-                    layer_idx = parts[2]
-                    suffix = ".".join(parts[3:])
-                    # Skip layer-scale entries that vLLM doesn't use
+    # Edit 1 (optional): stop discarding explicit LayerScale weights from legacy
+    # radio_model.* checkpoints. Stock vLLM drops native-format
+    # layer_scale{1,2}.lambda1 names entirely; only custom builds with a native
+    # name mapping route them to ls{1,2}.
+    skip_old = """                    # Skip layer-scale entries that vLLM doesn't use
                     if suffix in {"ls1", "ls2"} or suffix.startswith(("ls1.", "ls2.")):
                         continue
-                    vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"
+"""
+    skip_new = ""
 
-            if vllm_key and vllm_key in params_dict:
-                param = params_dict[vllm_key]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, weight)
-                loaded_params.add(vllm_key)
+    # Edit 2 (required): give every LayerScale parameter the checkpoint did not
+    # supply the configured identity factor instead of dummy-init noise.
+    # RadioConfig defaults initializer_factor=1.0, and getattr keeps this safe
+    # for configs that omit it. This is the edit that matters for the folded
+    # checkpoints we train on, which contain no ls1/ls2 tensors whatsoever.
+    old_snippet = """                loaded_params.add(vllm_key)
 
         return loaded_params
 """
-    new_snippet = """            elif sub.startswith("model.blocks."):
-                # Encoder blocks: HF 'model.blocks.{i}.' ->
-                # vLLM 'model.encoder.layers.{i}.'
-                parts = sub.split(".")
-                if len(parts) >= 4:
-                    layer_idx = parts[2]
-                    suffix = ".".join(parts[3:])
-                    vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"
+    new_snippet = """                loaded_params.add(vllm_key)
 
-            if vllm_key and vllm_key in params_dict:
-                param = params_dict[vllm_key]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, weight)
-                loaded_params.add(vllm_key)
-
-        initializer_factor = self.config.initializer_factor
-        for name, param in params_dict.items():
-            if name.endswith((".ls1", ".ls2")) and name not in loaded_params:
-                param.data.fill_(initializer_factor)
-                loaded_params.add(name)
+        initializer_factor = getattr(self.config, "initializer_factor", 1.0)
+        # Refit calls load_weights once per batch. Remember every LayerScale name
+        # any batch has loaded, so a later batch does not reset it to the factor.
+        ever_loaded_ls = getattr(self, "_nemo_rl_loaded_layerscale", set())
+        ever_loaded_ls.update(n for n in loaded_params if n.endswith((".ls1", ".ls2")))
+        self._nemo_rl_loaded_layerscale = ever_loaded_ls
+        for ls_name, ls_param in params_dict.items():
+            if ls_name.endswith((".ls1", ".ls2")) and ls_name not in ever_loaded_ls:
+                ls_param.data.fill_(initializer_factor)
+                loaded_params.add(ls_name)
 
         return loaded_params
 """
 
     with _locked_file_patch(file_to_patch) as (content, write_back):
-        if new_snippet in content:
+        if "ls_param.data.fill_(initializer_factor)" in content:
             logger.info("vLLM RADIO LayerScale loader patch already applied.")
             return
-        if old_snippet not in content:
+
+        updated = content
+        skip_removed = skip_old in updated
+        if skip_removed:
+            updated = updated.replace(skip_old, skip_new, 1)
+
+        if old_snippet not in updated:
+            # Without the fill loop the parameters stay at dummy init, so refuse
+            # to write a half-applied patch and make the reason loud.
             logger.warning(
-                "Could not apply vLLM RADIO LayerScale loader patch: expected "
-                "vLLM 0.25.1 source shape was not found in %s.",
+                "Could not apply vLLM RADIO LayerScale loader patch: the "
+                "load_weights tail anchor was not found in %s. LayerScale "
+                "parameters would keep their dummy initialization; expect a "
+                "degraded vision tower and inflated token_mult_prob_error.",
                 file_to_patch,
             )
             return
-        write_back(content.replace(old_snippet, new_snippet, 1))
+        updated = updated.replace(old_snippet, new_snippet, 1)
 
-    logger.info("Successfully patched vLLM RADIO LayerScale loading.")
+        write_back(updated)
+
+    logger.info(
+        "Successfully patched vLLM RADIO LayerScale loading "
+        "(explicit legacy-skip removed: %s).",
+        skip_removed,
+    )
+
+
+def _patch_vllm_radio_native_loader(logger) -> None:
+    """Accept transformers-native RADIO weight names in vLLM's RADIO loader.
+
+    vLLM's ``RadioModel.load_weights`` only understands the legacy timm-style
+    layout (``radio_model.model.blocks.N.attn.qkv`` with a fused qkv). Nemotron
+    3.5 Super VL ships transformers-native remote code, so the Automodel policy
+    holds ``encoder.layer.N.attention.attention.{query,key,value}`` and
+    ``layer_scale{1,2}.lambda1`` parameters. Its per-tensor refit path cannot
+    fuse the three attention tensors back into one ``attn.qkv``, so those names
+    reach vLLM unchanged (Automodel main) or under the legacy block prefix
+    (Automodel r0.6.0: ``radio_model.model.blocks.N.attention.attention.query``).
+    Stock vLLM silently drops both forms and keeps generating with stale vision
+    weights once the vision tower is trained.
+
+    Port the native branch of the ``super_vl_rl_v0.25.1`` fork loader
+    (TomerBN-Nvidia/vllm commit 436aefb8): map native embedding and encoder
+    names onto vLLM's keys and write q/k/v as shards of the fused
+    ``QKVParallelLinear``. Legacy names keep the stock code path, so the
+    LayerScale loader patch and its anchors are unaffected.
+    """
+    try:
+        radio_file = _get_vllm_file("model_executor/models/radio.py")
+        vl_file = _get_vllm_file("model_executor/models/nano_nemotron_vl.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate the RADIO model files for the native loader patch."
+        )
+        return
+
+    radio_replacements = (
+        (
+            """    def load_weights(self, weights) -> set[str]:
+        loaded_params: set[str] = set()
+        params_dict = dict(self.named_parameters())
+""",
+            """    def load_weights(self, weights) -> set[str]:
+        loaded_params: set[str] = set()
+        params_dict = dict(self.named_parameters())
+
+        def native_to_vllm(sub: str) -> tuple[str, str | None] | None:
+            # transformers-native RadioModel names -> vLLM keys (+ qkv shard).
+            # Returns None for names the legacy code path below handles.
+            for source, target in (
+                ("embeddings.patch_projection.", "model.patch_generator.embedder."),
+                (
+                    "embeddings.video_patch_projection.",
+                    "model.patch_generator.video_embedder.",
+                ),
+                ("embeddings.position_embedding", "model.patch_generator.pos_embed"),
+                ("embeddings.cls_register_token", "model.patch_generator.cls_token.token"),
+            ):
+                if sub.startswith(source):
+                    return target + sub[len(source) :], None
+            for prefix in ("encoder.layer.", "model.blocks."):
+                if not sub.startswith(prefix):
+                    continue
+                layer_idx, _, suffix = sub[len(prefix) :].partition(".")
+                for source, (target, shard_id) in (
+                    ("attention.attention.query.", ("attn.qkv.", "q")),
+                    ("attention.attention.key.", ("attn.qkv.", "k")),
+                    ("attention.attention.value.", ("attn.qkv.", "v")),
+                    ("attention.output.dense.", ("attn.proj.", None)),
+                    ("layer_scale1.lambda1", ("ls1", None)),
+                    ("layer_scale2.lambda1", ("ls2", None)),
+                ):
+                    if suffix.startswith(source):
+                        vllm_suffix = target + suffix[len(source) :]
+                        return f"model.encoder.layers.{layer_idx}.{vllm_suffix}", shard_id
+                if prefix == "encoder.layer.":
+                    return f"model.encoder.layers.{layer_idx}.{suffix}", None
+                return None
+            return None
+""",
+        ),
+        (
+            """        for name, weight in weights_list:
+            if not name.startswith("radio_model."):
+                # Skip non-radio weights
+                continue
+
+            sub = name[len("radio_model.") :]  # drop "radio_model." prefix
+
+            # Skip buffers not used in vLLM
+            if sub in {"summary_idxs"}:
+                continue
+            if sub.startswith("input_conditioner."):
+                # we normalize in the input processor,
+                # based on norm and std values from the config
+                continue
+
+            vllm_key = None
+            if sub.startswith("model.patch_generator."):
+""",
+            """        for name, weight in weights_list:
+            is_legacy = name.startswith("radio_model.")
+            sub = name.removeprefix("radio_model.")  # drop "radio_model." prefix
+            if not is_legacy and not sub.startswith(("embeddings.", "encoder.layer.")):
+                # Skip non-radio weights
+                continue
+
+            # Skip buffers not used in vLLM
+            if sub in {"summary_idxs"}:
+                continue
+            if sub.startswith("input_conditioner."):
+                # we normalize in the input processor,
+                # based on norm and std values from the config
+                continue
+
+            native = native_to_vllm(sub)
+            if native is not None:
+                vllm_key, shard_id = native
+                param = params_dict.get(vllm_key)
+                if param is not None:
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    if shard_id is None:
+                        weight_loader(param, weight)
+                    else:
+                        weight_loader(param, weight, shard_id)
+                    loaded_params.add(vllm_key)
+                continue
+
+            vllm_key = None
+            if sub.startswith("model.patch_generator."):
+""",
+        ),
+    )
+    vl_replacements = (
+        (
+            """        def is_vision_weights(name: str) -> bool:
+            return name.startswith("vision_model.radio_model.")
+""",
+            """        def is_vision_weights(name: str) -> bool:
+            # Legacy "vision_model.radio_model.*" and transformers-native
+            # "vision_model.{embeddings,encoder}.*" RADIO names.
+            return name.startswith("vision_model.")
+""",
+        ),
+    )
+
+    for file_to_patch, replacements in (
+        (radio_file, radio_replacements),
+        (vl_file, vl_replacements),
+    ):
+        with _locked_file_patch(file_to_patch) as (content, write_back):
+            if all(new in content for _, new in replacements):
+                logger.info(
+                    "vLLM RADIO native-name loader patch already applied to %s.",
+                    file_to_patch,
+                )
+                continue
+            if any(content.count(old) != 1 for old, _ in replacements):
+                logger.warning(
+                    "Could not apply vLLM RADIO native-name loader patch: expected "
+                    "vLLM 0.29 source shape was not found in %s. Refit of a "
+                    "transformers-native RADIO vision tower (Nemotron 3.5 Super VL) "
+                    "would be silently dropped by vLLM.",
+                    file_to_patch,
+                )
+                return
+            for old, new in replacements:
+                content = content.replace(old, new, 1)
+            write_back(content)
+        logger.info(
+            "Successfully patched vLLM RADIO loader for native weight names in %s.",
+            file_to_patch,
+        )
+
+
+def _patch_vllm_radio_final_layernorm(logger) -> None:
+    """Make vLLM's Super Omni final vision LayerNorm match the Megatron scoring path.
+
+    vLLM 0.33 builds the layer itself, but runs it in the LLM dtype after the
+    BF16 cast, applies it even when no checkpoint weights were loaded, and only
+    reads the ``vision_projector.`` weight names. This patch runs it in FP32
+    before the cast, turns it on only once both affine parameters have loaded
+    (so dummy startup + refit stays a no-op until then), and also reads the bare
+    ``vision_final_layernorm.`` names.
+    Supports stock vLLM 0.33 source or this patch's complete output; unexpected
+    source layouts fail before writing rather than being skipped.
+    References: RL #4036.
+    """
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/nano_nemotron_vl.py")
+    except RuntimeError:
+        logger.warning("Could not locate the Nemotron VL model for final LayerNorm.")
+        return
+
+    replacements = (
+        (
+            """            # Match the HF vision projector for checkpoints trained with MTP.
+            self.vision_final_layernorm = (
+                nn.LayerNorm(
+                    vit_hidden_size,
+                    eps=getattr(vision_config, "layer_norm_eps", 1e-6),
+                ).to(llm_dtype)
+                if (getattr(config.text_config, "num_nextn_predict_layers", 0) or 0) > 0
+                else None
+            )
+""",
+            """            self.vision_final_layernorm: nn.LayerNorm | None = None
+            if (
+                getattr(config.text_config, "num_nextn_predict_layers", 0) or 0
+            ) > 0:
+                # Keep the tiny affine in fp32 so normalization matches the
+                # Megatron scoring path; checkpoint BF16 values load into it.
+                self.vision_final_layernorm = nn.LayerNorm(
+                    vit_hidden_size,
+                    eps=getattr(vision_config, "layer_norm_eps", 1.0e-6),
+                ).float()
+            self._loaded_vision_final_layernorm_params: set[str] = set()
+            self._vision_final_layernorm_enabled = False
+""",
+        ),
+        (
+            """        return x
+
+    def extract_feature_dynamic(
+""",
+            """        return x
+
+    def _apply_vision_final_layernorm(
+        self, vit_embeds: torch.Tensor
+    ) -> torch.Tensor:
+        if not self._vision_final_layernorm_enabled:
+            return vit_embeds
+        assert self.vision_final_layernorm is not None
+        output_dtype = vit_embeds.dtype
+        return self.vision_final_layernorm(vit_embeds.float()).to(output_dtype)
+
+    def extract_feature_dynamic(
+""",
+        ),
+        (
+            """        _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
+        vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+        if self.vision_final_layernorm is not None:
+            vit_embeds = self.vision_final_layernorm(vit_embeds)
+""",
+            """        _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
+        vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
+        vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+""",
+        ),
+        (
+            """            else:
+                _, vit_embeds = self.vision_model(chunk)
+            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+            if self.vision_final_layernorm is not None:
+                vit_embeds = self.vision_final_layernorm(vit_embeds)
+""",
+            """            else:
+                _, vit_embeds = self.vision_model(chunk)
+            vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
+            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+""",
+        ),
+        (
+            """        vision_norm_prefix = "vision_projector.vision_final_layernorm."
+
+        def is_vision_norm_weights(name: str) -> bool:
+            return name.startswith(vision_norm_prefix)
+""",
+            """        def get_final_layernorm_name(name: str) -> str | None:
+            for prefix in (
+                "vision_final_layernorm.",
+                "vision_projector.vision_final_layernorm.",
+            ):
+                if name.startswith(prefix):
+                    return name.removeprefix(prefix)
+            return None
+""",
+        ),
+        (
+            """                elif is_vision_norm_weights(name):
+                    if not load_multimodal_weights:
+                        continue
+                    param_name = name.removeprefix(vision_norm_prefix)
+                    assert param_name in vision_norm_params, (
+                        f"Unexpected vision LayerNorm weight: {name}"
+                    )
+                    with torch.no_grad():
+                        default_weight_loader(vision_norm_params[param_name], w)
+""",
+            """                elif (param_name := get_final_layernorm_name(name)) is not None:
+                    if not load_multimodal_weights:
+                        continue
+                    if self.vision_final_layernorm is None:
+                        raise ValueError(
+                            "Checkpoint has final vision LayerNorm weights but "
+                            "the model configuration did not construct the layer"
+                        )
+                    with torch.no_grad():
+                        default_weight_loader(vision_norm_params[param_name], w)
+                    self._loaded_vision_final_layernorm_params.add(param_name)
+                    if (
+                        self._loaded_vision_final_layernorm_params
+                        >= vision_norm_params.keys()
+                    ):
+                        self._vision_final_layernorm_enabled = True
+""",
+        ),
+    )
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if all(new in content for _, new in replacements):
+            return
+        if any(content.count(old) != 1 for old, _ in replacements):
+            raise RuntimeError(
+                "Final vision LayerNorm patch requires the vLLM 0.33 model source "
+                f"or its fully patched equivalent: {file_to_patch}"
+            )
+        for old, new in replacements:
+            content = content.replace(old, new, 1)
+        write_back(content)
+    logger.info("Patched checkpoint-backed Super Omni final vision LayerNorm.")
 
 
 def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
@@ -685,11 +916,13 @@ def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) ->
     old_snippet = (
         "        if self.routed_experts.quant_method.is_monolithic:\n"
         "            # Monolithic kernels: pass router_logits to routed_experts\n"
+        "            router_logits = self.router.prepare_monolithic_logits(router_logits)\n"
         "            fused_out = self.routed_experts.forward_monolithic("
     )
     new_snippet = (
         "        if self.routed_experts.quant_method.is_monolithic:\n"
         "            # Monolithic kernels: pass router_logits to routed_experts\n"
+        "            router_logits = self.router.prepare_monolithic_logits(router_logits)\n"
         "            # NeMo-RL patch (routed-experts capture for router replay): "
         "monolithic MoE kernels compute top-k routing\n"
         "            # inside the fused kernel and never call router.select_experts,\n"
@@ -731,20 +964,16 @@ def _patch_vllm_routed_experts_capture_router_fallback(
 ) -> bool:
     """Let monolithic MoE kernels without in-kernel capture use the router hook.
 
-    vLLM 0.29 moved the routed-experts binding into
-    ``routed_experts_capturer.bind_routed_experts_capturer``. For a monolithic
-    kernel it requires ``fused_experts.supports_routing_replay_capture()`` and
-    binds the capture function to that experts *object* (the kernel then writes
-    ``routing_replay_out`` itself); any other monolithic kernel is rejected with
-    ``ValueError``. Two things make the object binding unusable for NeMo-RL's
-    NVFP4 per-token method: the kernel is rebuilt on every refit, so the bound
-    capture function is dropped after the first weight update and the returned
-    routes go back to all-zero; and the per-token kernel is the one FlashInfer
-    launch that has not been validated with a replay buffer attached. Kernels
-    that report no in-kernel capture (see ``nvfp4_pertoken.host_captured_experts_cls``)
-    therefore fall back to ``router.set_capture_fn`` — the hook that
-    ``_patch_vllm_moe_routed_experts_capture`` fires on the monolithic branch
-    and the path vLLM 0.26 used for every monolithic kernel.
+    ``routed_experts_capturer.bind_routed_experts_capturer`` requires a
+    monolithic kernel to report ``supports_routing_replay_capture()`` and then
+    gives the layer a ``RoutedExpertsSink`` whose buffer the kernel fills with
+    ``routing_replay_out``; any other monolithic kernel is rejected with
+    ``ValueError``. NeMo-RL's NVFP4 per-token kernel is the one FlashInfer
+    launch that has not been validated with a replay buffer attached, so it
+    reports no in-kernel capture (see
+    ``nvfp4_pertoken.host_captured_experts_cls``). Such kernels fall back to
+    ``router.set_capture_fn`` — the hook that
+    ``_patch_vllm_moe_routed_experts_capture`` fires on the monolithic branch.
     """
     try:
         file_to_patch = _get_vllm_file(
@@ -762,7 +991,6 @@ def _patch_vllm_routed_experts_capture_router_fallback(
 
     marker = "NeMo-RL patch (router fallback for monolithic routed-experts capture)"
     old_snippet = (
-        "        if quant_method.is_monolithic:\n"
         "            if not (\n"
         "                isinstance(fused_experts, FusedMoEExpertsMonolithic)\n"
         "                and fused_experts.supports_routing_replay_capture()\n"
@@ -771,11 +999,12 @@ def _patch_vllm_routed_experts_capture_router_fallback(
         '                    "Routed-experts capture is not supported with monolithic "\n'
         '                    f"MoE kernel {type(fused_experts).__name__}."\n'
         "                )\n"
-        "            fused_experts.set_capture_fn(capture_fn)\n"
+        "            module.routed_experts.routing_sink = RoutedExpertsSink(\n"
+        "                fused_experts.moe_config, capture_fn\n"
+        "            )\n"
         "            num_bound += 1\n"
     )
     new_snippet = (
-        "        if quant_method.is_monolithic:\n"
         "            # NeMo-RL patch (router fallback for monolithic routed-experts capture):\n"
         "            # a monolithic kernel that does not capture routing itself is\n"
         "            # captured through the router; NeMo-RL's moe_runner patch fires\n"
@@ -784,7 +1013,9 @@ def _patch_vllm_routed_experts_capture_router_fallback(
         "                isinstance(fused_experts, FusedMoEExpertsMonolithic)\n"
         "                and fused_experts.supports_routing_replay_capture()\n"
         "            ):\n"
-        "                fused_experts.set_capture_fn(capture_fn)\n"
+        "                module.routed_experts.routing_sink = RoutedExpertsSink(\n"
+        "                    fused_experts.moe_config, capture_fn\n"
+        "                )\n"
         "                num_bound += 1\n"
         "            elif isinstance(module.router, BaseRouter):\n"
         "                module.router.set_capture_fn(capture_fn)\n"
@@ -817,153 +1048,6 @@ def _patch_vllm_routed_experts_capture_router_fallback(
         "Successfully patched routed-experts capture (router fallback for "
         "monolithic kernels)."
     )
-    return True
-
-
-def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> bool:
-    """Compute NemotronH logits with an fp32 LM head (MiniMax-M1-style).
-
-    bf16 rounding of the logits GEMM output is the dominant contributor to
-    generation/training logprob mismatch (train/token_mult_prob_error). With
-    this patch the sampled-token logprobs come from fp32 logits, matching a
-    trainer that enables megatron_cfg.fp32_lm_head.
-
-    This must be a source patch (not a monkeypatch): the model executes in
-    vLLM's EngineCore worker subprocesses, which import vllm independently of
-    this process. The patched code is opt-in at runtime via an internal
-    NRL_VLLM_FP32_LM_HEAD=1 environment variable set from
-    policy.generation.vllm_cfg.fp32_lm_head.
-    When enabled, the live ParallelLMHead keeps its original parameter dtype
-    and quantization config; only the projection path casts hidden states,
-    weights, and optional bias to fp32 at runtime.
-    """
-    try:
-        file_to_patch = _get_vllm_file("model_executor/models/nemotron_h.py")
-    except RuntimeError:
-        logger.warning("Could not locate nemotron_h.py for the fp32 LM head patch.")
-        return False
-
-    old_import_snippet = """import torch
-from torch import nn"""
-    old_fp32_import_snippet = """import os
-
-import torch
-from torch import nn"""
-    new_import_snippet = old_fp32_import_snippet
-    old_lm_head_snippet = """        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=self.quant_config,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )"""
-    new_lm_head_snippet = f"""        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=self.quant_config,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
-        self._nrl_fp32_lm_head = (
-            os.environ.get("{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR}", "0") == "1"
-        )"""
-    old_logits_processor_snippet = (
-        "        self.logits_processor = LogitsProcessor(config.vocab_size)"
-    )
-    new_logits_processor_snippet = """        self.logits_processor = LogitsProcessor(config.vocab_size)
-        if self._nrl_fp32_lm_head:
-
-            def _nrl_fp32_lm_head_forward(
-                input_, embedding_bias=None, _lm_head=self.lm_head
-            ):
-                if not getattr(_lm_head, "_nrl_fp32_lm_head_forward_logged", False):
-                    print(
-                        "[fp32_lm_head] NemotronH vLLM lm_head.forward casts "
-                        "input and weight to fp32",
-                        flush=True,
-                    )
-                    _lm_head._nrl_fp32_lm_head_forward_logged = True
-                logits = torch.matmul(
-                    input_.to(dtype=torch.float32),
-                    _lm_head.weight.to(dtype=torch.float32).t(),
-                )
-                if embedding_bias is not None:
-                    logits = logits + embedding_bias.to(dtype=torch.float32)
-                return logits
-
-            self.lm_head.forward = _nrl_fp32_lm_head_forward
-            _orig_quant_apply = self.lm_head.quant_method.apply
-
-            def _nrl_fp32_lm_head_apply(
-                layer,
-                input_,
-                bias=None,
-                _lm_head=self.lm_head,
-                _orig_apply=_orig_quant_apply,
-                **kwargs,
-            ):
-                if layer is _lm_head:
-                    return _lm_head(input_, bias)
-                return _orig_apply(layer, input_, bias=bias, **kwargs)
-
-            self.lm_head.quant_method.apply = _nrl_fp32_lm_head_apply"""
-    old_snippet = """        logits = self.logits_processor(self.lm_head, hidden_states)
-        return logits"""
-
-    with _locked_file_patch(file_to_patch) as (content, write_back):
-        if (
-            new_import_snippet in content
-            and new_lm_head_snippet in content
-            and new_logits_processor_snippet in content
-        ):
-            logger.info("NemotronH fp32 LM head patch already present.")
-            return True
-
-        if new_import_snippet not in content:
-            if old_fp32_import_snippet in content:
-                content = content.replace(
-                    old_fp32_import_snippet, new_import_snippet, 1
-                )
-            elif content.count(old_import_snippet) == 1:
-                content = content.replace(old_import_snippet, new_import_snippet, 1)
-            else:
-                logger.warning(
-                    "NemotronH fp32 LM head import anchor not found exactly once "
-                    "in %s; patch not applied.",
-                    file_to_patch,
-                )
-                return False
-
-        if new_lm_head_snippet not in content:
-            if content.count(old_lm_head_snippet) != 1:
-                logger.warning(
-                    "NemotronH fp32 LM head constructor anchor not found exactly "
-                    "once in %s; patch not applied.",
-                    file_to_patch,
-                )
-                return False
-            content = content.replace(old_lm_head_snippet, new_lm_head_snippet, 1)
-
-        if new_logits_processor_snippet not in content:
-            if content.count(old_logits_processor_snippet) != 1:
-                logger.warning(
-                    "NemotronH fp32 logits_processor anchor not found exactly once "
-                    "in %s; patch not applied.",
-                    file_to_patch,
-                )
-                return False
-            content = content.replace(
-                old_logits_processor_snippet, new_logits_processor_snippet, 1
-            )
-
-        if content.count(old_snippet) != 1:
-            logger.warning(
-                "NemotronH fp32 compute_logits anchor not found exactly once "
-                "in %s; patch not applied.",
-                file_to_patch,
-            )
-            return False
-        write_back(content)
-
-    logger.info("Applied NemotronH fp32 LM head source patch.")
     return True
 
 
@@ -1011,96 +1095,113 @@ def modelopt_moe_amax_aliases(model: "torch.nn.Module") -> Iterator[None]:
             delattr(module, alias)
 
 
+def install_output_loop_yield(llm: Any, *, reader_budget_s: float) -> None:
+    """Make ``llm``'s output loops yield to other tasks on the event loop.
+
+    AsyncLLM runs two loops on the generation actor's event loop: the socket
+    reader (``AsyncMPClient``) that receives EngineCore outputs, and
+    ``output_handler`` (``AsyncLLM``) that does the per-token work. Under a
+    generation backlog each finds its next message already waiting, and awaiting
+    a done future does not yield, so either can hold the loop for minutes and
+    starve refit and other Ray calls to the actor.
+
+    ``output_handler`` now yields once per engine step, and the reader once it
+    has run for ``reader_budget_s`` without waiting. Yielding the reader on every
+    message instead starves it against ``output_handler`` and moves the backlog
+    into the socket. This bounds how long control calls wait behind generation;
+    it does not make the per-token work cheaper.
+
+    Args:
+        llm: The ``vllm.v1.engine.async_llm.AsyncLLM`` whose output loops to patch.
+        reader_budget_s: How long the socket reader may run without yielding.
+
+    Raises:
+        ValueError: If ``reader_budget_s`` is not positive.
+        RuntimeError: If the installed vLLM does not have the internals this patches.
+    """
+    if reader_budget_s <= 0:
+        raise ValueError(f"reader_budget_s must be positive, got {reader_budget_s}")
+    try:
+        from vllm.v1.engine.core_client import AsyncMPClient
+
+        original_get = AsyncMPClient.get_output_async
+        socket = llm.engine_core.resources.output_socket
+        original_recv = socket.recv_multipart
+    except (ImportError, AttributeError) as e:
+        raise RuntimeError(
+            "output-loop yielding is enabled (vllm_cfg.output_loop_yield_budget_ms) but "
+            "the installed vLLM does not have the AsyncMPClient output-loop internals it "
+            "patches; disable it or update install_output_loop_yield in "
+            "nemo_rl/models/generation/vllm/patches.py for this vLLM version"
+        ) from e
+
+    # output_handler: yield once per engine step. Patched on the class once per process.
+    if not getattr(AsyncMPClient, "_nrl_output_loop_yield", False):
+
+        async def get_output_async(self):
+            outputs = await original_get(self)
+            await asyncio.sleep(0)
+            return outputs
+
+        AsyncMPClient.get_output_async = get_output_async
+        AsyncMPClient._nrl_output_loop_yield = True
+
+    # Reader: yield after reader_budget_s of work; patch this socket instance only.
+    state = {"since": time.monotonic()}
+
+    async def recv_multipart(*args, **kwargs):
+        # A done future means a message was waiting; awaiting it does not yield.
+        future = original_recv(*args, **kwargs)
+        if not future.done():
+            # This receive waits, so the loop gets its turn; restart the budget.
+            frames = await future
+            state["since"] = time.monotonic()
+            return frames
+        frames = await future
+        if time.monotonic() - state["since"] >= reader_budget_s:
+            await asyncio.sleep(0)
+            state["since"] = time.monotonic()
+        return frames
+
+    socket.recv_multipart = recv_multipart
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
     Safe to call from any process that imports vLLM directly (e.g. the
     tools/model_diagnostics scripts, which construct ``vllm.LLM`` without
     going through a NeMo-RL generation worker). Must be called BEFORE the
-    first ``import vllm`` submodule that pulls in ``vllm.tool_parsers``.
+    first ``import vllm`` submodule that pulls in the patched model files.
     Worker processes get this via ``_apply_vllm_patches`` at init.
     """
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
-    _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
+    _patch_vllm_radio_native_loader(patch_logger)
+    _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
 
 
 def _apply_vllm_patches(
-    py_executable: str,
     *,
     extra_env_vars: list[str] | None = None,
-    nemotron_h_fp32_lm_head: bool | None = None,
     require_moe_routed_experts_capture: bool = False,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
-    import vllm.envs as envs
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
-    nemotron_h_fp32_lm_head_enabled = bool(nemotron_h_fp32_lm_head)
-    if nemotron_h_fp32_lm_head_enabled:
-        os.environ[VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR] = "1"
-        extra_env_vars = [
-            *(extra_env_vars or []),
-            VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
-        ]
-    else:
-        os.environ.pop(VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, None)
 
-    # Whether the v1 patch matters at all depends on which executor vLLM will
-    # select. 0.25 defaults this to "1" (RayExecutorV2), which has no
-    # _init_workers_ray; the patch is only load-bearing when it is set to "0".
-    # Reporting the same way in both cases either cries wolf or hides a real
-    # break, so branch on it.
-    uses_v1_executor = not envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
-    applied = _patch_vllm_init_workers_ray(py_executable, extra_env_vars)
-
-    if applied and uses_v1_executor:
-        patch_logger.info(
-            "Successfully patched vllm v1 _init_workers_ray; Ray workers will "
-            "launch under %s.",
-            py_executable,
-        )
-    elif applied:
-        patch_logger.info(
-            "Patched vllm v1 _init_workers_ray, but VLLM_USE_RAY_V2_EXECUTOR_"
-            "BACKEND selects RayExecutorV2, which has no such method. The "
-            "patch is inert here; workers inherit py_executable from this "
-            "actor's runtime_env instead."
-        )
-    elif uses_v1_executor:
-        patch_logger.error(
-            "vllm v1 _init_workers_ray patch did NOT apply: the "
-            "'self._init_workers_ray(placement_group)' anchor was not found, "
-            "and VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0 selects the v1 executor "
-            "that depends on it. Ray workers will launch under the wrong "
-            "interpreter. Either the anchor moved upstream, or unset "
-            "VLLM_USE_RAY_V2_EXECUTOR_BACKEND to use RayExecutorV2."
-        )
-    else:
-        patch_logger.info(
-            "vllm v1 _init_workers_ray anchor not found, which is harmless "
-            "here: RayExecutorV2 is selected and does not use it."
-        )
-
+    _forward_env_vars_to_ray_workers(extra_env_vars)
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
-    _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
+    _patch_vllm_radio_native_loader(patch_logger)
+    _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
-    if nemotron_h_fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(
-        patch_logger
-    ):
-        raise RuntimeError(
-            "vllm_cfg.fp32_lm_head is enabled, but that flag currently maps to "
-            "the Nemotron-H-only vLLM fp32 LM head source patch, and the patch "
-            "could not be applied. Disable the flag or update the patch anchors "
-            "for this vLLM version."
-        )
     _patch_vllm_moe_routed_experts_capture(
         patch_logger, required=require_moe_routed_experts_capture
     )

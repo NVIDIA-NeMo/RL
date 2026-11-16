@@ -3,6 +3,7 @@ checkpointing:
   checkpoint_dir: results/grpo-deepseek-v3-64n4g-async-1off-mxfp8-rollout
 policy:
   generation:
+    refit_transport: nccl_reshard
     vllm_cfg:
       precision: "fp8"
       is_mx: true

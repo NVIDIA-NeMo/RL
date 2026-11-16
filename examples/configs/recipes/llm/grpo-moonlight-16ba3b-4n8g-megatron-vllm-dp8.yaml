@@ -1,0 +1,9 @@
+defaults: ./grpo-moonlight-16ba3b-4n8g-megatron.yaml
+policy:
+  generation:
+    vllm_cfg:
+      expert_parallel_size: 8
+      async_engine: true
+logger:
+  wandb:
+    name: grpo-moonlight-16ba3b-4n8g-megatron-vllm-dp

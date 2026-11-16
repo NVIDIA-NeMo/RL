@@ -697,11 +697,9 @@ if [[ ! -x "\$NRL_VLLM_PY" ]]; then
   patch_status=1
 else
   PYTHONPATH=/opt/nemo-rl "\$NRL_VLLM_PY" - <<'PY' || patch_status=1
-import sys
-
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 
-_apply_vllm_patches(sys.executable)
+_apply_vllm_patches()
 
 # Verify the import that previously failed before Ray or Gym starts.
 import vllm.entrypoints.openai.api_server  # noqa: F401, E402
@@ -762,6 +760,13 @@ export SETUP_COMMAND
 # learning rate, etc.) live in CONFIG_PATH. The launcher only passes the
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
+# run_in_allocation.sh replaces this token with the gate that holds rollouts
+# until every external pool is healthy. Without external pools there is nothing
+# to gate, and ray.sub would pass the literal token to Hydra.
+EXTERNAL_SERVICE_READINESS_ARG=""
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+  EXTERNAL_SERVICE_READINESS_ARG="${EXTERNAL_SERVICE_READINESS_PLACEHOLDER}"
+fi
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 if compgen -G \"${RUN_DIR}/setup_failures/vllm_patch_*\" >/dev/null; then \
   echo '[VLLM PATCH] ERROR: setup failed on one or more nodes:' >&2; \
@@ -801,8 +806,8 @@ data.train.data_path=${TRAIN_PATH} \
 data.validation.data_path=${VAL_PATH} \
 ${GENRM_OVERRIDE:+${GENRM_OVERRIDE}} \
 ${NL2BASH_OVERRIDE:+${NL2BASH_OVERRIDE}} \
+${EXTERNAL_SERVICE_READINESS_ARG} \
 ${SAFETY_JUDGE_MODEL:+env.nemo_gym.safety_judge_model.responses_api_models.local_vllm_model.model=${SAFETY_JUDGE_MODEL}} \
-env.nemo_gym.nemo_gym_log_dir=${LOG_DIR}/nemo_gym \
 logger.log_dir=${LOG_DIR} \
 logger.wandb_enabled=${WANDB_ENABLED} \
 logger.wandb.name=${WANDB_NAME} \

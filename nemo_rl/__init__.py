@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib.metadata
 import logging
 import os
 import sys
@@ -340,13 +341,39 @@ def patch_transformers_module_dir(
 patch_transformers_module_dir(os.environ, apply_to_current_interpreter=True)
 
 
-# Transformers 5.11 and 5.12 follow cached snapshot symlinks into blobs/ while
-# hashing trust_remote_code modules. Install the version-gated upstream fix
-# before model configurations are loaded in this interpreter. Remove this
-# bootstrap after the minimum Transformers version is upgraded to 5.13.0.
+def use_per_torch_version_extension_dir(env_vars: dict[str, str]) -> None:
+    """Build torch JIT extensions in a folder of their own per torch version.
+
+    torch 2.14 leaves the build lock file in place after a build, and older torch
+    reads an existing lock file as a running build and waits on it forever. Worker
+    venvs with different torch versions would otherwise share one build folder.
+    """
+    try:
+        torch_version = importlib.metadata.version("torch")
+    except importlib.metadata.PackageNotFoundError:
+        return
+    root = env_vars.get("TORCH_EXTENSIONS_DIR") or os.path.expanduser(
+        "~/.cache/torch_extensions"
+    )
+    # A worker inherits the folder its parent chose for the parent's torch version.
+    folder = os.path.basename(root)
+    if folder.startswith("torch-") and folder[len("torch-") :][:1].isdigit():
+        root = os.path.dirname(root)
+    env_vars["TORCH_EXTENSIONS_DIR"] = os.path.join(root, f"torch-{torch_version}")
+
+
+use_per_torch_version_extension_dir(os.environ)
+
+
+# Install compatibility fixes before trust_remote_code model configurations are
+# loaded in this interpreter. The dynamic-module hashing patch is version-gated;
+# the torch-FX helper is installed only when Transformers no longer exposes it.
 from nemo_rl.transformers_compat import (  # noqa: E402
     _patch_transformers_dynamic_module_symlink_cache,
+    _patch_transformers_torch_fx_compat,
 )
 
 _patch_transformers_dynamic_module_symlink_cache()
+_patch_transformers_torch_fx_compat()
 del _patch_transformers_dynamic_module_symlink_cache
+del _patch_transformers_torch_fx_compat

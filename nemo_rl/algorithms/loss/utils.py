@@ -21,6 +21,20 @@ from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 
 
+def skips_policy_logprob_pass(
+    loss_cfg: Any, seq_logprob_error_threshold: Optional[float]
+) -> bool:
+    """Whether the separate policy-logprob forward can be skipped.
+
+    ``force_on_policy_ratio`` makes the ratio 1, so previous logprobs are only
+    needed when the sequence-logprob threshold is checked before training.
+    """
+    return bool(
+        loss_cfg.force_on_policy_ratio
+        and (seq_logprob_error_threshold is None or loss_cfg.seq_logprob_error_in_loss)
+    )
+
+
 def rescale_loss_metrics(
     metrics: dict[str, Any],
     normalizers: dict[str, MetricNormalizer],
@@ -30,19 +44,24 @@ def rescale_loss_metrics(
 ) -> dict[str, Any]:
     """Change global loss denominators while preserving raw counts and extrema.
 
-    Metrics absent from ``normalizers`` are returned unchanged. Unlike
-    split-API normalization of raw sums, this only adjusts denominators
-    explicitly advertised by the loss.
+    Every metric must be listed in ``normalizers``; an unlisted metric raises
+    instead of being rescaled by a guessed denominator.
     """
     factors = {
         MetricNormalizer.TOKENS: token_factor,
         MetricNormalizer.SEQUENCES: sequence_factor,
         MetricNormalizer.NONE: 1.0,
     }
-    return {
-        key: value * factors[normalizers[key]] if key in normalizers else value
-        for key, value in metrics.items()
-    }
+    rescaled = {}
+    for key, value in metrics.items():
+        if key not in normalizers:
+            # Guessing a denominator would log a silently wrong value.
+            raise ValueError(
+                f"Metric {key!r} is missing from the loss's metric_normalizations; "
+                "survivor rescaling needs every metric's denominator."
+            )
+        rescaled[key] = value * factors[normalizers[key]]
+    return rescaled
 
 
 def map_teacher_logits_to_draft_vocab(
@@ -360,7 +379,7 @@ def _pack_input_ids(
     cp_size: int = 1,
     roll_shift: int = 0,
 ) -> torch.Tensor:
-    """Pack input_ids from [B, S] to [1, T_packed // CP] using sequence boundaries.
+    """Pack input_ids from [B, S, ...] to [1, T_packed // CP, ...] using sequence boundaries.
 
     Each sequence is individually padded to its padded length (from
     cu_seqlens_q_padded), optionally rolled, and CP-sharded at that padded
@@ -368,7 +387,7 @@ def _pack_input_ids(
     Megatron packs and CP-shards sequences in _pack_sequences_for_megatron.
 
     Args:
-        input_ids: Unpacked input IDs [B, S].
+        input_ids: Unpacked input IDs [B, S, ...]; trailing dims are preserved.
         cu_seqlens_q: Unpadded cumulative sequence lengths [B+1].
         cu_seqlens_q_padded: Padded cumulative sequence lengths [B+1].
         cp_rank: Context parallelism rank.
@@ -380,13 +399,19 @@ def _pack_input_ids(
     batch_size = input_ids.shape[0]
     total_packed_len = cu_seqlens_q_padded[-1] // cp_size
     packed = torch.zeros(
-        total_packed_len, dtype=input_ids.dtype, device=input_ids.device
+        (total_packed_len, *input_ids.shape[2:]),
+        dtype=input_ids.dtype,
+        device=input_ids.device,
     )
     for i in range(batch_size):
         actual_len = cu_seqlens_q[i + 1] - cu_seqlens_q[i]
         padded_len = cu_seqlens_q_padded[i + 1] - cu_seqlens_q_padded[i]
         packed_start = cu_seqlens_q_padded[i]
-        seq = torch.zeros(padded_len, dtype=input_ids.dtype, device=input_ids.device)
+        seq = torch.zeros(
+            (padded_len, *input_ids.shape[2:]),
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
         # The packer absorbs bin-level alignment padding into the last
         # sequence's effective length (see _get_pack_sequence_parameters_for_megatron),
         # so cu_seqlens can exceed the unpacked row width. Copy only real

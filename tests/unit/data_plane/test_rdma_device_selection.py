@@ -35,14 +35,23 @@ def fake_fabric(monkeypatch):
     availability and the link_layer glob enumerates.
     """
 
-    def _install(layers: dict[str, str], *, uverbs: bool = True):
+    def _install(
+        layers: dict[str, str],
+        *,
+        uverbs: bool = True,
+        inactive: frozenset[str] = frozenset(),
+    ):
         def fake_glob(pattern: str):
             if pattern.startswith("/dev/infiniband/uverbs"):
                 return ["/dev/infiniband/uverbs0"] if uverbs else []
-            return [f"/sys/class/infiniband/{d}/ports/1/link_layer" for d in layers]
+            # The scan enumerates ports/1/state and reads link_layer beside it.
+            return [f"/sys/class/infiniband/{d}/ports/1/state" for d in layers]
 
         def fake_read_text(path, *args, **kwargs):
-            return layers[path.parents[2].name]
+            device = path.parents[2].name
+            if path.name == "state":
+                return "4: DOWN" if device in inactive else "4: ACTIVE"
+            return layers[device]
 
         monkeypatch.setattr(tq_env.glob, "glob", fake_glob)
         monkeypatch.setattr(tq_env.Path, "read_text", fake_read_text)
@@ -83,6 +92,23 @@ def test_prefers_infiniband_and_excludes_roce(fake_fabric):
 def test_falls_back_to_roce_only_when_no_ib(fake_fabric):
     fake_fabric({"mlx5_0": "Ethernet", "mlx5_1": "Ethernet"})
     assert tq_adapter.rdma_devices() == "mlx5_0,mlx5_1"
+
+
+def test_any_device_name_with_an_active_port_one_is_offered(fake_fabric):
+    """Selection is by port-1 state, not by an ``mlx5_*`` name.
+
+    The rails with an inactive port 1 are left out (mooncake only checks port
+    1), and non-mlx5 names such as ``rdma_vf_rail*`` are kept.
+    """
+    fake_fabric(
+        {
+            "rdma_rail0": "Ethernet",
+            "rdma_vf_rail0": "Ethernet",
+            "rdma_vf_rail1": "Ethernet",
+        },
+        inactive=frozenset({"rdma_rail0"}),
+    )
+    assert tq_adapter.rdma_devices() == "rdma_vf_rail0,rdma_vf_rail1"
 
 
 def test_every_roce_rail_is_offered(fake_fabric):
@@ -204,6 +230,53 @@ def test_not_applied_to_simple_backend(clean_env, fake_fabric):
     fake_fabric({"mlx5_0": "Ethernet"})
     tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "simple"})
     assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
+
+
+@pytest.mark.parametrize("preset", [None, "rc_x,self"])
+def test_nixl_defaults_ucx_to_rdma_only(clean_env, monkeypatch, preset):
+    """nixl refuses an unset UCX_TLS; fill an RDMA-only default, keep a launcher's."""
+    monkeypatch.delenv("UCX_TLS", raising=False)
+    monkeypatch.delenv("UCX_NET_DEVICES", raising=False)
+    if preset:
+        monkeypatch.setenv("UCX_TLS", preset)
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_TLS"] == (preset or "rc,cuda_copy,cuda_ipc,self,sm")
+    assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
+
+
+@pytest.mark.parametrize("injected", ["rc,tcp,self", "all"])
+def test_nixl_replaces_a_tcp_ucx_tls_on_the_driver(clean_env, monkeypatch, injected):
+    """A tcp-capable UCX_TLS is replaced, so no launcher setup is needed."""
+    monkeypatch.setenv("UCX_TLS", injected)
+    monkeypatch.delenv("UCX_NET_DEVICES", raising=False)
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_TLS"] == "rc,cuda_copy,cuda_ipc,self,sm"
+
+
+def test_nixl_drops_eth0_from_a_cluster_ucx_net_devices(clean_env, monkeypatch):
+    """The GB200 job env is UCX_TLS=tcp + the rails + eth0; only the rails survive."""
+    monkeypatch.setenv("UCX_TLS", "tcp")
+    monkeypatch.setenv("UCX_NET_DEVICES", "mlx5_0:1,mlx5_1:1,eth0")
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_TLS"] == "rc,cuda_copy,cuda_ipc,self,sm"
+    assert os.environ["UCX_NET_DEVICES"] == "mlx5_0:1,mlx5_1:1"
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [_mooncake_cfg(), {**_mooncake_cfg(), "backend": "nixl", "enabled": False}],
+    ids=["mooncake_cpu", "nixl-disabled"],
+)
+def test_ucx_swap_is_nixl_only(clean_env, fake_fabric, monkeypatch, cfg):
+    """Only an enabled nixl data plane rewrites UCX; nothing else touches it."""
+    from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
+
+    fake_fabric({"mlx5_0": "InfiniBand"})
+    monkeypatch.setenv("UCX_TLS", "tcp")
+    monkeypatch.setenv("UCX_NET_DEVICES", "mlx5_0:1,eth0")
+    maybe_configure_data_plane_env(cfg)
+    assert os.environ["UCX_TLS"] == "tcp"
+    assert os.environ["UCX_NET_DEVICES"] == "mlx5_0:1,eth0"
 
 
 def test_raises_when_the_engine_was_already_imported(engine_imported, fake_fabric):

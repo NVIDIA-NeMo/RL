@@ -7,7 +7,7 @@
 # Algorithmic settings track ProRLv2 (dynamic sampling, decoupled clipping,
 # token-level loss, REINFORCE++, ICE-POP TIS, etc.) since the on-policy
 # variants are what makes long-horizon QA training stable. See
-# ``examples/configs/prorlv2.yaml`` for the canonical (DTensor) ProRLv2
+# ``examples/configs/prorlv2.v2.yaml`` for the canonical (Automodel) ProRLv2
 # config; this file inlines the same settings on top of the Megatron 8B
 # base because NeMo-RL configs use single-defaults inheritance.
 #
@@ -24,7 +24,7 @@
 defaults: "../configs/grpo_math_8B_megatron.yaml"
 
 # ============================================================================
-# ProRLv2 algorithmic settings (mirrored from examples/configs/prorlv2.yaml)
+# ProRLv2 algorithmic settings (mirrored from examples/configs/prorlv2.v2.yaml)
 # ============================================================================
 grpo:
   # Smaller rollout volume than the 8B base (64×32) to keep this example

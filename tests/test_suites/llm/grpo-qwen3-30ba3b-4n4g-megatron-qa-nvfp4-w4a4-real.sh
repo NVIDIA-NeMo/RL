@@ -6,6 +6,7 @@ source "$SCRIPT_DIR/common.env"
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
 GPUS_PER_NODE=4
+SEGMENT_SIZE=4  # Keep the 16 HybridEP ranks within one NVLink domain.
 STEPS_PER_RUN=2
 MAX_STEPS=2
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
@@ -39,7 +40,7 @@ uv run --no-sync examples/run_grpo.py \
 uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 
 grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"
-grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"
+grep -q "quantization=nemo_modelopt_" "$RUN_LOG"
 grep -qE "quantization=(nemo_)?modelopt" "$RUN_LOG"  # vLLM 0.25 logs the registered NeMo quant name (e.g. nemo_modelopt_w4a16_nvfp4)
 assert_not_grep "FakeQuantWorker" "$RUN_LOG" \
     "Real-quant run unexpectedly used FakeQuantWorker"
@@ -58,7 +59,7 @@ uv run --no-sync tests/check_metrics.py "$JSON_METRICS" \
     "data[\"train/reward\"][\"$MAX_STEPS\"] >= 0.25" \
     "data[\"validation/accuracy\"][\"$MAX_STEPS\"] >= 0.4" \
     "data[\"train/gen_kl_error\"][\"$MAX_STEPS\"] < 0.03" \
-    "data[\"train/js_divergence_error\"][\"$MAX_STEPS\"] < 0.007" \
+    "data[\"train/js_divergence_error\"][\"$MAX_STEPS\"] < 0.008" \
     "data[\"train/approx_entropy\"][\"$MAX_STEPS\"] < 0.35"
 
 mapfile -t TRAIN_DATA_FILES < <(

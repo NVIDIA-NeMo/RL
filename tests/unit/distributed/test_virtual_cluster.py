@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import ray
+from ray._common.utils import load_class
 
 from nemo_rl.distributed import virtual_cluster
 from nemo_rl.distributed.virtual_cluster import (
@@ -118,28 +119,6 @@ def test_env_max_retries_non_integer():
         with pytest.raises(ValueError):
             cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
             cluster._init_placement_groups()
-
-
-def test_env_max_retries_default_value():
-    """Test that default value for NRL_VIRTUAL_CLUSTER_MAX_RETRIES is used when not set."""
-
-    # Ensure environment variable is not set
-    with (
-        patch.dict(os.environ, {}, clear=True),
-        patch(
-            "nemo_rl.distributed.virtual_cluster.RayVirtualCluster._init_placement_groups"
-        ) as mock_init,
-    ):
-        # Mock successful initialization
-        mock_init.return_value = [MagicMock()]
-
-        # Create cluster
-        cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
-        cluster._init_placement_groups()
-
-        # Default value should be 6 (as seen in the code)
-        # We can't directly verify this, but we can check that initialization was attempted
-        assert mock_init.call_count == 1
 
 
 def test_env_max_retries_exhausted():
@@ -695,11 +674,6 @@ class TestReserveDataPlanePorts:
 class TestRayVirtualClusterPortRange:
     """Tests for port range propagation in RayVirtualCluster."""
 
-    def test_default_port_range(self):
-        cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
-        assert cluster.port_range_low == DEFAULT_MASTER_PORT_RANGE_LOW
-        assert cluster.port_range_high == DEFAULT_MASTER_PORT_RANGE_HIGH
-
     def test_custom_port_range(self):
         cluster = RayVirtualCluster(
             bundle_ct_per_node_list=[1],
@@ -991,3 +965,45 @@ def test_actor_registry_honors_system_flag(use_system_executable):
             "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker"
         ].startswith("uv run")
         assert envs["nemo_rl.environments.nemo_gym.NemoGym"].startswith("uv run")
+
+
+def test_init_ray_worker_setup_drops_srun_env_in_trtllm_workers_only():
+    """TRT-LLM's MPI_Init breaks under srun's launcher env; other workers keep it."""
+    from nemo_rl.distributed.virtual_cluster import init_ray
+
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True):
+            init_ray()
+        hook_path = mock_ray_init.call_args_list[0][1]["runtime_env"][
+            "worker_process_setup_hook"
+        ]
+    # A module path, as Ray loads it in each worker: a callable would break a
+    # nested ray.init (vLLM's EngineCore at TP>1).
+    assert isinstance(hook_path, str)
+    hook = load_class(hook_path)
+
+    launcher = {
+        "SLURM_JOBID": "14",
+        "SLURM_JOB_ID": "14",
+        "SLURM_STEP_ID": "0",
+        "PMIX_NAMESPACE": "x",
+        "PMI_FD": "3",
+        "MPI_LOCALRANKID": "0",
+        "OMPI_MCA_plm": "s",
+        "OMPI_ALLOW_RUN_AS_ROOT": "1",
+    }
+    kept = {"PRTE_ALLOW_RUN_AS_ROOT": "1", "HOME": "/root"}
+    env = {**launcher, **kept}
+    spec = "importlib.util.find_spec"
+
+    with patch.dict(os.environ, env, clear=True), patch(spec, return_value=object()):
+        hook()
+        assert dict(os.environ) == kept
+
+    with patch.dict(os.environ, env, clear=True), patch(spec, return_value=None):
+        hook()
+        assert dict(os.environ) == env

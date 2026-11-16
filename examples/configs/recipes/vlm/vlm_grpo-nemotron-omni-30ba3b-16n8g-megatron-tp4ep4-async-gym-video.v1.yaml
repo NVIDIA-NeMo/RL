@@ -9,6 +9,7 @@ grpo:
   async_grpo:
     enabled: true
     in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
 policy:
   model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
   is_vlm: true
@@ -111,5 +112,11 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/mcqa/configs/mcqa.yaml
+    # Drop inherited wrappers for environments omitted from this recipe.
+    math_with_judge_environment_server: null
+    code_gen_environment_server: null
+    workplace_assistant_environment_server: null
+    instruction_following_environment_server: null
+    structured_outputs_environment_server: null
 cluster:
   num_nodes: 16

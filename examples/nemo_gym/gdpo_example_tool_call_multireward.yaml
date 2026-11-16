@@ -37,6 +37,17 @@ env:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/example_tool_call_multireward/configs/example_tool_call_multireward.yaml
 
+    # Drop the inherited wrapper for the replaced environment.
+    workplace_assistant_environment_server: null
+    # Use legacy agent orchestration.
+    example_tool_call_multireward_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: example_tool_call_multireward_simple_agent
+
 logger:
   wandb:
     project: "gdpo-dev"

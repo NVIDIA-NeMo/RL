@@ -42,7 +42,8 @@ an actor are converted to a picklable member of this taxonomy *before* they cros
 from __future__ import annotations
 
 import enum
-from typing import Final, Optional
+from dataclasses import dataclass
+from typing import Any, Final, Optional
 
 import ray.exceptions
 
@@ -109,11 +110,62 @@ class GymTransportError(RolloutInfraFailure):
     """NeMo-Gym failed at the transport layer rather than returning a rollout."""
 
 
+class GymAdmissionClosed(RolloutInfraFailure):
+    """NeMo-Gym refused a new ``/run`` because a checkpoint has admission closed.
+
+    Gym refuses before it records anything for the episode, so the attempt is
+    unwound and re-dispatched once dispatch admission reopens. The NemoGym actor
+    yields it per row instead of raising, so rows Gym did admit keep streaming.
+    It is INFRA only as a fallback: a caller without a dispatch recorder that
+    raises it retries the row instead of charging the prompt a data failure.
+    """
+
+    def __init__(
+        self,
+        detail: str,
+        rowidx: int,
+        timing_metrics: Optional[dict[str, Any]] = None,
+    ) -> None:
+        # Every value rides in ``args`` so the exception pickles across Ray.
+        super().__init__(detail, rowidx, timing_metrics)
+        self.detail = detail
+        self.rowidx = rowidx
+        # The ``/run`` timing, when this refusal was the run's last row.
+        self.timing_metrics = timing_metrics
+
+    def __str__(self) -> str:
+        return self.detail
+
+
+@dataclass(frozen=True)
+class GymRowFailure:
+    """One row whose Gym ``/run`` failed, yielded so the rest of its stream continues.
+
+    The NemoGym actor yields this instead of raising: a raise ends the stream
+    for every row of the dispatch, while their ``/run``s keep going in Gym, and
+    the caller would then re-send rows that are still running.
+    """
+
+    rowidx: int
+    error: Exception
+    # The ``/run`` timing, when this failure was the run's last row.
+    timing_metrics: Optional[dict[str, Any]] = None
+
+
 class RolloutDataFailure(RolloutFailure):
     """This prompt cannot be rolled out, and another shard would fail identically.
 
     Usually a configuration problem — most often ``policy.max_total_sequence_length``
     exceeding the generation engine's ``max_model_len``.
+    """
+
+
+class GymTerminalEpisodeFailure(RolloutDataFailure):
+    """An Environment Server forbids retrying this episode.
+
+    Kept as a plain exception with a message so its type survives the Ray actor
+    boundary. Unlike ordinary data failures, it exhausts the retry budget on the
+    first attempt, following the configured prompt skip or fail policy.
     """
 
 
@@ -233,6 +285,33 @@ def _is_infra(exc: BaseException) -> bool:
     return any(cls.__name__ in _INFRA_TYPE_NAMES for cls in type(exc).__mro__)
 
 
+def is_terminal_gym_episode_failure(exc: BaseException) -> bool:
+    """Find a terminal episode failure through Ray, cause, and group wrappers.
+
+    A failed sibling prohibits retrying the complete prompt group even when
+    another sibling reports an infrastructure failure. Follow explicit causes
+    only, not incidental exception contexts, and bound traversal of cause chains.
+    """
+    pending = [(exc, 0)]
+    seen: set[int] = set()
+    while pending:
+        current, depth = pending.pop()
+        if id(current) in seen or depth >= _MAX_CAUSE_DEPTH:
+            continue
+        seen.add(id(current))
+        if isinstance(current, GymTerminalEpisodeFailure):
+            return True
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend((nested, depth + 1) for nested in current.exceptions)
+        if isinstance(current, ray.exceptions.RayTaskError) and isinstance(
+            current.cause, BaseException
+        ):
+            pending.append((current.cause, depth + 1))
+        if current.__cause__ is not None:
+            pending.append((current.__cause__, depth + 1))
+    return False
+
+
 def classify_rollout_failure(exc: BaseException) -> FailureClass:
     """Bucket a rollout exception into ``INFRA`` or ``DATA``.
 
@@ -248,7 +327,7 @@ def classify_rollout_failure(exc: BaseException) -> FailureClass:
     Returns:
         The :class:`FailureClass` governing this failure's retry budget.
     """
-    if isinstance(exc, RolloutDataFailure):
+    if isinstance(exc, RolloutDataFailure) or is_terminal_gym_episode_failure(exc):
         return FailureClass.DATA
 
     seen: set[int] = set()

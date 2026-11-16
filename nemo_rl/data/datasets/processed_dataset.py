@@ -43,7 +43,8 @@ class AllTaskProcessedDataset:
         task_data_processors: Either a single TaskDataProcessFnCallable for single-task,
             or a dict mapping task names to (TaskDataSpec, TaskDataProcessFnCallable) for multi-task
         max_seq_length: Maximum sequence length for tokenized outputs
-        agent_name_sources: Stable NeMo Gym source identities used by sharded validation.
+        agent_name_sources: Stable NeMo Gym source identities the setup-time agent
+            coverage check reads instead of scanning rows.
     """
 
     def __init__(

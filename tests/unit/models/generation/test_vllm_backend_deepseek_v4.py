@@ -68,6 +68,8 @@ async def test_checkpoint_engine_refit_guard(monkeypatch, model_type, fp8_enable
     model = torch.nn.Module()
     model.config = SimpleNamespace(model_type=model_type)
     ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    ext.model_config = object()
+    ext.device = "cpu"
     ext._uses_unquantized_flashinfer_trtllm = lambda: False
     ext._maybe_process_fp8_kv_cache = lambda: None
 
@@ -78,6 +80,10 @@ async def test_checkpoint_engine_refit_guard(monkeypatch, model_type, fp8_enable
     receiver = Mock(side_effect=empty_batches)
     ext.checkpoint_engine = SimpleNamespace(receive_weight_batches=receiver)
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: fp8_enabled)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        lambda *_args: None,
+    )
 
     if model_type == "deepseek_v4" and fp8_enabled:
         with pytest.raises(RuntimeError, match="checkpoint-engine.*DeepSeek V4 FP8"):
@@ -104,6 +110,26 @@ def test_deepseek_v4_fp8_selects_supported_native_refit(monkeypatch, transport):
 
     assert ext._uses_native_layerwise_refit(transport)
     ext._validate_native_layerwise_refit(transport)
+
+
+def test_deepseek_v4_fp8_rejects_nccl_reshard_refit(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(model_type="deepseek_v4")
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    ext._uses_unquantized_flashinfer_trtllm = lambda: False
+    ext._get_mxfp8_linear_reload_roots = lambda: ()
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
+
+    assert ext._uses_deepseek_v4_fp8_refit()
+    assert not ext._uses_native_layerwise_refit("nccl_reshard")
+    with pytest.raises(RuntimeError, match="nccl-reshard.*DeepSeek V4 FP8"):
+        ext._validate_native_layerwise_refit("nccl_reshard")
 
 
 def test_weight_update_lifecycle_uses_layerwise_reload_for_deepseek_v4_fp8(
@@ -264,9 +290,9 @@ def test_deepseek_v4_context_entry_failure_preserves_original_error(
     monkeypatch.setattr(
         vllm.config,
         "set_current_vllm_config",
-        lambda _config: FailingContext()
-        if context_name == "config"
-        else contextlib.nullcontext(),
+        lambda _config: (
+            FailingContext() if context_name == "config" else contextlib.nullcontext()
+        ),
     )
     if context_name == "device":
         monkeypatch.setattr(
@@ -338,5 +364,4 @@ def test_weight_update_lifecycle_keeps_full_post_load_for_non_deepseek_models(
         ("stream", None),
         ("post_load", None),
         ("mtp", None),
-        ("kv", None),
     ]
