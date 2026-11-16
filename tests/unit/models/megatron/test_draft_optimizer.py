@@ -39,6 +39,7 @@ from nemo_rl.models.megatron.draft.utils import DRAFT_GRAD_NORM_GROUP
 from nemo_rl.models.policy.draft_config import (
     DraftOptimizerConfig,
     Eagle3DraftConfig,
+    LiLiCorrDraftConfig,
 )
 
 pytestmark = pytest.mark.mcore
@@ -280,3 +281,17 @@ def test_draft_lr_override_produces_finite_stable_toy_updates() -> None:
     assert override_losses[-1] < override_losses[0]
     assert override_policy == baseline_policy
     assert override_draft > baseline_draft
+
+
+def test_lilicorr_learning_rate_sets_the_draft_param_group_lr() -> None:
+    draft_parameter = torch.nn.Parameter(torch.ones(2, 2))
+    draft_parameter.grad_norm_group = DRAFT_GRAD_NORM_GROUP
+    provider = build_draft_optimizer_override_provider(
+        LiLiCorrDraftConfig(enabled=True, learning_rate=5.0e-5)
+    )
+    assert provider is not None
+
+    overrides = _combined_overrides_for_parameter(
+        provider, draft_parameter, "draft_model.body.fc.weight", policy_min_lr=0.0
+    )
+    assert overrides["max_lr"] == pytest.approx(5.0e-5)
