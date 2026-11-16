@@ -1020,6 +1020,9 @@ def test_reset_prefix_cache_returns_engine_bool(
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
     worker.cfg = {"vllm_cfg": {"async_engine": False}}
     worker.llm = MagicMock()
+    # vLLM 0.33 drains engine_core.batch_queue before the reset. An empty queue
+    # keeps that drain a no-op so the test still checks the returned bool.
+    worker.llm.llm_engine.engine_core.engine_core.batch_queue = []
     worker.llm.llm_engine.reset_prefix_cache.return_value = engine_result
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_worker.torch.cuda.empty_cache",
