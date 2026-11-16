@@ -34,7 +34,10 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
     SamplerConfig,
+    require_drop_accounting_members,
     required_buffer_capacity_for_config,
+    sampler_requires_single_weight_batch,
+    sampler_uses_pooled_replacements,
 )
 from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
@@ -142,8 +145,9 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     absorbed, one that does not stops the run.
 
     Once a prompt has been given up on, ``on_dropped_prompt`` decides what happens to
-    the training step it was stamped for: train the step on fewer groups, or substitute
-    a fresh prompt so the step keeps its configured batch size.
+    the training step it is charged to (the step it was stamped for, or the step being
+    assembled when the sampler stamps none): train the step on fewer groups, or
+    substitute a fresh prompt so the step keeps its configured batch size.
     """
 
     # ── shared: consumed by generate_and_push, above the impl split ──
@@ -198,10 +202,10 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     # and should not be treated like losing 1 of 128. The floor is ceil(fraction * N),
     # so at the default a batch of 8 or fewer tolerates no drops at all.
     min_step_batch_fraction: Annotated[float, Field(gt=0.0, le=1.0)] = 0.9
-    # What becomes of the training step a given-up prompt was stamped for. Only stamped
-    # prompts are affected: with a sampler that does not stamp (WeightFifoSampler,
-    # whose admit returns None) a step fills from whatever is ready, so a drop costs
-    # throughput but strands nothing and there is nothing to substitute for.
+    # What becomes of the training step a given-up prompt is charged to: the step it was
+    # stamped for under in_order, the step being assembled under ready_first, and none
+    # under windowed (its rollout keeps producing, so later groups make up for it).
+    # weight_fifo cannot honour a drop at all, so a nonzero budget is rejected for it.
     #
     # "shrink" (the default, and the behaviour before this knob existed) closes the step
     # on fewer groups, bounded by min_step_batch_fraction above.
@@ -528,6 +532,13 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     recompute_kv_cache_after_weight_updates: bool = True
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
+    # Max groups the streaming trainer dispatches in one chunk. ``None`` leaves
+    # chunks unbounded, so a buffer that is already warm hands the whole step
+    # over at once and the trainers and advantage stage materialize a step's
+    # worth of rows together. A cap bounds that peak: the chunk is what gets
+    # sharded to the DP ranks and what the advantage stage fetches, so it is
+    # what decides host-memory high-water mark on a generation-bound run.
+    max_groups_for_streaming_train: Optional[int] = None
     # Cap on in-flight generate_and_push calls in the rollout pump.
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
@@ -572,6 +583,32 @@ class AsyncRLConfig(BaseModel, extra="allow"):
             raise ValueError(
                 "async_rl blocks have been renamed to say what they watch or route:\n"
                 + "\n".join(stale)
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_streaming_chunk_bounds(self) -> "AsyncRLConfig":
+        """The chunk cap must leave room for the floor it is capping.
+
+        ``_train_pump`` clamps the floor down to the cap so a short tail chunk can
+        still close the step. Set the cap below the floor and that clamp fires on
+        *every* chunk, so the configured floor never applies and the run streams at
+        the cap instead -- the floor becomes dead config rather than a bound.
+        """
+        max_groups = self.max_groups_for_streaming_train
+        if max_groups is None:
+            return self
+        if max_groups < 1:
+            raise ValueError(
+                f"async_rl.max_groups_for_streaming_train ({max_groups}) must be >= 1"
+            )
+        if max_groups < self.min_groups_for_streaming_train:
+            raise ValueError(
+                "async_rl.max_groups_for_streaming_train "
+                f"({max_groups}) must be >= "
+                "async_rl.min_groups_for_streaming_train "
+                f"({self.min_groups_for_streaming_train}): the cap would clamp the "
+                "floor on every chunk, leaving the floor with no effect."
             )
         return self
 
@@ -1224,16 +1261,10 @@ def _validate_failure_settings(
     ``on_dropped_prompt="replace"`` unable to ever produce a replacement. These are the
     combinations it cannot see, because each depends on a field outside that block.
 
-    Warnings rather than errors for most of them, deliberately: a strict "never train a
-    short batch" run, one base YAML whose sampler is overridden per experiment, a
-    deliberately deep spare pool are all coherent things to have typed, so rejecting
-    them would forbid configurations somebody wants. What is not acceptable is finding
-    out hours into a run, or not at all.
-
-    The exception, and the only hard error here, is a drop budget under a sampler that
-    stamps no target step. That one is not a knob cancelling itself out; it converts a
-    recoverable prompt failure into a stalled run, so there is no configuration it
-    could be the intent of.
+    Most checks warn rather than raise: strict full batches, per-experiment sampler
+    overrides, and deep spare pools can be intentional. A nonzero drop budget
+    requires a boolean class declaration of the sampler's single-weight requirement
+    and rejects policies that need a complete single-weight batch.
     """
     failure_config = async_config.rollout_failure
     drop_budget = (
@@ -1241,46 +1272,32 @@ def _validate_failure_settings(
         + failure_config.max_consecutive_dropped_prompts
     )
     floor = math.ceil(num_prompts_per_step * failure_config.min_step_batch_fraction)
-    # InOrderSampler is the only built-in that stamps a target step, and only a
-    # stamped step can be credited short, so for the others the floor is unreachable
-    # and the spare pool is never filled. A "custom" sampler may or may not stamp,
-    # which is why it is in neither set -- a warning nobody can act on is noise.
-    #
-    # Named by exclusion rather than by list so that a sampler added later is guarded
-    # by default instead of silently exempt: every built-in but InOrderSampler leaves
-    # _GatedSampler._stamp returning None, and ready_first (#3582) landed doing exactly
-    # that after this check was first written.
+    # Only samplers that charge a drop to a step get the floor warning below.
     sampler_name = async_config.sampler.name
-    sampler_stamps = sampler_name == "in_order"
-    sampler_never_stamps = sampler_name not in ("in_order", "custom")
+    sampler_charges_drops_to_steps = sampler_name in (
+        "in_order",
+        "ready_first",
+        "weight_fifo",
+    )
 
-    # A budget that permits drops is worse than inert under an unstamped sampler: the
-    # prompt is still given up on, but _credit_shortfall has no step to charge it to,
-    # so the step's target never falls and the train pump waits on a group nobody is
-    # generating. How that ends depends on the sampler. Under weight_fifo the wait never
-    # does: the same gate that stops the rollout pump running ahead also stops it
-    # reaching exhaustion, so the "rollout exhausted" error never fires and the run
-    # holds its GPUs until the wall clock kills it. Under windowed and ready_first the
-    # shortfall instead migrates from batch to batch until the last one, which has none
-    # left to borrow from, and the run dies there hours in. A zero budget is exempt: no
-    # drop is tolerated at all then, so nothing reaches the shortfall path and the
-    # warnings below are the right register.
-    if sampler_never_stamps and drop_budget:
+    # Replacements may use newer weights, leaving the original weight bucket short.
+    if drop_budget and sampler_requires_single_weight_batch(async_config.sampler):
         raise ValueError(
-            f"async_rl.sampler.name={sampler_name!r} stamps no target step, so the drop "
-            f"budget (max_skipped_prompts={failure_config.max_skipped_prompts}, "
+            f"async_rl.sampler.name={sampler_name!r} cannot honour the drop budget "
+            f"(max_skipped_prompts={failure_config.max_skipped_prompts}, "
             f"max_consecutive_dropped_prompts="
-            f"{failure_config.max_consecutive_dropped_prompts}) cannot be honoured: a "
-            "prompt that is given up on is never subtracted from the step waiting for "
-            "it, so that step waits on a group no one is generating -- ending the run "
-            "at its final step, or stalling it outright with no error at all. Set "
-            "async_rl.sampler.name='in_order' to get the tolerance these budgets "
-            "promise, or set both budgets to 0 to end the run on the first dropped "
-            "prompt instead."
+            f"{failure_config.max_consecutive_dropped_prompts}): it builds each step "
+            "only from groups generated under one weight version, so a lost group can "
+            "be neither reliably replaced (its replacement is dispatched later, and "
+            "lands in a newer weight's bucket unless the trainer has not moved since) "
+            "nor charged to a step, and the step waits on a group no one is "
+            "generating. Set async_rl.sampler.name to 'in_order' or "
+            "'ready_first', or set both budgets to 0 to end the run on the first "
+            "dropped prompt instead."
         )
 
     if (
-        sampler_stamps
+        sampler_charges_drops_to_steps
         and drop_budget
         and floor >= num_prompts_per_step
         and failure_config.on_dropped_prompt == "shrink"
@@ -1298,13 +1315,14 @@ def _validate_failure_settings(
             stacklevel=2,
         )
 
-    if failure_config.on_dropped_prompt == "replace" and sampler_never_stamps:
+    if (
+        failure_config.on_dropped_prompt == "replace"
+        and not sampler_uses_pooled_replacements(async_config.sampler)
+    ):
         warnings.warn(
-            f"async_rl.rollout_failure.on_dropped_prompt='replace' does nothing with "
-            f"the {sampler_name} sampler: it does not stamp a target step, so no step "
-            "is ever left short, the spare pool is never filled, and every drop "
-            "behaves as 'shrink'. replaced_prompt_groups will stay at 0 whether or "
-            "not anything failed.",
+            "async_rl.rollout_failure.on_dropped_prompt='replace' does nothing "
+            "with this sampler: it does not use a spare pool. "
+            "replaced_prompt_groups will stay at 0 whether or not anything failed.",
             stacklevel=2,
         )
 
@@ -1552,6 +1570,14 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             )
         # Reached only for GRPO (PPO is rejected above); name the key accordingly.
         algo_prefix = "grpo"
+        if sampler_requires_single_weight_batch(async_config.sampler):
+            raise ValueError(
+                "grpo.use_dynamic_sampling cannot be combined with "
+                f"async_rl.sampler.name={async_config.sampler.name!r}: the resolved sampler "
+                "requires a complete batch from one weight version. Replacements can carry a newer "
+                "weight version and leave the oldest bucket permanently short. "
+                "Use 'in_order', 'ready_first', or 'windowed'."
+            )
         grpo_cfg = cast(GRPOConfig, algo_cfg)
         if grpo_cfg.adv_estimator.name != "grpo":
             raise ValueError(
@@ -1570,17 +1596,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 f"{algo_prefix}.use_dynamic_sampling is set (got "
                 f"{grpo_cfg.dynamic_sampling_max_gen_batches}): a step needs at least "
                 "the batch it was admitted with."
-            )
-        # By name: neither the stamping nor the interruptible admission wait this
-        # needs is knowable for a `custom` class at setup. #4784 reopens it.
-        if async_config.sampler.name != "in_order":
-            raise ValueError(
-                f"{algo_prefix}.use_dynamic_sampling requires "
-                "async_rl.sampler.name='in_order', but got "
-                f"'{async_config.sampler.name}': a filtered group is charged to the "
-                "target step the sampler stamps, and the spare pool is refilled while "
-                "the pump waits to admit, neither of which the other samplers "
-                "support yet."
             )
         if algo_cfg.num_generations_per_prompt < 2:
             raise ValueError(
@@ -1702,8 +1717,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
     if (
         getattr(algo_cfg, "policy_training_start_step", 0) > 0
-        and master_config.checkpointing["enabled"]
-        and master_config.checkpointing["save_optimizer"]
+        and master_config.checkpointing.enabled
+        and master_config.checkpointing.save_optimizer
         and policy_megatron_cfg is not None
         and policy_megatron_cfg.get("enabled")
         and cast(MegatronConfig, policy_megatron_cfg)
@@ -1739,6 +1754,30 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
 
+def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
+    """Samples a dispatch must be a multiple of to split cleanly on this consumer.
+
+    A dispatch is split twice: once across the DP ranks, and then on the static
+    batching path again inside each rank by the train and logprob microbatch
+    sizes. Packed and dynamically batched consumers form their own microbatches,
+    so for them only the DP split applies.
+
+    Args:
+        config: Policy or value configuration of the consuming trainer.
+        dp_size: Data-parallel size of that trainer.
+
+    Returns:
+        The sample count both splits divide.
+    """
+    if config["dynamic_batching"]["enabled"] or (
+        config.get("sequence_packing") and config["sequence_packing"]["enabled"]
+    ):
+        return dp_size
+    train_micro_batch_size = config["train_micro_batch_size"]
+    logprob_batch_size = config.get("logprob_batch_size") or train_micro_batch_size
+    return dp_size * math.lcm(train_micro_batch_size, logprob_batch_size)
+
+
 def resolve_ppo_chunk_alignment(
     master_config: MasterConfig, policy_dp: int, value_dp: int
 ) -> tuple[int, int]:
@@ -1748,15 +1787,6 @@ def resolve_ppo_chunk_alignment(
     value_config = master_config.value
     if value_config is None:
         raise ValueError("PPO requires a value model configuration")
-
-    def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
-        if config["dynamic_batching"]["enabled"] or (
-            config.get("sequence_packing") and config["sequence_packing"]["enabled"]
-        ):
-            return dp_size
-        train_micro_batch_size = config["train_micro_batch_size"]
-        logprob_batch_size = config.get("logprob_batch_size") or train_micro_batch_size
-        return dp_size * math.lcm(train_micro_batch_size, logprob_batch_size)
 
     sample_alignment = math.lcm(
         sample_multiple(master_config.policy, policy_dp),
@@ -1779,10 +1809,73 @@ def resolve_ppo_chunk_alignment(
             f"policy/value group multiple ({group_multiple}) so each chunk "
             "contains complete microbatches on every DP rank"
         )
+    # Tail-aware selection refuses an unaligned max, and only a binding cap can
+    # produce one: the uncapped max is the already-aligned step remainder.
+    chunk_cap = master_config.async_rl.max_groups_for_streaming_train
+    if (
+        chunk_cap is not None
+        and chunk_cap < ppo_config.num_prompts_per_step
+        and chunk_cap % group_multiple != 0
+    ):
+        raise ValueError(
+            "PPO max_groups_for_streaming_train must be divisible by the "
+            f"policy/value group multiple ({group_multiple}) so each capped "
+            "chunk contains complete microbatches on every DP rank"
+        )
     min_remaining_groups = (
         (min_groups + 1) // 2 if min_groups < ppo_config.num_prompts_per_step else 0
     )
     return group_multiple, min_remaining_groups
+
+
+def validate_grpo_chunk_cap_alignment(
+    master_config: MasterConfig, policy_dp: int
+) -> None:
+    """Reject a GRPO chunk cap whose samples cannot split across the policy.
+
+    GRPO passes no ``group_multiple`` to the sampler, so a chunk can be any size
+    from the floor up to the cap, and the training dispatch shards it without
+    ``allow_uneven_shards``. The chunk therefore has to satisfy the same
+    ``sample_multiple`` PPO aligns to: the DP split, and under static batching the
+    microbatch split inside each rank as well. This guards the full-cap chunk
+    only: a cap of 3 at 2 generations per prompt is 6 samples, which fails on a
+    DP of 4. An unaligned chunk below the cap stays reachable, as it already is
+    from an unaligned ``min_groups_for_streaming_train``, which no validator
+    covers today.
+
+    Only a cap below ``num_prompts_per_step`` can bind, and Forest is exempt: its
+    producer pads each group to the policy execution row multiple, so the logical
+    group count is not the physical row count.
+
+    Args:
+        master_config: The run configuration.
+        policy_dp: Data-parallel size of the policy trainer.
+
+    Raises:
+        ValueError: The capped chunk's sample count is not a multiple of the
+            policy's ``sample_multiple``.
+    """
+    if is_ppo_run(master_config):
+        return
+    chunk_cap = master_config.async_rl.max_groups_for_streaming_train
+    algo_cfg = algo_config(master_config)
+    if (
+        master_config.token_capture.forest_training
+        or chunk_cap is None
+        or chunk_cap >= algo_cfg.num_prompts_per_step
+    ):
+        return
+    chunk_multiple = sample_multiple(master_config.policy, policy_dp)
+    if (chunk_cap * algo_cfg.num_generations_per_prompt) % chunk_multiple != 0:
+        raise ValueError(
+            "GRPO async_rl.max_groups_for_streaming_train "
+            f"({chunk_cap}) x num_generations_per_prompt "
+            f"({algo_cfg.num_generations_per_prompt}) must be divisible by "
+            f"{chunk_multiple} -- the policy data-parallel size ({policy_dp}), "
+            "times the train/logprob microbatch multiple when sequence packing "
+            "and dynamic batching are both off -- so each capped chunk shards "
+            "evenly across the training ranks and into complete microbatches"
+        )
 
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
@@ -1814,6 +1907,10 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+
+    # The sampler's drop-accounting members are read on the async SC path regardless
+    # of dynamic sampling, so a custom sampler missing one must fail validation here.
+    require_drop_accounting_members(async_config.sampler)
 
     if async_config.defer_async_checkpoint_finalize:
         megatron_cfg = master_config.policy.get("megatron_cfg")
@@ -2023,9 +2120,9 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     # Top-k retention keys off checkpointing.metric_name, but SC has no
     # validation loop yet (see _save_checkpoint), so a "val:" metric would
     # never be collected and top-k would silently degrade to a no-op.
-    metric_name = master_config.checkpointing["metric_name"]
+    metric_name = master_config.checkpointing.metric_name
     if (
-        master_config.checkpointing["enabled"]
+        master_config.checkpointing.enabled
         and metric_name is not None
         and not metric_name.startswith("train:")
     ):

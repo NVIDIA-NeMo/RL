@@ -124,7 +124,7 @@ def test_generic_launchers_reject_nemo_gym_configs(
         env={"should_use_nemo_gym": use_nemo_gym},
         data_plane=None,
         logger=SimpleNamespace(log_dir="logs"),
-        checkpointing={"enabled": False},
+        checkpointing=SimpleNamespace(enabled=False),
     )
     common_fakes = {
         "register_omegaconf_resolvers": lambda: None,
