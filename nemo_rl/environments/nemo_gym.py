@@ -288,6 +288,19 @@ def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
     )
 
 
+def _rollout_id_from_rl_group(row: Mapping[str, Any]) -> str:
+    """Return the Gym rollout id of a row stamped with RL group coordinates.
+
+    Sync training and validation carry RL group coordinates instead of Gym task
+    indices. The id includes the retry attempt without using Gym's reserved
+    ``-a<N>`` suffix.
+    """
+    return (
+        f"{row[NEMO_GYM_GROUP_ID_KEY]}-g{row[NEMO_GYM_ROLLOUT_INDEX_KEY]}"
+        f"-t{row[NEMO_GYM_GROUP_ATTEMPT_KEY]}"
+    )
+
+
 def _prepare_materialized_nemo_gym_rows(
     rows: list[dict],
     environment_server_routes: Mapping[str, str],
@@ -309,13 +322,7 @@ def _prepare_materialized_nemo_gym_rows(
         server_name = get_nemo_gym_route_name(row, environment_server_routes)
         row["_ng_environment_server"] = server_name
         if maybe_rollout_id_from_run_body(row) is None:
-            # Sync training and validation carry RL group coordinates instead
-            # of Gym task indices. Include the retry attempt without using
-            # Gym's reserved '-a<N>' suffix.
-            row[_NG_ROLLOUT_ID_BODY_KEY] = (
-                f"{row[NEMO_GYM_GROUP_ID_KEY]}-g{row[NEMO_GYM_ROLLOUT_INDEX_KEY]}"
-                f"-t{row[NEMO_GYM_GROUP_ATTEMPT_KEY]}"
-            )
+            row[_NG_ROLLOUT_ID_BODY_KEY] = _rollout_id_from_rl_group(row)
 
 
 def _require_nemo_gym_response_without_capture(
