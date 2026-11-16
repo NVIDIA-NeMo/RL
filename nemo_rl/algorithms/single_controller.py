@@ -51,7 +51,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import replace
 from functools import cached_property, partial
 from pathlib import Path
@@ -185,6 +185,7 @@ from nemo_rl.environments.checkpointing import build_environment_checkpoint
 from nemo_rl.environments.checkpointing.interfaces import (
     EnvironmentCheckpoint,
 )
+from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import NemoGymShardSet, should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
@@ -4507,7 +4508,12 @@ class SingleControllerActor:
         only NeMo-Gym has subprocess servers to lose.
         """
         problems: list[str] = []
-        for env_name, handle in self._env_handles.items():
+        # Setup stores the NeMo-Gym shard set among the handles, which their annotation
+        # does not say.
+        handles: Mapping[str, EnvironmentInterface | NemoGymShardSet] = (
+            self._env_handles
+        )
+        for env_name, handle in handles.items():
             if isinstance(handle, NemoGymShardSet):
                 problems.extend(
                     await self._check_shard_set_health(env_name, handle, timeout_s)
