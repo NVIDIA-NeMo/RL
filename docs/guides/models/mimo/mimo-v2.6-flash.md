@@ -34,8 +34,8 @@ Validated scope:
 
 Support is not on `main` yet. Check out the support branch and initialize its submodules:
 
-- NeMo-RL branch `mimo-v26-flash-support`, based on NeMo-RL `main` at `5939fa538`. It carries the 10 commits of the open NeMo-RL PR #5129, which bumps AutoModel to 41f9262 (0.8.0, transformers 5.18.0) and brings MiMo-V2.6 support (AutoModel PR #3992 and the sliding-window fix #4343), plus the changes listed below.
-- AutoModel branch `rl/mimo-v26-support`, which is upstream commit `41f926247` plus one commit that saves Transformer Engine `FusedAdam` state in its stored dtypes. Without it, the first checkpoint save OOMs in `FusedAdam.state_dict`.
+- NeMo-RL branch [`mimo-v26-flash-support`](https://github.com/NVIDIA-NeMo/RL/tree/mimo-v26-flash-support), based on NeMo-RL `main` at `5939fa538`. It carries the 10 commits of the open NeMo-RL [PR #5129](https://github.com/NVIDIA-NeMo/RL/pull/5129), which bumps AutoModel to 41f9262 (0.8.0, transformers 5.18.0) and brings MiMo-V2.6 support (AutoModel PR #3992 and the sliding-window fix #4343), plus the changes listed below.
+- AutoModel branch [`rl/mimo-v26-support`](https://github.com/NVIDIA-NeMo/Automodel/tree/rl/mimo-v26-support), which is upstream commit `41f926247` plus one commit that saves Transformer Engine `FusedAdam` state in its stored dtypes. Without it, the first checkpoint save OOMs in `FusedAdam.state_dict`.
 - vLLM 0.33.0, as pinned by NeMo-RL `main`; it already contains the MiMo-V2 model classes.
 
 NeMo-RL changes on the branch beyond PR #5129:
@@ -44,8 +44,7 @@ NeMo-RL changes on the branch beyond PR #5129:
 - `vllm_backend.py`: when vLLM runs the text-only `MiMoV2ForCausalLM`, refit skips the `visual.`, `audio_encoder.` and `speech_embeddings.` weights held by the trainer.
 
 ```bash
-git clone <support-branch-url> nemo-rl && cd nemo-rl
-git checkout mimo-v26-flash-support
+git clone -b mimo-v26-flash-support https://github.com/NVIDIA-NeMo/RL.git nemo-rl && cd nemo-rl
 git submodule update --init --recursive
 ```
 
