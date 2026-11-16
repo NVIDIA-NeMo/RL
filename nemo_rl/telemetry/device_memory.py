@@ -30,10 +30,13 @@ scales with the model rather than the run, and its numbers need the caveats
 below to read correctly, so it is a tool for a memory question rather than
 something to leave running.
 
-Importing this module declares its row, and declaration closes when telemetry
-registers the metric group at startup (see ``freeze_metrics``). A worker that
-imports it lazily, inside the training loop, therefore raises rather than
-quietly exporting nothing -- so import it at module scope, as its callers do.
+Importing this module declares its row, and declaration closes when the metric
+group is registered -- on a worker, the first time anything records a metric
+(see ``freeze_metrics``). The import has to happen before that, which means a
+module the entry point already pulls in at startup; module scope alone is not
+enough if that module is itself imported late. Getting it wrong raises on the
+import rather than silently exporting nothing. Nothing imports this yet: the
+call site is still to come, and it has to be placed with that ordering in mind.
 
 What the categories mean, and how far to trust them:
 
@@ -60,6 +63,7 @@ What the categories mean, and how far to trust them:
 from __future__ import annotations
 
 import logging
+from itertools import chain
 from typing import Any, Iterable, Iterator, Optional
 
 from nemo_rl.telemetry.metrics import record_rl_metrics, warn_once
@@ -243,17 +247,21 @@ def _parameters(model: Any) -> list[Any]:
 def _gradients(parameters: Iterable[Any]) -> Iterator[Any]:
     """Gradients of *parameters*, from wherever this run keeps them.
 
-    ``.grad`` is the torch convention, but mcore's DistributedDataParallel
-    accumulates into ``param.main_grad`` -- a view onto its own bucket, often
-    in a different dtype -- and leaves ``.grad`` unset. Reading only ``.grad``
-    on a Megatron run therefore reports no gradients at all and quietly adds
-    their bytes to ``other``. Both are yielded, and the dedup in
-    :func:`attribute_device_memory` keeps a run that populates both from being
-    billed twice.
+    ``.grad`` is the torch convention, but mcore uses two more slots and a run
+    can hold several at once. Its DistributedDataParallel accumulates into
+    ``param.main_grad`` -- a view onto its own bucket, often in a different
+    dtype -- and leaves ``.grad`` unset, so reading only ``.grad`` on a
+    Megatron run reports no gradients at all. The precision-aware optimizer
+    adds ``decoupled_grad``, which it reads in place of ``.grad``.
+
+    All three are yielded for every parameter, and the dedup in
+    :func:`attribute_device_memory` keeps a parameter that populates more than
+    one of them from being billed more than once.
     """
     for parameter in parameters:
         yield getattr(parameter, "grad", None)
         yield getattr(parameter, "main_grad", None)
+        yield getattr(parameter, "decoupled_grad", None)
 
 
 def _optimizer_links(optimizer: Any) -> list[Any]:
@@ -271,33 +279,46 @@ def _optimizer_links(optimizer: Any) -> list[Any]:
     return [optimizer] if links is None else list(links)
 
 
-def _optimizer_state_tensors(optimizer: Any) -> Iterator[Any]:
-    """Tensors *optimizer* holds, across a chained optimizer's links.
+def _optimizer_params(optimizer: Any) -> list[Any]:
+    """Parameters *optimizer* steps, which are not always the model's.
 
-    Two places, because mcore's distributed optimizer splits them. The moments
-    are in ``.state`` as usual, but the sharded fp32 main copy of each weight
-    is swapped into ``param_groups[*]["params"]`` -- ``distrib_optimizer.py``
-    replaces the inner optimizer's groups with the main params and keys
-    ``.state`` by them -- so reading ``.state`` alone counts the moments and
-    misses the copy they are moments of.
+    mcore's distributed optimizer swaps the sharded fp32 main copy of each
+    weight into ``param_groups[*]["params"]`` and keys ``.state`` by them, so
+    these are the main copies rather than the model's own tensors -- real
+    memory that reading ``.state`` alone never reaches.
 
     For a plain torch optimizer the groups hold the model's own parameters,
     already counted; the dedup in :func:`attribute_device_memory` charges them
     to ``parameters`` and nothing is double-billed.
+
+    A list, not a generator: these are walked twice, once for their gradients
+    and once for themselves.
+    """
+    params = []
+    for link in _optimizer_links(optimizer):
+        for group in getattr(link, "param_groups", None) or ():
+            if isinstance(group, dict):
+                params.extend(group.get("params") or ())
+    return params
+
+
+def _optimizer_state_tensors(optimizer: Any) -> Iterator[Any]:
+    """Tensors in *optimizer*'s state, across a chained optimizer's links.
+
+    The moments, and whatever else the optimizer keeps per parameter. The main
+    copies they are moments of are :func:`_optimizer_params`.
     """
     for link in _optimizer_links(optimizer):
         state = getattr(link, "state", None)
         # ProxyDict and friends: anything without values() is not a state map
         # this knows how to read, and is skipped rather than raised over.
         per_param_states = getattr(state, "values", None)
-        if callable(per_param_states):
-            for per_param_state in per_param_states():
-                values = getattr(per_param_state, "values", None)
-                if callable(values):
-                    yield from values()
-        for group in getattr(link, "param_groups", None) or ():
-            if isinstance(group, dict):
-                yield from group.get("params") or ()
+        if not callable(per_param_states):
+            continue
+        for per_param_state in per_param_states():
+            values = getattr(per_param_state, "values", None)
+            if callable(values):
+                yield from values()
 
 
 def device_memory_bytes(model: Any, optimizer: Any) -> dict[str, int]:
@@ -310,11 +331,19 @@ def device_memory_bytes(model: Any, optimizer: Any) -> dict[str, int]:
 
     _warn_if_chunks_are_unreachable(model)
     parameters = _parameters(model)
+    # The optimizer's own parameters carry gradients too, and under mcore they
+    # are a second, fp32 set: _copy_model_grads_to_main_grads assigns
+    # main_param.grad = model_param.main_grad.float(), which against a bf16
+    # grad buffer is a whole extra shard that lives until zero_grad.
+    optimizer_params = _optimizer_params(optimizer)
     return attribute_device_memory(
         (
             (CATEGORY_PARAMETERS, parameters),
-            (CATEGORY_GRADIENTS, _gradients(parameters)),
-            (CATEGORY_OPTIMIZER_STATE, _optimizer_state_tensors(optimizer)),
+            (CATEGORY_GRADIENTS, _gradients(parameters + optimizer_params)),
+            (
+                CATEGORY_OPTIMIZER_STATE,
+                chain(_optimizer_state_tensors(optimizer), optimizer_params),
+            ),
         ),
         torch.cuda.memory_allocated(),
     )
@@ -330,8 +359,8 @@ def record_device_memory(
     Does nothing unless telemetry is enabled *and*
     ``telemetry.device_memory_enabled`` is set (or ``NEMO_RL_OTEL_ENABLED`` and
     ``NEMO_RL_OTEL_DEVICE_MEMORY`` in the environment). The gate is checked
-    before the walk, not after, so a run that leaves it off pays one env lookup
-    per step and nothing else -- see the field's docstring in
+    before the walk, not after, so a run that leaves it off pays two env
+    lookups per step and nothing else -- see the field's docstring in
     :mod:`nemo_rl.telemetry.config` for why it is not on by default.
 
     Call once per step, from the worker that owns *model* and *optimizer*. The

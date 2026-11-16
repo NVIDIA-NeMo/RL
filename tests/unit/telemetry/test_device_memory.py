@@ -24,6 +24,7 @@ from nemo_rl.telemetry.device_memory import (
     RL_MEMORY_CATEGORY_ATTR,
     _gradients,
     _local_tensor,
+    _optimizer_params,
     _optimizer_state_tensors,
     _parameters,
     _warn_if_chunks_are_unreachable,
@@ -146,16 +147,58 @@ def test_host_tensors_are_filtered_before_anything_is_charged():
     assert totals[CATEGORY_PARAMETERS] == 0
 
 
-def test_the_real_storage_api_reports_the_real_byte_count():
-    """Against torch itself: _local_tensor feeds the storage calls the walk makes.
+def test_real_views_share_one_storage_and_report_the_whole_buffer():
+    """The premise the dedup rests on, checked against torch rather than assumed.
 
-    The filter in _storages means no CPU tensor can exercise this end of it, so
-    the storage read is tested on its own rather than only through a stand-in.
+    A view reports its *buffer's* size and address, not its own slice, which is
+    both why summing storages is right for a gradient bucket and why they have
+    to be deduplicated. The device filter keeps real CPU tensors out of
+    _storages, so this exercises the same calls directly.
     """
-    weight = torch.zeros(256, dtype=torch.float32)
-    storage = _local_tensor(weight).untyped_storage()
-    assert storage.nbytes() == 256 * 4
-    assert storage.data_ptr() == weight.untyped_storage().data_ptr()
+    buffer = torch.zeros(1024, dtype=torch.float32)
+    slices = [buffer[:10], buffer[10:20], buffer[20:]]
+
+    addresses, sizes = set(), set()
+    for tensor in slices:
+        storage = _local_tensor(tensor).untyped_storage()
+        addresses.add(storage.data_ptr())
+        sizes.add(storage.nbytes())
+
+    # One buffer, however many views onto it.
+    assert len(addresses) == 1
+    assert addresses == {buffer.untyped_storage().data_ptr()}
+    assert sizes == {4096}
+    # What summing tensors instead of storages would have billed.
+    assert sum(t.numel() * t.element_size() for t in slices) == 4096
+
+    # And through the dedup: three views of one 4 KiB buffer cost 4 KiB.
+    totals = attribute_device_memory(
+        ((CATEGORY_GRADIENTS, [_Tensor(a, s) for a in addresses for s in sizes]),),
+        allocated=4096,
+    )
+    assert totals[CATEGORY_GRADIENTS] == 4096
+
+
+def test_the_fp32_main_params_own_gradients_are_counted():
+    """mcore sets main_param.grad = model_param.main_grad.float().
+
+    Against a bf16 grad buffer that is a whole extra fp32 shard, and walking
+    only the model's parameters would leave every byte of it in `other`.
+    """
+    model_param = SimpleNamespace(grad=None, main_grad=_Tensor(1, 128))
+    main_param = SimpleNamespace(grad=_Tensor(2, 256), main_grad=None)
+    found = list(_gradients([model_param, main_param]))
+    assert model_param.main_grad in found
+    assert main_param.grad in found
+
+
+def test_the_precision_aware_decoupled_grad_slot_is_counted():
+    """The precision-aware optimizer reads decoupled_grad in place of .grad."""
+    param = SimpleNamespace(grad=None, main_grad=None, decoupled_grad=_Tensor(1, 64))
+    totals = attribute_device_memory(
+        ((CATEGORY_GRADIENTS, _gradients([param])),), allocated=64
+    )
+    assert totals[CATEGORY_GRADIENTS] == 64
 
 
 def test_a_real_dtensor_is_measured_as_its_local_shard():
@@ -290,7 +333,9 @@ def test_the_fp32_main_copy_is_collected_from_param_groups():
         state={"main": {"exp_avg": _Tensor(1, 2048)}},
         groups=[{"params": [main_param], "lr": 0.1}],
     )
-    assert main_param in list(_optimizer_state_tensors(opt))
+    assert main_param in _optimizer_params(opt)
+    # Not in .state -- that is exactly why reading it alone missed the copy.
+    assert main_param not in list(_optimizer_state_tensors(opt))
 
 
 def test_a_plain_optimizers_groups_do_not_double_count_the_model():
@@ -300,7 +345,7 @@ def test_a_plain_optimizers_groups_do_not_double_count_the_model():
     totals = attribute_device_memory(
         (
             (CATEGORY_PARAMETERS, [weight]),
-            (CATEGORY_OPTIMIZER_STATE, _optimizer_state_tensors(opt)),
+            (CATEGORY_OPTIMIZER_STATE, _optimizer_params(opt)),
         ),
         allocated=512,
     )
@@ -316,7 +361,7 @@ def test_chained_optimizers_are_walked_through_their_links():
             _optimizer(groups=[{"params": [second]}]),
         ]
     )
-    found = list(_optimizer_state_tensors(chained))
+    found = list(_optimizer_state_tensors(chained)) + _optimizer_params(chained)
     assert first in found and second in found
 
 
@@ -332,6 +377,7 @@ def test_an_empty_chained_optimizer_reports_nothing_rather_than_raising():
         state=_ProxyDict([{"a": {"exp_avg": _Tensor(1, 8)}}]),
     )
     assert list(_optimizer_state_tensors(empty)) == []
+    assert _optimizer_params(empty) == []
 
 
 def test_a_state_map_without_values_is_skipped_not_raised():
@@ -357,6 +403,40 @@ def test_device_memory_bytes_partitions_what_torch_reports(monkeypatch):
         CATEGORY_OPTIMIZER_STATE: 200,
         CATEGORY_OTHER: 100,
     }
+
+
+def test_the_mcore_shape_lands_in_the_right_categories(monkeypatch):
+    """A distributed-optimizer rank end to end, with every slot mcore uses.
+
+    bf16 weight and grad buffer on the model side; fp32 main copy and its own
+    fp32 grad on the optimizer side. Before the optimizer's parameters were
+    walked, the last two were 768 bytes of `other`.
+    """
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 2500)
+
+    weight = _Tensor(1, 256)  # bf16 weight
+    weight.grad = None  # mcore leaves .grad unset
+    weight.main_grad = _Tensor(2, 256)  # the DDP bucket
+
+    main_param = _Tensor(3, 1024)  # fp32 main copy, in param_groups
+    main_param.grad = _Tensor(4, 512)  # its own fp32 grad shard
+    main_param.main_grad = None
+
+    monkeypatch.setattr(
+        "nemo_rl.telemetry.device_memory._parameters", lambda model: [weight]
+    )
+    totals = device_memory_bytes(
+        object(),
+        _optimizer(
+            state={"m": {"exp_avg": _Tensor(5, 128)}},
+            groups=[{"params": [main_param]}],
+        ),
+    )
+    assert totals[CATEGORY_PARAMETERS] == 256
+    assert totals[CATEGORY_GRADIENTS] == 256 + 512  # bucket + fp32 shard
+    assert totals[CATEGORY_OPTIMIZER_STATE] == 128 + 1024  # moment + main copy
+    assert totals[CATEGORY_OTHER] == 2500 - 2176
+    assert sum(totals.values()) == 2500
 
 
 def test_the_config_field_reaches_a_worker_as_an_env_var():

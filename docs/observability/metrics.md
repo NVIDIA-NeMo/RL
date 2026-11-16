@@ -220,7 +220,7 @@ One series, labelled by `rl.memory.category`:
 | Category | What it covers |
 |---|---|
 | `parameters` | weights, in whatever dtype they are stored in — MXFP8 storage makes this smaller than a parameter count implies |
-| `gradients` | `.grad`, and mcore DDP's `main_grad` bucket, which is where a Megatron run actually keeps them |
+| `gradients` | `.grad`, mcore DDP's `main_grad` bucket (where a Megatron run actually keeps them), and the precision-aware optimizer's `decoupled_grad` — on the model's parameters and on the optimizer's, which under mcore are a second fp32 set |
 | `optimizer_state` | moments, and the fp32 main copy a mixed-precision optimizer keeps beside the model's |
 | `other` | the residual: `allocated` minus everything walked |
 
@@ -240,7 +240,7 @@ Per rank falls out of the resource attributes: lens neither filters nor samples 
 
 A rank visits roughly five or six tensors per parameter tensor it owns, at a few hundred nanoseconds each, on the worker's own thread inline in the step — order a millisecond for a rank holding 500 parameter tensors, against a step measured in seconds. The walk touches only tensor metadata, never data; it allocates nothing on the device, performs no collective, and does not synchronize, so it cannot perturb stream timing or desynchronize ranks. Host memory is transient: one integer per distinct storage, freed when the call returns.
 
-The gate is checked before the walk, so a run that leaves it off pays one environment lookup per step. Everything after the gate is wrapped so that a model or optimizer shaped unexpectedly, or a dead exporter, costs one warning rather than a failed training step.
+The gate is checked before the walk, so a run that leaves it off pays two environment lookups per step — the master switch and this one. Everything after the gate is wrapped so that a model or optimizer shaped unexpectedly, or a dead exporter, costs one warning rather than a failed training step.
 
 ## Metric vs span tag vs resource attribute
 
