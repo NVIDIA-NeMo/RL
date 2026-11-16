@@ -38,6 +38,7 @@ from nemo_rl.experience.reward_penalties import (
     RewardLogContext,
     parse_reward_log_context,
 )
+from nemo_rl.utils.length_penalty import LengthPenaltyInput
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
@@ -1992,13 +1993,17 @@ class RolloutRecoveryLedger:
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
                 raw_checks = attempt_state.get("reward_checks")
-                if raw_checks is not None and (
-                    not isinstance(raw_checks, dict)
-                    or set(raw_checks)
-                    != {"duplicated_reasoning", "empty_final_answer", "low_effort"}
-                ):
-                    raise ValueError("invalid reward_checks record")
-                checks = RewardChecks(**raw_checks) if raw_checks is not None else None
+                checks = None
+                if raw_checks is not None:
+                    saved_length = raw_checks.get("length_penalty")
+                    checks = RewardChecks(
+                        raw_checks["duplicated_reasoning"],
+                        raw_checks["empty_final_answer"],
+                        raw_checks["low_effort"],
+                        LengthPenaltyInput(**saved_length)
+                        if saved_length is not None
+                        else None,
+                    )
                 log_context = parse_reward_log_context(
                     attempt_state.get("reward_log_context")
                 )
