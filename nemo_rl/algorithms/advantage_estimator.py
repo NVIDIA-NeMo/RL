@@ -830,7 +830,15 @@ class OPDAdvantageEstimator(AdvantageEstimator):
 def create_advantage_estimator(
     config: AdvEstimatorConfig | GAEConfig, loss_config: ClippedPGLossConfig
 ) -> AdvantageEstimator:
-    """Build the same estimator for setup validation and advantage computation."""
+    """Create the advantage estimator selected by the algorithm configuration.
+
+    Args:
+        config: GRPO-family or PPO advantage estimator configuration.
+        loss_config: Loss settings used by estimators that include KL rewards.
+
+    Returns:
+        The configured advantage estimator.
+    """
     if isinstance(config, GAEConfig):
         if config.name == "gae":
             return GeneralizedAdvantageEstimator(config, loss_config)
