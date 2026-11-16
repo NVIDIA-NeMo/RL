@@ -17,7 +17,7 @@ policy:
     expert_model_parallel_size: 4
     fp4_cfg:
       enabled: false
-    te_precision_config_file: ''
+    te_precision_config_file: null
     first_last_layers_bf16: false
     transformer_impl: inference_optimized
     inference_grouped_gemm_backend: flashinfer

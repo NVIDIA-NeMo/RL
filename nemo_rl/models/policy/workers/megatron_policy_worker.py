@@ -174,7 +174,14 @@ from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
-from nemo_rl.utils.path_utils import maybe_enable_msc
+from nemo_rl.utils.path_utils import (
+    as_path,
+    listdir,
+    load_checkpoint_object,
+    maybe_enable_msc,
+    path_isdir,
+    save_checkpoint_object,
+)
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 from nemo_rl.utils.tensor_ops import pad_and_concat
 from nemo_rl.utils.timer import Timer
@@ -5353,9 +5360,9 @@ class MegatronPolicyWorkerImpl(
         """Save this rank's snapshots into a checkpoint (one file per version)."""
         if self._version_snapshots is None:
             return
-        os.makedirs(path, exist_ok=True)
+        as_path(path).mkdir(parents=True, exist_ok=True)
         for version in self._version_snapshots.versions():
-            torch.save(
+            save_checkpoint_object(
                 self._version_snapshots.snapshots[version],
                 os.path.join(path, f"rank_{self.rank}_version_{version}.pt"),
             )
@@ -5363,7 +5370,7 @@ class MegatronPolicyWorkerImpl(
     def load_version_snapshots(self, path: str, keep_versions: int) -> list[int]:
         """Restore this rank's snapshots from a checkpoint; returns the restored versions."""
         prefix = f"rank_{self.rank}_version_"
-        files = os.listdir(path) if os.path.isdir(path) else []
+        files = listdir(path) if path_isdir(path, strict=False) else []
         versions = sorted(
             int(name[len(prefix) : -len(".pt")])
             for name in files
@@ -5374,7 +5381,7 @@ class MegatronPolicyWorkerImpl(
         if self._version_snapshots is None:
             self._version_snapshots = self._new_version_snapshots(keep_versions)
         for version in versions[-keep_versions:]:
-            tensors = torch.load(
+            tensors = load_checkpoint_object(
                 os.path.join(path, f"{prefix}{version}.pt"),
                 map_location="cpu",
                 weights_only=True,

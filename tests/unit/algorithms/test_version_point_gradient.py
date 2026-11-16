@@ -13,6 +13,8 @@
 # limitations under the License.
 """Version-point gradients (grpo.async_grpo.version_point_gradient)."""
 
+import json
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -334,8 +336,33 @@ def test_keep_l_plus_one_versions_covers_every_fixed_lead_batch(lag):
 
 
 @pytest.mark.mcore
-def test_snapshots_survive_a_checkpoint_round_trip(tmp_path, Worker):
+@pytest.mark.parametrize("storage", ["local", "msc"])
+def test_snapshots_survive_a_checkpoint_round_trip(
+    tmp_path, monkeypatch, Worker, storage
+):
     """Saved and restored snapshots swap in bitwise; a resumed run has 0 IS-path steps."""
+    path = str(tmp_path / "snapshots")
+    if storage == "msc":
+        profile = "vpg-" + uuid.uuid4().hex
+        config = tmp_path / "msc.json"
+        objects = tmp_path / "objects"
+        objects.mkdir()
+        config.write_text(
+            json.dumps(
+                {
+                    "profiles": {
+                        profile: {
+                            "storage_provider": {
+                                "type": "file",
+                                "options": {"base_path": str(objects)},
+                            }
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("MSC_CONFIG", str(config))
+        path = f"msc://{profile}/snapshots"
     lag = 3
     keep = version_point_keep_versions(lag)
     model = _FlatModel(torch.bfloat16)
@@ -349,12 +376,12 @@ def test_snapshots_survive_a_checkpoint_round_trip(tmp_path, Worker):
             model.flat[4:].add_(0.25)
     with torch.no_grad():
         model.flat.copy_(history[5])  # the checkpoint holds the weights of version 5
-    Worker.save_version_snapshots(fake, str(tmp_path))
+    Worker.save_version_snapshots(fake, path)
 
     # A fresh worker on the restored weights.
     resumed = _fake_worker(Worker, None, rank=1)
     resumed._new_version_snapshots = lambda k: _snapshots(model, k)
-    assert Worker.load_version_snapshots(resumed, str(tmp_path), keep) == [2, 3, 4, 5]
+    assert Worker.load_version_snapshots(resumed, path, keep) == [2, 3, 4, 5]
     assert Worker.snapshot_version_weights(resumed, 5, keep)["consistent"]
     # Every version the restored buffer can reference (5 - L .. 5) takes the version point.
     for version in range(5 - lag, 6):
@@ -366,7 +393,7 @@ def test_snapshots_survive_a_checkpoint_round_trip(tmp_path, Worker):
         assert _bits_equal(model.flat, history[5])
     # No checkpointed snapshots (other rank / older checkpoint): nothing restored.
     other = _fake_worker(Worker, None, rank=0)
-    assert Worker.load_version_snapshots(other, str(tmp_path), keep) == []
+    assert Worker.load_version_snapshots(other, path, keep) == []
 
 
 def _config(**over):
