@@ -107,6 +107,7 @@ Each stage is launched with `super_launch.sh`. Set the following variables befor
 * `$PERSISTENT_CACHE`: Path to a directory used to store caches for vLLM and FlashInfer.
 * `$EXTRA_MOUNTS`: Comma-separated `host:container` mount pairs for shared filesystems that your data, models, and checkpoints reside on (e.g. `EXTRA_MOUNTS=/scratch:/scratch,/lustre:/lustre`). The launch script only mounts the code snapshot directory by default.
 * `$SKIP_CODE_SNAPSHOT`: Optional. Set to `true` to run from the current checkout instead of creating or refreshing a code snapshot.
+* `$GYM_VENV_ARCHIVE`: Optional. Absolute path of a Gym venv archive to unpack on every node at startup, as described in [Python Environments on Shared Filesystems](../../../cluster.md#python-environments-on-shared-filesystems). Its directory must be in `$EXTRA_MOUNTS` at the same path.
 * `$SIF_DIR`: *(Stage 2.2 only)* Path to the directory containing Apptainer `.sif` images for the SWE-bench environments. These are converted Docker images from R2E-Gym, SWE-Gym, and SWE-Bench Verified. See [Stage 2.2](#stage-22---swe-2-64-h100-gpu-nodes) for download instructions.
 * `$SLURM_PARTITION`
 * `$SLURM_ACCOUNT`
