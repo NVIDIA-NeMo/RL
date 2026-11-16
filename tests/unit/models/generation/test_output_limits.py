@@ -48,13 +48,24 @@ def test_mixed_caps_respect_global_and_remaining_context_without_changing_null_r
     ) == [10, 3, 10, 2, 10]
 
 
-@pytest.mark.parametrize(
-    "caps", [[1], [0, None], [True, None], [1.5, None], [-2, None]]
-)
+@pytest.mark.parametrize("caps", [[0, None], [True, None], [1.5, None], [-2, None]])
 def test_invalid_request_caps_are_rejected(caps):
-    with pytest.raises(ValueError, match="max_output_tokens"):
+    with pytest.raises(ValueError, match="positive integers or None"):
         per_request_output_limits(
             caps, [5, 5], configured_max_new_tokens=10, max_model_len=100
+        )
+
+
+def test_cap_of_one_is_valid():
+    assert per_request_output_limits(
+        [1, None], [5, 5], configured_max_new_tokens=10, max_model_len=100
+    ) == [1, 10]
+
+
+def test_caps_must_match_request_count():
+    with pytest.raises(ValueError, match="one value per generation request"):
+        per_request_output_limits(
+            [1], [5, 5], configured_max_new_tokens=10, max_model_len=100
         )
 
 
@@ -108,3 +119,31 @@ def test_async_worker_applies_row_cap():
     with pytest.raises(_StopBeforeGeneration):
         asyncio.run(consume())
     assert worker.requested_max_new_tokens == [3]
+
+
+@pytest.mark.parametrize("cap", [3, 0])
+def test_async_worker_validates_cap_when_prompt_fills_context(cap):
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    worker = _worker(
+        VllmAsyncGenerationWorkerImpl, {"max_model_len": 5, "async_engine": True}
+    )
+    batch = BatchedDataDict(
+        input_ids=torch.ones((1, 5), dtype=torch.long),
+        input_lengths=torch.tensor([5]),
+        max_output_tokens=[cap],
+    )
+
+    async def outputs():
+        return [output async for _, output in worker.generate_async(batch)]
+
+    if cap < 1:
+        with pytest.raises(ValueError, match="positive integers or None"):
+            asyncio.run(outputs())
+        return
+    # A valid cap keeps the async convention for a full context: an empty rollout.
+    (output,) = asyncio.run(outputs())
+    assert output["generation_lengths"].tolist() == [0]
+    assert worker.requested_max_new_tokens == []

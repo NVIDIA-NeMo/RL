@@ -28,6 +28,14 @@ def _context_capped_max_new_tokens(
     return min(configured_max_new_tokens, remaining_context)
 
 
+def validate_output_caps(output_caps: list[int | None]) -> None:
+    """Reject row caps that are neither positive integers nor None."""
+    if any(
+        cap is not None and (type(cap) is not int or cap < 1) for cap in output_caps
+    ):
+        raise ValueError("max_output_tokens must contain positive integers or None")
+
+
 def per_request_output_limits(
     output_caps: list[int | None],
     input_lengths: list[int],
@@ -38,10 +46,7 @@ def per_request_output_limits(
     """Bound explicit row caps; null rows preserve the configured generation limit."""
     if len(output_caps) != len(input_lengths):
         raise ValueError("max_output_tokens must have one value per generation request")
-    if any(
-        cap is not None and (type(cap) is not int or cap < 1) for cap in output_caps
-    ):
-        raise ValueError("max_output_tokens must contain positive integers or None")
+    validate_output_caps(output_caps)
     return [
         configured_max_new_tokens
         if cap is None

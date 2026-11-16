@@ -106,7 +106,10 @@ from nemo_rl.models.generation.vllm.config import (
     parse_nvfp4_pertoken_rollout,
 )
 from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
-from nemo_rl.models.generation.vllm.output_limits import per_request_output_limits
+from nemo_rl.models.generation.vllm.output_limits import (
+    per_request_output_limits,
+    validate_output_caps,
+)
 from nemo_rl.models.generation.rollout_result import RolloutResult
 from nemo_rl.models.generation.vllm.request_pipeline import (
     rollout_output,
@@ -2721,13 +2724,15 @@ class VllmAsyncGenerationWorkerImpl(
         allowed_new_tokens = max(
             0, min(self.cfg["max_new_tokens"], max_model_len - input_length)
         )
-        if max_output_tokens is not None and allowed_new_tokens > 0:
-            (allowed_new_tokens,) = per_request_output_limits(
-                [max_output_tokens],
-                [input_length],
-                configured_max_new_tokens=allowed_new_tokens,
-                max_model_len=max_model_len,
-            )
+        if max_output_tokens is not None:
+            validate_output_caps([max_output_tokens])
+            if allowed_new_tokens > 0:
+                (allowed_new_tokens,) = per_request_output_limits(
+                    [max_output_tokens],
+                    [input_length],
+                    configured_max_new_tokens=allowed_new_tokens,
+                    max_model_len=max_model_len,
+                )
         spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
         spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
         if allowed_new_tokens > 0 and spec_lookahead > 0:
