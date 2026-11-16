@@ -15,6 +15,7 @@
 import copy
 import gc
 import inspect
+import json
 import logging
 import os
 from typing import Any, Optional, cast
@@ -487,6 +488,7 @@ class BaseVllmGenerationWorker:
         # reach this actor. No-op unless telemetry is enabled.
         init_telemetry_worker()
 
+        _register_vllm_only_config(config["model_name"])
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
@@ -1073,6 +1075,28 @@ class BaseVllmGenerationWorker:
         receiver = self._sparse_refit_receiver
         if receiver is not None:
             receiver.stop_zmq_sparse_refit_relay()
+
+
+def _register_vllm_only_config(model_name: str) -> None:
+    """Make transformers' AutoConfig parse model types only vLLM registers.
+
+    vLLM resolves configs such as Inkling2's ``inkling2`` from its own
+    registry, but this worker also reads the checkpoint with
+    ``AutoConfig.from_pretrained``.
+    """
+    from transformers import CONFIG_MAPPING
+    from transformers.utils import cached_file
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
+
+    config_file = cached_file(
+        model_name, "config.json", _raise_exceptions_for_missing_entries=False
+    )
+    if config_file is None:
+        return
+    with open(config_file) as f:
+        model_type = json.load(f).get("model_type")
+    if model_type in _CONFIG_REGISTRY and model_type not in CONFIG_MAPPING:
+        AutoConfig.register(model_type, _CONFIG_REGISTRY[model_type], exist_ok=True)
 
 
 class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationWorker):

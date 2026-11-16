@@ -247,6 +247,7 @@ _AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
         "save_consolidated",
         "single_rank_consolidation",
         "consolidation_timeout_minutes",
+        "resume_on_cpu",
         "model_cache_dir",
         "model_repo_id",
         "is_peft",

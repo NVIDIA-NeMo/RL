@@ -634,7 +634,9 @@ def _build_generation(
     """
     t0 = time.perf_counter()
     generation_config = master_config.policy["generation"]
-    generation_config["model_name"] = master_config.policy["model_name"]
+    generation_config["model_name"] = (
+        generation_config.get("model_name") or master_config.policy["model_name"]
+    )
     backend = generation_config["backend"]
 
     if backend == "vllm":

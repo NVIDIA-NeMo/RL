@@ -411,7 +411,8 @@ def _module_params_generator(
                         adapted_fqn, adapted_tensor, target_dtype, model
                     )
                     yield (
-                        adapted_fqn + EXPERT_CHUNK_SUFFIX.format(start=start, stop=stop),
+                        adapted_fqn
+                        + EXPERT_CHUNK_SUFFIX.format(start=start, stop=stop),
                         adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
                     )
                     del adapted_tensor
@@ -752,6 +753,9 @@ class AutomodelPolicyWorkerImpl(
         )
         self._init_checkpoint_manager(
             config_updates=checkpoint_config,
+        )
+        self.checkpoint_manager.resume_on_cpu = bool(
+            automodel_cfg["checkpoint"].get("resume_on_cpu")
         )
 
         # Set up model and optimizer.

@@ -1445,7 +1445,11 @@ def setup(
         colocated=colocated_inference,
         refit_transport=generation_config.get("refit_transport"),
     )
-    generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
+    # Needed for vLLM. A recipe may point generation at its own view of the
+    # policy checkpoint (same weights and tokenizer, backend-specific config).
+    generation_config["model_name"] = (
+        generation_config.get("model_name") or policy_config["model_name"]
+    )
     generation_config["_debug_payload_metrics"] = grpo_config.debug_payload_metrics
     remote_transport = None
     remote_synchronizer_cls = None

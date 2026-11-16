@@ -13,16 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Launch Inkling 2 Small GRPO (Automodel policy + colocated SGLang, BF16 serving) on a
-# Slurm cluster of 4-GPU GB200 nodes through ray.sub. Submits one self-ending job.
+# Launch Inkling 2 Small GRPO (Automodel policy + SGLang BF16 or vLLM MXFP8 rollouts)
+# on a Slurm cluster of 4-GPU GB200 nodes through ray.sub. Submits one self-ending job.
 #
 #   ACCOUNT=<acct> CONTAINER=<image.sqsh> WORKDIR=<dir> bash tools/inkling2/launch_slurm.sh proxy
-#   ... launch_slurm.sh full    # 16 nodes (does not fit; see the 16n recipe)
-#   ... launch_slurm.sh full32  # 32 nodes, EP64 + HybridEP in 16-node rack segments
+#   ... launch_slurm.sh full        # SGLang, 16 nodes (does not fit; see the 16n recipe)
+#   ... launch_slurm.sh full32      # SGLang, 32 nodes, EP64 + HybridEP in 16-node rack segments
+#   ... launch_slurm.sh vllm-tiny   # vLLM MXFP8, 1 node, tiny checkpoint smoke test
+#   ... launch_slurm.sh vllm-full   # vLLM MXFP8, 16 nodes, colocated
+#   ... launch_slurm.sh vllm-async  # vLLM MXFP8, 24 nodes: 16 training + 8 generation
+#
+# The vllm-* modes need a CONTAINER whose vLLM serves Inkling2 (vllm-project/vllm#67325)
+# and views built with make_vllm_mxfp8_views.py (make_tiny_mxfp8_view.py for vllm-tiny).
 #
 # Required: ACCOUNT (Slurm account), CONTAINER (NeMo RL image with the sglang and
 # automodel extras), WORKDIR (shared dir for logs, checkpoints and the HF cache).
-# Set policy.model_name / policy.generation.sglang_cfg.model_path through
+# Set policy.model_name and policy.generation.sglang_cfg.model_path (SGLang) or
+# policy.generation.model_name (vLLM) through
 # EXTRA_OVERRIDES or edit the recipe; DATA_MOUNTS adds container mounts for them.
 #
 # Optional: PARTITION (batch), QOS_OVERRIDE / TIME_OVERRIDE (per-mode QOS/time limit),
@@ -31,12 +38,12 @@
 # SEGMENT_OVERRIDE=16 (Slurm segment size), SECRETS_FILE (shell file sourced in a
 # subshell for WANDB_API_KEY and HF_TOKEN only; never echoed).
 #
-# full/full32 keep checkpoints in a fixed dir ($WORKDIR/checkpoints/<mode>;
+# full/full32/vllm-full/vllm-async keep checkpoints in a fixed dir ($WORKDIR/checkpoints/<mode>;
 # CKPT_DIR_OVERRIDE changes it) and resume from its latest checkpoint. The job saves
 # one checkpoint SAVE_MARGIN_MIN (default 10) minutes before its time limit (or at
 # SAVE_BY_OVERRIDE, DD:HH:MM:SS from job start), then exits.
 set -euo pipefail
-MODE=${1:?proxy|full|full32}
+MODE=${1:?proxy|full|full32|vllm-tiny|vllm-full|vllm-async}
 : "${ACCOUNT:?set ACCOUNT}" "${CONTAINER:?set CONTAINER}" "${WORKDIR:?set WORKDIR}"
 PARTITION=${PARTITION:-batch}
 RL=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)  # NeMo RL tree: nemo_rl mount, recipes, ray.sub
@@ -65,11 +72,26 @@ case $MODE in
     SEGMENT=16
     EXTRA="logger.wandb_enabled=true logger.wandb.name=grpo-inkling2-32n4g-gb200-automodel-sglang-$STAMP"
     ;;
+  vllm-tiny)
+    RECIPE=$RECIPES/grpo-inkling2-tiny-1n4g-automodel-vllm-mxfp8.yaml
+    NODES=1; QOS=interactive; TIME=01:00:00; EXTRA=""
+    ;;
+  vllm-full)
+    RECIPE=$RECIPES/grpo-inkling2-16n4g-automodel-vllm-mxfp8.yaml
+    NODES=16; QOS=normal; TIME=04:00:00
+    EXTRA="logger.wandb_enabled=true logger.wandb.name=grpo-inkling2-16n4g-automodel-vllm-mxfp8-$STAMP"
+    ;;
+  vllm-async)
+    RECIPE=$RECIPES/grpo-inkling2-24n4g-automodel-vllm-mxfp8-async.yaml
+    NODES=24; QOS=normal; TIME=04:00:00
+    EXTRA="logger.wandb_enabled=true logger.wandb.name=grpo-inkling2-24n4g-automodel-vllm-mxfp8-async-$STAMP"
+    ;;
   *) echo "unknown mode $MODE" >&2; exit 2 ;;
 esac
 QOS=${QOS_OVERRIDE:-$QOS}; TIME=${TIME_OVERRIDE:-$TIME}
 AM=${AM_OVERRIDE:-$AM}; SEGMENT=${SEGMENT_OVERRIDE:-$SEGMENT}
-if [[ $MODE == full* ]]; then CKPT_DIR=$WORKDIR/checkpoints/$MODE; else CKPT_DIR=$OUT/ckpt; fi
+case $MODE in proxy|vllm-tiny) LONG_RUN=false ;; *) LONG_RUN=true ;; esac
+if $LONG_RUN; then CKPT_DIR=$WORKDIR/checkpoints/$MODE; else CKPT_DIR=$OUT/ckpt; fi
 CKPT_DIR=${CKPT_DIR_OVERRIDE:-$CKPT_DIR}
 # checkpoint_must_save_by (DD:HH:MM:SS from job start) = time limit - SAVE_MARGIN_MIN.
 # Slurm time is [D-]HH:MM:SS. The margin covers one step plus the ~70 s synchronous
@@ -94,7 +116,7 @@ if [[ -n "$SECRETS" && -r "$SECRETS" ]]; then
   [[ -n "${HF_TOKEN:-}" ]] || HF_TOKEN=$(bash -c "source '$SECRETS' >/dev/null 2>&1; printf '%s' \"\${HF_TOKEN:-}\"")
 fi
 [[ -n "${HF_TOKEN:-}" ]] && export HF_TOKEN
-if [[ $MODE == full* ]]; then
+if $LONG_RUN; then
   [[ -n "${WANDB_API_KEY:-}" ]] || { echo "WANDB_API_KEY is not set (env or SECRETS_FILE)" >&2; exit 1; }
   export WANDB_API_KEY
 fi
@@ -113,5 +135,5 @@ cd "$RL"
 CONTAINER=$CONTAINER MOUNTS=$MOUNTS GPUS_PER_NODE=4 BASE_LOG_DIR=$OUT \
 COMMAND="$ENVS; cd /opt/nemo-rl && uv run --no-sync python examples/run_grpo.py --config $RECIPE logger.log_dir=$OUT/logs checkpointing.checkpoint_dir=$CKPT_DIR $EXTRA" \
 sbatch -A "$ACCOUNT" -p "$PARTITION" -q $QOS -N$NODES --gres=gpu:4 --exclusive -t $TIME $SEGMENT_ARG \
-  -J inkling2-$MODE-gb200-sglang -o "$OUT/slurm-%j.out" ray.sub
+  -J inkling2-$MODE-gb200 -o "$OUT/slurm-%j.out" ray.sub
 echo "logs: $OUT"

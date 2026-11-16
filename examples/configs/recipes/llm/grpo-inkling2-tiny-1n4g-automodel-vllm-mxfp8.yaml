@@ -1,0 +1,124 @@
+# Inkling2 tiny GRPO smoke test: Automodel (DTensor, EP4) policy + colocated
+# vLLM rollouts with MXFP8 routed experts, on one 4-GPU node. Pipeline check
+# only: the tiny checkpoint has random weights, so rewards are noise.
+# Follows grpo-qwen3.8-flash-next-dapo-8n8g-automodel (branch
+# qwen3-8-flash-next-support): Automodel text-only path, TP1 + EP training,
+# vLLM rollouts with rollout EP == TP, DAPO-style loss settings.
+#
+# vLLM (vllm-project/vllm#67325) serves Inkling2 routed experts only as NVFP4 or
+# MXFP8. The checkpoint view marks every layer's experts mxfp8 in
+# hf_quant_config.json; vLLM starts from dummy weights and each refit
+# quantizes the policy's BF16 experts to MXFP8
+# (nemo_rl/models/generation/vllm/inkling2_mxfp8_refit.py). Build the view with
+# tools/inkling2/make_tiny_mxfp8_view.py.
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_num_steps: 5
+  use_leave_one_out_baseline: false
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-inkling2-tiny-1n4g-automodel-vllm-mxfp8
+policy:
+  # Two views of one checkpoint (tools/inkling2/make_tiny_mxfp8_view.py): Automodel
+  # reads the text-only config (Inkling2ForCausalLM, no vision tower), vLLM the
+  # image/text config it registers (generation.model_name below).
+  model_name: /path/to/inkling2-tiny-vllm-mxfp8-automodel-text
+  tokenizer:
+    name: ${policy.model_name}
+    # The release tokenizer defines no eos/pad token; Automodel's Inkling2
+    # processor uses <|content_model_end_sampling|> (id 200006, the eos_token_id).
+    tokenizer_kwargs:
+      eos_token: "<|content_model_end_sampling|>"
+      pad_token: "<|content_model_end_sampling|>"
+    # The release tokenizer ships no chat_template. Text-only form of
+    # Automodel's Inkling2 template (components/models/inkling2/processing.py)
+    # that also accepts plain-string content and adds a generation prompt.
+    chat_template: >-
+      {%- for message in messages -%}
+      {%- set role = 'model' if message['role'] == 'assistant' else message['role'] -%}
+      {%- if message['content'] is string -%}
+      {%- set items = [{'type': 'text', 'text': message['content']}] -%}
+      {%- else -%}
+      {%- set items = message['content'] -%}
+      {%- endif -%}
+      {%- for item in items -%}
+      {{- '<|message_' + role + '|><|content_' + item['type'] + '|>' + item['text'] + '<|end_message|>' -}}
+      {%- endfor -%}
+      {%- if message['role'] == 'assistant' -%}
+      {{- '<|content_model_end_sampling|>' -}}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- if add_generation_prompt -%}
+      {{- '<|message_model|><|content_text|>' -}}
+      {%- endif -%}
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 512
+  make_sequence_length_divisible_by: 1
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      betas: [0.9, 0.95]
+      eps: 1.0e-08
+      foreach: false
+      fused: false
+  automodel_cfg:
+    expert_parallel_size: 4
+    activation_checkpointing: false
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.BackendConfig
+        attn: eager
+        linear: torch
+        rms_norm: torch
+        experts: torch_mm
+        dispatcher: torch
+        enable_hf_state_dict_adapter: true
+  generation:
+    model_name: /path/to/inkling2-tiny-vllm-mxfp8
+    max_new_tokens: 256
+    vllm_cfg:
+      # Inkling2 shards experts over the TP group (EP == TP); TP1 gives four
+      # single-GPU rollout replicas.
+      tensor_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.5
+      max_model_len: 512
+      enforce_eager: true
+      load_format: dummy
+      # vLLM's Inkling2 multimodal processor needs the tokenizer at startup.
+      skip_tokenizer_init: false
+      env_vars:
+        NRL_VLLM_INKLING2_MXFP8_REFIT: "1"
+    vllm_kwargs:
+      # Text-only rollouts: skip the vision tower and its encoder profiling.
+      language_model_only: true
+data:
+  max_input_seq_length: 256
+logger:
+  log_dir: logs/grpo-inkling2-tiny-1n4g-automodel-vllm-mxfp8
+  wandb_enabled: false
+  tensorboard_enabled: true
+  wandb:
+    name: grpo-inkling2-tiny-1n4g-automodel-vllm-mxfp8
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
