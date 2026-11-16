@@ -55,12 +55,17 @@ communicator teardown warnings. These small gates serialize the two worker
 worlds; they do not exercise concurrent DynamicInferenceEngine, CP2 or GRPO
 lifecycle behavior.
 
-The required next full-model qualification uses eight GPUs with training
-TP4/CP2/EP4/ETP1 and inference TP2/CP1/EP4/ETP1. Mixed TP plus training CP is not
-yet validated end to end. Existing Ultra training CP8 to inference CP1 evidence
-uses matching TP and does not establish this new combination. Inference CP is
-not a supported target; inference remains PP1, and inference-optimized experts
-remain ETP1. Training ETP greater than one, pipeline training, arbitrary PP
-changes and mixed-EP full-model layouts are not GPU-model qualified by these
-gates. Native metadata and CPU planning coverage do not establish those runtime
-cases. No speedup is implied by sharing coverage or a small projection test.
+An eight-GPU Nano full-model qualification passed with training TP4/CP2/EP4/ETP1 and inference TP2/CP1/EP4/ETP1, with PP1 in both roles.
+Native SingleController completed three Math GRPO updates with 192 accepted sequences, finite nonzero gradients and mixed-sign advantages, using sequence packing and a GPU-only optimizer configuration.
+The run exercised concurrent DynamicInferenceEngine graphs, generation, learner forward/backward and optimizer updates, and four native refits combining local aliases with remote residual transfers.
+Both nodes completed owned-process cleanup without CUDA IPC producer-lifetime or NCCL communicator teardown warnings, and the allocation completed successfully.
+
+That GPU qualification ran NeMo RL revision `8af83078` with Megatron-Core base `3e95097b` plus five reviewed native file corrections: the two MTP prefill helpers, per-forward MoE metadata, partial-destination planning, and NCCL communicator initialization.
+The current-main integration has separate source review and 718 passing focused CPU tests; it is not the exact NeMo RL revision executed by the full-model GPU test.
+The test establishes functional mixed-TP/training-CP behavior for the stated layout, not full-model per-tensor numerical parity, trajectory equivalence, convergence or performance.
+
+Existing Ultra training CP8 to inference CP1 evidence uses matching TP and covers a different layout.
+Inference CP is not a supported target; inference remains CP1 and PP1, and inference-optimized experts remain ETP1.
+Training ETP greater than one, pipeline training, arbitrary PP changes and changed-EP full-model layouts remain unqualified by these GPU tests.
+Native metadata and CPU planning coverage do not establish those runtime cases.
+No speedup is implied by sharing coverage or functional qualification.
