@@ -335,7 +335,7 @@ class RolloutRestorer(_UsesRolloutParts):
             buffer_state, dp_client=self._dp_client, partition_id=self._partition_id
         )
 
-        if self._master_config.checkpointing.get("load_replay_buffer") is False:
+        if not self._master_config.checkpointing.load_replay_buffer:
             # Validate and load the native snapshot before discarding it. This keeps
             # replay-free resume fail-closed: a mismatched/corrupt checkpoint must
             # not silently turn into a different training stream.
