@@ -5558,20 +5558,20 @@ def test_grpo_failed_checkpoint_finalization_stops_before_next_step(
     master_config.grpo.val_at_start = False
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 2
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_period = 2
+    master_config.checkpointing.metric_name = None
 
     checkpointer = CheckpointManager(
-        {
-            "enabled": True,
-            "checkpoint_dir": tmp_path,
-            "metric_name": None,
-            "higher_is_better": False,
-            "save_period": 2,
-            "keep_top_k": None,
-            "save_optimizer": True,
-        }
+        CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            metric_name=None,
+            higher_is_better=False,
+            save_period=2,
+            keep_top_k=None,
+            save_optimizer=True,
+        )
     )
     policy.finalize_async_save.side_effect = OSError("async checkpoint write failed")
 
