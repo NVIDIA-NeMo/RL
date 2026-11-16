@@ -31,6 +31,7 @@ import ray.exceptions
 
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutStats
 from nemo_rl.models.generation.fleet_health import (
@@ -699,6 +700,129 @@ class TestEnvHealthCheck:
             env_handles={"nemo_gym": _Handle()},
         )
         asyncio.run(_run_ticks(ctrl, 2))
+
+    def test_an_unhealthy_actor_of_a_shard_set_is_named_by_its_instance_label(self):
+        """A shard set is not an actor, so each actor it holds is asked and named."""
+        asked = []
+        healthy = _gym_actor(lambda: _completed(asked.append("tools")))
+        unhealthy = _gym_actor(
+            lambda: _failed(RuntimeError("Process `search` finished unexpectedly!"))
+        )
+        ctrl = _make_controller(
+            stats=RolloutStats(),
+            inflight=0,
+            stall_timeout_s=1000.0,
+            stall_action="abort",
+            gym_subprocess_check=True,
+            env_handles={
+                "nemo_gym": NemoGymShardSet(
+                    handles={"tools": [healthy], "search": [unhealthy]}
+                )
+            },
+        )
+        with pytest.raises(
+            RuntimeError, match="'nemo_gym' instance 'search' reported unhealthy"
+        ) as raised:
+            asyncio.run(_run_ticks(ctrl, 2))
+        assert "instance 'tools'" not in str(raised.value)
+        assert asked == ["tools"], "the healthy actor should have been asked too"
+
+    def test_a_shard_set_of_healthy_actors_reports_nothing(self):
+        asked = []
+        tools = _gym_actor(lambda: _completed(asked.append("tools")))
+        search = _gym_actor(lambda: _completed(asked.append("search")))
+        ctrl = _make_controller(
+            stats=RolloutStats(),
+            inflight=0,
+            stall_timeout_s=1000.0,
+            # Any reported problem would end the pump with an error.
+            stall_action="abort",
+            gym_subprocess_check=True,
+            env_handles={
+                "nemo_gym": NemoGymShardSet(
+                    handles={"tools": [tools], "search": [search]}
+                )
+            },
+        )
+        asyncio.run(_run_ticks(ctrl, 2))
+        assert set(asked) == {"tools", "search"}, (
+            "every actor of the shard set should have been asked"
+        )
+
+    def test_a_silent_actor_of_a_shard_set_does_not_hide_the_other_actors(self, capsys):
+        """An actor that never answers is reported within the tick, by its label.
+
+        The other replica of the shard is still asked, and the pump keeps ticking.
+        """
+        never_resolves: list[asyncio.Future] = []
+
+        def _hang():
+            future: asyncio.Future = asyncio.get_event_loop().create_future()
+            never_resolves.append(future)
+            return future
+
+        asked = []
+        silent = _gym_actor(_hang)
+        answering = _gym_actor(lambda: _completed(asked.append("tools/1")))
+        ctrl = _make_controller(
+            stats=RolloutStats(),
+            inflight=0,
+            stall_timeout_s=1000.0,
+            stall_action="warn",
+            gym_subprocess_check=True,
+            env_handles={
+                "nemo_gym": NemoGymShardSet(handles={"tools": [silent, answering]})
+            },
+        )
+        asyncio.run(_run_ticks(ctrl, 4))
+        out = capsys.readouterr().out
+        assert "'nemo_gym' instance 'tools/0' did not answer its health check" in out
+        assert "tools/1" not in out
+        assert never_resolves, "the silent actor was never asked"
+        assert asked, "the actor after the silent one was never asked"
+        assert len(ctrl._logger.metrics) >= 2, (
+            "watchdog stopped ticking while an actor of the shard set was silent"
+        )
+
+    def test_the_actors_of_a_shard_set_are_asked_concurrently(self):
+        """Every actor is asked before the timeout of a silent one runs out.
+
+        Asked one after another, each silent actor would add a full timeout to the tick.
+        """
+        asked = []
+
+        def _hang(label):
+            def _remote():
+                asked.append(label)
+                return asyncio.get_event_loop().create_future()
+
+            return _remote
+
+        replicas = [_gym_actor(_hang("tools/0")), _gym_actor(_hang("tools/1"))]
+        ctrl = _make_controller(
+            stats=RolloutStats(),
+            inflight=0,
+            stall_timeout_s=1000.0,
+            gym_subprocess_check=True,
+            env_handles={"nemo_gym": NemoGymShardSet(handles={"tools": replicas})},
+        )
+
+        async def _main():
+            # The timeout outlasts the test, so only a concurrent check reaches the
+            # second actor while the first one stays silent.
+            check = asyncio.ensure_future(ctrl._check_env_health(timeout_s=1000.0))
+            await asyncio.sleep(0.01)
+            asked_while_silent = list(asked)
+            check.cancel()
+            await asyncio.gather(check, return_exceptions=True)
+            return asked_while_silent
+
+        assert asyncio.run(_main()) == ["tools/0", "tools/1"]
+
+
+def _gym_actor(remote):
+    """Stand in for a NemoGym actor handle whose health check call is ``remote``."""
+    return SimpleNamespace(health_check=SimpleNamespace(remote=remote))
 
 
 def _completed(_value=None):
