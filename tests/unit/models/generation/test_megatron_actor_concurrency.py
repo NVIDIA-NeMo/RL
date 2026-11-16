@@ -25,14 +25,17 @@ import asyncio
 import pytest
 import ray
 
-from nemo_rl.models.policy.workers.megatron_policy_worker import MegatronPolicyWorker
-
 pytestmark = pytest.mark.mcore
 
 IN_FLIGHT_ROWS = 1500  # above Ray's async-actor default of 1000
 
 
 def test_control_call_is_not_queued_behind_in_flight_generation():
+    # Other backend lanes collect this module without the optional Bridge dependency.
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorker,
+    )
+
     options = {
         k: v
         for k, v in MegatronPolicyWorker._default_options.items()
@@ -41,24 +44,29 @@ def test_control_call_is_not_queued_behind_in_flight_generation():
 
     @ray.remote(num_cpus=0, **options)
     class _Rank0:
-        def __init__(self):
-            self.released = None
+        def __init__(self) -> None:
+            self.released = asyncio.Event()
+            self.all_started = asyncio.Event()
+            self.started = 0
 
-        def _event(self):
-            if self.released is None:
-                self.released = asyncio.Event()
-            return self.released
+        async def generate_async(self) -> None:
+            self.started += 1
+            if self.started == IN_FLIGHT_ROWS:
+                self.all_started.set()
+            await self.released.wait()
 
-        async def generate_async(self):
-            await self._event().wait()
+        async def wait_for_all_started(self) -> None:
+            await self.all_started.wait()
 
-        async def finish_generation(self):
-            self._event().set()
+        async def finish_generation(self) -> bool:
+            self.released.set()
             return True
 
     actor = _Rank0.remote()
     try:
         rows = [actor.generate_async.remote() for _ in range(IN_FLIGHT_ROWS)]
+        # Async actor calls may start out of submission order.
+        ray.get(actor.wait_for_all_started.remote(), timeout=60)
         assert ray.get(actor.finish_generation.remote(), timeout=60)
         ray.get(rows, timeout=60)
     finally:
