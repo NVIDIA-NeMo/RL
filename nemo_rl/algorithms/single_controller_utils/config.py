@@ -595,6 +595,11 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         *every* chunk, so the configured floor never applies and the run streams at
         the cap instead -- the floor becomes dead config rather than a bound.
         """
+        min_groups = self.min_groups_for_streaming_train
+        if min_groups < 1:
+            raise ValueError(
+                f"async_rl.min_groups_for_streaming_train ({min_groups}) must be >= 1"
+            )
         max_groups = self.max_groups_for_streaming_train
         if max_groups is None:
             return self
@@ -602,12 +607,12 @@ class AsyncRLConfig(BaseModel, extra="allow"):
             raise ValueError(
                 f"async_rl.max_groups_for_streaming_train ({max_groups}) must be >= 1"
             )
-        if max_groups < self.min_groups_for_streaming_train:
+        if max_groups < min_groups:
             raise ValueError(
                 "async_rl.max_groups_for_streaming_train "
                 f"({max_groups}) must be >= "
                 "async_rl.min_groups_for_streaming_train "
-                f"({self.min_groups_for_streaming_train}): the cap would clamp the "
+                f"({min_groups}): the cap would clamp the "
                 "floor on every chunk, leaving the floor with no effect."
             )
         return self
