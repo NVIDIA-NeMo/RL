@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import pytest
 import torch
+from pydantic import ValidationError
 
-from nemo_rl.algorithms.grpo import RewardScalingConfig, scale_rewards
+from nemo_rl.algorithms.grpo import GRPOConfig, RewardScalingConfig, scale_rewards
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -24,6 +28,166 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import decompose_message_log
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from tests.unit.algorithms.utils import create_mock_batch_with_responses
+
+
+class TestRewardScalingValidation:
+    """Validate active bounds at configuration construction on every path."""
+
+    @pytest.mark.parametrize(
+        ("target_min", "target_max"), [(-1.0, 1.0), (1.0, 1.0), (1.0, -1.0)]
+    )
+    def test_accepts_finite_target_intervals(
+        self, target_min: float, target_max: float
+    ) -> None:
+        config = RewardScalingConfig(
+            enabled=True, target_min=target_min, target_max=target_max
+        )
+        assert (config.target_min, config.target_max) == (target_min, target_max)
+
+    @pytest.mark.parametrize(("source_min", "source_max"), [(1.0, 1.0), (1.0, 0.0)])
+    def test_rejects_empty_or_inverted_source_interval(
+        self, source_min: float, source_max: float
+    ) -> None:
+        with pytest.raises(ValidationError, match="reward_scaling.source_min"):
+            RewardScalingConfig(
+                enabled=True, source_min=source_min, source_max=source_max
+            )
+
+    @pytest.mark.parametrize(
+        "bound", ["source_min", "source_max", "target_min", "target_max"]
+    )
+    @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+    def test_rejects_non_finite_bounds(self, bound: str, value: float) -> None:
+        with pytest.raises(ValidationError, match="bounds must be finite"):
+            RewardScalingConfig(
+                enabled=True,
+                source_min=value if bound == "source_min" else 0.0,
+                source_max=value if bound == "source_max" else 1.0,
+                target_min=value if bound == "target_min" else 0.0,
+                target_max=value if bound == "target_max" else 1.0,
+            )
+
+    def test_ignores_unused_invalid_bounds_when_disabled(self) -> None:
+        config = RewardScalingConfig(
+            enabled=False,
+            source_min=1.0,
+            source_max=1.0,
+            target_min=math.nan,
+            target_max=math.inf,
+        )
+        assert not config.enabled
+
+    @pytest.mark.parametrize("algorithm_type", [GRPOConfig, PPOConfig])
+    @pytest.mark.parametrize(
+        "bounds",
+        [
+            {"source_min": 1.0, "source_max": 1.0},
+            {"source_min": 1.0, "source_max": 0.0},
+            {"source_min": math.nan},
+            {"target_max": math.inf},
+        ],
+    )
+    def test_algorithm_config_rejects_invalid_scaling(
+        self,
+        algorithm_type: type[GRPOConfig] | type[PPOConfig],
+        bounds: dict[str, float],
+    ) -> None:
+        with pytest.raises(ValidationError) as error:
+            algorithm_type(reward_scaling={"enabled": True, **bounds})
+        assert error.value.errors()[0]["loc"] == ("reward_scaling",)
+
+
+class TestRewardShapingValidation:
+    """Reject invalid active settings when either algorithm loads its config."""
+
+    @pytest.mark.parametrize("max_response_length", [256, 512, 1024])
+    def test_warns_when_the_buffer_covers_the_response_length(
+        self, max_response_length: int, recwarn: pytest.WarningsRecorder
+    ) -> None:
+        RewardShapingConfig(
+            enabled=True,
+            overlong_buffer_length=512,
+            overlong_buffer_penalty=1,
+            max_response_length=max_response_length,
+        )
+
+        assert len(recwarn) == int(max_response_length <= 512)
+        if recwarn:
+            message = str(recwarn[0].message)
+            assert (
+                f"reward_shaping.max_response_length={max_response_length}" in message
+            )
+            assert "reward_shaping.overlong_buffer_length=512" in message
+
+    def test_accepts_a_zero_overlong_penalty(self) -> None:
+        RewardShapingConfig(
+            enabled=True,
+            overlong_buffer_length=512,
+            overlong_buffer_penalty=0,
+            max_response_length=4096,
+        )
+
+    @pytest.mark.parametrize("algorithm_type", [GRPOConfig, PPOConfig])
+    @pytest.mark.parametrize(
+        ("buffer_length", "penalty", "max_length", "coef"),
+        [
+            (None, 1.0, 4096, None),
+            (512, None, 4096, None),
+            (512, 1.0, None, None),
+            (0, 1.0, 4096, None),
+            (-1, 1.0, 4096, None),
+            (512, -1.0, 4096, None),
+            (512, math.nan, 4096, None),
+            (512, math.inf, 4096, None),
+            (512, -math.inf, 4096, None),
+            (512, 1.0, 4096, -0.1),
+            (512, 1.0, 4096, 1.1),
+        ],
+    )
+    def test_algorithm_reports_the_invalid_shaping_field(
+        self,
+        algorithm_type: type[GRPOConfig] | type[PPOConfig],
+        buffer_length: int | None,
+        penalty: float | None,
+        max_length: int | None,
+        coef: float | None,
+    ) -> None:
+        # Revalidate an existing model too, including settings mutated after loading.
+        shaping = RewardShapingConfig.model_construct(
+            enabled=True,
+            overlong_buffer_length=buffer_length,
+            overlong_buffer_penalty=penalty,
+            max_response_length=max_length,
+            stop_properly_penalty_coef=coef,
+        )
+        with pytest.raises(ValidationError) as error:
+            algorithm_type(reward_shaping=shaping)
+        assert error.value.errors()[0]["loc"] == ("reward_shaping",)
+
+    @pytest.mark.parametrize("coef", [0.0, 0.5, 1.0])
+    def test_truncation_mode_accepts_ignored_invalid_dapo_settings(
+        self, coef: float, recwarn: pytest.WarningsRecorder
+    ) -> None:
+        RewardShapingConfig(
+            enabled=True,
+            stop_properly_penalty_coef=coef,
+            overlong_buffer_length=0,
+            overlong_buffer_penalty=math.nan,
+            max_response_length=-1,
+        )
+        assert not recwarn
+
+    def test_disabled_shaping_accepts_ignored_invalid_settings(
+        self, recwarn: pytest.WarningsRecorder
+    ) -> None:
+        RewardShapingConfig(
+            enabled=False,
+            overlong_buffer_length=0,
+            overlong_buffer_penalty=math.inf,
+            max_response_length=-1,
+            stop_properly_penalty_coef=-1.0,
+        )
+        assert not recwarn
 
 
 def test_reward_scaling_disabled():
@@ -268,10 +432,11 @@ def test_reward_shaping_missing_config_values():
     )
 
     config = RewardShapingConfig(
-        enabled=True,
+        enabled=False,
         overlong_buffer_penalty=0.1,
         max_response_length=25,
     )
+    config.enabled = True
 
     with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
         apply_reward_shaping(batch, config)

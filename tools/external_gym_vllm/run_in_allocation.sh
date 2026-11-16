@@ -236,6 +236,7 @@ for pool in "${pool_names[@]}"; do
   export "${pool}_SERVED_MODEL_NAME=${served_model_names[${pool}]}"
   export "${pool}_VLLM_PORT=${backend_ports[${pool}]}"
   export "${pool}_ENV_VARS=$(pool_value "${pool}" ENV_VARS)"
+  export "${pool}_CACHE_DIR=$(pool_value "${pool}" CACHE_DIR)"
   export "${pool}_VLLM_ARGS=$(pool_value "${pool}" VLLM_ARGS)"
 
   for numeric_suffix in REPLICAS TENSOR_PARALLEL_SIZE VLLM_PORT LB_PORT STARTUP_TIMEOUT; do
@@ -297,6 +298,17 @@ for pool in "${pool_names[@]}"; do
   while IFS= read -r shared_path; do
     [[ -n "${shared_path}" ]] && shared_paths+=("${shared_path}")
   done <<< "$(pool_value "${pool}" SHARED_PATHS)"
+  cache_dir=$(pool_value "${pool}" CACHE_DIR)
+  if [[ -n "${cache_dir}" ]]; then
+    shared_paths+=("${cache_dir}")
+    # The pools run the cache script from the NeMo RL checkout these tools are
+    # in, unless NRL_COMPILE_CACHE_SYNC_SCRIPT names another.
+    cache_sync="${NRL_COMPILE_CACHE_SYNC_SCRIPT:-${EXTERNAL_VLLM_TOOLS_DIR_HOST}/../../nemo_rl/utils/cache_sync.sh}"
+    if [[ ! -f "${cache_sync}" ]]; then
+      echo "[FATAL] ${pool}_CACHE_DIR: cache script not found: ${cache_sync}" >&2
+      exit 1
+    fi
+  fi
 done
 for shared_path in "${shared_paths[@]}"; do
   if [[ "${shared_path}" != "${EXTERNAL_VLLM_SHARED_ROOT}" && "${shared_path}" != "${EXTERNAL_VLLM_SHARED_ROOT}"/* ]]; then
@@ -407,6 +419,11 @@ cleanup() {
     if [[ "$(cat "${EXTERNAL_VLLM_POOL_DIR}/owner" 2>/dev/null || true)" == "${pool_generation}" ]]; then
       rm -f "${EXTERNAL_VLLM_POOL_DIR}/owner" 2>/dev/null || true
     fi
+  fi
+  if (( status == 0 )); then
+    # Let Slurm end the pool steps. Killing their srun clients makes the job end
+    # CANCELLED instead of COMPLETED, and CI reads CANCELLED as a failure.
+    exit 0
   fi
   if [[ -n "${ray_sub_pid}" ]] && kill -0 "${ray_sub_pid}" 2>/dev/null; then
     kill "${ray_sub_pid}" 2>/dev/null || true
@@ -575,6 +592,7 @@ MAX_WORKER_PORT=2999
 VLLM_ENGINE_PORT=7000
 
 cleanup_replica() {
+  [[ -n "${CACHE_SIDECAR_PID:-}" ]] && kill "${CACHE_SIDECAR_PID}" 2>/dev/null
   if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     registry_remove "${REPLICA_ID}" || true
   fi
@@ -582,6 +600,29 @@ cleanup_replica() {
 }
 trap cleanup_replica EXIT
 trap 'trap - EXIT; cleanup_replica; exit 143' TERM INT
+
+# Optional persistent compile cache (<POOL>_CACHE_DIR on the shared filesystem):
+# copied to node-local storage on every node before Ray starts, so the Ray-spawned
+# vLLM workers inherit the paths, and new entries are written back in the
+# background (cache_sync.sh). NRL_COMPILE_CACHE_FORCE_FRESH=1 starts empty but still
+# writes back.
+POOL_CACHE_DIR=$(pool_value CACHE_DIR)
+CACHE_SYNC="${NRL_COMPILE_CACHE_SYNC_SCRIPT:-${EXTERNAL_VLLM_TOOLS_DIR}/../../nemo_rl/utils/cache_sync.sh}"
+LOCAL_CACHE_ROOT="${NRL_COMPILE_CACHE_LOCAL_DIR:-/tmp/nemo_rl_compile_cache}/${POOL_PREFIX,,}"
+export_cache_env() {
+  local root="${LOCAL_CACHE_ROOT}"
+  export VLLM_CACHE_ROOT="${root}/vllm" TORCHINDUCTOR_CACHE_DIR="${root}/inductor"
+  export TRITON_CACHE_DIR="${root}/triton" FLASHINFER_WORKSPACE_BASE="${root}/flashinfer"
+}
+if [[ -n "${POOL_CACHE_DIR}" ]]; then
+  rm -rf "${LOCAL_CACHE_ROOT}" "${LOCAL_CACHE_ROOT}".{seeded,sent}
+  if [[ "${NRL_COMPILE_CACHE_FORCE_FRESH:-0}" != "1" ]]; then
+    bash "${CACHE_SYNC}" seed "${POOL_CACHE_DIR}" "${LOCAL_CACHE_ROOT}" || exit 1
+  fi
+  bash "${CACHE_SYNC}" sidecar "${LOCAL_CACHE_ROOT}" "${POOL_CACHE_DIR}" &
+  CACHE_SIDECAR_PID=$!
+  export_cache_env
+fi
 
 if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
   rm -f "${HEAD_IP_FILE}"
@@ -620,6 +661,8 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     fi
     export "${assignment}"
   done <<< "$(pool_value ENV_VARS)"
+  # The pool's own ENV_VARS (e.g. FLASHINFER_WORKSPACE_BASE=/tmp) must not undo the cache.
+  [[ -n "${POOL_CACHE_DIR}" ]] && export_cache_env
 
   # Keep vLLM's TCPStore and MessageQueue ports inside the reserved
   # 7000-7999 band. serve_vllm_on_ray.py applies the NeMo RL compatibility
@@ -664,7 +707,11 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
   fi
   exit "${vllm_status}"
 else
-  for _ in $(seq 1 120); do
+  # The head node publishes its IP after copying the pool's compile cache, which
+  # can take minutes on a large cache; wait longer then.
+  head_ip_wait_s=120
+  [[ -n "${POOL_CACHE_DIR:-}" ]] && head_ip_wait_s=900
+  for _ in $(seq 1 "${head_ip_wait_s}"); do
     [[ -s "${HEAD_IP_FILE}" ]] && break
     sleep 1
   done

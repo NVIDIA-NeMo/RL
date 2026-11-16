@@ -383,8 +383,8 @@ def setup(
 
     if loss_config.seq_logprob_error_in_loss:
         raise ValueError(
-            "loss_fn.seq_logprob_error_in_loss is not supported by PPO. "
-            "Use a GRPO trainer (legacy or SingleController)."
+            "loss_fn.seq_logprob_error_in_loss is not supported by the legacy PPO "
+            "trainer. Use the SingleController trainer with ppo.ppo_epochs=1."
         )
 
     assert generation_config is not None, (

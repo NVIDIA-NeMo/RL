@@ -94,6 +94,25 @@ runs:
         echo "id=$(uuidgen)" >> "$GITHUB_OUTPUT"
 
     - name: Checkout NeMo
+      id: checkout
+      continue-on-error: true
+      uses: actions/checkout@v6
+      env:
+        DIR: ${{ github.run_id }}
+      with:
+        submodules: "recursive"
+        path: ${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl
+        ref: ${{ inputs.test-commit-sha }}
+
+    - name: Wait before retrying checkout
+      if: steps.checkout.outcome == 'failure'
+      shell: bash
+      run: |
+        echo "::warning title=Retrying checkout::Checkout failed (e.g. git fetch-pack error); retrying once in 30s."
+        sleep 30
+
+    - name: Retry checkout NeMo
+      if: steps.checkout.outcome == 'failure'
       uses: actions/checkout@v6
       env:
         DIR: ${{ github.run_id }}
@@ -180,6 +199,7 @@ runs:
         echo -e "\033[1;34m│  rdma      : ${RDMA_FLAGS[*]:-none}\033[0m"
         echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
 
+        run_shard() {
         echo "::group::Logs"
         # docker/Dockerfile always installs Alloy, so NEMO_RL_REQUIRE_ALLOY turns
         # the config validation test's skip into a failure: losing that COPY should
@@ -222,6 +242,19 @@ runs:
             bash tests/${{ inputs.is_doc_test == 'true' && 'docs' || (inputs.is_unit_test == 'true' && 'unit' || 'functional') }}/${{ inputs.script }}.sh && \
             echo "Finished successfully." || echo "Did not finish."' 2>&1 | tee err.log
         echo "::endgroup::"
+        }
+
+        run_shard
+        if ! tail -n 1 err.log | grep -q "Finished successfully."; then
+          patterns_file="${{ github.workspace }}/${{ github.run_id }}/${{ steps.uuid.outputs.id }}/nemo-rl/.github/scripts/known-flake-patterns.txt"
+          flake_line=$(grep -m 1 -E -f <(grep -vE '^[[:space:]]*(#|$)' "$patterns_file") err.log | cut -c1-300 || true)
+          if [[ -n "$flake_line" ]]; then
+            echo "::warning title=Known flake, re-running ${{ inputs.script }}::${flake_line}"
+            echo "Re-ran \`${{ inputs.script }}\` once after a known flake: \`${flake_line}\`" >> "$GITHUB_STEP_SUMMARY"
+            mv err.log err.attempt1.log
+            run_shard
+          fi
+        fi
 
     - name: Check result
       id: check
