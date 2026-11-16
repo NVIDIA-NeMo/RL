@@ -161,11 +161,7 @@ class DatumSpec(TypedDict):
     __extra__: Any  # This allows additional fields of any type
 ```
 
-A processor can cap one sample's response length by setting
-`extra_env_info["max_output_tokens"]` to a positive integer. The vLLM backend generates at
-most `min(max_new_tokens, max_output_tokens)` tokens for that sample, still bounded by the
-remaining context. Samples without the key keep `max_new_tokens`. Other generation
-backends raise an error instead of ignoring the cap.
+A processor can cap one sample's response length by setting `extra_env_info["max_output_tokens"]` to a positive integer. The vLLM backend generates at most `min(max_new_tokens, max_output_tokens)` tokens for that sample, still bounded by the remaining context. Samples without the key keep `max_new_tokens`. Caps are not supported for rollouts served through Dynamo (`policy.generation.dynamo: true`) or by other generation backends; those raise an error instead of ignoring the cap.
 
 #### Data Processors
 

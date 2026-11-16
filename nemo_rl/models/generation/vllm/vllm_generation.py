@@ -1636,6 +1636,11 @@ class VllmGeneration(GenerationInterface):
             f"but received batch_size={data.size}. Please handle batching "
             "outside this method."
         )
+        if (data.get("max_output_tokens") or [None])[0] is not None:
+            raise ValueError(
+                "Per-sample max_output_tokens caps are not supported through the "
+                "Dynamo frontend; set policy.generation.dynamo=false to use them."
+            )
         verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
         input_length = int(data["input_lengths"][0].item())
         input_ids = data["input_ids"][0]
