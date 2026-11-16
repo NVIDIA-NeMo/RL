@@ -1036,6 +1036,10 @@
    "label": "vLLM MXFP8 \u00b7 async \u00b7 24 nodes (16 train + 8 gen)",
    "wandb_runs": [
     {
+     "id": "kdnw7tlm",
+     "name": "vllm-mxfp8-async-val-step0-original"
+    },
+    {
      "id": "uk530hix",
      "name": "full-vllm-mxfp8-20261114-vllm"
     },
@@ -1979,6 +1983,11 @@
     }
    ],
    "validation": [
+    {
+     "nemo_rl/step": 0,
+     "validation/accuracy": 0.40234375,
+     "validation/avg_length": 2440.5546875
+    },
     {
      "nemo_rl/step": 10,
      "validation/accuracy": 0.421875,

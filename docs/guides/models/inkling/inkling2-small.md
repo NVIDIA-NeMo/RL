@@ -104,7 +104,7 @@ symlinks resolve. The recipes use `/path/to/...` placeholders for the views.
 | Schedule | 5 steps of linear warmup (from 1% of LR), then constant | Same |
 | Loss | Reference KL 0; clip 0.2 / 0.28; truncated importance sampling ratio 2; sequence-level loss | Reference KL 0; clip 0.2 / 0.28; truncated importance sampling ratio 5; token-level loss |
 | Sampling | Temperature 1, top-p 1 | Same |
-| Validation | Every 10 steps; step 0 evaluated separately before training | Every 10 steps |
+| Validation | Every 10 steps; step 0 evaluated separately before training | Same |
 | Checkpointing | Saved before each job's time limit and resumed by the next job | Same |
 
 ### Launch
@@ -139,7 +139,7 @@ Each 2 h job logged a separate run:
 | Experiment | W&B runs (in order) |
 | --- | --- |
 | SGLang BF16, sync | [`ehmcmnug`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/ehmcmnug) (step-0 eval), [`1gl23wkh`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/1gl23wkh) (1–17), [`u1uvgoww`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/u1uvgoww) (18–40), [`ai60m9ku`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/ai60m9ku) (41–64), [`m1y9ip39`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/m1y9ip39) (65–87) |
-| vLLM MXFP8, async | [`uk530hix`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/uk530hix) (1–18), [`d80ps72r`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/d80ps72r) (19–41), [`yfkayhu1`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/yfkayhu1) (42–64), [`28de0sqt`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/28de0sqt) (65–84) |
+| vLLM MXFP8, async | [`kdnw7tlm`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/kdnw7tlm) (step-0 eval), [`uk530hix`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/uk530hix) (1–18), [`d80ps72r`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/d80ps72r) (19–41), [`yfkayhu1`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/yfkayhu1) (42–64), [`28de0sqt`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/28de0sqt) (65–84) |
 
 The figure overlays both experiments on the same nine metrics used for other
 model guides. **Blue, solid: SGLang BF16, sync. Orange, dashed: vLLM MXFP8, async.**
@@ -148,7 +148,8 @@ model guides. **Blue, solid: SGLang BF16, sync. Orange, dashed: vLLM MXFP8, asyn
 
 | Measurement | SGLang BF16, sync | vLLM MXFP8, async |
 | --- | --- | --- |
-| AIME 2024 accuracy, first evaluation | 39.06% at step 0 (base model) | 42.19% at step 10 |
+| AIME 2024 accuracy, step 0 (base model) | 39.06% | 40.23% |
+| AIME 2024 accuracy, step 10 | 67.19% | 42.19% |
 | AIME 2024 accuracy, step 40 | 80.08% | 76.56% |
 | AIME 2024 accuracy, best | **82.03% at step 70** | **81.25% at step 70** |
 | AIME 2024 accuracy, step 80 | 80.08% | 80.86% |
@@ -158,9 +159,9 @@ model guides. **Blue, solid: SGLang BF16, sync. Orange, dashed: vLLM MXFP8, asyn
 | Generation KL, median | 0.0013 | 0.0024 |
 | Step time, median (including validation steps) | 237 s on 128 GPUs | 214 s on 96 GPUs |
 
-Both experiments reach about 80% AIME accuracy by step 40–70 and then plateau.
-The synchronous run improves faster early (67% vs 42% at step 10); by step 50
-the curves overlap. With a 0/1 math-verify reward, training reward equals
+Both experiments start from about 40% AIME accuracy at step 0, reach about 80%
+by step 40–70, and then plateau. The synchronous run improves faster early (67%
+vs 42% at step 10); by step 50 the curves overlap. With a 0/1 math-verify reward, training reward equals
 training accuracy on the sampled prompts.
 
 How to read the comparison:
@@ -171,8 +172,11 @@ How to read the comparison:
   dispatcher (HybridEP vs torch), and GPU count and placement (128 colocated vs
   96 split 64/32). Training loss is therefore not comparable across the two
   lines.
-- **Step 0 exists for SGLang BF16 only.** It was evaluated by a separate
-  validation-only job on the base model; the vLLM MXFP8 line starts at step 10.
+- **Step 0 is the base model.** Each experiment evaluated it in a separate
+  validation-only job with its own serving stack: 39.06% with SGLang BF16 and
+  40.23% with vLLM MXFP8. The 1.2-point gap is within sampling noise for 256
+  single-sample responses, so MXFP8 serving does not visibly hurt the base
+  model's accuracy.
 - **Generation KL** is the logged generation/training log-probability
   discrepancy, not a reference-policy KL loss. It is higher for MXFP8 serving,
   as expected from serving quantized experts while training in BF16, and also

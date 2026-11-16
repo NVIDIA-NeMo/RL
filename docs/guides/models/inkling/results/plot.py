@@ -112,7 +112,7 @@ def main() -> None:
         0.055,
         0.018,
         "Raw logged values, no smoothing; each experiment is a chain of 2 h jobs resumed from checkpoints.\n"
-        "AIME: 256 of the 960 rows, one response each. Step 0 (base model) was evaluated with SGLang BF16 only.",
+        "AIME: 256 of the 960 rows, one response each. Step 0 is the base model, evaluated with each serving stack.",
         color="#475569",
         fontsize=10,
         linespacing=1.6,
