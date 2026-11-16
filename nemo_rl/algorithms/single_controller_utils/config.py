@@ -1776,11 +1776,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
 
-    # A lost group is accounted off the sampler on the async SC path regardless of
-    # dynamic sampling -- credit_shortfall reads charge_step_for_lost_group and
-    # requires_shortfall_reconciliation, EOF reads closes_short_at_exhaustion, and the
-    # fault-tolerance replacement reads uses_pooled_replacements. Require the members
-    # here so a custom sampler missing one fails validation, not mid-run.
+    # The sampler's drop-accounting members are read on the async SC path regardless
+    # of dynamic sampling, so a custom sampler missing one must fail validation here.
     require_drop_accounting_members(async_config.sampler)
 
     if async_config.defer_async_checkpoint_finalize:

@@ -66,12 +66,9 @@ class StepAssembler:
         self._controller = controller
         self._assembling_version = initial_version
         self._step_assembly: Optional[StepAssembly] = None
-        # How many allow-short reasons the assembler itself has charged to each
-        # step, so reconciliation can undo only its own racing contribution.
-        # ``steps_allowed_short`` is otherwise append-only and written by several
-        # paths (drained pooled steps, exhausted closes) plus checkpoint restore;
-        # those are treated as a standing reason (see ``_allow_short_reasons``), so
-        # a racing credit's release can never drop a permission another path owns.
+        # Per-step count of allow-short reasons this assembler charged, so
+        # reconciliation undoes only its own racing contribution (see
+        # ``_allow_short_reasons``).
         self._allow_short_charges: dict[int, int] = {}
 
     @property
@@ -171,14 +168,8 @@ class StepAssembler:
                 self._runtime.batch_shortfall[credit.charged_step] = remaining
             else:
                 del self._runtime.batch_shortfall[credit.charged_step]
-            # Undo the allow-short permission the racing credit added so the
-            # reapplication below can re-add it at whatever step the settled
-            # selection actually charges. Reference-counted so a permission another
-            # path (a drained pooled step, an exhausted close, a restore) owns is
-            # never dropped: without this, a racing allow-short credit whose charged
-            # step moves on reconciliation would strand a stale permission on the set
-            # -- which is otherwise append-only -- silently skipping a later
-            # legitimate shortfall on that step instead of tripping the batch floor.
+            # Undo this racing credit's allow-short permission; the reapplication
+            # below re-adds it at the settled charged step (see _release...).
             if credit.allow_short:
                 self._release_step_allowed_short(credit.charged_step)
         self._assembling_version = assembling_version

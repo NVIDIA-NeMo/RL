@@ -1561,10 +1561,8 @@ class SingleControllerActor:
                         ) from cleanup_error
                     if self._sampler.uses_pooled_replacements:
                         replacement = self._pop_filtered_replacement(target_step)
-                        # filtered=True: a zero-variance drop that closes its step short
-                        # (pool drained at EOF) is allowed below the floor, like the
-                        # non-capture filtered path; omitting it would fail an allowance
-                        # it never spent when reconciliation moves the loss.
+                        # filtered=True: a zero-variance EOF short close is allowed
+                        # below the floor, like the non-capture filtered path.
                         lineage_group_id, replacement_step = (
                             self._substitute_dropped_group(
                                 cut, replacement, target_step, filtered=True
@@ -2978,15 +2976,12 @@ class SingleControllerActor:
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
-                            # windowed spends no pool, so this is the only place its
-                            # generation budget is enforced: a step still starved while
-                            # data flows means the filter rejects faster than the data
-                            # refills it, which v1 ends the run on. The exhaustion branch
-                            # above closes a data-exhausted step short before reaching
-                            # here, so EOF never trips the budget.
+                            # windowed enforces its generation budget only here; skip
+                            # once exhausted, when a starved tail is an EOF short close.
                             if (
                                 self._dynamic_sampling_enabled
                                 and not self._sampler.uses_pooled_replacements
+                                and not self._dataloader_exhausted
                             ):
                                 self._check_filtered_budget(
                                     self._step_assembler.assembling_version
