@@ -196,7 +196,7 @@ project-includes = [
   "nemo_rl/data_plane/nixl/nixl_io.py",
   "nemo_rl/data_plane/nixl_storage_unit.py",
   "nemo_rl/data_plane/observability.py",
-  "nemo_rl/data_plane/offload.py",
+  "nemo_rl/data_plane/delegate.py",
   "nemo_rl/data_plane/preshard.py",
   "nemo_rl/data_plane/prefix_writer_actor.py",
   "nemo_rl/data_plane/prefix_pipeline.py",

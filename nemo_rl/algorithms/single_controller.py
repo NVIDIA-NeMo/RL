@@ -160,7 +160,7 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
 )
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
-from nemo_rl.data_plane.offload import OffloadPool
+from nemo_rl.data_plane.delegate import DelegatePool
 from nemo_rl.data_plane.observability import (
     log_step_metrics,
     metrics_never_fail_the_step,
@@ -512,7 +512,7 @@ class SingleControllerActor:
         # in-process through the same computer the actors wrap, so a run without
         # a pool and a run with one cannot drift.
         self._advantage_actors: list[Any] = list(actor_args.advantage_actors)
-        self._advantage_pool = OffloadPool(self._advantage_actors)
+        self._advantage_pool = DelegatePool(self._advantage_actors)
         self._advantage_computer = AdvantageComputer(
             self._dp_client,
             config=self._advantage_stage_config,
@@ -562,7 +562,7 @@ class SingleControllerActor:
         if gen_snapshots is not None:
             self._trainer.add_data_plane_snapshot_fn(gen_snapshots)
         self._storage_units = tuple(actor_args.storage_units)
-        self._finalizer_pool = OffloadPool(self._finalizer_actors)
+        self._finalizer_pool = DelegatePool(self._finalizer_actors)
         self._active_finalizers = 0
         self._finalizer_waiters = 0
         self._finalizer_unknown_outcomes = 0

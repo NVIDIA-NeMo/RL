@@ -26,12 +26,12 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageStageConfig,
 )
 from nemo_rl.data_plane import DataPlaneConfig
-from nemo_rl.data_plane.offload import OffloadClient, OffloadPool, spread_off_head
+from nemo_rl.data_plane.delegate import DataPlaneDelegate, DelegatePool, spread_off_head
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 
 
 @ray.remote
-class AdvantageActor(OffloadClient):  # pragma: no cover
+class AdvantageActor(DataPlaneDelegate):  # pragma: no cover
     """Run one advantage computer on its own connect-only data-plane client."""
 
     # It writes the ``advantages`` column through its own client, so its
@@ -70,7 +70,7 @@ def create_advantage_actors(
     num_workers: int,
 ) -> list[Any]:
     """Start the pool, kept off the controller's node, after TQ partitions exist."""
-    pool = OffloadPool.start(
+    pool = DelegatePool.start(
         AdvantageActor,
         dp_config,
         config,

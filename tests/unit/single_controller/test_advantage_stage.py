@@ -57,7 +57,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.offload import OffloadPool
+from nemo_rl.data_plane.delegate import DelegatePool
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.rpc_guard import assert_metadata_only
@@ -685,7 +685,7 @@ def _controller(
         )
         for index in range(num_actors)
     ]
-    ctrl._advantage_pool = OffloadPool(ctrl._advantage_actors)
+    ctrl._advantage_pool = DelegatePool(ctrl._advantage_actors)
     ctrl._opd_stat_sum = ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
     ctrl._opd_gap_sum = 0.0

@@ -13,9 +13,9 @@
 # limitations under the License.
 """CPU Ray actors that do data-plane work for another process.
 
-An ``OffloadClient`` is a CPU-only Ray actor with its own data-plane client.
+A ``DataPlaneDelegate`` is a CPU-only Ray actor with its own data-plane client.
 A subclass overrides ``process(request)``: read, compute and write as it needs.
-An ``OffloadPool`` starts N of them with one placement and hands out free ones.
+A ``DelegatePool`` starts N of them with one placement and hands out free ones.
 Each user starts its own pool; pools are never shared.
 """
 
@@ -36,7 +36,7 @@ from nemo_rl.data_plane.observability import is_metrics_client
 Placement = Callable[[int], Any]
 
 
-class OffloadClient:
+class DataPlaneDelegate:
     """Own a connect-only data-plane client and do one job on it.
 
     ``owns_storage`` decides whether this process lends memory to a Mooncake
@@ -106,8 +106,8 @@ def spread_off_head() -> Placement:
     )
 
 
-class OffloadPool:
-    """A fixed set of offload actors, and which of them are free.
+class DelegatePool:
+    """A fixed set of delegate actors, and which of them are free.
 
     ``acquire`` waits for a free actor; ``release`` gives it back after its call
     finished. A caller does not release an actor whose call raised: its
@@ -128,14 +128,14 @@ class OffloadPool:
         n: int,
         placement: Placement | None = None,
         **ray_options: Any,
-    ) -> OffloadPool:
+    ) -> DelegatePool:
         """Create ``n`` CPU-only, non-restarting actors; do not wait for them.
 
-        ``client_cls`` is an ``OffloadClient`` subclass, plain or already
+        ``client_cls`` is an ``DataPlaneDelegate`` subclass, plain or already
         wrapped by ``@ray.remote``. Each actor gets its index as ``label``.
         """
         if n <= 0:
-            raise ValueError(f"an offload pool needs at least one actor, got {n}")
+            raise ValueError(f"a delegate pool needs at least one actor, got {n}")
         remote_cls = (
             client_cls if hasattr(client_cls, "options") else ray.remote(client_cls)
         )
@@ -209,4 +209,4 @@ class OffloadPool:
             try:
                 ray.kill(actor, no_restart=True)
             except Exception as error:
-                print(f"offload actor cleanup failed: {error}", flush=True)
+                print(f"delegate actor cleanup failed: {error}", flush=True)

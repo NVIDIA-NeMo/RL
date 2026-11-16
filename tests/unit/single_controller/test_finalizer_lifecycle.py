@@ -35,7 +35,7 @@ from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
 )
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.offload import OffloadPool
+from nemo_rl.data_plane.delegate import DelegatePool
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.experience.reward_penalties import FinalizedReward
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -109,7 +109,7 @@ def _controller(actor: object) -> Any:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._rollout_runtime = RolloutRuntimeState()
-    ctrl._finalizer_pool = OffloadPool([actor])
+    ctrl._finalizer_pool = DelegatePool([actor])
     ctrl._active_finalizers = 0
     ctrl._finalizer_waiters = 0
     ctrl._finalizer_unknown_outcomes = 0

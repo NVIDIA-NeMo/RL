@@ -35,7 +35,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
-from nemo_rl.data_plane.offload import OffloadClient, OffloadPool, on_this_node
+from nemo_rl.data_plane.delegate import DataPlaneDelegate, DelegatePool, on_this_node
 
 G_LOGGER = logging.getLogger(__name__)
 G_DTYPES = {
@@ -259,7 +259,7 @@ class PrefixWriterService:
         )
 
 
-class PrefixWriterActor(OffloadClient):
+class PrefixWriterActor(DataPlaneDelegate):
     """Run ``PrefixWriterService`` on its own TQ client, with no engine or GPU."""
 
     def __init__(
@@ -286,7 +286,7 @@ class RayPrefixWriterClient:
     a stalled PUT. Outstanding callers fail; they must not publish receipts.
     """
 
-    def __init__(self, pool: OffloadPool, *, writer_pid: int) -> None:
+    def __init__(self, pool: DelegatePool, *, writer_pid: int) -> None:
         if pool.size != 1:
             raise ValueError(f"the prefix writer is one actor, got {pool.size}")
         self._pool = pool
@@ -383,7 +383,7 @@ async def create_prefix_writer(
 ) -> RayPrefixWriterClient:
     """Create one non-restarting, serial CPU writer on the generation node."""
     node_id = ray.get_runtime_context().get_node_id()
-    pool = OffloadPool.start(
+    pool = DelegatePool.start(
         PrefixWriterActor,
         config,
         partition_id,

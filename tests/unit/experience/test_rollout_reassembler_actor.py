@@ -26,7 +26,7 @@ import ray
 import torch
 
 import nemo_rl.data_plane as data_plane_module
-import nemo_rl.data_plane.offload as offload_module
+import nemo_rl.data_plane.delegate as delegate_module
 import nemo_rl.experience.rollout_reassembler_actor as actor_module
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import KVBatchMeta
@@ -132,7 +132,7 @@ def test_finalizer_forwards_mooncake_checkpoint_commands(
     command = {"operation": "INFO"}
     response = {"participant_id": "finalizer"}
     dispatch = MagicMock(return_value=response)
-    monkeypatch.setattr(offload_module, "run_checkpoint_command", dispatch)
+    monkeypatch.setattr(delegate_module, "run_checkpoint_command", dispatch)
 
     assert actor.mooncake_checkpoint(command) is response
     dispatch.assert_called_once_with(command)
@@ -342,7 +342,7 @@ def test_factory_selects_compatible_environment_and_waits_for_dependencies(
             ]
             if cleanup_fails:
                 assert (
-                    "offload actor cleanup failed: kill failed"
+                    "delegate actor cleanup failed: kill failed"
                     in capsys.readouterr().out
                 )
         else:

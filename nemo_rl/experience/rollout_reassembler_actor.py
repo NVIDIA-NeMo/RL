@@ -22,7 +22,7 @@ import ray
 
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import DataPlaneConfig
-from nemo_rl.data_plane.offload import OffloadClient, OffloadPool
+from nemo_rl.data_plane.delegate import DataPlaneDelegate, DelegatePool
 from nemo_rl.data_plane.schema import forest_row_ids
 from nemo_rl.distributed.actor_environments import (
     NEMO_GYM_ACTOR_FQN,
@@ -153,7 +153,7 @@ class RolloutReassemblerActorConfig:
 
 
 @ray.remote
-class RolloutReassemblerActor(OffloadClient):  # pragma: no cover
+class RolloutReassemblerActor(DataPlaneDelegate):  # pragma: no cover
     """Run one lightweight finalizer on its own connect-only TQ client."""
 
     # Finalized rows are written through this client, so its local store holds
@@ -261,7 +261,7 @@ def create_rollout_reassembler_actors(
     runtime_env = make_actor_runtime_env(
         NEMO_GYM_ACTOR_FQN if same_env else ROLLOUT_REASSEMBLER_ACTOR_FQN
     )
-    pool = OffloadPool.start(
+    pool = DelegatePool.start(
         RolloutReassemblerActor,
         dp_config,
         config,

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""OffloadClient and OffloadPool: placement, start-up, free actors, storage."""
+"""DataPlaneDelegate and DelegatePool: placement, start-up, free actors, storage."""
 
 import asyncio
 from types import SimpleNamespace
@@ -20,10 +20,10 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 
 import nemo_rl.data_plane as data_plane_module
-import nemo_rl.data_plane.offload as offload
-from nemo_rl.data_plane.offload import (
-    OffloadClient,
-    OffloadPool,
+import nemo_rl.data_plane.delegate as delegate
+from nemo_rl.data_plane.delegate import (
+    DataPlaneDelegate,
+    DelegatePool,
     on_this_node,
     spread_off_head,
 )
@@ -41,8 +41,8 @@ def _patch_cluster(monkeypatch: pytest.MonkeyPatch, nodes: list[dict]) -> None:
     for node in nodes:
         for key, value in node["Resources"].items():
             resources[key] = resources.get(key, 0.0) + value
-    monkeypatch.setattr(offload.ray, "nodes", lambda: nodes)
-    monkeypatch.setattr(offload.ray, "cluster_resources", lambda: resources)
+    monkeypatch.setattr(delegate.ray, "nodes", lambda: nodes)
+    monkeypatch.setattr(delegate.ray, "cluster_resources", lambda: resources)
 
 
 class TestPlacement:
@@ -62,7 +62,7 @@ class TestPlacement:
 
     def test_on_this_node_is_a_hard_pin_to_the_callers_node(self, monkeypatch) -> None:
         monkeypatch.setattr(
-            offload.ray,
+            delegate.ray,
             "get_runtime_context",
             lambda: SimpleNamespace(get_node_id=lambda: COMPUTE_A_ID),
         )
@@ -89,7 +89,7 @@ class _RecordingRemoteClass:
 class TestPoolStart:
     def test_start_applies_shared_options_placement_and_labels(self) -> None:
         remote_cls = _RecordingRemoteClass()
-        pool = OffloadPool.start(
+        pool = DelegatePool.start(
             remote_cls, "cfg", n=2, placement=lambda i: f"node{i}", max_concurrency=1
         )
         assert pool.size == pool.free == 2
@@ -111,49 +111,49 @@ class TestPoolStart:
         remote_cls = _RecordingRemoteClass()
         wrapped = []
         monkeypatch.setattr(
-            offload.ray, "remote", lambda cls: wrapped.append(cls) or remote_cls
+            delegate.ray, "remote", lambda cls: wrapped.append(cls) or remote_cls
         )
 
-        class Plain(OffloadClient):
+        class Plain(DataPlaneDelegate):
             pass
 
-        OffloadPool.start(Plain, n=1)
+        DelegatePool.start(Plain, n=1)
         assert wrapped == [Plain]
         assert "scheduling_strategy" not in remote_cls.options_seen[0]
 
     def test_start_rejects_an_empty_pool(self) -> None:
         with pytest.raises(ValueError, match="at least one actor"):
-            OffloadPool.start(_RecordingRemoteClass(), n=0)
+            DelegatePool.start(_RecordingRemoteClass(), n=0)
 
     def test_failed_ready_check_kills_every_actor(self, monkeypatch) -> None:
         actors = [MagicMock(), MagicMock()]
         kill = MagicMock(side_effect=[RuntimeError("already dead"), None])
-        monkeypatch.setattr(offload.ray, "kill", kill)
+        monkeypatch.setattr(delegate.ray, "kill", kill)
         monkeypatch.setattr(
-            offload.ray, "get", MagicMock(side_effect=RuntimeError("missing dep"))
+            delegate.ray, "get", MagicMock(side_effect=RuntimeError("missing dep"))
         )
         with pytest.raises(RuntimeError, match="missing dep"):
-            OffloadPool(actors).wait_ready("check_dependencies", timeout_s=5)
+            DelegatePool(actors).wait_ready("check_dependencies", timeout_s=5)
         # One failed kill must not skip the others.
         assert kill.call_args_list == [call(a, no_restart=True) for a in actors]
 
     def test_async_ready_check_returns_replies_or_kills(self, monkeypatch) -> None:
         good = SimpleNamespace(ready=SimpleNamespace(remote=AsyncMock(return_value=7)))
-        assert asyncio.run(OffloadPool([good]).wait_ready_async("ready")) == [7]
+        assert asyncio.run(DelegatePool([good]).wait_ready_async("ready")) == [7]
 
         bad = SimpleNamespace(
             ready=SimpleNamespace(remote=AsyncMock(side_effect=RuntimeError("boom")))
         )
         kill = MagicMock()
-        monkeypatch.setattr(offload.ray, "kill", kill)
+        monkeypatch.setattr(delegate.ray, "kill", kill)
         with pytest.raises(RuntimeError, match="boom"):
-            asyncio.run(OffloadPool([bad]).wait_ready_async("ready", timeout_s=5))
+            asyncio.run(DelegatePool([bad]).wait_ready_async("ready", timeout_s=5))
         kill.assert_called_once_with(bad, no_restart=True)
 
 
 def test_acquire_waits_for_a_released_actor() -> None:
     async def scenario() -> list[str]:
-        pool = OffloadPool(["only"])
+        pool = DelegatePool(["only"])
         order = []
         first = await pool.acquire()
         assert pool.free == 0
@@ -186,9 +186,9 @@ class TestClient:
             or "client",
         )
         dispatch = MagicMock(return_value={"ok": True})
-        monkeypatch.setattr(offload, "run_checkpoint_command", dispatch)
+        monkeypatch.setattr(delegate, "run_checkpoint_command", dispatch)
 
-        class Writer(OffloadClient):
+        class Writer(DataPlaneDelegate):
             pass
 
         Writer.owns_storage = owns_storage
@@ -206,4 +206,4 @@ class TestClient:
             data_plane_module, "build_data_plane_client", lambda *a, **k: None
         )
         with pytest.raises(NotImplementedError):
-            OffloadClient("cfg").process("request")
+            DataPlaneDelegate("cfg").process("request")
