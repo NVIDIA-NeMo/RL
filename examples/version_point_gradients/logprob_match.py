@@ -16,9 +16,10 @@ import json
 import math
 import struct
 import sys
+from typing import Any
 
 
-def first(x):
+def first(x: list[Any]) -> list[Any]:
     return x[0] if x and isinstance(x[0], list) else x
 
 

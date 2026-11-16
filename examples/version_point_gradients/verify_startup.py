@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
@@ -49,7 +50,7 @@ if mode in ("vpg", "baseline"):
     for event in sorted(latest.rglob("events.out.tfevents.*")):
         accumulator = EventAccumulator(str(event), size_guidance={"scalars": 0})
         accumulator.Reload()
-        for tag in accumulator.Tags()["scalars"]:
+        for tag in cast(list[str], accumulator.Tags()["scalars"]):
             metrics.setdefault(tag, {}).update(
                 {e.step: e.value for e in accumulator.Scalars(tag)}
             )
