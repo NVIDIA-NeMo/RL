@@ -1,39 +1,20 @@
-# General TP resharding dependency fixes — held staging
+# General TP resharding dependency fixes
 
-This is a build-time patch for exactly Megatron-LM
-`3e95097b4a9ab6ea6b2a39eb2b2b24e4a6dfa54a`. It is **not promoted** into the
-clean NeMo RL branch. Promotion requires the candidate native reverse-IPC cleanup
-result (now passed) and the full-model Nano TP/CP qualification (still pending),
-followed by source review.
-File-patch composition alone is not either of those results.
+This build-time patch supports co-resident Megatron refit across different tensor-parallel layouts. It targets exactly Megatron-LM commit `3e95097b4a9ab6ea6b2a39eb2b2b24e4a6dfa54a`; it does not upgrade the dependency to current upstream main.
 
-The two changes are:
+The patch makes two changes:
 
-- `planner.py`: validate destination-mesh completeness before looking up its first
-  rank. Partial residual destination rosters can omit that rank. The optional
-  tensor-mesh specification then returns its existing unsupported reason, while
-  the existing generic transfer schedule remains usable. This is the narrow fix
-  in [PR 9465](https://github.com/NVIDIA/Megatron-LM/pull/9465), companion commit
-  `22690d3996b7981efc8647d1fdc1405dbdb80419`.
-- `nccl_copy_service.py`: replace private eager communicator connection with one
-  public all-reduce of one CUDA int32 element per service, including ranks with
-  empty local transfer queues. Transfer methods are unchanged. This candidate
-  addresses duplicated, untracked communicators on the tested PyTorch revision;
-  native owned-process cleanup passed; full-model TP/CP evidence is still a
-  promotion requirement.
+- `planner.py` validates destination-mesh completeness before looking up its first rank. Residual-only destinations can omit that rank, so the optional whole-mesh description must decline while the existing generic transfer schedule remains usable. This is the narrow correction in [Megatron-LM #9465](https://github.com/NVIDIA/Megatron-LM/pull/9465), companion commit `22690d3996b7981efc8647d1fdc1405dbdb80419`.
+- `nccl_copy_service.py` initializes its communicator once per service with a public all-reduce of one CUDA int32 element. Every process-group rank participates, including ranks without local transfer operations. Transfer planning and execution are unchanged.
 
-`SOURCE.json` records exact source and output hashes. The patch contains only
-these changes, not full vendored files. The companion planner file and the native
-copy-service base are otherwise byte-identical to this pinned dependency, so no
-unrelated current-main upgrade is required.
+`SOURCE.json`, `BASE.sha256` and `PATCHED.sha256` record the exact dependency revision and source hashes. The patch contains only these two corrections, without complete vendored modules or runtime monkeypatches.
 
-## Exact application
+## Apply and install
 
-Set `PATCH_ROOT` to this staged directory and `MCORE_ROOT` to a separate clean
-checkout of the exact base. Review the held status before using this in a future
-qualification environment; do not alter an active model checkout.
+Use a separate checkout before starting model workers. Set `NRL_ROOT` to this NeMo RL checkout, `MCORE_ROOT` to the clean Megatron-LM checkout, and `POLICY_PYTHON` to the interpreter used by the actual policy and inference workers.
 
 ```bash
+PATCH_ROOT="$NRL_ROOT/tools/megatron_patches/general_tp"
 test "$(git -C "$MCORE_ROOT" rev-parse HEAD)" = 3e95097b4a9ab6ea6b2a39eb2b2b24e4a6dfa54a
 (cd "$MCORE_ROOT" && sha256sum --check "$PATCH_ROOT/BASE.sha256")
 git -C "$MCORE_ROOT" apply --unidiff-zero --check "$PATCH_ROOT/general-tp-resharding.patch"
@@ -41,53 +22,45 @@ git -C "$MCORE_ROOT" apply --unidiff-zero "$PATCH_ROOT/general-tp-resharding.pat
 (cd "$MCORE_ROOT" && sha256sum --check "$PATCH_ROOT/PATCHED.sha256")
 ```
 
-Exact base-file hashes are mandatory for this zero-context patch. It is safe
-against whitespace/EOF fixers; do not force-apply it to a different revision.
-Repeated application must fail rather than silently add another modification.
+Exact base-file checks are required for this zero-context patch. Reject a mismatched revision or hash; repeated application must fail. Do not force-apply the patch to another dependency revision.
 
-## Composition with Ultra inference fixes
+Build the policy environment with the patched checkout through the existing Megatron-Bridge workspace dependency. Alternatively, install it into an already prepared policy environment, retaining that environment's dependency pins and build dependencies:
 
-This patch touches two resharding files. The clean branch's
-`tools/megatron_patches/ultra_inference` patch touches three different inference
-files. `COMPOSITION_CHECK.json` records successful application in **both orders**
-against fresh copies of the exact base files and verification of all five final
-hashes. Each patch retains its own base/output checks. Apply both before building
-or importing the policy environment; inspect the actual normal module paths.
-There is no runtime monkeypatch, container worker overlay or private import path.
+```bash
+uv pip install --python "$POLICY_PYTHON" --no-deps --no-build-isolation "$MCORE_ROOT"
+```
 
-## Integration hazards and remaining scope
+If the environment is packaged into a container, perform this installation during the image build and use that image on every worker. Updating a host checkout alone does not change an installed container package. Verify the imported source in the actual worker interpreter:
 
-1. All ranks of a copy service's process group must enter `run()` in matching
-   order, even zero-operation ranks. The public collective is once per service,
-   not once globally. Cached services must be created/replaced symmetrically.
-2. The connection token uses the current CUDA device. Each learner must select
-   its assigned device before constructing/executing the service. Native
-   subgroup rank mapping and source/destination metadata remain authoritative.
-3. A partial destination roster deliberately lacks the optional full-mesh tensor
-   specification. Generic scheduling still must validate all required coverage;
-   this fix does not accept missing source data or invent remote owners.
-4. Engine-owned residual allocations must stay alive through reverse-IPC writes
-   and acknowledgment. Learner receive mappings must be released before engine
-   owners exit. These are NeMo RL lifecycle responsibilities, not patch effects.
-5. The serialized small native gate does not establish concurrent model pause,
-   refit, TP/CP, optimizer or publication correctness. Require the full native
-   model qualification before promotion; no throughput improvement is claimed.
-6. The portable transfer source checker currently accepts exactly the three
-   Ultra inference files. A future reviewed integration must explicitly extend
-   that allowlist and exact hashes to these two files (five total), refresh the
-   native NeMo RL worker pin after the TP merge, and requalify the new layout.
-   Do not relax arbitrary dirty-source rejection.
+```bash
+"$POLICY_PYTHON" - "$PATCH_ROOT/SOURCE.json" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
 
-No scheduler actions, GPU executions, source-checkout edits, clean-branch
-modifications, freeze or push were performed to prepare this staging artifact.
+import megatron.core.resharding.copy_services.nccl_copy_service as copy_service
+import megatron.core.resharding.planner as planner
 
-## Proposed documentation update
+source = json.loads(Path(sys.argv[1]).read_text())
+for module in (planner, copy_service):
+    relative = module.__name__.replace(".", "/") + ".py"
+    path = Path(module.__file__)
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == source["files"][relative]["patched_sha256"], path
+    print(path)
+PY
+```
 
-`proposal/docs/design-docs/mps-parallelism-sharing.md` and `DOC_UPDATE.patch`
-stage the corresponding source-document correction without editing an active
-branch. They record the primitive cleanup PASS and preserve the full-model
-qualification hold. Inference CP1/PP1 and inference-optimized ETP1 remain required;
-training ETP>1, pipeline training/arbitrary PP changes and changed-EP full-model
-cases remain unqualified by the current gates. Apply this docs change only with
-the reviewed dependency inclusion; its link targets the intended
-`tools/megatron_patches/general_tp` installation path.
+## Compose with the Ultra inference fixes
+
+The [Ultra inference patch](../ultra_inference/README.md) changes three different files. Apply both patches to the same exact-base checkout before building or importing the policy environment, using each patch's base and output hash checks. `COMPOSITION_CHECK.json` records successful application in both orders and verification of all five final source hashes; source composition is not a full-model qualification result.
+
+## Runtime contract and validation limits
+
+All ranks of a copy service's process group must enter `run()` in matching order, including ranks with no local operations. Each learner must select its assigned CUDA device before using the service. Native rank mapping and shard metadata remain authoritative; incomplete source coverage is still an error.
+
+Engine-owned receive allocations must remain alive through reverse-IPC writes and completion acknowledgment. Learner receive mappings must be released before their inference owners exit. NeMo RL pauses and drains inference, completes residual and local copies, refreshes caches, and resumes only after publication.
+
+Inference requires CP1 and PP1; `inference_optimized` experts require ETP1. Training CP greater than one requires `policy.sequence_packing.enabled: true` and `policy.megatron_cfg.use_fused_linear_logprobs: false`. Virtual pipeline chunks and GTP rematerialization are unsupported by this sharing path.
+
+Native distributed projection, reverse-IPC numerical/storage-lifetime and owned-process cleanup checks have passed. **Full-model mixed TP/CP qualification remains pending.** Training ETP greater than one, pipeline training, arbitrary PP changes and mixed-EP full-model layouts are not established by these checks. There is no speedup or convergence claim from the small gates. See the [sharing design and validation scope](../../../docs/design-docs/mps-parallelism-sharing.md).

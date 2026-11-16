@@ -1,5 +1,4 @@
 {
-  "status": "HELD_FULL_NANO_CP2_PROOF_PENDING",
   "base_repository": "https://github.com/NVIDIA/Megatron-LM",
   "base_commit": "3e95097b4a9ab6ea6b2a39eb2b2b24e4a6dfa54a",
   "patch_sha256": "d4c6935dc390de403a0b40b2db2da39a70cc10c6a80ac1a51807c2f107c162f0",
@@ -22,9 +21,8 @@
     },
     {
       "path": "megatron/core/resharding/copy_services/nccl_copy_service.py",
-      "upstream_status": "Candidate, not promoted",
-      "scope": "Only _ensure_nccl_connected: one public int32 CUDA all_reduce per service replaces private eager connect. Every process-group rank participates, including ranks with no P2P operations. Transfer planning and execution unchanged.",
-      "native_gpu_proof": "Native reverse-IPC primitives and clean owned-process teardown PASS; full model TP/CP proof pending"
+      "upstream_status": "Local correction; upstream merge not asserted",
+      "scope": "Only _ensure_nccl_connected: one public int32 CUDA all_reduce per service replaces private eager connect. Every process-group rank participates, including ranks with no P2P operations. Transfer planning and execution unchanged."
     }
   ],
   "composition": {
@@ -32,13 +30,18 @@
     "changed_paths_disjoint": true,
     "combined_changed_runtime_files": 5
   },
-  "scope": "Portable build-time patch artifact only, no vendor full files, no runtime monkeypatch, no clean-branch changes or native proof claim.",
-  "intended_install_path": "tools/megatron_patches/general_tp",
-  "documentation_proposal": {
-    "source_relative_path": "docs/design-docs/mps-parallelism-sharing.md",
-    "base_sha256": "651b4926cb9cb71aa1632bc97d0aa8f9eed8b37f1e4538313610d1aec15a5878",
-    "proposed_sha256": "329a3a0f322bcfbb7c4303f10e6c5271e1209029958446655272b53236ae93fe",
-    "patch_sha256": "4d73950f7186811fd6506fa46a6d4b16ae813dbd81c4035c05cce6b90a95d1ee",
-    "scope": "Cleanup primitive PASS only; mixed TP/CP full model and additional ETP/PP/EP layouts remain unqualified."
+  "scope": "Exact-base build-time patch for two native resharding files; no complete vendored modules or runtime monkeypatch.",
+  "package_path": "tools/megatron_patches/general_tp",
+  "validation": {
+    "distributed_projection": "PASS",
+    "reverse_ipc_numerical_and_storage_lifetime": "PASS",
+    "owned_process_cleanup": "PASS",
+    "full_model_mixed_tp_cp": "PENDING",
+    "unqualified_full_model_layouts": [
+      "training ETP greater than one",
+      "pipeline training or arbitrary PP changes",
+      "mixed EP layouts"
+    ],
+    "limits": "Small native gates do not establish concurrent full-model GRPO, performance or convergence."
   }
 }
