@@ -13,8 +13,7 @@ when_to_use: Investigating a CI failure; understanding the pipeline structure; t
 NeMo-RL CI runs on GitHub Actions. Workflows live in `.github/workflows/`.
 
 The main test workflow triggers on pushes to `pull-request/<number>` branches.
-These branches are created automatically by **copy-pr-bot** when a contributor
-pushes to their fork and the PR receives a trust signal:
+These branches are created automatically by **copy-pr-bot** when a contributor pushes to their fork and the PR receives a trust signal:
 - The commit is GPG-signed by a maintainer, **or**
 - A maintainer posts `/ok to test <full-sha>` as a PR comment.
 
@@ -30,17 +29,13 @@ After pushing a new commit to your PR, trigger CI with:
 
 Use `git rev-parse HEAD` (not the short form) to get the full SHA.
 
-> **Re-triggering after new commits**: each `/ok to test <sha>` is specific to
-> that SHA. After pushing additional commits, post a new comment with the
-> updated SHA.
+> **Re-triggering after new commits**: each `/ok to test <sha>` is specific to that SHA. After pushing additional commits, post a new comment with the updated SHA.
 
 ---
 
 ## CI Labels
 
-Every PR **must** have exactly one `CI:*` label — the quality-check job stays
-red until one is attached. Labels control which test tier runs and whether a
-new container image is built.
+Every PR **must** have exactly one `CI:*` label — the quality-check job stays red until one is attached. Labels control which test tier runs and whether a new container image is built.
 
 | Label | What runs | Container |
 |-------|-----------|-----------|
@@ -98,19 +93,12 @@ To retry a failed run on the **same commit**, re-run only the failed jobs:
 gh run rerun <run-id> --failed --repo NVIDIA-NeMo/RL
 ```
 
-In the UI this is **Re-run jobs → Re-run failed jobs**. It keeps every job that
-already passed and also re-runs jobs that were cancelled or skipped because of
-a failed job, including a run cancelled by a failing `CPU config checks` job.
+In the UI this is **Re-run jobs → Re-run failed jobs**. It keeps every job that already passed and also re-runs jobs that were cancelled or skipped because of a failed job, including a run cancelled by a failing `CPU config checks` job.
 
 Rules for agents:
 
-- **Never run `gh run rerun <run-id>` without `--failed`**, and never suggest
-  **Re-run all jobs**. A full re-run repeats every GPU job on a commit that
-  already passed most of them.
-- **Read the failure first** (`gh run view <run-id> --log-failed`). Re-run only
-  when the failure is unrelated to the change: a known flaky test, a download or
-  network error, a runner or container problem.
-- **If the failure comes from the change, fix it and push.** A new commit needs a
-  new `/ok to test <full-sha>` comment; do not re-run the old commit.
+- **Never run `gh run rerun <run-id>` without `--failed`**, and never suggest **Re-run all jobs**. A full re-run repeats every GPU job on a commit that already passed most of them.
+- **Read the failure first** (`gh run view <run-id> --log-failed`). Re-run only when the failure is unrelated to the change: a known flaky test, a download or network error, a runner or container problem.
+- **If the failure comes from the change, fix it and push.** A new commit needs a new `/ok to test <full-sha>` comment; do not re-run the old commit.
 - **Do not push empty commits** to re-trigger CI; use `--failed` on the existing run.
 

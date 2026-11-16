@@ -50,6 +50,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
 from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.experience.dynamic_sampling import mask_sample_flagged
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -997,11 +998,6 @@ def test_async_vlm_multiturn_drops_stale_vllm_content(
     assert [call["dedup"] for call in calls] == [deduplicate_multimodal_data] * 2
 
 
-class _DummyDynamoGeneration(_DummySGLangGeneration):
-    def __init__(self):
-        self.cfg = {"backend": "dynamo"}
-
-
 def test_generate_responses_async_requires_sglang_opt_in():
     generation_input_data = BatchedDataDict(
         {
@@ -1035,30 +1031,6 @@ def test_generate_responses_async_allows_sglang_opt_in():
     updated_batch, generated_ids, gen_metrics = asyncio.run(
         generate_responses_async(
             _DummySGLangGeneration(use_async_rollouts=True),
-            generation_input_data,
-            batch,
-            _DummyTokenizer(),
-            input_lengths=generation_input_data["input_lengths"],
-        )
-    )
-
-    assert updated_batch["message_log"][0][-1]["content"] == "ok"
-    assert generated_ids[0].tolist() == [2]
-    assert gen_metrics["total_generated_tokens"] == 1
-
-
-def test_generate_responses_async_allows_dynamo():
-    generation_input_data = BatchedDataDict(
-        {
-            "input_ids": torch.tensor([[1]]),
-            "input_lengths": torch.tensor([1], dtype=torch.long),
-        }
-    )
-    batch = BatchedDataDict({"message_log": [[]]})
-
-    updated_batch, generated_ids, gen_metrics = asyncio.run(
-        generate_responses_async(
-            _DummyDynamoGeneration(),
             generation_input_data,
             batch,
             _DummyTokenizer(),
@@ -2879,6 +2851,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     }
     manager._tokenizer = None
     manager._effort_config = None
+    manager._length_penalty_config = None
     manager._results_to_completions = lambda results: (
         [result["value"] for result in results],
         {},
@@ -2988,7 +2961,14 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
         def __init__(self):
             self.values = iter(
                 [
-                    _ReadyRef((0, {"name": "agent"}, {"value": "first"}, None)),
+                    _ReadyRef(
+                        (
+                            0,
+                            {"name": "agent"},
+                            {"value": "first", "full_result": {"reward": 1.0}},
+                            None,
+                        )
+                    ),
                     _ReadyRef((0, {"name": "agent"}, {"value": "duplicate"}, None)),
                 ]
             )
@@ -3023,6 +3003,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
     }
     manager._tokenizer = None
     manager._effort_config = None
+    manager._length_penalty_config = None
 
     with pytest.raises(ValueError, match="duplicate row index 0"):
         asyncio.run(
@@ -3111,6 +3092,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
     }
     manager._tokenizer = None
     manager._effort_config = None
+    manager._length_penalty_config = None
     manager._stats = None
 
     async def fake_stream_rows(
@@ -3480,25 +3462,17 @@ def test_reattach_preserves_marker_across_aliased_message_log_views():
 
 
 def test_mask_sample_flags_read_either_form_of_the_flag():
-    """Either the verify response's first-class ``mask_sample`` field or the
-    ``instance_config.mask_sample`` extras mapping flags a sample. Gym defaults
-    the first-class field to False on every response, so a nested-only
-    environment carries a false first-class field beside the true nested one
-    and the two reads must be OR-ed, not ordered; unflagged and empty rows stay
-    unmasked."""
-    flags = rollouts_mod._mask_sample_flags(
-        [
-            {"mask_sample": True},
-            {"instance_config": {"mask_sample": True}},
-            # An older-form environment on a Gym that defaults the first-class
-            # field to False: either form flags the sample.
-            {"mask_sample": False, "instance_config": {"mask_sample": True}},
-            {"mask_sample": False, "instance_config": {}},
-            {},
-            None,
-        ]
-    )
-    assert flags.tolist() == [True, True, True, False, False, False]
+    extras = [
+        {"mask_sample": True},
+        {"instance_config": {"mask_sample": True}},
+        {"mask_sample": False, "instance_config": {"mask_sample": True}},
+        {"mask_sample": False, "instance_config": {}},
+        {},
+        None,
+    ]
+    expected = [True, True, True, False, False, False]
+    assert rollouts_mod._mask_sample_flags(extras).tolist() == expected
+    assert [mask_sample_flagged(extra) for extra in extras] == expected
 
 
 @pytest.mark.nemo_gym
@@ -3519,6 +3493,7 @@ def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
     }
     impl._tokenizer = None
     impl._effort_config = None
+    impl._length_penalty_config = None
 
     async def fake_stream_rows(environment, pending, results, shaping, *_a, **_k):
         selected.append(environment)

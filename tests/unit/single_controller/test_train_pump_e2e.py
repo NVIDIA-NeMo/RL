@@ -43,6 +43,7 @@ from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
 from tests.unit.models.policy.test_megatron_worker import create_megatron_test_config
 from tests.unit.single_controller._dp_fakes import _PARTITION_ID
@@ -196,7 +197,7 @@ class _FakeGeneration:
     def snapshot_step_metrics(self) -> None:
         pass
 
-    def get_step_metrics(self) -> dict[str, float]:
+    def get_step_metrics(self, *, keep_snapshot: bool = False) -> dict[str, float]:
         return {}
 
     def pause_generation_for_refit(
@@ -347,6 +348,8 @@ def test_train_pump_drives_mcore_training_step(
             ),
             suspend_request_deadlines=lambda: None,
             resume_request_deadlines=lambda: None,
+            drain_step_reward_metrics=lambda _step: {},
+            filter_zero_variance_groups=False,
         )
 
         master_config = MasterConfig.model_construct(
@@ -382,16 +385,16 @@ def test_train_pump_drives_mcore_training_step(
             logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
             # Actor __init__ builds a CheckpointManager + TimeoutChecker from
             # this block; enabled=False keeps the run write-free.
-            checkpointing={
-                "enabled": False,
-                "checkpoint_dir": str(tmp_path / "checkpoints"),
-                "metric_name": None,
-                "higher_is_better": False,
-                "keep_top_k": None,
-                "save_period": 10_000,
-                "save_optimizer": False,
-                "checkpoint_must_save_by": None,
-            },
+            checkpointing=CheckpointingConfig(
+                enabled=False,
+                checkpoint_dir=str(tmp_path / "checkpoints"),
+                metric_name=None,
+                higher_is_better=False,
+                keep_top_k=None,
+                save_period=10_000,
+                save_optimizer=False,
+                checkpoint_must_save_by=None,
+            ),
         )
 
         actor_args = SingleControllerActorArgs(

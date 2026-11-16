@@ -67,6 +67,8 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
+    ReadyFirstSampler,
+    ReadyFirstSamplerConfig,
     WindowedSamplerConfig,
     sampler_supports_buffer_checkpoint,
 )
@@ -112,6 +114,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.algorithms.single_controller_utils.step_assembly import (
+    StepAssembly as _StepAssembly,
+)
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTE_PLAN_TAG
@@ -133,7 +138,11 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
 )
 from nemo_rl.telemetry.vocabulary import TELEMETRY_WALL_TIME_METRIC
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+    PretrainedCheckpointConfig,
+)
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker
 
@@ -170,8 +179,9 @@ class _FakeEnvironmentSnapshot:
     def __init__(self) -> None:
         self.checked_cuts: list[Any] = []
 
-    async def check_against_cut(self, cut: Any) -> None:
+    async def check_against_cut(self, cut: Any) -> frozenset[str]:
         self.checked_cuts.append(cut)
+        return frozenset()
 
     def metrics(self, paused_seconds: float) -> dict[str, float]:
         return {"environment_paused_seconds": paused_seconds}
@@ -355,6 +365,11 @@ class _FailingFinalizeTrainer(_FakeTrainer):
 
 class _FakeSampler:
     """PromptGroupSampler stand-in: always returns a full, fresh batch."""
+
+    # BaseSampler's gated defaults; the controller reads these directly off the sampler.
+    uses_pooled_replacements = True
+    closes_short_at_exhaustion = False
+    requires_shortfall_reconciliation = True
 
     def __init__(self, supports_buffer_checkpoint: bool = True) -> None:
         self._supports_buffer_checkpoint = supports_buffer_checkpoint
@@ -600,7 +615,7 @@ class _FakeGeneration:
     def snapshot_step_metrics(self) -> None:
         pass
 
-    def get_step_metrics(self) -> dict[str, float]:
+    def get_step_metrics(self, *, keep_snapshot: bool = False) -> dict[str, float]:
         return {}
 
     def pause_generation_for_refit(
@@ -696,6 +711,15 @@ class _FakeRolloutManager:
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    def set_tally_step_provider(self, provider: Any) -> None:
+        self.tally_step_provider = provider
+
+    filter_zero_variance_groups = False
+
+    def drain_step_reward_metrics(self, step: int) -> dict[str, float]:
+        del step
+        return {}
 
     def reserve_prompt_group(
         self,
@@ -927,6 +951,7 @@ def _actor_master_config(
             "train_global_batch_size": num_prompts_per_step * 2,
             "generation": {
                 "backend": "vllm",
+                "vllm_cfg": {"http_api_server_count": 1},
                 "top_k": None,
                 "top_p": 1.0,
                 "colocated": {"enabled": False},
@@ -944,19 +969,19 @@ def _actor_master_config(
         ),
         logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
         cluster=ClusterConfig(num_nodes=1, gpus_per_node=1),
-        checkpointing={
-            "enabled": enabled,
-            "checkpoint_dir": str(tmp_path / "checkpoints"),
-            "metric_name": metric_name,
-            "higher_is_better": True,
-            "keep_top_k": None,
-            "save_period": save_period,
-            "save_optimizer": save_optimizer,
-            "save_data_plane": data_plane_checkpoint,
-            "load_replay_buffer": load_replay_buffer,
-            "checkpoint_must_save_by": checkpoint_must_save_by,
-            "ft_save_period": ft_save_period,
-        },
+        checkpointing=CheckpointingConfig(
+            enabled=enabled,
+            checkpoint_dir=str(tmp_path / "checkpoints"),
+            metric_name=metric_name,
+            higher_is_better=True,
+            keep_top_k=None,
+            save_period=save_period,
+            save_optimizer=save_optimizer,
+            save_data_plane=data_plane_checkpoint,
+            load_replay_buffer=load_replay_buffer,
+            checkpoint_must_save_by=checkpoint_must_save_by,
+            ft_save_period=ft_save_period,
+        ),
         data_plane={
             "enabled": True,
             "impl": "transfer_queue",
@@ -1390,6 +1415,9 @@ class TestCounterRestore:
 
         assert actor._train_steps == 7
         assert actor._trainer_version == 11
+        # A group with no step of its own is charged to the step being assembled, so a
+        # resume that left this at 0 would charge the first loss to a long-closed step.
+        assert actor._step_assembler._assembling_version == 11
         assert actor._sampler.dispatch_index == 10
 
     def test_restores_exact_sampler_dispatch_index(self, tmp_path):
@@ -1414,6 +1442,7 @@ class TestCounterRestore:
 
         assert actor._train_steps == 0
         assert actor._trainer_version == 0
+        assert actor._step_assembler._assembling_version == 0
         assert actor._sampler.dispatch_index == -1
         assert actor._consumed_samples == 0
         assert actor._current_epoch == 0
@@ -2025,7 +2054,11 @@ class TestPeriodicRolloutCheckpoint:
             (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).read_text()
         )
         assert manifest["rolled_back_train_group_count"] == int(claimed)
-        assert torch.load(snapshot / "replacement_reserve.pt", weights_only=True) == []
+        # Two pools since dynamic sampling got its own; both empty here.
+        assert torch.load(snapshot / "replacement_reserve.pt", weights_only=True) == {
+            "replacement": [],
+            "filtered": [],
+        }
         restored_state = torch.load(
             snapshot / REPLAY_BUFFER_METADATA_FILENAME, weights_only=False
         )
@@ -2467,6 +2500,7 @@ class TestPeriodicRolloutCheckpoint:
             "reason_missing_trainer_anchor",
             "reason_no_data_plane_mutations",
             "reason_optimizer_commit_in_progress",
+            "reason_shortfall_reconciliation_pending",
             "reason_timeout",
             "reason_trainer_state_changed",
         }
@@ -2680,7 +2714,7 @@ class TestPeriodicRolloutCheckpoint:
             )
 
     @pytest.mark.parametrize("checkpoint_kind", ["snapshot", "full"])
-    def test_snapshot_persists_and_restores_pending_finalizer_metrics(
+    def test_snapshot_persists_and_restores_pending_step_state(
         self, tmp_path: Path, checkpoint_kind: str
     ):
         """Only canonical groups' pending statistics are saved; restore keeps them."""
@@ -2691,6 +2725,8 @@ class TestPeriodicRolloutCheckpoint:
         from nemo_rl.experience.rollout_recovery import parse_rollout_recovery_state
 
         actor = self._actor(tmp_path)
+        actor._rollout_runtime.steps_allowed_short = {0}
+        actor._rollout_runtime.batch_shortfall = {0: 1}
         claimed_meta = KVBatchMeta(
             partition_id=_PARTITION_ID,
             task_name=None,
@@ -2743,11 +2779,15 @@ class TestPeriodicRolloutCheckpoint:
         state = torch.load(
             snapshot / ROLLOUT_RECOVERY_STATE_FILENAME, weights_only=True
         )
+        assert state["steps_allowed_short"] == [0]
+        assert state["batch_shortfall"] == {0: 1}
         assert state["finalizer_metrics_by_group"] == {"claimed-group": pending}
         assert parse_rollout_recovery_state(state).finalizer_rewards_by_group == {
             "claimed-group": observations
         }
 
+        actor._rollout_runtime.steps_allowed_short = set()
+        actor._rollout_runtime.batch_shortfall = {}
         actor._rollout_runtime.finalizer_metrics_by_group = {}
         actor._rollout_runtime.finalizer_rewards_by_group = {}
         actor._buffer.training_claims = []
@@ -2766,6 +2806,8 @@ class TestPeriodicRolloutCheckpoint:
         assert actor._rollout_runtime.finalizer_rewards_by_group == {
             "claimed-group": observations
         }
+        assert actor._rollout_runtime.steps_allowed_short == {0}
+        assert actor._rollout_runtime.batch_shortfall == {0: 1}
 
     def test_snapshot_reindexes_rows_owned_by_active_streamed_step(
         self, tmp_path: Path
@@ -2826,6 +2868,66 @@ class TestPeriodicRolloutCheckpoint:
             assert not result.saved
             assert result.reason == "optimizer_commit_in_progress"
             assert actor._dp_client.save_calls == []
+        finally:
+            actor._checkpointer.shutdown()
+
+    @pytest.mark.parametrize("when", ["before_attempt", "after_anchor"])
+    def test_snapshot_waits_for_selection_shortfall_reconciliation(
+        self, tmp_path: Path, when: str
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._algo_cfg.num_prompts_per_step = 4
+        actor._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
+        actor._master_config.async_rl.sampler = ReadyFirstSamplerConfig(
+            max_staleness_versions=1
+        )
+        actor._sampler = ReadyFirstSampler(actor._buffer, max_staleness_versions=1)
+        actor._step_assembler._step_assembly = _StepAssembly(0, 0, [])
+        attach_rollout_checkpointing(actor)
+
+        def lose() -> None:
+            for _ in range(3):
+                actor._step_assembler.credit_shortfall(None)
+            assert actor._rollout_runtime.batch_shortfall == {0: 3}
+
+        async def exercise() -> None:
+            if when == "before_attempt":
+                lose()
+            else:
+                resolve_anchor = actor._rollout_snapshots._resolve_anchor
+
+                async def lose_after_anchor():
+                    anchor = await resolve_anchor()
+                    lose()
+                    return anchor
+
+                actor._rollout_snapshots._resolve_anchor = lose_after_anchor
+            skipped = await actor._rollout_snapshots.save_snapshot(force=True)
+            assert not skipped.saved
+            assert skipped.reason == "shortfall_reconciliation_pending"
+            assert actor._dp_client.save_calls == []
+            if when == "after_anchor":
+                actor._rollout_snapshots._resolve_anchor = resolve_anchor
+            async with actor._data_plane_checkpoint_barrier.checkpoint() as cut:
+                with pytest.raises(RuntimeError, match="unreconciled selection"):
+                    await actor._rollout_snapshots.capture(
+                        cut, tmp_path / "unsafe", "rollout_snapshot"
+                    )
+            credits = actor._step_assembler._step_assembly.selection_credits
+            actor._step_assembler._step_assembly.selection_credits = None
+            actor._step_assembler._step_assembly.selected_groups = 3
+            actor._step_assembler.reconcile_selection_credits(0, credits)
+            assert actor._target_groups_for_step(0) == 3
+            assert actor._target_groups_for_step(1) == 2
+            saved = await actor._rollout_snapshots.save_snapshot(force=True)
+            assert saved.saved
+
+        try:
+            asyncio.run(exercise())
+            paths = list(tmp_path.rglob(ROLLOUT_RECOVERY_STATE_FILENAME))
+            assert len(paths) == 1
+            state = torch.load(paths[0], weights_only=True)
+            assert state["batch_shortfall"] == {0: 1, 1: 2}
         finally:
             actor._checkpointer.shutdown()
 
@@ -3074,6 +3176,77 @@ class TestPeriodicRolloutCheckpoint:
         assert not (checkpoints / "step_1").exists()
         assert list(checkpoints.glob("tmp_rollout_snapshot_step_*")) == []
 
+    @pytest.mark.parametrize(
+        ("prefix_cuts_enabled", "restore_level", "expect_save"),
+        [
+            (True, RecoveryTargetLevel.PREFIX, True),
+            (False, RecoveryTargetLevel.PREFIX, False),
+            (True, RecoveryTargetLevel.TURN, False),
+        ],
+    )
+    def test_unchanged_data_plane_still_cuts_a_decoding_prefix(
+        self,
+        tmp_path: Path,
+        prefix_cuts_enabled: bool,
+        restore_level: RecoveryTargetLevel,
+        expect_save: bool,
+    ) -> None:
+        """Decoding grows a recoverable prefix without mutating the data plane."""
+
+        class _SaveStarted(Exception):
+            pass
+
+        actor = self._actor(tmp_path)
+        snapshots = actor._rollout_snapshots
+        # Only the cadence check reads the target; the rest of this actor is
+        # built for sibling recovery.
+        actor._master_config.rollout_recovery.target_level = (
+            RecoveryTargetLevel.PREFIX
+            if prefix_cuts_enabled
+            else RecoveryTargetLevel.SIBLING
+        )
+        ledger = actor._rollout_recovery_ledger
+
+        async def dispatch() -> None:
+            async with actor._data_plane_checkpoint_barrier.mutation() as cut:
+                ledger.reserve_group(
+                    cut,
+                    group_id="g7",
+                    admission_id="batch-7",
+                    prompt_id="7",
+                    prompt_payload={"idx": 7, "message_log": []},
+                    expected_generations=2,
+                    target_step=0,
+                    start_weight_version=0,
+                    restore_level=restore_level,
+                    admitted=True,
+                )
+                ledger.mark_group_dispatched(
+                    cut, "g7", environment_instance_id="tools/replica-0"
+                )
+
+        asyncio.run(dispatch())
+        snapshots._last_snapshot_mutation_version = (
+            actor._data_plane_checkpoint_barrier.mutation_version
+        )
+        result = None
+        try:
+            with patch.object(
+                actor._checkpointer, "finalize_pending", side_effect=_SaveStarted
+            ):
+                try:
+                    result = asyncio.run(snapshots.save_snapshot())
+                except _SaveStarted:
+                    pass
+        finally:
+            actor._checkpointer.shutdown()
+
+        if expect_save:
+            assert result is None
+        else:
+            assert result is not None
+            assert result.reason == "no_data_plane_mutations"
+
     def test_periodic_pump_reports_each_consecutive_failure(
         self,
         tmp_path: Path,
@@ -3302,6 +3475,7 @@ class TestDataPlaneCheckpoint:
         state = build_rollout_recovery_state(
             ledger,
             batch_shortfall={},
+            steps_allowed_short=set(),
             sampler_stamps_target_steps=True,
             reward_settings=CaptureRewardSettings.from_configs(
                 config.reward_penalties, None, None
@@ -3861,13 +4035,18 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._consumed_samples = 0
     actor._total_valid_tokens = 0
     actor._rollout_runtime.replacement_reserve = []
+    actor._rollout_runtime.filtered_reserve = []
+    actor._rollout_runtime.finalizer_metrics_by_group = {}
+    actor._rollout_runtime.finalizer_rewards_by_group = {}
     actor._async_cfg = SimpleNamespace(
         sampler=SimpleNamespace(name="in_order"),
         max_buffered_rollouts=4,
     )
     actor._sampler = _FakeSampler()
     actor._master_config = SimpleNamespace(
-        checkpointing={"metric_name": None, "save_data_plane": False},
+        checkpointing=CheckpointingConfig.model_construct(
+            metric_name=None, save_data_plane=False
+        ),
         data_plane={},
     )
     actor._dataloader = SimpleNamespace(state_dict=lambda: {})
@@ -3957,9 +4136,31 @@ class TestPPOWarmupCheckpoint:
         # The critic trains from step 0, so its optimizer is always written.
         assert actor._value.save_kwargs["optimizer_path"] is not None
 
+    @pytest.mark.parametrize("consumed_samples", [0, 16])
+    def test_grpo_skipped_step_checkpoint_preserves_only_initialized_optimizer(
+        self, actor, consumed_samples
+    ):
+        actor._is_ppo = False
+        actor._consumed_samples = consumed_samples
+        actor._train_steps = 2
+
+        asyncio.run(
+            actor._save_checkpoint(
+                {"skipped_step": 1},
+                is_policy_training_step=True,
+                is_final_checkpoint=True,
+            )
+        )
+
+        assert actor._trainer.save_kwargs["weights_path"] is not None
+        assert (actor._trainer.save_kwargs["optimizer_path"] is not None) == (
+            consumed_samples > 0
+        )
+        assert actor._save_state.consumed_samples == consumed_samples
+
     def test_warmup_step_skips_the_top_k_metric(self, actor):
         """No policy metrics exist yet, so the checkpoint just is not a candidate."""
-        actor._master_config.checkpointing["metric_name"] = "train:loss"
+        actor._master_config.checkpointing.metric_name = "train:loss"
         # Seed it so the delattr in the warmup branch is observable; the bare
         # namespace never had the attribute, so the assertion would be vacuous.
         setattr(actor._save_state, "train:loss", 1.23)
@@ -3975,7 +4176,7 @@ class TestPPOWarmupCheckpoint:
 
     def test_a_training_step_still_raises_on_a_missing_metric(self, actor):
         """The warmup branch must not soften the misconfiguration error."""
-        actor._master_config.checkpointing["metric_name"] = "train:loss"
+        actor._master_config.checkpointing.metric_name = "train:loss"
 
         with pytest.raises(ValueError, match="not found in train metrics"):
             asyncio.run(
@@ -4177,6 +4378,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             "megatron_cfg": {"enabled": False},
             "generation": {
                 "backend": "vllm",
+                "vllm_cfg": {"http_api_server_count": 1},
                 "colocated": {"enabled": False, "resources": {}},
             },
         },
@@ -4187,17 +4389,17 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             min_groups_for_streaming_train=4,
             max_buffered_rollouts=8,
         ),
-        checkpointing={
-            "enabled": True,
-            "checkpoint_dir": checkpoint_dir,
-            "metric_name": None,
-            "higher_is_better": True,
-            "keep_top_k": None,
-            "save_period": 2,
-            "save_optimizer": True,
-            "save_data_plane": True,
-            "checkpoint_must_save_by": None,
-        },
+        checkpointing=CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_dir,
+            metric_name=None,
+            higher_is_better=True,
+            keep_top_k=None,
+            save_period=2,
+            save_optimizer=True,
+            save_data_plane=True,
+            checkpoint_must_save_by=None,
+        ),
     )
 
 
@@ -4268,7 +4470,7 @@ class TestSetupResumeWiring:
     ):
         ckpt_dir = tmp_path / "ckpts"
         mc = _setup_master_config(str(ckpt_dir))
-        mc.checkpointing["save_period"] = 1
+        mc.checkpointing.save_period = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=120.0
         )
@@ -4408,8 +4610,10 @@ class TestSetupResumeWiring:
         tmp_path,
     ):
         mc = _setup_master_config(str(tmp_path / "ckpts"))
-        pretrained = {"path": "/some/ckpt", "format": "megatron_bridge"}
-        mc.checkpointing["pretrained_checkpoint"] = pretrained
+        pretrained = PretrainedCheckpointConfig(
+            path="/some/ckpt", format="megatron_bridge"
+        )
+        mc.checkpointing.pretrained_checkpoint = pretrained
 
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -5037,7 +5241,10 @@ class TestReplacementReservePersistence:
 
         reserve_path = tmp_path / "checkpoints" / "step_2" / "replacement_reserve.pt"
         assert reserve_path.exists()
-        assert torch.load(reserve_path, weights_only=False) == ["spare0", "spare1"]
+        assert torch.load(reserve_path, weights_only=False) == {
+            "replacement": ["spare0", "spare1"],
+            "filtered": [],
+        }
         # Saved, not consumed: the pool the run continues with is untouched.
         assert list(actor._rollout_runtime.replacement_reserve) == ["spare0", "spare1"]
 
@@ -5049,7 +5256,10 @@ class TestReplacementReservePersistence:
 
         step_dir = tmp_path / "checkpoints" / "step_2"
         assert step_dir.exists()
-        assert torch.load(step_dir / "replacement_reserve.pt", weights_only=False) == []
+        assert torch.load(step_dir / "replacement_reserve.pt", weights_only=False) == {
+            "replacement": [],
+            "filtered": [],
+        }
 
     def test_run_restores_the_pooled_spares(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"
