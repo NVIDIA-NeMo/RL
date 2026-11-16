@@ -1563,8 +1563,9 @@ def patched_holder(monkeypatch):
         (None, 2),
     ],
 )
+@pytest.mark.parametrize("gpu_order", [None, [2, 0, 3, 1]])
 def test_reserve_http_server_addresses_pins_every_frontend_bundle(
-    patched_holder, sorted_bundle_indices, model_parallel_size
+    patched_holder, sorted_bundle_indices, model_parallel_size, gpu_order, monkeypatch
 ):
     """Each reserved address must sit on the bundle its frontend rank will occupy.
 
@@ -1613,6 +1614,11 @@ def test_reserve_http_server_addresses_pins_every_frontend_bundle(
         },
     }
 
+    monkeypatch.setattr(
+        MegatronGeneration,
+        "_coresident_gpu_order",
+        staticmethod(lambda config, cluster: gpu_order),
+    )
     urls, rank_to_port, holders = MegatronGeneration.reserve_http_server_addresses(
         cluster, config
     )
@@ -1621,6 +1627,8 @@ def test_reserve_http_server_addresses_pins_every_frontend_bundle(
     expected_placement = _bundles_via_worker_group(
         sorted_bundle_indices, cluster.num_gpus_per_node, placement_groups
     )
+    if gpu_order is not None:
+        expected_placement = [expected_placement[gpu] for gpu in gpu_order]
     assert list(rank_to_port) == expected_ranks
     assert len(urls) == len(holders) == len(expected_ranks)
 

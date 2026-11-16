@@ -185,6 +185,9 @@ class MegatronGeneration(GenerationInterface):
 
         placement_groups = cluster.get_placement_groups()
         placement = cls._rank_placement(cluster)
+        gpu_order = cls._coresident_gpu_order(config, cluster)
+        if gpu_order is not None:
+            placement = [placement[gpu] for gpu in gpu_order]
         ranks = cls.frontend_ranks(cluster, config)
 
         # Zero-gap reservation: a holder actor on each frontend's node binds and
@@ -391,27 +394,19 @@ class MegatronGeneration(GenerationInterface):
     def _coresident_gpu_order(
         config: PolicyConfig, cluster: RayVirtualCluster
     ) -> Optional[list[int]]:
-        """Place inference expert ranks beside their matching learner expert shards.
-
-        Co-resident engine with an EP that is a multiple of the learner's: the GPU of each engine rank, so that its
-        experts are a block of the co-located learner rank's (sm_partition.engine_rank_gpus); None otherwise.
-        """
+        """Match joint dense/expert shard ownership across the two rank layouts."""
         from nemo_rl.models.megatron import sm_partition
 
         if sm_partition.engine_sm_fraction(config) is None:
             return None
-        learner_ep = config["megatron_cfg"].get("expert_model_parallel_size") or 1
-        engine_ep = (
-            config["generation"]["mcore_generation_config"].get(
-                "expert_model_parallel_size"
-            )
-            or learner_ep
+        placement = sm_partition.engine_rank_gpus(
+            cluster.world_size(),
+            learner=sm_partition.ParallelismLayout.from_config(config["megatron_cfg"]),
+            engine=sm_partition.ParallelismLayout.from_config(
+                MegatronGeneration.effective_megatron_cfg(config)
+            ),
         )
-        if engine_ep == learner_ep:
-            return None
-        return sm_partition.engine_rank_gpus(
-            cluster.world_size(), learner_ep, engine_ep
-        )
+        return None if placement == list(range(cluster.world_size())) else placement
 
     @property
     def uses_native_refit(self) -> bool:

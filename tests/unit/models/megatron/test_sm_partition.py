@@ -88,25 +88,6 @@ def test_validate_accepts_the_supported_config():
         ({"generation.refit_transport": None}, MPS, "refit_transport=ipc"),
         ({}, {}, "MPS control daemon"),
         (
-            {"generation.mcore_generation_config.expert_model_parallel_size": 6},
-            MPS,
-            "not built yet",
-        ),
-        (
-            {"generation.mcore_generation_config.tensor_model_parallel_size": 2},
-            MPS,
-            "not built yet",
-        ),
-        (
-            {
-                "megatron_cfg.tensor_model_parallel_size": 2,  # an EP multiple is placed for TP = 1 only
-                "generation.mcore_generation_config.tensor_model_parallel_size": 2,
-                "generation.mcore_generation_config.expert_model_parallel_size": 8,
-            },
-            MPS,
-            "TP = ETP = 1",
-        ),
-        (
             {
                 "megatron_cfg.pipeline_model_parallel_size": 2,
                 "generation.mcore_generation_config.pipeline_model_parallel_size": 2,
@@ -119,6 +100,56 @@ def test_validate_accepts_the_supported_config():
 def test_validate_rejects(over, env, match):
     with pytest.raises(ValueError, match=match):
         smp.validate(_cfg(**over), env=env)
+
+
+@pytest.mark.parametrize("engine_tp", [2, 4])
+def test_validate_accepts_local_tp_refinement(engine_tp: int) -> None:
+    smp.validate(
+        _cfg(
+            **{
+                "generation.mcore_generation_config.tensor_model_parallel_size": engine_tp
+            }
+        ),
+        env=MPS,
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "megatron_cfg.tensor_model_parallel_size": 4,
+            "generation.mcore_generation_config.tensor_model_parallel_size": 2,
+        },
+        {
+            "megatron_cfg.tensor_model_parallel_size": 2,
+            "generation.mcore_generation_config.tensor_model_parallel_size": 4,
+        },
+        {"generation.mcore_generation_config.expert_model_parallel_size": 8},
+        {"generation.mcore_generation_config.expert_model_parallel_size": 2},
+        {
+            "megatron_cfg.expert_tensor_parallel_size": 2,
+            "generation.mcore_generation_config.expert_tensor_parallel_size": 1,
+        },
+        {"megatron_cfg.context_parallel_size": 2},
+        {
+            "megatron_cfg.pipeline_model_parallel_size": 2,
+            "generation.mcore_generation_config.pipeline_model_parallel_size": 1,
+        },
+    ],
+)
+def test_validate_allows_layouts_requiring_native_residual_transfers(
+    overrides: dict,
+) -> None:
+    smp.validate(_cfg(**overrides), env=MPS)
+
+
+def test_validate_keeps_inference_context_parallel_limit() -> None:
+    with pytest.raises(ValueError, match="does not support context parallelism"):
+        smp.validate(
+            _cfg(**{"generation.mcore_generation_config.context_parallel_size": 2}),
+            env=MPS,
+        )
 
 
 def test_validate_rejects_unsupported_features():
@@ -447,7 +478,11 @@ def test_bind_shared_then_copy_whatever_is_not_aliased(
     "world, l_ep, e_ep", [(16, 4, 8), (16, 8, 8), (8, 2, 8), (4, 2, 4), (64, 8, 32)]
 )
 def test_engine_rank_gpus_put_experts_on_their_learner(world, l_ep, e_ep):
-    gpus = smp.engine_rank_gpus(world, l_ep, e_ep)
+    gpus = smp.engine_rank_gpus(
+        world,
+        learner=smp.ParallelismLayout(1, l_ep, 1, 1, 1),
+        engine=smp.ParallelismLayout(1, e_ep, 1, 1, 1),
+    )
     assert sorted(gpus) == list(range(world))
     experts = 128
     for r, g in enumerate(gpus):
@@ -456,41 +491,6 @@ def test_engine_rank_gpus_put_experts_on_their_learner(world, l_ep, e_ep):
         assert set(e_block) <= set(l_block), (r, g)
     if l_ep == e_ep:
         assert gpus == list(range(world))
-
-
-def test_map_sources_by_resolved_name_and_rank_coordinates():
-    """Engine EP rank 1 of 8 (global experts 16..31) next to learner EP rank 0 of 4 (global experts 0..31): each engine
-    tensor maps to the learner tensor with the same Megatron resolved name (global expert index)."""
-    src = {
-        f"decoder.layers.1.mlp.experts.linear_fc1.weight{i}": torch.full((1,), float(i))
-        for i in range(32)
-    }
-    src["decoder.layers.0.self_attention.linear_qkv.weight"] = torch.zeros(1)
-    dst = {
-        f"decoder.layers.1.mlp.experts.linear_fc1.weight{i}": f"decoder.layers.1.mlp.experts.linear_fc1.weight{16 + i}"
-        for i in range(16)
-    }
-    dst["decoder.layers.0.self_attention.linear_qkv.weight"] = (
-        "decoder.layers.0.self_attention.linear_qkv.weight"
-    )
-    coords = {"tp": (0, 1), "pp": (0, 1)}
-    got = smp.map_sources(src, coords, dst, coords)
-    assert [
-        int(got[f"decoder.layers.1.mlp.experts.linear_fc1.weight{i}"].item())
-        for i in range(16)
-    ] == list(range(16, 32))
-    # Negative: the engine rank sits next to another TP rank's learner (same names and shapes, wrong shard).
-    with pytest.raises(ValueError, match="engine ranks are misplaced"):
-        smp.map_sources(
-            src, {"tp": (1, 2), "pp": (0, 1)}, dst, {"tp": (0, 2), "pp": (0, 1)}
-        )
-    # Negative: an engine expert that this GPU's learner rank does not hold.
-    far = {
-        **dst,
-        "decoder.layers.1.mlp.experts.linear_fc1.weight0": "decoder.layers.1.mlp.experts.linear_fc1.weight40",
-    }
-    with pytest.raises(ValueError, match="not on this GPU's learner rank"):
-        smp.map_sources(src, coords, far, coords)
 
 
 class _Group:
@@ -521,7 +521,9 @@ def test_coresident_refit_publishes_only_in_sync_weights(monkeypatch, weights):
             log,
             "learner",
             {
-                "export_coresident_refit_handles": ("gpu0", {}, "fp", {}),
+                "export_coresident_refit_handles": smp.RefitExport(
+                    smp.RefitPlacement("gpu0", 0), [], {}, "fp"
+                ),
                 "coresident_refit_source_ready": "fp",
             },
         ),
@@ -534,7 +536,8 @@ def test_coresident_refit_publishes_only_in_sync_weights(monkeypatch, weights):
             log,
             "engine",
             {
-                "open_coresident_refit_handles": {},
+                "coresident_refit_placement": smp.RefitPlacement("gpu0", 0),
+                "open_coresident_refit_handles": smp.RefitBinding([], {}),
                 "coresident_refit_copy": {
                     "seconds": 0.0,
                     "bytes": 1.0,
@@ -642,7 +645,9 @@ def test_coresident_copy_failure_keeps_engine_paused(
             log,
             "learner",
             {
-                "export_coresident_refit_handles": ("gpu0", {}, "fp", {}),
+                "export_coresident_refit_handles": smp.RefitExport(
+                    smp.RefitPlacement("gpu0", 0), [], {}, "fp"
+                ),
                 "coresident_refit_source_ready": "fp",
             },
         ),
@@ -655,7 +660,8 @@ def test_coresident_copy_failure_keeps_engine_paused(
             log,
             "engine",
             {
-                "open_coresident_refit_handles": {},
+                "coresident_refit_placement": smp.RefitPlacement("gpu0", 0),
+                "open_coresident_refit_handles": smp.RefitBinding([], {}),
                 "coresident_refit_copy": {
                     "seconds": 0.0,
                     "bytes": 1.0,
@@ -759,3 +765,184 @@ def test_expert_parameter_order_leaves_incompatible_parameters_untouched() -> No
     before = list(linear._parameters.items())
     assert not smp._reverse_expert_parameter_order(linear, num_experts=2)
     assert list(linear._parameters.items()) == before
+
+
+@pytest.mark.parametrize(
+    "failure", [None, "export_coresident_refit_destinations", "coresident_reshard"]
+)
+def test_residual_transfer_precedes_publication_and_failures_keep_engine_paused(
+    monkeypatch: pytest.MonkeyPatch, failure: str | None
+) -> None:
+    from nemo_rl.weight_sync import megatron_weight_synchronizer as mws
+
+    log = []
+
+    class Fleet:
+        def __init__(self, role: str, replies: dict) -> None:
+            self.role = role
+            self.replies = replies
+            self.calls = []
+
+        def run_all_workers_single_data(self, method: str, **kwargs) -> list:
+            log.append(f"{self.role}.{method}")
+            self.calls.append((method, kwargs))
+            return self.replies.get(method, [None, None])
+
+    def get(refs: list, **kwargs) -> list:
+        for value in refs:
+            if isinstance(value, Exception):
+                raise value
+        return refs
+
+    monkeypatch.setattr(mws, "_get_fail_fast", get)
+    exports = [
+        smp.RefitExport(smp.RefitPlacement(f"gpu{rank}", rank), [], {}, f"source{rank}")
+        for rank in range(2)
+    ]
+    residual = [
+        {"owner_rank": rank, "name": "weight", "shape": (8, 4), "element_size": 4}
+        for rank in range(2)
+    ]
+    learner = Fleet(
+        "learner",
+        {
+            "export_coresident_refit_handles": exports,
+            "coresident_refit_source_ready": [item.fingerprint for item in exports],
+        },
+    )
+    engine = Fleet(
+        "engine",
+        {
+            "coresident_refit_placement": [item.placement for item in exports],
+            "open_coresident_refit_handles": [
+                smp.RefitBinding([item], {"tensors_bound": 0}) for item in residual
+            ],
+            "export_coresident_refit_destinations": [
+                smp.RefitDestination(f"gpu{rank}", f"receive{rank}", {})
+                for rank in range(2)
+            ],
+            "coresident_refit_copy": [
+                {"seconds": 0.0, "bytes": 0.0, "bytes_shared": 16.0}
+            ]
+            * 2,
+        },
+    )
+    generation = SimpleNamespace(
+        worker_group=engine, refresh_dp_openai_server_base_urls=lambda **kwargs: None
+    )
+    refit = mws.CoresidentRefit(
+        SimpleNamespace(cfg=_cfg(), worker_group=learner), generation
+    )
+    refit.init_communicator()
+    assert "learner.init_coresident_reshard" in log
+    log.clear()
+    if failure is not None:
+        (engine if failure.startswith("export_") else learner).replies[failure] = [
+            ValueError("transfer failed")
+        ]
+        with pytest.raises(ValueError, match="transfer failed"):
+            refit.sync_weights()
+        assert "engine.coresident_refit_copy" not in log
+        assert "engine.coresident_resume" not in log
+        assert refit._paused_at is not None
+    else:
+        stats = refit.sync_weights()
+        assert log == [
+            "engine.coresident_pause",
+            "learner.coresident_refit_source_ready",
+            "engine.export_coresident_refit_destinations",
+            "learner.coresident_reshard",
+            "engine.coresident_refit_copy",
+            "engine.coresident_resume",
+        ]
+        assert stats["coresident_copy_bytes_total"] == 256
+        assert stats["coresident_shared_bytes_total"] == 32
+        replacements = [
+            smp.RefitDestination(f"gpu{rank}", f"moved{rank}", {"weight": ("new", ())})
+            for rank in range(2)
+        ]
+        engine.replies["export_coresident_refit_destinations"] = replacements
+        refit.sync_weights()
+        forwarded = [
+            kwargs["destinations"]
+            for method, kwargs in learner.calls
+            if method == "coresident_reshard"
+        ]
+        assert forwarded[-1] == {item.device_id: item for item in replacements}
+        refit.shutdown()
+        assert log[-1] == "learner.release_coresident_receives"
+        refit.shutdown()
+        assert log.count("learner.release_coresident_receives") == 1
+        with pytest.raises(RuntimeError, match="closed"):
+            refit.sync_weights()
+
+
+@pytest.mark.parametrize(
+    "world,learner,engine,expected",
+    [
+        (4, (2, 1, 1, 1, 1), (4, 1, 1, 1, 1), [0, 2, 1, 3]),
+        (8, (2, 4, 1, 1, 1), (4, 8, 1, 1, 1), [0, 4, 1, 5, 2, 6, 3, 7]),
+        (8, (2, 4, 1, 1, 1), (4, 4, 1, 1, 1), list(range(8))),
+        (8, (4, 1, 1, 1, 1), (2, 1, 1, 1, 1), list(range(8))),
+        (8, (2, 1, 1, 2, 1), (2, 1, 1, 1, 1), list(range(8))),
+    ],
+)
+def test_joint_rank_placement_and_residual_fallback(
+    world, learner, engine, expected
+) -> None:
+    assert (
+        smp.engine_rank_gpus(
+            world,
+            learner=smp.ParallelismLayout(*learner),
+            engine=smp.ParallelismLayout(*engine),
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("cp", [1, 2, 4])
+def test_joint_placement_matches_native_dense_and_expert_group_coordinates(
+    cp: int,
+) -> None:
+    from megatron.core.parallel_state import RankGenerator
+
+    world = 32
+    learner = smp.ParallelismLayout(2, 4, 1, 1, cp)
+    engine = smp.ParallelismLayout(4, 8, 1, 1, 1)
+    placement = smp.engine_rank_gpus(world, learner=learner, engine=engine)
+    assert sorted(placement) == list(range(world))
+
+    def groups(layout):
+        dense = RankGenerator(
+            tp=layout.tp,
+            ep=1,
+            dp=world // (layout.tp * layout.cp),
+            pp=1,
+            cp=layout.cp,
+            order="tp-cp-ep-dp-pp",
+        )
+        expert = RankGenerator(
+            tp=layout.etp,
+            ep=layout.ep,
+            dp=world // (layout.etp * layout.ep),
+            pp=1,
+            cp=1,
+            order="tp-cp-ep-dp-pp",
+        )
+        return dense.get_ranks("tp"), expert.get_ranks("tp"), expert.get_ranks("ep")
+
+    source_groups, destination_groups = groups(learner), groups(engine)
+    ratios = (
+        engine.tp // learner.tp,
+        engine.etp // learner.etp,
+        engine.ep // learner.ep,
+    )
+    for rank, gpu in enumerate(placement):
+        for source, destination, ratio in zip(
+            source_groups, destination_groups, ratios
+        ):
+            source_index = next(group.index(gpu) for group in source if gpu in group)
+            destination_index = next(
+                group.index(rank) for group in destination if rank in group
+            )
+            assert source_index == destination_index // ratio

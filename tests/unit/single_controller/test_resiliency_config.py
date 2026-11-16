@@ -133,7 +133,14 @@ def test_mps_shared_weights_reject_reference_policy_swaps(
     cfg = _master_config()
     cfg.cluster = ClusterConfig(gpus_per_node=4, num_nodes=1)
     cfg.loss_fn.reference_policy_kl_penalty = reference_kl
-    cfg.policy["megatron_cfg"] = {"enabled": True, "expert_model_parallel_size": 4}
+    cfg.policy["megatron_cfg"] = {
+        "enabled": True,
+        "tensor_model_parallel_size": 1,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "expert_model_parallel_size": 4,
+        "expert_tensor_parallel_size": 1,
+    }
     cfg.policy["generation"] = {
         "backend": "megatron",
         "refit_transport": "ipc",
