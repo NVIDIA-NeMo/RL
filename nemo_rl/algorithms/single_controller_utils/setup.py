@@ -49,6 +49,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_buffer_checkpoint,
     sampler_supports_training_claims,
+    sampler_supports_transactional_admission,
 )
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
@@ -85,6 +86,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     logprob_passes_required,
     resolve_ppo_chunk_alignment,
     rollout_snapshots_enabled,
+    validate_grpo_chunk_cap_alignment,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.simulator import (
@@ -1282,6 +1284,12 @@ def setup_single_controller(
             "master_config.data_plane.enabled=True. The async-RL "
             "SingleController path is built on the TransferQueue data plane."
         )
+    if algo_cfg.use_dynamic_sampling:
+        if not sampler_supports_transactional_admission(master_config.async_rl.sampler):
+            raise ValueError(
+                "Dynamic sampling requires TransactionalAdmissionSampler: the admission "
+                "wait must permit filtering-pool refill outside checkpoint mutations."
+            )
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
     snapshots_enabled = rollout_snapshots_enabled(master_config)
@@ -1935,6 +1943,10 @@ def setup_single_controller(
             reserved_http_server_ports=reserved_http_server_ports,
         )
         if not is_ppo_run(master_config):
+            validate_grpo_chunk_cap_alignment(
+                master_config,
+                trainer.sharding_annotations.get_axis_size("data_parallel"),
+            )
             return trainer, None, time_metrics
 
         trainer.offload_to_cpu()
