@@ -219,7 +219,11 @@ class NixlStorageUnit:  # pragma: no cover
             numa_utils.first_touch(self.slab)
         self._mu = threading.RLock()
         self._init_ssd(
-            int(slab_bytes), ssd_dir, int(staging_bytes), float(pickup_s), int(io_threads)
+            int(slab_bytes),
+            ssd_dir,
+            int(staging_bytes),
+            float(pickup_s),
+            int(io_threads),
         )
         self.ep = NixlEndpoint(
             f"unit-{self.unit_id}-{uuid.uuid4().hex[:6]}",
@@ -524,7 +528,9 @@ class NixlStorageUnit:  # pragma: no cover
         """Drop unpinned staged copies, oldest first.
 
         A copy no reader has pinned yet is kept for ``pickup_s`` after its
-        stage, so the reader polling for it finds it (design §4.2).
+        stage, so the reader polling for it finds it (design §4.2). A copy a
+        checkpoint is reading (``holds``) stays too: a hold stops only the
+        release, so eviction has to check it itself.
         """
         need = align_up(nbytes, self.staging_.align)
         old = sorted(
@@ -532,6 +538,7 @@ class NixlStorageUnit:  # pragma: no cover
             for b, r in self._staged.items()
             if not r.staging
             and r.disk is not None  # never the only copy
+            and not r.holds  # save_shard is copying this region
             and r.pin_expiry(now) <= now
             and (r.picked_up or now - r.staged_at >= self.pickup_s)
         )
@@ -993,7 +1000,8 @@ class NixlStorageUnit:  # pragma: no cover
                     else:
                         with self._mu:
                             # A spill whose file is not written yet: its IO copy
-                            # is complete and held, so it is copied from there.
+                            # is complete, and the hold keeps _evict_staged off
+                            # its region even if the write ends mid-copy.
                             live_io_copy = rec.disk is None and self.blobs.get(b) is rec
                             io_off = rec.staged_off if live_io_copy else None
                             fd = None if rec.disk is None else os.dup(rec.disk)
