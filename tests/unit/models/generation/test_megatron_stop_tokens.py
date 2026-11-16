@@ -17,16 +17,23 @@
 from types import SimpleNamespace
 
 import pytest
-from megatron.core.inference.sampling_params import SamplingParams
-
-from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
 
 pytestmark = pytest.mark.mcore
 
 
 @pytest.mark.parametrize("stop_ids", [None, [], [7], [7, 9, 7]])
 @pytest.mark.parametrize("greedy", [False, True])
-def test_configured_stop_ids_reach_sampling_params(stop_ids, greedy):
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_configured_stop_ids_reach_sampling_params(
+    stop_ids: list[int] | None, greedy: bool, ignore_eos: bool
+) -> None:
+    # Keep optional Megatron/Bridge dependencies out of non-MCore collection.
+    from megatron.core.inference.sampling_params import SamplingParams
+
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationMixin,
+    )
+
     worker = SimpleNamespace(
         cfg={
             "generation": {
@@ -35,6 +42,7 @@ def test_configured_stop_ids_reach_sampling_params(stop_ids, greedy):
                 "temperature": 1.0,
                 "max_new_tokens": 8,
                 "stop_token_ids": stop_ids,
+                "ignore_eos": ignore_eos,
             }
         },
         megatron_tokenizer=SimpleNamespace(eod=11),
@@ -43,7 +51,7 @@ def test_configured_stop_ids_reach_sampling_params(stop_ids, greedy):
     assert params.stop_token_ids == (
         sorted(set(stop_ids)) if stop_ids is not None else None
     )
-    assert params.termination_id == 11
+    assert params.termination_id == (-1 if ignore_eos else 11)
     assert params.stop_words == ["END"]
     assert params.detokenize_stop_sequence
     restored = SamplingParams.deserialize(params.serialize())
