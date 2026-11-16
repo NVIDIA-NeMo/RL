@@ -68,6 +68,7 @@ class _InstrumentedRolloutManager:
         target_step: int | None = None,
         inflight_registry: Any = None,
         lineage_group_id: str | None = None,
+        replacement_index: int = 0,
     ) -> RolloutOutcome:
         fields = {
             "group_id": lineage_group_id,
@@ -99,6 +100,7 @@ class _InstrumentedRolloutManager:
             target_step=target_step,
             inflight_registry=inflight_registry,
             lineage_group_id=lineage_group_id,
+            replacement_index=replacement_index,
         )
         if outcome is RolloutOutcome.COMMITTED:
             append_event(self._events_path, "canonical_tq_commit", **fields)

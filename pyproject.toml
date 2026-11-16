@@ -26,11 +26,11 @@ dependencies = [
   "pip",        # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",      # for flash-attn parallel build
   # Deliberately a range, not an exact pin: each backend extra pins the torch its
-  # wheels were built against (vllm/mcore/automodel/trtllm: 2.13.0; sglang:
-  # 2.11.0) and resolves in its own uv conflict fork, so the base spec must admit
-  # both. The ceiling keeps the driver venv from drifting to a newer torch on a
-  # relock; it resolves to the highest allowed (2.13.0), matching vLLM.
-  "torch>=2.11,<2.14",
+  # wheels were built against (vllm: 2.14.0; mcore/automodel/trtllm: 2.13.0;
+  # sglang: 2.11.0) and resolves in its own uv conflict fork, so the base spec must
+  # admit all of them. The ceiling keeps the driver venv from drifting to a newer
+  # torch on a relock; it resolves to the highest allowed (2.14.0), matching vLLM.
+  "torch>=2.11,<2.15",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]>=2.58.0",                                                                                # CVE mitigation
@@ -54,7 +54,7 @@ dependencies = [
   "plotly",
   "sympy>=1.14.0",
   "pillow>=12.3.0",                                                                                      # Address CVE (Pillow 12.3.0)
-  "torchvision>=0.26,<0.29",                                                                             # tracks the torch range above (0.26 <-> 2.11, 0.28 <-> 2.13)
+  "torchvision>=0.26,<0.30",                                                                             # tracks the torch range above (0.26 <-> 2.11, 0.29 <-> 2.14)
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range compatible with every backend-specific pin (5.5.4 through
@@ -139,7 +139,10 @@ dependencies = [
 
 [project.optional-dependencies]
 automodel = [
-  # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
+  # Colocated with vLLM engines (CUDA-IPC refit), so vLLM must be able to open the
+  # CUDA IPC handles this torch writes. torch 2.13 and 2.14 (vLLM) write the same
+  # handle version. Not moved to 2.14: its headers need C++20, which DeepEP,
+  # flash-attn, mamba-ssm and causal-conv1d (built from source here) do not use.
   "torch==2.13.0",
   "torchvision==0.28.0",
   "nemo-automodel[moe]",
@@ -160,25 +163,43 @@ automodel = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
 ]
 vllm = [
-  # ABI of the vLLM 0.29.0 cu130 wheels.
-  "torch==2.13.0",
-  "torchvision==0.28.0",
-  "transformers==5.12.1",
+  # ABI of the vLLM 0.33.0 cu130 wheels.
+  "torch==2.14.0",
+  "torchvision==0.29.0",
+  "transformers==5.16.1",
   "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "cuda-python",
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
-  # deep_ep also needs libibverbs-dev
-  # sudo apt-get update
-  # sudo apt-get install libibverbs-dev
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
+  # No standalone deep_gemm: the vLLM wheel ships its own prebuilt DeepGEMM
+  # (vllm.third_party.deep_gemm) and only falls back to it when `import deep_gemm`
+  # fails, so a separately pinned build would shadow the one vLLM was tested with.
+  # No deep_ep either: the pinned DeepEP compiles as C++17, which torch 2.14's
+  # headers reject, and NeMo-RL's vLLM engines use vLLM's default
+  # allgather_reducescatter all2all backend, which does not need it.
   # PyPI publishes the default cu130 wheels for both supported architectures.
-  # https://github.com/vllm-project/vllm/releases/tag/v0.29.0
-  "vllm==0.29.0",
+  # https://github.com/vllm-project/vllm/releases/tag/v0.33.0
+  "vllm==0.33.0",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.18",
-  "flashinfer-cubin==0.6.18",
-  "flashinfer-jit-cache==0.6.18",
-  "nvidia-cutlass-dsl[cu13]==4.6.2",
+  "flashinfer-python==0.7.2.post1",
+  "flashinfer-cubin==0.7.2.post1",
+  "flashinfer-jit-cache==0.7.2.post1",
+  # flashinfer-jit-cache 0.7.2 is a meta package over one wheel per GPU arch. They only
+  # exist on the flashinfer cu130 index, and [tool.uv.sources] index pins only apply to
+  # direct requirements, so each one is named here.
+  # sm110a and sm121a ship aarch64 wheels only (see the matching override-dependencies).
+  "flashinfer-jit-cache-sm80==0.7.2.post1",
+  "flashinfer-jit-cache-sm89==0.7.2.post1",
+  "flashinfer-jit-cache-sm90a==0.7.2.post1",
+  "flashinfer-jit-cache-sm100a==0.7.2.post1",
+  "flashinfer-jit-cache-sm103a==0.7.2.post1",
+  "flashinfer-jit-cache-sm110a==0.7.2.post1; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm120f==0.7.2.post1",
+  "flashinfer-jit-cache-sm121a==0.7.2.post1; platform_machine == 'aarch64'",
+  "nvidia-cutlass-dsl[cu13]==4.8.0",
+  # Dynamo serving (policy.generation.dynamo=true) hosts these vLLM workers behind
+  # dynamo.frontend through Dynamo's engine-agnostic backend SDK. Only the base
+  # package: its [vllm] extra pins Dynamo's own vLLM, which NeMo RL never runs.
+  "ai-dynamo==1.5.1",
+  "ai-dynamo-runtime==1.5.1",
 ]
 sglang = [
   # sglang-miles (3003d70f) and sglang-kernel 0.4.5 are built against torch 2.11;
@@ -217,7 +238,10 @@ mcore = [
   # dependency megatron-core[dev,mlm] and its [tool.uv.sources] path mapping, so Megatron-LM
   # pyproject changes propagate on bump without any mirror here.
   "megatron-bridge[te,ssm]",
-  # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
+  # Colocated with vLLM engines (CUDA-IPC refit), so vLLM must be able to open the
+  # CUDA IPC handles this torch writes. torch 2.13 and 2.14 (vLLM) write the same
+  # handle version. Not moved to 2.14: its headers need C++20, which DeepEP,
+  # flash-attn, mamba-ssm and causal-conv1d (built from source here) do not use.
   "torch==2.13.0",
   "torchvision==0.28.0",
   # Within Megatron-Bridge's supported range (>=5.15,<5.20); Megatron-Bridge itself locks 5.19.0.
@@ -378,6 +402,14 @@ nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "43
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.7.0" }
 flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm80 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm89 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm90a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm100a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm103a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm110a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm120f = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm121a = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
 members = [
@@ -426,7 +458,6 @@ no-build-isolation-package = [
   "mamba-ssm",
   "causal-conv1d",
   "fast-hadamard-transform",
-  "deep_gemm",
   "deep_ep",
   "flash_mla",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
@@ -449,16 +480,24 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
+  # uv reads flashinfer-jit-cache's requirements from its aarch64 wheel, which also lists
+  # these two aarch64-only GPU-arch wheels; without the marker an x86_64 sync fails on them.
+  "flashinfer-jit-cache-sm110a==0.7.2.post1; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm121a==0.7.2.post1; platform_machine == 'aarch64'",
   "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.26.0.51; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
-  # Keep NCCL shared with the isolated Dynamo environment across torch upgrades.
   "nvidia-nccl-cu13==2.30.7",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
   "opencv-python-headless; sys_platform == 'never'",
+  # ai-dynamo (vllm extra) requires these for its planner and simulators only
+  # (aisimulate brings jax, flax and tfp-nightly). The backend SDK and frontend
+  # that Dynamo serving uses import neither.
+  "aisimulate; sys_platform == 'never'",
+  "kubernetes; sys_platform == 'never'",
   "timm<=1.0.22",
   "fastapi[standard]>=0.133.0,<0.137.0",
   "nvidia-modelopt[torch]>=0.44.0a0",
@@ -596,7 +635,6 @@ conflicts = [
 flash-attn = [{ requirement = "torch", match-runtime = true }]
 # Git-sourced packages CAN use match-runtime = true if we provide dependency-metadata
 deep_ep = [{ requirement = "torch", match-runtime = true }]
-deep_gemm = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
@@ -650,12 +688,6 @@ version = "1.2.1+17cfb81"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
-name = "deep_gemm"
-# This version has to match the version in the commit/rev/tag used
-version = "2.5.0"
-requires-dist = ["torch", "packaging", "ninja"]
-
-[[tool.uv.dependency-metadata]]
 name = "nv-grouped-gemm"
 # This version has to match the version in the commit/rev/tag used
 version = "v1.1.4.post7"
@@ -701,7 +733,9 @@ exclude = '''
 '''
 
 [tool.pytest.ini_options]
-addopts = "--durations=100 -s -rA -x"
+# ai-dynamo (vllm extra) registers pytest plugins that skip test_sglang_*,
+# test_trtllm_* and test_triton_* files when those frameworks are absent.
+addopts = "--durations=100 -s -rA -x -p no:vllm_tests -p no:sglang_tests -p no:trtllm_tests -p no:triton_tests"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [

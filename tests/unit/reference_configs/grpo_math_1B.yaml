@@ -155,6 +155,9 @@ checkpointing:
   load_replay_buffer: true
   save_data_plane: false
   save_optimizer: true
+  ft_keep_latest_k: null
+  ft_save_period: null
+  pretrained_checkpoint: null
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
@@ -508,6 +511,7 @@ policy:
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
       http_server_num_replicas: 8  # HTTP frontend event loops per model-parallel coordinator.
     vllm_cfg:
+      http_api_server_count: 1 # Positive process count; values >1 require async_engine: true and expose_http_server: true.
       http_server_api_key_required: false  # Require a per-job bearer token on the exposed server's /v1/* and /tokenize routes; the token is generated at startup and handed to the NeMo-Gym model server.
       async_engine: false
       precision: ${policy.precision}
@@ -648,6 +652,8 @@ data_plane:
   backend: "simple"                  # TQ storage backend ('simple', 'mooncake_cpu' or 'nixl')
   claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
   simple:
+    async_checkpoint: false  # enable the optional stable-view capture API; RAM-only
+    checkpoint_io_timeout_s: 600.0  # RPC budget per retained-view persist/release
     storage_capacity: 1000000        # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
     storage_unit_placement: null     # all, or cluster names like [inference]; null = TQ SPREAD

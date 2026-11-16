@@ -351,6 +351,8 @@ class RolloutSnapshotter(_UsesRolloutParts):
         cut: DataPlaneMutationCut,
         checkpoint_path: PathLike,
         kind: CheckpointKind,
+        *,
+        additional_expected_staging_keys: Optional[set[str]] = None,
     ) -> CapturedRolloutState:
         """Capture restart-facing controller state and save TQ under the barrier.
 
@@ -360,19 +362,24 @@ class RolloutSnapshotter(_UsesRolloutParts):
         only; the live trainer keeps accumulating gradients without modification.
         """
         cut.require_live()
+        if self._rollout_runtime.shortfall_reconciliation_pending:
+            raise RuntimeError("cannot checkpoint unreconciled selection shortfalls")
         snapshot = kind == "rollout_snapshot"
         dataloader_state = self._dataloader.state_dict()
         next_nemo_gym_task_index = self._rollout_manager.get_next_nemo_gym_task_index()
         # The spare pool and dataloader advance together under the same mutation
         # cut in recovery-enabled dispatch, so preserve them in this cut too.
-        replacement_reserve = list(self._rollout_runtime.replacement_reserve)
+        replacement_reserve = {
+            "replacement": list(self._rollout_runtime.replacement_reserve),
+            "filtered": list(self._rollout_runtime.filtered_reserve),
+        }
         replay_metadata: Optional[TQReplayMetadataState] = None
         recovery_payload: Optional[bytes] = None
         recovery_group_count: Optional[int] = None
         training_owned_groups: list[TQReplayGroupMetadata] = []
         staging_row_count = 0
         tq_save_seconds = 0.0
-        if snapshot or self._master_config.checkpointing.get("save_data_plane"):
+        if snapshot or self._master_config.checkpointing.save_data_plane:
             training_owned_groups = self._buffer.training_owned_replay_groups()
             if training_owned_groups and not snapshot:
                 raise RuntimeError(
@@ -395,6 +402,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 recovery_state = build_rollout_recovery_state(
                     self._rollout_manager.recovery_ledger,
                     batch_shortfall=self._rollout_runtime.batch_shortfall,
+                    steps_allowed_short=self._rollout_runtime.steps_allowed_short,
                     sampler_stamps_target_steps=self._rollout_runtime.sampler_stamps_target_steps,
                     finalizer_metrics_by_group=self._rollout_runtime.finalizer_metrics_by_group,
                     finalizer_rewards_by_group=self._rollout_runtime.finalizer_rewards_by_group,
@@ -419,6 +427,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     staging_partition=self._master_config.token_capture.staging_partition,
                     replay_metadata=replay_metadata,
                     clear_unreferenced=False,
+                    additional_expected_staging_keys=additional_expected_staging_keys,
                 )
             tq_save_started = time.monotonic()
             await self._save_data_plane_checkpoint(
@@ -617,6 +626,10 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 step_N never appears.
         """
         async with self._save_lock:
+            if self._rollout_runtime.shortfall_reconciliation_pending:
+                return RolloutCheckpointSaveResult(
+                    saved=False, reason="shortfall_reconciliation_pending"
+                )
             if self._optimizer_commit_in_progress:
                 return RolloutCheckpointSaveResult(
                     saved=False,
@@ -628,6 +641,12 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 not force
                 and self._last_snapshot_mutation_version
                 == self._data_plane_checkpoint_barrier.mutation_version
+                # Decoding grows a live call's recoverable prefix without
+                # mutating the data plane, so keep cutting while one is active.
+                and not (
+                    self._master_config.rollout_recovery.generation_prefix_cuts_enabled
+                    and self._rollout_recovery_ledger.has_dispatched_generation_prefix()
+                )
             ):
                 return RolloutCheckpointSaveResult(
                     saved=False,
@@ -697,11 +716,28 @@ class RolloutSnapshotter(_UsesRolloutParts):
                                 saved=False,
                                 reason="trainer_state_changed",
                             )
+                        if self._rollout_runtime.shortfall_reconciliation_pending:
+                            await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
+                            return RolloutCheckpointSaveResult(
+                                saved=False,
+                                reason="shortfall_reconciliation_pending",
+                            )
                         snapshot_epoch = self._read_progress().current_epoch
+                        environment_staging_keys: frozenset[str] = frozenset()
                         if environment_snapshot is not None:
-                            await environment_snapshot.check_against_cut(cut)
+                            # The environment's saved state can reference rows
+                            # RL's ledger does not own, such as a generation
+                            # prefix; the TQ capture must hold those too.
+                            environment_staging_keys = (
+                                await environment_snapshot.check_against_cut(cut)
+                            )
                         snapshot_cut = await self.capture(
-                            cut, tmp_path, "rollout_snapshot"
+                            cut,
+                            tmp_path,
+                            "rollout_snapshot",
+                            additional_expected_staging_keys=set(
+                                environment_staging_keys
+                            ),
                         )
                     barrier_released = time.monotonic()
                 # Dispatch reopens and the environment resumes when that block
@@ -781,11 +817,13 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 "controller_sidecar_bytes": float(controller_sidecar_bytes),
             }
             restarted_rollouts = 0
+            environment_metrics: dict[str, float] = {}
             if environment_snapshot is not None:
                 restarted_rollouts = environment_snapshot.restarted_rollouts
-                checkpoint_metrics.update(
-                    environment_snapshot.metrics(environment_paused_seconds)
+                environment_metrics = environment_snapshot.metrics(
+                    environment_paused_seconds
                 )
+                checkpoint_metrics.update(environment_metrics)
                 _warn_if_environment_paused_past_interval(
                     environment_paused_seconds,
                     self._master_config.rollout_checkpointing.snapshot_attempt_interval_s,
@@ -811,7 +849,13 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 f"restarted_rollouts={restarted_rollouts}, "
                 f"total_save_seconds={checkpoint_metrics['total_save_seconds']:.2f}, "
                 "exclusive_hold_seconds="
-                f"{checkpoint_metrics['exclusive_hold_seconds']:.2f})",
+                f"{checkpoint_metrics['exclusive_hold_seconds']:.2f}"
+                # The environment's own figures, e.g. a prefix cut's fence hold.
+                + "".join(
+                    f", {name}={value:.2f}"
+                    for name, value in environment_metrics.items()
+                )
+                + ")",
                 flush=True,
             )
             return RolloutCheckpointSaveResult(saved=True, reason="completed")

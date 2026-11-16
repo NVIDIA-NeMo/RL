@@ -23,6 +23,34 @@ from megatron.core.transformer.moe.moe_utils import (
     reduce_aux_losses_tracker_across_ranks,
 )
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.utils import unwrap_model
+
+from nemo_rl.data.multimodal_utils import (
+    chunks_accept_media_token_validity_mask,
+    media_placeholder_token_id_from_chunks,
+)
+
+
+def _unwrapped_chunks(model: Any) -> list[Any]:
+    """Return model chunks after removing distributed/module wrappers."""
+    unwrapped = unwrap_model(model)
+    return list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+
+
+def model_slices_context_parallel_inputs(model: Any) -> bool:
+    """Whether the model consumes full THD input and slices CP after embedding."""
+    return any(
+        bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
+        for chunk in _unwrapped_chunks(model)
+    )
+
+
+def model_media_placeholder_token_id(model: Any) -> Optional[int]:
+    """Return the media token only when the model explicitly accepts its mask."""
+    chunks = _unwrapped_chunks(model)
+    if not chunks_accept_media_token_validity_mask(chunks):
+        return None
+    return media_placeholder_token_id_from_chunks(chunks)
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
