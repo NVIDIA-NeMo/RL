@@ -234,6 +234,10 @@ tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-n
 # slot from later dispatches; ready_first draws from its own replacement pool.
 tests/test_suites/llm/dapo-llama3.1-8b-instruct-2n8g-windowed-single-controller.sh
 tests/test_suites/llm/dapo-llama3.1-8b-instruct-2n8g-ready-first-single-controller.sh
+# SC dynamic sampling on the token-capture path across the same two samplers
+# (Qwen2.5-1.5B, OpenMathReasoning through NeMo-Gym); gate on finalizer health.
+tests/test_suites/llm/dapo-qwen2.5-1.5b-instruct-1n8g-windowed-single-controller-token_capture.sh
+tests/test_suites/llm/dapo-qwen2.5-1.5b-instruct-1n8g-ready-first-single-controller-token_capture.sh
 
 #############
 # Diffusion #
