@@ -16,7 +16,7 @@ import copy
 
 import pytest
 
-from nemo_rl.algorithms.grpo import _merge_vllm_hf_overrides
+from nemo_rl.models.generation.vllm.config import merge_vllm_hf_overrides
 
 
 @pytest.mark.parametrize(
@@ -30,7 +30,7 @@ def test_generation_only_overrides_survive_and_policy_wins(policy_overrides):
     }
     policy = {"hf_config_overrides": copy.deepcopy(policy_overrides)}
 
-    _merge_vllm_hf_overrides(vllm_kwargs, policy)
+    merge_vllm_hf_overrides(vllm_kwargs, policy)
 
     overrides = vllm_kwargs["hf_overrides"]
     assert overrides["generation_only"] == generation_only
@@ -51,11 +51,11 @@ def test_generation_only_overrides_survive_and_policy_wins(policy_overrides):
 )
 def test_missing_overrides_are_empty(policy_overrides, generation_overrides, expected):
     vllm_kwargs = {"hf_overrides": generation_overrides}
-    _merge_vllm_hf_overrides(vllm_kwargs, {"hf_config_overrides": policy_overrides})
+    merge_vllm_hf_overrides(vllm_kwargs, {"hf_config_overrides": policy_overrides})
     assert vllm_kwargs["hf_overrides"] == expected
 
 
 def test_policy_without_override_key():
     vllm_kwargs = {}
-    _merge_vllm_hf_overrides(vllm_kwargs, {})
+    merge_vllm_hf_overrides(vllm_kwargs, {})
     assert vllm_kwargs == {"hf_overrides": {}}

@@ -147,6 +147,7 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    merge_vllm_hf_overrides,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
@@ -714,20 +715,6 @@ def _needs_hf_refit_handshake(
     if generation_backend == "megatron":
         return False
     return not (nccl_reshard_refit_enabled and not colocated_inference)
-
-
-def _merge_vllm_hf_overrides(
-    vllm_kwargs: dict[str, Any], policy_config: PolicyConfig
-) -> None:
-    """Make vLLM HF overrides match the policy while keeping generation-only keys.
-
-    Policy ``hf_config_overrides`` win on shared keys so generation and training
-    see the same model config.
-    """
-    vllm_kwargs["hf_overrides"] = {
-        **(vllm_kwargs.get("hf_overrides") or {}),
-        **(policy_config.get("hf_config_overrides") or {}),
-    }
 
 
 def _shutdown_completed_nemo_gym_startup(
@@ -1824,7 +1811,7 @@ def setup(
 
         configure_vllm_for_router_replay(policy_config)
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
-        _merge_vllm_hf_overrides(vllm_kwargs, policy_config)
+        merge_vllm_hf_overrides(vllm_kwargs, policy_config)
 
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
