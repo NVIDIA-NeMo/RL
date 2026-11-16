@@ -66,6 +66,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     validate_forest_checkpoint_metadata,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSampler,
     InOrderSamplerConfig,
     ReadyFirstSampler,
     ReadyFirstSamplerConfig,
@@ -123,6 +124,7 @@ from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.checkpoint import CheckpointCapture, CheckpointReleaseError
 from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTE_PLAN_TAG
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
 from nemo_rl.environments.gym_checkpoint_coordinator import (
@@ -157,6 +159,7 @@ from tests.unit.environments.gym_checkpoint_fakes import (
     gym_environment_checkpoint,
 )
 from tests.unit.experience.test_rollout_recovery import _forest_sealed_ledger
+from tests.unit.single_controller._dp_fakes import _ReadyGroupBuffer
 from tests.unit.single_controller._rollout_checkpoints import (
     attach_rollout_checkpointing,
 )
@@ -370,6 +373,23 @@ class _FailingFinalizeTrainer(_FakeTrainer):
         raise RuntimeError("injected async-writer failure")
 
 
+class _ShardCheckedTrainer(_FakeTrainer):
+    """Shards every training chunk across the policy DP ranks, as the dispatch does."""
+
+    def __init__(self, policy_dp: int) -> None:
+        super().__init__()
+        self._policy_dp = policy_dp
+        self.chunk_sizes: list[int] = []
+
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
+        self.chunk_sizes.append(len(meta.sample_ids))
+        BatchedDataDict({"x": torch.zeros(len(meta.sample_ids))}).shard_by_batch_size(
+            self._policy_dp
+        )
+
+
 class _FakeSampler:
     """PromptGroupSampler stand-in: always returns a full, fresh batch."""
 
@@ -451,6 +471,21 @@ class _ExhaustingSampler(_FakeSampler):
             return None, 0
         self._remaining -= 1
         return await super().select(**kwargs)
+
+
+class _WavesSampler(_FakeSampler):
+    """Real in-order selection over groups that finish rolling out in waves."""
+
+    def __init__(self, generations: int, waves: list[int]) -> None:
+        super().__init__()
+        self._buffer = _ReadyGroupBuffer(generations)
+        self._waves = list(waves)
+        self._sampler = InOrderSampler(self._buffer, max_lookahead_versions=1)
+
+    async def select(self, **kwargs) -> tuple[Optional[KVBatchMeta], int]:
+        if self._waves:
+            self._buffer.add_groups(self._waves.pop(0))
+        return await self._sampler.select(**kwargs)
 
 
 class _EvictOnceSampler(_FakeSampler):
@@ -1027,6 +1062,7 @@ def _make_actor_args(
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None,
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None,
     loss_fn: Optional[Any] = None,
+    grpo_group_multiple: int = 1,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
         gen_handle=gen if gen is not None else _FakeGeneration(),
@@ -1057,6 +1093,7 @@ def _make_actor_args(
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
+        grpo_group_multiple=grpo_group_multiple,
     )
 
 
@@ -1500,6 +1537,25 @@ class TestCounterRestore:
         info = _training_info(tmp_path / "checkpoints", 4)
         assert info["current_step"] == 4
         assert info["consumed_samples"] == 4 + 2 * 2
+
+
+def test_grpo_pump_trains_only_chunks_that_shard_across_policy_dp(tmp_path) -> None:
+    """21 ready groups of 16 samples on policy DP 32 must not reach training as 336."""
+    mc = _actor_master_config(tmp_path, max_num_steps=1, num_prompts_per_step=32)
+    mc.grpo.num_generations_per_prompt = 16
+    mc.async_rl.min_groups_for_streaming_train = 1
+    trainer = _ShardCheckedTrainer(policy_dp=32)
+
+    def ready_groups_arrive_in_waves(actor: Any) -> None:
+        actor._sampler = _WavesSampler(generations=16, waves=[21, 11])
+
+    _run_train_pump(
+        mc,
+        _make_actor_args(trainer=trainer, grpo_group_multiple=2),
+        seed=ready_groups_arrive_in_waves,
+    )
+
+    assert trainer.chunk_sizes == [20 * 16, 12 * 16]
 
 
 # ── save trigger + write path ────────────────────────────────────────────────
@@ -5234,6 +5290,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
         policy={
             "train_global_batch_size": 8,
             "max_total_sequence_length": 32,
+            "dynamic_batching": {"enabled": True},
             "tokenizer": {"use_fastokens": False},
             "megatron_cfg": {"enabled": False},
             "generation": {
