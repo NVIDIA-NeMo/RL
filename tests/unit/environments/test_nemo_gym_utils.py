@@ -1208,6 +1208,39 @@ def test_build_nemo_gym_actors_hands_every_actor_the_policy_api_key(
     assert all(cfg["policy_api_key"] == "per-job-key" for cfg in cluster.actor_configs)
 
 
+@pytest.mark.parametrize(
+    "env_configs", [_env_configs, _shard_env_configs], ids=["unsharded", "sharded"]
+)
+@pytest.mark.parametrize("rollout_fan_in", [None, 34_816], ids=["no-fan-in", "fan-in"])
+def test_build_nemo_gym_actors_sizes_every_actor_for_the_whole_fan_in(
+    detected_uv_dirs, env_configs, rollout_fan_in
+):
+    """Each replica admits the whole fan-in, since routing by agent name does not
+    split it evenly; without a fan-in the actors keep Ray's default."""
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+            rollout_fan_in=rollout_fan_in,
+        )
+
+    assert cluster.actor_options
+    if rollout_fan_in is None:
+        assert all("max_concurrency" not in opts for opts in cluster.actor_options)
+    else:
+        expected = rollout_fan_in + nemo_gym_mod.NEMO_GYM_CONTROL_CONCURRENCY_HEADROOM
+        assert [opts["max_concurrency"] for opts in cluster.actor_options] == [
+            expected
+        ] * len(cluster.actor_options)
+
+
 def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
     detected_uv_dirs,
 ):
