@@ -1418,7 +1418,6 @@ class AutomodelPolicyWorkerImpl(
                     device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
                     padding_token_id=self.tokenizer.pad_token_id or 0,
-                    is_reward_model=False,
                     allow_flash_attn_args=self.allow_flash_attn_args,
                 )
                 with prepared.model_context_factory(), self._autocast_context():
