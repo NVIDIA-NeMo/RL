@@ -392,7 +392,9 @@ def _config(**over):
                 in_flight_weight_updates=o["in_flight"],
             ),
         ),
-        loss_fn=ClippedPGLossConfig.model_construct(force_on_policy_ratio=False),
+        loss_fn=ClippedPGLossConfig.model_construct(
+            force_on_policy_ratio=False, use_importance_sampling_correction=True
+        ),
         data_plane=None,
         policy={
             "train_global_batch_size": o["gbs"],
@@ -498,6 +500,10 @@ def test_pending_gather_finishes_before_current_weights_are_restored(Worker):
         (
             lambda c: setattr(c.grpo, "seq_logprob_error_threshold", 0.1),
             "seq_logprob_error_in_loss",
+        ),
+        (
+            lambda c: setattr(c.loss_fn, "use_importance_sampling_correction", False),
+            "use_importance_sampling_correction",
         ),
     ],
 )

@@ -3368,6 +3368,10 @@ def validate_version_point_config(master_config: MasterConfig) -> None:
         problems.append("the in-process replay buffer (data_plane.enabled=false)")
     if master_config.loss_fn.force_on_policy_ratio:
         problems.append("loss_fn.force_on_policy_ratio=false")
+    if not master_config.loss_fn.use_importance_sampling_correction:
+        problems.append(
+            "loss_fn.use_importance_sampling_correction=true for fallback steps"
+        )
     if policy["generation"]["colocated"]["enabled"]:
         problems.append("non-colocated generation")
     if router_replay_enabled(policy):
