@@ -36,7 +36,7 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.engines.dynamic_engine import EngineState
-from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import (
     quantize_params_to_mxfp8,
@@ -44,9 +44,7 @@ from megatron.core.inference.quantization.utils import (
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import set_decode_expert_padding
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_inference_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_inference_spec
 from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
 from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
@@ -104,9 +102,7 @@ from nemo_rl.models.megatron.memory_saver import (
     pause_inference_weights,
     resume_inference_weights,
 )
-from nemo_rl.models.megatron.zero_train_gen_mismatch import (
-    allow_installed_flash_attn_4,
-)
+from nemo_rl.models.megatron.zero_train_gen_mismatch import allow_installed_flash_attn_4
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
@@ -1326,7 +1322,20 @@ class MegatronGenerationMixin:
         data: BatchedDataDict[GenerationDatumSpec],
         result: list,
     ) -> BatchedDataDict[GenerationOutputSpec]:
-        """Pack DynamicInferenceRequest results into a GenerationOutputSpec batch."""
+        """Pack completed engine replies, including their authoritative truncated flags."""
+        for index, request in enumerate(result):
+            if getattr(request, "status", None) == Status.FAILED:
+                raise RuntimeError(
+                    "Megatron generation request "
+                    f"{getattr(request, 'request_id', None)!r} at batch index {index} "
+                    "failed in the inference engine. See the engine logs for details."
+                )
+        finish_reasons = [getattr(request, "finish_reason", None) for request in result]
+        if any(reason not in ("stop", "length") for reason in finish_reasons):
+            raise RuntimeError(
+                "Megatron returned missing or unsupported finish_reason metadata: "
+                f"{finish_reasons}. Expected 'stop' or 'length' for completed generation."
+            )
         input_lengths = data["input_lengths"]
         input_ids = data["input_ids"]
         batch_size = input_ids.size(0)
@@ -1393,12 +1402,6 @@ class MegatronGenerationMixin:
                 )
             )
 
-        finish_reasons = [getattr(request, "finish_reason", None) for request in result]
-        if any(reason not in ("stop", "length") for reason in finish_reasons):
-            raise RuntimeError(
-                "Megatron returned missing or unsupported finish_reason metadata: "
-                f"{finish_reasons}. Expected 'stop' or 'length' for completed generation."
-            )
         out_dict = {
             "truncated": torch.tensor(
                 [reason == "length" for reason in finish_reasons],
@@ -1429,6 +1432,7 @@ class MegatronGenerationMixin:
                 - logprobs: Log probabilities for tokens
                 - generation_lengths: Lengths of each response
                 - unpadded_sequence_lengths: Lengths of each input + generated sequence
+                - truncated: Whether the engine ended generation at a length limit
         """
         prompts, multi_modal_data_list, sampling_params = (
             self._prepare_data_for_generation(data, greedy)
@@ -1505,8 +1509,6 @@ class MegatronGenerationMixin:
         sampling_params: list[SamplingParams],
     ) -> list:
         """Submit requests through the persistent inference client (rank 0 only)."""
-        from megatron.core.inference.inference_request import DynamicInferenceRequest
-
         dist_rank = torch.distributed.get_rank()
         assert dist_rank == 0, (
             "Only rank 0 creates a client to communicate with the coordinator"

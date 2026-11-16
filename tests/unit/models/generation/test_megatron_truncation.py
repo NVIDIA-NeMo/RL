@@ -23,7 +23,6 @@ import torch
 
 import nemo_rl.experience.rollouts as rollouts
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
 
 pytestmark = pytest.mark.mcore
 
@@ -54,6 +53,10 @@ class MegatronGeneration:
         )
 
     def _parse(self, data):
+        from nemo_rl.models.generation.megatron.megatron_worker import (
+            MegatronGenerationMixin,
+        )
+
         worker = SimpleNamespace(tokenizer=Tokenizer())
         return MegatronGenerationMixin._parse_result_to_batched_data_dict(
             worker, data, [self._result]
@@ -66,7 +69,7 @@ class MegatronGeneration:
         yield 0, self._parse(data)
 
 
-def _rollout(rollout_fn, reason):
+def _rollout(rollout_fn, reason, *, engine_reply=None):
     batch = BatchedDataDict(
         {
             "message_log": [
@@ -89,9 +92,12 @@ def _rollout(rollout_fn, reason):
         next_stop_strings=[None],
         metadata=[None],
     )
+    generation = MegatronGeneration(reason)
+    if engine_reply is not None:
+        generation._result = engine_reply
     with patch.object(rollouts, "calculate_rewards", return_value=feedback):
         return rollout_fn(
-            MegatronGeneration(reason),
+            generation,
             batch,
             Tokenizer(),
             {},
@@ -120,6 +126,10 @@ def test_async_rollout_fails_on_missing_or_unknown_reason(reason):
 
 @pytest.mark.parametrize("reason", [None, "unknown", "error"])
 def test_missing_or_unknown_reason_is_not_reported_as_success(reason):
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationMixin,
+    )
+
     data = BatchedDataDict(
         {"input_ids": torch.tensor([[10]]), "input_lengths": torch.tensor([1])}
     )
@@ -133,6 +143,10 @@ def test_missing_or_unknown_reason_is_not_reported_as_success(reason):
 
 
 def test_old_engine_rejected_before_engine_construction():
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationMixin,
+    )
+
     @dataclass
     class OldRequest:
         generated_length: int = 0
@@ -145,3 +159,48 @@ def test_old_engine_rejected_before_engine_construction():
             MegatronGenerationMixin._initialize_inference_engine(
                 SimpleNamespace(_inference_engine_initialized=False), {}
             )
+
+
+@pytest.mark.parametrize("generated_tokens", [None, []])
+def test_failed_admission_rejected_before_accessing_generation_payload(
+    generated_tokens,
+):
+    from megatron.core.inference.inference_request import Status
+
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationMixin,
+    )
+
+    data = BatchedDataDict(
+        {"input_ids": torch.tensor([[10]]), "input_lengths": torch.tensor([1])}
+    )
+    request = SimpleNamespace(
+        request_id=42,
+        status=Status.FAILED,
+        generated_tokens=generated_tokens,
+        generated_log_probs=None,
+        finish_reason=None,
+    )
+    with pytest.raises(
+        RuntimeError, match="request 42.*failed in the inference engine"
+    ):
+        MegatronGenerationMixin._parse_result_to_batched_data_dict(
+            SimpleNamespace(tokenizer=Tokenizer()), data, [request]
+        )
+
+
+@pytest.mark.parametrize("rollout_fn", ROLLOUTS, ids=["sync", "async"])
+def test_failed_admission_fails_rollout(rollout_fn):
+    from megatron.core.inference.inference_request import Status
+
+    request = SimpleNamespace(
+        request_id=42,
+        status=Status.FAILED,
+        generated_tokens=[],
+        generated_log_probs=None,
+        finish_reason=None,
+    )
+    with pytest.raises(
+        RuntimeError, match="request 42.*failed in the inference engine"
+    ):
+        _rollout(rollout_fn, None, engine_reply=request)
