@@ -824,7 +824,7 @@ Set `data_plane.simple.async_checkpoint: true` (needs `ssd_offload.enabled: fals
 - Other backends and configurations keep the synchronous save.
 - If a captured view cannot be released, checkpointing stops and keeps the unpublished directory; do not delete it while the run is alive.
 
-To measure the gain, compare `exclusive_hold_seconds` and `gym_parked_seconds` with the setting on and off. The phase names are mapped in `_CHECKPOINT_DURATION_PHASES` in `nemo_rl/telemetry/metrics.py`; see `docs/observability/metrics.md`.
+To measure the gain, compare `exclusive_hold_seconds` and `gym_parked_seconds` with the setting on and off. The phase names are mapped in `_CHECKPOINT_DURATION_PHASES` in `nemo_rl/telemetry/metrics.py`; see `docs/observability/metrics.md`. Inside the barrier, the inventory checks, the recovery-state build and the TQ capture run concurrently, so `exclusive_hold_seconds` tracks the longest of those phases, not their sum.
 
 ## Async path (proposed)
 

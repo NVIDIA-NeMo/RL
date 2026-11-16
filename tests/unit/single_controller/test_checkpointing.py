@@ -2184,6 +2184,148 @@ class TestPeriodicRolloutCheckpoint:
         assert "data-plane checkpoint captured:" in output
         assert "data-plane checkpoint save started:" not in output
 
+    def test_capture_phases_overlap_under_the_barrier(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        actor = self._actor(tmp_path)
+        build_started = threading.Event()
+        capture_started = threading.Event()
+        build_rollout_recovery_state = snapshots_module.build_rollout_recovery_state
+
+        def build(*args, **kwargs):
+            build_started.set()
+            # Phases run one after another would never reach the capture.
+            assert capture_started.wait(timeout=10)
+            return build_rollout_recovery_state(*args, **kwargs)
+
+        class Capture(CheckpointCapture):
+            token = "capture-1"
+
+            def persist(self, *, extra_metadata=None) -> None:
+                pass
+
+            def release(self) -> None:
+                pass
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            capture_started.set()
+            assert build_started.wait(timeout=10)
+            return Capture()
+
+        monkeypatch.setattr(snapshots_module, "build_rollout_recovery_state", build)
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        try:
+            assert asyncio.run(actor._rollout_snapshots.save_snapshot(force=True)).saved
+        finally:
+            actor._checkpointer.shutdown()
+
+    @pytest.mark.parametrize(
+        "phase",
+        [
+            "validate_replay_inventory",
+            "validate_rollout_recovery_inventory",
+            "build_rollout_recovery_state",
+        ],
+    )
+    def test_failed_capture_phase_releases_the_captured_view(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events = []
+        captured = threading.Event()
+
+        class Capture(CheckpointCapture):
+            token = "capture-1"
+
+            def persist(self, *, extra_metadata=None) -> None:
+                events.append("persist")
+
+            def release(self) -> None:
+                events.append("release")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            events.append("capture")
+            captured.set()
+            return Capture()
+
+        def fail_after_capture(*args, **kwargs):
+            assert captured.wait(timeout=10)
+            raise OSError(f"{phase} failed")
+
+        async def fail_after_capture_async(*args, **kwargs):
+            await asyncio.to_thread(fail_after_capture)
+
+        monkeypatch.setattr(
+            snapshots_module,
+            phase,
+            fail_after_capture
+            if phase == "build_rollout_recovery_state"
+            else fail_after_capture_async,
+        )
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        try:
+            with pytest.raises(OSError, match=f"{phase} failed"):
+                asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events == ["capture", "release"]
+        snapshots = tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        assert not list(snapshots.glob("tmp_snapshot_*"))
+        assert not list(snapshots.glob("snapshot_*"))
+
+    def test_cancelled_capture_phases_release_the_captured_view(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events = []
+        captured = threading.Event()
+        proceed = threading.Event()
+        build_rollout_recovery_state = snapshots_module.build_rollout_recovery_state
+
+        def build(*args, **kwargs):
+            assert proceed.wait(timeout=10)
+            return build_rollout_recovery_state(*args, **kwargs)
+
+        class Capture(CheckpointCapture):
+            token = "capture-1"
+
+            def persist(self, *, extra_metadata=None) -> None:
+                events.append("persist")
+
+            def release(self) -> None:
+                events.append("release")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            events.append("capture")
+            captured.set()
+            return Capture()
+
+        monkeypatch.setattr(snapshots_module, "build_rollout_recovery_state", build)
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+
+        async def exercise() -> None:
+            task = asyncio.create_task(
+                actor._rollout_snapshots.save_snapshot(force=True)
+            )
+            try:
+                assert await asyncio.to_thread(captured.wait, 10)
+                # Let the capture phase hand its view back to the loop.
+                await asyncio.sleep(0.1)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                proceed.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events == ["capture", "release"]
+
     @pytest.mark.parametrize("anchor_step", [0, 1])
     @pytest.mark.parametrize("claimed", [False, True])
     def test_forest_snapshot_preserves_buffered_and_training_owned_rows(
@@ -2508,6 +2650,7 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["total_save_seconds"] > 0
         assert 0 <= logged["barrier_wait_seconds"] <= logged["total_save_seconds"]
         assert 0 <= logged["tq_save_seconds"] <= logged["exclusive_hold_seconds"]
+        # This backend saves inside the barrier, so serialization is held too.
         held_phases = (
             "replay_inventory_seconds",
             "recovery_state_build_seconds",
@@ -2515,9 +2658,10 @@ class TestPeriodicRolloutCheckpoint:
             "staging_inventory_seconds",
             "tq_capture_seconds",
         )
-        assert all(logged[phase] > 0 for phase in held_phases)
-        held_seconds = sum(logged[phase] for phase in held_phases)
-        assert held_seconds <= logged["exclusive_hold_seconds"]
+        assert all(
+            0 < logged[phase] <= logged["exclusive_hold_seconds"]
+            for phase in held_phases
+        )
         assert 0 <= logged["sidecar_save_seconds"] <= logged["total_save_seconds"]
         assert 0 <= logged["snapshot_commit_seconds"] <= logged["total_save_seconds"]
         assert logged["controller_sidecar_bytes"] > 0
