@@ -54,6 +54,7 @@ from nemo_rl.models.generation.vllm.speculator_runtime import (
     find_draft_model,
     is_speculator_type,
 )
+from nemo_rl.models.generation.vllm import inkling2_mxfp8_refit
 from nemo_rl.models.generation.vllm.utils import _format_refit_key_error
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
@@ -93,6 +94,10 @@ WeightUpdateFinalizer = Callable[[], None]
 
 if os.environ.get(DRAFT_DISABLE_MODULE_SHARING_ENV) == "1":
     disable_draft_module_sharing()
+
+# vLLM resolves this worker extension before it builds the model, so the
+# Inkling2 loader patch is in place for the dummy load and every refit.
+inkling2_mxfp8_refit.maybe_install()
 
 
 class IPCWeightManifestError(RuntimeError):

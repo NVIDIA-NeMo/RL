@@ -181,6 +181,7 @@ policy:
       save_consolidated: "false"
       single_rank_consolidation: false
       consolidation_timeout_minutes: 30
+      resume_on_cpu: false  # stage resumed model and optimizer state in CPU memory
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false

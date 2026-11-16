@@ -1,0 +1,42 @@
+# grpo-inkling2-8n4g-automodel-sglang on 16 GB200 nodes (185 GB/GPU).
+#
+# STATUS: does not fit. Both mem_fraction_static 0.88 and 0.78 OOM when SGLang
+# resumes its ~141.6 GB/GPU of BF16 weights next to the policy's ~19 GB/GPU shard and
+# NCCL/DeepEP buffers. Use grpo-inkling2-32n4g-gb200-automodel-sglang.yaml (EP128).
+#
+# Why 16 nodes: BF16 params + grads + AdamW states (~4.8 TB) need ~110 GB/GPU over 64
+# GPUs; 32 GB200s (the 8-node layout) would need ~220 GB/GPU.
+#
+# SGLang serves BF16 experts, so each engine still holds ~150 GB/GPU of weights at
+# TP 8 / EP 8 (2 nodes per engine, 8 engines). Inkling2 attention caps TP at its 8 KV
+# heads, and SGLang's Inkling2 model rejects DP attention, so engines cannot be wider.
+# What makes it fit:
+#   - the policy is moved to CPU after every refit (offload_after_refit), so generation
+#     has the GPU to itself;
+#   - mem_fraction_static 0.78 (~144 GB: weights + small KV; 0.88 OOMed on resume; Inkling2's 40 local layers
+#     use sliding windows, global layers ~4 KB/token/GPU);
+#   - refit peak = SGLang weights + this rank's policy shard (~19 GB) + 2 x 2 GB buckets;
+#   - no SGLang CPU weight backup: every refit rewrites all weights, and the backup
+#     (~600 GB/node) plus the offloaded optimizer would exceed host RAM.
+defaults: grpo-inkling2-8n4g-automodel-sglang.yaml
+policy:
+  model_name: /path/to/inkling2-small-automodel-text
+  refit_buffer_size_gb: 2
+  automodel_cfg:
+    # 384 experts / 64 ranks = 6 experts per GPU.
+    expert_parallel_size: 64
+  generation:
+    sglang_cfg:
+      model_path: /path/to/inkling2-small-sglang-bf16
+      tp_size: 8
+      ep_size: 8
+      mem_fraction_static: 0.78
+      sglang_server_config:
+        num_gpus: 64
+        cpu_weight_backup: false
+logger:
+  log_dir: logs/grpo-inkling2-16n4g-gb200-automodel-sglang
+  wandb:
+    name: grpo-inkling2-16n4g-gb200-automodel-sglang
+cluster:
+  num_nodes: 16

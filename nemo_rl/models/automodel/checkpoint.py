@@ -17,6 +17,7 @@ This module provides a wrapper class around the nemo_automodel Checkpointer
 for saving and loading model checkpoints in Automodel policy workers.
 """
 
+import gc
 import logging
 import os
 import tempfile
@@ -158,9 +159,13 @@ def _patch_qwen_vl_vision_key_mapping() -> None:
     if getattr(_orig, "_nrl_vision_patch", False):
         return
 
-    def _patched_get_combined_key_mapping(model_type, model_key_mapping=None):
-        result = _orig(model_type, model_key_mapping)
-        if model_type in _vision_nested:
+    def _patched_get_combined_key_mapping(model_type, model_key_mapping=None, **kwargs):
+        # Newer Automodel passes keyword-only args (e.g. ``model=``) and may
+        # return a callable instead of a dict; forward and pass those through.
+        result = _orig(model_type, model_key_mapping, **kwargs)
+        if model_type in _vision_nested and (
+            result is None or isinstance(result, dict)
+        ):
             result = dict(result or {})
             if not any(str(t).startswith("model.visual") for t in result.values()):
                 result[r"^visual\."] = "model.visual."
@@ -212,6 +217,9 @@ class AutomodelCheckpointManager:
             moe_mesh: Optional MoE device mesh.
         """
         self.checkpointer: Optional[Checkpointer] = None
+        # Stage resumed state in CPU memory while loading it (see
+        # AutomodelCheckpointConfig.resume_on_cpu).
+        self.resume_on_cpu = False
         self.dp_mesh = dp_mesh
         self.tp_mesh = tp_mesh
         self.moe_mesh = moe_mesh
@@ -445,22 +453,34 @@ class AutomodelCheckpointManager:
             "Call init_checkpointer() first."
         )
 
-        # load model
-        model_dir = os.path.join(weights_path, "model")
-        self.checkpointer.load_model(
-            model=model,
-            model_path=model_dir,
-        )
-
-        # load optimizer
-        if optimizer_path and optimizer is not None:
-            self.check_master_weight_dtypes(model, optimizer, optimizer_path)
-            self.checkpointer.load_optimizer(
-                optimizer=optimizer,
+        # Automodel's cpu_offload applies to saves as well, so enable it only
+        # for this load.
+        cpu_offload = self.checkpointer.config.cpu_offload
+        self.checkpointer.config.cpu_offload = cpu_offload or self.resume_on_cpu
+        try:
+            # load model
+            model_dir = os.path.join(weights_path, "model")
+            self.checkpointer.load_model(
                 model=model,
-                weights_path=optimizer_path,
-                scheduler=scheduler,
+                model_path=model_dir,
             )
+
+            # load optimizer
+            if optimizer_path and optimizer is not None:
+                self.check_master_weight_dtypes(model, optimizer, optimizer_path)
+                self.checkpointer.load_optimizer(
+                    optimizer=optimizer,
+                    model=model,
+                    weights_path=optimizer_path,
+                    scheduler=scheduler,
+                )
+        finally:
+            self.checkpointer.config.cpu_offload = cpu_offload
+        if self.resume_on_cpu:
+            # Return the load's cached blocks so training (and cuBLAS, which
+            # allocates outside the caching allocator) starts from a clean pool.
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def check_master_weight_dtypes(
         self,

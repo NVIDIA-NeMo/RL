@@ -196,6 +196,12 @@ class AutomodelCheckpointConfig(TypedDict, total=False):
     save_consolidated: Literal["false", "final", "every"]
     single_rank_consolidation: bool
     consolidation_timeout_minutes: int
+    # Stage model and optimizer state in CPU memory while resuming. Loading the
+    # optimizer otherwise holds a full FP32 copy of it on the GPU, which large
+    # MoE models (Inkling2) cannot fit. Saves stay on the GPU: Automodel's
+    # cpu_offload also moves save-time state to CPU, where the Inkling2 HF
+    # adapter's all-gathers have no backend.
+    resume_on_cpu: bool
 
 
 class AutomodelConfig(TypedDict):

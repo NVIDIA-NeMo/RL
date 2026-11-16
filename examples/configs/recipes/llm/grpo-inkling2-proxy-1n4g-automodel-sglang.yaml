@@ -1,0 +1,44 @@
+# One-node bring-up of grpo-inkling2-8n4g-automodel-sglang on a real-format proxy:
+# the release checkpoint sliced to layers [0-5 NVFP4, 46-47 MXFP8] and the first 96
+# experts (tools/inkling2/make_proxy.py). Storage precision, FP32 groups, global/local
+# attention, BF16 expert serving with a dummy initial load, and the refit match the
+# full model; the weights are not a coherent model, so rewards are noise. Checks
+# plumbing and train/serve logprob agreement before an 8-node run. One 4-GPU engine
+# (the proxy's BF16 copy is small).
+defaults: grpo-inkling2-8n4g-automodel-sglang.yaml
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_num_steps: 3
+  val_period: 0
+policy:
+  model_name: /path/to/inkling2-small-proxy-automodel-text
+  train_global_batch_size: 32
+  max_total_sequence_length: 1024
+  automodel_cfg:
+    expert_parallel_size: 4
+  generation:
+    max_new_tokens: 512
+    sglang_cfg:
+      model_path: /path/to/inkling2-small-proxy-sglang-bf16
+      tp_size: 4
+      ep_size: 4
+      context_length: 1024
+      mem_fraction_static: 0.6
+      sglang_server_config:
+        num_gpus: 4
+data:
+  max_input_seq_length: 512
+  train:
+    dataset_name: OpenMathInstruct-2
+  validation: null
+  default:
+    prompt_file: examples/prompts/cot.txt
+env:
+  math:
+    math_verify_impl: hf_math_verify
+logger:
+  log_dir: logs/grpo-inkling2-proxy-1n4g-automodel-sglang
+  wandb_enabled: false
+cluster:
+  num_nodes: 1

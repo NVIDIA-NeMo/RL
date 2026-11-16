@@ -818,10 +818,13 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
         if all(new in content for _, new in replacements):
             return
         if any(content.count(old) != 1 for old, _ in replacements):
-            raise RuntimeError(
-                "Final vision LayerNorm patch requires the vLLM 0.33 model source "
-                f"or its fully patched equivalent: {file_to_patch}"
+            # Only Nemotron VL needs this; other models must still start on
+            # vLLM builds whose source differs (e.g. Inkling2's).
+            logger.warning(
+                "Skipped final vision LayerNorm patch: it requires the vLLM 0.33 "
+                f"model source or its fully patched equivalent: {file_to_patch}"
             )
+            return
         for old, new in replacements:
             content = content.replace(old, new, 1)
         write_back(content)

@@ -27,9 +27,9 @@ dependencies = [
   "ninja",      # for flash-attn parallel build
   # Deliberately a range, not an exact pin: each backend extra pins the torch its
   # wheels were built against (vllm: 2.14.0; mcore/automodel/trtllm: 2.13.0;
-  # sglang: 2.11.0) and resolves in its own uv conflict fork, so the base spec must
-  # admit all of them. The ceiling keeps the driver venv from drifting to a newer
-  # torch on a relock; it resolves to the highest allowed (2.14.0), matching vLLM.
+  # sglang: 2.14.1 for Inkling 2 Small) and resolves in its own uv conflict fork, so
+  # the base spec must admit all of them. The ceiling keeps the driver venv from
+  # drifting past the newest backend torch on a relock.
   "torch>=2.11,<2.15",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
@@ -58,8 +58,8 @@ dependencies = [
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range compatible with every backend-specific pin (5.5.4 through
-  # 5.16.1). Environments without a backend extra resolve to the upper bound.
-  "transformers>=5.5.0,<=5.16.1",
+  # 5.19.0). Environments without a backend extra resolve to the upper bound.
+  "transformers>=5.5.0,<=5.19.0",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -153,8 +153,8 @@ automodel = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
-  # Mirrors nemo-automodel's own `transformers==5.12.1` pin (Automodel r0.6.0).
-  "transformers==5.12.1",
+  # Mirrors nemo-automodel's own `transformers==5.18.0` pin (Inkling2).
+  "transformers==5.18.0",
   "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",
@@ -202,24 +202,33 @@ vllm = [
   "ai-dynamo-runtime==1.5.1",
 ]
 sglang = [
-  # sglang-miles (3003d70f) and sglang-kernel 0.4.5 are built against torch 2.11;
-  # on 2.13 sgl_kernel fails with `undefined symbol: _ZNK2at10TensorBase14const_data_ptr…`.
-  "torch==2.11.0",
-  "torchvision==0.26.0",
-  # sgl-project/sglang branch `sglang-miles` (based on v0.5.16). Needed for the
-  # begin_weight_update / end_weight_update refit session: quantized weights
-  # carry derived scales (swizzled blockscales, g1/g2 alphas) that have to be
-  # re-materialized once, after the last bucket lands. No tagged release has
-  # those endpoints, and re-running the finalize per bucket is not idempotent.
+  # SGLang with Inkling 2 Small support (sgl-project/sglang#50186) and its
+  # sglang-kernel are built against torch 2.14.1.
+  "torch==2.14.1",
+  "torchvision==0.29.1",
   "sglang",
-  "sglang-kernel==0.4.5",                                                       # Direct dep for explicit version control; required by sglang-miles
+  "sglang-kernel==0.4.11",                                                      # Direct dep for explicit version control; pinned by sgl-project/sglang#50186
   "sglang-router",                                                              # Used by nemo_rl.models.generation.sglang.sglang_router for multi-engine routing
   "kernels>=0.14.1,<0.15",
-  "flashinfer-python==0.6.14",
-  "flashinfer-cubin==0.6.14",
-  "flashinfer-jit-cache==0.6.14",
-  "transformers==5.12.1",
-  "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "flashinfer-python==0.7.4",
+  "flashinfer-cubin==0.7.4",
+  # flashinfer-jit-cache 0.7 is a loader that requires one wheel per SM arch, all
+  # published only on the flashinfer cu130 index; they are listed directly so the
+  # [tool.uv.sources] index pins apply. aarch64 (GB200/GB300) only: the loader's
+  # requirements differ per platform (sm110a/sm121a are aarch64-only) and uv reads a
+  # single wheel's metadata for every platform, so x86_64 cannot resolve it. On
+  # x86_64 flashinfer JIT-compiles kernels at runtime instead.
+  "flashinfer-jit-cache==0.7.4; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm80==0.7.4; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm89==0.7.4; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm90a==0.7.4; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm100a==0.7.4; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm103a==0.7.4; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm110a==0.7.4; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm120f==0.7.4; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm121a==0.7.4; platform_machine == 'aarch64'",
+  "transformers==5.19.0",
+  "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
@@ -369,7 +378,8 @@ nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2
 # newest PyPI release so dropping either one fails to resolve instead of
 # falling back to 0.1.0.
 nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "4d045c03186b90afdc815db46b671f6a21bc7e98" }
-sglang = { git = "https://github.com/sgl-project/sglang.git", rev = "3003d70f680d41c59d1b7acbf65cb47795dfd19e", subdirectory = "python" }
+# sgl-project/sglang#50186 (Inkling 2 Small support) head.
+sglang = { git = "https://github.com/sgl-project/sglang.git", rev = "ea3742849fa4f32a5a136f0792f667226d345f25", subdirectory = "python" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
   { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" },

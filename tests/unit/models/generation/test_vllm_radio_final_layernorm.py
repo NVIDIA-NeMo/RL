@@ -250,12 +250,15 @@ def test_final_norm_disabled_multimodal_and_missing_module(patched_model):
     assert not model._vision_final_layernorm_enabled
 
 
-def test_final_norm_patch_rejects_unknown_source_atomically(tmp_path, monkeypatch):
+def test_final_norm_patch_skips_unknown_source_atomically(
+    tmp_path, monkeypatch, caplog
+):
     target = tmp_path / "nano_nemotron_vl.py"
     target.write_text("class NemotronH_Nano_VL_V2: pass\n")
     monkeypatch.setattr(patches, "_get_vllm_file", lambda relative: str(target))
-    with pytest.raises(RuntimeError, match="requires the vLLM 0.33"):
+    with caplog.at_level(logging.WARNING):
         patches._patch_vllm_radio_final_layernorm(logging.getLogger(__name__))
+    assert "requires the vLLM 0.33" in caplog.text
     assert target.read_text() == "class NemotronH_Nano_VL_V2: pass\n"
 
 
