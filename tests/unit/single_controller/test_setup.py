@@ -1029,6 +1029,21 @@ class TestSetup:
         assert rollout_manager.call_args.kwargs["reward_penalty_config"] is resolved
         assert actor_args.rollout_manager is rollout_manager.return_value
 
+    @pytest.mark.parametrize("use_dynamic_sampling", [True, False])
+    def test_checks_a_custom_sampler_for_drop_accounting(self, use_dynamic_sampling):
+        # The drop-accounting members are read off the sampler on the async SC path
+        # regardless of dynamic sampling, so config validation requires them always.
+        mc = _make_master_config()
+        mc.grpo.use_dynamic_sampling = use_dynamic_sampling
+
+        with patch(
+            "nemo_rl.algorithms.single_controller_utils.config."
+            "require_drop_accounting_members"
+        ) as require_members:
+            validate_single_controller_config(mc)
+
+        require_members.assert_called_once_with(mc.async_rl.sampler)
+
     def test_raises_when_data_plane_disabled(self):
         mc = _make_master_config(dp_enabled=False)
         with pytest.raises(ValueError, match="data_plane.enabled=True"):
