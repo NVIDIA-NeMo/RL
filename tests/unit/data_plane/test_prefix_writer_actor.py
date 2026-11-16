@@ -24,7 +24,6 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from nemo_rl.data_plane.delegate import DelegatePool
 from nemo_rl.data_plane.prefix_writer_actor import (
     PackedColumn,
     PrefixPut,
@@ -216,8 +215,8 @@ def test_service_ack_waits_for_tq_and_preserves_keys_and_tags() -> None:
 def test_client_refuses_bad_ack_and_closed_writer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    actor = SimpleNamespace(process=MagicMock())
-    client = RayPrefixWriterClient(DelegatePool([actor]), writer_pid=99)
+    actor = SimpleNamespace(put=MagicMock())
+    client = RayPrefixWriterClient(actor, writer_pid=99)
     monkeypatch.setattr("ray.put", lambda batch: batch)
     monkeypatch.setattr(
         "ray.get", lambda ref: PrefixWriteReply(("wrong",), 0, 0, 0, 0, 0)
@@ -247,12 +246,12 @@ def test_client_records_timings_and_orders_failed_write_cleanup(
     data = MagicMock()
     service = PrefixWriterService(data, "staging")
     actor = SimpleNamespace(
-        process=SimpleNamespace(remote=service.put),
+        put=SimpleNamespace(remote=service.put),
         clear=SimpleNamespace(remote=service.clear),
     )
     monkeypatch.setattr("ray.put", lambda batch: batch)
     monkeypatch.setattr("ray.get", lambda result: result)
-    client = RayPrefixWriterClient(DelegatePool([actor]), writer_pid=99)
+    client = RayPrefixWriterClient(actor, writer_pid=99)
     batch = _batch()
     client.put_samples(
         sample_ids=list(batch.sample_ids),
@@ -448,8 +447,8 @@ def test_close_unblocks_pending_call_without_ack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entered, stopped = threading.Event(), threading.Event()
-    actor = SimpleNamespace(process=MagicMock())
-    client = RayPrefixWriterClient(DelegatePool([actor]), writer_pid=99)
+    actor = SimpleNamespace(put=MagicMock())
+    client = RayPrefixWriterClient(actor, writer_pid=99)
     monkeypatch.setattr("ray.put", lambda batch: batch)
 
     def get(reference: object) -> object:

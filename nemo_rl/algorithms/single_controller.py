@@ -160,7 +160,6 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
 )
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
-from nemo_rl.data_plane.delegate import DelegatePool
 from nemo_rl.data_plane.observability import (
     log_step_metrics,
     metrics_never_fail_the_step,
@@ -512,7 +511,9 @@ class SingleControllerActor:
         # in-process through the same computer the actors wrap, so a run without
         # a pool and a run with one cannot drift.
         self._advantage_actors: list[Any] = list(actor_args.advantage_actors)
-        self._advantage_pool = DelegatePool(self._advantage_actors)
+        self._available_advantage_actors: asyncio.Queue = asyncio.Queue()
+        for actor in self._advantage_actors:
+            self._available_advantage_actors.put_nowait(actor)
         self._advantage_computer = AdvantageComputer(
             self._dp_client,
             config=self._advantage_stage_config,
@@ -562,7 +563,9 @@ class SingleControllerActor:
         if gen_snapshots is not None:
             self._trainer.add_data_plane_snapshot_fn(gen_snapshots)
         self._storage_units = tuple(actor_args.storage_units)
-        self._finalizer_pool = DelegatePool(self._finalizer_actors)
+        self._available_finalizers: asyncio.Queue[Any] = asyncio.Queue()
+        for actor in self._finalizer_actors:
+            self._available_finalizers.put_nowait(actor)
         self._active_finalizers = 0
         self._finalizer_waiters = 0
         self._finalizer_unknown_outcomes = 0
@@ -1008,7 +1011,7 @@ class SingleControllerActor:
             "epoch": self._current_epoch,
             "active_finalizers": self._active_finalizers,
             "finalizer_waiters": self._finalizer_waiters,
-            "finalizer_queue_depth": self._finalizer_pool.free,
+            "finalizer_queue_depth": self._available_finalizers.qsize(),
             "finalizer_unknown_outcomes": self._finalizer_unknown_outcomes,
         }
 
@@ -1363,11 +1366,11 @@ class SingleControllerActor:
         self._finalizer_waiters += 1
         queue_depth = max(
             0,
-            self._finalizer_waiters - self._finalizer_pool.free,
+            self._finalizer_waiters - self._available_finalizers.qsize(),
         )
         queue_start = time.perf_counter()
         try:
-            actor = await self._finalizer_pool.acquire()
+            actor = await self._available_finalizers.get()
         except asyncio.CancelledError:
             await self._cleanup_known_finalization_request(request)
             raise
@@ -1394,7 +1397,7 @@ class SingleControllerActor:
                 ledger.mark_finalization_started(cut, request.group_id)
                 try:
                     rpc_submitted = True
-                    finalized = await actor.process.remote(request)
+                    finalized = await actor.finalize.remote(request)
                 except BaseException:
                     self._finalizer_unknown_outcomes += 1
                     ledger.mark_finalization_unknown(cut, request.group_id)
@@ -1521,7 +1524,7 @@ class SingleControllerActor:
         finally:
             self._active_finalizers -= 1
             if actor_reusable or not rpc_submitted:
-                self._finalizer_pool.release(actor)
+                self._available_finalizers.put_nowait(actor)
         finalize_total_ms = (time.perf_counter() - finalize_start) * 1000.0
         if not committed:
             return None
@@ -5123,9 +5126,9 @@ class SingleControllerActor:
         """Run one advantage stage on the pool, or in-process without one."""
         if not self._advantage_actors:
             return await self._advantage_computer.run(request)
-        actor = await self._advantage_pool.acquire()
+        actor = await self._available_advantage_actors.get()
         try:
-            outcome = await actor.process.remote(request)
+            outcome = await actor.run.remote(request)
         except BaseException:
             # The writeback is half-done and unreadable from here, so this
             # propagates rather than retrying, and the actor is not handed back.
@@ -5136,8 +5139,9 @@ class SingleControllerActor:
                 flush=True,
             )
             raise
-        self._advantage_pool.release(actor)
-        return outcome
+        else:
+            self._available_advantage_actors.put_nowait(actor)
+            return outcome
 
     def _absorb_advantage_outcome(self, outcome: AdvantageOutcome) -> None:
         """Fold one call's reduced results into this step's accumulators."""

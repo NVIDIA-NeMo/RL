@@ -26,17 +26,18 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageStageConfig,
 )
 from nemo_rl.data_plane import DataPlaneConfig
-from nemo_rl.data_plane.delegate import DataPlaneDelegate, DelegatePool, spread_off_head
+from nemo_rl.data_plane.delegate import (
+    CPU_ACTOR_OPTIONS,
+    DataPlaneDelegate,
+    spread_off_head,
+    start_cpu_actors,
+)
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 
 
-@ray.remote
+@ray.remote(**CPU_ACTOR_OPTIONS)
 class AdvantageActor(DataPlaneDelegate):  # pragma: no cover
     """Run one advantage computer on its own connect-only data-plane client."""
-
-    # It writes the ``advantages`` column through its own client, so its
-    # local store holds rows a data-plane snapshot must see.
-    owns_storage = True
 
     def __init__(
         self,
@@ -54,7 +55,7 @@ class AdvantageActor(DataPlaneDelegate):  # pragma: no cover
             shard_id=label,
         )
 
-    async def process(self, request: AdvantageRequest) -> AdvantageOutcome:
+    async def run(self, request: AdvantageRequest) -> AdvantageOutcome:
         """Run one advantage stage without letting payloads cross Ray RPC."""
         assert_metadata_only(request)
         outcome = await self._computer.run(request)
@@ -70,13 +71,10 @@ def create_advantage_actors(
     num_workers: int,
 ) -> list[Any]:
     """Start the pool, kept off the controller's node, after TQ partitions exist."""
-    pool = DelegatePool.start(
-        AdvantageActor,
-        dp_config,
-        config,
-        advantage_estimator,
+    placement = spread_off_head()
+    return start_cpu_actors(
+        lambda index: AdvantageActor.options(
+            scheduling_strategy=placement(index)
+        ).remote(dp_config, config, advantage_estimator, label=str(index)),
         n=num_workers,
-        placement=spread_off_head(),
     )
-    pool.wait_ready()
-    return pool.actors

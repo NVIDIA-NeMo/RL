@@ -22,7 +22,11 @@ import ray
 
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import DataPlaneConfig
-from nemo_rl.data_plane.delegate import DataPlaneDelegate, DelegatePool
+from nemo_rl.data_plane.delegate import (
+    CPU_ACTOR_OPTIONS,
+    DataPlaneDelegate,
+    start_cpu_actors,
+)
 from nemo_rl.data_plane.schema import forest_row_ids
 from nemo_rl.distributed.actor_environments import (
     NEMO_GYM_ACTOR_FQN,
@@ -152,13 +156,9 @@ class RolloutReassemblerActorConfig:
     thinking_tags: tuple[str, ...] | None = None
 
 
-@ray.remote
+@ray.remote(**CPU_ACTOR_OPTIONS)
 class RolloutReassemblerActor(DataPlaneDelegate):  # pragma: no cover
     """Run one lightweight finalizer on its own connect-only TQ client."""
-
-    # Finalized rows are written through this client, so its local store holds
-    # rows a data-plane snapshot must see.
-    owns_storage = True
 
     def __init__(
         self,
@@ -204,7 +204,7 @@ class RolloutReassemblerActor(DataPlaneDelegate):  # pragma: no cover
             RolloutReceipt,  # noqa: F401
         )
 
-    def process(self, request: ReassemblyRequest) -> FinalizedGroup:
+    def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:
         """Finalize one request without allowing tensor payloads across Ray RPC."""
         assert_metadata_only(request)
         if not (
@@ -261,12 +261,10 @@ def create_rollout_reassembler_actors(
     runtime_env = make_actor_runtime_env(
         NEMO_GYM_ACTOR_FQN if same_env else ROLLOUT_REASSEMBLER_ACTOR_FQN
     )
-    pool = DelegatePool.start(
-        RolloutReassemblerActor,
-        dp_config,
-        config,
+    return start_cpu_actors(
+        lambda index: RolloutReassemblerActor.options(runtime_env=runtime_env).remote(
+            dp_config, config, label=str(index)
+        ),
         n=num_workers,
-        runtime_env=runtime_env,
+        ready="check_dependencies",
     )
-    pool.wait_ready("check_dependencies")
-    return pool.actors

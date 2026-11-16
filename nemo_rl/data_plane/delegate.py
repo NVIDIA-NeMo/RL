@@ -11,19 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU Ray actors that do data-plane work for another process.
+"""CPU Ray actors the controller hands data-plane work to.
 
-A ``DataPlaneDelegate`` is a CPU-only Ray actor with its own data-plane client.
-A subclass overrides ``process(request)``: read, compute and write as it needs.
-A ``DelegatePool`` starts N of them with one placement and hands out free ones.
-Each user starts its own pool; pools are never shared.
+The advantage stage and the finalizers each run as a pool of these. A
+``DataPlaneDelegate`` owns a data-plane client whose store holds rows, so it
+answers the data-plane checkpoint and metrics calls. ``start_cpu_actors``
+starts a pool and kills it if any actor fails to come up.
 """
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable, Sequence
-from typing import Any, ClassVar
+from collections.abc import Callable
+from typing import Any
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -32,43 +31,35 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_co
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.data_plane.observability import is_metrics_client
 
-# Maps an actor's index in the pool to its Ray scheduling strategy.
-Placement = Callable[[int], Any]
+# One CPU, no GPU, and no retries: a retried call could write twice.
+CPU_ACTOR_OPTIONS: dict[str, Any] = {
+    "num_cpus": 1,
+    "num_gpus": 0,
+    "max_restarts": 0,
+    "max_task_retries": 0,
+}
 
 
 class DataPlaneDelegate:
-    """Own a connect-only data-plane client and do one job on it.
+    """Own a connect-only data-plane client whose store holds rows.
 
-    ``owns_storage`` decides whether this process lends memory to a Mooncake
-    store. Rows written through a client that owns storage live in this
-    process, so a data-plane checkpoint must reach it (``mooncake_checkpoint``).
-    A client that owns none (``segment_size=0``) writes into other processes'
-    storage and needs no checkpoint hook.
+    Rows written through this client live in this process's Mooncake memory,
+    so a data-plane checkpoint must reach it (``mooncake_checkpoint``).
     """
-
-    owns_storage: ClassVar[bool] = False
 
     def __init__(self, dp_config: DataPlaneConfig, *, label: str = "0") -> None:
         from nemo_rl.data_plane import build_data_plane_client
 
         self.label = label
-        self.dp_client = build_data_plane_client(
-            dp_config,
-            bootstrap=False,
-            segment_size=None if self.owns_storage else 0,
-        )
-
-    def process(self, request: Any) -> Any:
-        """Do this client's job for one request."""
-        raise NotImplementedError
+        self.dp_client = build_data_plane_client(dp_config, bootstrap=False)
 
     def __repr__(self) -> str:
         # Ray prefixes this actor's log lines with its repr.
         return f"{type(self).__name__}[{self.label}]"
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
-        """Save or restore the rows this process holds; metadata only."""
-        return run_checkpoint_command(body) if self.owns_storage else None
+        """Run an owner-local checkpoint command; return metadata, never payloads."""
+        return run_checkpoint_command(body)
 
     def get_data_plane_snapshot(self) -> dict[str, Any] | None:
         """This client's data-plane I/O counters, if metrics are on."""
@@ -77,14 +68,8 @@ class DataPlaneDelegate:
         return self.dp_client.snapshot(reset_step_window=True)
 
 
-def on_this_node() -> Placement:
-    """Pin every actor to the caller's node; fail rather than land elsewhere."""
-    node_id = ray.get_runtime_context().get_node_id()
-    return lambda _: NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
-
-
-def spread_off_head() -> Placement:
-    """Round-robin over the nodes that are not a dedicated Ray head.
+def spread_off_head() -> Callable[[int], Any]:
+    """Map an actor's index to a strategy that keeps it off a dedicated head.
 
     The head under ray.sub's DEDICATED_RAY_HEAD=1 hosts the controller and is
     compute-free. CPU-only actors that ask for plain CPUs would otherwise be
@@ -106,107 +91,29 @@ def spread_off_head() -> Placement:
     )
 
 
-class DelegatePool:
-    """A fixed set of delegate actors, and which of them are free.
-
-    ``acquire`` waits for a free actor; ``release`` gives it back after its call
-    finished. A caller does not release an actor whose call raised: its
-    outcome is unknown, so it is never handed out again.
-    """
-
-    def __init__(self, actors: Sequence[Any]) -> None:
-        self.actors = list(actors)
-        self._free: asyncio.Queue[Any] = asyncio.Queue()
-        for actor in self.actors:
-            self._free.put_nowait(actor)
-
-    @classmethod
-    def start(
-        cls,
-        client_cls: Any,
-        *args: Any,
-        n: int,
-        placement: Placement | None = None,
-        **ray_options: Any,
-    ) -> DelegatePool:
-        """Create ``n`` CPU-only, non-restarting actors; do not wait for them.
-
-        ``client_cls`` is an ``DataPlaneDelegate`` subclass, plain or already
-        wrapped by ``@ray.remote``. Each actor gets its index as ``label``.
-        """
-        if n <= 0:
-            raise ValueError(f"a delegate pool needs at least one actor, got {n}")
-        remote_cls = (
-            client_cls if hasattr(client_cls, "options") else ray.remote(client_cls)
-        )
-        options = {
-            "num_cpus": 1,
-            "num_gpus": 0,
-            "max_restarts": 0,
-            "max_task_retries": 0,
-            **ray_options,
-        }
-        actors = [
-            remote_cls.options(
-                **options,
-                **(
-                    {}
-                    if placement is None
-                    else {"scheduling_strategy": placement(index)}
-                ),
-            ).remote(*args, label=str(index))
-            for index in range(n)
-        ]
-        return cls(actors)
-
-    def wait_ready(
-        self, method: str = "__ray_ready__", *, timeout_s: float | None = None
-    ) -> list[Any]:
-        """Block until every actor answers ``method``; kill all if one fails."""
+def _kill_all(actors: list[Any]) -> None:
+    # One failed kill must not skip the others or hide the startup error.
+    for actor in actors:
         try:
-            return ray.get(
-                [getattr(actor, method).remote() for actor in self.actors],
-                timeout=timeout_s,
-            )
-        except BaseException:
-            self.kill()
-            raise
+            ray.kill(actor, no_restart=True)
+        except Exception as error:
+            print(f"cpu actor cleanup failed: {error}", flush=True)
 
-    async def wait_ready_async(
-        self, method: str = "__ray_ready__", *, timeout_s: float | None = None
-    ) -> list[Any]:
-        """``wait_ready`` for a caller that must not block its event loop."""
-        try:
-            return await asyncio.wait_for(
-                asyncio.gather(
-                    *(getattr(actor, method).remote() for actor in self.actors)
-                ),
-                timeout=timeout_s,
-            )
-        except BaseException:
-            self.kill()
-            raise
 
-    @property
-    def size(self) -> int:
-        return len(self.actors)
-
-    @property
-    def free(self) -> int:
-        return self._free.qsize()
-
-    async def acquire(self) -> Any:
-        """Wait until an actor is free and take it."""
-        return await self._free.get()
-
-    def release(self, actor: Any) -> None:
-        """Give back an actor whose call finished, successfully or not at all."""
-        self._free.put_nowait(actor)
-
-    def kill(self) -> None:
-        """Kill every actor; errors from already-dead actors are reported."""
-        for actor in self.actors:
-            try:
-                ray.kill(actor, no_restart=True)
-            except Exception as error:
-                print(f"delegate actor cleanup failed: {error}", flush=True)
+def start_cpu_actors(
+    make_actor: Callable[[int], Any],
+    *,
+    n: int,
+    ready: str = "__ray_ready__",
+    timeout_s: float | None = None,
+) -> list[Any]:
+    """Create ``n`` actors, wait for ``ready`` on each, kill all if one fails."""
+    if n <= 0:
+        raise ValueError(f"need at least one actor, got {n}")
+    actors = [make_actor(index) for index in range(n)]
+    try:
+        ray.get([getattr(actor, ready).remote() for actor in actors], timeout=timeout_s)
+    except BaseException:
+        _kill_all(actors)
+        raise
+    return actors

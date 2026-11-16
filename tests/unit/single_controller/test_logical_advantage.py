@@ -41,7 +41,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_forest_objective,
 )
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.delegate import DelegatePool
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from tests.unit.single_controller.test_advantage_stage import _InlineActor, _RowStore
 
@@ -408,7 +407,9 @@ def test_forest_reward_scaling_before_owner_baseline(
     )
     ctrl._advantage_computer = computer
     ctrl._advantage_actors = [_InlineActor(computer) for _ in range(actor_count)]
-    ctrl._advantage_pool = DelegatePool(ctrl._advantage_actors)
+    ctrl._available_advantage_actors = asyncio.Queue()
+    for actor in ctrl._advantage_actors:
+        ctrl._available_advantage_actors.put_nowait(actor)
     scaled = torch.tensor([-1.0, -0.5, 1.0])
     for _ in range(2):
         ctrl._step_log_dict.clear()
@@ -489,7 +490,9 @@ def test_logical_advantages_match_through_sharded_stage(mask_owner: bool) -> Non
         )
         ctrl._advantage_computer = computer
         ctrl._advantage_actors = [_InlineActor(computer) for _ in range(actor_count)]
-        ctrl._advantage_pool = DelegatePool(ctrl._advantage_actors)
+        ctrl._available_advantage_actors = asyncio.Queue()
+        for actor in ctrl._advantage_actors:
+            ctrl._available_advantage_actors.put_nowait(actor)
         _, valid = asyncio.run(ctrl._advantage_stage(meta))
         assert valid
         assert sum(ctrl._step_log_dict["num_mask_sample_filtered"]) == int(mask_owner)

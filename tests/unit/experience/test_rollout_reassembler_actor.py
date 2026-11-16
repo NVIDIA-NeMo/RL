@@ -106,7 +106,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
     actor._finalizer.finalize_group.return_value = result
     request = replace(_request(), loss_multiplier=0.25)
 
-    assert actor.process(request) is result
+    assert actor.finalize(request) is result
     actor._finalizer.finalize_group.assert_called_once_with(
         "group",
         ["group_g0"],
@@ -146,9 +146,7 @@ def test_actor_forwards_capture_media_to_the_reassembler(
     setup -> actor config -> RolloutReassembler -> its TQ source/sink."""
     actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
     monkeypatch.setattr(
-        data_plane_module,
-        "build_data_plane_client",
-        lambda cfg, bootstrap, segment_size: MagicMock(),
+        data_plane_module, "build_data_plane_client", lambda cfg, bootstrap: MagicMock()
     )
     config = RolloutReassemblerActorConfig(
         partition_id="canonical",
@@ -342,8 +340,7 @@ def test_factory_selects_compatible_environment_and_waits_for_dependencies(
             ]
             if cleanup_fails:
                 assert (
-                    "delegate actor cleanup failed: kill failed"
-                    in capsys.readouterr().out
+                    "cpu actor cleanup failed: kill failed" in capsys.readouterr().out
                 )
         else:
             assert (
@@ -358,19 +355,7 @@ def test_factory_selects_compatible_environment_and_waits_for_dependencies(
 
         make_env.assert_called_once_with(gym_fqn if reuse_gym_env else actor_fqn)
         expected_runtime = prepared_gym_env if reuse_gym_env else runtime_env
-        assert (
-            options.call_args_list
-            == [
-                call(
-                    num_cpus=1,
-                    num_gpus=0,
-                    max_restarts=0,
-                    max_task_retries=0,
-                    runtime_env=expected_runtime,
-                )
-            ]
-            * 2
-        )
+        assert options.call_args_list == [call(runtime_env=expected_runtime)] * 2
         assert options.return_value.remote.call_args_list == [
             call(dp_config, config, label="0"),
             call(dp_config, config, label="1"),
@@ -412,5 +397,5 @@ def test_reward_checks_remain_metadata_only_and_reach_finalizer():
     actor._finalizer.finalize_group.return_value = FinalizedGroup(
         None, 4, 4, [], dropped=True
     )
-    actor.process(request)
+    actor.finalize(request)
     assert actor._finalizer.finalize_group.call_args.kwargs["reward_checks"] == [checks]
