@@ -128,7 +128,7 @@ def _setup_2d_process_groups(rank, world_size, cp_size, tp_size):
     return my_cp_rank, my_tp_rank, cp_group, tp_group
 
 
-def _build_test_case(cp_size, tp_size, my_tp_rank, cp_group):
+def _build_test_case(cp_size, tp_size, my_tp_rank, cp_group, dtype=torch.float32):
     """Build a small packed batch with CP-aware packing."""
     from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
     from nemo_rl.models.megatron.data import _pack_sequences_for_megatron
@@ -197,7 +197,7 @@ def _build_test_case(cp_size, tp_size, my_tp_rank, cp_group):
     assert cu_seqlens_padded is not None
 
     full_logits = torch.randn(
-        batch_size, max_seq_len, vocab_size_total, device=device, dtype=torch.float32
+        batch_size, max_seq_len, vocab_size_total, device=device, dtype=dtype
     )
 
     def make_logits_and_packed_logits():
@@ -214,7 +214,11 @@ def _build_test_case(cp_size, tp_size, my_tp_rank, cp_group):
 
         total_padded_tokens = int(cu_seqlens_padded[-1].item())
         packed_logits = torch.zeros(
-            1, total_padded_tokens // cp_size, vocab_size_local, device=device
+            1,
+            total_padded_tokens // cp_size,
+            vocab_size_local,
+            device=device,
+            dtype=dtype,
         )
 
         run_seq = 0
@@ -223,7 +227,9 @@ def _build_test_case(cp_size, tp_size, my_tp_rank, cp_group):
             padded_seq_len = int(
                 (cu_seqlens_padded[i + 1] - cu_seqlens_padded[i]).item()
             )
-            tmp = torch.zeros(1, padded_seq_len, vocab_size_local, device=device)
+            tmp = torch.zeros(
+                1, padded_seq_len, vocab_size_local, device=device, dtype=dtype
+            )
             tmp[:, :seq_len, :] = logits_local[i : i + 1, :seq_len, :]
             packed_logits[
                 :,
@@ -251,16 +257,26 @@ def _build_test_case(cp_size, tp_size, my_tp_rank, cp_group):
     }
 
 
-def _run_compare_sequence_packing_wrappers(rank, world_size, cp_size, tp_size):
+def _run_compare_sequence_packing_wrappers(
+    rank,
+    world_size,
+    cp_size,
+    tp_size,
+    chunk_size=None,
+    reuse_logits_storage=False,
+    dtype=torch.float32,
+):
     """Compare SequencePackingFusionLossWrapper vs SequencePackingLossWrapper.
 
     Verifies that the fused wrapper produces identical loss values and
-    backward gradients w.r.t. vocab-parallel logits.
+    backward gradients w.r.t. vocab-parallel logits, and that it writes the
+    grad into the packed logits' storage iff reuse is requested and
+    ``chunk_size`` is set.
     """
     _my_cp_rank, my_tp_rank, cp_group, tp_group = _setup_2d_process_groups(
         rank, world_size, cp_size, tp_size
     )
-    tc = _build_test_case(cp_size, tp_size, my_tp_rank, cp_group)
+    tc = _build_test_case(cp_size, tp_size, my_tp_rank, cp_group, dtype=dtype)
     base_loss_fn = ClippedPGLossFn(tc["loss_cfg"])
     data_dict = tc["data_dict"]
 
@@ -276,7 +292,11 @@ def _run_compare_sequence_packing_wrappers(rank, world_size, cp_size, tp_size):
 
     candidate_wrapper = SequencePackingFusionLossWrapper(
         loss_fn=base_loss_fn,
-        prepare_fn=prepare_packed_loss_input,
+        prepare_fn=functools.partial(
+            prepare_packed_loss_input,
+            chunk_size=chunk_size,
+            reuse_logits_storage=reuse_logits_storage,
+        ),
         cu_seqlens_q=to_cpu_int_tuple(tc["cu_seqlens"]),
         cu_seqlens_q_padded=to_cpu_int_tuple(tc["cu_seqlens_padded"]),
         vocab_parallel_rank=my_tp_rank,
@@ -297,6 +317,7 @@ def _run_compare_sequence_packing_wrappers(rank, world_size, cp_size, tp_size):
 
     # Candidate run (fresh logits, identical values)
     candidate_logits, candidate_packed_logits = tc["make_logits_and_packed_logits"]()
+    packed_before = candidate_packed_logits.detach().clone()
     candidate_loss, _candidate_metrics = candidate_wrapper(
         candidate_packed_logits,
         data_dict,
@@ -306,16 +327,25 @@ def _run_compare_sequence_packing_wrappers(rank, world_size, cp_size, tp_size):
     (candidate_loss / cp_size).backward()
     candidate_grad = candidate_logits.grad.clone()
 
+    # Only the chunked fused path with reuse on writes the grad into the logits.
+    reused = not torch.equal(candidate_packed_logits.detach(), packed_before)
+    expected_reuse = reuse_logits_storage and chunk_size is not None
+    assert reused == expected_reuse, (
+        f"reuse={reused} with chunk_size={chunk_size}, "
+        f"reuse_logits_storage={reuse_logits_storage} on rank {rank}"
+    )
+
     # Sanity: gradients must be non-None and non-zero
     assert baseline_grad.abs().sum() > 0, f"baseline grad is all zeros on rank {rank}"
     assert candidate_grad.abs().sum() > 0, f"candidate grad is all zeros on rank {rank}"
 
+    tol = 1e-5 if dtype == torch.float32 else 1e-2
     # Forward: loss values must match
     torch.testing.assert_close(
         baseline_loss,
         candidate_loss,
-        atol=1e-5,
-        rtol=1e-5,
+        atol=tol,
+        rtol=tol,
         msg=f"Loss mismatch on rank {rank}",
     )
 
@@ -323,8 +353,8 @@ def _run_compare_sequence_packing_wrappers(rank, world_size, cp_size, tp_size):
     torch.testing.assert_close(
         baseline_grad,
         candidate_grad,
-        atol=1e-5,
-        rtol=1e-5,
+        atol=tol,
+        rtol=tol,
         msg=f"Gradient mismatch on rank {rank}",
     )
 
@@ -437,7 +467,15 @@ def _run_compare_sequence_packing_wrappers_with_sampling(
     ],
     ids=lambda cp_tp: f"cp{cp_tp[0]}_tp{cp_tp[1]}",
 )
-def test_sequence_packing_fusion_vs_baseline(distributed_test_runner, cp_tp):
+@pytest.mark.parametrize(
+    "chunk_size,reuse_logits_storage",
+    [(None, True), (3, False), (3, True)],
+    ids=["nochunk-reuse", "chunk3", "chunk3-reuse"],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=str)
+def test_sequence_packing_fusion_vs_baseline(
+    distributed_test_runner, cp_tp, chunk_size, reuse_logits_storage, dtype
+):
     """Compare SequencePackingFusionLossWrapper vs SequencePackingLossWrapper.
 
     Verifies that the fused wrapper produces identical:
@@ -452,6 +490,9 @@ def test_sequence_packing_fusion_vs_baseline(distributed_test_runner, cp_tp):
         _run_compare_sequence_packing_wrappers,
         cp_size=cp_size,
         tp_size=tp_size,
+        chunk_size=chunk_size,
+        reuse_logits_storage=reuse_logits_storage,
+        dtype=dtype,
     )
     distributed_test_runner(test_fn, world_size=world_size)
 

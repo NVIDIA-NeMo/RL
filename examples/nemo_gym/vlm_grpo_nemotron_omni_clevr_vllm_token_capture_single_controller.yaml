@@ -2,15 +2,35 @@
 # generation, a Megatron learner, and vLLM media token capture enabled.
 #
 # Functional-test config (not a nightly recipe, so it lives beside the other
-# Gym smoke configs rather than under examples/configs/recipes/):
-# tests/functional/nemotron_omni_clevr_vllm_token_capture_single_controller_1n2g.sh
-# supplies the data paths, the 1 trainer + 1 generator split, and the step
-# budget. Token capture requires the Gym rollout path, so the native CLEVR
+# Gym smoke configs rather than under examples/configs/recipes/). It pins the
+# 1n2g split both Omni CLEVR vLLM tests use: one GPU trains the frozen-decoder
+# policy, one hosts async vLLM. The tests
+# (tests/functional/nemotron_omni_clevr_vllm_*_single_controller_1n2g.sh)
+# supply the data paths, sequence lengths and step budget. Token capture
+# requires the Gym rollout path, so the native CLEVR
 # dataset/environment of the parent recipe are swapped for Gym rows here.
 # Prefix caching stays off (hybrid-Mamba align cache mode asserts chunked
 # prefill) and the parent's mm_processor_cache_gb=0 keeps concrete pixels
 # available to the capture host.
 defaults: ../configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml
+cluster:
+  num_nodes: 1
+  gpus_per_node: 2
+  segment_size: 1
+grpo:
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+async_rl:
+  generation_fleet_health:
+    refit_timeout_s: null
+data_plane:
+  simple:
+    num_storage_units: 2
+logger:
+  tensorboard_enabled: true
+  wandb_enabled: false
+  monitor_gpus: false
 data:
   _override_: true
   max_input_seq_length: null
@@ -52,10 +72,39 @@ env:
         simple_agent:
           max_steps: 1
 policy:
+  train_micro_batch_size: 1
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    bias_dropout_fusion: false
+    freeze_config:
+      freeze_language_model: true
+    optimizer:
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      params_dtype: bfloat16
+      main_grads_dtype: bfloat16
+      main_params_dtype: float16
+      exp_avg_dtype: bfloat16
+      exp_avg_sq_dtype: bfloat16
+      store_param_remainders: false
   generation:
     backend: vllm
     refit_transport: null
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 1
+        gpus_per_node: 1
     vllm_cfg:
+      tensor_parallel_size: 1
+      expert_parallel_size: 1
+      pipeline_parallel_size: 1
+      gpu_memory_utilization: 0.6
       async_engine: true
       expose_http_server: true
       logprobs_mode: raw_logprobs
