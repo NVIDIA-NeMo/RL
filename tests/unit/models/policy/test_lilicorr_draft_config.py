@@ -98,3 +98,30 @@ def test_a_genuine_typo_is_still_rejected(drafter_checkpoint):
     config = dict(MERGED_RECIPE_DRAFT, model_name=drafter_checkpoint, loss_wieght=0.2)
     with pytest.raises(Exception):
         _DRAFT_CONFIG_ADAPTER.validate_python(config)
+
+
+def test_learning_rate_reaches_the_draft_optimizer(drafter_checkpoint):
+    # The Megatron train step reads only policy.draft.optimizer. Before this, a recipe
+    # setting learning_rate silently trained the drafter at the policy's RL lr.
+    config = dict(MERGED_RECIPE_DRAFT, model_name=drafter_checkpoint)
+    resolved = _DRAFT_CONFIG_ADAPTER.validate_python(config)
+    assert resolved.optimizer is not None
+    assert resolved.optimizer.lr == pytest.approx(1.0e-4)
+
+    config = dict(config, learning_rate=3.0e-6)
+    assert _DRAFT_CONFIG_ADAPTER.validate_python(config).optimizer.lr == pytest.approx(
+        3.0e-6
+    )
+
+
+def test_explicit_optimizer_block_takes_precedence(drafter_checkpoint):
+    # learning_rate is inherited from the base recipe whether or not it was meant for
+    # this draft, so an explicit optimizer block must win rather than conflict.
+    config = dict(
+        MERGED_RECIPE_DRAFT,
+        model_name=drafter_checkpoint,
+        optimizer={"lr": 5.0e-5, "min_lr": 1.0e-6},
+    )
+    resolved = _DRAFT_CONFIG_ADAPTER.validate_python(config)
+    assert resolved.optimizer.lr == pytest.approx(5.0e-5)
+    assert resolved.optimizer.min_lr == pytest.approx(1.0e-6)

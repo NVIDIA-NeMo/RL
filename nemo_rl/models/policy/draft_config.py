@@ -345,8 +345,24 @@ class LiLiCorrDraftConfig(_MegatronBlockDraftConfigBase):
     # weights is the same silent-accuracy-loss failure the rest of this class avoids.
     num_layers: Annotated[int, Field(gt=0)] | None = None
     loss_weight: Annotated[float, Field(gt=0)] = 0.1
+    # The drafter's own learning rate. The Megatron train step only reads
+    # ``optimizer`` (NVIDIA-NeMo/RL#3707); left unset, it falls back to the POLICY lr,
+    # which for RL is orders of magnitude below what a drafter needs, and the drafter
+    # stays effectively frozen with nothing reporting it. So when ``optimizer`` is
+    # unset, this value becomes ``optimizer.lr`` (see _learning_rate_drives_optimizer).
+    # An explicit ``optimizer`` block takes precedence: recipes inherit
+    # learning_rate from grpo_math_1B.yaml whether or not it was meant for this draft.
     learning_rate: Annotated[float, Field(gt=0)] = 1.0e-4
     optimizer: DraftOptimizerConfig | None = None
+
+    @model_validator(mode="after")
+    def _learning_rate_drives_optimizer(self) -> Self:
+        """Make ``learning_rate`` the draft param group's lr on the Megatron path."""
+        if self.optimizer is None:
+            object.__setattr__(
+                self, "optimizer", DraftOptimizerConfig(lr=self.learning_rate)
+            )
+        return self
 
     # Plan geometry, shared with the other Megatron block drafters so the anchor
     # schedule, loss mask and normalization counts can be reused rather than
