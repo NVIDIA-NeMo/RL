@@ -106,16 +106,8 @@ uvx --from huggingface-hub hf download nvidia/Nemotron-RL-agent-workplace_assist
 
 ## Launch
 
-The text and image recipes default to 16 nodes x 4 GPUs; the agentic recipe to
-8 training + 8 generation nodes (`cluster.num_nodes` is the sum,
-`policy.generation.colocated.resources.num_nodes` the generation share). The NeMo
-Gym venvs for the `workplace_assistant` resource server are built on first launch,
-or prebaked into the container as in the
-[Nemotron 3.5 Lightning guide](nemotron-3.5-lightning.md#container) with
-`--build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/nemotron-3.5-super-vl/workplace_assistant_automodel.yaml"`.
-To reuse them without rebuilding the image, see
-[Python Environments on Shared Filesystems](../../../cluster.md#python-environments-on-shared-filesystems);
-do not put them on a shared filesystem as a way to skip rebuilding them.
+The text and image recipes default to 16 nodes x 4 GPUs; the agentic recipe to 8 training + 8 generation nodes (`cluster.num_nodes` is the sum, `policy.generation.colocated.resources.num_nodes` the generation share). The NeMo Gym venvs for the `workplace_assistant` resource server are built on first launch, or prebaked into the container as in the [Nemotron 3.5 Lightning guide](nemotron-3.5-lightning.md#container) with `--build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/nemotron-3.5-super-vl/workplace_assistant_automodel.yaml"`.
+To reuse them without rebuilding the image, see [Python Environments on Shared Filesystems](../../../cluster.md#python-environments-on-shared-filesystems); do not put them on a shared filesystem as a way to skip rebuilding them.
 
 ```bash
 # Text DAPO (DAPO-Math-17K / AIME-2024)
