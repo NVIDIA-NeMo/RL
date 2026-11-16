@@ -139,6 +139,7 @@ def test_startup_rejects_invalid_explicit_checkpoint(tmp_path: Path, converted_p
         )
 
 
+@pytest.mark.sglang
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires real CUDA quantization"
 )

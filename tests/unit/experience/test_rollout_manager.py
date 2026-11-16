@@ -380,6 +380,12 @@ def _make_manager(
     mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
+    mgr._filter_zero_variance_groups = False
+    # Participation rules for the zero-variance predicate. None means no
+    # group-relative baseline, so every row votes -- the shape these tests assert on.
+    mgr._masked_reward_policy = None
+    mgr._overlong_filtering = False
+    mgr._step_rewards = {}
     return mgr
 
 
@@ -1462,10 +1468,13 @@ def test_nemo_gym_reward_penalties_match_legacy_rewards_counts_and_metrics(
 ):
     impl = _nemo_gym_impl(True, reward_penalty_config)
     result = _reward_penalty_result(output, assistant_overrides, assistant_tokens)
+    result["reward_original"] = 1.0
 
     completions, penalty_counts = impl._results_to_completions([result])
 
     assert completions[0].reward == 0.0
+    # Dynamic sampling still sees the reward the penalty overwrote.
+    assert completions[0].reward_original == 1.0
     assert penalty_counts[count_key] == 1
     assert sum(penalty_counts.values()) == 1
     assert impl._compute_reward_penalty_metrics(penalty_counts, 1) == {metric_name: 1.0}
@@ -2055,12 +2064,11 @@ def test_async_nemo_gym_rollout_manager(
             None,
         )
         assert last_assistant is not None, f"Completion {i}: no assistant message found"
-        assert torch.equal(
-            last_assistant["token_ids"],
-            torch.tensor([151667, 198, 32313, 11, 1077]),
-        ), (
-            f"Completion {i}: last assistant token_ids {last_assistant['token_ids'].tolist()} "
-            f"!= [151667, 198, 32313, 11, 1077]"
+        # Sampling runs at temperature 1.0. On vLLM 0.33 the fifth token varies between
+        # requests for the same prompt (279 or 1077), so only the first four ids are fixed.
+        token_ids = last_assistant["token_ids"].tolist()
+        assert len(token_ids) == 5 and token_ids[:4] == [151667, 198, 32313, 11], (
+            f"Completion {i}: last assistant token_ids {token_ids}"
         )
 
         # 3. reward
@@ -2185,7 +2193,11 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         assert new_token_ids is not None, (
             f"Completion {i}: no assistant message in manager"
         )
-        assert torch.equal(orig_token_ids, new_token_ids), (
+        # Sampling runs at temperature 1.0. On vLLM 0.33 the fifth token varies between
+        # requests for the same prompt, so only the first four ids are compared.
+        assert len(orig_token_ids) == len(new_token_ids) and torch.equal(
+            orig_token_ids[:4], new_token_ids[:4]
+        ), (
             f"Completion {i}: last assistant token_ids mismatch\n"
             f"  original:  {orig_token_ids.tolist()}\n"
             f"  manager:   {new_token_ids.tolist()}"
@@ -2320,6 +2332,8 @@ def _make_capture_manager(
     mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
+    mgr._filter_zero_variance_groups = False
+    mgr._step_rewards = {}
     mgr._recovery_ledger = RolloutRecoveryLedger()
     mgr._data_plane_checkpoint_barrier = buf.data_plane_checkpoint_barrier
 
@@ -2940,3 +2954,148 @@ def test_receipt_raw_metrics_preserve_mask_but_defer_reward(honor_mask: bool) ->
         "ng_receipt" in key or "ng_logical_selection" in key for key in metrics
     )
     assert ("mask_sample" in completions[0].env_extras) is honor_mask
+
+
+def _scored_record(*rewards: float) -> PromptGroupRecord:
+    return PromptGroupRecord(
+        prompt_idx=0,
+        prompt=[],
+        extra_env_info=None,
+        metadata={},
+        completions=[
+            SimpleNamespace(
+                reward=reward, reward_original=None, env_extras=None, truncated=False
+            )
+            for reward in rewards
+        ],
+        rollout_metrics={},
+    )
+
+
+class TestStepRewardMetrics:
+    def test_committed_group_is_tallied_under_its_target_step(self):
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(record=_scored_record(1.0, 0.0, 1.0, 0.0)))
+
+        outcome = _run(mgr.generate_and_push({"idx": 0}, target_step=3))
+
+        assert outcome is RolloutOutcome.COMMITTED
+        metrics = mgr.drain_step_reward_metrics(3)
+        assert metrics["generated_prompt_groups"] == 1.0
+        assert metrics["zero_variance_prompt_groups"] == 0.0
+        assert metrics["unfiltered_reward"] == pytest.approx(0.5)
+        assert metrics["first_attempt_reward"] == pytest.approx(0.5)
+
+    def test_dropped_zero_variance_group_still_counts_toward_the_reward(self):
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(record=_scored_record(0.0, 0.0, 0.0, 0.0)))
+        mgr._filter_zero_variance_groups = True
+
+        outcome = _run(mgr.generate_and_push({"idx": 0}, target_step=2))
+
+        # FILTERED, not SKIPPED: the rollout succeeded, so the caller replaces it out
+        # of the dynamic-sampling budget rather than the fault-tolerance one.
+        assert outcome is RolloutOutcome.FILTERED
+        assert len(buf.remove_calls) == 1
+        metrics = mgr.drain_step_reward_metrics(2)
+        assert metrics["generated_prompt_groups"] == 1.0
+        assert metrics["zero_variance_prompt_groups"] == 1.0
+        assert metrics["zero_variance_fraction"] == 1.0
+        assert metrics["unfiltered_reward"] == 0.0
+
+    def test_zero_variance_drop_clears_the_consecutive_drop_run(self):
+        # Healthy filtered rollouts must reset consecutive infrastructure failures.
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(record=_scored_record(0.0, 0.0, 0.0, 0.0)))
+        mgr._filter_zero_variance_groups = True
+        mgr._consecutive_infra_drops = 3
+
+        outcome = _run(mgr.generate_and_push({"idx": 0}, target_step=2))
+
+        assert outcome is RolloutOutcome.FILTERED
+        assert mgr._consecutive_infra_drops == 0
+
+    def test_zero_variance_is_counted_even_when_the_filter_is_off(self):
+        mgr = _make_manager(
+            _FakeBuffer(), _FakeImpl(record=_scored_record(1.0, 1.0, 1.0, 1.0))
+        )
+
+        outcome = _run(mgr.generate_and_push({"idx": 0}, target_step=0))
+
+        assert outcome is RolloutOutcome.COMMITTED
+        assert mgr.drain_step_reward_metrics(0)["zero_variance_prompt_groups"] == 1.0
+
+    def test_replacement_is_excluded_from_the_first_attempt_reward(self):
+        mgr = _make_manager(
+            _FakeBuffer(), _FakeImpl(record=_scored_record(1.0, 1.0, 0.0, 0.0))
+        )
+
+        _run(mgr.generate_and_push({"idx": 0}, target_step=0, replacement_index=1))
+
+        metrics = mgr.drain_step_reward_metrics(0)
+        assert metrics["unfiltered_reward"] == pytest.approx(0.5)
+        assert "first_attempt_reward" not in metrics
+
+    def test_unstamped_prompt_is_not_tallied(self):
+        mgr = _make_manager(
+            _FakeBuffer(), _FakeImpl(record=_scored_record(1.0, 0.0, 1.0, 0.0))
+        )
+
+        _run(mgr.generate_and_push({"idx": 0}))
+
+        assert mgr._step_rewards == {}
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_length_penalty_runs_after_group_collection_or_is_saved_for_capture(capture):
+    from nemo_rl.utils.length_penalty import LengthPenaltyConfig, LengthPenaltyParams
+    from nemo_rl.utils.timer import Timer
+
+    class Remote:
+        def options(self, **kwargs):
+            return self
+
+        def remote(self, pending, *args, **kwargs):
+            async def value(row):
+                index = row["_rowidx"]
+                result = _mask_gate_receipt_result() if capture else _mask_gate_result()
+                result["input_message_log"] = [{"role": "user", "token_ids": [9]}]
+                result["full_result"]["response"] = {
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"text": "x" * (index + 1) * 10}],
+                        }
+                    ]
+                }
+                return index, {"name": "agent"}, result, None
+
+            async def stream():
+                for row in reversed(pending):
+                    yield value(row)
+
+            return stream()
+
+    impl = _nemo_gym_impl(True)
+    impl._length_penalty_config = LengthPenaltyConfig(
+        default=LengthPenaltyParams(
+            length_type="chars", group_total_length_penalty_coeff=0.2
+        )
+    )
+    impl._num_generations_per_prompt = 2
+    impl._task_to_env = {"nemo_gym": SimpleNamespace(run_rollouts=Remote())}
+    inputs = [{"_rowidx": i, "agent_ref": {"name": "agent"}} for i in range(2)]
+    completions, _, metrics = _run(impl._run_rollouts(inputs, Timer(), "test"))
+    if capture:
+        assert [completion.reward for completion in completions] == [1.0, 1.0]
+        assert [
+            completion.env_extras["ng_reward_checks"].length_penalty.answer_length
+            for completion in completions
+        ] == [10, 20]
+        assert "length_penalty/adjusted_frac" not in metrics
+    else:
+        assert [completion.reward for completion in completions] == pytest.approx(
+            [1.1, 0.9]
+        )
+        assert metrics["length_penalty/env_reward_mean"] == 1.0
+        assert metrics["length_penalty/adjusted_frac"] == 1.0
