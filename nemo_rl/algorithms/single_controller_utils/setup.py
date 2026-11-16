@@ -79,7 +79,6 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageStageConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
-    DEFAULT_TOKEN_CAPTURE_ROOT,
     MasterConfig,
     algo_config,
     forest_execution_row_multiple,
@@ -224,14 +223,20 @@ def _default_token_capture_dir() -> str:
 
     The path is resolved here on the driver.
     Gym creates it on each node that hosts a Gym actor.
+    The parent is per user because it outlives the run,
+    and another user could not create a directory in it.
     The random suffix keeps two runs on one node apart, even within one Slurm job,
     because their rollout IDs can repeat.
     """
+    import getpass
     import secrets
 
     run_name = os.environ.get("SLURM_JOB_ID") or "local"
     return os.path.join(
-        DEFAULT_TOKEN_CAPTURE_ROOT, f"{run_name}-{secrets.token_hex(4)}"
+        "/tmp",
+        f"nemo_rl-{getpass.getuser()}",
+        "token_capture",
+        f"{run_name}-{secrets.token_hex(4)}",
     )
 
 

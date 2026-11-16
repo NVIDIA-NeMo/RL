@@ -435,3 +435,16 @@ def test_nemo_gym_shutdown_keeps_a_configured_capture_dir(tmp_path):
     ).shutdown()
 
     assert (Path(capture["capture_dir"]) / "lineage").is_dir()
+
+
+def test_nemo_gym_shutdown_twice_reports_no_capture_cleanup_failure(tmp_path, capsys):
+    capture = _derived_capture(tmp_path / "4242-abcd", 0)
+    actor = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class(
+        {"token_capture": capture}
+    )
+
+    actor.shutdown()
+    actor.shutdown()
+
+    assert not (tmp_path / "4242-abcd").exists()
+    assert "Failed to remove token capture path" not in capsys.readouterr().out

@@ -1029,6 +1029,9 @@ def _remove_derived_capture_dir(token_capture: Optional[Mapping[str, Any]]) -> N
         return
     instance_dir = Path(token_capture["capture_dir"])
     run_dir = Path(token_capture["capture_root"])
+    if not instance_dir.exists():
+        # Shutdown already ran, or Gym never created the directory.
+        return
     shutil.rmtree(
         instance_dir,
         onexc=lambda _fn, path, exc: print(
@@ -2844,7 +2847,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             rh, self.rh = self.rh, None
             if rh is not None:
                 _shut_down_gym_servers(rh)
-            # getattr: shutdown must also work on an actor whose __init__ never ran.
+            # getattr: tests build actors with __new__ and set only rh.
             _remove_derived_capture_dir(getattr(self, "cfg", {}).get("token_capture"))
         finally:
             # Ray reaps this actor, so no atexit handler runs: whatever the span

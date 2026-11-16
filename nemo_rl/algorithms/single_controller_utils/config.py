@@ -700,11 +700,6 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         return self
 
 
-# Node-local parent of the capture directories setup derives when token_capture.capture_dir is unset.
-# Ledger traffic is many small-file metadata operations, which must stay off shared filesystems.
-DEFAULT_TOKEN_CAPTURE_ROOT = "/tmp/nemo_rl/token_capture"
-
-
 class TokenCaptureConfig(BaseModel, extra="allow"):
     """Ledger-authoritative token capture (token-in/token-out via NeMo-Gym).
 
@@ -728,8 +723,9 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # surface as a failed dispatch, not a silent retry stall).
     control_timeout_s: float = 60.0
     # Root for Gym's per-rollout capture ledgers and base capture layer.
-    # None = derived at setup as a fresh directory under DEFAULT_TOKEN_CAPTURE_ROOT on each Gym node's local disk.
-    # Each Gym shard runs all of its servers on one node,
+    # None = derived at setup as a fresh directory under /tmp/nemo_rl-<user>/token_capture on each Gym node's local disk.
+    # Ledger traffic is many small-file metadata operations, which must stay off shared filesystems.
+    # Each Gym actor runs all of its servers on its own node,
     # and a checkpoint copies the ledger rows it needs into the checkpoint directory,
     # so nothing reads the ledgers from another node or after the run.
     capture_dir: Optional[str] = None

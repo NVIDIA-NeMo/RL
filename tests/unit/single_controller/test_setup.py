@@ -3413,6 +3413,7 @@ class TestSetup:
     ):
         """Ledgers stay off the run's log dir, which is on shared storage."""
         monkeypatch.setenv("SLURM_JOB_ID", "4242")
+        monkeypatch.setattr("getpass.getuser", lambda: "alice")
         patched_factories["setup_response_data"].return_value = (list(range(8)), None)
         capture_dirs = []
         for _ in range(2):
@@ -3423,20 +3424,22 @@ class TestSetup:
             capture_dirs.append(Path(token_capture["capture_dir"]))
 
         for capture_dir in capture_dirs:
-            assert capture_dir.parent == Path("/tmp/nemo_rl/token_capture")
+            # Per user: the parent outlives the run, and another user's run could not create a directory in it.
+            assert capture_dir.parent == Path("/tmp/nemo_rl-alice/token_capture")
             assert capture_dir.name.startswith("4242-")
         # Two runs in one Slurm job may share a node and repeat rollout IDs.
         assert capture_dirs[0] != capture_dirs[1]
 
     def test_token_capture_default_outside_slurm(self, patched_factories, monkeypatch):
         monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+        monkeypatch.setattr("getpass.getuser", lambda: "bob")
         patched_factories["setup_response_data"].return_value = (list(range(8)), None)
         mc = self._make_megatron_token_capture_config()
 
         token_capture = self._run_token_capture_setup(mc)
 
         capture_dir = Path(token_capture["capture_dir"])
-        assert capture_dir.parent == Path("/tmp/nemo_rl/token_capture")
+        assert capture_dir.parent == Path("/tmp/nemo_rl-bob/token_capture")
         assert capture_dir.name.startswith("local-")
 
     def test_token_capture_keeps_a_configured_capture_dir(self, patched_factories):
