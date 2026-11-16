@@ -1,0 +1,2025 @@
+{
+ "source": "W&B project nvidia/GRPO Inkling; raw logged values indexed by nemo_rl/step",
+ "experiments": {
+  "sglang-bf16-sync": {
+   "label": "SGLang BF16 \u00b7 sync \u00b7 32 nodes colocated",
+   "wandb_runs": [
+    {
+     "id": "ehmcmnug",
+     "name": "grpo-inkling2-32n4g-step0-eval-20261114-224632"
+    },
+    {
+     "id": "1gl23wkh",
+     "name": "grpo-inkling2-32n4g-gb200-automodel-20261114-sglang"
+    },
+    {
+     "id": "u1uvgoww",
+     "name": "grpo-inkling2-32n4g-gb200-automodel-20261114-sglang"
+    },
+    {
+     "id": "ai60m9ku",
+     "name": "grpo-inkling2-32n4g-gb200-automodel-20261114-sglang"
+    },
+    {
+     "id": "m1y9ip39",
+     "name": "grpo-inkling2-32n4g-gb200-automodel-20261114-sglang"
+    }
+   ],
+   "training": [
+    {
+     "nemo_rl/step": 1,
+     "train/gen_kl_error": 0.0008989760825741655,
+     "train/policy_kl_error": 0.0009468816587911988,
+     "train/approx_entropy": 0.46967050426246715,
+     "train/mean_gen_tokens_per_sample": 1966.3984375,
+     "train/loss": 0.003047709120437503,
+     "train/reward": 0.5703125,
+     "train/truncation_rate": 0.375,
+     "timing/train/total_step_time": 332.7642452089349
+    },
+    {
+     "nemo_rl/step": 2,
+     "train/gen_kl_error": 0.0009728058216467161,
+     "train/policy_kl_error": 0.0010409222684302222,
+     "train/approx_entropy": 0.42565669360919856,
+     "train/mean_gen_tokens_per_sample": 1836.76171875,
+     "train/loss": -0.006436482770368457,
+     "train/reward": 0.71484375,
+     "train/truncation_rate": 0.25,
+     "timing/train/total_step_time": 283.41800344898365
+    },
+    {
+     "nemo_rl/step": 3,
+     "train/gen_kl_error": 0.0010551814271551052,
+     "train/policy_kl_error": 0.001079934884142375,
+     "train/approx_entropy": 0.4813658214479801,
+     "train/mean_gen_tokens_per_sample": 1940.796875,
+     "train/loss": 0.015393866342492402,
+     "train/reward": 0.66796875,
+     "train/truncation_rate": 0.32421875,
+     "timing/train/total_step_time": 306.00227591907606
+    },
+    {
+     "nemo_rl/step": 4,
+     "train/gen_kl_error": 0.0008629606066108408,
+     "train/policy_kl_error": 0.0008965589422018638,
+     "train/approx_entropy": 0.4554255826806184,
+     "train/mean_gen_tokens_per_sample": 2277.83984375,
+     "train/loss": -0.0015182107454165816,
+     "train/reward": 0.48046875,
+     "train/truncation_rate": 0.48046875,
+     "timing/train/total_step_time": 276.17978942010086
+    },
+    {
+     "nemo_rl/step": 5,
+     "train/gen_kl_error": 0.0008737348366025799,
+     "train/policy_kl_error": 0.0008966200639974886,
+     "train/approx_entropy": 0.4368627385774744,
+     "train/mean_gen_tokens_per_sample": 2040.125,
+     "train/loss": 0.027325007366016507,
+     "train/reward": 0.62109375,
+     "train/truncation_rate": 0.375,
+     "timing/train/total_step_time": 251.60109357407782
+    },
+    {
+     "nemo_rl/step": 6,
+     "train/gen_kl_error": 0.0008747831716604537,
+     "train/policy_kl_error": 0.000958014190999279,
+     "train/approx_entropy": 0.4285055695218034,
+     "train/mean_gen_tokens_per_sample": 1452.84765625,
+     "train/loss": 0.0015530012315139174,
+     "train/reward": 0.79296875,
+     "train/truncation_rate": 0.16015625,
+     "timing/train/total_step_time": 278.43014567298815
+    },
+    {
+     "nemo_rl/step": 7,
+     "train/gen_kl_error": 0.001105419060095869,
+     "train/policy_kl_error": 0.0011456364646171835,
+     "train/approx_entropy": 0.500047689425628,
+     "train/mean_gen_tokens_per_sample": 1955.05859375,
+     "train/loss": -0.003975309897214174,
+     "train/reward": 0.5859375,
+     "train/truncation_rate": 0.40625,
+     "timing/train/total_step_time": 284.8594662740361
+    },
+    {
+     "nemo_rl/step": 8,
+     "train/gen_kl_error": 0.0008548315310363819,
+     "train/policy_kl_error": 0.0011306045500276696,
+     "train/approx_entropy": 0.38541982754395576,
+     "train/mean_gen_tokens_per_sample": 1494.64453125,
+     "train/loss": 0.001588543877005577,
+     "train/reward": 0.74609375,
+     "train/truncation_rate": 0.21875,
+     "timing/train/total_step_time": 246.40236378193367
+    },
+    {
+     "nemo_rl/step": 9,
+     "train/gen_kl_error": 0.0011042703775103746,
+     "train/policy_kl_error": 10.398125902097917,
+     "train/approx_entropy": 0.44171558894595364,
+     "train/mean_gen_tokens_per_sample": 1515.29296875,
+     "train/loss": -0.00243435672018677,
+     "train/reward": 0.76953125,
+     "train/truncation_rate": 0.1875,
+     "timing/train/total_step_time": 263.4882525569992
+    },
+    {
+     "nemo_rl/step": 10,
+     "train/gen_kl_error": 0.0008824689732449542,
+     "train/policy_kl_error": 0.0038736774264549467,
+     "train/approx_entropy": 0.3913666730222758,
+     "train/mean_gen_tokens_per_sample": 1172.80859375,
+     "train/loss": -0.006443513440899551,
+     "train/reward": 0.80859375,
+     "train/truncation_rate": 0.08984375,
+     "timing/train/total_step_time": 457.99515695497394
+    },
+    {
+     "nemo_rl/step": 11,
+     "train/gen_kl_error": 0.0012185838151239636,
+     "train/policy_kl_error": 0.0012839221482323637,
+     "train/approx_entropy": 0.47400383793137735,
+     "train/mean_gen_tokens_per_sample": 1348.82421875,
+     "train/loss": -0.0416147792711854,
+     "train/reward": 0.7265625,
+     "train/truncation_rate": 0.15625,
+     "timing/train/total_step_time": 237.83222378301434
+    },
+    {
+     "nemo_rl/step": 12,
+     "train/gen_kl_error": 0.0011589354948995378,
+     "train/policy_kl_error": 0.0012263003489394464,
+     "train/approx_entropy": 0.5175701366897556,
+     "train/mean_gen_tokens_per_sample": 1714.37109375,
+     "train/loss": -0.016816862393170595,
+     "train/reward": 0.6171875,
+     "train/truncation_rate": 0.2734375,
+     "timing/train/total_step_time": 244.06756399793085
+    },
+    {
+     "nemo_rl/step": 13,
+     "train/gen_kl_error": 0.0012367256173533292,
+     "train/policy_kl_error": 0.001271503366183424,
+     "train/approx_entropy": 0.4885124633965461,
+     "train/mean_gen_tokens_per_sample": 1410.7421875,
+     "train/loss": -0.002448865328915417,
+     "train/reward": 0.75390625,
+     "train/truncation_rate": 0.1796875,
+     "timing/train/total_step_time": 257.98675001901574
+    },
+    {
+     "nemo_rl/step": 14,
+     "train/gen_kl_error": 0.0011299744128123734,
+     "train/policy_kl_error": 0.0012628301696580024,
+     "train/approx_entropy": 0.46258128643603413,
+     "train/mean_gen_tokens_per_sample": 1239.85546875,
+     "train/loss": -0.029603500617668033,
+     "train/reward": 0.859375,
+     "train/truncation_rate": 0.1171875,
+     "timing/train/total_step_time": 259.5816402999917
+    },
+    {
+     "nemo_rl/step": 15,
+     "train/gen_kl_error": 0.0015396303980139692,
+     "train/policy_kl_error": 0.0016142748899312664,
+     "train/approx_entropy": 0.5762115783727495,
+     "train/mean_gen_tokens_per_sample": 1326.2109375,
+     "train/loss": 7.75244552642107e-05,
+     "train/reward": 0.7578125,
+     "train/truncation_rate": 0.15234375,
+     "timing/train/total_step_time": 227.4195330629591
+    },
+    {
+     "nemo_rl/step": 16,
+     "train/gen_kl_error": 0.0012951070551991961,
+     "train/policy_kl_error": 0.001336339965746447,
+     "train/approx_entropy": 0.5804464251195895,
+     "train/mean_gen_tokens_per_sample": 1357.5625,
+     "train/loss": -0.0014801106881350279,
+     "train/reward": 0.77734375,
+     "train/truncation_rate": 0.19140625,
+     "timing/train/total_step_time": 243.47137023403775
+    },
+    {
+     "nemo_rl/step": 17,
+     "train/gen_kl_error": 0.0014153772147551535,
+     "train/policy_kl_error": 0.00148024544165537,
+     "train/approx_entropy": 0.5760136290919036,
+     "train/mean_gen_tokens_per_sample": 1466.82421875,
+     "train/loss": -0.011311630718410015,
+     "train/reward": 0.68359375,
+     "train/truncation_rate": 0.2421875,
+     "timing/train/total_step_time": 299.2100372450659
+    },
+    {
+     "nemo_rl/step": 18,
+     "train/gen_kl_error": 0.001181273742197675,
+     "train/policy_kl_error": 0.0013388111699441652,
+     "train/approx_entropy": 0.4697770682287228,
+     "train/mean_gen_tokens_per_sample": 1220.07421875,
+     "train/loss": 0.011990064638666809,
+     "train/reward": 0.8046875,
+     "train/truncation_rate": 0.109375,
+     "timing/train/total_step_time": 277.9780176267959
+    },
+    {
+     "nemo_rl/step": 19,
+     "train/gen_kl_error": 0.001263146707742635,
+     "train/policy_kl_error": 0.0015278243471641417,
+     "train/approx_entropy": 0.5174389687017538,
+     "train/mean_gen_tokens_per_sample": 1297.328125,
+     "train/loss": 0.006487583741545677,
+     "train/reward": 0.79296875,
+     "train/truncation_rate": 0.16796875,
+     "timing/train/total_step_time": 239.37900720210746
+    },
+    {
+     "nemo_rl/step": 20,
+     "train/gen_kl_error": 0.0012677627688404414,
+     "train/policy_kl_error": 0.0013325084511492946,
+     "train/approx_entropy": 0.5142791553553252,
+     "train/mean_gen_tokens_per_sample": 1628.25390625,
+     "train/loss": -0.03224380884785205,
+     "train/reward": 0.67578125,
+     "train/truncation_rate": 0.234375,
+     "timing/train/total_step_time": 512.8416943592019
+    },
+    {
+     "nemo_rl/step": 21,
+     "train/gen_kl_error": 0.0012453546356994138,
+     "train/policy_kl_error": 0.0013598731553656762,
+     "train/approx_entropy": 0.4284080279940099,
+     "train/mean_gen_tokens_per_sample": 1479.73046875,
+     "train/loss": -0.006336661404930055,
+     "train/reward": 0.76953125,
+     "train/truncation_rate": 0.1484375,
+     "timing/train/total_step_time": 243.26880517182872
+    },
+    {
+     "nemo_rl/step": 22,
+     "train/gen_kl_error": 0.001213235088471265,
+     "train/policy_kl_error": 0.0012678944861903574,
+     "train/approx_entropy": 0.4923178722092416,
+     "train/mean_gen_tokens_per_sample": 1370.00390625,
+     "train/loss": -0.015985470963642,
+     "train/reward": 0.765625,
+     "train/truncation_rate": 0.15234375,
+     "timing/train/total_step_time": 246.3511880110018
+    },
+    {
+     "nemo_rl/step": 23,
+     "train/gen_kl_error": 0.001179071360212447,
+     "train/policy_kl_error": 0.001243600280162127,
+     "train/approx_entropy": 0.4388019385805819,
+     "train/mean_gen_tokens_per_sample": 1535.4609375,
+     "train/loss": -0.012805881444364786,
+     "train/reward": 0.8125,
+     "train/truncation_rate": 0.1640625,
+     "timing/train/total_step_time": 218.41742555284873
+    },
+    {
+     "nemo_rl/step": 24,
+     "train/gen_kl_error": 0.0012943573411661191,
+     "train/policy_kl_error": 0.001336016259706696,
+     "train/approx_entropy": 0.5165343562803173,
+     "train/mean_gen_tokens_per_sample": 1472.2578125,
+     "train/loss": -0.01538308011367917,
+     "train/reward": 0.72265625,
+     "train/truncation_rate": 0.2578125,
+     "timing/train/total_step_time": 209.0600909916684
+    },
+    {
+     "nemo_rl/step": 25,
+     "train/gen_kl_error": 0.0013277034234988605,
+     "train/policy_kl_error": 0.0016634658035172833,
+     "train/approx_entropy": 0.4681992108380655,
+     "train/mean_gen_tokens_per_sample": 1241.203125,
+     "train/loss": -0.023211164050735533,
+     "train/reward": 0.81640625,
+     "train/truncation_rate": 0.109375,
+     "timing/train/total_step_time": 217.89446566579863
+    },
+    {
+     "nemo_rl/step": 26,
+     "train/gen_kl_error": 0.00119271458735426,
+     "train/policy_kl_error": 0.0012635186795364461,
+     "train/approx_entropy": 0.3994835452904226,
+     "train/mean_gen_tokens_per_sample": 1407.859375,
+     "train/loss": 0.003089980804361403,
+     "train/reward": 0.8125,
+     "train/truncation_rate": 0.140625,
+     "timing/train/total_step_time": 198.0490052420646
+    },
+    {
+     "nemo_rl/step": 27,
+     "train/gen_kl_error": 0.0011631220726258107,
+     "train/policy_kl_error": 0.001203094324750964,
+     "train/approx_entropy": 0.4235172755579697,
+     "train/mean_gen_tokens_per_sample": 1610.42578125,
+     "train/loss": -0.0034092204878106713,
+     "train/reward": 0.61328125,
+     "train/truncation_rate": 0.24609375,
+     "timing/train/total_step_time": 203.7638449240476
+    },
+    {
+     "nemo_rl/step": 28,
+     "train/gen_kl_error": 0.0010431539253374922,
+     "train/policy_kl_error": 0.0010745597337660229,
+     "train/approx_entropy": 0.38718929378228495,
+     "train/mean_gen_tokens_per_sample": 1434.109375,
+     "train/loss": -0.00345437228679657,
+     "train/reward": 0.75390625,
+     "train/truncation_rate": 0.15234375,
+     "timing/train/total_step_time": 206.52453128807247
+    },
+    {
+     "nemo_rl/step": 29,
+     "train/gen_kl_error": 0.0013915673946947038,
+     "train/policy_kl_error": 0.001508320690614795,
+     "train/approx_entropy": 0.44769296968661365,
+     "train/mean_gen_tokens_per_sample": 1214.08984375,
+     "train/loss": -0.011391296167857945,
+     "train/reward": 0.82421875,
+     "train/truncation_rate": 0.1328125,
+     "timing/train/total_step_time": 213.6060586096719
+    },
+    {
+     "nemo_rl/step": 30,
+     "train/gen_kl_error": 0.0012259899101394467,
+     "train/policy_kl_error": 0.001306335529932312,
+     "train/approx_entropy": 0.4241094189201249,
+     "train/mean_gen_tokens_per_sample": 1310.05078125,
+     "train/loss": -0.037041263305582106,
+     "train/reward": 0.87109375,
+     "train/truncation_rate": 0.109375,
+     "timing/train/total_step_time": 437.87350272294134
+    },
+    {
+     "nemo_rl/step": 31,
+     "train/gen_kl_error": 0.001276095785868847,
+     "train/policy_kl_error": 0.0013404962714957946,
+     "train/approx_entropy": 0.4232521087687928,
+     "train/mean_gen_tokens_per_sample": 1279.65625,
+     "train/loss": 0.0014870869927108288,
+     "train/reward": 0.83203125,
+     "train/truncation_rate": 0.1328125,
+     "timing/train/total_step_time": 206.450524575077
+    },
+    {
+     "nemo_rl/step": 32,
+     "train/gen_kl_error": 0.0011677288065641278,
+     "train/policy_kl_error": 0.0012275220725541658,
+     "train/approx_entropy": 0.4224534593959106,
+     "train/mean_gen_tokens_per_sample": 1295.44921875,
+     "train/loss": -0.008853168110363185,
+     "train/reward": 0.8203125,
+     "train/truncation_rate": 0.09375,
+     "timing/train/total_step_time": 239.67704461701214
+    },
+    {
+     "nemo_rl/step": 33,
+     "train/gen_kl_error": 0.0011709633973566724,
+     "train/policy_kl_error": 0.0012496339521419486,
+     "train/approx_entropy": 0.4227497387037147,
+     "train/mean_gen_tokens_per_sample": 1131.44140625,
+     "train/loss": -0.00889357051346451,
+     "train/reward": 0.828125,
+     "train/truncation_rate": 0.1171875,
+     "timing/train/total_step_time": 199.33889620006084
+    },
+    {
+     "nemo_rl/step": 34,
+     "train/gen_kl_error": 0.0011946112706979761,
+     "train/policy_kl_error": 0.0012561984743015842,
+     "train/approx_entropy": 0.4489696726668626,
+     "train/mean_gen_tokens_per_sample": 1555.70703125,
+     "train/loss": -0.016770481830462813,
+     "train/reward": 0.7421875,
+     "train/truncation_rate": 0.1953125,
+     "timing/train/total_step_time": 264.8363947691396
+    },
+    {
+     "nemo_rl/step": 35,
+     "train/gen_kl_error": 0.0013405724886865755,
+     "train/policy_kl_error": 0.0013951984770415038,
+     "train/approx_entropy": 0.4343367696419591,
+     "train/mean_gen_tokens_per_sample": 1239.5078125,
+     "train/loss": -0.012911297497339547,
+     "train/reward": 0.8203125,
+     "train/truncation_rate": 0.1328125,
+     "timing/train/total_step_time": 236.77203824184835
+    },
+    {
+     "nemo_rl/step": 36,
+     "train/gen_kl_error": 0.001392439109025645,
+     "train/policy_kl_error": 0.0014486128912949425,
+     "train/approx_entropy": 0.46080853228340857,
+     "train/mean_gen_tokens_per_sample": 1325.2578125,
+     "train/loss": -0.005408377503044903,
+     "train/reward": 0.73046875,
+     "train/truncation_rate": 0.15234375,
+     "timing/train/total_step_time": 244.73960721399635
+    },
+    {
+     "nemo_rl/step": 37,
+     "train/gen_kl_error": 0.0014469935203891282,
+     "train/policy_kl_error": 0.0015017714978284857,
+     "train/approx_entropy": 0.4912914720007393,
+     "train/mean_gen_tokens_per_sample": 1371.12109375,
+     "train/loss": -0.007350688683800399,
+     "train/reward": 0.86328125,
+     "train/truncation_rate": 0.11328125,
+     "timing/train/total_step_time": 213.70476609282196
+    },
+    {
+     "nemo_rl/step": 38,
+     "train/gen_kl_error": 0.0014492027123083062,
+     "train/policy_kl_error": 0.0015451148695433403,
+     "train/approx_entropy": 0.48440904189192224,
+     "train/mean_gen_tokens_per_sample": 1195.2734375,
+     "train/loss": -0.025798499351367354,
+     "train/reward": 0.8359375,
+     "train/truncation_rate": 0.1171875,
+     "timing/train/total_step_time": 243.86969094118103
+    },
+    {
+     "nemo_rl/step": 39,
+     "train/gen_kl_error": 0.0018341997944446575,
+     "train/policy_kl_error": 0.0020193067551872446,
+     "train/approx_entropy": 0.47035705271264305,
+     "train/mean_gen_tokens_per_sample": 1003.0859375,
+     "train/loss": -0.0034369740169495344,
+     "train/reward": 0.83203125,
+     "train/truncation_rate": 0.10546875,
+     "timing/train/total_step_time": 185.6625403012149
+    },
+    {
+     "nemo_rl/step": 40,
+     "train/gen_kl_error": 0.001571733655140406,
+     "train/policy_kl_error": 0.0016831066119777915,
+     "train/approx_entropy": 0.4497499943317962,
+     "train/mean_gen_tokens_per_sample": 1322.5859375,
+     "train/loss": 0.006998677738010883,
+     "train/reward": 0.7578125,
+     "train/truncation_rate": 0.08984375,
+     "timing/train/total_step_time": 506.62486848514527
+    },
+    {
+     "nemo_rl/step": 41,
+     "train/gen_kl_error": 0.0012300245903418272,
+     "train/policy_kl_error": 0.001281844902862872,
+     "train/approx_entropy": 0.42501192465715576,
+     "train/mean_gen_tokens_per_sample": 1069.6796875,
+     "train/loss": -0.020253872615285218,
+     "train/reward": 0.87109375,
+     "train/truncation_rate": 0.09375,
+     "timing/train/total_step_time": 278.1924603069201
+    },
+    {
+     "nemo_rl/step": 42,
+     "train/gen_kl_error": 0.001410729260186372,
+     "train/policy_kl_error": 0.0014951488018368764,
+     "train/approx_entropy": 0.4630239865364274,
+     "train/mean_gen_tokens_per_sample": 1195.53515625,
+     "train/loss": -0.015247910981997848,
+     "train/reward": 0.82421875,
+     "train/truncation_rate": 0.125,
+     "timing/train/total_step_time": 227.8222354380414
+    },
+    {
+     "nemo_rl/step": 43,
+     "train/gen_kl_error": 0.0015399464684549002,
+     "train/policy_kl_error": 0.001642277999962971,
+     "train/approx_entropy": 0.4770258964272216,
+     "train/mean_gen_tokens_per_sample": 1415.0078125,
+     "train/loss": -0.01440286508295685,
+     "train/reward": 0.80078125,
+     "train/truncation_rate": 0.16796875,
+     "timing/train/total_step_time": 244.29845395404845
+    },
+    {
+     "nemo_rl/step": 44,
+     "train/gen_kl_error": 0.0011420256397229878,
+     "train/policy_kl_error": 0.001194564640087492,
+     "train/approx_entropy": 0.433801905499422,
+     "train/mean_gen_tokens_per_sample": 1282.40234375,
+     "train/loss": -0.024213929544202983,
+     "train/reward": 0.78515625,
+     "train/truncation_rate": 0.1640625,
+     "timing/train/total_step_time": 212.4944789307192
+    },
+    {
+     "nemo_rl/step": 45,
+     "train/gen_kl_error": 0.001268189644477502,
+     "train/policy_kl_error": 0.0013360415993162178,
+     "train/approx_entropy": 0.4268799192359438,
+     "train/mean_gen_tokens_per_sample": 1449.44140625,
+     "train/loss": -0.01682471262756735,
+     "train/reward": 0.75,
+     "train/truncation_rate": 0.1484375,
+     "timing/train/total_step_time": 211.48580963350832
+    },
+    {
+     "nemo_rl/step": 46,
+     "train/gen_kl_error": 0.0012843450695925185,
+     "train/policy_kl_error": 0.004750141441775213,
+     "train/approx_entropy": 0.47475077294075163,
+     "train/mean_gen_tokens_per_sample": 1443.328125,
+     "train/loss": -0.013927675900049508,
+     "train/reward": 0.7890625,
+     "train/truncation_rate": 0.1875,
+     "timing/train/total_step_time": 208.71910236682743
+    },
+    {
+     "nemo_rl/step": 47,
+     "train/gen_kl_error": 0.0012420856360293442,
+     "train/policy_kl_error": 0.0013499991732146555,
+     "train/approx_entropy": 0.3890093720110599,
+     "train/mean_gen_tokens_per_sample": 1263.5859375,
+     "train/loss": -0.017738905153237283,
+     "train/reward": 0.875,
+     "train/truncation_rate": 0.078125,
+     "timing/train/total_step_time": 200.29401843063533
+    },
+    {
+     "nemo_rl/step": 48,
+     "train/gen_kl_error": 0.0015358926054176436,
+     "train/policy_kl_error": 0.0016736258557017436,
+     "train/approx_entropy": 0.4245315773951006,
+     "train/mean_gen_tokens_per_sample": 1257.171875,
+     "train/loss": -0.046517170732840896,
+     "train/reward": 0.8671875,
+     "train/truncation_rate": 0.109375,
+     "timing/train/total_step_time": 250.95088873058558
+    },
+    {
+     "nemo_rl/step": 49,
+     "train/gen_kl_error": 0.0015030183484725512,
+     "train/policy_kl_error": 0.0017194583017783316,
+     "train/approx_entropy": 0.45446676755091175,
+     "train/mean_gen_tokens_per_sample": 1504.484375,
+     "train/loss": -0.0024311429588124156,
+     "train/reward": 0.69921875,
+     "train/truncation_rate": 0.20703125,
+     "timing/train/total_step_time": 263.25851185433567
+    },
+    {
+     "nemo_rl/step": 50,
+     "train/gen_kl_error": 0.001439719106940629,
+     "train/policy_kl_error": 0.0015314547090952146,
+     "train/approx_entropy": 0.3658173598232679,
+     "train/mean_gen_tokens_per_sample": 1025.91796875,
+     "train/loss": -0.030640129814855754,
+     "train/reward": 0.84375,
+     "train/truncation_rate": 0.0546875,
+     "timing/train/total_step_time": 458.712530836463
+    },
+    {
+     "nemo_rl/step": 51,
+     "train/gen_kl_error": 0.0014616706499452903,
+     "train/policy_kl_error": 0.0015250705412057641,
+     "train/approx_entropy": 0.3991154281393392,
+     "train/mean_gen_tokens_per_sample": 1323.2421875,
+     "train/loss": -0.006502329255454242,
+     "train/reward": 0.78515625,
+     "train/truncation_rate": 0.10546875,
+     "timing/train/total_step_time": 209.604229984805
+    },
+    {
+     "nemo_rl/step": 52,
+     "train/gen_kl_error": 0.001384442129051422,
+     "train/policy_kl_error": 0.0014900191818014719,
+     "train/approx_entropy": 0.39686205562611576,
+     "train/mean_gen_tokens_per_sample": 1066.00390625,
+     "train/loss": -0.007813077070750296,
+     "train/reward": 0.828125,
+     "train/truncation_rate": 0.0390625,
+     "timing/train/total_step_time": 202.64487334247679
+    },
+    {
+     "nemo_rl/step": 53,
+     "train/gen_kl_error": 0.0011594760161415252,
+     "train/policy_kl_error": 0.0012988791139605382,
+     "train/approx_entropy": 0.2656139999162406,
+     "train/mean_gen_tokens_per_sample": 908.60546875,
+     "train/loss": -0.00982313184067607,
+     "train/reward": 0.9140625,
+     "train/truncation_rate": 0,
+     "timing/train/total_step_time": 195.0825942903757
+    },
+    {
+     "nemo_rl/step": 54,
+     "train/gen_kl_error": 0.0014606272796697795,
+     "train/policy_kl_error": 0.0015235962499389188,
+     "train/approx_entropy": 0.40663267207855824,
+     "train/mean_gen_tokens_per_sample": 1235.40625,
+     "train/loss": -0.0306459479033947,
+     "train/reward": 0.828125,
+     "train/truncation_rate": 0.09765625,
+     "timing/train/total_step_time": 254.26542060729116
+    },
+    {
+     "nemo_rl/step": 55,
+     "train/gen_kl_error": 0.0016969607648320562,
+     "train/policy_kl_error": 0.0018336368465270425,
+     "train/approx_entropy": 0.40493275980406906,
+     "train/mean_gen_tokens_per_sample": 1145.8515625,
+     "train/loss": -0.02979285328183323,
+     "train/reward": 0.8046875,
+     "train/truncation_rate": 0.078125,
+     "timing/train/total_step_time": 207.8602637462318
+    },
+    {
+     "nemo_rl/step": 56,
+     "train/gen_kl_error": 0.0012361550065236315,
+     "train/policy_kl_error": 0.0013040586622707906,
+     "train/approx_entropy": 0.3721808342379518,
+     "train/mean_gen_tokens_per_sample": 1151.70703125,
+     "train/loss": -0.02166721981484443,
+     "train/reward": 0.8203125,
+     "train/truncation_rate": 0.078125,
+     "timing/train/total_step_time": 249.1864243177697
+    },
+    {
+     "nemo_rl/step": 57,
+     "train/gen_kl_error": 0.0019381014928114837,
+     "train/policy_kl_error": 0.002197962221856642,
+     "train/approx_entropy": 0.4669750104731065,
+     "train/mean_gen_tokens_per_sample": 1281.6484375,
+     "train/loss": -0.002442145370878279,
+     "train/reward": 0.73828125,
+     "train/truncation_rate": 0.14453125,
+     "timing/train/total_step_time": 211.66105358302593
+    },
+    {
+     "nemo_rl/step": 58,
+     "train/gen_kl_error": 0.0014075694327431165,
+     "train/policy_kl_error": 0.001473537412010728,
+     "train/approx_entropy": 0.40927427562564844,
+     "train/mean_gen_tokens_per_sample": 1121.73046875,
+     "train/loss": 0.0005370046710595489,
+     "train/reward": 0.83984375,
+     "train/truncation_rate": 0.078125,
+     "timing/train/total_step_time": 212.2244707616046
+    },
+    {
+     "nemo_rl/step": 59,
+     "train/gen_kl_error": 0.001082324993575412,
+     "train/policy_kl_error": 0.0011375883853474988,
+     "train/approx_entropy": 0.32912189279159065,
+     "train/mean_gen_tokens_per_sample": 977.3671875,
+     "train/loss": -0.007353686029091477,
+     "train/reward": 0.95703125,
+     "train/truncation_rate": 0.02734375,
+     "timing/train/total_step_time": 207.62819586414844
+    },
+    {
+     "nemo_rl/step": 60,
+     "train/gen_kl_error": 0.0015070346049057548,
+     "train/policy_kl_error": 0.0015846647449819784,
+     "train/approx_entropy": 0.4296826933059492,
+     "train/mean_gen_tokens_per_sample": 1331.18359375,
+     "train/loss": -0.007900787401013076,
+     "train/reward": 0.875,
+     "train/truncation_rate": 0.06640625,
+     "timing/train/total_step_time": 387.17890229355544
+    },
+    {
+     "nemo_rl/step": 61,
+     "train/gen_kl_error": 0.0014024809711088437,
+     "train/policy_kl_error": 0.0014290878552003505,
+     "train/approx_entropy": 0.3725604818755528,
+     "train/mean_gen_tokens_per_sample": 976.0703125,
+     "train/loss": -0.003938174224458635,
+     "train/reward": 0.9375,
+     "train/truncation_rate": 0.03515625,
+     "timing/train/total_step_time": 204.10894303396344
+    },
+    {
+     "nemo_rl/step": 62,
+     "train/gen_kl_error": 0.001522336910070976,
+     "train/policy_kl_error": 0.0015978152574405158,
+     "train/approx_entropy": 0.4394779826543527,
+     "train/mean_gen_tokens_per_sample": 1161.0390625,
+     "train/loss": 0.007508827489800751,
+     "train/reward": 0.80078125,
+     "train/truncation_rate": 0.1015625,
+     "timing/train/total_step_time": 204.1740454910323
+    },
+    {
+     "nemo_rl/step": 63,
+     "train/gen_kl_error": 0.0013618012009573022,
+     "train/policy_kl_error": 0.0014344094986711298,
+     "train/approx_entropy": 0.40105734394455794,
+     "train/mean_gen_tokens_per_sample": 1390.08203125,
+     "train/loss": -0.029696445795707405,
+     "train/reward": 0.8203125,
+     "train/truncation_rate": 0.1171875,
+     "timing/train/total_step_time": 213.0137076349929
+    },
+    {
+     "nemo_rl/step": 64,
+     "train/gen_kl_error": 0.0014015847021369154,
+     "train/policy_kl_error": 0.006649971901424578,
+     "train/approx_entropy": 0.4242202900859411,
+     "train/mean_gen_tokens_per_sample": 1420.65625,
+     "train/loss": -0.006355454213917255,
+     "train/reward": 0.74609375,
+     "train/truncation_rate": 0.13671875,
+     "timing/train/total_step_time": 361.5963522018865
+    },
+    {
+     "nemo_rl/step": 65,
+     "train/gen_kl_error": 0.0012956200272924434,
+     "train/policy_kl_error": 0.0013652954789762362,
+     "train/approx_entropy": 0.3596422184346011,
+     "train/mean_gen_tokens_per_sample": 1265.9296875,
+     "train/loss": 0.010415004449896514,
+     "train/reward": 0.88671875,
+     "train/truncation_rate": 0.08203125,
+     "timing/train/total_step_time": 273.03993766661733
+    },
+    {
+     "nemo_rl/step": 66,
+     "train/gen_kl_error": 0.0012697870281215273,
+     "train/policy_kl_error": 0.0014379393085448555,
+     "train/approx_entropy": 0.38645072219514987,
+     "train/mean_gen_tokens_per_sample": 1144.296875,
+     "train/loss": 1.3231299817562103e-05,
+     "train/reward": 0.921875,
+     "train/truncation_rate": 0.046875,
+     "timing/train/total_step_time": 218.03812328353524
+    },
+    {
+     "nemo_rl/step": 67,
+     "train/gen_kl_error": 0.0011394997345632873,
+     "train/policy_kl_error": 0.0011832613594151553,
+     "train/approx_entropy": 0.2907074109534733,
+     "train/mean_gen_tokens_per_sample": 1006.625,
+     "train/loss": -0.0410093649988994,
+     "train/reward": 0.96484375,
+     "train/truncation_rate": 0.00390625,
+     "timing/train/total_step_time": 213.93270131386817
+    },
+    {
+     "nemo_rl/step": 68,
+     "train/gen_kl_error": 0.0013361165566720956,
+     "train/policy_kl_error": 0.0014522317094645132,
+     "train/approx_entropy": 0.36197325020475546,
+     "train/mean_gen_tokens_per_sample": 1404.765625,
+     "train/loss": -0.025706845335662365,
+     "train/reward": 0.875,
+     "train/truncation_rate": 0.08203125,
+     "timing/train/total_step_time": 259.0387798259035
+    },
+    {
+     "nemo_rl/step": 69,
+     "train/gen_kl_error": 0.0012903280653517868,
+     "train/policy_kl_error": 0.0013741182536648466,
+     "train/approx_entropy": 0.36958742735441774,
+     "train/mean_gen_tokens_per_sample": 1211.29296875,
+     "train/loss": -0.019935284391976893,
+     "train/reward": 0.84765625,
+     "train/truncation_rate": 0.0625,
+     "timing/train/total_step_time": 220.73030935414135
+    },
+    {
+     "nemo_rl/step": 70,
+     "train/gen_kl_error": 0.0014019520103971672,
+     "train/policy_kl_error": 0.027727972320604977,
+     "train/approx_entropy": 0.3823285456528538,
+     "train/mean_gen_tokens_per_sample": 1426.421875,
+     "train/loss": 0.007344305864535272,
+     "train/reward": 0.83203125,
+     "train/truncation_rate": 0.1015625,
+     "timing/train/total_step_time": 432.963146366179
+    },
+    {
+     "nemo_rl/step": 71,
+     "train/gen_kl_error": 0.0015995379148989741,
+     "train/policy_kl_error": 0.0016875746442224226,
+     "train/approx_entropy": 0.4097815050772624,
+     "train/mean_gen_tokens_per_sample": 1248.59765625,
+     "train/loss": -0.003399459761567414,
+     "train/reward": 0.87109375,
+     "train/truncation_rate": 0.08984375,
+     "timing/train/total_step_time": 225.57935515325516
+    },
+    {
+     "nemo_rl/step": 72,
+     "train/gen_kl_error": 0.0014610002064330274,
+     "train/policy_kl_error": 0.0015582871119761421,
+     "train/approx_entropy": 0.39267178790760227,
+     "train/mean_gen_tokens_per_sample": 1351.81640625,
+     "train/loss": -0.002470723120495677,
+     "train/reward": 0.80859375,
+     "train/truncation_rate": 0.07421875,
+     "timing/train/total_step_time": 235.25172298494726
+    },
+    {
+     "nemo_rl/step": 73,
+     "train/gen_kl_error": 0.001478578100005734,
+     "train/policy_kl_error": 0.0015389068200875045,
+     "train/approx_entropy": 0.4040512518695323,
+     "train/mean_gen_tokens_per_sample": 1119.3125,
+     "train/loss": -0.027179556782357395,
+     "train/reward": 0.90234375,
+     "train/truncation_rate": 0.078125,
+     "timing/train/total_step_time": 198.7925065914169
+    },
+    {
+     "nemo_rl/step": 74,
+     "train/gen_kl_error": 0.001711413925605143,
+     "train/policy_kl_error": 0.0017927196864633288,
+     "train/approx_entropy": 0.4736708762284252,
+     "train/mean_gen_tokens_per_sample": 1563.453125,
+     "train/loss": -0.030715805827639997,
+     "train/reward": 0.7265625,
+     "train/truncation_rate": 0.203125,
+     "timing/train/total_step_time": 246.3152129780501
+    },
+    {
+     "nemo_rl/step": 75,
+     "train/gen_kl_error": 0.0015670694575646849,
+     "train/policy_kl_error": 0.0016542578643452543,
+     "train/approx_entropy": 0.364828751226014,
+     "train/mean_gen_tokens_per_sample": 1196.8359375,
+     "train/loss": 0.00400835694745183,
+     "train/reward": 0.8828125,
+     "train/truncation_rate": 0.08984375,
+     "timing/train/total_step_time": 229.46418678946793
+    },
+    {
+     "nemo_rl/step": 76,
+     "train/gen_kl_error": 0.0013740126054813118,
+     "train/policy_kl_error": 0.0015079063978191698,
+     "train/approx_entropy": 0.31627893350378145,
+     "train/mean_gen_tokens_per_sample": 1352.859375,
+     "train/loss": -0.019304671557620168,
+     "train/reward": 0.86328125,
+     "train/truncation_rate": 0.0390625,
+     "timing/train/total_step_time": 225.72127114236355
+    },
+    {
+     "nemo_rl/step": 77,
+     "train/gen_kl_error": 0.001527571044562137,
+     "train/policy_kl_error": 0.0016095644583913327,
+     "train/approx_entropy": 0.40492840157821774,
+     "train/mean_gen_tokens_per_sample": 1445.60546875,
+     "train/loss": -0.037659058114513755,
+     "train/reward": 0.796875,
+     "train/truncation_rate": 0.1328125,
+     "timing/train/total_step_time": 233.3773169182241
+    },
+    {
+     "nemo_rl/step": 78,
+     "train/gen_kl_error": 0.0014914979179820875,
+     "train/policy_kl_error": 0.001594297261718225,
+     "train/approx_entropy": 0.32457685307599604,
+     "train/mean_gen_tokens_per_sample": 1277.83984375,
+     "train/loss": -0.020817491109482944,
+     "train/reward": 0.9375,
+     "train/truncation_rate": 0.03515625,
+     "timing/train/total_step_time": 239.32357395626605
+    },
+    {
+     "nemo_rl/step": 79,
+     "train/gen_kl_error": 0.0011755428733888351,
+     "train/policy_kl_error": 0.0013126360884916366,
+     "train/approx_entropy": 0.2903266028743019,
+     "train/mean_gen_tokens_per_sample": 1041.34375,
+     "train/loss": -0.025762025150470436,
+     "train/reward": 0.96875,
+     "train/truncation_rate": 0.0078125,
+     "timing/train/total_step_time": 204.46432643663138
+    },
+    {
+     "nemo_rl/step": 80,
+     "train/gen_kl_error": 0.0017478104026906749,
+     "train/policy_kl_error": 0.004484111372903499,
+     "train/approx_entropy": 0.43216104671591893,
+     "train/mean_gen_tokens_per_sample": 1571.96484375,
+     "train/loss": 0.00400977348908782,
+     "train/reward": 0.7421875,
+     "train/truncation_rate": 0.19140625,
+     "timing/train/total_step_time": 461.2650155769661
+    },
+    {
+     "nemo_rl/step": 81,
+     "train/gen_kl_error": 0.0015305685166850935,
+     "train/policy_kl_error": 0.0016000278051677697,
+     "train/approx_entropy": 0.3816085877988371,
+     "train/mean_gen_tokens_per_sample": 1199.1484375,
+     "train/loss": -0.01291989115998149,
+     "train/reward": 0.8828125,
+     "train/truncation_rate": 0.11328125,
+     "timing/train/total_step_time": 199.47371043916792
+    },
+    {
+     "nemo_rl/step": 82,
+     "train/gen_kl_error": 0.0017655605644222305,
+     "train/policy_kl_error": 0.0018944246458261205,
+     "train/approx_entropy": 0.3464910086186137,
+     "train/mean_gen_tokens_per_sample": 1156.8125,
+     "train/loss": -0.0003853610251098871,
+     "train/reward": 0.78515625,
+     "train/truncation_rate": 0.0546875,
+     "timing/train/total_step_time": 220.85994974337518
+    },
+    {
+     "nemo_rl/step": 83,
+     "train/gen_kl_error": 0.0013694444419911633,
+     "train/policy_kl_error": 0.0014423882342811112,
+     "train/approx_entropy": 0.2945846298825927,
+     "train/mean_gen_tokens_per_sample": 1126.41015625,
+     "train/loss": -0.01930521405301988,
+     "train/reward": 0.89453125,
+     "train/truncation_rate": 0.01953125,
+     "timing/train/total_step_time": 208.674752920866
+    },
+    {
+     "nemo_rl/step": 84,
+     "train/gen_kl_error": 0.001690202791195361,
+     "train/policy_kl_error": 0.0018002699816292989,
+     "train/approx_entropy": 0.36045683789416216,
+     "train/mean_gen_tokens_per_sample": 1417.91015625,
+     "train/loss": 0.0030789687298238277,
+     "train/reward": 0.8125,
+     "train/truncation_rate": 0.0859375,
+     "timing/train/total_step_time": 235.7524155266583
+    },
+    {
+     "nemo_rl/step": 85,
+     "train/gen_kl_error": 0.0016720319403873418,
+     "train/policy_kl_error": 0.0017448776597746019,
+     "train/approx_entropy": 0.338670585420914,
+     "train/mean_gen_tokens_per_sample": 1126.6015625,
+     "train/loss": -0.004868589690886438,
+     "train/reward": 0.9453125,
+     "train/truncation_rate": 0.046875,
+     "timing/train/total_step_time": 199.6558885332197
+    },
+    {
+     "nemo_rl/step": 86,
+     "train/gen_kl_error": 0.0019259511689142528,
+     "train/policy_kl_error": 0.0020342863824680535,
+     "train/approx_entropy": 0.3223240247898502,
+     "train/mean_gen_tokens_per_sample": 1111.14453125,
+     "train/loss": -0.008922212873585522,
+     "train/reward": 0.859375,
+     "train/truncation_rate": 0.0625,
+     "timing/train/total_step_time": 216.75361790601164
+    },
+    {
+     "nemo_rl/step": 87,
+     "train/gen_kl_error": 0.002455886324923995,
+     "train/policy_kl_error": 0.0026108212675239884,
+     "train/approx_entropy": 0.41237746296974365,
+     "train/mean_gen_tokens_per_sample": 1303.5078125,
+     "train/loss": -0.02966333692893386,
+     "train/reward": 0.8046875,
+     "train/truncation_rate": 0.10546875,
+     "timing/train/total_step_time": 319.3358958400786
+    }
+   ],
+   "validation": [
+    {
+     "nemo_rl/step": 0,
+     "validation/accuracy": 0.390625,
+     "validation/avg_length": 2446.57421875
+    },
+    {
+     "nemo_rl/step": 10,
+     "validation/accuracy": 0.671875,
+     "validation/avg_length": 1880.02734375
+    },
+    {
+     "nemo_rl/step": 20,
+     "validation/accuracy": 0.72265625,
+     "validation/avg_length": 1858.9921875
+    },
+    {
+     "nemo_rl/step": 30,
+     "validation/accuracy": 0.78515625,
+     "validation/avg_length": 1790.3125
+    },
+    {
+     "nemo_rl/step": 40,
+     "validation/accuracy": 0.80078125,
+     "validation/avg_length": 1622.80078125
+    },
+    {
+     "nemo_rl/step": 50,
+     "validation/accuracy": 0.7734375,
+     "validation/avg_length": 1493.0390625
+    },
+    {
+     "nemo_rl/step": 60,
+     "validation/accuracy": 0.80078125,
+     "validation/avg_length": 1605.96875
+    },
+    {
+     "nemo_rl/step": 70,
+     "validation/accuracy": 0.8203125,
+     "validation/avg_length": 1670.8828125
+    },
+    {
+     "nemo_rl/step": 80,
+     "validation/accuracy": 0.80078125,
+     "validation/avg_length": 1717.94921875
+    }
+   ]
+  },
+  "vllm-mxfp8-async": {
+   "label": "vLLM MXFP8 \u00b7 async \u00b7 24 nodes (16 train + 8 gen)",
+   "wandb_runs": [
+    {
+     "id": "uk530hix",
+     "name": "full-vllm-mxfp8-20261114-vllm"
+    },
+    {
+     "id": "d80ps72r",
+     "name": "full-vllm-mxfp8-20261114-vllm"
+    },
+    {
+     "id": "yfkayhu1",
+     "name": "full-vllm-mxfp8-20261114-vllm"
+    },
+    {
+     "id": "28de0sqt",
+     "name": "full-vllm-mxfp8-20261114-vllm"
+    }
+   ],
+   "training": [
+    {
+     "nemo_rl/step": 1,
+     "train/gen_kl_error": 0.0017083239382884585,
+     "train/policy_kl_error": 0.0018063042385279005,
+     "train/approx_entropy": 0.47272207018977497,
+     "train/mean_gen_tokens_per_sample": 1959.6796875,
+     "train/loss": 0.026157762273214757,
+     "train/reward": 0.5859375,
+     "train/truncation_rate": 0.3671875,
+     "timing/train/total_step_time": 119.27230925718322
+    },
+    {
+     "nemo_rl/step": 2,
+     "train/gen_kl_error": 0.001704359221633922,
+     "train/policy_kl_error": 0.0020368566735839977,
+     "train/approx_entropy": 0.42885832236061106,
+     "train/mean_gen_tokens_per_sample": 1824.83203125,
+     "train/loss": 0.05272338510258123,
+     "train/reward": 0.69921875,
+     "train/truncation_rate": 0.2578125,
+     "timing/train/total_step_time": 170.49302938580513
+    },
+    {
+     "nemo_rl/step": 3,
+     "train/gen_kl_error": 0.0018985533960176326,
+     "train/policy_kl_error": 0.0020958121199896595,
+     "train/approx_entropy": 0.46617391709878575,
+     "train/mean_gen_tokens_per_sample": 1922.1875,
+     "train/loss": 0.02642202950664796,
+     "train/reward": 0.66796875,
+     "train/truncation_rate": 0.31640625,
+     "timing/train/total_step_time": 254.55575777497143
+    },
+    {
+     "nemo_rl/step": 4,
+     "train/gen_kl_error": 0.0016285974039647044,
+     "train/policy_kl_error": 0.0017622454172396829,
+     "train/approx_entropy": 0.4672698150970973,
+     "train/mean_gen_tokens_per_sample": 2379.5625,
+     "train/loss": 0.03944281506119296,
+     "train/reward": 0.4765625,
+     "train/truncation_rate": 0.49609375,
+     "timing/train/total_step_time": 167.5746280811727
+    },
+    {
+     "nemo_rl/step": 5,
+     "train/gen_kl_error": 0.0015755392496998866,
+     "train/policy_kl_error": 0.001877559054946687,
+     "train/approx_entropy": 0.42092473890807014,
+     "train/mean_gen_tokens_per_sample": 2206.96484375,
+     "train/loss": 0.05445559247164056,
+     "train/reward": 0.55859375,
+     "train/truncation_rate": 0.44140625,
+     "timing/train/total_step_time": 288.35454813810065
+    },
+    {
+     "nemo_rl/step": 6,
+     "train/gen_kl_error": 0.0015198428330336355,
+     "train/policy_kl_error": 0.0015759685157377135,
+     "train/approx_entropy": 0.4264900714333635,
+     "train/mean_gen_tokens_per_sample": 1678.93359375,
+     "train/loss": 0.04531865636818111,
+     "train/reward": 0.75390625,
+     "train/truncation_rate": 0.23046875,
+     "timing/train/total_step_time": 200.8674531239085
+    },
+    {
+     "nemo_rl/step": 7,
+     "train/gen_kl_error": 0.0017532832751072647,
+     "train/policy_kl_error": 0.001871652450283534,
+     "train/approx_entropy": 0.4699979080178309,
+     "train/mean_gen_tokens_per_sample": 2185.46484375,
+     "train/loss": 0.03177565417718142,
+     "train/reward": 0.515625,
+     "train/truncation_rate": 0.484375,
+     "timing/train/total_step_time": 216.61099150869995
+    },
+    {
+     "nemo_rl/step": 8,
+     "train/gen_kl_error": 0.0014526343203158376,
+     "train/policy_kl_error": 0.0015558984753738514,
+     "train/approx_entropy": 0.38528150363708846,
+     "train/mean_gen_tokens_per_sample": 1925.37890625,
+     "train/loss": 0.03229652205482125,
+     "train/reward": 0.625,
+     "train/truncation_rate": 0.359375,
+     "timing/train/total_step_time": 216.76272101001814
+    },
+    {
+     "nemo_rl/step": 9,
+     "train/gen_kl_error": 0.0017143720735361967,
+     "train/policy_kl_error": 0.001891510314635525,
+     "train/approx_entropy": 0.44752012376557104,
+     "train/mean_gen_tokens_per_sample": 2086.06640625,
+     "train/loss": 0.02423871954670176,
+     "train/reward": 0.59375,
+     "train/truncation_rate": 0.390625,
+     "timing/train/total_step_time": 217.50719241145998
+    },
+    {
+     "nemo_rl/step": 10,
+     "train/gen_kl_error": 0.001576276999600168,
+     "train/policy_kl_error": 0.001704097814808847,
+     "train/approx_entropy": 0.4251330715487711,
+     "train/mean_gen_tokens_per_sample": 1893.08984375,
+     "train/loss": 0.05601110644056462,
+     "train/reward": 0.66796875,
+     "train/truncation_rate": 0.27734375,
+     "timing/train/total_step_time": 667.1429797234014
+    },
+    {
+     "nemo_rl/step": 11,
+     "train/gen_kl_error": 0.0018017193577009039,
+     "train/policy_kl_error": 0.0019407785771363706,
+     "train/approx_entropy": 0.4505368656318751,
+     "train/mean_gen_tokens_per_sample": 1930.46484375,
+     "train/loss": 0.0209377845749259,
+     "train/reward": 0.578125,
+     "train/truncation_rate": 0.359375,
+     "timing/train/total_step_time": 186.193866816815
+    },
+    {
+     "nemo_rl/step": 12,
+     "train/gen_kl_error": 0.0017811537702527858,
+     "train/policy_kl_error": 0.0019831415244766504,
+     "train/approx_entropy": 0.4708663546371099,
+     "train/mean_gen_tokens_per_sample": 2277.16015625,
+     "train/loss": 0.028722515096887946,
+     "train/reward": 0.4453125,
+     "train/truncation_rate": 0.51953125,
+     "timing/train/total_step_time": 177.20530202798545
+    },
+    {
+     "nemo_rl/step": 13,
+     "train/gen_kl_error": 0.0018488440685260343,
+     "train/policy_kl_error": 0.0019312542432849966,
+     "train/approx_entropy": 0.4753085223310336,
+     "train/mean_gen_tokens_per_sample": 1957.8671875,
+     "train/loss": 0.0180634050630033,
+     "train/reward": 0.58984375,
+     "train/truncation_rate": 0.3671875,
+     "timing/train/total_step_time": 265.2931208075024
+    },
+    {
+     "nemo_rl/step": 14,
+     "train/gen_kl_error": 0.0016415433434389115,
+     "train/policy_kl_error": 0.001775877829196304,
+     "train/approx_entropy": 0.4352062547495734,
+     "train/mean_gen_tokens_per_sample": 1784.515625,
+     "train/loss": 0.03752736980095506,
+     "train/reward": 0.67578125,
+     "train/truncation_rate": 0.3203125,
+     "timing/train/total_step_time": 208.17057226365432
+    },
+    {
+     "nemo_rl/step": 15,
+     "train/gen_kl_error": 0.0019320087109804263,
+     "train/policy_kl_error": 0.002021791290871988,
+     "train/approx_entropy": 0.47608306679467205,
+     "train/mean_gen_tokens_per_sample": 1954.9375,
+     "train/loss": 0.028410226223059,
+     "train/reward": 0.64453125,
+     "train/truncation_rate": 0.3125,
+     "timing/train/total_step_time": 230.61701073031873
+    },
+    {
+     "nemo_rl/step": 16,
+     "train/gen_kl_error": 0.0020711170577243365,
+     "train/policy_kl_error": 0.00217289883184435,
+     "train/approx_entropy": 0.5134384362027049,
+     "train/mean_gen_tokens_per_sample": 1935.63671875,
+     "train/loss": 0.033478086290415376,
+     "train/reward": 0.62109375,
+     "train/truncation_rate": 0.36328125,
+     "timing/train/total_step_time": 211.19580513006076
+    },
+    {
+     "nemo_rl/step": 17,
+     "train/gen_kl_error": 0.002089869997291771,
+     "train/policy_kl_error": 0.002212797687377588,
+     "train/approx_entropy": 0.48822983405261766,
+     "train/mean_gen_tokens_per_sample": 1968.171875,
+     "train/loss": 0.06066472356906161,
+     "train/reward": 0.58203125,
+     "train/truncation_rate": 0.359375,
+     "timing/train/total_step_time": 220.5942739523016
+    },
+    {
+     "nemo_rl/step": 18,
+     "train/gen_kl_error": 0.002122425811094786,
+     "train/policy_kl_error": 0.005165929264805413,
+     "train/approx_entropy": 0.43385037304324214,
+     "train/mean_gen_tokens_per_sample": 1722.12109375,
+     "train/loss": 0.05019843822810799,
+     "train/reward": 0.69921875,
+     "train/truncation_rate": 0.265625,
+     "timing/train/total_step_time": 295.952470949851
+    },
+    {
+     "nemo_rl/step": 19,
+     "train/gen_kl_error": 0.0019212083911952504,
+     "train/policy_kl_error": 0.002103203245098939,
+     "train/approx_entropy": 0.44870925890427316,
+     "train/mean_gen_tokens_per_sample": 1714.4921875,
+     "train/loss": 0.03656920834328048,
+     "train/reward": 0.71484375,
+     "train/truncation_rate": 0.2578125,
+     "timing/train/total_step_time": 166.6710671199835
+    },
+    {
+     "nemo_rl/step": 20,
+     "train/gen_kl_error": 0.0020463943047843713,
+     "train/policy_kl_error": 0.0021490038876947892,
+     "train/approx_entropy": 0.48336644646769855,
+     "train/mean_gen_tokens_per_sample": 2018.953125,
+     "train/loss": 0.04288208682555705,
+     "train/reward": 0.52734375,
+     "train/truncation_rate": 0.3828125,
+     "timing/train/total_step_time": 602.7266530515044
+    },
+    {
+     "nemo_rl/step": 21,
+     "train/gen_kl_error": 0.002012419009986388,
+     "train/policy_kl_error": 0.0021886826642401047,
+     "train/approx_entropy": 0.3998137616508757,
+     "train/mean_gen_tokens_per_sample": 1860.296875,
+     "train/loss": 0.037437824124936014,
+     "train/reward": 0.66015625,
+     "train/truncation_rate": 0.296875,
+     "timing/train/total_step_time": 183.6233500529779
+    },
+    {
+     "nemo_rl/step": 22,
+     "train/gen_kl_error": 0.0021918333046642147,
+     "train/policy_kl_error": 0.0033684481114164555,
+     "train/approx_entropy": 0.47124235246155877,
+     "train/mean_gen_tokens_per_sample": 1640.6015625,
+     "train/loss": 0.06765086014638655,
+     "train/reward": 0.70703125,
+     "train/truncation_rate": 0.2265625,
+     "timing/train/total_step_time": 183.25717941700714
+    },
+    {
+     "nemo_rl/step": 23,
+     "train/gen_kl_error": 0.002101905136555615,
+     "train/policy_kl_error": 0.002380039871070494,
+     "train/approx_entropy": 0.470923138957005,
+     "train/mean_gen_tokens_per_sample": 1806.4609375,
+     "train/loss": 0.0569180995807983,
+     "train/reward": 0.7109375,
+     "train/truncation_rate": 0.28125,
+     "timing/train/total_step_time": 229.50634964427445
+    },
+    {
+     "nemo_rl/step": 24,
+     "train/gen_kl_error": 0.002300884321044805,
+     "train/policy_kl_error": 0.0451158618162637,
+     "train/approx_entropy": 0.5221192692260956,
+     "train/mean_gen_tokens_per_sample": 1577.99609375,
+     "train/loss": 0.038538095948752016,
+     "train/reward": 0.69140625,
+     "train/truncation_rate": 0.2890625,
+     "timing/train/total_step_time": 201.4354509198456
+    },
+    {
+     "nemo_rl/step": 25,
+     "train/gen_kl_error": 0.002457843469699128,
+     "train/policy_kl_error": 0.046486019121942945,
+     "train/approx_entropy": 0.48667146475054324,
+     "train/mean_gen_tokens_per_sample": 1372.75,
+     "train/loss": 0.03297058024327271,
+     "train/reward": 0.75390625,
+     "train/truncation_rate": 0.1875,
+     "timing/train/total_step_time": 222.95637042273302
+    },
+    {
+     "nemo_rl/step": 26,
+     "train/gen_kl_error": 0.002080760508391677,
+     "train/policy_kl_error": 0.003376587674580378,
+     "train/approx_entropy": 0.44610689188994,
+     "train/mean_gen_tokens_per_sample": 1517.13671875,
+     "train/loss": 0.01859645574586466,
+     "train/reward": 0.7890625,
+     "train/truncation_rate": 0.171875,
+     "timing/train/total_step_time": 206.17629045789363
+    },
+    {
+     "nemo_rl/step": 27,
+     "train/gen_kl_error": 0.0020621747208338093,
+     "train/policy_kl_error": 0.0024647908045949407,
+     "train/approx_entropy": 0.43375111075874884,
+     "train/mean_gen_tokens_per_sample": 1746.78515625,
+     "train/loss": 0.014112062723143026,
+     "train/reward": 0.55859375,
+     "train/truncation_rate": 0.2734375,
+     "timing/train/total_step_time": 198.2159439342213
+    },
+    {
+     "nemo_rl/step": 28,
+     "train/gen_kl_error": 0.0021089392305384536,
+     "train/policy_kl_error": 0.06293380154085071,
+     "train/approx_entropy": 0.4299773018756241,
+     "train/mean_gen_tokens_per_sample": 1558.0078125,
+     "train/loss": 0.036066644301172346,
+     "train/reward": 0.73046875,
+     "train/truncation_rate": 0.19140625,
+     "timing/train/total_step_time": 212.33635949500604
+    },
+    {
+     "nemo_rl/step": 29,
+     "train/gen_kl_error": 0.002373345389898418,
+     "train/policy_kl_error": 0.03474378680419932,
+     "train/approx_entropy": 0.4333223594148876,
+     "train/mean_gen_tokens_per_sample": 1322.21484375,
+     "train/loss": 0.052257917675888166,
+     "train/reward": 0.78515625,
+     "train/truncation_rate": 0.15625,
+     "timing/train/total_step_time": 213.31604710884858
+    },
+    {
+     "nemo_rl/step": 30,
+     "train/gen_kl_error": 0.0021162351874153273,
+     "train/policy_kl_error": 0.0023968451619111875,
+     "train/approx_entropy": 0.4387843734693888,
+     "train/mean_gen_tokens_per_sample": 1489.6875,
+     "train/loss": 0.06731195450993255,
+     "train/reward": 0.81640625,
+     "train/truncation_rate": 0.1640625,
+     "timing/train/total_step_time": 530.0703604351147
+    },
+    {
+     "nemo_rl/step": 31,
+     "train/gen_kl_error": 0.0021233467490731073,
+     "train/policy_kl_error": 0.003268939602548926,
+     "train/approx_entropy": 0.42218821529240813,
+     "train/mean_gen_tokens_per_sample": 1378.1796875,
+     "train/loss": 0.08093851231387816,
+     "train/reward": 0.7421875,
+     "train/truncation_rate": 0.19140625,
+     "timing/train/total_step_time": 184.15666977502406
+    },
+    {
+     "nemo_rl/step": 32,
+     "train/gen_kl_error": 0.0023931093703026818,
+     "train/policy_kl_error": 2.6498016750938405,
+     "train/approx_entropy": 0.4309711300302297,
+     "train/mean_gen_tokens_per_sample": 1381.7890625,
+     "train/loss": 0.062082678778097034,
+     "train/reward": 0.76953125,
+     "train/truncation_rate": 0.13671875,
+     "timing/train/total_step_time": 176.46433897397947
+    },
+    {
+     "nemo_rl/step": 33,
+     "train/gen_kl_error": 0.0021389784712084747,
+     "train/policy_kl_error": 0.0023547837955106843,
+     "train/approx_entropy": 0.41274141205940396,
+     "train/mean_gen_tokens_per_sample": 1216.9609375,
+     "train/loss": 0.02354027089313604,
+     "train/reward": 0.8046875,
+     "train/truncation_rate": 0.125,
+     "timing/train/total_step_time": 247.7558778944658
+    },
+    {
+     "nemo_rl/step": 34,
+     "train/gen_kl_error": 0.0023726384732754013,
+     "train/policy_kl_error": 0.008026825141428162,
+     "train/approx_entropy": 0.44830915447164443,
+     "train/mean_gen_tokens_per_sample": 1570.8046875,
+     "train/loss": 0.06384704366791993,
+     "train/reward": 0.7109375,
+     "train/truncation_rate": 0.22265625,
+     "timing/train/total_step_time": 189.59358489717124
+    },
+    {
+     "nemo_rl/step": 35,
+     "train/gen_kl_error": 0.002453636670566084,
+     "train/policy_kl_error": 0.0566694490082682,
+     "train/approx_entropy": 0.44160670344354,
+     "train/mean_gen_tokens_per_sample": 1259.90625,
+     "train/loss": 0.03271359238715377,
+     "train/reward": 0.765625,
+     "train/truncation_rate": 0.140625,
+     "timing/train/total_step_time": 238.81149150792044
+    },
+    {
+     "nemo_rl/step": 36,
+     "train/gen_kl_error": 0.0026558905017282086,
+     "train/policy_kl_error": 0.00448871325215805,
+     "train/approx_entropy": 0.47660029389953706,
+     "train/mean_gen_tokens_per_sample": 1384.921875,
+     "train/loss": 0.043331130349542946,
+     "train/reward": 0.67578125,
+     "train/truncation_rate": 0.19140625,
+     "timing/train/total_step_time": 202.23983078310266
+    },
+    {
+     "nemo_rl/step": 37,
+     "train/gen_kl_error": 0.0028116413720908895,
+     "train/policy_kl_error": 0.0032829029366325813,
+     "train/approx_entropy": 0.5056546148844063,
+     "train/mean_gen_tokens_per_sample": 1453.62890625,
+     "train/loss": 0.05296167131746188,
+     "train/reward": 0.7890625,
+     "train/truncation_rate": 0.1640625,
+     "timing/train/total_step_time": 211.69254286773503
+    },
+    {
+     "nemo_rl/step": 38,
+     "train/gen_kl_error": 0.0030936557460563563,
+     "train/policy_kl_error": 0.004923120044168172,
+     "train/approx_entropy": 0.5021395464427769,
+     "train/mean_gen_tokens_per_sample": 1239.12890625,
+     "train/loss": 0.08098943694494665,
+     "train/reward": 0.80859375,
+     "train/truncation_rate": 0.13671875,
+     "timing/train/total_step_time": 218.19906642090064
+    },
+    {
+     "nemo_rl/step": 39,
+     "train/gen_kl_error": 0.00311908415852713,
+     "train/policy_kl_error": 0.003500759576411383,
+     "train/approx_entropy": 0.47581236343830824,
+     "train/mean_gen_tokens_per_sample": 1044.203125,
+     "train/loss": 0.011273409851128235,
+     "train/reward": 0.828125,
+     "train/truncation_rate": 0.10546875,
+     "timing/train/total_step_time": 218.2814474630286
+    },
+    {
+     "nemo_rl/step": 40,
+     "train/gen_kl_error": 0.002487348088266117,
+     "train/policy_kl_error": 0.0030197353336802735,
+     "train/approx_entropy": 0.4690367137081921,
+     "train/mean_gen_tokens_per_sample": 1489.26171875,
+     "train/loss": 0.042966950742993504,
+     "train/reward": 0.73828125,
+     "train/truncation_rate": 0.125,
+     "timing/train/total_step_time": 521.5930791380815
+    },
+    {
+     "nemo_rl/step": 41,
+     "train/gen_kl_error": 0.0022497280359630167,
+     "train/policy_kl_error": 0.0024127418537887024,
+     "train/approx_entropy": 0.4108632948627928,
+     "train/mean_gen_tokens_per_sample": 1115.62109375,
+     "train/loss": 0.02259684304590337,
+     "train/reward": 0.828125,
+     "train/truncation_rate": 0.09375,
+     "timing/train/total_step_time": 260.3883363889763
+    },
+    {
+     "nemo_rl/step": 42,
+     "train/gen_kl_error": 0.0024313484176445854,
+     "train/policy_kl_error": 0.002600247265490907,
+     "train/approx_entropy": 0.4929199805992539,
+     "train/mean_gen_tokens_per_sample": 1228.26953125,
+     "train/loss": 0.026962159667164087,
+     "train/reward": 0.8125,
+     "train/truncation_rate": 0.13671875,
+     "timing/train/total_step_time": 190.3179811919108
+    },
+    {
+     "nemo_rl/step": 43,
+     "train/gen_kl_error": 0.002877482504914042,
+     "train/policy_kl_error": 0.003210297304917731,
+     "train/approx_entropy": 0.5273274229839444,
+     "train/mean_gen_tokens_per_sample": 1533.27734375,
+     "train/loss": 0.03615308494772762,
+     "train/reward": 0.765625,
+     "train/truncation_rate": 0.21484375,
+     "timing/train/total_step_time": 288.38066960312426
+    },
+    {
+     "nemo_rl/step": 44,
+     "train/gen_kl_error": 0.0025054960246961855,
+     "train/policy_kl_error": 0.0026663324580340486,
+     "train/approx_entropy": 0.45363506335706916,
+     "train/mean_gen_tokens_per_sample": 1361.19140625,
+     "train/loss": 0.03756270502344705,
+     "train/reward": 0.7265625,
+     "train/truncation_rate": 0.1875,
+     "timing/train/total_step_time": 180.65624141320586
+    },
+    {
+     "nemo_rl/step": 45,
+     "train/gen_kl_error": 0.00260201900073298,
+     "train/policy_kl_error": 0.0029102114431225345,
+     "train/approx_entropy": 0.4495423274493078,
+     "train/mean_gen_tokens_per_sample": 1518.72265625,
+     "train/loss": 0.029685641784453765,
+     "train/reward": 0.703125,
+     "train/truncation_rate": 0.16796875,
+     "timing/train/total_step_time": 232.6083414098248
+    },
+    {
+     "nemo_rl/step": 46,
+     "train/gen_kl_error": 0.0024528916347890117,
+     "train/policy_kl_error": 0.0032837391179327824,
+     "train/approx_entropy": 0.48899134615203366,
+     "train/mean_gen_tokens_per_sample": 1523.57421875,
+     "train/loss": 0.015934246926917695,
+     "train/reward": 0.7265625,
+     "train/truncation_rate": 0.24609375,
+     "timing/train/total_step_time": 205.1086703222245
+    },
+    {
+     "nemo_rl/step": 47,
+     "train/gen_kl_error": 0.0025141980020464416,
+     "train/policy_kl_error": 0.0028059232244999066,
+     "train/approx_entropy": 0.4088064811185177,
+     "train/mean_gen_tokens_per_sample": 1309.125,
+     "train/loss": 0.05644767917692661,
+     "train/reward": 0.765625,
+     "train/truncation_rate": 0.1328125,
+     "timing/train/total_step_time": 209.24768494721502
+    },
+    {
+     "nemo_rl/step": 48,
+     "train/gen_kl_error": 0.0028451290352222713,
+     "train/policy_kl_error": 0.003161995177947574,
+     "train/approx_entropy": 0.44804059740999946,
+     "train/mean_gen_tokens_per_sample": 1322.18359375,
+     "train/loss": 0.04676178755471483,
+     "train/reward": 0.7421875,
+     "train/truncation_rate": 0.140625,
+     "timing/train/total_step_time": 220.5843117889017
+    },
+    {
+     "nemo_rl/step": 49,
+     "train/gen_kl_error": 0.0028655787538127697,
+     "train/policy_kl_error": 0.003191820905840359,
+     "train/approx_entropy": 0.4960333033814095,
+     "train/mean_gen_tokens_per_sample": 1559.83203125,
+     "train/loss": 0.025587035401258618,
+     "train/reward": 0.640625,
+     "train/truncation_rate": 0.2265625,
+     "timing/train/total_step_time": 208.13419022690505
+    },
+    {
+     "nemo_rl/step": 50,
+     "train/gen_kl_error": 0.002646130571122285,
+     "train/policy_kl_error": 0.0034136364111532203,
+     "train/approx_entropy": 0.40419737935371813,
+     "train/mean_gen_tokens_per_sample": 1033.69140625,
+     "train/loss": 0.035775322816334665,
+     "train/reward": 0.82421875,
+     "train/truncation_rate": 0.07421875,
+     "timing/train/total_step_time": 608.7065088320524
+    },
+    {
+     "nemo_rl/step": 51,
+     "train/gen_kl_error": 0.0027423528865710978,
+     "train/policy_kl_error": 0.0030312877168512387,
+     "train/approx_entropy": 0.46217819161029183,
+     "train/mean_gen_tokens_per_sample": 1474.44140625,
+     "train/loss": 0.05113635689485818,
+     "train/reward": 0.77734375,
+     "train/truncation_rate": 0.14453125,
+     "timing/train/total_step_time": 181.3849931312725
+    },
+    {
+     "nemo_rl/step": 52,
+     "train/gen_kl_error": 0.0030305460070394474,
+     "train/policy_kl_error": 0.0036621261118625625,
+     "train/approx_entropy": 0.4490310367255006,
+     "train/mean_gen_tokens_per_sample": 1218.98828125,
+     "train/loss": 0.030135131761198863,
+     "train/reward": 0.80859375,
+     "train/truncation_rate": 0.09765625,
+     "timing/train/total_step_time": 187.40493795275688
+    },
+    {
+     "nemo_rl/step": 53,
+     "train/gen_kl_error": 0.0024686427797746546,
+     "train/policy_kl_error": 0.0029568833399480354,
+     "train/approx_entropy": 0.312117289773596,
+     "train/mean_gen_tokens_per_sample": 1024.69921875,
+     "train/loss": 0.03652234247419983,
+     "train/reward": 0.9296875,
+     "train/truncation_rate": 0.015625,
+     "timing/train/total_step_time": 256.28892582654953
+    },
+    {
+     "nemo_rl/step": 54,
+     "train/gen_kl_error": 0.002471191007998641,
+     "train/policy_kl_error": 0.853083202352451,
+     "train/approx_entropy": 0.4271252262478811,
+     "train/mean_gen_tokens_per_sample": 1448.8046875,
+     "train/loss": 0.04111382004339248,
+     "train/reward": 0.80078125,
+     "train/truncation_rate": 0.125,
+     "timing/train/total_step_time": 182.33605779707432
+    },
+    {
+     "nemo_rl/step": 55,
+     "train/gen_kl_error": 0.0025506201502594195,
+     "train/policy_kl_error": 0.00279368491482046,
+     "train/approx_entropy": 0.4229070079745725,
+     "train/mean_gen_tokens_per_sample": 1325.2265625,
+     "train/loss": 0.06504415633389726,
+     "train/reward": 0.7734375,
+     "train/truncation_rate": 0.125,
+     "timing/train/total_step_time": 241.98105490207672
+    },
+    {
+     "nemo_rl/step": 56,
+     "train/gen_kl_error": 0.0022154344208047405,
+     "train/policy_kl_error": 0.0023874075973822073,
+     "train/approx_entropy": 0.3789481035855715,
+     "train/mean_gen_tokens_per_sample": 1240.20703125,
+     "train/loss": 0.05925440706778318,
+     "train/reward": 0.80859375,
+     "train/truncation_rate": 0.11328125,
+     "timing/train/total_step_time": 192.93001913744956
+    },
+    {
+     "nemo_rl/step": 57,
+     "train/gen_kl_error": 0.003009913764230987,
+     "train/policy_kl_error": 0.0033835632646628255,
+     "train/approx_entropy": 0.4923100452251674,
+     "train/mean_gen_tokens_per_sample": 1387.82421875,
+     "train/loss": 0.0440097231476102,
+     "train/reward": 0.6796875,
+     "train/truncation_rate": 0.2421875,
+     "timing/train/total_step_time": 223.88385230861604
+    },
+    {
+     "nemo_rl/step": 58,
+     "train/gen_kl_error": 0.0024698071168245406,
+     "train/policy_kl_error": 0.0035933098697285004,
+     "train/approx_entropy": 0.439508161151025,
+     "train/mean_gen_tokens_per_sample": 1227.8359375,
+     "train/loss": 0.009208090574247763,
+     "train/reward": 0.78125,
+     "train/truncation_rate": 0.11328125,
+     "timing/train/total_step_time": 204.643287579529
+    },
+    {
+     "nemo_rl/step": 59,
+     "train/gen_kl_error": 0.0022636503672401886,
+     "train/policy_kl_error": 0.002505524721755137,
+     "train/approx_entropy": 0.327376068365993,
+     "train/mean_gen_tokens_per_sample": 968.17578125,
+     "train/loss": 0.03180322464322671,
+     "train/reward": 0.953125,
+     "train/truncation_rate": 0.03515625,
+     "timing/train/total_step_time": 220.37286277022213
+    },
+    {
+     "nemo_rl/step": 60,
+     "train/gen_kl_error": 0.002750189449699292,
+     "train/policy_kl_error": 0.0030331535464256376,
+     "train/approx_entropy": 0.44757148216376663,
+     "train/mean_gen_tokens_per_sample": 1321.39453125,
+     "train/loss": 0.041588710620999336,
+     "train/reward": 0.84765625,
+     "train/truncation_rate": 0.09765625,
+     "timing/train/total_step_time": 554.9514544047415
+    },
+    {
+     "nemo_rl/step": 61,
+     "train/gen_kl_error": 0.002803620197255441,
+     "train/policy_kl_error": 0.003031704384056866,
+     "train/approx_entropy": 0.39175390235322993,
+     "train/mean_gen_tokens_per_sample": 916.24609375,
+     "train/loss": 0.03134862193837762,
+     "train/reward": 0.8828125,
+     "train/truncation_rate": 0.04296875,
+     "timing/train/total_step_time": 192.2623562272638
+    },
+    {
+     "nemo_rl/step": 62,
+     "train/gen_kl_error": 0.003095290874910006,
+     "train/policy_kl_error": 0.0036147665674803875,
+     "train/approx_entropy": 0.45046764903963776,
+     "train/mean_gen_tokens_per_sample": 1052.5078125,
+     "train/loss": 0.017458720598369837,
+     "train/reward": 0.80078125,
+     "train/truncation_rate": 0.12109375,
+     "timing/train/total_step_time": 186.89718120731413
+    },
+    {
+     "nemo_rl/step": 63,
+     "train/gen_kl_error": 0.002726485267260159,
+     "train/policy_kl_error": 0.0031948175480067675,
+     "train/approx_entropy": 0.41165468256076565,
+     "train/mean_gen_tokens_per_sample": 1246.30859375,
+     "train/loss": 0.02780235093086958,
+     "train/reward": 0.8203125,
+     "train/truncation_rate": 0.09375,
+     "timing/train/total_step_time": 222.41221930924803
+    },
+    {
+     "nemo_rl/step": 64,
+     "train/gen_kl_error": 0.003198134048375323,
+     "train/policy_kl_error": 0.003414968401727947,
+     "train/approx_entropy": 0.426401727629127,
+     "train/mean_gen_tokens_per_sample": 1223.5625,
+     "train/loss": 0.02383617841405794,
+     "train/reward": 0.71875,
+     "train/truncation_rate": 0.12890625,
+     "timing/train/total_step_time": 290.4757376536727
+    },
+    {
+     "nemo_rl/step": 65,
+     "train/gen_kl_error": 0.002432861147042331,
+     "train/policy_kl_error": 0.0025851080387724323,
+     "train/approx_entropy": 0.3739114546806377,
+     "train/mean_gen_tokens_per_sample": 1082.265625,
+     "train/loss": 0.024201805936172605,
+     "train/reward": 0.85546875,
+     "train/truncation_rate": 0.06640625,
+     "timing/train/total_step_time": 167.5943923650775
+    },
+    {
+     "nemo_rl/step": 66,
+     "train/gen_kl_error": 0.0025604379931678523,
+     "train/policy_kl_error": 0.002978334030217411,
+     "train/approx_entropy": 0.39697578014602186,
+     "train/mean_gen_tokens_per_sample": 982.95703125,
+     "train/loss": 0.0365827766363509,
+     "train/reward": 0.89453125,
+     "train/truncation_rate": 0.046875,
+     "timing/train/total_step_time": 411.98971060907934
+    },
+    {
+     "nemo_rl/step": 67,
+     "train/gen_kl_error": 0.0023876237498825503,
+     "train/policy_kl_error": 0.0027468030062323123,
+     "train/approx_entropy": 0.29205090791219845,
+     "train/mean_gen_tokens_per_sample": 835.08203125,
+     "train/loss": 0.05669092040625401,
+     "train/reward": 0.89453125,
+     "train/truncation_rate": 0.01171875,
+     "timing/train/total_step_time": 191.81564349506516
+    },
+    {
+     "nemo_rl/step": 68,
+     "train/gen_kl_error": 0.0025439507087412494,
+     "train/policy_kl_error": 0.0029463593079981365,
+     "train/approx_entropy": 0.3781735923985252,
+     "train/mean_gen_tokens_per_sample": 1157.57421875,
+     "train/loss": 0.017464073112932965,
+     "train/reward": 0.8515625,
+     "train/truncation_rate": 0.05078125,
+     "timing/train/total_step_time": 266.5194437367609
+    },
+    {
+     "nemo_rl/step": 69,
+     "train/gen_kl_error": 0.0024343327068550025,
+     "train/policy_kl_error": 0.013451801175619948,
+     "train/approx_entropy": 0.37500181738869287,
+     "train/mean_gen_tokens_per_sample": 1046.7109375,
+     "train/loss": 0.016781655547674745,
+     "train/reward": 0.80078125,
+     "train/truncation_rate": 0.05859375,
+     "timing/train/total_step_time": 207.87709210976027
+    },
+    {
+     "nemo_rl/step": 70,
+     "train/gen_kl_error": 0.0024711450024881287,
+     "train/policy_kl_error": 0.002762894151942419,
+     "train/approx_entropy": 0.4036626067972975,
+     "train/mean_gen_tokens_per_sample": 1219.17578125,
+     "train/loss": 0.04337303608190268,
+     "train/reward": 0.765625,
+     "train/truncation_rate": 0.1015625,
+     "timing/train/total_step_time": 690.3972433549352
+    },
+    {
+     "nemo_rl/step": 71,
+     "train/gen_kl_error": 0.0027192253112389153,
+     "train/policy_kl_error": 0.0030381125304757006,
+     "train/approx_entropy": 0.4298811578628374,
+     "train/mean_gen_tokens_per_sample": 1045.6015625,
+     "train/loss": 0.02755405119387433,
+     "train/reward": 0.85546875,
+     "train/truncation_rate": 0.0703125,
+     "timing/train/total_step_time": 192.67516209289897
+    },
+    {
+     "nemo_rl/step": 72,
+     "train/gen_kl_error": 0.0025919905557429956,
+     "train/policy_kl_error": 0.0029041986923630247,
+     "train/approx_entropy": 0.4061111043411074,
+     "train/mean_gen_tokens_per_sample": 1106.8203125,
+     "train/loss": 0.0057647162466309965,
+     "train/reward": 0.78515625,
+     "train/truncation_rate": 0.05078125,
+     "timing/train/total_step_time": 190.6612297031097
+    },
+    {
+     "nemo_rl/step": 73,
+     "train/gen_kl_error": 0.002431989641877408,
+     "train/policy_kl_error": 0.0027179770735301645,
+     "train/approx_entropy": 0.41375995910493657,
+     "train/mean_gen_tokens_per_sample": 922.9609375,
+     "train/loss": 0.009858631063252687,
+     "train/reward": 0.90625,
+     "train/truncation_rate": 0.05078125,
+     "timing/train/total_step_time": 286.3245222836267
+    },
+    {
+     "nemo_rl/step": 74,
+     "train/gen_kl_error": 0.0028417480840516873,
+     "train/policy_kl_error": 0.0034666129735114737,
+     "train/approx_entropy": 0.47694810954271816,
+     "train/mean_gen_tokens_per_sample": 1313.43359375,
+     "train/loss": 0.04782067402265966,
+     "train/reward": 0.7578125,
+     "train/truncation_rate": 0.1171875,
+     "timing/train/total_step_time": 211.55585527431685
+    },
+    {
+     "nemo_rl/step": 75,
+     "train/gen_kl_error": 0.0027304740058866628,
+     "train/policy_kl_error": 0.003048960433261527,
+     "train/approx_entropy": 0.3855292807566002,
+     "train/mean_gen_tokens_per_sample": 994.88671875,
+     "train/loss": 0.03577173931989819,
+     "train/reward": 0.86328125,
+     "train/truncation_rate": 0.07421875,
+     "timing/train/total_step_time": 252.95758637145627
+    },
+    {
+     "nemo_rl/step": 76,
+     "train/gen_kl_error": 0.0024785586803091064,
+     "train/policy_kl_error": 0.00273628148863736,
+     "train/approx_entropy": 0.3421147118351655,
+     "train/mean_gen_tokens_per_sample": 1098.19921875,
+     "train/loss": -0.00242388405604288,
+     "train/reward": 0.8046875,
+     "train/truncation_rate": 0.02734375,
+     "timing/train/total_step_time": 215.05870172625873
+    },
+    {
+     "nemo_rl/step": 77,
+     "train/gen_kl_error": 0.0026261971024723607,
+     "train/policy_kl_error": 0.0029152881119216545,
+     "train/approx_entropy": 0.4449332742806291,
+     "train/mean_gen_tokens_per_sample": 1200.2890625,
+     "train/loss": 0.012081551423761994,
+     "train/reward": 0.7734375,
+     "train/truncation_rate": 0.09375,
+     "timing/train/total_step_time": 255.24260381853674
+    },
+    {
+     "nemo_rl/step": 78,
+     "train/gen_kl_error": 0.0025291652142414023,
+     "train/policy_kl_error": 0.005545566351088382,
+     "train/approx_entropy": 0.35349635446618777,
+     "train/mean_gen_tokens_per_sample": 1056.22265625,
+     "train/loss": 0.0243966116104275,
+     "train/reward": 0.94140625,
+     "train/truncation_rate": 0.01171875,
+     "timing/train/total_step_time": 206.70551203435753
+    },
+    {
+     "nemo_rl/step": 79,
+     "train/gen_kl_error": 0.002154811232855991,
+     "train/policy_kl_error": 0.0024327526619174478,
+     "train/approx_entropy": 0.31015772659520735,
+     "train/mean_gen_tokens_per_sample": 883.60546875,
+     "train/loss": 0.029390253592282534,
+     "train/reward": 0.93359375,
+     "train/truncation_rate": 0.015625,
+     "timing/train/total_step_time": 254.41982790001202
+    },
+    {
+     "nemo_rl/step": 80,
+     "train/gen_kl_error": 0.002663074967358625,
+     "train/policy_kl_error": 0.0029700201835680673,
+     "train/approx_entropy": 0.4891841167482198,
+     "train/mean_gen_tokens_per_sample": 1370.5234375,
+     "train/loss": 0.014873464242555201,
+     "train/reward": 0.765625,
+     "train/truncation_rate": 0.125,
+     "timing/train/total_step_time": 586.4435084097786
+    },
+    {
+     "nemo_rl/step": 81,
+     "train/gen_kl_error": 0.0025359620281335538,
+     "train/policy_kl_error": 0.0029486500390589754,
+     "train/approx_entropy": 0.4156522368066362,
+     "train/mean_gen_tokens_per_sample": 1058.7421875,
+     "train/loss": 0.058152233716100454,
+     "train/reward": 0.83984375,
+     "train/truncation_rate": 0.0703125,
+     "timing/train/total_step_time": 192.8706118259579
+    },
+    {
+     "nemo_rl/step": 82,
+     "train/gen_kl_error": 0.0025206349124573535,
+     "train/policy_kl_error": 0.002832945063346415,
+     "train/approx_entropy": 0.37444447840971407,
+     "train/mean_gen_tokens_per_sample": 956.62109375,
+     "train/loss": -0.011264590313658118,
+     "train/reward": 0.80859375,
+     "train/truncation_rate": 0.02734375,
+     "timing/train/total_step_time": 183.60691677592695
+    },
+    {
+     "nemo_rl/step": 83,
+     "train/gen_kl_error": 0.002329362343630237,
+     "train/policy_kl_error": 0.0026184931087982477,
+     "train/approx_entropy": 0.34565000908332877,
+     "train/mean_gen_tokens_per_sample": 984.52734375,
+     "train/loss": 0.05603115522535518,
+     "train/reward": 0.8671875,
+     "train/truncation_rate": 0.015625,
+     "timing/train/total_step_time": 287.7551117594121
+    },
+    {
+     "nemo_rl/step": 84,
+     "train/gen_kl_error": 0.002494388598847763,
+     "train/policy_kl_error": 0.0027080915652959447,
+     "train/approx_entropy": 0.4441281890904065,
+     "train/mean_gen_tokens_per_sample": 1205.2578125,
+     "train/loss": 0.06342342426069081,
+     "train/reward": 0.78515625,
+     "train/truncation_rate": 0.0703125,
+     "timing/train/total_step_time": 266.1955830352381
+    }
+   ],
+   "validation": [
+    {
+     "nemo_rl/step": 10,
+     "validation/accuracy": 0.421875,
+     "validation/avg_length": 2428.7109375
+    },
+    {
+     "nemo_rl/step": 20,
+     "validation/accuracy": 0.54296875,
+     "validation/avg_length": 2210.04296875
+    },
+    {
+     "nemo_rl/step": 30,
+     "validation/accuracy": 0.68359375,
+     "validation/avg_length": 1935.47265625
+    },
+    {
+     "nemo_rl/step": 40,
+     "validation/accuracy": 0.765625,
+     "validation/avg_length": 1687.51953125
+    },
+    {
+     "nemo_rl/step": 50,
+     "validation/accuracy": 0.76953125,
+     "validation/avg_length": 1640.22265625
+    },
+    {
+     "nemo_rl/step": 60,
+     "validation/accuracy": 0.79296875,
+     "validation/avg_length": 1554.12890625
+    },
+    {
+     "nemo_rl/step": 70,
+     "validation/accuracy": 0.8125,
+     "validation/avg_length": 1445.91015625
+    },
+    {
+     "nemo_rl/step": 80,
+     "validation/accuracy": 0.80859375,
+     "validation/avg_length": 1541.18359375
+    }
+   ]
+  }
+ }
+}
