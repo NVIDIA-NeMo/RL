@@ -7,9 +7,6 @@ grpo:
   val_num_generations_per_prompt: 4
   max_num_steps: 25
   max_val_samples: null
-  num_prompts_per_step: 32
-  async_grpo: null
-  val_period: 0
 loss_fn:
   reference_policy_kl_penalty: 0
   kl_input_clamp_value: null
@@ -19,7 +16,6 @@ loss_fn:
   use_importance_sampling_correction: true
   force_on_policy_ratio: true
 checkpointing:
-  enabled: false
   checkpoint_dir: results/nemotron-nano-mps/checkpoints
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
@@ -47,17 +43,11 @@ policy:
     optimizer:
       lr: 1.0e-06
       min_lr: 1.0e-06
-      use_distributed_optimizer: true
-      use_precision_aware_optimizer: true
-      optimizer_cpu_offload: false
-      optimizer_offload_fraction: 0.0
     scheduler:
       lr_decay_iters: null
     distributed_data_parallel_config:
       overlap_grad_reduce: false
       average_in_collective: false
-      grad_reduce_in_fp32: false
-      overlap_param_gather: true
     env_vars:
       OMP_NUM_THREADS: '2'
       MKL_NUM_THREADS: '2'
@@ -65,12 +55,6 @@ policy:
     recompute_granularity: selective
     recompute_modules:
     - moe_act
-    enabled: true
-    tensor_model_parallel_size: 1
-    pipeline_model_parallel_size: 1
-    context_parallel_size: 1
-    expert_tensor_parallel_size: 1
-    freeze_moe_router: true
   dynamic_batching:
     train_mb_tokens: 10240
     logprob_mb_tokens: 10240
@@ -113,13 +97,7 @@ policy:
         OMP_NUM_THREADS: '2'
         MKL_NUM_THREADS: '2'
         CUDA_MPS_CLIENT_PRIORITY: '0'
-      cuda_graph_impl: local
-      cuda_graph_sizing_distribution: hybrid
-      cuda_graph_max_tokens: 512
-      inference_cuda_graph_scope: block
-      use_cuda_graphs_for_non_decode_steps: true
-      enable_chunked_prefill: true
-      num_speculative_tokens: 0
+    # Separate engine processes, placed on the training GPUs by the MPS path.
     colocated:
       resources:
         gpus_per_node: null
@@ -128,26 +106,15 @@ policy:
       engine_sm_fraction: 0.42
       engine_weights: shared
       sm_partition_backend: mps_percentage
-      # Separate engine processes, placed on the training GPUs by the MPS path.
-      enabled: false
     refit_transport: ipc
-  precision: bfloat16
-  offload_optimizer_for_logprob: false
 logger:
   log_dir: results/nemotron-nano-mps
-  wandb_enabled: false
-  tensorboard_enabled: false
-  mlflow_enabled: false
   monitor_gpus: false
 cluster:
-  num_nodes: 1
   gpus_per_node: 8
 data_plane:
   simple:
     num_storage_units: 4
-  enabled: true
-  impl: transfer_queue
-  backend: simple
 async_rl:
   generation_fleet_health:
     refit_timeout_s: null
@@ -173,5 +140,3 @@ env:
   math_parity:
     num_workers: 16
     math_verify_impl: dapo_math_verify
-token_capture:
-  enabled: false

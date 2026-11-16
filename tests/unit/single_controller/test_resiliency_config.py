@@ -135,16 +135,27 @@ def test_mps_shared_weights_reject_reference_policy_swaps(
     cfg.loss_fn.reference_policy_kl_penalty = reference_kl
     cfg.policy["megatron_cfg"] = {"enabled": True, "expert_model_parallel_size": 4}
     cfg.policy["generation"] = {
-        "backend": "megatron", "refit_transport": "ipc",
-        "colocated": {"enabled": False, "engine_sm_fraction": 0.42, "engine_weights": engine_weights},
+        "backend": "megatron",
+        "refit_transport": "ipc",
+        "colocated": {
+            "enabled": False,
+            "engine_sm_fraction": 0.42,
+            "engine_weights": engine_weights,
+        },
         "mcore_generation_config": {"expert_model_parallel_size": 4},
     }
     monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", "/tmp/test-mps")
     # GPU worker imports are optional for driver-side config validation.
-    monkeypatch.setitem(sys.modules, "nemo_rl.models.generation.megatron.megatron_worker",
-                        SimpleNamespace(check_generation_calls=lambda *args: None))
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_rl.models.generation.megatron.megatron_worker",
+        SimpleNamespace(check_generation_calls=lambda *args: None),
+    )
     if engine_weights == "shared" and reference_kl > 0:
-        with pytest.raises(ValueError, match="reference-policy weight swapping with shared engine weights"):
+        with pytest.raises(
+            ValueError,
+            match="reference-policy weight swapping with shared engine weights",
+        ):
             validate_single_controller_config(cfg)
     else:
         validate_single_controller_config(cfg)

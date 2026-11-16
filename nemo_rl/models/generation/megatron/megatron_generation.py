@@ -402,12 +402,16 @@ class MegatronGeneration(GenerationInterface):
             return None
         learner_ep = config["megatron_cfg"].get("expert_model_parallel_size") or 1
         engine_ep = (
-            config["generation"]["mcore_generation_config"].get("expert_model_parallel_size")
+            config["generation"]["mcore_generation_config"].get(
+                "expert_model_parallel_size"
+            )
             or learner_ep
         )
         if engine_ep == learner_ep:
             return None
-        return sm_partition.engine_rank_gpus(cluster.world_size(), learner_ep, engine_ep)
+        return sm_partition.engine_rank_gpus(
+            cluster.world_size(), learner_ep, engine_ep
+        )
 
     @property
     def uses_native_refit(self) -> bool:
@@ -650,7 +654,9 @@ class MegatronGeneration(GenerationInterface):
                 "report_dp_openai_server_base_url"
             )
             self.dp_openai_server_base_urls = [
-                url for url in ray.get(url_futures, timeout=timeout_s) if url is not None
+                url
+                for url in ray.get(url_futures, timeout=timeout_s)
+                if url is not None
             ]
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:

@@ -72,7 +72,7 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         self._refit_timeout_s = refit_timeout_s
         self._offload_policy_before_refit = offload_policy_before_refit
         self._refit_backend: Optional[str] = None
-        self._transport: Optional[WeightSynchronizer] = None
+        self._transport: WeightSynchronizer | CoresidentRefit | None = None
         if colocated:
             # Colocated refit always uses the in-place wake-reshard, so
             # any other transport is inert. Reject rather than silently ignoring it:
@@ -88,7 +88,9 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         if not colocated and not generation.uses_native_refit:
             if generation.cfg.get("refit_transport") == "ipc":
                 self._transport = CoresidentRefit(
-                    policy=policy, generation=generation, refit_timeout_s=refit_timeout_s
+                    policy=policy,
+                    generation=generation,
+                    refit_timeout_s=refit_timeout_s,
                 )
             elif generation.cfg.get("refit_transport") == "nccl_reshard":
                 self._transport = NcclReshardWeightSynchronizer(
@@ -252,7 +254,9 @@ def _get_fail_fast(refs: list, *, timeout_s: Optional[float] = None) -> list:
         if deadline is not None:
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
-                raise TimeoutError(f"co-resident refit: {len(pending)} worker call(s) did not return within {timeout_s}s")
+                raise TimeoutError(
+                    f"co-resident refit: {len(pending)} worker call(s) did not return within {timeout_s}s"
+                )
             wait_s = min(wait_s, remaining)
         done, pending = ray.wait(pending, num_returns=len(pending), timeout=wait_s)
         ray.get(done)
@@ -274,7 +278,9 @@ class CoresidentRefit:
     Actor calls use the configured refit timeout, or a 360-second fallback, so an unresponsive worker fails the run.
     """
 
-    def __init__(self, policy: Any, generation: Any, *, refit_timeout_s: Optional[float] = None) -> None:
+    def __init__(
+        self, policy: Any, generation: Any, *, refit_timeout_s: Optional[float] = None
+    ) -> None:
         self._policy = policy
         self._generation = generation
         self._fingerprints: list[str] = []
@@ -286,26 +292,36 @@ class CoresidentRefit:
 
     def init_communicator(self) -> None:
         exported = _get_fail_fast(
-            self._policy.worker_group.run_all_workers_single_data("export_coresident_refit_handles"),
+            self._policy.worker_group.run_all_workers_single_data(
+                "export_coresident_refit_handles"
+            ),
             timeout_s=self._control_timeout_s,
         )
         by_device = {dev: (handles, coords) for dev, handles, _, coords in exported}
         if len(by_device) != len(exported):
-            raise RuntimeError("co-resident refit: two learner ranks report the same GPU")
+            raise RuntimeError(
+                "co-resident refit: two learner ranks report the same GPU"
+            )
         self._fingerprints = [fp for _, _, fp, _ in exported]
         bound = _get_fail_fast(
             self._generation.worker_group.run_all_workers_single_data(
-                "open_coresident_refit_handles", handles_by_device=by_device, share=self._shared
+                "open_coresident_refit_handles",
+                handles_by_device=by_device,
+                share=self._shared,
             ),
             timeout_s=self._control_timeout_s,
         )
-        print(f"[sm_partition] co-resident engine weights ({'shared' if self._shared else 'copy'}) bound: {bound[0]}",
-              flush=True)
+        print(
+            f"[sm_partition] co-resident engine weights ({'shared' if self._shared else 'copy'}) bound: {bound[0]}",
+            flush=True,
+        )
 
     def _pause(self) -> float:
         t0 = time.perf_counter()
         _get_fail_fast(
-            self._generation.worker_group.run_all_workers_single_data("coresident_pause"),
+            self._generation.worker_group.run_all_workers_single_data(
+                "coresident_pause"
+            ),
             timeout_s=self._control_timeout_s,
         )
         self._paused_at = t0
@@ -315,15 +331,23 @@ class CoresidentRefit:
         if self._shared and self._engine_running:
             self._pause_s = self._pause()
 
-    def sync_weights(self, *, kv_scales: Optional[dict[str, float]] = None) -> dict[str, float]:
+    def sync_weights(
+        self, *, kv_scales: Optional[dict[str, float]] = None
+    ) -> dict[str, float]:
         if kv_scales:
-            raise NotImplementedError("co-resident refit with FP8 KV scales is not built yet")
+            raise NotImplementedError(
+                "co-resident refit with FP8 KV scales is not built yet"
+            )
         if self._paused_at is None:
             self._pause_s = self._pause()
+        paused_at = self._paused_at
+        assert paused_at is not None, "Co-resident readers must be paused before refit"
         gen = self._generation.worker_group
         t0 = time.perf_counter()
         ready = _get_fail_fast(
-            self._policy.worker_group.run_all_workers_single_data("coresident_refit_source_ready"),
+            self._policy.worker_group.run_all_workers_single_data(
+                "coresident_refit_source_ready"
+            ),
             timeout_s=self._control_timeout_s,
         )
         if ready != self._fingerprints:
@@ -333,10 +357,14 @@ class CoresidentRefit:
             )
         t1 = time.perf_counter()
         copies = _get_fail_fast(
-            gen.run_all_workers_single_data("coresident_refit_copy"), timeout_s=self._control_timeout_s
+            gen.run_all_workers_single_data("coresident_refit_copy"),
+            timeout_s=self._control_timeout_s,
         )
         t2 = time.perf_counter()
-        _get_fail_fast(gen.run_all_workers_single_data("coresident_resume"), timeout_s=self._control_timeout_s)
+        _get_fail_fast(
+            gen.run_all_workers_single_data("coresident_resume"),
+            timeout_s=self._control_timeout_s,
+        )
         if not self._engine_running:
             self._generation.refresh_dp_openai_server_base_urls(
                 timeout_s=self._control_timeout_s
@@ -348,7 +376,7 @@ class CoresidentRefit:
             "coresident_copy_s": t2 - t1,
             "coresident_copy_s_max_rank": max(c["seconds"] for c in copies),
             "coresident_unpause_s": t3 - t2,
-            "coresident_engine_paused_s": t3 - self._paused_at,
+            "coresident_engine_paused_s": t3 - paused_at,
             "coresident_copy_bytes_per_rank": copies[0]["bytes"],
             "coresident_shared_bytes_per_rank": copies[0]["bytes_shared"],
         }

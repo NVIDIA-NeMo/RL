@@ -315,7 +315,9 @@ MAX_GENERATION_CALLS = 1 << 16
 WORKER_CONCURRENCY_GROUPS = {GENERATION_CONCURRENCY_GROUP: MAX_GENERATION_CALLS}
 
 
-def check_generation_calls(max_inflight_prompts: int, generations_per_prompt: int) -> None:
+def check_generation_calls(
+    max_inflight_prompts: int, generations_per_prompt: int
+) -> None:
     """Reject a config whose in-flight generation calls (one per row) could exceed MAX_GENERATION_CALLS."""
     calls = max_inflight_prompts * generations_per_prompt
     if calls > MAX_GENERATION_CALLS:
@@ -817,7 +819,9 @@ class MegatronGenerationMixin:
         """
         if not self._inference_engine_initialized:
             return
-        asyncio.run_coroutine_threadsafe(self._coresident_pause(), self._inference_loop).result()
+        asyncio.run_coroutine_threadsafe(
+            self._coresident_pause(), self._inference_loop
+        ).result()
 
     async def _coresident_pause(self) -> None:
         if torch.distributed.get_rank() == 0:
@@ -836,7 +840,9 @@ class MegatronGenerationMixin:
         if not self._inference_engine_initialized:
             self.prepare_for_generation()
             return
-        asyncio.run_coroutine_threadsafe(self._coresident_unpause(), self._inference_loop).result()
+        asyncio.run_coroutine_threadsafe(
+            self._coresident_unpause(), self._inference_loop
+        ).result()
 
     async def _coresident_unpause(self) -> None:
         if torch.distributed.get_rank() == 0:
@@ -2493,7 +2499,9 @@ class MegatronGenerationRefitMixin:
         # TODO: Optimize away the full synchronization.
         torch.cuda.synchronize()
 
-    def open_coresident_refit_handles(self, handles_by_device: dict[str, dict], share: bool = False) -> dict:
+    def open_coresident_refit_handles(
+        self, handles_by_device: dict[str, dict], share: bool = False
+    ) -> dict:
         """Map local learner refit tensors through CUDA IPC and optionally share them.
 
         Matching engine tensors are bound before their first forward. Returns
@@ -2512,10 +2520,16 @@ class MegatronGenerationRefitMixin:
         if not share:
             return {"tensors_bound": 0, "tensors": len(self._coresident_src)}
         if self._inference_engine_initialized:
-            raise RuntimeError("shared engine weights must be bound before the engine's first forward")
+            raise RuntimeError(
+                "shared engine weights must be bound before the engine's first forward"
+            )
         leaf_ids = {id(p) for p in core.parameters()}
-        stats = sm_partition.bind_shared(self._coresident_src, named_refit_tensors(core), leaf_ids)
-        expert_stats = sm_partition.bind_shared_expert_stacks(core, self._coresident_src)
+        stats = sm_partition.bind_shared(
+            self._coresident_src, named_refit_tensors(core), leaf_ids
+        )
+        expert_stats = sm_partition.bind_shared_expert_stacks(
+            core, self._coresident_src
+        )
         print(f"[sm_partition] expert storage: {expert_stats}", flush=True)
         return {**stats, **expert_stats}
 
@@ -2550,9 +2564,7 @@ class MegatronGenerationRefitMixin:
 
         t0 = time.perf_counter()
         core = sm_partition.refit_core(self._gen_model())
-        stats = sm_partition.copy_refit(
-            self._coresident_src, named_refit_tensors(core)
-        )
+        stats = sm_partition.copy_refit(self._coresident_src, named_refit_tensors(core))
         with torch.inference_mode():
             refresh_module_caches(core)
         # Derived weight storage, as every other refit path (FlashInfer MXFP8 experts; no-op otherwise).

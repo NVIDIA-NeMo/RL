@@ -1071,7 +1071,9 @@ class MegatronPolicyWorkerImpl(
                 or self.megatron_cfg.optimizer.use_layer_wise_distributed_optimizer
             )
         ):
-            sm_partition.configure_shared_expert_checkpoint(self.megatron_cfg.checkpoint)
+            sm_partition.configure_shared_expert_checkpoint(
+                self.megatron_cfg.checkpoint
+            )
             shared_expert_hooks = [sm_partition.prepare_shared_expert_layout]
         model_and_optimizer_state = setup_model_and_optimizer(
             config,
@@ -4999,7 +5001,9 @@ class MegatronPolicyWorkerImpl(
         from megatron.core.resharding.utils import named_refit_tensors
 
         torch.cuda.synchronize()
-        return sm_partition.storage_fingerprint(named_refit_tensors(sm_partition.refit_core(self.model)))
+        return sm_partition.storage_fingerprint(
+            named_refit_tensors(sm_partition.refit_core(self.model))
+        )
 
     def _refit_is_trtllm_nccl_reshard(self) -> bool:
         """Whether this policy refits TRT-LLM engines shard-to-shard."""

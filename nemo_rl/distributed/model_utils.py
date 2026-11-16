@@ -330,14 +330,14 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             softmax_output = softmax_output.exp()
 
             selected_indices = masked_target[:, chunk_start:chunk_end].unsqueeze(-1)
-            selected_grad = (~target_mask[:, chunk_start:chunk_end]).unsqueeze(-1).float()
+            selected_grad = (
+                (~target_mask[:, chunk_start:chunk_end]).unsqueeze(-1).float()
+            )
             selected_grad.sub_(softmax_output.gather(-1, selected_indices))
             # Subtract before scaling to preserve rounding, including zero's sign.
             torch.sub(zero, softmax_output, out=softmax_output)
             softmax_output.scatter_(-1, selected_indices, selected_grad)
-            softmax_output.mul_(
-                grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1)
-            )
+            softmax_output.mul_(grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1))
             grad_input[:, chunk_start:chunk_end, :].copy_(softmax_output)
 
             # Explicitly free before next iteration allocates

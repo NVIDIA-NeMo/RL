@@ -45,14 +45,22 @@ class _GroupedWorker(_PlainWorker):
 
 @pytest.fixture(scope="module")
 def ray_local():
-    ray.init(num_cpus=2, include_dashboard=False, ignore_reinit_error=True, _temp_dir="/tmp/ray_gcg_test")
+    ray.init(
+        num_cpus=2,
+        include_dashboard=False,
+        ignore_reinit_error=True,
+        _temp_dir="/tmp/ray_gcg_test",
+    )
     yield
     ray.shutdown()
 
 
 def _control_latency(actor_cls) -> float:
     actor = actor_cls.remote()
-    gens = [actor.generate_async.options(num_returns="streaming").remote(i) for i in range(IN_FLIGHT)]
+    gens = [
+        actor.generate_async.options(num_returns="streaming").remote(i)
+        for i in range(IN_FLIGHT)
+    ]
     time.sleep(5.0)  # let the calls reach the actor
     t0 = time.perf_counter()
     done, _ = ray.wait([actor.control.remote()], timeout=15.0)
@@ -68,8 +76,15 @@ def test_control_call_passes_with_a_generation_group(ray_local):
         WORKER_CONCURRENCY_GROUPS,
     )
 
-    ray.method(concurrency_group=GENERATION_CONCURRENCY_GROUP)(_GroupedWorker.generate_async)
-    assert _control_latency(ray.remote(concurrency_groups=WORKER_CONCURRENCY_GROUPS)(_GroupedWorker)) < 5.0
+    ray.method(concurrency_group=GENERATION_CONCURRENCY_GROUP)(
+        _GroupedWorker.generate_async
+    )
+    assert (
+        _control_latency(
+            ray.remote(concurrency_groups=WORKER_CONCURRENCY_GROUPS)(_GroupedWorker)
+        )
+        < 5.0
+    )
 
 
 def test_control_call_queues_without_it(ray_local):
@@ -84,14 +99,27 @@ def test_megatron_workers_put_generate_async_in_the_generation_group():
         GENERATION_CONCURRENCY_GROUP,
         MegatronGenerationMixin,
     )
-    from nemo_rl.models.policy.workers.megatron_policy_worker import MegatronPolicyWorker
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorker,
+    )
 
-    assert MegatronPolicyWorker._default_options["concurrency_groups"][GENERATION_CONCURRENCY_GROUP] >= IN_FLIGHT
-    assert MegatronGenerationMixin.generate_async.__ray_concurrency_group__ == GENERATION_CONCURRENCY_GROUP
+    assert (
+        MegatronPolicyWorker._default_options["concurrency_groups"][
+            GENERATION_CONCURRENCY_GROUP
+        ]
+        >= IN_FLIGHT
+    )
+    assert (
+        MegatronGenerationMixin.generate_async.__ray_concurrency_group__
+        == GENERATION_CONCURRENCY_GROUP
+    )
 
 
 def test_check_generation_calls():
-    from nemo_rl.models.generation.megatron.megatron_worker import MAX_GENERATION_CALLS, check_generation_calls
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MAX_GENERATION_CALLS,
+        check_generation_calls,
+    )
 
     check_generation_calls(MAX_GENERATION_CALLS // 8, 8)
     with pytest.raises(ValueError, match="generation calls in flight"):

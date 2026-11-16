@@ -82,7 +82,9 @@ def test_coresident_refit_refreshes_captured_mamba_cache(shared: bool) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize("packed", [False, True])
-def test_shared_expert_stacks_keep_graph_addresses_and_refit_values(packed: bool) -> None:
+def test_shared_expert_stacks_keep_graph_addresses_and_refit_values(
+    packed: bool,
+) -> None:
     # Actual inference modules are optional in the standalone CPU suite.
     from megatron.core.resharding.utils import named_refit_tensors
     from megatron.core.transformer.module import MegatronModule
@@ -99,15 +101,21 @@ def test_shared_expert_stacks_keep_graph_addresses_and_refit_values(packed: bool
         backing = torch.randn(3, 16, 16, device="cuda", dtype=torch.bfloat16)
         for index in range(3):
             tensor = backing[index] if packed else backing[2 - index]
-            linear.register_parameter(f"weight{index}", torch.nn.Parameter(torch.empty_like(tensor)))
+            linear.register_parameter(
+                f"weight{index}", torch.nn.Parameter(torch.empty_like(tensor))
+            )
             source[f"{linear_name}.weight{index}"] = tensor
-    sm_partition.bind_shared(source, named_refit_tensors(experts), {id(p) for p in experts.parameters()})
+    sm_partition.bind_shared(
+        source, named_refit_tensors(experts), {id(p) for p in experts.parameters()}
+    )
     stats = sm_partition.bind_shared_expert_stacks(experts, source)
     assert stats["shared_expert_layers"] == int(packed)
     if not packed:
         assert not experts._concatenated_weights_built
         experts._build_concatenated_weights()
-    assert not {"_fc1_weight", "_fc2_weight"}.intersection(dict(named_refit_tensors(experts)))
+    assert not {"_fc1_weight", "_fc2_weight"}.intersection(
+        dict(named_refit_tensors(experts))
+    )
     stacks = (experts._fc1_weight, experts._fc2_weight)
     pointers = [stack.data_ptr() for stack in stacks]
     x = torch.randn(3, 8, 16, device="cuda", dtype=torch.bfloat16)
@@ -124,13 +132,14 @@ def test_shared_expert_stacks_keep_graph_addresses_and_refit_values(packed: bool
         stats = sm_partition.copy_refit(source, named_refit_tensors(experts))
         graph.replay()
         torch.cuda.synchronize()
-        expected_stacks = [torch.stack([source[f"{name}.weight{i}"] for i in range(3)])
-                           for name in ("linear_fc1", "linear_fc2")]
+        expected_stacks = [
+            torch.stack([source[f"{name}.weight{i}"] for i in range(3)])
+            for name in ("linear_fc1", "linear_fc2")
+        ]
         expected = torch.bmm(torch.bmm(x, expected_stacks[0]), expected_stacks[1])
         assert torch.equal(out, expected)
         assert [stack.data_ptr() for stack in stacks] == pointers
         assert (stats["bytes"] == 0) == packed
-
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -155,10 +164,16 @@ def test_shared_expert_order_uses_native_optimizer_storage_layout() -> None:
     models = [experts]
     assert sm_partition.prepare_shared_expert_layout(models) is models
     layout = DistributedOptimizer._compute_per_buffer_param_layout(
-        list(experts.parameters()), bucket_size=512, data_parallel_world_size=1,
+        list(experts.parameters()),
+        bucket_size=512,
+        data_parallel_world_size=1,
         ddp_config=DistributedDataParallelConfig(pad_buckets_for_high_nccl_busbw=False),
     )
-    backing = torch.empty(max(end for _, end, _ in layout.param_index_map.values()), device="cuda", dtype=torch.bfloat16)
+    backing = torch.empty(
+        max(end for _, end, _ in layout.param_index_map.values()),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
     for name, parameter in experts.named_parameters():
         start, end, _ = layout.param_index_map[parameter]
         parameter.data = backing[start:end].view_as(parameter)
@@ -168,5 +183,8 @@ def test_shared_expert_order_uses_native_optimizer_storage_layout() -> None:
         weights = [getattr(linear, f"weight{i}") for i in range(3)]
         stack = sm_partition._contiguous_expert_stack(weights)
         assert stack is not None
-        assert torch.equal(stack, torch.stack([originals[f"{linear_name}.weight{i}"] for i in range(3)]))
+        assert torch.equal(
+            stack,
+            torch.stack([originals[f"{linear_name}.weight{i}"] for i in range(3)]),
+        )
         assert all(stack[i].data_ptr() == weights[i].data_ptr() for i in range(3))

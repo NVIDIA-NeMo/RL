@@ -90,7 +90,10 @@ def engine_sm_fraction(policy_cfg: Any) -> Optional[float]:
 
 
 def validate(
-    policy_cfg: Any, *, env: Optional[dict] = None, unsupported: Optional[dict[str, bool]] = None
+    policy_cfg: Any,
+    *,
+    env: Optional[dict] = None,
+    unsupported: Optional[dict[str, bool]] = None,
 ) -> None:
     """Reject configurations co-residence cannot serve (the driver calls it at setup).
 
@@ -101,27 +104,37 @@ def validate(
         return
     env = os.environ if env is None else env
     if not 0.0 < frac < 1.0:
-        raise ValueError(f"policy.generation.colocated.engine_sm_fraction must be in (0, 1), got {frac}")
+        raise ValueError(
+            f"policy.generation.colocated.engine_sm_fraction must be in (0, 1), got {frac}"
+        )
     gen = policy_cfg["generation"]
     if gen.get("backend") != "megatron":
-        raise ValueError("engine_sm_fraction (co-resident generation) needs the Megatron generation backend")
+        raise ValueError(
+            "engine_sm_fraction (co-resident generation) needs the Megatron generation backend"
+        )
     if gen["colocated"].get("enabled", False):
         raise ValueError(
             "engine_sm_fraction runs the engine as its own processes on the training GPUs: set "
             "policy.generation.colocated.enabled=false (the in-process colocated engine stands down for training)"
         )
     if engine_weights_mode(policy_cfg) not in ("copy", "shared"):
-        raise ValueError("policy.generation.colocated.engine_weights must be 'copy' or 'shared'")
+        raise ValueError(
+            "policy.generation.colocated.engine_weights must be 'copy' or 'shared'"
+        )
     backend = partition_backend(policy_cfg)
     if backend not in BACKENDS:
-        raise ValueError(f"policy.generation.colocated.sm_partition_backend must be one of {BACKENDS}, got {backend!r}")
+        raise ValueError(
+            f"policy.generation.colocated.sm_partition_backend must be one of {BACKENDS}, got {backend!r}"
+        )
     if backend == "mps_static" and not env.get(MPS_PARTITION_MAP_ENV):
         raise ValueError(
             f"sm_partition_backend='mps_static' needs {MPS_PARTITION_MAP_ENV}: the per-node map of MPS static SM "
             "partitions the job created before Ray (driver R590+ / CUDA 13.1+, MPS daemon started with -S)"
         )
     if gen.get("refit_transport") != "ipc":
-        raise ValueError("engine_sm_fraction needs policy.generation.refit_transport=ipc (same-GPU CUDA IPC refit)")
+        raise ValueError(
+            "engine_sm_fraction needs policy.generation.refit_transport=ipc (same-GPU CUDA IPC refit)"
+        )
     if not env.get("CUDA_MPS_PIPE_DIRECTORY"):
         raise ValueError(
             "engine_sm_fraction needs an MPS control daemon on every node, started before Ray, with "
@@ -151,7 +164,9 @@ def validate(
             f"(learner, engine): {mismatch}"
         )
     if (learner.get("pipeline_model_parallel_size") or 1) > 1:
-        raise ValueError("engine_sm_fraction with pipeline parallelism is not built yet")
+        raise ValueError(
+            "engine_sm_fraction with pipeline parallelism is not built yet"
+        )
     for what, on in (unsupported or {}).items():
         if on:
             raise ValueError(f"engine_sm_fraction with {what} is not built yet")
@@ -194,14 +209,20 @@ def mps_percentage(frac: float, role: Role) -> Optional[int]:
     return 100 - max(1, min(99, round(100 * frac)))
 
 
-def actor_env(policy_cfg: Any, role: Role, *, env: Optional[dict] = None) -> dict[str, str]:
+def actor_env(
+    policy_cfg: Any, role: Role, *, env: Optional[dict] = None
+) -> dict[str, str]:
     """Environment of a co-resident worker of ``role`` (empty when not co-resident)."""
     frac = engine_sm_fraction(policy_cfg)
     if frac is None:
         return {}
     env = os.environ if env is None else env
     out = {}
-    pct = mps_percentage(frac, role) if partition_backend(policy_cfg) == "mps_percentage" else None
+    pct = (
+        mps_percentage(frac, role)
+        if partition_backend(policy_cfg) == "mps_percentage"
+        else None
+    )
     if pct is not None:
         out[MPS_PCT_ENV] = str(pct)
     for k in ("CUDA_MPS_PIPE_DIRECTORY", MPS_PARTITION_MAP_ENV):
@@ -210,13 +231,18 @@ def actor_env(policy_cfg: Any, role: Role, *, env: Optional[dict] = None) -> dic
     return out
 
 
-def select_static_partition(policy_cfg: Any, role: Role, gpu_index: int) -> Optional[str]:
+def select_static_partition(
+    policy_cfg: Any, role: Role, gpu_index: int
+) -> Optional[str]:
     """Select the worker static MPS partition before CUDA initializes.
 
     ``mps_static``: in a co-resident worker BEFORE its first CUDA call, pick this GPU's partition for ``role``
     (``CUDA_MPS_SM_PARTITION``). No-op for the other backends.
     """
-    if engine_sm_fraction(policy_cfg) is None or partition_backend(policy_cfg) != "mps_static":
+    if (
+        engine_sm_fraction(policy_cfg) is None
+        or partition_backend(policy_cfg) != "mps_static"
+    ):
         return None
     import json
 
@@ -227,7 +253,9 @@ def select_static_partition(policy_cfg: Any, role: Role, gpu_index: int) -> Opti
     return os.environ["CUDA_MPS_SM_PARTITION"]
 
 
-def check_worker(policy_cfg: Any, role: Role, *, rank: int = 0) -> Optional[dict[str, Any]]:
+def check_worker(
+    policy_cfg: Any, role: Role, *, rank: int = 0
+) -> Optional[dict[str, Any]]:
     """In a co-resident worker after CUDA init: its SM share must be in effect. Logs and returns what it sees.
 
     Proof (capped learner): the process sees fewer SMs than the GPU has (NVML's count is unaffected by MPS). Without an
@@ -236,13 +264,21 @@ def check_worker(policy_cfg: Any, role: Role, *, rank: int = 0) -> Optional[dict
     """
     if engine_sm_fraction(policy_cfg) is None:
         return None
-    seen = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    seen = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
     if partition_backend(policy_cfg) == "mps_static":
         want = int(os.environ.get("NRL_MPS_SM_PARTITION_SMS", "0"))
-        info = {"role": role, "mps_sm_partition": os.environ.get("CUDA_MPS_SM_PARTITION"), "sms_seen": seen,
-                "sms_partition": want}
+        info = {
+            "role": role,
+            "mps_sm_partition": os.environ.get("CUDA_MPS_SM_PARTITION"),
+            "sms_seen": seen,
+            "sms_partition": want,
+        }
         if seen != want:
-            raise RuntimeError(f"co-resident {role} worker: the MPS static partition was not applied: {info}")
+            raise RuntimeError(
+                f"co-resident {role} worker: the MPS static partition was not applied: {info}"
+            )
         print(f"[sm_partition] rank={rank} {info}", flush=True)
         return info
     pct = os.environ.get(MPS_PCT_ENV)
@@ -262,10 +298,14 @@ def check_worker(policy_cfg: Any, role: Role, *, rank: int = 0) -> Optional[dict
     return _check_limit(role, pct, seen, _device_sm_count(), rank)
 
 
-def _check_limit(role: Role, pct: Optional[str], seen: int, full: int, rank: int) -> dict[str, Any]:
+def _check_limit(
+    role: Role, pct: Optional[str], seen: int, full: int, rank: int
+) -> dict[str, Any]:
     info = {"role": role, "mps_pct": pct, "sms_seen": seen, "sms_device": full}
     if pct is None or not seen < full:
-        raise RuntimeError(f"co-resident {role} worker is not running under its MPS limit (no MPS daemon?): {info}")
+        raise RuntimeError(
+            f"co-resident {role} worker is not running under its MPS limit (no MPS daemon?): {info}"
+        )
     print(f"[sm_partition] rank={rank} {info}", flush=True)
     return info
 
@@ -282,9 +322,17 @@ def _device_sm_count() -> int:
 
     env = {k: v for k, v in os.environ.items() if k != MPS_PCT_ENV}
     out = subprocess.run(
-        [sys.executable, "-c", "import torch; "
-         f"print(torch.cuda.get_device_properties({torch.cuda.current_device()}).multi_processor_count)"],
-        env=env, capture_output=True, text=True, check=True, timeout=180,
+        [
+            sys.executable,
+            "-c",
+            "import torch; "
+            f"print(torch.cuda.get_device_properties({torch.cuda.current_device()}).multi_processor_count)",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=180,
     )
     return int(out.stdout.strip().splitlines()[-1])
 
@@ -325,7 +373,10 @@ def engine_rank_gpus(world: int, learner_ep: int, engine_ep: int) -> list[int]:
     Learner rank g is on GPU g; EP ranks are the fastest-varying expert-group coordinate (TP = ETP = 1).
     """
     m = engine_ep // learner_ep
-    gpus = [learner_ep * (m * (r // engine_ep) + (r % engine_ep) % m) + (r % engine_ep) // m for r in range(world)]
+    gpus = [
+        learner_ep * (m * (r // engine_ep) + (r % engine_ep) % m) + (r % engine_ep) // m
+        for r in range(world)
+    ]
     assert sorted(gpus) == list(range(world)), gpus
     return gpus
 
@@ -338,7 +389,9 @@ def refit_names(core: torch.nn.Module) -> dict[str, str]:
     """
     from megatron.core.resharding.planner import _extract_module_metadata
 
-    metadata = _extract_module_metadata(core, torch.distributed.get_rank(), core.config.num_moe_experts, 0, {})
+    metadata = _extract_module_metadata(
+        core, torch.distributed.get_rank(), core.config.num_moe_experts, 0, {}
+    )
     return {m.name: m.resolved_name for m in metadata}
 
 
@@ -347,8 +400,14 @@ def rank_coordinates() -> dict[str, tuple[int, int]]:
     from megatron.core import parallel_state as ps
 
     return {
-        "tp": (ps.get_tensor_model_parallel_rank(), ps.get_tensor_model_parallel_world_size()),
-        "pp": (ps.get_pipeline_model_parallel_rank(), ps.get_pipeline_model_parallel_world_size()),
+        "tp": (
+            ps.get_tensor_model_parallel_rank(),
+            ps.get_tensor_model_parallel_world_size(),
+        ),
+        "pp": (
+            ps.get_pipeline_model_parallel_rank(),
+            ps.get_pipeline_model_parallel_world_size(),
+        ),
     }
 
 
@@ -385,7 +444,9 @@ def open_refit_handles(handles: dict[str, tuple]) -> dict[str, torch.Tensor]:
 
 
 def bind_shared(
-    src: dict[str, torch.Tensor], named_dst: Iterable[tuple[str, torch.Tensor]], leaf_ids: set[int]
+    src: dict[str, torch.Tensor],
+    named_dst: Iterable[tuple[str, torch.Tensor]],
+    leaf_ids: set[int],
 ) -> dict[str, float]:
     """Bind compatible inference parameters to learner CUDA IPC storage.
 
@@ -401,10 +462,17 @@ def bind_shared(
     for name, d in dst.items():
         s = src[name]
         if s.shape != d.shape:
-            raise ValueError(f"co-resident refit: {name} has shape {tuple(s.shape)} (learner) vs {tuple(d.shape)} (engine)")
+            raise ValueError(
+                f"co-resident refit: {name} has shape {tuple(s.shape)} (learner) vs {tuple(d.shape)} (engine)"
+            )
         # A strided view is never bound: TE GEMMs read weights as dense (TE 2.15 is silently wrong on strided ones).
         # Persistent buffers can change during backward, before the optimizer pause.
-        if isinstance(d, torch.nn.Parameter) and s.dtype == d.dtype and s.is_contiguous() and id(d) in leaf_ids:
+        if (
+            isinstance(d, torch.nn.Parameter)
+            and s.dtype == d.dtype
+            and s.is_contiguous()
+            and id(d) in leaf_ids
+        ):
             d.data = s
             bound += 1
     return {"tensors_bound": bound, "tensors": len(dst)}
@@ -443,10 +511,14 @@ def _contiguous_expert_stack(weights: list[torch.Tensor]) -> Optional[torch.Tens
             or weight.storage_offset() != first.storage_offset() + index * first.numel()
         ):
             return None
-    return first.as_strided((len(weights), *first.shape), (first.numel(), *first.stride()))
+    return first.as_strided(
+        (len(weights), *first.shape), (first.numel(), *first.stride())
+    )
 
 
-def _reverse_expert_parameter_order(linear: torch.nn.Module, *, num_experts: int) -> bool:
+def _reverse_expert_parameter_order(
+    linear: torch.nn.Module, *, num_experts: int
+) -> bool:
     """Keep expert names and objects while ordering weights for native DDP's reversed layout."""
     names = [f"weight{index}" for index in range(num_experts)]
     parameters = linear._parameters
@@ -465,7 +537,9 @@ def _reverse_expert_parameter_order(linear: torch.nn.Module, *, num_experts: int
     ):
         return False
     weight_names = set(names)
-    ordered = [(name, value) for name, value in parameters.items() if name not in weight_names]
+    ordered = [
+        (name, value) for name, value in parameters.items() if name not in weight_names
+    ]
     ordered.extend((name, parameters[name]) for name in reversed(names))
     parameters.clear()
     parameters.update(ordered)
@@ -479,7 +553,11 @@ def configure_shared_expert_checkpoint(checkpoint_config: CheckpointConfig) -> N
     Validate the saved format before model setup and require name-based saves for
     subsequent resumes, including resumes into a learner without weight sharing.
     """
-    if checkpoint_config.load_optim and not checkpoint_config.finetune and checkpoint_config.load is not None:
+    if (
+        checkpoint_config.load_optim
+        and not checkpoint_config.finetune
+        and checkpoint_config.load is not None
+    ):
         # Bridge and the distributed optimizer are optional outside this learner.
         from megatron.bridge.training.checkpointing import (
             _DIRECT_ITERATION_DIR_SENTINEL,
@@ -489,18 +567,30 @@ def configure_shared_expert_checkpoint(checkpoint_config: CheckpointConfig) -> N
         from megatron.core import dist_checkpointing
         from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
-        iteration, release = _resolve_checkpoint_iteration(checkpoint_config.load, checkpoint_config.ckpt_step)
+        iteration, release = _resolve_checkpoint_iteration(
+            checkpoint_config.load, checkpoint_config.ckpt_step
+        )
         if not release and iteration != -1:
             checkpoint_dir = (
                 checkpoint_config.load
                 if iteration == _DIRECT_ITERATION_DIR_SENTINEL
-                else get_checkpoint_name(checkpoint_config.load, iteration, release=False)
+                else get_checkpoint_name(
+                    checkpoint_config.load, iteration, release=False
+                )
             )
             common_state = dist_checkpointing.load_common_state_dict(checkpoint_dir)
             if "optimizer" in common_state:
-                metadata = dist_checkpointing.load_content_metadata(preloaded_state_dict=common_state) or {}
+                metadata = (
+                    dist_checkpointing.load_content_metadata(
+                        preloaded_state_dict=common_state
+                    )
+                    or {}
+                )
                 saved_format = metadata.get("distrib_optim_sharding_type")
-                if saved_format not in DistributedOptimizer.checkpoint_fully_reshardable_formats:
+                if (
+                    saved_format
+                    not in DistributedOptimizer.checkpoint_fully_reshardable_formats
+                ):
                     raise ValueError(
                         "Shared expert weights require a model-space optimizer checkpoint; "
                         f"{checkpoint_dir!r} uses {saved_format!r}. Bucket-position optimizer state cannot "
@@ -512,7 +602,9 @@ def configure_shared_expert_checkpoint(checkpoint_config: CheckpointConfig) -> N
     checkpoint_config.dist_ckpt_optim_fully_reshardable = True
 
 
-def prepare_shared_expert_layout(models: list[torch.nn.Module]) -> list[torch.nn.Module]:
+def prepare_shared_expert_layout(
+    models: list[torch.nn.Module],
+) -> list[torch.nn.Module]:
     """Pre-DDP hook: pack ordinary expert weights in inference order without changing their kernels."""
     # Megatron's expert modules are optional outside the co-resident learner.
     from megatron.core.transformer.moe.experts import TEGroupedMLP
@@ -522,12 +614,18 @@ def prepare_shared_expert_layout(models: list[torch.nn.Module]) -> list[torch.nn
         for module in model.modules():
             if isinstance(module, TEGroupedMLP):
                 for linear in (module.linear_fc1, module.linear_fc2):
-                    linears += _reverse_expert_parameter_order(linear, num_experts=module.num_local_experts)
-    print(f"[sm_partition] expert projections prepared before DDP: {linears}", flush=True)
+                    linears += _reverse_expert_parameter_order(
+                        linear, num_experts=module.num_local_experts
+                    )
+    print(
+        f"[sm_partition] expert projections prepared before DDP: {linears}", flush=True
+    )
     return models
 
 
-def bind_shared_expert_stacks(core: torch.nn.Module, src: dict[str, torch.Tensor]) -> dict[str, float]:
+def bind_shared_expert_stacks(
+    core: torch.nn.Module, src: dict[str, torch.Tensor]
+) -> dict[str, float]:
     """Keep compatible BF16/FP16 expert stacks in learner storage through inference initialization.
 
     Both projections must already alias their corresponding source parameters and be packed in expert order.
@@ -541,7 +639,9 @@ def bind_shared_expert_stacks(core: torch.nn.Module, src: dict[str, torch.Tensor
         if not isinstance(module, InferenceGroupedMLP):
             continue
         if module._concatenated_weights_built:
-            raise RuntimeError("shared expert stacks must be bound before the first inference forward")
+            raise RuntimeError(
+                "shared expert stacks must be bound before the first inference forward"
+            )
         stacks = {}
         for linear_name, buffer_name in module._EXPERT_WEIGHT_GROUPS:
             linear = getattr(module, linear_name)
@@ -550,7 +650,9 @@ def bind_shared_expert_stacks(core: torch.nn.Module, src: dict[str, torch.Tensor
                 name = f"{prefix + '.' if prefix else ''}{linear_name}.weight{index}"
                 weight = getattr(linear, f"weight{index}")
                 source = src[name]
-                if not isinstance(weight, torch.nn.Parameter) or not _aliases(weight, source):
+                if not isinstance(weight, torch.nn.Parameter) or not _aliases(
+                    weight, source
+                ):
                     break
                 weights.append(source)
             if len(weights) != module.num_local_experts:
@@ -571,10 +673,17 @@ def bind_shared_expert_stacks(core: torch.nn.Module, src: dict[str, torch.Tensor
 
 
 def _aliases(d: torch.Tensor, s: torch.Tensor) -> bool:
-    return d.data_ptr() == s.data_ptr() and d.shape == s.shape and d.stride() == s.stride() and d.dtype == s.dtype
+    return (
+        d.data_ptr() == s.data_ptr()
+        and d.shape == s.shape
+        and d.stride() == s.stride()
+        and d.dtype == s.dtype
+    )
 
 
-def copy_refit(src: dict[str, torch.Tensor], named_dst: Iterable[tuple[str, torch.Tensor]]) -> dict[str, float]:
+def copy_refit(
+    src: dict[str, torch.Tensor], named_dst: Iterable[tuple[str, torch.Tensor]]
+) -> dict[str, float]:
     """Copy private inference tensors and account for shared storage.
 
     Engine side, per step (engine paused, learner idle): copy every learner tensor into the engine tensor of the
@@ -597,7 +706,11 @@ def copy_refit(src: dict[str, torch.Tensor], named_dst: Iterable[tuple[str, torc
             if _aliases(d, s):
                 shared += nbytes
                 continue
-            if nbytes <= _FOREACH_COPY_MAX_BYTES and s.is_contiguous() and d.is_contiguous():
+            if (
+                nbytes <= _FOREACH_COPY_MAX_BYTES
+                and s.is_contiguous()
+                and d.is_contiguous()
+            ):
                 # Mixed dtype lists force foreach back to one copy per tensor.
                 key = (s.device, d.device, s.dtype, d.dtype)
                 group = copy_groups.get(key)

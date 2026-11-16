@@ -30,7 +30,9 @@ from nemo_rl.distributed.model_utils import (
 @pytest.fixture
 def local_collectives(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
-    monkeypatch.setattr(torch.distributed.nn.functional, "all_reduce", lambda tensor, **kwargs: tensor)
+    monkeypatch.setattr(
+        torch.distributed.nn.functional, "all_reduce", lambda tensor, **kwargs: tensor
+    )
 
 
 def _old_backward(ctx: SimpleNamespace, grad_output: torch.Tensor) -> torch.Tensor:
@@ -40,7 +42,9 @@ def _old_backward(ctx: SimpleNamespace, grad_output: torch.Tensor) -> torch.Tens
         end = min(start + ctx.chunk_size, logits.shape[1])
         chunk = logits[:, start:end].float()
         softmax = _compute_distributed_log_softmax(chunk, group=None).exp()
-        chosen = (~target_mask[:, start:end]).unsqueeze(-1) * torch.nn.functional.one_hot(
+        chosen = (~target_mask[:, start:end]).unsqueeze(
+            -1
+        ) * torch.nn.functional.one_hot(
             masked_target[:, start:end], num_classes=logits.shape[-1]
         )
         chunk_grad = chosen.float().sub_(softmax)
@@ -50,14 +54,30 @@ def _old_backward(ctx: SimpleNamespace, grad_output: torch.Tensor) -> torch.Tens
     return grad
 
 
-@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"))])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="needs a GPU"
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("reuse", [False, True])
 @pytest.mark.parametrize("offset", [0, 20])
 @pytest.mark.parametrize("underflow", [False, True])
 def test_chunked_backward_is_bitwise_equal_to_dense_mask(
-    local_collectives: None, monkeypatch: pytest.MonkeyPatch,
-    device: str, dtype: torch.dtype, reuse: bool, offset: int, underflow: bool,
+    local_collectives: None,
+    monkeypatch: pytest.MonkeyPatch,
+    device: str,
+    dtype: torch.dtype,
+    reuse: bool,
+    offset: int,
+    underflow: bool,
 ) -> None:
     torch.manual_seed(44)
     leaf = torch.randn(2, 5, 17, device=device, dtype=dtype)
@@ -70,16 +90,22 @@ def test_chunked_backward_is_bitwise_equal_to_dense_mask(
     target[0, 0], target[1, -1] = offset - 1, offset + 17
     mask = (target < offset) | (target >= offset + 17)
     masked = (target - offset).masked_fill(mask, 0)
-    upstream = torch.tensor([[0.0, -0.0, 1.0, -0.75, 2.3], [-0.0, 0.0, -1.0, 0.125, -3.0]], device=device)
-    ctx = SimpleNamespace(saved_tensors=(logits.detach().clone(), mask, masked), chunk_size=2)
+    upstream = torch.tensor(
+        [[0.0, -0.0, 1.0, -0.75, 2.3], [-0.0, 0.0, -1.0, 0.125, -3.0]], device=device
+    )
+    ctx = SimpleNamespace(
+        saved_tensors=(logits.detach().clone(), mask, masked), chunk_size=2
+    )
     expected = _old_backward(ctx, upstream)
 
     def forbid_one_hot(*args: object, **kwargs: object) -> None:
         raise AssertionError("backward must not allocate a dense vocabulary mask")
 
     monkeypatch.setattr(torch.nn.functional, "one_hot", forbid_one_hot)
-    output = ChunkedDistributedLogprob.apply(logits, target, offset, offset + 17, 2, None, False, reuse)
-    actual, = torch.autograd.grad(output, leaf, grad_outputs=upstream)
+    output = ChunkedDistributedLogprob.apply(
+        logits, target, offset, offset + 17, 2, None, False, reuse
+    )
+    (actual,) = torch.autograd.grad(output, leaf, grad_outputs=upstream)
     bits = torch.int32 if dtype == torch.float32 else torch.int16
     assert torch.equal(actual.view(bits), expected.view(bits))
 
@@ -89,7 +115,12 @@ def test_chunked_backward_reduces_real_peak_memory(local_collectives: None) -> N
     logits = torch.randn(1, 512, 131072, device="cuda", dtype=torch.bfloat16)
     target = torch.randint(0, 131072, (1, 512), device="cuda")
     mask = torch.zeros_like(target, dtype=torch.bool)
-    ctx = SimpleNamespace(saved_tensors=(logits, mask, target), chunk_size=512, tp_group=None, reuse_logits_storage=False)
+    ctx = SimpleNamespace(
+        saved_tensors=(logits, mask, target),
+        chunk_size=512,
+        tp_group=None,
+        reuse_logits_storage=False,
+    )
     upstream = torch.randn(1, 512, device="cuda")
 
     T = TypeVar("T")
@@ -112,10 +143,17 @@ def test_chunked_backward_reduces_real_peak_memory(local_collectives: None) -> N
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_chunked_backward_graph_observes_changed_logits(local_collectives: None) -> None:
+def test_chunked_backward_graph_observes_changed_logits(
+    local_collectives: None,
+) -> None:
     logits = torch.randn(1, 4, 17, device="cuda")
     target = torch.tensor([[0, 2, 4, 6]], device="cuda")
-    ctx = SimpleNamespace(saved_tensors=(logits, torch.zeros_like(target, dtype=torch.bool), target), chunk_size=3, tp_group=None, reuse_logits_storage=False)
+    ctx = SimpleNamespace(
+        saved_tensors=(logits, torch.zeros_like(target, dtype=torch.bool), target),
+        chunk_size=3,
+        tp_group=None,
+        reuse_logits_storage=False,
+    )
     upstream = torch.tensor([[0.0, -0.0, -0.75, 2.3]], device="cuda")
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
