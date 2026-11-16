@@ -45,6 +45,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
+from nemo_rl.algorithms.single_controller_utils.simulator import SimulatorConfig
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig as XTokenOffPolicyDistillationMasterConfig,
 )
@@ -169,6 +170,10 @@ def _check_outdated_config(config_file: str, config: DictConfig) -> None:
     # checks do not apply to them. run_eval.py skips them for the same reason.
     if "/evals/" in config_file:
         pytest.skip("eval configs have a different structure from training configs")
+    # Loaded next to a recipe by run_single_controller_simulator.py; the entrypoint
+    # checks run on the recipe, not on the simulator config.
+    if "/simulator/" in config_file:
+        pytest.skip("simulator configs are not training configs")
 
     print(f"\nValidating config file: {config_file}")
 
@@ -199,6 +204,9 @@ def _check_required_keys(config_file: str, config: DictConfig) -> None:
     if "/evals/" in config_file:
         master_config_class = EvalMasterConfig
         config_type = "eval"
+    elif "/simulator/" in config_file:
+        master_config_class = SimulatorConfig
+        config_type = "simulator"
     elif "async_rl" in config_dict:
         # SingleController configs also carry a grpo or ppo block, so match them first.
         master_config_class = SingleControllerMasterConfig

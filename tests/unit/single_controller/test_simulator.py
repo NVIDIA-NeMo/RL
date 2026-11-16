@@ -18,17 +18,16 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 
-from examples import run_single_controller_simulator
 from nemo_rl.algorithms import single_controller as single_controller_module
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
@@ -45,7 +44,7 @@ from nemo_rl.algorithms.single_controller_utils.simulator import (
     CpuTrainer,
     NoOpWeightSynchronizer,
     SGLangNoOpWeightSynchronizer,
-    SimulatorSettings,
+    SimulatorConfig,
     apply_simulator_overrides,
     build_simulated_weight_synchronizer,
     reject_online_quantization,
@@ -54,6 +53,11 @@ from nemo_rl.algorithms.single_controller_utils.simulator import (
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.observability import MetricsDataPlaneClient
+from nemo_rl.utils.config import load_config
+
+_SIMULATOR_EXEMPLAR = (
+    Path(__file__).parents[3] / "examples/configs/simulator/rollout_only.yaml"
+)
 
 _PARTITION = "rollout_data"
 _DP_CFG: dict[str, Any] = {
@@ -63,41 +67,51 @@ _DP_CFG: dict[str, Any] = {
 }
 
 
-# ── settings ────────────────────────────────────────────────────────────────
+# ── simulator config ────────────────────────────────────────────────────────
 
 
-def test_settings_default_to_rollout_only_with_cpu_trainer() -> None:
-    settings = SimulatorSettings()
+def test_config_defaults_to_rollout_only_with_cpu_trainer() -> None:
+    settings = SimulatorConfig()
     assert settings.mode == "rollout_only"
     assert settings.uses_cpu_trainer
 
 
+def test_shipped_simulator_yaml_states_the_schema_defaults() -> None:
+    """The exemplar documents every key at the value the schema defaults it to."""
+    shipped = OmegaConf.to_container(load_config(_SIMULATOR_EXEMPLAR), resolve=True)
+    assert isinstance(shipped, dict)
+    assert shipped == SimulatorConfig().model_dump()
+    assert SimulatorConfig.model_validate(shipped) == SimulatorConfig()
+
+
 @pytest.mark.parametrize("mode", ["train_only", "train_rollout"])
-def test_settings_reject_unimplemented_modes(mode: str) -> None:
+def test_config_rejects_unimplemented_modes(mode: str) -> None:
     with pytest.raises(NotImplementedError, match=mode):
-        SimulatorSettings(mode=mode)  # type: ignore[arg-type]
+        SimulatorConfig(mode=mode)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("backend", ["automodel", "mcore"])
-def test_settings_reject_real_train_backends_in_rollout_only(backend: str) -> None:
+def test_config_rejects_real_train_backends_in_rollout_only(backend: str) -> None:
     with pytest.raises(NotImplementedError, match="cpu"):
-        SimulatorSettings(train_backend=backend)  # type: ignore[arg-type]
+        SimulatorConfig(train_backend=backend)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    "build",
     [
-        {"mode": "bogus"},
-        {"train_backend": "gpu"},
-        {"train_time_s": -1.0},
-        {"refit_time_s": -0.5},
-        {"num_nodes": 0},
-        {"num_steps": 0},
+        lambda: SimulatorConfig(mode="bogus"),  # type: ignore[arg-type]
+        lambda: SimulatorConfig(train_backend="gpu"),  # type: ignore[arg-type]
+        lambda: SimulatorConfig(train_time_s=-1.0),
+        lambda: SimulatorConfig(refit_time_s=-0.5),
+        lambda: SimulatorConfig(num_nodes=0),
+        lambda: SimulatorConfig(num_steps=0),
+        # A misspelt key must not silently fall back to the default.
+        lambda: SimulatorConfig(train_time=5.0),  # type: ignore[call-arg]
     ],
 )
-def test_settings_reject_invalid_values(kwargs: dict[str, Any]) -> None:
+def test_config_rejects_invalid_values(build: Callable[[], SimulatorConfig]) -> None:
     with pytest.raises(ValueError):
-        SimulatorSettings(**kwargs)
+        build()
 
 
 # ── config overrides ────────────────────────────────────────────────────────
@@ -124,7 +138,7 @@ def _raw_config(*, colocated: bool = False) -> dict[str, Any]:
 def test_apply_overrides_sets_steps_nodes_and_drops_validation() -> None:
     raw = _raw_config()
     apply_simulator_overrides(
-        raw, SimulatorSettings(num_steps=20, num_nodes=4, train_time_s=1.0)
+        raw, SimulatorConfig(num_steps=20, num_nodes=4, train_time_s=1.0)
     )
     assert raw["grpo"]["max_num_steps"] == 20
     # Widened so a short dataset cannot clamp the requested steps away.
@@ -140,15 +154,15 @@ def test_apply_overrides_sizes_sglang_engines_from_num_nodes() -> None:
     generation = raw["policy"]["generation"]
     generation["backend"] = "sglang"
     generation["sglang_cfg"] = {"sglang_server_config": {"num_gpus": 1}}
-    apply_simulator_overrides(raw, SimulatorSettings(num_nodes=4))
+    apply_simulator_overrides(raw, SimulatorConfig(num_nodes=4))
     # SGLang counts its engines from num_gpus, so it follows the node count.
     assert generation["sglang_cfg"]["sglang_server_config"]["num_gpus"] == 4 * 8
     assert generation["colocated"]["resources"]["num_nodes"] == 4
 
 
-def test_apply_overrides_keeps_recipe_values_when_flags_absent() -> None:
+def test_apply_overrides_keeps_recipe_values_when_keys_are_unset() -> None:
     raw = _raw_config()
-    apply_simulator_overrides(raw, SimulatorSettings())
+    apply_simulator_overrides(raw, SimulatorConfig())
     assert raw["grpo"]["max_num_steps"] == 1000
     assert raw["grpo"]["max_num_epochs"] == 1
     assert raw["policy"]["generation"]["colocated"]["resources"]["num_nodes"] == 2
@@ -160,13 +174,13 @@ def test_apply_overrides_keeps_recipe_values_when_flags_absent() -> None:
 def test_apply_overrides_keeps_larger_recipe_epoch_count() -> None:
     raw = _raw_config()
     raw["grpo"]["max_num_epochs"] = 50
-    apply_simulator_overrides(raw, SimulatorSettings(num_steps=3))
+    apply_simulator_overrides(raw, SimulatorConfig(num_steps=3))
     assert raw["grpo"]["max_num_epochs"] == 50
 
 
 def test_apply_overrides_colocated_recipe_only_touches_cluster_nodes() -> None:
     raw = _raw_config(colocated=True)
-    apply_simulator_overrides(raw, SimulatorSettings(num_nodes=3))
+    apply_simulator_overrides(raw, SimulatorConfig(num_nodes=3))
     assert raw["cluster"]["num_nodes"] == 3
     assert raw["policy"]["generation"]["colocated"]["resources"]["num_nodes"] == 2
 
@@ -174,7 +188,7 @@ def test_apply_overrides_colocated_recipe_only_touches_cluster_nodes() -> None:
 def test_apply_overrides_defaults_load_format_to_auto() -> None:
     raw = _raw_config()
     raw["policy"]["generation"]["vllm_cfg"] = {}
-    apply_simulator_overrides(raw, SimulatorSettings())
+    apply_simulator_overrides(raw, SimulatorConfig())
     # No refit follows to fill dummy weights in, so the engine loads the checkpoint.
     assert raw["policy"]["generation"]["vllm_cfg"]["load_format"] == "auto"
 
@@ -182,7 +196,7 @@ def test_apply_overrides_defaults_load_format_to_auto() -> None:
 def test_apply_overrides_keeps_explicit_load_format() -> None:
     raw = _raw_config()
     raw["policy"]["generation"]["vllm_cfg"] = {"load_format": "safetensors"}
-    apply_simulator_overrides(raw, SimulatorSettings())
+    apply_simulator_overrides(raw, SimulatorConfig())
     assert raw["policy"]["generation"]["vllm_cfg"]["load_format"] == "safetensors"
 
 
@@ -231,32 +245,32 @@ def _master_config(
 
 
 def test_validate_accepts_vllm_rollout_only_recipe() -> None:
-    validate_simulator_config(_master_config(), SimulatorSettings(refit_time_s=5.0))
+    validate_simulator_config(_master_config(), SimulatorConfig(refit_time_s=5.0))
 
 
 def test_validate_rejects_ppo() -> None:
     with pytest.raises(NotImplementedError, match="PPO"):
-        validate_simulator_config(_master_config(ppo=True), SimulatorSettings())
+        validate_simulator_config(_master_config(ppo=True), SimulatorConfig())
 
 
 @pytest.mark.parametrize("backend", ["megatron", "trtllm"])
 def test_validate_rejects_unsupported_backends(backend: str) -> None:
     with pytest.raises(NotImplementedError, match="vllm"):
-        validate_simulator_config(_master_config(backend=backend), SimulatorSettings())
+        validate_simulator_config(_master_config(backend=backend), SimulatorConfig())
 
 
 def test_validate_accepts_sglang_rollout_only_recipe() -> None:
     # No vllm_cfg at all: the vLLM-only checks must not be reached.
     master_config = _master_config(backend="sglang")
     del master_config.policy["generation"]["vllm_cfg"]
-    validate_simulator_config(master_config, SimulatorSettings(refit_time_s=5.0))
+    validate_simulator_config(master_config, SimulatorConfig(refit_time_s=5.0))
 
 
 def test_validate_rejects_sglang_in_place_pause() -> None:
     with pytest.raises(ValueError, match="in_place"):
         validate_simulator_config(
             _master_config(backend="sglang", sglang_pause_mode="in_place"),
-            SimulatorSettings(),
+            SimulatorConfig(),
         )
 
 
@@ -265,56 +279,54 @@ def test_validate_rejects_sglang_needs_offload() -> None:
     with pytest.raises(ValueError, match="needs_offload"):
         validate_simulator_config(
             _master_config(backend="sglang", sglang_needs_offload=True),
-            SimulatorSettings(),
+            SimulatorConfig(),
         )
 
 
 def test_validate_rejects_dynamo_serving() -> None:
     with pytest.raises(NotImplementedError, match="policy.generation.dynamo=true"):
         validate_simulator_config(
-            _master_config(generation_extra={"dynamo": True}), SimulatorSettings()
+            _master_config(generation_extra={"dynamo": True}), SimulatorConfig()
         )
 
 
 def test_validate_rejects_dummy_load_format() -> None:
     with pytest.raises(ValueError, match="load_format='dummy'"):
         validate_simulator_config(
-            _master_config(vllm_cfg={"load_format": "dummy"}), SimulatorSettings()
+            _master_config(vllm_cfg={"load_format": "dummy"}), SimulatorConfig()
         )
 
 
 def test_validate_rejects_checkpointing() -> None:
     with pytest.raises(ValueError, match="checkpointing.enabled=false"):
         validate_simulator_config(
-            _master_config(checkpointing_enabled=True), SimulatorSettings()
+            _master_config(checkpointing_enabled=True), SimulatorConfig()
         )
 
 
 def test_validate_rejects_refittable_fp8_kv_cache() -> None:
     with pytest.raises(NotImplementedError, match="kv_cache_dtype"):
         validate_simulator_config(
-            _master_config(vllm_cfg={"kv_cache_dtype": "fp8"}), SimulatorSettings()
+            _master_config(vllm_cfg={"kv_cache_dtype": "fp8"}), SimulatorConfig()
         )
 
 
 def test_validate_rejects_deferred_routed_experts() -> None:
     with pytest.raises(NotImplementedError, match="defer_routed_experts_to_policy"):
-        validate_simulator_config(
-            _master_config(defer_routes=True), SimulatorSettings()
-        )
+        validate_simulator_config(_master_config(defer_routes=True), SimulatorConfig())
 
 
 def test_validate_rejects_forest_training() -> None:
     with pytest.raises(NotImplementedError, match="forest_training"):
         validate_simulator_config(
-            _master_config(forest_training=True), SimulatorSettings()
+            _master_config(forest_training=True), SimulatorConfig()
         )
 
 
 def test_validate_rejects_adaptive_ppo_clip() -> None:
     with pytest.raises(NotImplementedError, match="adaptive-ppo-clip"):
         validate_simulator_config(
-            _master_config(tis_type="adaptive-ppo-clip"), SimulatorSettings()
+            _master_config(tis_type="adaptive-ppo-clip"), SimulatorConfig()
         )
 
 
@@ -323,9 +335,9 @@ def test_validate_rejects_refit_hold_at_or_over_the_refit_timeout() -> None:
     timeout = config.async_rl.generation_fleet_health.refit_timeout_s
     assert timeout is not None
     with pytest.raises(ValueError, match="refit_timeout_s"):
-        validate_simulator_config(config, SimulatorSettings(refit_time_s=timeout))
+        validate_simulator_config(config, SimulatorConfig(refit_time_s=timeout))
     config.async_rl.generation_fleet_health.refit_timeout_s = None
-    validate_simulator_config(config, SimulatorSettings(refit_time_s=timeout))
+    validate_simulator_config(config, SimulatorConfig(refit_time_s=timeout))
 
 
 @pytest.mark.parametrize(
@@ -634,7 +646,7 @@ def test_cpu_trainer_has_every_member_the_controller_uses_on_its_trainer() -> No
 # ── the controller's simulated train step ───────────────────────────────────
 
 
-def _bare_controller(settings: SimulatorSettings | None, *, inflight: int):
+def _bare_controller(settings: SimulatorConfig | None, *, inflight: int):
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._simulator = settings
@@ -647,19 +659,19 @@ def _bare_controller(settings: SimulatorSettings | None, *, inflight: int):
 def test_simulated_training_is_free_outside_a_simulator_run() -> None:
     ctrl = _bare_controller(None, inflight=1)
     assert asyncio.run(ctrl._simulate_training()) == (0.0, 0.0)
-    ctrl = _bare_controller(SimulatorSettings(train_time_s=0.0), inflight=1)
+    ctrl = _bare_controller(SimulatorConfig(train_time_s=0.0), inflight=1)
     assert asyncio.run(ctrl._simulate_training()) == (0.0, 0.0)
 
 
 def test_simulated_training_holds_the_full_time_while_rollouts_run() -> None:
-    ctrl = _bare_controller(SimulatorSettings(train_time_s=0.1), inflight=1)
+    ctrl = _bare_controller(SimulatorConfig(train_time_s=0.1), inflight=1)
     held, skipped = asyncio.run(ctrl._simulate_training())
     assert held >= 0.1
     assert skipped == 0.0
 
 
 def test_simulated_training_ends_early_once_rollouts_go_idle() -> None:
-    ctrl = _bare_controller(SimulatorSettings(train_time_s=5.0), inflight=1)
+    ctrl = _bare_controller(SimulatorConfig(train_time_s=5.0), inflight=1)
 
     async def run() -> tuple[float, float]:
         async def go_idle() -> None:
@@ -678,71 +690,8 @@ def test_simulated_training_ends_early_once_rollouts_go_idle() -> None:
 
 
 def test_simulated_training_treats_an_unstarted_dispatch_as_busy() -> None:
-    ctrl = _bare_controller(SimulatorSettings(train_time_s=0.1), inflight=0)
+    ctrl = _bare_controller(SimulatorConfig(train_time_s=0.1), inflight=0)
     ctrl._dispatched_rollouts = {object()}
     held, skipped = asyncio.run(ctrl._simulate_training())
     assert held >= 0.1
     assert skipped == 0.0
-
-
-# ── entrypoint flags ────────────────────────────────────────────────────────
-
-
-def test_entrypoint_parses_flags_and_passes_overrides_through(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "run_single_controller_simulator.py",
-            "--config",
-            "sc.yaml",
-            "--num-steps",
-            "7",
-            "--num-nodes",
-            "2",
-            "--train-time-s",
-            "12.5",
-            "--refit-time-s",
-            "3",
-            "grpo.num_prompts_per_step=8",
-            "++async_rl.max_inflight_prompts=8",
-        ],
-    )
-    args, overrides = run_single_controller_simulator.parse_args()
-    settings = run_single_controller_simulator.settings_from_args(args)
-    assert args.config == "sc.yaml"
-    # Flags left out stay None on the namespace; the dataclass supplies them.
-    assert args.mode is None and args.train_backend is None
-    assert settings == SimulatorSettings(
-        mode="rollout_only",
-        train_backend="cpu",
-        train_time_s=12.5,
-        refit_time_s=3.0,
-        num_nodes=2,
-        num_steps=7,
-    )
-    assert overrides == [
-        "grpo.num_prompts_per_step=8",
-        "++async_rl.max_inflight_prompts=8",
-    ]
-
-
-def test_entrypoint_rejects_unimplemented_mode_before_loading_anything(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "run_single_controller_simulator.py",
-            "--config",
-            "sc.yaml",
-            "--mode",
-            "train_only",
-        ],
-    )
-    args, _ = run_single_controller_simulator.parse_args()
-    with pytest.raises(NotImplementedError, match="train_only"):
-        run_single_controller_simulator.settings_from_args(args)

@@ -49,6 +49,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_buffer_checkpoint,
     sampler_supports_training_claims,
+    sampler_supports_transactional_admission,
 )
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
@@ -85,11 +86,12 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     logprob_passes_required,
     resolve_ppo_chunk_alignment,
     rollout_snapshots_enabled,
+    validate_grpo_chunk_cap_alignment,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.simulator import (
     CpuTrainer,
-    SimulatorSettings,
+    SimulatorConfig,
     build_simulated_weight_synchronizer,
     validate_simulator_config,
 )
@@ -221,7 +223,7 @@ class SingleControllerActorArgs:
     value_loss_fn: Optional[LossFunction] = None
     # None on a training run. A simulator run (run_single_controller_simulator.py)
     # carries the stand-in settings the controller reads for its held train step.
-    simulator: Optional[SimulatorSettings] = None
+    simulator: Optional[SimulatorConfig] = None
     ppo_group_multiple: int = 1
     ppo_min_remaining_groups: int = 0
 
@@ -1202,7 +1204,7 @@ def setup_single_controller(
     *,
     processor: Optional[AutoProcessor] = None,
     partition_id: str = "rollout_data",
-    simulator: Optional[SimulatorSettings] = None,
+    simulator: Optional[SimulatorConfig] = None,
 ) -> tuple[SingleControllerActorArgs, SetupTimingMetrics]:
     """Build the full SC actor args driver-side.
 
@@ -1283,6 +1285,12 @@ def setup_single_controller(
             "master_config.data_plane.enabled=True. The async-RL "
             "SingleController path is built on the TransferQueue data plane."
         )
+    if algo_cfg.use_dynamic_sampling:
+        if not sampler_supports_transactional_admission(master_config.async_rl.sampler):
+            raise ValueError(
+                "Dynamic sampling requires TransactionalAdmissionSampler: the admission "
+                "wait must permit filtering-pool refill outside checkpoint mutations."
+            )
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
     snapshots_enabled = rollout_snapshots_enabled(master_config)
@@ -1444,10 +1452,6 @@ def setup_single_controller(
     )
     if generation_prefix_cuts_enabled:
         # The vLLM-only check ran above with the other turn/prefix checks.
-        if capture_media:
-            raise NotImplementedError(
-                "generation-prefix recovery does not yet support multimodal capture"
-            )
         if router_replay_enabled(master_config.policy):
             raise NotImplementedError(
                 "generation-prefix recovery does not yet support router replay"
@@ -1940,6 +1944,10 @@ def setup_single_controller(
             reserved_http_server_ports=reserved_http_server_ports,
         )
         if not is_ppo_run(master_config):
+            validate_grpo_chunk_cap_alignment(
+                master_config,
+                trainer.sharding_annotations.get_axis_size("data_parallel"),
+            )
             return trainer, None, time_metrics
 
         trainer.offload_to_cpu()
@@ -2489,6 +2497,11 @@ def setup_single_controller(
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config
                 ),
+                length_penalty_config=(
+                    master_config.grpo.length_penalty
+                    if master_config.grpo is not None
+                    else None
+                ),
                 tokenizer_config=(
                     policy_config["tokenizer"]
                     if master_config.reward_penalties.penalize_malformed_think_tag
@@ -2542,6 +2555,11 @@ def setup_single_controller(
             wandb_config=master_config.logger.wandb,
         ),
         reward_penalty_config=resolved_reward_penalty_config,
+        length_penalty_config=(
+            master_config.grpo.length_penalty
+            if master_config.grpo is not None
+            else None
+        ),
         tq_buffer=tq_buffer,
         timeouts=RolloutTimeouts(
             rollout_s=master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s,

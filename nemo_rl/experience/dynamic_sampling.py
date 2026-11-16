@@ -16,10 +16,13 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.experience.interfaces import PromptGroupRecord
+
+if TYPE_CHECKING:
+    from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 
 
 def mask_sample_flagged(extra: dict[str, Any] | None) -> bool:
@@ -32,9 +35,9 @@ def mask_sample_flagged(extra: dict[str, Any] | None) -> bool:
 
 
 def rewards_carry_no_signal(rewards: Sequence[float]) -> bool:
-    """Whether a group's participating rewards leave every row zero advantage.
+    """Whether a group's voting rewards leave every row zero advantage.
 
-    True for at most one participating reward, or when they are all exactly equal.
+    True for at most one voting reward, or when they are all exactly equal.
     Exact equality rather than a std threshold because float roundoff can give a
     uniform group a tiny nonzero std.
 
@@ -47,13 +50,16 @@ def rewards_carry_no_signal(rewards: Sequence[float]) -> bool:
     return len(rewards) <= 1 or max(rewards) == min(rewards)
 
 
-def participating_rewards(
-    record: PromptGroupRecord,
+def voting_rewards(
+    rewards: Sequence[float],
     *,
+    mask_sample: Sequence[bool],
+    truncated: Sequence[bool],
+    loss_multiplier: float,
     masked_reward_policy: Optional[str],
     overlong_filtering: bool,
 ) -> list[float]:
-    """The rewards that vote in this group's baseline and std.
+    """The rewards that vote in a group's baseline and std.
 
     Mirrors v1's ``_dynamic_sampling_valid_mask``, which is the mask the group
     statistics are actually computed under. Filtering on the full reward list instead
@@ -70,18 +76,69 @@ def participating_rewards(
     ``overlong_filtering`` so do truncated ones -- the rows the loss drops later in
     the step. Under ``include`` both still vote: their rewards are measurements of
     the policy even though they carry no loss.
+
+    Args:
+        rewards: One Gym reward per row, before effort shaping and reward penalties.
+        mask_sample: Per-row environment ``mask_sample`` flag, parallel to ``rewards``.
+        truncated: Per-row truncation flag, parallel to ``rewards``.
+        loss_multiplier: The group's dataset loss weight.
+        masked_reward_policy: ``grpo.masked_reward_policy``; ``None`` is PPO, which
+            has no group-relative baseline to mask rows out of.
+        overlong_filtering: ``grpo.overlong_filtering``.
     """
-    if record.loss_multiplier == 0:
+    if loss_multiplier == 0:
         return []
-    # None is PPO: no group-relative baseline exists to mask rows out of.
     if masked_reward_policy != "exclude":
-        return [completion.reward for completion in record.completions]
+        return list(rewards)
     return [
-        completion.reward
-        for completion in record.completions
-        if not mask_sample_flagged(completion.env_extras)
-        and not (overlong_filtering and completion.truncated)
+        reward
+        for reward, masked, is_truncated in zip(
+            rewards, mask_sample, truncated, strict=True
+        )
+        if not masked and not (overlong_filtering and is_truncated)
     ]
+
+
+def voting_rewards_from_record(
+    record: PromptGroupRecord,
+    *,
+    masked_reward_policy: Optional[str],
+    overlong_filtering: bool,
+) -> list[float]:
+    """The rewards that vote in a group's baseline, read from its ``Completion`` rows."""
+    return voting_rewards(
+        [
+            completion.reward
+            if completion.reward_original is None
+            else completion.reward_original
+            for completion in record.completions
+        ],
+        mask_sample=[
+            mask_sample_flagged(completion.env_extras)
+            for completion in record.completions
+        ],
+        truncated=[completion.truncated for completion in record.completions],
+        loss_multiplier=record.loss_multiplier,
+        masked_reward_policy=masked_reward_policy,
+        overlong_filtering=overlong_filtering,
+    )
+
+
+def voting_rewards_from_finalized(
+    finalized: "FinalizedGroup",
+    *,
+    masked_reward_policy: Optional[str],
+    overlong_filtering: bool,
+) -> list[float]:
+    """The rewards that vote in a group's baseline, read from a finalized capture group."""
+    return voting_rewards(
+        finalized.reward_original,
+        mask_sample=finalized.reward_mask_sample,
+        truncated=finalized.reward_truncated,
+        loss_multiplier=finalized.loss_multiplier,
+        masked_reward_policy=masked_reward_policy,
+        overlong_filtering=overlong_filtering,
+    )
 
 
 @dataclass

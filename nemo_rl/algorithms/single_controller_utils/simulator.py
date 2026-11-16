@@ -33,11 +33,16 @@ from __future__ import annotations
 import logging
 import time
 import warnings
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, cast
 
 import ray
+from pydantic import (
+    BaseModel,
+    NonNegativeFloat,
+    PositiveInt,
+    model_validator,
+)
 from tensordict import TensorDict
 
 from nemo_rl.algorithms import opd as opd_module
@@ -73,8 +78,9 @@ logger = logging.getLogger(__name__)
 SimulatorMode = Literal["rollout_only", "train_only", "train_rollout"]
 TrainBackend = Literal["cpu", "automodel", "mcore"]
 
-SIMULATOR_MODES: tuple[str, ...] = ("rollout_only", "train_only", "train_rollout")
-TRAIN_BACKENDS: tuple[str, ...] = ("cpu", "automodel", "mcore")
+# Top-level key the simulator YAML is mounted under next to the recipe, so a
+# command-line override addresses it as simulator.<key>=<value>.
+SIMULATOR_CONFIG_KEY = "simulator"
 # Generation backends validated under the SC refit lifecycle with the trainer
 # stubbed out; build_simulated_weight_synchronizer dispatches on the same set.
 SIMULATOR_GENERATION_BACKENDS: tuple[str, ...] = ("vllm", "sglang")
@@ -85,45 +91,32 @@ PREV_LOGPROBS_FIELD = "prev_logprobs"
 REFERENCE_LOGPROBS_FIELD = "reference_policy_logprobs"
 
 
-@dataclass(frozen=True)
-class SimulatorSettings:
+class SimulatorConfig(BaseModel, extra="forbid", frozen=True):
     """What a simulator run replaces, and how long the stand-ins take.
 
-    Attributes:
-        mode: Which side of the loop is real. Only ``rollout_only`` is implemented.
-        train_backend: The trainer. ``rollout_only`` requires ``cpu``, the mock.
-        train_time_s: Seconds the mock trainer holds each step where
-            ``policy.train()`` would run. Generation keeps serving during the
-            hold, as it does beside a non-colocated trainer. The hold ends early
-            once no rollout is in flight, because dispatch waits on the trainer
-            version (or, for ``windowed``, on buffer capacity released at step
-            cleanup) and neither moves until the train step ends; the skipped
-            seconds are logged so the e2e step time can still be read off the run.
-        refit_time_s: Seconds the mock weight transfer holds inside the refit
-            pause, where the real transfer would keep generation frozen.
-        num_nodes: Inference nodes of this allocation; overrides the recipe's
-            generation node count. None keeps the recipe's.
-        num_steps: Steps to run; overrides the recipe's ``max_num_steps``. None
-            keeps the recipe's.
+    The schema of the simulator YAML (``examples/configs/simulator/``), which
+    ``examples/run_single_controller_simulator.py`` loads next to an SC recipe.
     """
 
+    # Which side of the loop is real. Only rollout_only is implemented.
     mode: SimulatorMode = "rollout_only"
+    # The trainer. rollout_only requires cpu, the stand-in that uses no GPU.
     train_backend: TrainBackend = "cpu"
-    train_time_s: float = 0.0
-    refit_time_s: float = 0.0
-    num_nodes: Optional[int] = None
-    num_steps: Optional[int] = None
+    # Seconds the stand-in trainer holds each step where policy.train() would
+    # run. Generation keeps serving meanwhile; the hold ends early once no
+    # rollout is in flight, and the skipped seconds are logged.
+    train_time_s: NonNegativeFloat = 0.0
+    # Seconds the stand-in weight transfer holds inside the refit pause, where
+    # the real transfer would keep generation frozen.
+    refit_time_s: NonNegativeFloat = 0.0
+    # Inference nodes of this allocation; overrides the recipe's generation
+    # node count. None keeps the recipe's.
+    num_nodes: Optional[PositiveInt] = None
+    # Steps to run; overrides the recipe's max_num_steps. None keeps the recipe's.
+    num_steps: Optional[PositiveInt] = None
 
-    def __post_init__(self) -> None:
-        if self.mode not in SIMULATOR_MODES:
-            raise ValueError(
-                f"simulator mode must be one of {SIMULATOR_MODES}; got {self.mode!r}"
-            )
-        if self.train_backend not in TRAIN_BACKENDS:
-            raise ValueError(
-                f"train_backend must be one of {TRAIN_BACKENDS}; got "
-                f"{self.train_backend!r}"
-            )
+    @model_validator(mode="after")
+    def _check_implemented(self) -> "SimulatorConfig":
         if self.mode != "rollout_only":
             raise NotImplementedError(
                 f"simulator mode {self.mode!r} is not implemented yet; only "
@@ -137,14 +130,7 @@ class SimulatorSettings:
                 f"'cpu'; got {self.train_backend!r}. A real train backend is the "
                 "ordinary run_grpo_single_controller.py run."
             )
-        if self.train_time_s < 0:
-            raise ValueError("train_time_s must be non-negative")
-        if self.refit_time_s < 0:
-            raise ValueError("refit_time_s must be non-negative")
-        if self.num_nodes is not None and self.num_nodes < 1:
-            raise ValueError("num_nodes must be positive")
-        if self.num_steps is not None and self.num_steps < 1:
-            raise ValueError("num_steps must be positive")
+        return self
 
     @property
     def uses_cpu_trainer(self) -> bool:
@@ -153,7 +139,7 @@ class SimulatorSettings:
 
 
 def apply_simulator_overrides(
-    raw_config: dict[str, Any], settings: SimulatorSettings
+    raw_config: dict[str, Any], settings: SimulatorConfig
 ) -> None:
     """Override, in place, the few recipe fields a simulator run must own.
 
@@ -249,7 +235,7 @@ def reject_online_quantization(generation_config: GenerationConfig) -> None:
 
 
 def validate_simulator_config(
-    master_config: MasterConfig, settings: SimulatorSettings
+    master_config: MasterConfig, settings: SimulatorConfig
 ) -> None:
     """Refuse the recipes a rollout-only run cannot serve faithfully.
 
@@ -344,7 +330,7 @@ def validate_simulator_config(
     refit_timeout_s = master_config.async_rl.generation_fleet_health.refit_timeout_s
     if refit_timeout_s is not None and settings.refit_time_s >= refit_timeout_s:
         raise ValueError(
-            f"refit_time_s ({settings.refit_time_s}) must be below "
+            f"simulator.refit_time_s ({settings.refit_time_s}) must be below "
             "async_rl.generation_fleet_health.refit_timeout_s "
             f"({refit_timeout_s}); otherwise every simulated refit is aborted as "
             "a stuck transfer. Raise the timeout or set it to null."

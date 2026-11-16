@@ -92,7 +92,10 @@ class TestTheCallSite:
     after ``init_ray()`` would be silently too late rather than an error.
     """
 
-    ENTRYPOINT = REPO_ROOT / "examples" / "run_grpo_single_controller.py"
+    # The launch path both SC entrypoints (training and simulator) share.
+    ENTRYPOINT = (
+        REPO_ROOT / "nemo_rl/algorithms/single_controller_utils/entrypoint_utils.py"
+    )
 
     def _call_lines(self, name):
         tree = ast.parse(self.ENTRYPOINT.read_text())
@@ -108,11 +111,11 @@ class TestTheCallSite:
         reaping = self._call_lines("maybe_configure_engine_reaping_env")
         init_ray = self._call_lines("init_ray")
         assert reaping, (
-            "run_grpo_single_controller.py no longer calls "
+            "entrypoint_utils.py no longer calls "
             "maybe_configure_engine_reaping_env; every shard killed by fleet health "
             "will leak its EngineCore's GPU for the rest of the run."
         )
-        assert init_ray, "expected run_grpo_single_controller.py to call init_ray()"
+        assert init_ray, "expected entrypoint_utils.py to call init_ray()"
         assert max(reaping) < min(init_ray), (
             f"maybe_configure_engine_reaping_env at line {max(reaping)} runs after "
             f"init_ray() at line {min(init_ray)}; the raylet has already been spawned "

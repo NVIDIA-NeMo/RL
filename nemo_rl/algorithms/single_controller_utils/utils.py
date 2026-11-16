@@ -16,12 +16,10 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
-import ray
 import torch
 from tensordict import TensorDict
 
@@ -29,7 +27,9 @@ from nemo_rl.algorithms.metric_utils import REWARD_KEY
 from nemo_rl.data_plane import KVBatchMeta
 
 if TYPE_CHECKING:
-    from nemo_rl.algorithms.single_controller_utils.config import WatchdogConfig
+    from nemo_rl.data.interfaces import DatumSpec
+    from nemo_rl.experience.reward_penalties import FinalizedReward
+    from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
@@ -180,6 +180,48 @@ class AdvantagePartial:
             minimum=float(values.min()),
             maximum=float(values.max()),
         )
+
+
+@dataclass(frozen=True)
+class RejectedGroup:
+    """A finalized group the controller rejected before commit.
+
+    The group never became selectable. ``replacement`` is the spare prompt taken
+    in the same mutation cut that cleaned the group up (None when the step was
+    credited short instead), ``target_step`` the step it was reserved for, and
+    ``lineage_group_id`` its ledger reservation when rollout recovery is enabled.
+    ``reward_observations`` are the valid rows' rewards and ``zero_variance``
+    whether the rows that vote carried no signal; the pump still tallies both
+    into the step's reward metrics.
+    """
+
+    replacement: Optional[DatumSpec]
+    lineage_group_id: Optional[str]
+    target_step: Optional[int]
+    reward_observations: list[FinalizedReward]
+    zero_variance: bool
+
+
+@dataclass(frozen=True)
+class BelowValidFractionGroup(RejectedGroup):
+    """Rejected by ``token_capture.min_valid_fraction_per_group``."""
+
+    valid_count: int
+    total_count: int
+
+
+@dataclass(frozen=True)
+class ZeroVarianceGroup(RejectedGroup):
+    """Rejected by dynamic sampling: the voting rewards left every row zero advantage.
+
+    ``target_step`` is the lender's when the dropped step was filled from a later
+    step's finished group, which the replacement then repays.
+    """
+
+
+type FinalizeOutcome = FinalizedGroup | RejectedGroup | None
+"""What ``_finalize_with_actor`` returns: the group committed, a group the controller
+rejected, or ``None`` when the finalizer dropped it as a structural outcome."""
 
 
 def reduce_advantage_pump_metrics(
@@ -453,50 +495,3 @@ def fields_for_put(meta: KVBatchMeta, fields: dict[str, torch.Tensor]) -> Tensor
             packed[field_name] = value.detach().contiguous()
     # pyrefly: ignore[bad-argument-type]
     return TensorDict(packed, batch_size=[meta.size])
-
-
-def run_with_controller_liveness_watch(
-    sc: ray.actor.ActorHandle, watchdog_config: WatchdogConfig
-) -> dict[str, Any]:
-    """Await the SC run, polling ping() so a frozen event loop cannot hide.
-
-    The in-actor watchdog is an asyncio task on the SC's own event loop, so it cannot
-    observe that loop being blocked -- by a synchronous Ray call into a wedged worker,
-    say. The driver is a separate process that already holds the handle, which makes it
-    the cheapest possible external observer; no supervisor actor required.
-
-    ping() returning is the liveness signal. A slow reply is not a freeze, so the check
-    only escalates once the loop has been unresponsive for the same budget the in-actor
-    watchdog uses to call a stall.
-
-    Shared by every SingleController entrypoint (training and simulator) so the
-    liveness semantics cannot drift between them.
-    """
-    run_ref = sc.run.remote()
-    last_pong_at = time.monotonic()
-
-    ready: list[Any] = []
-    while not ready:
-        ready, _ = ray.wait([run_ref], timeout=watchdog_config.interval_s)
-        if ready:
-            break
-
-        try:
-            ray.get(sc.ping.remote(), timeout=watchdog_config.interval_s)
-        except Exception as error:
-            unresponsive_s = time.monotonic() - last_pong_at
-            print(
-                f"SingleController ping failed after {unresponsive_s:.0f}s "
-                f"unresponsive: {type(error).__name__}: {error}",
-                flush=True,
-            )
-            if unresponsive_s > watchdog_config.stall_timeout_s:
-                raise RuntimeError(
-                    "SingleController event loop has been unresponsive for "
-                    f"{unresponsive_s:.0f}s (stall_timeout_s="
-                    f"{watchdog_config.stall_timeout_s}); its in-actor watchdog runs "
-                    "on that loop and cannot report this."
-                ) from error
-        else:
-            last_pong_at = time.monotonic()
-    return ray.get(run_ref)
