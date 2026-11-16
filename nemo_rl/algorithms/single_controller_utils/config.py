@@ -528,6 +528,13 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     recompute_kv_cache_after_weight_updates: bool = True
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
+    # Max groups the streaming trainer dispatches in one chunk. ``None`` leaves
+    # chunks unbounded, so a buffer that is already warm hands the whole step
+    # over at once and the trainers and advantage stage materialize a step's
+    # worth of rows together. A cap bounds that peak: the chunk is what gets
+    # sharded to the DP ranks and what the advantage stage fetches, so it is
+    # what decides host-memory high-water mark on a generation-bound run.
+    max_groups_for_streaming_train: Optional[int] = None
     # Cap on in-flight generate_and_push calls in the rollout pump.
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
@@ -572,6 +579,32 @@ class AsyncRLConfig(BaseModel, extra="allow"):
             raise ValueError(
                 "async_rl blocks have been renamed to say what they watch or route:\n"
                 + "\n".join(stale)
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_streaming_chunk_bounds(self) -> "AsyncRLConfig":
+        """The chunk cap must leave room for the floor it is capping.
+
+        ``_train_pump`` clamps the floor down to the cap so a short tail chunk can
+        still close the step. Set the cap below the floor and that clamp fires on
+        *every* chunk, so the configured floor never applies and the run streams at
+        the cap instead -- the floor becomes dead config rather than a bound.
+        """
+        max_groups = self.max_groups_for_streaming_train
+        if max_groups is None:
+            return self
+        if max_groups < 1:
+            raise ValueError(
+                f"async_rl.max_groups_for_streaming_train ({max_groups}) must be >= 1"
+            )
+        if max_groups < self.min_groups_for_streaming_train:
+            raise ValueError(
+                "async_rl.max_groups_for_streaming_train "
+                f"({max_groups}) must be >= "
+                "async_rl.min_groups_for_streaming_train "
+                f"({self.min_groups_for_streaming_train}): the cap would clamp the "
+                "floor on every chunk, leaving the floor with no effect."
             )
         return self
 
@@ -1449,23 +1482,35 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "directly, so nothing over-generates. Set it to 1."
         )
 
-    # An enabled one here describes shaping this run does not do. An entry leaves
-    # this list once the SC path implements it; overlong_filtering is applied in
-    # the advantage stage from the raw completion flags in the TransferQueue.
+    if (
+        master_config.grpo is not None
+        and master_config.grpo.length_penalty is not None
+        and not should_use_nemo_gym(master_config)
+    ):
+        raise ValueError(
+            "grpo.length_penalty requires env.should_use_nemo_gym=true on SingleController"
+        )
+
+    # An enabled one here describes shaping this run does not do. length_penalty is
+    # implemented for GRPO, so it only appears here for PPO; overlong_filtering is
+    # applied in the advantage stage from the raw completion flags in the TransferQueue.
     unsupported = [
         name
         for name, enabled in (
-            # getattr: PPO's config has no length_penalty field.
-            ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
+            (
+                "ppo.length_penalty",
+                master_config.ppo is not None
+                and getattr(algo_cfg, "length_penalty", None) is not None,
+            ),
         )
         if enabled
     ]
     if unsupported:
         names = ", ".join(unsupported)
         raise NotImplementedError(
-            f"{names} not supported on the SingleController path, which "
-            "implements none of them -- the run would silently skip the "
-            "shaping. Disable them."
+            f"{names} not supported for PPO on the SingleController path -- the "
+            "run would silently skip the shaping. Disable them. GRPO supports "
+            "grpo.length_penalty."
         )
 
     # Rejected here rather than at the first advantage call, which is a whole
@@ -1552,14 +1597,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                     f"grpo.use_dynamic_sampling requires grpo.{key} to be 0 or null: "
                     "nonzero message-level overrides can train constant-reward groups."
                 )
-        # Capture cannot borrow future groups, so routine filtering would stall training.
-        if master_config.token_capture.enabled:
-            raise ValueError(
-                f"{algo_prefix}.use_dynamic_sampling is not supported together with "
-                "token_capture.enabled: on the capture path a replacement cannot borrow "
-                "a finished group from a later step, so every dropped group stalls its "
-                "step for a full fresh rollout. Disable one of the two."
-            )
         if grpo_cfg.dynamic_sampling_max_gen_batches < 1:
             raise ValueError(
                 f"{algo_prefix}.dynamic_sampling_max_gen_batches must be >= 1 when "
@@ -1735,6 +1772,30 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
 
+def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
+    """Samples a dispatch must be a multiple of to split cleanly on this consumer.
+
+    A dispatch is split twice: once across the DP ranks, and then on the static
+    batching path again inside each rank by the train and logprob microbatch
+    sizes. Packed and dynamically batched consumers form their own microbatches,
+    so for them only the DP split applies.
+
+    Args:
+        config: Policy or value configuration of the consuming trainer.
+        dp_size: Data-parallel size of that trainer.
+
+    Returns:
+        The sample count both splits divide.
+    """
+    if config["dynamic_batching"]["enabled"] or (
+        config.get("sequence_packing") and config["sequence_packing"]["enabled"]
+    ):
+        return dp_size
+    train_micro_batch_size = config["train_micro_batch_size"]
+    logprob_batch_size = config.get("logprob_batch_size") or train_micro_batch_size
+    return dp_size * math.lcm(train_micro_batch_size, logprob_batch_size)
+
+
 def resolve_ppo_chunk_alignment(
     master_config: MasterConfig, policy_dp: int, value_dp: int
 ) -> tuple[int, int]:
@@ -1744,15 +1805,6 @@ def resolve_ppo_chunk_alignment(
     value_config = master_config.value
     if value_config is None:
         raise ValueError("PPO requires a value model configuration")
-
-    def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
-        if config["dynamic_batching"]["enabled"] or (
-            config.get("sequence_packing") and config["sequence_packing"]["enabled"]
-        ):
-            return dp_size
-        train_micro_batch_size = config["train_micro_batch_size"]
-        logprob_batch_size = config.get("logprob_batch_size") or train_micro_batch_size
-        return dp_size * math.lcm(train_micro_batch_size, logprob_batch_size)
 
     sample_alignment = math.lcm(
         sample_multiple(master_config.policy, policy_dp),
@@ -1775,10 +1827,73 @@ def resolve_ppo_chunk_alignment(
             f"policy/value group multiple ({group_multiple}) so each chunk "
             "contains complete microbatches on every DP rank"
         )
+    # Tail-aware selection refuses an unaligned max, and only a binding cap can
+    # produce one: the uncapped max is the already-aligned step remainder.
+    chunk_cap = master_config.async_rl.max_groups_for_streaming_train
+    if (
+        chunk_cap is not None
+        and chunk_cap < ppo_config.num_prompts_per_step
+        and chunk_cap % group_multiple != 0
+    ):
+        raise ValueError(
+            "PPO max_groups_for_streaming_train must be divisible by the "
+            f"policy/value group multiple ({group_multiple}) so each capped "
+            "chunk contains complete microbatches on every DP rank"
+        )
     min_remaining_groups = (
         (min_groups + 1) // 2 if min_groups < ppo_config.num_prompts_per_step else 0
     )
     return group_multiple, min_remaining_groups
+
+
+def validate_grpo_chunk_cap_alignment(
+    master_config: MasterConfig, policy_dp: int
+) -> None:
+    """Reject a GRPO chunk cap whose samples cannot split across the policy.
+
+    GRPO passes no ``group_multiple`` to the sampler, so a chunk can be any size
+    from the floor up to the cap, and the training dispatch shards it without
+    ``allow_uneven_shards``. The chunk therefore has to satisfy the same
+    ``sample_multiple`` PPO aligns to: the DP split, and under static batching the
+    microbatch split inside each rank as well. This guards the full-cap chunk
+    only: a cap of 3 at 2 generations per prompt is 6 samples, which fails on a
+    DP of 4. An unaligned chunk below the cap stays reachable, as it already is
+    from an unaligned ``min_groups_for_streaming_train``, which no validator
+    covers today.
+
+    Only a cap below ``num_prompts_per_step`` can bind, and Forest is exempt: its
+    producer pads each group to the policy execution row multiple, so the logical
+    group count is not the physical row count.
+
+    Args:
+        master_config: The run configuration.
+        policy_dp: Data-parallel size of the policy trainer.
+
+    Raises:
+        ValueError: The capped chunk's sample count is not a multiple of the
+            policy's ``sample_multiple``.
+    """
+    if is_ppo_run(master_config):
+        return
+    chunk_cap = master_config.async_rl.max_groups_for_streaming_train
+    algo_cfg = algo_config(master_config)
+    if (
+        master_config.token_capture.forest_training
+        or chunk_cap is None
+        or chunk_cap >= algo_cfg.num_prompts_per_step
+    ):
+        return
+    chunk_multiple = sample_multiple(master_config.policy, policy_dp)
+    if (chunk_cap * algo_cfg.num_generations_per_prompt) % chunk_multiple != 0:
+        raise ValueError(
+            "GRPO async_rl.max_groups_for_streaming_train "
+            f"({chunk_cap}) x num_generations_per_prompt "
+            f"({algo_cfg.num_generations_per_prompt}) must be divisible by "
+            f"{chunk_multiple} -- the policy data-parallel size ({policy_dp}), "
+            "times the train/logprob microbatch multiple when sequence packing "
+            "and dynamic batching are both off -- so each capped chunk shards "
+            "evenly across the training ranks and into complete microbatches"
+        )
 
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
@@ -1831,6 +1946,17 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
 
     generation_cfg = master_config.policy["generation"]
+    if (
+        generation_cfg["backend"] == "vllm"
+        and cast(VllmConfig, generation_cfg)["vllm_cfg"].get("http_api_server_count", 1)
+        > 1
+        and async_config.generation_fleet_health.enabled
+    ):
+        raise ValueError(
+            "Multiple HTTP API servers do not support fault tolerance with "
+            "async_rl.generation_fleet_health.enabled=true. "
+            "See https://github.com/NVIDIA-NeMo/RL/pull/5075."
+        )
     top_logprobs = generation_cfg.get("top_logprobs", 0)
     if (
         isinstance(top_logprobs, bool)
@@ -2011,6 +2137,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError(
                 "forest training does not support message-level advantage overrides"
             )
+        if master_config.grpo.length_penalty is not None:
+            raise ValueError("Forest training does not support grpo.length_penalty")
         if token_capture_config.defer_routed_experts_to_policy:
             raise ValueError("forest training requires direct routed-expert assembly")
         validate_forest_objective(master_config.grpo, master_config.loss_fn)

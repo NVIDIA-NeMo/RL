@@ -71,6 +71,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     TokenCaptureConfig,
     logprob_passes_required,
     resolve_ppo_chunk_alignment,
+    validate_grpo_chunk_cap_alignment,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
@@ -285,11 +286,20 @@ def test_ppo_group_multiple_requires_complete_microbatches(
 
 
 @pytest.mark.parametrize(
-    ("num_prompts_per_step", "min_groups", "error"),
-    [(32, 1, "min_groups_for_streaming_train"), (3, 2, "num_prompts_per_step")],
+    ("num_prompts_per_step", "min_groups", "chunk_cap", "error"),
+    [
+        (32, 1, None, "min_groups_for_streaming_train"),
+        (3, 2, None, "num_prompts_per_step"),
+        # The cap becomes the sampler's max_prompt_groups, and tail-aware
+        # selection refuses an unaligned max. The uncapped max is
+        # target - dispatched, which stays aligned because the target is and
+        # every chunk is, so only a cap can break the invariant -- and it would
+        # break it on the first select, with the allocation already up.
+        (32, 2, 3, "max_groups_for_streaming_train"),
+    ],
 )
 def test_ppo_chunk_validation_rejects_incomplete_chunks(
-    num_prompts_per_step: int, min_groups: int, error: str
+    num_prompts_per_step: int, min_groups: int, chunk_cap: int | None, error: str
 ) -> None:
     config = MasterConfig.model_construct(
         ppo=PPOConfig(
@@ -304,10 +314,35 @@ def test_ppo_chunk_validation_rejects_incomplete_chunks(
             "train_micro_batch_size": 1,
             "dynamic_batching": {"enabled": True},
         },
-        async_rl=AsyncRLConfig(min_groups_for_streaming_train=min_groups),
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=min_groups,
+            max_groups_for_streaming_train=chunk_cap,
+        ),
     )
     with pytest.raises(ValueError, match=error):
         resolve_ppo_chunk_alignment(config, 8, 8)
+
+
+def test_ppo_accepts_a_chunk_cap_aligned_to_the_dp_layout() -> None:
+    config = MasterConfig.model_construct(
+        ppo=PPOConfig(num_prompts_per_step=32, num_generations_per_prompt=16),
+        policy={
+            "train_micro_batch_size": 4,
+            "dynamic_batching": {"enabled": False},
+        },
+        value={
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": True},
+        },
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=2,
+            max_groups_for_streaming_train=4,
+        ),
+    )
+
+    # An aligned cap is accepted and leaves the alignment it would have had
+    # uncapped: group multiple 2, tail floor (2 + 1) // 2.
+    assert resolve_ppo_chunk_alignment(config, 8, 8) == (2, 1)
 
 
 def test_ppo_chunk_validation_accepts_complete_chunks() -> None:
@@ -324,6 +359,153 @@ def test_ppo_chunk_validation_accepts_complete_chunks() -> None:
         async_rl=AsyncRLConfig(min_groups_for_streaming_train=2),
     )
     assert resolve_ppo_chunk_alignment(config, 8, 8) == (2, 1)
+
+
+@pytest.mark.parametrize(("min_groups", "expected"), [(32, (2, 0)), (2, (2, 1))])
+def test_ppo_accepts_a_chunk_cap_that_cannot_bind(
+    min_groups: int, expected: tuple[int, int]
+) -> None:
+    """A cap at or above num_prompts_per_step never reaches the sampler.
+
+    The pump's maximum is ``target - dispatched`` and the target is
+    ``num_prompts_per_step`` less any dropped groups, so ``min(target, 33)`` is
+    always the target. Requiring alignment of a cap that cannot limit a
+    selection rejects a config that would have run.
+    """
+    config = MasterConfig.model_construct(
+        ppo=PPOConfig(num_prompts_per_step=32, num_generations_per_prompt=16),
+        policy={
+            "train_micro_batch_size": 4,
+            "dynamic_batching": {"enabled": False},
+        },
+        value={
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": True},
+        },
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=min_groups,
+            max_groups_for_streaming_train=33,
+        ),
+    )
+
+    assert resolve_ppo_chunk_alignment(config, 8, 8) == expected
+
+
+def _grpo_chunk_cap_config(
+    chunk_cap: int | None,
+    *,
+    num_generations_per_prompt: int = 2,
+    forest_training: bool = False,
+    train_micro_batch_size: int = 1,
+    dynamic_batching: bool = True,
+    sequence_packing: bool = False,
+) -> MasterConfig:
+    return MasterConfig.model_construct(
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=8,
+            num_generations_per_prompt=num_generations_per_prompt,
+        ),
+        policy={
+            "train_micro_batch_size": train_micro_batch_size,
+            "dynamic_batching": {"enabled": dynamic_batching},
+            "sequence_packing": {"enabled": sequence_packing},
+        },
+        token_capture=TokenCaptureConfig.model_construct(
+            forest_training=forest_training
+        ),
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=2,
+            max_groups_for_streaming_train=chunk_cap,
+        ),
+    )
+
+
+def test_grpo_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp() -> None:
+    """GRPO passes no group_multiple, so the cap alone decides the chunk size.
+
+    Three groups at two generations each is six samples, and the training
+    dispatch shards without allow_uneven_shards, so six cannot split four ways.
+    """
+    with pytest.raises(ValueError, match="max_groups_for_streaming_train"):
+        validate_grpo_chunk_cap_alignment(_grpo_chunk_cap_config(3), 4)
+
+
+def test_grpo_rejects_a_cap_that_leaves_each_rank_a_partial_microbatch() -> None:
+    """Static batching splits a chunk twice, so the DP split alone is not enough.
+
+    Three groups at four generations is twelve samples, six per rank on DP 2,
+    and the Megatron worker then splits those six by a microbatch size of four.
+    Checking only the DP size accepts this config and it fails mid-step.
+    """
+    config = _grpo_chunk_cap_config(
+        3,
+        num_generations_per_prompt=4,
+        train_micro_batch_size=4,
+        dynamic_batching=False,
+    )
+
+    with pytest.raises(ValueError, match="max_groups_for_streaming_train"):
+        validate_grpo_chunk_cap_alignment(config, 2)
+
+
+@pytest.mark.parametrize("chunk_cap", [None, 2, 4, 8, 9])
+def test_grpo_accepts_shardable_and_nonbinding_chunk_caps(
+    chunk_cap: int | None,
+) -> None:
+    # 2 and 4 shard evenly across DP 4; 8 and 9 are at or above
+    # num_prompts_per_step and so never bind; None is the unbounded default.
+    validate_grpo_chunk_cap_alignment(_grpo_chunk_cap_config(chunk_cap), 4)
+
+
+@pytest.mark.parametrize(
+    ("dynamic_batching", "sequence_packing"), [(True, False), (False, True)]
+)
+def test_grpo_ignores_microbatch_sizes_when_the_consumer_bins_its_own(
+    dynamic_batching: bool, sequence_packing: bool
+) -> None:
+    """Packed and dynamically batched consumers only need complete DP shards.
+
+    The same twelve samples over DP 2 that the static-batching case rejects are
+    accepted here, so the microbatch term cannot reject a config that ran before.
+    """
+    config = _grpo_chunk_cap_config(
+        3,
+        num_generations_per_prompt=4,
+        train_micro_batch_size=4,
+        dynamic_batching=dynamic_batching,
+        sequence_packing=sequence_packing,
+    )
+
+    validate_grpo_chunk_cap_alignment(config, 2)
+
+
+def test_forest_is_exempt_because_its_groups_are_padded_to_execution_rows() -> None:
+    """Forest's producer pads each group to the policy execution row multiple.
+
+    Its logical group count is therefore not its physical row count, so the
+    sample arithmetic this guard does would be measuring the wrong thing.
+    """
+    validate_grpo_chunk_cap_alignment(
+        _grpo_chunk_cap_config(3, forest_training=True), 4
+    )
+
+
+def test_the_grpo_chunk_cap_guard_leaves_ppo_to_its_own_alignment() -> None:
+    # 3 groups x 2 generations is 6 samples, which DP 4 cannot shard, so the
+    # GRPO guard would reject this config if it did not skip PPO runs.
+    config = MasterConfig.model_construct(
+        ppo=PPOConfig(num_prompts_per_step=32, num_generations_per_prompt=2),
+        policy={
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": True},
+        },
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=2,
+            max_groups_for_streaming_train=3,
+        ),
+    )
+
+    validate_grpo_chunk_cap_alignment(config, 4)
 
 
 def _one_group_tags(count: int, *, weight_version: int = 0) -> list[dict[str, object]]:
@@ -2407,6 +2589,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._async_cfg = SimpleNamespace(
         min_groups_for_streaming_train=1,
+        max_groups_for_streaming_train=None,
         rollout_failure=SimpleNamespace(min_step_batch_fraction=0.9),
         sampler=SimpleNamespace(
             max_lookahead_versions=1,
@@ -2762,6 +2945,7 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
     if single_forward_cispo:
         cfg = _grpo_master_config(tmp_path)
         cfg.policy["generation"]["backend"] = "vllm"
+        cfg.policy["generation"]["vllm_cfg"] = {"http_api_server_count": 1}
         cfg.async_rl.sampler = ReadyFirstSamplerConfig()
         cfg.loss_fn = ClippedPGLossConfig(
             use_cispo=True,
@@ -3162,6 +3346,124 @@ def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> No
 
     assert ctrl._train_steps == 1
     assert "policy.offload_to_cpu" not in calls
+
+
+class _OverfilledSampler(_EmptySampler):
+    """A buffer generation has already raced far ahead of the trainer.
+
+    Grants whatever the pump asks for, up to what is ready. That is the part of
+    the sampler contract the cap depends on: the only thing standing between a
+    full buffer and a single step-sized dispatch is the bound the pump passes
+    in, so a fake that returns a fixed size cannot show the cap working.
+    """
+
+    def __init__(self, meta: KVBatchMeta, ready: int) -> None:
+        self._meta = meta
+        self.ready = ready
+        self.select_bounds: list[tuple[int, int]] = []
+        self.chunks: list[int] = []
+
+    async def select(self, **kwargs):
+        min_prompt_groups = kwargs["min_prompt_groups"]
+        max_prompt_groups = kwargs["max_prompt_groups"]
+        self.select_bounds.append((min_prompt_groups, max_prompt_groups))
+        if self.ready < min_prompt_groups:
+            return None, 0
+        granted = min(self.ready, max_prompt_groups)
+        self.ready -= granted
+        self.chunks.append(granted)
+        return self._meta, granted
+
+
+def _chunk_cap_controller(
+    monkeypatch, *, cap: int | None, num_prompts: int, floor: int, ready: int = 8
+):
+    """A pump over a buffer holding ``ready`` groups the trainer has not taken."""
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=_one_group_tags(1),
+    )
+    sampler = _OverfilledSampler(meta, ready=ready)
+    ctrl = _train_pump_controller(sampler=sampler)
+    ctrl._algo_cfg.num_prompts_per_step = num_prompts
+    ctrl._async_cfg.min_groups_for_streaming_train = floor
+    ctrl._async_cfg.max_groups_for_streaming_train = cap
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._trainer = _OrderRecordingTrainer([])
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    return ctrl, sampler
+
+
+def test_an_uncapped_pump_swallows_a_generation_lead_in_one_chunk(
+    monkeypatch,
+) -> None:
+    """The behaviour the cap exists to bound, stated as the baseline.
+
+    Training is slow, so generation has run 64 groups ahead of an 8-group step.
+    Uncapped, the first select asks for the whole outstanding step and the
+    buffer can satisfy it, so the step is one chunk and the trainers and
+    advantage stage materialize all 8 groups' rows together.
+    """
+    ctrl, sampler = _chunk_cap_controller(
+        monkeypatch, cap=None, num_prompts=8, floor=2, ready=64
+    )
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert sampler.chunks == [8]
+    assert ctrl._train_steps == 1
+
+
+def test_a_capped_pump_takes_only_the_cap_from_an_overfilled_buffer(
+    monkeypatch,
+) -> None:
+    """Same lead, capped: the chunk size is the cap, not what is available.
+
+    The buffer can hand over the whole step on the first select and is asked for
+    the cap instead, so no single dispatch carries more than the cap's rows. The
+    lead itself is untouched -- the step still consumes exactly
+    ``num_prompts_per_step`` groups, so capping changes how much is materialized
+    at once, not how much the step trains on.
+    """
+    ctrl, sampler = _chunk_cap_controller(
+        monkeypatch, cap=2, num_prompts=8, floor=2, ready=64
+    )
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert sampler.chunks == [2, 2, 2, 2]
+    assert max(upper for _, upper in sampler.select_bounds) == 2
+    assert sampler.ready == 64 - 8
+    assert ctrl._train_steps == 1
+
+
+def test_a_capped_chunk_keeps_its_floor_and_still_closes_an_uneven_step(
+    monkeypatch,
+) -> None:
+    """A cap bounds the chunk without costing the floor or stranding the tail.
+
+    The floor rides along on every full chunk, so a capped run still waits for a
+    worthwhile batch rather than streaming single groups. The last chunk of an
+    uneven step is smaller than the floor, and only there does the clamp fire,
+    so the step still closes instead of waiting for groups that will not come.
+    """
+    ctrl, sampler = _chunk_cap_controller(
+        monkeypatch, cap=2, num_prompts=3, floor=2, ready=64
+    )
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    # Full chunk carries the configured floor; the 1-group tail clamps it down.
+    assert sampler.select_bounds == [(2, 2), (1, 1)]
+    assert sampler.chunks == [2, 1]
+    assert ctrl._train_steps == 1
 
 
 # ── PPO ────────────────────────────────────────────────────────────────────
