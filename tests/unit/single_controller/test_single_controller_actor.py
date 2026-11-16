@@ -2468,8 +2468,8 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
-    ctrl._step_assembler._assembling_version = 0
-    ctrl._step_assembler._step_assembly = None
+    # _step_assembler is a cached_property: left unbuilt here so it seeds from the
+    # trainer version and prompts-per-step each test sets before first using it.
     ctrl._train_steps = 0
     attach_rollout_checkpointing(ctrl)
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()

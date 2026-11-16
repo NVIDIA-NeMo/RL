@@ -125,8 +125,8 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
     ctrl._rollout_runtime.sampler_stamps_target_steps = False
-    ctrl._step_assembler._assembling_version = 0
-    ctrl._step_assembler._step_assembly = None
+    # _step_assembler is a cached_property; leaving it unbuilt lets it seed from the
+    # controller once the builder has set the sampler, config and runtime it reads.
     # Empty means the legacy (non-token-capture) dispatch path.
     ctrl._finalizer_actors = []
     ctrl._rollout_runtime.replacement_reserve = deque()
@@ -1175,10 +1175,12 @@ class TestChargeShortfall:
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
         ctrl._sampler = sampler
-        ctrl._step_assembler._assembling_version = assembling_version
-        ctrl._step_assembler._step_assembly = None
         ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=4)
         ctrl._rollout_runtime = RolloutRuntimeState()
+        # _step_assembler (cached_property) reads the three fields above when first
+        # accessed, so build it only after they are set.
+        ctrl._step_assembler._assembling_version = assembling_version
+        ctrl._step_assembler._step_assembly = None
         return ctrl
 
     def test_a_stamped_group_is_charged_to_its_own_step(self):
@@ -1246,10 +1248,12 @@ class TestALostGroupDoesNotStallTheGate:
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
         ctrl._sampler = sampler
-        ctrl._step_assembler._assembling_version = 0
-        ctrl._step_assembler._step_assembly = None
         ctrl._rollout_runtime = RolloutRuntimeState()
         ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=2)
+        # _step_assembler (cached_property) reads sampler/config/runtime on first
+        # access, so build it only after they are set.
+        ctrl._step_assembler._assembling_version = 0
+        ctrl._step_assembler._step_assembly = None
         ctrl._async_cfg = SimpleNamespace(
             rollout_failure=SimpleNamespace(min_step_batch_fraction=0.5)
         )

@@ -1038,7 +1038,9 @@ class SingleControllerActor:
         construct via ``object.__new__`` get it without a hand-written assignment.
         """
         return StepAssembler(
-            controller=self,
+            sampler=self._sampler,
+            num_prompts_per_step=self._algo_cfg.num_prompts_per_step,
+            runtime=self._rollout_runtime,
             initial_version=getattr(self, "_trainer_version", 0),
         )
 

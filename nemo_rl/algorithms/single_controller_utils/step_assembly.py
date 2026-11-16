@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.staleness_sampler import PromptGroupSampler
     from nemo_rl.algorithms.rollout_checkpointing.state import RolloutRuntimeState
-    from nemo_rl.algorithms.single_controller import SingleControllerActor
 
 
 @dataclass(frozen=True)
@@ -49,39 +48,31 @@ class StepAssembly:
 class StepAssembler:
     """Track the step being assembled and charge lost groups to it.
 
-    The controller injects itself as the backref; the sampler, the shared
-    ``RolloutRuntimeState`` (read for its current ``batch_shortfall`` /
-    ``steps_allowed_short`` / ``shortfall_reconciliation_pending``) and the
-    per-step prompt-group target are read live off it rather than cached, so
-    the assembler tracks the controller's current state. The cursor starts
-    from the restored trainer version so step ``0`` stays valid after a restore.
+    Holds the sampler, the per-step prompt-group target and the shared
+    ``RolloutRuntimeState`` object directly. The runtime's ``batch_shortfall`` /
+    ``steps_allowed_short`` / ``shortfall_reconciliation_pending`` maps and sets
+    are read live off that object, so restore replacements stay visible. The
+    cursor starts from the restored trainer version so step ``0`` stays valid
+    after a restore.
     """
 
     def __init__(
         self,
         *,
-        controller: "SingleControllerActor",
+        sampler: "PromptGroupSampler",
+        num_prompts_per_step: int,
+        runtime: "RolloutRuntimeState",
         initial_version: int,
     ) -> None:
-        self._controller = controller
+        self._sampler = sampler
+        self._num_prompts_per_step = num_prompts_per_step
+        self._runtime = runtime
         self._assembling_version = initial_version
         self._step_assembly: Optional[StepAssembly] = None
         # Per-step count of allow-short reasons this assembler charged, so
         # reconciliation undoes only its own racing contribution (see
         # ``_allow_short_reasons``).
         self._allow_short_charges: dict[int, int] = {}
-
-    @property
-    def _sampler(self) -> "PromptGroupSampler":
-        return self._controller._sampler
-
-    @property
-    def _runtime(self) -> "RolloutRuntimeState":
-        return self._controller._rollout_runtime
-
-    @property
-    def _num_prompts_per_step(self) -> int:
-        return self._controller._algo_cfg.num_prompts_per_step
 
     @property
     def assembling_version(self) -> int:
