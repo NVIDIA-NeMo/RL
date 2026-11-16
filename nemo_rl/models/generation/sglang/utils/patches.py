@@ -162,12 +162,19 @@ def _patch_sglang_inkling2_bucketed_refit() -> None:
         os.path.join(root, "srt", "models", "inkling2.py"),
         os.path.join(root, "tml", "model.py"),
     )
-    file_to_patch = next((c for c in candidates if os.path.exists(c)), None)
+    # Some builds keep a thin srt/models/inkling2.py that re-exports tml/model.py,
+    # so patch the first candidate that defines the model's load_weights.
+    file_to_patch = content = None
+    for candidate in candidates:
+        if not os.path.exists(candidate):
+            continue
+        with open(candidate, "r") as f:
+            text = f.read()
+        if "def load_weights(" in text and "Missing checkpoint tensors" in text:
+            file_to_patch, content = candidate, text
+            break
     if file_to_patch is None:
         return
-
-    with open(file_to_patch, "r") as f:
-        content = f.read()
 
     flag = "_nemo_rl_initial_load_done"
     edits = (

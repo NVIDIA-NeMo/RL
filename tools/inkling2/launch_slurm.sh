@@ -131,9 +131,11 @@ if [[ -n "$SEGMENT" ]]; then
 fi
 mkdir -p "$CKPT_DIR"
 echo "checkpoint_dir=$CKPT_DIR  must_save_by=$SAVE_BY (limit $TIME)"
+# SGLang jobs end in -sglang so they are easy to tell apart in squeue.
+if [[ $MODE == vllm-* ]]; then JOB_NAME=inkling2-$MODE-gb200; else JOB_NAME=inkling2-$MODE-gb200-sglang; fi
 cd "$RL"
 CONTAINER=$CONTAINER MOUNTS=$MOUNTS GPUS_PER_NODE=4 BASE_LOG_DIR=$OUT \
 COMMAND="$ENVS; cd /opt/nemo-rl && uv run --no-sync python examples/run_grpo.py --config $RECIPE logger.log_dir=$OUT/logs checkpointing.checkpoint_dir=$CKPT_DIR $EXTRA" \
 sbatch -A "$ACCOUNT" -p "$PARTITION" -q $QOS -N$NODES --gres=gpu:4 --exclusive -t $TIME $SEGMENT_ARG \
-  -J inkling2-$MODE-gb200 -o "$OUT/slurm-%j.out" ray.sub
+  -J "$JOB_NAME" -o "$OUT/slurm-%j.out" ray.sub
 echo "logs: $OUT"
