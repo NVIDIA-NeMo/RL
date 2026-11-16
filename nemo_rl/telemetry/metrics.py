@@ -212,6 +212,7 @@ _CHECKPOINT_DURATION_PHASES = {
     "exclusive_hold_seconds": "exclusive_hold",
     "sidecar_save_seconds": "sidecar_save",
     "snapshot_commit_seconds": "publication",
+    "trainer_publish_wait_seconds": "trainer_publish_wait",
     "gym_parked_seconds": "gym_parked",
     "total_load_seconds": "total",
     "snapshot_resolution_seconds": "snapshot_resolution",

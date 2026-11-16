@@ -13,6 +13,7 @@
 # limitations under the License.
 import gc
 import json
+import math
 import os
 import time
 import warnings
@@ -127,7 +128,6 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
 )
-from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
@@ -221,7 +221,7 @@ def _maybe_restore_async_replay_buffer_checkpoint(
     replay_buffer: Any,
     checkpoint_path: str,
     *,
-    load_replay_buffer: bool | None,
+    load_replay_buffer: bool,
     num_prompts_per_step: int,
     current_training_step: int,
     max_age_steps: int,
@@ -240,7 +240,7 @@ def _maybe_restore_async_replay_buffer_checkpoint(
         The restore metadata from ``load_from_path``, or ``None`` when the
         restore was skipped or no checkpoint file exists.
     """
-    if load_replay_buffer is False:
+    if not load_replay_buffer:
         print(
             "📦 Skipping replay buffer restore (checkpointing.load_replay_buffer=false)"
         )
@@ -295,6 +295,32 @@ class RewardScalingConfig(BaseModel, extra="allow"):
     source_max: float = 1.0
     target_min: float = 0.0
     target_max: float = 1.0
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "RewardScalingConfig":
+        """Validate enabled scaling bounds before any backend consumes them."""
+        if not self.enabled:
+            return self
+        non_finite = [
+            f"{name}={value}"
+            for name, value in (
+                ("source_min", self.source_min),
+                ("source_max", self.source_max),
+                ("target_min", self.target_min),
+                ("target_max", self.target_max),
+            )
+            if not math.isfinite(value)
+        ]
+        if non_finite:
+            raise ValueError(
+                f"reward_scaling bounds must be finite, got {', '.join(non_finite)}."
+            )
+        if self.source_min >= self.source_max:
+            raise ValueError(
+                f"reward_scaling.source_min={self.source_min} must be less "
+                f"than reward_scaling.source_max={self.source_max}."
+            )
+        return self
 
 
 class AsyncGRPOConfig(BaseModel, extra="allow"):
@@ -600,11 +626,14 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
     """Validate the single-forward threshold path before allocating workers.
 
     Shared by the GRPO and SingleController trainers, whose master configs are
-    separate classes with the fields read here.
+    separate classes with the fields read here. SingleController also runs it
+    for PPO, whose config has a ``ppo`` block instead of ``grpo``.
     """
     if not master_config.loss_fn.seq_logprob_error_in_loss:
         return
-    if master_config.grpo.seq_logprob_error_threshold is None:
+    ppo = getattr(master_config, "ppo", None)
+    algo = ppo if ppo is not None else master_config.grpo
+    if algo.seq_logprob_error_threshold is None:
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
         )
@@ -614,10 +643,17 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
             "loss_fn.seq_logprob_error_in_loss requires force_on_policy_ratio=true "
             "and token_level_loss=true"
         )
-    if master_config.grpo.adv_estimator.name != "grpo" or loss.use_kl_in_reward:
+    # Without the policy-logprob pass, KL-in-reward would have no policy logprobs.
+    if loss.use_kl_in_reward or (ppo is None and algo.adv_estimator.name != "grpo"):
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires the grpo advantage estimator "
-            "without use_kl_in_reward"
+            "(or PPO) without use_kl_in_reward"
+        )
+    # A forced ratio is exact only for the first optimizer step on a batch.
+    if ppo is not None and ppo.ppo_epochs != 1:
+        raise ValueError(
+            "loss_fn.seq_logprob_error_in_loss requires ppo.ppo_epochs=1, got "
+            f"ppo.ppo_epochs={ppo.ppo_epochs}"
         )
     policy = master_config.policy
     if "megatron_cfg" not in policy or not policy["megatron_cfg"]["enabled"]:
@@ -678,19 +714,6 @@ def _needs_hf_refit_handshake(
     if generation_backend == "megatron":
         return False
     return not (nccl_reshard_refit_enabled and not colocated_inference)
-
-
-def _uses_managed_noncolocated_refit(
-    generation_backend: str,
-    nccl_reshard_refit_enabled: bool,
-    offload_policy_before_refit: bool,
-) -> bool:
-    """Whether non-colocated setup must attach a weight synchronizer."""
-    return (
-        nccl_reshard_refit_enabled
-        or generation_backend == "dynamo"
-        or offload_policy_before_refit
-    )
 
 
 def _shutdown_completed_nemo_gym_startup(
@@ -754,7 +777,7 @@ def setup(
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
 
-    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
+    checkpointing_pretrained = checkpointing_config.pretrained_checkpoint
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
@@ -773,20 +796,6 @@ def setup(
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
-    elif generation_config["backend"] == "dynamo":
-        # Validate the complete managed-Dynamo boundary before allocating Ray
-        # placement groups or starting any external services.
-        if grpo_config.async_grpo.in_flight_weight_updates:
-            raise ValueError(
-                "grpo.async_grpo.in_flight_weight_updates must be false when "
-                "policy.generation.backend='dynamo'; managed Dynamo drains "
-                "rollouts before layerwise weight refit"
-            )
-        generation_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
-            policy_config.get("hf_config_overrides") or {}
-        )
-        generation_config = DynamoConfig.model_validate(generation_config).model_dump()
-        policy_config["generation"] = generation_config
 
     # generation.disaggregation is written in backend-agnostic terms, but only
     # the TRT-LLM backend implements it today: every other backend would
@@ -1318,10 +1327,6 @@ def setup(
                     gpus_per_instance = replica_width(
                         cast(TrtllmConfig, generation_config)
                     )
-                elif generation_config["backend"] == "dynamo":
-                    gpus_per_instance = DynamoConfig.model_validate(
-                        generation_config
-                    ).engine_world_size
                 else:
                     sglang_cfg = generation_config.get("sglang_cfg", {})
                     gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
@@ -1395,10 +1400,6 @@ def setup(
                 MegatronGeneration.init_cluster_placement_groups(
                     inference_cluster, policy_config
                 )
-            elif generation_config["backend"] == "dynamo":
-                # Managed Dynamo creates one single-node engine per placement
-                # group and does not need a backend-specific PG strategy.
-                inference_cluster.get_placement_groups()
             else:
                 {
                     "vllm": VllmGeneration,
@@ -1953,37 +1954,6 @@ def setup(
             )
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
-    elif backend == "dynamo":
-        # Managed Dynamo owns a fixed worker fleet on the inference virtual cluster.
-
-        def init_dynamo():
-            t0 = time.perf_counter()
-            generation = DynamoGeneration(
-                cluster=inference_cluster,
-                config=generation_config,
-                tokenizer=tokenizer,
-                tokenizer_config=policy_config["tokenizer"],
-            )
-            return generation, time.perf_counter() - t0
-
-        policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_dynamo,
-            colocated_inference=False,
-            setup_timing_metrics=setup_timing_metrics,
-        )
-
-        if enable_nemo_gym:
-            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
-                policy_generation.dp_openai_server_base_urls,
-                generation_config["model_name"],
-            )
-            setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
-
-        print(
-            f"  ✓ Using Dynamo backend (frontend: {policy_generation.frontend_url})",
-            flush=True,
-        )
-
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
@@ -2000,12 +1970,14 @@ def setup(
     if refit_transport is not None and not (
         backend == "vllm"
         or (backend == "megatron" and refit_transport in ("mcore", "nccl_reshard"))
+        or (backend == "trtllm" and refit_transport == "nccl_reshard")
     ):
         raise NotImplementedError(
             f"refit_transport={refit_transport!r} is not supported for "
             f"policy.generation.backend={backend!r}. "
             "Set policy.generation.refit_transport=null. Megatron generation "
-            "supports refit_transport='mcore' or 'nccl_reshard'."
+            "supports refit_transport='mcore' or 'nccl_reshard'; TRT-LLM "
+            "generation supports 'nccl_reshard'."
         )
 
     if backend == "megatron":
@@ -2023,12 +1995,8 @@ def setup(
         and checkpoint_engine_config is None
     ):
         t0 = time.perf_counter()
-        # init collective
-        if _uses_managed_noncolocated_refit(
-            generation_backend=backend,
-            nccl_reshard_refit_enabled=nccl_reshard_refit_enabled,
-            offload_policy_before_refit=offload_policy_before_refit,
-        ):
+        # init collective; these refits need an attached weight synchronizer.
+        if nccl_reshard_refit_enabled or offload_policy_before_refit:
             policy_generation.weight_synchronizer = create_weight_synchronizer(
                 policy=policy,
                 generation=policy_generation,
@@ -3611,7 +3579,7 @@ def _grpo_train_impl(
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -3710,7 +3678,7 @@ def _grpo_train_impl(
             "See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details."
         )
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     while (
         max_num_epochs is None or current_epoch < max_num_epochs
@@ -4567,8 +4535,7 @@ def _grpo_train_impl(
                     is_last_step
                     # Early stop saves the final state like a last step.
                     or early_stop_message is not None
-                    or (total_steps + 1) % master_config.checkpointing["save_period"]
-                    == 0
+                    or (total_steps + 1) % master_config.checkpointing.save_period == 0
                     or (
                         ft_save_period is not None
                         and (total_steps + 1) % ft_save_period == 0
@@ -4578,7 +4545,7 @@ def _grpo_train_impl(
                 should_save_by_timeout = timeout.check_save()
 
                 memory_tracker.snapshot_start_of_stage("Checkpointing", dir())
-                if master_config.checkpointing["enabled"] and (
+                if master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     policy.prepare_for_training()
@@ -4595,7 +4562,7 @@ def _grpo_train_impl(
                     grpo_save_state.consumed_samples = consumed_samples
                     _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
@@ -5313,17 +5280,17 @@ def async_grpo_train(
             media to NeMo Gym prompt rows.
     """
     # Ensure we are running with a compatible async generation backend.
-    # Async GRPO supports vLLM, Megatron, TRT-LLM, and Dynamo;
+    # Async GRPO supports vLLM, Megatron, and TRT-LLM;
     # SGLang async rollouts do not support the async GRPO replay path.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
-    assert backend in ("vllm", "megatron", "trtllm", "dynamo"), (
-        "Async GRPO supports the vLLM, Megatron, TRT-LLM, and Dynamo generation backends; "
+    assert backend in ("vllm", "megatron", "trtllm"), (
+        "Async GRPO supports the vLLM, Megatron, and TRT-LLM generation backends; "
         f"got policy.generation.backend={backend!r}."
     )
     assert should_use_async_rollouts(generation_config), (
-        "Async GRPO requires Dynamo, Megatron, or an async vLLM or TRT-LLM "
-        "generation engine. Set policy.generation.backend=dynamo, "
+        "Async GRPO requires Megatron, or an async vLLM or TRT-LLM "
+        "generation engine. Set "
         "policy.generation.vllm_cfg.async_engine=true (vLLM), or "
         "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM). "
         "Megatron Inference always uses its async engine."
@@ -5360,7 +5327,7 @@ def async_grpo_train(
     _tracer = _telemetry.tracer if _telemetry is not None else None
     training_wall_start = time.perf_counter()
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -5446,7 +5413,7 @@ def async_grpo_train(
         replay_buffer_restore_metadata = _maybe_restore_async_replay_buffer_checkpoint(
             replay_buffer,
             last_checkpoint_path,
-            load_replay_buffer=master_config.checkpointing.get("load_replay_buffer"),
+            load_replay_buffer=master_config.checkpointing.load_replay_buffer,
             num_prompts_per_step=num_prompts_per_step,
             current_training_step=step,
             max_age_steps=max_trajectory_age_steps,
@@ -5620,7 +5587,7 @@ def async_grpo_train(
             raise
 
     # Generation must hold the policy's real weights before any backend starts
-    # collecting. In particular, vLLM and Dynamo start with dummy weights when
+    # collecting. In particular, vLLM starts with dummy weights when
     # the first refit supplies model parameters.
     ray.get(trajectory_collector.set_weight_version.remote(weight_version))
     ray.get(trajectory_collector.start_collection.remote(CyclingDataLoader(dataloader)))
@@ -5779,7 +5746,7 @@ def async_grpo_train(
         init_total_s = timer.stop(INIT_TOTAL_CATEGORY)
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     # Main training loop
     try:
@@ -6269,13 +6236,13 @@ def async_grpo_train(
                 is_last_step = step + 1 == max_num_steps
                 should_save_by_step = (
                     is_last_step
-                    or (step + 1) % master_config.checkpointing["save_period"] == 0
+                    or (step + 1) % master_config.checkpointing.save_period == 0
                     or (ft_save_period is not None and (step + 1) % ft_save_period == 0)
                 )
                 # Checked pre-validation so the wake-deferral below can see it.
                 # A crossing during refit/validation is caught by the lookahead in check_save.
                 should_save_by_timeout = timeout.check_save()
-                will_save_checkpoint = master_config.checkpointing["enabled"] and (
+                will_save_checkpoint = master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 )
                 # An early stop (known only after validation) also saves.
@@ -6406,7 +6373,7 @@ def async_grpo_train(
                             stop_at_validation_metric,
                         )
                         saving_this_step = will_save_checkpoint or (
-                            master_config.checkpointing["enabled"]
+                            master_config.checkpointing.enabled
                             and early_stop_message is not None
                         )
                         # Save-bound steps need the GPUs for checkpointing,
@@ -6537,7 +6504,7 @@ def async_grpo_train(
                     grpo_save_state.consumed_samples = consumed_samples
                     _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics

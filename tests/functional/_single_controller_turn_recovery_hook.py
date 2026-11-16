@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Test-only SC entrypoint that records turn-recovery ownership.
+"""Test-only SC entrypoint that records Gym-recovery ownership.
 
 Gym's policy calls go through ``_gym_policy_proxy``, which holds the first one
 carrying a tool result when ``SC_TURN_RECOVERY_HOLD_FIRST_TOOL_RESULT=1``, so
@@ -26,10 +26,18 @@ episodes a Gym restore installed. A two-process functional test can therefore
 prove that a restored episode returns to the same Gym instance under
 ``gym_attempt + 1`` and continues from its saved turn, without depending on log
 wording.
+
+When ``SC_PREFIX_RECOVERY_STAGING_KEYS`` is set, the hook also records the live
+token-capture staging keys before each training chunk, and with
+``SC_PREFIX_RECOVERY_FLUSH_KEYS`` right after each snapshot's delete of ended
+calls' generation chunk rows. A prefix-recovery run can then prove restored
+prefix rows are retired at their terminal write and deleted by the next
+snapshot. The trained rows themselves come from ``async_rl.log_full_train_data``.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
@@ -42,6 +50,75 @@ from nemo_rl.experience.rollout_manager import RolloutCompletionCallback
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from tests.functional._gym_policy_proxy import PolicyHoldProxy
 from tests.functional._single_controller_hook_utils import append_event, find_group
+
+
+class _StagingKeyProbe:
+    """Test-only TQPolicy wrapper that records live staging keys per train step."""
+
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        output_path: Path,
+        initial_train_step: int,
+        partition: str,
+    ) -> None:
+        self._delegate = delegate
+        self._output_path = output_path
+        self._train_step = initial_train_step
+        self._partition = partition
+
+    def __getattr__(self, name: str) -> Any:
+        delegate = self.__dict__.get("_delegate")
+        if delegate is None:
+            raise AttributeError(name)
+        return getattr(delegate, name)
+
+    def begin_train_step(self, *args: Any, **kwargs: Any) -> Any:
+        result = self._delegate.begin_train_step(*args, **kwargs)
+        self._train_step += 1
+        return result
+
+    def train_microbatches_from_meta(self, meta: Any, *args: Any, **kwargs: Any) -> Any:
+        keys = self._delegate.dp_client.list_sample_ids(partition_id=self._partition)
+        with self._output_path.open("a") as stream:
+            record = {
+                "train_step": self._train_step,
+                "staging_sample_ids": sorted(keys),
+            }
+            stream.write(json.dumps(record) + "\n")
+        return self._delegate.train_microbatches_from_meta(meta, *args, **kwargs)
+
+
+class _FlushKeyProbe:
+    """Test-only generation wrapper that records live staging keys after each flush."""
+
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        dp_client: Any,
+        output_path: Path,
+        partition: str,
+    ) -> None:
+        self._delegate = delegate
+        self._dp_client = dp_client
+        self._output_path = output_path
+        self._partition = partition
+
+    def __getattr__(self, name: str) -> Any:
+        delegate = self.__dict__.get("_delegate")
+        if delegate is None:
+            raise AttributeError(name)
+        return getattr(delegate, name)
+
+    def flush_obsolete_generation_cut_rows(self, epoch: int, **kwargs: Any) -> Any:
+        result = self._delegate.flush_obsolete_generation_cut_rows(epoch, **kwargs)
+        keys = self._dp_client.list_sample_ids(partition_id=self._partition)
+        with self._output_path.open("a") as stream:
+            record = {"epoch": epoch, "staging_sample_ids": sorted(keys)}
+            stream.write(json.dumps(record) + "\n")
+        return result
 
 
 class _InstrumentedNemoGymRolloutImpl:
@@ -88,13 +165,13 @@ class _InstrumentedNemoGymRolloutImpl:
         dispatch_recorder: Any = None,
     ) -> Any:
         if rollout_ids is None or generation_indices is None or on_completion is None:
-            raise RuntimeError("turn recovery hook requires token capture")
+            raise RuntimeError("Gym recovery hook requires token capture")
         if environment_instance_id is None:
-            raise RuntimeError("turn recovery hook requires a Gym checkpoint owner")
+            raise RuntimeError("Gym recovery hook requires a Gym checkpoint owner")
         if dispatch_recorder is None:
-            raise RuntimeError("turn recovery hook requires a dispatch recorder")
+            raise RuntimeError("Gym recovery hook requires a dispatch recorder")
 
-        group = find_group(self._recovery_ledger, rollout_ids, hook="turn")
+        group = find_group(self._recovery_ledger, rollout_ids, hook="Gym")
         indices = list(generation_indices)
         common = {
             "group_id": group.group_id,
@@ -226,7 +303,7 @@ def _spinup_gym_behind_policy_proxy(
         hold_first_tool_result=os.environ.get("SC_TURN_RECOVERY_HOLD_FIRST_TOOL_RESULT")
         == "1",
         follow_up_tool=os.environ.get("SC_TURN_RECOVERY_FOLLOW_UP_TOOL") or None,
-        events_path=Path(os.environ["SC_TURN_RECOVERY_TEST_EVENTS"]),
+        events_path=Path(os.environ["SC_GYM_RECOVERY_TEST_EVENTS"]),
     ).start()
     _policy_proxies.append(proxy)
     return _original_spinup_gym(*args, base_urls=proxy.base_urls, **kwargs)
@@ -237,11 +314,12 @@ sc_setup._spinup_gym = _spinup_gym_behind_policy_proxy
 _original_setup_single_controller = run_grpo_single_controller.setup_single_controller
 
 
-def _setup_with_turn_recovery_hook(*args: Any, **kwargs: Any) -> Any:
+def _setup_with_gym_recovery_hook(*args: Any, **kwargs: Any) -> Any:
     actor_args, timing_metrics = _original_setup_single_controller(*args, **kwargs)
+    master_config = args[0] if args else kwargs["master_config"]
     manager = actor_args.rollout_manager
     impl = manager._impl
-    events_path = Path(os.environ["SC_TURN_RECOVERY_TEST_EVENTS"])
+    events_path = Path(os.environ["SC_GYM_RECOVERY_TEST_EVENTS"])
     instrumented = _InstrumentedNemoGymRolloutImpl(
         impl,
         recovery_ledger=manager.recovery_ledger,
@@ -252,13 +330,29 @@ def _setup_with_turn_recovery_hook(*args: Any, **kwargs: Any) -> Any:
         ledger, events_path=events_path
     ).prepare_for_restart
     # Patch the instance method rather than replacing ``_impl``: RolloutManager
-    # gates checkpoint admission and turn recovery on
+    # gates checkpoint admission and Gym recovery on
     # ``isinstance(self._impl, AsyncNemoGymRolloutImpl)``.
     impl.run_rollout = instrumented.run_rollout
+    staging_keys_path = os.environ.get("SC_PREFIX_RECOVERY_STAGING_KEYS")
+    if staging_keys_path is not None:
+        actor_args.trainer_handle = _StagingKeyProbe(
+            actor_args.trainer_handle,
+            output_path=Path(staging_keys_path),
+            initial_train_step=int(actor_args.save_state.current_step),
+            partition=master_config.token_capture.staging_partition,
+        )
+    flush_keys_path = os.environ.get("SC_PREFIX_RECOVERY_FLUSH_KEYS")
+    if flush_keys_path is not None:
+        actor_args.gen_handle = _FlushKeyProbe(
+            actor_args.gen_handle,
+            dp_client=actor_args.dp_client,
+            output_path=Path(flush_keys_path),
+            partition=master_config.token_capture.staging_partition,
+        )
     return actor_args, timing_metrics
 
 
-run_grpo_single_controller.setup_single_controller = _setup_with_turn_recovery_hook
+run_grpo_single_controller.setup_single_controller = _setup_with_gym_recovery_hook
 
 
 if __name__ == "__main__":

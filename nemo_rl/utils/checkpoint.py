@@ -31,7 +31,6 @@ from typing import (
     Iterator,
     Literal,
     Mapping,
-    NotRequired,
     Optional,
     TypedDict,
     Union,
@@ -200,45 +199,53 @@ class PretrainedCheckpointConfig(TypedDict):
     format: Literal["megatron_bridge", "megatron_lm"]
 
 
-class CheckpointingConfig(TypedDict):
+class CheckpointingConfig(BaseModel, extra="allow"):
     """Configuration for checkpoint management.
 
     Attributes:
-    enabled (bool): Whether checkpointing is enabled.
-    checkpoint_dir (PathLike): Directory where checkpoints will be saved.
-    metric_name (str | None): Name of the metric to use for determining best checkpoints.
-        Must be of the form "val:<metric_name>" or "train:<metric_name>" to indicate whether
-        the metric should be taken from the validation or training metrics.
-    higher_is_better (bool): Whether higher values of the metric indicate better performance.
-    keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
-    ft_keep_latest_k (Optional[int]): Number of most recent checkpoints to keep for crash recovery.
-    ft_save_period (Optional[int]): How often to save fault-tolerance checkpoints, in steps.
-        When set, a checkpoint is saved every ft_save_period steps for crash recovery.
-        Requires ft_keep_latest_k to control how many of these are retained.
-    save_optimizer (bool): Whether to save optimizer state with checkpoints.
-    save_data_plane (bool): Whether SingleController checkpoints include the
-        native TQ snapshot and replay-buffer metadata. Supported by the simple
-        and mooncake_cpu backends; no backend-specific checkpoint switch is needed.
-    load_replay_buffer (bool): Whether async GRPO or SingleController restores
-        replay-buffer state when resuming from a checkpoint. Defaults to True.
-        When False, a frontier-aligned async resume or a SingleController native
-        TQ resume regenerates the buffered prompt groups on the current policy
-        instead of reusing completed groups.
+        enabled (bool): Whether checkpointing is enabled.
+        checkpoint_dir (PathLike): Directory where checkpoints will be saved.
+        metric_name (str | None): Name of the metric to use for determining best checkpoints.
+            Must be of the form "val:<metric_name>" or "train:<metric_name>" to indicate whether
+            the metric should be taken from the validation or training metrics.
+        higher_is_better (bool): Whether higher values of the metric indicate better performance.
+            Only read when metric_name is set.
+        save_period (int): How often to save a checkpoint, in steps.
+        keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
+        ft_keep_latest_k (Optional[int]): Number of most recent checkpoints to keep for crash recovery.
+        ft_save_period (Optional[int]): How often to save fault-tolerance checkpoints, in steps.
+            When set, a checkpoint is saved every ft_save_period steps for crash recovery.
+            Requires ft_keep_latest_k to control how many of these are retained.
+        checkpoint_must_save_by (Optional[str]): Deadline in DD:HH:MM:SS, measured from job start,
+            by which a checkpoint is saved. None disables it.
+        pretrained_checkpoint (Optional[PretrainedCheckpointConfig]): Megatron checkpoint overriding
+            policy.pretrained_checkpoint for the initial weights. None leaves the policy setting
+            unchanged; model_name supplies the weights when neither setting specifies a checkpoint.
+        save_optimizer (bool): Whether to save optimizer state with checkpoints.
+        save_data_plane (bool): Whether SingleController checkpoints include the
+            native TQ snapshot and replay-buffer metadata. Supported by the simple
+            and mooncake_cpu backends; no backend-specific checkpoint switch is needed.
+        load_replay_buffer (bool): Whether async GRPO or SingleController restores
+            replay-buffer state when resuming from a checkpoint. When False, a
+            frontier-aligned async resume or a SingleController native TQ resume
+            regenerates the buffered prompt groups on the current policy instead
+            of reusing completed groups.
     """
 
     enabled: bool
     checkpoint_dir: PathLike
     metric_name: str | None
+    # Only read when metric_name is set.
     higher_is_better: bool
-    save_period: int
-    keep_top_k: NotRequired[int | None]
-    ft_keep_latest_k: NotRequired[int | None]
-    ft_save_period: NotRequired[int]
-    checkpoint_must_save_by: NotRequired[str | None]
-    pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig | None]
-    save_optimizer: NotRequired[bool]  # Default: True
-    save_data_plane: NotRequired[bool]
-    load_replay_buffer: NotRequired[bool]  # Default: True
+    save_period: int = 10
+    keep_top_k: Optional[int] = None
+    ft_keep_latest_k: Optional[int] = None
+    ft_save_period: Optional[int] = None
+    checkpoint_must_save_by: Optional[str] = None
+    pretrained_checkpoint: Optional[PretrainedCheckpointConfig] = None
+    save_optimizer: bool = True
+    save_data_plane: bool = False
+    load_replay_buffer: bool = True
 
 
 _AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
@@ -283,8 +290,10 @@ class CheckpointManager:
         Args:
             config (CheckpointingConfig)
         """
+        # These fields no longer exist on the schema, so legacy keys arrive via
+        # extra="allow" — check model_extra rather than the field set.
         automodel_only_fields = sorted(
-            _AUTOMODEL_ONLY_CHECKPOINT_FIELDS.intersection(config)
+            _AUTOMODEL_ONLY_CHECKPOINT_FIELDS.intersection(config.model_extra or {})
         )
         if automodel_only_fields:
             raise ValueError(
@@ -297,18 +306,18 @@ class CheckpointManager:
                 "internally."
             )
 
-        if is_msc_path(config["checkpoint_dir"]) and config.get("save_data_plane"):
+        if is_msc_path(config.checkpoint_dir) and config.save_data_plane:
             raise ValueError(
                 "MSC checkpoints do not yet support data-plane snapshots; set save_data_plane=false."
             )
-        self.checkpoint_dir = as_path(config["checkpoint_dir"])
-        self._storage = make_storage(config["checkpoint_dir"])
-        self.metric_name: str | None = config["metric_name"]
-        self.higher_is_better = config["higher_is_better"]
-        self.keep_top_k = config["keep_top_k"]
-        self.save_period: int = config["save_period"]
-        self.ft_keep_latest_k: int | None = config.get("ft_keep_latest_k", None)
-        self.save_optimizer = config["save_optimizer"]
+        self.checkpoint_dir = as_path(config.checkpoint_dir)
+        self._storage = make_storage(config.checkpoint_dir)
+        self.metric_name: str | None = config.metric_name
+        self.higher_is_better = config.higher_is_better
+        self.keep_top_k = config.keep_top_k
+        self.save_period: int = config.save_period
+        self.ft_keep_latest_k: int | None = config.ft_keep_latest_k
+        self.save_optimizer = config.save_optimizer
 
         # Async finalization state
         self._finalize_thread: Optional[threading.Thread] = None
