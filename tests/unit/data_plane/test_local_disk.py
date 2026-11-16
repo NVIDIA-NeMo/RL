@@ -34,7 +34,9 @@ def test_filesystem_is_the_longest_mount_prefix(tmp_path):
 def test_ram_backed_path_is_refused_and_names_the_setting(monkeypatch):
     monkeypatch.setattr(local_disk, "filesystem_of", lambda path, text=None: "tmpfs")
     with pytest.raises(ValueError, match=r"nixl\.ssd\.path.*tmpfs"):
-        local_disk.require_disk_backed("/dev/shm/nrl", setting="data_plane.nixl.ssd.path")
+        local_disk.require_disk_backed(
+            "/dev/shm/nrl", setting="data_plane.nixl.ssd.path"
+        )
 
 
 def test_disk_backed_path_passes(monkeypatch):
@@ -46,8 +48,16 @@ def test_disk_backed_path_passes(monkeypatch):
     ("raid_line", "writable", "expected"),
     [
         ("/dev/md0 /raid ext4 rw 0 0", True, "/raid/nrl_x"),  # the DGX NVMe RAID
-        ("", True, "/tmp/nrl_x"),  # no /raid mount on this node (a plain dir is not one)
-        ("tmpfs /raid tmpfs rw 0 0", True, "/tmp/nrl_x"),  # a /raid that is RAM is not a disk
+        (
+            "",
+            True,
+            "/tmp/nrl_x",
+        ),  # no /raid mount on this node (a plain dir is not one)
+        (
+            "tmpfs /raid tmpfs rw 0 0",
+            True,
+            "/tmp/nrl_x",
+        ),  # a /raid that is RAM is not a disk
         ("/dev/md0 /raid ext4 rw 0 0", False, "/tmp/nrl_x"),  # root-owned /raid
     ],
 )
@@ -68,7 +78,10 @@ def test_the_fallback_is_noted_once_with_what_tmp_is(monkeypatch):
     local_disk.note_ssd_dir_fallback_once(log)
     local_disk.note_ssd_dir_fallback_once(log)
     (note,) = notes
-    assert note.startswith("/raid is not mounted on ") and "/tmp (ext4 mounted at /)" in note
+    assert (
+        note.startswith("/raid is not mounted on ")
+        and "/tmp (ext4 mounted at /)" in note
+    )
 
 
 def test_no_note_when_raid_is_usable(monkeypatch):
