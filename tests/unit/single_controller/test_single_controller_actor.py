@@ -412,6 +412,7 @@ def _grpo_chunk_cap_config(
     sequence_packing: bool = False,
 ) -> MasterConfig:
     return MasterConfig.model_construct(
+        loss_fn=ClippedPGLossConfig(),
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=8,
             num_generations_per_prompt=num_generations_per_prompt,
@@ -434,8 +435,6 @@ def _grpo_chunk_cap_config(
 @pytest.mark.parametrize(
     ("policy_dp", "generations", "dynamic_batching", "forest", "expected_groups"),
     [
-        # 21 ready groups are 336 samples, which DP 32 cannot split.
-        (32, 16, True, False, 2),
         # Static batching also needs whole microbatches of 4 on each rank.
         (2, 4, False, False, 2),
         # Forest pads each group, so its group count needs no alignment.
@@ -457,6 +456,39 @@ def test_grpo_group_multiple_aligns_chunks_to_policy_shards(
         dynamic_batching=dynamic_batching,
     )
     assert resolve_grpo_group_multiple(config, policy_dp) == expected_groups
+
+
+def test_grpo_rejects_a_step_size_that_cannot_shard_across_policy_dp() -> None:
+    """A step size that is not a group multiple strands the last chunk.
+
+    Eight groups at two generations each is sixteen samples. DP 6 needs a
+    multiple of three groups, so no selection can fill the last chunk.
+    """
+    with pytest.raises(ValueError, match="num_prompts_per_step"):
+        validate_grpo_chunk_cap_alignment(_grpo_chunk_cap_config(None), 6)
+
+
+def test_grpo_group_multiple_ignores_logprob_batch_size_without_a_logprob_pass() -> (
+    None
+):
+    """On-policy ratio and no KL skip every logprob forward.
+
+    The dispatch then splits only on the train microbatch size, so a logprob
+    batch size of 6 must not widen the multiple to lcm(4, 6) = 12.
+    """
+    config = _grpo_chunk_cap_config(
+        None,
+        num_generations_per_prompt=16,
+        train_micro_batch_size=4,
+        dynamic_batching=False,
+    )
+    config.policy["logprob_batch_size"] = 6
+    config.loss_fn = ClippedPGLossConfig(
+        force_on_policy_ratio=True, reference_policy_kl_penalty=0
+    )
+    assert not any(logprob_passes_required(config, config.grpo))
+    # 32 x 4 = 128 samples is 8 groups of 16; lcm(4, 6) would give 384 -> 24.
+    assert resolve_grpo_group_multiple(config, 32) == 8
 
 
 def test_grpo_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp() -> None:
