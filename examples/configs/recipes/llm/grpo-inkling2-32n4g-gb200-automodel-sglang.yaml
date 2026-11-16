@@ -1,0 +1,60 @@
+# grpo-inkling2-16n4g-gb200-automodel-sglang on 32 GB200 nodes (185 GB/GPU).
+#
+# Why 32 nodes: on 16 nodes SGLang ran out of memory resuming
+# its weights at the first refit. During a refit the GPU holds SGLang's BF16 weights
+# (138.5 GB/GPU at TP 8 / EP 8, the widest Inkling2 allows) and this rank's bf16 policy
+# shard at the same time, plus CUDA contexts and NCCL / expert-dispatch buffers.
+# Spreading the policy over 128 GPUs halves its shard (~19 -> ~9.5 GB/GPU) and its
+# per-rank training state. SGLang engines are unchanged (16 engines of 2 nodes).
+#
+# Expert parallelism follows Automodel's GB200 HybridEP recipes (e.g. mistral_large4,
+# kimi_k3): an EP group never crosses an NVL72 rack. EP64 + HybridEP inside a 16-node
+# block of one rack; the two blocks share the experts through FSDP over the extra
+# expert-sharding dim (ep_shard=2, plain NCCL). EP128 spans two racks and HybridEP's
+# inter-rack RDMA path segfaulted; EP64 runs cleanly.
+# Needs Automodel with Inkling2 HybridEP support (NVIDIA-NeMo/Automodel#4755, in main)
+# and an sbatch --segment=16 allocation (tools/inkling2/launch_slurm.sh full32).
+defaults: grpo-inkling2-16n4g-gb200-automodel-sglang.yaml
+policy:
+  automodel_cfg:
+    # 384 experts / 64 ranks = 6 experts per GPU, FSDP-sharded 2-way across racks.
+    expert_parallel_size: 64
+    automodel_kwargs:
+      backend:
+        dispatcher: hybridep
+        # Presize HybridEP buffers so they never regrow mid-run ("Failed to create QP").
+        dispatcher_hybridep_max_tokens_per_rank: 4096
+    # Policy workers only (SGLang keeps its own allocator / memory saver). An earlier run
+    # OOMed in step 5 backward asking for 4.7 GiB with 26 GiB reserved-but-unallocated:
+    # fragmentation. Never splitting cached blocks > 512 MB keeps large segments whole
+    # and releasable. expandable_segments is avoided: it slows CUDA-IPC refit and
+    # empty_cache() under it can corrupt the allocator (nemo_rl/models/policy/utils.py).
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: max_split_size_mb:512
+  generation:
+    sglang_cfg:
+      mem_fraction_static: 0.8
+      # Gather routed experts 12 at a time (2 trainer ranks of 6; SGLang EP ranks
+      # hold 48) instead of a layer's full 384-expert stack (30 GiB for
+      # gate_and_up in BF16), which OOMed next to SGLang.
+      expert_refit_chunk_size: 12
+      sglang_server_config:
+        num_gpus: 128
+checkpointing:
+  # Save weights + optimizer (~5 TB) so the next job resumes from the latest step.
+  # tools/inkling2/launch_slurm.sh sets a fixed checkpoint_dir per mode and
+  # checkpoint_must_save_by = job time limit - SAVE_MARGIN (10 min), so a checkpoint is written
+  # before Slurm kills the job; training then stops cleanly. Only the latest checkpoint
+  # and the best save_period-aligned one (by val:accuracy) are kept.
+  enabled: true
+  checkpoint_dir: results/grpo-inkling2-32n4g-gb200-automodel-sglang
+  save_period: 50
+  keep_top_k: 1
+logger:
+  log_dir: logs/grpo-inkling2-32n4g-gb200-automodel-sglang
+  wandb:
+    name: grpo-inkling2-32n4g-gb200-automodel-sglang
+cluster:
+  num_nodes: 32
+  # Place workers by 16-node NVLink segment so each EP64 group stays in one rack.
+  segment_size: 16

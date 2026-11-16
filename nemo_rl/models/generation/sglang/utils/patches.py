@@ -64,21 +64,42 @@ def _patch_sglang_safe_unpickler() -> None:
     with open(file_to_patch, "r") as f:
         content = f.read()
 
-    sentinel = '"nemo_rl.models.generation.sglang.utils.train_utils."'
-    if sentinel in content:
+    module = "nemo_rl.models.generation.sglang.utils.train_utils"
+    prefix_sentinel = f'"{module}."'
+    if prefix_sentinel in content:
         return
 
-    anchor = '        "torch.nn.parameter.",\n'
-    insertion = (
-        anchor + '        "nemo_rl.models.generation.sglang.utils.train_utils.",\n'
+    # Older sglang allowlists module prefixes; newer sglang (e.g. the Inkling2
+    # build, 0.5.17+) allowlists exact (module, name) pairs and rejects prefixes.
+    prefix_anchor = '        "torch.nn.parameter.",\n'
+    pair_anchor = '        ("torch.nn.parameter", "Parameter"),\n'
+    # Globals NeMo RL refit payloads reference: the flattened bucket containers
+    # and the CUDA-IPC rebuild function installed by monkey_patch_torch_reductions.
+    pair_names = (
+        "FlattenedTensorMetadata",
+        "FlattenedTensorBucket",
+        "_rebuild_cuda_tensor_modified",
     )
-    if anchor not in content:
+    pair_lines = "".join(f'        ("{module}", "{name}"),\n' for name in pair_names)
+    pair_sentinel = f'("{module}", "{pair_names[0]}")'
+
+    if prefix_anchor in content:
+        content = content.replace(
+            prefix_anchor, prefix_anchor + f"        {prefix_sentinel},\n", 1
+        )
+        sentinel = prefix_sentinel
+    elif pair_anchor in content:
+        if pair_sentinel in content:
+            return
+        content = content.replace(pair_anchor, pair_anchor + pair_lines, 1)
+        sentinel = pair_sentinel
+    else:
         raise RuntimeError(
-            f"SafeUnpickler allowlist anchor '{anchor.strip()}' not found in "
-            f"{file_to_patch}."
+            "SafeUnpickler allowlist anchor not found in "
+            f"{file_to_patch}: expected '{prefix_anchor.strip()}' or "
+            f"'{pair_anchor.strip()}'."
         )
 
-    content = content.replace(anchor, insertion, 1)
     _write_and_verify(file_to_patch, content, sentinel)
     logger.info("Patched SafeUnpickler allowlist in %s.", file_to_patch)
 
@@ -107,6 +128,145 @@ def _patch_sglang_transformers_compat_bootstrap() -> None:
     compile(patched_content, file_to_patch, "exec")
     _write_and_verify(file_to_patch, patched_content, sentinel)
     logger.info("Patched Transformers compatibility bootstrap in %s.", file_to_patch)
+
+
+def _patch_sglang_inkling2_bucketed_refit() -> None:
+    """Let Inkling2 accept refit weights in buckets.
+
+    The Inkling2 model's ``load_weights`` rejects any call that does not carry
+    every parameter (and every fused-projection shard). That is right for the
+    initial checkpoint load, but NeMo RL refits stream weights in buckets and
+    SGLang calls ``load_weights`` once per bucket. Each call has already copied
+    its tensors when the completeness check runs, so only the check is limited
+    to the first (initial) load; per-tensor name, dtype and shape checks still
+    apply to every bucket.
+
+    Loaders that bypass ``load_weights`` (``load_format: dummy``, used when SGLang
+    serves BF16 experts that only the first refit fills) call the model's
+    ``post_load_weights`` hook instead, so the patch adds that hook to mark the
+    initial load done.
+
+    It also lets ``load_weights`` take routed-expert stacks in chunks named
+    ``<name>@nemo_rl_experts_<start>_<stop>`` (``expert_refit_chunk_size``):
+    each EP rank copies the chunks inside its expert range and skips the rest,
+    so the trainer never has to gather a layer's full expert stack. No-op on
+    SGLang builds without Inkling2.
+    """
+    spec = find_spec("sglang")
+    if spec is None or not spec.submodule_search_locations:
+        return
+    root = next(iter(spec.submodule_search_locations))
+    # sgl-project/sglang#50186 adds the model at srt/models/inkling2.py; earlier
+    # Inkling2 builds shipped it as tml/model.py.
+    candidates = (
+        os.path.join(root, "srt", "models", "inkling2.py"),
+        os.path.join(root, "tml", "model.py"),
+    )
+    file_to_patch = next((c for c in candidates if os.path.exists(c)), None)
+    if file_to_patch is None:
+        return
+
+    with open(file_to_patch, "r") as f:
+        content = f.read()
+
+    flag = "_nemo_rl_initial_load_done"
+    edits = (
+        (
+            "# NeMo RL: refit buckets after the initial load carry a subset.",
+            "        if missing:\n"
+            '            raise ValueError(f"Missing checkpoint tensors: {sorted(missing)}")\n',
+            "        # NeMo RL: refit buckets after the initial load carry a subset.\n"
+            f'        if missing and not getattr(self, "{flag}", False):\n'
+            '            raise ValueError(f"Missing checkpoint tensors: {sorted(missing)}")\n'
+            f"        self.{flag} = True\n",
+        ),
+        (
+            "# NeMo RL: loaders that bypass load_weights",
+            "    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n",
+            "    def post_load_weights(self):\n"
+            "        # NeMo RL: loaders that bypass load_weights (load_format=dummy)\n"
+            "        # initialize every parameter; later refits may arrive in buckets.\n"
+            f"        self.{flag} = True\n"
+            "\n"
+            "    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n",
+        ),
+        (
+            "# NeMo RL: chunked routed-expert refit",
+            "    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n",
+            "    def _nemo_rl_expert_chunks(self, params, weights):\n"
+            "        # NeMo RL: chunked routed-expert refit. A tensor named\n"
+            '        # "<name>@nemo_rl_experts_<start>_<stop>" carries experts [start, stop)\n'
+            "        # of one stacked routed-expert tensor; copy it into this EP rank's\n"
+            "        # slice (or skip it on other ranks) instead of requiring all experts.\n"
+            "        import re\n"
+            "\n"
+            '        pattern = re.compile(r"(.+)@nemo_rl_experts_(\\d+)_(\\d+)")\n'
+            "        ep_rank = get_parallel().moe_ep_rank\n"
+            "        for checkpoint_name, weight in weights:\n"
+            "            match = pattern.fullmatch(checkpoint_name)\n"
+            "            if match is None:\n"
+            "                yield checkpoint_name, weight\n"
+            "                continue\n"
+            "            source, start, stop = match[1], int(match[2]), int(match[3])\n"
+            '            name = source.removeprefix("model.")\n'
+            '            for leaf in ("w13_weight", "w2_weight"):\n'
+            '                name = name.replace(f".mlp.{leaf}", f".mlp.experts.{leaf}")\n'
+            "            param = params.get(name)\n"
+            '            if param is None or ".experts." not in name or ".shared_experts." in name:\n'
+            '                raise ValueError(f"Unrecognized chunked expert tensor: {checkpoint_name}")\n'
+            "            if self.quant_config is not None:\n"
+            "                expected_dtype = self.quant_config.tensor_dtypes[source]\n"
+            "                if weight.dtype != expected_dtype:\n"
+            "                    raise ValueError(\n"
+            '                        f"{checkpoint_name}: expected {expected_dtype}, got {weight.dtype}"\n'
+            "                    )\n"
+            "            if param.dtype != weight.dtype:\n"
+            "                raise ValueError(\n"
+            '                    f"{checkpoint_name}: parameter dtype {param.dtype} would change checkpoint precision {weight.dtype}"\n'
+            "                )\n"
+            "            local = param.shape[0]\n"
+            "            low, high = ep_rank * local, (ep_rank + 1) * local\n"
+            "            if stop <= low or start >= high:\n"
+            "                continue\n"
+            "            if start < low or stop > high:\n"
+            '                raise ValueError(f"{checkpoint_name}: chunk crosses expert-parallel ranks")\n'
+            "            if tuple(weight.shape) != (stop - start, *param.shape[1:]):\n"
+            "                raise ValueError(\n"
+            '                    f"{checkpoint_name}: chunk shape {tuple(weight.shape)} does not match "\n'
+            '                    f"{(stop - start, *param.shape[1:])} (expert TP must be 1)"\n'
+            "                )\n"
+            "            param.data[start - low : stop - low].copy_(weight)\n"
+            "\n"
+            "    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n",
+        ),
+        (
+            "weights = self._nemo_rl_expert_chunks(params, weights)",
+            "        params = dict(self.named_parameters())\n"
+            "        loaded = set()\n"
+            "        projections = (\n",
+            "        params = dict(self.named_parameters())\n"
+            "        weights = self._nemo_rl_expert_chunks(params, weights)\n"
+            "        loaded = set()\n"
+            "        projections = (\n",
+        ),
+    )
+    patched_content = content
+    applied = False
+    for sentinel, anchor, replacement in edits:
+        if sentinel in patched_content:
+            continue
+        if patched_content.count(anchor) != 1:
+            raise RuntimeError(
+                f"Inkling2 refit patch anchor not found exactly once in {file_to_patch}: "
+                f"{anchor.strip().splitlines()[0]}"
+            )
+        patched_content = patched_content.replace(anchor, replacement, 1)
+        applied = True
+    if not applied:
+        return
+    compile(patched_content, file_to_patch, "exec")
+    _write_and_verify(file_to_patch, patched_content, tuple(s for s, _, _ in edits))
+    logger.info("Patched Inkling2 bucketed refit loading in %s.", file_to_patch)
 
 
 def _override_sglang_imbalance_check_env() -> None:
@@ -201,6 +361,7 @@ def _apply_sglang_compat_patches() -> None:
     # Keep while nemo_rl.transformers_compat installs any patch; the torch-FX helper outlives Transformers 5.13.
     _patch_sglang_transformers_compat_bootstrap()
     _patch_sglang_safe_unpickler()
+    _patch_sglang_inkling2_bucketed_refit()
     _override_sglang_imbalance_check_env()
     _patch_megatron_dynamic_context_hook_mode()
     _patch_megatron_training_hook_mode()

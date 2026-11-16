@@ -1,0 +1,165 @@
+# Inkling 2 Small (48-layer, 384-expert MoE) GRPO: Automodel policy + SGLang
+# rollouts, colocated on 8 GB300 nodes x 4 GPUs.
+#
+# Precision: the released checkpoint stores routed experts packed (NVFP4 in layers
+# 0-39, MXFP8 in 40-47; see hf_quant_config.json). Automodel dequantizes them into
+# BF16 training weights, and SGLang serves the same BF16 experts
+# (grouped_gemm_triton), so refit is a plain BF16 copy (quantization.scheme: bf16).
+# Only the experts were ever quantized; attention, embeddings, unembed and router
+# are BF16 in the release, plus the FP32 AttnRes queries and router bias.
+#
+# Two checkpoint views (metadata files + symlinks to the release weights):
+#   policy.model_name           Automodel text-only view (config.json carries
+#                               quantization_config so the packed experts are decoded).
+#   sglang_cfg.model_path       SGLang view whose hf_quant_config.json lists the experts
+#                               as BF16 (tools/inkling2/make_sglang_bf16_view.py). The packed
+#                               files cannot fill BF16 parameters, so SGLang starts with
+#                               load_format: dummy and the first refit, which runs before
+#                               any generation, supplies every weight.
+#
+# Memory (594B params): BF16 params + grads + AdamW states ~4.8 TB, sharded over 32
+# GPUs (~150 GB each, offloaded during generation). A BF16 SGLang copy is ~1.19 TB,
+# which does not fit one 4-GPU node (288 GB/GPU), so each engine spans 2 nodes
+# (TP 8, experts EP 8: ~150 GB/GPU of weights), 4 engines in total.
+# Modeled on grpo-qwen3.8-flash-next-dapo-8n8g-automodel and
+# grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128.
+defaults: ../../grpo_math_1B_sglang.yaml
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  max_num_steps: 500
+  val_period: 10
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: 256
+  val_batch_size: 256
+loss_fn:
+  token_level_loss: false
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+checkpointing:
+  # A full checkpoint (weights + optimizer) is ~5 TB; enable deliberately.
+  enabled: false
+  checkpoint_dir: results/grpo-inkling2-8n4g-automodel-sglang
+  keep_top_k: 1
+  save_period: 50
+policy:
+  model_name: /path/to/inkling2-small-automodel-text
+  tokenizer:
+    name: ${policy.model_name}
+    # The release defines no eos/pad token and ships no chat template. Both tokens
+    # are <|content_model_end_sampling|> (id 200006, the checkpoint eos_token_id),
+    # matching Automodel's Inkling2 processor, so stop tokens agree with SGLang.
+    tokenizer_kwargs:
+      eos_token: "<|content_model_end_sampling|>"
+      pad_token: "<|content_model_end_sampling|>"
+    # Text-only form of Automodel's Inkling2 template
+    # (components/models/inkling2/processing.py), plus a generation prompt.
+    chat_template: >-
+      {%- for message in messages -%}
+      {%- set role = 'model' if message['role'] == 'assistant' else message['role'] -%}
+      {%- if message['content'] is string -%}
+      {%- set items = [{'type': 'text', 'text': message['content']}] -%}
+      {%- else -%}
+      {%- set items = message['content'] -%}
+      {%- endif -%}
+      {%- for item in items -%}
+      {{- '<|message_' + role + '|><|content_' + item['type'] + '|>' + item['text'] + '<|end_message|>' -}}
+      {%- endfor -%}
+      {%- if message['role'] == 'assistant' -%}
+      {{- '<|content_model_end_sampling|>' -}}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- if add_generation_prompt -%}
+      {{- '<|message_model|><|content_text|>' -}}
+      {%- endif -%}
+  refit_buffer_size_gb: 4
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  make_sequence_length_divisible_by: 64
+  offload_optimizer_for_logprob: true
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      betas: [0.9, 0.95]
+      eps: 1.0e-08
+      foreach: false
+      fused: false
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.01
+      end_factor: 1.0
+      total_iters: 5
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 5
+  automodel_cfg:
+    # 384 experts / 32 ranks = 12 experts per GPU; dense weights FSDP-sharded over 32.
+    expert_parallel_size: 32
+    activation_checkpointing: true
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.BackendConfig
+        attn: eager
+        linear: torch
+        rms_norm: torch
+        experts: torch_mm
+        dispatcher: torch
+  generation:
+    max_new_tokens: 3072
+    sglang_cfg:
+      # Serve BF16 experts; refit copies the training weights as they are.
+      quantization:
+        scheme: bf16
+      model_path: /path/to/inkling2-small-sglang-bf16
+      load_format: dummy
+      dtype: bfloat16
+      # One engine per 2 nodes. Inkling2 experts use either TP or EP; EP 8 gives
+      # 48 experts per GPU.
+      tp_size: 8
+      ep_size: 8
+      context_length: 4096
+      attention_backend: fa4
+      # ~150 GB weights + KV cache within 0.7 x 288 GB.
+      mem_fraction_static: 0.7
+      sglang_server_config:
+        num_gpus: 32
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: logs/grpo-inkling2-8n4g-automodel-sglang
+  wandb_enabled: true
+  tensorboard_enabled: true
+  num_val_samples_to_print: 2
+  num_train_samples_to_print: 2
+  wandb:
+    project: GRPO Inkling
+    name: grpo-inkling2-8n4g-automodel-sglang
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8

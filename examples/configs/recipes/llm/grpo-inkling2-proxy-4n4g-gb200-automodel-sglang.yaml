@@ -1,0 +1,26 @@
+# 4-node GB200 bring-up for grpo-inkling2-16n4g-gb200-automodel-sglang: the real-format
+# proxy (8 layers, 96 experts) with the full run's engine shape, i.e. BF16 SGLang
+# engines spanning 2 nodes (TP 8 / EP 8, dummy load), no CPU weight backup, 2 GB
+# refit buckets. Checks multi-node engines and train/serve agreement, not memory.
+defaults: grpo-inkling2-proxy-1n4g-automodel-sglang.yaml
+policy:
+  model_name: /path/to/inkling2-small-proxy-automodel-text
+  refit_buffer_size_gb: 2
+  automodel_cfg:
+    # 96 experts / 16 ranks.
+    expert_parallel_size: 16
+  generation:
+    sglang_cfg:
+      model_path: /path/to/inkling2-small-proxy-sglang-bf16
+      tp_size: 8
+      ep_size: 8
+      # Send routed experts 12 at a time (2 trainer ranks of 6 experts; one
+      # chunk per SGLang EP rank) to exercise the 32-node chunked refit.
+      expert_refit_chunk_size: 12
+      sglang_server_config:
+        num_gpus: 16
+        cpu_weight_backup: false
+logger:
+  log_dir: logs/grpo-inkling2-proxy-4n4g-gb200-automodel-sglang
+cluster:
+  num_nodes: 4

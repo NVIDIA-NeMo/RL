@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import re
 import warnings
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -101,8 +102,33 @@ from nemo_rl.utils.tensor_ops import pad_and_concat
 from nemo_rl.utils.timer import Timer
 
 
+# Inkling2 tensors the release stores (and SGLang's loader expects) in FP32: the
+# attention-residual queries and the MoE router bias.
+_INKLING2_FP32_HF_KEY = re.compile(
+    r"model\.llm\.(?:attn_res\.(?:attn|mlp)_queries\.\d+|attn_res\.output_query"
+    r"|layers\.\d+\.mlp\.gate\.bias)"
+)
+# Matches what ``_maybe_adapt_tensor_to_hf`` asks other adapters to exclude.
+_EXTRA_STATE_KEY = re.compile(r".*_extra_state.*")
+
+
+def _is_inkling2_adapter(adapter: Any) -> bool:
+    """Whether ``adapter`` is Automodel's Inkling2 state-dict adapter.
+
+    Its ``convert_single_tensor_to_hf`` takes a closed set of options (it raises
+    on ``exclude_key_regex`` / ``quantization``) and it has no
+    ``refit_tensor_dtype`` hook, so NeMo RL applies both itself.
+    """
+    return adapter is not None and type(adapter).__module__.startswith(
+        "nemo_automodel.components.models.inkling2."
+    )
+
+
 def _refit_tensor_dtype(
-    fqn: str, tensor: torch.Tensor, default_dtype: torch.dtype
+    fqn: str,
+    tensor: torch.Tensor,
+    default_dtype: torch.dtype,
+    model: Optional[nn.Module] = None,
 ) -> torch.dtype:
     """Preserve the dtype of non-floating-point buffers and FP32 MoE router state.
 
@@ -110,9 +136,24 @@ def _refit_tensor_dtype(
     keep their dtype — token ids are not representable in bf16. FP32
     ``e_score_correction_bias`` tensors are inference-critical MoE router
     state and must also stay FP32.
+
+    When ``model`` has a state-dict adapter exposing ``refit_tensor_dtype``,
+    that adapter decides the dtype of each exported (HF-named) floating
+    tensor; it returns ``None`` to defer to the rules above. Models whose
+    inference loader checks per-tensor source dtypes (e.g. Inkling2, whose
+    attention-residual queries and router biases are stored in FP32) use it.
     """
-    if not tensor.is_floating_point():
+    if not tensor.is_floating_point() or tensor.element_size() == 1:
+        # Integer/bool buffers and packed FP8 serving weights/scales keep their encoding.
         return tensor.dtype
+    adapter = getattr(model, "state_dict_adapter", None) if model is not None else None
+    adapter_dtype_fn = getattr(adapter, "refit_tensor_dtype", None)
+    if adapter_dtype_fn is not None:
+        adapter_dtype = adapter_dtype_fn(fqn)
+        if adapter_dtype is not None:
+            return adapter_dtype
+    elif _is_inkling2_adapter(adapter) and _INKLING2_FP32_HF_KEY.fullmatch(fqn):
+        return torch.float32
     is_router_correction_bias = fqn.rsplit(".", maxsplit=1)[-1] == (
         "e_score_correction_bias"
     )
@@ -217,8 +258,98 @@ def automodel_lora_params_generator(
         )
 
 
+_ROUTED_EXPERT_STACK = re.compile(
+    r"(?:^|\.)layers\.\d+\.mlp\.experts\.(?:gate_and_up_projs|down_projs)$"
+)
+# Suffix that marks a chunk of a stacked expert tensor; SGLang's Inkling2
+# load_weights is patched (sglang/utils/patches.py) to strip and place it.
+EXPERT_CHUNK_SUFFIX = "@nemo_rl_experts_{start}_{stop}"
+
+
+def _iter_expert_stack_chunks(
+    tensor: DTensor, chunk_experts: int
+) -> Optional[Iterable[tuple[int, int, torch.Tensor]]]:
+    """Gather an expert-sharded stacked tensor ``chunk_experts`` experts at a time.
+
+    ``full_tensor()`` on a routed-expert stack materializes every expert of the
+    layer on every rank (30 GiB for an Inkling2 ``gate_and_up_projs`` in BF16),
+    which does not fit next to a colocated BF16 SGLang engine. This broadcasts
+    each chunk from the expert-parallel ranks that own it instead, so a rank
+    holds one chunk at a time.
+
+    Returns ``None`` (caller falls back to ``full_tensor()``) unless dim 0 is
+    sharded evenly on exactly one mesh dimension and chunks line up with the
+    per-rank expert blocks. Every rank of the mesh must call this with the same
+    tensors in the same order, as ``state_dict()`` iteration guarantees.
+    """
+    import torch.distributed as dist
+    from torch.distributed.tensor import Replicate, Shard
+
+    placements = tensor.placements
+    expert_dims = [
+        i for i, p in enumerate(placements) if isinstance(p, Shard) and p.dim == 0
+    ]
+    if len(expert_dims) != 1:
+        return None
+    ep_dim = expert_dims[0]
+    mesh = tensor.device_mesh
+    num_experts = tensor.shape[0]
+    ep_size = mesh.size(ep_dim)
+    if num_experts % ep_size or num_experts % chunk_experts:
+        return None
+    local_experts = num_experts // ep_size
+    if chunk_experts % local_experts and local_experts % chunk_experts:
+        return None
+    if any(i != ep_dim and not p.is_replicate() for i, p in enumerate(placements)):
+        # FSDP shards the other dims on other mesh dims; replicating those only
+        # costs this rank's own experts at full width.
+        tensor = tensor.redistribute(
+            placements=tuple(
+                p if i == ep_dim else Replicate() for i, p in enumerate(placements)
+            )
+        )
+    local = tensor.to_local()
+    if local.shape[0] != local_experts:
+        return None
+    group = mesh.get_group(ep_dim)
+    group_ranks = dist.get_process_group_ranks(group)
+    my_coord = mesh.get_local_rank(ep_dim)
+    tail = tuple(local.shape[1:])
+
+    def chunks() -> Generator[tuple[int, int, torch.Tensor], None, None]:
+        for start in range(0, num_experts, chunk_experts):
+            stop = start + chunk_experts
+            if chunk_experts >= local_experts:
+                out = torch.empty(
+                    (chunk_experts, *tail), dtype=local.dtype, device=local.device
+                )
+                for owner in range(start // local_experts, stop // local_experts):
+                    offset = owner * local_experts - start
+                    view = out[offset : offset + local_experts]
+                    if owner == my_coord:
+                        view.copy_(local)
+                    dist.broadcast(view, src=group_ranks[owner], group=group)
+            else:
+                owner = start // local_experts
+                if owner == my_coord:
+                    begin = start - owner * local_experts
+                    out = local[begin : begin + chunk_experts].contiguous()
+                else:
+                    out = torch.empty(
+                        (chunk_experts, *tail), dtype=local.dtype, device=local.device
+                    )
+                dist.broadcast(out, src=group_ranks[owner], group=group)
+            yield start, stop, out
+            del out
+
+    return chunks()
+
+
 def _module_params_generator(
-    model: nn.Module, target_dtype: torch.dtype
+    model: nn.Module,
+    target_dtype: torch.dtype,
+    quantization: bool = False,
+    expert_chunk_size: int = 0,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
 
@@ -226,11 +357,18 @@ def _module_params_generator(
         model: The model whose parameters to generate.
         target_dtype: The default dtype for refit tensors. Source-FP32
             ``e_score_correction_bias`` tensors retain FP32.
+        quantization: Ask the state-dict adapter for the checkpoint's serving
+            precision (packed weights plus scales) instead of floating weights.
+        expert_chunk_size: When positive, stream expert-sharded routed-expert
+            stacks (without LoRA) this many experts at a time, named
+            ``<hf name>@nemo_rl_experts_<start>_<stop>``. Floating refits only.
 
     Yields:
         Tuples of (fully_qualified_name, tensor) where tensors are converted to
         the refit dtype and made contiguous.
     """
+    if expert_chunk_size and quantization:
+        raise ValueError("Chunked expert refit supports floating (bf16) refits only")
     # Key the module map by the names ``state_dict()`` uses. With activation
     # checkpointing Automodel wraps every decoder block in torch's
     # ``CheckpointWrapper``, whose ``_checkpoint_wrapped_module.`` component
@@ -247,12 +385,48 @@ def _module_params_generator(
     for name, tensor in state_dict.items():
         if _is_lora_adapter_tensor(name):
             continue
+        chunks = None
+        if (
+            expert_chunk_size > 0
+            and isinstance(tensor, DTensor)
+            and _ROUTED_EXPERT_STACK.search(name)
+            and _grouped_expert_lora_adapters(module_map, name)[1] is None
+        ):
+            chunks = _iter_expert_stack_chunks(tensor, expert_chunk_size)
+            if chunks is None:
+                # Falling back to full_tensor() would bring back the memory
+                # spike the setting exists to avoid; fail fast instead.
+                raise ValueError(
+                    f"expert_refit_chunk_size={expert_chunk_size} cannot chunk {name}: "
+                    f"needs dim 0 ({tensor.shape[0]} experts) sharded evenly on one mesh "
+                    f"dimension (placements {tensor.placements}) and a chunk size that "
+                    "is a multiple or divisor of the experts per trainer rank."
+                )
+        if chunks is not None:
+            for start, stop, chunk in chunks:
+                for adapted_fqn, adapted_tensor in _maybe_adapt_tensor_to_hf(
+                    model, name, chunk
+                ):
+                    refit_dtype = _refit_tensor_dtype(
+                        adapted_fqn, adapted_tensor, target_dtype, model
+                    )
+                    yield (
+                        adapted_fqn + EXPERT_CHUNK_SUFFIX.format(start=start, stop=stop),
+                        adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
+                    )
+                    del adapted_tensor
+                del chunk
+            continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
         merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
 
-        adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
+        adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
+            model, name, merged_tensor, quantization=quantization
+        )
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            refit_dtype = _refit_tensor_dtype(adapted_fqn, adapted_tensor, target_dtype)
+            refit_dtype = _refit_tensor_dtype(
+                adapted_fqn, adapted_tensor, target_dtype, model
+            )
             yield (
                 adapted_fqn,
                 adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
@@ -267,13 +441,19 @@ def automodel_params_generator(
     model: nn.Module,
     target_dtype: torch.dtype,
     draft_model: Optional[nn.Module] = None,
+    quantization: bool = False,
+    expert_chunk_size: int = 0,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Policy weights, followed by ``draft.<name>`` weights when co-training.
 
     The draft is a plain HF module (no LoRA, no state-dict adapter), so
     ``_module_params_generator``'s merge/adapt steps are no-ops for it.
+    ``quantization`` and ``expert_chunk_size`` apply to the policy only (see
+    _module_params_generator).
     """
-    yield from _module_params_generator(model, target_dtype)
+    yield from _module_params_generator(
+        model, target_dtype, quantization, expert_chunk_size
+    )
     if draft_model is not None:
         from nemo_rl.models.automodel.draft.runtime import draft_refit_export_name
 
@@ -412,6 +592,15 @@ def _maybe_adapt_tensor_to_hf(
     v4_compatible: bool = False,
 ) -> list[tuple[str, torch.Tensor]]:
     adapter = getattr(model_part, "state_dict_adapter", None)
+    if adapter and _is_inkling2_adapter(adapter):
+        if quantization or v4_compatible:
+            raise ValueError(
+                "Inkling2 refit supports BF16 serving only (no checkpoint-precision "
+                "or v4-compatible export)."
+            )
+        if _EXTRA_STATE_KEY.match(fqn):
+            return []
+        return adapter.convert_single_tensor_to_hf(fqn, tensor)
     if adapter:
         adapter_kwargs = {
             "exclude_key_regex": r".*_extra_state.*",
@@ -545,9 +734,11 @@ class AutomodelPolicyWorkerImpl(
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Initialize checkpoint manager now that distributed is set up
-        requires_synchronous_checkpoint = (
-            getattr(runtime_config.model_config, "model_type", None) == "deepseek_v4"
-        )
+        # Inkling2: async DCP staging copied an already-invalidated storage after the
+        # timeout save ("copy_() on an invalid python storage"), so save synchronously.
+        requires_synchronous_checkpoint = getattr(
+            runtime_config.model_config, "model_type", None
+        ) in ("deepseek_v4", "inkling2_model")
         automodel_cfg = config["automodel_cfg"]
         checkpoint_config = build_checkpoint_config(
             automodel_cfg,
@@ -571,6 +762,19 @@ class AutomodelPolicyWorkerImpl(
         # rolling anchor), granting the policy a fresh drift budget per resume.
         # Instead, build the model from the pristine base weights, capture the
         # reference, then load the checkpoint below.
+        if weights_path:
+            # Resume: create cuBLAS handles (main + autograd backward thread) before
+            # optimizer state lands on GPU. Fresh runs create them in step 1 while
+            # memory is free; on resume the first backward hit
+            # CUBLAS_STATUS_ALLOC_FAILED in cublasCreate.
+            _w = torch.randn(
+                64, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
+            (_w @ _w).float().sum().backward()
+            _w32 = torch.randn(64, 64, device="cuda", requires_grad=True)
+            (_w32 @ _w32).sum().backward()
+            del _w, _w32
+            torch.cuda.synchronize()
         defer_checkpoint_load = init_reference_model and bool(weights_path)
         if defer_checkpoint_load:
             print(
@@ -1377,7 +1581,7 @@ class AutomodelPolicyWorkerImpl(
             )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
                 refit_dtype = _refit_tensor_dtype(
-                    adapted_fqn, adapted_tensor, self.dtype
+                    adapted_fqn, adapted_tensor, self.dtype, self.model
                 )
                 state_dict_info[adapted_fqn] = (adapted_tensor.shape, refit_dtype)
 
@@ -1464,15 +1668,29 @@ class AutomodelPolicyWorkerImpl(
         sent, so trainer-side IPC tensors stay alive until the engine has
         copied them and per-chunk engine failures surface immediately.
         """
-        if target_precision != "bf16":
+        if target_precision not in ("bf16", "checkpoint"):
             raise NotImplementedError(
-                "The Automodel policy only supports BF16 SGLang refits; "
-                f"got target_precision={target_precision!r}."
+                "The Automodel policy supports BF16 and checkpoint-precision SGLang "
+                f"refits; got target_precision={target_precision!r}."
             )
-        del sglang_quantization_cfg  # accepted for dispatch parity, bf16-only
+        # "checkpoint": the state-dict adapter packs weights into the precision the
+        # engine loaded from the checkpoint (and raises if it cannot).
+        quantization = target_precision == "checkpoint"
+        if quantization and getattr(self.model, "state_dict_adapter", None) is None:
+            raise ValueError(
+                "SGLang quantization.scheme='checkpoint' requires a model with a "
+                "state-dict adapter that exports serving-precision weights."
+            )
+        del sglang_quantization_cfg  # the scheme is carried by target_precision
 
-        # Manually move model to cuda for cpu offload case
-        if self.cpu_offload:
+        # Manually move model to cuda for cpu offload case. Also onload when an
+        # earlier refit's offload_after_refit() left the model on CPU and no
+        # training step ran since (e.g. the refit after validation released
+        # SGLang weights that had no CPU backup): DTensor collectives need CUDA.
+        first_param = next(self.model.parameters(), None)
+        if self.cpu_offload or (
+            first_param is not None and first_param.device.type == "cpu"
+        ):
             self.model = self.move_to_cuda(self.model)
 
         from nemo_rl.models.policy.utils import (
@@ -1480,8 +1698,19 @@ class AutomodelPolicyWorkerImpl(
             send_hf_buckets_via_ipc_actor_impl,
         )
 
+        expert_chunk_size = int(
+            (self.cfg.get("generation") or {})
+            .get("sglang_cfg", {})
+            .get("expert_refit_chunk_size", 0)
+            or 0
+        )
         bucket_iter = iter_named_tensor_buckets(
-            automodel_params_generator(self.model, self.dtype),
+            automodel_params_generator(
+                self.model,
+                self.dtype,
+                quantization=quantization,
+                expert_chunk_size=expert_chunk_size,
+            ),
             buffer_size_bytes=buffer_size_bytes,
         )
         send_hf_buckets_via_ipc_actor_impl(

@@ -26,12 +26,19 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
 class SglangQuantizationConfig(TypedDict):
-    """SGLang weight precision. Only BF16 on this layer."""
+    """SGLang weight precision.
 
-    scheme: Literal["bf16"]
+    ``bf16``: refit sends floating weights in the policy dtype.
+    ``checkpoint``: the engine serves the precision the checkpoint declares
+    (e.g. Inkling2 NVFP4/MXFP8 experts via hf_quant_config.json) and refit
+    requantizes into that format through the model's state-dict adapter.
+    Automodel policies only.
+    """
+
+    scheme: Literal["bf16", "checkpoint"]
 
 
-SUPPORTED_SGLANG_QUANTIZATION_SCHEMES = frozenset({"bf16"})
+SUPPORTED_SGLANG_QUANTIZATION_SCHEMES = frozenset({"bf16", "checkpoint"})
 
 
 def get_sglang_quantization_scheme(quantization_config: dict[str, Any]) -> str:
@@ -149,6 +156,16 @@ class SglangSpecificArgs(TypedDict):
 
     # Path to model weights (local folder or HF repo id).
     model_path: NotRequired[str]
+
+    # SGLang weight load format. "dummy" allocates weights without reading them;
+    # NeMo RL's first refit (before any generation) then supplies every weight.
+    load_format: NotRequired[str]
+    # Experts per refit chunk for stacked routed-expert tensors (Inkling2 only).
+    # 0 or unset gathers each layer's full expert stack on every trainer rank;
+    # a positive value gathers and sends that many experts at a time, and each
+    # SGLang EP rank copies only the chunks inside its own expert range. Must
+    # divide the experts per SGLang EP rank. Not sent to the SGLang server.
+    expert_refit_chunk_size: NotRequired[int]
     # Random seed for the engine; if None, SGLang picks one.
     random_seed: NotRequired[int]
     # Skip tokenizer init; callers must pass `input_ids` in generate requests.

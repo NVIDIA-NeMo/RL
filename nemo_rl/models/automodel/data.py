@@ -37,6 +37,9 @@ from nemo_rl.models.huggingface.common import (
 # Passed only to forwards that name them explicitly; ``**kwargs`` forwards would
 # leak them into submodules that do not expect them.
 _EXPLICIT_ONLY_FORWARD_KWARGS = frozenset({"media_token_validity_mask"})
+# Generic HF hints that ``**kwargs`` forwards keep receiving, but that native
+# Automodel forwards with a closed signature (e.g. Inkling2) may not accept.
+_OPTIONAL_FORWARD_KWARGS = frozenset({"use_cache"})
 
 
 @cache
@@ -59,11 +62,19 @@ def _accepted_forward_kwargs(
 def drop_explicit_only_kwargs_not_in_forward(
     model: nn.Module, kwargs: dict[str, Any]
 ) -> None:
-    """Remove ``_EXPLICIT_ONLY_FORWARD_KWARGS`` that ``model.forward`` does not name."""
+    """Remove ``_EXPLICIT_ONLY_FORWARD_KWARGS`` that ``model.forward`` does not name.
+
+    Also remove ``_OPTIONAL_FORWARD_KWARGS`` when ``model.forward`` has a closed
+    signature (no ``**kwargs``) that does not name them.
+    """
     accepted_kwargs = _accepted_forward_kwargs(type(model))
     for key in _EXPLICIT_ONLY_FORWARD_KWARGS:
         if accepted_kwargs is None or key not in accepted_kwargs:
             kwargs.pop(key, None)
+    if accepted_kwargs is not None:
+        for key in _OPTIONAL_FORWARD_KWARGS:
+            if key not in accepted_kwargs:
+                kwargs.pop(key, None)
 
 
 def _all_image_sizes_equal(imgs_sizes: torch.Tensor) -> bool:

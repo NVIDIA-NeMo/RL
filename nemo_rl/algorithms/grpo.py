@@ -3249,6 +3249,25 @@ def refit_policy_generation(
     return {}
 
 
+def _generation_drops_weights_on_finish(master_config: MasterConfig) -> bool:
+    """Whether finish_generation() discards the rollout engine's weights.
+
+    Colocated SGLang with the memory saver on and no CPU weight backup frees its
+    weight memory on release and gets uninitialized memory back on resume. The
+    weights then survive only until the next finish_generation(), so any
+    generation that follows one without an intervening policy update (e.g. the
+    first training step after validation) must refit, even though the policy
+    did not change.
+    """
+    generation = master_config.policy["generation"]
+    if not generation["colocated"]["enabled"] or generation["backend"] != "sglang":
+        return False
+    server_cfg = (generation.get("sglang_cfg") or {}).get("sglang_server_config") or {}
+    return bool(server_cfg.get("needs_offload", True)) and not server_cfg.get(
+        "cpu_weight_backup", False
+    )
+
+
 def _initial_policy_generation_stale(
     policy_generation: GenerationInterface, completed_steps: int
 ) -> bool:
@@ -3649,6 +3668,8 @@ def _grpo_train_impl(
             processor=processor,
         )
         policy_generation.finish_generation()
+        if _generation_drops_weights_on_finish(master_config):
+            POLICY_GENERATION_STALE = True
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
         if master_config.grpo.debug_payload_metrics:
@@ -4418,6 +4439,10 @@ def _grpo_train_impl(
                         processor=processor,
                     )
                     policy_generation.finish_generation()
+                    # Validation released the engines; without a CPU weight backup
+                    # their weights are gone, so the next step must refit.
+                    if _generation_drops_weights_on_finish(master_config):
+                        POLICY_GENERATION_STALE = True
                     logger.log_metrics(
                         validation_timings, total_steps + 1, prefix="timing/validation"
                     )
