@@ -34,11 +34,16 @@ from __future__ import annotations
 import logging
 import math
 import statistics
+from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
-from nemo_rl.environments.nemo_gym_task import get_nemo_gym_attribution_key
+from nemo_rl.environments.nemo_gym_task import (
+    get_nemo_gym_attribution_key,
+    get_nemo_gym_task_input,
+    is_nemo_gym_task,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -241,19 +246,38 @@ def _extract_reasoning_and_answer_text(result: dict[str, Any]) -> tuple[str, str
     return reasoning_text, answer_text
 
 
-def _generated_token_count(result: dict[str, Any]) -> int:
+def generated_token_count(result: dict[str, Any]) -> int:
     """Count every token the policy generated for one rollout.
 
     The assistant messages of a Gym rollout's ``message_log`` hold exactly the
     generated token ids of each turn (think tags, end-of-turn and tool-call
     tokens included); prompt, chat-template and environment-observation tokens
     are in its user messages.
+
+    Args:
+        result: Gym rollout result containing tokenized assistant messages.
+
+    Returns:
+        The total number of tokens in all assistant messages.
     """
     return sum(
         len(message["token_ids"])
         for message in result["message_log"]
         if message["role"] == "assistant"
     )
+
+
+def _scored_text_lengths(
+    texts: tuple[str, str], *, length_type: str, tokenizer: Any
+) -> tuple[int, int]:
+    """Measure the reasoning and answer channels using the resolved unit."""
+    if length_type == "tokens" and tokenizer is not None:
+        reasoning, answer = (
+            len(tokenizer.encode(text, add_special_tokens=False)) if text else 0
+            for text in texts
+        )
+        return reasoning, answer
+    return len(texts[0]), len(texts[1])
 
 
 def _split_length_settings_in_use(params: dict[str, Any]) -> list[str]:
@@ -330,11 +354,144 @@ def _validate_resolved_params(name: str, params: dict[str, Any]) -> None:
             )
 
 
+@dataclass(frozen=True)
+class LengthPenaltyInput:
+    """Token-free length and profile data retained with a rollout attempt."""
+
+    agent_name: str
+    reasoning_length: int
+    answer_length: int
+    all_generated_tokens: bool
+    has_reward_components: bool
+    profiled_rewards: list[float] | None
+    profiled_output_lengths: list[float] | None
+    profile_band: dict[str, Any] | None
+
+
+def length_profile_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Return the per-row profile fields used by length adjustments.
+
+    Args:
+        row: Original Gym task row, including any nested task_data.
+
+    Returns:
+        Profile values with outer task-input fields overriding nested task_data.
+    """
+    task_input = get_nemo_gym_task_input(row)
+    if is_nemo_gym_task(row):
+        task_data = task_input.get("task_data")
+        if isinstance(task_data, dict):
+            task_input = {**task_data, **task_input}
+    return {
+        key: task_input.get(key)
+        for key in ("profiled_rewards", "profiled_output_lengths", "profile_band")
+    }
+
+
+def prepare_length_penalty_input(
+    result: dict[str, Any],
+    row: dict[str, Any],
+    config: LengthPenaltyConfig,
+    tokenizer: Any,
+) -> LengthPenaltyInput:
+    """Measure scored text before discarding the response envelope.
+
+    Args:
+        result: Gym rollout result containing the scored response and reward components.
+        row: Original task row carrying attribution and profile metadata.
+        config: Length settings used to resolve the agent's measurement unit.
+        tokenizer: Policy tokenizer for text token counts; None uses character counts.
+
+    Returns:
+        Token-free text lengths and profile data. All-generated-token totals are
+        supplied separately when the group is adjusted.
+    """
+    agent_name = get_nemo_gym_attribution_key(row)
+    if agent_name is None:
+        raise ValueError("Length penalties require a NeMo-Gym attribution key")
+    params = _resolve_agent_params(
+        agent_name, config.agent_overrides, config.resolved_defaults()
+    )
+    length_type = params["length_type"]
+    if length_type == "all_generated_tokens":
+        reasoning_length, answer_length = 0, 0
+    else:
+        reasoning_length, answer_length = _scored_text_lengths(
+            _extract_reasoning_and_answer_text(result),
+            length_type=length_type,
+            tokenizer=tokenizer,
+        )
+    return LengthPenaltyInput(
+        agent_name=agent_name,
+        reasoning_length=reasoning_length,
+        answer_length=answer_length,
+        all_generated_tokens=length_type == "all_generated_tokens",
+        has_reward_components=bool(result["full_result"].get("reward_components")),
+        **length_profile_fields(row),
+    )
+
+
+def apply_group_length_penalties_from_inputs(
+    inputs: list[LengthPenaltyInput],
+    rewards: list[float],
+    *,
+    generated_lengths: list[int],
+    low_effort: list[bool],
+    config: LengthPenaltyConfig,
+) -> tuple[list[float], dict[str, float]]:
+    """Apply shared length adjustments to one complete prompt group.
+
+    Args:
+        inputs: Saved length and profile metadata in rollout order.
+        rewards: Rewards after effort shaping and reward penalties, in the same order.
+        generated_lengths: Verified generated-token totals in rollout order.
+        low_effort: Per-rollout flags that bypass the group's length adjustments.
+        config: Shared length-adjustment settings.
+
+    Returns:
+        A tuple of adjusted rewards in input order and the shared per-rollout metrics.
+        The input rewards are unchanged.
+    """
+    results = []
+    lengths = []
+    for sample, reward, generated, bypass in zip(
+        inputs, rewards, generated_lengths, low_effort, strict=True
+    ):
+        results.append(
+            {
+                "agent_ref": {"name": sample.agent_name},
+                "full_result": {
+                    "reward": reward,
+                    "reward_components": sample.has_reward_components,
+                },
+                "profiled_rewards": sample.profiled_rewards,
+                "profiled_output_lengths": sample.profiled_output_lengths,
+                "profile_band": sample.profile_band,
+                "low_effort_applied": bypass,
+            }
+        )
+        lengths.append(
+            (
+                sample.reasoning_length,
+                sample.answer_length,
+                generated
+                if sample.all_generated_tokens
+                else sample.reasoning_length + sample.answer_length,
+            )
+        )
+    metrics = apply_group_length_penalties(
+        results, config, len(results), lengths=lengths
+    )
+    return [result["full_result"]["reward"] for result in results], metrics
+
+
 def apply_group_length_penalties(
     results: list[dict[str, Any]],
     length_penalty_config: LengthPenaltyConfig | dict[str, Any],
     group_size: int,
     tokenizer: Any = None,
+    *,
+    lengths: list[tuple[int, int, int]] | None = None,
 ) -> dict[str, float]:
     """Apply per-prompt-group length bonuses/penalties.
 
@@ -348,6 +505,7 @@ def apply_group_length_penalties(
             validated into :class:`LengthPenaltyConfig`).
         group_size: Number of contiguous rows per prompt group.
         tokenizer: Tokenizer for computing reasoning/answer token counts.
+        lengths: Optional precomputed (reasoning, answer, total) lengths per row.
 
     Returns:
         ``length_penalty/*`` rollout metrics, all per-row means over
@@ -380,6 +538,8 @@ def apply_group_length_penalties(
     defaults = cfg.resolved_defaults()
 
     n = len(results)
+    if lengths is not None and len(lengths) != n:
+        raise ValueError("precomputed lengths must cover every rollout")
     original_rewards = [r["full_result"]["reward"] for r in results]
     agent_names: list[str] = []
     for result in results:
@@ -480,25 +640,18 @@ def apply_group_length_penalties(
 
         for k in range(group_size):
             idx = g + k
+            if lengths is not None:
+                reasoning_lengths[idx], answer_lengths[idx], total_lengths[idx] = (
+                    lengths[idx]
+                )
+                continue
             if group_lt == "all_generated_tokens":
                 # Reasoning/answer stay 0; the config rejects settings that read them.
-                total_lengths[idx] = _generated_token_count(results[idx])
+                total_lengths[idx] = generated_token_count(results[idx])
                 continue
-            r_text, a_text = texts[idx]
-            if group_lt == "tokens" and tokenizer is not None:
-                reasoning_lengths[idx] = (
-                    len(tokenizer.encode(r_text, add_special_tokens=False))
-                    if r_text
-                    else 0
-                )
-                answer_lengths[idx] = (
-                    len(tokenizer.encode(a_text, add_special_tokens=False))
-                    if a_text
-                    else 0
-                )
-            else:
-                reasoning_lengths[idx] = len(r_text)
-                answer_lengths[idx] = len(a_text)
+            reasoning_lengths[idx], answer_lengths[idx] = _scored_text_lengths(
+                texts[idx], length_type=group_lt, tokenizer=tokenizer
+            )
             total_lengths[idx] = reasoning_lengths[idx] + answer_lengths[idx]
 
         if cap_only:
@@ -1085,7 +1238,7 @@ def _resolve_agent_params(
     agent_name: str,
     agents_cfg: dict[str, LengthPenaltyParams | None] | None,
     defaults: dict[str, Any],
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     """Resolve length bonus parameters for a given agent."""
     if agents_cfg is None:
         return dict(defaults)
