@@ -1870,7 +1870,10 @@ class TestLossPostProcessor:
         ):
             processor = megatron_train.LossPostProcessor(
                 loss_fn=MagicMock(),
-                cfg={"sequence_packing": {"enabled": True, "fuse_loss": fuse_loss}},
+                cfg={
+                    "sequence_packing": {"enabled": True, "fuse_loss": fuse_loss},
+                    "megatron_cfg": {},
+                },
                 cp_normalize=False,
             )
             processor(data_dict=data, packed_seq_params=packed_params)
