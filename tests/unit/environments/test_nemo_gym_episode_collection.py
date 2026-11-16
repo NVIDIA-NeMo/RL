@@ -300,7 +300,13 @@ def test_real_collector_streams_episode_and_flat_http_results(
                     sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
                     num_generations=2,
                 )
-                assert all("_ng_rollout_id" not in row for row in rows)
+                # The NeMo-Gym actor names the materialized episodes below; the
+                # driver names the flat group's episodes, which it numbered itself.
+                assert all("_ng_rollout_id" not in row for row in rows[:2])
+                assert [row["_ng_rollout_id"] for row in rows[2:]] == [
+                    f"{rows[2]['_ng_group_id']}-g{index}-t{group_attempt}"
+                    for index in range(2)
+                ]
                 expected_task["task_input"]["responses_create_params"]["top_p"] = 0.9
                 expected_episode_ids = [
                     {
