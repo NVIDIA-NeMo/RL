@@ -1,0 +1,20 @@
+{
+  "status": "CPU_FILE_PATCH_COMPOSITION_PASS_NOT_NATIVE_VALIDATION",
+  "checks": [
+    {
+      "order": "general-first",
+      "all_five_exact_hashes": "PASS",
+      "general_patch_repeat_rejected": true
+    },
+    {
+      "order": "ultra-first",
+      "all_five_exact_hashes": "PASS",
+      "general_patch_repeat_rejected": true
+    }
+  ],
+  "whitespace_and_eof_fixer_invariant": true,
+  "patch_sha256": "d4c6935dc390de403a0b40b2db2da39a70cc10c6a80ac1a51807c2f107c162f0",
+  "limits": "This verifies source-file composition only; it does not establish native API integration, cleanup, TP/CP training or distributed numerical correctness.",
+  "all_copy_service_code_outside_connection_method_ast_identical": true,
+  "planner_delta": "Only completeness-check ordering and corresponding compact formatting; generic plan generation untouched."
+}

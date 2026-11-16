@@ -13,6 +13,7 @@ Use the existing MPS configuration with `refit_transport: ipc` and
 `policy.generation.mcore_generation_config`. With `inference_optimized` and TP>1,
 set `sequence_parallel: true`. Changing inference TP changes its data-parallel
 degree and aggregate request capacity; account for both when comparing runs.
+Training CP greater than one requires `policy.sequence_packing.enabled: true` and `policy.megatron_cfg.use_fused_linear_logprobs: false`, as enforced by native Megatron setup. Inference remains CP1.
 
 | Destination storage | Publication behavior |
 |---|---|
@@ -43,7 +44,14 @@ The native planner needs [Megatron-LM #9465](https://github.com/NVIDIA/Megatron-
 optional whole-mesh transfer descriptions must reject an incomplete destination
 mesh before indexing its first rank. The generic transfer schedule then handles
 residual-only destinations normally. This is a companion Megatron fix, not a
-runtime patch in NeMo RL.
+runtime patch in NeMo RL. The tested native copy-service correction also uses a
+public collective to initialize its communicator once per service; every learner
+group rank participates, including ranks without local transfer operations.
+Exact-base build-time patches and file hashes are provided in
+[the dependency instructions](../../tools/megatron_patches/general_tp/README.md).
+Apply the same dependency source to all participating workers before startup.
+These resharding changes compose with the separate Ultra inference fixes and do
+not require copying a complete native worker into the installation.
 
 Validation is staged. CPU tests cover native shard planning, both TP directions,
 packed projections, expert/pipeline naming, rank permutations and publication
@@ -51,13 +59,19 @@ failure ordering. The earlier GPU IPC test covered TP1-to-TP2 local views only.
 The native distributed projection gate passed 12 layouts on four ranks with two
 publications each, including both TP directions and packed projections. The
 separate-process reverse-IPC gate passed TP2-to-TP4 and TP4-to-TP2 numerical and
-storage-lifetime checks; final NCCL communicator cleanup qualification is still
-pending. These small gates do not exercise the full DynamicInferenceEngine or
-GRPO lifecycle.
+storage-lifetime checks. The corrected copy service also passed owned-process
+cleanup: all consumer imports were released, all native process groups were
+destroyed, and preserved logs contained no CUDA IPC producer-lifetime or NCCL
+communicator teardown warnings. These small gates serialize the two worker
+worlds; they do not exercise concurrent DynamicInferenceEngine, CP2 or GRPO
+lifecycle behavior.
 
 The required next full-model qualification uses eight GPUs with training
 TP4/CP2/EP4/ETP1 and inference TP2/CP1/EP4/ETP1. Mixed TP plus training CP is not
 yet validated end to end. Existing Ultra training CP8 to inference CP1 evidence
 uses matching TP and does not establish this new combination. Inference CP is
-not a supported target. Pipeline training and arbitrary PP changes are not GPU
-validated. No speedup is implied by sharing coverage or a small projection test.
+not a supported target; inference remains PP1, and inference-optimized experts
+remain ETP1. Training ETP greater than one, pipeline training, arbitrary PP
+changes and mixed-EP full-model layouts are not GPU-model qualified by these
+gates. Native metadata and CPU planning coverage do not establish those runtime
+cases. No speedup is implied by sharing coverage or a small projection test.

@@ -1,0 +1,44 @@
+{
+  "status": "HELD_FULL_NANO_CP2_PROOF_PENDING",
+  "base_repository": "https://github.com/NVIDIA/Megatron-LM",
+  "base_commit": "3e95097b4a9ab6ea6b2a39eb2b2b24e4a6dfa54a",
+  "patch_sha256": "d4c6935dc390de403a0b40b2db2da39a70cc10c6a80ac1a51807c2f107c162f0",
+  "files": {
+    "megatron/core/resharding/planner.py": {
+      "base_sha256": "93e9abeb28e69dc48e2830fce769a6bff0ea92a0af4313d7e4b4b48dadf7f96d",
+      "patched_sha256": "b79244c8a8769f4bf221a82132a8aa7614614bf213f04d5921bbae2ed3de9787"
+    },
+    "megatron/core/resharding/copy_services/nccl_copy_service.py": {
+      "base_sha256": "de322c590e401b6656b7e0cd8008fac34115f2ae7e9e5dfeb641e7504ed1a2ab",
+      "patched_sha256": "1be6bb985f9060be402f1e283fd3a8bec9230d4133a4bc6c285799f9e246b90d"
+    }
+  },
+  "fixes": [
+    {
+      "path": "megatron/core/resharding/planner.py",
+      "pull_request": "https://github.com/NVIDIA/Megatron-LM/pull/9465",
+      "companion_commit": "22690d3996b7981efc8647d1fdc1405dbdb80419",
+      "scope": "Destination mesh completeness validation before first mesh-rank dereference. Generic residual schedule unchanged. Companion planner file is otherwise byte-identical to the pinned base."
+    },
+    {
+      "path": "megatron/core/resharding/copy_services/nccl_copy_service.py",
+      "upstream_status": "Candidate, not promoted",
+      "scope": "Only _ensure_nccl_connected: one public int32 CUDA all_reduce per service replaces private eager connect. Every process-group rank participates, including ranks with no P2P operations. Transfer planning and execution unchanged.",
+      "native_gpu_proof": "Native reverse-IPC primitives and clean owned-process teardown PASS; full model TP/CP proof pending"
+    }
+  ],
+  "composition": {
+    "ultra_inference_patch_sha256": "763d28978e3a6452183094c880976cea9b792e4d6a0699bbdd2b43921e488980",
+    "changed_paths_disjoint": true,
+    "combined_changed_runtime_files": 5
+  },
+  "scope": "Portable build-time patch artifact only, no vendor full files, no runtime monkeypatch, no clean-branch changes or native proof claim.",
+  "intended_install_path": "tools/megatron_patches/general_tp",
+  "documentation_proposal": {
+    "source_relative_path": "docs/design-docs/mps-parallelism-sharing.md",
+    "base_sha256": "651b4926cb9cb71aa1632bc97d0aa8f9eed8b37f1e4538313610d1aec15a5878",
+    "proposed_sha256": "329a3a0f322bcfbb7c4303f10e6c5271e1209029958446655272b53236ae93fe",
+    "patch_sha256": "4d73950f7186811fd6506fa46a6d4b16ae813dbd81c4035c05cce6b90a95d1ee",
+    "scope": "Cleanup primitive PASS only; mixed TP/CP full model and additional ETP/PP/EP layouts remain unqualified."
+  }
+}
