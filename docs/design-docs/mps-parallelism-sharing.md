@@ -48,7 +48,16 @@ runtime patch in NeMo RL.
 Validation is staged. CPU tests cover native shard planning, both TP directions,
 packed projections, expert/pipeline naming, rank permutations and publication
 failure ordering. The earlier GPU IPC test covered TP1-to-TP2 local views only.
-The general distributed TP and reverse-IPC tests are pending; full GPT/Hybrid
-model execution, CP attention, pipeline training and end-to-end performance are
-not yet established for these new combinations. No speedup is implied by sharing
-coverage or a small projection test.
+The native distributed projection gate passed 12 layouts on four ranks with two
+publications each, including both TP directions and packed projections. The
+separate-process reverse-IPC gate passed TP2-to-TP4 and TP4-to-TP2 numerical and
+storage-lifetime checks; final NCCL communicator cleanup qualification is still
+pending. These small gates do not exercise the full DynamicInferenceEngine or
+GRPO lifecycle.
+
+The required next full-model qualification uses eight GPUs with training
+TP4/CP2/EP4/ETP1 and inference TP2/CP1/EP4/ETP1. Mixed TP plus training CP is not
+yet validated end to end. Existing Ultra training CP8 to inference CP1 evidence
+uses matching TP and does not establish this new combination. Inference CP is
+not a supported target. Pipeline training and arbitrary PP changes are not GPU
+validated. No speedup is implied by sharing coverage or a small projection test.
