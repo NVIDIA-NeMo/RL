@@ -170,6 +170,7 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
 from nemo_rl.data_plane.observability import (
+    backend_health_metrics,
     log_step_metrics,
     metrics_never_fail_the_step,
 )
@@ -1758,22 +1759,10 @@ class SingleControllerActor:
         off: a leak only shows over a long run, in the runs that need it, and
         the first SSD spill / offload of a run logs its warning from here.
         """
-        if self._dp_backend == "nixl":
-            from nemo_rl.data_plane.adapters.tq_nixl import unit_metrics
-
-            unit = unit_metrics()
-            if unit:
-                self._logger.log_metrics(
-                    unit, self._train_steps, prefix="data_plane/nixl"
-                )
-        elif self._dp_backend == "mooncake_cpu":
-            from nemo_rl.data_plane.adapters.mooncake_ssd_offload import step_metrics
-
-            master = await asyncio.to_thread(step_metrics)  # an HTTP read
-            if master:
-                self._logger.log_metrics(
-                    master, self._train_steps, prefix="data_plane/mooncake"
-                )
+        health = await asyncio.to_thread(backend_health_metrics, self._dp_backend)
+        if health:
+            prefix, metrics = health
+            self._logger.log_metrics(metrics, self._train_steps, prefix=prefix)
         result = await asyncio.to_thread(
             self._trainer.get_data_plane_step_metrics,
             total_step_time,

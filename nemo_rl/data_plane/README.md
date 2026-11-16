@@ -402,7 +402,7 @@ data_plane:
     ssd_offload:                       # see "Mooncake SSD offload"
       enabled: true                    # spill memory to local SSD above the threshold
       path: null                       # null: node NVMe (/raid if mounted, else /tmp); or an absolute dir
-      offload_threshold: 0.5           # offload above this share of segment memory
+      offload_threshold: 0.8           # offload above this share of segment memory
   observability:                       # NotRequired
     enabled: true                      # per-op timing / latency percentiles / volume
     verify_tensor_hash: false          # debug: wire-in vs wire-out tensor check
@@ -655,7 +655,8 @@ mount the NVMe RAID) when it is mounted, a disk and writable, else `/tmp`.
 `ray.sub` mounts a per-user NVMe directory at the container's `/raid` by
 itself: `NRL_NVME_DIR` when set (for example `/raid/scratch/$USER` on a
 cluster whose RAID root is root-owned), else `/raid/$USER` (created when the
-user owns `/raid`). Nothing is mounted otherwise, and the driver logs one
+user owns `/raid`), listed before `MOUNTS` so a bind of your own at or under
+`/raid` (such as `/raid/scratch`) stays visible. Nothing is mounted otherwise, and the driver logs one
 note saying the tiers use `/tmp` and what `/tmp` is (in an enroot container
 `/tmp` is often the node's NVMe already). Other launchers mount the directory
 at `/raid` the same way, or set `path`. The directory must be on a disk: an owner
@@ -692,7 +693,7 @@ memory > offload_threshold ──> SSD copy written ──> memory copy dropped
   | `0` | every client mounting `global_segment_size`: driver, trainers, rollout actors (generation workers mount none) |
 
 - **Data-plane checkpoints work.** Offload needs evictable replicas, so a save copies each object through Mooncake's normal read (`batch_get_into`) instead of reading pinned memory in place. That read also fetches objects already on SSD. A restore retries a write that finds memory full while eviction frees space. See "Experimental Mooncake storage checkpoints".
-- **A put that finds memory full waits; it does not fail.** Mooncake accepts a put only into free segment memory, and offload frees memory in the background, so a burst of writes can briefly fill every segment. Each client then retries the keys that did not fit (`NO_AVAILABLE_HANDLE`) with backoff, logging one warning per waiting put, for up to 600 s. Sustained writes therefore run at most as fast as offload frees memory; bursts become stalls, not crashes. A new object can be evicted once its 1 s lease expires; that lease must cover one whole batch read (up to `staging_buffer_size`), or the read fails with `LEASE_EXPIRED`. The 0.5 default `offload_threshold` leaves room for a burst while offload catches up.
+- **A put that finds memory full waits; it does not fail.** Mooncake accepts a put only into free segment memory, and offload frees memory in the background, so a burst of writes can briefly fill every segment. Each client then retries the keys that did not fit (`NO_AVAILABLE_HANDLE`) with backoff, logging one warning per waiting put, for up to 600 s. Sustained writes therefore run at most as fast as offload frees memory; bursts become stalls, not crashes. A new object can be evicted once its 1 s lease expires; that lease must cover one whole batch read (up to `staging_buffer_size`), or the read fails with `LEASE_EXPIRED`. The 0.8 default `offload_threshold` keeps most of the memory for data while leaving a fifth of it for a burst while offload catches up; a lower value offloads earlier (more reads from SSD, fewer put waits), a higher one later.
 - **Directories:** each owner writes to `<path>/nemo_rl_mooncake_offload/<ray job>-<pid>-<random>` (mode 0700).
   At the end of a run the SingleController asks each storage unit to delete its directory, and every client deletes its own in `close()`. Mooncake's SIGTERM handler exits without running Python cleanup, so an owner that crashes or is killed before that leaves its directory behind. Each owner holds a lock on its directory while it lives, and the next run's owners on that node delete any directory whose lock is free.
 - **Cleared data:** Mooncake's remove drops only the master's record, so each owner deletes the SSD files of cleared keys itself, every 30 s.

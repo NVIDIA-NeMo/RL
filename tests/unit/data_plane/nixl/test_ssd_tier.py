@@ -46,8 +46,8 @@ KB = 1 << 10
 BLOB = 128 * KB
 
 
-def _unit(tmp_path, *, slab=1 << 20, staging=256 * KB, pickup_s=10.0, read_pin_s=60.0):
-    """1 MiB slab: 768 KiB put area (six 128 KiB blobs), 256 KiB IO area (two)."""
+def _unit(tmp_path, *, slab=768 * KB, staging=256 * KB, pickup_s=10.0, read_pin_s=60.0):
+    """768 KiB put area (six 128 KiB blobs) plus a 256 KiB IO area (two) beside it."""
     return bare_unit(
         slab,
         read_pin_s=read_pin_s,
@@ -694,7 +694,9 @@ def test_deadline_during_commit_aborts_the_blob():
 def test_ssd_config_validation():
     assert tq_nixl.ssd_config({"ssd": {"enabled": False}}) is None
     # On by default, under the node's NVMe.
-    assert tq_nixl.ssd_config({})["ssd_dir"] == local_disk.default_ssd_dir("nrl_nixl_ssd")
+    assert tq_nixl.ssd_config({})["ssd_dir"] == local_disk.default_ssd_dir(
+        "nrl_nixl_ssd"
+    )
     ssd = {"enabled": True, "path": "/x"}
     on = {"unit_slab_bytes": 1 << 30, "ssd": ssd}
     assert tq_nixl.ssd_config(on) == {
@@ -708,8 +710,15 @@ def test_ssd_config_validation():
     )
     with pytest.raises(ValueError, match="pickup_s"):
         tq_nixl.ssd_config({**on, "ssd": {**ssd, "pickup_s": 1.0}})
+    # The IO area is pinned beside the slab, so it may be as large as the slab.
+    assert (
+        tq_nixl.ssd_config({**on, "ssd": {**ssd, "staging_bytes": 1 << 30}})[
+            "staging_bytes"
+        ]
+        == 1 << 30
+    )
     with pytest.raises(ValueError, match="staging_bytes"):
-        tq_nixl.ssd_config({**on, "ssd": {**ssd, "staging_bytes": 1 << 30}})
+        tq_nixl.ssd_config({**on, "ssd": {**ssd, "staging_bytes": -1}})
 
 
 @pytest.mark.parametrize(

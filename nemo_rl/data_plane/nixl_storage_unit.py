@@ -68,6 +68,21 @@ def split_key(key: str) -> tuple[int, str]:
     return int(gidx), fld
 
 
+def io_area_bytes(ssd_dir: str | None, staging_bytes: int) -> int:
+    """Bytes of IO area a unit pins beside its put area: 0 with the SSD tier off.
+
+    The area is pinned in addition to ``slab_bytes``, so turning the tier on
+    never shrinks the put area; a unit with the tier on holds
+    ``slab_bytes + staging_bytes`` (4 KiB aligned).
+    """
+    if not ssd_dir:
+        return 0
+    io = int(staging_bytes) // 4096 * 4096
+    if io <= 0:
+        raise ValueError(f"ssd staging_bytes={staging_bytes} must be >= 4096")
+    return io
+
+
 @dataclass
 class BlobRec:
     off: int
@@ -218,7 +233,10 @@ class NixlStorageUnit:  # pragma: no cover
             # memory stay socket-local; NICs stay as UCX_NET_DEVICES allows.
             self.numa_node = node
         self._nics = nixl_init_params.get("device_list", "env")
-        self.slab = np.empty(int(slab_bytes), dtype=np.uint8)
+        # With the SSD tier on, the IO area is pinned beside the put area, so
+        # the put area keeps its configured size.
+        io_bytes = io_area_bytes(ssd_dir, int(staging_bytes))
+        self.slab = np.empty(int(slab_bytes) + io_bytes, dtype=np.uint8)
         if self.numa_node is not None:
             numa_utils.first_touch(self.slab)
         self._mu = threading.RLock()
@@ -265,8 +283,8 @@ class NixlStorageUnit:  # pragma: no cover
     # Spill, not demote. Data is read oldest first (the FIFO contract), so a put
     # the put area cannot take goes to disk from birth and data already in the put
     # area never moves: no victims, no pin drain, no eviction policy. The put's
-    # WRITE lands in the IO area (carved from the slab, as the staging area was),
-    # and its commit publishes the blob at once: its bytes are in the unit's
+    # WRITE lands in the IO area (pinned beside the put area: a unit with the
+    # tier on holds slab_bytes + staging_bytes), and its commit publishes the blob at once: its bytes are in the unit's
     # memory, the same guarantee a put-area blob has. An IO worker then writes
     # the file; readers meanwhile read the IO-area copy, which stays after the
     # write as a staged copy (evictable once unpinned). A write that fails keeps
@@ -310,17 +328,10 @@ class NixlStorageUnit:  # pragma: no cover
         self._failed_spill_bytes = 0
         self._spill_error = ""
         self._staged = {}  # blobs with a staged copy
+        self.alloc_ = SlabAllocator(slab_bytes)
         if not ssd_dir:
-            self.alloc_ = SlabAllocator(slab_bytes)
             return
-        main = (slab_bytes - staging_bytes) // 4096 * 4096
-        if staging_bytes <= 0 or main <= 0:
-            raise ValueError(
-                f"ssd staging_bytes={staging_bytes} must be in (0, slab {slab_bytes})"
-            )
-        self.alloc_ = SlabAllocator(main)
-        self.staging_ = SlabAllocator(slab_bytes - main)
-        self.staging_base = main
+        self.staging_ = SlabAllocator(io_area_bytes(ssd_dir, staging_bytes))
         require_disk_backed(ssd_dir, setting="data_plane.nixl.ssd.path")
         self.ssd_dir = os.path.join(
             ssd_dir, f"nixl-unit-{self.unit_id}-{uuid.uuid4().hex[:6]}"
