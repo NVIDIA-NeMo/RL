@@ -29,7 +29,6 @@ from pydantic import ValidationError
 from nemo_rl.algorithms.async_utils.staleness_sampler import SamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
-from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     FleetHealthConfig,
@@ -69,7 +68,11 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
         ),
         policy={
             "train_global_batch_size": num_prompts_per_step * 4,
-            "generation": {"backend": "vllm", "colocated": {"enabled": False}},
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {"http_api_server_count": 1},
+                "colocated": {"enabled": False},
+            },
         },
         loss_fn=ClippedPGLossConfig(
             reference_policy_kl_penalty=0,
@@ -96,14 +99,6 @@ def test_single_forward_threshold_accepted_and_skips_policy_logprobs() -> None:
     assert logprob_passes_required(cfg, cfg.grpo) == (False, False)
     cfg.loss_fn.seq_logprob_error_in_loss = False
     assert logprob_passes_required(cfg, cfg.grpo) == (True, False)
-
-
-def test_single_forward_threshold_rejected_for_ppo() -> None:
-    cfg = _single_forward_config()
-    cfg.ppo = PPOConfig.model_construct()
-    cfg.grpo = None
-    with pytest.raises(ValueError, match="requires GRPO"):
-        validate_single_controller_config(cfg)
 
 
 def test_single_forward_threshold_rejected_for_forest_training() -> None:
@@ -341,7 +336,11 @@ class TestWrongPathFaultToleranceIsRejected:
             ),
             policy={
                 "train_global_batch_size": 8,
-                "generation": {"backend": "vllm", "colocated": {"enabled": False}},
+                "generation": {
+                    "backend": "vllm",
+                    "vllm_cfg": {"http_api_server_count": 1},
+                    "colocated": {"enabled": False},
+                },
             },
             loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0),
             env={"should_use_nemo_gym": use_nemo_gym},

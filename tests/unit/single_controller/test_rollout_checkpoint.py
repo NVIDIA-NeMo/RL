@@ -972,6 +972,12 @@ def test_capture_bootstrap_uses_semantic_reward_settings(tmp_path: Path) -> None
             "penalize_unwanted_tokens": True,
             "token_ids": {"unwanted": [42, 7, 42]},
         },
+        "grpo": {
+            "length_penalty": {
+                "verbose": False,
+                "default": {"group_total_length_penalty_coeff": 0.2},
+            }
+        },
         "env": {
             "nemo_gym": {"effort_levels": {"low_weight": 1, "low_string": "budget"}}
         },
@@ -989,6 +995,8 @@ def test_capture_bootstrap_uses_semantic_reward_settings(tmp_path: Path) -> None
     equivalent["env"]["nemo_gym"]["effort_levels"].update(
         low_ub=64000, low_penalty=1, note="unused"
     )
+    # A verbose-only length-penalty change is a logging switch, not a reward rule.
+    equivalent["grpo"]["length_penalty"]["verbose"] = True
     validate_bootstrap_anchor(
         anchor,
         identity=bootstrap_compatibility_identity(cast(Any, _DumpedConfig(equivalent))),
@@ -1000,6 +1008,18 @@ def test_capture_bootstrap_uses_semantic_reward_settings(tmp_path: Path) -> None
             anchor,
             identity=bootstrap_compatibility_identity(
                 cast(Any, _DumpedConfig(changed))
+            ),
+        )
+    # A real length-penalty rule change must still reject the restart.
+    changed_length = deepcopy(base)
+    changed_length["grpo"]["length_penalty"]["default"][
+        "group_total_length_penalty_coeff"
+    ] = 0.3
+    with pytest.raises(ValueError):
+        validate_bootstrap_anchor(
+            anchor,
+            identity=bootstrap_compatibility_identity(
+                cast(Any, _DumpedConfig(changed_length))
             ),
         )
 

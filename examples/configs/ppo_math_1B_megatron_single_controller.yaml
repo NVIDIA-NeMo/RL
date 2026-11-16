@@ -9,9 +9,11 @@ ppo:
   # SC does not support validation yet.
   val_period: 0
   val_at_start: false
-  # SC does not implement reward_shaping, so leaving it enabled would describe
-  # shaping this run does not do. reward_scaling is applied by the advantage
-  # stage (source_min must be < source_max).
+  # Both are applied by the advantage stage, scaling first: the overlong
+  # penalty is subtracted from the reward, so its magnitude is only meaningful
+  # against the scaled range. reward_scaling needs source_min < source_max;
+  # reward_shaping needs either the three DAPO overlong fields or
+  # stop_properly_penalty_coef.
   reward_shaping:
     enabled: false
   reward_scaling:

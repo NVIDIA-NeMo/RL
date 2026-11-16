@@ -655,14 +655,8 @@ class TestStragglersAreWaitedForBeforeARebuild:
 class TestBackendsWithoutAWorkerGroup:
     """CollectiveWeightSynchronizer holds a GenerationInterface, not a VllmGeneration.
 
-    Only some implementations own a Ray worker group with DP shards -- vLLM and TRT-LLM do;
-    Dynamo, Megatron and SGLang do not, and the interface declares nothing either way. Of
-    those, Dynamo reaches this synchronizer through the ordinary non-colocated branch of
-    the factory, so reading self._generation.worker_group broke it on the plain grpo.py
-    path:
-
-        grpo.py:1747  policy_generation.weight_synchronizer.init_communicator()
-        AttributeError: 'DynamoGeneration' object has no attribute 'worker_group'
+    Not every implementation owns a Ray worker group with DP shards, and the interface
+    declares nothing either way.
 
     Membership tracking is only meaningful where shards exist, so a backend without one
     records None and every reconcile falls through to "nothing to do" -- which is exactly

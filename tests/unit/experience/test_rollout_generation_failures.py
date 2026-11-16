@@ -536,7 +536,11 @@ class _FakeGymMethod:
             return (
                 rowidx,
                 {"name": "agent"},
-                {"input_message_log": [], "message_log": []},
+                {
+                    "input_message_log": [],
+                    "message_log": [],
+                    "full_result": {"reward": 1.0},
+                },
                 None,
             )
 
@@ -584,6 +588,8 @@ def _make_gym_impl(
     impl._reward_penalty_config = None
     # Effort-level reward shaping is off unless env.nemo_gym.effort_levels is set.
     impl._effort_config = None
+    # Group length penalties are off unless grpo.length_penalty is set.
+    impl._length_penalty_config = None
     return impl
 
 

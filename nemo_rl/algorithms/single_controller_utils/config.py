@@ -1324,13 +1324,110 @@ def _validate_failure_settings(
         )
 
 
+def _vlm_architecture_signature(
+    model_name: str, hf_config_overrides: Mapping[str, Any] | None
+) -> tuple[Any, ...]:
+    """Return the VLM structure that determines packed-media compatibility."""
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        **dict(hf_config_overrides or {}),
+    )
+    get_text_config = getattr(config, "get_text_config", None)
+    text_config = get_text_config() if callable(get_text_config) else None
+    vision_config = getattr(config, "vision_config", None)
+    media_token_fields = (
+        "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+    )
+    return (
+        getattr(config, "model_type", None),
+        tuple(getattr(config, "architectures", None) or ()),
+        getattr(text_config, "model_type", None),
+        getattr(vision_config, "model_type", None),
+        tuple((name, getattr(config, name, None)) for name in media_token_fields),
+    )
+
+
+def _vlm_tokenizer_signature(
+    tokenizer_config: Mapping[str, Any], fallback_name: str
+) -> tuple[Any, ...]:
+    """Fingerprint the token-to-id contract consumed by the critic."""
+    import hashlib
+
+    from transformers import AutoTokenizer
+
+    tokenizer_name = tokenizer_config.get("name") or fallback_name
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name,
+        trust_remote_code=True,
+        **dict(tokenizer_config.get("tokenizer_kwargs") or {}),
+    )
+    vocab = tokenizer.get_vocab()
+    digest = hashlib.sha256()
+    for token, token_id in sorted(vocab.items()):
+        token_bytes = token.encode("utf-8", errors="surrogatepass")
+        digest.update(len(token_bytes).to_bytes(8, "big"))
+        digest.update(token_bytes)
+        digest.update(int(token_id).to_bytes(8, "big", signed=True))
+    special_token_ids = tuple(
+        getattr(tokenizer, f"{name}_token_id", None)
+        for name in ("bos", "eos", "pad", "unk", "sep", "cls", "mask")
+    )
+    return len(vocab), digest.hexdigest(), special_token_ids
+
+
+def _validate_vlm_critic_compatibility(
+    policy_config: Mapping[str, Any], value_config: Mapping[str, Any]
+) -> None:
+    """Allow distinct checkpoints only when their media and token contracts match."""
+    policy_model_name = policy_config.get("model_name")
+    value_model_name = value_config.get("model_name")
+    if not policy_model_name or not value_model_name:
+        raise ValueError(
+            "Multimodal PPO requires model_name for both the policy and critic."
+        )
+
+    policy_hf_overrides = policy_config.get("hf_config_overrides") or {}
+    value_hf_overrides = value_config.get("hf_config_overrides") or {}
+    if (
+        policy_model_name != value_model_name
+        or policy_hf_overrides != value_hf_overrides
+    ) and _vlm_architecture_signature(
+        policy_model_name, policy_hf_overrides
+    ) != _vlm_architecture_signature(value_model_name, value_hf_overrides):
+        raise ValueError(
+            "Multimodal PPO requires compatible policy and critic VLM "
+            f"architectures; got {policy_model_name!r} and {value_model_name!r}."
+        )
+
+    policy_tokenizer_config = policy_config.get("tokenizer") or {}
+    value_tokenizer_config = value_config.get("tokenizer") or {}
+    policy_tokenizer_name = policy_tokenizer_config.get("name") or policy_model_name
+    value_tokenizer_name = value_tokenizer_config.get("name") or value_model_name
+    if (
+        policy_tokenizer_name != value_tokenizer_name
+        or (policy_tokenizer_config.get("tokenizer_kwargs") or {})
+        != (value_tokenizer_config.get("tokenizer_kwargs") or {})
+    ) and _vlm_tokenizer_signature(
+        policy_tokenizer_config, policy_model_name
+    ) != _vlm_tokenizer_signature(value_tokenizer_config, value_model_name):
+        raise ValueError(
+            "Multimodal PPO requires compatible policy and critic tokenizers; "
+            f"got {policy_tokenizer_name!r} and {value_tokenizer_name!r}."
+        )
+
+
 def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
     Both directions on the critic: one the PPO path needs and does not have, and
-    one a GRPO run carries and would never build. Plus the reward-shaping and
-    sampling knobs SC reads on neither path, and a range check on the one it
-    does read.
+    one a GRPO run carries and would never build, plus sampling and length-penalty
+    settings the SC path does not implement.
     """
     algo_cfg = algo_config(master_config)
 
@@ -1352,24 +1449,35 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "directly, so nothing over-generates. Set it to 1."
         )
 
-    # An enabled one here describes shaping this run does not do. An entry leaves
-    # this list once the SC path implements it; overlong_filtering is applied in
-    # the advantage stage from the raw completion flags in the TransferQueue.
+    if (
+        master_config.grpo is not None
+        and master_config.grpo.length_penalty is not None
+        and not should_use_nemo_gym(master_config)
+    ):
+        raise ValueError(
+            "grpo.length_penalty requires env.should_use_nemo_gym=true on SingleController"
+        )
+
+    # An enabled one here describes shaping this run does not do. length_penalty is
+    # implemented for GRPO, so it only appears here for PPO; overlong_filtering is
+    # applied in the advantage stage from the raw completion flags in the TransferQueue.
     unsupported = [
         name
         for name, enabled in (
-            ("reward_shaping", algo_cfg.reward_shaping.enabled),
-            # getattr: PPO's config has no length_penalty field.
-            ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
+            (
+                "ppo.length_penalty",
+                master_config.ppo is not None
+                and getattr(algo_cfg, "length_penalty", None) is not None,
+            ),
         )
         if enabled
     ]
     if unsupported:
         names = ", ".join(unsupported)
         raise NotImplementedError(
-            f"{names} not supported on the SingleController path, which "
-            "implements none of them -- the run would silently skip the "
-            "shaping. Disable them."
+            f"{names} not supported for PPO on the SingleController path -- the "
+            "run would silently skip the shaping. Disable them. GRPO supports "
+            "grpo.length_penalty."
         )
 
     # Rejected here rather than at the first advantage call, which is a whole
@@ -1456,14 +1564,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                     f"grpo.use_dynamic_sampling requires grpo.{key} to be 0 or null: "
                     "nonzero message-level overrides can train constant-reward groups."
                 )
-        # Capture cannot borrow future groups, so routine filtering would stall training.
-        if master_config.token_capture.enabled:
-            raise ValueError(
-                f"{algo_prefix}.use_dynamic_sampling is not supported together with "
-                "token_capture.enabled: on the capture path a replacement cannot borrow "
-                "a finished group from a later step, so every dropped group stalls its "
-                "step for a full fresh rollout. Disable one of the two."
-            )
         if grpo_cfg.dynamic_sampling_max_gen_batches < 1:
             raise ValueError(
                 f"{algo_prefix}.dynamic_sampling_max_gen_batches must be >= 1 when "
@@ -1511,10 +1611,15 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "See examples/configs/ppo_math_1B_megatron_single_controller.yaml."
             )
 
+    value_config = master_config.value
+    assert value_config is not None
+    if master_config.policy.get("is_vlm", False):
+        _validate_vlm_critic_compatibility(master_config.policy, value_config)
+
     # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
     # setup_data_plane unconditionally, so an Automodel critic dies in Ray with the
     # model already on GPU. ppo_math_1B.yaml ships automodel_cfg.enabled=true.
-    value_megatron_cfg = master_config.value.get("megatron_cfg", {})  # type: ignore
+    value_megatron_cfg = value_config.get("megatron_cfg", {})
     if not value_megatron_cfg.get("enabled"):
         raise ValueError(
             "PPO on the SingleController path requires a Megatron critic "
@@ -1683,8 +1788,6 @@ def resolve_ppo_chunk_alignment(
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
-        if is_ppo_run(master_config):
-            raise ValueError("loss_fn.seq_logprob_error_in_loss requires GRPO")
         _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)
 
@@ -1753,6 +1856,17 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
 
     generation_cfg = master_config.policy["generation"]
+    if (
+        generation_cfg["backend"] == "vllm"
+        and cast(VllmConfig, generation_cfg)["vllm_cfg"].get("http_api_server_count", 1)
+        > 1
+        and async_config.generation_fleet_health.enabled
+    ):
+        raise ValueError(
+            "Multiple HTTP API servers do not support fault tolerance with "
+            "async_rl.generation_fleet_health.enabled=true. "
+            "See https://github.com/NVIDIA-NeMo/RL/pull/5075."
+        )
     top_logprobs = generation_cfg.get("top_logprobs", 0)
     if (
         isinstance(top_logprobs, bool)
@@ -1952,6 +2066,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError(
                 "forest training does not support message-level advantage overrides"
             )
+        if master_config.grpo.length_penalty is not None:
+            raise ValueError("Forest training does not support grpo.length_penalty")
         if token_capture_config.defer_routed_experts_to_policy:
             raise ValueError("forest training requires direct routed-expert assembly")
         validate_forest_objective(master_config.grpo, master_config.loss_fn)
