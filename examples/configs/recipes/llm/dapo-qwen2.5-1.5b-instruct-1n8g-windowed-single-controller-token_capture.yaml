@@ -62,9 +62,6 @@ async_rl:
 checkpointing:
   checkpoint_dir: results/dapo-qwen2.5-1.5b-instruct-1n8g-windowed-single-controller-token_capture
 env:
-  math:
-    num_workers: 16
-    math_verify_impl: dapo_math_verify
   should_use_nemo_gym: true
   nemo_gym:
     config_paths:

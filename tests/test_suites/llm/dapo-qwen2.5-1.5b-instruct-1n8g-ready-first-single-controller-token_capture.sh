@@ -60,6 +60,8 @@ uv run examples/run_grpo_single_controller.py \
     $@ \
     2>&1 | tee $RUN_LOG
 
+assert_not_grep 'finalize: rollout .* rejected ' "$RUN_LOG" "Token-capture finalizer rejected a rollout"
+
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
