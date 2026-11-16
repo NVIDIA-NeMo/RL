@@ -248,7 +248,9 @@ _nvme_dir=${NRL_NVME_DIR:-/raid/$USER}
 srun --nodes="$SLURM_JOB_NUM_NODES" --ntasks-per-node=1 --overlap \
   bash -c "[[ -w '$(dirname "$_nvme_dir")' ]] && mkdir -p '$_nvme_dir'" 2>/dev/null || true
 if [[ -d "$_nvme_dir" && -w "$_nvme_dir" ]]; then
-  MOUNTS="${MOUNTS:+$MOUNTS,}$_nvme_dir:/raid"
+  # Listed before the user's MOUNTS: a later bind at or under /raid (for example
+  # a /raid/scratch venv cache) is mounted on top of this one and stays visible.
+  MOUNTS="$_nvme_dir:/raid${MOUNTS:+,$MOUNTS}"
   echo "[INFO] data-plane SSD tiers: $_nvme_dir mounted at /raid"
 elif [[ -n "${NRL_NVME_DIR:-}" ]]; then
   echo "WARNING: NRL_NVME_DIR=$NRL_NVME_DIR is not a writable directory on $(hostname); the data plane's SSD tiers will use /tmp." >&2

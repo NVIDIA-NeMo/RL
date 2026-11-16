@@ -148,7 +148,7 @@ class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
 
     enabled: bool = True
     path: str | None = None  # absolute; null: the node's NVMe (dir())
-    offload_threshold: Annotated[float, Field(gt=0, le=1)] = 0.5
+    offload_threshold: Annotated[float, Field(gt=0, le=1)] = 0.8
 
     @model_validator(mode="after")
     def _require_absolute_path(self) -> "MooncakeSsdOffloadConfig":
@@ -245,8 +245,11 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
 class NixlSsdConfig(BaseModel, extra="forbid"):
     """SSD tier of the nixl storage units (see ``tq_nixl.ssd_config``).
 
-    A put the unit's RAM cannot take goes to a file under ``path`` (node-local,
-    absolute) through an IO area of ``staging_bytes`` carved from the slab.
+    A put the unit's put area cannot take goes to a file under ``path``
+    (node-local, absolute) through an IO area of ``staging_bytes`` (default a
+    quarter of ``unit_slab_bytes``) that the unit pins beside its slab, so the
+    put area keeps its configured size: with the tier on a unit holds
+    ``unit_slab_bytes + staging_bytes`` of pinned memory.
     A spilled put is acknowledged once its bytes are in the IO area; the file
     write runs behind the ack on the unit's ``io_threads`` file-I/O threads,
     which also read spilled blobs back. One thread moves about 2.5 GB/s on
@@ -262,7 +265,9 @@ class NixlSsdConfig(BaseModel, extra="forbid"):
 
     enabled: bool = True
     path: str | None = None  # absolute; null: the node's NVMe (dir())
-    staging_bytes: PositiveInt | None = None  # None: unit_slab_bytes // 4
+    staging_bytes: PositiveInt | None = (
+        None  # pinned beside the slab; None: unit_slab_bytes // 4
+    )
     pickup_s: float = 10.0
     io_threads: PositiveInt = 4
 
@@ -319,7 +324,7 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     node_ids: list[str] | None = None
     unit_slab_bytes: int = 17179869184  # 16 GiB pinned per unit
     # A put over this is split at key boundaries; None: a quarter of the put
-    # area (the slab minus SSD staging).
+    # area (the slab).
     max_blob_bytes: PositiveInt | None = None
     numa: Literal["auto", "off"] = "auto"
     # Client registered-buffer pool: base buffers plus kept-registered oversize ones.
