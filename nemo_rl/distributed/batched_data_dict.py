@@ -749,7 +749,6 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 all_chunk_padded_seqlens.append(chunk_padded_seqlens_list)
 
             # create shards with the packed bins
-            sharded_data: list[list[dict]] = [[] for _ in range(shards)]
             sharded_micro_indices: list = [[] for _ in range(shards)]
             sharded_micro_lengths: list = [[] for _ in range(shards)]
             sharded_elem_counts_per_gb: list = [[] for _ in range(shards)]
@@ -783,9 +782,6 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
                     for bin_indices in shard_bin_assignments:
                         global_bin_indices = [i + chunk_start for i in bin_indices]
-                        sharded_data[shard_idx].append(
-                            self.select_indices(global_bin_indices)
-                        )
                         global_indices_per_shard[shard_idx].extend(global_bin_indices)
                         bin_seqlen = sum(chunk_padded_seqlens[i] for i in bin_indices)
 
@@ -811,14 +807,13 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                         chunk_sharded_micro_indices[shard_idx][-1][1]
                     )
 
-            # flatten global_indices_per_shard
             batch_sorted_indices = []
-            for shard_idx in range(shards):
-                batch_sorted_indices.extend(global_indices_per_shard[shard_idx])
-
             aggregated_shards = []
-            for shard_idx in range(shards):
-                shard = SlicedDataDict.from_batches(sharded_data[shard_idx])
+            for shard_idx, indices in enumerate(global_indices_per_shard):
+                # Gather once in execution order; the boundaries below retain
+                # the original global-batch and microbatch layout.
+                shard = SlicedDataDict(self.select_indices(indices))
+                batch_sorted_indices.extend(indices)
                 shard.micro_batch_indices = sharded_micro_indices[shard_idx]
                 shard.micro_batch_lengths = sharded_micro_lengths[shard_idx]
                 shard.elem_counts_per_gb = sharded_elem_counts_per_gb[shard_idx]
