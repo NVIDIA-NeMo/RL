@@ -2244,7 +2244,6 @@ class MegatronPolicyWorkerImpl(
         with (
             maybe_r3_trace_stage("train", enabled=use_router_replay),
             self.model.no_sync(),
-            self._version_point_scope(enabled=True),
         ):
             rerun_state_machine = get_rerun_state_machine()
             while rerun_state_machine.should_run_forward_backward(data_iterator):
@@ -5275,10 +5274,21 @@ class MegatronPolicyWorkerImpl(
             local_shards=lambda: ddp_local_param_shards(self.model),
             sync=lambda: self.model.start_param_sync(force_sync=True),
             keep_versions=keep_versions,
-            cached_weight_modules=[
-                m for m in self.model.modules() if hasattr(m, "is_first_microbatch")
-            ],
+            invalidate_weight_caches=self._invalidate_version_point_weight_caches,
         )
+
+    def _invalidate_version_point_weight_caches(self) -> None:
+        """Release cached casts derived from weights replaced through DDP buffers."""
+        for module in self.model.modules():
+            if hasattr(module, "is_first_microbatch"):
+                module.is_first_microbatch = True
+        if getattr(self._get_model_config(), "moe_training_matches_inference", False):
+            # The value-pass cache exists only in MCore builds supporting matched experts.
+            from megatron.core.transformer.moe.training_matches_inference import (
+                release_inference_value_pass_weights,
+            )
+
+            release_inference_value_pass_weights(self.model)
 
     def snapshot_version_weights(
         self, version: int, keep_versions: int
@@ -5333,11 +5343,11 @@ class MegatronPolicyWorkerImpl(
             return
         assert self._version_snapshots is not None
         self._drain_param_gather()
-        try:
-            with self._version_snapshots.swapped_in(self._version_point):
+        with self._version_snapshots.swapped_in(self._version_point):
+            try:
                 yield
-        finally:
-            self._drain_param_gather()
+            finally:
+                self._drain_param_gather()
 
     def save_version_snapshots(self, path: str) -> None:
         """Save this rank's snapshots into a checkpoint (one file per version)."""

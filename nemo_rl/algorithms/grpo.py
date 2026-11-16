@@ -830,6 +830,7 @@ def setup(
 
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
+    validate_version_point_config(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
 
     _validate_val_sampling(master_config)
@@ -3349,7 +3350,7 @@ def _validate_use_kl_in_reward_compat(master_config: MasterConfig) -> None:
 def validate_version_point_config(master_config: MasterConfig) -> None:
     """Reject settings ``grpo.async_grpo.version_point_gradient`` does not support."""
     async_cfg = master_config.grpo.async_grpo
-    if not async_cfg.version_point_gradient:
+    if async_cfg is None or not async_cfg.version_point_gradient:
         return
     policy = master_config.policy
     megatron = policy.get("megatron_cfg")
@@ -3371,9 +3372,29 @@ def validate_version_point_config(master_config: MasterConfig) -> None:
         problems.append("non-colocated generation")
     if router_replay_enabled(policy):
         problems.append("policy.router_replay disabled")
+    if megatron.get("moe_router_enable_expert_bias") or (
+        megatron.get("model_overrides") or {}
+    ).get("moe_router_enable_expert_bias"):
+        problems.append(
+            "moe_router_enable_expert_bias=false (router buffers are not snapshotted)"
+        )
+    if (
+        master_config.grpo.seq_logprob_error_threshold is not None
+        and not master_config.loss_fn.seq_logprob_error_in_loss
+    ):
+        problems.append(
+            "seq_logprob_error_in_loss=true when filtering sequence log-prob errors"
+        )
     fp8_cfg = megatron.get("fp8_cfg") or {}
     if fp8_cfg.get("enabled") and fp8_cfg.get("fp8_param"):
         problems.append("fp8_cfg.fp8_param=false (BF16 param buffers are swapped)")
+    fp4_cfg = megatron.get("fp4_cfg")
+    if fp4_cfg is not None and fp4_cfg.enabled and fp4_cfg.fp4_param:
+        problems.append("fp4_cfg.fp4_param=false (plain param buffers are required)")
+    if async_cfg.max_trajectory_age_steps < 1:
+        problems.append("max_trajectory_age_steps >= 1")
+    if megatron.get("cuda_graph_impl") not in (None, "none"):
+        problems.append("training cuda_graph_impl=none")
     optimizer = megatron.get("optimizer") or {}
     if megatron and not optimizer.get("use_distributed_optimizer"):
         problems.append("the distributed optimizer")
@@ -6184,7 +6205,8 @@ def async_grpo_train(
                             weight_version - vp_version
                         )
                         # The trainer log-probs at the current weights are not needed.
-                        skip_prev_logprobs = True
+                        if step > 0:
+                            skip_prev_logprobs = True
                 seq_logprob_error_threshold = (
                     master_config.grpo.seq_logprob_error_threshold
                 )
@@ -6242,9 +6264,10 @@ def async_grpo_train(
 
                 if vp_version is not None:
                     # At the generation weights the PPO ratio and the IS weight are 1.
-                    train_data["prev_logprobs"] = train_data[
-                        "generation_logprobs"
-                    ].clone()
+                    if step > 0:
+                        train_data["prev_logprobs"] = train_data[
+                            "generation_logprobs"
+                        ].clone()
                     print(
                         f"  Version point: gradient at generation version {vp_version} "
                         f"(age {weight_version - vp_version})",

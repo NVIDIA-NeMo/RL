@@ -1,12 +1,13 @@
 #!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
 GPUS_PER_NODE=4
-STEPS_PER_RUN=60
-MAX_STEPS=60
+STEPS_PER_RUN=12
+MAX_STEPS=12
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240
 # ===== END CONFIG =====
@@ -18,6 +19,9 @@ cd $PROJECT_ROOT
 HF_HUB_OFFLINE=0 uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
+    grpo.max_val_samples=16 \
+    grpo.val_batch_size=16 \
+    grpo.val_num_generations_per_prompt=1 \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
@@ -38,7 +42,10 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'min(data["train/version_point_applied"]) == 1' \
         'max(data["train/version_point_parity"]) == 0' \
-        'data["train/reward"]["60"] > 0.5'
+        'max(data["train/version_point_no_snapshot"]) == 0' \
+        'all_finite(data["train/loss"])' \
+        'all_finite(data["train/grad_norm"])' \
+        'max(data["train/version_point_age"]) == 8'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

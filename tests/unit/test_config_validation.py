@@ -32,6 +32,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
+    validate_version_point_config,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.mpo import MasterConfig as MPOMasterConfig
@@ -362,6 +363,15 @@ def _check_zero_train_gen_kl(config: DictConfig) -> None:
     validate_zero_train_gen_kl(policy, check_environment=False)
 
 
+def _check_version_point_config(config: DictConfig) -> None:
+    config_dict = OmegaConf.to_container(config, resolve=True)
+    if "grpo" not in config_dict:
+        return
+    if "async_rl" in config_dict:
+        return
+    validate_version_point_config(GRPOMasterConfig(**config_dict))
+
+
 @pytest.mark.parametrize("config_file", full_config_files)
 def test_shipped_config(config_file: str, subtests: pytest.Subtests) -> None:
     """Load each shipped config once and report each applicable check separately."""
@@ -390,6 +400,8 @@ def test_shipped_config(config_file: str, subtests: pytest.Subtests) -> None:
             _check_nccl_reshard_refit_support(deepcopy(config))
         with subtests.test(check="zero_train_gen_kl"):
             _check_zero_train_gen_kl(deepcopy(config))
+        with subtests.test(check="version_point"):
+            _check_version_point_config(deepcopy(config))
 
 
 @pytest.mark.parametrize(

@@ -20,17 +20,23 @@ import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
 from nemo_rl.algorithms.grpo import (
+    AsyncGRPOConfig,
+    GRPOConfig,
+    MasterConfig,
     validate_version_point_config,
     version_point_candidate,
     version_point_keep_versions,
 )
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.models.megatron.version_snapshots import VersionSnapshots, _bits
+from nemo_rl.models.policy import Fp4Config
 
-worker_module = pytest.importorskip(
-    "nemo_rl.models.policy.workers.megatron_policy_worker"
-)
-# The methods under test (the Ray actor class wraps them).
-Worker = worker_module.MegatronPolicyWorkerImpl
+
+@pytest.fixture(name="Worker")
+def worker_class():
+    # Worker integration needs the optional Megatron/Bridge runtime.
+    module = pytest.importorskip("nemo_rl.models.policy.workers.megatron_policy_worker")
+    return module.MegatronPolicyWorkerImpl
 
 
 class _FlatModel(torch.nn.Module):
@@ -60,11 +66,11 @@ def _snapshots(model, keep_versions=3):
         local_shards=lambda: shards,
         sync=lambda: None,
         keep_versions=keep_versions,
-        cached_weight_modules=[],
+        invalidate_weight_caches=lambda: None,
     )
 
 
-def _fake_worker(snapshots, rank=0):
+def _fake_worker(Worker, snapshots, rank=0):
     fake = SimpleNamespace(
         rank=rank,
         _version_snapshots=snapshots,
@@ -87,7 +93,8 @@ def _set_specials(flat):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_scope_swaps_in_the_snapshot_and_restores_bitwise(dtype):
+@pytest.mark.mcore
+def test_scope_swaps_in_the_snapshot_and_restores_bitwise(dtype, Worker):
     model = _FlatModel(dtype)
     flat = model.flat
     _set_specials(flat)
@@ -100,7 +107,7 @@ def test_scope_swaps_in_the_snapshot_and_restores_bitwise(dtype):
     with torch.no_grad():
         flat[4:].mul_(-1.5)
     theta_t = flat.clone()
-    fake = _fake_worker(snapshots)
+    fake = _fake_worker(Worker, snapshots)
 
     assert Worker.set_version_point(fake, 0) is True
     assert _bits_equal(flat, theta_t)  # nothing swapped before the scope
@@ -127,7 +134,8 @@ def test_scope_swaps_in_the_snapshot_and_restores_bitwise(dtype):
     assert Worker.set_version_point(fake, None) is False
 
 
-def test_gradient_is_taken_at_the_version_point_and_applied_to_current_weights():
+@pytest.mark.mcore
+def test_gradient_is_taken_at_the_version_point_and_applied_to_current_weights(Worker):
     model = _FlatModel()
     flat = model.flat
     snapshots = _snapshots(model)
@@ -141,7 +149,7 @@ def test_gradient_is_taken_at_the_version_point_and_applied_to_current_weights()
     reference(x).square().sum().backward()
     grad_ref = [p.grad.clone() for p in reference.parameters()]
 
-    fake = _fake_worker(snapshots)
+    fake = _fake_worker(Worker, snapshots)
     assert Worker.set_version_point(fake, 3)
     with Worker._version_point_scope(fake, enabled=True):
         model(x).square().sum().backward()
@@ -172,7 +180,7 @@ def test_gradient_is_taken_at_the_version_point_and_applied_to_current_weights()
 
 @pytest.mark.mcore
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="TE FusedAdam needs CUDA")
-def test_precision_aware_master_needs_the_swap_back_before_the_step():
+def test_precision_aware_master_needs_the_swap_back_before_the_step(Worker):
     """TE FusedAdam with int16 remainders: the master is the bf16 param bits + remainder.
 
     Stepping after the scope exits equals a reference step from theta_t with the version-point
@@ -216,7 +224,7 @@ def test_precision_aware_master_needs_the_swap_back_before_the_step():
         )
         with torch.no_grad():
             ref_model.flat.copy_(theta_t)
-        fake = _fake_worker(snapshots)
+        fake = _fake_worker(Worker, snapshots)
         assert Worker.set_version_point(fake, 0)
         with Worker._version_point_scope(fake, enabled=True):
             model(x).float().square().sum().backward()
@@ -325,13 +333,14 @@ def test_keep_l_plus_one_versions_covers_every_fixed_lead_batch(lag):
     assert _fixed_lead_fallbacks(lag, keep, 200, resume_at=50, restore=False) == lag
 
 
-def test_snapshots_survive_a_checkpoint_round_trip(tmp_path):
+@pytest.mark.mcore
+def test_snapshots_survive_a_checkpoint_round_trip(tmp_path, Worker):
     """Saved and restored snapshots swap in bitwise; a resumed run has 0 IS-path steps."""
     lag = 3
     keep = version_point_keep_versions(lag)
     model = _FlatModel(torch.bfloat16)
     _set_specials(model.flat)
-    fake = _fake_worker(_snapshots(model, keep), rank=1)
+    fake = _fake_worker(Worker, _snapshots(model, keep), rank=1)
     history = {}
     for version in range(6):
         Worker.snapshot_version_weights(fake, version, keep)
@@ -343,7 +352,7 @@ def test_snapshots_survive_a_checkpoint_round_trip(tmp_path):
     Worker.save_version_snapshots(fake, str(tmp_path))
 
     # A fresh worker on the restored weights.
-    resumed = _fake_worker(None, rank=1)
+    resumed = _fake_worker(Worker, None, rank=1)
     resumed._new_version_snapshots = lambda k: _snapshots(model, k)
     assert Worker.load_version_snapshots(resumed, str(tmp_path), keep) == [2, 3, 4, 5]
     assert Worker.snapshot_version_weights(resumed, 5, keep)["consistent"]
@@ -356,7 +365,7 @@ def test_snapshots_survive_a_checkpoint_round_trip(tmp_path):
             assert _bits_equal(model.flat, history[version])
         assert _bits_equal(model.flat, history[5])
     # No checkpointed snapshots (other rank / older checkpoint): nothing restored.
-    other = _fake_worker(None, rank=0)
+    other = _fake_worker(Worker, None, rank=0)
     assert Worker.load_version_snapshots(other, str(tmp_path), keep) == []
 
 
@@ -372,18 +381,18 @@ def _config(**over):
         batch_invariant=True,
     )
     o.update(over)
-    return SimpleNamespace(
-        grpo=SimpleNamespace(
+    return MasterConfig.model_construct(
+        grpo=GRPOConfig.model_construct(
             num_prompts_per_step=16,
             num_generations_per_prompt=16,
-            async_grpo=SimpleNamespace(
+            async_grpo=AsyncGRPOConfig(
                 enabled=o["async_enabled"],
                 version_point_gradient=o["enabled"],
                 max_trajectory_age_steps=8,
                 in_flight_weight_updates=o["in_flight"],
             ),
         ),
-        loss_fn=SimpleNamespace(force_on_policy_ratio=False),
+        loss_fn=ClippedPGLossConfig.model_construct(force_on_policy_ratio=False),
         data_plane=None,
         policy={
             "train_global_batch_size": o["gbs"],
@@ -415,3 +424,91 @@ def test_validate_version_point_config():
     ):
         with pytest.raises(ValueError, match=match):
             validate_version_point_config(_config(**bad))
+
+
+def test_staging_failure_restores_current_weights_and_clears_caches():
+    model = _FlatModel()
+    snapshots = _snapshots(model)
+    snapshots.snapshot(0)
+    model.flat.add_(1)
+    current = model.flat.clone()
+    calls = []
+
+    def invalidate():
+        calls.append(model.flat.clone())
+        if len(calls) == 1:
+            raise RuntimeError("cache failure")
+
+    snapshots._invalidate_weight_caches = invalidate
+    with pytest.raises(RuntimeError, match="cache failure"):
+        with snapshots.swapped_in(0):
+            pytest.fail("staging must fail before the body")
+    assert torch.equal(model.flat, current)
+    assert torch.equal(calls[-1], current)
+    assert not snapshots._saved_current
+
+
+@pytest.mark.mcore
+def test_pending_gather_finishes_before_current_weights_are_restored(Worker):
+    model = _FlatModel()
+    snapshots = _snapshots(model)
+    snapshots.snapshot(0)
+    behavior = model.flat.clone()
+    model.flat.add_(1)
+    current = model.flat.clone()
+    fake = _fake_worker(Worker, snapshots)
+    calls = []
+
+    def drain():
+        calls.append(1)
+        if len(calls) == 2:
+            model.flat.copy_(behavior)
+
+    fake._drain_param_gather = drain
+    assert Worker.set_version_point(fake, 0)
+    with Worker._version_point_scope(fake, enabled=True):
+        pass
+    assert len(calls) == 2
+    assert torch.equal(model.flat, current)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda c: c.policy["megatron_cfg"].update(cuda_graph_impl="local"),
+            "cuda_graph_impl",
+        ),
+        (
+            lambda c: c.policy["megatron_cfg"].update(
+                fp4_cfg=Fp4Config(enabled=True, fp4_param=True)
+            ),
+            "fp4_param",
+        ),
+        (
+            lambda c: c.policy["megatron_cfg"].update(
+                model_overrides={"moe_router_enable_expert_bias": True}
+            ),
+            "moe_router_enable_expert_bias",
+        ),
+        (
+            lambda c: setattr(c.grpo.async_grpo, "max_trajectory_age_steps", 0),
+            "max_trajectory_age_steps",
+        ),
+        (
+            lambda c: setattr(c.grpo, "seq_logprob_error_threshold", 0.1),
+            "seq_logprob_error_in_loss",
+        ),
+    ],
+)
+def test_version_point_rejects_unsupported_runtime_settings(mutation, message):
+    config = _config()
+    mutation(config)
+    with pytest.raises(ValueError, match=message):
+        validate_version_point_config(config)
+
+
+def test_sync_config_can_omit_the_async_block():
+    config = _config()
+    config.grpo.async_grpo = None
+    validate_version_point_config(config)

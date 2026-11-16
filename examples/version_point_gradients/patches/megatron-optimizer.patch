@@ -1,0 +1,315 @@
+diff --git a/megatron/core/optimizer/__init__.py b/megatron/core/optimizer/__init__.py
+index 7be70d59b..22010a8ff 100644
+--- a/megatron/core/optimizer/__init__.py
++++ b/megatron/core/optimizer/__init__.py
+@@ -621,6 +621,10 @@ def _get_megatron_optimizer_based_on_param_groups(
+                 pin_cpu_grads=config.pin_cpu_grads,
+                 pin_cpu_params=config.pin_cpu_params,
+                 param_update_in_fp32=True,
++                _defer_sub_optimizer_init=(
++                    config.use_distributed_optimizer
++                    and not model_chunks[0].ddp_config.use_megatron_fsdp
++                ),
+                 **optimizer_defaults,
+             )
+             init_state_fn = None
+diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+index 307883f93..24de1b08d 100644
+--- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
++++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+@@ -52,8 +52,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+         pin_cpu_grads: bool = True,
+         pin_cpu_params: bool = True,
+         overlap_cpu_optimizer_d2h_h2d: bool = True,
++        _defer_sub_optimizer_init: bool = False,
+         **kwargs,
+-    ):
++    ) -> None:
+         super(HybridDeviceOptimizer, self).__init__(
+             params,
+             defaults={
+@@ -77,8 +78,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+         self.param_update_in_fp32 = param_update_in_fp32
+         self.sub_optimizer_kwargs = kwargs
+ 
+-        self._init_sub_optimizers()
+-        self._register_load_state_dict_hooks()
++        # DistributedOptimizer replaces this temporary optimizer after sharding.
++        # Allocating full-parameter CPU copies here would leave a large pinned
++        # allocation cache even after the temporary optimizer is discarded.
++        # Keep this internal flag out of defaults so the replacement initializes.
++        if not _defer_sub_optimizer_init:
++            self._init_sub_optimizers()
++            self._register_load_state_dict_hooks()
+ 
+     def _set_sub_optimizer_grads(self):
+         if self.param_update_in_fp32:
+@@ -324,6 +330,21 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+                     new_state[orig_param]["master_param"] = param
+         self.state = new_state
+ 
++        # FusedAdam advances a group-level step. Publish it back to HDO so a
++        # restored counter is not copied over the newer value on every step.
++        # CPU Adam keeps its counters in per-parameter state instead.
++        if self.gpu_optimizer is not None:
++            steps = {
++                self.inner_param_to_orig_param[group["params"][0]]: group["step"]
++                for group in self.gpu_optimizer.param_groups
++                if "step" in group
++            }
++            for group in self.param_groups:
++                for param in group["params"]:
++                    if param in steps:
++                        group["step"] = steps[param]
++                        break
++
+     def _sync_hdo_state_to_sub_optimizers(self):
+         for optimizer in self.sub_optimizers:
+             new_state = defaultdict(dict)
+@@ -374,11 +395,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+         if not self.param_update_in_fp32:
+             return
+         for param, v in self.state.items():
+-            # Native FP32 params do not need a separate master parameter and are
+-            # intentionally absent from param_to_fp32_param.
+-            fp32_param = self.param_to_fp32_param.get(param)
+-            if fp32_param is not None:
+-                fp32_param.data.copy_(v["master_param"])
++            # Native FP32 parameters can also have an offloaded CPU copy.
++            # Restore the actual inner parameter, including those copies.
++            self.param_to_inner_param[param].data.copy_(v["master_param"])
+ 
+     @torch.no_grad()
+     def update_fp32_param_by_new_param(self):
+@@ -441,12 +460,16 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+                     for i, param in enumerate(group["params"]):
+                         group["params"][i] = self.fp32_param_to_orig_param.get(param, param)
+ 
+-            # 2. After loading state_dict, the parameters may change, and we need to
+-            # reinitialize the sub-optimizers to regenerate the new parameters and
+-            # cpu copy pairs.
+-            self._init_sub_optimizers()
++            # Optimizer.load_state_dict preserves the current parameter objects.
++            # Reuse their CPU copies and FP32 masters; rebuilding them here doubles
++            # master-parameter storage while the loaded state is still live.
+             self._sync_hdo_param_groups_to_sub_optimizers()
+             self._sync_hdo_state_to_sub_optimizers()
++            if not self.param_update_in_fp32:
++                # These copies are not stored as master_param in the optimizer
++                # checkpoint. Refresh them from the separately restored model.
++                for param, cpu_copy in self.gpu_params_map_cpu_copy.items():
++                    cpu_copy.data.copy_(param)
+ 
+         self.register_load_state_dict_post_hook(post_load_state_dict_hook)
+ 
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index fb5f859e1..1e2bca7ab 100644
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -7,6 +7,7 @@ import itertools
+ import logging
+ import re
+ from collections import ChainMap, defaultdict
++from copy import deepcopy
+ from dataclasses import replace
+ from logging import getLogger
+ from typing import Any, Callable, Dict, List, Optional, Tuple
+@@ -14,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
+ import torch
+ import torch.nn.functional
+ 
+-from megatron.core.utils import get_model_config, log_single_rank
++from megatron.core.utils import get_model_config, is_te_min_version, log_single_rank
+ 
+ from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
+ 
+@@ -962,6 +963,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+         }
+         return dtype_map.get(key, torch.float32)
+ 
++    def _uses_native_te_state_initialization(self) -> bool:
++        """Whether metadata can be restored without TE tensor-state serialization."""
++        # Keep custom subclasses and registered load hooks on their normal
++        # loader path. TE 2.18+ has the public remainder-aware initializer.
++        return (
++            USING_TE_OPTIMIZER
++            and type(self.optimizer) is Adam
++            and is_te_min_version("2.18")
++            and not self.optimizer._optimizer_load_state_dict_pre_hooks
++            and not self.optimizer._optimizer_load_state_dict_post_hooks
++        )
++
+     def state_dict(self):
+         """
+         The state dict contains all non-DP-rank-dependent (i.e., non-parameter-
+@@ -970,7 +983,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
+         checkpoint file by calling 'save_parameter_state()'.
+         """
+-        inner_state_dict = self.optimizer.state_dict()
++        # Only group metadata is retained here. TE's override materializes
++        # unscaled tensor states, which are saved separately by this wrapper.
++        inner_state_dict = (
++            torch.optim.Optimizer.state_dict(self.optimizer)
++            if self._uses_native_te_state_initialization()
++            else self.optimizer.state_dict()
++        )
+         state_dict = {}
+ 
+         # Extract 'step', for non-Apex/TE support.
+@@ -1068,6 +1087,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+             if isinstance(self.optimizer, HybridDeviceOptimizer):
+                 self.optimizer.dummy_step()
+ 
++        native_te_state = self._uses_native_te_state_initialization()
++        if native_te_state:
++            # Allocate final state buffers once, without constructing a full
++            # dummy state dict and sending it through TE's copying loader.
++            # Parameter values are restored separately below by load_parameter_state*.
++            for group in self.optimizer.param_groups:
++                for param in group["params"]:
++                    if not self.optimizer.state[param]:
++                        self.optimizer.initialize_state(
++                            param,
++                            self.optimizer.store_param_remainders and param.dtype == torch.bfloat16,
++                        )
++
+         # Get the Torch optimizer's state dict.
+         # - This 'inner' optimizer at this point is unallocated, and only
+         #   contains an integer ordering of parameters within each group, and
+@@ -1091,7 +1123,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+         for param_group in state_dict["optimizer"]["param_groups"]:
+             needed_groups = make_needed_groups(param_group)
+             param_groups_map[needed_groups] = param_group
+-        inner_state_dict = self.optimizer.state_dict()
++        inner_state_dict = (
++            torch.optim.Optimizer.state_dict(self.optimizer)
++            if native_te_state
++            else self.optimizer.state_dict()
++        )
+         state_dict_param_groups = []
+         for inner_param_group in inner_state_dict["param_groups"]:
+             needed_groups = make_needed_groups(inner_param_group)
+@@ -1175,10 +1211,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                 for v in self.optimizer.state.values():
+                     v["step"] = step.detach().clone()
+ 
+-        # Optimizer.
+-        self.optimizer.load_state_dict(
+-            {"state": state_dict_state, "param_groups": state_dict_param_groups}
+-        )
++        # This checkpoint portion contains group metadata, not parameter
++        # state. Preserve TE's existing buffers: loading their state_dict back
++        # into TE casts and reallocates the complete state even when unchanged.
++        if native_te_state:
++            loaded_groups = deepcopy(state_dict_param_groups)
++            for current_group, loaded_group in zip(
++                self.optimizer.param_groups, loaded_groups, strict=True
++            ):
++                loaded_group["params"] = current_group["params"]
++            self.optimizer.param_groups = loaded_groups
++        else:
++            self.optimizer.load_state_dict(
++                {"state": state_dict_state, "param_groups": state_dict_param_groups}
++            )
+ 
+         # Grad scaler.
+         if 'grad_scaler' not in state_dict:
+diff --git a/tests/unit_tests/test_optimizer.py b/tests/unit_tests/test_optimizer.py
+index 3c229b9d2..b15344fa6 100644
+--- a/tests/unit_tests/test_optimizer.py
++++ b/tests/unit_tests/test_optimizer.py
+@@ -1933,3 +1933,54 @@ def test_float16_optimizer_rejects_unmatchable_main_params():
+     new_optimizer = _float16_optimizer(_decay_layer_params(fp32_decay=True))
+     with pytest.raises(RuntimeError, match="Cannot match the 9 saved main params"):
+         new_optimizer.load_state_dict(state_dict)
++
++
++def test_distributed_cpu_offload_initializes_only_parameter_shards(monkeypatch):
++    """Do not allocate an offloaded full-model copy before distributed sharding."""
++    from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
++
++    world = int(os.getenv("WORLD_SIZE", "1"))
++    rank = int(os.getenv("RANK", "0"))
++    _init_distributed(world, rank)
++    Utils.initialize_model_parallel()
++    try:
++        module = torch.nn.Linear(1024, 1024, bias=False, dtype=torch.bfloat16, device="cuda")
++        module.weight.data.fill_(1.0)
++        model = DistributedDataParallel(
++            TransformerConfig(num_attention_heads=1, num_layers=1),
++            DistributedDataParallelConfig(use_distributed_optimizer=True),
++            module,
++        )
++        allocated_numels = []
++        original_init = HybridDeviceOptimizer._init_sub_optimizers
++
++        def record_init(optimizer):
++            allocated_numels.append(
++                sum(param.numel() for group in optimizer.param_groups for param in group["params"])
++            )
++            return original_init(optimizer)
++
++        monkeypatch.setattr(HybridDeviceOptimizer, "_init_sub_optimizers", record_init)
++        optimizer = get_megatron_optimizer(
++            OptimizerConfig(
++                optimizer="adam",
++                lr=0.01,
++                bf16=True,
++                use_distributed_optimizer=True,
++                optimizer_cpu_offload=True,
++                optimizer_offload_fraction=1.0,
++                overlap_cpu_optimizer_d2h_h2d=False,
++                clip_grad=0.0,
++            ),
++            [model],
++        )
++        assert allocated_numels == [module.weight.numel() // world]
++        optimizer.zero_grad()
++        model.zero_grad_buffer()
++        module.weight.main_grad.fill_(rank + 1)
++        model.finish_grad_sync()
++        success, _, _ = optimizer.step()
++        assert success
++        assert not torch.equal(module.weight, torch.ones_like(module.weight))
++    finally:
++        Utils.destroy_model_parallel()
+diff --git a/tests/unit_tests/test_optimizer_cpu_offloading.py b/tests/unit_tests/test_optimizer_cpu_offloading.py
+index 8b8521e7c..6d7eff79b 100644
+--- a/tests/unit_tests/test_optimizer_cpu_offloading.py
++++ b/tests/unit_tests/test_optimizer_cpu_offloading.py
+@@ -414,3 +414,34 @@ def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param():
+         assert update_successful
+     finally:
+         Utils.destroy_model_parallel()
++
++
++def test_deferred_initialization_does_not_propagate_to_replacement(monkeypatch):
++    """The temporary distributed-optimizer placeholder owns no pinned copies."""
++    parameter = torch.nn.Parameter(torch.ones(1024, dtype=torch.bfloat16, device="cuda"))
++    calls = []
++    original_init = HybridDeviceOptimizer._init_sub_optimizers
++
++    def record_init(optimizer):
++        calls.append(optimizer)
++        return original_init(optimizer)
++
++    monkeypatch.setattr(HybridDeviceOptimizer, "_init_sub_optimizers", record_init)
++    temporary = HybridDeviceOptimizer(
++        [parameter],
++        offload_fraction=1.0,
++        cpu_optimizer_cls=torch.optim.AdamW,
++        gpu_optimizer_cls=GPUAdam,
++        param_update_in_fp32=True,
++        overlap_cpu_optimizer_d2h_h2d=False,
++        _defer_sub_optimizer_init=True,
++        lr=0.01,
++    )
++    assert calls == []
++    assert "_defer_sub_optimizer_init" not in temporary.defaults
++    shard = torch.nn.Parameter(parameter[:512].float())
++    replacement = HybridDeviceOptimizer([shard], **temporary.defaults)
++    assert calls == [replacement]
++    shard.grad = torch.ones_like(shard)
++    replacement.step()
++    assert not torch.equal(shard, torch.ones_like(shard))

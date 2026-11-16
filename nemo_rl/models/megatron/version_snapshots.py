@@ -29,12 +29,15 @@ expert parallelism need nothing extra.
 """
 
 from contextlib import contextmanager
-from typing import Callable, Iterator
+from typing import TYPE_CHECKING, Callable, Iterator
 
 import torch
 
+if TYPE_CHECKING:
+    from megatron.core.distributed import DistributedDataParallel
 
-def ddp_local_param_shards(model) -> list[torch.Tensor]:
+
+def ddp_local_param_shards(model: "DistributedDataParallel") -> list[torch.Tensor]:
     """This rank's shard of every param bucket of a Megatron ``DistributedDataParallel`` model.
 
     These are the slices the distributed optimizer updates and ``start_param_sync`` all-gathers.
@@ -69,15 +72,14 @@ class VersionSnapshots:
         local_shards: Callable[[], list[torch.Tensor]],
         sync: Callable[[], None],
         keep_versions: int,
-        cached_weight_modules: list[torch.nn.Module],
-    ):
+        invalidate_weight_caches: Callable[[], None],
+    ) -> None:
         if keep_versions < 1:
             raise ValueError(f"keep_versions must be >= 1, got {keep_versions}.")
         self.local_shards = local_shards
         self.sync = sync
         self.keep_versions = keep_versions
-        # Modules that cache per-weight state across microbatches (TE FP8 weight casts).
-        self._cached_weight_modules = cached_weight_modules
+        self._invalidate_weight_caches = invalidate_weight_caches
         self.snapshots: dict[int, list[torch.Tensor]] = {}
         self._saved_current: list[torch.Tensor] = []
 
@@ -100,7 +102,7 @@ class VersionSnapshots:
         if version in self.snapshots:
             same = all(
                 torch.equal(_bits(saved), _bits(shard.cpu()))
-                for saved, shard in zip(self.snapshots[version], shards)
+                for saved, shard in zip(self.snapshots[version], shards, strict=True)
             )
             if not same:
                 del self.snapshots[version]
@@ -122,10 +124,6 @@ class VersionSnapshots:
             t.numel() * t.element_size() for v in self.snapshots.values() for t in v
         )
 
-    def _invalidate_weight_caches(self) -> None:
-        for module in self._cached_weight_modules:
-            module.is_first_microbatch = True
-
     @contextmanager
     def swapped_in(self, version: int) -> Iterator[None]:
         """Hold the weights of ``version`` in the param buffers while inside; restore bitwise on exit."""
@@ -134,18 +132,21 @@ class VersionSnapshots:
         if self._saved_current:
             raise RuntimeError("A version is already swapped in.")
         with torch.no_grad():
-            self.sync()  # the buffers hold exactly the all-gather of the current shards
+            self.sync()
             shards = self.local_shards()
             self._saved_current = [shard.clone() for shard in shards]
-            for shard, saved in zip(shards, self.snapshots[version]):
-                shard.copy_(saved, non_blocking=True)
-            self.sync()
-            self._invalidate_weight_caches()
         try:
+            with torch.no_grad():
+                for shard, saved in zip(shards, self.snapshots[version], strict=True):
+                    shard.copy_(saved, non_blocking=True)
+                self.sync()
+                self._invalidate_weight_caches()
             yield
         finally:
             with torch.no_grad():
-                for shard, saved in zip(self.local_shards(), self._saved_current):
+                for shard, saved in zip(
+                    self.local_shards(), self._saved_current, strict=True
+                ):
                     shard.copy_(saved)
                 self._saved_current = []
                 self.sync()
@@ -153,6 +154,8 @@ class VersionSnapshots:
 
     def restore(self, version: int, tensors: list[torch.Tensor]) -> None:
         """Add a snapshot loaded from a checkpoint (one version at a time bounds host memory)."""
+        if self._saved_current:
+            raise RuntimeError("restore() while a version is swapped in.")
         shapes = [(s.shape, s.dtype) for s in self.local_shards()]
         if [(t.shape, t.dtype) for t in tensors] != shapes:
             raise ValueError(
