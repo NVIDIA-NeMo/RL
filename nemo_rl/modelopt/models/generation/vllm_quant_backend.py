@@ -354,15 +354,23 @@ def _iter_modelopt_quant_modules(
 ) -> list[tuple[str, torch.nn.Module]]:
     """Return modules whose runtime layout is owned by vLLM ModelOpt methods."""
     from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptLinearMethod,
         ModelOptNvFp4FusedMoE,
-        ModelOptNvFp4LinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kNvfp4Static,
     )
 
-    method_types = (ModelOptNvFp4FusedMoE, ModelOptNvFp4LinearMethod)
+    def is_nvfp4_method(quant_method: Any) -> bool:
+        return isinstance(quant_method, ModelOptNvFp4FusedMoE) or (
+            isinstance(quant_method, ModelOptLinearMethod)
+            and quant_method.spec.weight == kNvfp4Static
+        )
+
     return [
         (module_name, module)
         for module_name, module in model.named_modules()
-        if isinstance(getattr(module, "quant_method", None), method_types)
+        if is_nvfp4_method(getattr(module, "quant_method", None))
     ]
 
 

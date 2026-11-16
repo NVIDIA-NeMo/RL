@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import ray
@@ -30,6 +30,9 @@ from nemo_rl.data_plane import KVBatchMeta
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import WatchdogConfig
+    from nemo_rl.data.interfaces import DatumSpec
+    from nemo_rl.experience.reward_penalties import FinalizedReward
+    from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
@@ -180,6 +183,48 @@ class AdvantagePartial:
             minimum=float(values.min()),
             maximum=float(values.max()),
         )
+
+
+@dataclass(frozen=True)
+class RejectedGroup:
+    """A finalized group the controller rejected before commit.
+
+    The group never became selectable. ``replacement`` is the spare prompt taken
+    in the same mutation cut that cleaned the group up (None when the step was
+    credited short instead), ``target_step`` the step it was reserved for, and
+    ``lineage_group_id`` its ledger reservation when rollout recovery is enabled.
+    ``reward_observations`` are the valid rows' rewards and ``zero_variance``
+    whether the rows that vote carried no signal; the pump still tallies both
+    into the step's reward metrics.
+    """
+
+    replacement: Optional[DatumSpec]
+    lineage_group_id: Optional[str]
+    target_step: Optional[int]
+    reward_observations: list[FinalizedReward]
+    zero_variance: bool
+
+
+@dataclass(frozen=True)
+class BelowValidFractionGroup(RejectedGroup):
+    """Rejected by ``token_capture.min_valid_fraction_per_group``."""
+
+    valid_count: int
+    total_count: int
+
+
+@dataclass(frozen=True)
+class ZeroVarianceGroup(RejectedGroup):
+    """Rejected by dynamic sampling: the voting rewards left every row zero advantage.
+
+    ``target_step`` is the lender's when the dropped step was filled from a later
+    step's finished group, which the replacement then repays.
+    """
+
+
+type FinalizeOutcome = FinalizedGroup | RejectedGroup | None
+"""What ``_finalize_with_actor`` returns: the group committed, a group the controller
+rejected, or ``None`` when the finalizer dropped it as a structural outcome."""
 
 
 def reduce_advantage_pump_metrics(
@@ -467,19 +512,21 @@ def run_with_controller_liveness_watch(
 
     ping() returning is the liveness signal. A slow reply is not a freeze, so the check
     only escalates once the loop has been unresponsive for the same budget the in-actor
-    watchdog uses to call a stall.
+    watchdog uses to call a stall. A controller that never answered a ping is reported
+    as unstarted rather than stalled: an unschedulable actor and a wedged loop look the
+    same from here, but they are fixed in different places.
 
     Shared by every SingleController entrypoint (training and simulator) so the
     liveness semantics cannot drift between them.
     """
     run_ref = sc.run.remote()
     last_pong_at = time.monotonic()
+    started = False
 
-    ready: list[Any] = []
-    while not ready:
+    while True:
         ready, _ = ray.wait([run_ref], timeout=watchdog_config.interval_s)
         if ready:
-            break
+            return ray.get(run_ref)
 
         try:
             ray.get(sc.ping.remote(), timeout=watchdog_config.interval_s)
@@ -491,6 +538,12 @@ def run_with_controller_liveness_watch(
                 flush=True,
             )
             if unresponsive_s > watchdog_config.stall_timeout_s:
+                if not started:
+                    raise RuntimeError(
+                        f"SingleController has not started after {unresponsive_s:.0f}s. "
+                        "With a dedicated Ray head it can only run there; check that "
+                        "the head has a free CPU (`ray status`)."
+                    ) from error
                 raise RuntimeError(
                     "SingleController event loop has been unresponsive for "
                     f"{unresponsive_s:.0f}s (stall_timeout_s="
@@ -498,5 +551,5 @@ def run_with_controller_liveness_watch(
                     "on that loop and cannot report this."
                 ) from error
         else:
+            started = True
             last_pong_at = time.monotonic()
-    return ray.get(run_ref)

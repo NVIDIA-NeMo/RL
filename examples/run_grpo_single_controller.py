@@ -24,7 +24,9 @@ import argparse
 import os
 import pprint
 import sys
+from typing import Any
 
+import ray
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.single_controller import SingleControllerActor
@@ -75,6 +77,17 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     )
     args, overrides = parser.parse_known_args()
     return args, overrides
+
+
+def _controller_placement() -> dict[str, Any]:
+    """Pin the controller to ray.sub's dedicated head (the ``ray_head`` resource) when the cluster has one.
+
+    Returns:
+        ``SingleControllerActor.options`` kwargs; empty when there is no ``ray_head``.
+    """
+    if ray.cluster_resources().get("ray_head", 0) >= 1:
+        return {"resources": {"ray_head": 1}}
+    return {}
 
 
 def main() -> None:
@@ -202,8 +215,11 @@ def main() -> None:
                     config, tokenizer, processor=processor
                 )
 
-        print("🚀 Launching SingleControllerActor")
-        sc = SingleControllerActor.remote(
+        placement = _controller_placement()
+        print(
+            f"🚀 Launching SingleControllerActor (placement={placement or 'default'})"
+        )
+        sc = SingleControllerActor.options(**placement).remote(
             master_config=config,
             actor_args=actor_args,
             setup_timing_metrics=setup_timing_metrics,

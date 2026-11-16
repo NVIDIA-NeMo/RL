@@ -1443,10 +1443,6 @@ def setup_single_controller(
     )
     if generation_prefix_cuts_enabled:
         # The vLLM-only check ran above with the other turn/prefix checks.
-        if capture_media:
-            raise NotImplementedError(
-                "generation-prefix recovery does not yet support multimodal capture"
-            )
         if router_replay_enabled(master_config.policy):
             raise NotImplementedError(
                 "generation-prefix recovery does not yet support router replay"
@@ -2486,6 +2482,11 @@ def setup_single_controller(
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config
                 ),
+                length_penalty_config=(
+                    master_config.grpo.length_penalty
+                    if master_config.grpo is not None
+                    else None
+                ),
                 tokenizer_config=(
                     policy_config["tokenizer"]
                     if master_config.reward_penalties.penalize_malformed_think_tag
@@ -2539,6 +2540,11 @@ def setup_single_controller(
             wandb_config=master_config.logger.wandb,
         ),
         reward_penalty_config=resolved_reward_penalty_config,
+        length_penalty_config=(
+            master_config.grpo.length_penalty
+            if master_config.grpo is not None
+            else None
+        ),
         tq_buffer=tq_buffer,
         timeouts=RolloutTimeouts(
             rollout_s=master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s,
