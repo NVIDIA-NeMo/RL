@@ -599,7 +599,7 @@ class TestADropBudgetIsAcceptedUnderEverySampler:
 
     A drop budget used to be rejected under a sampler that stamps no target step,
     because the lost group was charged to no step and that step waited on a group
-    nobody was generating. See ``DropAccountingSampler``.
+    nobody was generating. See ``charge_step_for_lost_group``.
     """
 
     @pytest.mark.parametrize("sampler_name", ["windowed", "ready_first"])

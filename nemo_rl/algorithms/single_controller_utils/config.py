@@ -34,6 +34,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
     SamplerConfig,
+    require_drop_accounting_members,
     required_buffer_capacity_for_config,
     sampler_requires_single_weight_batch,
     sampler_uses_pooled_replacements,
@@ -1774,6 +1775,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+
+    # A lost group is accounted off the sampler on the async SC path regardless of
+    # dynamic sampling -- credit_shortfall reads charge_step_for_lost_group and
+    # requires_shortfall_reconciliation, EOF reads closes_short_at_exhaustion, and the
+    # fault-tolerance replacement reads uses_pooled_replacements. Require the members
+    # here so a custom sampler missing one fails validation, not mid-run.
+    require_drop_accounting_members(async_config.sampler)
 
     if async_config.defer_async_checkpoint_finalize:
         megatron_cfg = master_config.policy.get("megatron_cfg")

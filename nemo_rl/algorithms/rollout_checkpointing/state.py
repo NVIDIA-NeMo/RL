@@ -76,7 +76,7 @@ class RolloutRuntimeState:
     filtered_reserve: deque[DatumSpec] = field(default_factory=deque)
     # Exhausted steps use the final train-or-skip floor instead of failing early.
     steps_allowed_short: set[int] = field(default_factory=set)
-    # Lost groups charged to each step according to DropAccountingSampler.
+    # Lost groups charged to each step according to the sampler's charge policy.
     batch_shortfall: dict[int, int] = field(default_factory=dict)
     # Transient: snapshots must wait until an awaited selection's losses are reconciled.
     shortfall_reconciliation_pending: bool = False

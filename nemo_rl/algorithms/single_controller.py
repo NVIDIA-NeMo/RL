@@ -1561,9 +1561,13 @@ class SingleControllerActor:
                         ) from cleanup_error
                     if self._sampler.uses_pooled_replacements:
                         replacement = self._pop_filtered_replacement(target_step)
+                        # filtered=True: a zero-variance drop that closes its step short
+                        # (pool drained at EOF) is allowed below the floor, like the
+                        # non-capture filtered path; omitting it would fail an allowance
+                        # it never spent when reconciliation moves the loss.
                         lineage_group_id, replacement_step = (
                             self._substitute_dropped_group(
-                                cut, replacement, target_step
+                                cut, replacement, target_step, filtered=True
                             )
                         )
                     else:
@@ -2457,7 +2461,7 @@ class SingleControllerActor:
         to ``on_dropped_prompt="shrink"`` rather than waiting, because a step whose
         replacements keep failing still has to close.
 
-        The sampler's DropAccountingSampler capability decides whether it uses a pool.
+        The sampler's uses_pooled_replacements flag decides whether it uses a pool.
         """
         failure_cfg = self._async_cfg.rollout_failure
         if failure_cfg.on_dropped_prompt != "replace":
@@ -2659,7 +2663,7 @@ class SingleControllerActor:
 
         ``num_prompts_per_step`` is the target; groups charged to this step that were
         given up on are subtracted, because they are never arriving. Which step a lost
-        group is charged to is the sampler's call (see ``DropAccountingSampler``): the
+        group is charged to is the sampler's call (``charge_step_for_lost_group``): the
         step it was stamped for, the step being assembled, or none. Without this the
         pump waits on a group no one is generating.
 

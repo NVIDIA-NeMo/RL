@@ -26,8 +26,10 @@ loop in one object, injected into both pumps:
   - ``is_on_policy`` / ``required_buffer_capacity`` (derived facts): what the
     weight-sync and capacity-validation paths need *without* re-reading raw
     knobs, so those consumers can't drift out of sync with the sampler.
-  - ``DropAccountingSampler`` (optional): what losing a prompt group for good
-    costs under this policy, i.e. which step it is charged to and whether a
+  - drop accounting (``charge_step_for_lost_group`` plus the
+    ``uses_pooled_replacements`` / ``closes_short_at_exhaustion`` /
+    ``requires_shortfall_reconciliation`` flags): what losing a prompt group for
+    good costs under this policy, i.e. which step it is charged to and whether a
     spare pool replaces it.
 
 ``PromptGroupSampler`` is the interface; ``WindowedSampler`` /
@@ -204,54 +206,6 @@ class TransactionalAdmissionSampler(Protocol):
         ...
 
 
-@runtime_checkable
-class DropAccountingSampler(Protocol):
-    """Sampler that says what it costs to lose a prompt group for good.
-
-    A group is lost when its rollout is dropped (a failure, or dynamic sampling
-    filtering a zero-variance group) and no replacement is available. The controller
-    reads these members directly off the sampler, so a custom sampler used with dynamic
-    sampling must declare all of them.
-
-    Declare the flags as class attributes, not in ``__init__``. Setup validates the
-    sampler class before it is constructed, so flags that exist only on an instance are
-    invisible there and are rejected even though the controller -- which checks the
-    instance -- would honour them.
-    """
-
-    uses_pooled_replacements: ClassVar[bool]
-    """Whether dropped groups use pool-based replacements.
-
-    Filtering and rollout failures use separate prompt pools and budgets. Each
-    feature enables its pool independently when the sampler uses this strategy.
-    """
-
-    closes_short_at_exhaustion: ClassVar[bool]
-    """Whether the last step may close on the groups that exist once the data runs out."""
-
-    requires_shortfall_reconciliation: ClassVar[bool]
-    """Whether a loss charged during an awaited selection must be reconciled."""
-
-    def charge_step_for_lost_group(
-        self, *, target_step: Optional[int], assembling_version: int
-    ) -> Optional[int]:
-        """Return the step a permanently lost group is charged to.
-
-        This policy may be re-evaluated after an awaited selection completes;
-        compute the destination without mutating sampler state.
-
-        Args:
-            target_step: The step stamped on the lost group, or ``None`` if the
-                policy does not stamp.
-            assembling_version: The step the train pump is assembling, or will
-                assemble next once the current one has finished selecting.
-
-        Returns:
-            The step whose size shrinks by one, or ``None`` if nothing is charged.
-        """
-        ...
-
-
 class BaseSampler(abc.ABC):
     """Shared machinery for the built-in policies.
 
@@ -263,7 +217,7 @@ class BaseSampler(abc.ABC):
     supports_buffer_checkpoint: ClassVar[bool] = False
     supports_training_claims: ClassVar[bool] = True
 
-    # Defaults for DropAccountingSampler, right for a gated sampler that does not stamp.
+    # Drop-accounting defaults, right for a gated sampler that does not stamp.
     uses_pooled_replacements: ClassVar[bool] = True
     closes_short_at_exhaustion: ClassVar[bool] = False
 
@@ -1007,7 +961,7 @@ def sampler_uses_pooled_replacements(cfg: SamplerConfig) -> bool:
 
     Reads the resolved class without constructing it. A sampler that does not
     declare the capability gets the gated default, matching the controller's
-    fallback for a custom sampler that omits ``DropAccountingSampler``.
+    fallback for a custom sampler that omits the drop-accounting members.
     """
     sampler_cls = _sampler_class_for_config(cfg)
     return bool(getattr(sampler_cls, "uses_pooled_replacements", True))
