@@ -408,6 +408,10 @@ class RolloutSnapshotter(_UsesRolloutParts):
         training_owned_groups: list[TQReplayGroupMetadata] = []
         staging_row_count = 0
         tq_save_seconds = 0.0
+        replay_inventory_seconds = 0.0
+        recovery_state_build_seconds = 0.0
+        recovery_state_serialize_seconds = 0.0
+        staging_inventory_seconds = 0.0
         data_plane_capture = None
         if snapshot or self._master_config.checkpointing.save_data_plane:
             training_owned_groups = self._buffer.training_owned_replay_groups()
@@ -421,14 +425,17 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     saved_capacity=self._async_cfg.max_buffered_rollouts,
                     additional_groups=training_owned_groups,
                 )
+                replay_inventory_started = time.monotonic()
                 await validate_replay_inventory(
                     replay_metadata,
                     dp_client=self._dp_client,
                     partition_id=self._partition_id,
                 )
+                replay_inventory_seconds = time.monotonic() - replay_inventory_started
 
             recovery_digest: Optional[str] = None
             if snapshot or self._records_prompt_groups():
+                recovery_state_build_started = time.monotonic()
                 recovery_state = build_rollout_recovery_state(
                     self._rollout_manager.recovery_ledger,
                     batch_shortfall=self._rollout_runtime.batch_shortfall,
@@ -443,13 +450,21 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     if replay_metadata is not None
                     else set(),
                 )
+                recovery_state_serialize_started = time.monotonic()
+                recovery_state_build_seconds = (
+                    recovery_state_serialize_started - recovery_state_build_started
+                )
                 payload_buffer = io.BytesIO()
                 await asyncio.to_thread(torch.save, recovery_state, payload_buffer)
                 recovery_payload = payload_buffer.getvalue()
                 recovery_digest = hashlib.sha256(recovery_payload).hexdigest()
+                recovery_state_serialize_seconds = (
+                    time.monotonic() - recovery_state_serialize_started
+                )
                 recovery_group_count = len(recovery_state["groups"])
 
             if self._master_config.token_capture.enabled:
+                staging_inventory_started = time.monotonic()
                 staging_row_count = await validate_rollout_recovery_inventory(
                     cut,
                     dp_client=self._dp_client,
@@ -459,6 +474,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     clear_unreferenced=False,
                     additional_expected_staging_keys=additional_expected_staging_keys,
                 )
+                staging_inventory_seconds = time.monotonic() - staging_inventory_started
             tq_save_started = time.monotonic()
             data_plane_capture = await self._save_data_plane_checkpoint(
                 checkpoint_path,
@@ -504,6 +520,10 @@ class RolloutSnapshotter(_UsesRolloutParts):
             rolled_back_train_group_count=len(training_owned_groups),
             mutation_version=self._data_plane_checkpoint_barrier.mutation_version,
             tq_save_seconds=tq_save_seconds,
+            replay_inventory_seconds=replay_inventory_seconds,
+            recovery_state_build_seconds=recovery_state_build_seconds,
+            recovery_state_serialize_seconds=recovery_state_serialize_seconds,
+            staging_inventory_seconds=staging_inventory_seconds,
         )
         return SnapshotCapture(state=state, data_plane=data_plane_capture)
 
@@ -871,6 +891,14 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 "tq_capture_seconds": snapshot_cut.tq_save_seconds,
                 "tq_persist_seconds": tq_persist_seconds,
                 "tq_release_seconds": tq_release_seconds,
+                "replay_inventory_seconds": snapshot_cut.replay_inventory_seconds,
+                "recovery_state_build_seconds": (
+                    snapshot_cut.recovery_state_build_seconds
+                ),
+                "recovery_state_serialize_seconds": (
+                    snapshot_cut.recovery_state_serialize_seconds
+                ),
+                "staging_inventory_seconds": snapshot_cut.staging_inventory_seconds,
                 "barrier_wait_seconds": barrier_acquired - barrier_requested,
                 "exclusive_hold_seconds": barrier_released - barrier_acquired,
                 "sidecar_save_seconds": sidecar_save_seconds,

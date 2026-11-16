@@ -848,6 +848,18 @@ The `timing/rollout_checkpoint` metrics split `tq_capture_seconds`,
 and persistence. Compare these with `environment_paused_seconds` and
 `exclusive_hold_seconds` to measure time removed from the pause.
 
+The rest of the barrier hold is split into the checks and recovery state that
+stay inside it:
+
+| Metric | Phase |
+|---|---|
+| `replay_inventory_seconds` | Compare TQ replay keys with the replay index |
+| `recovery_state_build_seconds` | Copy and validate the rollout-recovery ledger |
+| `recovery_state_serialize_seconds` | `torch.save` and sha256 of that state |
+| `staging_inventory_seconds` | Compare TQ staging keys with recovery ownership |
+
+A phase that does not run for the configuration logs 0.
+
 ## Async path (proposed)
 
 The data-plane interface covers both sync and async, but the **sync trainer uses only half of it**. The task-mediated half (`claim_meta` / `get_data` / `check_consumption_status`) is reserved for the async trainer, which is not yet wired into production.

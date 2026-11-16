@@ -2367,6 +2367,16 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["total_save_seconds"] > 0
         assert 0 <= logged["barrier_wait_seconds"] <= logged["total_save_seconds"]
         assert 0 <= logged["tq_save_seconds"] <= logged["exclusive_hold_seconds"]
+        held_phases = (
+            "replay_inventory_seconds",
+            "recovery_state_build_seconds",
+            "recovery_state_serialize_seconds",
+            "staging_inventory_seconds",
+            "tq_capture_seconds",
+        )
+        assert all(logged[phase] > 0 for phase in held_phases)
+        held_seconds = sum(logged[phase] for phase in held_phases)
+        assert held_seconds <= logged["exclusive_hold_seconds"]
         assert 0 <= logged["sidecar_save_seconds"] <= logged["total_save_seconds"]
         assert 0 <= logged["snapshot_commit_seconds"] <= logged["total_save_seconds"]
         assert logged["controller_sidecar_bytes"] > 0
