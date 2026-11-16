@@ -53,7 +53,10 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     row_group_ids,
     split_meta_by_prompt_group,
 )
-from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AdvantageConfig,
+    TokenCaptureConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     DebugWriterConfig,
     JsonDebugWriter,
@@ -104,6 +107,7 @@ def test_from_master_config_uses_typed_logger(
             log_full_train_data=log_full_train_data,
             debug_writer=DebugWriterConfig(),
         ),
+        token_capture=TokenCaptureConfig(),
     )
 
     config = AdvantageStageConfig.from_master_config(master_config)
@@ -526,6 +530,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         # disk shard-side.
         "train_data_dump_s",
         "train_data_dump_receipt",
+        # Three integers under rollout_token_mean, not the weights.
+        "rollout_loss_counts",
     }
 
 

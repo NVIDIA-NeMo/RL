@@ -13,6 +13,7 @@
 # limitations under the License.
 """Validate logical owners for replay restore and the existing GRPO estimator."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, fields
 
 import torch
@@ -40,6 +41,89 @@ class LogicalOwnerBatch:
     def fanout(self, values: torch.Tensor) -> torch.Tensor:
         """Broadcast one scalar per owner, with zero for ownerless padding."""
         return values[self.row_owner.clamp_min(0)] * (self.row_owner >= 0)
+
+    def owner_mass(self, row_mass: torch.Tensor) -> torch.Tensor:
+        """Sum one value per row into its owner; padding contributes nothing."""
+        owned = self.row_owner >= 0
+        return torch.zeros(
+            self.valid_mask.shape, dtype=torch.float64, device=row_mass.device
+        ).index_add_(0, self.row_owner[owned], row_mass[owned].double())
+
+
+def _row_trainable_tokens(
+    token_mask: torch.Tensor, sample_mask: torch.Tensor
+) -> torch.Tensor:
+    """Count each row's trainable tokens; position 0 is never predicted."""
+    return (token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1)
+
+
+def rollout_token_mean_weights(
+    owner_batch: LogicalOwnerBatch,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Build float32 per-row weights ``1 / T_r`` for equal logical-rollout token means.
+
+    ``T_r`` is the trainable token mass of row ``i``'s logical rollout:
+    ``sum_j token_mask[j, 1:].sum() * sample_mask[j]`` over the rollout's
+    segments. Shared prefixes are already owned by one row, so they count once.
+    Execution padding and rollouts with ``T_r == 0`` get weight 0.
+
+    This mirrors ``group_token_mean_weights`` in the ``loss_fn.normalization``
+    reducers, grouped by logical rollout instead of prompt group.
+
+    Args:
+        owner_batch: Logical owners of the rows.
+        token_mask: ``[B, S]`` loss mask aligned with ``input_ids``.
+        sample_mask: ``[B]`` binary row participation.
+
+    Returns:
+        ``[B]`` float32 detached weights; ``sum_i T_i * sample_mask_i * w_i``
+        equals the number of rollouts with trainable tokens.
+    """
+    mass = owner_batch.owner_mass(_row_trainable_tokens(token_mask, sample_mask))
+    inverse = torch.where(mass > 0, mass.reciprocal(), 0.0)
+    return owner_batch.fanout(inverse).float().detach()
+
+
+@dataclass(frozen=True)
+class RolloutLossCounts:
+    """One call's training masses under ``rollout_token_mean``.
+
+    The rollout weights turn the workers' token and row normalizers into the
+    rollout count and a sum of weights, so the stage reports the counts.
+    """
+
+    # Participating physical rows: what global_valid_seqs counts otherwise.
+    rows: int
+    # Trainable tokens: what global_valid_toks counts otherwise.
+    tokens: int
+    # Logical rollouts with trainable tokens: the loss normalizer.
+    rollouts: int
+
+    @classmethod
+    def from_masks(
+        cls,
+        owner_batch: LogicalOwnerBatch,
+        token_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+    ) -> "RolloutLossCounts":
+        """Count from the binary participation mask, before rollout weighting."""
+        row_tokens = _row_trainable_tokens(token_mask, sample_mask)
+        return cls(
+            rows=int(sample_mask.count_nonzero()),
+            tokens=int(row_tokens.sum().round()),
+            rollouts=int((owner_batch.owner_mass(row_tokens) > 0).sum()),
+        )
+
+
+def rollout_loss_step_metrics(counts: Sequence[RolloutLossCounts]) -> dict[str, float]:
+    """Step-level counts that replace the workers' weighted masses."""
+    return {
+        "global_valid_seqs": float(sum(count.rows for count in counts)),
+        "global_valid_toks": float(sum(count.tokens for count in counts)),
+        "global_valid_rollouts": float(sum(count.rollouts for count in counts)),
+    }
 
 
 def validate_logical_owner_metadata(

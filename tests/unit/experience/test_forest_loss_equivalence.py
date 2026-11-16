@@ -172,13 +172,17 @@ def test_packing_bins_preserve_forest_loss_accounting(
     torch.testing.assert_close(packed_grad, reference_grad)
 
 
-@pytest.mark.parametrize(
-    "corruption",
-    [None, "reordered_history", "duplicate_loss", "owner_weight", "denominator"],
-)
-def test_same_calls_as_segments_preserve_loss_and_gradients(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, corruption: str | None
-) -> None:
+def _capture_forest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    forest_loss_normalization: str = "global_token_mean",
+) -> tuple[list[tuple[str, dict[str, Any]]], Any]:
+    """Stage, finalize and run the controller advantage stage on one forest.
+
+    Returns every model call's full worker inputs, observed before staging, and
+    the canonical training rows. Owner g0 has two segments and four sampled
+    tokens; its sibling g1 has one segment and one token.
+    """
     calls = []
     complete_call = RolloutTokenCapture.complete_call
 
@@ -224,13 +228,22 @@ def test_same_calls_as_segments_preserve_loss_and_gradients(
             partition_id="canonical",
             select_fields=meta.fields,
         )
-        ctrl = _controller(meta, canonical)
+        ctrl = _controller(
+            meta, canonical, forest_loss_normalization=forest_loss_normalization
+        )
         _, valid = asyncio.run(ctrl._advantage_stage(meta))
         assert valid
     finally:
         harness.client.close()
         asyncio.run(harness.ledger.close())
 
+    return calls, canonical
+
+
+def _per_call_rows(
+    calls: list[tuple[str, dict[str, Any]]],
+) -> list[dict[str, torch.Tensor]]:
+    """Build one training row per model call straight from its worker inputs."""
     reference = []
     for scope, evidence in calls:
         prompt, generated = (
@@ -252,6 +265,38 @@ def test_same_calls_as_segments_preserve_loss_and_gradients(
                 "advantages": torch.full((len(prompt) + len(generated),), advantage),
             }
         )
+    return reference
+
+
+def _padded(rows: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
+    return pad_sequence(list(rows), batch_first=True)
+
+
+def _with_prev_logprobs(model: nn.Module, batches: list[BatchedDataDict]) -> None:
+    for batch in batches:
+        with torch.no_grad():
+            # Freeze old-policy evidence BEFORE applying corruption; otherwise
+            # recomputing it could hide a damaged conditioning prefix at ratio 1.
+            batch["prev_logprobs"] = nn.functional.pad(
+                model(batch["input_ids"]) - 0.05, (1, 0)
+            )
+
+
+def _model() -> nn.Module:
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(11)
+        return _CausalModel().double()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [None, "reordered_history", "duplicate_loss", "owner_weight", "denominator"],
+)
+def test_same_calls_as_segments_preserve_loss_and_gradients(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, corruption: str | None
+) -> None:
+    calls, canonical = _capture_forest(monkeypatch, tmp_path)
+    reference = _per_call_rows(calls)
     fields = tuple(reference[0])
     batches = [
         BatchedDataDict(
@@ -279,16 +324,8 @@ def test_same_calls_as_segments_preserve_loss_and_gradients(
     for batch in batches:
         assert (batch["token_mask"][:, 1:] * batch["sample_mask"][:, None]).sum() == 5
 
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(11)
-        model = _CausalModel().double()
-    for batch in batches:
-        with torch.no_grad():
-            # Freeze old-policy evidence BEFORE applying corruption; otherwise
-            # recomputing it could hide a damaged conditioning prefix at ratio 1.
-            batch["prev_logprobs"] = nn.functional.pad(
-                model(batch["input_ids"]) - 0.05, (1, 0)
-            )
+    model = _model()
+    _with_prev_logprobs(model, batches)
     expected = _loss_gradient(model, batches[0])
     merged = batches[1]
     denominator = 5
@@ -312,3 +349,54 @@ def test_same_calls_as_segments_preserve_loss_and_gradients(
     else:
         assert not torch.allclose(actual[0], expected[0], rtol=1e-6, atol=1e-12)
         assert not torch.allclose(actual[1], expected[1], rtol=1e-6, atol=1e-12)
+
+
+def test_rollout_token_mean_averages_each_executions_calls_then_executions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Per-call oracle for rollout_token_mean on real staged and reassembled rows.
+
+    Each execution's sampled tokens share one unit of weight, however many
+    calls and segments produced them, and the step averages the executions.
+    """
+    calls, canonical = _capture_forest(
+        monkeypatch, tmp_path, forest_loss_normalization="rollout_token_mean"
+    )
+    reference = _per_call_rows(calls)
+    tokens = {"group_g0": 0, "group_g1": 0}
+    for (scope, _), row in zip(calls, reference, strict=True):
+        tokens[scope] += int(row["token_mask"].sum())
+    assert tokens == {"group_g0": 4, "group_g1": 1}
+    fields = tuple(reference[0])
+    oracle = BatchedDataDict(
+        {
+            **{key: _padded([row[key] for row in reference]) for key in fields},
+            "sample_mask": torch.tensor(
+                [1.0 / tokens[scope] for scope, _ in calls], dtype=torch.float64
+            ),
+        }
+    )
+    merged = BatchedDataDict(
+        {
+            **{key: _padded(canonical[key].unbind()) for key in fields},
+            "sample_mask": canonical["sample_mask"].double(),
+        }
+    )
+    assert _actions(oracle) == _actions(merged)
+    # The two-segment execution and its one-call sibling each weigh one.
+    mass = (merged["token_mask"][:, 1:] * merged["sample_mask"][:, None]).sum(-1)
+    torch.testing.assert_close(mass, torch.tensor([0.5, 0.5, 1.0], dtype=torch.float64))
+
+    model = _model()
+    _with_prev_logprobs(model, [oracle, merged])
+    expected = _loss_gradient(model, oracle, denominator=2)
+    actual = _loss_gradient(model, merged, denominator=2)
+    for observed, wanted in zip(actual, expected, strict=True):
+        torch.testing.assert_close(observed, wanted, rtol=1e-9, atol=1e-12)
+    # Token normalization weighs g0's four tokens against g1's one instead.
+    token_weighted = _loss_gradient(
+        model,
+        BatchedDataDict({**merged, "sample_mask": torch.ones(3, dtype=torch.float64)}),
+        denominator=5,
+    )
+    assert not torch.allclose(token_weighted[0], expected[0], rtol=1e-6)
