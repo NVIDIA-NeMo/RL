@@ -88,16 +88,20 @@ unpack() {
         ! while read -r server; do
             [[ -x "${staging}/$(basename "${VENV_DIR}")/${server}/.venv/bin/python" ]] || echo "missing: ${server}"
         done < "${archive}.servers" | grep . >&2 &&
-        rm -rf "${VENV_DIR}" &&
-        mv "${staging}/$(basename "${VENV_DIR}")" "${VENV_DIR}" &&
-        printf '%s\n' "${archive}" > "${marker}"; then
-        rm -rf "${staging}"
-        echo "Gym venvs: unpacked ${archive} into ${VENV_DIR}"
-        return 0
+        { [[ ! -e "${VENV_DIR}" ]] || mv "${VENV_DIR}" "${staging}/.previous"; }; then
+        # Both renames stay on one filesystem, so the existing venvs are deleted only after the new ones are in place.
+        if mv "${staging}/$(basename "${VENV_DIR}")" "${VENV_DIR}" && printf '%s\n' "${archive}" > "${marker}"; then
+            rm -rf "${staging}"
+            echo "Gym venvs: unpacked ${archive} into ${VENV_DIR}"
+            return 0
+        fi
+        rm -rf "${VENV_DIR}"
+        [[ -e "${staging}/.previous" ]] && mv "${staging}/.previous" "${VENV_DIR}"
     fi
     echo "Error: unpacking ${archive} into ${VENV_DIR} failed on $(hostname)." >&2
     echo "  Check that the archive is mounted at this path and that its .size and .servers files sit next to it." >&2
-    [[ -n "${staging:-}" ]] && rm -rf "${staging}"
+    # A .previous left in staging means the old venvs could not be put back; keep them there.
+    [[ -n "${staging:-}" && ! -e "${staging}/.previous" ]] && rm -rf "${staging}"
     [[ -n "${ended_file}" ]] && touch "${ended_file}"
     exit 1
 }
