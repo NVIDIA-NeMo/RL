@@ -231,10 +231,15 @@ def _default_token_capture_dir() -> str:
     import getpass
     import secrets
 
+    try:
+        user = getpass.getuser()
+    except OSError:
+        # A container running as an arbitrary uid may have no user name at all.
+        user = str(os.getuid())
     run_name = os.environ.get("SLURM_JOB_ID") or "local"
     return os.path.join(
         "/tmp",
-        f"nemo_rl-{getpass.getuser()}",
+        f"nemo_rl-{user}",
         "token_capture",
         f"{run_name}-{secrets.token_hex(4)}",
     )

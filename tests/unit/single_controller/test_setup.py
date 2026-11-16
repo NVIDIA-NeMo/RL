@@ -3442,6 +3442,22 @@ class TestSetup:
         assert capture_dir.parent == Path("/tmp/nemo_rl-bob/token_capture")
         assert capture_dir.name.startswith("local-")
 
+    def test_token_capture_default_without_a_user_name(
+        self, patched_factories, monkeypatch
+    ):
+        def no_user_name():
+            raise OSError("No username set in the environment")
+
+        monkeypatch.setattr("getpass.getuser", no_user_name)
+        monkeypatch.setattr("os.getuid", lambda: 12345)
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        mc = self._make_megatron_token_capture_config()
+
+        token_capture = self._run_token_capture_setup(mc)
+
+        capture_dir = Path(token_capture["capture_dir"])
+        assert capture_dir.parent == Path("/tmp/nemo_rl-12345/token_capture")
+
     def test_token_capture_keeps_a_configured_capture_dir(self, patched_factories):
         patched_factories["setup_response_data"].return_value = (list(range(8)), None)
         mc = self._make_megatron_token_capture_config()
