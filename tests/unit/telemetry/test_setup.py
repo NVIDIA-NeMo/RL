@@ -597,6 +597,46 @@ def test_shutdown_is_a_noop_without_telemetry():
     shutdown_telemetry()
 
 
+def test_shutdown_does_not_import_the_host_memory_monitor_to_stop_it(monkeypatch):
+    """A worker never starts the monitor, and must not import it on the way out.
+
+    host_memory declares its rows at import, and declaration closes once the
+    metric group is registered -- which a worker does the first time it records
+    anything. Importing it here would raise out of shutdown over a monitor the
+    process never ran, so absence from sys.modules is read as "nothing to stop".
+    """
+    import nemo_rl.telemetry.setup as setup_mod
+
+    monkeypatch.delitem(sys.modules, "nemo_rl.telemetry.host_memory", raising=False)
+    real_import = builtins.__import__
+
+    def _no_host_memory(name, *args, **kwargs):
+        if name == "nemo_rl.telemetry.host_memory":
+            pytest.fail("shutdown imported the host-memory monitor")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_host_memory)
+    setup_mod._TELEMETRY_HANDLE = None
+    shutdown_telemetry()
+
+    assert "nemo_rl.telemetry.host_memory" not in sys.modules
+
+
+def test_shutdown_stops_a_monitor_that_was_started(monkeypatch):
+    """The driver's path: already imported, so it is found and stopped."""
+    import nemo_rl.telemetry.host_memory as host_memory_mod
+    import nemo_rl.telemetry.setup as setup_mod
+
+    stopped = []
+    monkeypatch.setattr(
+        host_memory_mod, "stop_host_memory_monitoring", lambda: stopped.append(True)
+    )
+    setup_mod._TELEMETRY_HANDLE = None
+    shutdown_telemetry()
+
+    assert stopped == [True]
+
+
 def test_shutdown_clears_the_handle_so_a_second_call_cannot_reach_a_dead_provider():
     # Both the driver's `finally` and the worker shutdown hooks call this, and
     # flushing an already-shut-down provider is what logs "Already shutdown".

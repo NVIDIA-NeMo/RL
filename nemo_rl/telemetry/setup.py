@@ -43,6 +43,7 @@ import functools
 import importlib.metadata
 import logging
 import os
+import sys
 import threading
 import uuid
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, cast
@@ -852,15 +853,23 @@ def shutdown_telemetry(timeout_ms: int = 5000) -> None:
     spans an unreachable collector was going to lose anyway, and being a daemon
     it never holds up process exit.
     """
-    # Deferred to break the cycle: host_memory reads get_telemetry_handle from
-    # this module.
-    from nemo_rl.telemetry.host_memory import stop_host_memory_monitoring
+    # Looked up rather than imported, for two reasons. The deferral breaks a
+    # cycle -- host_memory reads get_telemetry_handle from this module -- and
+    # the module is only ever imported by the driver's monitor startup, so its
+    # absence here means no monitor was started and there is nothing to stop.
+    #
+    # Importing it anyway would not merely be wasted work: host_memory declares
+    # its rows at import, declaration closes once the metric group is
+    # registered, and a worker registers that group the first time it records
+    # anything. Shutting a worker down would then raise out of this function
+    # over a monitor it never ran.
+    host_memory = sys.modules.get("nemo_rl.telemetry.host_memory")
 
     # Called before the early return below, and before the flush: the monitor
     # records through the providers this is about to shut down, so leaving it
     # sampling would have it writing into a closed meter for a whole interval.
-
-    stop_host_memory_monitoring()
+    if host_memory is not None:
+        host_memory.stop_host_memory_monitoring()
 
     global _TELEMETRY_HANDLE
     handle = _TELEMETRY_HANDLE
