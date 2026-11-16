@@ -1615,11 +1615,15 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     ):
         algo_prefix = "ppo" if is_ppo_run(master_config) else "grpo"
         raise ValueError(
-            f"{algo_prefix}.adv_estimator={algo_cfg.adv_estimator} requires "
-            "async_rl.min_groups_for_streaming_train == "
-            f"{algo_prefix}.num_prompts_per_step: this estimator needs the global "
-            "batch. Use full-batch chunks or an estimator configuration without "
-            "global batch statistics."
+            f"{algo_prefix}.adv_estimator.name={algo_cfg.adv_estimator.name!r} "
+            "requires the whole step's batch with its current settings "
+            "(reinforce_plus_plus always; gae and raw_reward with "
+            "normalize_advantages=true; opd with subtract_global_baseline=true). "
+            "Set async_rl.min_groups_for_streaming_train "
+            f"({async_config.min_groups_for_streaming_train}) == "
+            f"{algo_prefix}.num_prompts_per_step ({algo_cfg.num_prompts_per_step}). "
+            "To stream with gae/raw_reward, set normalize_advantages=false; "
+            "with opd, set subtract_global_baseline=false."
         )
 
     if not is_ppo_run(master_config):

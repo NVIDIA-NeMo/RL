@@ -43,7 +43,7 @@ Reference papers:
 
 import math
 from abc import ABC, abstractmethod
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Callable, ClassVar, Literal, Optional
 
 import torch
 from pydantic import BaseModel, Field
@@ -105,11 +105,10 @@ class AdvantageEstimator(ABC):
         Implementations must account for settings that enable batch statistics.
         """
 
-    @abstractmethod
-    def compute_advantage(
-        self, *args: Any, **kwargs: Any
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
-        """Compute advantages, and optionally value-model targets."""
+    # Each estimator takes different inputs; callers know which one they hold.
+    compute_advantage: ClassVar[
+        Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]]
+    ]
 
 
 class GRPOAdvantageEstimator(AdvantageEstimator):
