@@ -411,27 +411,7 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 
 ## Rollout-Only Simulator
 
-`examples/run_single_controller_simulator.py` runs one side of the SC loop with the other side mocked, on the same pumps, data plane, sampler and refit lifecycle as a training run. Only `--mode rollout_only` is implemented: generation, the environments (NeMo-Gym or native) and the TransferQueue data plane are real, while the trainer is a `CpuTrainer` (`--train-backend cpu`) that uses no GPU. There is no training cluster: the inference cluster is sized from the recipe's generation node count, or from `--num-nodes`, which gives every node of the allocation to generation. Because every GPU node serves rollouts, a Ray head node with GPUs hosts a vLLM rank next to the driver, the `SingleControllerActor` and the generation router, which have no placement rule of their own; on a training run the head may be a train node instead. Launch from a CPU-only head node, or expect the head's rollout rank to share CPUs with those processes, when comparing against a training run.
-
-```bash
-uv run examples/run_single_controller_simulator.py --config <your-sc.yaml> \
-    --num-steps 20 --num-nodes 4 --train-time-s 300 --refit-time-s 20 \
-    <hydra overrides...>
-```
-
-The recipe is used as-is and must be an SC recipe (`data_plane.enabled: true`, `async_rl:`, `grpo.async_grpo: null`). The driver overrides only what a rollout-only run owns: `--num-steps` sets `max_num_steps` (and widens `max_num_epochs` so a short dataset cannot clamp it), `--num-nodes` sets the generation node count, `data.validation` is dropped, and `vllm_cfg.load_format` defaults to `auto` so the engine loads the real checkpoint instead of dummy weights plus a first refit (an explicit `dummy` is rejected). Everything else about the engine is configured exactly as `run_grpo_single_controller.py` configures it, including the `skip_tokenizer_init` rule, so it does the same per-token work as an engine beside a trainer.
-
-What the stand-ins do, per step:
-
-- The rollout pump, `RolloutManager`, `TQReplayBuffer` and the configured sampler run unchanged, so admission is gated exactly as in training: on the trainer version, or on buffer capacity for the `windowed` sampler.
-- The train pump selects the step's groups and runs the advantage stage; the `CpuTrainer` copies `generation_logprobs` into `prev_logprobs` / `reference_policy_logprobs` (so the advantage stage runs unchanged and the training/generation logprob ratio is exactly 1: `train/max_seq_mult_prob_error` reads 1.0), accepts the chunk, and holds `--train-time-s` where `policy.train()` would run. Generation keeps serving during the hold. The hold ends early once no rollout is in flight; `train/simulated_train_idle_skipped_s` reports how much was skipped, so the e2e step time is `total_step_time + simulated_train_idle_skipped_s`.
-- `_sync_weights` runs its full lifecycle -- dispatch gate, `pause_generation_for_refit(clear_cache=recompute_kv_cache_after_weight_updates)`, resume -- around a `NoOpWeightSynchronizer` that moves nothing and holds `--refit-time-s`. The trainer version advances, which releases the sampler's next target.
-
-Everything on the rollout side is available: `generation_router`, `generation_fleet_health` (probes and shard restarts), the stall watchdog, token capture, and the `NRL_NSYS_*` profiling hooks.
-
-`tests/functional/grpo_async_gym_single_controller_rollout_only.sh` is the smoke for this path: the recipe and overrides of `tests/functional/grpo_async_gym_single_controller.sh` (`examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml` on Qwen3-0.6B with a 1-GPU vLLM split) with the trainer stubbed out, gated on a scored rollout and on the stand-in's metrics.
-
-Not supported by `rollout_only`: PPO, non-vLLM generation backends (Megatron generation serves the trainer's own weights; TRT-LLM and SGLang are not validated under the SC refit lifecycle), Dynamo serving (`policy.generation.dynamo: true`, not validated under the simulator's refit lifecycle yet), checkpointing, on-policy distillation, `token_capture.defer_routed_experts_to_policy`, `token_capture.forest_training`, refittable fp8 KV caches, adaptive-ppo-clip, and online quantization (`precision: fp8`, `nvfp4_pertoken_rollout`, `quant_cfg`, `real_quant`): those quantize at refit, which this run has none of. Setup rejects each before any engine starts. The `train_only` mode and the `cpu` rollout backend are tracked in [issue #4860](https://github.com/NVIDIA-NeMo/RL/issues/4860).
+See the [Single-Controller simulator guide](single-controller-simulator.md) for setup, usage, timing metrics and limitations.
 
 ## Relation to Legacy Async GRPO
 

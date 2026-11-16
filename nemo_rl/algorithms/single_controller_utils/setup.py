@@ -90,7 +90,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.simulator import (
     CpuTrainer,
     NoOpWeightSynchronizer,
-    SimulatorSettings,
+    SimulatorConfig,
     validate_simulator_config,
 )
 from nemo_rl.algorithms.utils import set_seed
@@ -221,7 +221,7 @@ class SingleControllerActorArgs:
     value_loss_fn: Optional[LossFunction] = None
     # None on a training run. A simulator run (run_single_controller_simulator.py)
     # carries the stand-in settings the controller reads for its held train step.
-    simulator: Optional[SimulatorSettings] = None
+    simulator: Optional[SimulatorConfig] = None
     ppo_group_multiple: int = 1
     ppo_min_remaining_groups: int = 0
 
@@ -1202,7 +1202,7 @@ def setup_single_controller(
     *,
     processor: Optional[AutoProcessor] = None,
     partition_id: str = "rollout_data",
-    simulator: Optional[SimulatorSettings] = None,
+    simulator: Optional[SimulatorConfig] = None,
 ) -> tuple[SingleControllerActorArgs, SetupTimingMetrics]:
     """Build the full SC actor args driver-side.
 

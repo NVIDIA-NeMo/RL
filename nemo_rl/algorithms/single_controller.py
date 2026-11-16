@@ -146,7 +146,7 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
     _maybe_restore_native_data_plane_checkpoint,
     _register_single_controller_partitions,
 )
-from nemo_rl.algorithms.single_controller_utils.simulator import SimulatorSettings
+from nemo_rl.algorithms.single_controller_utils.simulator import SimulatorConfig
 from nemo_rl.algorithms.single_controller_utils.utils import (
     BelowValidFractionGroup,
     FinalizeOutcome,
@@ -374,7 +374,7 @@ class SingleControllerActor:
     # Same again: the train pump asks for the simulated train step on every
     # step, and ``None`` is the training-run answer, so a controller built
     # without __init__ (the test stubs) trains rather than raises.
-    _simulator: Optional[SimulatorSettings] = None
+    _simulator: Optional[SimulatorConfig] = None
 
     def __init__(
         self,
@@ -522,7 +522,7 @@ class SingleControllerActor:
         # None on a training run. Like the fleet monitor and router below, None is
         # the documented "feature off" value, so absence degrades to a training
         # run rather than to a broken one.
-        self._simulator: Optional[SimulatorSettings] = getattr(
+        self._simulator: Optional[SimulatorConfig] = getattr(
             actor_args, "simulator", None
         )
         self._advantage_estimator = actor_args.advantage_estimator

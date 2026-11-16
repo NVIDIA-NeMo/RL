@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from examples import run_grpo_single_controller
+from nemo_rl.algorithms.single_controller_utils import entrypoint_utils
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
 from tests.functional._single_controller_hook_utils import append_event
 
@@ -107,7 +108,7 @@ class _InstrumentedRolloutManager:
         return outcome
 
 
-_original_setup_single_controller = run_grpo_single_controller.setup_single_controller
+_original_setup_single_controller = entrypoint_utils.setup_single_controller
 
 
 def _setup_with_recovery_hook(*args: Any, **kwargs: Any) -> Any:
@@ -126,7 +127,7 @@ def _setup_with_recovery_hook(*args: Any, **kwargs: Any) -> Any:
     return actor_args, timing_metrics
 
 
-run_grpo_single_controller.setup_single_controller = _setup_with_recovery_hook
+entrypoint_utils.setup_single_controller = _setup_with_recovery_hook
 
 
 if __name__ == "__main__":

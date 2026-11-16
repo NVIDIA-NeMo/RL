@@ -57,9 +57,10 @@ jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/da
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_single_controller_simulator.py \
     --config $PROJECT_ROOT/examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml \
-    --num-steps 6 \
-    --train-time-s 15 \
-    --refit-time-s 3 \
+    --simulator-config $PROJECT_ROOT/examples/configs/simulator/rollout_only.yaml \
+    simulator.num_steps=6 \
+    simulator.train_time_s=15 \
+    simulator.refit_time_s=3 \
     policy.model_name=Qwen/Qwen3-0.6B \
     policy.automodel_cfg.enabled=false \
     policy.megatron_cfg.enabled=true \
@@ -108,13 +109,15 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
     uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-    # Liveness: the environment scored at least one rollout. Fidelity: the cpu trainer
-    # publishes generation_logprobs as prev_logprobs, so the training/generation ratio is
-    # exactly 1, and the held train step is reported with its idle-skipped part bounded
-    # by the hold.
+    # Liveness: the environment scored at least one rollout and all six steps ran.
+    # Fidelity: the cpu trainer publishes generation_logprobs as prev_logprobs, so the
+    # training/generation ratio is exactly 1; the held train step is reported with its
+    # idle-skipped part bounded by the hold; every refit pause lasts the 3 s hold.
     uv run tests/check_metrics.py $JSON_METRICS \
         'max(data["train/reward"]) > 0' \
         'abs(max(data["train/max_seq_mult_prob_error"]) - 1.0) < 1e-6' \
         'min(data["train/simulated_train_time_s"]) >= 0' \
-        'max(data["train/simulated_train_idle_skipped_s"]) <= 15'
+        'max(data["train/simulated_train_idle_skipped_s"]) <= 15' \
+        'len(data["train/simulated_train_time_s"]) == 6' \
+        'mean(data["timing/train/weight_sync"]) >= 3'
 fi

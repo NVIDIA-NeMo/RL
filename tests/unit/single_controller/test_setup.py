@@ -76,7 +76,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     CpuTrainer,
     MasterConfig,
     NoOpWeightSynchronizer,
-    SimulatorSettings,
+    SimulatorConfig,
     SingleControllerActorArgs,
     setup_single_controller,
 )
@@ -4853,7 +4853,7 @@ class TestSimulatorRolloutOnlySetup:
             "build_data_plane_client",
             patched_factories["build_data_plane_client"],
         )
-        settings = SimulatorSettings(train_time_s=30.0, refit_time_s=1.5)
+        settings = SimulatorConfig(train_time_s=30.0, refit_time_s=1.5)
 
         actor_args, _ = setup_single_controller(
             mc, MagicMock(pad_token_id=0), simulator=settings
@@ -4890,7 +4890,7 @@ class TestSimulatorRolloutOnlySetup:
 
         with pytest.raises(ValueError, match="checkpointing.enabled=false"):
             setup_single_controller(
-                mc, MagicMock(pad_token_id=0), simulator=SimulatorSettings()
+                mc, MagicMock(pad_token_id=0), simulator=SimulatorConfig()
             )
 
         patched_factories["setup_response_data"].assert_not_called()
@@ -4904,7 +4904,7 @@ class TestSimulatorRolloutOnlySetup:
 
         with pytest.raises(NotImplementedError, match="vllm"):
             setup_single_controller(
-                mc, MagicMock(pad_token_id=0), simulator=SimulatorSettings()
+                mc, MagicMock(pad_token_id=0), simulator=SimulatorConfig()
             )
 
         patched_factories["setup_response_data"].assert_not_called()
@@ -4939,7 +4939,7 @@ class TestSimulatorRolloutOnlySetup:
 
         with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
             actor_args, _ = setup_single_controller(
-                mc, MagicMock(pad_token_id=0), simulator=SimulatorSettings()
+                mc, MagicMock(pad_token_id=0), simulator=SimulatorConfig()
             )
 
         checkpointer.get_latest_checkpoint_path.assert_not_called()

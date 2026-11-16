@@ -36,11 +36,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     RolloutFailureConfig,
     TokenCaptureConfig,
-    WatchdogConfig,
     logprob_passes_required,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
+from nemo_rl.algorithms.single_controller_utils.watchdog import WatchdogConfig
 
 
 def _all_sampler_names() -> list[str]:
