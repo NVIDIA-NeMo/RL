@@ -27,8 +27,8 @@ updating TQ; this module must not silently run against another implementation.
 
 from __future__ import annotations
 
-import copy
 import contextlib
+import copy
 import json
 import logging
 import pickle
