@@ -80,6 +80,7 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     JsonDebugWriter,
     TrainChunk,
 )
+from nemo_rl.algorithms.single_controller_utils.step_assembly import ShortfallCredit
 from nemo_rl.algorithms.single_controller_utils.utils import tensor_field
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
@@ -2475,6 +2476,10 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
     ctrl._dynamic_sampling_enabled = False
+    # A loose generation-batch budget so dynamic-sampling pump tests do not trip it by
+    # default; tests that exercise the budget set these two fields explicitly.
+    ctrl._filtered_prompt_budget = 10 * ctrl._algo_cfg.num_prompts_per_step
+    ctrl._filtered_prompts_by_step = {}
     ctrl._rollout_runtime.steps_allowed_short = set()
     ctrl._rollout_runtime.finalizer_metrics_by_group = {}
     ctrl._rollout_runtime.finalizer_rewards_by_group = {}
@@ -2689,6 +2694,45 @@ def test_windowed_tail_under_dynamic_sampling_trains_or_skips_by_the_floor(
     assert metrics["skipped_step"] == int(skipped)
 
 
+@pytest.mark.parametrize(
+    ("pooled", "selected", "drawn", "raises"),
+    [
+        (True, 0, 100, False),
+        (False, 2, 8, False),
+        (False, 2, 9, True),
+        (False, 1, 9, False),
+        (False, 1, 10, True),
+        (False, 0, 10, False),
+        (False, 0, 11, True),
+    ],
+)
+def test_windowed_filtered_budget_counts_selected_plus_drawn(
+    pooled: bool, selected: int, drawn: int, raises: bool
+) -> None:
+    """The after-selection budget is selected-plus-drawn against the whole allowance.
+
+    Budget 10, PPS 2. A pooled sampler is exempt (it charges as it draws). A full step
+    (selected == PPS) matches the old budget-minus-PPS behaviour; an EOF tail that
+    selected fewer than PPS keeps the larger budget-minus-selected allowance instead of
+    being overcounted against a full PPS; a step that selected nothing still accumulates
+    draws, so an all-filtered wrapping loader eventually trips the budget.
+    """
+    ctrl = _train_pump_controller(
+        sampler=SimpleNamespace(uses_pooled_replacements=pooled)
+    )
+    ctrl._filtered_prompt_budget = 10
+    ctrl._algo_cfg.dynamic_sampling_max_gen_batches = 5
+    ctrl._filtered_prompts_by_step = {3: drawn} if drawn else {}
+
+    if raises:
+        with pytest.raises(
+            RuntimeError, match="generation batches that step is allowed"
+        ):
+            ctrl._enforce_windowed_filtered_budget(3, selected)
+    else:
+        ctrl._enforce_windowed_filtered_budget(3, selected)
+
+
 def test_the_closes_short_stub_declares_what_the_windowed_sampler_does() -> None:
     """The stub drives the pump tests above, so it must not drift from the real one."""
     windowed = WindowedSampler(MagicMock(), max_staleness_versions=1)
@@ -2713,8 +2757,8 @@ class _ReadyFirstFilteringSampler(_OneThenEmptySampler):
 
     Stands in for a dynamic-sampling drop under ready_first: the group is filtered
     after it finishes generating, so it carries no target_step and the pump is already
-    waiting on it. The credit goes through _credit_shortfall rather than writing the
-    dict, so the real ReadyFirstSampler.charge_step_for_lost_group decides the step.
+    waiting on it. The credit goes through StepAssembler.credit_shortfall rather than
+    writing the dict, so the real ReadyFirstSampler.charge_step_for_lost_group decides the step.
     """
 
     def __init__(self, meta: KVBatchMeta) -> None:
@@ -2979,6 +3023,46 @@ def test_selection_reconciliation_preserves_sampler_charge_policy(
     assert ctrl._rollout_runtime.batch_shortfall == (
         {} if policy == "windowed" else {7: 2}
     )
+
+
+@pytest.mark.parametrize("reconciles", [True, False])
+@pytest.mark.parametrize("allow_short", [True, False])
+def test_a_loss_racing_selection_defers_only_under_reconciliation(
+    reconciles: bool, allow_short: bool
+) -> None:
+    """A loss that races an awaited selection charges its step immediately; only a
+    reconciling sampler also collects the credit and defers the snapshot."""
+
+    class Sampler(_EmptySampler):
+        uses_pooled_replacements = True
+        closes_short_at_exhaustion = False
+        requires_shortfall_reconciliation = reconciles
+
+        def charge_step_for_lost_group(self, *, target_step, assembling_version):
+            return assembling_version if target_step is None else target_step
+
+    ctrl = _train_pump_controller(sampler=Sampler())
+    asm = ctrl._step_assembler
+    asm.begin_step(0)
+    # The controller arms a credit sink before awaiting select(), so a racing
+    # loss is collected rather than lost (single_controller.py).
+    asm.step_assembly.selection_credits = []
+
+    asm.credit_shortfall(None, allow_short=allow_short)
+
+    # Immediate in both cases: the step is charged, and permitted short when exhausted.
+    assert ctrl._rollout_runtime.batch_shortfall == {0: 1}
+    assert (0 in ctrl._rollout_runtime.steps_allowed_short) == allow_short
+
+    # Credit collection, pending state and snapshot deferral only for a reconciler.
+    if reconciles:
+        assert asm.step_assembly.selection_credits == [
+            ShortfallCredit(None, 0, allow_short)
+        ]
+        assert ctrl._rollout_runtime.shortfall_reconciliation_pending
+    else:
+        assert asm.step_assembly.selection_credits == []
+        assert not ctrl._rollout_runtime.shortfall_reconciliation_pending
 
 
 def test_a_group_lost_while_the_last_chunk_trains_counts_toward_the_next_step(

@@ -2523,6 +2523,39 @@ class SingleControllerActor:
         self._record_filtered_prompt(target_step)
         self._check_filtered_budget(self._step_assembler.accounting_step(target_step))
 
+    def _enforce_windowed_filtered_budget(
+        self, step: int, selected_groups: int
+    ) -> None:
+        """Fail a non-pooled step once its total draw exceeds the allowance.
+
+        Windowed draws no spare per filter, so unlike the pooled path it cannot enforce
+        the budget as each filter arrives; the train pump calls this after every
+        selection instead. The check is against the groups actually selected, not a full
+        ``num_prompts_per_step``, so an EOF tail that legitimately selected fewer groups
+        keeps its full resample allowance rather than being overcounted. A still-starved
+        step (nothing selected yet) keeps accumulating draws across polls, so an
+        all-filtered wrapping loader still trips the budget.
+
+        Raises:
+            RuntimeError: Selected plus filtered draws spent the whole allowance.
+        """
+        if self._sampler.uses_pooled_replacements:
+            return
+        drawn = self._filtered_prompts_by_step.get(step, 0)
+        if selected_groups + drawn <= self._filtered_prompt_budget:
+            return
+        raise RuntimeError(
+            f"dynamic sampling drew {drawn} replacement prompt(s) for target_step="
+            f"{step} on top of {selected_groups} selected group(s), past the "
+            f"grpo.dynamic_sampling_max_gen_batches="
+            f"{cast(GRPOConfig, self._algo_cfg).dynamic_sampling_max_gen_batches} "
+            f"generation batches that step is allowed "
+            f"({self._filtered_prompt_budget} prompt(s) total). The filter is "
+            "rejecting faster than the data can refill the step; check "
+            "zero_variance_fraction, then raise the allowance or revisit the "
+            "reward/prompt mix."
+        )
+
     async def _wait_for_filtered_reserve(self) -> None:
         """Wait for pump refill without holding a checkpoint mutation cut."""
         while (
@@ -2899,6 +2932,12 @@ class SingleControllerActor:
                         self._step_assembler.reconcile_selection_credits(
                             cursor_before_selection, selection_credits
                         )
+                        if self._dynamic_sampling_enabled:
+                            # Enforce the windowed budget against what was actually
+                            # selected, every poll -- not only when a poll starves.
+                            self._enforce_windowed_filtered_budget(
+                                version_during_step, assembly.selected_groups
+                            )
                         training_claim_ids_after = (
                             self._buffer.training_owned_group_ids()
                         )
@@ -2975,16 +3014,6 @@ class SingleControllerActor:
                                     f"{groups_dispatched}/{target_groups} prompt "
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
-                                )
-                            # windowed enforces its generation budget only here; skip
-                            # once exhausted, when a starved tail is an EOF short close.
-                            if (
-                                self._dynamic_sampling_enabled
-                                and not self._sampler.uses_pooled_replacements
-                                and not self._dataloader_exhausted
-                            ):
-                                self._check_filtered_budget(
-                                    self._step_assembler.assembling_version
                                 )
                             # Safe to span the select: a starved poll never
                             # reaches the data plane, so nothing below is

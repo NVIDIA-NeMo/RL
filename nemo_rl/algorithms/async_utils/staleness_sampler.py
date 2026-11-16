@@ -959,12 +959,13 @@ def sampler_requires_single_weight_batch(cfg: SamplerConfig) -> bool:
 def sampler_uses_pooled_replacements(cfg: SamplerConfig) -> bool:
     """Whether the configured sampler replaces lost groups from a spare pool.
 
-    Reads the resolved class without constructing it. A sampler that does not
-    declare the capability gets the gated default, matching the controller's
-    fallback for a custom sampler that omits the drop-accounting members.
+    Reads the resolved class without constructing it. Every sampler declares the
+    member: built-ins as a ClassVar, custom samplers enforced by
+    ``require_drop_accounting_members`` during config validation, which runs
+    before this reader, so the attribute is always present.
     """
     sampler_cls = _sampler_class_for_config(cfg)
-    return bool(getattr(sampler_cls, "uses_pooled_replacements", True))
+    return sampler_cls.uses_pooled_replacements
 
 
 def sampler_supports_buffer_checkpoint(cfg: SamplerConfig) -> bool:
@@ -1010,14 +1011,6 @@ def sampler_supports_training_claims(cfg: SamplerConfig) -> bool:
     return capability
 
 
-_DROP_ACCOUNTING_MEMBERS = (
-    "uses_pooled_replacements",
-    "closes_short_at_exhaustion",
-    "requires_shortfall_reconciliation",
-    "charge_step_for_lost_group",
-)
-
-
 def require_drop_accounting_members(cfg: SamplerConfig) -> None:
     """Reject a custom sampler that omits a drop-accounting class attribute.
 
@@ -1042,6 +1035,14 @@ def require_drop_accounting_members(cfg: SamplerConfig) -> None:
         "uses_pooled_replacements=True, closes_short_at_exhaustion=False; a "
         "windowed-style producer uses False/True."
     )
+
+
+_DROP_ACCOUNTING_MEMBERS = (
+    "uses_pooled_replacements",
+    "closes_short_at_exhaustion",
+    "requires_shortfall_reconciliation",
+    "charge_step_for_lost_group",
+)
 
 
 def create_sampler(

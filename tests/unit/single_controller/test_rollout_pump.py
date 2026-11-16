@@ -1139,8 +1139,8 @@ class TestTakeReplacement:
             "pool left untouched"
         )
 
-    def test_an_unstamped_group_is_still_substituted(self):
-        """A group with no target_step of its own is replaced like any other."""
+    def test_the_last_spare_is_still_substituted(self):
+        """Take the last spare from the pool."""
         ctrl = self._controller(spares=1)
         assert ctrl._take_replacement(0) is not None
 
