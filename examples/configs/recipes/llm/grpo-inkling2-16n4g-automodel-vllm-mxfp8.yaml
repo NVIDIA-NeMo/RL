@@ -117,8 +117,12 @@ policy:
     activation_checkpointing: true
     env_vars:
       # Training peaks near 180 GB/GPU; routing skew on one EP rank can OOM with
-      # much of the cache reserved but fragmented.
-      PYTORCH_CUDA_ALLOC_CONF: max_split_size_mb:512
+      # much of the cache reserved but fragmented. The 0.97 fraction keeps ~5.5 GiB
+      # outside the cache for the CUDA context and allocations the cache cannot
+      # serve (lazily loaded kernels, NCCL buffers): a resumed run reaches its
+      # first backward with the optimizer state already loaded, and with 0.99
+      # (~1.8 GiB) an EP all-reduce there still failed in a CUDA call.
+      PYTORCH_CUDA_ALLOC_CONF: max_split_size_mb:512,per_process_memory_fraction:0.97
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.BackendConfig
