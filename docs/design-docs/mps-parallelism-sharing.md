@@ -40,18 +40,7 @@ IPC handle is installed before the next transfer. Imported receive buffers are
 released before their inference owners shut down. Source storage changes fail
 closed. Every rank finishes copying and cache refresh before inference resumes.
 
-The native planner needs [Megatron-LM #9465](https://github.com/NVIDIA/Megatron-LM/pull/9465):
-optional whole-mesh transfer descriptions must reject an incomplete destination
-mesh before indexing its first rank. The generic transfer schedule then handles
-residual-only destinations normally. This is a companion Megatron fix, not a
-runtime patch in NeMo RL. The tested native copy-service correction also uses a
-public collective to initialize its communicator once per service; every learner
-group rank participates, including ranks without local transfer operations.
-Exact-base build-time patches and file hashes are provided in
-[the dependency instructions](../../tools/megatron_patches/general_tp/README.md).
-Apply the same dependency source to all participating workers before startup.
-These resharding changes compose with the separate Ultra inference fixes and do
-not require copying a complete native worker into the installation.
+Residual transfers use Megatron's native reshard planner and NCCL copy service. Every learner group rank participates in communicator setup, including ranks without local transfer operations. All participating workers must use the same compatible Megatron dependency. Dependency changes are maintained separately from this NeMo RL implementation.
 
 Validation is staged. CPU tests cover native shard planning, both TP directions,
 packed projections, expert/pipeline naming, rank permutations and publication
