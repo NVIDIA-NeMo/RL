@@ -1,0 +1,44 @@
+--- a/megatron/core/inference/text_generation_controllers/mtp_utils_pytorch.py
++++ b/megatron/core/inference/text_generation_controllers/mtp_utils_pytorch.py
+@@ -251,0 +252,3 @@
++        else:
++            accepted_tokens_per_request[pid].fill_(-1)
++            accepted_token_counts[pid] = 0
+--- a/megatron/core/inference/text_generation_controllers/mtp_utils_triton.py
++++ b/megatron/core/inference/text_generation_controllers/mtp_utils_triton.py
+@@ -307,0 +308,6 @@
++    else:
++        spec_offsets = tl.arange(0, SPEC_BLOCK_SIZE)
++        spec_valid = spec_offsets < NUM_SPEC_TOKENS
++        out_base = pid.to(tl.int64) * accepted_tokens_out_stride
++        tl.store(ACCEPTED_TOKENS_OUT_PTR + out_base + spec_offsets, -1, mask=spec_valid)
++        tl.store(ACCEPTED_COUNTS_OUT_PTR + pid, 0)
+--- a/megatron/core/inference/utils.py
++++ b/megatron/core/inference/utils.py
+@@ -222,2 +222,6 @@
+-    Exactly one dispatcher per model — the first MoE layer — fires update_metadata
+-    each step. All subsequent layers skip it to avoid redundant collective calls.
++    The dispatcher metadata (the valid-token count the experts read and, at EP > 1, the
++    per-rank token layout) describes the rows of one forward pass, so exactly one dispatcher
++    per forward fires update_metadata: that of the first inference MoE layer of the main model
++    forward, and of each MTP layer. Speculative decoding runs every MTP layer as a forward
++    of its own (`forward_single_position`) on request-shaped rows, without the decoder's MoE
++    layers. All other layers skip it to avoid redundant collective calls.
+@@ -225,0 +230,2 @@
++    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
++
+@@ -231 +237,9 @@
+-    for i, moe_layer in enumerate(moe_layer_cache):
++    # The forward each MoE layer runs in: its MTP layer, or None for the main forward.
++    forward_of = {}
++    for module in model.modules():
++        if isinstance(module, MultiTokenPredictionLayer):
++            for submodule in module.modules():
++                forward_of[id(submodule)] = id(module)
++    synced_forwards = set()
++    for moe_layer in moe_layer_cache:
++        forward = forward_of.get(id(moe_layer))
+@@ -234 +248,2 @@
+-            dispatcher._runs_metadata_sync = i == 0
++            dispatcher._runs_metadata_sync = forward not in synced_forwards
++            synced_forwards.add(forward)

@@ -601,6 +601,10 @@ class MegatronGenerationMixin:
             inference_wrapper_cls
         )
         engine_model = media_model if media_model is not None else self._gen_model()
+        # Dedicated inference parameters must use graph-owned gather scratch;
+        # the colocated learner model must retain its training gradient flags.
+        if not self.is_generation_colocated or self.inference_model is not None:
+            engine_model.requires_grad_(False)
         pg_collection = get_attr_wrapped_model(self._gen_model(), "pg_collection")
         model_config = inference_model.config
 
