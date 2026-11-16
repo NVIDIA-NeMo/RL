@@ -2248,12 +2248,11 @@ def setup_single_controller(
             generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
             generation_cut_control_token=token_capture_cfg.control_auth_token,
             generation_cut_control_timeout_s=token_capture_cfg.control_timeout_s,
-            generation_prefix_batch_size=(
-                master_config.rollout_recovery.generation_prefix_batch_size
+            prefix_write_max_rows=master_config.rollout_recovery.prefix_write_max_rows,
+            prefix_write_max_tokens=(
+                master_config.rollout_recovery.prefix_write_max_tokens
             ),
-            generation_prefix_batch_max_tokens=(
-                master_config.rollout_recovery.generation_prefix_batch_max_tokens
-            ),
+            prefix_read_max_rows=master_config.rollout_recovery.prefix_read_max_rows,
         )
         if capture_media and media_columns is None:
             raise RuntimeError(

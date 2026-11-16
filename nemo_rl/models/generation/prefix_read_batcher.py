@@ -23,9 +23,9 @@ LOGGER = logging.getLogger(__name__)
 class PrefixReadBatcher:
     """Share GETs across requests without sharing request cancellation.
 
-    The fetch callback must validate row identity and return requested order
-    (TQTokenSource.fetch does both). A GET holds at most ``max_rows`` distinct
-    keys. Shutdown fails waiters but cannot interrupt an executing GET.
+    The fetch callback must validate row identity and count and return
+    requested order (TQTokenSource.fetch does all three). A GET holds at most
+    ``max_rows`` distinct keys. Shutdown fails waiters but cannot interrupt an executing GET.
     """
 
     def __init__(
@@ -33,15 +33,13 @@ class PrefixReadBatcher:
         fetch: Callable[[list[str]], list[Any]],
         *,
         max_rows: int,
-        max_pending: int = 1024,
         wait_seconds: float = 0.002,
     ) -> None:
-        if min(max_rows, max_pending) < 1 or wait_seconds < 0:
-            raise ValueError("prefix read limits must be positive and wait nonnegative")
+        if max_rows < 1 or wait_seconds < 0:
+            raise ValueError("prefix read rows must be positive and wait nonnegative")
         self._fetch = fetch
         self._max_rows = max_rows
         self._wait_seconds = wait_seconds
-        self._slots = asyncio.Semaphore(max_pending)
         self._queue: deque[tuple[str, asyncio.Future[Any]]] = deque()
         self._wake = asyncio.Event()
         self._pending: set[asyncio.Future[Any]] = set()
@@ -50,47 +48,31 @@ class PrefixReadBatcher:
 
     async def fetch(self, keys: list[str]) -> list[Any]:
         """Read a chain in order; cancellation affects only this caller."""
-        if len(keys) != len(set(keys)):
-            raise ValueError("prefix read keys must be unique")
-        if (
-            self._runner is not None
-            and self._runner.get_loop() is not asyncio.get_running_loop()
-        ):
+        loop = asyncio.get_running_loop()
+        if self._runner is not None and self._runner.get_loop() is not loop:
             raise RuntimeError("prefix reads must use one serving event loop")
-        futures: list[asyncio.Future[Any]] = []
+        if self._closed:
+            raise RuntimeError("prefix reader closed")
+        futures = [loop.create_future() for _ in keys]
+        self._pending.update(futures)
+        self._queue.extend(zip(keys, futures))
+        self._wake.set()
+        if self._runner is None:
+            self._runner = asyncio.create_task(self._run())
         try:
-            for key in keys:
-                await self._slots.acquire()
-                if self._closed:
-                    self._slots.release()
-                    raise RuntimeError("prefix reader closed")
-                future = asyncio.get_running_loop().create_future()
-                self._pending.add(future)
-                futures.append(future)
-                self._queue.append((key, future))
-                self._wake.set()
-                if self._runner is None:
-                    self._runner = asyncio.create_task(self._run())
             rows = await asyncio.gather(*futures)
         finally:
             for future in futures:
                 if not future.done():
                     future.cancel()
                 elif not future.cancelled():
-                    # Retrieve failures even if enqueue was interrupted.
+                    # gather propagates only the first failure; retrieve the rest.
                     future.exception()
         return list(rows)
-
-    def _release(self, future: asyncio.Future[Any]) -> None:
-        if future in self._pending:
-            self._pending.remove(future)
-            self._slots.release()
 
     async def _read(self, keys: list[str]) -> dict[str, Any | Exception]:
         try:
             rows = await asyncio.to_thread(self._fetch, keys)
-            if len(rows) != len(keys):
-                raise KeyError("incomplete prefix read")
             return dict(zip(keys, rows))
         except Exception as error:
             if len(keys) == 1:
@@ -111,7 +93,7 @@ class PrefixReadBatcher:
                     key, future = self._queue[0]
                     if future.done():
                         self._queue.popleft()
-                        self._release(future)
+                        self._pending.discard(future)
                         continue
                     if key not in batch and len(batch) >= self._max_rows:
                         break
@@ -139,13 +121,13 @@ class PrefixReadBatcher:
                                 waiter.set_exception(result)
                             else:
                                 waiter.set_result(result)
-                        self._release(waiter)
+                        self._pending.discard(waiter)
         finally:
             self._closed = True
-            for future in tuple(self._pending):
+            for future in self._pending:
                 if not future.done():
                     future.set_exception(RuntimeError("prefix reader closed"))
-                self._release(future)
+            self._pending.clear()
             self._queue.clear()
 
     async def aclose(self) -> None:
@@ -153,7 +135,8 @@ class PrefixReadBatcher:
         if self._runner is not None:
             owner = self._runner.get_loop()
             if owner is not asyncio.get_running_loop():
-                if owner.is_closed():
+                if owner.is_closed() or not owner.is_running():
+                    # A stopped loop never runs the close coroutine below.
                     self._closed = True
                     return
                 await asyncio.wrap_future(
@@ -168,8 +151,8 @@ class PrefixReadBatcher:
         if self._runner is not None:
             self._runner.cancel()
             await asyncio.gather(self._runner, return_exceptions=True)
-        for future in tuple(self._pending):
+        for future in self._pending:
             if not future.done():
                 future.set_exception(RuntimeError("prefix reader closed"))
-            self._release(future)
+        self._pending.clear()
         self._queue.clear()

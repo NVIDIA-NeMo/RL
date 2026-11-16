@@ -186,9 +186,12 @@ class PrefixRecovery:
         self._cleanup_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="nrl-generation-cut-cleanup"
         )
-        # Restores arriving together share their chunk reads.
-        self._reader = PrefixReadBatcher(
-            self._fetch_rows, max_rows=parts.generation_prefix_batch_size
+        # Restores arriving together share their chunk reads; with one row
+        # per read, each restore reads on its own thread instead.
+        self._reader = (
+            PrefixReadBatcher(self._fetch_rows, max_rows=parts.prefix_read_max_rows)
+            if parts.prefix_read_max_rows > 1
+            else None
         )
 
     @property
@@ -513,10 +516,10 @@ class PrefixRecovery:
         """Hold one live call's cut frozen until its row is written and acknowledged.
 
         Yields ``(record, chunk_sequence, attachments)``, receives the staged
-        key, then yields the call's acknowledgement; resuming it once more
-        seals the cut. A call with nothing new to stage returns its
-        acknowledgement (or ``None`` if abort won the race) without yielding.
-        Closing it before the seal rolls the cut back and clears its row.
+        key, then seals and returns its acknowledgement. A call with nothing new
+        to stage returns its acknowledgement (or ``None`` if abort won the race)
+        without yielding. Closing it before the seal rolls the cut back and
+        clears its row.
 
         ``route_pieces`` are the call's router-replay route pieces, copied with
         its tokens by the cut's progress read.
@@ -709,10 +712,6 @@ class PrefixRecovery:
                     terminal_finish_reason=progress.terminal_finish_reason,
                     terminal_stop_reason=progress.terminal_stop_reason,
                 )
-                if frozen.chunk_token_ids:
-                    # Every acknowledgement in a batch is built before any of
-                    # its calls seals; a failed one leaves its cut to roll back.
-                    yield acknowledgement
                 owned.seal(checkpoint_id, staged_key)
             except BaseException:
                 # Closing the transaction early raises GeneratorExit here.
@@ -848,8 +847,8 @@ class PrefixRecovery:
 
         Each call's cut stays frozen until its batch is written and every
         acknowledgement in the batch is built. A batch holds at most
-        ``generation_prefix_batch_size`` rows and, unless one row alone is
-        larger, ``generation_prefix_batch_max_tokens`` tokens.
+        ``prefix_write_max_rows`` rows and, unless one row alone is
+        larger, ``prefix_write_max_tokens`` tokens.
 
         Gym acknowledges cuts per call, so a call that cannot be cut (a failed
         freeze, write, acknowledgement or seal) is acknowledged as a failure
@@ -858,8 +857,8 @@ class PrefixRecovery:
         only its own call. Past ``deadline`` no further write starts, and the
         calls not yet written are acknowledged as failures.
         """
-        max_rows = self._parts.generation_prefix_batch_size
-        max_tokens = self._parts.generation_prefix_batch_max_tokens
+        max_rows = self._parts.prefix_write_max_rows
+        max_tokens = self._parts.prefix_write_max_tokens
         checkpoint_id = inventory.checkpoint_id
         call_ids = [prefix.model_call_id for prefix in inventory.active_prefixes]
         if len(set(call_ids)) != len(call_ids):
@@ -916,21 +915,12 @@ class PrefixRecovery:
                     exc_info=True,
                 )
             keys = []
-            for _, record, sequence, attachments, prefix in batch:
+            for row in batch:
                 if past_deadline():
-                    late.append(prefix)
+                    late.append(row[4])
                     keys.append(None)
-                    continue
-                try:
-                    keys += sink.stage_generation_prefix_batch(
-                        [record],
-                        checkpoint_id=checkpoint_id,
-                        chunk_sequences=[sequence],
-                        attachments=[attachments],
-                    )
-                except Exception:
-                    fail(prefix)
-                    keys.append(None)
+                else:
+                    keys += stage([row])
             return keys
 
         def flush() -> None:
@@ -947,31 +937,22 @@ class PrefixRecovery:
             handed = 0
             try:
                 keys = stage(batch)
-                ready = []
                 for (transaction, _, _, _, prefix), key in zip(
                     batch, keys, strict=True
                 ):
                     handed += 1
                     if key is None:
+                        # Closing rolls the frozen cut back.
                         transaction.close()
                         continue
                     try:
-                        # A failure here rolls the call back and clears its row.
-                        ready.append((transaction, prefix, transaction.send(key)))
+                        # Builds the ack and seals; a failure rolls the call
+                        # back and clears its row.
+                        transaction.send(key)
+                    except StopIteration as done:
+                        acknowledgements.append(done.value)
                     except Exception:
                         fail(prefix)
-                for transaction, prefix, acknowledgement in ready:
-                    try:
-                        transaction.send(None)
-                    except StopIteration:
-                        acknowledgements.append(acknowledgement)
-                    except Exception:
-                        fail(prefix)
-                    else:
-                        transaction.close()
-                        acknowledgements.append(
-                            self._failed_ack(prefix, reason="cut_error", uncut=uncut)
-                        )
             finally:
                 # Only an interruption leaves written rows that no transaction
                 # received; nothing may advertise them.
@@ -1065,7 +1046,7 @@ class PrefixRecovery:
         return chunks
 
     async def read_restore_chunks(self, admission: Any) -> list[Any] | None:
-        """Read a restored call's chunks through the shared restore reader.
+        """Read a restored call's chunks, through the shared reader if any.
 
         Returns None when the admission restores no cut, or when the shared
         read failed; ``resolve_restore`` then reads the rows itself.
@@ -1073,8 +1054,11 @@ class PrefixRecovery:
         continuation = admission.generation_cut
         if continuation is None:
             return None
+        keys = list(continuation.staging_keys)
         try:
-            return await self._reader.fetch(list(continuation.staging_keys))
+            if self._reader is None:
+                return await asyncio.to_thread(self._fetch_rows, keys)
+            return await self._reader.fetch(keys)
         except Exception:  # noqa: BLE001 - resolve_restore retries the read
             LOGGER.debug(
                 "shared prefix read failed for model call %s",
@@ -1085,7 +1069,8 @@ class PrefixRecovery:
 
     async def aclose(self) -> None:
         """Fail pending restore reads; call before ``shutdown``."""
-        await self._reader.aclose()
+        if self._reader is not None:
+            await self._reader.aclose()
 
     def _rebuild_prefix(
         self,
