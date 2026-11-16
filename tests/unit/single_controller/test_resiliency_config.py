@@ -697,8 +697,21 @@ class TestADropBudgetIsAcceptedUnderEverySampler:
         )
         validate_single_controller_config(cfg)
 
-    def test_a_zero_budget_does_not_require_importing_a_custom_sampler(self):
+    def test_a_zero_budget_still_accepts_a_compliant_custom_sampler(self):
+        """The interface check is unconditional, so the class is imported even with no
+        drop tolerated."""
         cfg = _master_config(
-            sampler=CustomSamplerConfig(target="my_pkg.samplers:MySampler")
+            sampler=CustomSamplerConfig(
+                target="nemo_rl.algorithms.async_utils.staleness_sampler:InOrderSampler"
+            )
         )
         validate_single_controller_config(cfg)
+
+    def test_a_zero_budget_rejects_a_custom_sampler_without_the_members(self):
+        cfg = _master_config(
+            sampler=CustomSamplerConfig(
+                target="tests.unit.single_controller.test_sampler_interface:NoDropAccounting"
+            )
+        )
+        with pytest.raises(ValueError, match="missing the required"):
+            validate_single_controller_config(cfg)
