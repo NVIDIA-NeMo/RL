@@ -146,9 +146,11 @@ def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
     ``ssd: {enabled, path, staging_bytes, pickup_s, io_threads}``: when a unit's put area cannot
     take a put, the put goes to a file under ``path`` (node-local NVMe; null
     picks ``/raid`` or ``/tmp``, see ``local_disk.default_ssd_dir``) from birth,
-    through an IO area of ``staging_bytes`` carved from the slab; reads of such
-    blobs are staged back into the same area, by ``io_threads`` file-I/O threads
-    per unit. Data already in the put area never moves.
+    through an IO area of ``staging_bytes`` the unit pins beside its slab (the
+    put area keeps its configured size; a unit holds ``unit_slab_bytes +
+    staging_bytes``); reads of such blobs are staged back into the same area,
+    by ``io_threads`` file-I/O threads per unit. Data already in the put area
+    never moves.
 
     Contract: data is read roughly oldest first (the ``weight_fifo``,
     ``in_order`` and ``ready_first`` samplers), so the oldest data stays in RAM
@@ -162,10 +164,8 @@ def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
     slab = int(cfg["unit_slab_bytes"])
     staging = int(ssd["staging_bytes"] or slab // 4)
     pickup_s = float(ssd["pickup_s"])
-    if not 0 < staging < slab:
-        raise ValueError(
-            f"NixlStore ssd.staging_bytes={staging} must be in (0, unit_slab_bytes={slab})"
-        )
+    if staging <= 0:
+        raise ValueError(f"NixlStore ssd.staging_bytes={staging} must be > 0")
     if pickup_s < 2 * BUSY_RETRY_MAX_S:
         # A reader polls a pending blob every <= BUSY_RETRY_MAX_S; a staged copy
         # must not become evictable between two of its polls (design §4.2).
@@ -324,11 +324,11 @@ class NixlKVClient(StorageKVClient):
             cfg["debug_check_finite"] or os.environ.get("NVDP_CHECK_FINITE") == "1"
         )
         ssd = ssd_config(cfg)
-        # A blob is one region of one unit's put area (the slab minus SSD
-        # staging); a put bigger than max_blob_bytes is split at key
-        # boundaries into several blobs, so it fits a unit with room to spare.
+        # A blob is one region of one unit's put area (the slab; the SSD
+        # tier's IO area is pinned beside it); a put bigger than
+        # max_blob_bytes is split at key boundaries into several blobs, so it
+        # fits a unit with room to spare.
         area = int(cfg["unit_slab_bytes"])
-        area -= ssd["staging_bytes"] if ssd else 0
         self.max_blob_bytes = int(cfg["max_blob_bytes"] or area // 4)
         self.store = UnitSlabStore(
             self.ep,
