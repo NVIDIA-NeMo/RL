@@ -117,8 +117,8 @@ class PromptGroupSampler(Protocol):
             max_prompt_groups: Maximum selection size. For chunked training,
                 this is the groups remaining in the current batch, or
                 ``async_rl.max_groups_for_streaming_train`` when that is lower.
-            group_multiple: Align the capped selection to this many complete
-                groups, leaving any unaligned ready groups unclaimed.
+            group_multiple: Align the selection to this many complete groups,
+                leaving any unaligned ready groups unclaimed.
             min_remaining_groups: Defer a nonfinal selection if it would leave
                 fewer than this many groups in ``max_prompt_groups``. Under a
                 chunk cap that window is the capped chunk rather than the step,
