@@ -29,7 +29,6 @@ from megatron.bridge.training.checkpointing import (
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
     LinearForLastLayer,
-    create_value_head_hook,
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
 )
@@ -51,9 +50,14 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer import MegatronModule
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType, MetricNormalizer
+from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    attach_media_token_validity_mask,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
@@ -63,6 +67,8 @@ from nemo_rl.models.megatron.common import (
     clear_transient_megatron_caches,
     get_aux_loss_track_names,
     get_moe_metrics,
+    model_media_placeholder_token_id,
+    model_slices_context_parallel_inputs,
 )
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -86,6 +92,7 @@ from nemo_rl.models.megatron.setup import (
 from nemo_rl.models.megatron.train import (
     LossPostProcessor,
     megatron_forward_backward,
+    model_forward,
     suspend_activation_offload_for_forward_only,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
@@ -93,6 +100,10 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
+from nemo_rl.models.value.utils import (
+    gather_and_right_shift_values,
+    right_shift_values,
+)
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
@@ -120,8 +131,43 @@ class _ValueTrainStep:
     failed: bool = False
 
 
-def _install_value_head_load_skip(chunk: GPTModel) -> None:
-    """Give the chunk a ``hide_loss_modules`` context manager that drops ``output_layer.*``.
+def _report_multimodal_input_once(worker: Any, data: BatchedDataDict[Any]) -> None:
+    """Emit one rank-zero marker proving that media reached the value worker."""
+    if getattr(worker, "_reported_multimodal_input", False):
+        return
+    media_fields = sorted(field for field in PACKED_MULTIMODAL_FIELDS if field in data)
+    if not media_fields or getattr(worker, "rank", 0) != 0:
+        return
+    print(
+        "MegatronValueWorker multimodal input fields: " + ",".join(media_fields),
+        flush=True,
+    )
+    worker._reported_multimodal_input = True
+
+
+def _value_head_parent(chunk: MegatronModule) -> tuple[Any, str]:
+    """Return the module and state-dict path that own a chunk's language head.
+
+    Plain GPT models expose ``output_layer`` directly. Megatron-Bridge VLM
+    wrappers (including Qwen2.5-VL) keep the causal-LM head under
+    ``language_model.output_layer``; installing a top-level head on those
+    wrappers leaves the real vocabulary head active and makes the critic emit
+    logits instead of scalar values.
+    """
+    language_model = getattr(chunk, "language_model", None)
+    if language_model is not None and hasattr(language_model, "output_layer"):
+        return language_model, "language_model.output_layer"
+    if hasattr(chunk, "output_layer"):
+        return chunk, "output_layer"
+    raise AttributeError(
+        f"Post-process model chunk {type(chunk).__name__} has no supported output layer"
+    )
+
+
+def _install_value_head_load_skip(
+    chunk: MegatronModule, output_layer_path: str
+) -> None:
+    """Install ``hide_loss_modules`` for the actual scalar-head state-dict path.
 
     The freshly-initialized value head is never in a base checkpoint, so Megatron-Bridge
     enters this context during finetune loads (and HF->Megatron conversion) to skip it.
@@ -138,7 +184,7 @@ def _install_value_head_load_skip(chunk: GPTModel) -> None:
         )
         if chunk._skip_value_head_in_sharded_sd:
             for key in list(sharded_sd.keys()):
-                if key.startswith(f"{prefix}output_layer."):
+                if key.startswith(f"{prefix}{output_layer_path}."):
                     del sharded_sd[key]
         return sharded_sd
 
@@ -156,18 +202,29 @@ def _install_value_head_load_skip(chunk: GPTModel) -> None:
     chunk.hide_loss_modules = hide_loss_modules
 
 
+# Megatron-Bridge's public create_value_head_hook currently hard-codes a
+# top-level "output_layer". Keep this local equivalent until that API accepts
+# an output_layer_path for VLM wrappers with nested language-model heads.
 def make_value_head_hook(hidden_size: int, sequence_parallel: bool):
-    """Build the pre-wrap hook that installs the value head and lets it skip base loads."""
-    base_hook = create_value_head_hook(
-        hidden_size=hidden_size, sequence_parallel=sequence_parallel
-    )
+    """Build a pre-wrap scalar-head hook for both GPT and VLM model layouts."""
 
     def hook(model):
-        model = base_hook(model)
-        for chunk in model if isinstance(model, list) else [model]:
-            if isinstance(getattr(chunk, "output_layer", None), LinearForLastLayer):
-                _install_value_head_load_skip(chunk)
-        return model
+        chunks = model if isinstance(model, list) else [model]
+        for chunk in chunks:
+            if not getattr(chunk, "post_process", False):
+                continue
+            output_parent, output_layer_path = _value_head_parent(chunk)
+            output_parent.output_layer = LinearForLastLayer(
+                input_size=hidden_size,
+                output_size=1,
+                sequence_parallel=sequence_parallel,
+                bias=False,
+                dropout=0.0,
+                output_in_fp32=True,
+                tp_group=getattr(getattr(chunk, "pg_collection", None), "tp", None),
+            )
+            _install_value_head_load_skip(chunk, output_layer_path)
+        return chunks
 
     return hook
 
@@ -235,14 +292,7 @@ def _value_loss_prepare_fn(
     # Drop the value head's trailing singleton ([..., 1]).
     if values.ndim > 2 and values.shape[-1] == 1:
         values = values.squeeze(-1)
-    cp_size = (
-        1
-        if context_parallel_group is None
-        else torch.distributed.get_world_size(context_parallel_group)
-    )
-    if cp_size > 1:
-        values = allgather_cp_sharded_tensor(values, context_parallel_group, seq_dim=1)
-    values = torch.cat([torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1)
+    values = gather_and_right_shift_values(values, context_parallel_group)
     values = values[:, : data["returns"].shape[1]]
     return {"logits": values}, data
 
@@ -511,6 +561,10 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
             self.model,
             self.optimizer,
         )
+        self.media_placeholder_token_id = model_media_placeholder_token_id(self.model)
+        self.model_slices_context_parallel_inputs = (
+            model_slices_context_parallel_inputs(self.model)
+        )
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
         self._maybe_enable_manual_gc()
@@ -547,6 +601,8 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
         """
         if self._train_step_state is not None:
             raise RuntimeError("finish or abort the open value train step before train")
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
+        _report_multimodal_input_once(self, data)
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -599,6 +655,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                     self._policy_like_cfg,
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
+                    model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                 )
                 total_num_microbatches += int(num_microbatches)
 
@@ -627,6 +684,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                         defer_fp32_logits=self.defer_fp32_logits,
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
+                        model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                     )
 
                 # Empty unused memory
@@ -828,6 +886,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                 raise ValueError(
                     "each value train chunk must contain complete microbatches per DP rank"
                 )
+            attach_media_token_validity_mask(data, self.media_placeholder_token_id)
             sample_mask = data["sample_mask"]
             state.counts[0] += sample_mask.sum()
             state.counts[1] += (
@@ -1013,6 +1072,8 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                 "finish or abort the value train step before inference/offload"
             )
 
+        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
+        _report_multimodal_input_once(self, data)
         no_grad = torch.no_grad()
         no_grad.__enter__()
 
@@ -1037,6 +1098,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
             self._policy_like_cfg,
             value_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
         )
 
         def forward_step_fn(
@@ -1049,15 +1111,17 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
             position_ids = processed_mb.position_ids
             packed_seq_params = processed_mb.packed_seq_params
 
-            additional_kwargs = {}
-            if packed_seq_params is not None:
-                additional_kwargs["packed_seq_params"] = packed_seq_params
-
-            output_tensor = model(
-                input_ids=input_ids_cp_sharded,
+            output_tensor = model_forward(
+                model=model,
+                data_dict=data_dict,
+                input_ids_cp_sharded=input_ids_cp_sharded,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
-                **additional_kwargs,
+                packed_seq_params=packed_seq_params,
+                defer_fp32_logits=self.defer_fp32_logits,
+                straggler_timer=self.mcore_state.straggler_timer,
+                media_token_validity_mask=processed_mb.media_token_validity_mask,
+                model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
             )
 
             def collection_fn(output_tensor):
@@ -1081,10 +1145,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                     )
                 else:
                     # [B, S]: shift right by 1 so values[t] = V(state before token t).
-                    values = output_tensor.squeeze(-1)
-                    values = torch.cat(
-                        [torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1
-                    )
+                    values = right_shift_values(output_tensor.squeeze(-1))
                 return torch.tensor(0.0, device=values.device), {"values": values}
 
             return output_tensor, collection_fn

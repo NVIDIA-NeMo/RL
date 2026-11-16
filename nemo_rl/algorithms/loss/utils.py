@@ -21,6 +21,20 @@ from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 
 
+def skips_policy_logprob_pass(
+    loss_cfg: Any, seq_logprob_error_threshold: Optional[float]
+) -> bool:
+    """Whether the separate policy-logprob forward can be skipped.
+
+    ``force_on_policy_ratio`` makes the ratio 1, so previous logprobs are only
+    needed when the sequence-logprob threshold is checked before training.
+    """
+    return bool(
+        loss_cfg.force_on_policy_ratio
+        and (seq_logprob_error_threshold is None or loss_cfg.seq_logprob_error_in_loss)
+    )
+
+
 def rescale_loss_metrics(
     metrics: dict[str, Any],
     normalizers: dict[str, MetricNormalizer],
@@ -30,19 +44,24 @@ def rescale_loss_metrics(
 ) -> dict[str, Any]:
     """Change global loss denominators while preserving raw counts and extrema.
 
-    Metrics absent from ``normalizers`` are returned unchanged. Unlike
-    split-API normalization of raw sums, this only adjusts denominators
-    explicitly advertised by the loss.
+    Every metric must be listed in ``normalizers``; an unlisted metric raises
+    instead of being rescaled by a guessed denominator.
     """
     factors = {
         MetricNormalizer.TOKENS: token_factor,
         MetricNormalizer.SEQUENCES: sequence_factor,
         MetricNormalizer.NONE: 1.0,
     }
-    return {
-        key: value * factors[normalizers[key]] if key in normalizers else value
-        for key, value in metrics.items()
-    }
+    rescaled = {}
+    for key, value in metrics.items():
+        if key not in normalizers:
+            # Guessing a denominator would log a silently wrong value.
+            raise ValueError(
+                f"Metric {key!r} is missing from the loss's metric_normalizations; "
+                "survivor rescaling needs every metric's denominator."
+            )
+        rescaled[key] = value * factors[normalizers[key]]
+    return rescaled
 
 
 def map_teacher_logits_to_draft_vocab(

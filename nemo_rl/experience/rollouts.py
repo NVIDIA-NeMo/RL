@@ -73,6 +73,7 @@ from nemo_rl.environments.nemo_gym_task import (
 from nemo_rl.environments.nemotron_utils import (
     verify_static_video_media_alignment,
 )
+from nemo_rl.experience.dynamic_sampling import mask_sample_flagged
 from nemo_rl.experience.failures import GymRowFailure
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -101,6 +102,7 @@ from nemo_rl.telemetry.instrumentation import dispatch_with_trace_context
 from nemo_rl.utils.length_penalty import (
     LengthPenaltyConfig,
     apply_group_length_penalties,
+    length_profile_fields,
 )
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
@@ -413,14 +415,9 @@ def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
     flags only ``instance_config.mask_sample`` carries a false first-class
     field beside the true nested one.
     """
-
-    def flagged(extra: dict[str, Any] | None) -> bool:
-        extra = extra or {}
-        if extra.get(MASK_SAMPLE):
-            return True
-        return bool((extra.get("instance_config") or {}).get(MASK_SAMPLE, False))
-
-    return torch.tensor([flagged(extra) for extra in extras], dtype=torch.bool)
+    return torch.tensor(
+        [mask_sample_flagged(extra) for extra in extras], dtype=torch.bool
+    )
 
 
 def _attach_routed_experts_to_message_log_prefix(
@@ -604,12 +601,16 @@ def _apply_effort_shaping(
     lengths = [_terminal_completion_length(r) for r in results]
     orig_rewards = [r["full_result"]["reward"] for r in results]
     for i, result in enumerate(results):
+        # Record the low-effort classification so the group length penalty bypasses
+        # the same rollouts the capture path does (it reads RewardChecks.low_effort).
+        low_effort = is_low_effort(nemo_gym_rows[i], effort_config)
+        result["low_effort_applied"] = low_effort
         # Inline results with a missing or empty message log have no terminal
         # length. Skip them to avoid awarding an unearned shortness bonus.
         length = lengths[i]
         if length is None:
             continue
-        if is_low_effort(nemo_gym_rows[i], effort_config):
+        if low_effort:
             new_reward, length_reward = shape_effort_reward(
                 orig_rewards[i], length=length, config=effort_config
             )
@@ -763,7 +764,6 @@ async def generate_responses_async(
     # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``;
     # vLLM exposes ``cfg`` and gates on ``vllm_cfg.async_engine``;
     # TRT-LLM requires its flag; the Megatron backend is always async.
-    # Managed Dynamo always exposes its rollout frontend asynchronously.
     vllm_cfg = getattr(policy_generation, "cfg", None)
     sglang_cfg = getattr(policy_generation, "sglang_cfg", None)
     generation_config = vllm_cfg or sglang_cfg or {}
@@ -775,8 +775,6 @@ async def generate_responses_async(
         use_async_generation = bool(
             generation_config.get("vllm_cfg", {}).get("async_engine", False)
         )
-    elif backend == "dynamo":
-        use_async_generation = True
     elif backend == "trtllm":
         assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
             "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
@@ -2799,9 +2797,10 @@ async def run_async_nemo_gym_rollout(
         sampling_params = GenerationSamplingParams.from_generation_config(
             generation_config
         )
-    # Top k is not OpenAI compatible, so NeMo-Gym does not guarantee support over it.
-    assert not sampling_params.top_k, (
-        "Top k is not supported in the sampling params in NeMo-Gym path!"
+    # Top k is not OpenAI compatible, so NeMo-Gym requests leave it unset; only
+    # NeMo-RL's vLLM server pins it to the configured profile.
+    assert not sampling_params.top_k or generation_config["backend"] == "vllm", (
+        "Top k in the sampling params in NeMo-Gym path needs the vLLM backend!"
     )
     if num_generations <= 0:
         raise ValueError("num_generations must be greater than zero")
@@ -3269,16 +3268,7 @@ def _postprocess_single_nemo_gym_group(
     if length_penalty_config is not None:
         # Copy the per-row fields the length adjustments consume.
         for nemo_gym_row, result in zip(nemo_gym_rows, results):
-            task_input = get_nemo_gym_task_input(nemo_gym_row)
-            if is_nemo_gym_task(nemo_gym_row):
-                task_data = task_input.get("task_data")
-                if isinstance(task_data, dict):
-                    task_input = {**task_data, **task_input}
-            result["profiled_rewards"] = task_input.get("profiled_rewards")
-            result["profiled_output_lengths"] = task_input.get(
-                "profiled_output_lengths"
-            )
-            result["profile_band"] = task_input.get("profile_band")
+            result.update(length_profile_fields(nemo_gym_row))
         env_rewards = torch.tensor([r["full_result"]["reward"] for r in results])
         length_penalty_metrics = apply_group_length_penalties(
             results,

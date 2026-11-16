@@ -2412,11 +2412,11 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
     NeMo-Gym's vllm_model sets logprobs=True and return_tokens_as_token_ids=True to extract
     per-token ids and logprobs for training (Gym omits top_logprobs on the capture path, so
     vLLM applies its default; Gym PR #1612 additionally pins top_logprobs=0, which is
-    equivalent). vLLM computes `logprobs = top_logprobs if logprobs else None`, so omitting
-    top_logprobs (default 0) or sending 0 returns logprobs, while an explicit null returns
-    none and silently empties the captured token ids. This exercises the real HTTP path where
-    that translation lives (the offline LLM API does not), so a vLLM bump that changes the
-    contract fails here instead of silently freezing training.
+    equivalent). Omitting top_logprobs (default 0), sending 0 and sending an explicit null
+    must all return per-token logprobs; a request that returns none silently empties the
+    captured token ids. This exercises the real HTTP path where that translation lives (the
+    offline LLM API does not), so a vLLM bump that changes the contract fails here instead
+    of silently freezing training.
 
     All three cases share the (expensive) vLLM fixture, so they run in a single test rather
     than as separate parametrized cases.
@@ -2466,20 +2466,9 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
     _assert_has_token_ids(_chat(_OMIT_TOP_LOGPROBS), "omitted top_logprobs")
     _assert_has_token_ids(_chat(0), "top_logprobs=0")
 
-    # Explicit null is the divergence that motivates the Gym fix: vLLM returns no logprobs
-    # (200 with logprobs=None) or rejects the request outright. Both mean capture gets
-    # nothing. If a future vLLM makes null behave like 0, this fails and signals the Gym
-    # workaround can be relaxed.
-    null_resp = _chat(None)
-    if null_resp.status_code == 200:
-        assert null_resp.json()["choices"][0].get("logprobs") is None
-    else:
-        # A rejection must be a client-side validation error, not an unrelated server failure
-        # that would let this branch pass vacuously.
-        assert 400 <= null_resp.status_code < 500, (
-            f"expected null top_logprobs accepted-with-None or rejected as 4xx, "
-            f"got {null_resp.status_code}: {null_resp.text}"
-        )
+    # An explicit null used to return no logprobs, which is why Gym pins top_logprobs=0.
+    # vLLM 0.33 treats null like 0.
+    _assert_has_token_ids(_chat(None), "top_logprobs=null")
 
 
 @pytest.mark.nemo_gym
@@ -2601,6 +2590,7 @@ def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkey
             use_fastokens=False,
             checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
             turn_checkpointing_enabled=False,
+            generation_prefix_cuts_enabled=False,
         )
         NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
         return started[-1]
@@ -2660,6 +2650,7 @@ def test_spinup_forwards_job_identity_to_gym_servers(monkeypatch):
             use_fastokens=False,
             checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
             turn_checkpointing_enabled=False,
+            generation_prefix_cuts_enabled=False,
         )
         NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
         return parse_otel_resource_attributes(os.environ["OTEL_RESOURCE_ATTRIBUTES"])

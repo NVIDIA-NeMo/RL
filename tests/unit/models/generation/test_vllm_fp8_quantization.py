@@ -15,6 +15,7 @@
 import os
 import types
 from dataclasses import dataclass
+from typing import Literal
 
 import pytest
 import torch
@@ -895,6 +896,7 @@ def test_process_mxfp8_linear_separates_checkpoint_and_runtime_scales(
     fp8_module, monkeypatch
 ):
     from vllm.model_executor import parameter as vllm_parameter
+    from vllm.model_executor.kernels.linear.mxfp8 import flashinfer
     from vllm.model_executor.layers.quantization.utils import mxfp8_utils
 
     layer = torch.nn.Module()
@@ -918,6 +920,7 @@ def test_process_mxfp8_linear_separates_checkpoint_and_runtime_scales(
         vllm_parameter, "get_tensor_model_parallel_world_size", lambda: 1
     )
     kernel_type = type("FlashInferCutlassMxfp8LinearKernel", (), {})
+    monkeypatch.setattr(flashinfer, "FlashInferCutlassMxfp8LinearKernel", kernel_type)
     method = types.SimpleNamespace(kernel=kernel_type())
 
     fp8_module.process_weights_after_loading_mxfp8_linear(method, layer)
@@ -1466,36 +1469,18 @@ def test_process_mxfp8_moe_padding_rejects_modular_kernel(fp8_module, monkeypatc
 def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(
     fp8_module, requires_padding
 ):
+    import inspect
+
+    from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+
     fp8 = fp8_module
     calls = []
+    kernel_signature = inspect.signature(FusedMoEKernel.apply_monolithic)
 
     class Kernel:
-        def apply_monolithic(
-            self,
-            x,
-            w13,
-            w2,
-            router_logits,
-            *,
-            activation,
-            global_num_experts,
-            expert_map,
-            apply_router_weight_on_input,
-            num_expert_group,
-            topk_group,
-            e_score_correction_bias,
-            routed_scaling_factor,
-        ):
-            kwargs = {
-                "activation": activation,
-                "global_num_experts": global_num_experts,
-                "expert_map": expert_map,
-                "apply_router_weight_on_input": apply_router_weight_on_input,
-                "num_expert_group": num_expert_group,
-                "topk_group": topk_group,
-                "e_score_correction_bias": e_score_correction_bias,
-                "routed_scaling_factor": routed_scaling_factor,
-            }
+        def apply_monolithic(self, x, w13, w2, router_logits, **kwargs):
+            # Fails when the installed vLLM kernel takes different arguments.
+            kernel_signature.bind(self, x, w13, w2, router_logits, **kwargs)
             calls.append((x, w13, w2, router_logits, kwargs))
             return x + 1
 
@@ -1521,6 +1506,7 @@ def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(
         "topk_group": 2,
         "e_score_correction_bias": "correction-bias",
         "routed_scaling_factor": 1.25,
+        "routing_sink": "routing-sink",
     }
     if requires_padding:
         layer_kwargs.update(
@@ -1556,6 +1542,7 @@ def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(
         "topk_group": 2,
         "e_score_correction_bias": "correction-bias",
         "routed_scaling_factor": 1.25,
+        "routing_sink": "routing-sink",
     }
     assert tuple(output.shape) == (2, 2688)
     torch.testing.assert_close(output, x + 1)
@@ -1667,11 +1654,6 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     expected_mxfp8_calls = [
         (
             "vllm.model_executor.layers.quantization.modelopt."
-            "ModelOptMxFp8LinearMethod.process_weights_after_loading",
-            fp8.process_weights_after_loading_mxfp8_linear,
-        ),
-        (
-            "vllm.model_executor.layers.quantization.modelopt."
             "ModelOptMxFp8FusedMoE.create_weights",
             fp8.create_weights_mxfp8_moe,
         ),
@@ -1688,6 +1670,14 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     ]
     actual_mxfp8_calls = [call for call in patched_calls if "ModelOptMxFp8" in call[0]]
     assert actual_mxfp8_calls == expected_mxfp8_calls
+    # vLLM has one linear method for every ModelOpt format, so the MXFP8 linear
+    # post-load is patched onto it through a router.
+    assert [
+        path for path, _replacement in patched_calls if "ModelOptLinearMethod" in path
+    ] == [
+        "vllm.model_executor.layers.quantization.modelopt."
+        "ModelOptLinearMethod.process_weights_after_loading"
+    ]
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
     fp8.fp8_state = fp8.FP8State()
@@ -1951,14 +1941,9 @@ def test_process_mxfp8_moe_rejects_non_trtllm_backend_before_mutation(
     assert not hasattr(layer, "weight_block_size")
 
 
-@pytest.mark.parametrize(
-    "use_ray_v2", ["1", "0"], ids=["ray_executor_v2", "ray_executor_v1"]
-)
-def test_multi_gpu_fp8_patches_before_model_load(fp8_module, monkeypatch, use_ray_v2):
-    """Both Ray executors must receive the FP8 patches before worker/model init."""
-    from vllm import envs
+def test_multi_gpu_fp8_patches_before_model_load(fp8_module, monkeypatch):
+    """The Ray executor must receive the FP8 patches before worker/model init."""
     from vllm.v1.executor.abstract import Executor
-    from vllm.v1.executor.ray_executor import RayDistributedExecutor
     from vllm.v1.executor.ray_executor_v2 import RayExecutorV2, RayWorkerProc
 
     fp8 = fp8_module
@@ -1967,16 +1952,7 @@ def test_multi_gpu_fp8_patches_before_model_load(fp8_module, monkeypatch, use_ra
     vllm_config = types.SimpleNamespace(
         parallel_config=types.SimpleNamespace(distributed_executor_backend="ray")
     )
-
-    # vLLM memoizes env lookups once an engine has been built in-process, which
-    # would make setenv below a silent no-op and quietly test one branch twice.
-    envs.disable_envs_cache()
-    monkeypatch.setenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", use_ray_v2)
-    uses_v2 = use_ray_v2 == "1"
-    assert envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND is uses_v2
-    assert Executor.get_class(vllm_config) is (
-        RayExecutorV2 if uses_v2 else RayDistributedExecutor
-    )
+    assert Executor.get_class(vllm_config) is RayExecutorV2
 
     def fake_apply_fp8_patches(_worker, config):
         events.append(("apply_fp8_patches", config))
@@ -1989,73 +1965,35 @@ def test_multi_gpu_fp8_patches_before_model_load(fp8_module, monkeypatch, use_ra
             "installed its FP8 patches"
         )
 
-    def fake_collective_rpc(_executor, *_args, **_kwargs):
-        events.append(("collective_rpc", None))
-        assert fp8.fp8_patches_applied, (
-            "RayDistributedExecutor started worker/model initialization before "
-            "NeMo-RL installed its FP8 patches"
-        )
-
     monkeypatch.setattr(fp8, "apply_fp8_patches", fake_apply_fp8_patches)
-    # monkey_patch_vllm_ray_executor() rebinds these by raw class assignment with
-    # no cleanup of its own, so register both with monkeypatch to undo the rebind
+    # monkey_patch_vllm_ray_executor() rebinds this by raw class assignment with
+    # no cleanup of its own, so register it with monkeypatch to undo the rebind
     # even when this regression test fails.
     monkeypatch.setattr(RayWorkerProc, "initialize_worker", fake_initialize_worker)
-    monkeypatch.setattr(RayDistributedExecutor, "collective_rpc", fake_collective_rpc)
 
     fp8.monkey_patch_vllm_ray_executor(fp8_config)
 
-    if uses_v2:
-        assert RayDistributedExecutor.collective_rpc is fake_collective_rpc, (
-            "the V1 executor must be left unpatched when the V2 backend is active"
-        )
-        patched_initialize_worker = RayWorkerProc.initialize_worker
-        # cloudpickle reconstructs nested functions with a distinct globals dict.
-        worker_initialize_worker = types.FunctionType(
-            patched_initialize_worker.__code__,
-            patched_initialize_worker.__globals__.copy(),
-            closure=patched_initialize_worker.__closure__,
-        )
-        worker_initialize_worker(object(), 0, {})
-        worker_initialize_worker(object(), 0, {})
+    patched_initialize_worker = RayWorkerProc.initialize_worker
+    # cloudpickle reconstructs nested functions with a distinct globals dict.
+    worker_initialize_worker = types.FunctionType(
+        patched_initialize_worker.__code__,
+        patched_initialize_worker.__globals__.copy(),
+        closure=patched_initialize_worker.__closure__,
+    )
+    worker_initialize_worker(object(), 0, {})
+    worker_initialize_worker(object(), 0, {})
 
-        assert events == [
-            ("apply_fp8_patches", fp8_config),
-            ("initialize_worker", (0, {})),
-            ("initialize_worker", (0, {})),
-        ]
-    else:
-        assert RayWorkerProc.initialize_worker is fake_initialize_worker, (
-            "the V2 worker hook must be left unpatched when the V1 backend is active"
-        )
-
-        # execute_method(fn, cfg) ends up calling fn(worker, cfg) upstream, so pass
-        # the worker through rather than None to mirror apply_fp8_patches(self, cfg).
-        def make_worker():
-            worker = types.SimpleNamespace()
-
-            def fake_execute_method_remote(fn, config):
-                fn(worker, config)
-                return object()
-
-            worker.execute_method = types.SimpleNamespace(
-                remote=fake_execute_method_remote
-            )
-            return worker
-
-        monkeypatch.setattr(fp8, "ray", types.SimpleNamespace(get=lambda _future: None))
-        executor = types.SimpleNamespace(workers=[make_worker()])
-        RayDistributedExecutor.collective_rpc(executor, "init_device")
-        RayDistributedExecutor.collective_rpc(executor, "init_device")
-
-        assert events == [
-            ("apply_fp8_patches", fp8_config),
-            ("collective_rpc", None),
-            ("collective_rpc", None),
-        ]
+    assert events == [
+        ("apply_fp8_patches", fp8_config),
+        ("initialize_worker", (0, {})),
+        ("initialize_worker", (0, {})),
+    ]
 
 
-def test_fp8_ds_mla_skips_static_kv_scale_patch(fp8_module, monkeypatch):
+@pytest.mark.parametrize("cache_dtype", ["fp8_ds_mla", "fp8_per_token_head"])
+def test_dynamic_cache_skips_static_kv_scale_patch(
+    fp8_module, monkeypatch, cache_dtype
+):
     fp8 = fp8_module
     patched_paths = []
 
@@ -2074,14 +2012,15 @@ def test_fp8_ds_mla_skips_static_kv_scale_patch(fp8_module, monkeypatch):
         fp8.FP8Config(
             use_fp8_weights=True,
             model_parallel_size=1,
-            kv_cache_dtype="fp8_ds_mla",
+            kv_cache_dtype=cache_dtype,
         ),
     )
 
     assert not any("BaseKVCacheMethod" in path for path in patched_paths)
 
 
-def test_init_fp8_accepts_fp8_ds_mla(fp8_module, monkeypatch):
+@pytest.mark.parametrize("per_token", [False, True])
+def test_init_fp8_accepts_dynamic_cache(fp8_module, monkeypatch, per_token):
     fp8 = fp8_module
 
     monkeypatch.setattr(
@@ -2094,15 +2033,36 @@ def test_init_fp8_accepts_fp8_ds_mla(fp8_module, monkeypatch):
     vllm_kwargs = fp8.init_fp8(
         {
             "precision": "fp8",
-            "kv_cache_dtype": "fp8_ds_mla",
+            "kv_cache_dtype": "fp8_per_token_head" if per_token else "fp8_ds_mla",
             "async_engine": False,
         },
         "dummy-model",
         model_parallel_size=1,
     )
 
-    assert vllm_kwargs["kv_cache_dtype"] == "fp8_ds_mla"
-    assert fp8.global_fp8_config.kv_cache_dtype == "fp8_ds_mla"
+    expected = "fp8_per_token_head" if per_token else "fp8_ds_mla"
+    assert vllm_kwargs["kv_cache_dtype"] == expected
+    assert fp8.global_fp8_config.kv_cache_dtype == expected
+    assert "attention_backend" not in vllm_kwargs
+
+
+def test_init_fp8_rejects_unsupported_per_token_head_cache(fp8_module, monkeypatch):
+    import vllm.config.cache
+
+    monkeypatch.setattr(vllm.config.cache, "CacheDType", Literal["auto", "fp8"])
+    monkeypatch.setattr(
+        fp8_module.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    with pytest.raises(
+        ValueError, match="requires vLLM with fp8_per_token_head support"
+    ):
+        fp8_module.init_fp8(
+            {"precision": "fp8", "kv_cache_dtype": "fp8_per_token_head"},
+            "dummy-model",
+            model_parallel_size=1,
+        )
 
 
 def test_init_fp8_uses_explicit_e8m0_for_dsv4(fp8_module, monkeypatch):
@@ -2624,9 +2584,11 @@ def test_process_fp8_moe_preserves_storage_and_loaders(
 
     fp8_module.process_weights_after_loading_moe(method, layer)
     if change_layout != "none":
+        # On a layout change vLLM keeps the parameter object and gives it new
+        # storage; later refits must then reuse that storage.
         for name, param in params.items():
-            assert getattr(layer, name) is not param
-        params = {name: getattr(layer, name) for name in shapes}
+            assert getattr(layer, name) is param
+            assert param.data_ptr() != pointers[name]
         pointers = {name: param.data_ptr() for name, param in params.items()}
     for _ in range(2):
         fp8_module.process_weights_after_loading_moe(method, layer)
@@ -2791,7 +2753,11 @@ def test_deepseek_v4_two_refits_preserve_kernel_fp32_scale_references(
     # config (intermediate_size_per_partition / tp_size / hidden_dim); sizes
     # divisible by the [2, 2] block keep the checkpoint block shape.
     layer.moe_config = types.SimpleNamespace(
-        has_bias=False, intermediate_size_per_partition=4, tp_size=1, hidden_dim=4
+        has_bias=False,
+        intermediate_size_per_partition=4,
+        tp_size=1,
+        hidden_dim=4,
+        moe_backend="auto",
     )
     layer.quant_method = method = vllm_fp8.Fp8MoEMethod(
         vllm_fp8.Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[2, 2]),
@@ -3100,7 +3066,7 @@ def test_prequantized_grouped_expert_scale_rejects_unvalidated_layout(
     fp8_module, monkeypatch
 ):
     fp8 = fp8_module
-    fp8.global_fp8_config = types.SimpleNamespace(refit_prequantize=True)
+    fp8.global_fp8_config = types.SimpleNamespace(is_mx=False, refit_prequantize=True)
     monkeypatch.setattr(fp8, "_is_fp8_weight", lambda *_args: True)
     scale_name = "model.layers.0.mlp.experts.gate_up_proj_scale_from_checkpoint"
     runner = types.SimpleNamespace(
@@ -3415,6 +3381,445 @@ def test_get_module_still_uses_unambiguous_packed_mapping(fp8_module):
         model, "model.layers.0.self_attn.k_proj.weight"
     )
     assert module is model.model.layers[0].self_attn.qkv_proj
+
+
+@pytest.mark.parametrize(
+    ("kernel_name", "linear_backend", "runtime_weight_shape", "runtime_scale_shape"),
+    [
+        (
+            "FlashInferCutedslMxfp8LinearKernel",
+            "flashinfer_cutedsl",
+            (32, 2),
+            (2,),
+        ),
+        (
+            "FlashInferTrtllmMxfp8LinearKernel",
+            "flashinfer_trtllm",
+            (128, 32),
+            (128,),
+        ),
+    ],
+)
+def test_mxfp8_native_linear_kernel_refit_preserves_runtime_storage(
+    fp8_module,
+    monkeypatch,
+    kernel_name,
+    linear_backend,
+    runtime_weight_shape,
+    runtime_scale_shape,
+):
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+    from vllm.model_executor.model_loader.reload import (
+        finalize_layerwise_reload,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+
+    pad_rows = 126
+    pad_byte = 0x5A
+
+    def runtime_layout(weight_bytes, scale_bytes):
+        if kernel_name == "FlashInferCutedslMxfp8LinearKernel":
+            return weight_bytes.t().contiguous(), scale_bytes.flatten()
+        weight_pad = torch.full(
+            (pad_rows, weight_bytes.shape[1]), pad_byte, dtype=torch.uint8
+        )
+        scale_pad = torch.full(
+            (pad_rows, scale_bytes.shape[1]), pad_byte, dtype=torch.uint8
+        )
+        return (
+            torch.cat([weight_bytes, weight_pad]),
+            torch.cat([scale_bytes, scale_pad]).flatten(),
+        )
+
+    class Kernel:
+        def process_weights_after_loading(self, layer):
+            weight, scale = runtime_layout(
+                layer.weight.detach().view(torch.uint8),
+                layer.weight_scale.detach(),
+            )
+            layer.weight = torch.nn.Parameter(
+                weight.view(torch.float8_e4m3fn), requires_grad=False
+            )
+            layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+
+    Kernel.__name__ = kernel_name
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer." + kernel_name,
+        Kernel,
+        raising=False,
+    )
+
+    class Method(QuantizeMethodBase):
+        def __init__(self):
+            self.kernel = Kernel()
+
+        def create_weights(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def apply(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def process_weights_after_loading(self, layer):
+            fp8_module.process_weights_after_loading_mxfp8_linear(self, layer)
+
+    def weight_loader(param, loaded_weight, *args, **kwargs):
+        param.data.copy_(loaded_weight)
+
+    layer = torch.nn.Module()
+    layer.quant_method = Method()
+    generator = torch.Generator().manual_seed(0)
+
+    def random_bytes(shape):
+        return torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
+
+    layer.weight = torch.nn.Parameter(
+        random_bytes((2, 32)).view(torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(random_bytes((2, 1)), requires_grad=False)
+    layer.weight.weight_loader = weight_loader
+    layer.weight_scale.weight_loader = weight_loader
+    record_metadata_for_reloading(layer)
+
+    vllm_config = types.SimpleNamespace(
+        kernel_config=types.SimpleNamespace(linear_backend=linear_backend)
+    )
+    with set_current_vllm_config(vllm_config):
+        layer.quant_method.process_weights_after_loading(layer)
+
+    runtime_weight = layer.weight
+    runtime_scale = layer.weight_scale
+    runtime_weight_ptr = runtime_weight.data_ptr()
+    runtime_scale_ptr = runtime_scale.data_ptr()
+    assert tuple(runtime_weight.shape) == runtime_weight_shape
+    assert tuple(runtime_scale.shape) == runtime_scale_shape
+
+    for _ in range(2):
+        loaded_weight = random_bytes((2, 32))
+        loaded_scale = random_bytes((2, 1))
+        expected_weight, expected_scale = runtime_layout(loaded_weight, loaded_scale)
+        initialize_layerwise_reload(layer)
+        with set_current_vllm_config(vllm_config), torch.device("cpu"):
+            layer.weight.weight_loader(
+                layer.weight, loaded_weight.view(torch.float8_e4m3fn)
+            )
+            layer.weight_scale.weight_loader(layer.weight_scale, loaded_scale)
+            finalize_layerwise_reload(layer, model_config=None)
+
+        assert layer.weight is runtime_weight
+        assert layer.weight_scale is runtime_scale
+        assert layer.weight.data_ptr() == runtime_weight_ptr
+        assert layer.weight_scale.data_ptr() == runtime_scale_ptr
+        # Byte views compare every element, including the TRTLLM pad rows
+        # and NaN encodings in float8_e4m3fn.
+        assert torch.equal(layer.weight.detach().view(torch.uint8), expected_weight)
+        assert torch.equal(layer.weight_scale.detach(), expected_scale)
+
+    assert layer.quant_method.kernel.__class__.__name__ == kernel_name
+
+
+def test_mxfp8_cutedsl_refit_requires_vllm_config_context(fp8_module, monkeypatch):
+    from vllm.config import get_current_vllm_config_or_none
+
+    class FlashInferCutedslMxfp8LinearKernel:
+        def __init__(self, config):
+            self.config = config
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.FlashInferCutedslMxfp8LinearKernel",
+        FlashInferCutedslMxfp8LinearKernel,
+    )
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.zeros(2, 32, dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.zeros(2, 1, dtype=torch.uint8), requires_grad=False
+    )
+    kernel = FlashInferCutedslMxfp8LinearKernel(config=object())
+    method = types.SimpleNamespace(kernel=kernel)
+
+    assert get_current_vllm_config_or_none() is None
+    with pytest.raises(RuntimeError, match="requires set_current_vllm_config"):
+        fp8_module.process_weights_after_loading_mxfp8_linear(method, layer)
+    assert method.kernel is kernel
+    assert not hasattr(layer, "weight_scale_from_checkpoint")
+
+
+def test_mxfp8_linear_kernel_names_resolve_on_installed_vllm(fp8_module):
+    """Kernel detection matches class names, so a vLLM rename must fail here."""
+    import inspect
+
+    from vllm.model_executor.kernels.linear.mxfp8 import flashinfer
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptLinearMethod,
+    )
+
+    from nemo_rl.models.generation.vllm.config import NATIVE_MXFP8_LINEAR_KERNELS
+
+    for kernel_name in (
+        *NATIVE_MXFP8_LINEAR_KERNELS.values(),
+        "FlashInferCutlassMxfp8LinearKernel",
+    ):
+        kernel_type = getattr(flashinfer, kernel_name)
+        assert isinstance(kernel_type, type)
+        kernel = kernel_type.__new__(kernel_type)
+        assert fp8_module._is_flashinfer_mxfp8_linear_kernel(kernel, kernel_name)
+    assert "self.kernel" in inspect.getsource(ModelOptLinearMethod)
+
+
+def test_mxfp8_auto_linear_backend_keeps_refit_cutlass_default(fp8_module, monkeypatch):
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor import parameter as vllm_parameter
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    class FlashInferCutedslMxfp8LinearKernel:
+        def __init__(self, config):
+            self.config = config
+
+    class FlashInferCutlassMxfp8LinearKernel:
+        def __init__(self, config):
+            self.config = config
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.FlashInferCutedslMxfp8LinearKernel",
+        FlashInferCutedslMxfp8LinearKernel,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.FlashInferCutlassMxfp8LinearKernel",
+        FlashInferCutlassMxfp8LinearKernel,
+    )
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "swizzle_mxfp8_scale",
+        lambda scale, M, K: scale.contiguous(),
+    )
+    monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        vllm_parameter, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+
+    def weight_loader(param, loaded_weight, *args, **kwargs):
+        param.data.copy_(loaded_weight)
+
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.ones(2, 32, dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = vllm_parameter.ModelWeightParameter(
+        data=torch.ones(2, 1, dtype=torch.uint8),
+        input_dim=1,
+        output_dim=0,
+        weight_loader=weight_loader,
+    )
+    method = types.SimpleNamespace(
+        kernel=FlashInferCutedslMxfp8LinearKernel(config=object())
+    )
+    vllm_config = types.SimpleNamespace(
+        kernel_config=types.SimpleNamespace(linear_backend="auto")
+    )
+
+    with set_current_vllm_config(vllm_config):
+        fp8_module.process_weights_after_loading_mxfp8_linear(method, layer)
+
+    assert isinstance(method.kernel, FlashInferCutlassMxfp8LinearKernel)
+    assert hasattr(layer, "weight_scale_from_checkpoint")
+
+
+@pytest.mark.parametrize(
+    ("kernel_name", "expected_scale_name"),
+    [
+        ("FlashInferTrtllmMxfp8LinearKernel", "weight_scale"),
+        ("FlashInferCutedslMxfp8LinearKernel", "weight_scale"),
+        ("FlashInferCutlassMxfp8LinearKernel", "weight_scale_from_checkpoint"),
+    ],
+)
+def test_load_weights_uses_scale_name_for_mxfp8_linear_backend(
+    fp8_module, monkeypatch, kernel_name, expected_scale_name
+):
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=1,
+        is_mx=True,
+    )
+    kernel_type = type(kernel_name, (), {})
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer." + kernel_name,
+        kernel_type,
+        raising=False,
+    )
+    layer = types.SimpleNamespace(
+        quant_method=types.SimpleNamespace(kernel=kernel_type())
+    )
+    loaded = []
+    model = types.SimpleNamespace(load_weights=lambda weights: loaded.extend(weights))
+    model_runner = types.SimpleNamespace(model=model)
+    low_precision = torch.ones(2, 32, dtype=torch.float8_e4m3fn)
+    scale = torch.ones(2, 1, dtype=torch.uint8)
+
+    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: True)
+    monkeypatch.setattr(fp8, "get_module_from_param_name", lambda _model, _name: layer)
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "mxfp8_e4m3_quantize",
+        lambda _weight: (low_precision, scale.unsqueeze(-1)),
+    )
+
+    fp8.load_weights(
+        [("model.layers.0.mlp.up_proj.weight", torch.ones(2, 32))], model_runner
+    )
+
+    assert [name for name, _ in loaded] == [
+        "model.layers.0.mlp.up_proj.weight",
+        f"model.layers.0.mlp.up_proj.{expected_scale_name}",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kernel_name", "expected_scale_suffix"),
+    [
+        ("FlashInferTrtllmMxfp8LinearKernel", "weight_scale"),
+        ("FlashInferCutedslMxfp8LinearKernel", "weight_scale"),
+        ("FlashInferCutlassMxfp8LinearKernel", "weight_scale_from_checkpoint"),
+    ],
+)
+def test_load_weights_fused_qkv_shards_in_separate_batches(
+    fp8_module, monkeypatch, kernel_name, expected_scale_suffix
+):
+    """q/k/v shards resolve to the fused qkv_proj and keep per-shard scales."""
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=1,
+        is_mx=True,
+    )
+    kernel_type = type(kernel_name, (), {})
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer." + kernel_name,
+        kernel_type,
+        raising=False,
+    )
+
+    class Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv_proj = torch.nn.Linear(32, 6, bias=False)
+            self.qkv_proj.quant_method = types.SimpleNamespace(kernel=kernel_type())
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = Attn()
+
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([Layer()])
+
+    class Model(torch.nn.Module):
+        packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(model_type="llama")
+            self.model = Decoder()
+
+    model = Model()
+    loaded = []
+    model.load_weights = lambda weights: loaded.append(list(weights))
+    model_runner = types.SimpleNamespace(model=model)
+
+    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: True)
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "mxfp8_e4m3_quantize",
+        lambda weight: (
+            weight.to(torch.float8_e4m3fn),
+            weight[:, :1].to(torch.uint8).unsqueeze(-1),
+        ),
+    )
+
+    # The sender reuses one buffer. Batches are checked after all loads, so a
+    # loaded tensor that aliases the buffer would show the last shard's value.
+    sender_buffer = torch.empty(2, 32)
+    shards = ("q_proj", "k_proj", "v_proj")
+    for index, shard in enumerate(shards):
+        sender_buffer.fill_(index + 1)
+        fp8.load_weights(
+            [(f"model.layers.0.self_attn.{shard}.weight", sender_buffer)],
+            model_runner,
+        )
+
+    assert len(loaded) == len(shards)
+    for index, (shard, batch) in enumerate(zip(shards, loaded)):
+        prefix = f"model.layers.0.self_attn.{shard}"
+        assert [name for name, _ in batch] == [
+            f"{prefix}.weight",
+            f"{prefix}.{expected_scale_suffix}",
+        ]
+        _, batch_weight = batch[0]
+        _, batch_scale = batch[1]
+        assert torch.equal(batch_weight.float(), torch.full((2, 32), float(index + 1)))
+        assert torch.equal(
+            batch_scale.flatten(), torch.full((2,), index + 1, dtype=torch.uint8)
+        )
+
+
+@pytest.mark.parametrize(
+    ("kernel_name", "expected_scale_name"),
+    [
+        ("FlashInferTrtllmMxfp8LinearKernel", "weight_scale"),
+        ("FlashInferCutedslMxfp8LinearKernel", "weight_scale"),
+        ("FlashInferCutlassMxfp8LinearKernel", "weight_scale_from_checkpoint"),
+    ],
+)
+def test_prequantized_mxfp8_scale_uses_native_linear_loader_name(
+    fp8_module, monkeypatch, kernel_name, expected_scale_name
+):
+    fp8 = fp8_module
+    fp8.global_fp8_config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=1,
+        is_mx=True,
+    )
+    kernel_type = type(kernel_name, (), {})
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer." + kernel_name,
+        kernel_type,
+        raising=False,
+    )
+    layer = types.SimpleNamespace(
+        quant_method=types.SimpleNamespace(kernel=kernel_type())
+    )
+    model = types.SimpleNamespace()
+    model_runner = types.SimpleNamespace(model=model)
+    scale = torch.ones(2, 1, dtype=torch.uint8)
+    checkpoint_scale_name = "model.layers.0.mlp.up_proj.weight_scale_from_checkpoint"
+
+    monkeypatch.setattr(
+        fp8,
+        "get_module_from_param_name",
+        lambda _model, name: (
+            layer if name == "model.layers.0.mlp.up_proj.weight" else None
+        ),
+    )
+    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: False)
+
+    loaded = list(
+        fp8.get_quantized_weight_iterator(
+            [(checkpoint_scale_name, scale)],
+            model_runner,
+            refit_with_reload_api=False,
+        )
+    )
+
+    assert loaded == [(f"model.layers.0.mlp.up_proj.{expected_scale_name}", scale)]
 
 
 def test_deepseek_parameter_names_fall_back_on_legacy_rope_type(

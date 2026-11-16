@@ -34,7 +34,8 @@ from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.models.generation.interfaces import SamplerReplayConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import LoggerConfig
 
 
@@ -1005,12 +1006,12 @@ def _run_mock_ppo_train(
             "make_sequence_length_divisible_by": 1,
         },
         loss_fn=_make_loss_config(),
-        checkpointing={
-            "enabled": checkpoint_path is not None,
-            "checkpoint_must_save_by": None,
-            "save_period": 100,
-            "metric_name": None,
-        },
+        checkpointing=CheckpointingConfig.model_construct(
+            enabled=checkpoint_path is not None,
+            checkpoint_must_save_by=None,
+            save_period=100,
+            metric_name=None,
+        ),
         cluster=ClusterConfig(num_nodes=1, gpus_per_node=2),
     )
 
@@ -1613,10 +1614,9 @@ def _make_noncolocated_setup_config(
             gpus_per_node=total_gpus_per_node,
             segment_size=segment_size,
         ),
-        checkpointing={
-            "enabled": False,
-            "save_optimizer": False,
-        },
+        checkpointing=CheckpointingConfig.model_construct(
+            enabled=False, save_optimizer=False
+        ),
     )
 
 
@@ -1776,6 +1776,38 @@ def test_ppo_rejects_in_loss_filter_before_cluster_creation(
     config.loss_fn.seq_logprob_error_in_loss = True
 
     with pytest.raises(ValueError, match="seq_logprob_error_in_loss.*PPO"):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_ppo_rejects_sampler_support_replay_before_cluster_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replay reads the captured sampler head, which only SingleController stages."""
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.policy["generation"]["sampler_replay"] = SamplerReplayConfig(enabled=True)
+
+    with pytest.raises(ValueError, match="sampler_replay.*legacy PPO trainer"):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_ppo_forced_ratio_requires_one_policy_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.loss_fn = config.loss_fn.model_copy(update={"force_on_policy_ratio": True})
+    config.ppo = config.ppo.model_copy(update={"ppo_epochs": 4})
+
+    with pytest.raises(AssertionError, match="requires ppo.ppo_epochs=1"):
         ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
 
     cluster_cls.assert_not_called()
@@ -2462,7 +2494,7 @@ def _make_async_ppo_config() -> SimpleNamespace:
         ),
         data={"use_multiple_dataloader": False},
         env={},
-        checkpointing={"checkpoint_must_save_by": None},
+        checkpointing=CheckpointingConfig.model_construct(checkpoint_must_save_by=None),
     )
 
 
@@ -2794,10 +2826,9 @@ def test_async_ppo_completed_resume_exits_before_actor_start(monkeypatch):
     config.ppo.val_at_end = False
     config.ppo.num_prompts_per_step = 1
     config.ppo.skip_reference_policy_logprobs_calculation = False
-    config.checkpointing = {
-        "checkpoint_must_save_by": None,
-        "ft_save_period": None,
-    }
+    config.checkpointing = CheckpointingConfig.model_construct(
+        checkpoint_must_save_by=None, ft_save_period=None
+    )
     policy = MagicMock()
     generation = MagicMock()
     generation.requires_kv_scale_sync = False
@@ -2852,10 +2883,9 @@ def test_async_ppo_initial_refit_failure_cleans_up_actors(monkeypatch):
     config.ppo.max_rollout_turns = 1
     config.ppo.skip_reference_policy_logprobs_calculation = False
     config.ppo.adv_estimator = GAEConfig(name="raw_reward", normalize_advantages=False)
-    config.checkpointing = {
-        "checkpoint_must_save_by": None,
-        "ft_save_period": None,
-    }
+    config.checkpointing = CheckpointingConfig.model_construct(
+        checkpoint_must_save_by=None, ft_save_period=None
+    )
 
     replay_actor = MagicMock()
     collector_actor = MagicMock()
