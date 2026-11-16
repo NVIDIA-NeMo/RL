@@ -18,8 +18,6 @@
 # NVLink within each four-GPU expert group, CUDA MPS, and the NeMo RL Megatron
 # environment installed as described in docs/about/installation.md. The public
 # model and DAPOMath17K dataset must be accessible through Hugging Face.
-# Megatron dependency fixes and exact-version application instructions:
-#   tools/megatron_patches/ultra_inference/README.md
 #
 # Run from any directory:
 #   bash examples/run_nemotron_nano_mps.sh
