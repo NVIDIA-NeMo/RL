@@ -13,6 +13,7 @@
 # limitations under the License.
 """Version-point gradients (grpo.async_grpo.version_point_gradient)."""
 
+import asyncio
 import json
 import uuid
 from types import SimpleNamespace
@@ -25,11 +26,15 @@ from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
     MasterConfig,
+    _build_async_grpo_train_data,
+    add_grpo_token_loss_masks_and_generation_logprobs,
     validate_version_point_config,
     version_point_candidate,
     version_point_keep_versions,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.megatron.version_snapshots import VersionSnapshots, _bits
 from nemo_rl.models.policy import Fp4Config
 
@@ -545,3 +550,224 @@ def test_sync_config_can_omit_the_async_block():
     config = _config()
     config.grpo.async_grpo = None
     validate_version_point_config(config)
+
+
+def _tokenwise_config():
+    config = _config(in_flight=True)
+    config.grpo.async_grpo.version_point_per_token = True
+    config.policy["generation"]["backend"] = "megatron"
+    return config
+
+
+def test_tokenwise_config_requires_consistent_behavior_context():
+    validate_version_point_config(_tokenwise_config())
+    mutations = [
+        (
+            lambda c: setattr(c.grpo.async_grpo, "version_point_gradient", False),
+            "version_point_gradient",
+        ),
+        (
+            lambda c: setattr(
+                c.grpo.async_grpo, "recompute_kv_cache_after_weight_updates", False
+            ),
+            "recompute_kv_cache",
+        ),
+        (
+            lambda c: c.policy["generation"].update(backend="vllm"),
+            "Megatron generation",
+        ),
+        (lambda c: setattr(c.loss_fn, "token_level_loss", False), "token-level"),
+        (
+            lambda c: setattr(c.loss_fn, "sequence_level_importance_ratios", True),
+            "token-level",
+        ),
+        (
+            lambda c: setattr(c.grpo, "seq_logprob_error_threshold", 0.1),
+            "sequence log-prob",
+        ),
+        (
+            lambda c: c.policy["megatron_cfg"].update(moe_aux_loss_coeff=0.01),
+            "moe_aux_loss_coeff",
+        ),
+    ]
+    mutations.extend(
+        [
+            (lambda c: c.policy.update(tokenizer={"use_processor": True}), "text-only"),
+            (
+                lambda c: c.policy["megatron_cfg"].update(
+                    model_overrides={"mtp_num_layers": 1}
+                ),
+                "MTP",
+            ),
+            (
+                lambda c: c.policy["megatron_cfg"].update(
+                    moe_router_load_balancing_type="sinkhorn"
+                ),
+                "token-local",
+            ),
+            (
+                lambda c: c.policy["megatron_cfg"].update(
+                    model_overrides={
+                        "moe_router_load_balancing_type": ["quantile_balancing"]
+                    }
+                ),
+                "token-local",
+            ),
+        ]
+    )
+    mutations.extend(
+        [
+            (
+                lambda c: setattr(c.loss_fn, "positive_example_nll_weight", 0.1),
+                "positive_example_nll_weight",
+            ),
+            (
+                lambda c: setattr(
+                    c.loss_fn, "truncated_importance_sampling_type", "seq-mask-tis"
+                ),
+                "sequence-level IS",
+            ),
+        ]
+    )
+    for mutate, message in mutations:
+        config = _tokenwise_config()
+        mutate(config)
+        with pytest.raises(ValueError, match=message):
+            validate_version_point_config(config)
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("fail_in_body", [False, True])
+def test_split_token_version_pass_restores_current_weights_on_success_and_error(
+    Worker, fail_in_body
+):
+    model = _FlatModel()
+    snapshots = _snapshots(model)
+    snapshots.snapshot(0)
+    behavior = model.flat.clone()
+    with torch.no_grad():
+        model.flat.add_(1)
+    current = model.flat.clone()
+    worker = _fake_worker(Worker, snapshots)
+    worker._assert_step_open = lambda: {}
+    worker.set_version_point = lambda v: Worker.set_version_point(worker, v)
+    worker._version_point_scope = lambda enabled: Worker._version_point_scope(
+        worker, enabled
+    )
+    worker._set_mtp_grad_scale_func = lambda _: None
+    worker._restore_saved_mcore_hooks = lambda _: None
+
+    def body(state, data):
+        assert torch.equal(model.flat, behavior)
+        if fail_in_body:
+            raise ValueError("intentional body failure")
+        return None
+
+    worker._train_microbatch_body = body
+    if fail_in_body:
+        with pytest.raises(ValueError, match="intentional body failure"):
+            Worker.train_microbatch(worker, {}, version_point=0)
+    else:
+        Worker.train_microbatch(worker, {}, version_point=0)
+    assert torch.equal(model.flat, current)
+    assert worker._version_point is None
+
+
+def test_token_stamps_survive_message_flattening_and_training_batch_construction():
+    messages = [
+        [
+            {"role": "user", "content": "prompt", "token_ids": torch.tensor([1, 2, 3])},
+            {
+                "role": "assistant",
+                "content": "response",
+                "token_ids": torch.tensor([4, 5]),
+                "generation_logprobs": torch.tensor([-0.2, -0.3]),
+                "generation_versions": torch.tensor([1, 2]),
+            },
+            {"role": "user", "content": "tool", "token_ids": torch.tensor([6])},
+            {
+                "role": "assistant",
+                "content": "answer",
+                "token_ids": torch.tensor([7]),
+                "generation_logprobs": torch.tensor([-0.4]),
+                "generation_versions": torch.tensor([3]),
+            },
+        ]
+    ]
+    add_grpo_token_loss_masks_and_generation_logprobs(messages)
+    flat, lengths = batched_message_log_to_flat_message(
+        messages, pad_value_dict={"token_ids": 0}, make_sequence_length_divisible_by=4
+    )
+    data = _build_async_grpo_train_data(
+        flat,
+        lengths,
+        BatchedDataDict({"loss_multiplier": torch.ones(1)}),
+        {"precision": "bfloat16", "router_replay": {"enabled": False}},
+    )
+    assert data["generation_versions"].tolist() == [[0, 0, 0, 1, 2, 0, 3, 0]]
+    assert data["token_mask"].tolist() == [[0, 0, 0, 1, 1, 0, 1, 0]]
+    assert data["input_lengths"].tolist() == [7]
+
+
+@pytest.mark.mcore
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Generation backend imports require a CUDA runtime",
+)
+@pytest.mark.parametrize("rank", [0, 1])
+def test_new_epoch_is_sent_before_post_refit_resume(monkeypatch, rank):
+    # The generation backend requires the optional Megatron runtime.
+    module = pytest.importorskip("nemo_rl.models.generation.megatron.megatron_worker")
+    events = []
+    client = SimpleNamespace(
+        set_generation_epoch=lambda epoch: events.append(("epoch", epoch)),
+        resume_engines=lambda: events.append("resume"),
+        unpause_engines=lambda: events.append("unpause"),
+    )
+
+    async def wait_until(state):
+        events.append(state)
+
+    worker = SimpleNamespace(
+        _stamp_token_versions=False,
+        _pending_generation_epoch=None,
+        inference_client=client,
+        dynamic_inference_engine=SimpleNamespace(wait_until=wait_until),
+    )
+    monkeypatch.setattr(module.torch.distributed, "get_rank", lambda: rank)
+    module.MegatronGenerationMixin.set_generation_epoch(worker, 7, at_resume=True)
+    assert events == []
+    asyncio.run(module.MegatronGenerationMixin._wake_engine(worker))
+    if rank == 0:
+        assert events == [
+            ("epoch", 7),
+            "resume",
+            module.EngineState.RESUMED,
+            "unpause",
+            module.EngineState.RUNNING,
+        ]
+    else:
+        assert events == [module.EngineState.RESUMED, module.EngineState.RUNNING]
+    assert worker._pending_generation_epoch is None
+
+
+@pytest.mark.parametrize("tokenwise", [False, True])
+def test_tokenwise_config_is_rejected_by_single_controller(tokenwise):
+    # SingleController's config is an optional stack for the legacy GRPO tests.
+    from nemo_rl.algorithms.single_controller_utils.config import (
+        MasterConfig as SingleControllerConfig,
+    )
+    from nemo_rl.algorithms.single_controller_utils.config import (
+        validate_single_controller_config,
+    )
+
+    config = SingleControllerConfig.model_construct(
+        grpo=GRPOConfig.model_construct(
+            async_grpo=AsyncGRPOConfig(
+                version_point_gradient=not tokenwise,
+                version_point_per_token=tokenwise,
+            )
+        )
+    )
+    with pytest.raises(ValueError, match="not supported by SingleController"):
+        validate_single_controller_config(config)

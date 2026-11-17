@@ -2095,6 +2095,7 @@ class MegatronPolicyWorkerImpl(
     def train_microbatch(
         self,
         data: BatchedDataDict[Any],
+        version_point: Optional[int] = None,
     ) -> Optional[list[float]]:
         """One DP slice of data → one ``forward_backward_func`` invocation.
 
@@ -2114,7 +2115,18 @@ class MegatronPolicyWorkerImpl(
         if state.get("offloaded", False):
             raise RuntimeError("prepare_for_training must restore the offloaded step")
         try:
-            return self._train_microbatch_body(state, data)
+            if version_point is None:
+                return self._train_microbatch_body(state, data)
+            previous_version = self._version_point
+            try:
+                if not self.set_version_point(version_point):
+                    raise RuntimeError(
+                        f"Version-point snapshot {version_point} disappeared"
+                    )
+                with self._version_point_scope(enabled=True):
+                    return self._train_microbatch_body(state, data)
+            finally:
+                self._version_point = previous_version
         except Exception:
             # The body left all three mcore hooks nulled when begin_train_step
             # opened the step. If we propagate without restoring, future steps
@@ -2156,7 +2168,12 @@ class MegatronPolicyWorkerImpl(
         # the local sums, which is exactly what we're trying to defer.
         assert "sample_mask" in data, "sample_mask required on microbatch data"
         sample_mask = data["sample_mask"]
-        call_local_seqs = torch.sum(sample_mask).to(torch.float64)
+        sequence_count = (
+            data["version_point_sequence_count"]
+            if "version_point_sequence_count" in data
+            else sample_mask
+        )
+        call_local_seqs = torch.sum(sequence_count).to(torch.float64)
         if "token_mask" in data:
             token_mask = data["token_mask"]
             call_local_toks = torch.sum(
@@ -2384,13 +2401,14 @@ class MegatronPolicyWorkerImpl(
         else:
             n_true = global_valid_seqs
         n_safe = n_true if n_true.item() > 0 else torch.tensor(1.0, device="cuda")
-        inv_n = float((1.0 / n_safe).item())
+        normalization_scale = 1.0 / n_safe
+        inv_n = float(normalization_scale.item())
 
         # Rescale all locally-accumulated gradients by 1/N. The reduce
         # below sees the rescaled grads; for all_reduce the result is the
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
-        self.model.scale_gradients(inv_n)
+        self.model.scale_gradients(normalization_scale)
         if draft_step_state.active:
             draft_step_state.correct_main_grads(
                 self.model.parameters(),

@@ -118,3 +118,6 @@ tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-8n4g-bf16-baseline-lag4.sh
 tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-8n4g-nvfp4-pertoken-async-4t4g.sh
 tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-8n4g-nvfp4-vpg-lag1.sh
 tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-8n4g-nvfp4-vpg-lag4.sh
+
+# Tokenwise VPG: manual mixed-version qualification with the experimental native TE runtime.
+tests/test_suites/llm/grpo-qwen3-8b-base-1n4g-megatron-async-vpg-tokenwise.sh

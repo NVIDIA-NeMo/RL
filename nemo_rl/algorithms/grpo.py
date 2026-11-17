@@ -74,6 +74,7 @@ from nemo_rl.algorithms.utils import (
     print_performance_metrics,
     set_seed,
 )
+from nemo_rl.algorithms.version_point_tokens import token_version_candidates
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.dataloader import CyclingDataLoader, MultipleDataloaderWrapper
@@ -343,9 +344,13 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     # bitwise trainer/generator parity, e.g. policy.megatron_cfg.batch_invariant_mode), and
     # apply it to the current weights with the normal optimizer step. Keeps a host snapshot of
     # each rank's param shards for the last max_trajectory_age_steps + 1 versions (saved with
-    # checkpoints). Batches without a snapshot or mixing versions take the IS path.
+    # checkpoints). Batches without a snapshot take the IS path; mixed versions require
+    # version_point_per_token to use VPG.
     # See docs/guides/vpg.md.
     version_point_gradient: bool = False
+    # Mask and accumulate one causal-prefix pass per token behavior version. Requires
+    # Megatron generation, token-level loss and a KV-cache recompute after every refit.
+    version_point_per_token: bool = False
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
@@ -2412,6 +2417,16 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
             messages missing one of these fields get zeros (text).
     """
     backfill_missing_routed_experts(message_logs)
+    stamp_versions = any(
+        "generation_versions" in message for log in message_logs for message in log
+    )
+    if stamp_versions:
+        for log in message_logs:
+            for message in log:
+                if "generation_versions" not in message:
+                    message["generation_versions"] = torch.zeros_like(
+                        message["token_ids"]
+                    )
 
     def _owns_media(message: dict[str, Any]) -> bool:
         return any(
@@ -2681,6 +2696,8 @@ def _build_async_grpo_train_data(
             "sample_mask": repeated_batch["loss_multiplier"],
         }
     )
+    if "generation_versions" in flat_messages:
+        train_data["generation_versions"] = flat_messages["generation_versions"]
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
     # update multimodal data unconditionally
     extra_multimodal_data = flat_messages.get_multimodal_dict(
@@ -3350,7 +3367,11 @@ def _validate_use_kl_in_reward_compat(master_config: MasterConfig) -> None:
 def validate_version_point_config(master_config: MasterConfig) -> None:
     """Reject settings ``grpo.async_grpo.version_point_gradient`` does not support."""
     async_cfg = master_config.grpo.async_grpo
-    if async_cfg is None or not async_cfg.version_point_gradient:
+    if async_cfg is None:
+        return
+    if async_cfg.version_point_per_token and not async_cfg.version_point_gradient:
+        raise ValueError("version_point_per_token requires version_point_gradient=true")
+    if not async_cfg.version_point_gradient:
         return
     policy = master_config.policy
     megatron = policy.get("megatron_cfg")
@@ -3360,10 +3381,57 @@ def validate_version_point_config(master_config: MasterConfig) -> None:
     if not (megatron and megatron["enabled"]):
         problems.append("the Megatron policy (policy.megatron_cfg.enabled=true)")
         megatron = {}
-    if async_cfg.in_flight_weight_updates:
+    if async_cfg.in_flight_weight_updates and not async_cfg.version_point_per_token:
         problems.append(
             "in_flight_weight_updates=false (each rollout must come from one weight version)"
         )
+    if async_cfg.version_point_per_token:
+        if policy["generation"]["backend"] != "megatron":
+            problems.append("Megatron generation for tokenwise VPG")
+        if not async_cfg.recompute_kv_cache_after_weight_updates:
+            problems.append(
+                "recompute_kv_cache_after_weight_updates=true for tokenwise VPG"
+            )
+        loss = master_config.loss_fn
+        if not loss.token_level_loss or loss.sequence_level_importance_ratios:
+            problems.append("token-level loss and importance ratios for tokenwise VPG")
+        if master_config.grpo.seq_logprob_error_threshold is not None:
+            problems.append("no sequence log-prob filtering for tokenwise VPG")
+        if loss.positive_example_nll_weight != 0:
+            problems.append("positive_example_nll_weight=0 for tokenwise VPG")
+        if loss.truncated_importance_sampling_type == "seq-mask-tis":
+            problems.append("no sequence-level IS masks for tokenwise VPG")
+        if (megatron.get("context_parallel_size") or 1) != 1:
+            problems.append("context_parallel_size=1 for tokenwise VPG")
+        tokenizer_cfg = policy.get("tokenizer")
+        if tokenizer_cfg and tokenizer_cfg.get("use_processor"):
+            problems.append("text-only rollouts for tokenwise VPG")
+        overrides = megatron.get("model_overrides") or {}
+        draft = coerce_draft_config(policy.get("draft"))
+        if (
+            megatron.get("mtp_num_layers")
+            or overrides.get("mtp_num_layers")
+            or (draft is not None and draft.enabled)
+            or opd_module.is_opd_enabled(master_config)
+        ):
+            problems.append(
+                "MTP, draft and distillation training disabled for tokenwise VPG"
+            )
+        routing = overrides.get("moe_router_load_balancing_type")
+        if routing is None:
+            routing = megatron.get("moe_router_load_balancing_type")
+        routing_modes = routing if isinstance(routing, list) else [routing]
+        if any(mode in ("sinkhorn", "quantile_balancing") for mode in routing_modes):
+            problems.append("token-local MoE routing for tokenwise VPG")
+        if megatron.get("moe_aux_loss_coeff") or overrides.get("moe_aux_loss_coeff"):
+            problems.append("moe_aux_loss_coeff=0 for tokenwise VPG")
+        if (
+            megatron.get("moe_expert_capacity_factor") is not None
+            or overrides.get("moe_expert_capacity_factor") is not None
+        ):
+            problems.append("no MoE token dropping for tokenwise VPG")
+        if master_config.loss_fn.use_kl_in_reward:
+            problems.append("use_kl_in_reward=false for tokenwise VPG")
     if (master_config.data_plane or {}).get("enabled"):
         problems.append("the in-process replay buffer (data_plane.enabled=false)")
     if master_config.loss_fn.force_on_policy_ratio:
@@ -5425,6 +5493,7 @@ def async_grpo_train(
     max_generation_failures = master_config.grpo.async_grpo.max_generation_failures
     validate_version_point_config(master_config)
     version_point = master_config.grpo.async_grpo.version_point_gradient
+    tokenwise_vpg = master_config.grpo.async_grpo.version_point_per_token
     version_point_keep = version_point_keep_versions(max_trajectory_age_steps)
 
     if router_replay_enabled(master_config.policy) and (
@@ -5737,6 +5806,8 @@ def async_grpo_train(
                 "differs from the restored weights; its buffered batches take the IS path.",
                 stacklevel=1,
             )
+    if tokenwise_vpg:
+        policy_generation.set_generation_epoch(weight_version, at_resume=False)
     ray.get(trajectory_collector.set_weight_version.remote(weight_version))
     ray.get(trajectory_collector.start_collection.remote(CyclingDataLoader(dataloader)))
     print("📦 Started continuous background trajectory collection")
@@ -6193,8 +6264,15 @@ def async_grpo_train(
                 # Version-point gradient: the batch's single generation version, if its
                 # snapshot exists (otherwise this step takes the IS path).
                 vp_version: Optional[int] = None
+                vp_versions: list[int] = []
                 vp_metrics: dict[str, float] = {}
-                if version_point:
+                if tokenwise_vpg:
+                    vp_versions, vp_metrics = token_version_candidates(
+                        train_data, policy.has_version_weights
+                    )
+                    if vp_versions:
+                        skip_prev_logprobs = True
+                elif version_point:
                     vp_version, vp_metrics = version_point_candidate(
                         generation_versions, policy.has_version_weights
                     )
@@ -6266,6 +6344,10 @@ def async_grpo_train(
                         )
                     del logprob_data
 
+                if vp_versions:
+                    train_data["prev_logprobs"] = train_data[
+                        "generation_logprobs"
+                    ].clone()
                 if vp_version is not None:
                     # At the generation weights the PPO ratio and the IS weight are 1.
                     if step > 0:
@@ -6419,11 +6501,16 @@ def async_grpo_train(
                             f"Version-point snapshot {vp_version} disappeared."
                         )
                     try:
-                        train_results = policy.train(
-                            train_data,
-                            loss_fn,
-                            timer=timer,
-                        )
+                        if vp_versions:
+                            train_results = policy.train_token_versions(
+                                train_data, loss_fn, vp_versions, timer=timer
+                            )
+                        else:
+                            train_results = policy.train(
+                                train_data,
+                                loss_fn,
+                                timer=timer,
+                            )
                     finally:
                         if vp_version is not None:
                             policy.set_version_point(None)
@@ -6457,6 +6544,10 @@ def async_grpo_train(
                         )
                     vp_metrics["version_point_snapshot_gb"] = (
                         snapshot_info["stored_bytes"] / 1e9
+                    )
+                if tokenwise_vpg:
+                    policy_generation.set_generation_epoch(
+                        weight_version + 1, at_resume=True
                     )
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 if defer_wake_for_save:
@@ -6687,8 +6778,10 @@ def async_grpo_train(
                 total_valid_tokens += metrics["global_valid_toks"]
                 if version_point:
                     metrics.update(vp_metrics)
-                    metrics["version_point_applied"] = float(vp_version is not None)
-                    if vp_version is not None:
+                    metrics["version_point_applied"] = float(
+                        vp_version is not None or bool(vp_versions)
+                    )
+                    if vp_version is not None or vp_versions:
                         # max |PPO ratio - 1| over loss tokens: the ratio is exp(trainer lp at the
                         # generation weights - generation lp), exactly 1 under bitwise parity.
                         if "probs_ratio_max" in metrics:

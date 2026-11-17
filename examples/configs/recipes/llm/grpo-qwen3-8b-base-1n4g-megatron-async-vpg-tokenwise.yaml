@@ -1,0 +1,12 @@
+defaults: grpo-qwen3-8b-base-1n4g-megatron-async-vpg.yaml
+grpo:
+  async_grpo:
+    version_point_per_token: true
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: true
+policy:
+  generation:
+    mcore_generation_config:
+      kv_cache_management_mode: recompute
+logger:
+  log_dir: logs/grpo-qwen3-8b-base-1n4g-megatron-async-vpg-tokenwise

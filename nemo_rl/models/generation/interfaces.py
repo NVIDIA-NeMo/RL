@@ -448,6 +448,7 @@ class GenerationOutputSpec(TypedDict):
         torch.Tensor
     )  # Length of full valid sequence (input + generated response)
     logprobs: torch.Tensor
+    generation_versions: NotRequired[torch.Tensor]
     routed_experts: NotRequired[torch.Tensor]
     r3_routed_experts_missing_routes: NotRequired[torch.Tensor]
     r3_routed_experts_expected_routes: NotRequired[torch.Tensor]
@@ -751,6 +752,12 @@ class GenerationInterface(ABC):
         """
         raise NotImplementedError(
             f"token_capture.enabled is not supported for {type(self).__name__}"
+        )
+
+    def set_generation_epoch(self, version: int, *, at_resume: bool) -> None:
+        """Stamp token behavior versions now or on the next post-refit engine resume."""
+        raise NotImplementedError(
+            f"tokenwise VPG is not supported for {type(self).__name__}"
         )
 
     def captured_call_progress(

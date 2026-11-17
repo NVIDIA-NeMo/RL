@@ -692,6 +692,18 @@ class MegatronGeneration(GenerationInterface):
         )
         ray.get(futures)
 
+    def set_generation_epoch(self, version: int, *, at_resume: bool) -> None:
+        """Stamp generated tokens with weight ``version`` (per-token version points).
+
+        ``at_resume`` applies it at the next engine resume, i.e. to exactly the
+        tokens sampled after the coming refit; otherwise it applies now.
+        """
+        ray.get(
+            self._policy.worker_group.run_all_workers_single_data(
+                "set_generation_epoch", version=version, at_resume=at_resume
+            )
+        )
+
     def blocks_training(self) -> bool:
         """Whether the engine must stand down before a training step.
 

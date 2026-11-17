@@ -25,6 +25,7 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/algorithms/version_point_tokens.py",
   "examples/version_point_gradients/logprob_match.py",
   "examples/version_point_gradients/verify_startup.py",
   "nemo_rl/models/megatron/version_snapshots.py",

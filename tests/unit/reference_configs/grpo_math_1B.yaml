@@ -81,6 +81,7 @@ grpo:
     # Version-point gradients (Megatron policy, async only): compute each step's gradient at the weights that
     # generated its batch (IS weight 1) and apply it to the current weights. See docs/guides/vpg.md.
     version_point_gradient: false
+    version_point_per_token: false
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:

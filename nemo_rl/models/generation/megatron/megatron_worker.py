@@ -77,6 +77,10 @@ from torch.distributed.distributed_c10d import (
     _world,
 )
 
+from nemo_rl.algorithms.version_point_tokens import (
+    GENERATION_VERSIONS_FIELD,
+    generated_token_versions,
+)
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data.multimodal_utils import CACHED_VIDEO_FRAME_MANIFEST_MAGIC
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -347,6 +351,8 @@ class MegatronGenerationMixin:
         self._inference_loop = None
         self._inference_thread = None
         self._token_capture_enabled = False
+        self._stamp_token_versions = False
+        self._pending_generation_epoch: Optional[int] = None
         self._request_payload_stager = None
         self._request_prompt_preparer = None
 
@@ -813,7 +819,13 @@ class MegatronGenerationMixin:
 
     async def _wake_engine(self):
         if torch.distributed.get_rank() == 0:
+            if self._pending_generation_epoch is not None:
+                # Ordered on the same socket: stamp the new weights before resuming.
+                self.inference_client.set_generation_epoch(
+                    self._pending_generation_epoch
+                )
             self.inference_client.resume_engines()
+        self._pending_generation_epoch = None
         await self.dynamic_inference_engine.wait_until(EngineState.RESUMED)
 
         if torch.distributed.get_rank() == 0:
@@ -1209,6 +1221,29 @@ class MegatronGenerationMixin:
 
         asyncio.run_coroutine_threadsafe(_send_epoch(), self._inference_loop).result()
 
+    def set_generation_epoch(self, version: int, *, at_resume: bool) -> None:
+        """Stamp generated tokens with weight ``version`` (per-token version points).
+
+        ``at_resume`` defers the stamp to the next engine resume (the one that ends
+        the coming refit); otherwise it is sent now. Generation outputs then carry a
+        per-token ``generation_versions`` column (version + 1, 0 elsewhere).
+        """
+        if type(version) is not int or version < 0:
+            raise ValueError(
+                f"weight version must be a non-negative int, got {version!r}"
+            )
+        self._stamp_token_versions = True
+        if at_resume:
+            self._pending_generation_epoch = version
+            return
+        if torch.distributed.get_rank() != 0:
+            return
+
+        async def _send_epoch() -> None:
+            self.inference_client.set_generation_epoch(version)
+
+        asyncio.run_coroutine_threadsafe(_send_epoch(), self._inference_loop).result()
+
     def _build_sampling_params(
         self,
         greedy: bool,
@@ -1389,6 +1424,24 @@ class MegatronGenerationMixin:
             "generation_lengths": generation_lengths,
             "unpadded_sequence_lengths": unpadded_sequence_lengths,
         }
+
+        if self._stamp_token_versions:
+            # version + 1 per generated token from the engine's epoch boundaries;
+            # 0 (unknown) if the engine stamped none.
+            versions_padded = torch.zeros(
+                (batch_size, max_seq_len), dtype=torch.long, device=input_ids.device
+            )
+            for i in range(batch_size):
+                prompt_len = int(input_lengths[i].item())
+                num_generated = len(result[i].generated_tokens)
+                versions = generated_token_versions(
+                    result[i].policy_epoch, prompt_len, num_generated
+                )
+                if versions is not None:
+                    versions_padded[i, prompt_len : prompt_len + num_generated] = (
+                        torch.tensor(versions, dtype=torch.long) + 1
+                    )
+            out_dict[GENERATION_VERSIONS_FIELD] = versions_padded
 
         return BatchedDataDict.from_batches([out_dict]).to("cpu")
 

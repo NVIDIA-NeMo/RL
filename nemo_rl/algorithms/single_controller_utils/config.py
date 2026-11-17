@@ -1883,7 +1883,10 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     if (
         master_config.grpo is not None
         and master_config.grpo.async_grpo is not None
-        and master_config.grpo.async_grpo.version_point_gradient
+        and (
+            master_config.grpo.async_grpo.version_point_gradient
+            or master_config.grpo.async_grpo.version_point_per_token
+        )
     ):
         raise ValueError(
             "grpo.async_grpo.version_point_gradient requires legacy async GRPO; "

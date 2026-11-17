@@ -713,6 +713,10 @@ def generate_responses(
             assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
                 i, input_length:total_length
             ]
+        if "generation_versions" in generation_outputs:
+            assistant_message["generation_versions"] = generation_outputs[
+                "generation_versions"
+            ][i, input_length:total_length]
         if "routed_experts" in generation_outputs:
             routed_experts = generation_outputs["routed_experts"][i]
             prefix_length = _attach_routed_experts_to_message_log_prefix(
@@ -851,6 +855,10 @@ async def generate_responses_async(
             assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
                 i, input_length:total_length
             ]
+        if "generation_versions" in generation_outputs:
+            assistant_message["generation_versions"] = generation_outputs[
+                "generation_versions"
+            ][i, input_length:total_length]
         if "routed_experts" in generation_outputs:
             routed_experts = generation_outputs["routed_experts"][i]
             prefix_length = _attach_routed_experts_to_message_log_prefix(

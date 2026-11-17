@@ -24,7 +24,7 @@ With bitwise trainer/generator parity (`policy.megatron_cfg.batch_invariant_mode
 
 - async GRPO with the in-process replay buffer (`data_plane.enabled=false`);
 - the Megatron policy with the distributed optimizer, Megatron DDP (not Megatron-FSDP), pipeline parallel size 1, no optimizer CPU offload, no `overlap_param_gather_with_optimizer_step`, and BF16 parameters (no `fp8_param` or `fp4_param`), with training CUDA graphs disabled;
-- non-colocated generation with `in_flight_weight_updates=false`, so that each rollout comes from one weight version;
+- non-colocated generation; whole-batch VPG requires `in_flight_weight_updates=false`, while tokenwise VPG supports in-flight refits with Megatron generation and KV recomputation;
 - one optimizer step per rollout batch (`policy.train_global_batch_size` = prompts per step × generations per prompt);
 - `policy.router_replay` disabled, `loss_fn.force_on_policy_ratio=false`, and importance sampling enabled for fallback steps.
 
@@ -43,7 +43,36 @@ loss_fn:
   use_importance_sampling_correction: true   # used by steps that fall back to the IS path
 ```
 
-A step falls back to the IS path at `θ_t` when its batch mixes generation versions or its version has no snapshot. Neither happens with the fixed-lead replay buffer and `in_flight_weight_updates=false`. Fallbacks are logged.
+A whole-batch VPG step falls back to the IS path at `θ_t` when its batch mixes generation versions or its version has no snapshot. Fallbacks are logged.
+
+### Tokenwise version points
+
+The runnable example is `examples/configs/recipes/llm/grpo-qwen3-8b-base-1n4g-megatron-async-vpg-tokenwise.yaml`. For rollouts that cross in-flight weight updates, enable:
+
+```yaml
+grpo:
+  async_grpo:
+    enabled: true
+    version_point_gradient: true
+    version_point_per_token: true
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: true
+policy:
+  generation:
+    backend: megatron
+    mcore_generation_config:
+      kv_cache_management_mode: recompute
+```
+
+| Setting | Purpose and supported values |
+|---|---|
+| `grpo.async_grpo.version_point_per_token` | Boolean, default `false`. Evaluate each loss token at its stamped behavior-weight version. Requires `version_point_gradient=true`. |
+
+The Megatron extra’s `torch-memory-saver` dependency supplies stable KV pointers for recompute mode with inference CUDA graphs. The generator stamps tokens from the engine's policy-epoch boundaries. Before resuming after a refit, it installs the new epoch and recomputes the KV state under those weights. For each version in the batch, the trainer selects its rows and masks the loss to its tokens, truncating each prefix after the last selected token. These passes accumulate into the existing gradient buffers; the optimizer and scheduler step once at the restored current weights. DP padding rows carry zero token masks and sample weights. Each loss token contributes once to the global token denominator, and sequence counts include each original row once.
+
+This mode requires text-only rollouts, token-level loss and importance ratios, CP=1, no sequence log-prob filtering or sequence-level IS masks, no KL-in-reward, and no positive-example NLL, MTP, draft, distillation or MoE auxiliary objectives. MoE token dropping, Sinkhorn routing and quantile-balancing routing are unsupported. The existing VPG requirements also apply. SingleController remains unsupported. A batch with an unknown token stamp or an evicted snapshot takes the ordinary IS path as a whole.
+
+Cost grows with the number of behavior versions. Prefix activations from different weights cannot be shared exactly; prefix truncation and row selection reduce redundant work, while sequence packing or dynamic batching can reduce padding. This option changes the training path and is disabled in the six published paper-reproduction arms.
 
 Snapshots are saved with every checkpoint under `<checkpoint>/policy/version_snapshots/` and restored on resume, so a resumed run keeps computing every buffered batch's gradient at its generation weights.
 
@@ -53,8 +82,10 @@ Snapshots are saved with every checkpoint under `<checkpoint>/policy/version_sna
 |---|---|
 | `train/version_point_applied` | 1 if the step's gradient was taken at the generation weights, 0 on the IS path |
 | `train/version_point_age` | current version minus the batch's generation version |
-| `train/version_point_mixed_batch` | 1 if the batch mixed generation versions (IS path) |
-| `train/version_point_no_snapshot` | 1 if the batch's version had no snapshot (IS path) |
+| `train/version_point_mixed_batch` | 1 if the batch mixed generation versions; tokenwise VPG can handle it |
+| `train/version_point_no_snapshot` | 1 if a required version had no snapshot (IS path) |
+| `train/version_point_unstamped_tokens` | 1 if a tokenwise batch had unknown behavior stamps (IS path) |
+| `train/version_point_num_versions` | Number of stamped behavior versions in a tokenwise batch |
 | `train/version_point_parity` | max \|PPO ratio − 1\| over loss tokens on version-point steps; 0 under bitwise parity |
 | `train/version_point_snapshot_gb` | host memory held by the snapshots per trainer rank (GB) |
 | `timing/train/version_point_snapshot` | time to take the per-step snapshot |
