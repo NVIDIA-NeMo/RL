@@ -171,6 +171,10 @@ env:
       responses_api_models:
         vllm_model:
           return_token_id_information: false
+          # Gym's Nano Omni profile sends truncate_history_thinking=true with every
+          # request, which overrides the server default above.
+          chat_template_kwargs:
+            truncate_history_thinking: ${policy.tokenizer.chat_template_kwargs.truncate_history_thinking}
 
 token_capture:
   enabled: true

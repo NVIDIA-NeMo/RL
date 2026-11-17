@@ -196,6 +196,20 @@ def test_osworld_v2_recipe_resolves_paired_gym_configs(monkeypatch):
         gym_config.policy_model.responses_api_models.vllm_model.return_token_id_information
         is False
     )
+    request_kwargs = (
+        gym_config.policy_model.responses_api_models.vllm_model.chat_template_kwargs
+    )
+    server_kwargs = config.policy["generation"]["vllm_cfg"][
+        "http_server_serving_chat_kwargs"
+    ]["default_chat_template_kwargs"]
+    assert request_kwargs.truncate_history_thinking is False
+    assert (
+        request_kwargs.truncate_history_thinking
+        == server_kwargs["truncate_history_thinking"]
+        == config.policy["tokenizer"]["chat_template_kwargs"][
+            "truncate_history_thinking"
+        ]
+    )
 
 
 def test_osworld_v2_molt_b8k8_recipe_composes_and_validates(monkeypatch):
