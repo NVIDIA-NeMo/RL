@@ -31,7 +31,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 from nemo_rl.models.generation.dynamo.managed_runtime import (
@@ -44,6 +44,7 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
 from nemo_rl.models.generation.vllm.generation_cut_route import (
     GENERATION_CUT_ROUTE,
     answer_generation_cut,
+    merge_cut_receipts,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -56,40 +57,9 @@ CUT_PREFIXES_KEY = "prefixes"
 # The frontend's deadline for the cut, in extra_args: wall-clock seconds, since
 # an engine on another host does not share the frontend's monotonic clock.
 DEADLINE_KEY = "nemo_rl_generation_cut_deadline"
-# What an engine leaves of that deadline for its answer to reach the frontend.
-CUT_REPLY_MARGIN_S = 1.0
 # A cut times itself (the deadline above), so the route's own timeout is only a
 # backstop: the longest Dynamo accepts.
 _ROUTE_TIMEOUT_S = 365 * 24 * 60 * 60
-
-
-def merge_cut_receipts(inventory: Any, engine_prefixes: Iterable[Sequence[Any]]) -> Any:
-    """Build Gym's receipt for ``inventory`` from what each engine cut.
-
-    An engine acknowledges only the calls it cut. A call no engine
-    acknowledged gets Gym's failure ack, so it regenerates after a restore.
-    """
-    from nemo_gym._checkpoint.generation_cut import (
-        GenerationCutPrefixAck,
-        GenerationCutReceipt,
-    )
-
-    cut: dict[str, Any] = {}
-    for prefixes in engine_prefixes:
-        for prefix in prefixes:
-            ack = GenerationCutPrefixAck.model_validate(prefix)
-            cut.setdefault(ack.ticket_id, ack)
-    return GenerationCutReceipt(
-        checkpoint_id=inventory.checkpoint_id,
-        cut_id=f"frontend-{inventory.inventory_digest}",
-        inventory_digest=inventory.inventory_digest,
-        inventory=inventory,
-        backend_snapshot_id=f"tq-{inventory.inventory_digest}",
-        prefixes=tuple(
-            cut.get(prefix.ticket_id) or GenerationCutPrefixAck.failure(prefix)
-            for prefix in inventory.active_prefixes
-        ),
-    )
 
 
 class EngineCutFanOut:

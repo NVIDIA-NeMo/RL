@@ -218,6 +218,11 @@ class PrefixRecovery:
         """The bearer token the cut route requires; None refuses every cut."""
         return self._parts.control_token
 
+    @property
+    def control_timeout_s(self) -> float | None:
+        """How long a cut may take from its arrival; None waits indefinitely."""
+        return self._parts.control_timeout_s
+
     # ---- A call's life --------------------------------------------------
 
     def on_begin(self, admission: Any) -> None:
@@ -1316,6 +1321,7 @@ class NoPrefixRecovery:
     """
 
     control_token: str | None = None
+    control_timeout_s: float | None = None
 
     async def resolve_restore(
         self, admission: Any, prefix_token_ids: list[int]
