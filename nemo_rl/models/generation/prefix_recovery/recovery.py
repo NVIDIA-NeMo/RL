@@ -30,8 +30,9 @@ import logging
 import threading
 import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from nemo_rl.models.generation.prefix_recovery.parts import PrefixRecoveryParts
@@ -103,6 +104,82 @@ def _ends_inside_character(tokenizer: Any, generated_token_ids: list[int]) -> bo
     return tokenizer.decode(tail, skip_special_tokens=False).endswith("\ufffd")
 
 
+@dataclass(frozen=True)
+class CutClaim:
+    """One frontend's acknowledgement of a call it serves or has served.
+
+    Attributes:
+        ack: The call's ``GenerationCutPrefixAck``.
+        active: Whether the call was still running on this frontend, rather
+            than answered from its finished record.
+    """
+
+    ack: Any
+    active: bool
+
+
+def _cut_receipt(inventory: Any, acknowledgements: Sequence[Any]) -> Any:
+    """The worker's receipt for ``inventory``, one acknowledgement per call."""
+    from nemo_gym._checkpoint.generation_cut import GenerationCutReceipt
+
+    return GenerationCutReceipt(
+        checkpoint_id=inventory.checkpoint_id,
+        cut_id=f"worker-{inventory.inventory_digest}",
+        inventory_digest=inventory.inventory_digest,
+        inventory=inventory,
+        backend_snapshot_id=f"tq-{inventory.inventory_digest}",
+        prefixes=tuple(acknowledgements),
+    )
+
+
+def merge_cut_claims(
+    inventory: Any, frontend_claims: Sequence[Sequence[CutClaim | None]]
+) -> Any:
+    """Combine every HTTP frontend's claims into the worker's one receipt.
+
+    A call's state lives only in the frontend that accepted its request, so
+    each frontend claims the calls it knows. As within one frontend, a running
+    call wins over a finished record of the same call. A call no frontend
+    claims has not reached the worker, and regenerates after a restore.
+
+    Args:
+        inventory: Gym's frozen ``GenerationCutInventory``.
+        frontend_claims: Per frontend, one claim or ``None`` for each of the
+            inventory's calls, in inventory order.
+
+    Returns:
+        The ``GenerationCutReceipt`` answering every call in the inventory.
+    """
+    from nemo_gym._checkpoint.generation_cut import GenerationCutPrefixAck
+
+    prefixes = inventory.active_prefixes
+    if any(len(claims) != len(prefixes) for claims in frontend_claims):
+        raise ValueError("every frontend must claim or skip each inventory call")
+    acknowledgements = []
+    unclaimed = []
+    for index, prefix in enumerate(prefixes):
+        claims = [claims[index] for claims in frontend_claims]
+        claim = next(
+            (claim for claim in claims if claim is not None and claim.active),
+            next((claim for claim in claims if claim is not None), None),
+        )
+        if claim is None:
+            unclaimed.append(prefix.model_call_id)
+            acknowledgements.append(GenerationCutPrefixAck.failure(prefix))
+        else:
+            acknowledgements.append(claim.ack)
+    if unclaimed:
+        LOGGER.warning(
+            "generation cut %s: no frontend of this worker has a record of %d of "
+            "%d model calls; they regenerate after a restore: %s",
+            inventory.checkpoint_id,
+            len(unclaimed),
+            len(prefixes),
+            unclaimed,
+        )
+    return _cut_receipt(inventory, acknowledgements)
+
+
 class PrefixRecovery:
     """Generation-prefix cuts and restores for one worker's captured calls."""
 
@@ -112,7 +189,7 @@ class PrefixRecovery:
         # Guards this object's own state below; never held across TQ I/O.
         self._lock = threading.Lock()
         self._completed: dict[str, _CompletedCaptureState] = {}
-        self._receipts: dict[tuple[str, str], Any] = {}
+        self._cut_answers: dict[tuple[str, str, bool], list[CutClaim | None]] = {}
         # Calls this process resumed from a restored generation prefix, and
         # their prefix tokens; the driver logs the sums each step.
         self._restored_calls = 0
@@ -136,6 +213,11 @@ class PrefixRecovery:
     def control_token(self) -> str | None:
         """The bearer token the cut route requires; None refuses every cut."""
         return self._parts.control_token
+
+    @property
+    def control_timeout_s(self) -> float | None:
+        """How long Gym waits for a cut's receipt; None waits indefinitely."""
+        return self._parts.control_timeout_s
 
     # ---- A call's life --------------------------------------------------
 
@@ -284,12 +366,19 @@ class PrefixRecovery:
 
     async def run_cut(self, inventory: Any) -> Any:
         """Cut every call Gym's inventory names, off the serving loop."""
+        return await self._run_on_control(self.checkpoint_cut, inventory)
+
+    async def run_cut_claims(self, inventory: Any) -> list[CutClaim | None]:
+        """Cut the inventory's calls this frontend knows, off the serving loop."""
+        return await self._run_on_control(self.cut_claims, inventory)
+
+    async def _run_on_control(self, cut: Callable[..., Any], inventory: Any) -> Any:
         # Measured from arrival so time queued behind a stale cut counts.
         timeout_s = self._parts.control_timeout_s
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         return await asyncio.get_running_loop().run_in_executor(
             self._control_executor,
-            functools.partial(self.checkpoint_cut, inventory, deadline=deadline),
+            functools.partial(cut, inventory, deadline=deadline),
         )
 
     def _record_progress(
@@ -362,9 +451,18 @@ class PrefixRecovery:
         return GenerationCutPrefixAck.failure(prefix)
 
     def _completed_ack(
-        self, prefix: Any, checkpoint_id: str, uncut: Counter[str]
-    ) -> Any:
-        """Describe a call whose terminal path won the cut/abort race."""
+        self,
+        prefix: Any,
+        checkpoint_id: str,
+        uncut: Counter[str],
+        *,
+        claims_only: bool = False,
+    ) -> Any | None:
+        """Describe a call whose terminal path won the cut/abort race.
+
+        Returns ``None`` for a call this frontend has no record of when
+        ``claims_only`` is set: another frontend may serve it.
+        """
         from nemo_gym._checkpoint.generation_cut import (
             GenerationCutPrefixAck,
         )
@@ -375,6 +473,8 @@ class PrefixRecovery:
             _require_inventory_identity(
                 prefix, completed.coords.capture_key, call_kind="completed"
             )
+        if completed is None and claims_only:
+            return None
         if completed is None:
             # Gym can name a call before its request reaches this worker, so
             # absence does not mean the call's finished result aged out.
@@ -586,15 +686,43 @@ class PrefixRecovery:
         acknowledged as failures (they regenerate after restore) instead of
         holding the single cut-control thread for the next checkpoint.
         """
-        from nemo_gym._checkpoint.generation_cut import (
-            GenerationCutReceipt,
+        claims = self._cut_once(inventory, deadline=deadline, claims_only=False)
+        # Without claims_only every call is answered.
+        return _cut_receipt(
+            inventory, [claim.ack for claim in claims if claim is not None]
         )
 
-        receipt_key = (inventory.checkpoint_id, inventory.inventory_digest)
+    def cut_claims(
+        self, inventory: Any, *, deadline: float | None = None
+    ) -> list[CutClaim | None]:
+        """Cut the inventory's calls this frontend serves or has served.
+
+        With several HTTP frontends, a call's state lives only in the frontend
+        that accepted its request; ``merge_cut_claims`` combines every
+        frontend's claims into the worker's receipt.
+
+        Returns:
+            Per inventory call, its claim, or ``None`` when this frontend has
+            no record of it.
+        """
+        return self._cut_once(inventory, deadline=deadline, claims_only=True)
+
+    def _knows(self, model_call_id: str) -> bool:
+        """Whether this frontend runs the call or holds its finished record."""
+        if self._registry.get_by_model_call_id(model_call_id) is not None:
+            return True
         with self._lock:
-            cached_receipt = self._receipts.get(receipt_key)
-        if cached_receipt is not None:
-            return cached_receipt
+            return model_call_id in self._completed
+
+    def _cut_once(
+        self, inventory: Any, *, deadline: float | None, claims_only: bool
+    ) -> list[CutClaim | None]:
+        """Cut the inventory once; a repeated request gets the first answer."""
+        cache_key = (inventory.checkpoint_id, inventory.inventory_digest, claims_only)
+        with self._lock:
+            cached = self._cut_answers.get(cache_key)
+        if cached is not None:
+            return cached
         active_states = [
             state
             for prefix in inventory.active_prefixes
@@ -602,22 +730,33 @@ class PrefixRecovery:
             is not None
         ]
         self._record_progress(active_states, deadline=deadline)
-        acknowledgements = []
+        claims: list[CutClaim | None] = []
         # Why each uncut call was left uncut; Gym counts them per checkpoint.
         uncut: Counter[str] = Counter()
         for index, prefix in enumerate(inventory.active_prefixes):
             if deadline is not None and time.monotonic() >= deadline:
                 remaining = inventory.active_prefixes[index:]
+                uncut_ids = [
+                    call.model_call_id
+                    for call in remaining
+                    if not claims_only or self._knows(call.model_call_id)
+                ]
                 LOGGER.warning(
                     "generation cut passed its control deadline: checkpoint_id=%s "
                     "uncut=%d of %d model_call_ids=%s",
                     inventory.checkpoint_id,
-                    len(remaining),
+                    len(uncut_ids),
                     len(inventory.active_prefixes),
-                    [call.model_call_id for call in remaining],
+                    uncut_ids,
                 )
-                acknowledgements.extend(
-                    self._failed_ack(call, reason="control_deadline", uncut=uncut)
+                claims.extend(
+                    CutClaim(
+                        self._failed_ack(call, reason="control_deadline", uncut=uncut),
+                        active=self._registry.get_by_model_call_id(call.model_call_id)
+                        is not None,
+                    )
+                    if call.model_call_id in uncut_ids
+                    else None
                     for call in remaining
                 )
                 break
@@ -630,7 +769,10 @@ class PrefixRecovery:
                 )
                 if acknowledgement is None:
                     acknowledgement = self._completed_ack(
-                        prefix, inventory.checkpoint_id, uncut
+                        prefix,
+                        inventory.checkpoint_id,
+                        uncut,
+                        claims_only=claims_only,
                     )
             # Gym acknowledges cuts per call, so one call's failure (a TQ write,
             # an identity mismatch) regenerates that call alone after a restore
@@ -643,7 +785,11 @@ class PrefixRecovery:
                 acknowledgement = self._failed_ack(
                     prefix, reason="cut_error", uncut=uncut
                 )
-            acknowledgements.append(acknowledgement)
+            claims.append(
+                None
+                if acknowledgement is None
+                else CutClaim(acknowledgement, active=state is not None)
+            )
         if uncut:
             LOGGER.info(
                 "generation cut %s left %d of %d model calls uncut: %s",
@@ -652,19 +798,11 @@ class PrefixRecovery:
                 len(inventory.active_prefixes),
                 dict(sorted(uncut.items())),
             )
-        receipt = GenerationCutReceipt(
-            checkpoint_id=inventory.checkpoint_id,
-            cut_id=f"worker-{inventory.inventory_digest}",
-            inventory_digest=inventory.inventory_digest,
-            inventory=inventory,
-            backend_snapshot_id=f"tq-{inventory.inventory_digest}",
-            prefixes=tuple(acknowledgements),
-        )
         with self._lock:
-            self._receipts[receipt_key] = receipt
-            if len(self._receipts) > 256:
-                self._receipts.pop(next(iter(self._receipts)))
-        return receipt
+            self._cut_answers[cache_key] = claims
+            if len(self._cut_answers) > 256:
+                self._cut_answers.pop(next(iter(self._cut_answers)))
+        return claims
 
     def _rebuild_prefix(self, admission: Any, prefix_token_ids: list[int]) -> Any:
         """Fetch an admission's staged prefix chunks and rebuild the cumulative prefix."""
@@ -856,6 +994,7 @@ class NoPrefixRecovery:
     """
 
     control_token: str | None = None
+    control_timeout_s: float | None = None
 
     def resolve_restore(
         self, admission: Any, prefix_token_ids: list[int]
@@ -911,4 +1050,7 @@ class NoPrefixRecovery:
         pass
 
     async def run_cut(self, inventory: Any) -> Any:
+        raise RuntimeError("generation-prefix cuts are disabled on this worker")
+
+    async def run_cut_claims(self, inventory: Any) -> list[CutClaim | None]:
         raise RuntimeError("generation-prefix cuts are disabled on this worker")

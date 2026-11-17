@@ -22,6 +22,7 @@ import inspect
 import logging
 import os
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -456,6 +457,10 @@ class VllmAsyncGenerationWorkerImpl(
         self._http_engine_client = None
         # API server pool for multiple HTTP API servers
         self._api_server_pool = None
+        # With several HTTP frontends, each also listens on a loopback control
+        # URL so the one Gym's cut call reaches can ask the others for theirs.
+        self._peer_control_url: str | None = None
+        self._generation_cut_peer_urls: list[str] = []
 
         # Token capture state
         self._init_token_capture_state()
@@ -535,8 +540,6 @@ class VllmAsyncGenerationWorkerImpl(
         is never closed and re-opened, so there is zero gap where another process
         could steal the port.
         """
-        import socket
-
         from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
 
         self._reserved_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -814,7 +817,11 @@ class VllmAsyncGenerationWorkerImpl(
                 self._setup_vllm_server()
             )
             if self._api_server_pool is not None:
-                await self._api_server_pool.command("start")
+                child_urls = await self._api_server_pool.command("start")
+                assert self._peer_control_url is not None
+                control_urls = [self._peer_control_url, *child_urls]
+                await self._api_server_pool.command("peers", control_urls)
+                self.set_generation_cut_peers(control_urls)
 
     async def start_dynamo_endpoint_async(
         self, *, namespace: str, engine_env: dict[str, str], leader_worker_idx: int
@@ -899,10 +906,6 @@ class VllmAsyncGenerationWorkerImpl(
         """
         if not self.is_model_owner:
             return None
-        if generation_prefix_cuts_enabled and self._api_server_pool is not None:
-            raise ValueError(
-                "Multiple HTTP API servers do not support generation-prefix cuts"
-            )
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
         from nemo_gym.token_id_capture.staging import install_capture
@@ -1000,7 +1003,18 @@ class VllmAsyncGenerationWorkerImpl(
             )
         if self._api_server_pool is not None:
             await self._api_server_pool.command(
-                "capture", dp_cfg, staging_partition, capture_media, top_logprobs
+                "capture",
+                dp_cfg,
+                staging_partition,
+                {
+                    "capture_media": capture_media,
+                    "top_logprobs": top_logprobs,
+                    "generation_prefix_cuts_enabled": generation_prefix_cuts_enabled,
+                    "generation_cut_control_token": generation_cut_control_token,
+                    "generation_cut_control_timeout_s": (
+                        generation_cut_control_timeout_s
+                    ),
+                },
             )
         if not capture_media:
             return None
@@ -1025,6 +1039,12 @@ class VllmAsyncGenerationWorkerImpl(
         if self._api_server_pool is not None:
             await self._api_server_pool.command("version", int(version))
         self._rollout_weight_version = int(version)
+
+    def set_generation_cut_peers(self, control_urls: Sequence[str]) -> None:
+        """Keep the other HTTP frontends' control URLs, given every frontend's."""
+        self._generation_cut_peer_urls = [
+            url for url in control_urls if url != self._peer_control_url
+        ]
 
     async def get_data_plane_snapshots(self) -> list[dict[str, Any]]:
         """Collect each frontend's capture counters and reset its step window.
@@ -2101,7 +2121,11 @@ class VllmAsyncGenerationWorkerImpl(
         # belongs on the renderer subclass.
         worker_self = self
 
-        register_generation_cut_route(app, lambda: worker_self._prefix_recovery)
+        register_generation_cut_route(
+            app,
+            lambda: worker_self._prefix_recovery,
+            lambda: worker_self._generation_cut_peer_urls,
+        )
 
         class NeMoRLOpenAIServingChatMixin:
             async def chat_completion_full_generator(
@@ -2674,12 +2698,25 @@ class VllmAsyncGenerationWorkerImpl(
         uvicorn_logger.addFilter(No200Filter())
 
         if reserved_sock is not None:
-            # Hand the pre-bound listening socket directly to uvicorn's asyncio
+            sockets = [reserved_sock]
+            if self.cfg["vllm_cfg"].get("http_api_server_count", 1) > 1:
+                # Frontends share reserved_sock, so a request to it reaches any
+                # one of them; this socket reaches this frontend alone.
+                control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                control_sock.bind(("127.0.0.1", 0))
+                control_sock.listen(128)
+                control_sock.setblocking(False)
+                self._peer_control_url = (
+                    f"http://127.0.0.1:{control_sock.getsockname()[1]}"
+                )
+                sockets.append(control_sock)
+
+            # Hand the pre-bound listening sockets directly to uvicorn's asyncio
             # server via server.serve(sockets=). No close-and-rebind needed.
             def _run_with_socket() -> None:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                loop.run_until_complete(server.serve(sockets=[reserved_sock]))
+                loop.run_until_complete(server.serve(sockets=sockets))
 
             thread = threading.Thread(target=_run_with_socket, daemon=True)
         else:
@@ -3175,12 +3212,27 @@ class VllmAsyncGenerationWorkerImpl(
         Returns once the delete is done: TQ must not clear rows while the
         snapshot is saved.
         """
-        await self._prefix_recovery.flush(epoch)
+        if self._api_server_pool is None:
+            await self._prefix_recovery.flush(epoch)
+        else:
+            await asyncio.gather(
+                self._prefix_recovery.flush(epoch),
+                self._api_server_pool.command("flush", epoch),
+            )
         return True
 
     def get_generation_prefix_counts(self) -> dict[str, int]:
         """Generation-prefix restore and progress-read counts; see PrefixRecovery."""
         return self._prefix_recovery.counts()
+
+    async def get_generation_prefix_counts_per_frontend(
+        self,
+    ) -> list[dict[str, int]]:
+        """Each HTTP frontend's generation-prefix counts, this one first."""
+        counts = [self.get_generation_prefix_counts()]
+        if self._api_server_pool is not None:
+            counts.extend(await self._api_server_pool.command("counts"))
+        return counts
 
     async def resume_generation_async(self) -> bool:
         """Resume vLLM generation after an in-flight weight update."""
