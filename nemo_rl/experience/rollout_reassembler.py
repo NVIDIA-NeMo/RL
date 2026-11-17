@@ -55,7 +55,6 @@ from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
-    ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
     SAMPLER_TOPK_LOGPROBS_FIELD,
     SAMPLER_TOPK_TOKEN_IDS_FIELD,
@@ -79,7 +78,10 @@ from nemo_rl.experience.reward_penalties import (
     RewardLogContext,
     finalize_capture_reward,
 )
-from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+from nemo_rl.experience.rollout_recovery import (
+    _owned_staging_key,
+    _receipt_staging_keys,
+)
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     RouteFragment,
@@ -94,6 +96,10 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
     encoded_route_plan_size_bytes,
     validate_route_plan,
+)
+from nemo_rl.utils.length_penalty import (
+    LengthPenaltyConfig,
+    apply_group_length_penalties_from_inputs,
 )
 
 if TYPE_CHECKING:
@@ -132,6 +138,9 @@ class FinalizedRollout:
     output_masks: dict[str, list[bool]] = field(default_factory=dict)
     # One length per owned call, even when adjacent generations have no input gap.
     generation_lengths: tuple[int, ...] = ()
+    # (model call ID, weight version stamped when it began, tokens it generated)
+    # for the same owned calls.
+    call_versions: tuple[tuple[str, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -191,6 +200,14 @@ class FinalizedGroup:
     canonical_output_tokens: int = 0
     metrics: dict[str, float] = field(default_factory=dict)
     reward_observations: list[FinalizedReward] = field(default_factory=list)
+    # Parallel to ``reward_observations``: each row's environment ``mask_sample``
+    # flag, truncation and original reward (before effort shaping and penalties), plus
+    # the group's dataset loss weight. Which rewards vote in the group baseline
+    # depends on controller-side policy, so the raw flags travel instead of a verdict.
+    reward_mask_sample: list[bool] = field(default_factory=list)
+    reward_truncated: list[bool] = field(default_factory=list)
+    reward_original: list[float] = field(default_factory=list)
+    loss_multiplier: float = 1.0
     # True when the finalizer rejected the whole group as a structural outcome
     # (see drop_reason); the caller aborts the slot instead of committing it.
     # Policy decisions like a low valid-rollout fraction are made by the caller,
@@ -204,6 +221,18 @@ class FinalizedGroup:
     # group (the caller does not read these when dropped is True).
     valid_row_count: int = 0
     total_row_count: int = 0
+    # Token metrics counted from the verified rows. The controller merges them
+    # with the Gym rollout metrics into the group's ROLLOUT_METRICS sidecar.
+    token_metrics: dict[str, Any] = field(default_factory=dict)
+    # Each trained call's (model call ID, weight version it began on, tokens it
+    # generated), across the group's verified rollouts; empty when dropped.
+    call_versions: list[tuple[str, int, int]] = field(default_factory=list)
+    # The controller-set zero-variance verdict. The reassembler ships the raw
+    # reward flags above; the controller classifies the group once (via
+    # RolloutManager, which owns the voting settings) and fills this in before
+    # returning the committed group, so the dispatch loop reads it instead of
+    # reclassifying.
+    zero_variance: bool = False
 
 
 def _capture_token_metrics(
@@ -374,14 +403,21 @@ class RolloutReassembler:
         pad_token_id: int,
         max_seq_len: int,
         reward_penalty_config: RewardPenaltyConfig | None = None,
+        length_penalty_config: LengthPenaltyConfig | None = None,
         effort_config: EffortLevelsConfig | None = None,
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
         media_columns: Optional[MediaColumnSpec] = None,
+        tokenizer: Any = None,
+        thinking_tags: Sequence[str] | None = None,
         top_logprobs: int = 0,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
+        self._length_penalty_config = length_penalty_config
+        # Decodes generations for the malformed-think-tag string check.
+        self._tokenizer = tokenizer
+        self._thinking_tags = thinking_tags
         self._effort_config = effort_config
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -543,6 +579,8 @@ class RolloutReassembler:
                     effort_config=self._effort_config,
                     token_ids=row.token_ids,
                     link_spans=reward_spans,
+                    decode=self._decode if self._tokenizer is not None else None,
+                    thinking_tags=self._thinking_tags,
                 )
             except ValueError as error:
                 return rejected(f"reward_processing:{error}", staging_keys)
@@ -700,6 +738,11 @@ class RolloutReassembler:
                 for call_id, _, length in row.link_spans
                 if call_id not in loss_excluded_call_ids
             ),
+            call_versions=tuple(
+                (call_id, records_by_call[call_id].weight_version, length)
+                for call_id, _, length in row.link_spans
+                if call_id not in loss_excluded_call_ids
+            ),
             logprobs=row.logprobs,
             prompt_len=row.prompt_len,
             reward=reward,
@@ -716,6 +759,9 @@ class RolloutReassembler:
             sampler_topk_token_ids=sampler_topk_token_ids,
             sampler_topk_logprobs=sampler_topk_logprobs,
         )
+
+    def _decode(self, token_ids: Sequence[int]) -> str:
+        return self._tokenizer.decode(list(token_ids), skip_special_tokens=False)
 
     def _resolve_media(
         self,
@@ -920,6 +966,7 @@ class RolloutReassembler:
             else infra_failure
         )
         _rollouts_ms = (time.perf_counter() - _group_t0) * 1000.0
+        length_metrics = self._apply_length_penalty(rows, checks_by_rollout)
         valid_rows = [row for row in rows if row.valid]
         staging_keys = (
             logical.staging_keys
@@ -1060,12 +1107,13 @@ class RolloutReassembler:
                 count
             )
 
+        # (row index, logical slot, row): one entry per rollout.
         if logical is None:
-            reward_rows = list(enumerate(rows))
+            reward_rows = [(index, index, row) for index, row in enumerate(rows)]
         else:
             reward_rows = [
-                (tag["logical_slot"], row)
-                for tag, row in zip(logical.tags, rows, strict=True)
+                (index, tag["logical_slot"], row)
+                for index, (tag, row) in enumerate(zip(logical.tags, rows, strict=True))
                 if tag["segment_index"] == 0
             ]
         reward_observations = [
@@ -1075,12 +1123,33 @@ class RolloutReassembler:
                 row.reward,
                 log_contexts[slot],
             )
-            for slot, row in reward_rows
+            for _, slot, row in reward_rows
             if row.valid
         ]
+        for name, value in length_metrics.items():
+            metrics[f"finalize/{name}_sum"] = value * len(reward_observations)
+        # Truncated rollouts among the reward observations, pooled into
+        # termination rates like the penalty counts; receipt-side rates only
+        # saw a placeholder truncated=False.
+        truncated_flags = self._truncated_flags(rows, logical)
+        reward_mask_sample = [
+            mask_sample[index] for index, _, row in reward_rows if row.valid
+        ]
+        reward_truncated = [
+            truncated_flags[index] for index, _, row in reward_rows if row.valid
+        ]
+        reward_original = [rewards[slot] for _, slot, row in reward_rows if row.valid]
+        metrics["finalize/truncated_count"] = 0.0
+        for index, slot, row in reward_rows:
+            if row.valid:
+                truncated = float(truncated_flags[index])
+                metrics["finalize/truncated_count"] += truncated
+                context = log_contexts[slot]
+                if context is not None:
+                    key = f"finalize/truncated_count/{context.agent_name}"
+                    metrics[key] = metrics.get(key, 0.0) + truncated
 
-        # Reuse the ordinary replay metric channel; finalizer timing counters stay
-        # scalar-only. Compute before _publish_rows appends execution padding.
+        # Compute before _publish_rows appends execution padding.
         token_metrics = _capture_token_metrics(
             rows,
             [tag["logical_slot"] for tag in logical.tags]
@@ -1100,14 +1169,68 @@ class RolloutReassembler:
             metrics=metrics,
             rollouts_ms=_rollouts_ms,
             reward_observations=reward_observations,
+            reward_mask_sample=reward_mask_sample,
+            reward_truncated=reward_truncated,
+            reward_original=reward_original,
             logical=logical,
             execution_row_multiple=execution_row_multiple,
             canonical_sample_ids=canonical_sample_ids,
             loss_multiplier=loss_multiplier,
         )
-        if finalized.meta is not None:
-            finalized.meta.extra_info[ROLLOUT_METRICS] = [token_metrics]
+        # Length metrics are already pooled in finalize/length_penalty/*_sum.
+        # Keep them separate from token metrics.
+        finalized.token_metrics = token_metrics
         return finalized
+
+    def _apply_length_penalty(
+        self,
+        rows: list[FinalizedRollout],
+        checks: tuple[RewardChecks | None, ...],
+    ) -> dict[str, float]:
+        """Adjust each verified rollout once before publishing any rows.
+
+        Ordinary and non-Forest token capture only: Forest training together with
+        grpo.length_penalty is rejected at config validation.
+        """
+        config = self._length_penalty_config
+        if config is None:
+            return {}
+        valid_indices = [index for index, row in enumerate(rows) if row.valid]
+        if not valid_indices:
+            return {}
+        inputs, rewards, generated, bypass = [], [], [], []
+        for index in valid_indices:
+            evidence = checks[index]
+            if evidence is None or evidence.length_penalty is None:
+                raise ValueError(
+                    "length penalty requires saved rollout length metadata; restart rollouts"
+                )
+            inputs.append(evidence.length_penalty)
+            rewards.append(rows[index].reward)
+            generated.append(sum(rows[index].token_mask))
+            bypass.append(evidence.low_effort)
+        adjusted, metrics = apply_group_length_penalties_from_inputs(
+            inputs,
+            rewards,
+            generated_lengths=[int(value) for value in generated],
+            low_effort=bypass,
+            config=config,
+        )
+        for index, reward in zip(valid_indices, adjusted, strict=True):
+            rows[index] = replace(rows[index], reward=reward)
+        return metrics
+
+    def _truncated_flags(
+        self, rows: Sequence[FinalizedRollout], logical: Optional[_LogicalRows]
+    ) -> list[bool]:
+        """Per-row truncation, shared by the TRUNCATED column and termination rates.
+
+        Forest rows carry their rollout's Gym-reported truncation; ordinary rows
+        count as truncated when they fill ``max_seq_len``.
+        """
+        if logical is not None:
+            return list(logical.truncated)
+        return [len(row.token_ids) == self._max_seq_len for row in rows]
 
     def _publish_rows(
         self,
@@ -1123,6 +1246,9 @@ class RolloutReassembler:
         metrics: dict[str, float],
         rollouts_ms: float,
         reward_observations: list[FinalizedReward],
+        reward_mask_sample: list[bool],
+        reward_truncated: list[bool],
+        reward_original: list[float],
         logical: Optional[_LogicalRows],
         execution_row_multiple: int,
         canonical_sample_ids: list[str],
@@ -1270,10 +1396,7 @@ class RolloutReassembler:
             "total_reward": rewards_t,
             MASK_SAMPLE: torch.tensor(mask_sample, dtype=torch.bool),
             TRUNCATED: torch.tensor(
-                logical.truncated
-                if logical is not None
-                else [seq_len == self._max_seq_len for seq_len in seq_lens],
-                dtype=torch.bool,
+                self._truncated_flags(rows, logical), dtype=torch.bool
             ),
         }
         if sampler_topk_token_ids is not None:
@@ -1394,12 +1517,17 @@ class RolloutReassembler:
             meta=meta,
             group_min_wv=group_min_wv,
             group_max_wv=group_max_wv,
+            call_versions=[call for row in valid_rows for call in row.call_versions],
             staging_keys=(staging_keys if self._defer_routed_experts_to_policy else []),
             canonical_output_tokens=sum(
                 int(mask) for row in valid_rows for mask in row.token_mask
             ),
             metrics=metrics,
             reward_observations=reward_observations,
+            reward_mask_sample=reward_mask_sample,
+            reward_truncated=reward_truncated,
+            reward_original=reward_original,
+            loss_multiplier=loss_multiplier,
             valid_row_count=len(valid_rows),
             total_row_count=real_row_count,
         )
@@ -1417,7 +1545,6 @@ class RolloutReassembler:
         from nemo_gym.token_id_capture.staging.records import (
             CallRecord,
             RolloutReceipt,
-            staging_key,
         )
 
         if len(selections) != len(rollout_ids):
@@ -1429,7 +1556,10 @@ class RolloutReassembler:
             parsed = RolloutReceipt.model_validate(receipt)
             _receipt_staging_keys(receipt)
             if parsed.capture_key != owner or any(
-                record.staging_key != staging_key(owner, record.model_call_id)
+                record.staging_key
+                != _owned_staging_key(
+                    owner, record.model_call_id, record.source_capture_key
+                )
                 for record in parsed.manifest
             ):
                 raise ValueError("Foreign capture ownership in selected attempt")
@@ -1563,10 +1693,7 @@ class RolloutReassembler:
         No publication or cleanup happens before this method completes.
         """
         # Optional Gym dependency; ordinary/non-Gym import paths remain unchanged.
-        from nemo_gym.token_id_capture.staging.records import (
-            RolloutReceipt,
-            staging_key,
-        )
+        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
         n = len(rollout_ids)
         if not n or len(logical_segments) != n:
@@ -1614,7 +1741,11 @@ class RolloutReassembler:
                 if parsed is not None:
                     if parsed.capture_key != expected_id or any(
                         record.staging_key
-                        != staging_key(expected_id, record.model_call_id)
+                        != _owned_staging_key(
+                            expected_id,
+                            record.model_call_id,
+                            record.source_capture_key,
+                        )
                         for record in parsed.manifest
                     ):
                         raise ValueError("foreign receipt/staging ownership")

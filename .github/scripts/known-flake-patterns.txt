@@ -1,0 +1,7 @@
+# Extended regexes (grep -E) for transient errors. When a failed test shard's log matches one,
+# .github/actions/test-template/action.yml re-runs the shard once. Blank lines and # lines are ignored.
+EADDRINUSE|[Aa]ddress already in use
+Server error '5[0-9]{2} [^']*' for url 'https://huggingface\.co/
+5[0-9]{2} Server Error: [^:]* for url: https://huggingface\.co/
+5[0-9]{2} [^']*'? for url '?https?://[^/]+/generate([?'[:space:]]|$)
+Failed: Timeout \(>[0-9.]+s\) from pytest-timeout

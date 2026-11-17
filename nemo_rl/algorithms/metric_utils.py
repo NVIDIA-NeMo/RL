@@ -39,11 +39,13 @@ ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES: tuple[RolloutCheckpointAttemptOutcome, ...]
 
 RolloutCheckpointAttemptReason = Literal[
     "completed",
+    "gym_unavailable",
     "invariant_error",
     "io_error",
     "missing_trainer_anchor",
     "no_data_plane_mutations",
     "optimizer_commit_in_progress",
+    "shortfall_reconciliation_pending",
     "timeout",
     "trainer_state_changed",
 ]
@@ -96,6 +98,8 @@ class SetupTimingMetrics:
     generation_init_reserve_time_s: Optional[float] = None
     generation_init_load_time_s: Optional[float] = None
 
+    # sft_v2 only: elsewhere the placement wait falls inside policy_init.
+    cluster_init_time_s: Optional[float] = None
     policy_init_time_s: Optional[float] = None
     # PPO only: the critic shares the training GPUs, so it is built after the policy.
     value_init_time_s: Optional[float] = None

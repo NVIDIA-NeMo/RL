@@ -84,6 +84,10 @@ class TrtllmSpecificArgs(TrtllmEngineKnobs):
     model_name: NotRequired[str]
     max_model_len: int
     precision: str
+    # "auto" | "dummy", mirroring vllm_cfg.load_format. Defaults to "dummy" for
+    # training and "auto" for evaluation; an explicit value is kept. Shared by
+    # both engine roles, so it is not a per-role override.
+    load_format: NotRequired[str]
     # With precision="fp8", use MXFP8 (UE8M0 1x32 scales) instead of 128x128 block-FP8.
     is_mx: NotRequired[bool]
     expose_http_server: NotRequired[bool]
@@ -94,6 +98,12 @@ class TrtllmSpecificArgs(TrtllmEngineKnobs):
     in_flight_weight_updates: NotRequired[bool]
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
     default_chat_template_kwargs: NotRequired[dict[str, Any]]
+    # Jinja template that overrides the tokenizer's own, mirroring vLLM's
+    # http_server_serving_chat_kwargs.chat_template. A recipe that pins a custom
+    # template (the SWE blends keep <think> on every assistant turn, which the
+    # stock Qwen3 template strips) renders identically on both backends only if
+    # TRT-LLM honours it too.
+    chat_template: NotRequired[str]
     # TRT-LLM's registered parser names:
     #   "qwen3"       -> Qwen3ToolParser      (JSON format: {"name":..., "arguments":{...}})
     #   "qwen3_coder" -> Qwen3CoderToolParser  (XML format: <function=...>)
@@ -112,6 +122,8 @@ class TrtllmSpecificArgs(TrtllmEngineKnobs):
 
 
 class TrtllmConfig(GenerationConfig):
+    # None uses the topology default; nccl_reshard refits routed experts with pure EP.
+    refit_transport: NotRequired[Literal["nccl_reshard"] | None]
     trtllm_cfg: TrtllmSpecificArgs
     # Escape hatch for arbitrary TRT-LLM LLM/AsyncLLM constructor kwargs not
     # covered by TrtllmSpecificArgs (e.g. sampler_type, enable_attention_dp).

@@ -16,6 +16,8 @@
 
 import torch
 
+from nemo_rl.algorithms.loss.clipped_pg import adaptive_ppo_clip_kept_mask
+
 
 def compute_score_centering_term(
     policy_logprobs_at_sampler_topk: torch.Tensor,
@@ -24,6 +26,9 @@ def compute_score_centering_term(
     importance_sampling_mode: str,
     is_bounds: tuple[float, float] | None,
     token_mask: torch.Tensor,
+    sampler_replay: bool,
+    adaptive_ppo_clip_advantages: torch.Tensor | None = None,
+    adaptive_ppo_clip_outer_bound: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-token ``sum_v sg(c_v) * log p_v`` whose gradient is the sampler-expected score.
 
@@ -38,32 +43,58 @@ def compute_score_centering_term(
     coefficient is ``c_v = mass_v - alpha * p_v``.
     Untruncated IS makes this coefficient zero. ICEPOP instead retains ``p_v``
     only where ``p_v/q_v`` is in bounds, and retains the unit tail coefficient
-    only where ``1/rho`` is in bounds. These rules apply to every head/tail
+    only where ``1/rho`` is in bounds. adaptive-ppo-clip follows the same rule
+    with the bounds its filter picks by the sign of the position's advantage
+    (``adaptive_ppo_clip_kept_mask``). These rules apply to every head/tail
     candidate independently of the sampled token's weight.
 
+    Under sampler replay the trainer renormalizes over the sampler's
+    support S_q, which the head holds: slots the sampler filtered out are ``-inf``
+    for both and get no coefficient, and the head holds all of p, so there is no
+    tail and ``rho`` is zero. (miles uses ``rho = 1``; the two differ by a multiple
+    of ``sum_{S_q} p grad log p = 0``.)
+
     This utility leaves the base actor objective, advantage weighting, masking,
-    and normalization to the caller, so PPO and GRPO can share the estimator.
+    and normalization to the caller, so PPO and GRPO can share the estimator;
+    adaptive-ppo-clip reads only the advantage's sign.
     Adding this term does not center an arbitrary clipped PPO gradient exactly.
 
     Args:
         policy_logprobs_at_sampler_topk: Trainer log-probs at the sampler's top-k ids, ``[B, S, k]``,
-            carrying the gradient.
-        sampler_topk_logprobs: The sampler's log-probs at those ids, ``[B, S, k]``.
-        importance_sampling_mode: ``off``, ``is``, ``tis`` or ``icepop``.
-        is_bounds: ``(lo, hi)`` for TIS/ICEPOP, otherwise ``None``.
+            carrying the gradient; ``-inf`` where the sampler filtered the id out.
+        sampler_topk_logprobs: The sampler's log-probs at those ids, ``[B, S, k]``;
+            ``-inf`` where its filters removed the id.
+        importance_sampling_mode: ``off``, ``is``, ``tis``, ``icepop`` or
+            ``adaptive-ppo-clip``.
+        is_bounds: ``(lo, hi)`` for TIS/ICEPOP; for adaptive-ppo-clip, the
+            negative-advantage lower bound and the positive-advantage upper
+            bound including the controller's offset ``k``. Otherwise ``None``.
         token_mask: Active token/sample positions, before IS filtering. A zero
-            sampled-token ICEPOP weight must not mask the correction.
+            sampled-token ICEPOP or adaptive-ppo-clip weight must not mask the
+            correction.
+        sampler_replay: Whether the trainer log-probs are renormalized over the
+            sampler's support, so the head holds all of p and ``rho`` is zero.
+            Otherwise ``rho`` models the sampler's tail on the trainer's tail,
+            however small that tail is.
+        adaptive_ppo_clip_advantages: Per-token advantages ``[B, S]``, whose
+            sign selects adaptive-ppo-clip's bound. Read by that mode only.
+        adaptive_ppo_clip_outer_bound: adaptive-ppo-clip's upper bound for
+            either advantage sign. Read by that mode only.
 
     Returns:
         The per-token term ``[B, S]`` and the sampler mass the head covers ``[B, S]``.
     """
     active = token_mask.bool()
-    p_log = torch.where(active.unsqueeze(-1), policy_logprobs_at_sampler_topk, 0.0)
-    q_log = torch.where(active.unsqueeze(-1), sampler_topk_logprobs.detach(), 0.0)
-    p = p_log.detach().exp()
-    q = q_log.exp()
+    slots = active.unsqueeze(-1) & ~torch.isneginf(sampler_topk_logprobs)
+    p_log = torch.where(slots, policy_logprobs_at_sampler_topk, 0.0)
+    q_log = torch.where(slots, sampler_topk_logprobs.detach(), 0.0)
+    p = torch.where(slots, p_log.detach().exp(), 0.0)
+    q = torch.where(slots, q_log.exp(), 0.0)
     head_mass = q.sum(-1)
-    rho = (1.0 - head_mass).clamp(min=0.0) / (1.0 - p.sum(-1)).clamp(min=1e-6)
+    if sampler_replay:
+        rho = torch.zeros_like(head_mass)
+    else:
+        rho = (1.0 - head_mass).clamp(min=0.0) / (1.0 - p.sum(-1)).clamp(min=1e-6)
     if importance_sampling_mode == "off":
         mass, alpha = q, rho
     elif importance_sampling_mode == "is":
@@ -82,6 +113,29 @@ def compute_score_centering_term(
         tail_ratio = rho.reciprocal()
         # rho * (1/rho) == 1 on retained tails. Avoid 0 * inf at rho=0.
         alpha = ((tail_ratio >= lo) & (tail_ratio <= hi)).to(p.dtype)
+    elif importance_sampling_mode == "adaptive-ppo-clip":
+        assert is_bounds is not None
+        assert adaptive_ppo_clip_advantages is not None
+        assert adaptive_ppo_clip_outer_bound is not None
+        lo, hi = is_bounds
+        ratio = (p_log.detach() - q_log).exp()
+        head_kept = adaptive_ppo_clip_kept_mask(
+            ratio,
+            advantages=adaptive_ppo_clip_advantages.unsqueeze(-1),
+            lower_bound=lo,
+            upper_bound=hi,
+            outer_bound=adaptive_ppo_clip_outer_bound,
+        )
+        mass = torch.where(head_kept, p, 0.0)
+        # As with ICEPOP, the tail is kept or dropped whole at its shared ratio
+        # 1/rho. At rho=0 that ratio is inf, which a finite outer bound drops.
+        alpha = adaptive_ppo_clip_kept_mask(
+            rho.reciprocal(),
+            advantages=adaptive_ppo_clip_advantages,
+            lower_bound=lo,
+            upper_bound=hi,
+            outer_bound=adaptive_ppo_clip_outer_bound,
+        ).to(p.dtype)
     else:
         raise ValueError(
             f"Unsupported score-centering IS mode {importance_sampling_mode!r}"

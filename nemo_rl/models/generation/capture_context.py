@@ -45,20 +45,24 @@ def decide_capture_input(
         capture_key=admission.capture_key,
         model_call_id=admission.model_call_id,
         mode="text",
+        generation_cut=admission.generation_cut,
     )
+    # A restored cut must reach the worker's prefix splice; a plain new segment
+    # still renders as text.
+    root_serving = root if root.generation_cut is not None else None
     current = admission.request_replay
     previous = admission.candidate_replay
     if current is None or current.render_digest is None:
         raise ValueError("Missing current source/render evidence")
     if admission.mode == "text":
-        return CaptureInputDecision(root, None, True)
+        return CaptureInputDecision(root, root_serving, True)
     if previous is None or admission.requires_empty_tool_content_equivalence is None:
         raise ValueError("Missing candidate source-match proof")
     if (
         admission.requires_empty_tool_content_equivalence
         and not allow_empty_tool_content
     ):
-        return CaptureInputDecision(root, None, True)
+        return CaptureInputDecision(root, root_serving, True)
     suffix = current.items[previous.item_count :]
     suffix_roles = [item.role for item in suffix]
     # The supported converter preserves these observations as separate messages.
@@ -77,7 +81,7 @@ def decide_capture_input(
             admission.model_call_id,
             admission.parent_call_id,
         )
-        return CaptureInputDecision(root, None, True)
+        return CaptureInputDecision(root, root_serving, True)
     serving = CaptureAdmission(
         capture_key=admission.capture_key,
         model_call_id=admission.model_call_id,
@@ -87,5 +91,6 @@ def decide_capture_input(
         parent_chain_hash=admission.parent_chain_hash,
         staging_chain=admission.staging_chain,
         required_prefix_token_ids=admission.required_prefix_token_ids,
+        generation_cut=admission.generation_cut,
     )
     return CaptureInputDecision(serving, serving, True)

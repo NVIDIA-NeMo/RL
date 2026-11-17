@@ -27,6 +27,7 @@ import torch
 from pydantic import BaseModel, Field
 
 from nemo_rl.algorithms.loss.clipped_pg import (
+    adaptive_ppo_clip_kept_mask,
     clipped_pg_actor_objective,
     clipped_pg_diagnostic_metrics,
     materialize_scalar_metrics,
@@ -37,6 +38,7 @@ from nemo_rl.algorithms.loss.draft import (
     streaming_vocab_parallel_soft_ce,
 )
 from nemo_rl.algorithms.loss.interfaces import (
+    SEQ_LOGPROB_KEEP_MASK_KEY,
     LossFunction,
     LossInputType,
     LossType,
@@ -234,10 +236,10 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: bool = False
-    # Evaluate grpo.seq_logprob_error_threshold in the training loss, then
+    # Evaluate the algorithm's seq_logprob_error_threshold in the training loss, then
     # normalize accumulated gradients over survivors before the optimizer step.
     # Opt-in; supported only for token-level, force-on-policy Megatron GRPO
-    # with the non-streaming trainer.
+    # (non-streaming or SingleController) and SingleController PPO with ppo_epochs=1.
     seq_logprob_error_in_loss: bool = False
     # If True, use CISPO (Clipped IS-weight Policy Optimization) from MiniMax-M1.
     use_cispo: bool = False
@@ -255,7 +257,7 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # Score centering (arXiv:2609.20807): per token, add A * sum_v sg(c_v) log p_v
     # over the sampler's top-k ids so the update subtracts the sampler-expected
     # weighted score. Needs policy.generation.top_logprobs > 0; supports IS off,
-    # token-level untruncated IS, TIS and ICEPOP.
+    # token-level untruncated IS, TIS, ICEPOP and adaptive-ppo-clip.
     score_centering: bool = False
 
 
@@ -521,24 +523,17 @@ class ClippedPGLossFn(LossFunction):
             )
             assert not self.sequence_level_importance_ratios and (
                 not self.use_importance_sampling_correction
-                or self.truncated_importance_sampling_type in (None, "tis", "icepop")
+                or self.truncated_importance_sampling_type
+                in (None, "tis", "icepop", "adaptive-ppo-clip")
             ), (
                 "score_centering composes only with importance sampling off or "
-                "token-level untruncated IS, 'tis', or 'icepop'"
+                "token-level untruncated IS, 'tis', 'icepop', or 'adaptive-ppo-clip'"
             )
         self._score_centering_is_mode = (
             (self.truncated_importance_sampling_type or "is")
             if self.use_importance_sampling_correction
             else "off"
         )
-        # Bounds set the effective head and tail masses for TIS/ICEPOP.
-        self._score_centering_is_bounds: tuple[float, float] | None = None
-        if self.score_centering and self._score_centering_is_mode in ("tis", "icepop"):
-            assert self.truncated_importance_sampling_ratio is not None
-            self._score_centering_is_bounds = (
-                self.truncated_importance_sampling_ratio_min or 0.0,
-                self.truncated_importance_sampling_ratio,
-            )
 
         # Advertise, per returned metric, the global denominator it was
         # normalized by (see MetricNormalizer). Built here — next to the flags
@@ -653,6 +648,27 @@ class ClippedPGLossFn(LossFunction):
             self.truncated_importance_sampling_adaptive_k_max,
             max(0.0, float(k)),
         )
+
+    def _get_adaptive_ppo_clip_bounds(self) -> tuple[float, float]:
+        """adaptive-ppo-clip's ``(lo, hi)`` this step; ``hi`` includes the offset k."""
+        tis_min = self.truncated_importance_sampling_ratio_min
+        tis_max = self.truncated_importance_sampling_ratio
+        cur_k = self.cur_adaptive_ppo_clip_k
+        assert tis_min is not None and tis_max is not None and cur_k is not None
+        return tis_min, tis_max + cur_k
+
+    def _get_score_centering_is_bounds(self) -> tuple[float, float] | None:
+        """Bounds that set the score-centering head and tail masses this step."""
+        if self._score_centering_is_mode in ("tis", "icepop"):
+            assert self.truncated_importance_sampling_ratio is not None
+            return (
+                self.truncated_importance_sampling_ratio_min or 0.0,
+                self.truncated_importance_sampling_ratio,
+            )
+        elif self._score_centering_is_mode == "adaptive-ppo-clip":
+            # Read per call: the controller moves the upper bound between steps.
+            return self._get_adaptive_ppo_clip_bounds()
+        return None
 
     def update_adaptive_loss_state(self, entropy: float) -> None:
         """Step k once after a training step to steer entropy toward the target.
@@ -788,6 +804,9 @@ class ClippedPGLossFn(LossFunction):
             ).to(sample_mask.dtype)
             seq_error_metrics["num_masked_seqs_by_logprob_error"] = (
                 (sample_mask - filtered_sample_mask).sum().item()
+            )
+            seq_error_metrics[SEQ_LOGPROB_KEEP_MASK_KEY] = (
+                (errors <= self.seq_logprob_error_threshold).float().cpu().tolist()
             )
             sample_mask = filtered_sample_mask
             mask = token_mask * sample_mask.unsqueeze(-1)
@@ -963,24 +982,13 @@ class ClippedPGLossFn(LossFunction):
                     torch.zeros_like(actor_importance_weights_expanded),
                 )
             elif self.truncated_importance_sampling_type == "adaptive-ppo-clip":
-                tis_min = self.truncated_importance_sampling_ratio_min
-                assert tis_min is not None
-                cur_k = self.cur_adaptive_ppo_clip_k
-                assert cur_k is not None
-                tis_max = self.truncated_importance_sampling_ratio + cur_k
-
-                within_outer_bound = (
-                    actor_importance_weights_expanded
-                    <= self.truncated_importance_sampling_adaptive_outer_bound
-                )
-                negative_adv_kept = (advantages >= 0) | (
-                    actor_importance_weights_expanded >= tis_min
-                )
-                positive_adv_kept = (advantages <= 0) | (
-                    actor_importance_weights_expanded <= tis_max
-                )
-                token_kept_mask = (
-                    within_outer_bound & negative_adv_kept & positive_adv_kept
+                tis_min, tis_max = self._get_adaptive_ppo_clip_bounds()
+                token_kept_mask = adaptive_ppo_clip_kept_mask(
+                    actor_importance_weights_expanded,
+                    advantages=advantages,
+                    lower_bound=tis_min,
+                    upper_bound=tis_max,
+                    outer_bound=self.truncated_importance_sampling_adaptive_outer_bound,
                 )
                 _is_filter_metrics = {
                     "is_oob_ratio": masked_mean(
@@ -1072,8 +1080,13 @@ class ClippedPGLossFn(LossFunction):
                 policy_logprobs_at_sampler_topk,
                 sampler_topk_logprobs=data["sampler_topk_logprobs"][:, 1:],
                 importance_sampling_mode=self._score_centering_is_mode,
-                is_bounds=self._score_centering_is_bounds,
+                is_bounds=self._get_score_centering_is_bounds(),
                 token_mask=mask,
+                # Score centering under top-k/top-p always replays the sampler's
+                # support; only filtering supplies policy_support_mask.
+                sampler_replay=policy_support_mask is not None,
+                adaptive_ppo_clip_advantages=advantages,
+                adaptive_ppo_clip_outer_bound=self.truncated_importance_sampling_adaptive_outer_bound,
             )
             correction = advantages * centering
             if self.loss_type == LossType.TOKEN_LEVEL:
@@ -2138,6 +2151,7 @@ class MseValueLossFn(LossFunction):
         self.scale = cfg.scale
         self.cliprange = cfg.cliprange
         self.loss_type = LossType.TOKEN_LEVEL
+        self.metric_normalizations = {"num_valid_samples": MetricNormalizer.NONE}
 
     def __call__(
         self,

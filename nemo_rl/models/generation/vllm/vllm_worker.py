@@ -17,7 +17,6 @@ import gc
 import inspect
 import logging
 import os
-import sys
 from typing import Any, Optional, cast
 
 import ray
@@ -48,7 +47,7 @@ from nemo_rl.models.generation.vllm.config import (
     parse_nvfp4_pertoken_rollout,
     resolve_vllm_video_config,
     validate_nvfp4_pertoken_model,
-    vllm_nemotron_h_fp32_lm_head_enabled,
+    vllm_fp32_lm_head_enabled,
 )
 from nemo_rl.models.generation.vllm.lora_utils import make_native_lora_request
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
@@ -80,6 +79,7 @@ from nemo_rl.telemetry.setup import (
     vllm_native_tracing_requested,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils import compile_cache
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -223,6 +223,38 @@ def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -
     vllm_kwargs["hf_overrides"] = merged_hf_overrides
 
 
+def _apply_fp32_lm_head(vllm_cfg: dict[str, Any], vllm_kwargs: dict[str, Any]) -> None:
+    """Turn on vLLM's fp32 LM head when ``vllm_cfg.fp32_lm_head`` is set.
+
+    ``head_dtype="float32"`` (vllm-project/vllm#48390) makes vLLM's
+    LogitsProcessor run the lm_head GEMM on the bf16 operands with an fp32
+    output, the same GEMM as Megatron's ``logit_dtype=float32``, for any model
+    whose lm_head is unquantized. ``vllm_kwargs["hf_overrides"]`` must be a dict.
+    """
+    if not vllm_fp32_lm_head_enabled(vllm_cfg):
+        return
+    hf_overrides = vllm_kwargs["hf_overrides"]
+    if hf_overrides.get("head_dtype", "float32") != "float32":
+        raise ValueError(
+            "vllm_cfg.fp32_lm_head=true conflicts with hf_overrides.head_dtype="
+            f"{hf_overrides['head_dtype']!r}; remove the override."
+        )
+    hf_overrides["head_dtype"] = "float32"
+
+
+def _use_vllm_sampling_defaults(llm_kwargs: dict[str, Any]) -> None:
+    """Keep vLLM from taking sampling defaults from the model's generation_config.json.
+
+    With ``generation_config="vllm"``, a request that leaves a sampling field
+    unset gets vLLM's neutral value instead of the model file's (for example
+    Qwen2.5-Instruct's ``repetition_penalty: 1.05``), which the trainer does not
+    replay, and a request without ``max_tokens`` is no longer limited by the
+    model file's ``max_new_tokens``. EOS ids still load from the model file. A
+    ``generation_config`` set in ``vllm_kwargs`` is kept.
+    """
+    llm_kwargs.setdefault("generation_config", "vllm")
+
+
 def _validate_worker_extension_cls(
     vllm_kwargs: dict[str, Any], required_worker_extension_cls: str
 ) -> None:
@@ -332,10 +364,13 @@ class BaseVllmGenerationWorker:
             init_kwargs["seed"] = seed
             # Need to give each DP group its own vllm cache to address:
             # https://github.com/vllm-project/vllm/issues/18851
-            env_vars["VLLM_CACHE_ROOT"] = (
+            # With persistent compile caches, the engine's folder is under the
+            # node-local cache and filled from it before the engine starts.
+            env_vars["VLLM_CACHE_ROOT"] = compile_cache.vllm_engine_dir(seed) or (
                 os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
                 + f"_{seed}"
             )
+            env_vars.update(compile_cache.env_overrides("vllm"))
 
             # Give each vLLM engine a deterministic starting VLLM_PORT for the
             # TP/DP rendezvous. vLLM's _get_open_port() reads VLLM_PORT and
@@ -497,14 +532,11 @@ class BaseVllmGenerationWorker:
         self._extra_env_vars = extra_env_vars
         self._native_lora_request: Any = None
 
-        # Store the Python executable being used by this worker
-        self.py_executable = sys.executable
-
-        vllm_cfg = self.cfg["vllm_cfg"]
         _apply_vllm_patches(
-            self.py_executable,
-            extra_env_vars=extra_env_vars,
-            nemotron_h_fp32_lm_head=vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg),
+            extra_env_vars=[
+                *(extra_env_vars or []),
+                *compile_cache.env_overrides("vllm"),
+            ],
             require_moe_routed_experts_capture=bool(
                 (self.cfg.get("vllm_kwargs") or {}).get(
                     "enable_return_routed_experts", False
@@ -684,6 +716,7 @@ class BaseVllmGenerationWorker:
 
         if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}
+        _apply_fp32_lm_head(self.cfg["vllm_cfg"], vllm_kwargs)
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
@@ -753,6 +786,13 @@ class BaseVllmGenerationWorker:
         )
         _validate_worker_extension_cls(vllm_kwargs, default_worker_extension_cls)
         _log_effective_quantization_ignore_patterns(self.cfg["vllm_cfg"], vllm_kwargs)
+        if vllm_kwargs.get(
+            "enable_return_routed_experts", False
+        ) and not _resolve_enable_prefix_caching(self.cfg["vllm_cfg"]):
+            raise ValueError(
+                "vLLM returns routed experts (router replay) through its prefix-cache "
+                "blocks; set policy.generation.vllm_cfg.enable_prefix_caching=true."
+            )
         llm_kwargs = dict(
             model=self.model_name,
             served_model_name=self.model_name,
@@ -786,8 +826,11 @@ class BaseVllmGenerationWorker:
                 temporal_patch_size=video_config.temporal_patch_size,
             )
         _configure_nvfp4_pertoken_engine_kwargs(self.cfg, llm_kwargs)
+        _use_vllm_sampling_defaults(llm_kwargs)
         llm_kwargs.setdefault("worker_extension_cls", default_worker_extension_cls)
         _maybe_enable_vllm_native_tracing(llm_kwargs)
+        # Seed every node this engine runs on before it compiles.
+        compile_cache.prepare_vllm_engine(bundle_indices)
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
@@ -934,13 +977,15 @@ class BaseVllmGenerationWorker:
     def _patch_vllm_nsight_config() -> None:
         """Override vLLM's nsight config for internal TP workers to use deferred capture.
 
-        vLLM's default _configure_ray_workers_use_nsight applies an always-on nsight
-        config (no capture-range, cuda-graph-trace=node) which causes significant
+        vLLM's RayExecutorV2._build_runtime_env applies an always-on nsight config
+        (no capture-range, cuda-graph-trace=node) which causes significant
         overhead and hangs Ray's compiled DAG. This patch replaces it with NeMo RL's
         lighter config that uses capture-range=cudaProfilerApi, deferring actual
         tracing until start_gpu_profiling() triggers cudaProfilerStart() on each
         internal worker via collective_rpc.
         """
+        from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
+
         from nemo_rl.utils.nsys import NRL_NSYS_PROFILE_STEP_RANGE
 
         nsight_config = {
@@ -952,20 +997,15 @@ class BaseVllmGenerationWorker:
             "capture-range-end": "repeat",
             "cuda-graph-trace": "node",
         }
+        original_build_runtime_env = RayExecutorV2._build_runtime_env
 
-        try:
-            from vllm.v1.executor.ray_executor import RayDistributedExecutor
-        except ImportError:
-            from vllm.executor.ray_distributed_executor import (
-                RayDistributedExecutor,
-            )
+        def _patched_build_runtime_env(self) -> dict:
+            runtime_env = original_build_runtime_env(self)
+            if self.parallel_config.ray_workers_use_nsight:
+                runtime_env["nsight"] = nsight_config
+            return runtime_env
 
-        def _patched_configure(self, ray_remote_kwargs):
-            runtime_env = ray_remote_kwargs.setdefault("runtime_env", {})
-            runtime_env.update({"nsight": nsight_config})
-            return ray_remote_kwargs
-
-        RayDistributedExecutor._configure_ray_workers_use_nsight = _patched_configure
+        RayExecutorV2._build_runtime_env = _patched_build_runtime_env
 
     def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
         """Get the vLLM engine's Prometheus counters.
@@ -1599,6 +1639,21 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             traceback.print_exc()
             return False
 
+    def _reset_prefix_cache_with_no_batch_in_flight(self) -> None:
+        """Finish the engine's queued batches, then reset the prefix cache.
+
+        ``LLM.generate`` returns once every request has its final output. With
+        async scheduling that can leave one scheduled batch in the in-process
+        engine's queue. vLLM 0.33 asserts that no batch is in flight across a
+        prefix cache reset when routed experts are returned, so the next
+        ``generate`` would fail with "auxiliary output generation changed with
+        output in flight".
+        """
+        engine_client = self.llm.llm_engine.engine_core
+        while engine_client.engine_core.batch_queue:
+            engine_client.get_output()
+        self.llm.llm_engine.reset_prefix_cache()
+
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""
         assert self.llm is not None, (
@@ -1610,7 +1665,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 "reset_prefix_cache can only be used with async_engine=False. Use reset_prefix_cache_async instead."
             )
 
-        self.llm.llm_engine.reset_prefix_cache()
+        self._reset_prefix_cache_with_no_batch_in_flight()
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1626,7 +1681,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             )
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
-        self.llm.llm_engine.reset_prefix_cache()
+        self._reset_prefix_cache_with_no_batch_in_flight()
         # Clear the renderer's multimodal processor cache (sender side) so it
         # stays in sync with the receiver cache that vLLM clears internally
         # during sleep.  Without this, the sender thinks images are already
