@@ -21,17 +21,21 @@ from nemo_rl.models.generation.prefix_recovery.progress import (
     ProgressReader,
 )
 from nemo_rl.models.generation.prefix_recovery.recovery import (
+    CutClaim,
     NoPrefixRecovery,
     PrefixRecovery,
+    merge_cut_claims,
 )
 from nemo_rl.models.generation.prefix_recovery.state import CaptureRegistry
 
 __all__ = [
     "CaptureRegistry",
+    "CutClaim",
     "GenerationProgress",
     "NoPrefixRecovery",
     "PrefixRecovery",
     "PrefixRecoveryParts",
     "ProgressRead",
     "ProgressReader",
+    "merge_cut_claims",
 ]

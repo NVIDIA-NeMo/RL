@@ -31,12 +31,16 @@ from nemo_rl.data_plane.prefix_pipeline import (
     PrefixWritePipelineConfig,
 )
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink
-from nemo_rl.models.generation.prefix_recovery import PrefixRecovery
+from nemo_rl.models.generation.prefix_recovery import PrefixRecovery, merge_cut_claims
 from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
 from tests.unit.models.generation.test_vllm_token_capture_hosting import (
+    _active_call_inventory,
     _assert_rolled_back,
     _batch_worker_fixture,
+    _BatchPrefixSink,
+    _cuts,
     _next_inventory,
+    _worker_with_capture,
 )
 
 
@@ -164,7 +168,9 @@ def test_cross_inventory_merge_duplicates_and_overlap_barrier() -> None:
 
     sink.stage_generation_prefix_batch.side_effect = write
 
-    def prepare(inventory: Any, *, deadline: float | None) -> CutSteps:
+    def prepare(
+        inventory: Any, *, deadline: float | None, claims_only: bool
+    ) -> CutSteps:
         events.append(("prepare", inventory.inventory_digest, threading.get_ident()))
         record = SimpleNamespace(key=inventory.inventory_digest, delta_len=1)
         keys = yield PrefixWrite(
@@ -251,6 +257,69 @@ def test_native_pipeline_repeated_cuts_keep_the_saved_chunk_chain() -> None:
         pipeline._pipeline.close(wait=True)
         pipeline.shutdown()
         recovery.shutdown()
+
+
+def test_pipelined_frontends_cut_only_their_own_calls_into_one_receipt() -> None:
+    from nemo_gym._checkpoint.generation_cut import (
+        GenerationCutInventory,
+        GenerationCutPrefix,
+    )
+
+    # Each HTTP frontend pipelines the cuts of the calls whose requests it took.
+    owner, owner_sink, _, owner_calls = _batch_worker_fixture([2, 3])
+    child_sink = _BatchPrefixSink()
+    child_worker = _worker_with_capture(child_sink)
+    child = _cuts(child_worker)
+    child_calls, _ = _active_call_inventory(
+        child_worker, ("child-call", [20, 21, 22, 23]), output_limit=128
+    )
+    prefixes = [
+        prefix.model_copy(update={"ticket_id": f"owner-{index}"})
+        for index, prefix in enumerate(owner_calls.active_prefixes)
+    ] + [
+        child_calls.active_prefixes[0].model_copy(update={"ticket_id": "child-0"}),
+        GenerationCutPrefix(
+            ticket_id="not-arrived",
+            rollout_id="r9",
+            attempt=0,
+            model_call_id="not-arrived",
+            admitted_at=1.0,
+        ),
+    ]
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="cut", server_name="policy_model", active_prefixes=prefixes
+    )
+    pipelines = [_pipeline(owner), _pipeline(child)]
+    try:
+        claims = [
+            pipeline._pipeline.submit(
+                inventory, deadline=None, claims_only=True
+            ).result(5)
+            for pipeline in pipelines
+        ]
+    finally:
+        for pipeline in pipelines:
+            pipeline._pipeline.close(wait=True)
+            pipeline.shutdown()
+        owner.shutdown()
+        child.shutdown()
+
+    tickets = [prefix.ticket_id for prefix in inventory.active_prefixes]
+    assert [
+        {ticket for ticket, claim in zip(tickets, frontend) if claim is not None}
+        for frontend in claims
+    ] == [{"owner-0", "owner-1"}, {"child-0"}]
+    receipt = merge_cut_claims(inventory, claims)
+    receipt.validate_for(inventory)
+    assert {ack.ticket_id: ack.disposition for ack in receipt.prefixes} == {
+        "owner-0": "durable_prefix",
+        "owner-1": "durable_prefix",
+        "child-0": "durable_prefix",
+        "not-arrived": "durable_failure",
+    }
+    # Each frontend wrote only its own rows.
+    assert [len(batch) for batch in owner_sink.batches] == [2]
+    assert [len(batch) for batch in child_sink.batches] == [1]
 
 
 def test_shutdown_keeps_active_write_ownership_until_it_finishes() -> None:
