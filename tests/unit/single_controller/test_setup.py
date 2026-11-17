@@ -782,6 +782,19 @@ def test_gdpo_requires_non_capture_rollouts():
         validate_single_controller_config(mc)
 
 
+def test_gdpo_rejects_reward_shaping():
+    mc = _make_master_config(megatron_enabled=True)
+    mc.grpo.adv_estimator = AdvEstimatorConfig(name="gdpo")
+    mc.grpo.reward_shaping = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_length=512,
+        overlong_buffer_penalty=1,
+        max_response_length=4096,
+    )
+    with pytest.raises(NotImplementedError, match="reward_shaping.enabled=false"):
+        validate_single_controller_config(mc)
+
+
 def test_token_capture_top_logprobs_rejects_megatron_generation():
     mc = _make_master_config(
         backend="megatron",
