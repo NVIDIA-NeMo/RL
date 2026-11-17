@@ -23,8 +23,9 @@ from nemo_rl.models.policy.lm_policy import Policy
 
 
 @pytest.mark.parametrize("fail_version", [None, 1])
+@pytest.mark.parametrize("current_version", [1, 2])
 def test_versions_share_one_optimizer_step_and_deduplicate_tp_metrics(
-    monkeypatch, fail_version
+    monkeypatch, fail_version, current_version
 ):
     events = []
 
@@ -50,7 +51,9 @@ def test_versions_share_one_optimizer_step_and_deduplicate_tp_metrics(
             version = common_kwargs["version_point"]
             events.append(version)
             assert len(data) == 2
-            if version == fail_version:
+            if fail_version is not None and version == (
+                None if fail_version == current_version else fail_version
+            ):
                 raise ValueError("pass failed")
             return SimpleNamespace(results=[None, None])
 
@@ -79,16 +82,26 @@ def test_versions_share_one_optimizer_step_and_deduplicate_tp_metrics(
             "sample_mask": torch.ones(4),
         }
     )
+    last_version = None if current_version == 1 else 1
     if fail_version is not None:
         with pytest.raises(ValueError, match="pass failed"):
-            Policy.train_token_versions(policy, data, None, [0, 1])
-        assert events == ["begin_train_step_presharded", 0, 1, "abort_train_step"]
-    else:
-        result = Policy.train_token_versions(policy, data, None, [0, 1])
+            Policy.train_token_versions(
+                policy, data, None, [0, 1], current_version=current_version
+            )
         assert events == [
             "begin_train_step_presharded",
             0,
-            1,
+            last_version,
+            "abort_train_step",
+        ]
+    else:
+        result = Policy.train_token_versions(
+            policy, data, None, [0, 1], current_version=current_version
+        )
+        assert events == [
+            "begin_train_step_presharded",
+            0,
+            last_version,
             "finish_train_step_presharded",
         ]
         assert result["all_mb_metrics"]["tokens"] == [0, 2]
@@ -101,4 +114,4 @@ def test_multimodal_batch_is_rejected_before_opening_a_step():
     )
     data = SimpleNamespace(get_multimodal_dict=lambda: {"images": object()})
     with pytest.raises(ValueError, match="text-only"):
-        Policy.train_token_versions(policy, data, None, [0])
+        Policy.train_token_versions(policy, data, None, [0], current_version=0)

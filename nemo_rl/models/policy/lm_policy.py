@@ -1064,6 +1064,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         data: BatchedDataDict[Any],
         loss_fn: LossFunction,
         versions: list[int],
+        *,
+        current_version: int,
         timer: Optional[Timer] = None,
     ) -> dict[str, Any]:
         """Accumulate behavior-version token gradients and take one current-weight step."""
@@ -1097,6 +1099,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 if self.flops_tracker is not None:
                     for shard in shards:
                         self.flops_tracker.track_batch(shard["input_lengths"].tolist())
+                version_point = (
+                    None if plan.version == current_version else plan.version
+                )
                 futures = self.worker_group.run_all_workers_sharded_data(
                     "train_microbatch",
                     data=shards,
@@ -1111,7 +1116,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                         "tensor_parallel",
                         "pipeline_parallel",
                     ],
-                    common_kwargs={"version_point": plan.version},
+                    common_kwargs={"version_point": version_point},
                 )
                 self.worker_group.get_all_worker_results(futures)
             results = ray.get(

@@ -6499,7 +6499,11 @@ def async_grpo_train(
                     try:
                         if vp_versions:
                             train_results = policy.train_token_versions(
-                                train_data, loss_fn, vp_versions, timer=timer
+                                train_data,
+                                loss_fn,
+                                vp_versions,
+                                current_version=weight_version,
+                                timer=timer,
                             )
                         else:
                             train_results = policy.train(
