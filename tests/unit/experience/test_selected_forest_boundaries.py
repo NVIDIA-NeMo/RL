@@ -1462,6 +1462,7 @@ def test_forest_rows_take_their_rollouts_infra_failure_flag(forest):
         infra_failure=[False, True],
     )
     assert result.metrics["infra_failure_sample_rate"] == 0.5
+    assert result.reward_infra_failure == [False, True]
     assert [tag["logical_slot"] for tag in result.meta.tags] == [0, 0, 1, 1]
     sample_mask = [
         forest.plane.rows["canonical", sample_id]["sample_mask"].item()

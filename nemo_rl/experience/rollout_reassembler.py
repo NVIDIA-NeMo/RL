@@ -207,6 +207,9 @@ class FinalizedGroup:
     reward_mask_sample: list[bool] = field(default_factory=list)
     reward_truncated: list[bool] = field(default_factory=list)
     reward_original: list[float] = field(default_factory=list)
+    # Under grpo.masked_reward_policy=exclude_infra, whether each of those rows is an
+    # infrastructure failure (rollouts.infra_failure_flags); None under the other policies.
+    reward_infra_failure: Optional[list[bool]] = None
     loss_multiplier: float = 1.0
     # True when the finalizer rejected the whole group as a structural outcome
     # (see drop_reason); the caller aborts the slot instead of committing it.
@@ -1139,6 +1142,11 @@ class RolloutReassembler:
             truncated_flags[index] for index, _, row in reward_rows if row.valid
         ]
         reward_original = [rewards[slot] for _, slot, row in reward_rows if row.valid]
+        reward_infra_failure = (
+            [infra_failure[slot] for _, slot, row in reward_rows if row.valid]
+            if infra_failure is not None
+            else None
+        )
         metrics["finalize/truncated_count"] = 0.0
         for index, slot, row in reward_rows:
             if row.valid:
@@ -1172,6 +1180,7 @@ class RolloutReassembler:
             reward_mask_sample=reward_mask_sample,
             reward_truncated=reward_truncated,
             reward_original=reward_original,
+            reward_infra_failure=reward_infra_failure,
             logical=logical,
             execution_row_multiple=execution_row_multiple,
             canonical_sample_ids=canonical_sample_ids,
@@ -1249,6 +1258,7 @@ class RolloutReassembler:
         reward_mask_sample: list[bool],
         reward_truncated: list[bool],
         reward_original: list[float],
+        reward_infra_failure: Optional[list[bool]],
         logical: Optional[_LogicalRows],
         execution_row_multiple: int,
         canonical_sample_ids: list[str],
@@ -1527,6 +1537,7 @@ class RolloutReassembler:
             reward_mask_sample=reward_mask_sample,
             reward_truncated=reward_truncated,
             reward_original=reward_original,
+            reward_infra_failure=reward_infra_failure,
             loss_multiplier=loss_multiplier,
             valid_row_count=len(valid_rows),
             total_row_count=real_row_count,

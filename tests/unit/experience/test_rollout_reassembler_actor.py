@@ -221,6 +221,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "reward_mask_sample",
         "reward_truncated",
         "reward_original",
+        "reward_infra_failure",
         "loss_multiplier",
         "dropped",
         "drop_reason",

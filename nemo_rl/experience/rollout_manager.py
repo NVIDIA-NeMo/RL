@@ -2354,8 +2354,8 @@ class RolloutManager:
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
         self._rollout_recovery_config = rollout_recovery_config
-        # exclude_infra kinds for token-capture finalization (see
-        # rollouts.infra_failure_flags).
+        # exclude_infra kinds for token-capture finalization and the zero-variance
+        # check (see rollouts.infra_failure_flags).
         self._policy_failure_kinds = policy_failure_kinds
         self._tq_buffer = tq_buffer
         self._recovery_ledger = RolloutRecoveryLedger()
@@ -2588,6 +2588,14 @@ class RolloutManager:
             record,
             masked_reward_policy=self._masked_reward_policy,
             overlong_filtering=self._overlong_filtering,
+            infra_failure=(
+                infra_failure_flags(
+                    (completion.env_extras for completion in record.completions),
+                    self._policy_failure_kinds,
+                ).tolist()
+                if self._policy_failure_kinds is not None
+                else None
+            ),
         )
 
     def _is_zero_variance_finalized(self, finalized: "FinalizedGroup") -> bool:

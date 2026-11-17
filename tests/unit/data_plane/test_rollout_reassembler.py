@@ -343,6 +343,8 @@ def test_finalize_group_zeroes_infra_failure_weight(
     assert torch.as_tensor(rows["sample_mask"]).flatten().tolist() == [expected]
     assert torch.as_tensor(rows["mask_sample"]).flatten().tolist() == [True]
     assert finalized.metrics.get("infra_failure_sample_rate") == expected_rate
+    # The zero-variance check reads the same flag per reward row.
+    assert finalized.reward_infra_failure == infra_failure
 
 
 def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):

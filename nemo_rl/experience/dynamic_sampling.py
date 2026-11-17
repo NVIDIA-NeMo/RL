@@ -58,6 +58,7 @@ def voting_rewards(
     loss_multiplier: float,
     masked_reward_policy: Optional[str],
     overlong_filtering: bool,
+    infra_failure: Optional[Sequence[bool]] = None,
 ) -> list[float]:
     """The rewards that vote in a group's baseline and std.
 
@@ -75,7 +76,9 @@ def voting_rewards(
     Under ``exclude`` the environment's ``mask_sample`` rows drop out, and with
     ``overlong_filtering`` so do truncated ones -- the rows the loss drops later in
     the step. Under ``include`` both still vote: their rewards are measurements of
-    the policy even though they carry no loss.
+    the policy even though they carry no loss. ``exclude_infra`` votes like
+    ``include``, except for the rows in ``infra_failure``: the rollout builders give
+    them a sample weight of 0, so they never reach the baseline either.
 
     Args:
         rewards: One Gym reward per row, before effort shaping and reward penalties.
@@ -85,11 +88,20 @@ def voting_rewards(
         masked_reward_policy: ``grpo.masked_reward_policy``; ``None`` is PPO, which
             has no group-relative baseline to mask rows out of.
         overlong_filtering: ``grpo.overlong_filtering``.
+        infra_failure: Under ``exclude_infra``, whether each row is an
+            infrastructure failure (``rollouts.infra_failure_flags``), parallel to
+            ``rewards``; ``None`` under the other policies.
     """
     if loss_multiplier == 0:
         return []
     if masked_reward_policy != "exclude":
-        return list(rewards)
+        if infra_failure is None:
+            return list(rewards)
+        return [
+            reward
+            for reward, is_infra in zip(rewards, infra_failure, strict=True)
+            if not is_infra
+        ]
     return [
         reward
         for reward, masked, is_truncated in zip(
@@ -104,6 +116,7 @@ def voting_rewards_from_record(
     *,
     masked_reward_policy: Optional[str],
     overlong_filtering: bool,
+    infra_failure: Optional[Sequence[bool]] = None,
 ) -> list[float]:
     """The rewards that vote in a group's baseline, read from its ``Completion`` rows."""
     return voting_rewards(
@@ -121,6 +134,7 @@ def voting_rewards_from_record(
         loss_multiplier=record.loss_multiplier,
         masked_reward_policy=masked_reward_policy,
         overlong_filtering=overlong_filtering,
+        infra_failure=infra_failure,
     )
 
 
@@ -138,6 +152,7 @@ def voting_rewards_from_finalized(
         loss_multiplier=finalized.loss_multiplier,
         masked_reward_policy=masked_reward_policy,
         overlong_filtering=overlong_filtering,
+        infra_failure=finalized.reward_infra_failure,
     )
 
 
