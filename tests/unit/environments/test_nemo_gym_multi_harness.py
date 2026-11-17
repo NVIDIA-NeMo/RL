@@ -237,14 +237,20 @@ def _routes(*candidates):
     return MultiHarnessRoutes(candidates=(("swe", candidates),))
 
 
-def test_select_follows_the_weights():
+# Huge weights must not overflow their sum, nor tiny ones lose precision.
+@pytest.mark.parametrize(
+    ("opencode", "pi", "opencode_share"),
+    [(2.0, 1.0, 2 / 3), (1e308, 1e308, 1 / 2), (5e-324, 5e-324, 1 / 2)],
+    ids=["two-to-one", "huge-equal", "tiny-equal"],
+)
+def test_select_follows_the_weights(opencode, pi, opencode_share):
     routes = _routes(
-        ("opencode_agent", "swe_opencode", 2.0), ("pi_agent", "swe_pi", 1.0)
+        ("opencode_agent", "swe_opencode", opencode), ("pi_agent", "swe_pi", pi)
     )
 
     counts = Counter(routes.select("swe", f"group-{i}").harness for i in range(20_000))
 
-    assert counts["opencode_agent"] / 20_000 == pytest.approx(2 / 3, abs=0.02)
+    assert counts["opencode_agent"] / 20_000 == pytest.approx(opencode_share, abs=0.02)
 
 
 def test_select_depends_only_on_the_group_id():

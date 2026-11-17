@@ -176,14 +176,17 @@ class MultiHarnessRoutes:
                 "needs each row's prompt-group ID to choose its harness"
             )
         candidates = self._candidates(taskset)
+        # Scale by the largest weight so huge weights cannot overflow their sum
+        # and tiny ones keep their precision.
+        scale = max(weight for _, _, weight in candidates)
         digest = hashlib.sha256(_SELECTION_DOMAIN + group_id.encode()).digest()
         point = (
             int.from_bytes(digest[:8], "big")
             / _HASH_SPAN
-            * sum(weight for _, _, weight in candidates)
+            * sum(weight / scale for _, _, weight in candidates)
         )
         for agent, server, weight in candidates:
-            point -= weight
+            point -= weight / scale
             if point < 0:
                 return HarnessChoice(agent, server)
         # Float rounding can leave a point at the very top of the range.
