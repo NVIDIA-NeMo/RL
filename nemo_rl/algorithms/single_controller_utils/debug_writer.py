@@ -15,6 +15,7 @@
 """Stream untruncated training tensors without retaining a second step batch."""
 
 import dataclasses
+import functools
 import json
 import multiprocessing
 import os
@@ -322,6 +323,7 @@ class JsonDebugWriter(DebugWriter):
             part.unlink()
 
 
+@functools.cache
 def _parquet_schema() -> "pa.Schema":
     """Return the Parquet schema of a training dump row."""
     import pyarrow as pa
@@ -363,19 +365,25 @@ class ParquetDebugWriter(DebugWriter):
     so the json writer does not need it.
     """
 
+    def _validate(self, chunk: TrainChunk) -> None:
+        """Also raise ValueError for a column the Parquet schema lacks, before any background write."""
+        super()._validate(chunk)
+        names = _parquet_schema().names
+        unknown = [k for k in (*chunk.sequences, *chunk.scalars) if k not in names]
+        if unknown:
+            raise ValueError(
+                f"Parquet training dump has no column(s) {unknown}; add them to "
+                "_parquet_schema."
+            )
+
     def _step_dir(self, step: int) -> Path:
         """Return the directory holding the step's chunk files and manifest."""
         return self.log_dir / "train_data_parquet" / f"step-{step + 1:08d}"
 
     def _write_chunk(self, chunk: TrainChunk, *, replace: bool) -> ChunkReceipt:
-        """Write the chunk to a new Parquet file, first removing this shard's old files if replace is set."""
+        """Write the chunk to a new Parquet file; _publish_step drops the files of earlier attempts."""
         directory = self._step_dir(chunk.step)
         directory.mkdir(parents=True, exist_ok=True)
-        if replace:
-            # Flush first so a retried step cannot race its own earlier writes.
-            self.flush()
-            for old in directory.glob(f"step-*-shard-{self.shard_id}-*.parquet"):
-                old.unlink()
         name = (
             f"step-{chunk.step + 1:08d}-shard-{self.shard_id}-{uuid.uuid4().hex}"
             ".parquet"
@@ -411,11 +419,6 @@ class ParquetDebugWriter(DebugWriter):
                 for tag in chunk.tags
             ]
         for key, tensor in {**chunk.sequences, **chunk.scalars}.items():
-            if key not in schema.names:
-                raise ValueError(
-                    f"Parquet training dump has no column {key!r}; add it to "
-                    "_parquet_schema."
-                )
             dtype = schema.field(key).type
             tensor = tensor.detach().cpu()
             if tensor.is_floating_point():
@@ -455,11 +458,9 @@ class ParquetDebugWriter(DebugWriter):
         """Write _manifest.json listing the step's chunk files, after checking them against the receipts."""
         import pyarrow.parquet as pq
 
-        # A background writer may still hold chunks of this shard's step.
-        self.flush()
         directory = self._step_dir(step)
         files = [receipt.ref for receipt in receipts]
-        if not files or len(set(files)) != len(files):
+        if not files:
             raise RuntimeError("Completed optimizer step has no training dump")
         missing = [name for name in files if not (directory / name).is_file()]
         if missing:
@@ -475,11 +476,14 @@ class ParquetDebugWriter(DebugWriter):
                 f"the receipts report {expected_rows}"
             )
         final = directory / "_manifest.json"
-        if final.exists():
-            raise FileExistsError(f"Training dump already published: {final}")
         partial = directory / f"._manifest-{uuid.uuid4().hex}.partial"
         partial.write_text(json.dumps({"step": step + 1, "files": files}) + "\n")
         os.replace(partial, final)
+        # A retried step leaves the failed attempt's chunks and the previous
+        # manifest's chunks behind; drop them only after the new manifest is in place.
+        for stale in directory.glob("step-*.parquet"):
+            if stale.name not in files:
+                stale.unlink()
 
 
 def _share_tensor_storage(tensor: torch.Tensor) -> torch.Tensor:

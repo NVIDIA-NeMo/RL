@@ -670,3 +670,24 @@ def test_parquet_writer_rejects_a_short_dump_and_a_missing_chunk(
         writer.finish_step(0, [replace(receipt, rows=3)])
     with pytest.raises(RuntimeError, match="not found"):
         writer.finish_step(0, [replace(receipt, ref="missing.parquet")])
+
+
+def test_parquet_writer_republishes_a_retried_step_without_losing_the_old_dump(
+    tmp_path: Path, chunk: TrainChunk
+) -> None:
+    pytest.importorskip("pyarrow.parquet")
+    cfg = DebugWriterConfig(target="parquet")
+    first = make_debug_writer(cfg, str(tmp_path))
+    old = first.add_chunk(chunk)
+    first.finish_step(0, [old])
+    directory = tmp_path / "train_data_parquet" / "step-00000001"
+
+    retry = make_debug_writer(cfg, str(tmp_path))
+    new = retry.add_chunk(chunk)
+    # The published dump stays readable until the retry publishes.
+    assert json.loads((directory / "_manifest.json").read_text())["files"] == [old.ref]
+    assert (directory / old.ref).is_file()
+
+    retry.finish_step(0, [new])
+    assert json.loads((directory / "_manifest.json").read_text())["files"] == [new.ref]
+    assert not (directory / old.ref).exists()
