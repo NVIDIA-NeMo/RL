@@ -38,7 +38,7 @@ printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%
 
 UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
 UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
-UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py \
+UV_LINK_MODE=symlink uv run --extra nemo_gym python examples/nemo_gym/prefetch_venvs.py \
     examples/nemo_gym/prefetch_super_all_envs.yaml
 rm -f "${GYM_VLLM_OVERRIDE}"
 RUNEOF

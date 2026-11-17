@@ -438,8 +438,8 @@ UV_LINK_MODE=hardlink uv sync --frozen $GROUP_FLAGS
 # nemo_rl is an editable install: it only records that the package lives in
 # /opt/nemo-rl/nemo_rl, and the files show up there when the source is copied in.
 # The python-<ClassName> wrapper scripts are written here too, the same way
-# nemo_rl/utils/prefetch_venvs.py writes them. Unless NEMO_GYM_PREFETCH_CONFIGS is set,
-# nothing after the source COPY touches a venv, so a source-only change rebuilds no venv layer.
+# nemo_rl/utils/prefetch_venvs.py writes them. Nothing after the source COPY touches a venv
+# (the NeMo Gym prefetch runs before it), so a source-only change rebuilds no venv layer.
 #
 # nemo_rl/distributed/actor_environments.py is the single source of truth for which extras
 # each actor needs; the runtime registry imports the same dict. It is run as a script rather
@@ -845,6 +845,66 @@ fi
 EOF
 USER root
 
+# Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)
+# into the image. Gated on NEMO_GYM_PREFETCH_CONFIGS (no-op by default). It runs before the
+# source COPY below, with only the files it reads copied in first, so a change anywhere
+# else in the source does not rebuild the Gym venvs. The NeMo Gym tree itself is already
+# in the dependency layer.
+COPY --from=nemo-rl examples /opt/nemo-rl/examples
+COPY --from=nemo-rl nemo_rl/utils/__init__.py nemo_rl/utils/config.py /opt/nemo-rl/nemo_rl/utils/
+COPY --from=nemo-rl nemo_rl/environments/__init__.py nemo_rl/environments/nemo_gym_config_prep.py /opt/nemo-rl/nemo_rl/environments/
+# The gym server venvs are built in hardlink mode: examples/nemo_gym/prefetch_venvs.py pins
+# UV_LINK_MODE=hardlink, because Gym's setup scripts shell out to
+# `uv pip install --no-cache`, which uv refuses to combine with symlink installs.
+# Gym pins vllm==0.29.0; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
+# RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
+ARG NEMO_GYM_CUDA=cu130
+ARG NEMO_GYM_VLLM_VERSION=0.29.0
+RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}-${TORCH_CUDA_ARCH_LIST}-${NVTE_CUDA_ARCHS}-${FLASH_ATTN_CUDA_ARCHS}-${FLASH_MLA_DISABLE_SM90},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
+    # ether0 imports rdkit, whose bundled cairo links these libraries. The dry run below
+    # starts ether0, and so does every job that runs it, but the base stage has no X11
+    # libraries. swe_agents' `playwright install --with-deps` adds them only sometimes, and
+    # never when no swe_agents config precedes ether0, so install them here. The install
+    # stays inside this gate, so images built without prefetch configs don't get them.
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends libexpat1 libx11-6 libxext6 libxrender1
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+    # Same materialize/sync-back/strip dance as the other uv-writing RUNs.
+    # prefetch_venvs.py's Gym venvs install with UV_LINK_MODE=hardlink,
+    # which needs the plain same-filesystem UV_CACHE_DIR. Already exists from
+    # an earlier layer unless STRIP_UV_CACHE removed it there.
+    source /tmp/uv-cache-helper/uv_cache_mount.sh
+    uv_cache_restore
+    trap 'uv_cache_persist' EXIT
+    case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac
+    GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
+    printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s-cp38-abi3-manylinux_2_28_%s.whl\n' \
+        "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
+    # The NemoGym worker venv is the one that has NeMo Gym, and the one Gym runs in.
+    GYM_PYTHON="${NEMO_RL_VENV_DIR}/nemo_rl.environments.nemo_gym.NemoGym/bin/python"
+    if [[ ! -x "${GYM_PYTHON}" ]]; then
+        echo "NEMO_GYM_PREFETCH_CONFIGS needs the nemo_gym extra; add it to NRL_EXTRAS" >&2
+        exit 1
+    fi
+    UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
+    UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
+    "${GYM_PYTHON}" examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
+    rm -f "${GYM_VLLM_OVERRIDE}"
+    # Same CVE cleanup as the sweep above, for the Gym venvs this step just created.
+    find "${NEMO_GYM_VENV_DIR}" "${UV_CACHE_DIR}" -name ray_dist.jar -delete
+    # This step runs after the runtime-user sweep above, so hand over what it added.
+    # -uid 0 matches only entries still owned by root, so nothing else is copied up.
+    if [[ -z "${ROOT_ONLY:-}" ]]; then
+        find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
+            -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
+    fi
+fi
+EOF
+
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
 # NeMo Gym is left out: the hermetic stage already copied it from the nemo-gym build
@@ -870,58 +930,6 @@ fi
 # Generate container fingerprint for frozen environment support
 # Store outside /opt/nemo-rl to avoid being overwritten by user mounts
 python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
-EOF
-
-# Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)
-# into the image. Gated on NEMO_GYM_PREFETCH_CONFIGS (no-op by default). Runs after the
-# source COPY above so examples/nemo_gym/prefetch_venvs.py is present, which also makes it
-# re-run on every source change when it is enabled.
-# UV_LINK_MODE=symlink below applies to this outer `uv run` only. The gym server venvs
-# themselves are built in hardlink mode: examples/nemo_gym/prefetch_venvs.py pins
-# UV_LINK_MODE=hardlink in the Gym actor's runtime_env, because Gym's setup scripts shell
-# out to `uv pip install --no-cache`, which uv refuses to combine with symlink installs.
-# Gym pins vllm==0.29.0; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
-# RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
-ARG NEMO_GYM_CUDA=cu130
-ARG NEMO_GYM_VLLM_VERSION=0.29.0
-RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
-    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}-${TORCH_CUDA_ARCH_LIST}-${NVTE_CUDA_ARCHS}-${FLASH_ATTN_CUDA_ARCHS}-${FLASH_MLA_DISABLE_SM90},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
-if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
-    # ether0 imports rdkit, whose bundled cairo links these libraries. The dry run below
-    # starts ether0, and so does every job that runs it, but the base stage has no X11
-    # libraries. swe_agents' `playwright install --with-deps` adds them only sometimes, and
-    # never when no swe_agents config precedes ether0, so install them here. The install
-    # stays inside this gate, so images built without prefetch configs don't get them.
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y --no-install-recommends libexpat1 libx11-6 libxext6 libxrender1
-    apt-get clean
-    rm -rf /var/lib/apt/lists/*
-    # Same materialize/sync-back/strip dance as the other uv-writing RUNs.
-    # The outer `uv run` here is symlink-mode (safe across the mount), but
-    # prefetch_venvs.py's inner Gym venvs install with UV_LINK_MODE=hardlink,
-    # which needs the plain same-filesystem UV_CACHE_DIR. Already exists from
-    # an earlier layer unless STRIP_UV_CACHE removed it there.
-    source /tmp/uv-cache-helper/uv_cache_mount.sh
-    uv_cache_restore
-    trap 'uv_cache_persist' EXIT
-    case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac
-    GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
-    printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s-cp38-abi3-manylinux_2_28_%s.whl\n' \
-        "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
-    UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
-    UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
-    UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
-    rm -f "${GYM_VLLM_OVERRIDE}"
-    # Same CVE cleanup as the sweep above, for the Gym venvs this step just created.
-    find "${NEMO_GYM_VENV_DIR}" "${UV_CACHE_DIR}" -name ray_dist.jar -delete
-    # This step runs after the runtime-user sweep above, so hand over what it added.
-    # -uid 0 matches only entries still owned by root, so nothing else is copied up.
-    if [[ -z "${ROOT_ONLY:-}" ]]; then
-        find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
-            -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
-    fi
-fi
 EOF
 
 # Build identity, last: these change on every build and nothing after them has to re-run.

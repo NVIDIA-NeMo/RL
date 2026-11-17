@@ -3,7 +3,7 @@
 # available Gym server venv into the image:
 #   docker buildx build -f docker/Dockerfile \
 #     --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/prefetch_ultra_all_envs.yaml" .
-# Only env.nemo_gym is read (dry-run NemoGym._spinup); the dummy values below satisfy the bundled
+# Only env.nemo_gym is read (NeMo Gym dry run); the dummy values below satisfy the bundled
 # configs' interpolations during the dry run. swerl_gen is omitted because it is disabled in the
 # Ultra recipes.
 defaults: legacy_environment_servers/ultra_rlvr.yaml
