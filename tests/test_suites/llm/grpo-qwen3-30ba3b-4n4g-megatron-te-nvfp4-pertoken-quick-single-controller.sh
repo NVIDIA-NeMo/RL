@@ -79,6 +79,6 @@ mapfile -t TRAIN_DATA_FILES < <(
     find "$LOG_DIR" -type f -name 'train_data_step*.jsonl' -print | sort -V
 )
 if [[ ${#TRAIN_DATA_FILES[@]} -ne $MAX_STEPS ]]; then
-    echo "[ERROR] Expected $MAX_STEPS rollout JSONL files, found ${#TRAIN_DATA_FILES[@]}"
+    echo "[FAIL] Expected $MAX_STEPS rollout JSONL files, found ${#TRAIN_DATA_FILES[@]}"
     exit 1
 fi
