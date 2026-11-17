@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 30-step GB200 test for zero train/generation KL on Qwen3-30B-A3B: Megatron
+# training (TP1, EP4) with colocated Megatron inference on the same workers, using
+# the batch-invariant kernel stack (te_native GEMMs, ordered collectives, FA4).
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.env"
 
@@ -45,6 +48,7 @@ uv run --no-sync examples/run_grpo.py \
 
 uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 
+# The recipe must have switched the batch-invariant kernels on.
 grep -F -q "[zero_train_gen_mismatch] batch-invariant kernels enabled: backend=te_native collective=ordered flash_attention_version=4" "$RUN_LOG"
 
 MAX_RECORDED_STEP=$(jq -r 'if has("train/loss") then (."train/loss" | keys | map(tonumber) | max // 0) else 0 end' "$JSON_METRICS")
@@ -53,6 +57,9 @@ if [[ "$MAX_RECORDED_STEP" -lt "$MAX_STEPS" ]]; then
     exit 1
 fi
 
+# Zero train/generation KL means bitwise agreement: no valid token's logprob differs,
+# gen_kl_error is exactly 0 and probs_ratio is exactly 1 on every step. Both min and
+# max are checked so a negative KL estimate cannot slip through.
 uv run --no-sync tests/check_metrics.py "$JSON_METRICS" \
     'min(data["train/num_valid_samples"]) > 0' \
     'all_finite(data["train/loss"])' \
