@@ -39,42 +39,32 @@ The release image ships `uv`'s download cache (`/opt/nemo_rl_cache/uv`) so an un
 
 Right after that cache is restored, before any `uv sync`, `docker/prune_uv_cache.py` removes exactly those superseded entries: index wheels and source builds whose `(package, version)` the current `uv.lock` no longer pins, and git builds/checkouts for commits it no longer pins, across every extra (installed in this build or not). Running first means it only judges restored content, so the build-isolation dependencies the syncs resolve outside `uv.lock` (setuptools, a build-time torch, ...) are kept. It runs in the same layer the syncs fill, because deleting files in a later layer only hides them and the image still ships them, and the result is synced back into the cache mount. It never removes a wheel the offline-install promise depends on, since that promise is itself "every wheel `uv.lock` could need." This runs automatically on every build; there is no flag to disable it.
 
-## Skipping vLLM or SGLang Dependencies
+## Building Only Some Backends
 
-If you don't need vLLM, SGLang, or TRT-LLM support, you can skip building those dependencies to reduce build time and image size. Use the `SKIP_VLLM_BUILD`, `SKIP_SGLANG_BUILD`, and/or `SKIP_TRTLLM_BUILD` build arguments:
+Each backend is a uv extra (`vllm`, `sglang`, `mcore`, `automodel`, `modelopt`, `nemo_gym`, `trtllm`). By default the image builds all of them. To build only the ones you use, list them in `NRL_EXTRAS`:
 
 ```sh
-# Skip vLLM dependencies:
 docker buildx build -f docker/Dockerfile \
-    --build-arg SKIP_VLLM_BUILD=1 \
-    --tag <registry>/nemo-rl:latest \
-    .
-
-# Skip SGLang dependencies:
-docker buildx build -f docker/Dockerfile \
-    --build-arg SKIP_SGLANG_BUILD=1 \
-    --tag <registry>/nemo-rl:latest \
-    .
-
-# Skip TRT-LLM dependencies:
-docker buildx build -f docker/Dockerfile \
-    --build-arg SKIP_TRTLLM_BUILD=1 \
-    --tag <registry>/nemo-rl:latest \
-    .
-
-# Skip all three:
-docker buildx build -f docker/Dockerfile \
-    --build-arg SKIP_VLLM_BUILD=1 \
-    --build-arg SKIP_SGLANG_BUILD=1 \
-    --build-arg SKIP_TRTLLM_BUILD=1 \
+    --build-arg NRL_EXTRAS="mcore vllm nemo_gym" \
     --tag <registry>/nemo-rl:latest \
     .
 ```
 
-When these build arguments are set, the corresponding `uv sync --extra` commands are skipped, and the virtual environment prefetching will exclude actors that depend on those packages.
+| Build argument | Default | Effect |
+|---|---|---|
+| `NRL_EXTRAS` | all extras | Only these extras are installed, and only the worker virtual environments that need no other extra are prefetched. An unknown name fails the build. |
+| `NRL_GROUPS` | all dependency groups | Dependency groups to install in the main virtual environment, for example `build`. `uv run` always installs the default groups (`dev`, `build`), so this can only leave out the others (`docs`, `test`). |
+
+The Rust toolchain is only installed when `sglang` is built.
 
 > [!NOTE]
-> If you skip vLLM, SGLang, or TRT-LLM during the build but later try to use those backends at runtime, the dependencies will be fetched and built on-demand. This may add significant setup time on first use.
+> A backend left out of the build is fetched and built on first use, which can add a long setup time to that run.
+
+`NRL_EXTRAS` replaces the `SKIP_VLLM_BUILD`, `SKIP_SGLANG_BUILD` and `SKIP_TRTLLM_BUILD` arguments, and passing one of them now fails the build. To leave a backend out, list the others. For example, `SKIP_SGLANG_BUILD=1` with `SKIP_TRTLLM_BUILD=1` becomes:
+
+```sh
+--build-arg NRL_EXTRAS="vllm mcore automodel modelopt nemo_gym"
+```
 
 ## Stripping the uv Cache
 
