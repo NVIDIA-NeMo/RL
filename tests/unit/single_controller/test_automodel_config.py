@@ -14,6 +14,7 @@
 
 """Early guards for supported AutoModel single-controller configurations."""
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -30,7 +31,12 @@ from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 @pytest.fixture
 def config():
     register_omegaconf_resolvers()
-    raw = load_config("examples/configs/grpo_math_1B_automodel_single_controller.yaml")
+    repo_root = Path(__file__).resolve().parents[3]
+    raw = load_config(
+        str(
+            repo_root / "examples/configs/grpo_math_1B_automodel_single_controller.yaml"
+        )
+    )
     return OmegaConf.to_container(raw, resolve=True)
 
 

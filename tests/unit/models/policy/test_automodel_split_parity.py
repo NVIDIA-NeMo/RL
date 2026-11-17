@@ -80,7 +80,7 @@ def test_full_batch_split_parity(
         "tiny_llama_model_path" if expert_parallel_size == 1 else "tiny_moe_model_path"
     )
     register_omegaconf_resolvers()
-    config = load_config("examples/configs/grpo_math_1B.yaml")
+    config = load_config(str(root / "examples/configs/grpo_math_1B.yaml"))
     config.policy.logprob_chunk_size = logprob_chunk_size
     config.policy.automodel_cfg.expert_parallel_size = expert_parallel_size
     if expert_parallel_size > 1:
