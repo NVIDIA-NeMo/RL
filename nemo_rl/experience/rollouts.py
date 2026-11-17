@@ -2723,13 +2723,7 @@ def _resolve_generation_context_limit(
         context_length = cfg["sglang_cfg"].get("context_length")
         if context_length is not None:
             return context_length
-        if policy_max_seq_len is None:
-            raise ValueError(
-                "SGLang NeMo-Gym rollouts require either "
-                "policy.generation.sglang_cfg.context_length or a policy "
-                "max_total_sequence_length."
-            )
-        return policy_max_seq_len
+        return policy_generation.context_length
 
     if backend == "vllm":
         return cfg["vllm_cfg"]["max_model_len"]

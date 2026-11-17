@@ -5632,7 +5632,8 @@ def async_grpo_train(
             initial_val_metrics = val_metrics
             # A colocated engine keeps serving between phases (preserves its
             # KV/prefix cache); the backend makes that call, not the loop.
-            policy_generation.finish_generation(release_gpu=False)
+            if not isinstance(policy_generation, SGLangGeneration):
+                policy_generation.finish_generation(release_gpu=False)
             logger.log_metrics(val_metrics, step, prefix="validation")
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
             if master_config.grpo.debug_payload_metrics:
@@ -6394,9 +6395,10 @@ def async_grpo_train(
                         # Save-bound steps need the GPUs for checkpointing,
                         # so the engine must stand down; otherwise a colocated
                         # engine keeps serving (backend's call).
-                        policy_generation.finish_generation(
-                            release_gpu=saving_this_step
-                        )
+                        if not isinstance(policy_generation, SGLangGeneration):
+                            policy_generation.finish_generation(
+                                release_gpu=saving_this_step
+                            )
                         logger.log_metrics(
                             validation_timings, step + 1, prefix="timing/validation"
                         )

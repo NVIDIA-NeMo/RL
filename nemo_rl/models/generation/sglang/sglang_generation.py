@@ -130,6 +130,7 @@ class SGLangGeneration(GenerationInterface):
         self.gpu_offset: int = 0
         self.needs_offload: bool = sglang_server_cfg["needs_offload"]
         self.model_path: str | None = sglang_cfg["sglang_cfg"]["model_path"]
+        self.context_length: int | None = sglang_cfg["sglang_cfg"].get("context_length")
 
         # --- Weight-refit / fault-tolerance state ------------------------
         # Number of engines created by the most recent ``_start_engines``
@@ -161,6 +162,16 @@ class SGLangGeneration(GenerationInterface):
         if init_handles:
             ray.get(init_handles)
 
+        if self.context_length is None:
+            context_lengths = ray.get(
+                [engine.get_context_length.remote() for engine in self.engines]
+            )
+            if len(set(context_lengths)) != 1:
+                raise ValueError(
+                    f"SGLang engines must agree on their context length: {context_lengths}"
+                )
+            self.context_length = context_lengths[0]
+
         # Serializes weight-update broadcasts. Acquired per bucket by trainer
         # rank 0 in policy/utils.py; nothing on the generation side takes it.
         self.rollout_engine_lock = Lock.options(num_cpus=0, num_gpus=0).remote()
@@ -179,6 +190,7 @@ class SGLangGeneration(GenerationInterface):
         state["_health_monitor"] = None
         state["weight_synchronizer"] = None
         state["rollout_engine_lock"] = None
+        state["cluster"] = None
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:

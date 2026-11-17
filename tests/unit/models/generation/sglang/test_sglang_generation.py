@@ -32,7 +32,10 @@ from unittest.mock import MagicMock
 import pytest
 import ray
 import torch
+from ray import cloudpickle
+from ray.util import placement_group_table
 
+from nemo_rl.distributed import virtual_cluster
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.sglang import (
@@ -246,6 +249,76 @@ def test_nemo_gym_url_uses_stable_router():
     generation.router_port = 31000
 
     assert generation.dp_openai_server_base_urls == ["http://[2001:db8::1]:31000"]
+
+
+@pytest.mark.timeout(30)
+def test_pickle_copy_preserves_driver_placement_group(monkeypatch):
+    cluster = RayVirtualCluster(
+        bundle_ct_per_node_list=[1], use_gpus=False, num_gpus_per_node=0
+    )
+    owner = SGLangGeneration.__new__(SGLangGeneration)
+    owner.cluster = cluster
+    owner.sglang_cfg = _make_sglang_generation_cfg()
+    owner.cfg = owner.sglang_cfg
+    owner.context_length = 8192
+    owner._owns_runtime = True
+    remove_group = MagicMock(wraps=virtual_cluster.remove_placement_group)
+    monkeypatch.setattr(virtual_cluster, "remove_placement_group", remove_group)
+    try:
+        owner.pg = cluster._init_placement_groups(use_unified_pg=True)[0]
+        restored = cloudpickle.loads(cloudpickle.dumps(owner))
+        assert restored.context_length == 8192
+        assert restored.pg.id == owner.pg.id
+        del restored
+        gc.collect()
+        remove_group.assert_not_called()
+        assert placement_group_table(owner.pg)["state"] == "CREATED"
+        assert owner.cluster is cluster
+    finally:
+        owner.shutdown()
+        cluster.shutdown()
+
+
+@pytest.mark.parametrize("configured_limit", [None, 1024])
+def test_context_length_is_resolved_at_startup(monkeypatch, configured_limit) -> None:
+    cfg = _make_sglang_generation_cfg()
+    cfg["sglang_cfg"]["context_length"] = configured_limit
+    cluster = MagicMock()
+    cluster.num_gpus_per_node = 2
+    cluster._init_placement_groups.return_value = [object()]
+    engines = [MagicMock(), MagicMock()]
+    for engine in engines:
+        engine.get_context_length.remote.return_value = 8192
+
+    def start_engines(generation, port_cursors):
+        generation.all_engines = engines
+        return [], {}
+
+    monkeypatch.setattr(SGLangGeneration, "_start_engines", start_engines)
+    monkeypatch.setattr(sglang_generation_module.ray, "get", lambda refs: refs)
+    monkeypatch.setattr(
+        sglang_generation_module, "get_reordered_bundle", lambda group: ([], [], [])
+    )
+    monkeypatch.setattr(
+        sglang_generation_module,
+        "_start_router",
+        lambda config: ("localhost", 3000, None),
+    )
+    lock = MagicMock()
+    lock.options.return_value.remote.return_value = None
+    monkeypatch.setattr(sglang_generation_module, "Lock", lock)
+
+    generation = SGLangGeneration(cluster, cfg)
+    try:
+        assert generation.context_length == (configured_limit or 8192)
+        assert cfg["sglang_cfg"]["context_length"] is configured_limit
+        for engine in engines:
+            assert engine.get_context_length.remote.call_count == int(
+                configured_limit is None
+            )
+    finally:
+        generation._owns_runtime = False
+        generation.shutdown()
 
 
 def test_pickle_copy_cannot_shutdown_driver_runtime(monkeypatch):

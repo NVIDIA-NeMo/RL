@@ -47,6 +47,36 @@ WAIT_TIMEOUT = 5.0
 STOP_JOIN_TIMEOUT = CHECK_TIMEOUT + CHECK_INTERVAL + 5
 
 
+def test_worker_reads_effective_context_length(monkeypatch) -> None:
+    worker = sglang_worker.SGLangGenerationWorker.__new__(
+        sglang_worker.SGLangGenerationWorker
+    )
+    worker.server_base_url = "http://engine:3001"
+    response = MagicMock()
+    response.json.return_value = {
+        "data": [{"max_model_len": 8192}, {"max_model_len": None}]
+    }
+    request = MagicMock(return_value=response)
+    monkeypatch.setattr(sglang_worker.requests, "get", request)
+
+    assert worker.get_context_length() == 8192
+    request.assert_called_once_with("http://engine:3001/v1/models", timeout=30)
+    response.raise_for_status.assert_called_once()
+
+
+@pytest.mark.parametrize("context_length", [None, 0, -1, True, "8192"])
+def test_worker_rejects_invalid_context_length(monkeypatch, context_length) -> None:
+    worker = sglang_worker.SGLangGenerationWorker.__new__(
+        sglang_worker.SGLangGenerationWorker
+    )
+    worker.server_base_url = "http://engine:3001"
+    response = MagicMock()
+    response.json.return_value = {"data": [{"max_model_len": context_length}]}
+    monkeypatch.setattr(sglang_worker.requests, "get", MagicMock(return_value=response))
+    with pytest.raises(ValueError, match="invalid model context length"):
+        worker.get_context_length()
+
+
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------

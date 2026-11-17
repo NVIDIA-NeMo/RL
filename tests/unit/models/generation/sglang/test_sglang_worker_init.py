@@ -77,6 +77,16 @@ def test_init_sets_base_url(worker):
     assert url.startswith("http://")
 
 
+def test_worker_exposes_effective_context_length(worker):
+    url = ray.get(worker.get_base_url.remote())
+    response = requests.get(f"{url}/v1/models", timeout=30)
+    response.raise_for_status()
+    assert (
+        ray.get(worker.get_context_length.remote())
+        == response.json()["data"][0]["max_model_len"]
+    )
+
+
 def test_init_registers_with_router(worker, router):
     """The worker registers itself with the session router on init."""
     worker_url = ray.get(worker.get_base_url.remote())

@@ -1767,7 +1767,8 @@ def test_nemo_gym_context_limit_uses_active_sglang_backend():
     )
 
 
-def test_nemo_gym_context_limit_falls_back_for_nullable_sglang_limit():
+@pytest.mark.parametrize("policy_max_seq_len", [1024, 16384, None])
+def test_nemo_gym_context_limit_uses_resolved_sglang_limit(policy_max_seq_len):
     policy_generation = type(
         "_PolicyGeneration",
         (),
@@ -1776,22 +1777,32 @@ def test_nemo_gym_context_limit_falls_back_for_nullable_sglang_limit():
                 "backend": "sglang",
                 "sglang_cfg": {"context_length": None},
                 "vllm_cfg": {"max_model_len": 1},
-            }
+            },
+            "context_length": 8192,
         },
     )()
 
     assert (
         rollouts_mod._resolve_generation_context_limit(
             policy_generation,
-            policy_max_seq_len=512,
+            policy_max_seq_len=policy_max_seq_len,
         )
-        == 512
+        == 8192
     )
-    with pytest.raises(ValueError, match="SGLang NeMo-Gym rollouts require"):
-        rollouts_mod._resolve_generation_context_limit(
-            policy_generation,
-            policy_max_seq_len=None,
-        )
+    assert not nemo_gym_rollout_hit_max_tokens(
+        {"response": {"status": "completed", "incomplete_details": None}},
+        total_tokens=2048,
+        max_total_tokens_per_sample=rollouts_mod._resolve_generation_context_limit(
+            policy_generation, policy_max_seq_len=policy_max_seq_len
+        ),
+    )
+    assert nemo_gym_rollout_hit_max_tokens(
+        {"response": {"status": "completed", "incomplete_details": None}},
+        total_tokens=8192,
+        max_total_tokens_per_sample=rollouts_mod._resolve_generation_context_limit(
+            policy_generation, policy_max_seq_len=policy_max_seq_len
+        ),
+    )
 
 
 def test_native_rollout_groups_match_whole_batch(monkeypatch):

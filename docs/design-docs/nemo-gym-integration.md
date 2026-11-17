@@ -50,6 +50,36 @@ The exposed vLLM HTTP server binds every interface of its node and, by default, 
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
+### SGLang with async GRPO
+
+The legacy async-GRPO entrypoint also supports SGLang-backed Gym rollouts. Start from a SGLang Megatron-refit configuration and apply the following overrides together with the Gym environment configuration above:
+
+```yaml
+grpo:
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: false
+
+loss_fn:
+  use_importance_sampling_correction: true
+
+policy:
+  generation:
+    backend: sglang
+    use_async_rollouts: true
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 1
+        gpus_per_node: 1
+```
+
+SGLang requires dedicated generation resources for this async entrypoint; size the training cluster and generation allocation separately for the model. Importance-sampling correction is required because rollout weights can lag training weights. Gym uses the stable SGLang router endpoint through the shared Gym actor factory, including sharded Gym deployments.
+
+Before every refit the collector drains outstanding trajectories, even if `in_flight_weight_updates` is enabled. Generation overlaps training between refits, but this does not provide request-preserving in-flight refits. See [async GRPO usage tips](../guides/async-grpo.md#usage-tips) for cache invalidation semantics. Validation leaves the dedicated generation engines resident so collection can resume without a separate wake.
+
+When `policy.generation.sglang_cfg.context_length` is null, Gym truncation checks use the effective context window reported by the running SGLang engines, not `policy.max_total_sequence_length`. An explicit context length still selects the engine limit.
+
 ### Multiple vLLM HTTP frontends
 
 Set `policy.generation.vllm_cfg.http_api_server_count` to run several HTTP frontend processes for each model-owner worker. They share one vLLM engine, its model weights, and one listening socket, so NeMo Gym keeps using the same URL. The count includes the owning worker's frontend: a value of `8` starts seven additional frontend processes.
