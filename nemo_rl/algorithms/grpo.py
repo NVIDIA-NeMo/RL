@@ -3459,6 +3459,19 @@ def validate_version_point_config(master_config: MasterConfig) -> None:
     fp4_cfg = megatron.get("fp4_cfg")
     if fp4_cfg is not None and fp4_cfg.enabled and fp4_cfg.fp4_param:
         problems.append("fp4_cfg.fp4_param=false (plain param buffers are required)")
+    quantized = (
+        fp8_cfg.get("enabled")
+        or (fp4_cfg is not None and fp4_cfg.enabled)
+        or policy.get("quant_cfg")
+        or (megatron.get("model_overrides") or {}).get("quant_recipe")
+    )
+    if (
+        async_cfg.version_point_per_token
+        and quantized
+        and megatron.get("gradient_accumulation_fusion")
+    ):
+        # TE's quantized first-microbatch flag overwrites main_grad on each version pass.
+        problems.append("gradient_accumulation_fusion=false for quantized tokenwise VPG")
     if async_cfg.max_trajectory_age_steps < 1:
         problems.append("max_trajectory_age_steps >= 1")
     if megatron.get("cuda_graph_impl") not in (None, "none"):

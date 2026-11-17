@@ -72,7 +72,9 @@ The Megatron extra’s `torch-memory-saver` dependency supplies stable KV pointe
 
 This mode requires text-only rollouts, token-level loss and importance ratios, CP=1, no sequence log-prob filtering or sequence-level IS masks, no KL-in-reward, and no positive-example NLL, MTP, draft, distillation or MoE auxiliary objectives. MoE token dropping, Sinkhorn routing and quantile-balancing routing are unsupported. The existing VPG requirements also apply. SingleController remains unsupported. A batch with an unknown token stamp or an evicted snapshot takes the ordinary IS path as a whole.
 
-Cost grows with the number of behavior versions. Prefix activations from different weights cannot be shared exactly; prefix truncation and row selection reduce redundant work, while sequence packing or dynamic batching can reduce padding. This option changes the training path and is disabled in the six published paper-reproduction arms.
+Quantized FP8/FP4 forwards require `policy.megatron_cfg.gradient_accumulation_fusion=false` so successive version passes accumulate their weight gradients.
+
+Cost grows with the number of behavior versions. Prefix activations from different weights cannot be shared exactly; prefix truncation and row selection reduce redundant work, while sequence packing or dynamic batching can reduce padding. The live current version uses its existing weights directly, avoiding a snapshot swap. This option changes the training path and is disabled in the six published paper-reproduction arms.
 
 Snapshots are saved with every checkpoint under `<checkpoint>/policy/version_snapshots/` and restored on resume, so a resumed run keeps computing every buffered batch's gradient at its generation weights.
 
@@ -99,7 +101,7 @@ Each trainer rank keeps `L + 1` snapshots of its distributed-optimizer shard of 
 - **Host (pinned) memory per rank:** `(L + 1) × 2 bytes × P_rank / DP`, where `P_rank` is the number of parameters on the rank after tensor/expert parallelism and `DP` is the data-parallel size. For Qwen3-8B with 2 trainer ranks (DP 2), one version is 8.2 GB per rank, so `L = 8` needs 74 GB per rank (148 GB per node).
 - **GPU memory:** one extra copy of the rank's shard (8.2 GB for the 8B example) during the forward/backward pass.
 - **Checkpoint size:** the same `(L + 1)` shards per rank are written to every checkpoint (148 GB for the 8B example at `L = 8`).
-- **Time:** one snapshot (device-to-host copy of the shard) per step and two all-gathers of the parameters per training step. The trainer skips its log-prob pass at the current weights.
+- **Time:** one snapshot (device-to-host copy of the shard) per step. Each replayed version synchronizes current parameters, gathers the behavior weights, and gathers the restored current weights. A tokenwise pass at the live current version skips these swaps. The trainer skips its separate log-prob pass at the current weights.
 
 ## Reproduce a Result
 

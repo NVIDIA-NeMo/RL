@@ -559,6 +559,27 @@ def _tokenwise_config():
     return config
 
 
+@pytest.mark.parametrize("precision", ["bf16", "fp8", "fp4", "recipe"])
+@pytest.mark.parametrize("fused_wgrad", [False, True])
+def test_quantized_tokenwise_passes_reject_fused_gradient_overwrite(
+    precision, fused_wgrad
+):
+    config = _tokenwise_config()
+    megatron = config.policy["megatron_cfg"]
+    megatron["gradient_accumulation_fusion"] = fused_wgrad
+    if precision == "fp8":
+        megatron["fp8_cfg"].update(enabled=True, fp8_param=False)
+    elif precision == "fp4":
+        megatron["fp4_cfg"] = Fp4Config(enabled=True, fp4_param=False)
+    elif precision == "recipe":
+        config.policy["quant_cfg"] = "quantization.yaml"
+    if precision != "bf16" and fused_wgrad:
+        with pytest.raises(ValueError, match="gradient_accumulation_fusion=false"):
+            validate_version_point_config(config)
+    else:
+        validate_version_point_config(config)
+
+
 def test_tokenwise_config_requires_consistent_behavior_context():
     validate_version_point_config(_tokenwise_config())
     mutations = [
