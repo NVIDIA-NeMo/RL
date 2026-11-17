@@ -9,6 +9,13 @@ defaults: legacy_environment_servers/super_rlvr.yaml
 env:
   should_use_nemo_gym: true
   nemo_gym:
+    # code_gen requires sandbox_config.image, and the dry run validates it. The dry run starts no
+    # sandbox, so any string works here.
+    code_gen:
+      resources_servers:
+        code_gen:
+          sandbox_config:
+            image: prefetch-placeholder
     swe_pivot_single_step_tool_use_with_argument_comparison_environment_server:
       environment_servers:
         _delete_key: single_agent_turn_legacy
