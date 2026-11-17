@@ -15,9 +15,11 @@
 
 import asyncio
 import hashlib
+import json
+import logging
 import sys
 from types import ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from transformers import AutoTokenizer
@@ -25,10 +27,13 @@ from transformers import AutoTokenizer
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
 from nemo_rl.models.generation.vllm.tito import (
     QWEN3_TEMPLATE_SHA256,
-    CapturedQwen3Renderer,
+    CapturedTitoRenderer,
+    Qwen3IncrementalTokenizer,
     TitoNotApplicable,
-    preprocess_captured_qwen3,
+    TitoTrace,
+    preprocess_captured_tito,
     qwen3_suffix_text,
+    resolve_captured_continuation,
 )
 
 
@@ -160,7 +165,9 @@ def make_adapter(tokenizer, *, prefix, template=None):
         render_cmpl_async=AsyncMock(side_effect=prepare),
     )
     worker = SimpleNamespace(_resolve_admission_prefix=lambda a: list(prefix))
-    adapter = CapturedQwen3Renderer(renderer, worker, admission)
+    adapter = CapturedTitoRenderer(
+        renderer, worker, admission, Qwen3IncrementalTokenizer(), TitoTrace()
+    )
     params = SimpleNamespace(
         chat_template=template,
         chat_template_kwargs={},
@@ -201,9 +208,9 @@ def test_capture_adapter_encodes_only_suffix(tokenizer, parser_stub, monkeypatch
     assert encoded == [qwen3_suffix_text(messages[-1:], enable_thinking=False)]
     assert prompts[0]["prompt_token_ids"][: len(prefix)] == prefix
     assert conversation[0] == messages
-    assert adapter.decision.storage.mode == "token_in"
-    assert adapter.decision.storage.parent_call_id == "first"
-    assert adapter.prefix_token_ids == prefix
+    assert adapter.continuation.decision.storage.mode == "token_in"
+    assert adapter.continuation.decision.storage.parent_call_id == "first"
+    assert adapter.continuation.prefix_token_ids == prefix
 
 
 @pytest.mark.parametrize(
@@ -309,7 +316,8 @@ def online_stub(monkeypatch, parser_stub):
 
 def run_preprocess(state, messages=None):
     return asyncio.run(
-        preprocess_captured_qwen3(
+        preprocess_captured_tito(
+            model="qwen3",
             worker=state.worker,
             online_renderer=state.online_renderer,
             request=state.request,
@@ -342,7 +350,7 @@ def run_preprocess(state, messages=None):
 )
 def test_preprocess_leaves_unsupported_requests_to_native(online_stub, option, value):
     setattr(online_stub.request, option, value)
-    assert run_preprocess(online_stub) is None
+    assert run_preprocess(online_stub).continuation is None
     online_stub.native.assert_not_called()
     assert getattr(online_stub.request, option) == value
 
@@ -359,9 +367,9 @@ def test_preprocess_requires_qualified_capture(online_stub, case):
         online_stub.online_renderer.model_config.enable_prompt_embeds = True
     elif case == "root":
         online_stub.worker._capture_admission = lambda request: SimpleNamespace(
-            mode="text"
+            mode="text", root_reason="first_call"
         )
-    assert run_preprocess(online_stub) is None
+    assert run_preprocess(online_stub).continuation is None
     online_stub.native.assert_not_called()
 
 
@@ -395,11 +403,11 @@ def test_preprocess_is_request_local(tokenizer, online_stub, outcome):
 
         online_stub.worker._resolve_admission_prefix = broken
 
-    async def native(local, request, native_messages, **kwargs):
+    async def native(local, request, messages, **kwargs):
         assert local is not online_stub.online_renderer
-        assert isinstance(local.renderer, CapturedQwen3Renderer)
+        assert isinstance(local.renderer, CapturedTitoRenderer)
         return await local.renderer.render_chat_async(
-            [native_messages], params, object(), prompt_extras={}, skip_mm_cache=False
+            [messages], params, object(), prompt_extras={}, skip_mm_cache=False
         )
 
     online_stub.native.side_effect = native
@@ -409,10 +417,10 @@ def test_preprocess_is_request_local(tokenizer, online_stub, outcome):
     else:
         result = run_preprocess(online_stub, messages)
         if outcome == "fallback":
-            assert result is None
+            assert result.continuation is None
             renderer.render_cmpl_async.assert_not_called()
         else:
-            native_result, captured = result
+            native_result, captured = result.preprocessed, result.continuation
             assert native_result[1][0]["prompt_token_ids"][:2] == [
                 42,
                 tokenizer.eos_token_id,
@@ -423,7 +431,8 @@ def test_preprocess_is_request_local(tokenizer, online_stub, outcome):
 
 
 @pytest.mark.nemo_gym
-def test_incremental_swe_tokens_round_trip_through_gym_capture(tokenizer):
+@pytest.mark.parametrize("retry", [False, True])
+def test_incremental_swe_tokens_round_trip_through_gym_capture(tokenizer, retry):
     from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
     from nemo_gym.token_id_capture.staging.rebuild import verify_and_linearize
     from nemo_gym.token_id_capture.staging.records import (
@@ -484,6 +493,35 @@ def test_incremental_swe_tokens_round_trip_through_gym_capture(tokenizer):
         generated_token_ids=answer,
         generated_logprobs=[-0.5] * len(answer),
     )
+    terminal = "second"
+    if retry:
+        terminal = "retry"
+        suffix = Qwen3IncrementalTokenizer().encode_suffix(
+            tokenizer,
+            [{"role": "tool", "content": "different test result"}],
+            enable_thinking=False,
+        )
+        answer = tokenizer.encode(
+            "Try another fix.<|im_end|>", add_special_tokens=False
+        )
+        retried = capture.begin_call(
+            CaptureAdmission(
+                capture_key="swe",
+                model_call_id=terminal,
+                mode="token_in",
+                parent_call_id="first",
+                prev_len=len(prefix),
+                parent_chain_hash=coords.chain_hash,
+                required_prefix_token_ids=prefix,
+            ),
+            prefix_token_ids=prefix,
+        )
+        capture.complete_call(
+            retried,
+            prompt_token_ids=prefix + suffix,
+            generated_token_ids=answer,
+            generated_logprobs=[-0.5] * len(answer),
+        )
     snapshots, manifest = [], []
     for record in sink.records:
         payload = record.model_dump()
@@ -510,7 +548,7 @@ def test_incremental_swe_tokens_round_trip_through_gym_capture(tokenizer):
     row = verify_and_linearize(
         RolloutReceipt(
             capture_key="swe",
-            terminal_model_call_id="second",
+            terminal_model_call_id=terminal,
             manifest=manifest,
             terminal_selection="declared",
         ),
@@ -524,4 +562,216 @@ def test_incremental_swe_tokens_round_trip_through_gym_capture(tokenizer):
         suffix
     ) + [-0.5] * len(answer)
     assert row.prompt_len == len(prompt)
-    assert row.model_call_ids == ["first", "second"]
+    assert row.model_call_ids == ["first", terminal]
+
+
+@pytest.mark.parametrize(
+    "reason,outcome",
+    [
+        ("first_call", "initial"),
+        ("ambiguous_candidate", "no_history"),
+        ("no_prefix_match", "no_history"),
+    ],
+)
+def test_preprocess_reports_history_outcome(online_stub, caplog, reason, outcome):
+    online_stub.worker._capture_admission = lambda request: SimpleNamespace(
+        mode="text", root_reason=reason
+    )
+    with caplog.at_level(logging.DEBUG, logger="nemo_rl.models.generation.vllm.tito"):
+        result = run_preprocess(online_stub)
+    assert result.preprocessed is None and result.continuation is None
+    event = json.loads(caplog.records[-1].getMessage().removeprefix("Captured TITO "))
+    assert event["outcome"] == outcome
+    assert event["reason"] == reason
+    assert event["reused_tokens"] == event["suffix_tokens"] == 0
+    online_stub.native.assert_not_called()
+
+
+@pytest.mark.nemo_gym
+def test_continuation_rejects_changed_boundary_before_read(tokenizer):
+    adapter, _, messages = make_adapter(tokenizer, prefix=[42, tokenizer.eos_token_id])
+    messages[-2]["role"] = "user"
+    read = Mock()
+    with pytest.raises(TitoNotApplicable, match="unverified_boundary"):
+        asyncio.run(
+            resolve_captured_continuation(
+                adapter.admission,
+                messages=messages,
+                conversation=messages,
+                resolve_prefix=read,
+            )
+        )
+    read.assert_not_called()
+
+
+@pytest.mark.nemo_gym
+def test_continuation_rejects_truncated_storage(tokenizer, parser_stub):
+    adapter, params, messages = make_adapter(
+        tokenizer, prefix=[42, tokenizer.eos_token_id]
+    )
+    adapter.worker._resolve_admission_prefix = Mock(
+        return_value=[tokenizer.eos_token_id]
+    )
+    with pytest.raises(ValueError, match="prefix length"):
+        asyncio.run(
+            adapter.render_chat_async(
+                [messages], params, object(), prompt_extras={}, skip_mm_cache=False
+            )
+        )
+    adapter.renderer.render_cmpl_async.assert_not_called()
+
+
+@pytest.mark.nemo_gym
+def test_continuation_reads_once_and_retains_request_owned_prefix(
+    tokenizer, parser_stub
+):
+    prefix = [42, tokenizer.eos_token_id]
+    adapter, params, messages = make_adapter(tokenizer, prefix=prefix)
+    read = Mock(return_value=prefix)
+    adapter.worker._resolve_admission_prefix = read
+    _, prompts = asyncio.run(
+        adapter.render_chat_async(
+            [messages], params, object(), prompt_extras={}, skip_mm_cache=False
+        )
+    )
+    read.assert_called_once()
+    assert adapter.continuation.prefix_token_ids is prefix
+    assert adapter.trace.reused_tokens == 2
+    assert adapter.trace.suffix_tokens == len(prompts[0]["prompt_token_ids"]) - 2
+    prompts[0]["prompt_token_ids"][0] = 99
+    assert prefix == [42, tokenizer.eos_token_id]
+
+
+@pytest.mark.nemo_gym
+@pytest.mark.parametrize(
+    "scenario", ["latest", "retry", "fork", "ambiguous", "rewrite"]
+)
+def test_gym_history_selection_reaches_incremental_renderer(
+    tokenizer, parser_stub, scenario
+):
+    from nemo_gym.token_id_capture.external_capture import VLLMWorkerCaptureHandler
+    from nemo_gym.token_id_capture.lineage import InMemoryLineageStore
+    from nemo_gym.token_id_capture.replay import (
+        render_options_digest,
+        replay_context,
+        summarize_replay,
+    )
+    from nemo_gym.token_id_capture.sink import (
+        CaptureContext,
+        reset_token_sink,
+        resolve_parent,
+        set_token_sink,
+    )
+    from nemo_gym.token_id_capture.staging.records import CallRecord, RolloutManifest
+
+    first = [
+        {"role": "user", "content": "fix bug"},
+        {"role": "assistant", "content": "run tests"},
+    ]
+    later = first + [
+        {"role": "tool", "content": "failed"},
+        {"role": "assistant", "content": "inspect file"},
+    ]
+    messages = (later if scenario == "latest" else first) + [
+        {"role": "tool", "content": "new result"}
+    ]
+    if scenario == "rewrite":
+        messages = [{"role": "user", "content": "compacted summary"}]
+    payload = {"model": "Qwen/Qwen3-0.6B", "messages": messages}
+    digest = render_options_digest(payload)
+    prefixes = {
+        "first": [41, tokenizer.eos_token_id],
+        "later": [41, tokenizer.eos_token_id, 43, tokenizer.eos_token_id],
+    }
+
+    def record(call_id, history):
+        prefix = prefixes[call_id]
+        return CallRecord(
+            model_call_id=call_id,
+            prev_len=0,
+            delta_len=len(prefix),
+            cum_len=len(prefix),
+            weight_version=0,
+            digest="a" * 64,
+            extras_digest="b" * 64,
+            staging_key=call_id,
+            mode="text",
+            chain_hash="c" * 64,
+            cumulative_hash="d" * 64,
+            response_id="response-" + call_id,
+            replay=summarize_replay(replay_context(history, render_digest=digest)),
+        )
+
+    records = [
+        record("first", first),
+        record("later", first if scenario == "ambiguous" else later),
+    ]
+    ledger = InMemoryLineageStore()
+    ledger.manifest = AsyncMock(
+        return_value=RolloutManifest(capture_key="swe", records=records).model_dump()
+    )
+    context = CaptureContext(
+        capture_key="swe",
+        model_call_id="next",
+        token_sink=None,
+        lineage_store=ledger,
+        external_staging=True,
+        parent_resolution_mode="source_history",
+    )
+
+    async def run():
+        token = set_token_sink(context)
+        try:
+            await resolve_parent(messages)
+            VLLMWorkerCaptureHandler().prepare_request(payload)
+        finally:
+            reset_token_sink(token)
+        admission = context.capture_admission
+        if scenario in ("ambiguous", "rewrite"):
+            assert admission.mode == "text"
+            assert admission.root_reason == (
+                "ambiguous_candidate" if scenario == "ambiguous" else "no_prefix_match"
+            )
+            return
+        parent = "later" if scenario == "latest" else "first"
+        assert admission.parent_call_id == parent
+        adapter, params, _ = make_adapter(tokenizer, prefix=prefixes[parent])
+        adapter.admission = admission
+        read = Mock(side_effect=lambda selected: prefixes[selected.parent_call_id])
+        adapter.worker._resolve_admission_prefix = read
+        _, prompts = await adapter.render_chat_async(
+            [messages], params, object(), prompt_extras={}, skip_mm_cache=False
+        )
+        assert (
+            prompts[0]["prompt_token_ids"][: len(prefixes[parent])] == prefixes[parent]
+        )
+        assert adapter.continuation.decision.storage.parent_call_id == parent
+        read.assert_called_once()
+        if scenario == "fork":
+            branch_messages = messages[:-1] + [
+                {"role": "user", "content": "try another approach"}
+            ]
+            branch_admission = admission.model_copy(
+                update={
+                    "model_call_id": "branch",
+                    "request_replay": replay_context(
+                        branch_messages, render_digest=digest
+                    ),
+                }
+            )
+            branch, _, _ = make_adapter(tokenizer, prefix=prefixes[parent])
+            branch.admission = branch_admission
+            _, other = await branch.render_chat_async(
+                [branch_messages],
+                params,
+                object(),
+                prompt_extras={},
+                skip_mm_cache=False,
+            )
+            assert (
+                other[0]["prompt_token_ids"][: len(prefixes[parent])]
+                == prefixes[parent]
+            )
+            assert other[0]["prompt_token_ids"] != prompts[0]["prompt_token_ids"]
+
+    asyncio.run(run())

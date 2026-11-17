@@ -1758,13 +1758,14 @@ class VllmAsyncGenerationWorkerImpl(
                 if single_tool_call:
                     request.parallel_tool_calls = None
                 try:
-                    if worker_self.cfg["vllm_cfg"].get("tito_model") == "qwen3":
+                    if worker_self.cfg["vllm_cfg"].get("tito_model") is not None:
                         # Optional path: preserve the native renderer when disabled.
                         from nemo_rl.models.generation.vllm.tito import (
-                            preprocess_captured_qwen3,
+                            preprocess_captured_tito,
                         )
 
-                        incremental = await preprocess_captured_qwen3(
+                        incremental = await preprocess_captured_tito(
+                            model=worker_self.cfg["vllm_cfg"]["tito_model"],
                             worker=worker_self,
                             online_renderer=self,
                             request=request,
@@ -1776,8 +1777,9 @@ class VllmAsyncGenerationWorkerImpl(
                             parser=parser,
                             skip_mm_cache=skip_mm_cache,
                         )
-                        if incremental is not None:
-                            res, adapter = incremental
+                        if incremental.continuation is not None:
+                            res = incremental.preprocessed
+                            continuation = incremental.continuation
                             prompt_ids = res[1][0]["prompt_token_ids"]
                             if actual_request_max_tokens is not None:
                                 self._clamp_max_tokens(
@@ -1786,17 +1788,17 @@ class VllmAsyncGenerationWorkerImpl(
                             media = await asyncio.to_thread(
                                 worker_self._capture_request_media,
                                 res[1][0],
-                                admission=adapter.decision.serving,
-                                verify_retained_media=adapter.decision.verify_retained_media,
+                                admission=continuation.decision.serving,
+                                verify_retained_media=continuation.decision.verify_retained_media,
                             )
                             worker_self._enter_request_prefix(
-                                request, adapter.prefix_token_ids
+                                request, continuation.prefix_token_ids
                             )
                             worker_self._begin_request_capture(
                                 request,
                                 prompt_ids,
-                                admission=adapter.decision.storage,
-                                prefix_token_ids=adapter.prefix_token_ids,
+                                admission=continuation.decision.storage,
+                                prefix_token_ids=continuation.prefix_token_ids,
                                 media=media,
                             )
                             return res

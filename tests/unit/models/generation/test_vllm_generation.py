@@ -5724,9 +5724,11 @@ async def test_captured_tito_preserves_worker_capture_lifecycle(
         ),
     )
     helper = AsyncMock(
-        return_value=(incremental_result, adapter) if mode == "incremental" else None
+        return_value=tito.TitoPreprocessResult(incremental_result, adapter)
+        if mode == "incremental"
+        else tito.TitoPreprocessResult(None, None)
     )
-    monkeypatch.setattr(tito, "preprocess_captured_qwen3", helper)
+    monkeypatch.setattr(tito, "preprocess_captured_tito", helper)
     native = AsyncMock(return_value=native_result)
     monkeypatch.setattr(
         sys.modules["vllm.renderers.online_renderer"].OnlineRenderer,
@@ -5740,7 +5742,11 @@ async def test_captured_tito_preserves_worker_capture_lifecycle(
 
     async def check_tool_sampling(*args, **kwargs):
         assert request.parallel_tool_calls is not False
-        return (incremental_result, adapter) if mode == "incremental" else None
+        return (
+            tito.TitoPreprocessResult(incremental_result, adapter)
+            if mode == "incremental"
+            else tito.TitoPreprocessResult(None, None)
+        )
 
     helper.side_effect = check_tool_sampling
     result = await online.preprocess_chat(

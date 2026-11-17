@@ -1,6 +1,6 @@
 # Captured TITO
 
-Captured TITO reuses Gym's source-history matching and NeMo RL's exact token capture to construct subsequent model inputs from a stored prefix plus newly encoded observations. The initial implementation supports the official Qwen3-0.6B chat template on native async vLLM 0.33.0. It renders only appended user/tool messages, including grouped tool responses and the assistant opener. It preserves captured reasoning and tool-call tokens even when the harness's text representation differs.
+Captured TITO reuses Gym's source-history matching and NeMo RL's exact token capture to construct subsequent model inputs from a stored prefix plus newly encoded observations. The qualified model adapter supports the official Qwen3-0.6B chat template on native async vLLM 0.33.0. It renders only appended user/tool messages, including grouped tool responses and the assistant opener. It preserves captured reasoning and tool-call tokens even when the harness's text representation differs.
 
 ## Configuration
 
@@ -21,6 +21,39 @@ Gym continues to own history matching, identities, render-option compatibility a
 Successful continuations record exactly the prompt submitted to the engine with the original `token_in` parent and prefix. The synthetic newline and user/tool observations are conditioning context with zero loss and zero action logprob. Generated spans retain their sampled logprobs and loss masks. Existing capture finalization selects returned-history calls, reconstructs training rows and counts shared generated ancestors once. This change introduces no new receipt schema, reward policy or training-row format.
 
 The default path is unchanged. Cross-session history matching, a new matcher, a new capture transport and broader model/template support are outside this initial implementation. Miles provides the reference behavior (checkpoint reuse plus model-specific incremental suffix construction); existing NeMo RL/Gym mechanisms supply checkpoint selection and training ownership. This overlaps with PR #3581, but uses capture-selected prefixes and a qualified local template adapter rather than echoed token metadata and full marked-history rendering.
+
+## History reuse and model adapters
+
+`resolve_captured_continuation` is the internal history-reuse entry point. It consumes Gym's selected candidate, checks the converted-message boundary, reads the selected original prefix once and returns a `CapturedContinuation`. The worker uses that same continuation for input construction and capture registration. Selection can point to an older accepted call after a retry or to the common parent of sibling branches; it is not limited to the most recent call. Ambiguous or rewritten histories retain Gym's new-root behavior.
+
+`IncrementalTokenizer` separates template qualification, generation-boundary validation and suffix encoding from capture ownership. `Qwen3IncrementalTokenizer` is the registered adapter for `qwen3`. Its template digest cache is bounded and keyed by the actual effective template text, so request-local overrides are still qualified independently. Adding a model requires implementing and validating its boundary rules; sharing a model family name does not qualify a custom template.
+
+The prefix resolver returns a request-owned list. TITO retains it for capture and concatenates it with new suffix IDs once, avoiding additional full-prefix copies in the adapter. Existing storage/cache behavior is unchanged. Native message parsing still processes the full conversation, and unsupported requests still use the existing preprocessing path.
+
+## Observing incremental use
+
+Enable DEBUG logging for `nemo_rl.models.generation.vllm.tito` to collect one `Captured TITO {JSON}` event per completed preprocessing attempt. Events contain counts and durations, never prompt text or token IDs.
+
+| Outcome | Meaning |
+| --- | --- |
+| `initial` | Gym identified the first call; native preprocessing establishes the root. |
+| `incremental` | A verified parent was reused and the suffix was encoded incrementally. |
+| `no_history` | No candidate was available, including ambiguous or rewritten histories. |
+| `fallback` | The request, template, generation boundary or converted messages could not use incremental preprocessing. |
+
+`reason` identifies the cause, such as `unqualified_template`, `unfinished_generation`, `unverified_boundary`, `stream`, `prompt_truncation` or Gym's `ambiguous_candidate`. `reused_tokens` and `suffix_tokens` report successful construction. `history_seconds`, `suffix_seconds` and `prepare_seconds` measure the completed history-resolution, suffix-encoding and engine-input-preparation stages; they include executor wait when applicable. `total_seconds` covers this preprocessing attempt, including native message parsing. It excludes later native fallback work, capture finalization, GPU generation and sandbox execution. Invalid evidence and storage failures raise rather than producing a successful fallback event.
+
+## Component benchmark
+
+Compare qualified suffix construction against full-history rendering, encoding and capture prefix splice with the same tokenizer and input tokens:
+
+```bash
+uv run python tools/benchmark_captured_tito.py \
+  --model Qwen/Qwen3-0.6B --history-repeats 64 512 2048 \
+  --iterations 30 --output /tmp/captured-tito-cpu.json
+```
+
+The benchmark verifies token equality, warms both paths, alternates their measurement order and writes individual timing samples. It measures CPU input construction only: source-history matching, prefix storage reads, native message parsing, GPU generation and SWE execution are excluded. Use it to isolate the rendering/encoding contribution, not to claim end-to-end throughput. For rollout comparisons, keep capture/forest enabled in both runs, use `tito_model=null` as the control, and hold model, hardware, concurrency and engine caching settings constant. Report continuation hit/fallback rates alongside throughput and training-data compatibility.
 
 ## SWE compatibility smoke
 
@@ -50,7 +83,7 @@ Use `examples/nemo_gym/grpo_qwen3_0_6b_swe_tito.yaml`: Qwen/Qwen3-0.6B, one lear
      data.validation.data_path=/path/to/swe_tito_smoke.jsonl
    ```
 
-Confirm that the worker logs `Captured Qwen3 TITO reused ... prefix tokens`; a successful rollout alone may have used the native fallback. Inspect accepted multi-turn calls, actual prompt IDs, reconstructed masks/logprobs and the resulting training batch. If the model produces no tool calls, the run has not exercised incremental TITO. Compare against the same recipe with `policy.generation.vllm_cfg.tito_model=null`. Ensure at least one matched continuation before drawing any compatibility or performance conclusion.
+Confirm that the worker logs a `Captured TITO` event with `outcome=incremental`; a successful rollout alone may have used the native fallback. Inspect accepted multi-turn calls, actual prompt IDs, reconstructed masks/logprobs and the resulting training batch. If the model produces no tool calls, the run has not exercised incremental TITO. Compare against the same recipe with `policy.generation.vllm_cfg.tito_model=null`. Ensure at least one matched continuation before drawing any compatibility or performance conclusion.
 
 ## Validation scope
 
