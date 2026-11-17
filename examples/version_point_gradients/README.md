@@ -1,6 +1,6 @@
 # Version-point gradients: precision and lag comparisons
 
-These scripts reproduce the setup of the Qwen3-30B-A3B-Base async GRPO comparison on DAPOMath17K, with AIME 2024 validation. Ordinary BF16 and NVFP4 arms use 32 Blackwell GPUs (16 trainer and 16 rollout). BF16 VPG controls use 20 GPUs (4 trainer and 16 rollout), with full activation recomputation to fit the smaller trainer group. They contain no scheduler accounts, internal hosts, or shared filesystem paths.
+These scripts reproduce the setup of the Qwen3-30B-A3B-Base async GRPO comparison on DAPOMath17K, with AIME 2024 validation. Ordinary BF16 and NVFP4 arms use 32 Blackwell GPUs (16 trainer and 16 rollout). BF16 VPG controls use 24 GPUs (8 trainer and 16 rollout), with full activation recomputation to fit the smaller trainer group. They contain no scheduler accounts, internal hosts, or shared filesystem paths.
 
 | Script | Expert forward | Maximum trajectory age | VPG | Batch invariant |
 | --- | --- | ---: | --- | --- |
@@ -23,7 +23,7 @@ The original BF16 versus NVFP4 comparison changes precision, VPG, and batch inva
 
 For BF16 VPG, apply `patches/megatron-native-te-bf16.patch` after the optimizer patch, using a separate Megatron checkout. The native TE grouped-GEMM adapter is qualified on SM100 with cuBLASLt 13.5.1 and rejects other hardware/library combinations. Add the selected Megatron checkout and Bridge `src/` to `PYTHONPATH`. Runtime fields without a first-class NeMo-RL key use `model_overrides`, with the matched-expert training mode explicitly disabled on generation. The high-level inference selector is named `torch`; `batch_invariant_backend=te_native` directs its GEMMs through TE.
 
-Allocate five nodes for a BF16 VPG control or eight nodes for another arm, with four GPUs per node. Start a separate Ray cluster for each experiment:
+Allocate six nodes for a BF16 VPG control or eight nodes for another arm, with four GPUs per node. Start a separate Ray cluster for each experiment:
 
 ```bash
 # Head node:

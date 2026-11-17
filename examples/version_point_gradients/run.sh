@@ -15,8 +15,8 @@ shift
 NODES=8
 case "$ARM" in
     bf16_lag1) RECIPE=bf16-baseline-lag1; MODE=baseline; LAG=1; GATE_STEPS=5 ;;
-    bf16_vpg_lag1) RECIPE=bf16-vpg-lag1; NODES=5; MODE=vpg; LAG=1; GATE_STEPS=5 ;;
-    bf16_vpg_lag4) RECIPE=bf16-vpg-lag4; NODES=5; MODE=vpg; LAG=4; GATE_STEPS=6 ;;
+    bf16_vpg_lag1) RECIPE=bf16-vpg-lag1; NODES=6; MODE=vpg; LAG=1; GATE_STEPS=5 ;;
+    bf16_vpg_lag4) RECIPE=bf16-vpg-lag4; NODES=6; MODE=vpg; LAG=4; GATE_STEPS=6 ;;
     bf16_lag4) RECIPE=bf16-baseline-lag4; MODE=baseline; LAG=4; GATE_STEPS=5 ;;
     nvfp4_vpg_lag1) RECIPE=nvfp4-vpg-lag1; MODE=vpg; LAG=1; GATE_STEPS=5 ;;
     nvfp4_vpg_lag4) RECIPE=nvfp4-vpg-lag4; MODE=vpg; LAG=4; GATE_STEPS=6 ;;

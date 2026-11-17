@@ -80,25 +80,25 @@
       "gpus": 32
     },
     "bf16_vpg_lag1": {
-      "original_commit": "24a5054ceb533368b22ddb47bf4ac2859c64f7fd",
+      "original_commit": "62bb73f92d2d866eaf68d161c6659b6cb7ee406d",
       "lag": 1,
       "batch_invariant": true,
       "vpg": true,
-      "nodes": 5,
-      "training_nodes": 1,
+      "nodes": 6,
+      "training_nodes": 2,
       "generation_nodes": 4,
-      "gpus": 20,
+      "gpus": 24,
       "activation_recompute": "full, uniform, one layer"
     },
     "bf16_vpg_lag4": {
-      "original_commit": "8409436b7d8afebbe8de70f253a44d6b42bd3b6c",
+      "original_commit": "c54917d9d9476658ab5a003f2e99ca80d5b1b5a2",
       "lag": 4,
       "batch_invariant": true,
       "vpg": true,
-      "nodes": 5,
-      "training_nodes": 1,
+      "nodes": 6,
+      "training_nodes": 2,
       "generation_nodes": 4,
-      "gpus": 20,
+      "gpus": 24,
       "activation_recompute": "full, uniform, one layer"
     }
   },
@@ -107,6 +107,6 @@
     "Study-only rho probes and paper2 diagnostics are excluded. Recipes preserve the training objective and sampling settings; numerical equivalence of this current-main port needs the startup gates.",
     "BF16 VPG controls enable bias_activation_fusion to match inference SwiGLU rounding.",
     "Megatron runtime fields without a first-class NeMo-RL key use the existing model_overrides passthrough; generation explicitly disables the training-only matched-expert mode.",
-    "BF16 VPG controls use 4 trainer GPUs and 16 rollout GPUs, with full activation recomputation; the 32-GPU study arms use 16 trainers, so FP32 gradient reduction order differs."
+    "BF16 VPG controls use 8 trainer GPUs and 16 rollout GPUs, with full activation recomputation; the 32-GPU study arms use 16 trainers, so FP32 gradient reduction order differs."
   ]
 }

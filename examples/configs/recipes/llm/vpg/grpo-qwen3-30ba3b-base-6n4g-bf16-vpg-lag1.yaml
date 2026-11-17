@@ -19,4 +19,4 @@ policy:
       model_overrides:
         inference_moe_nvfp4_recipe: null
 cluster:
-  num_nodes: 5
+  num_nodes: 6
