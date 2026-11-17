@@ -1490,14 +1490,14 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     # infrastructure failure from a policy-caused mask (exclude_infra).
     assert failure_kinds == ["verifier_error", None]
 
-    # A version-5 ledger predates failure_kind and still loads, without one.
-    v5_state = copy.deepcopy(state)
-    v5_state["schema_version"] = 5
-    for group in v5_state["groups"]:
+    # A version-8 ledger predates failure_kind and still loads, without one.
+    v8_state = copy.deepcopy(state)
+    v8_state["schema_version"] = 8
+    for group in v8_state["groups"]:
         for sibling in group["siblings"]:
             for attempt in sibling["attempts"]:
                 del attempt["failure_kind"]
-    assert RolloutRecoveryLedger.from_state_dict(v5_state).finalization_inputs("g7")[
+    assert RolloutRecoveryLedger.from_state_dict(v8_state).finalization_inputs("g7")[
         7
     ] == [None, None]
 
