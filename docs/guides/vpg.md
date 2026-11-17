@@ -89,4 +89,4 @@ HF_HUB_OFFLINE=0 uv run examples/run_grpo.py \
   logger.log_dir=results/is_l8/logs checkpointing.checkpoint_dir=results/is_l8/ckpt
 ```
 
-For the six-arm Qwen3-30B-A3B BF16/NVFP4 comparison, including runtime provenance, startup gates, and portable launch scripts, see [the reproduction folder](../../examples/version_point_gradients/README.md). The 8B example above is a smaller, separate configuration.
+For the six-arm Qwen3-30B-A3B BF16/NVFP4 comparison, including runtime provenance, startup gates, and portable launch scripts, see [the reproduction folder](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/version_point_gradients). The 8B example above is a smaller, separate configuration.
