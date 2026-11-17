@@ -19,8 +19,9 @@ uv.lock pins one version (or one git commit) per package across the WHOLE
 project -- every extra, installed in this build or not. uv's cache is
 append-only: `uv sync` downloads what a build needs and never removes a version
 an older lockfile pinned. The CI seed persists the cache across builds for as
-long as BASE_IMAGE/UV_VERSION/HYBRID_EP_MULTINODE are unchanged (see the
-dependency-install RUN in docker/Dockerfile), so every dependency bump would
+long as BASE_IMAGE/UV_VERSION/HYBRID_EP_MULTINODE and the GPU-type build args are
+unchanged (see the dependency-install RUN in docker/Dockerfile), so every
+dependency bump would
 otherwise leave its predecessor in the seed and in every shipped image.
 `uv cache prune` does not help: it removes stale cache-format buckets, cached
 environments and unlinked archives, never a valid entry for an older version.
