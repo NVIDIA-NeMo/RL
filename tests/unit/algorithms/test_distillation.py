@@ -1307,7 +1307,7 @@ def test_real_quant_distillation_setup_builds_vllm_from_student_config(monkeypat
             ),
             "data": {"shuffle": False},
             "logger": {},
-            "checkpointing": {},
+            "checkpointing": CheckpointingConfig.model_construct(),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
         }
     )
