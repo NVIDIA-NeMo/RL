@@ -380,9 +380,12 @@ _REWARD_PENALTY_FLAGS = (
 )
 
 
-# Gym failure kinds (nemo_gym/failure_kinds.py) that the policy causes: it ran
-# out of time or of its turn, token or context budget, issued a command the
-# harness refuses, or produced output the harness cannot use.
+# Gym failure kinds that the policy causes: it ran out of time or of its turn,
+# token or context budget, issued a command the harness refuses, or produced
+# output the harness cannot use. These are the MODEL_FAULT_KINDS of Gym's shared
+# list (nemo_gym/core/failure_kinds.py) that a producer emits, without the
+# model-call kinds: in training the policy server is part of the setup, so a
+# failed or timed-out policy call is an infrastructure failure.
 DEFAULT_POLICY_FAILURE_KINDS = (
     "agent_timeout",
     "agent_command_not_allowed",

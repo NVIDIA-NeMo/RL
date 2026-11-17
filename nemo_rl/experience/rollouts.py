@@ -422,7 +422,7 @@ def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
 
 
 # Top-level NeMo-Gym verify-response field naming why a sample failed, from the
-# shared vocabulary in nemo_gym/failure_kinds.py (or "<server>:<kind>").
+# shared vocabulary in nemo_gym/core/failure_kinds.py (or "<server>:<kind>").
 FAILURE_KIND = "failure_kind"
 
 

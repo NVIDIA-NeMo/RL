@@ -396,6 +396,21 @@ def test_exclude_infra_votes_like_include_on_rows_ingestion_keeps() -> None:
             )
 
 
+@pytest.mark.nemo_gym
+def test_default_policy_failure_kinds_follow_gyms_shared_kind_list() -> None:
+    """A model-fault kind that Gym adds must reach the default or fail here.
+
+    The default is Gym's MODEL_FAULT_KINDS without the model-call kinds (the policy
+    server is part of the training setup) and without the kinds that only Gym's
+    evaluation gate derives (no producer emits them).
+    """
+    from nemo_gym.core import failure_kinds
+
+    assert frozenset(grpo_mod.DEFAULT_POLICY_FAILURE_KINDS) == (
+        failure_kinds.MODEL_FAULT_KINDS & failure_kinds.FAILURE_KINDS
+    ) - {failure_kinds.MODEL_REQUEST_ERROR, failure_kinds.MODEL_POLICY_RESPONSE_TIMEOUT}
+
+
 def test_exclude_infra_policy_kinds_only_under_exclude_infra() -> None:
     """Only exclude_infra asks the rollout builders to zero infra-failed rows."""
     kinds = grpo_mod.exclude_infra_policy_kinds(
