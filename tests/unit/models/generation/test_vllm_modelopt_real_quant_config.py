@@ -165,7 +165,11 @@ def _install_fake_vllm_reload(monkeypatch):
         loaded_weights=[],
         load_numel=0,
         load_numel_total=None,
+        kernel_tensors=None,
+        reset=lambda: None,
     )
+    layerwise_module.LOADING_LAYERS = set()
+    layerwise_module._place_kernel_tensors = lambda layer, info: None
     monkeypatch.setitem(
         sys.modules,
         "vllm.model_executor.model_loader.reload",
@@ -175,6 +179,35 @@ def _install_fake_vllm_reload(monkeypatch):
         sys.modules,
         "vllm.model_executor.model_loader.reload.layerwise",
         layerwise_module,
+    )
+    # MXFP8 post-reload processing scans for these native ModelOpt types.
+    modelopt_module = types.ModuleType(
+        "vllm.model_executor.layers.quantization.modelopt"
+    )
+    modelopt_module.ModelOptLinearMethod = type("ModelOptLinearMethod", (), {})
+    modelopt_module.ModelOptMxFp8FusedMoE = type("ModelOptMxFp8FusedMoE", (), {})
+    quant_utils_module = types.ModuleType(
+        "vllm.model_executor.layers.quantization.utils.quant_utils"
+    )
+    quant_utils_module.kMxfp8Static = object()
+    for module_name, module in (
+        ("vllm.model_executor.layers.quantization.modelopt", modelopt_module),
+        (
+            "vllm.model_executor.layers.quantization.utils",
+            types.ModuleType("vllm.model_executor.layers.quantization.utils"),
+        ),
+        (
+            "vllm.model_executor.layers.quantization.utils.quant_utils",
+            quant_utils_module,
+        ),
+    ):
+        monkeypatch.setitem(sys.modules, module_name, module)
+    utils_module = types.ModuleType("vllm.model_executor.model_loader.utils")
+    utils_module.process_weights_after_loading = (
+        lambda model, model_config, target_device: None
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm.model_executor.model_loader.utils", utils_module
     )
     hpc_module = types.ModuleType("vllm.model_executor.layers.hpc")
 

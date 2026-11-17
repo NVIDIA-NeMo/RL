@@ -2240,8 +2240,10 @@ def test_collective_reload_uses_runner_config_and_restores_previous_context(
     )
 
     def packed_broadcast_consumer(
-        iterator, group, src, post_unpack_func, return_iterator=False
+        iterator, group, src, post_unpack_func, return_iterator=False, num_buffers=None
     ):
+        # Only native layerwise refit forces a single receive buffer.
+        assert num_buffers is None
         assert list(iterator) == [("model.weight", expected_state_info)]
         assert group is ext.model_update_group
         assert src == 0

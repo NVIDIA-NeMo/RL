@@ -340,9 +340,14 @@ def test_composed_native_vision_refit(
     architecture,
 ):
     """Real loaders/lifecycle: late scales, folded defaults, frozen omission and graphs."""
-    from vllm.config import MultiModalConfig, VllmConfig, set_current_vllm_config
+    from vllm.config import (
+        LoadConfig,
+        MultiModalConfig,
+        VllmConfig,
+        set_current_vllm_config,
+    )
+    from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
     from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
-    from vllm.model_executor.model_loader.weight_utils import initialize_dummy_weights
     from vllm.model_executor.models.utils import AutoWeightsLoader
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -398,7 +403,7 @@ def test_composed_native_vision_refit(
             4, 4, bias=False
         ).bfloat16()
         model.vision_model = radio
-        initialize_dummy_weights(model, config)
+        DummyModelLoader(LoadConfig(load_format="dummy")).load_weights(model, config)
         expected = {name: param.clone() for name, param in model.named_parameters()}
         pointers = {name: param.data_ptr() for name, param in model.named_parameters()}
         record_metadata_for_reloading(model)
