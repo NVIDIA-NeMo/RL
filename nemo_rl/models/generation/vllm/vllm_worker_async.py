@@ -590,10 +590,18 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 """Clamp the request's max output tokens so that input + output <= max_model_len."""
                 remaining = self.model_config.max_model_len - len(prompt_token_ids)
                 if remaining <= 0:
-                    raise ValueError(
-                        f"Prompt length ({len(prompt_token_ids)}) fills or exceeds "
-                        f"max_model_len ({self.model_config.max_model_len}). "
-                        f"No room for output tokens."
+                    # [CUSTOM] VLLMValidationError (not ValueError) so that
+                    # create_chat_completion answers 400 instead of 500, and
+                    # "maximum context length" in the message so that Gym's
+                    # vllm_model ends the rollout with finish_reason="length",
+                    # like vLLM's own context-length overflow.
+                    raise VLLMValidationError(
+                        f"This model's maximum context length is "
+                        f"{self.model_config.max_model_len} tokens. However, the "
+                        f"prompt has {len(prompt_token_ids)} tokens after prefix-token "
+                        f"replacement, leaving no room for output tokens.",
+                        parameter="input_tokens",
+                        value=len(prompt_token_ids),
                     )
                 max_tokens = min(request_max_tokens, remaining)
                 self._set_max_tokens(request, max_tokens)

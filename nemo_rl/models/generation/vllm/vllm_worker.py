@@ -13,10 +13,13 @@
 # limitations under the License.
 
 import copy
+import functools
 import gc
+import inspect
 import logging
 import os
 import sys
+import threading
 from typing import Any, Optional, cast
 
 import ray
@@ -48,8 +51,92 @@ from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 logger = logging.getLogger(__name__)
 
 
+def _patch_vllm_swa_admission_cap() -> None:
+    """[CUSTOM] Backport of vLLM's fix for "Cannot get N free blocks from the pool".
+
+    vLLM 0.20.x caps the per-request block estimate of recycling-aware KV cache
+    groups (sliding window, chunked local attention) at
+    ``max_admission_blocks_per_request`` in *every* call of
+    ``SingleTypeKVCacheManager.get_num_blocks_to_allocate``. The cap is meant for
+    the full-sequence admission gate (``KVCacheManager.can_fit_full_sequence``),
+    but it is also applied to the per-step check in ``allocate_slots``. There, for
+    a request longer than ``window + max_num_batched_tokens``, the capped estimate
+    is compared against ``req_to_blocks`` (which keeps a null placeholder for every
+    block that slid out of the window), so the check reports 0 blocks needed while
+    ``allocate_new_blocks`` (uncapped) needs one every ``block_size`` tokens. With
+    the pool full the scheduler neither preempts nor skips the request, the
+    allocation raises ``ValueError: Cannot get 1 free blocks from the pool`` and
+    the EngineCore dies (seen on DomynEdge's SWA layers under KV-cache saturation).
+
+    Upstream vLLM (e.g. 0.32.1) applies the cap only in the admission gate
+    (``apply_admission_cap=True`` from ``can_fit_full_sequence``) and counts blocks
+    exactly everywhere else; this patch reproduces that behaviour. It is a no-op
+    on vLLM versions that already have the upstream ``apply_admission_cap``
+    parameter. It runs from the ``vllm.general_plugins`` entry point (see
+    ``_register_domyn_edge_plugin``), i.e. in every vLLM process, including the
+    EngineCore where the scheduler lives.
+    """
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
+
+    if getattr(SingleTypeKVCacheManager, "_nemo_rl_swa_cap_patched", False):
+        return
+    if (
+        "apply_admission_cap"
+        in inspect.signature(
+            SingleTypeKVCacheManager.get_num_blocks_to_allocate
+        ).parameters
+    ):
+        return  # This vLLM already has the upstream fix.
+    if not hasattr(KVCacheManager, "can_fit_full_sequence"):
+        print(
+            "⚠️ [CUSTOM] vLLM KVCacheManager has no can_fit_full_sequence: "
+            "SWA admission-cap patch NOT applied (unknown vLLM layout).",
+            flush=True,
+        )
+        return
+
+    # Set while the admission gate runs; the scheduler is single-threaded, the
+    # thread-local only guards against surprises.
+    in_admission_gate = threading.local()
+    orig_get_num_blocks = SingleTypeKVCacheManager.get_num_blocks_to_allocate
+    orig_can_fit = KVCacheManager.can_fit_full_sequence
+
+    @functools.wraps(orig_get_num_blocks)
+    def get_num_blocks_to_allocate(self, *args, **kwargs):
+        cap = getattr(self, "_max_admission_blocks_per_request", None)
+        if cap is None or getattr(in_admission_gate, "active", False):
+            return orig_get_num_blocks(self, *args, **kwargs)
+        # Per-step check: count blocks exactly, as allocate_new_blocks does.
+        self._max_admission_blocks_per_request = None
+        try:
+            return orig_get_num_blocks(self, *args, **kwargs)
+        finally:
+            self._max_admission_blocks_per_request = cap
+
+    @functools.wraps(orig_can_fit)
+    def can_fit_full_sequence(self, *args, **kwargs):
+        in_admission_gate.active = True
+        try:
+            return orig_can_fit(self, *args, **kwargs)
+        finally:
+            in_admission_gate.active = False
+
+    SingleTypeKVCacheManager.get_num_blocks_to_allocate = get_num_blocks_to_allocate
+    KVCacheManager.can_fit_full_sequence = can_fit_full_sequence
+    SingleTypeKVCacheManager._nemo_rl_swa_cap_patched = True
+    print(
+        "[CUSTOM] Patched vLLM SWA admission cap (cap only in can_fit_full_sequence).",
+        flush=True,
+    )
+
+
 def _register_domyn_edge_plugin() -> None:
-    """[CUSTOM] Registers DomynEdge with vLLM's model/config registries."""
+    """[CUSTOM] Registers DomynEdge with vLLM's model/config registries.
+
+    Also applies ``_patch_vllm_swa_admission_cap``: this function is the
+    ``vllm.general_plugins`` entry point, so it runs in every vLLM process.
+    """
     import vllm
     from vllm.transformers_utils.config import _CONFIG_REGISTRY
 
@@ -58,6 +145,7 @@ def _register_domyn_edge_plugin() -> None:
 
     vllm.ModelRegistry.register_model("DomynEdgeForCausalLM", DomynEdgeForCausalLM)
     _CONFIG_REGISTRY["domynedge"] = DomynEdgeConfig
+    _patch_vllm_swa_admission_cap()
 
 
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
