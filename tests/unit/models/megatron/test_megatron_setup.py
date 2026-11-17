@@ -815,6 +815,77 @@ class TestApplyParallelismConfig:
 
         assert model_cfg.context_parallel_size == 4
 
+    @pytest.mark.parametrize(
+        ("megatron_overrides", "sequence_packing", "message"),
+        [
+            ({}, False, "Sequence Packing must be enabled"),
+            ({"context_parallel_size": 2}, True, "context_parallel_size to 1"),
+            (
+                {"pipeline_model_parallel_size": 2},
+                True,
+                "pipeline_model_parallel_size to 1",
+            ),
+            ({"use_fused_linear_logprobs": True}, True, "linear CE fusion"),
+        ],
+    )
+    def test_dynamic_context_parallel_rejects_unsupported_settings(
+        self, megatron_overrides, sequence_packing, message
+    ):
+        from nemo_rl.models.megatron.setup import _apply_parallelism_config
+
+        config = {
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+                "num_layers_in_first_pipeline_stage": None,
+                "num_layers_in_last_pipeline_stage": None,
+                "sequence_parallel": False,
+                "context_parallel_size": 1,
+                "dynamic_context_parallel": True,
+                **megatron_overrides,
+            },
+            "sequence_packing": {"enabled": sequence_packing},
+        }
+
+        with pytest.raises(AssertionError, match=message):
+            _apply_parallelism_config(SimpleNamespace(), config)
+
+    def test_dynamic_context_parallel_is_enabled_after_bridge_validation(self):
+        from nemo_rl.models.megatron.setup import validate_megatron_config
+
+        events = []
+        model_cfg = SimpleNamespace(
+            dynamic_context_parallel=False,
+            max_seqlen_per_dp_cp_rank=None,
+            finalize=lambda: events.append(
+                (
+                    "finalize",
+                    model_cfg.dynamic_context_parallel,
+                    model_cfg.max_seqlen_per_dp_cp_rank,
+                )
+            ),
+        )
+        megatron_cfg = SimpleNamespace(
+            model=model_cfg,
+            validate=lambda: events.append(
+                ("bridge_validate", model_cfg.dynamic_context_parallel)
+            ),
+        )
+        config = {
+            "megatron_cfg": {"dynamic_context_parallel": True},
+            "sequence_packing": {
+                "enabled": True,
+                "train_mb_tokens": 4096,
+                "logprob_mb_tokens": 8192,
+            },
+        }
+
+        validate_megatron_config(megatron_cfg, config)
+
+        # Bridge rejects the flag without its own packing dataset, and MCore
+        # checks the model config once the flag and the rank capacity are set.
+        assert events == [("bridge_validate", False), ("finalize", True, 8192)]
+
 
 @pytest.mark.mcore
 class TestApplyMultimodalConfig:

@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, 
 import torch
 from megatron.core import tensor_parallel
 from megatron.core.models.gpt import GPTModel
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_context_parallel_world_size,
@@ -480,6 +480,12 @@ def forward_with_post_processing_fn(
             cu_seqlens=(
                 None if packed_seq_params is None else packed_seq_params.cu_seqlens_q
             ),
+            packed_seq_params=packed_seq_params,
+        )
+    elif packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+        raise NotImplementedError(
+            f"{type(post_processing_fn).__name__} does not support dynamic "
+            "context parallelism."
         )
     elif isinstance(post_processing_fn, TeacherFullPayloadPostProcessor):
         assert original_seq_length is not None
@@ -763,6 +769,7 @@ class LossPostProcessor:
                 wrapper_cls = SequencePackingLossWrapper
                 prepare_fn = prepare_loss_input_wrapped
 
+            cp_group = resolve_cp_group(get_context_parallel_group(), packed_seq_params)
             cu_seqlens_q_cpu = to_cpu_int_tuple(packed_seq_params.cu_seqlens_q)
             cu_seqlens_q_padded_cpu = (
                 to_cpu_int_tuple(packed_seq_params.cu_seqlens_q_padded)
@@ -776,7 +783,7 @@ class LossPostProcessor:
                 cu_seqlens_q_padded=cu_seqlens_q_padded_cpu,
                 vocab_parallel_rank=get_tensor_model_parallel_rank(),
                 vocab_parallel_group=get_tensor_model_parallel_group(),
-                context_parallel_group=get_context_parallel_group(),
+                context_parallel_group=cp_group,
             )
             if "student_logits" in data_dict:
                 # draft + use_fused_linear_logprobs is rejected at setup in
@@ -792,7 +799,7 @@ class LossPostProcessor:
                     loss_weight=float(self.cfg["draft"].loss_weight),
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
-                    context_parallel_group=get_context_parallel_group(),
+                    context_parallel_group=cp_group,
                     cu_seqlens_q=packed_seq_params.cu_seqlens_q,
                     cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
                     d2t=self.d2t,
@@ -842,12 +849,17 @@ class LossPostProcessor:
         )
 
         if self.cp_normalize:
-            cp_size = get_context_parallel_world_size()
+            # Every rank of the microbatch's CP group computes the whole loss.
+            loss_replicas = (
+                get_context_parallel_world_size()
+                if packed_seq_params is None or packed_seq_params.local_cp_size is None
+                else packed_seq_params.local_cp_size
+            )
             prev_loss_fn = loss_fn_wrapped
 
             def _div_by_cp_size(*args, **kwargs):
                 loss, metrics = prev_loss_fn(*args, **kwargs)
-                return loss / cp_size, metrics
+                return loss / loss_replicas, metrics
 
             loss_fn_wrapped = _div_by_cp_size
 
@@ -900,6 +912,7 @@ class LogprobsPostProcessor:
         cu_seqlens_padded: Optional[torch.Tensor | CpuIntTuple],
         original_seq_length: int,
         cu_seqlens: Optional[torch.Tensor | CpuIntTuple] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
 
@@ -913,6 +926,8 @@ class LogprobsPostProcessor:
             original_seq_length: Sequence width before dense padding was applied
             cu_seqlens: Unpadded packed-sequence boundaries; needed to replay the
                 sampler's support on packed sequences
+            packed_seq_params: Parameters for packed sequences; carries the
+                microbatch's context-parallel group under dynamic context parallelism
 
         Returns:
             Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
@@ -938,7 +953,11 @@ class LogprobsPostProcessor:
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
                     context_parallel_group=(
-                        get_context_parallel_group() if packed else None
+                        resolve_cp_group(
+                            get_context_parallel_group(), packed_seq_params
+                        )
+                        if packed
+                        else None
                     ),
                     chunk_size=self.cfg.get("logprob_chunk_size", None),
                     cu_seqlens_q=to_cpu_int_tuple(cu_seqlens) if packed else None,
@@ -958,7 +977,9 @@ class LogprobsPostProcessor:
                     vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
                     group=tp_grp,
                     inference_only=True,
-                    cp_group=get_context_parallel_group(),
+                    cp_group=resolve_cp_group(
+                        get_context_parallel_group(), packed_seq_params
+                    ),
                     chunk_size=logprob_chunk_size,
                     sampling_params=self.sampling_params,
                 )

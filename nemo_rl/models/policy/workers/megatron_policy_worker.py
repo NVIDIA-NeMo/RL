@@ -95,7 +95,9 @@ from nemo_rl.models.megatron.common import (
 )
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
+    owns_dynamic_cp_pack,
     process_global_batch,
+    schedule_dynamic_cp,
 )
 from nemo_rl.models.megatron.draft.step_state import (
     DRAFT_LOSS_METRIC_KEY,
@@ -1138,6 +1140,13 @@ class MegatronPolicyWorkerImpl(
         self.model_slices_context_parallel_inputs = (
             model_slices_context_parallel_inputs(self.model)
         )
+        if self.cfg["megatron_cfg"].get("dynamic_context_parallel") and (
+            self.delegate_pack_to_model or self.model_slices_context_parallel_inputs
+        ):
+            raise NotImplementedError(
+                "Dynamic context parallelism requires NeMo-RL to pack and "
+                "context-parallel shard the inputs, but this model does it itself."
+            )
         mtp_num_layers = self._get_model_config().mtp_num_layers
         self.mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
         # A media placeholder is an ordinary vocabulary entry, so text that
@@ -1431,6 +1440,9 @@ class MegatronPolicyWorkerImpl(
             group=parallel_state.get_data_parallel_group(),
         )
         num_global_batches = int(total_dataset_size.item()) // gbs
+        if data.micro_batch_cp_sizes is not None:
+            # The rows of a pack are replicated on every rank of its CP group.
+            num_global_batches = len(data.micro_batch_cp_sizes)
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -1573,6 +1585,16 @@ class MegatronPolicyWorkerImpl(
                             router_replay_train=not eval_mode,
                         )
 
+                if data.micro_batch_cp_sizes is not None:
+                    # Every rank of a CP group computed its pack's metrics.
+                    losses_reduced = [
+                        metrics
+                        for metrics, cp_size in zip(
+                            losses_reduced, data.micro_batch_cp_sizes[gb_idx]
+                        )
+                        if owns_dynamic_cp_pack(cp_size)
+                    ]
+
                 # Clear mtp_grad_scale_func after the forward-backward pass so
                 # it doesn't get serialized in the run_config.yaml when saving
                 self._set_mtp_grad_scale_func(None)
@@ -1686,7 +1708,9 @@ class MegatronPolicyWorkerImpl(
                     mb_losses = [x["loss"] for x in gb_loss_metrics]
 
                 all_mb_metrics.extend(gb_loss_metrics)
-                if all(isinstance(loss, torch.Tensor) for loss in mb_losses):
+                if mb_losses and all(
+                    isinstance(loss, torch.Tensor) for loss in mb_losses
+                ):
                     losses.append(torch.stack(mb_losses).sum())
                 else:
                     losses.append(
@@ -3318,6 +3342,16 @@ class MegatronPolicyWorkerImpl(
 
         self._refit_param_info_hf = refit_param_info_hf
         return refit_param_info_hf
+
+    def schedule_dynamic_cp(
+        self, *, seq_lengths: tuple[int, ...], max_tokens_per_rank: int
+    ) -> list[list[list[int]]]:
+        """Schedule one global batch for dynamic context parallelism.
+
+        Returns:
+            Rounds holding one pack of sequence indices per data-parallel rank.
+        """
+        return schedule_dynamic_cp(seq_lengths, max_tokens_per_rank, self.cfg)
 
     def prepare_refit_info(
         self,

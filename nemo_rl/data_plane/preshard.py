@@ -88,6 +88,13 @@ def shard_meta_for_dp(
         raise ValueError(
             "Pass at most one of sequence_packing_args / dynamic_batching_args."
         )
+    if sequence_packing_args and "dynamic_cp_schedule" in sequence_packing_args:
+        # A pack is held by every rank of its CP group; the per-rank key lists
+        # and their write-back assume each sample lives on one rank.
+        raise NotImplementedError(
+            "policy.megatron_cfg.dynamic_context_parallel is not supported with "
+            "data_plane.enabled=true."
+        )
 
     seq_lens = list(meta.sequence_lengths)
     # Skeleton BatchedDataDict — `shard_by_batch_size` only needs

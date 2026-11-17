@@ -1659,6 +1659,7 @@ class TestLossPostProcessor:
         mock_packed_seq_params = MagicMock()
         mock_packed_seq_params.cu_seqlens_q = torch.tensor([0, 5, 10])
         mock_packed_seq_params.cu_seqlens_q_padded = torch.tensor([0, 8, 16])
+        mock_packed_seq_params.local_cp_size = None
 
         processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg, cp_normalize=False)
 
@@ -1666,6 +1667,49 @@ class TestLossPostProcessor:
 
         # Verify SequencePackingLossWrapper was called
         mock_wrapper.assert_called_once()
+
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1
+    )
+    @patch("nemo_rl.models.megatron.train.SequencePackingLossWrapper")
+    def test_loss_post_processor_uses_the_dynamic_cp_group_of_the_microbatch(
+        self, mock_wrapper, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
+    ):
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        from nemo_rl.models.megatron.train import LossPostProcessor
+
+        dynamic_cp_group = MagicMock()
+        dynamic_cp_group.size.return_value = 4
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=torch.tensor([0, 8, 16]),
+            cu_seqlens_q_padded=torch.tensor([0, 8, 16]),
+            local_cp_size=4,
+            cp_group=dynamic_cp_group,
+        )
+        mock_wrapper.return_value = MagicMock(return_value=(torch.tensor(8.0), {}))
+
+        processor = LossPostProcessor(
+            loss_fn=MagicMock(),
+            cfg={"sequence_packing": {"enabled": True}},
+            num_microbatches=3,
+        )
+        loss, _ = processor(data_dict=MagicMock(), packed_seq_params=packed_seq_params)(
+            torch.randn(1, 4, 8)
+        )
+
+        assert mock_wrapper.call_args.kwargs["context_parallel_group"] is (
+            dynamic_cp_group
+        )
+        # Each of the group's 4 ranks computes the whole loss, and MCore rescales
+        # by the built CP size (1) over the microbatch count (3).
+        assert torch.isclose(loss, torch.tensor(8.0 / 4 * 3 / 1))
 
 
 def test_direct_model_loss_normalizes_target_aligned_tokens_and_schedule_scaling():

@@ -15,6 +15,7 @@ from collections import UserDict
 from copy import deepcopy
 from typing import (
     Any,
+    Callable,
     Generic,
     Iterator,
     Literal,
@@ -115,6 +116,14 @@ class SequencePackingArgs(TypedDict):
     )
     pair_grouping_key: NotRequired[str]
     max_sequences_per_bin: NotRequired[int]
+    # Dynamic context parallelism: forms the packs in place of 'algorithm'. Maps
+    # one global batch's padded sequence lengths and 'max_tokens_per_microbatch'
+    # (here the token capacity of one shard) to rounds holding one pack of
+    # sequence indices per shard. Shards that share a pack run it as one
+    # context-parallel group.
+    dynamic_cp_schedule: NotRequired[
+        Callable[[tuple[int, ...], int], list[list[list[int]]]]
+    ]
 
 
 class DynamicBatchingArgs(TypedDict):
@@ -157,6 +166,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         self.micro_batch_indices = None
         self.micro_batch_lengths = None
+        # Context-parallel group size of every microbatch; set only for dynamic CP.
+        self.micro_batch_cp_sizes = None
         self.elem_counts_per_gb = None
 
     def get_multimodal_dict(
@@ -457,7 +468,11 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         return chunked_batch
 
     def reorder_data(self, reorded_indices: list[int]):
-        """Reorders the data along the batch dimension by the given indices."""
+        """Reorders the data along the batch dimension by the given indices.
+
+        An index that occurs more than once marks a row replicated across shards
+        (a dynamic-CP pack held by every rank of its group); it is kept once.
+        """
         batch_sizes = set()
         for val in self.data.values():
             if isinstance(val, torch.Tensor):
@@ -470,9 +485,10 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         )
         total_batch_size = batch_sizes.pop()
 
-        indices = range(total_batch_size)
-        reordered = sorted(zip(reorded_indices, indices), key=lambda pair: pair[0])
-        reordered_indices = [idx[1] for idx in reordered]
+        first_position: dict[int, int] = {}
+        for original_index, position in zip(reorded_indices, range(total_batch_size)):
+            first_position.setdefault(original_index, position)
+        reordered_indices = [first_position[i] for i in sorted(first_position)]
 
         for k, v in self.data.items():
             sorted_v: torch.Tensor | list[Any]
@@ -679,6 +695,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             def _get_padded_seqlen(seqlen: int) -> int:
                 return (seqlen + pad_multiple - 1) // pad_multiple * pad_multiple
 
+            dynamic_cp_schedule = sequence_packing_args.get("dynamic_cp_schedule")
             grouping_key = sequence_packing_args.get("pair_grouping_key")
             grouping_values = None
             if grouping_key is not None:
@@ -693,6 +710,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
             # Store bin assignments for each chunk to reuse later
             all_chunk_bin_assignments = []
+            all_chunk_cp_sizes = []
             all_chunk_padded_seqlens = []
 
             # Process each chunk separately to respect chunk boundaries
@@ -706,7 +724,25 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     _get_padded_seqlen(seq_len.item()) for seq_len in chunk_seqlens
                 ]
 
-                if grouping_values is None:
+                if dynamic_cp_schedule is not None:
+                    rounds = dynamic_cp_schedule(
+                        tuple(chunk_padded_seqlens_list),
+                        sequence_packing_args["max_tokens_per_microbatch"],
+                    )
+                    assert all(
+                        len(packs) == shards and all(packs) for packs in rounds
+                    ), (
+                        "Every dynamic CP round must hold one non-empty pack per "
+                        f"shard ({shards})"
+                    )
+                    # Round-major order: the round-robin split below then hands
+                    # shard i the i-th pack of every round.
+                    chunk_bin_assignments = [pack for packs in rounds for pack in packs]
+                    # A pack's CP group is the set of shards holding it this round.
+                    all_chunk_cp_sizes.append(
+                        [packs.count(pack) for packs in rounds for pack in packs]
+                    )
+                elif grouping_values is None:
                     chunk_bin_assignments = bin_packer.pack(
                         sequence_lengths=chunk_padded_seqlens_list,
                     )
@@ -749,9 +785,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 all_chunk_padded_seqlens.append(chunk_padded_seqlens_list)
 
             # create shards with the packed bins
-            sharded_data: list[list[dict]] = [[] for _ in range(shards)]
             sharded_micro_indices: list = [[] for _ in range(shards)]
             sharded_micro_lengths: list = [[] for _ in range(shards)]
+            sharded_micro_cp_sizes: list = [[] for _ in range(shards)]
             sharded_elem_counts_per_gb: list = [[] for _ in range(shards)]
             global_indices_per_shard: list[list[int]] = [[] for _ in range(shards)]
             for chunk_idx in range(num_chunks):
@@ -782,11 +818,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                         )
 
                     for bin_indices in shard_bin_assignments:
-                        global_bin_indices = [i + chunk_start for i in bin_indices]
-                        sharded_data[shard_idx].append(
-                            self.select_indices(global_bin_indices)
+                        global_indices_per_shard[shard_idx].extend(
+                            i + chunk_start for i in bin_indices
                         )
-                        global_indices_per_shard[shard_idx].extend(global_bin_indices)
                         bin_seqlen = sum(chunk_padded_seqlens[i] for i in bin_indices)
 
                         if chunk_sharded_micro_indices[shard_idx] == []:
@@ -807,6 +841,10 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     sharded_micro_lengths[shard_idx].append(
                         chunk_sharded_micro_lengths[shard_idx]
                     )
+                    if dynamic_cp_schedule is not None:
+                        sharded_micro_cp_sizes[shard_idx].append(
+                            all_chunk_cp_sizes[chunk_idx][shard_idx::shards]
+                        )
                     sharded_elem_counts_per_gb[shard_idx].append(
                         chunk_sharded_micro_indices[shard_idx][-1][1]
                     )
@@ -818,9 +856,15 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
             aggregated_shards = []
             for shard_idx in range(shards):
-                shard = SlicedDataDict.from_batches(sharded_data[shard_idx])
+                # One gather per shard keeps the driver cheap when dynamic CP ships
+                # a pack to every shard of its group.
+                shard = SlicedDataDict(
+                    self.select_indices(global_indices_per_shard[shard_idx])
+                )
                 shard.micro_batch_indices = sharded_micro_indices[shard_idx]
                 shard.micro_batch_lengths = sharded_micro_lengths[shard_idx]
+                if dynamic_cp_schedule is not None:
+                    shard.micro_batch_cp_sizes = sharded_micro_cp_sizes[shard_idx]
                 shard.elem_counts_per_gb = sharded_elem_counts_per_gb[shard_idx]
                 aggregated_shards.append(shard)
 
@@ -983,6 +1027,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             batch = self.slice(cum_elem_count[batch_idx], cum_elem_count[batch_idx + 1])
             batch.micro_batch_indices = [self.micro_batch_indices[batch_idx]]
             batch.micro_batch_lengths = [self.micro_batch_lengths[batch_idx]]  # type: ignore # This exists if idxs do
+            if self.micro_batch_cp_sizes is not None:
+                batch.micro_batch_cp_sizes = [self.micro_batch_cp_sizes[batch_idx]]
             batch.elem_counts_per_gb = [elem_count]
             return batch
 
