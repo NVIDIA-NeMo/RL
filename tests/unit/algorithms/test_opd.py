@@ -240,18 +240,21 @@ def test_compute_teacher_logprobs_mixed_media_and_text_rows_per_teacher():
     assert result.shape == (3, 8)
 
 
-def test_compute_teacher_logprobs_routes_to_correct_teacher():
+@pytest.mark.parametrize("materialized", [False, True])
+def test_compute_teacher_logprobs_routes_to_correct_teacher(materialized):
     """Samples are routed to the right teacher and results stitched back."""
     math_twg = _MockTeacherWorkerGroup(fill_value=1.0, dp_size=1)
     code_twg = _MockTeacherWorkerGroup(fill_value=2.0, dp_size=1)
+    math_key = "math:train" if materialized else "math_agent"
+    code_key = "code:train" if materialized else "code_agent"
 
     collector = _make_collector(
         teacher_worker_groups={"math": math_twg, "code": code_twg},
-        alias_to_group_alias={"math_agent": "math", "code_agent": "code"},
+        alias_to_group_alias={math_key: "math", code_key: "code"},
         on_policy_distillation_cfg={
             "teacher_model_by_agent_name": {
-                "math_agent": "/ckpt/math",
-                "code_agent": "/ckpt/code",
+                math_key: "/ckpt/math",
+                code_key: "/ckpt/code",
             },
         },
         _has_distillation_teachers=True,
@@ -260,11 +263,13 @@ def test_compute_teacher_logprobs_routes_to_correct_teacher():
     B, S = 4, 8
     input_ids = torch.randint(0, 100, (B, S))
     agent_refs = [
-        {"name": "math_agent"},
-        {"name": "code_agent"},
-        {"name": "math_agent"},
-        {"name": "code_agent"},
+        {"name": math_key},
+        {"name": code_key},
+        {"name": math_key},
+        {"name": code_key},
     ]
+    if materialized:
+        agent_refs = [math_key, code_key, math_key, code_key]
 
     result, _ = collector._compute_teacher_logprobs(input_ids, agent_refs)
 
@@ -298,6 +303,68 @@ def test_compute_teacher_logprobs_deduplication():
     result, _ = collector._compute_teacher_logprobs(input_ids, agent_refs)
     assert result.shape == (B, S)
     assert torch.allclose(result, torch.tensor(3.0))
+
+
+def test_enqueue_rollout_group_routes_taskset_attribution_to_teacher():
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    add = AsyncMock(return_value="success")
+    collector = _make_collector(
+        teacher_worker_groups={
+            "teacher": _MockTeacherWorkerGroup(fill_value=2.0, dp_size=1)
+        },
+        alias_to_group_alias={"math:train": "teacher"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"math:train": "/ckpt/teacher"},
+            "strict_agent_name_match": True,
+        },
+        _has_distillation_teachers=True,
+        _teacher_seq_pad_multiple=1,
+        _debug_payload_metrics=False,
+        running=True,
+        replay_buffer=SimpleNamespace(add=SimpleNamespace(remote=add)),
+        tokenizer=SimpleNamespace(pad_token_id=0),
+    )
+    batch = BatchedDataDict(
+        {
+            "attribution_key": ["math:train"],
+            "agent_ref": [None],
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "prompt",
+                        "token_ids": torch.tensor([1, 2]),
+                    }
+                ]
+            ],
+        }
+    )
+    rollout_result = SimpleNamespace(
+        final_batch=batch, rollout_metrics={}, task_index=None, group_index=0
+    )
+    buffered_groups = set()
+
+    asyncio.run(
+        collector._enqueue_rollout_group(
+            rollout_result,
+            generation_weight_version=0,
+            target_weight_version=0,
+            expected_prompt_groups=1,
+            buffered_group_indices=buffered_groups,
+            collection_started_at=0.0,
+        )
+    )
+
+    buffered_batch = add.call_args.args[0]["batch"]
+    assert buffered_groups == {0}
+    assert buffered_batch["agent_ref"] == [None]
+    assert buffered_batch["attribution_key"] == ["math:train"]
+    assert torch.equal(
+        buffered_batch["teacher_reference_logprobs"], torch.full((1, 2), 2.0)
+    )
 
 
 def test_compute_teacher_logprobs_default_alias_fallback_routes():
@@ -593,6 +660,31 @@ def test_tq_teacher_padding_preserves_media_wire_rows(
     client.clear_samples.assert_called_once_with(
         sample_ids=temporary_ids, partition_id=meta.partition_id
     )
+
+
+@pytest.mark.parametrize("processed", [False, True])
+def test_tq_teacher_routing_uses_taskset_without_an_agent_ref(processed):
+    from nemo_rl.algorithms import opd
+
+    coordinator = opd.TQTeacherLogprobCoordinator(
+        dp_client=object(),
+        teacher_worker_groups={"teacher": _MockTeacherWorkerGroup(dp_size=1)},
+        alias_to_group_alias={"math:train": "teacher"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"math:train": "/ckpt/teacher"},
+            "strict_agent_name_match": True,
+        },
+    )
+    row = (
+        {"attribution_key": "math:train", "agent_ref": None}
+        if processed
+        else {
+            "task_id": {"taskset": "math:train", "task_id": "first"},
+            "task_input": {},
+            "agent_ref": {"name": "stale-agent"},
+        }
+    )
+    assert coordinator._resolve_teacher(row) == ("math:train", "teacher")
 
 
 def test_tq_teacher_routing_rejects_missing_agent_ref_without_retry_hint():

@@ -119,12 +119,22 @@ def test_nemo_gym_data_processor_without_task_data_spec():
         ({"type": "output_text", "text": "not media"}, False),
     ],
 )
-def test_gym_row_has_video_media_is_row_specific(content_part, expected):
-    extra_env_info = {
+@pytest.mark.parametrize("materialized", [False, True], ids=["flat", "materialized"])
+def test_gym_row_has_video_media_is_row_specific(content_part, expected, materialized):
+    task_input = {
         "responses_create_params": {
             "input": [{"role": "user", "content": [content_part]}]
         }
     }
+    # A materialized task row nests the same request under task_input.
+    extra_env_info = (
+        {
+            "task_id": {"taskset": "video:train", "task_id": "0"},
+            "task_input": task_input,
+        }
+        if materialized
+        else task_input
+    )
 
     assert _gym_row_has_video_media(extra_env_info) is expected
 

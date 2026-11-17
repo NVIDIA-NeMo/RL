@@ -11,6 +11,8 @@
 
 ## 📣 News
 
+* [11/02/2026] Muse Spark text GRPO training is supported on the [Muse Spark support branch](https://github.com/NVIDIA-NeMo/RL/tree/larkz/muse-spark-support) with the AutoModel backend and BF16 vLLM generation! See the [model guide](https://github.com/NVIDIA-NeMo/RL/blob/larkz/muse-spark-support/docs/guides/models/muse/muse-spark.md) for setup, the validated recipe, and known limitations.
+* [11/02/2026] Flint early-access GRPO training is supported on the [flint-support branch](https://github.com/NVIDIA-NeMo/RL/tree/flint-support) with the AutoModel backend and SGLang generation! See the [model guide](https://github.com/NVIDIA-NeMo/RL/blob/flint-support/docs/guides/models/flint/flint.md) for access requirements, setup, and training results.
 * [10/22/2026] MiniMax-M3.1-Flash BF16 GRPO training is supported on the [minimax-m3-1-flash branch](https://github.com/NVIDIA-NeMo/RL/tree/minimax-m3-1-flash) with the AutoModel backend and vLLM generation! See the [model guide](https://github.com/NVIDIA-NeMo/RL/blob/minimax-m3-1-flash/docs/guides/models/minimax/minimax-m3-1-flash.md) for setup, the validated recipe, and known limitations.
 * [10/22/2026] Nemotron 3.5 Super VL (120B-A12B) is now supported in NeMo RL with text DAPO, image GRPO, and NeMo Gym agentic training on the Automodel backend with vLLM generation! See the [model guide](docs/guides/models/nemotron/nemotron-3.5-super-vl.md) for recipes and training results.
 * [10/16/2026] Beam 1.0 Day 0 support by NeMo RL with SFT and RL recipes! See the [beam-support branch](https://github.com/NVIDIA-NeMo/RL/tree/beam-support) and [doc](https://github.com/NVIDIA-NeMo/RL/blob/beam-support/docs/guides/models/reflection/beam.md).
@@ -20,8 +22,7 @@
 * [08/12/2026] MuseGlimmer RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/muse-glimmer-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/muse-glimmer-support/docs/guides/models/muse-glimmer.md).
 * [08/11/2026] Nemotron-3.5-lightning is released. Trained natively using NeMo RL. Check out [reproducible recipes](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/nemo_gym/nemotron-3.5-lightning).
 * [07/25/2026] [Release v0.7.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.7.0): PPO, MOPD, Cross-tokenizer, Router-replay, CISPO, model support for Qwen3-Omni, Nemotron Nano v3 Omni, Gemma 4, GLM 5.1 and many more!
-* [06/12/2026] [Minimax-M3](https://github.com/NVIDIA-NeMo/RL/tree/minimax-m3) Day 0 support by NeMo RL! More details on the [accuracy verifications](https://github.com/NVIDIA-NeMo/RL/blob/minimax-m3/docs/guides/minimax-m3.md). Thank you [vLLM for the shoutout](https://x.com/vllm_project/status/2065445062423826534
-).
+* [06/12/2026] [Minimax-M3](https://github.com/NVIDIA-NeMo/RL/tree/minimax-m3) Day 0 support by NeMo RL! More details on the [accuracy verifications](https://github.com/NVIDIA-NeMo/RL/blob/minimax-m3/docs/guides/minimax-m3.md). Thank you [vLLM for the shoutout](https://x.com/vllm_project/status/2065445062423826534).
 * [06/04/2026] [Nemotron-3-Ultra](https://research.nvidia.com/labs/nemotron/Nemotron-3-Ultra/) was trained with NeMo-RL! Follow [this guide](https://github.com/NVIDIA-NeMo/RL/blob/ultra-v3/docs/guides/nemotron-3-ultra.md) to explore the post-training recipe.
 * [04/30/2026] [Release v0.6.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.6.0)
     * Sglang backend, Muon Optimizer, Speculative Decoding, Yarn long-context training, Chunked Cross Entropy Loss, top-p/top-k training
@@ -266,8 +267,7 @@ git submodule update --init --recursive
 # You will have to run the full `git submodule update --init --recursive` command in these situations.
 ```
 
-If you are using the Megatron backend on bare metal (outside of a container), you may
-need to install the cuDNN headers as well. Here is how you check and install them:
+If you are using the Megatron backend on bare metal (outside of a container), you may need to install the cuDNN headers as well. Here is how you check and install them:
 ```sh
 # Check if you have libcudnn installed
 dpkg -l | grep cudnn.*cuda
@@ -737,8 +737,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
 
 - Large amounts of memory fragmentation might occur when running models without support for FlashAttention2.
   If OOM occurs after a few iterations of training, it may help to tweak the allocator settings to reduce memory fragmentation.
-  To do so, specify [`max_split_size_mb`](https://docs.pytorch.org/docs/2.12/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf)
-  at **either** one of the following places:
+  To do so, specify [`max_split_size_mb`](https://docs.pytorch.org/docs/2.12/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf) at **either** one of the following places:
   1. Launch training with:
   ```sh
   # This will globally apply to all Ray actors

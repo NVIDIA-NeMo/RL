@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -138,10 +139,67 @@ class CapturedMediaItem:
 
 @dataclass(frozen=True)
 class CapturedMedia:
-    """New placeholder metadata and owned tensors for the common staging sink."""
+    """New placeholder metadata and owned tensors for the common staging sink.
+
+    ``tensor_digests`` fingerprints ``tensors`` (see ``media_tensor_digests``)
+    when generation-prefix cuts are on. A media bundle restored from a prefix
+    row carries the staged digests and no tensors.
+    """
 
     items: tuple[CapturedMediaItem, ...]
     tensors: dict[str, torch.Tensor] | None
+    tensor_digests: dict[str, dict[str, Any]] | None = None
+
+
+# Generation-prefix extras key for the call's tensor digests. Prefix rows store
+# these instead of the pixels: a restore reprocesses the media anyway and only
+# has to prove it produced the bytes the interrupted call staged.
+MEDIA_TENSOR_DIGESTS_FIELD = "media_tensor_digests"
+
+
+def media_tensor_digests(
+    tensors: Mapping[str, torch.Tensor] | None,
+) -> dict[str, dict[str, Any]]:
+    """Fingerprint each media tensor by its dtype, shape, and raw bytes."""
+    digests: dict[str, dict[str, Any]] = {}
+    for name, value in sorted((tensors or {}).items()):
+        tensor = value.detach().cpu().contiguous()
+        raw = tensor.reshape(-1).view(torch.uint8).numpy()
+        digests[name] = {
+            "dtype": str(tensor.dtype),
+            "shape": list(tensor.shape),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    return digests
+
+
+def verify_restored_media(captured: CapturedMedia, restored: CapturedMedia) -> None:
+    """Require reprocessed media to match what an interrupted call staged.
+
+    Args:
+        captured: The media just reprocessed from the resumed request.
+        restored: The items and tensor digests read from the call's first
+            generation-prefix row.
+
+    Raises:
+        MediaCaptureRejected: ``retained_media_changed`` when the items or
+            any tensor's dtype, shape, or bytes differ.
+    """
+    current = captured.tensor_digests or {}
+    staged = restored.tensor_digests or {}
+    if captured.items != restored.items or current != staged:
+        # Name what differs, so a rejection can be triaged from the log.
+        changed = sorted(
+            name
+            for name in current.keys() | staged.keys()
+            if current.get(name) != staged.get(name)
+        )
+        raise MediaCaptureRejected(
+            "Restored generation media differs from reprocessed input "
+            f"(items equal: {captured.items == restored.items}; "
+            f"changed tensors: {changed})",
+            code="retained_media_changed",
+        )
 
 
 def verified_media_items(call: FetchedStagedCall) -> tuple[CapturedMediaItem, ...]:

@@ -19,6 +19,7 @@ import subprocess
 import time
 from functools import lru_cache
 from pathlib import Path
+from threading import Lock
 
 import ray
 from ray.util import placement_group
@@ -28,6 +29,11 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 DEFAULT_VENV_DIR = os.path.join(git_root, "venvs")
 
 logger = logging.getLogger(__name__)
+
+# Driver-side state: Ray may dispatch repeated builds to different workers.
+G_BUILT_VENVS: dict[tuple[str, str, frozenset[str]], str] = {}
+G_VENV_BUILD_LOCKS: dict[tuple[str, str, frozenset[str]], Lock] = {}
+G_VENV_CACHE_LOCK = Lock()
 
 
 def add_hf_modules_cache_to_pythonpath(env_vars: dict[str, str]) -> dict[str, str]:
@@ -183,8 +189,8 @@ def _env_builder(
             started_file.unlink()
 
 
-def create_local_venv_on_each_node(py_executable: str, venv_name: str):
-    """Create a virtual environment on each Ray node.
+def create_local_venv_on_each_node(py_executable: str, venv_name: str) -> str:
+    """Prepare a venv once per driver for a Python command, path and node set.
 
     Args:
         py_executable (str): Command to run with the virtual environment
@@ -200,32 +206,47 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
         for n in ray.nodes()
         if n.get("Alive", False) and n.get("Resources", {}).get("CPU", 0) > 0
     ]
-    num_nodes = len(nodes)
-    # Reserve one CPU on each node using a STRICT_SPREAD placement group
-    bundles = [{"CPU": 1} for _ in range(num_nodes)]
-    pg = placement_group(bundles=bundles, strategy="STRICT_SPREAD")
-    ray.get(pg.ready())
-
-    force_rebuild = os.environ.get("NRL_FORCE_REBUILD_VENVS", "false").lower() == "true"
-    # Launch one actor per node
-    actors = [
-        _env_builder.options(placement_group=pg).remote(
-            py_executable, venv_name, i, force_rebuild
-        )
-        for i, _ in enumerate(nodes)
-    ]
-    # ensure setup runs on each node
-    paths = ray.get([actor for actor in actors])
-    # Normalize paths to handle double slashes and other path inconsistencies
-    normalized_paths = [os.path.normpath(p) for p in paths]
-    assert len(set(normalized_paths)) == 1, (
-        f"All nodes should have the same venv, but got: {set(normalized_paths)}"
+    venv_dir = os.path.abspath(os.environ.get("NEMO_RL_VENV_DIR", DEFAULT_VENV_DIR))
+    key = (
+        py_executable,
+        os.path.normpath(os.path.join(venv_dir, venv_name)),
+        frozenset(node["NodeID"] for node in nodes),
     )
-
-    # Clean up the placement group
-    ray.util.remove_placement_group(pg)
-    # Return mapping from node IP to venv python path
-    return paths[0]
+    with G_VENV_CACHE_LOCK:
+        build_lock = G_VENV_BUILD_LOCKS.setdefault(key, Lock())
+    with build_lock:
+        if key in G_BUILT_VENVS:
+            return G_BUILT_VENVS[key]
+        num_nodes = len(nodes)
+        # Reserve one CPU on each node using a STRICT_SPREAD placement group
+        bundles = [{"CPU": 1} for _ in range(num_nodes)]
+        pg = placement_group(bundles=bundles, strategy="STRICT_SPREAD")
+        try:
+            ray.get(pg.ready())
+            force_rebuild = (
+                os.environ.get("NRL_FORCE_REBUILD_VENVS", "false").lower() == "true"
+            )
+            # Launch one actor per node
+            actors = [
+                _env_builder.options(placement_group=pg).remote(
+                    py_executable, venv_name, i, force_rebuild
+                )
+                for i, _ in enumerate(nodes)
+            ]
+            # Ensure setup runs on each node
+            paths = ray.get(actors)
+            # Normalize paths to handle double slashes and other path inconsistencies
+            normalized_paths = [os.path.normpath(p) for p in paths]
+            assert len(set(normalized_paths)) == 1, (
+                f"All nodes should have the same venv, but got: {set(normalized_paths)}"
+            )
+        finally:
+            # Clean up the placement group even if setup fails
+            ray.util.remove_placement_group(pg)
+        # Never rebuild a prepared environment while actors may be using it.
+        G_BUILT_VENVS[key] = paths[0]
+        # Return the common venv Python path
+        return paths[0]
 
 
 def make_actor_runtime_env(

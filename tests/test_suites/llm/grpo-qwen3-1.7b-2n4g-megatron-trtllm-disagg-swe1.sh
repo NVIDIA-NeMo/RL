@@ -15,6 +15,9 @@ USE_GYM_CONTAINER=true
 
 exit_if_max_steps_reached
 
+# NIXL KV transfer must use the RDMA HCAs, not the image's management NIC.
+export UCX_NET_DEVICES=all
+
 # Run the experiment
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config $CONFIG_PATH \

@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import itertools
 import logging
+import pickle
 import random
+import threading
 from contextlib import contextmanager
 from time import monotonic
 
@@ -1729,3 +1731,75 @@ def test_spans_cost_nothing_when_telemetry_is_off():
     assert snap["total_bytes"] >= 8  # 2 x float32
     # Written only on a put, so the register alone cannot satisfy this.
     assert snap["last_put_bytes_per_key"] == 4  # float32
+
+
+def test_snapshot_while_another_thread_records_loses_no_call():
+    """The controller reads its client from a worker thread while the event loop
+    keeps recording on it. Each window read zeroes ``step_wall_ms``; an op landing
+    between the copy and the zeroing used to vanish from the step series."""
+    client = _client(register=False)
+    n_calls = 3_000
+    seen_ms = 0.0
+    done = threading.Event()
+
+    def writer():
+        _emit(client, [1.0] * n_calls)
+        done.set()
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    while not done.is_set():
+        seen_ms += client.snapshot(reset_step_window=True)["step_wall_ms"]
+    thread.join()
+    seen_ms += client.snapshot(reset_step_window=True)["step_wall_ms"]
+
+    final = client.snapshot()
+    assert final["by_op"]["put"]["calls"] == n_calls
+    assert seen_ms == pytest.approx(final["total_wall_ms"])
+    client.close()
+
+
+def test_snapshot_survives_partitions_registering_concurrently():
+    """``n_keys_outstanding`` walks the per-partition key sets while the recording
+    thread adds partitions; iterating the live dict raised mid-run."""
+    client = _client(register=False)
+    errors: list[BaseException] = []
+    done = threading.Event()
+
+    def writer():
+        try:
+            for i in range(400):
+                client._keys_by_partition[f"part{i}"] = {"k"}
+        finally:
+            done.set()
+
+    def reader():
+        try:
+            while not done.is_set():
+                client.snapshot(reset_step_window=True)
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assert below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    assert client.snapshot()["n_keys_outstanding"] == 400
+    client.close()
+
+
+def test_client_pickles_with_its_counters_for_the_controller_actor():
+    """The SC driver cloudpickles ``dp_client`` into the controller actor; the
+    stats lock must not stop that, and the clone must still count."""
+    client = _client(register=False)
+    _emit(client, [2.0, 3.0])
+
+    clone = pickle.loads(pickle.dumps(client))
+    _emit(clone, [1.0])
+
+    assert clone.snapshot()["by_op"]["put"]["calls"] == 3
+    assert client.snapshot()["by_op"]["put"]["calls"] == 2
+    client.close()
