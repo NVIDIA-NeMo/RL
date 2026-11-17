@@ -44,16 +44,13 @@ pytest.importorskip("vllm")
 pytest.importorskip("nemo_gym.token_id_capture.staging")
 
 import httpx  # noqa: E402
-from dynamo.llm.exceptions import HttpError  # noqa: E402
+from dynamo.llm.exceptions import HttpError, InvalidArgument  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
     GenerationCutInventory,
     GenerationCutPrefix,
 )
 from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter  # noqa: E402
-from nemo_gym.token_id_capture.external_capture import (  # noqa: E402
-    split_dynamo_capture_refusal,
-)
 from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER  # noqa: E402
 from nemo_gym.token_id_capture.replay import (  # noqa: E402
     replay_context,
@@ -498,12 +495,17 @@ class _Router:
 class _Context:
     def __init__(self, stopped: bool) -> None:
         self._stopped = stopped
+        self.response_headers: dict[str, str] = {}
 
     def id(self) -> str:
         return "chatcmpl-0"
 
     def is_stopped(self) -> bool:
         return self._stopped
+
+    def set_response_header(self, name: str, value: str) -> bool:
+        self.response_headers[name] = value
+        return True
 
 
 class SimpleItem:
@@ -533,6 +535,8 @@ async def _dynamo(
         )
     )
     capture._prefix_cache = host._chain_prefix
+    # The frontend's request context, which carries the response headers.
+    context = _Context(stopped)
     engine = chat_engine.NemoRLChatEngine(
         pool=kit.pool,
         routed_engine=_Router(
@@ -544,17 +548,18 @@ async def _dynamo(
         capture=capture,
     )
     try:
-        (chunk,) = [chunk async for chunk in engine.generate(request, None)]
-    except HttpError as error:
-        message, acknowledged = split_dynamo_capture_refusal(error.message)
+        (chunk,) = [chunk async for chunk in engine.generate(request, context)]
+    except (HttpError, InvalidArgument) as error:
+        # Dynamo answers InvalidArgument with HTTP 400 and its message.
+        refused = isinstance(error, InvalidArgument)
         return _Outcome(
             # The frontend's answer to a client that went away reaches nobody.
-            None if stopped else error.code,
-            {"error": message},
+            None if stopped else (400 if refused else error.code),
+            {"error": str(error) if refused else error.message},
             host.llm.runs,
             sink.staged,
             failed,
-            acknowledged,
+            context.response_headers.get(CAPTURE_REFUSAL_HEADER),
         )
     return _Outcome(
         200,

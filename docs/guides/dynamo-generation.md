@@ -72,7 +72,7 @@ Where the behavior differs from the native endpoint:
 - The frontend refuses more than 32 `stop` strings, and vLLM request fields its own request type lacks (for example `structured_outputs`, `return_token_ids`, `truncate_prompt_tokens`, `priority`, `chat_template`), with HTTP 400.
 - gpt-oss (Harmony) chat calls are refused with HTTP 400.
 - A call that streams (`stream: true`) or asks for more than one choice (`n`) is refused with HTTP 400. The native endpoint serves both, and fails the capture of a streamed token-capture call. NeMo-Gym sends neither.
-- A token-capture call refused for its context length acknowledges the refusal at the end of the error message instead of in the native endpoint's `x-ng-capture-refused` header, which Dynamo's errors cannot carry. Gym's dialect moves it back to the header, so the harness sees the native error.
+- A call refused with a status other than 400 (a full queue's 503, for example) is answered with that status and the status's standard text. The engine's own message is only in the frontend's log. A 400 keeps its message, and a refused token-capture call is acknowledged in the `x-ng-capture-refused` header, both as on the native endpoint.
 - A call's processed media travels to the engine inside the request.
 
 ### Rollout recovery

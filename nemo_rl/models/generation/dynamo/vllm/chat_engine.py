@@ -48,7 +48,7 @@ from collections.abc import Coroutine
 from typing import Any, AsyncGenerator, Optional, TypedDict
 
 from dynamo.llm import PythonAsyncEngine
-from dynamo.llm.exceptions import HttpError, InvalidArgument
+from dynamo.llm.exceptions import HttpError, InvalidArgument, RoutedEngineError
 
 from nemo_rl.models.generation.dynamo.engine_adapter import weight_free_model_path
 from nemo_rl.models.generation.dynamo.managed_runtime import (
@@ -129,21 +129,35 @@ class GymEngineReply(TypedDict, total=False):
 _DYNAMO_ONLY_FIELDS = {"nvext", "chat_template_args", "unsupported_fields"}
 
 
-def _capture_refusal_ack(extras: GymCallExtras) -> str:
-    """Gym's acknowledgement that a capture call was refused before it ran.
+def _refusal_error(
+    context: Any,
+    extras: GymCallExtras,
+    *,
+    status: int,
+    message: str,
+    acknowledge: bool,
+) -> Exception:
+    """The error that answers a refused call as the native server does.
 
-    The native route sends it as a header; Dynamo's frontend forwards only an
-    error's status and message, so it ends the message instead.
+    A 400 carries ``message``. Dynamo answers any other status with the status's
+    standard text and only logs ``message``. With ``acknowledge``, Gym is told
+    its capture call was refused before it ran, in the native route's header.
     """
-    if extras.ng_capture is None or extras.ng_measure:
-        # Native's /tokenize never acknowledges a measure call.
-        return ""
-    # Deferred: Gym is installed wherever a call carries ng_capture.
-    from nemo_gym.token_id_capture.external_capture import (
-        dynamo_capture_refusal_suffix,
-    )
+    # Native's /tokenize never acknowledges a measure call.
+    if acknowledge and extras.ng_capture is not None and not extras.ng_measure:
+        # Deferred: Gym is installed wherever a call carries ng_capture.
+        from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER
 
-    return dynamo_capture_refusal_suffix(extras.ng_capture["model_call_id"])
+        if not context.set_response_header(
+            CAPTURE_REFUSAL_HEADER, extras.ng_capture["model_call_id"]
+        ):
+            LOGGER.warning(
+                "The frontend could not carry %s for a refused capture call",
+                CAPTURE_REFUSAL_HEADER,
+            )
+    if status == 400:
+        return InvalidArgument(message)
+    return HttpError(status, message)
 
 
 # Free-form JSON the client wrote (a tool's parameters, a response_format
@@ -298,15 +312,14 @@ class NemoRLChatEngine:
             (request.get("nvext") or {}).get("annotations") or ()
         )
         if extras is None:
-            raise HttpError(
-                400,
+            raise InvalidArgument(
                 "NeMo RL's Dynamo frontend serves NeMo-Gym's calls (the "
                 "nemo_rl:gym: annotation) on chat; NeMo RL's own rollouts use "
-                "/v1/completions.",
+                "/v1/completions."
             )
         try:
             chunk = await self._serve(request, extras, context)
-        except HttpError:
+        except (HttpError, InvalidArgument, RoutedEngineError):
             raise
         except Exception as error:
             # The steps before the engine refuse a call with these, as
@@ -314,8 +327,13 @@ class NemoRLChatEngine:
             failure = error_reply(error)
             if failure is None:
                 raise
-            ack = _capture_refusal_ack(extras) if failure.acknowledge else ""
-            raise HttpError(failure.status, failure.message + ack) from error
+            raise _refusal_error(
+                context,
+                extras,
+                status=failure.status,
+                message=failure.message,
+                acknowledge=failure.acknowledge,
+            ) from error
         yield chunk
 
     async def _serve(
@@ -414,8 +432,13 @@ class NemoRLChatEngine:
         steps.mark("engine")
         if (refusal := engine_data.get("refusal")) is not None:
             # The engine refused the call before it ran, with the native status.
-            ack = _capture_refusal_ack(extras) if refusal["acknowledge"] else ""
-            raise HttpError(refusal["status"], refusal["message"] + ack)
+            raise _refusal_error(
+                context,
+                extras,
+                status=refusal["status"],
+                message=refusal["message"],
+                acknowledge=refusal["acknowledge"],
+            )
         result = GymCallResult.model_validate(engine_data["result"])
         reply_request = rendered.request
         if result.ng_commit_coords is not None:
@@ -452,11 +475,13 @@ class NemoRLChatEngine:
                 data = item.data()
                 if data and data.get("engine_data"):
                     engine_data = data["engine_data"]
+        except RoutedEngineError:
+            # An engine that is gone or overloaded: the status its error maps to.
+            raise
         except (ValueError, InvalidArgument) as error:
-            # Dynamo raises an engine's error as a ValueError, or from 1.7 the
-            # engine adapter's InvalidArgument as itself (not a ValueError), and
-            # would answer either with 400. The engine sends every status it means
-            # as a refusal, so anything raised is an engine failure: 500, as natively.
+            # Dynamo would answer the engine adapter's InvalidArgument, or an
+            # unclassified ValueError, with 400. The engine sends every status it
+            # means as a refusal, so this is an engine failure: 500, as natively.
             raise HttpError(500, str(error)) from error
         if engine_data is None:
             raise HttpError(500, "the engine returned no result for this call")

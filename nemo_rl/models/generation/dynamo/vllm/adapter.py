@@ -593,9 +593,9 @@ def _wire_logprobs(logprobs: Any) -> Optional[list[dict[str, list[Any]]]]:
 def _refusal(status: int, message: str, *, acknowledge: bool = False) -> GenerateChunk:
     """A Gym call the engine refused before it ran, answered in the chunk.
 
-    Dynamo hands an error the engine raises to the frontend's chat engine
-    without its status, so it could only answer 500; the chat engine answers
-    this with ``status``, as the native server does.
+    An error the engine raises reaches the frontend's chat engine with its
+    status, but only a 400 keeps its message and none carries ``acknowledge``;
+    the chat engine answers this with all three, as the native server does.
     """
     reply: GymEngineReply = {
         "refusal": {

@@ -28,7 +28,11 @@ pytestmark = pytest.mark.vllm
 pytest.importorskip("dynamo._core")
 pytest.importorskip("vllm")
 
-from dynamo.llm.exceptions import HttpError, InvalidArgument  # noqa: E402
+from dynamo.llm.exceptions import (  # noqa: E402
+    HttpError,
+    InvalidArgument,
+    RoutedEngineError,
+)
 
 from nemo_rl.models.generation.dynamo.managed_runtime import (  # noqa: E402
     ChatProcessorOptions,
@@ -149,6 +153,17 @@ class _Router:
         return stream()
 
 
+class _Context:
+    """Dynamo's request context: keeps the response headers the engine sets."""
+
+    def __init__(self) -> None:
+        self.response_headers: dict[str, str] = {}
+
+    def set_response_header(self, name: str, value: str) -> bool:
+        self.response_headers[name] = value
+        return True
+
+
 class _Capture:
     """The TQ prefix source: returns the staged prefix for a token_in admission."""
 
@@ -201,7 +216,7 @@ def _options(chat_settings_file: str | None = None) -> dict:
     )._asdict()
 
 
-def _serve(pool, router, request, capture=None) -> list[dict]:
+def _serve(pool, router, request, capture=None, context=None) -> list[dict]:
     engine = chat_engine.NemoRLChatEngine(
         pool=pool,
         routed_engine=router,
@@ -210,7 +225,9 @@ def _serve(pool, router, request, capture=None) -> list[dict]:
     )
 
     async def run():
-        return [chunk async for chunk in engine.generate(request, None)]
+        return [
+            chunk async for chunk in engine.generate(request, context or _Context())
+        ]
 
     return asyncio.run(run())
 
@@ -388,10 +405,10 @@ def test_gym_calls_nemo_rl_cannot_serve_are_refused_with_a_400(
     router = _Router()
     request_fields = {"extras": {}, **request_fields}
 
-    with pytest.raises(HttpError, match=error) as refused:
+    # Dynamo answers InvalidArgument with HTTP 400 and its message.
+    with pytest.raises(InvalidArgument, match=error):
         _serve(pool, router, _call(**request_fields))
 
-    assert refused.value.code == 400
     assert router.requests == []
 
 
@@ -401,9 +418,7 @@ def test_gym_calls_nemo_rl_cannot_serve_are_refused_with_a_400(
 def test_a_call_refused_before_it_runs_acknowledges_its_capture_to_gym(
     captured, refused_by
 ) -> None:
-    from nemo_gym.token_id_capture.external_capture import (
-        split_dynamo_capture_refusal,
-    )
+    from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER
     from vllm.exceptions import VLLMValidationError
 
     pool = _Pool(_rendered())
@@ -422,14 +437,15 @@ def test_a_call_refused_before_it_runs_acknowledges_its_capture_to_gym(
             }
         }
     extras = {"ng_capture": TOKEN_IN} if captured else {}
+    context = _Context()
 
-    with pytest.raises(HttpError) as refused:
-        _serve(pool, router, _call(extras))
+    with pytest.raises(InvalidArgument, match="maximum context length"):
+        _serve(pool, router, _call(extras), context=context)
 
-    # Gym reads the acknowledgement off the message, as natively off the header.
-    message, refused_call = split_dynamo_capture_refusal(refused.value.message)
-    assert (refused.value.code, "maximum context length" in message) == (400, True)
-    assert refused_call == (TOKEN_IN["model_call_id"] if captured else None)
+    # Gym reads the acknowledgement off the header, as from the native server.
+    assert context.response_headers == (
+        {CAPTURE_REFUSAL_HEADER: TOKEN_IN["model_call_id"]} if captured else {}
+    )
 
 
 @pytest.mark.parametrize(
@@ -469,6 +485,14 @@ def test_an_engine_that_does_not_serve_the_call_fails_it(router, status, message
         _serve(_Pool(_rendered()), router, _call({}))
 
     assert failed.value.code == status
+
+
+def test_an_engine_error_dynamo_classified_keeps_its_status() -> None:
+    router = _Router(error=RoutedEngineError("worker gone"))
+
+    # Raised as it came: the frontend answers with the status the error maps to.
+    with pytest.raises(RoutedEngineError, match="worker gone"):
+        _serve(_Pool(_rendered()), router, _call({}))
 
 
 def test_dynamos_frontend_still_builds_its_runtime_by_the_name_nemo_rl_wraps():
