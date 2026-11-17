@@ -452,6 +452,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
         init_telemetry_worker()
 
         self.cfg = config
+        self._keep_resident = bool(config.get("dedicated"))
         self.rank = get_rank_safe()
         # Fail on a bad manual_gc config before the expensive setup below; GC itself
         # is disabled at the end of __init__ (_maybe_enable_manual_gc).
@@ -962,15 +963,14 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                 raise ValueError(
                     f"value train step has {samples} samples; expected {state.gbs}"
                 )
-            denominator = (
-                toks if state.loss_fn.loss_type == LossType.TOKEN_LEVEL else seqs
-            )
+            count = counts[1 if state.loss_fn.loss_type == LossType.TOKEN_LEVEL else 0]
+            denominator = count.item()
             if denominator <= 0:
                 raise ValueError(
                     "value train step has no valid training tokens or sequences"
                 )
             inv_n = 1.0 / denominator
-            self.model.scale_gradients(inv_n)
+            self.model.scale_gradients(count.reciprocal())
             if self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
                 "overlap_grad_reduce"
             ]:
@@ -1179,19 +1179,24 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
 
     def prepare_for_training(self) -> None:
         """Move model and optimizer to CUDA for training."""
-        self.model = self.move_model(
-            self.model, "cuda", move_grads=True, move_params=True
-        )
+        if not self._keep_resident:
+            self.model = self.move_model(
+                self.model, "cuda", move_grads=True, move_params=True
+            )
         self.model.train()
 
         if (
             hasattr(self, "optimizer")
             and self.optimizer is not None
             and not self.optimizer_cpu_offload
+            and not self._keep_resident
         ):
             self.move_optimizer("cuda")
 
-        if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+        if (
+            not self._keep_resident
+            and self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1
+        ):
             torch.cuda.empty_cache()
 
     def prepare_for_inference(self):
@@ -1201,16 +1206,17 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                 "finish or abort the value train step before inference/offload"
             )
 
-        self.model = self.move_model(self.model, "cuda", move_grads=False)
+        if not self._keep_resident:
+            self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
 
         # Offload gradients
-        self.model = self.move_model(
-            self.model, "cpu", move_params=False, move_grads=True
-        )
-
-        gc.collect()
-        torch.cuda.empty_cache()
+        if not self._keep_resident:
+            self.model = self.move_model(
+                self.model, "cpu", move_params=False, move_grads=True
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
 
     @torch.no_grad()
     def move_model(
@@ -1370,12 +1376,12 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                 "finish or abort the value train step before inference/offload"
             )
 
-        self.model = self.move_model(
-            self.model, "cpu", move_params=True, move_grads=False
-        )
-
-        gc.collect()
-        torch.cuda.empty_cache()
+        if not self._keep_resident:
+            self.model = self.move_model(
+                self.model, "cpu", move_params=True, move_grads=False
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def finish_training(self) -> None:
         """Offload model, gradients, and optimizer to CPU after training."""
@@ -1387,6 +1393,8 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
         # from A_log (-torch.exp(A_log.float())). Do this before model offload frees
         # CUDA parameter storage; refreshing afterward would read invalid storage.
         self.model.eval()
+        if self._keep_resident:
+            return
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True
         )
