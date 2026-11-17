@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any, Optional, cast
 import torch
 
 from nemo_rl.algorithms.advantage_estimator import (
-    GRPOAdvantageEstimator,
+    ReinforceBaselineAdvantageEstimator,
     create_advantage_estimator,
 )
 from nemo_rl.algorithms.grpo import (
@@ -68,6 +68,7 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
 from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
     build_logical_owner_batch,
     has_logical_owners,
+    supports_forest_estimator,
 )
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
@@ -354,11 +355,12 @@ class AdvantageComputer:
         if logical and (
             cfg.is_ppo
             or not isinstance(cfg.algo, GRPOConfig)
-            or cfg.algo.adv_estimator.name != "grpo"
-            or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
+            or not supports_forest_estimator(
+                cfg.algo.adv_estimator.name, self._advantage_estimator
+            )
         ):
             raise ValueError(
-                "Forest logical owners require the standard GRPO estimator"
+                "Forest logical owners require the grpo or reinforce_baseline estimator"
             )
         input_fields = cfg.input_fields()
         if logical and adv_cfg.prompt_ids_field not in input_fields:
@@ -601,18 +603,26 @@ class AdvantageComputer:
                 advantage_valid_mask[owned_rows],
                 reduce="amax",
             )
+            estimator_kwargs: dict[str, torch.Tensor] = {}
+            if isinstance(
+                self._advantage_estimator, ReinforceBaselineAdvantageEstimator
+            ):
+                estimator_kwargs["action_token_counts"] = (
+                    owner_batch.action_token_counts(mask[:, 1:])
+                )
             owner_advantages = self._advantage_estimator.compute_advantage(
                 prompt_ids=owner_batch.group_ids,
                 rewards=rewards[rows],
                 mask=owner_batch.valid_mask.unsqueeze(-1),
                 valid_mask=owner_participation,
+                **estimator_kwargs,
             )
             if (
                 owner_advantages.shape != (len(rows), 1)
                 or not torch.isfinite(owner_advantages).all()
             ):
                 raise ValueError(
-                    "GRPO must return one finite advantage per Forest owner"
+                    "The estimator must return one finite advantage per Forest owner"
                 )
             # Clip one value per rollout before fanout, preserving zero values
             # for filtered owners and ownerless execution padding.

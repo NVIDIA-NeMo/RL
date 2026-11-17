@@ -70,7 +70,6 @@ from ray.exceptions import RayActorError
 from wandb import Table
 
 from nemo_rl.algorithms import opd as opd_module
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CHECKPOINT_MUTATION_KINDS,
     CheckpointMutationKind,
@@ -141,6 +140,7 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
 )
 from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
     has_logical_owners,
+    supports_forest_estimator,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerActorArgs,
@@ -5345,11 +5345,13 @@ class SingleControllerActor:
             if (
                 self._is_ppo
                 or not isinstance(self._algo_cfg, GRPOConfig)
-                or self._algo_cfg.adv_estimator.name != "grpo"
-                or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
+                or not supports_forest_estimator(
+                    self._algo_cfg.adv_estimator.name, self._advantage_estimator
+                )
             ):
                 raise ValueError(
-                    "Forest logical owners require the standard GRPO estimator"
+                    "Forest logical owners require the grpo or reinforce_baseline "
+                    "estimator"
                 )
             validate_forest_objective(self._algo_cfg, self._master_config.loss_fn)
         if self._advantage_estimator is None:

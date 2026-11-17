@@ -11,16 +11,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Validate logical owners for replay restore and the existing GRPO estimator."""
+"""Validate logical owners for replay restore and the Forest estimators."""
 
 from dataclasses import dataclass, fields
 
 import torch
 
+from nemo_rl.algorithms.advantage_estimator import (
+    GRPOAdvantageEstimator,
+    ReinforceBaselineAdvantageEstimator,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import LogicalRowTag, forest_segment_id
 
 _OWNER_TAGS = frozenset(field.name for field in fields(LogicalRowTag))
+_FOREST_ESTIMATORS = {
+    "grpo": GRPOAdvantageEstimator,
+    "reinforce_baseline": ReinforceBaselineAdvantageEstimator,
+}
+
+
+def supports_forest_estimator(name: str, estimator: object) -> bool:
+    """Whether Forest owners can use the configured advantage estimator."""
+    expected = _FOREST_ESTIMATORS.get(name)
+    return expected is not None and isinstance(estimator, expected)
 
 
 def has_logical_owners(meta: KVBatchMeta) -> bool:
@@ -40,6 +54,22 @@ class LogicalOwnerBatch:
     def fanout(self, values: torch.Tensor) -> torch.Tensor:
         """Broadcast one scalar per owner, with zero for ownerless padding."""
         return values[self.row_owner.clamp_min(0)] * (self.row_owner >= 0)
+
+    def action_token_counts(self, action_mask: torch.Tensor) -> torch.Tensor:
+        """Sum eligible action tokens over every physical segment per owner."""
+        if action_mask.ndim != 2 or action_mask.shape[0] != self.row_owner.shape[0]:
+            raise ValueError(
+                "Forest action mask must be row-aligned and two-dimensional"
+            )
+        row_counts = action_mask.float().sum(dim=-1).to(self.row_owner.device)
+        counts = torch.zeros(
+            len(self.representative_rows),
+            dtype=row_counts.dtype,
+            device=self.row_owner.device,
+        )
+        owned = self.row_owner >= 0
+        counts.scatter_add_(0, self.row_owner[owned], row_counts[owned])
+        return counts
 
 
 def validate_logical_owner_metadata(

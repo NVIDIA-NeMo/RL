@@ -1005,13 +1005,15 @@ class ClippedPGLossFn(LossFunction):
                     torch.zeros_like(actor_importance_weights_expanded),
                 )
             elif self.truncated_importance_sampling_type == "seq-mask-tis":
-                # geo_mean_i = exp( mean_t( log(π_prev / π_gen) ) )
+                # geo_mean_i = exp( mean_t( log(π_prev / π_gen) ) ), one gate per
+                # physical row. Infinite token ratios saturate, so they push
+                # the row outside the gate instead of counting as ratio 1.
                 log_is_ratio = torch.nan_to_num(
                     prev_logprobs - generation_logprobs,
                     nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                )
+                    posinf=30.0,
+                    neginf=-30.0,
+                ).clamp(min=-30.0, max=30.0)
                 seq_log_is_ratio_mean = masked_mean(
                     log_is_ratio, token_mask, dim=-1
                 )  # [B]

@@ -19,7 +19,10 @@ from pydantic import ValidationError
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
     OPDAdvantageEstimator,
+    ReinforceBaselineAdvantageEstimator,
+    create_advantage_estimator,
 )
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
 
 
 def _make_estimator(alpha=1.0, subtract_global_baseline=False):
@@ -31,6 +34,79 @@ def _make_estimator(alpha=1.0, subtract_global_baseline=False):
         ),
         {},
     )
+
+
+def _make_reinforce_baseline_estimator():
+    estimator = create_advantage_estimator(
+        AdvEstimatorConfig(name="reinforce_baseline"), ClippedPGLossConfig()
+    )
+    assert isinstance(estimator, ReinforceBaselineAdvantageEstimator)
+    return estimator
+
+
+def test_reinforce_baseline_requires_the_global_batch():
+    assert _make_reinforce_baseline_estimator().requires_global_batch
+
+
+def test_reinforce_baseline_uses_full_group_mean_not_leave_one_out():
+    estimator = _make_reinforce_baseline_estimator()
+    prompt_ids = torch.tensor([[0], [0], [1], [1], [1], [2]])
+    rewards = torch.tensor([0.0, 2.0, 0.0, 4.0, 8.0, 7.0])
+    centered = torch.tensor([-1.0, 1.0, -4.0, 0.0, 4.0, 0.0])
+
+    advantages = estimator.compute_advantage(
+        prompt_ids=prompt_ids, rewards=rewards, mask=torch.ones(6, 1)
+    )
+
+    torch.testing.assert_close(
+        advantages[:, 0], centered / centered.pow(2).mean().sqrt()
+    )
+
+
+def test_reinforce_baseline_whitens_by_population_action_tokens():
+    estimator = _make_reinforce_baseline_estimator()
+    mask = torch.tensor([[1.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
+
+    advantages = estimator.compute_advantage(
+        prompt_ids=torch.tensor([[5], [5]]),
+        rewards=torch.tensor([1.0, 3.0]),
+        mask=mask,
+    )
+
+    expected = torch.tensor([[-(3.0**0.5), 0.0, 0.0], [1.0 / (3.0**0.5)] * 3])
+    torch.testing.assert_close(advantages, expected)
+    torch.testing.assert_close(
+        (advantages * mask).sum() / mask.sum(), torch.tensor(0.0)
+    )
+    torch.testing.assert_close(
+        (advantages.pow(2) * mask).sum() / mask.sum(), torch.tensor(1.0)
+    )
+
+
+def test_reinforce_baseline_excludes_invalid_rollouts_from_the_baseline():
+    estimator = _make_reinforce_baseline_estimator()
+
+    advantages = estimator.compute_advantage(
+        prompt_ids=torch.tensor([[0], [0], [0]]),
+        rewards=torch.tensor([0.0, 2.0, 10.0]),
+        mask=torch.ones(3, 1),
+        valid_mask=torch.tensor([1.0, 1.0, 0.0]),
+        action_token_counts=torch.tensor([1.0, 1.0, 0.0]),
+    )
+
+    torch.testing.assert_close(advantages[:2, 0], torch.tensor([-1.0, 1.0]))
+
+
+def test_reinforce_baseline_without_action_tokens_has_zero_advantages():
+    estimator = _make_reinforce_baseline_estimator()
+
+    advantages = estimator.compute_advantage(
+        prompt_ids=torch.tensor([[0], [0]]),
+        rewards=torch.tensor([0.0, 1.0]),
+        mask=torch.zeros(2, 3),
+    )
+
+    torch.testing.assert_close(advantages, torch.zeros(2, 3))
 
 
 def test_opd_basic_positive_distill_advantage():
