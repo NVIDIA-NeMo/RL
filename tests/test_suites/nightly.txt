@@ -403,8 +403,9 @@ tests/test_suites/llm/ppo-qwen3-0.6b-1n8g-megatron-gym-single-controller-forest.
 ########
 
 # GDPO over the example_tool_call_multireward NeMo Gym env (correctness / format /
-# schema_valid), Qwen2.5-1.5B — exercises the multi-reward gym rollout path end to end:
+# schema_valid), Qwen2.5-1.5B, on the SingleController path — exercises the multi-reward gym
+# rollout path end to end:
 # reward_components -> reward/<name> bridge -> GDPO with per-reward weights. Replaces the
 # native-rollout reward-weights nightly (that path is already covered on main; the
 # reward_weights math itself is covered by unit tests).
-tests/test_suites/llm/gdpo-qwen2.5-1.5b-1n8g-gym-multireward.sh
+tests/test_suites/llm/gdpo-qwen2.5-1.5b-1n8g-megatron-vllm-gym-single-controller-multireward.sh
