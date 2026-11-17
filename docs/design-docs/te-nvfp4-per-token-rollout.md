@@ -35,11 +35,9 @@ During policy training, per-token activation scaling gives each token its own ac
 
 Megatron-Bridge exports the updated policy weights with Hugging Face parameter names and reconstructs tensors across the training TP, PP, and EP topology, sending plain BF16. This is the same transport representation used by a BF16-only run.
 
-Each colocated vLLM engine receives the BF16 stream over CUDA IPC. NeMo RL converts each transport batch into owned checkpoint-format tensors and supplies one lazy iterator to vLLM's native `reload_weights` API. Routed-expert projections are quantized at load time, mirroring the fp8/mxfp8 real-quant rollout path. NeMo RL resolves the destination `RoutedExperts` container and classifies W1/W2/W3 from that container's vLLM checkpoint mapping; it does not maintain model-family projection names. W1 and W3 (often gate and up) share one per-expert global scale, while W2 (often down) is quantized independently. BF16 boundary layers pass through unchanged.
+Each vLLM engine receives the BF16 stream, over CUDA IPC when colocated and as NCCL broadcasts otherwise, and feeds it to vLLM's native `reload_weights` API. Routed-expert projections are quantized at load time, mirroring the fp8/mxfp8 real-quant rollout path. W1 and W3 (often gate and up) share one per-expert global scale, while W2 (often down) is quantized independently. The projections are identified from the destination `RoutedExperts` container's vLLM checkpoint mapping, not from model-family names. BF16 boundary layers pass through unchanged.
 
-The IPC allocation is acknowledged only after quantization and passthrough copies no longer depend on it. The final COMPLETE message is acknowledged only after `reload_weights` consumes the entire stream, performs layerwise post-processing, and completes the final device fence. If preparation or load fails, NeMo RL drains and acknowledges the remaining IPC messages so the sender cannot deadlock, and the rollout worker raises instead of serving stale weights.
-
-A non-colocated engine receives the same BF16 stream as NCCL broadcasts instead of CUDA IPC and feeds it to `reload_weights` through the same quantizer. If preparation or load fails, it still receives the remaining broadcasts so the policy workers are not left blocked, then raises.
+If quantization or load fails, the engine still drains the rest of the stream so the policy workers are not left blocked, then raises instead of serving stale weights.
 
 ### Per-token vLLM rollout
 
