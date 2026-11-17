@@ -40,7 +40,7 @@ class DebugWriterConfig(BaseModel, extra="allow"):
     # Key in DEBUG_WRITER_REGISTRY, or a dotted import path to a DebugWriter defined
     # outside this repo. Extra keys are forwarded to the constructor after log_dir
     # and shard_id.
-    target: str = "json"
+    target: str = "parquet"
 
 
 @dataclass(frozen=True)

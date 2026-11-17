@@ -14,6 +14,7 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     DebugWriter,
     DebugWriterConfig,
     JsonDebugWriter,
+    ParquetDebugWriter,
     TrainChunk,
     make_debug_writer,
 )
@@ -451,12 +452,18 @@ class _Unrelated:
 _NOT_A_CLASS = 5
 
 
-@pytest.mark.parametrize("cfg", [DebugWriterConfig(), DebugWriterConfig(target="json")])
-def test_make_debug_writer_selects_json_writer_by_default_and_by_name(
-    tmp_path: Path, cfg: DebugWriterConfig
+@pytest.mark.parametrize(
+    ("cfg", "writer_cls"),
+    [
+        (DebugWriterConfig(), ParquetDebugWriter),
+        (DebugWriterConfig(target="json"), JsonDebugWriter),
+    ],
+)
+def test_make_debug_writer_selects_parquet_by_default_and_json_by_name(
+    tmp_path: Path, cfg: DebugWriterConfig, writer_cls: type[DebugWriter]
 ) -> None:
     writer = make_debug_writer(cfg, str(tmp_path), shard_id="3")
-    assert type(writer) is JsonDebugWriter
+    assert type(writer) is writer_cls
     assert writer.log_dir == tmp_path
     assert writer.shard_id == "3"
 
