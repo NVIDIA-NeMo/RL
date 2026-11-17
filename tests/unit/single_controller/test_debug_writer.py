@@ -695,6 +695,14 @@ def test_parquet_writer_republishes_a_retried_step_without_losing_the_old_dump(
     assert json.loads((directory / "_manifest.json").read_text())["files"] == [old.ref]
     assert (directory / old.ref).is_file()
 
+    # A write that died after creating its `.partial` file leaves it behind.
+    orphan = directory / ".step-00000001-shard-0-dead.parquet.partial"
+    orphan.write_bytes(b"torn")
+
     retry.finish_step(0, [new])
     assert json.loads((directory / "_manifest.json").read_text())["files"] == [new.ref]
     assert not (directory / old.ref).exists()
+    assert not orphan.exists()
+    assert sorted(p.name for p in directory.iterdir()) == sorted(
+        ["_manifest.json", new.ref]
+    )

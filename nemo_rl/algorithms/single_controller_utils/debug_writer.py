@@ -479,9 +479,10 @@ class ParquetDebugWriter(DebugWriter):
         partial = directory / f"._manifest-{uuid.uuid4().hex}.partial"
         partial.write_text(json.dumps({"step": step + 1, "files": files}) + "\n")
         os.replace(partial, final)
-        # A retried step leaves the failed attempt's chunks and the previous
-        # manifest's chunks behind; drop them only after the new manifest is in place.
-        for stale in directory.glob("step-*.parquet"):
+        # A retried step leaves the failed attempt's chunks, the previous manifest's
+        # chunks and any `.partial` file from a failed write behind; drop them only
+        # after the new manifest is in place.
+        for stale in (*directory.glob("step-*.parquet"), *directory.glob(".*.partial")):
             if stale.name not in files:
                 stale.unlink()
 
