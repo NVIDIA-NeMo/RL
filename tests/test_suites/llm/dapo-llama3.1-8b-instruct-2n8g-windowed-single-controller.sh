@@ -31,21 +31,21 @@ uv run examples/run_grpo_single_controller.py \
 # Convert tensorboard logs to json
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Only run metrics if the target step is reached
-if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    uv run tests/check_metrics.py $JSON_METRICS \
-        "len(data[\"train/loss\"]) == $MAX_STEPS" \
-        'all_finite(data["train/loss"])' \
-        'all_finite(data["train/token_mult_prob_error"])' \
-        'median(data["train/token_mult_prob_error"]) < 1.05' \
-        'data["train/token_mult_prob_error"]["100"] < 1.05' \
-        'mean(data["train/grad_norm"], 2, 0) > 0.06' \
-        'median(data["train/unfiltered_reward"]) > 0.35' \
-        'max(data["rollout/zero_variance_groups_total"]) >= 100' \
-        'min(data["train/skipped_step"]) == max(data["train/skipped_step"]) == 0' \
-        'min(data["train/dropped_prompt_groups"]) == max(data["train/dropped_prompt_groups"]) == 0' \
-        'median(data["timing/train/total_step_time"]) < 180'
+uv run tests/check_metrics.py $JSON_METRICS \
+    "len(data[\"train/loss\"]) == $MAX_STEPS" \
+    'all_finite(data["train/loss"])' \
+    'all_finite(data["train/token_mult_prob_error"])' \
+    'median(data["train/token_mult_prob_error"]) < 1.02' \
+    'max(data["train/token_mult_prob_error"]) < 1.05' \
+    'median(data["train/gen_kl_error"]) < 0.001' \
+    'mean(data["train/grad_norm"], 2, 0) > 0.06' \
+    'median(data["train/unfiltered_reward"]) > 0.35' \
+    'max(data["rollout/zero_variance_groups_total"]) >= 1000' \
+    'max(data["train/num_masked_seqs_by_overlong_filtering"]) > 0' \
+    'min(data["train/skipped_step"]) == max(data["train/skipped_step"]) == 0' \
+    'min(data["train/dropped_prompt_groups"]) == max(data["train/dropped_prompt_groups"]) == 0' \
+    'max(data["train/replaced_prompt_groups"]) == 0' \
+    'median(data["timing/train/total_step_time"]) < 180'
 
-    # Clean up checkpoint directory after successful run to save space.
-    rm -rf "$CKPT_DIR"
-fi
+# Clean up checkpoint directory after successful run to save space.
+rm -rf "$CKPT_DIR"
