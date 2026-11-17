@@ -13,7 +13,6 @@
 # limitations under the License.
 import json
 import os
-import pickle
 import signal
 import subprocess
 import sys
@@ -26,6 +25,7 @@ import pytest
 from nemo_rl.models.generation.dynamo import managed_runtime
 from nemo_rl.models.generation.dynamo.config import DynamoCfg, DynamoFrontendArgs
 from nemo_rl.models.generation.dynamo.managed_runtime import (
+    ChatProcessorOptions,
     FrontendHost,
     FrontendUrls,
     ManagedDynamoRuntime,
@@ -389,6 +389,7 @@ class _FakeFrontendHostActor:
     def __init__(self):
         self.node_ids: list[str] = []
         self.envs: list[dict[str, str]] = []
+        self.ray_addresses: list[str] = []
         self.serve_chat: list[bool] = []
         self.captures: list[dict] = []
         self.chat_settings: list[dict] = []
@@ -405,6 +406,7 @@ class _FakeFrontendHostActor:
                 @staticmethod
                 def remote(**kwargs):
                     actor.envs.append(kwargs["env"])
+                    actor.ray_addresses.append(kwargs["ray_address"])
                     actor.serve_chat.append(kwargs["serves_chat"])
                     host = f"frontend-{len(actor.envs)}"
                     return FrontendUrls(
@@ -460,8 +462,8 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
         assert env["DYN_TCP_LISTEN_BACKLOG"] == "8192"
         assert env["DYN_NAMESPACE"] == "nemo-rl-test"
         assert env["VIRTUAL_ENV"] == "/venvs/vllm"
-        assert env[managed_runtime.RENDER_WORKERS_ENV] == "3"
-        assert env[managed_runtime.RAY_ADDRESS_ENV] == "10.0.0.1:6379"
+    # The Ray cluster each frontend's chat engine reads token-capture prefixes through.
+    assert hosts.ray_addresses == 3 * ["10.0.0.1:6379"]
     # Every frontend's chat engine reads token-capture prefixes, and checks a
     # cut's bearer token, the same way.
     assert hosts.captures == 3 * [
@@ -513,6 +515,7 @@ def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
         namespace="nemo-rl-test",
         dynamo_cfg=DynamoCfg(),
         env={"DYN_NAMESPACE": "nemo-rl-test"},
+        ray_address="10.0.0.1:6379",
         serves_chat=serves_chat,
     )
     host.publish_chat_capture({"staging_partition": "staging"})
@@ -522,33 +525,44 @@ def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
         generation_cut_control_url="http://10.0.0.2:2400",
     )
     ((command, env),) = launched
-    # Dynamo's frontend, with NeMo RL's chat engine serving chat calls.
     assert command[:3] == [
         "/venvs/vllm/bin/python",
         "-m",
         "nemo_rl.models.generation.dynamo.vllm.frontend",
     ]
     assert command[command.index("--http-port") + 1] == "3000"
+    # NeMo RL's chat engine serves chat calls, as Dynamo's chat processor.
+    assert (
+        command[command.index("--dyn-chat-processor") + 1]
+        == managed_runtime.CHAT_PROCESSOR
+    )
+    chat_options = ChatProcessorOptions(
+        **json.loads(command[command.index("--dyn-chat-processor-config") + 1])
+    )
+    assert (chat_options.render_workers, chat_options.ray_address) == (
+        DynamoCfg().frontend_args.render_workers,
+        "10.0.0.1:6379",
+    )
     assert env["DYN_NAMESPACE"] == "nemo-rl-test"
     assert "DYN_STALE_SETTING" not in env
     # NeMo-Gym's checkpoint generation cuts go to a port of the frontend's own.
     assert env[managed_runtime.GENERATION_CUT_PORT_ENV] == "2400"
     assert host.returncode() is None
-    # Capture is set up after the engines register; the chat engine reads it
-    # from the file on its own node that the frontend was told about.
-    with open(env[managed_runtime.CAPTURE_FILE_ENV], "rb") as capture_file:
-        assert pickle.load(capture_file) == {"staging_partition": "staging"}
+    # Capture is set up after the engines register; the chat engine and the
+    # cut server read it from the file on this node the frontend was told about.
+    assert env[managed_runtime.CAPTURE_FILE_ENV] == chat_options.capture_file
+    assert managed_runtime.read_chat_capture(chat_options.capture_file) == {
+        "staging_partition": "staging"
+    }
     # Only a run that serves chat names the file an engine's chat settings
     # arrive in before it loads; the frontend starts its render workers on it.
-    assert (managed_runtime.CHAT_SETTINGS_FILE_ENV in env) is serves_chat
-    if serves_chat:
-        monkeypatch.setenv(
-            managed_runtime.CHAT_SETTINGS_FILE_ENV,
-            env[managed_runtime.CHAT_SETTINGS_FILE_ENV],
+    assert (chat_options.chat_settings_file is not None) is serves_chat
+    if chat_options.chat_settings_file is not None:
+        assert (
+            managed_runtime.read_chat_settings(chat_options.chat_settings_file) is None
         )
-        assert managed_runtime.read_chat_settings() is None
         host.publish_chat_settings({"nemo_rl_chat": {"engine_args": {}}})
-        assert managed_runtime.read_chat_settings() == {
+        assert managed_runtime.read_chat_settings(chat_options.chat_settings_file) == {
             "nemo_rl_chat": {"engine_args": {}}
         }
 

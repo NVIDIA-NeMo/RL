@@ -37,6 +37,7 @@ from collections.abc import Iterable, Sequence
 from typing import Any
 
 from nemo_rl.models.generation.dynamo.managed_runtime import (
+    CAPTURE_FILE_ENV,
     DYNAMO_COMPONENT,
     DYNAMO_ENDPOINT,
     GENERATION_CUT_PORT_ENV,
@@ -86,6 +87,11 @@ def merge_cut_receipts(inventory: Any, engine_prefixes: Iterable[Sequence[Any]])
     )
 
 
+def _read_capture() -> dict[str, Any] | None:
+    """This frontend's capture config, which holds a cut's token and timeout."""
+    return read_chat_capture(os.environ[CAPTURE_FILE_ENV])
+
+
 class EngineCutFanOut:
     """Cuts a checkpoint's calls on every engine: what the cut route runs."""
 
@@ -104,14 +110,14 @@ class EngineCutFanOut:
     @property
     def control_token(self) -> str | None:
         """The bearer token a cut needs; None until capture is set up with cuts on."""
-        capture = read_chat_capture()
+        capture = _read_capture()
         return None if capture is None else capture["generation_cut_control_token"]
 
     async def run_cut(self, inventory: Any) -> Any:
         """Cut ``inventory``'s calls. Safe to await from the control server's loop."""
         # One deadline, from the cut's arrival, for this wait and every engine:
         # an engine that started its own later would answer after this gave up.
-        timeout_s = (read_chat_capture() or {}).get("generation_cut_control_timeout_s")
+        timeout_s = (_read_capture() or {}).get("generation_cut_control_timeout_s")
         deadline = None if timeout_s is None else time.time() + timeout_s
         return await asyncio.wrap_future(
             asyncio.run_coroutine_threadsafe(

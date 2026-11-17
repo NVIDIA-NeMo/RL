@@ -41,7 +41,6 @@ import asyncio
 import base64
 import importlib
 import logging
-import os
 import threading
 import time
 import uuid
@@ -53,8 +52,7 @@ from dynamo.llm.exceptions import HttpError, InvalidArgument
 
 from nemo_rl.models.generation.dynamo.engine_adapter import weight_free_model_path
 from nemo_rl.models.generation.dynamo.managed_runtime import (
-    RAY_ADDRESS_ENV,
-    RENDER_WORKERS_ENV,
+    ChatProcessorOptions,
     read_chat_capture,
     read_chat_settings,
 )
@@ -179,7 +177,8 @@ class _CaptureSource:
     for the frontend: capture starts after the engines register.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, options: ChatProcessorOptions) -> None:
+        self._options = options
         self._prefix_cache: Any = None
         # Calls run resolve_prefix on several threads at once; connect once.
         self._connect_lock = threading.Lock()
@@ -200,21 +199,20 @@ class _CaptureSource:
                     )
         return resolve_admission_prefix(serving_admission, self._prefix_cache)
 
-    @staticmethod
-    def _connect() -> Any:
+    def _connect(self) -> Any:
         import ray
 
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache, TQTokenSource
 
-        capture = read_chat_capture()
+        capture = read_chat_capture(self._options.capture_file)
         if capture is None:
             raise RuntimeError(
                 "a token-capture call reached the Dynamo frontend before token "
                 "capture was set up for it"
             )
         if not ray.is_initialized():
-            ray.init(address=os.environ[RAY_ADDRESS_ENV], log_to_driver=False)
+            ray.init(address=self._options.ray_address, log_to_driver=False)
         client = build_data_plane_client(
             capture["data_plane"], bootstrap=False, segment_size=0
         )
@@ -519,8 +517,9 @@ class ChatEngineFactory:
     engines register the same ``policy.generation``.
     """
 
-    def __init__(self) -> None:
-        self._capture = _CaptureSource()
+    def __init__(self, options: ChatProcessorOptions) -> None:
+        self._options = options
+        self._capture = _CaptureSource(options)
         # The workers started at launch and the settings they were built from
         # (None until those arrive), until a registration takes them.
         self._early_pool: Optional[RenderPool] = None
@@ -528,13 +527,14 @@ class ChatEngineFactory:
         # Held here: the event loop keeps only a weak reference to its tasks.
         self._tasks: list[asyncio.Task[None]] = []
 
-    def start_render_workers(self) -> None:
+    def start_render_workers(self, chat_settings_file: str) -> None:
         """Start the render workers before any engine registers.
 
-        Call it on the frontend's loop, in a run that serves chat.
+        Call it on the frontend's loop, in a run that serves chat. The workers
+        are built from the settings the driver writes to ``chat_settings_file``.
         """
         self._early_pool = self._new_pool(start=True)
-        self._run(self._build_early_pool(self._early_pool))
+        self._run(self._build_early_pool(self._early_pool, chat_settings_file))
 
     def _run(self, work: Coroutine[Any, Any, None]) -> None:
         task = asyncio.get_running_loop().create_task(work)
@@ -542,15 +542,17 @@ class ChatEngineFactory:
         self._tasks.append(task)
 
     def _new_pool(self, *, start: bool) -> RenderPool:
-        pool = RenderPool(workers=int(os.environ[RENDER_WORKERS_ENV]))
+        pool = RenderPool(workers=self._options.render_workers)
         if start:
             self._run(_start_chat_workers(pool))
         return pool
 
-    async def _build_early_pool(self, pool: RenderPool) -> None:
+    async def _build_early_pool(
+        self, pool: RenderPool, chat_settings_file: str
+    ) -> None:
         """Build ``pool`` from the settings an engine sends before it loads."""
         launched = time.monotonic()
-        while (runtime_data := read_chat_settings()) is None:
+        while (runtime_data := read_chat_settings(chat_settings_file)) is None:
             if self._early_pool is not pool:
                 return
             await asyncio.sleep(0.2)
@@ -634,3 +636,17 @@ class ChatEngineFactory:
             pool=pool, routed_engine=routed_engine, spec=spec, capture=self._capture
         )
         return PythonAsyncEngine(engine.generate, asyncio.get_running_loop())
+
+
+def provider(config: Any, options: dict[str, Any]) -> Any:
+    """Dynamo's custom chat processor provider: NeMo RL's ``chat_engine_factory``.
+
+    The frontend calls it once, on its event loop, with its own configuration and
+    the ``--dyn-chat-processor-config`` the managed runtime launched it with.
+    """
+    del config
+    chat_options = ChatProcessorOptions(**options)
+    factory = ChatEngineFactory(chat_options)
+    if chat_options.chat_settings_file is not None:
+        factory.start_render_workers(chat_options.chat_settings_file)
+    return factory.chat_engine_factory

@@ -58,7 +58,7 @@ A rollout through the frontend has the same `GenerationOutputSpec` as the native
 
 NeMo-Gym's policy model calls the frontend. Setup turns on Gym's Dynamo dialect (`dynamo_frontend` in Gym's [`vllm_model`](https://github.com/NVIDIA-NeMo/Gym/tree/main/responses_api_models/vllm_model) config). The frontend takes only OpenAI fields plus `nvext`, so Gym sends the native request's extra fields (`ng_capture`, `required_prefix_token_ids`), and `ng_measure` for the measure call it makes in place of `/tokenize`, in one `nemo_rl:gym:` annotation, and reads the call's token fields (`prompt_token_ids`, `generation_token_ids`, `generation_log_probs`, `routed_experts`, `ng_commit_coords`) from `nvext.nemo_rl`.
 
-The frontend serves chat with NeMo RL's chat engine instead of Dynamo's own renderer and parsers (Dynamo's `chat_engine_factory` hook). Each call takes the native server's steps, with the native server's code:
+The frontend serves chat with NeMo RL's chat engine instead of Dynamo's own renderer and parsers (it is the frontend's custom chat processor). Each call takes the native server's steps, with the native server's code:
 
 1. In the frontend, a render-pool process renders the call with the engine's own tokenizer, template, processor and `vllm_cfg` chat settings (parser plugins included), which each engine publishes when it registers. It also decides how a token-capture call's prefix is served.
 2. The chat engine checks on-policy sampling, reads a captured prefix from TQ, splices the prefix into the render, clamps the output budget to the context, and routes the final token IDs through the KV router.

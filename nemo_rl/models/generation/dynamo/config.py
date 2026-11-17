@@ -65,7 +65,11 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
     def _chat_is_nemo_rls(self) -> "DynamoFrontendArgs":
         # NeMo-Gym's chat calls are rendered and parsed by NeMo RL's chat
         # engine, never by Dynamo's own renderer or chat processor.
-        for flag in ("--dyn-chat-processor", "--custom-jinja-template"):
+        for flag in (
+            "--dyn-chat-processor",
+            "--dyn-chat-processor-config",
+            "--custom-jinja-template",
+        ):
             if any(arg.split("=", 1)[0] == flag for arg in self.extra_cli_args):
                 raise ValueError(
                     f"dynamo_cfg.frontend_args.extra_cli_args may not set {flag}: "

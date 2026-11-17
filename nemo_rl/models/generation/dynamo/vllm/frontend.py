@@ -12,60 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run Dynamo's frontend with NeMo RL's chat engine serving chat calls.
+"""Run Dynamo's frontend with NeMo-Gym's generation cuts served beside it.
 
 ``python -m nemo_rl.models.generation.dynamo.vllm.frontend <dynamo.frontend args>``
 
-The arguments are ``dynamo.frontend``'s own. Its ``main`` builds one
-``EntrypointArgs``; this wraps that name to add NeMo RL's
-``chat_engine_factory``, so every chat call reaches
-:mod:`~nemo_rl.models.generation.dynamo.vllm.chat_engine` and never Dynamo's
-Rust preprocessor. ``/v1/completions`` (NeMo RL's own rollouts, token ids in)
-is unchanged. It wraps ``DistributedRuntime`` the same way, to serve NeMo-Gym's
-checkpoint generation cuts through the frontend's own runtime
-(:mod:`~nemo_rl.models.generation.dynamo.vllm.generation_cut`) and, in a run
-that serves chat, to start the render workers at launch.
+The arguments are ``dynamo.frontend``'s own, and they name NeMo RL's chat
+engine as its chat processor. Its ``main`` builds one ``DistributedRuntime``;
+this wraps that name to serve NeMo-Gym's checkpoint generation cuts through
+the frontend's own runtime
+(:mod:`~nemo_rl.models.generation.dynamo.vllm.generation_cut`).
 """
 
-import os
 import sys
 
 
 def main() -> None:
     import dynamo.frontend.main as frontend_main
 
-    from nemo_rl.models.generation.dynamo.managed_runtime import (
-        CHAT_SETTINGS_FILE_ENV,
-    )
-    from nemo_rl.models.generation.dynamo.vllm.chat_engine import ChatEngineFactory
     from nemo_rl.models.generation.dynamo.vllm.generation_cut import (
         start_generation_cut_server,
     )
-
-    factory = ChatEngineFactory()
-    entrypoint_args = frontend_main.EntrypointArgs
-
-    def with_chat_engine(engine_type, **kwargs):
-        if "chat_engine_factory" in kwargs:
-            raise RuntimeError(
-                "NeMo RL's frontend serves chat with its own chat engine; remove "
-                "--dyn-chat-processor from dynamo_cfg.frontend_args.extra_cli_args"
-            )
-        return entrypoint_args(
-            engine_type, chat_engine_factory=factory.chat_engine_factory, **kwargs
-        )
 
     distributed_runtime = frontend_main.DistributedRuntime
 
     def on_the_frontends_loop(loop, *args, **kwargs):
         runtime = distributed_runtime(loop, *args, **kwargs)
         start_generation_cut_server(runtime, loop)
-        if CHAT_SETTINGS_FILE_ENV in os.environ:
-            # The driver names the file for a run that serves chat.
-            factory.start_render_workers()
         return runtime
 
-    frontend_main.EntrypointArgs = with_chat_engine
     frontend_main.DistributedRuntime = on_the_frontends_loop
     sys.argv[0] = "dynamo.frontend"
     frontend_main.main()

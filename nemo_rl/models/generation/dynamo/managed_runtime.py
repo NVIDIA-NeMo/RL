@@ -56,9 +56,32 @@ DYNAMO_ENDPOINT = "generate"
 
 LOGGER = logging.getLogger(__name__)
 
+# NeMo RL's chat engine, as the custom chat processor Dynamo's frontend loads.
+CHAT_PROCESSOR = "nemo_rl.models.generation.dynamo.vllm.chat_engine:provider"
+
+
+class ChatProcessorOptions(NamedTuple):
+    """What a frontend's chat engine starts with: Dynamo's chat processor config."""
+
+    # Processes that render chat calls and build their replies.
+    render_workers: int
+    # The Ray cluster the chat engine's TQ reads go through.
+    ray_address: str
+    # Where setup_token_capture writes the capture config, on the frontend's node.
+    capture_file: str
+    # Where the driver writes the chat settings an engine sends before it loads.
+    # Set only for a run that serves chat: the frontend then starts its render
+    # workers at launch.
+    chat_settings_file: str | None
+
 
 def frontend_argv(
-    *, host: str, port: int, namespace: str, dynamo_cfg: DynamoCfg
+    *,
+    host: str,
+    port: int,
+    namespace: str,
+    dynamo_cfg: DynamoCfg,
+    chat_options: ChatProcessorOptions,
 ) -> list[str]:
     """The ``dynamo.frontend`` arguments; ``extra_cli_args`` may not repeat one."""
     argv = [
@@ -76,6 +99,10 @@ def frontend_argv(
         "nats",
         "--router-mode",
         dynamo_cfg.frontend_args.router_mode,
+        "--dyn-chat-processor",
+        CHAT_PROCESSOR,
+        "--dyn-chat-processor-config",
+        json.dumps(chat_options._asdict()),
     ]
     if dynamo_cfg.frontend_args.num_frontends > 1:
         # Each replica's router sees the requests the others have in flight.
@@ -217,32 +244,23 @@ class _ServiceProcess:
             os.close(self._lifeline)
 
 
-# The frontend process's environment for NeMo RL's chat engine
-# (dynamo/vllm/chat_engine.py): its render workers, where setup_token_capture
-# writes the capture config, the Ray cluster its TQ reads go through, and the
-# port it takes NeMo-Gym's generation cuts on (dynamo/vllm/generation_cut.py).
-RENDER_WORKERS_ENV = "NEMO_RL_DYNAMO_RENDER_WORKERS"
-# Where the driver writes the chat settings an engine sends before it loads.
-# Set only for a run that serves chat: the frontend then starts its render
-# workers at launch.
-CHAT_SETTINGS_FILE_ENV = "NEMO_RL_DYNAMO_CHAT_SETTINGS_FILE"
+# The frontend process's environment for NeMo-Gym's generation cuts
+# (dynamo/vllm/generation_cut.py): the port it takes them on, and the capture
+# config that holds a cut's bearer token and timeout.
 CAPTURE_FILE_ENV = "NEMO_RL_DYNAMO_CAPTURE_FILE"
-RAY_ADDRESS_ENV = "NEMO_RL_DYNAMO_RAY_ADDRESS"
 GENERATION_CUT_PORT_ENV = "NEMO_RL_DYNAMO_GENERATION_CUT_PORT"
 
 
-def read_chat_capture() -> dict[str, Any] | None:
-    """What ``publish_chat_capture`` wrote for this frontend; None before it has."""
-    path = os.environ[CAPTURE_FILE_ENV]
+def read_chat_capture(path: str) -> dict[str, Any] | None:
+    """What ``publish_chat_capture`` wrote to ``path``; None before it has."""
     if not os.path.exists(path):
         return None
     with open(path, "rb") as capture_file:
         return pickle.load(capture_file)
 
 
-def read_chat_settings() -> dict[str, Any] | None:
-    """What ``publish_chat_settings`` wrote for this frontend; None before it has."""
-    path = os.environ[CHAT_SETTINGS_FILE_ENV]
+def read_chat_settings(path: str) -> dict[str, Any] | None:
+    """What ``publish_chat_settings`` wrote to ``path``; None before it has."""
     if not os.path.exists(path):
         return None
     with open(path) as settings_file:
@@ -260,8 +278,8 @@ class FrontendHost:
     """One frontend on the node a Ray actor (``_FrontendHostActor``) runs on.
 
     It runs Dynamo's frontend with NeMo RL's chat engine serving chat calls
-    (``dynamo/vllm/frontend.py``). The frontend stops when the actor dies,
-    however it dies (see ``_ServiceProcess``).
+    (``CHAT_PROCESSOR``). The frontend stops when the actor dies, however it
+    dies (see ``_ServiceProcess``).
     """
 
     def __init__(self) -> None:
@@ -275,6 +293,7 @@ class FrontendHost:
         namespace: str,
         dynamo_cfg: DynamoCfg,
         env: dict[str, str],
+        ray_address: str,
         serves_chat: bool,
     ) -> FrontendUrls:
         """Launch the frontend on free ports of this node; return where it serves.
@@ -291,8 +310,23 @@ class FrontendHost:
             DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
             max_retries=None,
         )
+        self._chat_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_chat_")
+        capture_file = os.path.join(self._chat_dir, "capture.pkl")
         argv = frontend_argv(
-            host="0.0.0.0", port=port, namespace=namespace, dynamo_cfg=dynamo_cfg
+            host="0.0.0.0",
+            port=port,
+            namespace=namespace,
+            dynamo_cfg=dynamo_cfg,
+            chat_options=ChatProcessorOptions(
+                render_workers=dynamo_cfg.frontend_args.render_workers,
+                ray_address=ray_address,
+                capture_file=capture_file,
+                chat_settings_file=(
+                    os.path.join(self._chat_dir, "chat_settings.json")
+                    if serves_chat
+                    else None
+                ),
+            ),
         )
         command = [
             frontend_python,
@@ -301,13 +335,8 @@ class FrontendHost:
             *argv,
         ]
         print(f"  [Dynamo] launching frontend argv={command!r}", flush=True)
-        self._chat_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_chat_")
         frontend_env = _service_env(env)
-        frontend_env[CAPTURE_FILE_ENV] = os.path.join(self._chat_dir, "capture.pkl")
-        if serves_chat:
-            frontend_env[CHAT_SETTINGS_FILE_ENV] = os.path.join(
-                self._chat_dir, "chat_settings.json"
-            )
+        frontend_env[CAPTURE_FILE_ENV] = capture_file
         frontend_env[GENERATION_CUT_PORT_ENV] = str(generation_cut_port)
         self._process = _ServiceProcess(command, env=frontend_env, label="frontend")
         host = _get_node_ip_local()
@@ -576,8 +605,6 @@ class ManagedDynamoRuntime:
             **self._manager_env,
             "VIRTUAL_ENV": dynamo_venv,
             "UV_PROJECT_ENVIRONMENT": dynamo_venv,
-            RENDER_WORKERS_ENV: str(self._dynamo_cfg.frontend_args.render_workers),
-            RAY_ADDRESS_ENV: self._ray_address,
         }
         extra_env = self._dynamo_cfg.frontend_args.extra_env
         if clashing := sorted(extra_env.keys() & env.keys()):
@@ -602,6 +629,7 @@ class ManagedDynamoRuntime:
                     namespace=self._namespace,
                     dynamo_cfg=self._dynamo_cfg,
                     env=env,
+                    ray_address=self._ray_address,
                     serves_chat=self.serves_chat,
                 )
                 for host in self._frontend_hosts

@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+
 import pytest
 
 from nemo_rl.models.generation import configure_generation_config
@@ -19,7 +21,11 @@ from nemo_rl.models.generation.dynamo.config import (
     DynamoFrontendArgs,
     dynamo_cfg,
 )
-from nemo_rl.models.generation.dynamo.managed_runtime import frontend_argv
+from nemo_rl.models.generation.dynamo.managed_runtime import (
+    CHAT_PROCESSOR,
+    ChatProcessorOptions,
+    frontend_argv,
+)
 
 
 class _Tokenizer:
@@ -129,6 +135,18 @@ def test_dynamo_true_alone_is_a_complete_config(dynamo: bool) -> None:
             ),
             "may not set --dyn-chat-processor",
         ),
+        # Its settings are the managed runtime's.
+        (
+            _vllm_config(
+                dynamo=True,
+                dynamo_cfg={
+                    "frontend_args": {
+                        "extra_cli_args": ["--dyn-chat-processor-config", "{}"]
+                    }
+                },
+            ),
+            "may not set --dyn-chat-processor-config",
+        ),
     ],
 )
 def test_configs_dynamo_would_not_serve_as_written_fail_at_startup(
@@ -138,14 +156,37 @@ def test_configs_dynamo_would_not_serve_as_written_fail_at_startup(
         configure_generation_config(config, _Tokenizer())
 
 
+def _frontend_argv(cfg: DynamoCfg) -> list[str]:
+    return frontend_argv(
+        host="0.0.0.0",
+        port=3001,
+        namespace="nemo-rl",
+        dynamo_cfg=cfg,
+        chat_options=ChatProcessorOptions(
+            render_workers=cfg.frontend_args.render_workers,
+            ray_address="10.0.0.1:6379",
+            capture_file="/chat/capture.pkl",
+            chat_settings_file=None,
+        ),
+    )
+
+
 def test_frontend_argv_is_runtime_owned() -> None:
     cfg = DynamoCfg(
         frontend_args=DynamoFrontendArgs(
             router_mode="kv", extra_cli_args=["--foo", "1"]
         )
     )
-    argv = frontend_argv(host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=cfg)
+    argv = _frontend_argv(cfg)
     assert argv[argv.index("--router-mode") + 1] == "kv"
+    # Chat goes to NeMo RL's chat engine, started with these settings.
+    assert argv[argv.index("--dyn-chat-processor") + 1] == CHAT_PROCESSOR
+    assert json.loads(argv[argv.index("--dyn-chat-processor-config") + 1]) == {
+        "render_workers": 8,
+        "ray_address": "10.0.0.1:6379",
+        "capture_file": "/chat/capture.pkl",
+        "chat_settings_file": None,
+    }
     # Gym names a token-capture call's session; keep the session on one engine.
     assert argv[argv.index("--router-session-affinity-ttl-secs") + 1] == "300"
     assert argv[argv.index("--router-session-affinity-max-entries") + 1] == str(
@@ -155,20 +196,14 @@ def test_frontend_argv_is_runtime_owned() -> None:
     # One frontend has no replicas to sync with; several share in-flight load.
     assert "--router-replica-sync" not in argv
     replicas = DynamoCfg.model_validate({"frontend_args": {"num_frontends": 2}})
-    assert "--router-replica-sync" in frontend_argv(
-        host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=replicas
-    )
+    assert "--router-replica-sync" in _frontend_argv(replicas)
     no_affinity = DynamoCfg.model_validate(
         {"frontend_args": {"session_affinity_ttl_secs": None}}
     )
-    assert "--router-session-affinity-ttl-secs" not in frontend_argv(
-        host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=no_affinity
-    )
+    assert "--router-session-affinity-ttl-secs" not in _frontend_argv(no_affinity)
 
     clashing = DynamoCfg(
         frontend_args=DynamoFrontendArgs(extra_cli_args=["--http-port", "9"])
     )
     with pytest.raises(ValueError, match="--http-port is set by both"):
-        frontend_argv(
-            host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=clashing
-        )
+        _frontend_argv(clashing)

@@ -44,7 +44,7 @@ No HTTP control routes are involved. The Rust Worker installs a SIGTERM handler 
 
 ## NeMo-Gym chat
 
-Dynamo's frontend hands chat calls to a Python `chat_engine_factory` when one is given. `dynamo/vllm/frontend.py` starts `dynamo.frontend`'s own `main` with NeMo RL's factory added to the `EntrypointArgs` it builds, so the frontend keeps its HTTP server, router and `/v1/completions` path, and only chat goes to NeMo RL's chat engine (`dynamo/vllm/chat_engine.py`).
+Dynamo's frontend hands chat calls to a custom chat processor when one is named. The managed runtime starts each frontend with `--dyn-chat-processor` naming NeMo RL's chat engine (`dynamo/vllm/chat_engine.py`) and its settings in `--dyn-chat-processor-config`, so the frontend keeps its HTTP server, router and `/v1/completions` path, and only chat goes to the chat engine.
 
 Each engine publishes, in its registration's `runtime_data`, its own engine args and the `policy.generation` chat settings. The chat engine builds a render pool (`dynamo/vllm/render_pool.py`) from them: `render_workers` spawned processes, each holding the vLLM renderer and chat serving the native server builds. Rendering is CPU-bound Python, and the frontend serves every call on one event loop, so it runs in the pool, first in first out.
 
@@ -87,7 +87,8 @@ The vLLM workers' venv (the `vllm` extra) carries the released `ai-dynamo` and `
 What a Dynamo upgrade has to re-check:
 - the `dynamo.common.backend` contract (`LLMEngine`, `Worker`, `WorkerConfig`, publisher and logprob helpers);
 - the request fields of Dynamo's preprocessed request, and `extra_args` reaching the engine;
-- the frontend's `chat_engine_factory` hook and the `EntrypointArgs` name `dynamo/vllm/frontend.py` wraps, which are internal API;
+- the custom chat processor contract: `--dyn-chat-processor`, its config, and the `chat_engine_factory` the provider returns;
+- the `DistributedRuntime` name `dynamo/vllm/frontend.py` wraps to serve generation cuts, which is internal API;
 - the Python chat request the hook receives, its `nvext` and annotation fields, and `EngineConfig.runtime_data` reaching the frontend.
 
 The one vLLM↔Dynamo wire coupling is vLLM's KV-event msgpack, which Dynamo's router decodes. A change there degrades routing, not serving. The managed runtime logs the router's applied-event counts at shutdown, and the Dynamo functional overlays fail if the engines published events but none were applied (`tests/functional/check_dynamo_overlay.sh`).

@@ -80,6 +80,9 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     ChainPrefixCache,
     StagedPrefix,
 )
+from nemo_rl.models.generation.dynamo.managed_runtime import (  # noqa: E402
+    ChatProcessorOptions,
+)
 from nemo_rl.models.generation.dynamo.vllm import chat_engine  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm.adapter import (  # noqa: E402
     DynamoVllmAdapter,
@@ -521,7 +524,14 @@ async def _dynamo(
     request["nvext"] = {
         "annotations": [GYM_EXTRAS_ANNOTATION_PREFIX + json.dumps(extras)]
     }
-    capture = chat_engine._CaptureSource()
+    capture = chat_engine._CaptureSource(
+        ChatProcessorOptions(
+            render_workers=1,
+            ray_address="",
+            capture_file="",
+            chat_settings_file=None,
+        )
+    )
     capture._prefix_cache = host._chain_prefix
     engine = chat_engine.NemoRLChatEngine(
         pool=kit.pool,

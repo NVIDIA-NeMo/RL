@@ -30,7 +30,9 @@ pytest.importorskip("vllm")
 
 from dynamo.llm.exceptions import HttpError, InvalidArgument  # noqa: E402
 
-from nemo_rl.models.generation.dynamo import managed_runtime  # noqa: E402
+from nemo_rl.models.generation.dynamo.managed_runtime import (  # noqa: E402
+    ChatProcessorOptions,
+)
 from nemo_rl.models.generation.dynamo.vllm import chat_engine  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm.render_pool import (  # noqa: E402
     RenderedCall,
@@ -187,6 +189,16 @@ def _call(extras: dict | None = None, **fields) -> dict:
         "nvext": nvext,
         **fields,
     }
+
+
+def _options(chat_settings_file: str | None = None) -> dict:
+    """The chat processor config Dynamo hands the provider, as parsed JSON."""
+    return ChatProcessorOptions(
+        render_workers=3,
+        ray_address="10.0.0.1:6379",
+        capture_file="/chat/capture.pkl",
+        chat_settings_file=chat_settings_file,
+    )._asdict()
 
 
 def _serve(pool, router, request, capture=None) -> list[dict]:
@@ -459,15 +471,12 @@ def test_an_engine_that_does_not_serve_the_call_fails_it(router, status, message
     assert failed.value.code == status
 
 
-def test_dynamos_frontend_still_builds_its_entrypoint_by_the_name_nemo_rl_wraps():
+def test_dynamos_frontend_still_builds_its_runtime_by_the_name_nemo_rl_wraps():
     import dynamo.frontend.main as frontend_main
 
-    # frontend.main() swaps this module global for one that adds NeMo RL's
-    # chat_engine_factory; if Dynamo stops reading it there, Dynamo's own
-    # preprocessor serves chat and every NeMo-Gym call is refused.
-    assert "EntrypointArgs" in frontend_main.async_main.__code__.co_names
-    # It swaps this one to serve NeMo-Gym's generation cuts from the frontend's
-    # runtime; if Dynamo stops reading it there, every cut gets a 404.
+    # frontend.main() swaps this module global to serve NeMo-Gym's generation
+    # cuts from the frontend's runtime; if Dynamo stops reading it there, every
+    # cut gets a 404.
     assert "DistributedRuntime" in frontend_main.async_main.__code__.co_names
 
 
@@ -479,9 +488,7 @@ def test_only_nemo_rls_engines_are_served() -> None:
     )
 
     async def build():
-        return await chat_engine.ChatEngineFactory().chat_engine_factory(
-            0, model, _Router()
-        )
+        return await chat_engine.provider(None, _options())(0, model, _Router())
 
     with pytest.raises(RuntimeError, match="without NeMo RL's chat settings"):
         asyncio.run(build())
@@ -504,7 +511,6 @@ def test_render_workers_start_at_registration_only_where_chat_is_served(
             started.append(self._workers)
 
     monkeypatch.setattr(chat_engine, "RenderPool", _StartedPool)
-    monkeypatch.setenv(chat_engine.RENDER_WORKERS_ENV, "3")
     # NeMo-Gym needs the flag, and the native worker starts its server on it.
     generation = {**GENERATION, "vllm_cfg": {"expose_http_server": exposes_chat}}
     spec = {"engine_args": {}, "generation": generation}
@@ -515,7 +521,8 @@ def test_render_workers_start_at_registration_only_where_chat_is_served(
     )
 
     async def register() -> None:
-        await chat_engine.ChatEngineFactory().chat_engine_factory(0, model, _Router())
+        # No chat settings file: the run serves no chat, so launch starts none.
+        await chat_engine.provider(None, _options())(0, model, _Router())
         # The start runs in the background; registration never waits for it.
         await asyncio.gather(*(asyncio.all_tasks() - {asyncio.current_task()}))
 
@@ -559,9 +566,7 @@ def test_registration_keeps_render_workers_built_from_the_same_settings(
 
     monkeypatch.setattr(chat_engine, "RenderPool", _Pool)
     monkeypatch.setattr(chat_engine, "weight_free_model_path", early_model_dir)
-    monkeypatch.setenv(chat_engine.RENDER_WORKERS_ENV, "3")
     settings_file = tmp_path / "chat_settings.json"
-    monkeypatch.setenv(managed_runtime.CHAT_SETTINGS_FILE_ENV, str(settings_file))
     generation = {
         **GENERATION,
         "model_name": "model",
@@ -585,11 +590,11 @@ def test_registration_keeps_render_workers_built_from_the_same_settings(
     )
 
     async def launch_then_register() -> None:
-        factory = chat_engine.ChatEngineFactory()
-        factory.start_render_workers()
+        # Dynamo calls the provider at launch, on the frontend's loop.
+        chat_engine_factory = chat_engine.provider(None, _options(str(settings_file)))
         while sent_early is not None and not pools[0].built:
             await asyncio.sleep(0.01)
-        await factory.chat_engine_factory(0, model, _Router())
+        await chat_engine_factory(0, model, _Router())
 
     asyncio.run(launch_then_register())
 
