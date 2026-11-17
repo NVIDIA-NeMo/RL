@@ -38,7 +38,7 @@ from nemo.lens.resources.attributes import (
     OTEL_RESOURCE_ATTRIBUTES_ENV,
     extend_otel_resource_attributes,
 )
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
@@ -286,6 +286,16 @@ def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
             "dataset was prepared without routing information."
         )
     )
+
+
+class NemoGymPostprocessConfig(BaseModel):
+    """NeMo-RL postprocessing options nested under ``env.nemo_gym``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    invalid_tool_call_patterns: list[str] | None = None
+    thinking_tags: list[str] | None = None
+    truncate_noncontiguous_episodes: bool = False
 
 
 def _prepare_materialized_nemo_gym_rows(
@@ -727,6 +737,9 @@ class NemoGymConfig(TypedDict):
     pad_dynamic_image_shapes: NotRequired[
         bool
     ]  # Preserve heterogeneous shapes for native-resolution patchification
+    # Opt-in recovery for token-prefix discontinuities in multi-turn rollouts.
+    # The default is supplied by NemoGymPostprocessConfig.
+    truncate_noncontiguous_episodes: bool
     # Ledger-authoritative token capture (token_capture.enabled): the dumped
     # TokenCaptureConfig. Turns on external staging in Gym's policy model
     # server, switches run_rollouts to receipt mode, and assembles receipts
@@ -1233,6 +1246,7 @@ class NemoGym(EnvironmentInterface):
         self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
+        from nemo_gym.config import MODEL_CALL_SAMPLING_BLOCK
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import (
             HEAD_SERVER_KEY_NAME,
@@ -1333,6 +1347,38 @@ Depending on your data shape, you may want to change these values."""
             "host": self.node_ip,
             "port": self.head_server_port,
         }
+
+        # Gym applies each row's _ng_model_sampling to these servers' calls and
+        # refuses one without them: policy_model, servers that _copy it, and any
+        # the recipe lists. Resources servers keep their own sampling.
+        sampling_block = dict(
+            initial_global_config_dict.get(MODEL_CALL_SAMPLING_BLOCK) or {}
+        )
+        required = [_POLICY_SERVER_NAME] + [
+            name
+            for name, block in initial_global_config_dict.items()
+            if isinstance(block, Mapping) and block.get("_copy") == _POLICY_SERVER_NAME
+        ]
+        for name in sampling_block.get("required_model_servers") or []:
+            if name not in required:
+                required.append(name)
+        initial_global_config_dict[MODEL_CALL_SAMPLING_BLOCK] = {
+            **sampling_block,
+            "required_model_servers": required,
+        }
+        policy_model_server = (
+            (initial_global_config_dict.get(_POLICY_SERVER_NAME) or {})
+            .get("responses_api_models", {})
+            .get("vllm_model", {})
+        )
+        if policy_model_server.get("sampling_overrides"):
+            raise ValueError(
+                f"env.nemo_gym.{_POLICY_SERVER_NAME} sets sampling_overrides, but the "
+                "agent NeMo-RL trains samples with policy.generation: temperature and "
+                "top_p, val_temperature and val_top_p for validation, and "
+                "max_new_tokens. Remove sampling_overrides; to pin an untrained "
+                "agent such as a judge, give it a model server of its own."
+            )
 
         # Ledger-authoritative token capture: enable external staging in the
         # policy model server (via the policy_model global-config override
@@ -2534,6 +2580,7 @@ Depending on your data shape, you may want to change these values."""
         media_geometry_failed = False
         seen_token_ids: List[int] = []
         batch_decode_items = []
+        nemo_gym_result["noncontiguous_truncated"] = False
         reasoning_text = nemo_gym_result.get("reasoning_text")
         answer_text = nemo_gym_result.get("answer_text")
         response_token_counts = None
@@ -2555,10 +2602,19 @@ Depending on your data shape, you may want to change these values."""
             if not _is_trainable_output_item(output_item_dict):
                 continue
 
-            assert (
+            is_contiguous = (
                 seen_token_ids
                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+            )
+            if not is_contiguous and self.cfg["truncate_noncontiguous_episodes"]:
+                print(
+                    "[nemo_gym] WARNING: non-contiguous turn; truncating episode "
+                    f"at {len(nemo_rl_message_log)} messages "
+                    f"(seen={len(seen_token_ids)} tokens); dropping corrupted tail."
+                )
+                nemo_gym_result["noncontiguous_truncated"] = True
+                break
+            assert is_contiguous, f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(seen_token_ids)]}
@@ -2971,7 +3027,7 @@ def build_nemo_gym_config(
     Args:
         env_configs: The master_config.env mapping; env_configs["nemo_gym"] supplies
             the Gym global config plus NeMo-RL detection knobs (invalid_tool_call_patterns,
-            thinking_tags, num_gpu_nodes).
+            thinking_tags, truncate_noncontiguous_episodes, num_gpu_nodes).
         base_urls: Per-DP-rank OpenAI-compatible server base URLs from the generation backend.
         model_name: Served model name the Gym rollouts should target.
         enable_router_replay: Sets ``require_routed_experts`` and selects the
@@ -3041,7 +3097,25 @@ def _build_gym_actor_config(
     Shared by the unsharded path and by each shard, so every actor gets the
     same treatment of NeMo-RL-side keys regardless of how it was composed.
     """
-    nemo_gym_dict = dict(nemo_gym_dict)
+    postprocess_cfg = NemoGymPostprocessConfig.model_validate(nemo_gym_dict)
+    nemo_gym_dict = {
+        key: value
+        for key, value in nemo_gym_dict.items()
+        if key not in NemoGymPostprocessConfig.model_fields
+    }
+    if postprocess_cfg.truncate_noncontiguous_episodes:
+        if enable_router_replay:
+            raise ValueError(
+                "truncate_noncontiguous_episodes is not compatible with router replay: "
+                "the next contiguous prompt is required to repair the retained prefix's "
+                "final route."
+            )
+        if token_capture and token_capture.get("enabled"):
+            raise ValueError(
+                "truncate_noncontiguous_episodes is not compatible with "
+                "token_capture.enabled: receipt mode bypasses the legacy token-prefix "
+                "check, so it cannot truncate non-contiguous episodes."
+            )
 
     # NeMo-RL-only keys are consumed here and must never reach Gym: the merged
     # config is serialized into every Gym child process, and unrecognized
@@ -3051,8 +3125,6 @@ def _build_gym_actor_config(
 
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
-    invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
-    thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
@@ -3131,12 +3203,13 @@ def _build_gym_actor_config(
         model_name=model_name,
         base_urls=base_urls,
         policy_api_key=policy_api_key,
-        invalid_tool_call_patterns=invalid_tool_call_patterns,
-        thinking_tags=thinking_tags,
+        invalid_tool_call_patterns=postprocess_cfg.invalid_tool_call_patterns,
+        thinking_tags=postprocess_cfg.thinking_tags,
         tokenizer_config=tokenizer_config,
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        truncate_noncontiguous_episodes=postprocess_cfg.truncate_noncontiguous_episodes,
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=instance_token_capture,
