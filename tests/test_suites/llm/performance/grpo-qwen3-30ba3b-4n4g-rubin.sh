@@ -23,7 +23,7 @@ SEGMENT_SIZE=4     # Matches cluster.segment_size and keeps MoE EP within one NV
 STEPS_PER_RUN=10
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
-NUM_MINUTES=100
+NUM_MINUTES=45
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
