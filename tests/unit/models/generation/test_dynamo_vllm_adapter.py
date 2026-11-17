@@ -22,7 +22,6 @@ import asyncio
 import base64
 import importlib.util
 import json
-import logging
 import pickle
 from pathlib import Path
 from types import SimpleNamespace
@@ -288,12 +287,6 @@ def _start_worker_config(monkeypatch, host) -> engine_adapter.WorkerConfig:
             return None
 
     monkeypatch.setattr(engine_adapter, "Worker", _Worker)
-    # Registered so the engine's replacement of Dynamo's logging setup is undone.
-    monkeypatch.setattr(
-        engine_adapter.dynamo_worker,
-        "configure_dynamo_logging",
-        engine_adapter.dynamo_worker.configure_dynamo_logging,
-    )
     env = {
         "DYN_DISCOVERY_BACKEND": "etcd",
         "DYN_REQUEST_PLANE": "tcp",
@@ -306,8 +299,7 @@ def _start_worker_config(monkeypatch, host) -> engine_adapter.WorkerConfig:
     async def start():
         await engine_adapter.start_dynamo_endpoint(
             vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0),
-            model_path="/snapshots/model",
-            served_model_name=host.model_name,
+            model_name=host.model_name,
             namespace="ns",
             engine_env=env,
         )
@@ -321,24 +313,12 @@ def test_engines_register_for_rollouts_and_nemo_gym_chat(monkeypatch) -> None:
     config = _start_worker_config(monkeypatch, _host(_FakeLLM()))
 
     assert config.namespace == "ns"
-    # Registered from the weight-free snapshot, served under the model's name.
-    assert (config.model_name, config.served_model_name) == (
-        "/snapshots/model",
-        "model",
-    )
+    # Registered by the model's name: Dynamo fetches a Hub ID without its weights.
+    assert (config.model_name, config.served_model_name) == ("model", "model")
     # NeMo RL's rollouts go to /v1/completions, NeMo-Gym's calls to chat.
     assert config.endpoint_types == "chat,completions"
-    # Worker.run() starts with Dynamo's logging setup, which keeps the worker's.
-    handlers = logging.getLogger().handlers[:]
-    engine_adapter.dynamo_worker.configure_dynamo_logging()
-    assert logging.getLogger().handlers == handlers
-
-
-def test_worker_run_still_calls_the_logging_setup_the_engine_replaces() -> None:
-    # Otherwise a Dynamo bump would silently take over the worker's logging again.
-    run = engine_adapter.Worker.run
-    assert run.__globals__ is vars(engine_adapter.dynamo_worker)
-    assert "configure_dynamo_logging" in run.__code__.co_names
+    # Worker.run() then leaves this process's logging alone.
+    assert config.configure_logging is False
 
 
 def test_requests_other_than_nemo_rls_are_refused() -> None:
