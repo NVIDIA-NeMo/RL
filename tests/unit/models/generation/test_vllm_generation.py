@@ -43,7 +43,11 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.captured_media import MediaCaptureRejected
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+    RayVirtualCluster,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -58,7 +62,9 @@ from nemo_rl.models.generation.vllm.config import (
     normalize_vllm_refit_config,
 )
 from nemo_rl.models.generation.vllm.generation_cut_route import GENERATION_CUT_ROUTE
+from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    BaseVllmGenerationWorker,
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
@@ -448,6 +454,44 @@ def test_context_capped_max_new_tokens():
         )
 
 
+@pytest.mark.parametrize("defer_model_load", [False, True])
+@pytest.mark.parametrize("api_server_count", [1, 2])
+@pytest.mark.parametrize("port_range", [None, (3400, 3410)])
+def test_async_vllm_worker_reserves_distinct_ports_in_range(
+    defer_model_load: bool,
+    api_server_count: int,
+    port_range: tuple[int, int] | None,
+    monkeypatch,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["async_engine"] = True
+    config["vllm_cfg"]["expose_http_server"] = True
+    config["vllm_cfg"]["http_api_server_count"] = api_server_count
+    if port_range is not None:
+        config["port_range_low"], config["port_range_high"] = port_range
+    low, high = port_range or (
+        DEFAULT_GENERATION_PORT_RANGE_LOW,
+        DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    )
+
+    def initialize_base(worker: Any, worker_config: VllmConfig, *args: Any) -> None:
+        worker.cfg = worker_config
+        worker.is_model_owner = True
+
+    monkeypatch.setattr(BaseVllmGenerationWorker, "__init__", initialize_base)
+    with contextlib.ExitStack() as cleanup:
+        workers = []
+        for index in range(2):
+            worker = VllmAsyncGenerationWorkerImpl(
+                config, bundle_indices=[index], defer_model_load=defer_model_load
+            )
+            cleanup.callback(worker._reserved_socket.close)
+            assert low <= worker._reserved_port < high
+            assert worker._reserved_socket.getsockname()[1] == worker._reserved_port
+            workers.append(worker)
+        assert workers[0]._reserved_port != workers[1]._reserved_port
+
+
 @pytest.mark.asyncio
 async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
@@ -783,6 +827,7 @@ async def test_async_vllm_worker_stops_http_server_before_engine(
     worker.http_server = MagicMock()
     worker._sparse_refit_receiver = SparseRefitReceiver()
     worker.llm = Engine()
+    worker._api_server_pool = None
     worker.tokenizer = MagicMock()
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_worker_async.shutdown_telemetry",
@@ -800,6 +845,58 @@ async def test_async_vllm_worker_stops_http_server_before_engine(
     assert calls == ["server", "sparse-refit", "engine-cleanup", "engine-shutdown"]
     assert worker.http_server.should_exit is True
     assert worker.server_thread is None
+    assert worker.llm is None
+
+
+@pytest.mark.asyncio
+async def test_failed_pool_does_not_update_owner_weight_version() -> None:
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    pool = MultiAPIServerPool(worker, 2)
+    pool.children = [MagicMock(is_alive=MagicMock(return_value=False))]
+    pool.connections = [MagicMock()]
+    worker._api_server_pool = pool
+    worker._rollout_weight_version = 3
+    with pytest.raises(RuntimeError, match="exited"):
+        await pool.command("version", 4)
+    with pytest.raises(RuntimeError, match="exited"):
+        await worker.set_rollout_weight_version(4)
+    assert worker._rollout_weight_version == 3
+
+
+@pytest.mark.asyncio
+async def test_worker_shutdown_cleans_up_an_unavailable_pool(monkeypatch) -> None:
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._init_frontend_state()
+    worker.server_thread = MagicMock()
+    worker.http_server = MagicMock()
+    worker._sparse_refit_receiver = None
+    worker.llm = MagicMock(collective_rpc=AsyncMock())
+    engine = worker.llm
+    pool = MultiAPIServerPool(worker, 2)
+    pool.children = [MagicMock(is_alive=MagicMock(return_value=False))]
+    pool.connections = [MagicMock()]
+    manager, coordinator = MagicMock(), MagicMock()
+    pool.engine_manager = manager
+    pool.coordinator = coordinator
+    worker._api_server_pool = pool
+    with pytest.raises(RuntimeError, match="exited"):
+        await pool.command("version", 4)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.shutdown_telemetry",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.torch.cuda.empty_cache",
+        lambda: None,
+    )
+    assert await worker.shutdown()
+    assert worker.http_server.should_exit
+    assert worker.server_thread is None
+    engine.collective_rpc.assert_not_awaited()
+    engine.shutdown.assert_called_once_with()
+    manager.shutdown.assert_called_once_with()
+    coordinator.shutdown.assert_called_once_with()
+    assert worker._api_server_pool is None
     assert worker.llm is None
 
 
@@ -1460,6 +1557,39 @@ def _route_through_full_generator(serving_chat, result_generator) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("top_k", [None, 20])
+@pytest.mark.parametrize("gym_sampling_header", [None, "null"])
+async def test_only_trained_agents_calls_must_match_the_policy_sampling(
+    monkeypatch, gym_sampling_header, top_k
+):
+    """Gym marks a call from an agent NeMo-RL does not train, such as an LLM
+    judge, with ``x-ng-sampling: null``; it keeps its own sampling, top_k included."""
+    _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    reached = []
+
+    async def create_chat_completion(request, _raw_request):
+        reached.append((request.temperature, request.top_p, request.top_k))
+        raise ValueError("Input length (2) exceeds model's maximum context length (1).")
+
+    serving_chat.create_chat_completion = create_chat_completion
+    request = _fake_chat_request()
+    # Neither the train (1.0, 1.0) nor the validation (0.0, 1.0) sampling.
+    request.temperature, request.top_p, request.top_k = 0.0, 0.5, top_k
+    raw_request = MagicMock(
+        headers={"x-ng-sampling": gym_sampling_header} if gym_sampling_header else {}
+    )
+
+    if gym_sampling_header is None:
+        with pytest.raises(ValueError, match="matches neither"):
+            await chat_handler(request, raw_request)
+        assert reached == []
+    else:
+        response = await chat_handler(request, raw_request)
+        assert response.status_code == 400
+        assert reached == [(0.0, 0.5, top_k)]
+
+
+@pytest.mark.asyncio
 async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
     """Overflow from _clamp_max_tokens must be HTTP 400 that NeMo Gym recognizes."""
     _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
@@ -2014,7 +2144,9 @@ async def test_pinned_with_cancellation_aborts_chat_completion_on_http_disconnec
     token_capture.fail_call.side_effect = lambda *_args, **_kwargs: released.set()
 
     receive_queue: asyncio.Queue = asyncio.Queue()
-    raw_request = Request({"type": "http", "app": FastAPI()}, receive=receive_queue.get)
+    raw_request = Request(
+        {"type": "http", "app": FastAPI(), "headers": []}, receive=receive_queue.get
+    )
     task = asyncio.create_task(chat_handler(request, raw_request))
     await asyncio.wait_for(started.wait(), 1)
     await receive_queue.put({"type": "http.disconnect"})

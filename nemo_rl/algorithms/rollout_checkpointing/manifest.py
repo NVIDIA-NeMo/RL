@@ -358,6 +358,14 @@ def _normalize_capture_reward_config(dumped: dict[str, Any]) -> None:
         get_nemo_gym_thinking_tags(dumped["env"]),
     ).to_state()
     dumped["reward_penalties"] = settings["penalties"]
+    # verbose is a logging switch the length sidecar already excludes from its
+    # semantic compare; drop it from the bootstrap identity too so a verbose-only
+    # change does not reject the restart before that compare runs.
+    grpo = dumped.get("grpo")
+    if grpo is not None:
+        length_penalty = grpo.get("length_penalty")
+        if length_penalty is not None:
+            length_penalty.pop("verbose", None)
     gym = dumped["env"].get("nemo_gym")
     if gym is not None:
         gym.pop("effort_levels", None)

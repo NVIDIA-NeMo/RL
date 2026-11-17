@@ -58,10 +58,15 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
     DEFAULT_GENERATION_PORT_RANGE_LOW,
+    _bind_socket_in_range,
     _get_free_port_local,
     _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_MODEL_SAMPLING_HEADER,
+    NEMO_GYM_MODEL_SAMPLING_NULL,
+)
 from nemo_rl.experience.route_assembly import boundary_route_rows
 from nemo_rl.models.generation.dynamo.config import dynamo_cfg, dynamo_enabled
 from nemo_rl.models.generation.prefix_recovery import (
@@ -89,6 +94,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.rollout_result import RolloutResult
 from nemo_rl.models.generation.score_centering import validate_score_centering_request
 from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
     CapturedChatLogprobsMixin,
@@ -99,8 +105,11 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
-from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
-from nemo_rl.models.generation.rollout_result import RolloutResult
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    parse_nvfp4_pertoken_rollout,
+)
+from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
 from nemo_rl.models.generation.vllm.request_pipeline import (
     rollout_output,
     rollout_result,
@@ -109,7 +118,6 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
-    extract_generation_logprobs,
     format_prompt_for_vllm_generation,
     check_sampling_param,
     validate_rollout_prompt,
@@ -415,16 +423,14 @@ class VllmAsyncGenerationWorkerImpl(
         self._deferred_bundle_indices = None
         self._deferred_seed = None
 
-        # Defaults for HTTP server state; populated after the actor loop starts.
-        self.server_thread = None
-        self.base_url = None
-        self.http_server = None
-        self._engine_loop = None
-        self._http_engine_client = None
         # The task serving this engine through Dynamo, when it is registered.
         self._dynamo_endpoint_task: Optional[asyncio.Task] = None
 
-        self._init_token_capture_state()
+        # Initialize HTTP server, token capture, and API server pool state.
+        self._init_frontend_state()
+
+        if bundle_indices is not None and config["vllm_cfg"].get("expose_http_server"):
+            self._reserve_port(config)
 
         super().__init__(
             config,
@@ -441,11 +447,22 @@ class VllmAsyncGenerationWorkerImpl(
         self._deferred_bundle_indices = bundle_indices
         self._deferred_seed = seed
 
-        if self.cfg["vllm_cfg"].get("expose_http_server"):
-            self._reserve_port()
-
         self.llm = None
         self.vllm_device_ids = None
+
+    def _init_frontend_state(self) -> None:
+        """Initialize frontend state without constructing a GPU worker."""
+        # Defaults for HTTP server state; populated after the actor loop starts.
+        self.server_thread = None
+        self.base_url = None
+        self.http_server = None
+        self._engine_loop = None
+        self._http_engine_client = None
+        # API server pool for multiple HTTP API servers
+        self._api_server_pool = None
+
+        # Token capture state
+        self._init_token_capture_state()
 
     def _init_token_capture_state(self) -> None:
         """Token-capture and generation-cut state, dormant until setup_token_capture.
@@ -521,8 +538,8 @@ class VllmAsyncGenerationWorkerImpl(
             self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
         )
 
-    def _reserve_port(self) -> None:
-        """Bind and listen on a TCP socket to reserve a free port from the OS.
+    def _reserve_port(self, config: VllmConfig) -> None:
+        """Reserve a listening socket within the configured generation port range.
 
         The socket is held open in LISTENING state and later passed directly to
         uvicorn via the ``sockets=`` parameter in ``server.serve()``. The socket
@@ -535,7 +552,11 @@ class VllmAsyncGenerationWorkerImpl(
 
         self._reserved_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._reserved_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._reserved_socket.bind(("", 0))
+        _bind_socket_in_range(
+            self._reserved_socket,
+            config.get("port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW),
+            config.get("port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH),
+        )
         self._reserved_socket.listen(128)
         self._reserved_socket.setblocking(False)
         self._reserved_port = self._reserved_socket.getsockname()[1]
@@ -580,11 +601,13 @@ class VllmAsyncGenerationWorkerImpl(
                     stacklevel=1,
                 )
             llm_kwargs["compilation_config"] = CompilationConfig(**compilation_config)
+
         self.stat_loggers = (
             [PrometheusStatLogger]
             if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
             else []
         )
+
         if dynamo_enabled(self.cfg):
             from nemo_rl.models.generation.dynamo.vllm_adapter import (
                 SnapshotStatLogger,
@@ -601,6 +624,7 @@ class VllmAsyncGenerationWorkerImpl(
                 ),
             )
             self.stat_loggers.append(SnapshotStatLogger)
+
         # AsyncEngineArgs leaves kv_events_config dicts unconverted.
         if isinstance(llm_kwargs.get("kv_events_config"), dict):
             from vllm.config import KVEventsConfig
@@ -610,9 +634,20 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
-        self.llm = AsyncLLM.from_engine_args(
-            self.llm_async_engine_args, stat_loggers=self.stat_loggers
-        )
+
+        # Initialize the vLLM engine
+        api_server_count = self.cfg["vllm_cfg"].get("http_api_server_count", 1)
+        if api_server_count > 1:
+            # Multiple API servers require separate frontend and engine setup.
+            self._api_server_pool = MultiAPIServerPool(self, api_server_count)
+            self.llm = self._api_server_pool.create_engine(
+                self.llm_async_engine_args, self.stat_loggers
+            )
+        else:
+            self.llm = AsyncLLM.from_engine_args(
+                self.llm_async_engine_args, stat_loggers=self.stat_loggers
+            )
+
         # Keep vLLM's output loops from monopolizing this actor's event loop under a
         # generation backlog (see install_output_loop_yield).
         output_loop_yield_budget_ms = self.cfg["vllm_cfg"].get(
@@ -789,6 +824,8 @@ class VllmAsyncGenerationWorkerImpl(
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
             )
+            if self._api_server_pool is not None:
+                await self._api_server_pool.command("start")
 
     async def start_dynamo_endpoint_async(
         self, *, namespace: str, engine_env: dict[str, str], leader_worker_idx: int
@@ -877,6 +914,10 @@ class VllmAsyncGenerationWorkerImpl(
         """
         if not self.is_model_owner:
             return None
+        if generation_prefix_cuts_enabled and self._api_server_pool is not None:
+            raise ValueError(
+                "Multiple HTTP API servers do not support generation-prefix cuts"
+            )
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
         from nemo_gym.token_id_capture.staging import install_capture
@@ -997,6 +1038,10 @@ class VllmAsyncGenerationWorkerImpl(
                     prefix_row_extras=self._generation_cut_record_payload,
                 )
             )
+        if self._api_server_pool is not None:
+            await self._api_server_pool.command(
+                "capture", dp_cfg, staging_partition, capture_media, top_logprobs
+            )
         if not capture_media:
             return None
         return MediaColumnSpec(
@@ -1017,7 +1062,27 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version stamped on subsequent captured calls."""
+        if self._api_server_pool is not None:
+            await self._api_server_pool.command("version", int(version))
         self._rollout_weight_version = int(version)
+
+    async def get_data_plane_snapshots(self) -> list[dict[str, Any]]:
+        """Collect each frontend's capture counters and reset its step window.
+
+        Returns:
+            One snapshot per frontend with data-plane observability enabled.
+        """
+        snapshots = []
+        local_snapshot = self.get_data_plane_snapshot()
+        if local_snapshot is not None:
+            snapshots.append(local_snapshot)
+        if self._api_server_pool is not None:
+            snapshots.extend(
+                snapshot
+                for snapshot in await self._api_server_pool.command("snapshot")
+                if snapshot is not None
+            )
+        return snapshots
 
     async def captured_call_progress(self) -> Optional[dict[str, Any]]:
         """Report how far each running captured call got on the current weights.
@@ -1026,11 +1091,25 @@ class VllmAsyncGenerationWorkerImpl(
         each call switches to the new weights. ``None`` on ranks that serve no
         captured calls.
         """
-        if self._http_engine_client is None or self.token_capture is None:
+        calls = []
+        capture_enabled = False
+        if self._http_engine_client is not None and self.token_capture is not None:
+            capture_enabled = True
+            calls.extend(await self._http_engine_client.captured_call_progress())
+        if self._api_server_pool is not None:
+            for progress in await self._api_server_pool.command("progress"):
+                if progress is not None:
+                    if progress["weight_version"] != self._rollout_weight_version:
+                        raise RuntimeError(
+                            "HTTP frontends have different weight versions"
+                        )
+                    capture_enabled = True
+                    calls.extend(progress["calls"])
+        if not capture_enabled:
             return None
         return {
             "weight_version": self._rollout_weight_version,
-            "calls": await self._http_engine_client.captured_call_progress(),
+            "calls": calls,
         }
 
     def _capture_admission(self, request: Any) -> Any | None:
@@ -2317,38 +2396,43 @@ class VllmAsyncGenerationWorkerImpl(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
             # Accept train and validation profiles; reject off-policy requests.
-            # vLLM fills an unset top_k/min_p/repetition_penalty from
-            # generation_config.json when vllm_kwargs sets generation_config="auto",
-            # so pin top_k to the matched profile's (as
-            # vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params does)
-            # and disable min_p and the repetition penalty. vLLM applies these and
-            # the presence/frequency penalties and logit bias before sampling; the
-            # trainer replays none of them, so a request may not set them.
-            top_k = check_sampling_param(
-                temperature=request.temperature,
-                top_p=request.top_p,
-                top_k=request.top_k,
-                generation_config=generation_config,
-            )
-            assert request.min_p in (None, 0.0), (
-                f"request min_p={request.min_p} is not supported; leave it unset"
-            )
-            assert request.repetition_penalty in (None, 1.0), (
-                f"request repetition_penalty={request.repetition_penalty} is not "
-                "supported; leave it unset"
-            )
-            assert request.presence_penalty in (None, 0.0), (
-                f"request presence_penalty={request.presence_penalty} is not "
-                "supported; leave it unset"
-            )
-            assert request.frequency_penalty in (None, 0.0), (
-                f"request frequency_penalty={request.frequency_penalty} is not "
-                "supported; leave it unset"
-            )
-            assert not request.logit_bias, "request logit_bias is not supported"
-            request.top_k = top_k
-            request.min_p = 0.0
-            request.repetition_penalty = 1.0
+            # Gym marks an untrained caller's call, such as an LLM judge's, which keeps its own sampling.
+            if (
+                raw_request.headers.get(NEMO_GYM_MODEL_SAMPLING_HEADER)
+                != NEMO_GYM_MODEL_SAMPLING_NULL
+            ):
+                # vLLM fills an unset top_k/min_p/repetition_penalty from
+                # generation_config.json when vllm_kwargs sets generation_config="auto",
+                # so pin top_k to the matched profile's (as
+                # vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params does)
+                # and disable min_p and the repetition penalty. vLLM applies these and
+                # the presence/frequency penalties and logit bias before sampling; the
+                # trainer replays none of them, so a request may not set them.
+                top_k = check_sampling_param(
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    top_k=request.top_k,
+                    generation_config=generation_config,
+                )
+                assert request.min_p in (None, 0.0), (
+                    f"request min_p={request.min_p} is not supported; leave it unset"
+                )
+                assert request.repetition_penalty in (None, 1.0), (
+                    f"request repetition_penalty={request.repetition_penalty} is not "
+                    "supported; leave it unset"
+                )
+                assert request.presence_penalty in (None, 0.0), (
+                    f"request presence_penalty={request.presence_penalty} is not "
+                    "supported; leave it unset"
+                )
+                assert request.frequency_penalty in (None, 0.0), (
+                    f"request frequency_penalty={request.frequency_penalty} is not "
+                    "supported; leave it unset"
+                )
+                assert not request.logit_bias, "request logit_bias is not supported"
+                request.top_k = top_k
+                request.min_p = 0.0
+                request.repetition_penalty = 1.0
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
@@ -3211,6 +3295,9 @@ class VllmAsyncGenerationWorkerImpl(
             prefix_recovery = getattr(self, "_prefix_recovery", None)
             if prefix_recovery is not None:
                 prefix_recovery.shutdown()
+            if self._api_server_pool is not None:
+                await self._api_server_pool.command("stop")
+                self._api_server_pool.stop_children()
             if self.server_thread is not None:
                 self.http_server.should_exit = True
                 await asyncio.to_thread(self.server_thread.join)
@@ -3221,7 +3308,11 @@ class VllmAsyncGenerationWorkerImpl(
 
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
-                await self.llm.collective_rpc("cleanup", args=tuple())
+                if (
+                    self._api_server_pool is None
+                    or self._api_server_pool._failure is None
+                ):
+                    await self.llm.collective_rpc("cleanup", args=tuple())
                 try:
                     self.llm.shutdown()
                 except Exception as e_stop:
@@ -3231,6 +3322,9 @@ class VllmAsyncGenerationWorkerImpl(
                 del self.llm
 
             self.llm = None
+            if self._api_server_pool is not None:
+                self._api_server_pool.close_engines()
+                self._api_server_pool = None
             self.tokenizer = None
 
             # Force garbage collection
