@@ -13,7 +13,7 @@ EXP_NAME="vpg/$(basename "${BASH_SOURCE[0]}" .sh)"
 source "$SCRIPT_DIR/../common.env"
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=6
+NUM_NODES=5
 GPUS_PER_NODE=4
 STEPS_PER_RUN=6
 MAX_STEPS=6

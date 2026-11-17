@@ -111,8 +111,8 @@ research/flow_grpo/tests/test_suites/flow_grpo_qwen_image_ocr.sh
 tests/test_suites/llm/grpo-qwen3-8b-base-1n4g-megatron-async-vpg.sh
 
 # Manual VPG reproduction gates require the pinned experimental Blackwell runtime.
-tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-6n4g-bf16-vpg-lag1.sh
-tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-6n4g-bf16-vpg-lag4.sh
+tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-5n4g-bf16-vpg-lag1.sh
+tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-5n4g-bf16-vpg-lag4.sh
 tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-8n4g-bf16-baseline-lag1.sh
 tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-8n4g-bf16-baseline-lag4.sh
 tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-8n4g-nvfp4-pertoken-async-4t4g.sh

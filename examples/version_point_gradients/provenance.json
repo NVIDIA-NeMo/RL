@@ -80,26 +80,28 @@
       "gpus": 32
     },
     "bf16_vpg_lag1": {
-      "original_commit": "62bb73f92d2d866eaf68d161c6659b6cb7ee406d",
+      "original_commit": "999a47ecc42380600f191aa35272eb730dd70e20",
       "lag": 1,
       "batch_invariant": true,
       "vpg": true,
-      "nodes": 6,
-      "training_nodes": 2,
+      "nodes": 5,
+      "training_nodes": 1,
       "generation_nodes": 4,
-      "gpus": 24,
-      "activation_recompute": "full, uniform, one layer"
+      "gpus": 20,
+      "activation_recompute": "full, uniform, one layer",
+      "logprob_chunk_size": 8
     },
     "bf16_vpg_lag4": {
-      "original_commit": "c54917d9d9476658ab5a003f2e99ca80d5b1b5a2",
+      "original_commit": "76a7a125f19c8215d78f0b44bb0cd8f96c04016e",
       "lag": 4,
       "batch_invariant": true,
       "vpg": true,
-      "nodes": 6,
-      "training_nodes": 2,
+      "nodes": 5,
+      "training_nodes": 1,
       "generation_nodes": 4,
-      "gpus": 24,
-      "activation_recompute": "full, uniform, one layer"
+      "gpus": 20,
+      "activation_recompute": "full, uniform, one layer",
+      "logprob_chunk_size": 8
     }
   },
   "port_notes": [
@@ -107,6 +109,7 @@
     "Study-only rho probes and paper2 diagnostics are excluded. Recipes preserve the training objective and sampling settings; numerical equivalence of this current-main port needs the startup gates.",
     "BF16 VPG controls enable bias_activation_fusion to match inference SwiGLU rounding.",
     "Megatron runtime fields without a first-class NeMo-RL key use the existing model_overrides passthrough; generation explicitly disables the training-only matched-expert mode.",
-    "BF16 VPG controls use 8 trainer GPUs and 16 rollout GPUs, with full activation recomputation; the 32-GPU study arms use 16 trainers, so FP32 gradient reduction order differs."
+    "BF16 VPG controls use 4 trainer GPUs and 16 rollout GPUs, with full activation recomputation; the 32-GPU study arms use 16 trainers, so FP32 gradient reduction order differs.",
+    "BF16 VPG logprob_chunk_size=8 bounds temporary loss memory. Four full-vocabulary GPU probes preserved exact forwards and exact native backward at the configured chunk size; changing from128 to8 differed by at most one BF16 ULP in the probed gradients."
   ]
 }

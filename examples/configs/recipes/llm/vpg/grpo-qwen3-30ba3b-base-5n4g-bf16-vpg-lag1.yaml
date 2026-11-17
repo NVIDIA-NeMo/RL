@@ -1,5 +1,6 @@
 defaults: ./grpo-qwen3-30ba3b-base-8n4g-nvfp4-vpg-lag1.yaml
 policy:
+  logprob_chunk_size: 8
   megatron_cfg:
     bias_activation_fusion: true
     recompute_granularity: full
@@ -19,4 +20,4 @@ policy:
       model_overrides:
         inference_moe_nvfp4_recipe: null
 cluster:
-  num_nodes: 6
+  num_nodes: 5

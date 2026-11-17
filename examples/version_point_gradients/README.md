@@ -1,6 +1,6 @@
 # Version-point gradients: precision and lag comparisons
 
-These scripts reproduce the setup of the Qwen3-30B-A3B-Base async GRPO comparison on DAPOMath17K, with AIME 2024 validation. Ordinary BF16 and NVFP4 arms use 32 Blackwell GPUs (16 trainer and 16 rollout). BF16 VPG controls use 24 GPUs (8 trainer and 16 rollout), with full activation recomputation to fit the smaller trainer group. They contain no scheduler accounts, internal hosts, or shared filesystem paths.
+These scripts reproduce the setup of the Qwen3-30B-A3B-Base async GRPO comparison on DAPOMath17K, with AIME 2024 validation. Ordinary BF16 and NVFP4 arms use 32 Blackwell GPUs (16 trainer and 16 rollout). BF16 VPG controls use 20 GPUs (4 trainer and 16 rollout), with full activation recomputation to fit the smaller trainer group. They contain no scheduler accounts, internal hosts, or shared filesystem paths.
 
 | Script | Expert forward | Maximum trajectory age | VPG | Batch invariant |
 | --- | --- | ---: | --- | --- |
@@ -13,7 +13,7 @@ These scripts reproduce the setup of the Qwen3-30B-A3B-Base async GRPO compariso
 
 Ordinary BF16 uses token importance sampling with TIS cap 2. NVFP4 applies to routed-expert forward computation; its surrogate backward recomputes in BF16 through TransformerEngine. Parameters remain BF16 and gradient reductions use FP32. BF16 VPG enables fused SwiGLU to match inference rounding. All GEMMs use TransformerEngine or FlashInfer; neither DeepGEMM nor a Triton GEMM backend is selected.
 
-The BF16 VPG controls keep the same global batch size, sampling, optimizer settings, and loss while reserving fewer trainer GPUs for this generation-bound workload. Their data-parallel gradient-reduction order differs from the 16-trainer arms. Full activation recomputation is a memory/compute tradeoff.
+The BF16 VPG controls keep the same global batch size, sampling, optimizer settings, and loss while reserving fewer trainer GPUs for this generation-bound workload. Their data-parallel gradient-reduction order differs from the 16-trainer arms. Full activation recomputation is a memory/compute tradeoff. BF16 VPG uses `logprob_chunk_size=8` to bound temporary log-prob memory on the four trainer GPUs.
 
 The original BF16 versus NVFP4 comparison changes precision, VPG, and batch invariance together. Compare BF16 VPG against NVFP4 VPG at the same lag to separate those effects, and compare matched steps and multiple seeds. This current-main port has not completed a convergence reproduction; its startup gates must pass in the prepared runtime before a long run starts.
 
@@ -23,7 +23,7 @@ The original BF16 versus NVFP4 comparison changes precision, VPG, and batch inva
 
 For BF16 VPG, apply `patches/megatron-native-te-bf16.patch` after the optimizer patch, using a separate Megatron checkout. The native TE grouped-GEMM adapter is qualified on SM100 with cuBLASLt 13.5.1 and rejects other hardware/library combinations. Add the selected Megatron checkout and Bridge `src/` to `PYTHONPATH`. Runtime fields without a first-class NeMo-RL key use `model_overrides`, with the matched-expert training mode explicitly disabled on generation. The high-level inference selector is named `torch`; `batch_invariant_backend=te_native` directs its GEMMs through TE.
 
-Allocate six nodes for a BF16 VPG control or eight nodes for another arm, with four GPUs per node. Start a separate Ray cluster for each experiment:
+Allocate five nodes for a BF16 VPG control or eight nodes for another arm, with four GPUs per node. Start a separate Ray cluster for each experiment:
 
 ```bash
 # Head node:
