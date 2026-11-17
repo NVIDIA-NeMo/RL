@@ -69,30 +69,54 @@ def test_expert_parallel_full_batch_supported(config, expert_parallel_size):
 @pytest.mark.parametrize(
     "path,value",
     [
-        ("async_rl.sampler.max_lookahead_versions", 2),
+        ("on_policy_distillation.enabled", True),
+        ("grpo.use_dynamic_sampling", True),
+        ("token_capture.enabled", True),
         ("async_rl.sampler.name", "ready_first"),
+        ("async_rl.sampler.max_lookahead_versions", 2),
+        ("async_rl.sampler.warmup_lookahead_versions", 1),
         ("async_rl.min_groups_for_streaming_train", 1),
-        ("policy.dynamic_batching.enabled", True),
-        ("policy.sequence_packing.enabled", True),
-        ("policy.automodel_cfg.context_parallel_size", 2),
-        ("policy.automodel_cfg.tensor_parallel_size", 2),
-        ("policy.automodel_cfg.dp_replicate_size", 2),
-        ("policy.automodel_cfg.cpu_offload", True),
-        ("policy.automodel_cfg.lora_cfg.enabled", True),
-        ("policy.tokenizer.use_processor", True),
-        ("policy.quant_cfg", "fp8"),
+        ("async_rl.rollout_failure.max_skipped_prompts", 1),
+        ("async_rl.rollout_failure.max_consecutive_dropped_prompts", 1),
+        ("policy.generation.backend", "megatron"),
         ("policy.generation.colocated.enabled", True),
         ("policy.generation.vllm_cfg.async_engine", False),
-        ("async_rl.rollout_failure.max_skipped_prompts", 1),
+        ("policy.sequence_packing.enabled", True),
+        ("policy.dynamic_batching.enabled", True),
+        ("policy.automodel_cfg.tensor_parallel_size", 2),
+        ("policy.automodel_cfg.context_parallel_size", 2),
+        ("policy.automodel_cfg.dp_replicate_size", 2),
+        ("policy.automodel_cfg.cpu_offload", True),
+        ("policy.automodel_cfg.custom_parallel_plan", "my.plan"),
+        ("policy.automodel_cfg.sequence_parallel", True),
+        ("policy.automodel_cfg.lora_cfg.enabled", True),
+        ("policy.is_vlm", True),
+        ("policy.tokenizer.use_processor", True),
+        ("policy.draft.enabled", True),
+        ("policy.quant_cfg", "fp8"),
+        ("policy.precision", "float16"),
     ],
 )
 def test_unsupported(config, path, value):
     raw = OmegaConf.create(config)
     OmegaConf.update(raw, path, value, merge=False)
-    with pytest.raises(ValueError, match="AutoModel SC"):
+    with pytest.raises(ValueError, match=f"Unsupported: .*{path}"):
         _validate_automodel_single_controller_config(
             MasterConfig(**OmegaConf.to_container(raw, resolve=True))
         )
+
+
+def test_ppo_unsupported(config):
+    config["ppo"] = config.pop("grpo")
+    # PPO estimators are gae/raw_reward; the GRPO exemplar's estimator does not parse.
+    config["ppo"].pop("adv_estimator")
+    with pytest.raises(ValueError, match="Unsupported: ppo"):
+        _validate_automodel_single_controller_config(MasterConfig(**config))
+
+
+def test_disabled_opd_block_supported(config):
+    config["on_policy_distillation"] = {"enabled": False}
+    _validate_automodel_single_controller_config(MasterConfig(**config))
 
 
 def test_megatron_unchanged(config):
