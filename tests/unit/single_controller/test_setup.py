@@ -5007,20 +5007,6 @@ def test_minf_image_preprocessing_emits_float32_pixels():
 @pytest.mark.parametrize(
     "backend_cfg",
     [
-        {
-            "automodel_cfg": {
-                "enabled": True,
-                "tensor_parallel_size": 2,
-                "context_parallel_size": 1,
-            }
-        },
-        {
-            "automodel_cfg": {
-                "enabled": True,
-                "tensor_parallel_size": 1,
-                "context_parallel_size": 2,
-            }
-        },
         {"megatron_cfg": {"enabled": True, "use_fused_linear_logprobs": True}},
         {"megatron_cfg": {"enabled": True, "reuse_logits_storage": True}},
     ],
@@ -5035,15 +5021,7 @@ def test_score_centering_rejects_unsupported_trainer_logits(backend_cfg):
     validate_single_controller_config(mc)
     for name, cfg in backend_cfg.items():
         mc.policy[name] = {**(mc.policy.get(name) or {}), **cfg}
-    # Exercise the shared score-centering guard independently of AutoModel's
-    # narrower full-batch capabilities, covered by test_automodel_config.
-    with (
-        patch(
-            "nemo_rl.algorithms.single_controller_utils.config."
-            "_validate_automodel_single_controller_config"
-        ),
-        pytest.raises(ValueError, match="loss_fn.score_centering"),
-    ):
+    with pytest.raises(ValueError, match="loss_fn.score_centering"):
         validate_single_controller_config(mc)
 
 

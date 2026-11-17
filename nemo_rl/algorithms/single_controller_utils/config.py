@@ -2158,18 +2158,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "See docs/guides/sampler-replay.md#head-size-and-top-p"
             )
 
-        automodel_cfg = master_config.policy.get("automodel_cfg")
-        if automodel_cfg is not None and automodel_cfg["enabled"]:
-            enabled_automodel_cfg = cast(AutomodelConfig, automodel_cfg)
-            if (
-                enabled_automodel_cfg["tensor_parallel_size"] > 1
-                or enabled_automodel_cfg["context_parallel_size"] > 1
-            ):
-                raise ValueError(
-                    "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
-                    "support Automodel only with tensor_parallel_size=1 and "
-                    "context_parallel_size=1; use Megatron for TP/CP"
-                )
         megatron_cfg = master_config.policy.get("megatron_cfg") or {}
         if megatron_cfg.get("enabled") and megatron_cfg.get(
             "use_fused_linear_logprobs"
