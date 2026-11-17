@@ -104,6 +104,17 @@ def prefetch_venvs(filters=None):
     return failed
 
 
+def wrapper_script(venv_path: str) -> str:
+    """Return the python-{ClassName} wrapper script that runs python from ``venv_path``."""
+    # docker/Dockerfile writes the same text with printf; keep the two in step.
+    return f"""#!/bin/bash
+VENV_PATH="{venv_path}"
+export VIRTUAL_ENV="$VENV_PATH"
+export PATH="$VENV_PATH/bin:$PATH"
+exec "$VENV_PATH/bin/python" "$@"
+"""
+
+
 def create_frozen_environment_symlinks(venv_configs):
     """Create python-{ClassName} wrapper scripts in /usr/local/bin for frozen environment support.
 
@@ -161,13 +172,7 @@ def create_frozen_environment_symlinks(venv_configs):
         # Get the venv directory path (parent of bin/python)
         venv_path = Path(python_path).parent.parent
 
-        # Create wrapper script content
-        wrapper_content = f"""#!/bin/bash
-VENV_PATH="{venv_path}"
-export VIRTUAL_ENV="$VENV_PATH"
-export PATH="$VENV_PATH/bin:$PATH"
-exec "$VENV_PATH/bin/python" "$@"
-"""
+        wrapper_content = wrapper_script(str(venv_path))
 
         try:
             # Remove existing wrapper if present

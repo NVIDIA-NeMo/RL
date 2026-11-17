@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import re
+import subprocess
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -304,3 +307,24 @@ class TestPrefetchVenvs:
             failed = prefetch_venvs_func(filters=None)
 
         assert failed == []
+
+
+def test_dockerfile_writes_the_same_wrapper():
+    """The image build writes the wrappers with printf; they must match wrapper_script."""
+    dockerfile = Path(__file__).parents[3] / "docker" / "Dockerfile"
+    match = re.search(
+        r"printf '(#!/bin/bash[^']*)' \\\n\s*\"([^\"]+)\" > \"\$wrapper\"",
+        dockerfile.read_text(),
+    )
+    assert match, "python-<ClassName> wrapper printf not found in docker/Dockerfile"
+    template, venv_arg = match.groups()
+    assert venv_arg == "${NEMO_RL_VENV_DIR}/${actor}"
+
+    venv = "/opt/ray_venvs/pkg.mod.SomeWorker"
+    rendered = subprocess.run(
+        ["bash", "-c", 'printf "$0" "$1"', template, venv],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert rendered == prefetch_venvs_module.wrapper_script(venv)
