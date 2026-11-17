@@ -62,7 +62,7 @@ Real-quant parameters have already been transformed into inference layouts, so I
 3. `finalize_layerwise_reload()` rebuilds runtime layouts and kernels.
 4. NeMo RL synchronizes before transport storage can be reused.
 
-Initialization invalidates the previous runtime layout. A failed native reload therefore makes that generation worker unusable. Deferred loader tensors are detached only when they still alias a reusable transport buffer.
+Initialization invalidates the previous runtime layout. A failed native reload therefore makes that generation worker unusable. Native reload may retain loader inputs until a later batch completes a layer, so NeMo RL hands vLLM independently owned copies rather than views into reusable transport buffers.
 
 ## Formats
 

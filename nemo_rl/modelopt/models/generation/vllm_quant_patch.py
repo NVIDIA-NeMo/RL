@@ -244,7 +244,7 @@ def _fakequant_run_prolog_worker(self) -> None:
 
 
 def _make_nvfp4_moe_input_scales_writable(model: torch.nn.Module) -> None:
-    """Backport writable shared NVFP4 MoE scales for vLLM 0.25.1."""
+    """Give shared (broadcast) NVFP4 MoE input scales their own writable storage."""
     scale_names = ("w13_input_scale", "w2_input_scale")
     for module in model.modules():
         for name in scale_names:
