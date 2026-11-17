@@ -33,7 +33,6 @@ SELECTION_FILE=$TEST_DIR/selected-snapshot.json
 SELECTED_BACKUP=$TEST_DIR/selected-snapshot
 TEST_DATA=$TEST_DIR/test-data.jsonl
 GYM_ROOT=$PROJECT_ROOT/3rdparty/Gym-workspace/Gym
-PHASE1_PID=""
 SENTINEL_EVENT="NeMo RL prefix recovery parity sentinel"
 
 # Cuttable Workplace prompts per step, one per list length.
@@ -124,36 +123,8 @@ jq -n -c \
     ' > "$TEST_DATA"
 
 
-stop_phase1() {
-    if [[ -z "$PHASE1_PID" ]]; then
-        return
-    fi
-    kill -KILL -- "-$PHASE1_PID" 2>/dev/null || true
-    wait "$PHASE1_PID" 2>/dev/null || true
-    PHASE1_PID=""
-    # Ray actors outlive the driver until their raylet notices the crash. Do
-    # not start phase two while the old controller can still write snapshots.
-    local deadline=$((SECONDS + 120))
-    while pgrep -f "^ray::SingleControllerActor" >/dev/null; do
-        if ((SECONDS >= deadline)); then
-            echo "[ERROR] phase-one SingleControllerActor outlived its driver"
-            return 1
-        fi
-        sleep 1
-    done
-}
-
-cleanup() {
-    local status=$?
-    stop_phase1
-    if [[ "$status" -eq 0 && "${SC_PREFIX_RECOVERY_KEEP_CHECKPOINTS:-0}" != "1" ]]; then
-        rm -rf "$CHECKPOINT_DIR" "$BASELINE_CHECKPOINT_DIR" "$SELECTED_BACKUP"
-    else
-        echo "Preserving prefix-recovery artifacts for inspection: $TEST_DIR"
-    fi
-    return "$status"
-}
-trap cleanup EXIT
+source "$SCRIPT_DIR/_gym_prefix_recovery_phases.sh"
+install_phase_cleanup "$CHECKPOINT_DIR" "$BASELINE_CHECKPOINT_DIR" "$SELECTED_BACKUP"
 
 COMMON_OVERRIDES=(
     policy.model_name="$MODEL_NAME"
@@ -246,21 +217,7 @@ uv run --directory "$PROJECT_ROOT" --no-sync python "$SNAPSHOT_HELPER" select \
 
 stop_phase1
 cp "$BASE_RUN_LOG" "$PHASE1_LOG"
-SNAPSHOT_DIR=$(uv run --directory "$PROJECT_ROOT" --no-sync python -c \
-    'import json, sys; print(json.load(open(sys.argv[1]))["snapshot"])' \
-    "$SELECTION_FILE")
-SNAPSHOT_ROOT=$(dirname "$SNAPSHOT_DIR")
-
-# Recover exactly the prefix selected above. A newer periodic snapshot or a
-# trainer checkpoint would represent work performed after the simulated crash.
-rm -rf "$SNAPSHOT_ROOT"
-mkdir -p "$SNAPSHOT_ROOT"
-cp -a "$SELECTED_BACKUP" "$SNAPSHOT_DIR"
-for trainer_checkpoint in "$CHECKPOINT_DIR"/step_*; do
-    if [[ -d "$trainer_checkpoint" ]]; then
-        rm -rf "$trainer_checkpoint"
-    fi
-done
+restore_selected_snapshot "$SELECTION_FILE" "$SELECTED_BACKUP" "$CHECKPOINT_DIR"
 
 # Avoid cutting the replacement request again while verifying that it consumes
 # the selected prefix and reaches normal completion.

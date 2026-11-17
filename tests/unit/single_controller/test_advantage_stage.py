@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -839,6 +840,67 @@ def test_training_dump_is_complete_however_the_stage_was_split(
     # The serialization is timed wherever it ran, and reported back as a
     # number so the controller's metric survives the move onto the pool.
     assert len(ctrl._timer.get_elapsed("train_data_dump")) == max(num_actors, 1)
+
+
+class _JaggedRowStore(_RowStore):
+    """A store that returns the sequence columns jagged, as the data plane does for mixed lengths."""
+
+    def get_samples(self, *, sample_ids, select_fields, **kwargs) -> TensorDict:
+        data = super().get_samples(
+            sample_ids=sample_ids, select_fields=select_fields, **kwargs
+        )
+        lengths = [int(self.rows[sid]["input_lengths"]) for sid in sample_ids]
+        for name in ("input_ids", "generation_logprobs", "prev_logprobs"):
+            if name not in data.keys():
+                continue
+            data[name] = torch.nested.as_nested_tensor(
+                [data[name][i, :n] for i, n in enumerate(lengths)],
+                layout=torch.jagged,
+            )
+        return data
+
+
+@pytest.mark.parametrize("estimator_name", ["grpo", "opd"])
+def test_training_dump_takes_jagged_columns_without_padding(
+    tmp_path: Path, estimator_name: str
+) -> None:
+    """The chunk carries the jagged columns as fetched, and the dump rows match them.
+
+    ``opd`` needs the policy logprobs, so only it puts ``prev_logprobs`` in the dump.
+    """
+    rows = _rows()
+    lengths = {sid: SEQ - (i % 3) for i, sid in enumerate(rows)}
+    for sid, length in lengths.items():
+        rows[sid]["input_lengths"] = torch.tensor(length)
+    store = _JaggedRowStore(rows)
+    ctrl = _controller(estimator_name, 0, store, dump_dir=str(tmp_path))
+    writer = ctrl._advantage_computer._train_data_dump
+    with patch.object(writer, "add_chunk", wraps=writer.add_chunk) as add_chunk:
+        asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    ctrl._advantage_computer.flush_train_data_dump()
+    ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_receipts)
+
+    chunk = add_chunk.call_args.args[0]
+    source_column = {
+        "token_ids": "input_ids",
+        "generation_logprobs": "generation_logprobs",
+        "prev_logprobs": "prev_logprobs",
+    }
+    expected_columns = ["token_ids", "generation_logprobs"] + (
+        ["prev_logprobs"] if estimator_name == "opd" else []
+    )
+    for column in expected_columns:
+        assert chunk.sequences[column].is_nested
+    dumped = [
+        json.loads(line)
+        for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
+    ]
+    assert len(dumped) == len(rows)
+    for row in dumped:
+        sid = row["sample_id"][0]
+        for column in expected_columns:
+            source = rows[sid][source_column[column]]
+            assert row[column][0] == source[: lengths[sid]].tolist()
 
 
 def _rows_with_response_lengths(

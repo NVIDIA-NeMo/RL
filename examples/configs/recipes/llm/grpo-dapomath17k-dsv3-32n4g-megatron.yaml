@@ -1,6 +1,9 @@
 defaults: ./grpo-dapomath17k-dsv3-megatron.yaml
 policy:
   megatron_cfg:
+    # Reduce peak host memory during checkpoint staging.
+    checkpoint:
+      async_save: false
     tensor_model_parallel_size: 4
     expert_model_parallel_size: 16
     # alltoall dispatch on GB200; reset the H100 recipe's HybridEP backend.
