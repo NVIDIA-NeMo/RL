@@ -326,6 +326,30 @@ def _filter_gemma4_unified_multimodal_weights(
     )
 
 
+_MIMO_V2_NON_LM_WEIGHT_PREFIXES = ("visual.", "audio_encoder.", "speech_embeddings.")
+
+
+def _is_mimo_v2_text_only(model_config: Any) -> bool:
+    """Return whether vLLM runs MiMo-V2 as the text-only MiMoV2ForCausalLM.
+
+    vLLM selects the text class only when the config it was given has no
+    vision_config (otherwise it builds the Omni wrapper with its vision tower).
+    """
+    architectures = getattr(model_config, "architectures", None) or []
+    return "MiMoV2ForCausalLM" in architectures
+
+
+def _filter_mimo_v2_non_lm_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Drop the vision, audio and speech-embedding tower weights of a text-only MiMo-V2."""
+    return (
+        (key, weight)
+        for key, weight in weights
+        if not key.startswith(_MIMO_V2_NON_LM_WEIGHT_PREFIXES)
+    )
+
+
 def _tied_embedding_aliases(model: torch.nn.Module | None) -> dict[str, str]:
     """Return vLLM's ``{alias qualname: canonical qualname}`` for tied embeddings.
 
@@ -833,6 +857,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
         if _is_gemma4_unified_text_only(model_config):
             weights = _filter_gemma4_unified_multimodal_weights(weights)
+        if _is_mimo_v2_text_only(model_config):
+            weights = _filter_mimo_v2_non_lm_weights(weights)
         model = getattr(self.model_runner, "model", None)
         aliases = _tied_embedding_aliases(model)
         if aliases:
@@ -1462,6 +1488,20 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     "Gemma4 Unified text-only refit dropped %d frozen "
                     "vision/audio weights",
                     num_dropped,
+                )
+
+        if _is_mimo_v2_text_only(model_config):
+            # The trainer holds the full multimodal model; the text-only vLLM model has no
+            # vision/audio modules, and the RL path never trains or runs them.
+            num_weights = len(weights)
+            weights = list(_filter_mimo_v2_non_lm_weights(weights))
+            if num_weights != len(weights) and not getattr(
+                self, "_logged_mimo_v2_drop", False
+            ):
+                self._logged_mimo_v2_drop = True
+                logger.info(
+                    "MiMo-V2 text-only refit dropped %d vision/audio tower weights",
+                    num_weights - len(weights),
                 )
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)

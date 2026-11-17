@@ -16,7 +16,7 @@
 
 import os
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, create_autospec, patch
 
 import pytest
@@ -2527,42 +2527,61 @@ class TestMaybeSetForceHf:
         _maybe_set_force_hf(kwargs, config)
         assert "force_hf" not in kwargs
 
-    def test_qwen2_auto_sets_force_hf(self):
-        """Qwen2's CombinedProjectionStateDictAdapter lacks convert_single_tensor_to_hf,
-        so force_hf should be auto-set when not explicitly configured."""
+    @pytest.mark.parametrize(
+        "arch", ["LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"]
+    )
+    def test_hf_default_arch_auto_sets_force_hf(self, arch):
+        """Dense HF-default architectures get force_hf=True when it is unset."""
         from nemo_automodel._transformers.registry import ModelRegistry
 
-        if "Qwen2ForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
-            pytest.skip("Qwen2ForCausalLM not in registry")
+        if arch not in ModelRegistry.model_arch_name_to_cls:
+            pytest.skip(f"{arch} not in registry")
 
         kwargs = {}
-        config = self._make_config("Qwen2ForCausalLM")
-        _maybe_set_force_hf(kwargs, config)
+        _maybe_set_force_hf(kwargs, self._make_config(arch))
         assert kwargs.get("force_hf") is True
 
-    def test_llama_auto_sets_force_hf(self):
-        """Llama also uses CombinedProjectionStateDictAdapter."""
-        from nemo_automodel._transformers.registry import ModelRegistry
-
-        if "LlamaForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
-            pytest.skip("LlamaForCausalLM not in registry")
-
-        kwargs = {}
-        config = self._make_config("LlamaForCausalLM")
-        _maybe_set_force_hf(kwargs, config)
-        assert kwargs.get("force_hf") is True
-
-    def test_qwen2_explicit_false_raises(self):
-        """When force_hf is explicitly False and adapter is incompatible, raise."""
+    def test_hf_default_arch_explicit_false_kept(self):
+        """An explicit force_hf=False opts an HF-default architecture into the custom model."""
         from nemo_automodel._transformers.registry import ModelRegistry
 
         if "Qwen2ForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
             pytest.skip("Qwen2ForCausalLM not in registry")
 
         kwargs = {"force_hf": False}
-        config = self._make_config("Qwen2ForCausalLM")
+        _maybe_set_force_hf(kwargs, self._make_config("Qwen2ForCausalLM"))
+        assert kwargs["force_hf"] is False
+
+    @pytest.fixture
+    def incompatible_adapter_arch(self, monkeypatch):
+        """Register a stand-in architecture whose adapter lacks convert_single_tensor_to_hf."""
+        from nemo_automodel._transformers.registry import ModelRegistry
+
+        package = "fake_incompatible_adapter_pkg"
+        model_module = ModuleType(f"{package}.model")
+        adapter_module = ModuleType(f"{package}.state_dict_adapter")
+        model_cls = type("FakeForCausalLM", (), {"__module__": model_module.__name__})
+        adapter_module.FakeStateDictAdapter = type("FakeStateDictAdapter", (), {})
+        monkeypatch.setitem(sys.modules, model_module.__name__, model_module)
+        monkeypatch.setitem(sys.modules, adapter_module.__name__, adapter_module)
+        monkeypatch.setattr(
+            ModelRegistry, "model_arch_name_to_cls", {"FakeForCausalLM": model_cls}
+        )
+        return "FakeForCausalLM"
+
+    def test_incompatible_adapter_auto_sets_force_hf(self, incompatible_adapter_arch):
+        """An adapter without convert_single_tensor_to_hf auto-sets force_hf=True."""
+        kwargs = {}
+        _maybe_set_force_hf(kwargs, self._make_config(incompatible_adapter_arch))
+        assert kwargs.get("force_hf") is True
+
+    def test_incompatible_adapter_explicit_false_raises(
+        self, incompatible_adapter_arch
+    ):
+        """When force_hf is explicitly False and adapter is incompatible, raise."""
+        kwargs = {"force_hf": False}
         with pytest.raises(RuntimeError, match="force_hf=False"):
-            _maybe_set_force_hf(kwargs, config)
+            _maybe_set_force_hf(kwargs, self._make_config(incompatible_adapter_arch))
 
     def test_compatible_adapter_no_change(self):
         """Models with adapters that implement convert_single_tensor_to_hf should

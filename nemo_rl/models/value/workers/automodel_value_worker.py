@@ -19,6 +19,9 @@ from typing import Any, Optional
 
 import ray
 import torch
+from nemo_automodel.components.distributed.tp_replicas import (
+    synchronize_tp_replica_gradients,
+)
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from torch import nn
 from transformers import (
@@ -371,6 +374,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
 
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
+                    synchronize_tp_replica_gradients([self.model], self.device_mesh)
                     grad_norm = scale_grads_and_clip_grad_norm(
                         self.max_grad_norm,
                         [self.model],

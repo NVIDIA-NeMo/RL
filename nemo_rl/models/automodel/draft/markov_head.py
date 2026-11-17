@@ -13,7 +13,7 @@
 # limitations under the License.
 #
 # Extends nemo_automodel.components.speculative.dspark.markov_head (3rdparty
-# Automodel r0.6.0). The head classes are re-exported unchanged; the local
+# Automodel). The head classes are re-exported unchanged; the local
 # delta is reduced-draft-vocab support for speculators-format checkpoints
 # (draft_vocab_size < target vocab): previous tokens are target-space ids, so
 # the prev-token embedding spans the FULL target vocab while the bias

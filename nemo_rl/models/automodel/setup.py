@@ -91,6 +91,12 @@ STRING_TO_DTYPE = {
     "float16": torch.float16,
 }
 
+# Dense architectures that default to the HF implementation even though Automodel ships a
+# custom one: RL numerics for these models were validated on HF. Set force_hf=false to opt in.
+HF_DEFAULT_ARCHITECTURES = frozenset(
+    {"LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"}
+)
+
 
 def _has_optimizer_fp32_master(
     optimizer_cls: type[torch.optim.Optimizer], optimizer_kwargs: dict[str, Any]
@@ -115,13 +121,14 @@ def _has_optimizer_fp32_master(
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     """Validate and maybe auto-set force_hf based on adapter compatibility.
 
-    Custom model implementations (e.g. Qwen2, Llama) use state_dict_adapters to
-    convert between native and HF weight formats. NeMo RL's weight syncing requires
-    the adapter to implement `convert_single_tensor_to_hf`. Some adapters (like
-    CombinedProjectionStateDictAdapter) don't implement this yet.
+    Some custom model implementations use state_dict_adapters to convert between
+    native and HF weight formats. NeMo RL's weight syncing requires the adapter to
+    implement `convert_single_tensor_to_hf`.
 
     This function checks the adapter BEFORE model loading to avoid wasting time:
     - force_hf=True: no check needed, HF model won't have an adapter.
+    - architecture in HF_DEFAULT_ARCHITECTURES: default force_hf to True; an explicit
+      force_hf=False selects the custom implementation.
     - force_hf not set + adapter incompatible: auto-set force_hf=True with a warning.
     - force_hf=False + adapter incompatible: raise an error telling the user to set
       force_hf=True or file an issue to NeMo-Automodel.
@@ -142,6 +149,10 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
         return
 
     arch = architectures[0]
+    if arch in HF_DEFAULT_ARCHITECTURES:
+        automodel_kwargs.setdefault("force_hf", True)
+        return
+
     model_cls = ModelRegistry.model_arch_name_to_cls[arch]
 
     # Check the adapter class from the model's sibling state_dict_adapter module.
@@ -379,7 +390,7 @@ def validate_and_prepare_config(
 
     # NeMoAutoModelForCausalLM uses flash_attention_2 by default
     # so we need to set it to None if sequence packing is disabled
-    # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
+    # See https://github.com/NVIDIA-NeMo/Automodel/blob/41f926247376f282bfe7c7e3a0a1e4d07229e0b3/nemo_automodel/_transformers/auto_model.py#L717-L721
     cp_size_cfg = config["automodel_cfg"]["context_parallel_size"]
     attn_impl = (
         "flash_attention_2"
@@ -897,7 +908,7 @@ def setup_model_and_optimizer(
 
     if cp_size > 1:
         # Match Automodel's CP context: MATH is incompatible with DTensor.
-        # https://github.com/NVIDIA-NeMo/Automodel/blob/b916107a5ce8e77a3f18682f8b0eaa46a4b54389/nemo_automodel/components/distributed/context_parallel/utils.py#L103-L109
+        # https://github.com/NVIDIA-NeMo/Automodel/blob/41f926247376f282bfe7c7e3a0a1e4d07229e0b3/nemo_automodel/components/distributed/context_parallel/utils.py#L103-L107
         sdpa_method = [
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,

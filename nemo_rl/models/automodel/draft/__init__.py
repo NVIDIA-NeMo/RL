@@ -14,7 +14,7 @@
 """DSpark/DFlash/EAGLE3 draft co-training on the Automodel backend.
 
 Thin extension layer over ``nemo_automodel.components.speculative`` (3rdparty
-Automodel r0.6.0): byte-identical building blocks are imported from Automodel;
+Automodel): unchanged building blocks are imported from Automodel;
 only the RL-co-training deltas live in this package (see each module's header
 for what it extends and why). The draft model predicts a block of tokens per
 anchor position in one parallel pass, cross-attending target-model hidden
