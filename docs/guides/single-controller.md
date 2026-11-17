@@ -489,6 +489,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   A group in which no rollout carried media (an all-text prompt in a mixed dataset) is published with empty media rows in the partition's pinned pixel dtype and patch width, so its keys can share a train fetch with media keys.
   Compaction, mixed image/video conversations, native audio, video token pruning, static tiling (`image_num_patches`), other processor families, and `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo Gym rollouts; multimodal/VLM MOPD is not yet supported. See [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
+- Multi-reward native environments (for example `math_multi_reward`) are supported: the rollout payload carries one `reward/<name>` column per reward component, and `total_reward` is their sum.
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
 - Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). vLLM generation can also serve through Dynamo (`policy.generation.dynamo: true`); see [Dynamo serving](dynamo-generation.md). SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
