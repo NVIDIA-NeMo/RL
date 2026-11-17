@@ -139,12 +139,21 @@ def test_startup_rejects_invalid_explicit_checkpoint(tmp_path: Path, converted_p
         )
 
 
-@pytest.mark.sglang
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires real CUDA quantization"
+@pytest.mark.parametrize(
+    "real_quantization", [False, pytest.param(True, marks=pytest.mark.sglang)]
 )
 @pytest.mark.parametrize("indexed", [False, True])
-def test_offline_checkpoint_matches_online_quantization(tmp_path: Path, indexed: bool):
+def test_offline_checkpoint_matches_online_quantization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    indexed: bool,
+    real_quantization: bool,
+) -> None:
+    if real_quantization and (
+        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10
+    ):
+        pytest.skip("FlashInfer MXFP8 quantization requires SM100 or newer (Blackwell)")
+    device = "cuda" if real_quantization else "cpu"
     source, output = tmp_path / "source", tmp_path / "output"
     source.mkdir()
     (source / "config.json").write_text(json.dumps({"num_hidden_layers": 2}))
@@ -156,6 +165,21 @@ def test_offline_checkpoint_matches_online_quantization(tmp_path: Path, indexed:
         preserved: torch.full((32, 64), 0.5, dtype=torch.bfloat16),
         "model.norm.weight": torch.ones(64, dtype=torch.bfloat16),
     }
+    if real_quantization:
+        expected_weight, expected_scale = quantize_mxfp8(weights[selected].to(device))
+    else:
+        expected_weight = weights[selected].to(torch.float8_e4m3fn)
+        expected_scale = torch.full((32, 2), 127, dtype=torch.uint8)
+
+        def quantize_for_checkpoint_io(
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            torch.testing.assert_close(weight, weights[selected], rtol=0, atol=0)
+            return expected_weight, expected_scale
+
+        monkeypatch.setattr(mxfp8_setup, "quantize_mxfp8", quantize_for_checkpoint_io)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
     safetensors.torch.save_file(weights, source / "model.safetensors")
     if indexed:
         (source / "model.safetensors.index.json").write_text(
@@ -165,11 +189,11 @@ def test_offline_checkpoint_matches_online_quantization(tmp_path: Path, indexed:
     mxfp8_setup.convert_mxfp8(
         str(source),
         str(output),
+        device=device,
         num_layers_at_start_in_bf16=1,
     )
 
-    actual = safetensors.torch.load_file(output / "model.safetensors", device="cuda")
-    expected_weight, expected_scale = quantize_mxfp8(weights[selected].cuda())
+    actual = safetensors.torch.load_file(output / "model.safetensors", device=device)
     scale_key = selected.removesuffix(".weight") + ".weight_scale_inv"
     assert actual.keys() == weights.keys() | {scale_key}
     torch.testing.assert_close(

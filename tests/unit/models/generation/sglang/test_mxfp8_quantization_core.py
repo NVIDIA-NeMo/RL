@@ -18,15 +18,43 @@
 so a change here silently desynchronizes a checkpoint from its refits.
 """
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
 from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
+    quantize_mxfp8,
     should_quantize,
     strip_weight_suffix,
 )
 
 _QUANTIZABLE = torch.ones((32, 64), dtype=torch.bfloat16)
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0)])
+def test_quantization_rejects_unsupported_cuda_device(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+) -> None:
+    weight = Mock(spec=torch.Tensor, is_cuda=True, device=torch.device("cuda:1"))
+    get_capability = Mock(return_value=capability)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
+
+    with pytest.raises(RuntimeError, match="requires SM100 or newer"):
+        quantize_mxfp8(weight)
+
+    get_capability.assert_called_once_with(weight.device)
+    weight.contiguous.assert_not_called()
+
+
+@pytest.mark.sglang
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_quantization_rejects_pre_blackwell_cuda() -> None:
+    if torch.cuda.get_device_capability()[0] >= 10:
+        pytest.skip("requires a pre-Blackwell GPU")
+
+    with pytest.raises(RuntimeError, match="requires SM100 or newer"):
+        quantize_mxfp8(_QUANTIZABLE.cuda())
 
 
 @pytest.mark.parametrize(
