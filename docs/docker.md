@@ -33,6 +33,25 @@ docker buildx build --build-context nemo-rl=. -f docker/Dockerfile \
 > [!NOTE]
 > The `--tag <registry>/nemo-rl:latest --push` flags are not necessary if you just want to build locally.
 
+## Worker Virtual Environments in the Image
+
+Each Ray actor runs in a virtual environment under `/opt/ray_venvs` (`NEMO_RL_VENV_DIR`). Actors that need the same set of extras share one environment, so the image builds one per distinct set of extras instead of one per actor:
+
+```text
+/opt/ray_venvs/extras-mcore-nemo_gym/                               # the shared environment
+/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker -> extras-mcore-nemo_gym
+```
+
+The path named after the actor still works, so nothing changes at run time. Setting `NRL_FORCE_REBUILD_VENVS=true` replaces an actor's link with its own environment and leaves the shared one untouched.
+
+To list which actors share an environment in your source tree, run:
+
+```sh
+python nemo_rl/distributed/actor_environments.py all
+```
+
+Each output line is one environment: its name, the build stage, the `uv sync` flags, and the actors that use it.
+
 ## uv Cache Pruning
 
 The release image ships `uv`'s download cache (`/opt/nemo_rl_cache/uv`) so an unprivileged runtime user can later run `uv run --extra <backend>` fully offline. Each build starts that cache from a BuildKit cache mount (seeded from the `uv-cache` registry image), and `uv` only ever adds to it: it never removes a version a prior `uv.lock` pinned and the current one doesn't. The seed export's `uv cache prune --ci` drops prebuilt wheels but keeps every version ever built from source, and a long-lived builder's cache mount keeps everything.
