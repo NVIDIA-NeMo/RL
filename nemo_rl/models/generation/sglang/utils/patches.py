@@ -974,13 +974,6 @@ def _patch_megatron_dynamic_context_hook_mode() -> None:
     _patch_megatron_hook_mode_in(file_path)
 
 
-def _patch_megatron_training_hook_mode() -> None:
-    file_path = _get_megatron_file("training", "training.py")
-    if file_path is None:
-        return
-    _patch_megatron_hook_mode_in(file_path)
-
-
 def _apply_sglang_compat_patches() -> None:
     # Keep while nemo_rl.transformers_compat installs any patch; the torch-FX helper outlives Transformers 5.13.
     _patch_sglang_transformers_compat_bootstrap()
@@ -992,4 +985,3 @@ def _apply_sglang_compat_patches() -> None:
     _patch_sglang_nvfp4_cutedsl_refit_scales()
     _override_sglang_imbalance_check_env()
     _patch_megatron_dynamic_context_hook_mode()
-    _patch_megatron_training_hook_mode()

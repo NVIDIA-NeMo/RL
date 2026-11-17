@@ -13,6 +13,7 @@ export EXP_NAME
 # number of chunks in a step depends on timing and is not asserted here.
 bash "${SCRIPT_DIR}/ppo_async_single_controller.sh" \
     ppo.ppo_epochs=1 \
+    ppo.adv_estimator.normalize_advantages=false \
     ppo.critic_ppo_epochs=2 \
     async_rl.min_groups_for_streaming_train=1 \
     async_rl.sampler.max_lookahead_versions=0 \

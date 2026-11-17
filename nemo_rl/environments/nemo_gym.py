@@ -38,7 +38,7 @@ from nemo.lens.resources.attributes import (
     OTEL_RESOURCE_ATTRIBUTES_ENV,
     extend_otel_resource_attributes,
 )
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
@@ -126,6 +126,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
 )
+from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -285,6 +286,16 @@ def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
             "dataset was prepared without routing information."
         )
     )
+
+
+class NemoGymPostprocessConfig(BaseModel):
+    """NeMo-RL postprocessing options nested under ``env.nemo_gym``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    invalid_tool_call_patterns: list[str] | None = None
+    thinking_tags: list[str] | None = None
+    truncate_noncontiguous_episodes: bool = False
 
 
 def _prepare_materialized_nemo_gym_rows(
@@ -484,6 +495,12 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         return False
 
     generation_config = master_config.policy["generation"]
+    if dynamo_enabled(generation_config):
+        raise ValueError(
+            "policy.generation.dynamo=true does not serve NeMo-Gym rollouts yet. "
+            "Set policy.generation.dynamo=false to run this NeMo-Gym config on "
+            "NeMo RL's vLLM servers."
+        )
     assert should_use_async_rollouts(generation_config), (
         "❌ Error: In order to use NeMo-Gym, you must use a generation "
         "backend with `async_engine: true`!"
@@ -499,10 +516,6 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         ).get("expose_http_server")
     elif generation_config["backend"] == "trtllm":
         should_expose_http_server = generation_config.get("trtllm_cfg", {}).get(
-            "expose_http_server"
-        )
-    elif generation_config["backend"] == "dynamo":
-        should_expose_http_server = generation_config.get("vllm_cfg", {}).get(
             "expose_http_server"
         )
     else:
@@ -724,6 +737,9 @@ class NemoGymConfig(TypedDict):
     pad_dynamic_image_shapes: NotRequired[
         bool
     ]  # Preserve heterogeneous shapes for native-resolution patchification
+    # Opt-in recovery for token-prefix discontinuities in multi-turn rollouts.
+    # The default is supplied by NemoGymPostprocessConfig.
+    truncate_noncontiguous_episodes: bool
     # Ledger-authoritative token capture (token_capture.enabled): the dumped
     # TokenCaptureConfig. Turns on external staging in Gym's policy model
     # server, switches run_rollouts to receipt mode, and assembles receipts
@@ -788,8 +804,8 @@ def _reject_typed_environment_servers(global_config: Mapping[str, Any]) -> None:
     )
     if typed:
         raise ValueError(
-            "rollout_recovery.target_level='turn' does not support environment "
-            f"servers with a typed episode protocol yet: {typed}; route these "
+            "rollout_recovery.target_level='turn' or 'prefix' does not support "
+            f"environment servers with a typed episode protocol yet: {typed}; route these "
             "rows through a legacy_agent environment server or use 'sibling'"
         )
 
@@ -2531,6 +2547,7 @@ Depending on your data shape, you may want to change these values."""
         media_geometry_failed = False
         seen_token_ids: List[int] = []
         batch_decode_items = []
+        nemo_gym_result["noncontiguous_truncated"] = False
         reasoning_text = nemo_gym_result.get("reasoning_text")
         answer_text = nemo_gym_result.get("answer_text")
         response_token_counts = None
@@ -2552,10 +2569,19 @@ Depending on your data shape, you may want to change these values."""
             if not _is_trainable_output_item(output_item_dict):
                 continue
 
-            assert (
+            is_contiguous = (
                 seen_token_ids
                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+            )
+            if not is_contiguous and self.cfg["truncate_noncontiguous_episodes"]:
+                print(
+                    "[nemo_gym] WARNING: non-contiguous turn; truncating episode "
+                    f"at {len(nemo_rl_message_log)} messages "
+                    f"(seen={len(seen_token_ids)} tokens); dropping corrupted tail."
+                )
+                nemo_gym_result["noncontiguous_truncated"] = True
+                break
+            assert is_contiguous, f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(seen_token_ids)]}
@@ -2915,8 +2941,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
 
     # Enable the backend's OpenAI-compatible server.
-    if generation_config["backend"] in ("vllm", "dynamo"):
-        # Dynamo uses these flags to expose its token wrapper to Gym.
+    if generation_config["backend"] == "vllm":
         generation_config["vllm_cfg"]["async_engine"] = True
         generation_config["vllm_cfg"]["expose_http_server"] = True
     elif generation_config["backend"] == "megatron":
@@ -2932,7 +2957,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         generation_config["trtllm_cfg"]["expose_http_server"] = True
     else:
         raise ValueError(
-            "NeMo-Gym setup supports vllm, dynamo, megatron, or trtllm "
+            "NeMo-Gym setup supports vllm, megatron, or trtllm "
             f"generation; got {generation_config['backend']!r}"
         )
 
@@ -2956,6 +2981,7 @@ def build_nemo_gym_config(
     enable_router_replay: bool,
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
+    generation_prefix_cuts_enabled: bool = False,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
@@ -2968,7 +2994,7 @@ def build_nemo_gym_config(
     Args:
         env_configs: The master_config.env mapping; env_configs["nemo_gym"] supplies
             the Gym global config plus NeMo-RL detection knobs (invalid_tool_call_patterns,
-            thinking_tags, num_gpu_nodes).
+            thinking_tags, truncate_noncontiguous_episodes, num_gpu_nodes).
         base_urls: Per-DP-rank OpenAI-compatible server base URLs from the generation backend.
         model_name: Served model name the Gym rollouts should target.
         enable_router_replay: Sets ``require_routed_experts`` and selects the
@@ -2977,6 +3003,9 @@ def build_nemo_gym_config(
             actor patches its tokenizer the same way the driver does.
         turn_checkpointing_enabled: Install Gym v2 checkpoint participants and
             validate their discovery during actor startup.
+        generation_prefix_cuts_enabled: Let Gym cut active model calls at a
+            checkpoint so a restore resumes them from their decoded prefix.
+            Requires ``turn_checkpointing_enabled``.
         policy_api_key: The bearer token the generation server requires on its
             OpenAI routes (VllmGeneration.http_server_api_key), or None when it
             checks none.
@@ -3011,6 +3040,7 @@ def build_nemo_gym_config(
             replica_index=0,
         ),
         turn_checkpointing_enabled=turn_checkpointing_enabled,
+        generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     )
@@ -3025,6 +3055,7 @@ def _build_gym_actor_config(
     use_fastokens: bool,
     checkpoint_instance: GymCheckpointInstance,
     turn_checkpointing_enabled: bool,
+    generation_prefix_cuts_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
@@ -3033,7 +3064,25 @@ def _build_gym_actor_config(
     Shared by the unsharded path and by each shard, so every actor gets the
     same treatment of NeMo-RL-side keys regardless of how it was composed.
     """
-    nemo_gym_dict = dict(nemo_gym_dict)
+    postprocess_cfg = NemoGymPostprocessConfig.model_validate(nemo_gym_dict)
+    nemo_gym_dict = {
+        key: value
+        for key, value in nemo_gym_dict.items()
+        if key not in NemoGymPostprocessConfig.model_fields
+    }
+    if postprocess_cfg.truncate_noncontiguous_episodes:
+        if enable_router_replay:
+            raise ValueError(
+                "truncate_noncontiguous_episodes is not compatible with router replay: "
+                "the next contiguous prompt is required to repair the retained prefix's "
+                "final route."
+            )
+        if token_capture and token_capture.get("enabled"):
+            raise ValueError(
+                "truncate_noncontiguous_episodes is not compatible with "
+                "token_capture.enabled: receipt mode bypasses the legacy token-prefix "
+                "check, so it cannot truncate non-contiguous episodes."
+            )
 
     # NeMo-RL-only keys are consumed here and must never reach Gym: the merged
     # config is serialized into every Gym child process, and unrecognized
@@ -3043,8 +3092,6 @@ def _build_gym_actor_config(
 
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
-    invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
-    thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
@@ -3116,17 +3163,20 @@ def _build_gym_actor_config(
             .setdefault("vllm_model", {})
         )
         policy_overrides["checkpoint"] = {"policy": True}
+        if generation_prefix_cuts_enabled:
+            policy_overrides["checkpoint"]["generation_cuts"] = True
 
     return NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
         policy_api_key=policy_api_key,
-        invalid_tool_call_patterns=invalid_tool_call_patterns,
-        thinking_tags=thinking_tags,
+        invalid_tool_call_patterns=postprocess_cfg.invalid_tool_call_patterns,
+        thinking_tags=postprocess_cfg.thinking_tags,
         tokenizer_config=tokenizer_config,
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        truncate_noncontiguous_episodes=postprocess_cfg.truncate_noncontiguous_episodes,
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=instance_token_capture,
@@ -3419,6 +3469,7 @@ def build_nemo_gym_actors(
     enable_router_replay: bool,
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
+    generation_prefix_cuts_enabled: bool = False,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
@@ -3437,6 +3488,9 @@ def build_nemo_gym_actors(
             per rollout call. See ``NemoGym.set_tokenizer`` for why.
         turn_checkpointing_enabled: Install and discover one Gym v2 checkpoint
             coordinator per actor without triggering checkpoint saves.
+        generation_prefix_cuts_enabled: Let Gym cut active model calls at a
+            checkpoint so a restore resumes them from their decoded prefix.
+            Requires ``turn_checkpointing_enabled``.
 
     Returns:
         A :class:`NemoGymShardSet` whose actors are all running and validated.
@@ -3458,6 +3512,7 @@ def build_nemo_gym_actors(
             enable_router_replay=enable_router_replay,
             use_fastokens=use_fastokens,
             turn_checkpointing_enabled=turn_checkpointing_enabled,
+            generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
             token_capture=token_capture,
             policy_api_key=policy_api_key,
         )
@@ -3471,6 +3526,7 @@ def build_nemo_gym_actors(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         turn_checkpointing_enabled=turn_checkpointing_enabled,
+        generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
         pg_ready_timeout=pg_ready_timeout,
@@ -3487,6 +3543,7 @@ def _build_single_gym_actor(
     enable_router_replay: bool,
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
+    generation_prefix_cuts_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
 ) -> NemoGymShardSet:
@@ -3502,6 +3559,7 @@ def _build_single_gym_actor(
             replica_index=0,
         ),
         turn_checkpointing_enabled=turn_checkpointing_enabled,
+        generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     )
@@ -3551,6 +3609,7 @@ def _build_sharded_gym_actors(
     enable_router_replay: bool,
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
+    generation_prefix_cuts_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float,
@@ -3640,6 +3699,7 @@ def _build_sharded_gym_actors(
                         replica_index=replica,
                     ),
                     turn_checkpointing_enabled=turn_checkpointing_enabled,
+                    generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
                     token_capture=token_capture,
                     policy_api_key=policy_api_key,
                 )

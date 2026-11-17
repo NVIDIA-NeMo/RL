@@ -53,6 +53,7 @@ from nemo_rl.environments.nemo_gym import (
     extract_external_service_readiness,
     extract_reward_components,
     setup_nemo_gym_config,
+    spinup_nemo_gym_actor,
     validate_reward_components_match_scalar,
 )
 from nemo_rl.environments.nemo_gym_multimodal import (
@@ -70,6 +71,7 @@ from nemo_rl.environments.nemotron_utils import (
     _expand_nemotron_video_placeholders,
     _flatten_nemotron_video_frame_messages,
 )
+from nemo_rl.experience.metric_utils import calculate_single_metric
 from nemo_rl.experience.rollouts import (
     _reattach_original_multimodal_payloads,
     _reattach_static_multimodal_payloads_to_result,
@@ -200,6 +202,19 @@ def test_multimodal_content_types_cover_responses_media_aliases():
         "audio",
         "audio_url",
     } <= MULTIMODAL_CONTENT_TYPES
+
+
+def test_spinup_nemo_gym_rejects_truncation_with_router_replay():
+    with pytest.raises(ValueError, match="not compatible with router replay"):
+        spinup_nemo_gym_actor(
+            {"nemo_gym": {"truncate_noncontiguous_episodes": True}},
+            base_urls=["http://127.0.0.1:30000/v1"],
+            model_name="test-model",
+            tokenizer=object(),
+            enable_router_replay=True,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+        )
 
 
 def _external_health_response(
@@ -1432,6 +1447,7 @@ openai_model:
         model_name=nemo_gym_vllm_generation.cfg["model_name"],
         base_urls=nemo_gym_vllm_generation.dp_openai_server_base_urls,
         initial_global_config_dict=safe_load(yaml_str),
+        truncate_noncontiguous_episodes=False,
         checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
         turn_checkpointing_enabled=False,
     )
@@ -1552,6 +1568,7 @@ def test_run_rollouts_takes_a_trace_carrier_without_disturbing_the_body():
         asyncio.run(stream.__anext__())
 
 
+@pytest.mark.parametrize("truncate_noncontiguous_episodes", [False, True])
 @pytest.mark.parametrize(
     ("token_fields", "expected_count"),
     [
@@ -1572,7 +1589,9 @@ def test_run_rollouts_takes_a_trace_carrier_without_disturbing_the_body():
         ),
     ],
 )
-def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
+def test_nemo_gym_postprocess_uses_batch_decode(
+    truncate_noncontiguous_episodes, token_fields, expected_count
+):
     class _Tokenizer:
         def __init__(self):
             self.batch_decode_calls = []
@@ -1610,7 +1629,7 @@ def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
     nemo_gym_result.update(token_fields)
 
     class _MockSelf:
-        cfg = {}
+        cfg = {"truncate_noncontiguous_episodes": truncate_noncontiguous_episodes}
 
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
@@ -1626,6 +1645,7 @@ def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
     assert result["message_log"][1]["token_ids"].tolist() == [3]
     assert result["message_log"][2]["token_ids"].tolist() == [4, 5]
     assert result["message_log"][3]["token_ids"].tolist() == [6, 7]
+    assert result["full_result"]["noncontiguous_truncated"] is False
     assert result["reasoning_token_count"] == expected_count
     assert result["response_token_count"] == expected_count
     assert result["token_extraction_valid"] is (expected_count is not None)
@@ -1638,6 +1658,102 @@ def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
+
+
+def _make_noncontiguous_nemo_gym_result():
+    return {
+        "reward": 0.75,
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3],
+                    "generation_log_probs": [-0.1],
+                },
+                {
+                    "prompt_token_ids": [1, 99, 3, 4],
+                    "generation_token_ids": [6],
+                    "generation_log_probs": [-0.2],
+                },
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+
+class _JoinTokenizer:
+    def batch_decode(self, batch):
+        return [" ".join(map(str, token_ids)) for token_ids in batch]
+
+
+def test_nemo_gym_postprocess_noncontiguous_asserts_when_truncation_disabled():
+    class _MockSelf:
+        cfg = {"truncate_noncontiguous_episodes": False}
+
+    with pytest.raises(AssertionError, match="Non-contiguous messages found"):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), {}, _make_noncontiguous_nemo_gym_result(), _JoinTokenizer()
+        )
+
+
+@pytest.mark.parametrize("divergent_prompt", [[1, 99, 3, 4], [1]])
+def test_nemo_gym_postprocess_noncontiguous_truncates_when_enabled(divergent_prompt):
+    class _MockSelf:
+        cfg = {"truncate_noncontiguous_episodes": True}
+
+    nemo_gym_result = _make_noncontiguous_nemo_gym_result()
+    output = nemo_gym_result["response"]["output"]
+    output[1]["prompt_token_ids"] = divergent_prompt
+    # Even a later turn that matches the retained prefix belongs to the dropped tail.
+    output.append(
+        {
+            "prompt_token_ids": [1, 2, 3, 4],
+            "generation_token_ids": [7],
+            "generation_log_probs": [-0.3],
+        }
+    )
+    dropped_tail = deepcopy(output[1:])
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), {}, nemo_gym_result, _JoinTokenizer()
+        )
+    )
+
+    assert len(result["message_log"]) == 2
+    assert result["message_log"][0]["token_ids"].tolist() == [1, 2]
+    assert result["message_log"][1]["token_ids"].tolist() == [3]
+    assert result["message_log"][1]["role"] == "assistant"
+    torch.testing.assert_close(
+        result["message_log"][1]["generation_logprobs"], torch.tensor([-0.1])
+    )
+    assert result["input_message_log"] == result["message_log"][:1]
+    assert result["full_result"]["reward"] == 0.75
+    assert result["full_result"]["noncontiguous_truncated"] is True
+    assert output[0]["generation_str"] == "3"
+    assert output[1:] == dropped_tail
+
+
+@pytest.mark.parametrize("first_truncated", [False, True])
+def test_nemo_gym_postprocess_reports_truncation_for_every_result(first_truncated):
+    mock_self = SimpleNamespace(cfg={"truncate_noncontiguous_episodes": True})
+    results = []
+    for should_truncate in (first_truncated, not first_truncated):
+        raw_result = _make_noncontiguous_nemo_gym_result()
+        raw_result["noncontiguous_truncated"] = not should_truncate
+        if not should_truncate:
+            raw_result["response"]["output"][1]["prompt_token_ids"] = [1, 2, 3, 4]
+        result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            mock_self, {}, raw_result, _JoinTokenizer()
+        )
+        assert result["full_result"]["noncontiguous_truncated"] is should_truncate
+        results.append(result["full_result"])
+
+    metrics = calculate_single_metric(
+        [float(result["noncontiguous_truncated"]) for result in results],
+        len(results),
+        "agent/noncontiguous_truncated",
+    )
+    assert metrics["agent/noncontiguous_truncated/mean"] == 0.5
 
 
 @pytest.mark.parametrize("include_initial_multimodal_data", [False, True])
@@ -2412,11 +2528,11 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
     NeMo-Gym's vllm_model sets logprobs=True and return_tokens_as_token_ids=True to extract
     per-token ids and logprobs for training (Gym omits top_logprobs on the capture path, so
     vLLM applies its default; Gym PR #1612 additionally pins top_logprobs=0, which is
-    equivalent). vLLM computes `logprobs = top_logprobs if logprobs else None`, so omitting
-    top_logprobs (default 0) or sending 0 returns logprobs, while an explicit null returns
-    none and silently empties the captured token ids. This exercises the real HTTP path where
-    that translation lives (the offline LLM API does not), so a vLLM bump that changes the
-    contract fails here instead of silently freezing training.
+    equivalent). Omitting top_logprobs (default 0), sending 0 and sending an explicit null
+    must all return per-token logprobs; a request that returns none silently empties the
+    captured token ids. This exercises the real HTTP path where that translation lives (the
+    offline LLM API does not), so a vLLM bump that changes the contract fails here instead
+    of silently freezing training.
 
     All three cases share the (expensive) vLLM fixture, so they run in a single test rather
     than as separate parametrized cases.
@@ -2466,20 +2582,9 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
     _assert_has_token_ids(_chat(_OMIT_TOP_LOGPROBS), "omitted top_logprobs")
     _assert_has_token_ids(_chat(0), "top_logprobs=0")
 
-    # Explicit null is the divergence that motivates the Gym fix: vLLM returns no logprobs
-    # (200 with logprobs=None) or rejects the request outright. Both mean capture gets
-    # nothing. If a future vLLM makes null behave like 0, this fails and signals the Gym
-    # workaround can be relaxed.
-    null_resp = _chat(None)
-    if null_resp.status_code == 200:
-        assert null_resp.json()["choices"][0].get("logprobs") is None
-    else:
-        # A rejection must be a client-side validation error, not an unrelated server failure
-        # that would let this branch pass vacuously.
-        assert 400 <= null_resp.status_code < 500, (
-            f"expected null top_logprobs accepted-with-None or rejected as 4xx, "
-            f"got {null_resp.status_code}: {null_resp.text}"
-        )
+    # An explicit null used to return no logprobs, which is why Gym pins top_logprobs=0.
+    # vLLM 0.33 treats null like 0.
+    _assert_has_token_ids(_chat(None), "top_logprobs=null")
 
 
 @pytest.mark.nemo_gym
@@ -2601,6 +2706,7 @@ def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkey
             use_fastokens=False,
             checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
             turn_checkpointing_enabled=False,
+            generation_prefix_cuts_enabled=False,
         )
         NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
         return started[-1]
@@ -2660,6 +2766,7 @@ def test_spinup_forwards_job_identity_to_gym_servers(monkeypatch):
             use_fastokens=False,
             checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
             turn_checkpointing_enabled=False,
+            generation_prefix_cuts_enabled=False,
         )
         NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
         return parse_otel_resource_attributes(os.environ["OTEL_RESOURCE_ATTRIBUTES"])
