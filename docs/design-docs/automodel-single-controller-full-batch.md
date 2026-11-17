@@ -107,7 +107,7 @@ At most one logical optimizer step can be open; the one-dispatch restriction is 
 | Finish | Dispatch completed | Clip, optimizer step, existing MoE gate-bias hook, scheduler step; return metrics; release step. |
 | Abort | Open or idle | Restore pre-step buffers/router counters and discard gradients; no optimizer/scheduler update; idempotent. |
 
-The MoE gate-bias update at finish and the router-load restore at abort are covered by the unit test in `tests/unit/models/policy/test_automodel_split_state.py` only.
+The MoE gate-bias update at finish and the router-load restore at abort are covered only by the unit test in `tests/unit/models/policy/test_automodel_split_state.py`, which drives a real AutoModel `Gate` with a positive `gate_bias_update_factor`.
 The Qwen3 and Qwen3.5 MoE validation runs set `gate_bias_update_factor=0.0`, so they do not exercise these paths.
 
 Mark dispatch attempted before execution.

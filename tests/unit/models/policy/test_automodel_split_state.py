@@ -21,6 +21,7 @@ import pytest
 import torch
 
 pytest.importorskip("nemo_automodel")
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import Gate
 
 from nemo_rl.models.policy.workers import automodel_policy_worker as implementation
@@ -180,33 +181,75 @@ def test_abort_restores_buffers_and_does_not_update(worker, backward):
     worker.abort_train_step()
 
 
-def test_moe_abort_and_gate_update_once(worker):
-    gate = object.__new__(Gate)
-    torch.nn.Module.__init__(gate)
-    gate._cumulative_expert_load = torch.tensor([2, 3])
+def _real_gate() -> Gate:
+    config = MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=1e-3,
+        aux_loss_coeff=0.0,
+        score_func="sigmoid",
+        route_scale=1.0,
+        dim=2,
+        inter_dim=4,
+        moe_inter_dim=4,
+        norm_topk_prob=False,
+        dtype=torch.float32,
+    )
+    gate = Gate(config)
+    with torch.no_grad():
+        # Every token routes to expert 0, so the load and the bias update are fixed.
+        gate.weight.copy_(
+            torch.tensor([[1.0, 1.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
+        )
+    return gate
+
+
+def route(gate: Gate, tokens: int) -> None:
+    gate(torch.ones(tokens, 2), torch.ones(tokens, dtype=torch.bool), None)
+
+
+def test_moe_abort_restores_router_load_and_finish_updates_bias_once(worker):
+    gate = _real_gate()
     worker.model.add_module("gate", gate)
+    worker.model.update_moe_gate_bias = gate.update_bias
     worker.is_moe_model = True
+    worker.model.train()
+
+    # No load at begin: abort drops the load the step's forwards accumulated.
     worker.begin_train_step(Mock())
-    gate._cumulative_expert_load.add_(10)
+    assert gate._cumulative_expert_load is None
+    route(gate, 3)
+    assert gate._cumulative_expert_load is not None
     dispatch(worker)
     worker.abort_train_step()
-    torch.testing.assert_close(gate._cumulative_expert_load, torch.tensor([2, 3]))
-    calls = []
+    assert gate._cumulative_expert_load is None
+    torch.testing.assert_close(gate.e_score_correction_bias, torch.zeros(4))
 
-    def update_bias():
-        assert worker.model.training
-        assert worker.optimizer.state  # The optimizer committed before the hook.
-        calls.append(gate._cumulative_expert_load.clone())
-        gate._cumulative_expert_load = None
-
-    worker.model.update_moe_gate_bias = update_bias
+    # Finish sums the step's forwards and applies one sign(avg - load) update.
     worker.begin_train_step(Mock())
-    gate._cumulative_expert_load.add_(1)
+    route(gate, 3)
+    route(gate, 5)
+    torch.testing.assert_close(gate._cumulative_expert_load, torch.tensor([8, 0, 0, 0]))
     dispatch(worker)
     worker.model.eval()
     worker.finish_train_step()
-    assert len(calls) == 1
-    torch.testing.assert_close(calls[0], torch.tensor([3, 4]))
+    assert worker.optimizer.state  # The optimizer committed before the hook.
+    assert gate._cumulative_expert_load is None
+    committed = torch.tensor([-1.0, 1.0, 1.0, 1.0]) * 1e-3
+    torch.testing.assert_close(gate.e_score_correction_bias, committed)
+
+    # A load present at begin, and the committed bias, both survive an abort.
+    route(gate, 2)
+    worker.begin_train_step(Mock())
+    route(gate, 4)
+    dispatch(worker)
+    worker.abort_train_step()
+    torch.testing.assert_close(gate._cumulative_expert_load, torch.tensor([2, 0, 0, 0]))
+    torch.testing.assert_close(gate.e_score_correction_bias, committed)
 
 
 def test_failed_commit_requires_recovery(worker, monkeypatch):
