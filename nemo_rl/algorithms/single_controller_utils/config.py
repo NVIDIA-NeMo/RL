@@ -1549,6 +1549,13 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "preserve. Set token_capture.enabled=false to use GDPO."
         )
 
+    if algo_cfg.adv_estimator.name == "gdpo" and algo_cfg.reward_shaping.enabled:
+        raise NotImplementedError(
+            "grpo.reward_shaping adjusts only the scalar reward, which GDPO does "
+            "not read -- the run would silently skip the shaping. Set "
+            "grpo.reward_shaping.enabled=false to use GDPO."
+        )
+
     async_config = master_config.async_rl
     generation_config = master_config.policy["generation"]
     if (
@@ -1653,7 +1660,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         raise ValueError(
             f"{algo_prefix}.adv_estimator.name={algo_cfg.adv_estimator.name!r} "
             "requires the whole step's batch with its current settings "
-            "(reinforce_plus_plus always; gae and raw_reward with "
+            "(gdpo and reinforce_plus_plus always; gae and raw_reward with "
             "normalize_advantages=true; opd with subtract_global_baseline=true). "
             "Set async_rl.min_groups_for_streaming_train "
             f"({async_config.min_groups_for_streaming_train}) == "
