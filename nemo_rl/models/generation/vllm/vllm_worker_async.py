@@ -803,11 +803,23 @@ class VllmAsyncGenerationWorkerImpl(
                 self._engine_loop,
                 flat_logprobs=bool(self.cfg["vllm_cfg"].get("flat_logprobs")),
             )
+            await self._start_http_serving()
+
+    async def _start_http_serving(self) -> None:
+        """Start this worker's HTTP server and its pool's child frontends."""
+        pool = self._api_server_pool
+        if pool is not None and not self.cfg["vllm_cfg"].get(
+            "http_api_owner_serves_http", True
+        ):
+            # The child frontends serve every request; this event loop keeps
+            # refit and control calls only.
+            self.base_url = pool.release_owner_listener()
+        else:
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
             )
-            if self._api_server_pool is not None:
-                await self._api_server_pool.command("start")
+        if pool is not None:
+            await pool.command("start")
 
     def announce_dynamo_chat_settings_to(self, queue: RayQueue) -> None:
         """Have this engine send ``queue`` its chat settings before it loads.
