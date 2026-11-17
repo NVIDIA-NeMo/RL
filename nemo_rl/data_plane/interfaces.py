@@ -352,6 +352,7 @@ class DataPlaneConfig(TypedDict):
     mooncake_cpu: NotRequired[MooncakeCpuConfig]
     nixl: NotRequired[NixlStoreConfig]
     controller_address: NotRequired[str]
+    metrics_port: NotRequired[Annotated[int, Field(strict=True, ge=1024, le=65535)]]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
 
