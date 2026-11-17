@@ -23,7 +23,7 @@ Recipes for both modes are in this branch.
 | Stage | Evidence |
 | --- | --- |
 | Functionally ready | Proxy (8 layers, 96 experts) and full 48-layer training, chunked expert refit, timed checkpoint save, and optimizer resume across 2 h allocation windows. |
-| Reference training completed | SGLang BF16 sync: 87 GRPO steps and 9 AIME evaluations. vLLM MXFP8 async: 84 GRPO steps and 8 AIME evaluations. |
+| Reference training completed | With this branch's code: SGLang BF16 sync, 71 GRPO steps and 8 AIME evaluations; vLLM MXFP8 async, 70 GRPO steps and 8 AIME evaluations. |
 | Broader convergence validation | Multiple seeds, other hardware, longer runs, and a controlled comparison of the two modes are not established by these results. |
 
 Both experiments began from the original weights and continued across 2 h
@@ -138,8 +138,8 @@ Each 2 h job logged a separate run:
 
 | Experiment | W&B runs (in order) |
 | --- | --- |
-| SGLang BF16, sync | [`ehmcmnug`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/ehmcmnug) (step-0 eval), [`1gl23wkh`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/1gl23wkh) (1–17), [`u1uvgoww`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/u1uvgoww) (18–40), [`ai60m9ku`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/ai60m9ku) (41–64), [`m1y9ip39`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/m1y9ip39) (65–87) |
-| vLLM MXFP8, async | [`kdnw7tlm`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/kdnw7tlm) (step-0 eval), [`uk530hix`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/uk530hix) (1–18), [`d80ps72r`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/d80ps72r) (19–41), [`yfkayhu1`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/yfkayhu1) (42–64), [`28de0sqt`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/28de0sqt) (65–84) |
+| SGLang BF16, sync | [`ehmcmnug`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/ehmcmnug) (step-0 eval), [`096mr0zx`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/096mr0zx) (1–23), [`2qpl0z76`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/2qpl0z76) (24–47), [`rxellueg`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/rxellueg) (48–71) |
+| vLLM MXFP8, async | [`kdnw7tlm`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/kdnw7tlm) (step-0 eval), [`w5u72yu1`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/w5u72yu1) (1–24), [`vuj9nwy8`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/vuj9nwy8) (25–46), [`pch93qa1`](https://forge.coreweave.com/wandb/nvidia/GRPO%20Inkling/runs/pch93qa1) (47–70) |
 
 The figure overlays both experiments on the same nine metrics used for other
 model guides. **Blue, solid: SGLang BF16, sync. Orange, dashed: vLLM MXFP8, async.**
@@ -149,19 +149,20 @@ model guides. **Blue, solid: SGLang BF16, sync. Orange, dashed: vLLM MXFP8, asyn
 | Measurement | SGLang BF16, sync | vLLM MXFP8, async |
 | --- | --- | --- |
 | AIME 2024 accuracy, step 0 (base model) | 39.06% | 40.23% |
-| AIME 2024 accuracy, step 10 | 67.19% | 42.19% |
-| AIME 2024 accuracy, step 40 | 80.08% | 76.56% |
-| AIME 2024 accuracy, best | **82.03% at step 70** | **81.25% at step 70** |
-| AIME 2024 accuracy, step 80 | 80.08% | 80.86% |
-| AIME mean response length, step 80 | 1,718 tokens | 1,541 tokens |
-| Training reward, mean of last 10 steps | 0.863 | 0.838 |
-| Training truncation, step 1 → mean of last 10 steps | 37.50% → 7.2% | 36.72% → 5.3% |
-| Generation KL, median | 0.0013 | 0.0024 |
-| Step time, median (including validation steps) | 237 s on 128 GPUs | 214 s on 96 GPUs |
+| AIME 2024 accuracy, step 10 | 64.84% | 42.97% |
+| AIME 2024 accuracy, step 20 | 78.91% | 63.67% |
+| AIME 2024 accuracy, step 40 | 78.91% | 76.56% |
+| AIME 2024 accuracy, step 70 (last evaluation) | **83.20%** | **78.52%** |
+| AIME mean response length, step 70 | 1,664 tokens | 1,535 tokens |
+| Training reward, mean of last 10 steps | 0.868 | 0.826 |
+| Training truncation, step 1 → mean of last 10 steps | 39.45% → 6.4% | 37.89% → 8.3% |
+| Generation KL, median | 0.0011 | 0.0022 |
+| Step time, median (including validation steps) | 224 s on 128 GPUs | 214 s on 96 GPUs |
 
-Both experiments start from about 40% AIME accuracy at step 0, reach about 80%
-by step 40–70, and then plateau. The synchronous run improves faster early (67%
-vs 42% at step 10); by step 50 the curves overlap. With a 0/1 math-verify reward, training reward equals
+Both experiments start from about 40% AIME accuracy at step 0. The synchronous
+run improves faster early (65% vs 43% at step 10, 79% vs 64% at step 20); the
+asynchronous run closes most of the gap by step 30 (77% vs 75%). From there both
+climb slowly, reaching 83% (sync) and 79% (async) at step 70. With a 0/1 math-verify reward, training reward equals
 training accuracy on the sampled prompts.
 
 How to read the comparison:
@@ -181,8 +182,8 @@ How to read the comparison:
   discrepancy, not a reference-policy KL loss. It is higher for MXFP8 serving,
   as expected from serving quantized experts while training in BF16, and also
   includes the async one-step trajectory age.
-- **Policy KL** uses a logarithmic axis and keeps its outliers (a step-9 spike
-  in the sync run, spikes near steps 32 and 54 in the async run).
+- **Policy KL** uses a logarithmic axis and keeps its outliers (a step-10 spike
+  in the sync run, spikes at steps 25 and 32 in the async run).
 - **Step time** is measured on different GPU counts and placements; it is
   reported for reference, not as a throughput comparison.
 
@@ -210,8 +211,9 @@ uv run docs/guides/models/inkling/results/plot.py
 - **SGLang and vLLM support are unmerged PRs.** The `sglang` pin in this branch
   tracks sgl-project/sglang#50186 and needs updating once it merges; vLLM
   serving relies on a container built with vllm-project/vllm#67325.
-- **The reference experiments ran on an earlier software stack.** The SGLang
-  BF16 run used an earlier AutoModel snapshot (the PR 4755 head) and an earlier
-  Inkling2 SGLang build, mounted over the same container. The exact dependency
-  set pinned in this branch has not yet completed a reference run.
+- **The reference experiments mount this branch over prebuilt containers.**
+  Both ran this branch's NeMo RL code and AutoModel main. The SGLang BF16 run
+  served with an earlier Inkling2 SGLang build already in its container, not
+  the sgl-project/sglang#50186 pin in this branch; the exact dependency set
+  pinned here has not yet completed a reference run.
 - Convergence across seeds, longer runs, and other hardware remain unverified.
