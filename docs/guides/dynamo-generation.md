@@ -71,6 +71,7 @@ Where the behavior differs from the native endpoint:
 - A call that streams (`stream: true`) or asks for more than one choice (`n`) is refused with HTTP 400. The native endpoint serves both, and fails the capture of a streamed token-capture call. NeMo-Gym sends neither.
 - A token-capture call refused for its context length acknowledges the refusal at the end of the error message instead of in the native endpoint's `x-ng-capture-refused` header, which Dynamo's errors cannot carry. Gym's dialect moves it back to the header, so the harness sees the native error.
 - A call's processed media travels to the engine inside the request.
+- Every chat call must match the training or validation sampling. That includes a call NeMo-Gym marks as untrained with `x-ng-sampling: null`, such as an LLM judge's on the policy model: NeMo RL's chat engine does not read that header, so the call is refused with HTTP 400 unless its sampling matches. The native endpoint lets such a call keep its own sampling. Give a judge that samples differently a model server of its own.
 
 ### Rollout recovery
 
