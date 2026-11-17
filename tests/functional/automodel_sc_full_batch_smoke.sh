@@ -20,7 +20,10 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(realpath "$SCRIPT_DIR/../..")
 # A fresh directory prevents stale checkpoints/metrics from satisfying assertions.
-EXP_DIR=${EXP_DIR:-$(mktemp -d "$SCRIPT_DIR/automodel_sc_full_batch_smoke.XXXXXX")}
+if [[ -z "${EXP_DIR:-}" ]]; then
+    EXP_DIR=$SCRIPT_DIR/$(basename "$0" .sh)
+    rm -rf "$EXP_DIR"
+fi
 mkdir -p "$EXP_DIR"
 EXP_DIR=$(realpath "$EXP_DIR")
 CKPT_DIR=$EXP_DIR/ckpts

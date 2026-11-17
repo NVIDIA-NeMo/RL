@@ -41,6 +41,7 @@ run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora_async
 run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora_non_colocated.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_automodel_lora.sh
 run_test      uv run --no-sync bash ./tests/functional/test_automodel_extra_installed_correctly.sh
+run_test fast uv run --no-sync bash ./tests/functional/automodel_sc_full_batch_smoke.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
