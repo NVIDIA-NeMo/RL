@@ -603,7 +603,11 @@ class HelpSteer3LocalDataset(torch.utils.data.Dataset):
                 gt_overall = one.get("ground_truth_overall")
                 gt_rubrics = one.get("ground_truth_rubric_scores")
                 preference = 0 if gt_overall["ranking"] <= 3 else 1
-                encode_non_text_input_data(one["responses_create_params"]["input"], media_path)
+                try:
+                    encode_non_text_input_data(one["responses_create_params"]["input"], media_path)
+                except:
+                    print("**** FAILED_TO_ENCODE_MULTIMODAL_SAMPLE: ", one["responses_create_params"]["input"], flush=True)
+                    continue
 
                 example = {
                     "num_responses": 2,
