@@ -1,0 +1,17 @@
+defaults: ./grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2.yaml
+grpo:
+  use_dynamic_sampling: true
+  overlong_filtering: true
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    max_response_length: ${policy.generation.max_new_tokens}
+logger:
+  log_dir: logs/dapo-llama3.1-8b-instruct-2n8g-windowed-single-controller
+  wandb:
+    name: dapo-llama3.1-8b-instruct-2n8g-windowed-single-controller
+checkpointing:
+  checkpoint_dir: results/dapo-llama3.1-8b-instruct-2n8g-windowed-single-controller

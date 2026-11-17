@@ -34,7 +34,7 @@ import pytest
 import ray
 import requests
 import torch
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import ValidationError
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
@@ -43,7 +43,11 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.captured_media import MediaCaptureRejected
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+    RayVirtualCluster,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -58,7 +62,9 @@ from nemo_rl.models.generation.vllm.config import (
     normalize_vllm_refit_config,
 )
 from nemo_rl.models.generation.vllm.generation_cut_route import GENERATION_CUT_ROUTE
+from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    BaseVllmGenerationWorker,
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
@@ -448,6 +454,44 @@ def test_context_capped_max_new_tokens():
         )
 
 
+@pytest.mark.parametrize("defer_model_load", [False, True])
+@pytest.mark.parametrize("api_server_count", [1, 2])
+@pytest.mark.parametrize("port_range", [None, (3400, 3410)])
+def test_async_vllm_worker_reserves_distinct_ports_in_range(
+    defer_model_load: bool,
+    api_server_count: int,
+    port_range: tuple[int, int] | None,
+    monkeypatch,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["async_engine"] = True
+    config["vllm_cfg"]["expose_http_server"] = True
+    config["vllm_cfg"]["http_api_server_count"] = api_server_count
+    if port_range is not None:
+        config["port_range_low"], config["port_range_high"] = port_range
+    low, high = port_range or (
+        DEFAULT_GENERATION_PORT_RANGE_LOW,
+        DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    )
+
+    def initialize_base(worker: Any, worker_config: VllmConfig, *args: Any) -> None:
+        worker.cfg = worker_config
+        worker.is_model_owner = True
+
+    monkeypatch.setattr(BaseVllmGenerationWorker, "__init__", initialize_base)
+    with contextlib.ExitStack() as cleanup:
+        workers = []
+        for index in range(2):
+            worker = VllmAsyncGenerationWorkerImpl(
+                config, bundle_indices=[index], defer_model_load=defer_model_load
+            )
+            cleanup.callback(worker._reserved_socket.close)
+            assert low <= worker._reserved_port < high
+            assert worker._reserved_socket.getsockname()[1] == worker._reserved_port
+            workers.append(worker)
+        assert workers[0]._reserved_port != workers[1]._reserved_port
+
+
 @pytest.mark.asyncio
 async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
@@ -783,6 +827,7 @@ async def test_async_vllm_worker_stops_http_server_before_engine(
     worker.http_server = MagicMock()
     worker._sparse_refit_receiver = SparseRefitReceiver()
     worker.llm = Engine()
+    worker._api_server_pool = None
     worker.tokenizer = MagicMock()
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_worker_async.shutdown_telemetry",
@@ -800,6 +845,58 @@ async def test_async_vllm_worker_stops_http_server_before_engine(
     assert calls == ["server", "sparse-refit", "engine-cleanup", "engine-shutdown"]
     assert worker.http_server.should_exit is True
     assert worker.server_thread is None
+    assert worker.llm is None
+
+
+@pytest.mark.asyncio
+async def test_failed_pool_does_not_update_owner_weight_version() -> None:
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    pool = MultiAPIServerPool(worker, 2)
+    pool.children = [MagicMock(is_alive=MagicMock(return_value=False))]
+    pool.connections = [MagicMock()]
+    worker._api_server_pool = pool
+    worker._rollout_weight_version = 3
+    with pytest.raises(RuntimeError, match="exited"):
+        await pool.command("version", 4)
+    with pytest.raises(RuntimeError, match="exited"):
+        await worker.set_rollout_weight_version(4)
+    assert worker._rollout_weight_version == 3
+
+
+@pytest.mark.asyncio
+async def test_worker_shutdown_cleans_up_an_unavailable_pool(monkeypatch) -> None:
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._init_frontend_state()
+    worker.server_thread = MagicMock()
+    worker.http_server = MagicMock()
+    worker._sparse_refit_receiver = None
+    worker.llm = MagicMock(collective_rpc=AsyncMock())
+    engine = worker.llm
+    pool = MultiAPIServerPool(worker, 2)
+    pool.children = [MagicMock(is_alive=MagicMock(return_value=False))]
+    pool.connections = [MagicMock()]
+    manager, coordinator = MagicMock(), MagicMock()
+    pool.engine_manager = manager
+    pool.coordinator = coordinator
+    worker._api_server_pool = pool
+    with pytest.raises(RuntimeError, match="exited"):
+        await pool.command("version", 4)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.shutdown_telemetry",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.torch.cuda.empty_cache",
+        lambda: None,
+    )
+    assert await worker.shutdown()
+    assert worker.http_server.should_exit
+    assert worker.server_thread is None
+    engine.collective_rpc.assert_not_awaited()
+    engine.shutdown.assert_called_once_with()
+    manager.shutdown.assert_called_once_with()
+    coordinator.shutdown.assert_called_once_with()
+    assert worker._api_server_pool is None
     assert worker.llm is None
 
 
@@ -1108,7 +1205,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     # The server resolves the chat template through vLLM's own loader, so the
     # stub tree needs this leaf even though the test does not assert on it.
     make_module(
-        "vllm.entrypoints.chat_utils",
+        "vllm.renderers.chat_utils.chat_template",
         load_chat_template=MagicMock(return_value=None),
     )
     make_module(
@@ -1515,6 +1612,33 @@ def test_clamp_max_tokens_sets_the_limit_the_request_uses(
     assert vars(request) == expected
 
 
+@pytest.mark.asyncio
+async def test_vllm_parser_does_not_see_parallel_tool_calls_false(monkeypatch):
+    """vLLM 0.33 turns the flag into a grammar that masks sampling."""
+    worker, serving_chat, _ = _setup_fake_vllm_chat_handler(monkeypatch)
+    worker._capture_media = False
+    worker._capture_request_media = MagicMock(return_value=None)
+    worker._begin_request_capture = MagicMock()
+    renderer = serving_chat.kwargs["online_renderer"]
+    seen_by_vllm = []
+
+    async def preprocess_chat(self, request, **kwargs):
+        seen_by_vllm.append(request.parallel_tool_calls)
+        return [], [{"prompt_token_ids": [1, 2]}]
+
+    vllm_online_renderer = sys.modules["vllm.renderers.online_renderer"].OnlineRenderer
+    monkeypatch.setattr(
+        vllm_online_renderer, "preprocess_chat", preprocess_chat, raising=False
+    )
+    request = types.SimpleNamespace(parallel_tool_calls=False)
+
+    await renderer.preprocess_chat(request, [], None, "auto", None)
+
+    assert seen_by_vllm == [None]
+    # vLLM reads the flag again to trim the response to the first tool call.
+    assert request.parallel_tool_calls is False
+
+
 @pytest.mark.parametrize(
     ("stream", "expected_kind"), [(False, "final_only"), (True, "delta")]
 )
@@ -1578,6 +1702,7 @@ def _generation_cut_route(
                 control_token=token,
                 control_timeout_s=timeout_s,
                 progress_reader=None,
+                prefix_row_extras=lambda state: None,
             )
         )
         recovery.checkpoint_cut = checkpoint_cut
@@ -1991,9 +2116,11 @@ async def test_pinned_with_cancellation_aborts_chat_completion_on_http_disconnec
     await asyncio.wait_for(started.wait(), 1)
     await receive_queue.put({"type": "http.disconnect"})
 
-    # The wrapper returns None once the disconnect listener wins, as in vLLM's
-    # own routes; the handler task is cancelled behind it.
-    assert await asyncio.wait_for(task, 1) is None
+    # The wrapper returns an empty response once the disconnect listener wins, as
+    # in vLLM's own routes; the handler task is cancelled behind it.
+    response = await asyncio.wait_for(task, 1)
+    assert type(response) is Response
+    assert response.body == b""
     await asyncio.wait_for(released.wait(), 1)
     assert cancelled.is_set()
     token_capture.fail_call.assert_called_once_with(call, reason="client_disconnect")
@@ -4051,6 +4178,8 @@ def test_vllm_http_server(cluster, tokenizer):
                 "stop_reason": None,
                 "token_ids": None,
                 "routed_experts": None,
+                # Added in vLLM 0.33.
+                "weight_versions": None,
             }
         ],
         "service_tier": None,
@@ -4094,16 +4223,14 @@ def test_vllm_http_server(cluster, tokenizer):
     ]
     assert _standardize(expected_result) == _standardize(actual_result)
 
-    # The server default requests token IDs, so top_logprobs=None cannot provide
-    # the log probabilities required by the training response contract.
+    # vLLM 0.33 treats top_logprobs=None like 0, so the response still carries the
+    # log probabilities the training response contract needs.
     response = requests.post(
         url=f"{base_urls[0]}/chat/completions",
         json=body | {"top_logprobs": None},
     )
-    assert response.status_code == 400
-    error = response.json()["error"]
-    assert error["code"] == 400
-    assert "top_logprobs" in error["message"]
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["logprobs"]["content"]
 
     # Check that tokenization route works
     response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
@@ -5569,3 +5696,36 @@ def test_async_vllm_http_client_forwards_admission_checks() -> None:
         client.check_admission(3, request_id="req-3")
 
     assert calls == [(1, None), (2, "req-2"), (3, "req-3")]
+
+
+def test_sync_worker_finishes_queued_batches_before_resetting_the_prefix_cache():
+    events = []
+
+    class EngineCore:
+        def __init__(self):
+            self.batch_queue = ["batch left by generate()"]
+
+    class EngineClient:
+        def __init__(self):
+            self.engine_core = EngineCore()
+
+        def get_output(self):
+            events.append("step")
+            self.engine_core.batch_queue.pop()
+
+    class Engine:
+        def __init__(self):
+            self.engine_core = EngineClient()
+
+        def reset_prefix_cache(self):
+            events.append(
+                f"reset with {len(self.engine_core.engine_core.batch_queue)} queued"
+            )
+
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.llm = types.SimpleNamespace(llm_engine=Engine())
+    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+
+    worker.reset_prefix_cache()
+
+    assert events == ["step", "reset with 0 queued"]

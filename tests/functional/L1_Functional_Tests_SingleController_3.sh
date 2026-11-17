@@ -34,6 +34,8 @@ run_test() {
     fi
 }
 
+# Two-phase SimpleStorage capture on real Ray/ZMQ actors (CPU only).
+run_test fast uv run --no-sync bash ./tests/functional/data_plane_simple_checkpoint_cpu.sh
 # Native TQ + metadata-only completed replay recovery (#3480).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh
 # Same recovery flow with Mooncake CPU storage and SSD offload on; skips
@@ -72,6 +74,13 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # Two-process Gym turn-level recovery against a stateful Workplace Assistant
 # server: a restored episode resumes on its Gym instance as its next attempt.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_turn_recovery.sh
+# Gym-v2 active-decode recovery: checkpoint a nonterminal vLLM prefix, restart
+# the process, restore that exact prefix, and generate only its remaining tail.
+# Three launches on 2 GPUs: an uninterrupted reference, the interrupted run and
+# the recovery (7-9 minutes locally). Full tier: it depends on three runs making
+# the same near-greedy choices, and local runs have failed for reasons outside
+# recovery, so it stays out of fast lanes until a CI-GPU pass rate is shown.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
