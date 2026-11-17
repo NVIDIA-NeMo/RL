@@ -39,9 +39,6 @@ DYNAMO_SDK_MODULES = {
     "dynamo.common.backend",
     "dynamo.common.backend.logprobs",
     "dynamo.common.backend.publisher",
-    # The frontend's entrypoint, wrapped to serve generation cuts. The frontend
-    # loads Dynamo's own vLLM chat processor only when named; NeMo RL names its own.
-    "dynamo.frontend.main",
     "dynamo.llm",
     "dynamo.llm.exceptions",
 }

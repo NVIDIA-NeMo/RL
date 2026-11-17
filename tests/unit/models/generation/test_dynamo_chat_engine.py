@@ -495,15 +495,6 @@ def test_an_engine_error_dynamo_classified_keeps_its_status() -> None:
         _serve(_Pool(_rendered()), router, _call({}))
 
 
-def test_dynamos_frontend_still_builds_its_runtime_by_the_name_nemo_rl_wraps():
-    import dynamo.frontend.main as frontend_main
-
-    # frontend.main() swaps this module global to serve NeMo-Gym's generation
-    # cuts from the frontend's runtime; if Dynamo stops reading it there, every
-    # cut gets a 404.
-    assert "DistributedRuntime" in frontend_main.async_main.__code__.co_names
-
-
 def test_only_nemo_rls_engines_are_served() -> None:
     model = SimpleNamespace(
         runtime_config=lambda: {"runtime_data": {}},

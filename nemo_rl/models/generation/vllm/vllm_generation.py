@@ -219,7 +219,6 @@ class VllmGeneration(GenerationInterface):
     # defaults, so shutdown() also works when __init__ failed before starting them.
     _dynamo_runtime: Optional["ManagedDynamoRuntime"] = None
     dynamo_frontend_urls: tuple[str, ...] = ()
-    dynamo_generation_cut_urls: tuple[str, ...] = ()
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
@@ -801,17 +800,6 @@ class VllmGeneration(GenerationInterface):
             return list(self.dynamo_frontend_urls)
         return self.dp_openai_server_base_urls
 
-    @property
-    def generation_cut_control_urls(self) -> Optional[list[str]]:
-        """Where NeMo-Gym sends checkpoint generation cuts, one per ``client_base_urls`` entry.
-
-        None when each base URL takes its own cuts, as every shard's server
-        does. Each Dynamo frontend takes them on a port of its own.
-        """
-        if self.dynamo_generation_cut_urls:
-            return list(self.dynamo_generation_cut_urls)
-        return None
-
     def _start_dynamo_services(self, cluster: RayVirtualCluster) -> None:
         """Start the etcd, NATS and frontends this fleet's engines register with.
 
@@ -835,7 +823,6 @@ class VllmGeneration(GenerationInterface):
         runtime.start(frontend_node_ids=cluster.get_node_ids())
         self._dynamo_runtime = runtime
         self.dynamo_frontend_urls = tuple(runtime.frontend_urls)
-        self.dynamo_generation_cut_urls = tuple(runtime.generation_cut_control_urls)
 
     def _publish_dynamo_chat_settings(
         self, chat_settings: RayQueue, loads: list[ray.ObjectRef]

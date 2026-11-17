@@ -58,6 +58,11 @@ LOGGER = logging.getLogger(__name__)
 
 # NeMo RL's chat engine, as the custom chat processor Dynamo's frontend loads.
 CHAT_PROCESSOR = "nemo_rl.models.generation.dynamo.vllm.chat_engine:provider"
+# NeMo-Gym's generation-cut route, as the route extension the frontend loads.
+CUT_ROUTES = "nemo_rl.models.generation.dynamo.vllm.generation_cut:routes"
+# The frontend's HTTP body limit. NeMo-Gym sends media inline, and a generation
+# cut lists every call in flight; Dynamo's default is 45 MB.
+HTTP_BODY_LIMIT_MB = 512
 
 
 class ChatProcessorOptions(NamedTuple):
@@ -103,6 +108,8 @@ def frontend_argv(
         CHAT_PROCESSOR,
         "--dyn-chat-processor-config",
         json.dumps(chat_options._asdict()),
+        "--frontend-route-extension",
+        CUT_ROUTES,
     ]
     if dynamo_cfg.frontend_args.num_frontends > 1:
         # Each replica's router sees the requests the others have in flight.
@@ -244,11 +251,10 @@ class _ServiceProcess:
             os.close(self._lifeline)
 
 
-# The frontend process's environment for NeMo-Gym's generation cuts
-# (dynamo/vllm/generation_cut.py): the port it takes them on, and the capture
-# config that holds a cut's bearer token and timeout.
+# Where the frontend's generation-cut route (dynamo/vllm/generation_cut.py) finds
+# the capture config, which holds a cut's bearer token and timeout. In the
+# frontend's environment because Dynamo passes a route extension no settings.
 CAPTURE_FILE_ENV = "NEMO_RL_DYNAMO_CAPTURE_FILE"
-GENERATION_CUT_PORT_ENV = "NEMO_RL_DYNAMO_GENERATION_CUT_PORT"
 
 
 def read_chat_capture(path: str) -> dict[str, Any] | None:
@@ -267,19 +273,13 @@ def read_chat_settings(path: str) -> dict[str, Any] | None:
         return json.load(settings_file)
 
 
-class FrontendUrls(NamedTuple):
-    """Where one frontend serves OpenAI calls and takes NeMo-Gym's generation cuts."""
-
-    base_url: str
-    generation_cut_control_url: str
-
-
 class FrontendHost:
     """One frontend on the node a Ray actor (``_FrontendHostActor``) runs on.
 
     It runs Dynamo's frontend with NeMo RL's chat engine serving chat calls
-    (``CHAT_PROCESSOR``). The frontend stops when the actor dies, however it
-    dies (see ``_ServiceProcess``).
+    (``CHAT_PROCESSOR``) and NeMo-Gym's generation cuts (``CUT_ROUTES``). The
+    frontend stops when the actor dies, however it dies (see
+    ``_ServiceProcess``).
     """
 
     def __init__(self) -> None:
@@ -295,19 +295,14 @@ class FrontendHost:
         env: dict[str, str],
         ray_address: str,
         serves_chat: bool,
-    ) -> FrontendUrls:
-        """Launch the frontend on free ports of this node; return where it serves.
+    ) -> str:
+        """Launch the frontend on a free port of this node; return its base URL.
 
         With ``serves_chat`` the frontend starts its render workers at launch.
         """
         port = _get_free_port_local(
             DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
             DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
-            max_retries=None,
-        )
-        generation_cut_port = _get_free_port_local(
-            DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
-            DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
             max_retries=None,
         )
         self._chat_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_chat_")
@@ -328,23 +323,14 @@ class FrontendHost:
                 ),
             ),
         )
-        command = [
-            frontend_python,
-            "-m",
-            "nemo_rl.models.generation.dynamo.vllm.frontend",
-            *argv,
-        ]
+        command = [frontend_python, "-m", "dynamo.frontend", *argv]
         print(f"  [Dynamo] launching frontend argv={command!r}", flush=True)
         frontend_env = _service_env(env)
         frontend_env[CAPTURE_FILE_ENV] = capture_file
-        frontend_env[GENERATION_CUT_PORT_ENV] = str(generation_cut_port)
         self._process = _ServiceProcess(command, env=frontend_env, label="frontend")
         host = _get_node_ip_local()
         host = f"[{host}]" if ":" in host else host
-        return FrontendUrls(
-            base_url=f"http://{host}:{port}/v1",
-            generation_cut_control_url=f"http://{host}:{generation_cut_port}",
-        )
+        return f"http://{host}:{port}/v1"
 
     def publish_chat_capture(self, capture: dict[str, Any]) -> None:
         """Write the token-capture config this frontend's chat engine reads."""
@@ -435,7 +421,6 @@ class ManagedDynamoRuntime:
         self._nats_process: _ServiceProcess | None = None
         self._frontend_hosts: list[ray.actor.ActorHandle] = []
         self._frontend_urls: list[str] = []
-        self._generation_cut_urls: list[str] = []
         self._etcd_data_dir: str | None = None
         self._nats_data_dir: str | None = None
 
@@ -449,16 +434,6 @@ class ManagedDynamoRuntime:
         if not self._started:
             raise RuntimeError("Managed Dynamo runtime has not been started")
         return list(self._frontend_urls)
-
-    @property
-    def generation_cut_control_urls(self) -> list[str]:
-        """Where each frontend takes NeMo-Gym's checkpoint generation cuts.
-
-        One per ``frontend_urls`` entry, in the same order.
-        """
-        if not self._started:
-            raise RuntimeError("Managed Dynamo runtime has not been started")
-        return list(self._generation_cut_urls)
 
     @property
     def engine_env(self) -> dict[str, str]:
@@ -502,10 +477,9 @@ class ManagedDynamoRuntime:
             "DYN_IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS": "0",
             "DYN_REQUEST_PLANE": "tcp",
             "DYN_EVENT_PLANE": "nats",
-            # NeMo-Gym sends media inline: raise the frontend's 45 MB HTTP body
-            # limit, and the 32 MiB request-plane limit above it (the engine
-            # request carries the same media plus token IDs).
-            "DYN_HTTP_BODY_LIMIT_MB": "512",
+            # The 32 MiB request-plane limit goes above the HTTP body limit: an
+            # engine request carries the same media plus token IDs.
+            "DYN_HTTP_BODY_LIMIT_MB": str(HTTP_BODY_LIMIT_MB),
             "DYN_TCP_MAX_MESSAGE_SIZE": str(1 << 30),
             # A canary request would stall behind a refit pause; engine liveness
             # is the Ray actor's, as for every other vLLM worker.
@@ -622,7 +596,7 @@ class ManagedDynamoRuntime:
                     )
                 ).remote()
             )
-        started: list[FrontendUrls] = ray.get(
+        self._frontend_urls = ray.get(
             [
                 host.start.remote(
                     frontend_python=self._frontend_python,
@@ -635,10 +609,6 @@ class ManagedDynamoRuntime:
                 for host in self._frontend_hosts
             ]
         )
-        self._frontend_urls = [urls.base_url for urls in started]
-        self._generation_cut_urls = [
-            urls.generation_cut_control_url for urls in started
-        ]
 
     def publish_chat_capture(
         self,
@@ -810,7 +780,6 @@ class ManagedDynamoRuntime:
                 LOGGER.exception("Failed to stop a managed Dynamo frontend")
         self._frontend_hosts = []
         self._frontend_urls = []
-        self._generation_cut_urls = []
         try:
             if self._nats_process is not None:
                 self._nats_process.stop()

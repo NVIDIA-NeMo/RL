@@ -26,6 +26,7 @@ from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
     GenerationCutInventory,
     GenerationCutPrefix,
     GenerationCutPrefixAck,
+    GenerationCutReceipt,
 )
 
 from nemo_rl.models.generation.dynamo import managed_runtime  # noqa: E402
@@ -34,12 +35,17 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (  # noqa: E402
     FrontendHost,
     ManagedDynamoRuntime,
 )
+from nemo_rl.models.generation.dynamo.vllm import generation_cut  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm.generation_cut import (  # noqa: E402
     CUT_PREFIXES_KEY,
     DEADLINE_KEY,
     GENERATION_CUT_ANNOTATION,
     INVENTORY_KEY,
     EngineCutFanOut,
+)
+from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
+    GENERATION_CUT_ROUTE,
+    answer_generation_cut,
 )
 
 pytestmark = pytest.mark.nemo_gym
@@ -143,7 +149,6 @@ def test_a_cut_reaches_every_engine_and_each_call_gets_its_engines_answer(
     )
     runtime = _Runtime(client)
     monkeypatch.setenv("DYN_NAMESPACE", "nemo-rl-test")
-    monkeypatch.setenv(managed_runtime.CAPTURE_FILE_ENV, str(tmp_path / "capture.pkl"))
     driver = ManagedDynamoRuntime(
         dynamo_cfg=DynamoCfg(),
         model_name="model",
@@ -163,9 +168,17 @@ def test_a_cut_reaches_every_engine_and_each_call_gets_its_engines_answer(
     driver._started = True
 
     async def run():
-        fan_out = EngineCutFanOut(runtime, asyncio.get_running_loop())
-        # Before capture is set up the route refuses every cut, as natively.
-        assert fan_out.control_token is None
+        fan_out = EngineCutFanOut(runtime, str(tmp_path / "capture.pkl"))
+
+        def post():
+            # What the frontend's route runs for a call from Gym.
+            return answer_generation_cut(
+                fan_out,
+                authorization="Bearer secret",
+                inventory=inventory.model_dump(mode="json"),
+            )
+
+        refused = await post()
         driver.publish_chat_capture(
             dp_cfg={"backend": "simple"},
             staging_partition="staging",
@@ -173,13 +186,16 @@ def test_a_cut_reaches_every_engine_and_each_call_gets_its_engines_answer(
             generation_cut_control_token="secret",
             generation_cut_control_timeout_s=0.5,
         )
-        assert fan_out.control_token == "secret"
         arrived = time.time()
-        return arrived, await fan_out.run_cut(inventory)
+        return refused, arrived, await post()
 
-    arrived, receipt = asyncio.run(run())
+    refused, arrived, (status, body) = asyncio.run(run())
 
+    # Before capture is set up the route refuses every cut, as natively.
+    assert refused == (404, {"detail": "generation-prefix cuts are disabled"})
+    assert status == 200
     # Gym accepts it as the answer to its inventory: every call acked once.
+    receipt = GenerationCutReceipt.model_validate(body)
     receipt.validate_for(inventory)
     assert {ack.model_call_id: ack.disposition for ack in receipt.prefixes} == {
         "held": "durable_prefix",
@@ -201,3 +217,13 @@ def test_a_cut_reaches_every_engine_and_each_call_gets_its_engines_answer(
         },
     }
     assert client.requests == {1: request, 2: request, 3: request, 4: request}
+
+
+@pytest.mark.vllm
+def test_dynamo_takes_the_cut_route_on_gyms_path(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(managed_runtime.CAPTURE_FILE_ENV, str(tmp_path / "capture.pkl"))
+
+    (route,) = generation_cut.routes()
+
+    # Building it is the check that Dynamo accepts its timeout and body limit.
+    assert (route.method, route.path) == ("POST", GENERATION_CUT_ROUTE)
