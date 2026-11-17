@@ -1,19 +1,8 @@
 # Cross-Tokenizer (X-Token) Off-Policy Distillation
 
-NeMo RL supports off-policy distillation between a student and a teacher that
-**do not share a tokenizer** — for example, distilling a Qwen3-4B teacher into
-a Llama-3.2-1B student. Cross-tokenizer ("x-token") distillation handles the
-vocabulary mismatch by routing student logits through a precomputed
-**projection matrix** that maps each student token to the teacher tokens it
-most plausibly corresponds to, projecting the student into the teacher's
-vocab space so the two distributions can be compared.
+NeMo RL supports off-policy distillation between a student and a teacher that **do not share a tokenizer** — for example, distilling a Qwen3-4B teacher into a Llama-3.2-1B student. Cross-tokenizer ("x-token") distillation handles the vocabulary mismatch by routing student logits through a precomputed **projection matrix** that maps each student token to the teacher tokens it most plausibly corresponds to, projecting the student into the teacher's vocab space so the two distributions can be compared.
 
-Tokenizer vocabularies overlap only partially, which is what makes the
-projection necessary. The table below reports the pairwise overlap
-(intersection divided by the smaller vocabulary, on canonical token forms)
-across several model tokenizers; the off-diagonal entries sit well below
-`1.0` — that shared-vocabulary gap is exactly what the projection matrix
-bridges.
+Tokenizer vocabularies overlap only partially, which is what makes the projection necessary. The table below reports the pairwise overlap (intersection divided by the smaller vocabulary, on canonical token forms) across several model tokenizers; the off-diagonal entries sit well below `1.0` — that shared-vocabulary gap is exactly what the projection matrix bridges.
 
 | Model | Mistral-NeMo-Minitron-8B | Qwen3-8B-Base | Llama-3.2-1B | gemma-3-4b-it | OLMo2-8B-SuperBPE-t160k | gpt-oss-20b |
 |---|---:|---:|---:|---:|---:|---:|
@@ -31,9 +20,7 @@ This guide explains how to:
 
 ## How it works
 
-A full run has two phases. The three prep steps are *offline data prep* —
-small CLI tools you run once per (student, teacher) pair — and the result is a
-single `.pt` file. The final step is the actual distillation training loop.
+A full run has two phases. The three prep steps are *offline data prep* — small CLI tools you run once per (student, teacher) pair — and the result is a single `.pt` file. The final step is the actual distillation training loop.
 
 ```
                         ┌──────────────────────────────────────────────┐
@@ -66,23 +53,15 @@ single `.pt` file. The final step is the actual distillation training loop.
                         └────────────────────────────────────────────────────┘
 ```
 
-The projection matrix is a sparse `[V_student, top_k]` tensor that the
-training-time loss multiplies against the student logits to project them into
-the teacher's vocab space.
+The projection matrix is a sparse `[V_student, top_k]` tensor that the training-time loss multiplies against the student logits to project them into the teacher's vocab space.
 
 <img src="../assets/projection_matrix_colour_matching.png" alt="Projection-matrix weights mapping student tokens (rows) to teacher tokens (columns)" width="600">
 
-Each row of the matrix holds the weights `W_{s,t}` that distribute a student
-token `s ∈ V_S` over the teacher tokens `t ∈ V_T` it corresponds to. Tokens
-shared by both vocabularies map 1-to-1 (e.g., `_the`, `_cat`, `_run`), while a
-student token that the teacher splits into pieces spreads its weight across
-those pieces (e.g., `201` → `2`, `0`, `1`). Rows are trimmed to the runtime
-`top_k` in Step 3, so low-weight tail entries are dropped (hatched cell).
+Each row of the matrix holds the weights `W_{s,t}` that distribute a student token `s ∈ V_S` over the teacher tokens `t ∈ V_T` it corresponds to. Tokens shared by both vocabularies map 1-to-1 (e.g., `_the`, `_cat`, `_run`), while a student token that the teacher splits into pieces spreads its weight across those pieces (e.g., `201` → `2`, `0`, `1`). Rows are trimmed to the runtime `top_k` in Step 3, so low-weight tail entries are dropped (hatched cell).
 
 ## Quickstart — single command
 
-For the typical case, `tools/x_token/build_projection_matrix.sh` chains
-the prep steps with auto-derived intermediate paths:
+For the typical case, `tools/x_token/build_projection_matrix.sh` chains the prep steps with auto-derived intermediate paths:
 
 ```bash
 ./tools/x_token/build_projection_matrix.sh \
@@ -91,30 +70,15 @@ the prep steps with auto-derived intermediate paths:
     --runtime-top-k 4
 ```
 
-The wrapper writes the final matrix to
-`cross_tokenizer_data/projection_matrix_<student>_<teacher>_top<N>.pt`
-(override with `--final-output`). Further tweaks to step 1 defaults can be configured using `--no-{scale-trick,reverse-pass,special-token-mapping}`. Run `./tools/x_token/build_projection_matrix.sh
---help` for the full list of options.
+The wrapper writes the final matrix to `cross_tokenizer_data/projection_matrix_<student>_<teacher>_top<N>.pt` (override with `--final-output`). Further tweaks to step 1 defaults can be configured using `--no-{scale-trick,reverse-pass,special-token-mapping}`. Run `./tools/x_token/build_projection_matrix.sh --help` for the full list of options.
 
-The per-step recipes below are for advanced customization (non-default
-weight thresholds, hand-picked intermediate filenames, etc.).
+The per-step recipes below are for advanced customization (non-default weight thresholds, hand-picked intermediate filenames, etc.).
 
 ## Backend and scope
 
-- **Automodel only.** Set `policy.automodel_cfg.enabled=true`. The Megatron policy
-  worker is not wired for cross-tokenizer distillation.
-- **Teacher logits travel via CUDA IPC**, so student and teacher policies must
-  be colocated on the same node. No remote-Ray transport for x-token logits.
-- **One colocated GPU pool, serial execution.** All teachers and the student
-  share a single `RayVirtualCluster`
-  (`max_colocated_worker_groups = len(teachers) + 1`). There is no separate
-  generation worker (off-policy distillation trains on a fixed dataset) and no
-  colocation toggle. Each step time-slices the shared GPUs: one teacher at a
-  time is onloaded, runs its forward pass, ships its logits to the student over
-  CUDA IPC, then offloads; the student trains last, reading and releasing each
-  teacher's IPC buffer. GPU memory therefore holds exactly one teacher's params
-  *or* the student's at any instant, plus the teachers' resident IPC logit
-  buffers.
+- **Automodel only.** Set `policy.automodel_cfg.enabled=true`. The Megatron policy worker is not wired for cross-tokenizer distillation.
+- **Teacher logits travel via CUDA IPC**, so student and teacher policies must be colocated on the same node. No remote-Ray transport for x-token logits.
+- **One colocated GPU pool, serial execution.** All teachers and the student share a single `RayVirtualCluster` (`max_colocated_worker_groups = len(teachers) + 1`). There is no separate generation worker (off-policy distillation trains on a fixed dataset) and no colocation toggle. Each step time-slices the shared GPUs: one teacher at a time is onloaded, runs its forward pass, ships its logits to the student over CUDA IPC, then offloads; the student trains last, reading and releasing each teacher's IPC buffer. GPU memory therefore holds exactly one teacher's params *or* the student's at any instant, plus the teachers' resident IPC logit buffers.
 
 ```
    RayVirtualCluster — one GPU pool, shared by every worker group
@@ -136,16 +100,11 @@ weight thresholds, hand-picked intermediate filenames, etc.).
    plus the teachers' IPC logit buffers (node-local).
 ```
 
-Future work will ease these requirements — we are actively working on
-improving cross-tokenizer distillation support.
+Future work will ease these requirements — we are actively working on improving cross-tokenizer distillation support.
 
 ## Step 1 — Build multi-token mappings
 
-Many student tokens (e.g., `"12"`) tokenize into multiple teacher tokens
-(e.g., `"1"`, `"2"`). `minimal_projection_via_multitoken.py` walks the
-student vocab, re-tokenizes each token with the teacher tokenizer, and adds
-weighted entries to the projection. With `--enable-reverse-pass` it also
-does the symmetric teacher → student walk.
+Many student tokens (e.g., `"12"`) tokenize into multiple teacher tokens (e.g., `"1"`, `"2"`). `minimal_projection_via_multitoken.py` walks the student vocab, re-tokenizes each token with the teacher tokenizer, and adds weighted entries to the projection. With `--enable-reverse-pass` it also does the symmetric teacher → student walk.
 
 ```bash
 uv run python -m tools.x_token.minimal_projection_via_multitoken \
@@ -159,17 +118,11 @@ uv run python -m tools.x_token.minimal_projection_via_multitoken \
 
 Output: `cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_32_double_special.pt`.
 
-Pass `--num-examples 50` to print a sample of student→teacher mappings after
-the matrix is built — useful for spot-checking that special tokens, numerals,
-and punctuation map to sensible teacher tokens.
+Pass `--num-examples 50` to print a sample of student→teacher mappings after the matrix is built — useful for spot-checking that special tokens, numerals, and punctuation map to sensible teacher tokens.
 
 ## Step 2 — Reapply exact-token map
 
-Tokenizers built with a similar algorithm (for example, BPE) typically share
-a sizable set of identical tokens — common punctuation, single ASCII
-characters, and frequent subwords. `reapply_exact_map.py` pins those
-overlapping tokens to 1-to-1 mappings with weight 1.0, overwriting whatever
-Step 1 produced for them.
+Tokenizers built with a similar algorithm (for example, BPE) typically share a sizable set of identical tokens — common punctuation, single ASCII characters, and frequent subwords. `reapply_exact_map.py` pins those overlapping tokens to 1-to-1 mappings with weight 1.0, overwriting whatever Step 1 produced for them.
 
 ```bash
 uv run python -m tools.x_token.reapply_exact_map \
@@ -182,11 +135,7 @@ Output is written next to the input as `<basename>_exact_map_remapped.pt`.
 
 ## Step 3 — Sort and trim to runtime `top_k`
 
-We observe the projection map is very sparse — each student token maps to at most 4–5
-teacher tokens. This step sorts each row by weight, trims to the chosen
-runtime `top_k`, and stores the result as a sparse `[V_student, top_k]`
-representation (per-row indices plus weights). That sparse format avoids materializing a computationally
-expensive dense projection matrix of size `[student_vocab, teacher_vocab]` during distillation.
+We observe the projection map is very sparse — each student token maps to at most 4–5 teacher tokens. This step sorts each row by weight, trims to the chosen runtime `top_k`, and stores the result as a sparse `[V_student, top_k]` representation (per-row indices plus weights). That sparse format avoids materializing a computationally expensive dense projection matrix of size `[student_vocab, teacher_vocab]` during distillation.
 
 ```bash
 uv run python -m tools.x_token.sort_and_cut_projection_matrix \
@@ -197,17 +146,7 @@ uv run python -m tools.x_token.sort_and_cut_projection_matrix \
 
 ## Step 4 — Launch x-token distillation
 
-The training entrypoint is `examples/run_xtoken_off_policy_distillation.py` with the
-exemplar config at `examples/configs/xtoken_off_policy_distillation.yaml`. The exemplar
-defaults to Llama-3.2-1B (student) ← Qwen3-4B (teacher) and the P-KL loss
-mode. For data it points `data.train.data_files` at the ungated, CC-BY-4.0
-NVIDIA **Nemotron-Pretraining-Specialized-v1.1** corpus
-(`Nemotron-Pretraining-Formal-Logic` subset) by dataset id + `data.train.subset`,
-so the recipe runs out of the box with no auth or extra setup (and from the HF
-cache under `HF_HUB_OFFLINE=1`). The `projection_matrix_path` below
-points at the `cross_tokenizer_data/` directory that Steps 1–3 create, so run
-those first (or the `build_projection_matrix.sh` wrapper). Override paths via
-Hydra CLI:
+The training entrypoint is `examples/run_xtoken_off_policy_distillation.py` with the exemplar config at `examples/configs/xtoken_off_policy_distillation.yaml`. The exemplar defaults to Llama-3.2-1B (student) ← Qwen3-4B (teacher) and the P-KL loss mode. For data it points `data.train.data_files` at the ungated, CC-BY-4.0 NVIDIA **Nemotron-Pretraining-Specialized-v1.1** corpus (`Nemotron-Pretraining-Formal-Logic` subset) by dataset id + `data.train.subset`, so the recipe runs out of the box with no auth or extra setup (and from the HF cache under `HF_HUB_OFFLINE=1`). The `projection_matrix_path` below points at the `cross_tokenizer_data/` directory that Steps 1–3 create, so run those first (or the `build_projection_matrix.sh` wrapper). Override paths via Hydra CLI:
 
 ```bash
 uv run python examples/run_xtoken_off_policy_distillation.py \
@@ -217,14 +156,7 @@ uv run python examples/run_xtoken_off_policy_distillation.py \
     cluster.num_nodes=1
 ```
 
-The exemplar config keeps each teacher's `aligner.projection_matrix_path` as
-`null`, so the projection matrix must always be supplied at the CLI (per
-teacher, e.g. `teachers.0.aligner.projection_matrix_path=...`) — this keeps the
-config reusable across (student, teacher) pairs. `data.train.data_files` and `data.train.subset`
-already point at the default NVIDIA corpus described above; override them only
-to train on your own `.arrow`/`.parquet`/`.json`/`.txt` corpus. Set both, since a
-file path requires `subset` to be null:
-`data.train.data_files=/path/glob/*.arrow data.train.subset=null`.
+The exemplar config keeps each teacher's `aligner.projection_matrix_path` as `null`, so the projection matrix must always be supplied at the CLI (per teacher, e.g. `teachers.0.aligner.projection_matrix_path=...`) — this keeps the config reusable across (student, teacher) pairs. `data.train.data_files` and `data.train.subset` already point at the default NVIDIA corpus described above; override them only to train on your own `.arrow`/`.parquet`/`.json`/`.txt` corpus. Set both, since a file path requires `subset` to be null: `data.train.data_files=/path/glob/*.arrow data.train.subset=null`.
 
 ### Text and chat batches
 
@@ -239,37 +171,17 @@ collator:
   num_packed_rows: 1
 ```
 
-For conversation data, set `collator.mode=chat` and use `chat_kd_processor` with
-raw `messages` or `conversation` data. Each model applies its own chat template
-to the full conversation, but training supervises **only the final assistant
-turn**. Earlier messages remain context and do not contribute training targets.
-Every chat row must end with an assistant message. CE, same-tokenizer KD, and
-teacher scoring include the final assistant content and its retained end-of-turn
-token; earlier turns, role headers, and padding are excluded. Cross-tokenizer KD
-aligns the final assistant content and uses a separate EOT pair when both
-tokenizations retain the terminator. This applies to both ordinary and native
-chat alignment; raw-text training is unchanged.
+For conversation data, set `collator.mode=chat` and use `chat_kd_processor` with raw `messages` or `conversation` data. Each model applies its own chat template to the full conversation, but training supervises **only the final assistant turn**. Earlier messages remain context and do not contribute training targets.
+Every chat row must end with an assistant message. CE, same-tokenizer KD, and teacher scoring include the final assistant content and its retained end-of-turn token; earlier turns, role headers, and padding are excluded. Cross-tokenizer KD aligns the final assistant content and uses a separate EOT pair when both tokenizations retain the terminator. This applies to both ordinary and native chat alignment; raw-text training is unchanged.
 
-Each chat row can supply `message_loss_mask`, a list containing one binary
-integer per message. Only assistant turns may have a value of `1`, and the final
-assistant message must be selected (`1`). Earlier mask entries never enable
-training on history: earlier messages are context only, even when their mask
-entry is `1`. Omitting the mask selects the final assistant turn for training.
+Each chat row can supply `message_loss_mask`, a list containing one binary integer per message. Only assistant turns may have a value of `1`, and the final assistant message must be selected (`1`). Earlier mask entries never enable training on history: earlier messages are context only, even when their mask entry is `1`. Omitting the mask selects the final assistant turn for training.
 The OpenAI adapter prepends a zero when it inserts a system message.
 
-The configuration class supplies defaults. Packing multiple examples per row
-remains unsupported; keep `num_packed_rows=1`. Text tokenization uses
-`add_special_tokens=False`. Chat
-rows exceeding either the student's or any teacher's context limit are rejected
-instead of independently truncating their conversations.
+The configuration class supplies defaults. Packing multiple examples per row remains unsupported; keep `num_packed_rows=1`. Text tokenization uses `add_special_tokens=False`. Chat rows exceeding either the student's or any teacher's context limit are rejected instead of independently truncating their conversations.
 
 ### Native reasoning and tool conversations
 
-Native alignment supports the Nano/Qwen ChatML layouts with explicit reasoning,
-answer, tool-call, and end-of-turn regions. Literal ChatML turn delimiters inside
-source content or schemas are rejected as ambiguous; embedded tool/think markup
-inside tool arguments is supported. Other layouts fail with an error;
-the Llama text exemplars are not native-chat recipes. Enable it explicitly:
+Native alignment supports the Nano/Qwen ChatML layouts with explicit reasoning, answer, tool-call, and end-of-turn regions. Literal ChatML turn delimiters inside source content or schemas are rejected as ambiguous; embedded tool/think markup inside tool arguments is supported. Other layouts fail with an error; the Llama text exemplars are not native-chat recipes. Enable it explicitly:
 
 ```yaml
 collator:
@@ -280,30 +192,12 @@ collator:
   num_packed_rows: 1
 ```
 
-Each row can supply `tools`. Set `use_preserving_dataset: true` for JSONL tool
-data to retain heterogeneous argument objects without Arrow adding null fields.
+Each row can supply `tools`. Set `use_preserving_dataset: true` for JSONL tool data to retain heterogeneous argument objects without Arrow adding null fields.
 
-The final assistant turn supervises reasoning text (when
-`include_thinking_in_loss` is true), the closing `</think>`, answers, tool payloads,
-and EOT. Opening thinking scaffolds, formatting-only tokens, schemas,
-user/system/tool-result text, earlier turns, and padding
-are excluded. `kd_alignment_regions` further restricts cross-tokenizer KD without
-changing CE or same-tokenizer KD masks. Prose and each tool call align separately;
-permitted Boolean/null spelling differences retain CE but omit the unequal piece
-from exact-text KD. Missing or transformed required content fails explicitly.
-An empty or whitespace-only final assistant turn is rejected; tool-only final
-turns are supported. Supervising a separate `reasoning_content` field requires native
-alignment. Ordinary chat supports reasoning embedded in `content` only when the
-chat template renders that content verbatim. For Qwen-style templates that extract
-inline `<think>...</think>` into a separate reasoning block, including the stock
-Qwen3 template and `qwen3_history.jinja`, set
-`collator.native_thinking_alignment=true`. Ordinary chat rejects requests to
-supervise a separate reasoning field without native alignment.
+The final assistant turn supervises reasoning text (when `include_thinking_in_loss` is true), the closing `</think>`, answers, tool payloads, and EOT. Opening thinking scaffolds, formatting-only tokens, schemas, user/system/tool-result text, earlier turns, and padding are excluded. `kd_alignment_regions` further restricts cross-tokenizer KD without changing CE or same-tokenizer KD masks. Prose and each tool call align separately; permitted Boolean/null spelling differences retain CE but omit the unequal piece from exact-text KD. Missing or transformed required content fails explicitly.
+An empty or whitespace-only final assistant turn is rejected; tool-only final turns are supported. Supervising a separate `reasoning_content` field requires native alignment. Ordinary chat supports reasoning embedded in `content` only when the chat template renders that content verbatim. For Qwen-style templates that extract inline `<think>...</think>` into a separate reasoning block, including the stock Qwen3 template and `qwen3_history.jinja`, set `collator.native_thinking_alignment=true`. Ordinary chat rejects requests to supervise a separate reasoning field without native alignment.
 
-Qwen3-4B's stock template drops historical reasoning when a later user turn
-follows it. To retain that reasoning as context, apply the maintained override to
-**each Qwen tokenizer** used by the collator (both `policy.tokenizer` and the
-appropriate `teachers[i].tokenizer`):
+Qwen3-4B's stock template drops historical reasoning when a later user turn follows it. To retain that reasoning as context, apply the maintained override to **each Qwen tokenizer** used by the collator (both `policy.tokenizer` and the appropriate `teachers[i].tokenizer`):
 
 ```yaml
 tokenizer:
@@ -317,46 +211,20 @@ tokenizer:
     truncate_history_thinking: false
 ```
 
-The template accepts explicit `reasoning_content` and leading inline
-`<think>...</think>` content. An explicit `truncate_history_thinking` wins:
-`false` retains history and `true` uses stock history truncation. When absent,
-`preserve_thinking=true` enables retention; otherwise stock behavior applies.
-`enable_thinking` preserves Qwen3's generation-prompt behavior, including its
-empty thinking block when false; it does not delete supplied reasoning. Training
-renders with `add_generation_prompt=False`. Native training requires the final
-turn's supervised reasoning to be retained and rejects a template that silently
-drops it. Historical reasoning follows the template's context-retention policy
-and does not contribute loss.
+The template accepts explicit `reasoning_content` and leading inline `<think>...</think>` content. An explicit `truncate_history_thinking` wins: `false` retains history and `true` uses stock history truncation. When absent, `preserve_thinking=true` enables retention; otherwise stock behavior applies.
+`enable_thinking` preserves Qwen3's generation-prompt behavior, including its empty thinking block when false; it does not delete supplied reasoning. Training renders with `add_generation_prompt=False`. Native training requires the final turn's supervised reasoning to be retained and rejects a template that silently drops it. Historical reasoning follows the template's context-retention policy and does not contribute loss.
 
-The override adds explicit history-retention controls to the pinned Qwen3-4B
-template while preserving its tool serialization and generation behavior. The shared offset matcher compares literal decoded strings; whitespace
-differences are unequal. Native Unicode repair is separate and requires both
-NFC-normalized decodings to equal the original source region. Ordinary chat uses
-one canonical nonempty content key on both sides for the final assistant turn.
-Content tokens that also absorb surrounding whitespace retain CE supervision;
-their full decoded strings still determine exact-match correctness.
+The override adds explicit history-retention controls to the pinned Qwen3-4B template while preserving its tool serialization and generation behavior. The shared offset matcher compares literal decoded strings; whitespace differences are unequal. Native Unicode repair is separate and requires both NFC-normalized decodings to equal the original source region. Ordinary chat uses one canonical nonempty content key on both sides for the final assistant turn.
+Content tokens that also absorb surrounding whitespace retain CE supervision; their full decoded strings still determine exact-match correctness.
 
-The [`xtoken_off_policy_distillation.sh`](../../tests/functional/xtoken_off_policy_distillation.sh)
-functional test covers raw text. The standalone
-[`xtoken_native_chat.sh`](../../tests/functional/xtoken_native_chat.sh) functional
-test covers native chat and is registered separately in the fast and full CI
-suites. Its
-[`chat configuration`](../../examples/configs/xtoken_native_chat.yaml)
-uses a SmolLM2-135M-Instruct student and Qwen3-1.7B teacher with distinct
-tokenizer vocabularies and token boundaries. Both use the history-preserving
-ChatML override so the test retains reasoning, tool calls, and end-of-turn
-supervision. The script reads the checked-in multi-turn arithmetic
-[`JSONL fixture`](../../tests/functional/test_data/xtoken_native_chat.jsonl), builds
-its projection matrix, and checks that three training steps produce finite
-losses. It owns its experiment directory and logs, so it can run independently:
+The [`xtoken_off_policy_distillation.sh`](../../tests/functional/xtoken_off_policy_distillation.sh) functional test covers raw text. The standalone [`xtoken_native_chat.sh`](../../tests/functional/xtoken_native_chat.sh) functional test covers native chat and is registered separately in the fast and full CI suites. Its [`chat configuration`](../../examples/configs/xtoken_native_chat.yaml) uses a SmolLM2-135M-Instruct student and Qwen3-1.7B teacher with distinct tokenizer vocabularies and token boundaries. Both use the history-preserving ChatML override so the test retains reasoning, tool calls, and end-of-turn supervision. The script reads the checked-in multi-turn arithmetic [`JSONL fixture`](../../tests/functional/test_data/xtoken_native_chat.jsonl), builds its projection matrix, and checks that three training steps produce finite losses. It owns its experiment directory and logs, so it can run independently:
 
 ```bash
 bash tests/functional/xtoken_native_chat.sh
 ```
 
 The chat scenario is functional coverage, not a nightly convergence benchmark.
-DP alignment, native student-only SFT, sequence packing, and backend/loss changes
-are outside this port.
+DP alignment, native student-only SFT, sequence packing, and backend/loss changes are outside this port.
 
 ### Loss-mode knobs
 
@@ -385,31 +253,19 @@ uv run python examples/run_xtoken_off_policy_distillation.py \
     cluster.num_nodes=1
 ```
 
-This run distills a `meta-llama/Llama-3.2-1B` student from two teachers at
-once: `microsoft/Phi-4-mini-instruct` (a cross-tokenizer teacher, projected
-through its projection matrix) and `meta-llama/Llama-3.2-3B` (which shares the
-student's tokenizer, so it contributes a direct top-K KL (`loss_fn.vocab_topk`)
-with no projection). The per-teacher objectives are summed (`loss_fn.kd_loss_mode=sum`).
-Config: global batch 96, micro-batch 1, sequence
-length 2048, 100 steps, 2 nodes (8 GPUs each), on the default
-Nemotron-Pretraining-Specialized-v1.1 / Formal-Logic corpus. The distillation
-objective converges and the student tracks both teachers more closely over
-training:
+This run distills a `meta-llama/Llama-3.2-1B` student from two teachers at once: `microsoft/Phi-4-mini-instruct` (a cross-tokenizer teacher, projected through its projection matrix) and `meta-llama/Llama-3.2-3B` (which shares the student's tokenizer, so it contributes a direct top-K KL (`loss_fn.vocab_topk`) with no projection). The per-teacher objectives are summed (`loss_fn.kd_loss_mode=sum`).
+Config: global batch 96, micro-batch 1, sequence length 2048, 100 steps, 2 nodes (8 GPUs each), on the default Nemotron-Pretraining-Specialized-v1.1 / Formal-Logic corpus. The distillation objective converges and the student tracks both teachers more closely over training:
 
 <img src="../assets/xtoken_mt_curves.png" alt="train/loss, train/kl_loss, train/ce_loss, and train/accuracy over 100 multi-teacher distillation steps" width="900">
 
 - **Loss** falls from ≈1.51 to ≈0.70.
-- **KL loss** (summed over both teachers) falls from ≈4.89 to ≈1.97. Almost
-  all of it comes from the cross-tokenizer Phi-4-mini teacher (≈4.75 → ≈1.76);
-  the same-tokenizer Llama-3.2-3B teacher's direct KL is already small and
-  stays there (≈0.14 → ≈0.21).
+- **KL loss** (summed over both teachers) falls from ≈4.89 to ≈1.97. Almost all of it comes from the cross-tokenizer Phi-4-mini teacher (≈4.75 → ≈1.76); the same-tokenizer Llama-3.2-3B teacher's direct KL is already small and stays there (≈0.14 → ≈0.21).
 - **CE loss** falls from ≈0.75 to ≈0.35.
 - **Top-1 accuracy** rises from ≈0.82 to ≈0.91.
 
 ### Downstream evaluation
 
-Benchmark scores of the distilled student against the undistilled
-`meta-llama/Llama-3.2-1B` base model:
+Benchmark scores of the distilled student against the undistilled `meta-llama/Llama-3.2-1B` base model:
 
 | Task | Base Llama-3.2-1B | Distilled |
 |---|---|---|
@@ -418,8 +274,7 @@ Benchmark scores of the distilled student against the undistilled
 
 ### Throughput and memory
 
-Measured on the same run (per training step, micro-batch 1, sequence length
-2048, with the two teachers forwarded serially):
+Measured on the same run (per training step, micro-batch 1, sequence length 2048, with the two teachers forwarded serially):
 
 | Metric | Value |
 |---|---|
@@ -427,10 +282,7 @@ Measured on the same run (per training step, micro-batch 1, sequence length
 | Teacher forward (both teachers) | 4.94 s mean — the dominant per-step cost |
 | Training throughput | ≈29.5k valid tokens/s (196,512 tokens/step ÷ mean step time) |
 
-Each teacher's full-vocab logits stay on-node: the producer publishes a
-rank-level `[B_r, T_t, V_t]` bf16 tray and hands the student a CUDA IPC handle
-to it, so teacher logits never cross the network even with two teachers in
-play.
+Each teacher's full-vocab logits stay on-node: the producer publishes a rank-level `[B_r, T_t, V_t]` bf16 tray and hands the student a CUDA IPC handle to it, so teacher logits never cross the network even with two teachers in play.
 
 ## Where files live
 

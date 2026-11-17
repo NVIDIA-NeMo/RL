@@ -49,6 +49,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_buffer_checkpoint,
     sampler_supports_training_claims,
+    sampler_supports_transactional_admission,
 )
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
@@ -80,11 +81,13 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
+    dedicated_value_enabled,
     forest_execution_row_multiple,
     is_ppo_run,
     logprob_passes_required,
     resolve_ppo_chunk_alignment,
     rollout_snapshots_enabled,
+    validate_grpo_chunk_cap_alignment,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.utils import set_seed
@@ -110,6 +113,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
     prepare_segment_topology,
+    reserve_disjoint_clusters,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
@@ -428,12 +432,14 @@ def _build_clusters(
 ) -> tuple[
     RayVirtualCluster,
     RayVirtualCluster,
+    Optional[RayVirtualCluster],
     Optional[dict[str, tuple[str, int]]],
 ]:
     """Allocate student clusters while leaving validated nodes for teachers.
 
-    Colocated (Megatron generation only) shares one cluster for policy and generation and
-    returns it for both arms; other backends split nodes into train + inference clusters.
+    Colocated (Megatron generation only) shares one cluster for policy and generation;
+    other backends split nodes into training and inference clusters. Dedicated value
+    resources reserve a third cluster.
     """
     cluster_config = master_config.cluster
     generation_config = master_config.policy["generation"]
@@ -445,7 +451,11 @@ def _build_clusters(
     port_range_low = cluster_config.master_port_range_low
     port_range_high = cluster_config.master_port_range_high
     teacher_nodes = _non_colocated_teacher_node_count(master_config)
-    policy_nodes = num_nodes - teacher_nodes
+    dedicated_value = dedicated_value_enabled(master_config)
+    value_nodes = (
+        cast(int, master_config.value["resources"].num_nodes) if dedicated_value else 0
+    )
+    policy_nodes = num_nodes - teacher_nodes - value_nodes
     if policy_nodes <= 0:
         raise ValueError(
             "cluster.num_nodes must leave at least one node for the student after "
@@ -455,7 +465,7 @@ def _build_clusters(
 
     # Worker groups sharing the training GPUs: the policy, plus the critic on
     # the PPO path.
-    train_worker_groups = 2 if is_ppo_run(master_config) else 1
+    train_worker_groups = 1 if not is_ppo_run(master_config) or dedicated_value else 2
 
     if colocated:
         # Policy (+ critic) + generation share GPUs — one cluster.
@@ -484,7 +494,7 @@ def _build_clusters(
             segment_size=segment_size,
             node_resource_constraints=node_constraints,
         )
-        return cluster, cluster, teacher_topology
+        return cluster, cluster, None, teacher_topology
 
     # Non-colocated: split node into train + inference clusters.
     inference_resources = generation_config["colocated"]["resources"]
@@ -509,6 +519,7 @@ def _build_clusters(
         )
 
     train_constraints = None
+    value_constraints = None
     inference_constraints = None
     train_segment_size = None
     inference_segment_size = None
@@ -536,6 +547,13 @@ def _build_clusters(
             remaining_topology = {
                 node_id: topology[node_id] for node_id in remaining_ids
             }
+            if dedicated_value:
+                value_constraints, value_remaining_ids, _ = prepare_segment_topology(
+                    segment_size, value_nodes, topology=remaining_topology, role="value"
+                )
+                remaining_topology = {
+                    node_id: topology[node_id] for node_id in value_remaining_ids
+                }
             generation_config_dict = cast(dict[str, Any], generation_config)
             if backend == "vllm":
                 vllm_cfg = generation_config_dict["vllm_cfg"]
@@ -604,7 +622,20 @@ def _build_clusters(
         segment_size=inference_segment_size,
         node_resource_constraints=inference_constraints,
     )
-    return train_cluster, inference_cluster, teacher_topology
+    value_cluster = None
+    if dedicated_value:
+        value_cluster = RayVirtualCluster(
+            name="sc_value_cluster",
+            bundle_ct_per_node_list=[gpus_per_node] * value_nodes,
+            use_gpus=True,
+            num_gpus_per_node=gpus_per_node,
+            max_colocated_worker_groups=1,
+            port_range_low=port_range_low,
+            port_range_high=port_range_high,
+            segment_size=segment_size,
+            node_resource_constraints=value_constraints,
+        )
+    return train_cluster, inference_cluster, value_cluster, teacher_topology
 
 
 def _build_generation(
@@ -1191,6 +1222,12 @@ def setup_single_controller(
             "master_config.data_plane.enabled=True. The async-RL "
             "SingleController path is built on the TransferQueue data plane."
         )
+    if algo_cfg.use_dynamic_sampling:
+        if not sampler_supports_transactional_admission(master_config.async_rl.sampler):
+            raise ValueError(
+                "Dynamic sampling requires TransactionalAdmissionSampler: the admission "
+                "wait must permit filtering-pool refill outside checkpoint mutations."
+            )
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
     snapshots_enabled = rollout_snapshots_enabled(master_config)
@@ -1212,7 +1249,7 @@ def setup_single_controller(
         if (
             rollout_checkpoint_cfg.snapshot_attempt_interval_s is None
             and not rollout_checkpoint_cfg.snapshot_on_trainer_checkpoint
-            and master_config.checkpointing.get("checkpoint_must_save_by") is None
+            and master_config.checkpointing.checkpoint_must_save_by is None
         ):
             raise ValueError(
                 f"rollout_recovery.target_level={recovery_target!r} would never save "
@@ -1232,24 +1269,22 @@ def setup_single_controller(
                 "rollout_checkpointing.restore_mode='latest'"
             )
     if (
-        master_config.checkpointing.get("save_data_plane") or snapshots_enabled
+        master_config.checkpointing.save_data_plane or snapshots_enabled
     ) and not data_plane_checkpointing_supported:
         raise NotImplementedError(
             "SingleController data-plane checkpointing is not supported for "
             f"data_plane.backend={dp_config['backend']!r}."
         )
-    if master_config.checkpointing["enabled"]:
+    if master_config.checkpointing.enabled:
         sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
             master_config.async_rl.sampler
         )
         # msc:// checkpoints cannot hold data-plane snapshots, so the replay-capable
         # sampler falls back to the same cursor-only recovery as the others.
-        checkpoint_dir_is_msc = is_msc_path(
-            master_config.checkpointing["checkpoint_dir"]
-        )
+        checkpoint_dir_is_msc = is_msc_path(master_config.checkpointing.checkpoint_dir)
         if (
             sampler_supports_replay_recovery
-            and not master_config.checkpointing.get("save_data_plane")
+            and not master_config.checkpointing.save_data_plane
             and not checkpoint_dir_is_msc
         ):
             error_message = (
@@ -1326,7 +1361,7 @@ def setup_single_controller(
             "to reuse the rollout's captured media for teacher scoring."
         )
 
-    checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
+    checkpointing_pretrained = master_config.checkpointing.pretrained_checkpoint
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
@@ -1352,10 +1387,6 @@ def setup_single_controller(
     )
     if generation_prefix_cuts_enabled:
         # The vLLM-only check ran above with the other turn/prefix checks.
-        if capture_media:
-            raise NotImplementedError(
-                "generation-prefix recovery does not yet support multimodal capture"
-            )
         if router_replay_enabled(master_config.policy):
             raise NotImplementedError(
                 "generation-prefix recovery does not yet support router replay"
@@ -1372,11 +1403,11 @@ def setup_single_controller(
         if token_capture_cfg.defer_routed_experts_to_policy:
             raise ValueError("VLM token capture requires direct router replay assembly")
     if snapshots_enabled:
-        if not master_config.checkpointing["enabled"]:
+        if not master_config.checkpointing.enabled:
             raise ValueError(
                 "rollout checkpointing requires checkpointing.enabled=true"
             )
-        if not master_config.checkpointing.get("save_data_plane"):
+        if not master_config.checkpointing.save_data_plane:
             raise ValueError(
                 "rollout checkpointing requires checkpointing.save_data_plane=true"
             )
@@ -1396,11 +1427,11 @@ def setup_single_controller(
             )
         if (
             rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
-            and master_config.checkpointing["save_period"] != 1
+            and master_config.checkpointing.save_period != 1
         ):
             warnings.warn(
                 "rollout checkpointing is enabled with "
-                f"checkpointing.save_period={master_config.checkpointing['save_period']}; "
+                f"checkpointing.save_period={master_config.checkpointing.save_period}; "
                 "periodic rollout snapshots can only be saved while a matching "
                 "trainer checkpoint exists. Set checkpointing.save_period=1 for "
                 "continuous post-step coverage.",
@@ -1722,16 +1753,19 @@ def setup_single_controller(
     setup_timing_metrics = SetupTimingMetrics()
 
     # Create clusters
-    train_cluster, inference_cluster, teacher_segment_topology = _build_clusters(
-        master_config
+    train_cluster, inference_cluster, value_cluster, teacher_segment_topology = (
+        _build_clusters(master_config)
     )
+    dedicated_value = value_cluster is not None
     colocated = generation_config["colocated"]["enabled"]
     segment_size = master_config.cluster.segment_size
 
     # Claim constrained training nodes before unconstrained inference or Gym
     # tasks can consume them. This matters when inference topology alignment
     # falls back while the training cluster remains topology-constrained.
-    if not colocated and segment_size is not None:
+    if value_cluster is not None:
+        reserve_disjoint_clusters(train_cluster, value_cluster)
+    elif not colocated and segment_size is not None:
         train_cluster.get_placement_groups()
 
     # Claim teacher placement groups before deferred generation starts NeMo-Gym,
@@ -1770,6 +1804,7 @@ def setup_single_controller(
     clusters_by_name: dict[str, RayVirtualCluster] = {
         "train": train_cluster,
         "inference": inference_cluster,
+        **({"value": value_cluster} if value_cluster is not None else {}),
         **{f"teacher:{name}": c for name, c in teacher_clusters.items()},
     }
     storage_unit_node_ids = plan_storage_unit_nodes(dp_config, clusters_by_name)
@@ -1798,10 +1833,9 @@ def setup_single_controller(
     ) -> tuple[Any, Optional[TQValue], dict[str, float]]:
         """Build the trainer, then the critic when this is a PPO run.
 
-        Serial, and with the trainer offloaded in between, because both worker
-        groups live on the same training GPUs: leaving the policy resident
-        while the critic loads is what OOMs a tight fit. The trainer comes back
-        to GPU before returning so callers see the same state GRPO leaves them.
+        Shared workers load serially, with the policy offloaded while the critic
+        loads. Dedicated value workers load onto their own cluster and both
+        models remain resident.
 
         Args:
             reserved_http_server_ports: Pre-published OpenAI server ports keyed
@@ -1823,33 +1857,41 @@ def setup_single_controller(
             checkpointing=bool(
                 recovery_checkpoint_path is not None
                 or (
-                    master_config.checkpointing["enabled"]
-                    and master_config.checkpointing.get("save_data_plane")
+                    master_config.checkpointing.enabled
+                    and master_config.checkpointing.save_data_plane
                 )
             ),
             storage_unit_node_ids=storage_unit_node_ids,
             reserved_http_server_ports=reserved_http_server_ports,
         )
         if not is_ppo_run(master_config):
+            validate_grpo_chunk_cap_alignment(
+                master_config,
+                trainer.sharding_annotations.get_axis_size("data_parallel"),
+            )
             return trainer, None, time_metrics
 
-        trainer.offload_to_cpu()
+        if not dedicated_value:
+            trainer.offload_to_cpu()
         value, time_metrics["value_time"] = _build_value(
-            train_cluster,
+            value_cluster if value_cluster is not None else train_cluster,
             master_config,
             tokenizer,
             seed=algo_cfg.seed,
             weights_path=value_weights_path,
             optimizer_path=value_optimizer_path,
         )
-        # Blocks on the critic's async Ray __init__, then parks it on CPU.
-        value.finish_training()
+        # Blocks on the critic's async Ray __init__.
         ppo_group_multiple, ppo_min_remaining_groups = resolve_ppo_chunk_alignment(
             master_config,
             trainer.sharding_annotations.get_axis_size("data_parallel"),
             value.sharding_annotations.get_axis_size("data_parallel"),
         )
-        trainer.prepare_for_training()
+        if dedicated_value:
+            value.prepare_for_training()
+        else:
+            value.finish_training()
+            trainer.prepare_for_training()
         return trainer, value, time_metrics
 
     def _build_generation_then_trainer(
@@ -2348,6 +2390,11 @@ def setup_single_controller(
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config
                 ),
+                length_penalty_config=(
+                    master_config.grpo.length_penalty
+                    if master_config.grpo is not None
+                    else None
+                ),
                 tokenizer_config=(
                     policy_config["tokenizer"]
                     if master_config.reward_penalties.penalize_malformed_think_tag
@@ -2401,6 +2448,11 @@ def setup_single_controller(
             wandb_config=master_config.logger.wandb,
         ),
         reward_penalty_config=resolved_reward_penalty_config,
+        length_penalty_config=(
+            master_config.grpo.length_penalty
+            if master_config.grpo is not None
+            else None
+        ),
         tq_buffer=tq_buffer,
         timeouts=RolloutTimeouts(
             rollout_s=master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s,

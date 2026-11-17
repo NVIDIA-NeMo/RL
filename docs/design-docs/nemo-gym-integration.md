@@ -29,6 +29,7 @@ policy:
 env:
   should_use_nemo_gym: true       # Enables NeMo Gym integration
   nemo_gym:
+    truncate_noncontiguous_episodes: false
     # NeMo Gym config paths and settings
     config_paths:
       - resources_servers/math/configs/math.yaml
@@ -41,32 +42,46 @@ logger:
     log_nemo_gym_full_result_tables: false
 ```
 
-When `log_nemo_gym_full_result_tables` is `false`, NeMo RL does not construct
-the per-agent `full_result` Tables. This prevents those payloads from entering
-the async replay buffer and avoids uploading them to W&B. Numeric per-agent
-rollout metrics are unaffected. Set the flag to `true` only when the complete
-Gym result payloads are needed for a short debugging run.
+`env.nemo_gym.truncate_noncontiguous_episodes` defaults to `false`, so a token-prefix discontinuity raises an error. When set to `true`, NeMo RL stops at the first trainable turn whose prompt does not preserve the tokens already seen, drops that turn and the remaining tail, and keeps the preceding contiguous prefix with the episode reward. This option cannot be used with `policy.router_replay.enabled: true` or `token_capture.enabled: true`. Truncation applies only to the legacy token-echo path; token-capture receipt mode bypasses that path and retains its own integrity checks. Every legacy result includes a boolean `noncontiguous_truncated` flag; its per-agent `{agent_name}/noncontiguous_truncated/mean` metric reports the fraction of episodes whose non-contiguous tail was dropped.
 
-The exposed vLLM HTTP server binds every interface of its node and, by default,
-checks no credential on its OpenAI routes; the NeMo Gym model server sends the
-placeholder key `dummy_key`. Set `policy.generation.vllm_cfg.http_server_api_key_required: true`
-to require a bearer token instead (the setting needs `expose_http_server: true`
-and is refused at setup without it): NeMo RL generates one random key per job,
-every vLLM worker refuses a `/v1/*` or `/tokenize` request without
-`Authorization: Bearer <key>` (HTTP 401), and the same key reaches the NeMo Gym
-model server as `policy_api_key`. The saved and logged job configuration never
-carries the key: the vLLM workers receive it in their own configuration copy,
-and the Gym servers receive it as an environment variable
-(`NEMO_RL_POLICY_API_KEY`) that each server resolves in its own process, so
-Gym's serialized global config, its head server's `/global_config_dict_yaml`
-endpoint and the server command lines carry only the variable name. The
-residual exposure is the server processes' environment and the Gym actor's
-constructor arguments, the same as for the token-capture secret. The setting
-covers the vLLM backend only: the Megatron, TRT-LLM and Dynamo exposed servers
-check no credential and their Gym actors keep `dummy_key` (Dynamo rejects the
-setting at configuration time rather than ignoring it).
+When `log_nemo_gym_full_result_tables` is `false`, NeMo RL does not construct the per-agent `full_result` Tables. This prevents those payloads from entering the async replay buffer and avoids uploading them to W&B. Numeric per-agent rollout metrics are unaffected. Set the flag to `true` only when the complete Gym result payloads are needed for a short debugging run.
+
+The exposed vLLM HTTP server binds every interface of its node and, by default, checks no credential on its OpenAI routes; the NeMo Gym model server sends the placeholder key `dummy_key`. Set `policy.generation.vllm_cfg.http_server_api_key_required: true` to require a bearer token instead (the setting needs `expose_http_server: true` and is refused at setup without it): NeMo RL generates one random key per job, every vLLM worker refuses a `/v1/*` or `/tokenize` request without `Authorization: Bearer <key>` (HTTP 401), and the same key reaches the NeMo Gym model server as `policy_api_key`. The saved and logged job configuration never carries the key: the vLLM workers receive it in their own configuration copy, and the Gym servers receive it as an environment variable (`NEMO_RL_POLICY_API_KEY`) that each server resolves in its own process, so Gym's serialized global config, its head server's `/global_config_dict_yaml` endpoint and the server command lines carry only the variable name. The residual exposure is the server processes' environment and the Gym actor's constructor arguments, the same as for the token-capture secret. The setting covers the vLLM backend only: the Megatron, TRT-LLM and Dynamo exposed servers check no credential and their Gym actors keep `dummy_key` (Dynamo rejects the setting at configuration time rather than ignoring it).
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
+
+### Multiple vLLM HTTP frontends
+
+Set `policy.generation.vllm_cfg.http_api_server_count` to run several HTTP frontend processes for each model-owner worker. They share one vLLM engine, its model weights, and one listening socket, so NeMo Gym keeps using the same URL. The count includes the owning worker's frontend: a value of `8` starts seven additional frontend processes.
+
+| Configuration key | Default | Purpose |
+|---|---|---|
+| `policy.generation.vllm_cfg.http_api_server_count` | `1` | Positive integer specifying the number of frontend processes per shared engine. |
+
+```yaml
+policy:
+  generation:
+    backend: vllm
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+      http_api_server_count: 8
+
+async_rl:
+  generation_fleet_health:
+    enabled: false
+```
+
+Counts greater than one require:
+
+- Async HTTP serving: both `async_engine` and `expose_http_server` must be `true`.
+- Local vLLM internal data parallelism of size one, without the Ray data-parallel backend, and colocated frontend-to-engine IPC connections. Tensor parallelism and multiple NeMo RL generation replicas remain supported.
+- A refit transport other than `vllm_s3_sparse` or `vllm_zmq_sparse`.
+- `async_rl.generation_fleet_health.enabled: false` on the SingleController path.
+
+Use multiple frontends when CPU-side HTTP handling, chat-template rendering, or tokenization limits throughput. Additional frontends consume CPU and host memory; they share GPU inference capacity. A count of one keeps the single-frontend construction path.
+
+See the [TP2 SingleController example with token capture](../../examples/configs/recipes/llm/grpo-qwen3-0.6b-1n8g-megatron-vllm-tp2-single-controller-gym-api8.yaml).
 
 ### Dataset formats and routing
 
