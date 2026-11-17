@@ -223,7 +223,7 @@ wheels = [
 
 [[package]]
 name = "ai-dynamo"
-version = "1.7.0.dev20261116"
+version = "1.8.0.dev20261117"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ai-dynamo-runtime" },
@@ -239,20 +239,20 @@ dependencies = [
     { name = "zstandard" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c1/bf/26e8dbef77a5d6c6dcc16c0c86463ddbaafd0816b5ec782a9de9e6acc101/ai_dynamo-1.7.0.dev20261116-py3-none-any.whl", hash = "sha256:84baa56baabb6e76a3c7ae9b23c74ac08440aac2c48b51262b3b643e65efc033", size = 5241799, upload-time = "2026-11-16T10:40:41.742Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/7f/69ae9a91b91bdc6c9a326486f252d2e29526818fdb327f15a9ce466e945d/ai_dynamo-1.8.0.dev20261117-py3-none-any.whl", hash = "sha256:23386f5538c441d412c47568ea8e4ca0b845b7b7f2f946aca51ffee47d7d7425", size = 5273261, upload-time = "2026-11-17T11:32:37.919Z" },
 ]
 
 [[package]]
 name = "ai-dynamo-runtime"
-version = "1.7.0.dev20261116"
+version = "1.8.0.dev20261117"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
     { name = "uvloop" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/41/5f/a14b92c227c59d74a33f3753c4c87ba3ec76528bbd6020e3dc2bac1c77e5/ai_dynamo_runtime-1.7.0.dev20261116-cp311-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:7043ac1416c862ba7334f503ae05c73db94fb59d10ad9e9434ee20ea2f6d1635", size = 84847118, upload-time = "2026-11-16T10:41:40.644Z" },
-    { url = "https://files.pythonhosted.org/packages/2d/0d/915b966655a52c161d07bdaa6c45f20ae4f9fb2d12740f61dfb2fbf28394/ai_dynamo_runtime-1.7.0.dev20261116-cp311-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:63f79ce7309c877cee401f3030174b37b40b81aec1a1d1e9695a72f0ba01de9d", size = 86203824, upload-time = "2026-11-16T10:42:11.943Z" },
+    { url = "https://files.pythonhosted.org/packages/45/7d/b66068294c486500420fc0e9bda2c578c1fa504b0a898f6fd16cb60007f1/ai_dynamo_runtime-1.8.0.dev20261117-cp311-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:5cf75c9ceda32e638d6986a25b9d3b5ab163a6e80faaf0fcec7188c2ad2dc3bb", size = 84888795, upload-time = "2026-11-17T11:34:00.931Z" },
+    { url = "https://files.pythonhosted.org/packages/40/39/7a96952f3ad68c44c993e93875720bd2bf46ad4008fea93febb3d7795ef0/ai_dynamo_runtime-1.8.0.dev20261117-cp311-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:82fa1e218d63365e74ea85692c0933116fe8b330578aaf3df44a0cbe4fbf26fe", size = 86257163, upload-time = "2026-11-17T11:34:32.366Z" },
 ]
 
 [[package]]
@@ -4550,8 +4550,8 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=0.26" },
-    { name = "ai-dynamo", marker = "extra == 'vllm'", specifier = "==1.7.0.dev20261116" },
-    { name = "ai-dynamo-runtime", marker = "extra == 'vllm'", specifier = "==1.7.0.dev20261116" },
+    { name = "ai-dynamo", marker = "extra == 'vllm'", specifier = "==1.8.0.dev20261117" },
+    { name = "ai-dynamo-runtime", marker = "extra == 'vllm'", specifier = "==1.8.0.dev20261117" },
     { name = "awscrt", specifier = ">=0.35.0" },
     { name = "blobfile" },
     { name = "causal-conv1d", marker = "extra == 'automodel'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" },
