@@ -4513,6 +4513,8 @@ class _BatchPrefixSink(_MemorySink):
         super().__init__()
         self.batches: list[list[int]] = []
         self.fail_after_write = False
+        # Fails every write of more than one row, so rows retry one at a time.
+        self.fail_multi_row = False
         self.before_write = lambda: None
 
     def stage_generation_prefix_batch(
@@ -4526,7 +4528,7 @@ class _BatchPrefixSink(_MemorySink):
             chunk_sequences=chunk_sequences,
             attachments=attachments,
         )
-        if self.fail_after_write:
+        if self.fail_after_write or (self.fail_multi_row and len(records) > 1):
             # Like TQTokenSink after a failed put: discard the batch, then raise.
             self.clear(keys)
             raise RuntimeError("injected batch transport failure after writes")
