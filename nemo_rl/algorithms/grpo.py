@@ -1948,7 +1948,11 @@ def _create_advantage_estimator(master_config: MasterConfig):
         print("  ✓ Using GRPO advantage estimator")
     elif adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
-        adv_estimator = OPDAdvantageEstimator({"name": "opd"}, loss_config)
+        adv_estimator = OPDAdvantageEstimator(
+            {"name": "opd"},
+            loss_config,
+            opd_config=master_config.on_policy_distillation,
+        )
         print("  ✓ Using OPD advantage estimator")
         # Warn if loss_fn is not configured per MOPD paper recommendations.
         if not loss_config.disable_ppo_ratio:
@@ -4171,6 +4175,7 @@ def async_grpo_train(
                         prev_logprobs=train_data["prev_logprobs"],
                         generation_logprobs=train_data["generation_logprobs"],
                         sample_mask=train_data["sample_mask"],
+                        token_mask=token_mask,
                     )
                     if (
                         hasattr(adv_estimator, "last_metrics")
@@ -4289,29 +4294,46 @@ def async_grpo_train(
                         POLICY_GENERATION_STALE = False
                     else:
                         policy_generation.prepare_for_generation()
-                    val_metrics, validation_timings = validate(
-                        policy_generation,
-                        val_dataloader,
-                        tokenizer,
-                        val_task_to_env,
-                        step=step + 1,
-                        master_config=master_config,
-                        logger=logger,
-                    )
-                    policy_generation.finish_generation()
-                    logger.log_metrics(
-                        validation_timings, step + 1, prefix="timing/validation"
-                    )
-                    logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                    # [CUSTOM-PERIODIC-VAL-GUARD 2026-11-09] Same guard as the initial
+                    # validation above: one failing rollout (e.g. an environment /run
+                    # 500 -- job 63909244 died at its step-20 validation on a single
+                    # swe_agents 500) must not kill a multi-day run. Skip this step's
+                    # validation metrics and keep training; always resume collection.
+                    try:
+                        val_metrics, validation_timings = validate(
+                            policy_generation,
+                            val_dataloader,
+                            tokenizer,
+                            val_task_to_env,
+                            step=step + 1,
+                            master_config=master_config,
+                            logger=logger,
+                        )
+                        logger.log_metrics(
+                            validation_timings, step + 1, prefix="timing/validation"
+                        )
+                        logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                    except Exception as e:
+                        val_metrics, validation_timings = None, None
+                        print(
+                            f"❌ Validation at step {step + 1} failed, skipping its "
+                            f"metrics and continuing training: {e}",
+                            flush=True,
+                        )
+                        import traceback
 
-                    # Explicit GPU memory cleanup after validation in async mode
-                    import gc
+                        traceback.print_exc()
+                    finally:
+                        policy_generation.finish_generation()
 
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                        # Explicit GPU memory cleanup after validation in async mode
+                        import gc
 
-                    # Resume trajectory collection after validation
-                    trajectory_collector.resume.remote()
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
+                        # Resume trajectory collection after validation
+                        trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
@@ -4514,6 +4536,8 @@ def async_grpo_train(
             log_data = {}
             if "agent_ref" in repeated_batch:
                 log_data["agent_ref"] = repeated_batch["agent_ref"]
+            if "truncated" in repeated_batch:  # [CUSTOM] for scripts/mopd_metrics.py
+                log_data["truncated"] = repeated_batch["truncated"].tolist()
             log_data["content"] = flat_messages_content
             log_data["rewards"] = rewards.tolist()
             if master_config.grpo["use_dynamic_sampling"]:

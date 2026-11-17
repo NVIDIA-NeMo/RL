@@ -1288,6 +1288,141 @@ class TestAsyncTrajectoryCollector:
         assert target_weight not in collector._completed_per_target
         assert target_weight not in collector._buffered_per_target
 
+    # --- [CUSTOM-GAPFILL-CURRENT] gap-filling a short current target (jobs 63795158, 63861875) ---
+
+    def _gap_fill_collector(self, monkeypatch, needs, last_consumed, current_version):
+        """Collector over a fake replay buffer: needs = {target: trajectories still needed}."""
+
+        class FakeReplayBuffer:
+            class get_trajectories_needed:  # noqa: N801 - mimics a Ray actor method
+                @staticmethod
+                def remote(target, num_prompts, max_age_steps):
+                    return needs.get(target, 0)
+
+            class get_last_target_weight_already_generated:  # noqa: N801
+                @staticmethod
+                def remote():
+                    return last_consumed
+
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.current_weight_version = current_version
+        return collector
+
+    @pytest.mark.parametrize(
+        "needs,last_consumed,reserved,expected",
+        [
+            # job 63861875: target 6 one group short after the refit to 6, 7/8 reserved
+            ({6: 1, 7: 2, 8: 2}, 5, {7, 8}, (6, 1)),
+            # a fully missing current target was consumed (race with sample()): never regenerate
+            ({6: 2, 7: 2, 8: 0}, 5, set(), (7, 2)),
+            # current target already consumed / already reserved / complete: skip to the window
+            ({6: 1, 7: 1, 8: 0}, 6, set(), (7, 1)),
+            ({6: 1, 7: 0, 8: 2}, 5, {6}, (8, 2)),
+            ({6: 0, 7: 0, 8: 0}, 5, set(), (None, 0)),
+        ],
+        ids=["short-current", "missing-current", "consumed", "reserved", "nothing"],
+    )
+    def test_find_target_gap_fills_current_target(
+        self, monkeypatch, needs, last_consumed, reserved, expected
+    ):
+        collector = self._gap_fill_collector(monkeypatch, needs, last_consumed, 6)
+        collector._generating_targets.update(reserved)
+        with collector._generation_check_lock:
+            assert collector._find_target_needing_generation(6) == expected
+        # pause decision and generation decision use the same candidates
+        assert collector._should_pause_for_generation_limits() is (expected[0] is None)
+
+    def test_find_target_initial_version_still_generates_fully(self, monkeypatch):
+        """The initial version stays a full-generation target (upstream behaviour)."""
+        collector = self._gap_fill_collector(monkeypatch, {0: 2, 1: 2, 2: 2}, -1, 0)
+        with collector._generation_check_lock:
+            assert collector._find_target_needing_generation(0) == (0, 2)
+
+    def test_get_next_target_reserves_short_current_target(self, monkeypatch):
+        collector = self._gap_fill_collector(monkeypatch, {6: 1, 7: 2, 8: 2}, 5, 6)
+        collector._generating_targets.update({7, 8})
+        assert collector._get_next_target_for_generation(6) == 6
+        assert 6 in collector._generating_targets
+
+    @pytest.mark.parametrize("buffered", [16, 20], ids=["short", "full"])
+    def test_release_wakes_paused_loop(self, buffered):
+        """A released reservation always wakes a paused loop, which re-checks for gap-filling."""
+        collector = self.create_local_collector()
+        target_weight = 5
+        collector._generation_limit_cleared.clear()  # loop paused: every target reserved
+        collector._generating_targets.add(target_weight)
+        collector._spawned_per_target[target_weight] = 20
+        collector._completed_per_target[target_weight] = 20
+        collector._buffered_per_target[target_weight] = buffered
+
+        collector._maybe_release_target(target_weight)
+
+        assert target_weight not in collector._generating_targets
+        assert collector._generation_limit_cleared.is_set()
+
+    def _run_collection_loop(self, monkeypatch, batches, pause_answers, process_answers):
+        """Run _collection_loop synchronously with scripted pause / process answers."""
+        collector = self.create_local_collector()
+        collector.running = True
+        pause_answers = list(pause_answers)
+        process_answers = list(process_answers)
+        processed, waits = [], []
+
+        def should_pause():
+            return pause_answers.pop(0) if pause_answers else False
+
+        def process_batch(batch):
+            processed.append(batch)
+            used = process_answers.pop(0) if process_answers else True
+            return used
+
+        class RecordingEvent:
+            def __init__(self):
+                self.cleared = 0
+
+            def clear(self):
+                self.cleared += 1
+
+            def set(self):
+                pass
+
+            def is_set(self):
+                return False
+
+            def wait(self, timeout=None):
+                waits.append(timeout)
+                return True
+
+        collector._should_pause_for_generation_limits = should_pause
+        collector._process_batch = process_batch
+        collector._generation_limit_cleared = RecordingEvent()
+        monkeypatch.setattr(trajectory_collector_mod.time, "sleep", lambda s: None)
+        collector.dataloader = iter(batches)
+        collector._collection_loop()
+        return processed, waits, collector._generation_limit_cleared.cleared
+
+    def test_collection_loop_keeps_batch_when_no_target(self, monkeypatch):
+        """'No targets need generation' must not drop the batch (job 63861875 dropped 478)."""
+        processed, _, _ = self._run_collection_loop(
+            monkeypatch, ["b1", "b2"], pause_answers=[], process_answers=[False, True, True]
+        )
+        assert processed == ["b1", "b1", "b2"]
+
+    def test_collection_loop_pauses_every_time_and_holds_batch(self, monkeypatch):
+        """Every pause clears the event and waits (with a timeout), even twice in one version."""
+        processed, waits, cleared = self._run_collection_loop(
+            monkeypatch,
+            ["b1", "b2"],
+            # b1: paused (check, re-check), paused again (check, re-check), then free;
+            # b2: free
+            pause_answers=[True, True, True, True, False, False],
+            process_answers=[True, True],
+        )
+        assert processed == ["b1", "b2"]
+        assert cleared == 2
+        assert waits == [trajectory_collector_mod._GENERATION_LIMIT_RECHECK_S] * 2
+
     def test_process_batch_releases_target_when_worker_start_fails(self, monkeypatch):
         """Test start failures do not leave a target reserved forever."""
 

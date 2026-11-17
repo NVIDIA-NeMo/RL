@@ -530,6 +530,12 @@ class DTensorPolicyWorkerV2Impl(
                         loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                        # [CUSTOM] one key per optimizer update: grpo sums each key over microbatches (each already
+                        # normalised by this global batch's tokens), so the plain key would add up all updates
+                        if "stale_kl" in loss_metrics:
+                            loss_metrics[f"stale_kl/update_{gb_idx}"] = (
+                                loss_metrics.pop("stale_kl")
+                            )
 
                         if num_valid_samples > 0:
                             mb_losses.append(loss.item())

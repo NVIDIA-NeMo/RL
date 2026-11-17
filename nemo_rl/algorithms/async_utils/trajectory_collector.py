@@ -42,6 +42,10 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 
+# [CUSTOM-GAPFILL-CURRENT] Backstop re-check period of a paused collection loop; wakes normally
+# come from set_weight_version (refit) and _maybe_release_target (a reservation released).
+_GENERATION_LIMIT_RECHECK_S = 60.0
+
 TokenizerType = PreTrainedTokenizerBase
 
 
@@ -98,6 +102,7 @@ class AsyncTrajectoryCollector:
 
         # Track when generation limits cause collection to pause
         self._last_limit_warning_version = None
+        self._last_pause_log_version = None
 
         # Event to signal when generation limits are cleared (more efficient than polling)
         self._generation_limit_cleared = _threading.Event()
@@ -179,11 +184,26 @@ class AsyncTrajectoryCollector:
 
         return [generation_weight_version + i for i in range(1, max_trajectory_age + 1)]
 
-    def _get_next_target_for_generation(
+    def _find_target_needing_generation(
         self, generation_weight_version: int
-    ) -> Optional[int]:
-        """Get the next target weight that needs generation (if any)."""
+    ) -> tuple[Optional[int], int]:
+        """Return (target, trajectories_needed) for the first target that needs generation.
+
+        Must be called with ``self._generation_check_lock`` held. Does not reserve.
+
+        [CUSTOM-GAPFILL-CURRENT 2026-11-08] Besides the future targets of
+        _calculate_target_weights, the CURRENT version is a gap-fill-only candidate: a prompt
+        group for target v whose worker fails after the refit to v (e.g. a NeMo-Gym 500)
+        leaves v short of a full batch, the trainer waits for v, and the upstream window
+        [v+1 .. v+age] never refills it -- job 63861875 hung at step 7 with 511/512 groups.
+        Gap-fill only (needed < num_prompts): a fully missing current target means the
+        trainer already consumed it (sample() removes the groups and advances the watermark
+        atomically), so it must never trigger a fresh full generation.
+        """
         target_weights = self._calculate_target_weights(generation_weight_version)
+        candidates = [(target, False) for target in target_weights]
+        if generation_weight_version not in target_weights:
+            candidates.insert(0, (generation_weight_version, True))
         num_prompts = int(self.master_config.grpo["num_prompts_per_step"])
         max_age_steps = int(
             self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
@@ -191,33 +211,43 @@ class AsyncTrajectoryCollector:
         last_consumed_target = ray.get(
             self.replay_buffer.get_last_target_weight_already_generated.remote()
         )
-
-        with self._generation_check_lock:
-            for target_weight in target_weights:
-                if target_weight <= last_consumed_target:
-                    continue
-                if target_weight in self._generating_targets:
-                    continue
-
-                trajectories_needed = ray.get(
-                    self.replay_buffer.get_trajectories_needed.remote(
-                        target_weight, num_prompts, max_age_steps
-                    )
+        for target_weight, gap_fill_only in candidates:
+            if target_weight <= last_consumed_target:
+                continue
+            if target_weight in self._generating_targets:
+                continue
+            trajectories_needed = ray.get(
+                self.replay_buffer.get_trajectories_needed.remote(
+                    target_weight, num_prompts, max_age_steps
                 )
-                if trajectories_needed <= 0:
-                    continue
+            )
+            if trajectories_needed <= 0:
+                continue
+            if gap_fill_only and trajectories_needed >= num_prompts:
+                continue
+            return target_weight, trajectories_needed
+        return None, 0
 
-                self._generating_targets.add(target_weight)
-                if trajectories_needed < num_prompts:
-                    print(
-                        f"🎯 Reserved target weight {target_weight} for gap-filling "
-                        f"(need {trajectories_needed}/{num_prompts} more trajectories)"
-                    )
-                else:
-                    print(f"🎯 Reserved target weight {target_weight} for generation")
-                return target_weight
-
-        return None
+    def _get_next_target_for_generation(
+        self, generation_weight_version: int
+    ) -> Optional[int]:
+        """Get the next target weight that needs generation (if any)."""
+        num_prompts = int(self.master_config.grpo["num_prompts_per_step"])
+        with self._generation_check_lock:
+            target_weight, trajectories_needed = self._find_target_needing_generation(
+                generation_weight_version
+            )
+            if target_weight is None:
+                return None
+            self._generating_targets.add(target_weight)
+            if trajectories_needed < num_prompts:
+                print(
+                    f"🎯 Reserved target weight {target_weight} for gap-filling "
+                    f"(need {trajectories_needed}/{num_prompts} more trajectories)"
+                )
+            else:
+                print(f"🎯 Reserved target weight {target_weight} for generation")
+            return target_weight
 
     def set_weight_version(self, version: int) -> None:
         self.current_weight_version = version
@@ -272,33 +302,25 @@ class AsyncTrajectoryCollector:
     def _should_pause_for_generation_limits(self) -> bool:
         """Check if collection should be paused due to generation limits."""
         try:
-            target_weights = self._calculate_target_weights(self.current_weight_version)
-            num_prompts = int(self.master_config.grpo["num_prompts_per_step"])
-            max_age_steps = int(
-                self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
-            )
-            last_consumed_target = ray.get(
-                self.replay_buffer.get_last_target_weight_already_generated.remote()
-            )
-
-            # Check if any target weight in our range needs generation
+            # Same candidates as _get_next_target_for_generation (incl. gap-filling the
+            # current target, [CUSTOM-GAPFILL-CURRENT]) so "pause" and "nothing to
+            # generate" can never disagree.
             with self._generation_check_lock:
-                for target_weight in target_weights:
-                    if target_weight <= last_consumed_target:
-                        continue
-                    if target_weight in self._generating_targets:
-                        continue
-                    trajectories_needed = ray.get(
-                        self.replay_buffer.get_trajectories_needed.remote(
-                            target_weight, num_prompts, max_age_steps
-                        )
-                    )
-                    if trajectories_needed > 0:
-                        return False  # Found a target that needs generation
+                target_weight, _ = self._find_target_needing_generation(
+                    self.current_weight_version
+                )
+            if target_weight is not None:
+                return False  # Found a target that needs generation
 
-            print(
-                f"⏸️ All target weights {target_weights} already generated or in progress, pausing"
-            )
+            # Called on every re-check of a paused loop: log once per weight version.
+            if self._last_pause_log_version != self.current_weight_version:
+                target_weights = self._calculate_target_weights(
+                    self.current_weight_version
+                )
+                print(
+                    f"⏸️ All target weights {target_weights} already generated or in progress, pausing"
+                )
+                self._last_pause_log_version = self.current_weight_version
             return True
         except Exception:
             return False
@@ -323,46 +345,59 @@ class AsyncTrajectoryCollector:
                 if not self.running:
                     break
 
-                # Check if manually paused and wait
-                if not self._manual_pause_cleared.is_set() and self.running:
-                    self._manual_pause_cleared.wait()
+                # [CUSTOM-GAPFILL-CURRENT 2026-11-08] Hold this batch until a target actually
+                # uses it. Upstream paused at most once per weight version (the event was only
+                # cleared together with the once-per-version warning), so any later wake made
+                # the loop pull batch after batch that _process_batch dropped with "No targets
+                # need generation": job 63861875 burned 478 batches, exhausted the dataloader
+                # and stopped collecting. Now every pause clears the event and re-checks, and a
+                # batch is only released once _process_batch has used it.
+                while self.running:
+                    # Check if manually paused and wait
+                    if not self._manual_pause_cleared.is_set():
+                        self._manual_pause_cleared.wait()
 
-                # Check if refit is in progress and wait
-                if not self._refit_pause_cleared.is_set() and self.running:
-                    print("⏸️ Pausing collection for refit...")
-                    self._refit_pause_cleared.wait()
-                    print("▶️ Refit completed, resuming collection")
+                    # Check if refit is in progress and wait
+                    if not self._refit_pause_cleared.is_set() and self.running:
+                        print("⏸️ Pausing collection for refit...")
+                        self._refit_pause_cleared.wait()
+                        print("▶️ Refit completed, resuming collection")
 
-                # Check if generation limits require pausing collection
-                if self._should_pause_for_generation_limits() and self.running:
-                    # Only log warning once per weight version
-                    if self._last_limit_warning_version != self.current_weight_version:
-                        async_cfg = self.master_config.grpo.get("async_grpo", {})
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
-
-                        print(
-                            f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                            f"already exist in buffer. Waiting for weight update..."
-                        )
-                        self._last_limit_warning_version = self.current_weight_version
-
-                        self._generation_limit_cleared.clear()  # Clear the event to pause
-
-                    # Efficiently wait for generation limits to be cleared (no polling!)
-                    self._generation_limit_cleared.wait()
-
-                    # Double-check we're still running after being woken up
                     if not self.running:
                         break
 
+                    # Check if generation limits require pausing collection
+                    if self._should_pause_for_generation_limits():
+                        # Only log warning once per weight version
+                        if (
+                            self._last_limit_warning_version
+                            != self.current_weight_version
+                        ):
+                            print(
+                                "⏸️ Pausing collection: every target for weight version "
+                                f"{self.current_weight_version} is generated or in progress. "
+                                "Waiting for a weight update or a short target to gap-fill..."
+                            )
+                            self._last_limit_warning_version = (
+                                self.current_weight_version
+                            )
+                        self._generation_limit_cleared.clear()  # Clear the event to pause
+                        # Re-check after clearing, so a wake landing between the check and
+                        # the clear is not lost; the timeout is only a backstop.
+                        if self._should_pause_for_generation_limits():
+                            self._generation_limit_cleared.wait(
+                                timeout=_GENERATION_LIMIT_RECHECK_S
+                            )
+                        continue
+
+                    if self._process_batch(batch):
+                        break
+                    # Nothing to generate after all (lost a race for the reservation):
+                    # keep this batch and re-check.
+                    time.sleep(1.0)
+
                 if not self.running:
                     break
-
-                self._process_batch(batch)
 
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
@@ -373,8 +408,12 @@ class AsyncTrajectoryCollector:
             self.running = False
             print("🛑 Trajectory collection stopped")
 
-    def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
-        """Process a single batch and generate for one target weight."""
+    def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> bool:
+        """Process a single batch and generate for one target weight.
+
+        Returns False when no target needed it (the caller keeps the batch), True when the
+        batch was used -- or failed while being used, as upstream (then it is dropped).
+        """
         target_weight: Optional[int] = None
         try:
             generation_weight_version = self.current_weight_version
@@ -394,7 +433,7 @@ class AsyncTrajectoryCollector:
                 print(
                     f"🔄 No targets need generation for weight {generation_weight_version}"
                 )
-                return
+                return False
 
             print(
                 f"🎯 Generating for target weight {target_weight} from generation_weight_version {generation_weight_version}"
@@ -412,7 +451,7 @@ class AsyncTrajectoryCollector:
                 )
                 with self._generation_check_lock:
                     self._generating_targets.discard(target_weight)
-                return
+                return False
 
             if num_prompts_to_generate < num_prompts_in_batch:
                 print(
@@ -534,6 +573,7 @@ class AsyncTrajectoryCollector:
                 self._maybe_release_target(target_weight)
 
             self._cleanup_finished_threads()
+            return True
 
         except Exception as e:
             if target_weight is not None:
@@ -544,6 +584,7 @@ class AsyncTrajectoryCollector:
             import traceback
 
             traceback.print_exc()
+            return True
 
     def get_weight_version(self) -> int:
         return self.current_weight_version
@@ -702,6 +743,21 @@ class AsyncTrajectoryCollector:
                     f"{target_weight_version} ({spawned} workers completed, "
                     f"{buffered} buffered)"
                 )
+
+        # [CUSTOM-GAPFILL-WAKE 2026-11-07, reworked 2026-11-08] Wake a paused collection loop on
+        # every release. A reservation can be released short of num_prompts_per_step (failed
+        # prompt-group workers, dynamic-sampling discards) while the loop is paused with every
+        # target reserved; only set_weight_version (a refit) used to wake it, and the trainer
+        # waits for that very target, so nothing would start the gap-filling round (job
+        # 63795158). The woken loop re-checks with the same candidates as the generation path
+        # (_find_target_needing_generation) and pauses again if there is nothing to do,
+        # holding its batch, so a wake without work costs nothing.
+        if buffered < spawned:
+            print(
+                f"⚠️ Target weight {target_weight_version} released short "
+                f"({buffered}/{spawned} buffered): waking collection to gap-fill"
+            )
+        self._generation_limit_cleared.set()
 
     def _compute_teacher_logprobs(
         self,

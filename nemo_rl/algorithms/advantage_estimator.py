@@ -28,9 +28,13 @@ Reference papers:
 - MOPD: https://arxiv.org/abs/2601.02780
 """
 
+import time
+from typing import TYPE_CHECKING, Optional
+
 import torch
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.opd_metrics import compute_opd_metrics, teacher_labels
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_kl,
@@ -38,6 +42,9 @@ from nemo_rl.algorithms.utils import (
     masked_mean,
     masked_var,
 )
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 
 
 class GRPOAdvantageEstimator:
@@ -533,8 +540,28 @@ class OPDAdvantageEstimator:
         prev_logprobs: [B, S] student training-engine log probabilities
     """
 
-    def __init__(self, estimator_config: dict, loss_config: dict):
+    def __init__(
+        self,
+        estimator_config: dict,
+        loss_config: dict,
+        opd_config: Optional["OnPolicyDistillationConfig"] = None,
+    ):
         self.last_metrics: dict[str, float] = {}
+        # [CUSTOM] per-teacher diagnostics (opd_metrics.py), off unless on_policy_distillation.detailed_metrics.enabled
+        self.detailed_metrics = (
+            opd_config.detailed_metrics
+            if opd_config is not None and opd_config.detailed_metrics.enabled
+            else None
+        )
+        self.teacher_label_by_agent: dict[str, str] = {}
+        self.default_teacher_label = "unmapped"
+        if self.detailed_metrics is not None:
+            self.teacher_label_by_agent = teacher_labels(
+                opd_config.teacher_model_by_agent_name
+            )
+            self.default_teacher_label = self.teacher_label_by_agent.get(
+                opd_config.default_teacher_alias, "unmapped"
+            )
 
     def compute_advantage(
         self,
@@ -570,8 +597,39 @@ class OPDAdvantageEstimator:
 
         # Metrics
         self._compute_metrics(distill_advantages, advantages, mask)
+        if self.detailed_metrics is not None:
+            self._compute_detailed_metrics(
+                teacher_logprobs, prev_logprobs, rewards, kwargs
+            )
 
         return advantages
+
+    def _compute_detailed_metrics(
+        self, teacher_logprobs, prev_logprobs, rewards, kwargs
+    ):
+        """Per-teacher / per-agent diagnostics; needs repeated_batch, token_mask, sample_mask, generation_logprobs."""
+        start = time.perf_counter()
+        batch = kwargs["repeated_batch"]
+        agents = [ref["name"] for ref in batch["agent_ref"]]
+        self.last_metrics.update(
+            compute_opd_metrics(
+                teacher_lp=teacher_logprobs,
+                student_lp=prev_logprobs,
+                token_mask=kwargs["token_mask"],
+                sample_mask=kwargs["sample_mask"],
+                teachers=[
+                    self.teacher_label_by_agent.get(a, self.default_teacher_label)
+                    for a in agents
+                ],
+                rewards=rewards,
+                truncated=batch["truncated"],
+                gen_lp=kwargs["generation_logprobs"],
+                agents=agents if self.detailed_metrics.per_agent else None,
+            )
+        )
+        self.last_metrics["on_policy_distillation/metrics_time_s"] = (
+            time.perf_counter() - start
+        )
 
     def _compute_metrics(self, distill_advantages, advantages, mask):
         """Compute OPD logging metrics and store in self.last_metrics."""
