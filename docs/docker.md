@@ -87,20 +87,23 @@ The Rust toolchain is only installed when `sglang` is built.
 
 ## Compiling for Fewer GPU Types
 
-Several dependencies compile CUDA code once per GPU architecture, and that is most of a cold build. By default most of them compile for Hopper (`9.0`) and Blackwell (`10.0`); flash-attn compiles for four types (`80;90;100;120`). To compile for one GPU type only, narrow the lists:
+Several dependencies compile CUDA code once per GPU architecture, and that is most of a cold build. By default most of them compile for Hopper (`9.0`), GB200 (`10.0`) and GB300 (`10.3`); flash-attn compiles for four types (`80;90;100;120`). To compile for one GPU type only, narrow the lists. This builds for GB300 only:
 
 ```sh
 docker buildx build -f docker/Dockerfile \
-    --build-arg TORCH_CUDA_ARCH_LIST=10.0 \
+    --build-arg TORCH_CUDA_ARCH_LIST=10.3 \
     --build-arg NVTE_CUDA_ARCHS=100 \
     --build-arg FLASH_ATTN_CUDA_ARCHS=100 \
+    --build-arg FLASH_MLA_DISABLE_SM90=1 \
     --tag <registry>/nemo-rl:latest \
     .
 ```
 
+flash-attn has no separate GB300 target, so it stays at `100`. Transformer Engine's `100` already includes its GB300 (`103a`) kernels.
+
 | Build argument | Default | Read by |
 |---|---|---|
-| `TORCH_CUDA_ARCH_LIST` | `9.0 10.0` | PyTorch C++/CUDA extension builds such as DeepEP. Also kept in the image: the Megatron backend refuses to start without it, and Megatron-Core compiles a small extension at run time. |
+| `TORCH_CUDA_ARCH_LIST` | `9.0 10.0 10.3` | PyTorch C++/CUDA extension builds such as DeepEP. Also kept in the image: the Megatron backend refuses to start without it, and Megatron-Core compiles a small extension at run time. |
 | `NVTE_CUDA_ARCHS` | `90;100` | Transformer Engine. |
 | `FLASH_ATTN_CUDA_ARCHS` | flash-attn's own default | flash-attn. |
 | `FLASH_MLA_DISABLE_SM90` | unset | FlashMLA. Set to `1` to skip its Hopper kernels. |
