@@ -402,6 +402,9 @@ class GRPOConfig(BaseModel, extra="allow"):
     val_start_at: int = -1
     val_batch_size: int | None = 256  # None for NeMo-Gym compatibility
     val_at_start: bool = False
+    # By default, val_at_start retains its historical fresh-run-only behavior.
+    # Enable this for evaluation-only jobs that restore a trained checkpoint.
+    val_at_resume: bool = False
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool = False
@@ -1468,6 +1471,10 @@ def setup(
         setup_timing_metrics.teacher_reservation_time_s = teacher_reservation_time
 
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    if not checkpointing_config.load_optimizer:
+        optimizer_path = None
+        if weights_path is not None:
+            print("  ✓ Restoring policy weights without optimizer state", flush=True)
 
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
@@ -3607,6 +3614,7 @@ def _grpo_train_impl(
         grpo_save_state.total_valid_tokens
     )  # total valid tokens processed across all epochs
     val_at_start = master_config.grpo.val_at_start
+    val_at_resume = master_config.grpo.val_at_resume
     val_at_end = master_config.grpo.val_at_end
     val_period = master_config.grpo.val_period
     val_start_at = master_config.grpo.val_start_at
@@ -3620,7 +3628,7 @@ def _grpo_train_impl(
 
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
-    if val_at_start and current_step == 0:
+    if val_at_start and (current_step == 0 or val_at_resume):
         print("\n🔍 Running initial validation...", flush=True)
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
@@ -3639,7 +3647,7 @@ def _grpo_train_impl(
             val_dataloader,
             tokenizer,
             val_task_to_env,
-            step=0,
+            step=current_step,
             master_config=master_config,
             logger=logger,
             processor=processor,
@@ -5354,6 +5362,7 @@ def async_grpo_train(
     val_period = master_config.grpo.val_period
     val_start_at = master_config.grpo.val_start_at
     val_at_start = master_config.grpo.val_at_start
+    val_at_resume = master_config.grpo.val_at_resume
     val_at_end = master_config.grpo.val_at_end
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
@@ -5591,7 +5600,7 @@ def async_grpo_train(
     print("✅ Policy generation setup complete, proceeding to validation...")
 
     # Run validation at start if configured
-    if val_at_start and step == 0:
+    if val_at_start and (step == 0 or val_at_resume):
         print("\n🔍 Running initial validation...")
         # Pause trajectory collection during initial validation
         ray.get(trajectory_collector.pause.remote())
@@ -5603,7 +5612,7 @@ def async_grpo_train(
                 val_dataloader,
                 tokenizer,
                 val_task_to_env,
-                step=0,
+                step=step,
                 master_config=master_config,
                 logger=logger,
                 processor=processor,

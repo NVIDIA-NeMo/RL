@@ -14,6 +14,7 @@ grpo:
   val_period: 10
   val_start_at: -1
   val_at_start: false
+  val_at_resume: false
   val_at_end: false
   overlong_filtering: false
   advantage_clip_low: null
@@ -155,6 +156,7 @@ checkpointing:
   load_replay_buffer: true
   save_data_plane: false
   save_optimizer: true
+  load_optimizer: true
   ft_keep_latest_k: null
   ft_save_period: null
   pretrained_checkpoint: null

@@ -222,6 +222,8 @@ class CheckpointingConfig(BaseModel, extra="allow"):
             policy.pretrained_checkpoint for the initial weights. None leaves the policy setting
             unchanged; model_name supplies the weights when neither setting specifies a checkpoint.
         save_optimizer (bool): Whether to save optimizer state with checkpoints.
+        load_optimizer (bool): Whether a resumed GRPO run restores optimizer state.
+            Disable it for evaluation-only jobs that only need policy weights.
         save_data_plane (bool): Whether SingleController checkpoints include the
             native TQ snapshot and replay-buffer metadata. Supported by the simple
             and mooncake_cpu backends; no backend-specific checkpoint switch is needed.
@@ -244,6 +246,7 @@ class CheckpointingConfig(BaseModel, extra="allow"):
     checkpoint_must_save_by: Optional[str] = None
     pretrained_checkpoint: Optional[PretrainedCheckpointConfig] = None
     save_optimizer: bool = True
+    load_optimizer: bool = True
     save_data_plane: bool = False
     load_replay_buffer: bool = True
 
