@@ -1,7 +1,4 @@
 # Tests that are temporarily disabled
-# Dedicated value 3n8g smoke remains manual until the nightly GPU-hour budget has room.
-tests/test_suites/llm/ppo-qwen2.5-1.5b-math-3n8g-megatron-dedicated-value.sh
-
 # The full 8-node per-token NVFP4 recipe is too expensive for nightly. Its
 # 4-node quick variant provides nightly coverage; run this driver manually when
 # validating the production topology.
