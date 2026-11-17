@@ -312,7 +312,7 @@ Some PRs can only be understood as a change to an equation. For those, put a sho
 **Add one when the page's argument is a claim about an equation** — a reader has to see a term go to 1, cancel, be swapped, or change between modes before they believe it:
 
 - The PR touches training math: a loss or objective, advantage estimation, KL, importance or ratio terms, clipping, normalization, or reward shaping.
-- A config flag fixes, drops, or replaces a term (`force_on_policy_ratio`, `use_kl_in_reward`, `token_level_loss`, the TIS type).
+- A config flag fixes, drops, or replaces a term (`force_on_policy_ratio`, `use_kl_in_reward`, `normalization`, the TIS type).
 - The page needs to say "X = 1 here", "this equals Y", or "only the logged value differs".
 - Several quantities have look-alike names (`prev` / `curr` / `gen` logprobs, the reference policy) and the reader must keep them apart.
 

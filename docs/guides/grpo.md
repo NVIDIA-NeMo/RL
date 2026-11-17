@@ -462,25 +462,16 @@ There are three choices:
 - **`normalization: sequence_mean`** — average within each response first, then average those per-response values. Every *response* counts the same regardless of length.
 - **`normalization: group_token_mean`** — average all valid response tokens within each prompt group, then average groups equally. See [Equal prompt-group token means](#equal-prompt-group-token-means) for supported training paths.
 
-The deprecated `token_level_loss` flag remains compatible: `true` selects
-`global_token_mean`, and `false` selects `sequence_mean`. Leave both selectors
-unset or `null` to preserve the default global token mean. Supplying a non-null
-`normalization` together with either legacy boolean is an error, even when they
-agree. Shared exemplars leave both unset so old child recipes still work. To
-change a custom parent that sets the old flag, clear it explicitly:
+Leave `normalization` unset or set it to `null` to use global token averaging.
+Set an explicit value to override the parent recipe's reduction.
 
 ```yaml
 loss_fn:
-  token_level_loss: null
   normalization: sequence_mean
 ```
 
-The resolved mode is internal: saving and reloading a config preserves the
-original selector, rather than adding a second conflicting one. Unchanged legacy
-recipes retain their reduction. This does not migrate existing bootstrap
-snapshot identities: those fingerprints include the serialized configuration
-and can reject changes in selector syntax or schema across code versions, even
-when the resolved averaging is equivalent.
+Bootstrap snapshot fingerprints include the serialized configuration.
+Changes to the selector syntax or schema across code versions can invalidate a snapshot even when the resolved averaging is equivalent.
 
 Writing $\ell_{i,t}$ for the per-token objective of token $t$ in response $o_i$ — the quantity inside the expectation in the formula above — $|o_i|$ for the number of unmasked tokens in that response, and $N$ for the number of valid responses:
 
@@ -562,7 +553,7 @@ Two notes on the table:
 
 #### Losses that do not expose this parameter
 
-`normalization` and its legacy alias `token_level_loss` are fields of `ClippedPGLossConfig` only. Every other loss fixes its normalization as a class attribute, so setting either selector in, say, an SFT config has no effect:
+`normalization` configures `ClippedPGLossConfig`. Other losses define their normalization as a class attribute.
 
 | Loss function | Used by | Normalization |
 | --- | --- | --- |
