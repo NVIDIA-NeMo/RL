@@ -852,7 +852,7 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
         ({"calculate_advantages_on_gpu": True}, {}),
         ({"invalid_tool_call_advantage": -5.0}, {}),
         ({"malformed_thinking_advantage": 0.0}, {}),
-        ({}, {"token_level_loss": False}),
+        ({}, {"normalization": "sequence_mean"}),
         ({}, {"normalization": "sequence_mean"}),
         ({}, {"sequence_level_importance_ratios": True}),
         ({}, {"truncated_importance_sampling_type": "seq-mask-tis"}),

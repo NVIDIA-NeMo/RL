@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
 from pathlib import Path
 
 import pytest
@@ -23,69 +22,48 @@ from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.utils.config import load_config
 
 
-def test_normalization_selectors_and_roundtrip() -> None:
-    cases = [
+@pytest.mark.parametrize(
+    "fields, expected",
+    [
         ({}, "global_token_mean"),
-        ({"token_level_loss": True}, "global_token_mean"),
-        ({"token_level_loss": False}, "sequence_mean"),
+        ({"normalization": None}, "global_token_mean"),
         ({"normalization": "global_token_mean"}, "global_token_mean"),
         ({"normalization": "sequence_mean"}, "sequence_mean"),
-    ]
-    for fields, expected in cases:
-        config = ClippedPGLossConfig(**fields)
-        assert config.resolved_normalization == expected
-        saved = config.model_dump()
-        assert "resolved_normalization" not in saved
-        reloaded = ClippedPGLossConfig.model_validate_json(config.model_dump_json())
-        assert reloaded.resolved_normalization == expected
-        assert reloaded.model_dump() == saved
-        if config.token_level_loss is None:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error")
-                loss = ClippedPGLossFn(config)
-        else:
-            with pytest.warns(FutureWarning, match="normalization"):
-                loss = ClippedPGLossFn(config)
-        assert loss.normalization == expected
+        ({"normalization": "group_token_mean"}, "group_token_mean"),
+    ],
+)
+def test_normalization_roundtrip(fields: dict, expected: str) -> None:
+    config = ClippedPGLossConfig(**fields)
+    saved = config.model_dump()
+    assert "resolved_normalization" not in saved
+    reloaded = ClippedPGLossConfig.model_validate_json(config.model_dump_json())
+    assert reloaded.model_dump() == saved
+    assert ClippedPGLossFn(reloaded).normalization == expected
 
-    # Strict during the deprecation window: one selector, even when they agree.
-    # The error must name the fix for an inherited legacy value.
-    for normalization in ("global_token_mean", "sequence_mean"):
-        for legacy in (True, False):
-            with pytest.raises(ValidationError, match="Set only one") as error:
-                ClippedPGLossConfig(
-                    normalization=normalization, token_level_loss=legacy
-                )
-            assert "token_level_loss=null" in str(error.value)
+
+def test_unknown_normalization_is_rejected() -> None:
     with pytest.raises(ValidationError):
         ClippedPGLossConfig(normalization="typo")
+
+
+@pytest.mark.parametrize("legacy", [True, False, None])
+def test_removed_normalization_selector_is_rejected(legacy: bool | None) -> None:
+    with pytest.raises(ValidationError, match=r"loss_fn\.token_level_loss was removed"):
+        ClippedPGLossConfig(token_level_loss=legacy)
 
 
 def test_normalization_yaml_inheritance(tmp_path: Path) -> None:
     config_dir = Path(__file__).resolve().parents[3] / "examples" / "configs"
     parent = config_dir / "grpo_math_1B_megatron.yaml"
-    old_child = tmp_path / "old.yaml"
-    old_child.write_text(f"defaults: {parent}\nloss_fn:\n  token_level_loss: false\n")
-    new_child = tmp_path / "new.yaml"
-    new_child.write_text(
-        f"defaults: {parent}\nloss_fn:\n  normalization: global_token_mean\n"
+    sequence_mean = tmp_path / "sequence.yaml"
+    sequence_mean.write_text(
+        f"defaults: {parent}\nloss_fn:\n  normalization: sequence_mean\n"
     )
-    for child, expected in (
-        (old_child, "sequence_mean"),
-        (new_child, "global_token_mean"),
+    override = tmp_path / "override.yaml"
+    override.write_text(f"defaults: {sequence_mean}\nloss_fn:\n  normalization: null\n")
+    for config_file, expected in (
+        (sequence_mean, "sequence_mean"),
+        (override, "global_token_mean"),
     ):
-        loss_config = OmegaConf.to_container(load_config(child).loss_fn, resolve=True)
-        assert ClippedPGLossConfig(**loss_config).resolved_normalization == expected
-
-    # An explicitly configured legacy parent must be cleared, not silently overridden.
-    new_child.write_text(
-        f"defaults: {old_child}\nloss_fn:\n  normalization: global_token_mean\n"
-    )
-    fields = OmegaConf.to_container(load_config(new_child).loss_fn, resolve=True)
-    with pytest.raises(ValidationError, match="token_level_loss=null"):
-        ClippedPGLossConfig(**fields)
-    new_child.write_text(
-        f"defaults: {old_child}\nloss_fn:\n  token_level_loss: null\n  normalization: global_token_mean\n"
-    )
-    fields = OmegaConf.to_container(load_config(new_child).loss_fn, resolve=True)
-    assert ClippedPGLossConfig(**fields).resolved_normalization == "global_token_mean"
+        fields = OmegaConf.to_container(load_config(config_file).loss_fn, resolve=True)
+        assert ClippedPGLossConfig(**fields).resolved_normalization == expected
