@@ -25,7 +25,10 @@ from nemo_gym.token_id_capture.staging.records import (
     RolloutManifest,
 )
 
-from nemo_rl.environments.call_selection import select_captured_calls
+from nemo_rl.environments.call_selection import (
+    NoAcceptedCapturedGenerationsError,
+    select_captured_calls,
+)
 from nemo_rl.environments.nemo_gym import _normalize_gym_validity
 from tests.unit.experience.test_agent_output_compatibility import captured  # noqa: F401
 from tests.unit.experience.test_common_output_comparison import message, record
@@ -328,6 +331,14 @@ def test_empty_synthetic_envelopes_do_not_erase_native_identity(
         assert [r.response_id for r in select_captured_calls(records, result)[0]] == [
             "response-1"
         ]
+
+
+def test_output_without_captured_generations_is_a_typed_failure() -> None:
+    with pytest.raises(NoAcceptedCapturedGenerationsError):
+        select_captured_calls(
+            [call(1, [message("first")])],
+            {"response": {"id": "harness-local", "output": []}},
+        )
 
 
 def test_empty_native_envelope_cannot_claim_a_captured_generation() -> None:

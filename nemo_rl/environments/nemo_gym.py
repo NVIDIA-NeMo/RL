@@ -2156,7 +2156,10 @@ Depending on your data shape, you may want to change these values."""
         from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
         from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
-        from nemo_rl.environments.call_selection import resolve_selection_policy
+        from nemo_rl.environments.call_selection import (
+            NoAcceptedCapturedGenerationsError,
+            resolve_selection_policy,
+        )
         from nemo_rl.experience.rollout_reassembler import (
             ActionOutputFlags,
             RolloutSelection,
@@ -2187,6 +2190,7 @@ Depending on your data shape, you may want to change these values."""
                 for f in parsed.failures
             )
         )
+        capture_failure_reason = "capture_incomplete"
         selected = []
         terminal_response_id = None
         if not capture_failed:
@@ -2208,6 +2212,14 @@ Depending on your data shape, you may want to change these values."""
                 if any(f.model_call_id in selected_call_ids for f in parsed.failures):
                     capture_failed = True
                     selected = []
+            except NoAcceptedCapturedGenerationsError as error:
+                # The agent ended before accepting any model call, e.g. every
+                # attempt of its first turn failed. Nothing here is trainable.
+                capture_failed = True
+                capture_failure_reason = "capture_no_accepted_generations"
+                selected = []
+                terminal_response_id = None
+                print(f"Rollout {owner!r} masked: {error}", flush=True)
             except ValueError as error:
                 raise ValueError(f"Rollout {owner!r}: {error}") from error
         if any(r.response_status is None for r in selected):
@@ -2240,7 +2252,7 @@ Depending on your data shape, you may want to change these values."""
         )
         selected_call_ids = {r.model_call_id for r in selected}
         if capture_failed:
-            receipt.update(capture_poisoned=True, failure_reason="capture_incomplete")
+            receipt.update(capture_poisoned=True, failure_reason=capture_failure_reason)
         elif any(
             r.response_status in ("failed", "unknown")
             or (
