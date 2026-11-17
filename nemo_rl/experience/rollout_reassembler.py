@@ -201,9 +201,10 @@ class FinalizedGroup:
     metrics: dict[str, float] = field(default_factory=dict)
     reward_observations: list[FinalizedReward] = field(default_factory=list)
     # Parallel to ``reward_observations``: each row's environment ``mask_sample``
-    # flag, truncation and original reward (before effort shaping and penalties), plus
-    # the group's dataset loss weight. Which rewards vote in the group baseline
-    # depends on controller-side policy, so the raw flags travel instead of a verdict.
+    # flag, truncation and original reward (before effort shaping, penalties and
+    # ``grpo.length_penalty``), plus the group's dataset loss weight. Which rewards
+    # vote in the group baseline depends on controller-side policy, so the raw flags
+    # and both rewards travel instead of a verdict.
     reward_mask_sample: list[bool] = field(default_factory=list)
     reward_truncated: list[bool] = field(default_factory=list)
     reward_original: list[float] = field(default_factory=list)

@@ -29,7 +29,9 @@ from nemo_rl.experience.rollout_manager import RolloutManager
 
 
 def _manager(
-    masked_reward_policy: str | None = None, overlong_filtering: bool = False
+    masked_reward_policy: str | None = None,
+    overlong_filtering: bool = False,
+    reward_source: str = "processed",
 ) -> RolloutManager:
     # The tally methods touch one dict and nothing else, so a full manager (tokenizer,
     # policy, Ray) is not needed to exercise them.
@@ -37,6 +39,7 @@ def _manager(
     manager._step_rewards = {}
     manager._masked_reward_policy = masked_reward_policy
     manager._overlong_filtering = overlong_filtering
+    manager._dynamic_sampling_reward_source = reward_source
     return manager
 
 
@@ -141,10 +144,12 @@ def test_the_record_and_finalized_adapters_pick_the_same_voters(
     assert from_flags == expected
     assert from_flags == voting_rewards_from_record(
         _record(completions),
+        reward_source="processed",
         masked_reward_policy=policy,
         overlong_filtering=overlong_filtering,
     )
     finalized = SimpleNamespace(
+        reward_observations=[SimpleNamespace(reward=c.reward) for c in completions],
         reward_original=[c.reward for c in completions],
         reward_mask_sample=[c.env_extras is not None for c in completions],
         reward_truncated=[c.truncated for c in completions],
@@ -152,24 +157,68 @@ def test_the_record_and_finalized_adapters_pick_the_same_voters(
     )
     assert from_flags == voting_rewards_from_finalized(
         finalized,
+        reward_source="processed",
         masked_reward_policy=policy,
         overlong_filtering=overlong_filtering,
     )
 
 
-def test_voting_rewards_read_the_original_reward_when_a_completion_has_one():
-    """Effort shaping and penalties rewrite ``reward``; voting reads the Gym value."""
+@pytest.mark.parametrize(
+    ("reward_source", "expected"),
+    [
+        # The rewards the group trains on.
+        ("processed", [1.9, 0.0, 0.5]),
+        # The Gym values; the third row was never rewritten, so it has only one.
+        ("raw", [1.0, 1.0, 0.5]),
+    ],
+)
+def test_voting_rewards_read_the_reward_the_source_names(reward_source, expected):
+    """Effort shaping and penalties rewrite ``reward`` and keep the Gym value beside it."""
     completions = [
         _completion(1.9, reward_original=1.0),
         _completion(0.0, reward_original=1.0),
         _completion(0.5),
     ]
 
-    assert voting_rewards_from_record(
-        _record(completions),
-        masked_reward_policy="include",
-        overlong_filtering=False,
-    ) == [1.0, 1.0, 0.5]
+    assert (
+        voting_rewards_from_record(
+            _record(completions),
+            reward_source=reward_source,
+            masked_reward_policy="include",
+            overlong_filtering=False,
+        )
+        == expected
+    )
+    assert (
+        _manager(reward_source=reward_source)._voting_rewards(_record(completions))
+        == expected
+    )
+    finalized = SimpleNamespace(
+        reward_observations=[SimpleNamespace(reward=c.reward) for c in completions],
+        reward_original=[1.0, 1.0, 0.5],
+        reward_mask_sample=[False] * 3,
+        reward_truncated=[False] * 3,
+        loss_multiplier=1.0,
+    )
+    assert (
+        voting_rewards_from_finalized(
+            finalized,
+            reward_source=reward_source,
+            masked_reward_policy="include",
+            overlong_filtering=False,
+        )
+        == expected
+    )
+
+
+def test_an_unknown_reward_source_is_rejected():
+    with pytest.raises(ValueError, match="dynamic_sampling_reward_source"):
+        voting_rewards_from_record(
+            _record([_completion(1.0), _completion(0.0)]),
+            reward_source="shaped",
+            masked_reward_policy="include",
+            overlong_filtering=False,
+        )
 
 
 def test_unfiltered_reward_counts_kept_and_dropped_groups():

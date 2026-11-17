@@ -68,6 +68,10 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQTokenSource,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
+from nemo_rl.experience.dynamic_sampling import (  # noqa: E402
+    rewards_carry_no_signal,
+    voting_rewards_from_finalized,
+)
 from nemo_rl.experience.reward_penalties import RewardLogContext  # noqa: E402
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler  # noqa: E402
 from nemo_rl.experience.route_assembly import RouteLayout  # noqa: E402
@@ -2138,6 +2142,26 @@ def test_length_penalty_published_rewards_match_shared_hook(
     assert [
         observation.reward for observation in finalized.reward_observations
     ] == pytest.approx(expected)
+    # Dynamic sampling votes on the published rewards under "processed" and on the
+    # Gym rewards, both 1.0 whatever the length adjustment did, under "raw".
+    processed = voting_rewards_from_finalized(
+        finalized,
+        reward_source="processed",
+        masked_reward_policy="include",
+        overlong_filtering=False,
+    )
+    raw = voting_rewards_from_finalized(
+        finalized,
+        reward_source="raw",
+        masked_reward_policy="include",
+        overlong_filtering=False,
+    )
+    assert processed == pytest.approx(expected)
+    assert raw == [1.0, 1.0]
+    # The filter's verdict on this all-correct group: "raw" always drops it, and
+    # "processed" keeps it exactly when the length penalty told the rows apart.
+    assert rewards_carry_no_signal(raw)
+    assert rewards_carry_no_signal(processed) is (expected[0] == expected[1])
     assert {
         key: finalized.metrics[f"finalize/{key}_sum"] / len(results)
         for key in expected_metrics

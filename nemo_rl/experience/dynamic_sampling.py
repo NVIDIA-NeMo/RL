@@ -78,7 +78,8 @@ def voting_rewards(
     the policy even though they carry no loss.
 
     Args:
-        rewards: One Gym reward per row, before effort shaping and reward penalties.
+        rewards: One reward per row, from the stage that
+            ``grpo.dynamic_sampling_reward_source`` names (see ``source_rewards``).
         mask_sample: Per-row environment ``mask_sample`` flag, parallel to ``rewards``.
         truncated: Per-row truncation flag, parallel to ``rewards``.
         loss_multiplier: The group's dataset loss weight.
@@ -99,20 +100,54 @@ def voting_rewards(
     ]
 
 
+def source_rewards(
+    processed: Sequence[float],
+    raw: Sequence[Optional[float]],
+    reward_source: str,
+) -> list[float]:
+    """Each row's reward at the stage ``grpo.dynamic_sampling_reward_source`` names.
+
+    ``processed`` is the reward the group trains on, after effort shaping, reward
+    penalties and ``grpo.length_penalty``, as v1 filters: an all-correct group that a
+    penalty splits is kept, with its penalty signal, and a group the penalties leave
+    uniform is dropped. ``raw`` is the environment's reward from before all three,
+    which filters on the task outcome alone. ``reward_scaling`` and
+    ``reward_shaping`` run in the advantage stage, after the filter, so neither
+    source includes them.
+
+    Args:
+        processed: One trained reward per row.
+        raw: One environment reward per row, parallel to ``processed``; ``None``
+            where nothing rewrote the row's reward.
+        reward_source: ``grpo.dynamic_sampling_reward_source``.
+    """
+    if reward_source == "processed":
+        return list(processed)
+    if reward_source != "raw":
+        raise ValueError(
+            "grpo.dynamic_sampling_reward_source must be 'raw' or 'processed', "
+            f"got {reward_source!r}"
+        )
+    return [
+        trained if original is None else original
+        for trained, original in zip(processed, raw, strict=True)
+    ]
+
+
 def voting_rewards_from_record(
     record: PromptGroupRecord,
     *,
+    reward_source: str,
     masked_reward_policy: Optional[str],
     overlong_filtering: bool,
 ) -> list[float]:
     """The rewards that vote in a group's baseline, read from its ``Completion`` rows."""
     return voting_rewards(
-        [
-            completion.reward
-            if completion.reward_original is None
-            else completion.reward_original
-            for completion in record.completions
-        ],
+        source_rewards(
+            [completion.reward for completion in record.completions],
+            [completion.reward_original for completion in record.completions],
+            reward_source,
+        ),
         mask_sample=[
             mask_sample_flagged(completion.env_extras)
             for completion in record.completions
@@ -127,12 +162,17 @@ def voting_rewards_from_record(
 def voting_rewards_from_finalized(
     finalized: "FinalizedGroup",
     *,
+    reward_source: str,
     masked_reward_policy: Optional[str],
     overlong_filtering: bool,
 ) -> list[float]:
     """The rewards that vote in a group's baseline, read from a finalized capture group."""
     return voting_rewards(
-        finalized.reward_original,
+        source_rewards(
+            [observation.reward for observation in finalized.reward_observations],
+            finalized.reward_original,
+            reward_source,
+        ),
         mask_sample=finalized.reward_mask_sample,
         truncated=finalized.reward_truncated,
         loss_multiplier=finalized.loss_multiplier,

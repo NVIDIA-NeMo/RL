@@ -174,6 +174,7 @@ def _manager(
     manager._filter_zero_variance_groups = False
     manager._masked_reward_policy = None
     manager._overlong_filtering = False
+    manager._dynamic_sampling_reward_source = "processed"
     manager._step_rewards = {}
     manager._canonical_groups_finalized = 0
     manager._canonical_output_tokens = 0

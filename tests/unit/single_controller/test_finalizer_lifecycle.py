@@ -130,6 +130,7 @@ def _controller(actor: object) -> Any:
         lambda finalized: rewards_carry_no_signal(
             voting_rewards_from_finalized(
                 finalized,
+                reward_source=ctrl._algo_cfg.dynamic_sampling_reward_source,
                 masked_reward_policy=(
                     None if ctrl._is_ppo else ctrl._algo_cfg.masked_reward_policy
                 ),
@@ -153,6 +154,7 @@ def _controller(actor: object) -> Any:
             num_prompts_per_step=1,
             masked_reward_policy="include",
             overlong_filtering=False,
+            dynamic_sampling_reward_source="processed",
         ),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
@@ -679,9 +681,11 @@ def _dynamic_sampling(
     exhausted: bool = False,
     policy: str = "include",
     overlong_filtering: bool = False,
+    reward_source: str = "processed",
     lender_step: int | None = None,
 ) -> None:
     ctrl._dynamic_sampling_enabled = True
+    ctrl._algo_cfg.dynamic_sampling_reward_source = reward_source
     ctrl._algo_cfg.masked_reward_policy = policy
     ctrl._algo_cfg.overlong_filtering = overlong_filtering
     ctrl._algo_cfg.dynamic_sampling_max_gen_batches = 10
@@ -811,22 +815,31 @@ def test_only_the_voting_rows_decide_the_filter(policy: str, rejected: bool) -> 
 
 
 @pytest.mark.parametrize(
-    ("trained", "gym", "rejected"),
+    ("trained", "gym", "reward_source", "rejected"),
     [
-        # Effort shaping or a penalty made the trained rewards differ; the Gym
-        # reward did not, so the group carries no task signal.
-        ([1.9, 1.0], [1.0, 1.0], True),
-        ([0.0, 1.0], [1.0, 1.0], True),
+        # Effort shaping, a reward penalty or the length penalty made the trained
+        # rewards differ; the Gym reward did not. "processed" keeps that signal,
+        # "raw" sees no task signal.
+        ([1.9, 1.0], [1.0, 1.0], "processed", False),
+        ([0.0, 1.0], [1.0, 1.0], "processed", False),
+        ([1.1, 0.9], [1.0, 1.0], "processed", False),
+        ([1.9, 1.0], [1.0, 1.0], "raw", True),
+        ([0.0, 1.0], [1.0, 1.0], "raw", True),
+        ([1.1, 0.9], [1.0, 1.0], "raw", True),
+        # Every row is correct and penalized alike: no signal under either source.
+        ([0.9, 0.9], [1.0, 1.0], "processed", True),
+        ([0.9, 0.9], [1.0, 1.0], "raw", True),
         # Only the trained rewards are uniform; the Gym rewards still differ.
-        ([0.0, 0.0], [0.0, 1.0], False),
+        ([0.0, 0.0], [0.0, 1.0], "processed", True),
+        ([0.0, 0.0], [0.0, 1.0], "raw", False),
     ],
 )
-def test_the_filter_reads_the_original_reward_not_the_trained_reward(
-    trained: list[float], gym: list[float], rejected: bool
+def test_the_filter_reads_the_reward_the_source_names(
+    trained: list[float], gym: list[float], reward_source: str, rejected: bool
 ) -> None:
     result = _signal_result(trained, reward_original=gym)
     ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
-    _dynamic_sampling(ctrl, spares=[{"idx": 7}])
+    _dynamic_sampling(ctrl, spares=[{"idx": 7}], reward_source=reward_source)
 
     outcome = _finalize_for_step_3(ctrl)
 

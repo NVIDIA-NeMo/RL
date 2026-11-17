@@ -2278,6 +2278,8 @@ class RolloutManager:
         # own grpo values, so these are not a second home for those defaults.
         masked_reward_policy: Optional[str] = None,
         overlong_filtering: bool = False,
+        # Which reward those rows vote with: grpo.dynamic_sampling_reward_source.
+        dynamic_sampling_reward_source: str = "processed",
         length_penalty_config: LengthPenaltyConfig | None = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
@@ -2287,6 +2289,7 @@ class RolloutManager:
         self._filter_zero_variance_groups = filter_zero_variance_groups
         self._masked_reward_policy = masked_reward_policy
         self._overlong_filtering = overlong_filtering
+        self._dynamic_sampling_reward_source = dynamic_sampling_reward_source
         # Resolved before the impl is built: the NeMo-Gym impl reads its row-retry
         # budget out of it at construction time, and shares the counters so its
         # row-level re-dispatches land in the same place as everything else.
@@ -2573,6 +2576,7 @@ class RolloutManager:
         """This group's voting rewards under the run's masking policy."""
         return voting_rewards_from_record(
             record,
+            reward_source=self._dynamic_sampling_reward_source,
             masked_reward_policy=self._masked_reward_policy,
             overlong_filtering=self._overlong_filtering,
         )
@@ -2582,6 +2586,7 @@ class RolloutManager:
         return rewards_carry_no_signal(
             voting_rewards_from_finalized(
                 finalized,
+                reward_source=self._dynamic_sampling_reward_source,
                 masked_reward_policy=self._masked_reward_policy,
                 overlong_filtering=self._overlong_filtering,
             )
