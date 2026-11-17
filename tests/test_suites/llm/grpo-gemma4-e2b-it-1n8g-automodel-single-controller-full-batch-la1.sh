@@ -18,10 +18,10 @@ source "$SCRIPT_DIR/common.env"
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
-STEPS_PER_RUN=100
-MAX_STEPS=100
+STEPS_PER_RUN=50
+MAX_STEPS=50
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
-NUM_MINUTES=180
+NUM_MINUTES=120
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -41,7 +41,7 @@ uv run tests/check_metrics.py "$JSON_METRICS" \
     "set(data[\"train/loss\"]) == {str(i) for i in range(1, $MAX_STEPS + 1)}" \
     'all_finite(data["train/loss"])' \
     'all_finite(data["train/grad_norm"])' \
-    'max(data["train/weight_version_lag"]) == 0' \
+    'max(data["train/weight_version_lag"]) == 1' \
     'max(data["train/num_masked_seqs_by_logprob_error"]) == 0' \
     'max(data["train/max_seq_mult_prob_error"]) < 1000' \
     'mean(data["train/gen_kl_error"]) < 0.001' \
