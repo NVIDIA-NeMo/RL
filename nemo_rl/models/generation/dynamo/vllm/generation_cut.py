@@ -217,8 +217,6 @@ def routes() -> list[Any]:
         importlib.import_module("nemo_gym._checkpoint.generation_cut")
         if hf_home is None:
             os.environ.pop("HF_HOME", None)
-    # Dynamo passes a route extension no settings, so the path is in the
-    # frontend's environment.
     handler = CutRouteHandler(os.environ[CAPTURE_FILE_ENV])
 
     async def serve_cut(context: Any) -> Any:
@@ -231,7 +229,6 @@ def routes() -> list[Any]:
             GENERATION_CUT_ROUTE,
             serve_cut,
             timeout_s=_ROUTE_TIMEOUT_S,
-            # Gym lists every call it has in flight: as large as any other body.
             max_body_bytes=HTTP_BODY_LIMIT_MB << 20,
         )
     ]

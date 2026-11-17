@@ -50,12 +50,8 @@ async def answer_generation_cut(
     """Answer one generation-cut call with its HTTP status and JSON body.
 
     Shared by every server of the route: the worker's FastAPI app, and the
-    Dynamo frontend's route (``dynamo/vllm/generation_cut.py``).
-
-    Args:
-        backend: What runs the cut.
-        authorization: The call's ``Authorization`` header, None when absent.
-        inventory: The call's JSON body, Gym's ``GenerationCutInventory``.
+    Dynamo frontend's route (``dynamo/vllm/generation_cut.py``). ``inventory`` is
+    the call's JSON body, Gym's ``GenerationCutInventory``.
     """
     # Deferred: nemo_gym is an optional extra.
     from nemo_gym._checkpoint.generation_cut import GenerationCutInventory

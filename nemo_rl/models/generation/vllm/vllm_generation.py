@@ -801,10 +801,7 @@ class VllmGeneration(GenerationInterface):
         return self.dp_openai_server_base_urls
 
     def _start_dynamo_services(self, cluster: RayVirtualCluster) -> None:
-        """Start the etcd, NATS and frontends this fleet's engines register with.
-
-        The frontends run on this fleet's own nodes.
-        """
+        """Start the etcd, NATS and frontends this fleet's engines register with."""
         from nemo_rl.models.generation.dynamo.managed_runtime import (
             ManagedDynamoRuntime,
         )

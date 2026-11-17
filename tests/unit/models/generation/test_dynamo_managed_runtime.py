@@ -48,8 +48,6 @@ def _runtime(serves_chat: bool = False, **frontend_args) -> ManagedDynamoRuntime
 
 
 class _FakeProcess:
-    returncode = None
-
     @staticmethod
     def poll():
         return None
@@ -111,7 +109,6 @@ def _started(
     """``runtime`` as started, with one frontend per host (default: one, alive)."""
     hosts = hosts or (_FakeFrontendHost(),)
     runtime._started = True
-    runtime._host = "10.0.0.1"
     runtime._namespace = "nemo-rl-test"
     runtime._etcd_process = _FakeProcess()
     runtime._nats_process = _FakeProcess()
@@ -168,7 +165,7 @@ def test_managed_service_and_frontend_environments_are_runtime_owned(
     monkeypatch.setenv("NATS_STALE_SETTING", "remove-me")
     monkeypatch.setenv("NCCL_DEBUG", "INFO")
 
-    service_env = runtime._service_env()
+    service_env = managed_runtime._service_env(runtime._manager_env)
     assert service_env["DYN_NAMESPACE"] == "managed"
     assert service_env["ETCD_ENDPOINTS"] == "http://managed-etcd:2379"
     assert service_env["NATS_SERVER"] == "nats://managed-nats:4222"
@@ -286,16 +283,8 @@ def test_shutdown_guards_each_owned_resource_independently(
     runtime = _started(_runtime(), failing, healthy)
     monkeypatch.setattr(runtime, "_log_router_kv_events", lambda: None)
     stopped = []
-
-    class _Service(_FakeProcess):
-        def __init__(self, label):
-            self.label = label
-
-        def stop(self):
-            stopped.append(self.label)
-
-    runtime._nats_process = _Service("NATS")
-    runtime._etcd_process = _Service("etcd")
+    runtime._nats_process = SimpleNamespace(stop=lambda: stopped.append("NATS"))
+    runtime._etcd_process = SimpleNamespace(stop=lambda: stopped.append("etcd"))
     runtime.shutdown()
     runtime.shutdown()
 
@@ -387,9 +376,7 @@ class _FakeFrontendHostActor:
 
     def __init__(self):
         self.node_ids: list[str] = []
-        self.envs: list[dict[str, str]] = []
-        self.ray_addresses: list[str] = []
-        self.serve_chat: list[bool] = []
+        self.started: list[dict] = []
         self.captures: list[dict] = []
         self.chat_settings: list[dict] = []
 
@@ -398,28 +385,15 @@ class _FakeFrontendHostActor:
         return self
 
     def remote(self):
-        actor = self
+        def start(**kwargs):
+            self.started.append(kwargs)
+            return f"http://frontend-{len(self.started)}:3000/v1"
 
-        class _Host:
-            class start:
-                @staticmethod
-                def remote(**kwargs):
-                    actor.envs.append(kwargs["env"])
-                    actor.ray_addresses.append(kwargs["ray_address"])
-                    actor.serve_chat.append(kwargs["serves_chat"])
-                    return f"http://frontend-{len(actor.envs)}:3000/v1"
-
-            class publish_chat_capture:
-                @staticmethod
-                def remote(capture):
-                    actor.captures.append(capture)
-
-            class publish_chat_settings:
-                @staticmethod
-                def remote(settings):
-                    actor.chat_settings.append(settings)
-
-        return _Host()
+        return SimpleNamespace(
+            start=SimpleNamespace(remote=start),
+            publish_chat_capture=SimpleNamespace(remote=self.captures.append),
+            publish_chat_settings=SimpleNamespace(remote=self.chat_settings.append),
+        )
 
 
 def test_frontends_spread_over_the_nodes_with_the_extra_environment(
@@ -430,7 +404,6 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
     runtime = _runtime(
         True,
         num_frontends=3,
-        render_workers=3,
         extra_env={"DYN_TCP_LISTEN_BACKLOG": "8192"},
     )
     runtime._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
@@ -449,12 +422,14 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
 
     assert hosts.node_ids == [node_a, node_b, node_a]
     assert runtime.frontend_urls == [f"http://frontend-{i}:3000/v1" for i in (1, 2, 3)]
-    for env in hosts.envs:
-        assert env["DYN_TCP_LISTEN_BACKLOG"] == "8192"
-        assert env["DYN_NAMESPACE"] == "nemo-rl-test"
-        assert env["VIRTUAL_ENV"] == "/venvs/vllm"
-    # The Ray cluster each frontend's chat engine reads token-capture prefixes through.
-    assert hosts.ray_addresses == 3 * ["10.0.0.1:6379"]
+    for started in hosts.started:
+        assert started["env"]["DYN_TCP_LISTEN_BACKLOG"] == "8192"
+        assert started["env"]["DYN_NAMESPACE"] == "nemo-rl-test"
+        assert started["env"]["VIRTUAL_ENV"] == "/venvs/vllm"
+        # The Ray cluster its chat engine reads token-capture prefixes through.
+        assert started["ray_address"] == "10.0.0.1:6379"
+        # It starts its render workers at launch.
+        assert started["serves_chat"] is True
     # Every frontend's chat engine reads token-capture prefixes, and checks a
     # cut's bearer token, the same way.
     assert hosts.captures == 3 * [
@@ -467,9 +442,8 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
         }
     ]
 
-    # Every frontend starts its render workers at launch, and builds them from
-    # the chat settings an engine sends before it loads.
-    assert hosts.serve_chat == 3 * [True]
+    # Every frontend builds its render workers from the chat settings an engine
+    # sends before it loads.
     assert hosts.chat_settings == 3 * [{"nemo_rl_chat": {"engine_args": {}}}]
 
     clashing = _runtime(extra_env={"DYN_NAMESPACE": "mine"})

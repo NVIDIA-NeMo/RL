@@ -112,7 +112,6 @@ def frontend_argv(
         CUT_ROUTES,
     ]
     if dynamo_cfg.frontend_args.num_frontends > 1:
-        # Each replica's router sees the requests the others have in flight.
         argv.append("--router-replica-sync")
     if dynamo_cfg.frontend_args.session_affinity_ttl_secs is not None:
         argv += [
@@ -296,10 +295,7 @@ class FrontendHost:
         ray_address: str,
         serves_chat: bool,
     ) -> str:
-        """Launch the frontend on a free port of this node; return its base URL.
-
-        With ``serves_chat`` the frontend starts its render workers at launch.
-        """
+        """Launch the frontend on a free port of this node; return its base URL."""
         port = _get_free_port_local(
             DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
             DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
@@ -499,9 +495,6 @@ class ManagedDynamoRuntime:
             self.shutdown()
             raise
 
-    def _service_env(self) -> dict[str, str]:
-        return _service_env(self._manager_env)
-
     def _start_etcd(self) -> None:
         self._etcd_data_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_etcd_")
         peer_url = f"http://{self._host}:{self._etcd_peer_port}"
@@ -521,7 +514,7 @@ class ManagedDynamoRuntime:
             self._etcd_data_dir,
         ]
         self._etcd_process = _ServiceProcess(
-            command, env=self._service_env(), label="etcd"
+            command, env=_service_env(self._manager_env), label="etcd"
         )
         self._wait_for_etcd()
         print(f"  [Dynamo] etcd ready on {self._host}:{self._etcd_port}", flush=True)
@@ -553,7 +546,7 @@ class ManagedDynamoRuntime:
                 "-p",
                 str(self._nats_port),
             ],
-            env=self._service_env(),
+            env=_service_env(self._manager_env),
             label="NATS",
         )
         self._wait_for_port(self._nats_port, "NATS", self._nats_process)

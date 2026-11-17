@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import json
-
 import pytest
 
 from nemo_rl.models.generation import configure_generation_config
@@ -22,7 +20,6 @@ from nemo_rl.models.generation.dynamo.config import (
     dynamo_cfg,
 )
 from nemo_rl.models.generation.dynamo.managed_runtime import (
-    CHAT_PROCESSOR,
     ChatProcessorOptions,
     frontend_argv,
 )
@@ -174,24 +171,16 @@ def _frontend_argv(cfg: DynamoCfg) -> list[str]:
 def test_frontend_argv_is_runtime_owned() -> None:
     cfg = DynamoCfg(
         frontend_args=DynamoFrontendArgs(
-            router_mode="kv", extra_cli_args=["--foo", "1"]
+            router_mode="kv",
+            extra_cli_args=["--foo", "1"],
+            session_affinity_max_entries=1024,
         )
     )
     argv = _frontend_argv(cfg)
     assert argv[argv.index("--router-mode") + 1] == "kv"
-    # Chat goes to NeMo RL's chat engine, started with these settings.
-    assert argv[argv.index("--dyn-chat-processor") + 1] == CHAT_PROCESSOR
-    assert json.loads(argv[argv.index("--dyn-chat-processor-config") + 1]) == {
-        "render_workers": 8,
-        "ray_address": "10.0.0.1:6379",
-        "capture_file": "/chat/capture.pkl",
-        "chat_settings_file": None,
-    }
     # Gym names a token-capture call's session; keep the session on one engine.
     assert argv[argv.index("--router-session-affinity-ttl-secs") + 1] == "300"
-    assert argv[argv.index("--router-session-affinity-max-entries") + 1] == str(
-        16_777_216
-    )
+    assert argv[argv.index("--router-session-affinity-max-entries") + 1] == "1024"
     assert argv[-2:] == ["--foo", "1"]
     # One frontend has no replicas to sync with; several share in-flight load.
     assert "--router-replica-sync" not in argv

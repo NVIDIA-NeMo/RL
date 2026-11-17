@@ -146,7 +146,7 @@ class _Router:
             if isinstance(self.error, Exception):
                 raise self.error
             if self.error is not None:
-                # Dynamo's binding raises an engine's error frame as a ValueError.
+                # An engine error Dynamo did not classify reaches us as a ValueError.
                 raise ValueError(self.error)
             yield _Item({"token_ids": [10], "engine_data": self.engine_data})
 

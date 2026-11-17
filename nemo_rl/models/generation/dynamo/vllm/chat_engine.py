@@ -479,9 +479,8 @@ class NemoRLChatEngine:
             # An engine that is gone or overloaded: the status its error maps to.
             raise
         except (ValueError, InvalidArgument) as error:
-            # Dynamo would answer the engine adapter's InvalidArgument, or an
-            # unclassified ValueError, with 400. The engine sends every status it
-            # means as a refusal, so this is an engine failure: 500, as natively.
+            # Dynamo would answer either with 400, but the engine sends every status
+            # it means as a refusal: this is an engine failure, 500 as natively.
             raise HttpError(500, str(error)) from error
         if engine_data is None:
             raise HttpError(500, "the engine returned no result for this call")
@@ -582,8 +581,7 @@ class ChatEngineFactory:
                 return
             await asyncio.sleep(0.2)
         spec = runtime_data[RUNTIME_DATA_KEY]
-        # The directory an engine registers from; registration brings Dynamo's
-        # copy of the same files.
+        # The model's config and tokenizer files; registration brings Dynamo's copy.
         model_dir = await weight_free_model_path(spec["generation"]["model_name"])
         if self._early_pool is not pool:
             # The engines registered meanwhile, and their settings built it.

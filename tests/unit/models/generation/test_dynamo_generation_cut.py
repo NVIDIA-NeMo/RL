@@ -39,7 +39,6 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (  # noqa: E402
     FrontendHost,
     ManagedDynamoRuntime,
 )
-from nemo_rl.models.generation.dynamo.vllm import generation_cut  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm.generation_cut import (  # noqa: E402
     CUT_PREFIXES_KEY,
     DEADLINE_KEY,
@@ -228,16 +227,6 @@ def test_a_cut_reaches_every_engine_and_each_call_gets_its_engines_answer(
 
 
 @pytest.mark.vllm
-def test_dynamo_takes_the_cut_route_on_gyms_path(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv(managed_runtime.CAPTURE_FILE_ENV, str(tmp_path / "capture.pkl"))
-
-    (route,) = generation_cut.routes()
-
-    # Building it is the check that Dynamo accepts its timeout and body limit.
-    assert (route.method, route.path) == ("POST", GENERATION_CUT_ROUTE)
-
-
-@pytest.mark.vllm
 def test_loading_the_route_imports_gym_and_keeps_an_unset_hf_home_unset(
     tmp_path,
 ) -> None:
@@ -245,7 +234,9 @@ def test_loading_the_route_imports_gym_and_keeps_an_unset_hf_home_unset(
     code = (
         "import os, sys\n"
         "from nemo_rl.models.generation.dynamo.vllm.generation_cut import routes\n"
-        "routes()\n"
+        # Building the route checks that Dynamo accepts its timeout and body limit.
+        "(route,) = routes()\n"
+        f"assert (route.method, route.path) == ('POST', {GENERATION_CUT_ROUTE!r})\n"
         "assert 'nemo_gym._checkpoint.generation_cut' in sys.modules\n"
         "assert 'HF_HOME' not in os.environ\n"
     )
