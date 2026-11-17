@@ -1207,14 +1207,19 @@ def test_result_to_completion_truncated_on_length_incomplete_response(
     assert completion.truncated is expected_truncated
 
 
+@pytest.mark.parametrize("with_episode_end", [False, True])
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
 @pytest.mark.parametrize("materialized", [False, True])
 def test_streamed_receipt_callback_uses_current_completion_conversion(
     log_full_result_tables,
     materialized,
+    with_episode_end,
 ):
     attribution_key = "usersim:train" if materialized else "resolved-agent"
     agent_ref = None if materialized else {"name": "resolved-agent"}
+    gym_result = {**_mask_gate_receipt_result(), "attribution_key": attribution_key}
+    if with_episode_end:
+        gym_result["full_result"]["episode_end_forced_fail"] = 1.0
 
     class _RunRolloutsRemote:
         def options(self, *, num_returns):
@@ -1228,7 +1233,7 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
                 return (
                     0,
                     agent_ref,
-                    {**_mask_gate_receipt_result(), "attribution_key": attribution_key},
+                    gym_result,
                     None,
                 )
 
@@ -1275,9 +1280,14 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
     assert "mask_sample" not in completion.env_extras["instance_config"]
     context = completion.env_extras["ng_reward_log_context"]
     assert context.agent_name == attribution_key
-    assert (context.full_result_json is not None) is log_full_result_tables
     if log_full_result_tables:
-        assert "reward" not in json.loads(context.full_result_json)
+        logged = json.loads(context.full_result_json)
+        assert "reward" not in logged
+        assert ("episode_end_forced_fail" in logged) is with_episode_end
+    elif with_episode_end:
+        assert json.loads(context.full_result_json) == {"episode_end_forced_fail": 1.0}
+    else:
+        assert context.full_result_json is None
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])

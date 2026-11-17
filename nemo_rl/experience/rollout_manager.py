@@ -77,7 +77,11 @@ from nemo_rl.experience.interfaces import (
     PromptGroupRecord,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
-from nemo_rl.experience.reward_penalties import RewardLogContext, compute_reward_checks
+from nemo_rl.experience.reward_penalties import (
+    EPISODE_END_METRIC_PREFIX,
+    RewardLogContext,
+    compute_reward_checks,
+)
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     PromptGroupStatus,
@@ -1525,17 +1529,21 @@ class AsyncNemoGymRolloutImpl:
                                 self._tokenizer,
                             ),
                         )
+                    logged_result = {
+                        key: value
+                        for key, value in result["full_result"].items()
+                        if key != "reward"
+                        and (
+                            self._log_full_result_tables
+                            or key.startswith(EPISODE_END_METRIC_PREFIX)
+                        )
+                    }
                     result["reward_log_context"] = RewardLogContext(
                         agent_name=_nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
                         full_result_json=json.dumps(
-                            {
-                                key: value
-                                for key, value in result["full_result"].items()
-                                if key != "reward"
-                            },
-                            separators=(",", ":"),
+                            logged_result, separators=(",", ":")
                         )
-                        if self._log_full_result_tables
+                        if logged_result
                         else None,
                     )
                 else:
