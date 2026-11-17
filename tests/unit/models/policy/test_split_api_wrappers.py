@@ -229,6 +229,85 @@ class TestTQPolicySplitFanout:
         # get_all_worker_results (unlike the single-data fan-outs)
         wg.get_all_worker_results.assert_called_once()
 
+    def test_train_microbatches_bound_physical_rows_per_dispatch(self):
+        p, wg = _make_tq_policy()
+        p.cfg["train_max_physical_rows_per_dispatch"] = 2
+        meta = KVBatchMeta(
+            partition_id="train",
+            task_name="train",
+            sample_ids=[f"s{i}" for i in range(5)],
+            sequence_lengths=[10, 11, 12, 13, 14],
+        )
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                side_effect=lambda m, **_: ([m, m], None),
+            ) as mock_shard,
+        ):
+            assert p.train_microbatches_from_meta(meta) is None
+
+        assert [call.args[0].sample_ids for call in mock_shard.call_args_list] == [
+            ["s0", "s1"],
+            ["s2", "s3"],
+            ["s4"],
+        ]
+        assert [
+            call.args[0].sequence_lengths for call in mock_shard.call_args_list
+        ] == [[10, 11], [12, 13], [14]]
+        assert wg.run_all_workers_sharded_data.call_count == 3
+        assert wg.get_all_worker_results.call_count == 3
+        # Partitions accumulate into one open step; begin/finish stay with the caller.
+        wg.run_all_workers_single_data.assert_not_called()
+
+    def test_logprob_dispatch_bound_defaults_to_the_training_bound(self):
+        p, wg = _make_tq_policy()
+        p.cfg["train_max_physical_rows_per_dispatch"] = 2
+        meta = KVBatchMeta(
+            partition_id="train",
+            task_name="train",
+            sample_ids=["s0", "s1", "s2"],
+        )
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                side_effect=lambda m, **_: ([m, m], None),
+            ) as mock_shard,
+        ):
+            p.get_reference_policy_logprobs_from_meta(meta)
+
+        assert [call.args[0].sample_ids for call in mock_shard.call_args_list] == [
+            ["s0", "s1"],
+            ["s2"],
+        ]
+        assert wg.get_all_worker_results.call_count == 2
+
+        p.cfg["logprob_max_physical_rows_per_dispatch"] = None
+        wg.reset_mock()
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                side_effect=lambda m, **_: ([m, m], None),
+            ) as mock_shard,
+        ):
+            p.get_reference_policy_logprobs_from_meta(meta)
+        assert mock_shard.call_count == 1
+
+    @pytest.mark.parametrize("limit", [0, -1, 1.5, True, "2"])
+    def test_physical_row_bound_must_be_a_positive_integer(self, limit):
+        p, _ = _make_tq_policy()
+        p.cfg["train_max_physical_rows_per_dispatch"] = limit
+        with (
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            pytest.raises(ValueError, match="train_max_physical_rows_per_dispatch"),
+        ):
+            p.train_microbatches_from_meta(_meta())
+
     def test_train_microbatches_fetches_only_requested_fields(self):
         p, _ = _make_tq_policy()
         meta = _meta()

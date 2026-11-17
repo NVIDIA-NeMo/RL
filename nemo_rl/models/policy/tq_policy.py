@@ -112,6 +112,22 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
 # dispatcher only waits for completion — no aggregation needed.
 
 
+def _bounded_meta_partitions(
+    meta: KVBatchMeta, row_limit: Any, *, config_name: str
+) -> list[KVBatchMeta]:
+    """Split physical rows without changing their keys, order, or ownership."""
+    if row_limit is not None and (
+        isinstance(row_limit, bool) or not isinstance(row_limit, int) or row_limit <= 0
+    ):
+        raise ValueError(f"{config_name} must be a positive integer or null")
+    if row_limit is None or meta.size <= row_limit:
+        return [meta]
+    return [
+        meta.slice(start, min(start + row_limit, meta.size))
+        for start in range(0, meta.size, row_limit)
+    ]
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -450,43 +466,55 @@ class TQPolicy(TQDriverMixin, Policy):
         completion.
         """
         spa, dba = self._packing_args("logprob_mb_tokens")
-        # Narrow the fetch to LP_SEED_FIELDS + optional routed_experts under
-        # R3 replay. ``_isolated_meta`` unions in the multimodal columns the
-        # rollout wrote, for this dispatch and the training one alike, so the
-        # prev/ref logprobs and the training forward see identical model inputs.
-        lp_meta = self._with_route_fields(
+        partitions = _bounded_meta_partitions(
             meta,
-            LP_SEED_FIELDS + extra_fields,
-            task_name=task_name,
-            want_routes=include_router_replay,
+            self.cfg.get(
+                "logprob_max_physical_rows_per_dispatch",
+                self.cfg.get("train_max_physical_rows_per_dispatch"),
+            ),
+            config_name="logprob_max_physical_rows_per_dispatch",
         )
-        with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
-            metas, _ = shard_meta_for_dp(
-                lp_meta,
-                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
-                batch_size=None,
-                sequence_packing_args=spa,
-                dynamic_batching_args=dba,
+        for partition in partitions:
+            # Narrow the fetch to LP_SEED_FIELDS + optional routed_experts under
+            # R3 replay. ``_isolated_meta`` unions in the multimodal columns the
+            # rollout wrote, for this dispatch and the training one alike, so the
+            # prev/ref logprobs and the training forward see identical model inputs.
+            lp_meta = self._with_route_fields(
+                partition,
+                LP_SEED_FIELDS + extra_fields,
+                task_name=task_name,
+                want_routes=include_router_replay,
             )
-        with timer.time(f"{timer_prefix}/submit_futures") if timer else nullcontext():
-            futures = self.worker_group.run_all_workers_sharded_data(
-                worker_method,
-                meta=metas,
-                in_sharded_axes=["data_parallel"],
-                replicate_on_axes=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                output_is_replicated=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                common_kwargs={**common_kwargs, **trace_context_kwargs()},
-            )
-        # Wait for completion; per-rank returns are None.
-        self.worker_group.get_all_worker_results(futures)
+            with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
+                metas, _ = shard_meta_for_dp(
+                    lp_meta,
+                    dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                    batch_size=None,
+                    sequence_packing_args=spa,
+                    dynamic_batching_args=dba,
+                )
+            with (
+                timer.time(f"{timer_prefix}/submit_futures") if timer else nullcontext()
+            ):
+                futures = self.worker_group.run_all_workers_sharded_data(
+                    worker_method,
+                    meta=metas,
+                    in_sharded_axes=["data_parallel"],
+                    replicate_on_axes=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    output_is_replicated=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    common_kwargs={**common_kwargs, **trace_context_kwargs()},
+                )
+            # Finish each partition before materializing the next; per-rank
+            # returns are None.
+            self.worker_group.get_all_worker_results(futures)
 
     def get_logprobs_from_meta(
         self,
@@ -715,32 +743,40 @@ class TQPolicy(TQDriverMixin, Policy):
             train_fields: Columns produced for this step and fetched by workers.
         """
         spa, dba = self._packing_args("train_mb_tokens")
-        train_meta = self._with_route_fields(
+        partitions = _bounded_meta_partitions(
             meta,
-            # Raw fields, not pre-wrapped in fields_with_optional_routed_experts:
-            # _with_route_fields applies that wrapper itself, gated on both
-            # router replay and route-plan passthrough. The opd_full payload
-            # column has no such gate, so it is appended here.
-            tuple(
-                fields_with_optional_opd_full(
-                    train_fields,
-                    field=self._opd_full_field,
-                    teacher_index_field=self._opd_full_teacher_index_field,
-                )
-            ),
-            task_name="train",
-            want_routes=True,
+            self.cfg.get("train_max_physical_rows_per_dispatch"),
+            config_name="train_max_physical_rows_per_dispatch",
         )
-        with timer.time("policy_training/shard_meta") if timer else nullcontext():
-            dp_metas, _ = shard_meta_for_dp(
-                train_meta,
-                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
-                batch_size=None,
-                sequence_packing_args=spa,
-                dynamic_batching_args=dba,
+        for partition in partitions:
+            # Each partition is isolated on its own, so packing and the forward
+            # padding target come only from the rows this dispatch materializes.
+            train_meta = self._with_route_fields(
+                partition,
+                # Raw fields, not pre-wrapped in fields_with_optional_routed_experts:
+                # _with_route_fields applies that wrapper itself, gated on both
+                # router replay and route-plan passthrough. The opd_full payload
+                # column has no such gate, so it is appended here.
+                tuple(
+                    fields_with_optional_opd_full(
+                        train_fields,
+                        field=self._opd_full_field,
+                        teacher_index_field=self._opd_full_teacher_index_field,
+                    )
+                ),
+                task_name="train",
+                want_routes=True,
             )
+            with timer.time("policy_training/shard_meta") if timer else nullcontext():
+                dp_metas, _ = shard_meta_for_dp(
+                    train_meta,
+                    dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                    batch_size=None,
+                    sequence_packing_args=spa,
+                    dynamic_batching_args=dba,
+                )
 
-        self._dispatch_train_microbatches(dp_metas, timer=timer)
+            self._dispatch_train_microbatches(dp_metas, timer=timer)
 
     def train_placed_microbatches(
         self,
