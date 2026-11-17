@@ -196,7 +196,17 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                         return_value={"weight_version": 10, "calls": [["child", 20]]}
                     )
                     self.get_data_plane_snapshot = Mock(return_value={"calls": 3})
+                    self.set_generation_cut_peers = Mock()
+                    self._setup_vllm_server = Mock(side_effect=self._start_server)
+                    self.flush_obsolete_generation_cut_rows_async = AsyncMock()
+                    self.get_generation_prefix_counts = Mock(
+                        return_value={"restored_calls": 2}
+                    )
                     hosts.append(self)
+
+                def _start_server(self):
+                    self._peer_control_url = "http://127.0.0.1:2"
+                    return Mock(), "http://localhost:8100/v1", Mock(started=True)
 
             engine = Mock()
             register_video_loader = Mock()
@@ -211,10 +221,27 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             connection = Mock()
             lifecycle.attach_mock(connection.send, "send")
             connection.recv.side_effect = [
-                ("capture", ({"impl": "transfer_queue"}, "stage", True, 4)),
+                ("start", ()),
+                ("peers", (["http://127.0.0.1:1", "http://127.0.0.1:2"],)),
+                (
+                    "capture",
+                    (
+                        {"impl": "transfer_queue"},
+                        "stage",
+                        {
+                            "capture_media": True,
+                            "top_logprobs": 4,
+                            "generation_prefix_cuts_enabled": True,
+                            "generation_cut_control_token": "control-token",
+                            "generation_cut_control_timeout_s": 30.0,
+                        },
+                    ),
+                ),
                 ("version", (10,)),
                 ("progress", ()),
                 ("snapshot", ()),
+                ("flush", (3,)),
+                ("counts", ()),
                 ("stop", ()),
             ]
             listener = Mock()
@@ -276,12 +303,22 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                 register_video_loader.assert_not_called()
             self.assertTrue(http_client.call_args.kwargs["flat_logprobs"])
             install_yield.assert_called_once_with(engine, reader_budget_s=0.02)
+            hosts[0].set_generation_cut_peers.assert_called_once_with(
+                ["http://127.0.0.1:1", "http://127.0.0.1:2"]
+            )
             hosts[0].setup_token_capture.assert_awaited_once_with(
                 {"impl": "transfer_queue"},
                 "stage",
                 capture_media=True,
                 top_logprobs=4,
+                generation_prefix_cuts_enabled=True,
+                generation_cut_control_token="control-token",
+                generation_cut_control_timeout_s=30.0,
             )
+            hosts[0].flush_obsolete_generation_cut_rows_async.assert_awaited_once_with(
+                3
+            )
+            hosts[0].get_generation_prefix_counts.assert_called_once_with()
             hosts[0].set_rollout_weight_version.assert_awaited_once_with(10)
             hosts[0].captured_call_progress.assert_awaited_once_with()
             hosts[0].get_data_plane_snapshot.assert_called_once_with()
@@ -294,6 +331,9 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                         "stage",
                         capture_media=True,
                         top_logprobs=4,
+                        generation_prefix_cuts_enabled=True,
+                        generation_cut_control_token="control-token",
+                        generation_cut_control_timeout_s=30.0,
                     )
                 ),
             )
@@ -305,10 +345,14 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                 [call.args[0] for call in connection.send.call_args_list],
                 [
                     ("ok", None),
+                    ("ok", "http://127.0.0.1:2"),
+                    ("ok", None),
                     ("ok", None),
                     ("ok", None),
                     ("ok", {"weight_version": 10, "calls": [["child", 20]]}),
                     ("ok", {"calls": 3}),
+                    ("ok", None),
+                    ("ok", {"restored_calls": 2}),
                     ("ok", None),
                 ],
             )

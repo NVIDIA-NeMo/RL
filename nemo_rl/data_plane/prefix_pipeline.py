@@ -70,6 +70,8 @@ CutSteps = Generator[PrefixWrite | BatchReleased, list[str | None], Any]
 class _Job:
     inventory: Any
     deadline: float | None
+    # Cut only the calls this HTTP frontend knows, answering with claims.
+    claims_only: bool
     future: Future[Any]
     iterator: CutSteps | None = None
     request: PrefixWrite | None = None
@@ -103,7 +105,7 @@ class PrefixWritePipeline:
         self._incoming: deque[_Job] = deque()
         self._ready: deque[_Job] = deque()
         self._prepared: deque[_Job] = deque()
-        self._jobs: dict[tuple[str, str], _Job] = {}
+        self._jobs: dict[tuple[str, str, bool], _Job] = {}
         self._busy: set[str] = set()
         self._buffered = 0
         self._closed = False
@@ -126,8 +128,10 @@ class PrefixWritePipeline:
         )
         self._thread.start()
 
-    def submit(self, inventory: Any, *, deadline: float | None) -> Future[Any]:
-        key = (inventory.checkpoint_id, inventory.inventory_digest)
+    def submit(
+        self, inventory: Any, *, deadline: float | None, claims_only: bool = False
+    ) -> Future[Any]:
+        key = (inventory.checkpoint_id, inventory.inventory_digest, claims_only)
         with self._condition:
             if self._closed:
                 raise RuntimeError("Prefix write pipeline is closed")
@@ -137,7 +141,7 @@ class PrefixWritePipeline:
                 raise RuntimeError("Prefix pipeline inventory admission limit reached")
             future: Future[Any] = Future()
             future.set_running_or_notify_cancel()
-            job = _Job(inventory, deadline, future)
+            job = _Job(inventory, deadline, claims_only, future)
             self._jobs[key] = job
             self._incoming.append(job)
             self._condition.notify_all()
@@ -176,7 +180,11 @@ class PrefixWritePipeline:
             )
         with self._condition:
             self._jobs.pop(
-                (job.inventory.checkpoint_id, job.inventory.inventory_digest)
+                (
+                    job.inventory.checkpoint_id,
+                    job.inventory.inventory_digest,
+                    job.claims_only,
+                )
             )
             self._stats[
                 "completed_inventories" if error is None else "failed_inventories"
@@ -192,7 +200,11 @@ class PrefixWritePipeline:
         self._reserve(job, self._config.max_batch_payload_bytes)
         try:
             if job.iterator is None:
-                job.iterator = self._prepare(job.inventory, deadline=job.deadline)
+                job.iterator = self._prepare(
+                    job.inventory,
+                    deadline=job.deadline,
+                    claims_only=job.claims_only,
+                )
                 self._busy.update(
                     prefix.model_call_id for prefix in job.inventory.active_prefixes
                 )

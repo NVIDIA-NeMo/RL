@@ -55,13 +55,20 @@ from nemo_rl.models.generation.interfaces import (
     sampler_replay_enabled,
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
-from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm import (
+    VllmConfig,
+    VllmGeneration,
+    generation_cut_route,
+)
 from nemo_rl.models.generation.vllm.config import (
     NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
-from nemo_rl.models.generation.vllm.generation_cut_route import GENERATION_CUT_ROUTE
+from nemo_rl.models.generation.vllm.generation_cut_route import (
+    GENERATION_CUT_CLAIMS_ROUTE,
+    GENERATION_CUT_ROUTE,
+)
 from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
 from nemo_rl.models.generation.vllm.vllm_worker import (
     BaseVllmGenerationWorker,
@@ -1387,6 +1394,7 @@ def _setup_fake_vllm_app(
 
     worker._capture_registry = CaptureRegistry()
     worker._prefix_recovery = NoPrefixRecovery()
+    worker._generation_cut_peer_urls = []
     worker._capture_top_logprobs = 0
     worker.token_capture = None
     worker.llm_async_engine_args = MagicMock()
@@ -1671,8 +1679,14 @@ def _generation_cut_route(
     enabled: bool = True,
     token: str | None = "control-token",
     timeout_s: float | None = None,
+    peer_urls: tuple[str, ...] = (),
+    claims: Any = None,
+    route: str = GENERATION_CUT_ROUTE,
 ):
-    """The generation-cut control route, with the cut it runs stubbed.
+    """A generation-cut control route, with the cuts it runs stubbed.
+
+    ``peer_urls`` are the worker's other HTTP frontends, and ``claims`` what
+    its own claims-only cut returns.
 
     Returns:
         The route handler and the ``(inventory, deadline)`` of each cut it ran.
@@ -1689,6 +1703,10 @@ def _generation_cut_route(
     def checkpoint_cut(inventory, *, deadline):
         cuts.append((inventory, deadline))
         return types.SimpleNamespace(model_dump=lambda mode: {"acked": inventory})
+
+    def cut_claims(inventory, *, deadline):
+        cuts.append((inventory, deadline))
+        return claims
 
     if enabled:
         recovery = PrefixRecovery(
@@ -1711,9 +1729,11 @@ def _generation_cut_route(
             )
         )
         recovery.checkpoint_cut = checkpoint_cut
+        recovery.cut_claims = cut_claims
         worker._prefix_recovery = recovery
     else:
         worker._prefix_recovery = NoPrefixRecovery()
+    worker._generation_cut_peer_urls = list(peer_urls)
     # nemo_gym is an optional extra; the route only uses it to type the inventory.
     generation_cut = types.ModuleType("nemo_gym._checkpoint.generation_cut")
     generation_cut.GenerationCutInventory = types.SimpleNamespace(
@@ -1722,7 +1742,7 @@ def _generation_cut_route(
     monkeypatch.setitem(
         sys.modules, "nemo_gym._checkpoint.generation_cut", generation_cut
     )
-    return _route_handler(app, GENERATION_CUT_ROUTE), cuts
+    return _route_handler(app, route), cuts
 
 
 @pytest.mark.asyncio
@@ -1776,6 +1796,131 @@ async def test_generation_cut_route_runs_the_cut_against_its_deadline(
     else:
         # The deadline counts from the request's arrival.
         assert arrived + timeout_s <= deadline <= returned + timeout_s
+
+
+@pytest.mark.asyncio
+async def test_generation_cut_route_merges_every_frontends_claims(monkeypatch):
+    peers = ("http://127.0.0.1:1", "http://127.0.0.1:3")
+    route, cuts = _generation_cut_route(
+        monkeypatch, timeout_s=30.0, peer_urls=peers, claims=["owner-claim", None]
+    )
+    typed_inventory = types.SimpleNamespace(active_prefixes=["c1", "c2"])
+    sys.modules[
+        "nemo_gym._checkpoint.generation_cut"
+    ].GenerationCutInventory = types.SimpleNamespace(
+        model_validate=lambda inventory: typed_inventory
+    )
+    peer_requests = []
+
+    async def peer_cut_claims(url, inventory, *, calls, control_token, timeout_s):
+        peer_requests.append((url, inventory, calls, control_token, timeout_s))
+        return [None, f"{url}-claim"]
+
+    merged = []
+
+    def merge_cut_claims(inventory, frontend_claims):
+        merged.append((inventory, frontend_claims))
+        return types.SimpleNamespace(model_dump=lambda mode: {"merged": True})
+
+    monkeypatch.setattr(generation_cut_route, "_peer_cut_claims", peer_cut_claims)
+    monkeypatch.setattr(generation_cut_route, "merge_cut_claims", merge_cut_claims)
+    inventory = {"checkpoint_id": "checkpoint-1"}
+
+    receipt = await route(inventory, authorization="Bearer control-token")
+
+    assert receipt == {"merged": True}
+    # This frontend cut only its own calls, and asked each peer for theirs.
+    assert [typed for typed, _ in cuts] == [typed_inventory]
+    assert peer_requests == [
+        (url, inventory, 2, "control-token", 30.0) for url in peers
+    ]
+    assert merged == [
+        (
+            typed_inventory,
+            [["owner-claim", None]] + [[None, f"{url}-claim"] for url in peers],
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generation_cut_claims_route_answers_this_frontends_calls(monkeypatch):
+    from nemo_rl.models.generation.prefix_recovery import CutClaim
+
+    ack = types.SimpleNamespace(model_dump=lambda mode: {"ticket_id": "ticket-1"})
+    route, cuts = _generation_cut_route(
+        monkeypatch,
+        claims=[CutClaim(ack, active=True), None],
+        route=GENERATION_CUT_CLAIMS_ROUTE,
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await route({}, authorization="Bearer wrong-token")
+    assert error.value.status_code == 401
+    answers = await route({}, authorization="Bearer control-token")
+
+    assert answers == [{"ack": {"ticket_id": "ticket-1"}, "active": True}, None]
+    assert len(cuts) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "answers", "answered"),
+    [
+        (200, [{"ack": {"ticket_id": "ticket-1"}, "active": True}, None], True),
+        (500, [], False),
+        (200, [None], False),
+    ],
+)
+async def test_peer_cut_claims_reads_a_frontends_answer_over_http(
+    monkeypatch, caplog, status, answers, answered
+):
+    from aiohttp import web
+
+    from nemo_rl.models.generation.prefix_recovery import CutClaim
+
+    generation_cut = types.ModuleType("nemo_gym._checkpoint.generation_cut")
+    generation_cut.GenerationCutPrefixAck = types.SimpleNamespace(
+        model_validate=lambda ack: ("ack", ack)
+    )
+    monkeypatch.setitem(
+        sys.modules, "nemo_gym._checkpoint.generation_cut", generation_cut
+    )
+    requests_seen = []
+
+    async def claims(request):
+        requests_seen.append((request.headers["authorization"], await request.json()))
+        return web.json_response(answers, status=status)
+
+    app = web.Application()
+    app.router.add_post(GENERATION_CUT_CLAIMS_ROUTE, claims)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        result = await generation_cut_route._peer_cut_claims(
+            f"http://127.0.0.1:{port}",
+            {"checkpoint_id": "checkpoint-1"},
+            calls=2,
+            control_token="control-token",
+            timeout_s=5.0,
+        )
+    finally:
+        await runner.cleanup()
+
+    assert requests_seen == [
+        ("Bearer control-token", {"checkpoint_id": "checkpoint-1"})
+    ]
+    if answered:
+        assert result == [
+            CutClaim(("ack", {"ticket_id": "ticket-1"}), active=True),
+            None,
+        ]
+    else:
+        # A frontend that does not answer claims nothing; its calls regenerate.
+        assert result == [None, None]
+        assert "did not answer the generation cut" in caplog.text
 
 
 @pytest.mark.asyncio

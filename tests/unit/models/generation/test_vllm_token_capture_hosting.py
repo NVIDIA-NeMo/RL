@@ -84,6 +84,7 @@ from nemo_rl.models.generation.prefix_recovery import (  # noqa: E402
     PrefixRecovery,
     PrefixRecoveryParts,
     ProgressRead,
+    merge_cut_claims,
 )
 from nemo_rl.models.generation.prefix_recovery.recovery import (  # noqa: E402
     _ResolvedGenerationCut,
@@ -440,9 +441,13 @@ def test_obsolete_generation_cut_row_flush_fans_out(monkeypatch):
 def test_generation_prefix_restore_counts_sum_over_workers(monkeypatch):
     gen = _generation_with_mock_group()
     gen.worker_group.workers = [object(), object()]
+    # The second worker runs two HTTP frontends.
     gen.worker_group.run_all_workers_single_data.return_value = [
-        {"restored_calls": 2, "restored_prefix_tokens": 50, "progress_reads": 1},
-        {"restored_calls": 1, "restored_prefix_tokens": 7, "progress_reads": 0},
+        [{"restored_calls": 2, "restored_prefix_tokens": 50, "progress_reads": 1}],
+        [
+            {"restored_calls": 1, "restored_prefix_tokens": 7, "progress_reads": 0},
+            {"restored_calls": 4, "restored_prefix_tokens": 9, "progress_reads": 2},
+        ],
     ]
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
@@ -450,12 +455,12 @@ def test_generation_prefix_restore_counts_sum_over_workers(monkeypatch):
     )
 
     assert gen.get_generation_prefix_counts() == {
-        "restored_calls": 3,
-        "restored_prefix_tokens": 57,
-        "progress_reads": 1,
+        "restored_calls": 7,
+        "restored_prefix_tokens": 66,
+        "progress_reads": 3,
     }
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
-        "get_generation_prefix_counts",
+        "get_generation_prefix_counts_per_frontend",
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
@@ -1527,7 +1532,7 @@ def test_generation_cut_stages_prefix_then_terminal_row_replaces_it():
     receipt = _cuts(worker).checkpoint_cut(inventory)
     replayed = _cuts(worker).checkpoint_cut(inventory)
 
-    assert replayed is receipt
+    assert replayed == receipt
     assert len(sink.generation_prefix_records) == 1
     assert receipt.prefixes[0].disposition == "durable_prefix"
     assert receipt.prefixes[0].prefix_token_count == 2
@@ -1671,6 +1676,105 @@ def _active_call_inventory(
         active_prefixes=prefixes,
     )
     return inventory, states
+
+
+def _inventory_of(*model_call_ids: str) -> GenerationCutInventory:
+    """Gym's inventory naming calls of rollout ``r0``, one ticket each."""
+    return GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy_model",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id=f"ticket-{model_call_id}",
+                rollout_id="r0",
+                attempt=0,
+                model_call_id=model_call_id,
+                admitted_at=1.0,
+            )
+            for model_call_id in model_call_ids
+        ],
+    )
+
+
+def test_frontends_cut_only_their_own_calls_into_one_receipt(caplog):
+    # Each HTTP frontend holds the calls whose requests it accepted.
+    sinks = [_MemorySink(), _MemorySink()]
+    owner, child = (_worker_with_capture(sink) for sink in sinks)
+    _active_call_inventory(owner, ("c1", [11, 12]))
+    _active_call_inventory(child, ("c2", [13, 14]))
+    inventory = _inventory_of("c1", "c2", "c3")
+
+    with caplog.at_level(logging.INFO):
+        claims = [_cuts(frontend).cut_claims(inventory) for frontend in (owner, child)]
+        receipt = merge_cut_claims(inventory, claims)
+
+    assert [claim is not None for claim in claims[0]] == [True, False, False]
+    assert [claim is not None for claim in claims[1]] == [False, True, False]
+    receipt.validate_for(inventory)
+    assert [ack.disposition for ack in receipt.prefixes] == [
+        "durable_prefix",
+        "durable_prefix",
+        "durable_failure",
+    ]
+    assert [len(sink.generation_prefix_records) for sink in sinks] == [1, 1]
+    # Only the merge reports the call no frontend has; neither frontend counts
+    # the other's calls as uncut.
+    assert "no frontend of this worker has a record of 1 of 3" in caplog.text
+    assert "model calls uncut" not in caplog.text
+    # A repeated request answers from the first cut without staging again.
+    assert _cuts(owner).cut_claims(inventory) == claims[0]
+    assert len(sinks[0].generation_prefix_records) == 1
+
+
+@pytest.mark.parametrize("running_first", [False, True])
+def test_merged_cut_takes_the_running_call_over_a_finished_record(running_first):
+    finished, running = (
+        _worker_with_capture(_MemorySink()),
+        _worker_with_capture(_MemorySink()),
+    )
+    _cuts(finished).remember_completed(
+        "c1",
+        SimpleNamespace(
+            capture_key="r0",
+            disposition="staged",
+            staging_key="terminal-key",
+            digest="a" * 64,
+        ),
+        3,
+        effective_output_limit=128,
+        terminal_finish_reason="stop",
+    )
+    _active_call_inventory(running, ("c1", [11, 12]))
+    inventory = _inventory_of("c1")
+    frontends = [running, finished] if running_first else [finished, running]
+
+    receipt = merge_cut_claims(
+        inventory, [_cuts(frontend).cut_claims(inventory) for frontend in frontends]
+    )
+
+    (ack,) = receipt.prefixes
+    assert ack.cut_kind == "active_prefix"
+
+
+def test_frontend_past_its_deadline_fails_only_the_calls_it_serves():
+    sink = _MemorySink()
+    frontend = _worker_with_capture(sink)
+    _active_call_inventory(frontend, ("c1", [11, 12]))
+    inventory = _inventory_of("c1", "c2")
+
+    served, elsewhere = _cuts(frontend).cut_claims(
+        inventory, deadline=time.monotonic() - 1
+    )
+
+    assert served.ack.disposition == "durable_failure"
+    assert served.active
+    assert elsewhere is None
+    assert sink.generation_prefix_records == []
+
+
+def test_merge_rejects_claims_that_skip_inventory_calls():
+    with pytest.raises(ValueError, match="claim or skip each inventory call"):
+        merge_cut_claims(_inventory_of("c1", "c2"), [[None]])
 
 
 def test_generation_cut_refuses_a_prefix_ending_inside_a_character(caplog):
