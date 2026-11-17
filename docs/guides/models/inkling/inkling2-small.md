@@ -185,11 +185,41 @@ How to read the comparison:
 - **Policy KL** uses a logarithmic axis and keeps its outliers (a step-10 spike
   in the sync run, spikes at steps 25 and 32 in the async run).
 - **Step time** is measured on different GPU counts and placements; it is
-  reported for reference, not as a throughput comparison.
+  reported for reference, not as a throughput comparison. See
+  [Step Timing](#step-timing).
+
+### Step Timing
+
+![Two panels: per-step wall time for both experiments with validation steps marked, and AIME validation time at each evaluation.](results/inkling2-small-step-time.png)
+
+| Median step time | SGLang BF16, sync | vLLM MXFP8, async |
+| --- | --- | --- |
+| Steps without validation | 221 s | 208 s |
+| Steps with AIME validation (every 10th) | 387 s | 507 s |
+| AIME validation alone | 121 s (115–148 s) | 262 s (225–340 s) |
+
+Training steps take about the same time in both experiments. The spikes every
+10 steps are AIME validation, which adds about 165 s to a synchronous step and
+about 300 s to an asynchronous one:
+
+- **Validation runs only on the generation GPUs.** The colocated SGLang run
+  serves validation from all 128 GPUs (16 engines, about 16 prompts each); the
+  vLLM run serves it from its 32 generation GPUs (4 engines, about 64 prompts
+  each). Validation is bound by the longest responses, so 4× the prompts per
+  engine costs about 2× the time rather than 4×.
+- **Async GRPO cannot hide validation.** The 64 training GPUs wait for it
+  (`timing/train/idle/validation`), and the rollout buffer refills afterward
+  (`timing/train/idle/buffer_starvation`).
+- vLLM validation time does not fall as AIME responses get shorter (2,396 →
+  1,535 mean tokens from step 10 to 70); the cause has not been isolated.
+
+To shorten validation steps, add generation nodes, validate less often, or
+lower `grpo.max_val_samples` (at the cost of noisier AIME estimates).
 
 All values are raw and unsmoothed, indexed by `nemo_rl/step`. Download the
-[SVG](results/inkling2-small-nine-panels.svg) or the
-[selected metric data](results/inkling2-small.json). Rebuild the figure with:
+[SVG](results/inkling2-small-nine-panels.svg), the
+[step-timing SVG](results/inkling2-small-step-time.svg), or the
+[selected metric data](results/inkling2-small.json). Rebuild both figures with:
 
 ```bash
 uv run docs/guides/models/inkling/results/plot.py

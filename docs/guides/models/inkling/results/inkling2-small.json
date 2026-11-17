@@ -813,37 +813,44 @@
     {
      "nemo_rl/step": 10,
      "validation/accuracy": 0.6484375,
-     "validation/avg_length": 2019.2109375
+     "validation/avg_length": 2019.2109375,
+     "timing/validation/total_validation_time": 148.47127810679376
     },
     {
      "nemo_rl/step": 20,
      "validation/accuracy": 0.7890625,
-     "validation/avg_length": 1622.69921875
+     "validation/avg_length": 1622.69921875,
+     "timing/validation/total_validation_time": 120.48190461006016
     },
     {
      "nemo_rl/step": 30,
      "validation/accuracy": 0.7734375,
-     "validation/avg_length": 1626.4375
+     "validation/avg_length": 1626.4375,
+     "timing/validation/total_validation_time": 116.92034553014673
     },
     {
      "nemo_rl/step": 40,
      "validation/accuracy": 0.7890625,
-     "validation/avg_length": 1464.2421875
+     "validation/avg_length": 1464.2421875,
+     "timing/validation/total_validation_time": 115.001261546975
     },
     {
      "nemo_rl/step": 50,
      "validation/accuracy": 0.79296875,
-     "validation/avg_length": 1383.359375
+     "validation/avg_length": 1383.359375,
+     "timing/validation/total_validation_time": 122.97564898105338
     },
     {
      "nemo_rl/step": 60,
      "validation/accuracy": 0.80078125,
-     "validation/avg_length": 1461.71875
+     "validation/avg_length": 1461.71875,
+     "timing/validation/total_validation_time": 121.2601830358617
     },
     {
      "nemo_rl/step": 70,
      "validation/accuracy": 0.83203125,
-     "validation/avg_length": 1663.9453125
+     "validation/avg_length": 1663.9453125,
+     "timing/validation/total_validation_time": 125.24690988939255
     }
    ]
   },
@@ -1648,37 +1655,44 @@
     {
      "nemo_rl/step": 10,
      "validation/accuracy": 0.4296875,
-     "validation/avg_length": 2396.2578125
+     "validation/avg_length": 2396.2578125,
+     "timing/validation/total_validation_time": 225.25079705705866
     },
     {
      "nemo_rl/step": 20,
      "validation/accuracy": 0.63671875,
-     "validation/avg_length": 2106.74609375
+     "validation/avg_length": 2106.74609375,
+     "timing/validation/total_validation_time": 262.39578681997955
     },
     {
      "nemo_rl/step": 30,
      "validation/accuracy": 0.75,
-     "validation/avg_length": 1879.76953125
+     "validation/avg_length": 1879.76953125,
+     "timing/validation/total_validation_time": 340.0974657256156
     },
     {
      "nemo_rl/step": 40,
      "validation/accuracy": 0.765625,
-     "validation/avg_length": 1722.328125
+     "validation/avg_length": 1722.328125,
+     "timing/validation/total_validation_time": 286.8584337728098
     },
     {
      "nemo_rl/step": 50,
      "validation/accuracy": 0.76171875,
-     "validation/avg_length": 1722.46484375
+     "validation/avg_length": 1722.46484375,
+     "timing/validation/total_validation_time": 285.5262185977772
     },
     {
      "nemo_rl/step": 60,
      "validation/accuracy": 0.78515625,
-     "validation/avg_length": 1590.11328125
+     "validation/avg_length": 1590.11328125,
+     "timing/validation/total_validation_time": 251.55785245029256
     },
     {
      "nemo_rl/step": 70,
      "validation/accuracy": 0.78515625,
-     "validation/avg_length": 1535.24609375
+     "validation/avg_length": 1535.24609375,
+     "timing/validation/total_validation_time": 257.0033984486945
     }
    ]
   }
