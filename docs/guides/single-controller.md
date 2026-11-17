@@ -18,11 +18,8 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 ### AutoModel full-batch baseline
 
-AutoModel supports the initial text GRPO baseline: dense and MoE full-parameter FSDP2,
-TP=CP=1, fixed microbatches, disaggregated async vLLM, `in_order` with
-`max_lookahead_versions` 0 or 1, and a streaming threshold equal to
-`grpo.num_prompts_per_step`. Packing, dynamic batching, CPU offload, HSDP,
-LoRA, draft training, VLM, PPO, distillation, dynamic sampling, and token capture are not enabled in this stage.
+AutoModel supports the initial text GRPO baseline: dense and MoE full-parameter FSDP2, TP=CP=1, fixed microbatches, disaggregated async vLLM, `in_order` with `max_lookahead_versions` 0 or 1, and a streaming threshold equal to `grpo.num_prompts_per_step`.
+Packing, dynamic batching, CPU offload, HSDP, LoRA, draft training, VLM, PPO, distillation, dynamic sampling, and token capture are not enabled in this stage.
 Both prompt-drop budgets must be zero. Explicit unsupported settings fail at
 setup; the worker also rejects unsupported model properties before training.
 
@@ -529,9 +526,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Compaction, mixed image/video conversations, native audio, video token pruning, static tiling (`image_num_patches`), other processor families, and `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo Gym rollouts; multimodal/VLM MOPD is not yet supported. See [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: Megatron supports the configurations described in this guide.
-  AutoModel is limited to the [full-batch baseline](#automodel-full-batch-baseline);
-  the streaming and broader sampler options elsewhere in this guide do not
-  apply to AutoModel yet.
+  AutoModel is limited to the [full-batch baseline](#automodel-full-batch-baseline); the streaming and broader sampler options elsewhere in this guide do not apply to AutoModel yet.
 - Generation backend: vLLM, Megatron and SGLang generation are supported.
   - vLLM: non-colocated only. It can also serve through Dynamo (`policy.generation.dynamo: true`); see [Dynamo serving](dynamo-generation.md).
   - Megatron: both non-colocated and colocated modes.
