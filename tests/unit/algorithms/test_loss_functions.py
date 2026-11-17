@@ -3087,6 +3087,7 @@ class TestMetricNormalizationAdvertisement:
             "probs_ratio",
             "probs_ratio_clamped",
             "token_mult_prob_error",
+            "token_abs_logprob_error",
             "gen_kl_error",
             "policy_kl_error",
             "js_divergence_error",
@@ -3223,6 +3224,7 @@ class TestMetricNormalizationAdvertisement:
             "policy_support_excluded_tokens": MetricNormalizer.NONE,
             "positive_nll_loss": MetricNormalizer.NONE,
             "token_mult_prob_error": MetricNormalizer.TOKENS,
+            "token_abs_logprob_error": MetricNormalizer.TOKENS,
         }
         if correction is not None:
             expected_normalizations["sampling_importance_ratio"] = (
@@ -3249,6 +3251,14 @@ class TestMetricNormalizationAdvertisement:
         )
         assert minimal_metrics["token_mult_prob_error"] == pytest.approx(
             expected_mismatch.item()
+        )
+        expected_abs_diff = (
+            (data["generation_logprobs"][0, 1:4] - data["prev_logprobs"][0, 1:4])
+            .abs()
+            .mean()
+        )
+        assert minimal_metrics["token_abs_logprob_error"] == pytest.approx(
+            expected_abs_diff.item()
         )
 
     def test_clipped_pg_metrics_use_one_host_transfer(self, monkeypatch):
@@ -3286,7 +3296,7 @@ class TestMetricNormalizationAdvertisement:
             .float(),
         )
 
-        assert len(stacked_values) == 6
+        assert len(stacked_values) == 7
         assert cpu_calls == 1
 
     @pytest.mark.parametrize("metrics_level", ["full", "minimal"])
