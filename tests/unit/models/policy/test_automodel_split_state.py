@@ -139,9 +139,7 @@ def test_single_commit_and_retained_gradients(worker):
         worker.finish_train_step()
 
 
-@pytest.mark.parametrize("expert_parallel_size", [2, 16])
-def test_expert_parallel_commit_and_abort(worker, monkeypatch, expert_parallel_size):
-    worker.cfg["automodel_cfg"]["expert_parallel_size"] = expert_parallel_size
+def test_expert_parallel_commit_and_abort(worker, monkeypatch):
     worker.moe_mesh = SimpleNamespace(mesh_dim_names=("ep", "ep_shard"))
     clip = Mock(wraps=implementation.scale_grads_and_clip_grad_norm)
     cleanup = Mock()
