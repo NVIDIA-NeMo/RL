@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import math
 
 import pytest
 import torch
@@ -2677,3 +2678,31 @@ def test_cross_tokenizer_ce_respects_sample_mask(tmp_path):
     ce_single = loss_fn._compute_ce(logits[:1], data_single, gvt_single)
 
     assert torch.allclose(ce_masked, ce_single, atol=1e-6)
+
+
+def test_clipped_pg_loss_stale_kl():
+    """[CUSTOM] stale_kl = k3 estimate of KL(prev || curr) on loss tokens; padding garbage must not leak in (CPU)."""
+    data, batch_size, seq_len, _ = _setup_clipped_pg_test_data(seq_len=5, device="cpu")
+    data["token_mask"][0, 4] = 0  # last position is padding
+    data["prev_logprobs"][0, 1:] = torch.tensor([-1.0, -2.0, -0.5, float("-inf")])
+    data["generation_logprobs"] = data["prev_logprobs"].clone()
+    curr = torch.tensor([[-1.0, -1.5, -1.0, -50.0]])  # drift on two of three loss tokens
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            disable_ppo_ratio=True,
+            ratio_clip_min=0.2,
+            ratio_clip_max=0.2,
+        )
+    )
+    mask = data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+    _, metrics = loss_fn(
+        next_token_logprobs=curr,
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(mask),
+    )
+    d = [0.0, 0.5, -0.5]  # curr - prev on the loss tokens
+    expected = sum(math.expm1(x) - x for x in d) / 3
+    assert metrics["stale_kl"] == pytest.approx(expected, rel=1e-5)
+    assert math.isfinite(metrics["stale_kl"])

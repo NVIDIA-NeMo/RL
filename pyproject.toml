@@ -498,12 +498,19 @@ override-dependencies = [
   # decord2 is pulled transitively by sglang → qwen-vl-utils[decord] on aarch64 Linux.
   # NeMo-RL no longer calls any decord API (replaced by torchvision/torchaudio).
   "decord2; sys_platform == 'never'",
+  # workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base and libs-cu13
+  # wheels overlap on ~180 shared file paths and race at install time (confirmed via a real
+  # `importlib.metadata.files()` diff, not just the upstream issue's say-so). libs-cu13 is a
+  # functional superset at 4.5.2, so drop libs-base the same way as av/decord2 above --
+  # `exclude-dependencies` (a real uv key, just not in this cluster's pinned uv 0.8.14) is NOT
+  # a substitute: an unsupported top-level `[tool.uv]` key fails "settings discovery" parsing
+  # for the WHOLE table (confirmed directly: removing just this one line, with
+  # exclude-dependencies gone, is what let the already-correct deep_ep
+  # extra-build-dependencies/dependency-metadata entries elsewhere in this file finally take
+  # effect at all) -- silently taking every other [tool.uv] directive down with it, not just
+  # this one. override-dependencies' marker-based exclusion has no such blast radius.
+  "nvidia-cutlass-dsl-libs-base; sys_platform == 'never'",
 ]
-
-# workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base and libs-cu13 wheels overlap and race on shared paths.
-# libs-cu13 is a functional superset at 4.5.2, so drop libs-base to make
-# installs deterministic.
-exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
 
 # CVE fixes
 constraint-dependencies = [

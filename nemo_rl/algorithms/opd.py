@@ -71,6 +71,20 @@ class NonColocatedTeachersConfig(BaseModel, extra="allow"):
     teacher_overrides: dict[str, TeacherResourceConfig] = Field(default_factory=dict)
 
 
+class OPDDetailedMetricsConfig(BaseModel, extra="allow"):
+    """[CUSTOM] Per-teacher / per-agent MOPD diagnostics (``nemo_rl/algorithms/opd_metrics.py``).
+
+    Attributes:
+        enabled: Log ``on_policy_distillation/<teacher>/*`` every step (reverse-KL estimators, signal sparsity and
+            tails, entropy, length/truncation, correct-vs-wrong split, position buckets). Costs a few seconds per step
+            on 128k batches. Default False.
+        per_agent: Also log the lighter ``on_policy_distillation/agent/<agent>/*`` set. Default True.
+    """
+
+    enabled: bool = False
+    per_agent: bool = True
+
+
 class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     """User-facing config for the top-level ``on_policy_distillation`` block."""
 
@@ -80,6 +94,9 @@ class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     strict_agent_name_match: bool = False
     deduplicate_shared_teacher_checkpoints: bool = True
     non_colocated_teachers: Optional[NonColocatedTeachersConfig] = None
+    detailed_metrics: OPDDetailedMetricsConfig = Field(
+        default_factory=OPDDetailedMetricsConfig
+    )  # [CUSTOM]
 
 
 # ---------------------------------------------------------------------------

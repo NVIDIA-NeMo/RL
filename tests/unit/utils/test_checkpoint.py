@@ -113,6 +113,24 @@ def test_remove_old_checkpoints(checkpoint_manager, checkpoint_dir):
     ] + [0.8]  # exclude latest
 
 
+def test_remove_old_checkpoints_keep_steps(checkpoint_config, checkpoint_dir):
+    checkpoint_config["keep_steps"] = [1, 3]
+    checkpoint_manager = CheckpointManager(checkpoint_config)
+    # Pinned steps 1 and 3 have the worst losses, so top-k alone would drop them.
+    steps = [1, 2, 3, 4, 5, 6, 7]
+    losses = [0.9, 0.3, 0.95, 0.2, 0.4, 0.1, 0.8]
+
+    for step, loss in zip(steps, losses):
+        tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, {"loss": loss})
+        checkpoint_manager.finalize_checkpoint(tmp_dir)
+
+    remaining_steps = sorted(
+        int(d.name.split("_")[1]) for d in checkpoint_dir.glob("step_*")
+    )
+    # pinned {1, 3} + top-3 of the rest by loss {6, 4, 2} + latest {7}
+    assert remaining_steps == [1, 2, 3, 4, 6, 7]
+
+
 def test_remove_old_checkpoints_topk_bias_recent_if_equal(
     checkpoint_manager, checkpoint_dir
 ):

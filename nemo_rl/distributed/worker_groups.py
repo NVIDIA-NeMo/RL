@@ -490,7 +490,17 @@ class RayWorkerGroup:
         # env_vars are passed through create_worker(). This reduces GCS actor
         # registrations from N_workers to N_nodes.
         unique_pg_indices = sorted({pg_idx for pg_idx, _ in bundle_indices_list})
-        initializer_runtime_env = {"py_executable": py_executable}
+        # [CUSTOM-ISOLATED-INITIALIZER-ENV 2026-11-02] IsolatedWorkerInitializer itself
+        # importlib.import_module()s the real worker class -- which is enough to trigger
+        # torch's own CUDA probe at import time (e.g. our CUDA-13-forward-compat shim's
+        # LD_LIBRARY_PATH, needed so torch doesn't see the host's older driver). Without
+        # env_vars here, Ray does not carry the driver env into this actor once
+        # py_executable switches it to the per-actor venv's python -- confirmed via a real
+        # job: "RuntimeError: The NVIDIA driver on your system is too old" fired on this
+        # exact actor class. `env_vars` above is already backfilled with os.environ
+        # (see the loop a few lines up) for the real per-worker runtime_env's own use --
+        # reuse it here too instead of re-deriving.
+        initializer_runtime_env = {"py_executable": py_executable, "env_vars": env_vars}
         self._initializer_pool: dict[int, ray.actor.ActorHandle] = {}
         for pg_idx in unique_pg_indices:
             # num_cpus=0 so the initializer doesn't consume a CPU slot — it

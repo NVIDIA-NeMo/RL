@@ -27,6 +27,7 @@ except ImportError:
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import get_next_token_logprobs_from_logits
 from nemo_rl.models.automodel.data import (
     ProcessedInputs,
     ProcessedMicrobatch,
@@ -41,10 +42,16 @@ from nemo_rl.models.automodel.train import (
     _needs_kv_cache_for_shared_layers,
     apply_temperature_scaling,
     automodel_forward_backward,
+    compute_fused_ce_next_token_logprobs,
     extract_logits,
     forward_with_post_processing_fn,
     model_forward,
 )
+
+try:
+    from nemo_automodel.components.loss.linear_ce import HAVE_CUT_CROSS_ENTROPY
+except ImportError:
+    HAVE_CUT_CROSS_ENTROPY = False
 
 
 @pytest.fixture
@@ -2023,9 +2030,7 @@ class TestAggregateTrainingStatistics:
     @patch("torch.cuda.get_device_name", return_value="NVIDIA A100")
     def test_basic_aggregation(self, mock_device_name, mock_get_rank, mock_all_reduce):
         """Test basic statistics aggregation."""
-        from nemo_rl.models.automodel.train import (
-            aggregate_training_statistics,
-        )
+        from nemo_rl.models.automodel.train import aggregate_training_statistics
 
         losses = [0.5, 0.4, 0.3]
         all_mb_metrics = [
@@ -2073,9 +2078,7 @@ class TestAggregateTrainingStatistics:
         self, mock_device_name, mock_get_rank, mock_all_reduce
     ):
         """Test aggregation with None grad_norm (eval mode)."""
-        from nemo_rl.models.automodel.train import (
-            aggregate_training_statistics,
-        )
+        from nemo_rl.models.automodel.train import aggregate_training_statistics
 
         losses = [0.5]
         all_mb_metrics = [{"loss": 0.5}]
@@ -2100,9 +2103,7 @@ class TestAggregateTrainingStatistics:
     @patch("torch.cuda.get_device_name", return_value="NVIDIA A100")
     def test_empty_metrics(self, mock_device_name, mock_get_rank, mock_all_reduce):
         """Test aggregation with empty metrics list."""
-        from nemo_rl.models.automodel.train import (
-            aggregate_training_statistics,
-        )
+        from nemo_rl.models.automodel.train import aggregate_training_statistics
 
         losses = []
         all_mb_metrics = []
@@ -2126,9 +2127,7 @@ class TestAggregateTrainingStatistics:
     @patch("torch.cuda.get_device_name", return_value="NVIDIA A100")
     def test_global_loss_on_cpu(self, mock_device_name, mock_get_rank, mock_all_reduce):
         """Test that global_loss is moved to CPU."""
-        from nemo_rl.models.automodel.train import (
-            aggregate_training_statistics,
-        )
+        from nemo_rl.models.automodel.train import aggregate_training_statistics
 
         losses = [0.5, 0.4]
         all_mb_metrics = [{"loss": 0.5}, {"loss": 0.4}]
@@ -2146,3 +2145,139 @@ class TestAggregateTrainingStatistics:
 
         # Verify global_loss is on CPU
         assert metrics["global_loss"].device == torch.device("cpu")
+
+
+# =====================
+# Test compute_fused_ce_next_token_logprobs
+# =====================
+@pytest.mark.automodel
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="cut_cross_entropy's Triton kernel requires a GPU")
+@pytest.mark.skipif(not HAVE_CUT_CROSS_ENTROPY, reason="cut_cross_entropy is not installed")
+class TestComputeFusedCeNextTokenLogprobsEquivalence:
+    """Numerical-equivalence tests for the linear-CE-fusion training-loss path.
+
+    compute_fused_ce_next_token_logprobs (hidden_states + lm_head.weight ->
+    per-token logprobs via cut_cross_entropy, never materializing full
+    [seq_len, vocab_size] logits) must be a drop-in replacement for the plain
+    path (lm_head(hidden_states) -> get_next_token_logprobs_from_logits):
+    same logprobs, same gradients into both hidden_states and lm_head.weight.
+
+    Use cosine similarity plus a loose allclose for checking, not exact equality.
+    """
+
+    def _build_inputs(self, batch_size, seq_len, hidden_size, vocab_size, seed=0):
+        torch.manual_seed(seed)
+        device = "cuda"
+        dtype = torch.bfloat16
+        hidden_states = torch.randn(
+            batch_size, seq_len, hidden_size, device=device, dtype=dtype
+        )
+        weight = torch.randn(vocab_size, hidden_size, device=device, dtype=dtype)
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+        return hidden_states, weight, input_ids
+
+    def _plain_path_logprobs(self, hidden_states, weight, input_ids):
+        """Mirrors the pre-fusion code path: lm_head(hidden_states) -> full
+        logits -> get_next_token_logprobs_from_logits (log_softmax+gather)."""
+        logits = torch.nn.functional.linear(hidden_states, weight)
+        return get_next_token_logprobs_from_logits(
+            input_ids=input_ids, next_token_logits=logits
+        )
+
+    def test_logprobs_match_plain_path(self):
+        hidden_states, weight, input_ids = self._build_inputs(
+            batch_size=2, seq_len=283, hidden_size=256, vocab_size=32003
+        )
+        model_stub = MagicMock()
+        model_stub.lm_head = torch.nn.Linear(
+            weight.shape[1], weight.shape[0], bias=False, device="cuda", dtype=torch.bfloat16
+        )
+        with torch.no_grad():
+            model_stub.lm_head.weight.copy_(weight)
+
+        ref_logprobs = self._plain_path_logprobs(hidden_states, weight, input_ids)
+        fused_logprobs = compute_fused_ce_next_token_logprobs(
+            model_stub, hidden_states, input_ids, sampling_params=None
+        )
+
+        assert fused_logprobs.shape == ref_logprobs.shape
+        assert fused_logprobs.dtype == torch.float32
+        assert torch.allclose(ref_logprobs, fused_logprobs, rtol=5e-2, atol=5e-2)
+        cos_sim = torch.nn.functional.cosine_similarity(
+            ref_logprobs.flatten(), fused_logprobs.flatten(), dim=0
+        )
+        assert cos_sim.item() >= 0.99999
+
+    def test_gradients_match_plain_path(self):
+        hidden_states, weight, input_ids = self._build_inputs(
+            batch_size=2, seq_len=283, hidden_size=256, vocab_size=32003
+        )
+
+        hidden_ref = hidden_states.detach().clone().requires_grad_(True)
+        weight_ref = weight.detach().clone().requires_grad_(True)
+        ref_logprobs = self._plain_path_logprobs(hidden_ref, weight_ref, input_ids)
+        ref_logprobs.sum().backward()
+
+        hidden_fused = hidden_states.detach().clone().requires_grad_(True)
+        model_stub = MagicMock()
+        model_stub.lm_head = torch.nn.Linear(
+            weight.shape[1], weight.shape[0], bias=False, device="cuda", dtype=torch.bfloat16
+        )
+        # nn.Parameter(existing_leaf_tensor) does NOT alias the original
+        # tensor's autograd graph, so read grads back off
+        # model_stub.lm_head.weight (what compute_fused_ce_next_token_logprobs
+        # actually reads/backprops into), not off a separately-held reference.
+        with torch.no_grad():
+            model_stub.lm_head.weight.copy_(weight)
+        fused_logprobs = compute_fused_ce_next_token_logprobs(
+            model_stub, hidden_fused, input_ids, sampling_params=None
+        )
+        fused_logprobs.sum().backward()
+
+        def cos_sim(a, b):
+            return torch.nn.functional.cosine_similarity(
+                a.float().flatten(), b.float().flatten(), dim=0
+            ).item()
+
+        weight_fused_grad = model_stub.lm_head.weight.grad
+        hidden_cos = cos_sim(hidden_ref.grad, hidden_fused.grad)
+        weight_cos = cos_sim(weight_ref.grad, weight_fused_grad)
+        assert hidden_cos >= 0.9997, f"hidden_states.grad cosine similarity too low: {hidden_cos}"
+        assert weight_cos >= 0.9997, f"lm_head.weight.grad cosine similarity too low: {weight_cos}"
+
+        # Gradient norms should also agree closely (catches a systematic
+        # scale bug that per-element cosine similarity alone could miss).
+        hidden_norm_ratio = hidden_fused.grad.float().norm() / hidden_ref.grad.float().norm()
+        weight_norm_ratio = weight_fused_grad.float().norm() / weight_ref.grad.float().norm()
+        assert abs(hidden_norm_ratio.item() - 1.0) < 0.01
+        assert abs(weight_norm_ratio.item() - 1.0) < 0.01
+
+    def test_rejects_temperature_scaling(self):
+        hidden_states, weight, input_ids = self._build_inputs(
+            batch_size=1, seq_len=8, hidden_size=32, vocab_size=97
+        )
+        model_stub = MagicMock()
+        model_stub.lm_head = torch.nn.Linear(
+            weight.shape[1], weight.shape[0], bias=False, device="cuda", dtype=torch.bfloat16
+        )
+        sampling_params = TrainingSamplingParams(temperature=0.7)
+
+        with pytest.raises(NotImplementedError):
+            compute_fused_ce_next_token_logprobs(
+                model_stub, hidden_states, input_ids, sampling_params=sampling_params
+            )
+
+    def test_rejects_top_k_filtering(self):
+        hidden_states, weight, input_ids = self._build_inputs(
+            batch_size=1, seq_len=8, hidden_size=32, vocab_size=97
+        )
+        model_stub = MagicMock()
+        model_stub.lm_head = torch.nn.Linear(
+            weight.shape[1], weight.shape[0], bias=False, device="cuda", dtype=torch.bfloat16
+        )
+        sampling_params = TrainingSamplingParams(temperature=1.0, top_k=10)
+
+        with pytest.raises(NotImplementedError):
+            compute_fused_ce_next_token_logprobs(
+                model_stub, hidden_states, input_ids, sampling_params=sampling_params
+            )

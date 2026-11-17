@@ -145,17 +145,39 @@ def apply_reward_shaping(
         else:
             response_lengths = list(response_token_lengths)
     else:
+        # [CUSTOM-PORTED 2026-11-02] Hand-ported from upstream commit e12d18ba8
+        # "fix(training): exclude prompt history from reward lengths and loss masks"
+        # (NVIDIA-NeMo/RL PR #4487, merged 2026-10-18) -- that PR's fix landed upstream on
+        # the fast `response_token_lengths` (data-plane/TQ) path above, which we don't use
+        # (sync_rollout_actor.py's data-plane path doesn't apply to our NeMo-Gym rollouts),
+        # so this legacy fallback branch still has the original bug upstream fixed
+        # elsewhere: it broke on the FIRST "assistant"-role message in message_log and used
+        # its length alone -- correct for a single-turn layout
+        # (message_log == [prompt, response]), silently wrong for our multi-turn
+        # swe_agents/NeMo-Gym rollouts (break on turn 1, ignoring every later turn,
+        # including the one that actually runs long/degenerates).
+        # Fix: sum token_ids across every assistant message that carries
+        # "generation_logprobs" (i.e. was actually generated this rollout, not part of
+        # prompt history) -- this key is already set by rollouts.py at generation time and
+        # only backfilled with zeros later in grpo.py (after this function runs), so the
+        # presence check correctly separates real generations from prompt-history turns.
+        #
+        # Safe to delete this patch (and this comment) once this fork's RL base starts
+        # populating response_token_lengths for our own rollout path too (making this
+        # fallback branch unreachable for us), or if upstream ever fixes this same fallback
+        # branch directly -- diff this branch against upstream at that point first to
+        # confirm it already matches before removing.
         response_lengths = []
         for message_log in batch["message_log"]:
-            length = None
-            for message in message_log:
-                if message["role"] == "assistant":
-                    length = message["token_ids"].shape[0]
-                    break
-            assert length is not None, (
+            assistant_lengths = [
+                message["token_ids"].shape[0]
+                for message in message_log
+                if message["role"] == "assistant" and "generation_logprobs" in message
+            ]
+            assert assistant_lengths, (
                 "Assistant response not found during reward shaping"
             )
-            response_lengths.append(length)
+            response_lengths.append(sum(assistant_lengths))
 
     assert len(response_lengths) == len(rewards), (
         "The number of messages in the batch must match the number of rewards"

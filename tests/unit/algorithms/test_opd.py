@@ -425,7 +425,9 @@ def test_create_advantage_estimator_opd_branch():
         truncated_importance_sampling_type="none",
     )
     master_config = SimpleNamespace(
-        grpo={"adv_estimator": {"name": "opd"}}, loss_fn=loss_fn
+        grpo={"adv_estimator": {"name": "opd"}},
+        loss_fn=loss_fn,
+        on_policy_distillation=None,
     )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")

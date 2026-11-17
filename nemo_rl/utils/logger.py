@@ -1616,3 +1616,101 @@ def get_next_experiment_dir(base_log_dir: str) -> str:
     os.makedirs(new_log_dir, exist_ok=True)
 
     return new_log_dir
+
+
+# ============================================================================
+# [CUSTOM] Rollout logging: decode token_ids -> text, dump COMPLETE jsonl, and
+# print a few samples to stdout. Used for both training and validation rollouts.
+#
+# MODES (env var NRL_ROLLOUT_LOG_MODE):
+#   "custom" (default) : do the jsonl dump + stdout print here.
+#                        wandb tables ALSO happen independently if the config has
+#                        env.should_log_nemo_gym_responses=true and wandb_enabled=true.
+#   "wandb"            : no-op (no jsonl, no stdout). Rely only on wandb tables.
+#                        Inspect later with scripts/inspect_wandb_rollouts.py.
+#
+# Other env vars:
+#   NRL_ROLLOUT_DUMP_DIR : base dir; files -> <dir>/<tag>/rollouts_<tag>_step<NNN>.jsonl
+#   NRL_ROLLOUT_DUMP_MAX : optional cap on samples written per file (default: all)
+# ============================================================================
+def log_rollouts(message_logs, rewards, tokenizer=None, num_print=3, step=0, tag="train"):
+    import os as _os, json as _json
+    if _os.environ.get("NRL_ROLLOUT_LOG_MODE", "custom").lower() == "wandb":
+        return  # use wandb tables only; nothing to do here
+    if not message_logs or rewards is None:
+        return
+    try:
+        rewards = rewards.tolist() if hasattr(rewards, "tolist") else list(rewards)
+    except Exception:
+        rewards = list(rewards)
+
+    def _decode(msg):
+        if not isinstance(msg, dict):
+            return str(msg), None
+        c = msg.get("content", "")
+        if c:
+            return str(c), None
+        tok = msg.get("token_ids", None)
+        if tok is not None and tokenizer is not None:
+            try:
+                ids = tok.tolist() if hasattr(tok, "tolist") else list(tok)
+                return tokenizer.decode(ids, skip_special_tokens=False), len(ids)
+            except Exception:
+                pass
+        try:
+            return "", (int(len(tok)) if tok is not None else None)
+        except Exception:
+            return "", None
+
+    rows = []
+    for _i, (_ml, _r) in enumerate(zip(message_logs, rewards)):
+        _msgs = []
+        for _m in _ml:
+            _role = _m.get("role", "") if isinstance(_m, dict) else ""
+            _text, _ntok = _decode(_m)
+            _msgs.append({"role": _role, "content": _text, "num_tokens": _ntok})
+        rows.append({"step": int(step), "tag": tag, "sample_index": _i,
+                     "reward": float(_r), "messages": _msgs})
+
+    _dump_dir = _os.environ.get("NRL_ROLLOUT_DUMP_DIR")
+    if _dump_dir:
+        try:
+            _sub = _os.path.join(_dump_dir, tag)
+            _os.makedirs(_sub, exist_ok=True)
+            _n = len(rows)
+            _cap = _os.environ.get("NRL_ROLLOUT_DUMP_MAX")
+            if _cap:
+                try:
+                    _n = min(_n, int(_cap))
+                except Exception:
+                    pass
+            _path = _os.path.join(_sub, f"rollouts_{tag}_step{int(step):08d}.jsonl")
+            with open(_path, "w") as _fh:
+                for _row in rows[:_n]:
+                    _fh.write(_json.dumps(_row, ensure_ascii=False) + "\n")
+            print(f"  \U0001F4DD [{tag}] dumped {_n}/{len(rows)} rollouts -> {_path}", flush=True)
+        except Exception as _e:
+            print(f"  ⚠️  [{tag}] rollout jsonl dump failed: {_e}", flush=True)
+
+    if num_print and num_print > 0 and rows:
+        try:
+            _rmean = sum(rewards) / len(rewards)
+            print(f"\n===== [{tag}] step {step} | {len(rewards)} rollouts | mean reward {_rmean:.4f} =====", flush=True)
+            _order = sorted(range(len(rows)), key=lambda j: rewards[j], reverse=True)
+            _half = max(1, num_print // 2)
+            _pick = _order[:_half] + _order[-(num_print - _half):]
+            _seen = set()
+            for _idx in _pick:
+                if _idx in _seen:
+                    continue
+                _seen.add(_idx)
+                _row = rows[_idx]
+                print(f"--- sample {_idx} | reward {_row['reward']:.3f} ---", flush=True)
+                for _m in _row["messages"]:
+                    _t = _m["content"]
+                    if len(_t) > 1500:
+                        _t = _t[:1500] + f"... [+{len(_t) - 1500} chars]"
+                    print(f"  [{_m['role']}] {_t}", flush=True)
+            print(f"===== end [{tag}] step {step} =====\n", flush=True)
+        except Exception as _e:
+            print(f"  ⚠️  [{tag}] rollout stdout print failed: {_e}", flush=True)

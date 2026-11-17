@@ -92,6 +92,7 @@ checkpointing:
   metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
   higher_is_better: true
   keep_top_k: 3
+  keep_steps: null # optional list of steps never pruned (don't count toward keep_top_k), e.g. [500, 1000]
   save_period: 10
   checkpoint_must_save_by: null
   model_save_format: "safetensors"

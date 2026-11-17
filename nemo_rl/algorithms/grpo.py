@@ -60,7 +60,6 @@ from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, VLMMessageLogType
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
-    get_keys_from_message_log,
 )
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
@@ -102,7 +101,6 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
-    print_message_log_samples,
 )
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
@@ -157,6 +155,34 @@ class AdvEstimatorConfig(TypedDict):
     minus_baseline: NotRequired[bool]
 
 
+class OverlongRepetitionConfig(TypedDict):
+    """[CUSTOM] Which truncated rollouts overlong filtering keeps in the loss.
+
+    Attributes:
+        enabled: Keep degenerate (looping or word-salad) truncated rollouts in the loss.
+        ngram: n of the distinct n-gram ratio.
+        window: Number of last generated tokens both checks are measured on.
+        max_distinct_ratio: A truncated rollout whose ratio is below this is a loop.
+        max_mean_logprob: A truncated rollout whose mean generation logprob is below
+            this is word salad (near-uniform sampling; coherent text sits above -1).
+            Omit it to keep loops only.
+        keep_all_truncated: Keep every truncated rollout, degenerate or not. Penalizing
+            only detected loops and salad let the degeneration drift just past each
+            detector (arms C5, C6), while nearly every truncated rollout was degenerate.
+        token_budget: A kept rollout weighs as much as this many tokens (loss
+            multiplier token_budget / generated tokens), so one 32k-token rollout
+            cannot dominate a token-level loss.
+    """
+
+    enabled: bool
+    ngram: NotRequired[int]
+    window: NotRequired[int]
+    max_distinct_ratio: NotRequired[float]
+    max_mean_logprob: NotRequired[float]
+    keep_all_truncated: NotRequired[bool]
+    token_budget: NotRequired[int]
+
+
 class GRPOConfig(TypedDict):
     num_prompts_per_step: int
     num_generations_per_prompt: int
@@ -177,10 +203,18 @@ class GRPOConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     max_val_samples: int | None  # None for NeMo-Gym compatibility
+    # [CUSTOM] Per-call override for validation rollouts' max new tokens (NeMo-Gym path only).
+    # generation_config["max_new_tokens"] is NOT applied on the NeMo-Gym rollout path, so
+    # without this a validation call can run all the way to the engine's max_model_len.
+    # Default: null (no override, validation uses the same bound as training).
+    val_max_new_tokens: NotRequired[int | None]
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
     overlong_filtering: NotRequired[bool]
+    # [CUSTOM] Truncated rollouts that end in a repetition loop stay in the loss (at reward 0)
+    # instead of being filtered, so loops are pushed down; see apply_overlong_filtering.
+    overlong_repetition: NotRequired["OverlongRepetitionConfig"]
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool
@@ -1026,7 +1060,14 @@ def setup(
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
 
         ## make vllm hf overrides match the training policy
-        vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
+        # [CUSTOM] dict(...) copy: vllm_kwargs["hf_overrides"] is mutated below
+        # (trained_vocab_size) -- without the copy that would silently mutate
+        # policy_config["hf_config_overrides"] itself via the shared dict reference.
+        vllm_kwargs["hf_overrides"] = dict(policy_config.get("hf_config_overrides", {}))
+        if policy_config.get("trained_vocab_size") is not None:
+            vllm_kwargs["hf_overrides"]["trained_vocab_size"] = policy_config[
+                "trained_vocab_size"
+            ]
 
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
@@ -1386,6 +1427,99 @@ def dynamic_sampling(
         else repeated_batch
     )
     return batch_to_return, is_batch_complete, batch_cache, dynamic_sampling_metrics
+
+
+def distinct_ngram_ratio(token_ids: list[int], ngram: int, window: int) -> float:
+    """Share of distinct n-grams among the last `window` tokens (1.0 when too short)."""
+    tail = token_ids[-window:]
+    if len(tail) <= ngram:
+        return 1.0
+    grams = [tuple(tail[i : i + ngram]) for i in range(len(tail) - ngram + 1)]
+    return len(set(grams)) / len(grams)
+
+
+def tail_mean_logprob(assistant_messages: list[dict], window: int) -> float:
+    """Mean generation logprob of the last `window` generated tokens (0.0 if unrecorded)."""
+    logprobs = torch.cat(
+        [
+            m.get(
+                "generation_logprobs",
+                torch.zeros_like(m["token_ids"], dtype=torch.float32),
+            ).float()
+            for m in assistant_messages
+        ]
+    )
+    return logprobs[-window:].mean().item()
+
+
+def apply_overlong_filtering(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    repetition_cfg: Optional[OverlongRepetitionConfig] = None,
+) -> BatchedDataDict[DatumSpec]:
+    """Zero the loss multiplier of truncated samples (DAPO overlong filtering).
+
+    Truncated samples still count toward their group's reward baseline; they are
+    only excluded from the policy-gradient loss.
+
+    [CUSTOM] With `repetition_cfg` enabled, a truncated sample whose generation ends
+    in a repetition loop, or in word salad, is kept in the loss with multiplier
+    min(1, token_budget / generated tokens). Filtering every truncated sample means
+    that degenerate endings were never penalized, and they can grow on
+    out-of-domain prompts. Penalizing loops alone turned them into word salad
+    (arm C5, steps 55+), which the n-gram ratio scores as perfectly diverse.
+
+    Args:
+        repeated_batch: Rollout batch with "loss_multiplier" and "truncated"
+            (and "message_log" when `repetition_cfg` is enabled).
+        repetition_cfg: Which truncated samples to keep; None filters all of them.
+
+    Returns:
+        The same batch with "loss_multiplier" replaced by the filtered copy.
+    """
+    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+    truncated = repeated_batch["truncated"]
+
+    if isinstance(truncated, list):
+        truncated = torch.tensor(truncated, dtype=torch.bool)
+
+    keep = torch.zeros_like(loss_multiplier)
+    if repetition_cfg is not None and repetition_cfg["enabled"]:
+        ngram = repetition_cfg.get("ngram", 4)
+        window = repetition_cfg.get("window", 2048)
+        max_ratio = repetition_cfg.get("max_distinct_ratio", 0.4)
+        max_logprob = repetition_cfg.get("max_mean_logprob")
+        budget = repetition_cfg.get("token_budget", 4096)
+        keep_all = repetition_cfg.get("keep_all_truncated", False)
+        loops = salads = others = 0
+        for i in torch.nonzero(truncated).flatten().tolist():
+            assistant = [
+                m for m in repeated_batch["message_log"][i] if m["role"] == "assistant"
+            ]
+            generated = [t for m in assistant for t in m["token_ids"].tolist()]
+            if not generated:
+                continue
+            if distinct_ngram_ratio(generated, ngram, window) < max_ratio:
+                loops += 1
+            elif (
+                max_logprob is not None
+                and tail_mean_logprob(assistant, window) < max_logprob
+            ):
+                salads += 1
+            elif keep_all:
+                others += 1
+            else:
+                continue
+            keep[i] = min(1.0, budget / len(generated))
+        print(
+            f"  overlong filtering: {int(truncated.sum())} truncated, "
+            f"{loops} repetition loops, {salads} word-salad and {others} other kept "
+            "in the loss",
+            flush=True,
+        )
+
+    loss_multiplier[truncated] = loss_multiplier[truncated] * keep[truncated]
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    return repeated_batch
 
 
 def scale_rewards(
@@ -1814,7 +1948,11 @@ def _create_advantage_estimator(master_config: MasterConfig):
         print("  ✓ Using GRPO advantage estimator")
     elif adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
-        adv_estimator = OPDAdvantageEstimator({"name": "opd"}, loss_config)
+        adv_estimator = OPDAdvantageEstimator(
+            {"name": "opd"},
+            loss_config,
+            opd_config=master_config.on_policy_distillation,
+        )
         print("  ✓ Using OPD advantage estimator")
         # Warn if loss_fn is not configured per MOPD paper recommendations.
         if not loss_config.disable_ppo_ratio:
@@ -2133,6 +2271,43 @@ def compute_and_apply_seq_logprob_error_masking(
 # ===============================================================================
 
 
+def _add_decoded_rollout_text(log_data: dict[str, Any], tokenizer: Any) -> None:
+    """[CUSTOM] Give NemoGym training dumps readable text.
+
+    Adds ``prompt_text`` and ``generated_text``; leaves ``content`` untouched.
+    No-op when ``content`` already holds text (non-gym runs), so dumps that are
+    already readable don't pay for a second copy of every rollout.
+    """
+    if tokenizer is None or "token_ids" not in log_data:
+        return
+
+    def _is_empty(entry: Any) -> bool:
+        if isinstance(entry, str):
+            return not entry
+        if isinstance(entry, list):
+            return all(_is_empty(e) for e in entry)
+        if isinstance(entry, dict):
+            return not entry.get("content")
+        return entry is None
+
+    content = log_data.get("content") or []
+    if content and not all(_is_empty(c) for c in content):
+        return
+
+    prompts, generations = [], []
+    for ids, mask in zip(log_data["token_ids"], log_data["token_loss_mask"]):
+        gen_ids = [t for t, m in zip(ids, mask) if m]
+        prompt_ids = [t for t, m in zip(ids, mask) if not m]
+        try:
+            prompts.append(tokenizer.decode(prompt_ids, skip_special_tokens=False))
+            generations.append(tokenizer.decode(gen_ids, skip_special_tokens=False))
+        except Exception:  # noqa: BLE001 - a dump must never fail a training step
+            prompts.append("")
+            generations.append("")
+    log_data["prompt_text"] = prompts
+    log_data["generated_text"] = generations
+
+
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -2431,6 +2606,28 @@ def grpo_train(
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
 
+                    # [CUSTOM] per-step TRAINING rollout logging (decoded text):
+                    #   stdout: num_val_samples_to_print samples; jsonl: complete dump (train/)
+                    #   Bypassed when NRL_ROLLOUT_LOG_MODE=wandb. Never breaks the step.
+                    try:
+                        from nemo_rl.utils.logger import log_rollouts as _log_rollouts
+
+                        _log_rollouts(
+                            repeated_batch["message_log"],
+                            rewards,
+                            tokenizer=tokenizer,
+                            num_print=master_config.logger.get(
+                                "num_val_samples_to_print", 3
+                            ),
+                            step=total_steps + 1,
+                            tag="train",
+                        )
+                    except Exception as _e:
+                        print(
+                            f"  ⚠️  per-step train rollout logging failed: {_e}",
+                            flush=True,
+                        )
+
                     print("▶ Computing advantages...", flush=True)
                     # For DAPO with reward shaping, compute std on the raw
                     # pre-shaping reward so dynamic sampling filters prompt
@@ -2527,16 +2724,11 @@ def grpo_train(
                     del std
 
                 with timer.time("data_processing"):
-                    use_overlong_filtering = master_config.grpo["overlong_filtering"]
-                    if use_overlong_filtering:
-                        loss_multiplier = repeated_batch["loss_multiplier"].clone()
-                        truncated = repeated_batch["truncated"]
-
-                        if isinstance(truncated, list):
-                            truncated = torch.tensor(truncated, dtype=torch.bool)
-
-                        loss_multiplier[truncated] = 0
-                        repeated_batch["loss_multiplier"] = loss_multiplier
+                    if master_config.grpo["overlong_filtering"]:
+                        repeated_batch = apply_overlong_filtering(
+                            repeated_batch,
+                            master_config.grpo.get("overlong_repetition"),
+                        )
                     add_grpo_token_loss_masks_and_generation_logprobs(
                         repeated_batch["message_log"]
                     )
@@ -2993,6 +3185,7 @@ def grpo_train(
                 ].tolist()
                 log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
 
+                _add_decoded_rollout_text(log_data, tokenizer)
                 logger.log_batched_dict_as_jsonl(
                     log_data, f"train_data_step{total_steps + 1}.jsonl"
                 )
@@ -3180,6 +3373,15 @@ def validate(
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
                 generation_config = master_config.policy["generation"]
+                # [CUSTOM] val_max_new_tokens: override max_new_tokens for validation rollouts
+                # only, via a shallow copy so the shared master_config.policy["generation"]
+                # dict (also used by training rollouts) isn't mutated in place.
+                val_max_new_tokens = master_config.grpo.get("val_max_new_tokens")
+                if val_max_new_tokens is not None:
+                    generation_config = {
+                        **generation_config,
+                        "max_new_tokens": val_max_new_tokens,
+                    }
                 nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
@@ -3219,12 +3421,30 @@ def validate(
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
             # Collect message logs for later display
-            to_env = [
-                get_keys_from_message_log(
-                    val_batch["message_log"][i], ["role", "content"]
-                )
-                for i in range(len(val_batch["message_log"]))
-            ]
+            # [CUSTOM] decode gym token_ids -> text inline so all_message_logs holds
+            # only strings (json-safe for stock log_batched_dict_as_jsonl below).
+            to_env = []
+            for _i in range(len(val_batch["message_log"])):
+                _decoded = []
+                for _m in val_batch["message_log"][_i]:
+                    _role = _m.get("role", "") if isinstance(_m, dict) else ""
+                    _content = _m.get("content", "") if isinstance(_m, dict) else ""
+                    if (
+                        not _content
+                        and isinstance(_m, dict)
+                        and "token_ids" in _m
+                        and tokenizer is not None
+                    ):
+                        try:
+                            _tok = _m["token_ids"]
+                            _ids = (
+                                _tok.tolist() if hasattr(_tok, "tolist") else list(_tok)
+                            )
+                            _content = tokenizer.decode(_ids, skip_special_tokens=False)
+                        except Exception:
+                            pass
+                    _decoded.append({"role": _role, "content": _content})
+                to_env.append(_decoded)
 
             all_message_logs.extend(to_env)
 
@@ -3240,6 +3460,17 @@ def validate(
             sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
         )
 
+        # [CUSTOM] See the full_result opt-in in grpo_train/async_grpo_train: same for
+        # validation -- per-agent full_result Tables hold every rollout's whole NeMo-Gym
+        # response, which makes offline wandb dirs huge to sync. The rollouts/ and
+        # val_data_step*.jsonl dumps keep the content.
+        if not _should_log_nemo_gym_responses(master_config):
+            additional_metrics_to_report = {
+                k: v
+                for k, v in additional_metrics_to_report.items()
+                if "full_result" not in k
+            }
+
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
@@ -3248,14 +3479,15 @@ def validate(
 
         # Print sample conversations only once at the end of validation
         try:
-            print_message_log_samples(
+            from nemo_rl.utils.logger import log_rollouts as _log_rollouts
+
+            _log_rollouts(
                 all_message_logs,
                 total_rewards,
-                num_samples=min(
-                    master_config.logger["num_val_samples_to_print"],
-                    len(all_message_logs),
-                ),
+                tokenizer=None,  # already decoded inline
+                num_print=master_config.logger["num_val_samples_to_print"],
                 step=step,
+                tag="val",
             )
         except Exception as e:
             print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
@@ -3779,22 +4011,36 @@ def async_grpo_train(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
                     )
 
+                    # [CUSTOM] per-step TRAINING rollout logging (decoded text): see
+                    # grpo_train's identical block for the full rationale. Never breaks the step.
+                    try:
+                        from nemo_rl.utils.logger import log_rollouts as _log_rollouts
+
+                        _log_rollouts(
+                            repeated_batch["message_log"],
+                            rewards,
+                            tokenizer=tokenizer,
+                            num_print=master_config.logger.get(
+                                "num_val_samples_to_print", 3
+                            ),
+                            step=step + 1,
+                            tag="train",
+                        )
+                    except Exception as _e:
+                        print(
+                            f"  ⚠️  per-step train rollout logging failed: {_e}",
+                            flush=True,
+                        )
+
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
                     # Apply overlong filtering - mask out truncated sequences from loss computation
                     with timer.time("overlong_filter"):
-                        use_overlong_filtering = master_config.grpo[
-                            "overlong_filtering"
-                        ]
-                        if use_overlong_filtering:
-                            loss_multiplier = repeated_batch["loss_multiplier"].clone()
-                            truncated = repeated_batch["truncated"]
-
-                            if isinstance(truncated, list):
-                                truncated = torch.tensor(truncated, dtype=torch.bool)
-
-                            loss_multiplier[truncated] = 0
-                            repeated_batch["loss_multiplier"] = loss_multiplier
+                        if master_config.grpo["overlong_filtering"]:
+                            repeated_batch = apply_overlong_filtering(
+                                repeated_batch,
+                                master_config.grpo.get("overlong_repetition"),
+                            )
 
                     # Add loss mask to each message
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
@@ -3929,12 +4175,34 @@ def async_grpo_train(
                         prev_logprobs=train_data["prev_logprobs"],
                         generation_logprobs=train_data["generation_logprobs"],
                         sample_mask=train_data["sample_mask"],
+                        token_mask=token_mask,
                     )
                     if (
                         hasattr(adv_estimator, "last_metrics")
                         and adv_estimator.last_metrics
                     ):
                         rollout_metrics.update(adv_estimator.last_metrics)
+
+                    # [CUSTOM-ADDED 2026-11-03] async_grpo_train never computed this on
+                    # its own (unlike grpo_train's baseline_for_log) -- added so
+                    # baseline_reward/pct_0, pct_1, pct_mixed (the zero- vs
+                    # non-zero-advantage group counts) get logged for async GRPO too, not
+                    # just the sync path. Confirmed missing upstream too: as of v0.7.0 and
+                    # current origin/main, async_grpo_train still only logs
+                    # advantages/mean|max|min (whole-batch aggregates), never calls
+                    # _log_mixed_rewards_and_advantages_information -- nothing to port,
+                    # this is net-new. Grouping by prompt_ids_for_adv matches exactly what
+                    # adv_estimator.compute_advantage itself just grouped by, so this is
+                    # the same authoritative grouping used for real training, not a
+                    # reconstructed-after-the-fact guess.
+                    baseline_for_log, _ = calculate_baseline_and_std_per_prompt(
+                        prompt_ids_for_adv,
+                        rewards,
+                        torch.ones_like(rewards),
+                        leave_one_out_baseline=master_config.grpo[
+                            "use_leave_one_out_baseline"
+                        ],
+                    )
                     del prompt_ids_for_adv
 
                     # Log advantages stats
@@ -4026,29 +4294,46 @@ def async_grpo_train(
                         POLICY_GENERATION_STALE = False
                     else:
                         policy_generation.prepare_for_generation()
-                    val_metrics, validation_timings = validate(
-                        policy_generation,
-                        val_dataloader,
-                        tokenizer,
-                        val_task_to_env,
-                        step=step + 1,
-                        master_config=master_config,
-                        logger=logger,
-                    )
-                    policy_generation.finish_generation()
-                    logger.log_metrics(
-                        validation_timings, step + 1, prefix="timing/validation"
-                    )
-                    logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                    # [CUSTOM-PERIODIC-VAL-GUARD 2026-11-09] Same guard as the initial
+                    # validation above: one failing rollout (e.g. an environment /run
+                    # 500 -- job 63909244 died at its step-20 validation on a single
+                    # swe_agents 500) must not kill a multi-day run. Skip this step's
+                    # validation metrics and keep training; always resume collection.
+                    try:
+                        val_metrics, validation_timings = validate(
+                            policy_generation,
+                            val_dataloader,
+                            tokenizer,
+                            val_task_to_env,
+                            step=step + 1,
+                            master_config=master_config,
+                            logger=logger,
+                        )
+                        logger.log_metrics(
+                            validation_timings, step + 1, prefix="timing/validation"
+                        )
+                        logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                    except Exception as e:
+                        val_metrics, validation_timings = None, None
+                        print(
+                            f"❌ Validation at step {step + 1} failed, skipping its "
+                            f"metrics and continuing training: {e}",
+                            flush=True,
+                        )
+                        import traceback
 
-                    # Explicit GPU memory cleanup after validation in async mode
-                    import gc
+                        traceback.print_exc()
+                    finally:
+                        policy_generation.finish_generation()
 
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                        # Explicit GPU memory cleanup after validation in async mode
+                        import gc
 
-                    # Resume trajectory collection after validation
-                    trajectory_collector.resume.remote()
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
+                        # Resume trajectory collection after validation
+                        trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
@@ -4061,7 +4346,25 @@ def async_grpo_train(
                     flat_advantages, flat_token_mask.bool()
                 )
 
+                # [CUSTOM-ADDED 2026-11-03] Logged into a scratch dict, not directly into
+                # `metrics`, because _log_mixed_rewards_and_advantages_information also
+                # sets "advantages/mean"/"advantages/sum" from the *unmasked* advantages
+                # tensor -- spreading it first lets the masked, token-level
+                # "advantages/mean"/"max"/"min" set below win, matching grpo_train's own
+                # final values (same dict-merge pattern grpo_train itself uses at its
+                # second metrics block to let the masked mean override the unmasked one).
+                baseline_metrics: dict[str, Any] = {}
+                _log_mixed_rewards_and_advantages_information(
+                    logger=logger,
+                    total_steps=step,
+                    metrics=baseline_metrics,
+                    baseline=baseline_for_log,
+                    advantages=train_data["advantages"],
+                )
+                del baseline_for_log
+
                 metrics = {
+                    **baseline_metrics,
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),
@@ -4078,6 +4381,24 @@ def async_grpo_train(
                     if response_advantages.numel() > 0
                     else 0.0,
                 }
+                # [CUSTOM] Dynamic sampling diagnostics: reward above only covers groups the
+                # trainer actually received (discarded groups never reach it -- see
+                # trajectory_collector.get_target_stats). filtered_reward is what's trained
+                # on; reward is overwritten with the mean over everything generated for this
+                # target, including discards, when available. Not implemented upstream at all.
+                if master_config.grpo["use_dynamic_sampling"]:
+                    target_stats = ray.get(
+                        trajectory_collector.get_target_stats.remote(weight_version)
+                    )
+                    metrics["filtered_reward"] = metrics["reward"]
+                    if "unfiltered_reward" in target_stats:
+                        metrics["reward"] = target_stats["unfiltered_reward"]
+                    metrics["dynamic_sampling_num_gen_batches"] = target_stats.get(
+                        "dynamic_sampling_num_gen_batches", 1.0
+                    )
+                    metrics["dynamic_sampling_num_discarded_groups"] = target_stats.get(
+                        "dynamic_sampling_num_discarded_groups", 0.0
+                    )
                 if "moe_metrics" in train_results:
                     metrics.update(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
@@ -4103,6 +4424,7 @@ def async_grpo_train(
                         "lr",
                         "wd",
                         "reward",
+                        "filtered_reward",
                         "global_valid_seqs",
                         "global_valid_toks",
                         "mean_prompt_length",
@@ -4214,6 +4536,8 @@ def async_grpo_train(
             log_data = {}
             if "agent_ref" in repeated_batch:
                 log_data["agent_ref"] = repeated_batch["agent_ref"]
+            if "truncated" in repeated_batch:  # [CUSTOM] for scripts/mopd_metrics.py
+                log_data["truncated"] = repeated_batch["truncated"].tolist()
             log_data["content"] = flat_messages_content
             log_data["rewards"] = rewards.tolist()
             if master_config.grpo["use_dynamic_sampling"]:
@@ -4227,6 +4551,7 @@ def async_grpo_train(
             log_data["advantages"] = train_data["advantages"].tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+            _add_decoded_rollout_text(log_data, tokenizer)
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{step + 1}.jsonl"
             )

@@ -51,6 +51,8 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.proxy import maybe_enable_proxy  # [CUSTOM]
+from nemo_rl.utils.redis_job import maybe_start_redis_job  # [CUSTOM]
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -134,6 +136,21 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
+
+    # [CUSTOM] Opt-in (config["proxy"]["enabled"]): exports HTTP_PROXY/HTTPS_PROXY from the
+    # standing external forward-proxy's URL for this process's whole lifetime, for
+    # environments that need real internet access (e.g. web-search tool servers). No-op if
+    # the config has no `proxy` block or `proxy.enabled` is false. Called here, before the
+    # dict -> MasterConfig conversion below (maybe_enable_proxy expects plain dict access) and
+    # before anything else that might itself want outbound internet.
+    maybe_enable_proxy(config)
+
+    # [CUSTOM] Opt-in (config["redis"]["enabled"]): launches the colocated Redis instance used
+    # as the backing store for rate-limited Gym resources servers (e.g. brave_search). No-op
+    # if the config has no `redis` block or `redis.enabled` is false. Started before init_ray()
+    # so the discovered host is captured in Ray's runtime_env env var snapshot.
+    maybe_start_redis_job(config)
+
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 
@@ -230,9 +247,13 @@ The validation set you pass in will directly be used for validation with no addi
         )
     # Check if async mode is enabled
     elif "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
-        # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
+        # [CUSTOM] Async GRPO does not support reward scaling or reward shaping (DAPO
+        # features). Dynamic sampling IS supported: the AsyncTrajectoryCollector drops
+        # zero-advantage (all-equal-reward) groups before they reach the replay buffer and
+        # relies on the collector's existing gap-filling retry to relaunch a replacement (see
+        # nemo_rl/algorithms/async_utils/trajectory_collector.py). Not implemented upstream at
+        # all (checked v0.7.0 and current upstream main).
         unsupported_features = [
-            "use_dynamic_sampling",
             "reward_scaling",
             "reward_shaping",
         ]
@@ -241,16 +262,10 @@ The validation set you pass in will directly be used for validation with no addi
             if feature not in config.grpo:
                 continue
 
-            if feature == "use_dynamic_sampling":
-                if config.grpo[feature]:
-                    raise NotImplementedError(
-                        f"{feature} is not supported with async GRPO"
-                    )
-            else:
-                if config.grpo[feature]["enabled"]:
-                    raise NotImplementedError(
-                        f"{feature} is not supported with async GRPO"
-                    )
+            if config.grpo[feature]["enabled"]:
+                raise NotImplementedError(
+                    f"{feature} is not supported with async GRPO"
+                )
 
         # Async GRPO does not support multiple dataloaders
         if config.data["use_multiple_dataloader"]:

@@ -33,6 +33,7 @@ from nemo_rl.algorithms.grpo import (
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
     aggregate_rollout_metrics,
+    apply_overlong_filtering,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
@@ -723,6 +724,13 @@ class StubAsyncTrajectoryCollector:
         mock.remote = MagicMock(return_value=MagicMock())
         return mock
 
+    @property
+    def get_target_stats(self):
+        """Per-target generation stats - {} like the real collector for an unknown target"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={})  # ray.get is patched to pass dicts through
+        return mock
+
 
 def mock_async_grpo_infrastructure(
     mock_batch, mock_rollout_metrics, seq_logprob_error_result=None
@@ -1275,6 +1283,107 @@ def test_dapo_dynamic_sampling_batch_caching(mock_grpo_components):
     )  # All samples from the single prompt with non-zero std
     assert is_batch_complete == True
     assert batch_cache is not None
+
+
+@pytest.mark.parametrize("truncated_as_list", [False, True])
+def test_apply_overlong_filtering_zeroes_truncated_samples(truncated_as_list):
+    truncated = [False, True, False, True]
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([1.0, 1.0, 0.0, 1.0]),
+            "truncated": truncated
+            if truncated_as_list
+            else torch.tensor(truncated, dtype=torch.bool),
+        }
+    )
+    original_multiplier = repeated_batch["loss_multiplier"]
+
+    filtered = apply_overlong_filtering(repeated_batch)
+
+    assert filtered["loss_multiplier"].tolist() == [1.0, 0.0, 0.0, 0.0]
+    # The caller's tensor is not modified in place.
+    assert original_multiplier.tolist() == [1.0, 1.0, 0.0, 1.0]
+
+
+def _assistant_log(token_ids):
+    return [
+        {"role": "user", "token_ids": torch.tensor([1, 2, 3])},
+        {"role": "assistant", "token_ids": torch.tensor(token_ids)},
+    ]
+
+
+def test_apply_overlong_filtering_keeps_truncated_loops_with_a_token_budget():
+    loop = [7, 8] * 4000  # 8000 tokens, 2 distinct 4-grams
+    varied = list(range(8000))  # truncated, but no repetition
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([1.0, 1.0, 1.0, 0.0]),
+            "truncated": torch.tensor([True, True, False, True]),
+            "message_log": [
+                _assistant_log(loop),
+                _assistant_log(varied),
+                _assistant_log(loop),
+                _assistant_log(loop),
+            ],
+        }
+    )
+    cfg = {"enabled": True, "token_budget": 2000}
+
+    filtered = apply_overlong_filtering(repeated_batch, cfg)
+
+    # The truncated loop weighs 2000 tokens' worth, the truncated non-loop is
+    # filtered, untruncated samples are untouched and a masked sample stays masked.
+    assert filtered["loss_multiplier"].tolist() == [0.25, 0.0, 1.0, 0.0]
+
+
+def test_apply_overlong_filtering_keeps_truncated_word_salad():
+    varied = list(range(8000))
+
+    def log(mean_logprob):
+        messages = _assistant_log(varied)
+        messages[1]["generation_logprobs"] = torch.full((8000,), mean_logprob)
+        return messages
+
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([1.0, 1.0, 1.0]),
+            "truncated": torch.tensor([True, True, True]),
+            # Salad, coherent long reasoning, and no logprobs recorded.
+            "message_log": [log(-9.0), log(-0.3), _assistant_log(varied)],
+        }
+    )
+    cfg = {"enabled": True, "token_budget": 2000, "max_mean_logprob": -3.0}
+
+    filtered = apply_overlong_filtering(repeated_batch, cfg)
+
+    assert filtered["loss_multiplier"].tolist() == [0.25, 0.0, 0.0]
+
+
+def test_apply_overlong_filtering_keep_all_truncated():
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([1.0, 1.0]),
+            "truncated": torch.tensor([True, False]),
+            "message_log": [_assistant_log(list(range(8000)))] * 2,
+        }
+    )
+    cfg = {"enabled": True, "token_budget": 2000, "keep_all_truncated": True}
+
+    filtered = apply_overlong_filtering(repeated_batch, cfg)
+
+    assert filtered["loss_multiplier"].tolist() == [0.25, 1.0]
+
+
+def test_apply_overlong_filtering_disabled_repetition_filters_all():
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([1.0]),
+            "truncated": torch.tensor([True]),
+            "message_log": [_assistant_log([7, 8] * 4000)],
+        }
+    )
+    filtered = apply_overlong_filtering(repeated_batch, {"enabled": False})
+    assert filtered["loss_multiplier"].tolist() == [0.0]
 
 
 def test_dapo_dynamic_sampling_disabled(mock_grpo_components):

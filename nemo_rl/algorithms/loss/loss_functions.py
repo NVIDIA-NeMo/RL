@@ -380,6 +380,21 @@ class ClippedPGLossFn(LossFunction):
             global_normalization_factor=global_valid_toks,
         ).item()
 
+        # [CUSTOM] stale-kl: KL(P_prev || P_curr), k3 estimator on loss tokens. prev_logprobs (and so any advantage
+        # built from them, e.g. OPD's teacher - prev) are frozen for the whole step, while the policy moves after every
+        # global batch: this measures how far it has drifted by the current optimizer update. The DTensor v2 worker
+        # re-keys it as stale_kl/update_<k>; other workers log the plain key, summed over the step's updates.
+        with torch.no_grad():
+            # masked first: padding positions may hold -inf/garbage and inf * 0 would give NaN
+            stale_log_ratio = torch.where(
+                mask.bool(), curr_logprobs.detach() - prev_logprobs, 0.0
+            )
+            stale_kl = masked_mean(
+                torch.expm1(stale_log_ratio) - stale_log_ratio,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+
         # Jensen-Shannon divergence
         # M = 0.5 * (P_train + P_gen)
         # JSD = 0.5 * KL(P_train || M) + 0.5 * KL(P_gen || M)
@@ -718,6 +733,7 @@ class ClippedPGLossFn(LossFunction):
                 "gen_kl_error": gen_kl_error,
                 "policy_kl_error": policy_kl_error,
                 "js_divergence_error": js_divergence_error,
+                "stale_kl": stale_kl,
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),

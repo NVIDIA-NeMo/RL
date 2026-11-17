@@ -192,6 +192,10 @@ If no `replay_buffer.pt` file is found in the latest checkpoint directory, train
 5. **Recompute KV Cache After Weight Updates**: While using in-flight weight update, user can choose whether to recompute
 KV caches after weight udpate by configuring `recompute_kv_cache_after_weight_update` configuration.
 
+6. **Dynamic Sampling**: `grpo.use_dynamic_sampling: true` works with async GRPO. The trajectory collector drops a prompt group whose rewards are all equal (zero advantage) before it reaches the replay buffer, and launches a replacement prompt for the same target weight version, so every training step still receives `num_prompts_per_step` groups. After `dynamic_sampling_max_gen_batches × num_prompts_per_step` launches for one target, further groups are accepted unfiltered so training cannot stall. `reward` is logged over all generated groups and `filtered_reward` over the trained ones. Expect more generation per step, by roughly 1 / (fraction of groups with mixed rewards).
+
+7. **Overlong Filtering**: `grpo.overlong_filtering: true` excludes truncated samples from the loss in async GRPO exactly as in sync GRPO. They still count toward their group's reward baseline.
+
 ## Why Importance Sampling Correction Is Required for Async
 
 ### The GRPO Objective

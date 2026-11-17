@@ -311,6 +311,14 @@ class DTensorPolicyWorkerV2Impl(
         )
 
         # Set up model and optimizer
+        # [CUSTOM] Defer the weights_path/optimizer_path load when init_reference_model: loading
+        # it here would resume the policy BEFORE setup_reference_model_state() below snapshots
+        # the reference, silently re-anchoring the KL reference to the resumed/fine-tuned policy
+        # instead of the original base weights on every resume. Loaded manually after the
+        # snapshot instead (see below).
+        # Fixed upstream in 646e6e49c "fix(dtensor-v2): keep the KL reference anchored to base
+        # weights across resumes" (#3722), not yet in v0.7.0 (our current base, checked
+        # 2026-11-02) -- safe to drop this patch once our base moves past that commit.
         model_and_optimizer_state = setup_model_and_optimizer(
             config=config,
             tokenizer=self.tokenizer,
@@ -319,8 +327,8 @@ class DTensorPolicyWorkerV2Impl(
             checkpoint_manager=self.checkpoint_manager,
             is_vlm=self.is_vlm,
             init_optimizer=init_optimizer,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
+            weights_path=None if init_reference_model else weights_path,
+            optimizer_path=None if init_reference_model else optimizer_path,
         )
 
         # Set instance attributes from model and optimizer state (tuple unpacking)
@@ -341,6 +349,11 @@ class DTensorPolicyWorkerV2Impl(
         self.reference_model_state_dict = None
         if init_reference_model:
             self.reference_model_state_dict = setup_reference_model_state(self.model)
+            if weights_path:
+                # Deferred from setup_model_and_optimizer above -- resume the policy only now
+                # that the KL reference has already been snapshotted from base weights.
+                print(f"Resuming policy from {weights_path} (KL reference: base weights)")
+                self.load_checkpoint(weights_path=weights_path, optimizer_path=optimizer_path)
 
         # Set instance attributes from runtime config (tuple unpacking)
         (
@@ -517,6 +530,12 @@ class DTensorPolicyWorkerV2Impl(
                         loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                        # [CUSTOM] one key per optimizer update: grpo sums each key over microbatches (each already
+                        # normalised by this global batch's tokens), so the plain key would add up all updates
+                        if "stale_kl" in loss_metrics:
+                            loss_metrics[f"stale_kl/update_{gb_idx}"] = (
+                                loss_metrics.pop("stale_kl")
+                            )
 
                         if num_valid_samples > 0:
                             mb_losses.append(loss.item())

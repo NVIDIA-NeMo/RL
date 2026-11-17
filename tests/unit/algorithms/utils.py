@@ -40,6 +40,10 @@ def create_mock_batch_with_responses(
                 "role": "assistant",
                 "content": f"Response {i}",
                 "token_ids": assistant_tokens,
+                # [CUSTOM-PORTED 2026-11-02] from upstream e12d18ba8 (PR #4487,
+                # see nemo_rl/algorithms/reward_functions.py) -- apply_reward_shaping's
+                # multi-turn fix only counts assistant turns carrying this key.
+                "generation_logprobs": torch.zeros(length),
             },
         ]
         message_logs.append(message_log)

@@ -1288,6 +1288,141 @@ class TestAsyncTrajectoryCollector:
         assert target_weight not in collector._completed_per_target
         assert target_weight not in collector._buffered_per_target
 
+    # --- [CUSTOM-GAPFILL-CURRENT] gap-filling a short current target (jobs 63795158, 63861875) ---
+
+    def _gap_fill_collector(self, monkeypatch, needs, last_consumed, current_version):
+        """Collector over a fake replay buffer: needs = {target: trajectories still needed}."""
+
+        class FakeReplayBuffer:
+            class get_trajectories_needed:  # noqa: N801 - mimics a Ray actor method
+                @staticmethod
+                def remote(target, num_prompts, max_age_steps):
+                    return needs.get(target, 0)
+
+            class get_last_target_weight_already_generated:  # noqa: N801
+                @staticmethod
+                def remote():
+                    return last_consumed
+
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.current_weight_version = current_version
+        return collector
+
+    @pytest.mark.parametrize(
+        "needs,last_consumed,reserved,expected",
+        [
+            # job 63861875: target 6 one group short after the refit to 6, 7/8 reserved
+            ({6: 1, 7: 2, 8: 2}, 5, {7, 8}, (6, 1)),
+            # a fully missing current target was consumed (race with sample()): never regenerate
+            ({6: 2, 7: 2, 8: 0}, 5, set(), (7, 2)),
+            # current target already consumed / already reserved / complete: skip to the window
+            ({6: 1, 7: 1, 8: 0}, 6, set(), (7, 1)),
+            ({6: 1, 7: 0, 8: 2}, 5, {6}, (8, 2)),
+            ({6: 0, 7: 0, 8: 0}, 5, set(), (None, 0)),
+        ],
+        ids=["short-current", "missing-current", "consumed", "reserved", "nothing"],
+    )
+    def test_find_target_gap_fills_current_target(
+        self, monkeypatch, needs, last_consumed, reserved, expected
+    ):
+        collector = self._gap_fill_collector(monkeypatch, needs, last_consumed, 6)
+        collector._generating_targets.update(reserved)
+        with collector._generation_check_lock:
+            assert collector._find_target_needing_generation(6) == expected
+        # pause decision and generation decision use the same candidates
+        assert collector._should_pause_for_generation_limits() is (expected[0] is None)
+
+    def test_find_target_initial_version_still_generates_fully(self, monkeypatch):
+        """The initial version stays a full-generation target (upstream behaviour)."""
+        collector = self._gap_fill_collector(monkeypatch, {0: 2, 1: 2, 2: 2}, -1, 0)
+        with collector._generation_check_lock:
+            assert collector._find_target_needing_generation(0) == (0, 2)
+
+    def test_get_next_target_reserves_short_current_target(self, monkeypatch):
+        collector = self._gap_fill_collector(monkeypatch, {6: 1, 7: 2, 8: 2}, 5, 6)
+        collector._generating_targets.update({7, 8})
+        assert collector._get_next_target_for_generation(6) == 6
+        assert 6 in collector._generating_targets
+
+    @pytest.mark.parametrize("buffered", [16, 20], ids=["short", "full"])
+    def test_release_wakes_paused_loop(self, buffered):
+        """A released reservation always wakes a paused loop, which re-checks for gap-filling."""
+        collector = self.create_local_collector()
+        target_weight = 5
+        collector._generation_limit_cleared.clear()  # loop paused: every target reserved
+        collector._generating_targets.add(target_weight)
+        collector._spawned_per_target[target_weight] = 20
+        collector._completed_per_target[target_weight] = 20
+        collector._buffered_per_target[target_weight] = buffered
+
+        collector._maybe_release_target(target_weight)
+
+        assert target_weight not in collector._generating_targets
+        assert collector._generation_limit_cleared.is_set()
+
+    def _run_collection_loop(self, monkeypatch, batches, pause_answers, process_answers):
+        """Run _collection_loop synchronously with scripted pause / process answers."""
+        collector = self.create_local_collector()
+        collector.running = True
+        pause_answers = list(pause_answers)
+        process_answers = list(process_answers)
+        processed, waits = [], []
+
+        def should_pause():
+            return pause_answers.pop(0) if pause_answers else False
+
+        def process_batch(batch):
+            processed.append(batch)
+            used = process_answers.pop(0) if process_answers else True
+            return used
+
+        class RecordingEvent:
+            def __init__(self):
+                self.cleared = 0
+
+            def clear(self):
+                self.cleared += 1
+
+            def set(self):
+                pass
+
+            def is_set(self):
+                return False
+
+            def wait(self, timeout=None):
+                waits.append(timeout)
+                return True
+
+        collector._should_pause_for_generation_limits = should_pause
+        collector._process_batch = process_batch
+        collector._generation_limit_cleared = RecordingEvent()
+        monkeypatch.setattr(trajectory_collector_mod.time, "sleep", lambda s: None)
+        collector.dataloader = iter(batches)
+        collector._collection_loop()
+        return processed, waits, collector._generation_limit_cleared.cleared
+
+    def test_collection_loop_keeps_batch_when_no_target(self, monkeypatch):
+        """'No targets need generation' must not drop the batch (job 63861875 dropped 478)."""
+        processed, _, _ = self._run_collection_loop(
+            monkeypatch, ["b1", "b2"], pause_answers=[], process_answers=[False, True, True]
+        )
+        assert processed == ["b1", "b1", "b2"]
+
+    def test_collection_loop_pauses_every_time_and_holds_batch(self, monkeypatch):
+        """Every pause clears the event and waits (with a timeout), even twice in one version."""
+        processed, waits, cleared = self._run_collection_loop(
+            monkeypatch,
+            ["b1", "b2"],
+            # b1: paused (check, re-check), paused again (check, re-check), then free;
+            # b2: free
+            pause_answers=[True, True, True, True, False, False],
+            process_answers=[True, True],
+        )
+        assert processed == ["b1", "b2"]
+        assert cleared == 2
+        assert waits == [trajectory_collector_mod._GENERATION_LIMIT_RECHECK_S] * 2
+
     def test_process_batch_releases_target_when_worker_start_fails(self, monkeypatch):
         """Test start failures do not leave a target reserved forever."""
 
@@ -1410,6 +1545,249 @@ class TestAsyncTrajectoryCollector:
         assert target_weight not in collector._spawning_targets
         assert target_weight not in collector._spawned_per_target
         assert target_weight not in collector._completed_per_target
+
+    # --- Dynamic sampling (DAPO-style zero-advantage group discard/replace) ---
+    # [CUSTOM] Not implemented upstream at all (checked v0.7.0 and current upstream main).
+
+    def create_mock_config_with_dynamic_sampling(
+        self, max_gen_batches: int = 2, num_prompts_per_step: int = 2
+    ) -> MasterConfig:
+        config = {
+            "grpo": {
+                "num_prompts_per_step": num_prompts_per_step,
+                "num_generations_per_prompt": 3,
+                "max_rollout_turns": 1,
+                "use_dynamic_sampling": True,
+                "dynamic_sampling_max_gen_batches": max_gen_batches,
+                "async_grpo": {"max_trajectory_age_steps": 2},
+            },
+            "policy": {
+                "max_total_sequence_length": 512,
+                "make_sequence_length_divisible_by": 1,
+            },
+            "env": {},
+        }
+        return MasterConfig.model_construct(**config)
+
+    def _fake_batch_with_reward(self, rewards):
+        return BatchedDataDict(
+            {
+                "total_reward": torch.tensor(rewards, dtype=torch.float32),
+                "message_log": [[{"role": "user", "content": "x"}]] * len(rewards),
+            }
+        )
+
+    def test_dynamic_sampling_discards_zero_advantage_group(self, monkeypatch):
+        """A filterable group whose rewards are all equal is dropped, not buffered."""
+        master_config = self.create_mock_config_with_dynamic_sampling()
+        collector = self.create_local_collector()
+        collector.master_config = master_config
+        collector._use_dynamic_sampling = True
+        collector.running = True
+        collector._spawning_targets.add(5)  # isolate from _maybe_release_target's cleanup
+
+        added = []
+
+        class FakeReplayBuffer:
+            class add:
+                @staticmethod
+                def remote(trajectory_group, generation_weight_version, target_weight_version):
+                    added.append(target_weight_version)
+                    return "success"
+
+        collector.replay_buffer = FakeReplayBuffer()
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "run_async_multi_turn_rollout",
+            lambda **kwargs: (
+                self._fake_batch_with_reward([1.0, 1.0]),
+                {"mean_gen_tokens_per_sample": 10},
+            ),
+        )
+
+        collector._run_prompt_group_worker(
+            repeated_batch=self._fake_batch_with_reward([1.0, 1.0]),
+            generation_weight_version=5,
+            target_weight_version=5,
+            prompt_idx=0,
+            filterable=True,
+        )
+
+        assert added == []
+        assert collector._discarded_per_target[5] == 1
+        assert collector._unfiltered_reward_sum[5] == 2.0
+        assert collector._unfiltered_reward_count[5] == 2
+
+    def test_dynamic_sampling_accepts_mixed_reward_group(self, monkeypatch):
+        """A filterable group with non-uniform rewards is buffered normally."""
+        collector = self.create_local_collector()
+        collector._use_dynamic_sampling = True
+        collector.running = True
+
+        added = []
+
+        class FakeReplayBuffer:
+            class add:
+                @staticmethod
+                def remote(trajectory_group, generation_weight_version, target_weight_version):
+                    added.append(target_weight_version)
+                    return "success"
+
+        collector.replay_buffer = FakeReplayBuffer()
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "run_async_multi_turn_rollout",
+            lambda **kwargs: (
+                self._fake_batch_with_reward([1.0, 0.0]),
+                {"mean_gen_tokens_per_sample": 10},
+            ),
+        )
+
+        collector._run_prompt_group_worker(
+            repeated_batch=self._fake_batch_with_reward([1.0, 0.0]),
+            generation_weight_version=5,
+            target_weight_version=5,
+            prompt_idx=0,
+            filterable=True,
+        )
+
+        assert added == [5]
+        assert collector._discarded_per_target.get(5, 0) == 0
+
+    def test_dynamic_sampling_not_filterable_always_accepted(self, monkeypatch):
+        """Past the per-target launch cap (filterable=False), zero-advantage groups still land."""
+        collector = self.create_local_collector()
+        collector._use_dynamic_sampling = True
+        collector.running = True
+
+        added = []
+
+        class FakeReplayBuffer:
+            class add:
+                @staticmethod
+                def remote(trajectory_group, generation_weight_version, target_weight_version):
+                    added.append(target_weight_version)
+                    return "success"
+
+        collector.replay_buffer = FakeReplayBuffer()
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "run_async_multi_turn_rollout",
+            lambda **kwargs: (
+                self._fake_batch_with_reward([1.0, 1.0]),
+                {"mean_gen_tokens_per_sample": 10},
+            ),
+        )
+
+        collector._run_prompt_group_worker(
+            repeated_batch=self._fake_batch_with_reward([1.0, 1.0]),
+            generation_weight_version=5,
+            target_weight_version=5,
+            prompt_idx=0,
+            filterable=False,
+        )
+
+        assert added == [5]
+        assert 5 not in collector._unfiltered_reward_sum
+
+    def test_process_batch_computes_filterable_respecting_cap(self, monkeypatch):
+        """_process_batch marks launches past the cap as non-filterable, in spawn order."""
+        master_config = self.create_mock_config_with_dynamic_sampling(
+            max_gen_batches=1, num_prompts_per_step=2
+        )  # cap = num_prompts_per_step * max_gen_batches = 2
+
+        class RemoteMethod:
+            def __init__(self, value):
+                self.value = value
+
+            def remote(self, *args, **kwargs):
+                return self.value
+
+        class FakeReplayBuffer:
+            def __init__(self):
+                self.get_trajectories_needed = RemoteMethod(4)
+
+        class FakeBatch:
+            size = 4
+
+            def slice(self, start, end):
+                return self
+
+            def repeat_interleave(self, repeats):
+                return self
+
+        captured_filterable = []
+
+        class RecordingThread:
+            def __init__(self, *args, **kwargs):
+                self._args = kwargs.get("args", ())
+
+            def start(self):
+                captured_filterable.append(self._args[4])
+                target = self._args[2]
+                with collector._counter_lock:
+                    collector._completed_per_target[target] = (
+                        collector._completed_per_target.get(target, 0) + 1
+                    )
+
+            def is_alive(self):
+                return False
+
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.master_config = master_config
+        collector._use_dynamic_sampling = True
+        collector._max_filtered_launches_per_target = 2
+        collector.running = True
+
+        target_weight = 9
+
+        def reserve_target(generation_weight_version):
+            collector._generating_targets.add(target_weight)
+            return target_weight
+
+        collector._get_next_target_for_generation = reserve_target
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading, "Thread", RecordingThread
+        )
+
+        collector._process_batch(FakeBatch())
+
+        assert captured_filterable == [True, True, False, False]
+
+    def test_get_target_stats(self):
+        collector = self.create_local_collector()
+        collector._dynsample_spawned_per_target[7] = 3
+        collector._discarded_per_target[7] = 1
+        collector._unfiltered_reward_sum[7] = 4.0
+        collector._unfiltered_reward_count[7] = 3
+
+        stats = collector.get_target_stats(7)
+        assert stats["dynamic_sampling_num_gen_batches"] == pytest.approx(1.5)
+        assert stats["dynamic_sampling_num_discarded_groups"] == 1.0
+        assert stats["unfiltered_reward"] == pytest.approx(4.0 / 3)
+        assert collector.get_target_stats(999) == {}
+
+    def test_set_weight_version_prunes_dynamic_sampling_counters(self):
+        collector = self.create_local_collector()
+        for t in (3, 4, 5, 6):
+            collector._dynsample_spawned_per_target[t] = 1
+            collector._discarded_per_target[t] = 1
+            collector._unfiltered_reward_sum[t] = 1.0
+            collector._unfiltered_reward_count[t] = 1
+
+        collector.set_weight_version(5)
+
+        assert 3 not in collector._dynsample_spawned_per_target
+        assert 4 not in collector._dynsample_spawned_per_target
+        assert 5 in collector._dynsample_spawned_per_target
+        assert 6 in collector._dynsample_spawned_per_target
+        assert 3 not in collector._discarded_per_target
+        assert 3 not in collector._unfiltered_reward_sum
+        assert 3 not in collector._unfiltered_reward_count
 
     def test_dataloader_state_retrieval(self):
         """Test getting dataloader state for checkpointing."""

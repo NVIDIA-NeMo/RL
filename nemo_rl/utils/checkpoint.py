@@ -79,6 +79,8 @@ class CheckpointingConfig(TypedDict):
         the metric should be taken from the validation or training metrics.
     higher_is_better (bool): Whether higher values of the metric indicate better performance.
     keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
+    keep_steps (Optional[list[int]]): Steps whose checkpoints are never pruned. They don't count
+        toward keep_top_k, so top-k still keeps k of the remaining checkpoints. Default: None.
     model_save_format (str | None): Format for saving model (v2 allowed values: "torch_save" or "safetensors", v1 allowed values: None).
     save_consolidated (bool): Whether to save consolidated checkpoints (for HF compatibility).
     model_cache_dir (str): Directory for model cache (for safetensors format).
@@ -93,6 +95,7 @@ class CheckpointingConfig(TypedDict):
     higher_is_better: bool
     save_period: int
     keep_top_k: NotRequired[int]
+    keep_steps: NotRequired[list[int] | None]
     checkpoint_must_save_by: NotRequired[str | None]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     save_optimizer: NotRequired[bool]  # Default: True
@@ -137,6 +140,7 @@ class CheckpointManager:
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
+        self.keep_steps: set[int] = set(config.get("keep_steps", None) or [])
         self.save_optimizer = config["save_optimizer"]
 
         # Store nemo-automodel specific config options
@@ -275,6 +279,9 @@ class CheckpointManager:
           (higher step numbers) are preferred.
         - If no metric is provided: the step number. The most recent k checkpoints are kept.
 
+        Checkpoints at steps listed in keep_steps are never removed and are excluded from
+        the top-k ranking.
+
         Args:
             exclude_latest (bool): Whether to exclude the latest checkpoint from deletion. (may result in K+1 checkpoints)
         """
@@ -286,6 +293,9 @@ class CheckpointManager:
             if checkpoint_history
             else None
         )
+        checkpoint_history = [
+            c for c in checkpoint_history if c[0] not in self.keep_steps
+        ]
 
         if self.metric_name is None:
             checkpoint_history.sort(key=lambda x: x[0], reverse=True)

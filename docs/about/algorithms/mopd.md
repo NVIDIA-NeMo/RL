@@ -141,6 +141,42 @@ The reference recipe self-distills `Qwen/Qwen3-1.7B` (student == teacher) across
 student and teacher are identical, the OPD loss stays near zero — it is a
 correctness smoke test, not a demonstration of distillation gains.
 
+## Monitoring
+
+By default MOPD logs three batch-wide scalars: `on_policy_distillation/teacher_student_logprob_gap_mean`,
+`adv_mean` and `adv_std`. In a multi-teacher run they are dominated by whichever teacher gets the most samples.
+`detailed_metrics` (`nemo_rl/algorithms/opd_metrics.py`) adds per-teacher diagnostics every step:
+
+```yaml
+on_policy_distillation:
+  detailed_metrics:
+    enabled: true     # on_policy_distillation/<teacher>/* every step (a few seconds per step on 128k batches)
+    per_agent: true   # plus on_policy_distillation/agent/<agent>/{n_samples,k1_tok,gen_len_mean,trunc_rate}
+```
+
+`<teacher>` is the first path component after the teachers' common root (e.g. `math`, `if-fc`), and `all` covers
+the whole batch. With A_t = log π_T − log π_S on the sampled token:
+
+| Metric | Meaning |
+|---|---|
+| `k1_tok`, `k1_seq`, `k3_tok` | Reverse KL(S‖T) estimates: k1 = −A (token mean, per-sequence mean), k3 = e^A − 1 − A |
+| `abs_adv`, `adv_p01`, `adv_p99` | Advantage magnitude and tails |
+| `frac_tok_small`, `frac_tok_neg`, `frac_tok_big` | Share of tokens with \|A\| < 0.01, A < −1, \|A\| > 5 |
+| `student_nll`, `teacher_xent` | −mean log-prob of the generated tokens under vLLM (≈ student entropy) and under the teacher |
+| `gen_len_mean`, `gen_len_p90`, `trunc_rate`, `n_samples`, `tok_share` | Response length and truncation over all samples, including overlong-filtered ones |
+| `acc`, `k1_tok_correct`, `k1_tok_wrong` | Verifier accuracy (reward ≥ 0.5) and reverse KL split by it |
+| `k1_tok_pos_<bucket>`, `abs_adv_pos_<bucket>` | The same by position in the response: 0-1k, 1k-4k, 4k-16k, 16k-64k, 64k+ tokens |
+| `budget_share` | The teacher's share of Σ\|A\| over loss tokens (= `tok_share` × `abs_adv`, normalised): with a token-mean loss, the share of the update it drives. Short-answer teachers get little even with a large gap |
+
+KL, advantage and entropy metrics use the loss tokens, so overlong-filtered samples are excluded from them. The same
+keys can be recomputed offline from the `train_data_step*.jsonl` dumps with the same function.
+
+The policy loss also logs `train/stale_kl/update_<k>` (DTensor v2 worker; other backends log a plain `stale_kl`
+summed over the step's updates): KL(π_prev ‖ π_current), k3 estimate on the loss tokens, at the k-th optimizer update
+of the step. The OPD advantage is built from `prev_logprobs`, frozen for the whole step, so this is how stale the
+advantage has become by that update. Update 0 should be ≈ 0; growth with k says the step's later updates follow an
+outdated target.
+
 ## References
 
 - LLM-Core Xiaomi, *MiMo-V2-Flash Technical Report*, which introduces the

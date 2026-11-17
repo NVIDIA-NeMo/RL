@@ -84,19 +84,34 @@ export LD_LIBRARY_PATH="/lib64:${LD_LIBRARY_PATH:-}"
 # cuda-13: NVIDIA's CUDA Forward Compatibility package (bundled with the cuda/13.0 module
 # install, under compat/) ships a newer libcuda.so than this node's actual driver
 # (535.274.02, self-reports max CUDA 12.2 -- below CUDA 13's official 580.65.06+ minimum).
-# Without this ahead of /lib64, real CUDA-13-compiled kernel calls fail with 
-# "CUDA driver version is insufficient for CUDA runtime version".
-# Resolved dynamically so a future cuda/13.0 module reinstall doesn't go stale here. 
-# Confirmed working both here (top-level sbatch script body) and inside `srun ... bash -c` 
-# (the same non-interactive-shell context head_cmd/worker_cmd below run in).
-# `module purge` first (also scoped to this subshell) is load-bearing, not defensive
-# boilerplate: this script's own top-level environment is inherited from `sbatch`, which
-# inherits it from the launcher -- and the launcher's own actor-venv build step `module load
-# gcc/12.2.0`. cuda/13.0's module conflicts with gcc/12.2.0's module, so without this
-# purge, `module load cuda/13.0` fails *silently* here (stderr discarded), `which nvcc` finds
-# nothing, and `dirname ""` resolves to "." -- producing a bogus relative "./compat" with no
-# error anywhere.
-CUDA13_COMPAT_DIR="$(module purge >/dev/null 2>&1; module load profile/candidate cuda/13.0 >/dev/null 2>&1; dirname "$(dirname "$(which nvcc)")")/compat"
+# Without this ahead of /lib64, real CUDA-13-compiled kernel calls fail with
+# "CUDA driver version is insufficient for CUDA runtime version". Plain module load, no
+# workarounds needed -- an earlier version of this routed around a module conflict
+# (cuda/13.0 vs the *default*-profile gcc/12.2.0's module, inherited here via the launcher's
+# own earlier actor-venv build step) via a `module purge`-in-a-subshell trick. That conflict
+# doesn't apply here at all though (this script's launcher-side module state, if any, isn't the
+# issue -- the real fix was simply that `module load cuda/13.0` already exports the correct
+# LD_LIBRARY_PATH itself, compat/ included as its very first entry, with zero manual
+# construction needed) -- confirmed via a real compiled-and-executed CUDA kernel (matmul on an
+# A100) using nothing but this plain module load. compat/ has no libnvidia-ml.so at all
+# (confirmed directly), so prepending it ahead of /lib64 above can't reintroduce the NVML
+# mismatch that /lib64 fix exists for.
+#
+# [FIXED 2026-11-02] The above is only true when `module load cuda/13.0` actually RUNS its
+# modulefile -- it's a no-op (exports nothing) when cuda/13.0 is already loaded in the
+# inherited environment, which happens here because launch.sh itself `module load cuda/13.0`s
+# before ever calling sbatch, and module state propagates with the rest of the env. When that
+# happens, LD_LIBRARY_PATH is left as whatever the /lib64 prepend above set it to -- /lib64
+# ahead of compat/, so libcuda.so.1 resolves to the too-old system driver copy instead of the
+# forward-compat shim. Confirmed via a real job's `.err` -x trace: this exact no-op happened,
+# and the driver process itself (not a Ray actor) logged "CUDA initialization: driver too old"
+# as a direct result. head_cmd/worker_cmd below don't hit this because they unconditionally
+# re-prepend compat/ themselves (via CUDA13_COMPAT_DIR_PLACEHOLDER), regardless of whether the
+# module load was a no-op -- do the same here so the explicit re-prepend doesn't depend on
+# module-load idempotency either.
+module load profile/candidate
+module load cuda/13.0
+CUDA13_COMPAT_DIR="$(dirname "$(dirname "$(which nvcc)")")/compat"
 export LD_LIBRARY_PATH="$CUDA13_COMPAT_DIR:${LD_LIBRARY_PATH:-}"
 ########################################################
 # Ports for all nodes

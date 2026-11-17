@@ -131,7 +131,6 @@ def calculate_baseline_and_std_per_prompt(
     unique_prompts = torch.unique(prompts, dim=0)
 
     baseline = torch.zeros_like(rewards)
-    sq_baseline = torch.zeros_like(rewards)
     std = torch.zeros_like(rewards)
     device_ordinal = rewards.get_device()
     if device_ordinal == -1:
@@ -175,24 +174,47 @@ def calculate_baseline_and_std_per_prompt(
                 )
                 / num_valid
             )
-            std_prompt_baseline_square = (
-                torch.matmul(
-                    baseline_mask_matrix,
-                    torch.pow(std_rewards[prompt_idx], 2) * valid_mask[prompt_idx],
+            # [CUSTOM] Two-pass variance: centre each baseline set's std_rewards on its OWN
+            # mean (std_prompt_baseline) before squaring. The algebraically equivalent
+            # E[r^2] - E[r]^2 form this replaces is not numerically stable (catastrophic
+            # cancellation when rewards are large/close together), causing exactly the
+            # advantage-explosion bug NVIDIA-NeMo/RL#4158 ("fix(LOO-Norm-Advantage): Fix spike
+            # in LOO normed advantage", merged to upstream main 2026-09-21, commit 8535caefc)
+            # documents and fixes via a different mechanism (an explicit is_trivial_distribution
+            # flag + extended normalize_mask, not a precision fix). Not in any tagged release as
+            # of v0.7.0 (our current base) -- re-check whether to drop this patch once our base
+            # moves past wherever #4158 lands in a release.
+            deviations = std_rewards[prompt_idx].unsqueeze(0) - std_prompt_baseline.unsqueeze(
+                1
+            )
+            weighted_sq_deviations = (
+                deviations.square()
+                * valid_mask[prompt_idx].unsqueeze(0)
+                * baseline_mask_matrix
+            )
+            bessel_denominator = num_valid - 1
+            if bessel_denominator > 0:
+                prompt_std = (
+                    (weighted_sq_deviations.sum(dim=1) / bessel_denominator)
+                    .clamp(min=0)
+                    .sqrt()
+                    .nan_to_num(0)
                 )
-                / num_valid
+            else:
+                prompt_std = torch.zeros_like(std_prompt_baseline)
+            # Snap near-zero std (floating-point noise around a truly-zero-variance group,
+            # e.g. all rewards identical) to exactly zero -- otherwise a tiny nonzero std can
+            # silently corrupt downstream advantage normalization (divide-by-near-zero) or
+            # make an "are all rewards equal" check (e.g. dynamic sampling) see nonzero.
+            reward_scale = std_rewards[prompt_idx].abs().max()
+            prompt_std = torch.where(
+                prompt_std < 1e-5 * reward_scale,
+                torch.zeros_like(prompt_std),
+                prompt_std,
             )
 
             baseline[prompt_idx] = prompt_baseline
-            sq_baseline[prompt_idx] = std_prompt_baseline_square
-            std[prompt_idx] = (
-                (
-                    (std_prompt_baseline_square - std_prompt_baseline.square())
-                    * (num_valid / (num_valid - 1))
-                )
-                .sqrt()
-                .nan_to_num(0)
-            )
+            std[prompt_idx] = prompt_std
 
     return baseline, std
 
