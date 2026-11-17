@@ -38,6 +38,7 @@ from nemo_rl.algorithms.loss.draft import (
     streaming_vocab_parallel_soft_ce,
 )
 from nemo_rl.algorithms.loss.interfaces import (
+    SEQ_LOGPROB_KEEP_MASK_KEY,
     LossFunction,
     LossInputType,
     LossType,
@@ -190,7 +191,7 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     reference_policy_kl_penalty: float = Field(default=0.01, ge=0, allow_inf_nan=False)
     # Can be set to k1, k2, k3
     # For more details, see http://joschu.net/blog/kl-approx.html
-    reference_policy_kl_type: str = "k3"
+    reference_policy_kl_type: Literal["k1", "k2", "k3"] = "k3"
     kl_input_clamp_value: Optional[float] = 20.0
     kl_output_clamp_value: Optional[float] = 10.0
     # If True, add KL penalty to reward instead of loss (used by Reinforce++)
@@ -207,7 +208,9 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     #   "adaptive-ppo-clip" – advantage-aware token filtering with an
     #                         entropy-adaptive upper bound
     #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
-    truncated_importance_sampling_type: Optional[str] = None
+    truncated_importance_sampling_type: Optional[
+        Literal["tis", "icepop", "adaptive-ppo-clip", "seq-mask-tis"]
+    ] = None
     truncated_importance_sampling_ratio: Optional[float] = None
     # Lower bound for TIS clipping, or ICE-POP / adaptive-ppo-clip /
     # seq-mask-tis filtering
@@ -235,10 +238,10 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: bool = False
-    # Evaluate grpo.seq_logprob_error_threshold in the training loss, then
+    # Evaluate the algorithm's seq_logprob_error_threshold in the training loss, then
     # normalize accumulated gradients over survivors before the optimizer step.
     # Opt-in; supported only for token-level, force-on-policy Megatron GRPO
-    # with the non-streaming or SingleController trainer.
+    # (non-streaming or SingleController) and SingleController PPO with ppo_epochs=1.
     seq_logprob_error_in_loss: bool = False
     # If True, use CISPO (Clipped IS-weight Policy Optimization) from MiniMax-M1.
     use_cispo: bool = False
@@ -803,6 +806,9 @@ class ClippedPGLossFn(LossFunction):
             ).to(sample_mask.dtype)
             seq_error_metrics["num_masked_seqs_by_logprob_error"] = (
                 (sample_mask - filtered_sample_mask).sum().item()
+            )
+            seq_error_metrics[SEQ_LOGPROB_KEEP_MASK_KEY] = (
+                (errors <= self.seq_logprob_error_threshold).float().cpu().tolist()
             )
             sample_mask = filtered_sample_mask
             mask = token_mask * sample_mask.unsqueeze(-1)

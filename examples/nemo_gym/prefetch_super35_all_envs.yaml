@@ -12,6 +12,13 @@
 env:
   should_use_nemo_gym: true
   nemo_gym:
+    # code_gen requires sandbox_config.image, and the dry run validates it. The dry run starts no
+    # sandbox, so any string works here.
+    code_gen:
+      resources_servers:
+        code_gen:
+          sandbox_config:
+            image: prefetch-placeholder
     skip_venv_if_present: true
     port_range_low: 5000
     port_range_high: 5999

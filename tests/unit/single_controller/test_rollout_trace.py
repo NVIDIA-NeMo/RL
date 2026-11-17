@@ -482,7 +482,10 @@ def test_a_published_group_traces_each_call_and_its_version(tmp_path: Path) -> N
     # The v4 refit paused c1 after 6 of its 10 tokens.
     ctrl._refit_cuts.record(3, 4, [["c1", 6]])
 
-    assert asyncio.run(ctrl._finalize_with_actor(_request(), {})) is result
+    finalized = asyncio.run(
+        ctrl._finalize_with_actor(_request(), {}, target_step=None, replacements_used=0)
+    )
+    assert finalized is result
     ctrl._rollout_trace.close()
 
     (published,) = [

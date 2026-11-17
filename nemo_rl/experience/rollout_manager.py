@@ -22,7 +22,7 @@ import math
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Optional, Protocol
 
 import ray.exceptions
@@ -50,16 +50,16 @@ from nemo_rl.environments.nemo_gym_multi_harness import (
 )
 from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
-    get_nemo_gym_task_input,
     is_nemo_gym_task,
 )
 from nemo_rl.experience.dynamic_sampling import (
     StepRewardStats,
     drain_step_reward_metrics,
     mask_sample_flagged,
-    participating_rewards,
     record_group_rewards,
     rewards_carry_no_signal,
+    voting_rewards_from_finalized,
+    voting_rewards_from_record,
 )
 from nemo_rl.experience.failures import (
     FailureClass,
@@ -78,6 +78,7 @@ from nemo_rl.experience.failures import (
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     Completion,
@@ -90,7 +91,6 @@ from nemo_rl.experience.rollout_recovery import (
     PromptGroupRecoveryRecord,
     PromptGroupStatus,
     RecoveryGranularity,
-    RecoveryTargetLevel,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
     SiblingSealResult,
@@ -122,6 +122,12 @@ from nemo_rl.telemetry.instrumentation import (
     dispatch_with_trace_context,
     in_per_prompt_scope,
 )
+from nemo_rl.utils.length_penalty import (
+    LengthPenaltyConfig,
+    apply_group_length_penalties_from_inputs,
+    generated_token_count,
+    prepare_length_penalty_input,
+)
 from nemo_rl.utils.routed_experts_codec import slice_routed_experts
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
@@ -131,6 +137,7 @@ RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
+    from nemo_rl.experience.rollout_reassembler import FinalizedGroup
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
 
@@ -1073,6 +1080,7 @@ class AsyncNemoGymRolloutImpl:
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
         forest_training: bool = False,
+        length_penalty_config: LengthPenaltyConfig | None = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -1085,6 +1093,7 @@ class AsyncNemoGymRolloutImpl:
         self._log_full_result_tables = log_full_result_tables
         self._reward_penalty_config = reward_penalty_config
         self._forest_training = forest_training
+        self._length_penalty_config = length_penalty_config
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._deadline_registry = deadline_registry
         self._max_gym_row_attempts = (
@@ -1271,26 +1280,13 @@ class AsyncNemoGymRolloutImpl:
         # sample. Row-level redispatch reuses these rows and keeps the same ID.
         template_row[NEMO_GYM_TASK_INDEX_KEY] = task_index
 
-        # We do not translate max_seq_len into row-level max_tokens here because that would
-        # change semantics from "total sequence length" to "max new tokens".
-        responses_create_params = get_nemo_gym_task_input(template_row).get(
-            "responses_create_params"
-        )
-        if not isinstance(responses_create_params, dict):
-            raise TypeError(
-                "Each NeMo-Gym task input must contain a responses_create_params dict"
-            )
-        responses_create_params["temperature"] = self._generation_config["temperature"]
-        responses_create_params["top_p"] = self._generation_config["top_p"]
-
-        # Configure max_output_tokens to respect the max_new_tokens setting.
-        # Will clamp max_output_tokens in vllm_worker_async.py so that input + output <= max_seq_len
-        existing = responses_create_params.get("max_output_tokens")
-        responses_create_params["max_output_tokens"] = (
-            min(existing, self._generation_config["max_new_tokens"])
-            if existing is not None
-            else self._generation_config["max_new_tokens"]
-        )
+        # Gym applies these to the agent's model calls. A row-level max_seq_len limit
+        # would mean "max new tokens", not "total sequence length", so none is set.
+        template_row[NEMO_GYM_MODEL_SAMPLING_KEY] = {
+            "temperature": self._generation_config["temperature"],
+            "top_p": self._generation_config["top_p"],
+            "max_output_tokens": self._generation_config["max_new_tokens"],
+        }
 
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
         if rollout_ids is not None:
@@ -1528,6 +1524,16 @@ class AsyncNemoGymRolloutImpl:
                         inputs_by_rowidx[rowidx],
                         self._effort_config,
                     )
+                    if self._length_penalty_config is not None:
+                        result["reward_checks"] = replace(
+                            result["reward_checks"],
+                            length_penalty=prepare_length_penalty_input(
+                                result,
+                                inputs_by_rowidx[rowidx],
+                                self._length_penalty_config,
+                                self._tokenizer,
+                            ),
+                        )
                     result["reward_log_context"] = RewardLogContext(
                         agent_name=harness_metric_namespace(
                             _nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
@@ -1545,6 +1551,8 @@ class AsyncNemoGymRolloutImpl:
                         else None,
                     )
                 else:
+                    # Effort shaping and the penalties rewrite this reward in place.
+                    result["reward_original"] = float(result["full_result"]["reward"])
                     shaping_by_rowidx[rowidx] = _apply_effort_shaping(
                         [result], [inputs_by_rowidx[rowidx]], self._effort_config
                     )
@@ -1807,11 +1815,41 @@ class AsyncNemoGymRolloutImpl:
             # All N rollouts share the same input prompt; tensorize one copy.
             prompt_message_log = completed_results[0]["input_message_log"]
             _tensorize_by_key(prompt_message_log, "token_ids")
-            # Apply penalties before Completion captures each result's reward, while
-            # preserving the batch-level counts used by legacy Gym metrics.
+            # Apply per-row penalties before conversion, then group length adjustments below.
             completions, penalty_counts = self._results_to_completions(
                 completed_results
             )
+            length_metrics: dict[str, float] = {}
+            if (
+                self._length_penalty_config is not None
+                and "receipt" not in completed_results[0]
+            ):
+                length_inputs = [
+                    prepare_length_penalty_input(
+                        result,
+                        inputs[index],
+                        self._length_penalty_config,
+                        self._tokenizer,
+                    )
+                    for index, result in enumerate(completed_results)
+                ]
+                adjusted, length_metrics = apply_group_length_penalties_from_inputs(
+                    length_inputs,
+                    [completion.reward for completion in completions],
+                    generated_lengths=[
+                        generated_token_count(result) for result in completed_results
+                    ],
+                    low_effort=[
+                        bool(result.get("low_effort_applied"))
+                        for result in completed_results
+                    ],
+                    config=self._length_penalty_config,
+                )
+                for completion, result, reward in zip(
+                    completions, completed_results, adjusted, strict=True
+                ):
+                    completion.reward = reward
+                    result["full_result"]["reward"] = reward
 
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):
@@ -1834,6 +1872,7 @@ class AsyncNemoGymRolloutImpl:
                 rollout_metrics.update(_nemo_gym_group_metrics(completed_results))
             # Same helper the batched path uses, so the two cannot drift apart.
             rollout_metrics.update(_effort_shaping_metrics(shaping))
+            rollout_metrics.update(length_metrics)
             rollout_metrics.update(
                 self._compute_reward_penalty_metrics(
                     penalty_counts,
@@ -1957,6 +1996,7 @@ class AsyncNemoGymRolloutImpl:
                     env_extras=env_extras,
                     truncated=truncated,
                     reward=float(result["full_result"]["reward"]),
+                    reward_original=result.get("reward_original"),
                 )
             )
         return completions, penalty_counts
@@ -2224,6 +2264,11 @@ class _LedgerDispatchRecorder:
 class RolloutManager:
     """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to a TQReplayBuffer."""
 
+    # Set by the controller: finds the step a group without a target step is tallied
+    # under. A class attribute so a manager built without a controller tallies only the
+    # stamped groups.
+    _tally_step_provider: Optional[Callable[[], int]] = None
+
     def __init__(
         self,
         tokenizer: TokenizerType,
@@ -2250,6 +2295,7 @@ class RolloutManager:
         # own grpo values, so these are not a second home for those defaults.
         masked_reward_policy: Optional[str] = None,
         overlong_filtering: bool = False,
+        length_penalty_config: LengthPenaltyConfig | None = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -2310,6 +2356,7 @@ class RolloutManager:
             stats=self._stats,
             effort_config=effort_config,
             forest_training=forest_training,
+            length_penalty_config=length_penalty_config,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
@@ -2502,6 +2549,14 @@ class RolloutManager:
         if isinstance(self._impl, AsyncNemoGymRolloutImpl):
             self._impl.set_next_nemo_gym_task_index(value)
 
+    def set_tally_step_provider(self, provider: Callable[[], int]) -> None:
+        """Set how a group with no target step finds the step it is tallied under.
+
+        Args:
+            provider: Zero-arg accessor for the step currently being assembled.
+        """
+        self._tally_step_provider = provider
+
     async def run_rollout(
         self,
         input_sample: DatumSpec,
@@ -2531,17 +2586,23 @@ class RolloutManager:
             dispatch_recorder=dispatch_recorder,
         )
 
-    def _participating_rewards(self, record: PromptGroupRecord) -> list[float]:
+    def _voting_rewards(self, record: PromptGroupRecord) -> list[float]:
         """This group's voting rewards under the run's masking policy."""
-        return participating_rewards(
+        return voting_rewards_from_record(
             record,
             masked_reward_policy=self._masked_reward_policy,
             overlong_filtering=self._overlong_filtering,
         )
 
-    def _is_zero_variance_group(self, record: PromptGroupRecord) -> bool:
-        """Whether this group's voters leave every row zero advantage."""
-        return rewards_carry_no_signal(self._participating_rewards(record))
+    def _is_zero_variance_finalized(self, finalized: "FinalizedGroup") -> bool:
+        """Whether a finalized capture group's voters leave every row zero advantage."""
+        return rewards_carry_no_signal(
+            voting_rewards_from_finalized(
+                finalized,
+                masked_reward_policy=self._masked_reward_policy,
+                overlong_filtering=self._overlong_filtering,
+            )
+        )
 
     def record_group_rewards(
         self,
@@ -2551,7 +2612,9 @@ class RolloutManager:
         replacement_index: int,
         zero_variance: bool,
     ) -> None:
-        """Record a finished group's rewards for its original target step."""
+        """Record group rewards under its stamp or the supplied tally step."""
+        if target_step is None and self._tally_step_provider is not None:
+            target_step = self._tally_step_provider()
         record_group_rewards(
             self._step_rewards,
             target_step,
@@ -2589,7 +2652,8 @@ class RolloutManager:
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
-            target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
+            target_step: Training step this rollout targets, stamped on the buffer slot;
+                ``None`` when the sampler stamps no step.
             inflight_registry: Optional controller-owned mapping from group ID to
                 its dispatch task and start weight version.
             lineage_group_id: Stable group minted by the rollout ledger before
@@ -2606,7 +2670,7 @@ class RolloutManager:
             ``max_consecutive_dropped_prompts``. A ``SKIPPED`` prompt committed nothing,
             so the caller owns both its backpressure permit and the checkpoint-atomic
             transition from its retained ledger record to either a replacement prompt
-            or the shortfall for the training step it was stamped for.
+            or the shortfall for the training step it is charged to.
 
             ``FILTERED`` when dynamic sampling dropped the group before commit because
             every generation scored the same reward. It carries the same two caller
@@ -2698,16 +2762,15 @@ class RolloutManager:
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(tq_group_id, None)
-                if self._filter_zero_variance_groups and self._is_zero_variance_group(
-                    record
-                ):
+                voting = self._voting_rewards(record)
+                is_zero_variance = rewards_carry_no_signal(voting)
+                if self._filter_zero_variance_groups and is_zero_variance:
                     # Filtering happens before commit, so removing the reservation writes no rows.
                     await self._tq_buffer.remove_group(tq_group_id)
                     # A filtered group is a healthy rollout and breaks a consecutive infrastructure-failure run.
                     self._consecutive_infra_drops = 0
                     self._stats.zero_variance_groups += 1
                     rewards = [c.reward for c in record.completions]
-                    voting = self._participating_rewards(record)
                     self.record_group_rewards(
                         target_step,
                         rewards,
@@ -2737,7 +2800,7 @@ class RolloutManager:
                     target_step,
                     [c.reward for c in record.completions],
                     replacement_index=replacement_index,
-                    zero_variance=self._is_zero_variance_group(record),
+                    zero_variance=is_zero_variance,
                 )
             except Exception as error:
                 # A failed rollout must not leave an unready slot that can block an
@@ -2808,6 +2871,12 @@ class RolloutManager:
                     )
                     self._stats.skipped += 1
                     return RolloutOutcome.SKIPPED
+                print(
+                    f"retrying prompt idx={input_sample['idx']} after deterministic "
+                    f"failure {data_attempts}/{policy.max_data_attempts} "
+                    f"({reason}: {error})",
+                    flush=True,
+                )
                 # A data retry, NOT a re-dispatch: the fleet is fine, this prompt is
                 # suspect. Recording it as a re-dispatch made rollout/redispatch_total --
                 # documented above as the sign the fleet is degrading -- climb for bad
@@ -2965,6 +3034,12 @@ class RolloutManager:
                 ):
                     self._stats.record_data_failure(reason)
                     raise
+                print(
+                    f"retrying prompt idx={input_sample['idx']} after deterministic "
+                    f"failure {data_attempts}/{policy.max_data_attempts} "
+                    f"({reason}: {error})",
+                    flush=True,
+                )
                 self._stats.record_data_retry(reason)
                 continue
 
@@ -3092,11 +3167,12 @@ class RolloutManager:
         if pending_owners:
             environment_instance_id = next(iter(pending_owners))
         elif (
-            pending_indices and recovery_group.restore_level is RecoveryTargetLevel.TURN
+            pending_indices
+            and recovery_group.restore_level.requires_environment_checkpoint
         ):
             if not isinstance(self._impl, AsyncNemoGymRolloutImpl):
                 raise RuntimeError(
-                    "turn-level recovery requires the NeMo-Gym rollout path"
+                    "turn/prefix recovery requires the NeMo-Gym rollout path"
                 )
             environment_instance_id = self._impl.select_checkpoint_instance(
                 attempt_input_sample

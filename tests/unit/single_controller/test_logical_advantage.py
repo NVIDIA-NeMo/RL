@@ -844,7 +844,7 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
     [
         ({"adv_estimator": {"name": "gdpo"}}, {}),
         ({"use_dynamic_sampling": True}, {}),
-        ({"reward_shaping": {"enabled": True}}, {}),
+        ({"reward_shaping": {"enabled": True, "stop_properly_penalty_coef": 0.5}}, {}),
         ({"calculate_advantages_on_gpu": True}, {}),
         ({"invalid_tool_call_advantage": -5.0}, {}),
         ({"malformed_thinking_advantage": 0.0}, {}),

@@ -69,7 +69,6 @@ from nemo_rl.experience.rollout_recovery import (
     SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS,
     ParsedRolloutRecoveryState,
     PromptGroupPhase,
-    RecoveryTargetLevel,
     parse_rollout_recovery_state,
 )
 from nemo_rl.utils.path_utils import (
@@ -336,7 +335,7 @@ class RolloutRestorer(_UsesRolloutParts):
             buffer_state, dp_client=self._dp_client, partition_id=self._partition_id
         )
 
-        if self._master_config.checkpointing.get("load_replay_buffer") is False:
+        if not self._master_config.checkpointing.load_replay_buffer:
             # Validate and load the native snapshot before discarding it. This keeps
             # replay-free resume fail-closed: a mismatched/corrupt checkpoint must
             # not silently turn into a different training stream.
@@ -400,25 +399,26 @@ class RolloutRestorer(_UsesRolloutParts):
         ) as cut:
             recovery_ledger.load_state_dict(cut, parsed_state.ledger_state)
             recovery_ledger.assert_checkpoint_safe()
-            turn_groups = [
+            environment_state_groups = [
                 group
                 for group in recovery_ledger.groups()
-                if group.restore_level is RecoveryTargetLevel.TURN
+                if group.restore_level.requires_environment_checkpoint
             ]
             restored = RestoredEnvironmentRollouts()
             # The environment stays restored until the rest of this restore
             # succeeds; on any failure it drops what it restored before it reopens.
             async with contextlib.AsyncExitStack() as environment_restore:
-                if turn_groups and not self._resume.from_rollout_snapshot:
+                if environment_state_groups and not self._resume.from_rollout_snapshot:
                     # A trainer checkpoint never holds environment state; with no
                     # later rollout snapshot, its unfinished turns start over below.
                     print(
                         "📦 Restoring a trainer checkpoint without environment "
-                        f"state: {len(turn_groups)} unfinished turn-level group(s) "
+                        f"state: {len(environment_state_groups)} unfinished turn/prefix "
+                        "group(s) "
                         "restart from their tasks",
                         flush=True,
                     )
-                elif turn_groups:
+                elif environment_state_groups:
                     restored = await environment_restore.enter_async_context(
                         self._environment_checkpoint.restored(Path(self._resume.path))
                     )
@@ -478,13 +478,7 @@ class RolloutRestorer(_UsesRolloutParts):
         self._rollout_runtime.sampler_stamps_target_steps = (
             parsed_state.sampler_stamps_target_steps
             if parsed_state.sampler_stamps_target_steps is not None
-            else any(
-                group.target_step is not None for group in recovery_ledger.groups()
-            )
-            or any(
-                group.get("target_step") is not None
-                for group in canonical_state["groups"]
-            )
+            else bool(recovery_ledger.groups()) or bool(canonical_state["groups"])
         )
 
         groups_to_recover = recovery_ledger.groups()
