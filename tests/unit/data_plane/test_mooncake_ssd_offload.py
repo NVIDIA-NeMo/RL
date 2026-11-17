@@ -337,7 +337,9 @@ def test_the_first_offload_round_warns_once(monkeypatch, caplog) -> None:
     monkeypatch.setattr(offload, "_warned_offload", False)
     with caplog.at_level("WARNING", logger=offload.LOGGER.name):
         for rounds in (0, 3, 9):
-            offload._warn_on_first_offload(offload.master_metrics(_MASTER.format(rounds=rounds)))
+            offload._warn_on_first_offload(
+                offload.master_metrics(_MASTER.format(rounds=rounds))
+            )
     (msg,) = [r.getMessage() for r in caplog.records]
     assert "3 SSD offload round(s)" in msg and "25% of 4.0 GiB" in msg
     assert "5 object(s), 2.0 MiB" in msg and "offload_threshold" in msg
