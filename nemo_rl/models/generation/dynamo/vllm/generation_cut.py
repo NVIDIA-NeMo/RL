@@ -182,32 +182,47 @@ class EngineCutFanOut:
         return prefixes
 
 
+class CutRouteHandler:
+    """Answers NeMo-Gym's cut call from the context Dynamo hands a route's handler."""
+
+    def __init__(self, capture_file: str) -> None:
+        self._capture_file = capture_file
+        self._fan_out: EngineCutFanOut | None = None
+
+    async def answer(self, context: Any) -> tuple[int, dict[str, Any]]:
+        """The call's HTTP status and JSON body, as the native route answers it."""
+        if self._fan_out is None:
+            # Dynamo hands over its runtime only with a request. The client
+            # shares the frontend's discovery watch, so it lists every engine.
+            self._fan_out = EngineCutFanOut(context.runtime, self._capture_file)
+        return await answer_generation_cut(
+            self._fan_out,
+            authorization=context.headers.get("authorization"),
+            inventory=json.loads(context.body),
+        )
+
+
 def routes() -> list[Any]:
     """Dynamo's route extension provider: the cut route, on the frontend's own port."""
     # Deferred: ai-dynamo is an optional dependency, and only the frontend
     # process calls this.
     from dynamo.llm import FrontendResponse, FrontendRoute
 
-    # Imported at launch where Gym is installed: at a cut, a chat call's thread
-    # may be midway through Gym's first import, which Python does not wait for.
+    # Gym is imported at launch where it is installed: a lazy import that met
+    # another thread's first import of Gym midway would get a half-built package.
     if importlib.util.find_spec("nemo_gym") is not None:
+        # Gym points an unset HF_HOME at its own cache directory, where the
+        # early render-worker build would then look for a Hub ID's files.
+        hf_home = os.environ.get("HF_HOME")
         importlib.import_module("nemo_gym._checkpoint.generation_cut")
+        if hf_home is None:
+            os.environ.pop("HF_HOME", None)
     # Dynamo passes a route extension no settings, so the path is in the
     # frontend's environment.
-    capture_file = os.environ[CAPTURE_FILE_ENV]
-    fan_out: EngineCutFanOut | None = None
+    handler = CutRouteHandler(os.environ[CAPTURE_FILE_ENV])
 
     async def serve_cut(context: Any) -> Any:
-        nonlocal fan_out
-        if fan_out is None:
-            # Dynamo hands over its runtime only with a request. The client
-            # shares the frontend's discovery watch, so it lists every engine.
-            fan_out = EngineCutFanOut(context.runtime, capture_file)
-        status, body = await answer_generation_cut(
-            fan_out,
-            authorization=context.headers.get("authorization"),
-            inventory=json.loads(context.body),
-        )
+        status, body = await handler.answer(context)
         return body if status == 200 else FrontendResponse(status, body)
 
     return [
