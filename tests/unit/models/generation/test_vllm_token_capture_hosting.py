@@ -233,6 +233,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> VllmAsyncGenerationWorkerImp
     worker._init_token_capture_state()
     worker.cfg = {"vllm_cfg": {}}
     worker.is_model_owner = is_model_owner
+    worker.cfg = {"vllm_cfg": {}}
     worker._http_engine_client = None
     worker._api_server_pool = None
     return worker
@@ -337,6 +338,66 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     # The adapter is the vLLM one (prefix ids enter via the worker's field).
     payload = worker.token_capture.adapter.enter_prefix({}, [1, 2])
     assert payload["required_prefix_token_ids"] == [1, 2]
+
+
+@pytest.mark.parametrize("unsupported", ["media", "topk", "no_http", "pool"])
+def test_setup_packed_capture_rejects_unsupported_mode(unsupported: str) -> None:
+    worker = _fake_worker()
+    worker.cfg["vllm_cfg"]["packed_capture_logprobs"] = True
+    worker._http_engine_client = None if unsupported == "no_http" else MagicMock()
+    worker._api_server_pool = MagicMock() if unsupported == "pool" else None
+    with pytest.raises(ValueError, match="Packed captured logprobs require"):
+        asyncio.run(
+            worker.setup_token_capture(
+                {},
+                "staging",
+                capture_media=unsupported == "media",
+                top_logprobs=1 if unsupported == "topk" else 0,
+            )
+        )
+
+
+def test_setup_packed_capture_installs_on_engine_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = _fake_worker()
+    worker.cfg["vllm_cfg"]["packed_capture_logprobs"] = True
+    sink = _MemorySink()
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client",
+        lambda *args, **kwargs: MagicMock(),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.tq_token_sink.TQTokenSink", lambda *args, **kwargs: sink
+    )
+    processor = object()
+    installs = []
+
+    async def on_engine_loop(operation):
+        installs.append("engine_loop")
+        return await operation()
+
+    def install_hook(output_processor, is_captured, *, history_factory):
+        assert output_processor is processor
+        assert not is_captured()
+        token = _CAPTURED_MODEL_CALL.set("captured-call")
+        try:
+            assert is_captured()
+        finally:
+            _CAPTURED_MODEL_CALL.reset(token)
+        installs.append(history_factory)
+        return MagicMock()
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.PackedCaptureLogprobs",
+        install_hook,
+    )
+    worker._http_engine_client = SimpleNamespace(
+        output_processor=processor, _run_on_engine_loop=on_engine_loop
+    )
+    assert asyncio.run(worker.setup_token_capture({}, "staging")) is None
+    assert installs[0] == "engine_loop"
+    assert worker._packed_capture_hook is not None
 
 
 def test_setup_token_capture_skips_non_model_owners(monkeypatch):

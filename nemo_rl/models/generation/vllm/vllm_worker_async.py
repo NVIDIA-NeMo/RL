@@ -97,6 +97,8 @@ from nemo_rl.models.generation.vllm.config import (
     parse_nvfp4_pertoken_rollout,
 )
 from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
+from nemo_rl.models.generation.vllm.packed_logprobs import PackedSelectedLogprobs
+from nemo_rl.models.generation.vllm.patches import PackedCaptureLogprobs
 from nemo_rl.models.generation.vllm.progress_reader import VllmProgressReader
 from nemo_rl.models.generation.vllm.request_pipeline import (
     rollout_output,
@@ -366,6 +368,7 @@ class VllmAsyncGenerationWorkerImpl(
     BaseVllmGenerationWorker,
 ):
     _prefix_writer: RayPrefixWriterClient | None
+    _packed_capture_hook: PackedCaptureLogprobs | None
 
     def __init__(
         self,
@@ -461,6 +464,7 @@ class VllmAsyncGenerationWorkerImpl(
         # In-flight captured calls, by request and by Gym's model-call ID.
         self._capture_registry = CaptureRegistry()
         self._capture_sink: Any | None = None
+        self._packed_capture_hook: PackedCaptureLogprobs | None = None
         # Generation-prefix cuts and restores; a no-op unless setup_token_capture
         # enables them.
         self._prefix_recovery: PrefixRecovery | NoPrefixRecovery = NoPrefixRecovery()
@@ -918,6 +922,16 @@ class VllmAsyncGenerationWorkerImpl(
             raise RuntimeError(
                 "Token capture with a prefix writer is already installed"
             )
+        packed_logprobs = self.cfg["vllm_cfg"].get("packed_capture_logprobs")
+        if packed_logprobs:
+            if capture_media or top_logprobs != 0:
+                raise ValueError(
+                    "Packed captured logprobs require text-only selected-token capture"
+                )
+            if self._http_engine_client is None or self._api_server_pool is not None:
+                raise ValueError(
+                    "Packed captured logprobs require a single async HTTP API server"
+                )
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
         from nemo_gym.token_id_capture.staging import install_capture
@@ -1064,6 +1078,18 @@ class VllmAsyncGenerationWorkerImpl(
                 writer.close()
                 raise
             self._prefix_writer = writer
+        if packed_logprobs:
+
+            async def install_packed_capture() -> None:
+                if self._packed_capture_hook is not None:
+                    self._packed_capture_hook.close()
+                self._packed_capture_hook = PackedCaptureLogprobs(
+                    self._http_engine_client.output_processor,
+                    lambda: _CAPTURED_MODEL_CALL.get() is not None,
+                    history_factory=PackedSelectedLogprobs,
+                )
+
+            await self._http_engine_client._run_on_engine_loop(install_packed_capture)
         if self._api_server_pool is not None:
             await self._api_server_pool.command(
                 "capture",
@@ -2399,6 +2425,10 @@ class VllmAsyncGenerationWorkerImpl(
             if prefix_writer is not None:
                 prefix_writer.close()
                 self._prefix_writer = None
+            packed_hook = getattr(self, "_packed_capture_hook", None)
+            if packed_hook is not None:
+                packed_hook.close()
+                self._packed_capture_hook = None
             # Waiting for a wedged TQ write here would make actor shutdown hang.
             prefix_recovery = getattr(self, "_prefix_recovery", None)
             if prefix_recovery is not None:
