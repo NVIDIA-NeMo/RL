@@ -164,6 +164,36 @@ def test_management_port_is_kept_when_it_is_the_only_rdma_device(fake_fabric):
     assert tq_adapter.rdma_devices() == "mlx5_8"
 
 
+# A real /proc/net/route: header, then a non-default route before the default.
+# The non-default row has Gateway 00000000, so reading the wrong column fails.
+_ROUTE = (
+    "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+    "rdma_vf_rail0\t0000A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n"
+    "eth0\t00000000\t0100000A\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+)
+
+
+@pytest.mark.parametrize(
+    "route, expected",
+    [(_ROUTE, "eth0"), (_ROUTE.splitlines()[0] + "\n", ""), (None, "")],
+    ids=["default-route", "no-default-route", "no-procfs"],
+)
+def test_default_route_netdev_reads_proc_net_route(
+    tmp_path, monkeypatch, route, expected
+):
+    """Every other test stubs this out, so pin the /proc/net/route parsing here."""
+    route_file = tmp_path / "route"
+    if route is not None:
+        route_file.write_text(route)
+    real_path = tq_env.Path
+    monkeypatch.setattr(
+        tq_env,
+        "Path",
+        lambda p: real_path(route_file) if p == "/proc/net/route" else real_path(p),
+    )
+    assert tq_env._default_route_netdev() == expected
+
+
 def test_empty_without_verbs_node(fake_fabric):
     """Containers see /sys without /dev/infiniband; mooncake fails late there."""
     fake_fabric(_MIXED, uverbs=False)
@@ -306,18 +336,20 @@ def test_nixl_drops_eth0_from_a_cluster_ucx_net_devices(clean_env, monkeypatch):
     assert os.environ["UCX_NET_DEVICES"] == "mlx5_0:1,mlx5_1:1"
 
 
+@pytest.mark.parametrize("value", ["eth0", "all,eth0"])
 def test_nixl_names_the_rails_when_ucx_net_devices_is_only_netdevs(
-    clean_env, fake_fabric, monkeypatch
+    clean_env, fake_fabric, monkeypatch, value
 ):
     """The GB300 job env is UCX_TLS=tcp + UCX_NET_DEVICES=eth0, with no rail named.
 
     The value must be set to the host's RDMA rails, not deleted: init_ray()
     copies os.environ into the Ray runtime_env, and a deleted key never reaches
-    the workers, which then keep eth0 and refuse to start.
+    the workers, which then keep eth0 and refuse to start. ``all,eth0`` names
+    no RDMA device either and must get the rails too, never ``all``.
     """
     fake_fabric(_GB300, mgmt="eth0", netdevs=_GB300_NET)
     monkeypatch.setenv("UCX_TLS", "tcp")
-    monkeypatch.setenv("UCX_NET_DEVICES", "eth0")
+    monkeypatch.setenv("UCX_NET_DEVICES", value)
     tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
     assert os.environ["UCX_TLS"] == "rc,cuda_copy,cuda_ipc,self,sm"
     assert (

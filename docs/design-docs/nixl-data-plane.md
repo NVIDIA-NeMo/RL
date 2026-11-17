@@ -57,7 +57,7 @@ export UCX_NET_DEVICES=<rdma dev>:1,<rdma dev>:1   # RDMA devices, never eth0
 
 NIXL's UCX backend honours `UCX_*` env vars over its own parameters, so the environment is the only reliable lever.
 
-You do not need to set either one. Before it starts Ray, the driver sets an unset or non-RDMA `UCX_TLS` to the list above and drops netdevs such as `eth0` from `UCX_NET_DEVICES`, warning when it replaces a value. Some clusters (OCI GB200) inject `UCX_TLS=tcp` and an `eth0` into every job.
+You do not need to set either one. Before it starts Ray, the driver sets an unset or non-RDMA `UCX_TLS` to the list above. It removes netdevs such as `eth0` from `UCX_NET_DEVICES` and keeps the RDMA devices the job named; if the job named only netdevs, it sets `UCX_NET_DEVICES` to this host's RDMA rails (without the management interface's RDMA port), and stops with an error if there are none. It warns when it replaces a value. Some clusters (OCI GB200) inject `UCX_TLS=tcp` and an `eth0` into every job.
 
 The `UCX_TLS` default is the list the NIXL checkpoint-engine refit uses (`refit_transport: nixl`, see the checkpoint-engine refit guide). The driver's `UCX_TLS` reaches every Ray worker, and the refit needs `cuda_copy` to register its GPU buffers (without it, refit hangs). `cuda_copy` and `cuda_ipc` never carry the data plane's CPU bytes off the node, so its cross-node traffic still goes over `rc` (RDMA) only. If you set `UCX_TLS` yourself with both features on, keep `cuda_copy,cuda_ipc` in it.
 
@@ -72,7 +72,7 @@ NIXL starts its bundled UCX ─▶ its ucs_* calls bind into HPC-X libucs
   ─▶ NIXL's IB/CUDA modules never load ─▶ rc/cuda "not available" ─▶ NIXL_ERR_BACKEND
 ```
 
-With `backend: nixl`, `configure_engine_env` sets `UCX_MODULES=^fuse` when it is unset, so neither UCX loads `fuse` and each keeps its own symbols. NCCL keeps its plugin; only UCX's monitoring filesystem is off. Measured on GB200 (2 nodes x 4 GPUs, image `nightly.2026-11-12`): NIXL works after NCCL, the processes exit cleanly (without it they segfault at exit), and NCCL all_reduce / all_gather / reduce_scatter at 32 MiB to 1 GiB stay within 1% with MNNVL on. The same check on GB300 (1 node x 4 GPUs, image `nightly-gym.2026-11-05`): without the fix and without `NCCL_NET_PLUGIN=none`, the nixl single-controller recovery test fails with the error above; with the fix it passes, as does the `nixl_ssd` variant.
+With `backend: nixl`, `configure_engine_env` sets `UCX_MODULES=^fuse` when it is unset, so neither UCX loads `fuse` and each keeps its own symbols. If you set `UCX_MODULES` yourself, keep `^fuse` in it. NCCL keeps its plugin; only UCX's monitoring filesystem is off. Measured on GB200 (2 nodes x 4 GPUs, image `nightly.2026-11-12`): NIXL works after NCCL, the processes exit cleanly (without it they segfault at exit), and NCCL all_reduce / all_gather / reduce_scatter at 32 MiB to 1 GiB stay within 1% with MNNVL on. The same check on GB300 (1 node x 4 GPUs, image `nightly-gym.2026-11-05`): without the fix and without `NCCL_NET_PLUGIN=none`, the nixl single-controller recovery test fails with the error above; with the fix it passes, as does the `nixl_ssd` variant.
 
 ## Design points
 

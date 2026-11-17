@@ -199,9 +199,7 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
             log.warning(
                 "Dropping network interfaces from UCX_NET_DEVICES=%s", ",".join(devs)
             )
-            # The RDMA devices the job named, else this host's rails (GB300 jobs
-            # name only eth0). Not ``all``: that lets UCX pick the management
-            # interface's RDMA function, the one device rdma_rails() leaves out.
+            # Not ``all``: UCX could then pick the management port rdma_rails() skips.
             rdma_devs = [d for d in devs if ":" in d] or [
                 f"{dev}:1" for dev in rdma_rails()
             ]
@@ -211,9 +209,8 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
                     "this host has no active RDMA rail; the NIXL data plane is "
                     "RDMA-only."
                 )
-            # Set, never delete: init_ray() copies os.environ into the Ray
-            # runtime_env, and a deleted key is not in that copy, so workers
-            # would keep the node's value (eth0) and refuse to start.
+            # Set, never delete: init_ray() ships os.environ, so a deleted key
+            # never reaches the workers.
             os.environ["UCX_NET_DEVICES"] = ",".join(rdma_devs)
         check_rdma_only()  # asserts the swap above left UCX RDMA-only
         return
