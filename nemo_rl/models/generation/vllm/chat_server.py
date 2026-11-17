@@ -60,6 +60,10 @@ from vllm.sampling_params import StructuredOutputsParams
 from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_MODEL_SAMPLING_HEADER,
+    NEMO_GYM_MODEL_SAMPLING_NULL,
+)
 from nemo_rl.models.generation.capture_context import resolve_capture_input
 from nemo_rl.models.generation.gym_call import GymCallResult, GymRequestFields
 from nemo_rl.models.generation.openai_server_utils import turn_end_token_ids
@@ -904,19 +908,24 @@ def register_routes(
         # with min_p and the repetition penalty off; the trainer replays none of
         # them, nor the penalties or logit bias a request may therefore not set.
         try:
-            sampling = on_policy_sampling(
-                temperature=request.temperature,
-                top_p=request.top_p,
-                top_k=request.top_k,
-                min_p=request.min_p,
-                repetition_penalty=request.repetition_penalty,
-                presence_penalty=request.presence_penalty,
-                frequency_penalty=request.frequency_penalty,
-                logit_bias=request.logit_bias,
-                generation_config=generation_config,
-            )
-            for field, value in sampling.items():
-                setattr(request, field, value)
+            # Gym marks an untrained caller's call, such as an LLM judge's, which keeps its own sampling.
+            if (
+                raw_request.headers.get(NEMO_GYM_MODEL_SAMPLING_HEADER)
+                != NEMO_GYM_MODEL_SAMPLING_NULL
+            ):
+                sampling = on_policy_sampling(
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    top_k=request.top_k,
+                    min_p=request.min_p,
+                    repetition_penalty=request.repetition_penalty,
+                    presence_penalty=request.presence_penalty,
+                    frequency_penalty=request.frequency_penalty,
+                    logit_bias=request.logit_bias,
+                    generation_config=generation_config,
+                )
+                for field, value in sampling.items():
+                    setattr(request, field, value)
             generator = await openai_serving_chat.create_chat_completion(
                 request, raw_request
             )

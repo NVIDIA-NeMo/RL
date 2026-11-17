@@ -74,6 +74,7 @@ Where the behavior differs from the native endpoint:
 - A call that streams (`stream: true`) or asks for more than one choice (`n`) is refused with HTTP 400. The native endpoint serves both, and fails the capture of a streamed token-capture call. NeMo-Gym sends neither.
 - A call refused with a status other than 400 (a full queue's 503, for example) is answered with that status and the status's standard text. The engine's own message is only in the frontend's log. A 400 keeps its message, and a refused token-capture call is acknowledged in the `x-ng-capture-refused` header, both as on the native endpoint.
 - A call's processed media travels to the engine inside the request.
+- Every chat call must match the training or validation sampling. That includes a call NeMo-Gym marks as untrained with `x-ng-sampling: null`, such as an LLM judge's on the policy model: NeMo RL's chat engine does not read that header, so the call is refused with HTTP 400 unless its sampling matches. The native endpoint lets such a call keep its own sampling. Give a judge that samples differently a model server of its own.
 
 ### Rollout recovery
 
