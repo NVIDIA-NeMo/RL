@@ -1366,13 +1366,14 @@ class MegatronPolicyWorkerImpl(
         # Multiplying by G/K, with K the global surviving token count, restores
         # S/K: the same normalization as filtering before training. Apply this
         # correction before optimizer.step() so gradient clipping sees S/K.
-        token_factor = float((global_valid_toks / token_denominator).item())
+        token_scale = global_valid_toks / token_denominator
+        token_factor = float(token_scale.item())
         sequence_factor = float((global_valid_seqs / sequence_denominator).item())
         if not eval_mode:
             # Finish any overlap on the comm stream before touching the reduced
             # gradient buffers (including distributed-optimizer gradient shards).
             torch.cuda.synchronize()
-            self.model.scale_gradients(token_factor)
+            self.model.scale_gradients(token_scale)
         metrics = [
             rescale_loss_metrics(
                 m,
@@ -2365,14 +2366,15 @@ class MegatronPolicyWorkerImpl(
             n_true = global_valid_toks
         else:
             n_true = global_valid_seqs
-        n_safe = n_true if n_true.item() > 0 else torch.tensor(1.0, device="cuda")
-        inv_n = float((1.0 / n_safe).item())
+        n_safe = n_true if n_true.item() > 0 else torch.ones_like(n_true)
+        gradient_scale = n_safe.reciprocal()
+        inv_n = float(gradient_scale.item())
 
         # Rescale all locally-accumulated gradients by 1/N. The reduce
         # below sees the rescaled grads; for all_reduce the result is the
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
-        self.model.scale_gradients(inv_n)
+        self.model.scale_gradients(gradient_scale)
         if draft_step_state.active:
             draft_step_state.correct_main_grads(
                 self.model.parameters(),
@@ -3585,7 +3587,9 @@ class MegatronPolicyWorkerImpl(
         """Return True if the train side stores weights as TE blockwise FP8."""
         return is_blockwise_fp8_param_storage(self.fp8_cfg)
 
-    def _build_refit_conversion_tasks(self) -> list:
+    def _build_refit_conversion_tasks(
+        self, *, exclude_param_patterns: tuple[str, ...] = ()
+    ) -> list:
         """Keep the general/misc export format expected by each backend."""
         # Deferred import to avoid circular import issues.
         from nemo_rl.models.megatron.draft import draft_model_detached
@@ -3593,11 +3597,13 @@ class MegatronPolicyWorkerImpl(
         with draft_model_detached([self.model]):
             if self._is_fp8_export() and not self._generation_needs_logical_weights():
                 return self.megatron_bridge.get_export_fp8_tasks(self.model)
-            return [
-                task
-                for task in self.megatron_bridge.get_conversion_tasks([self.model])
-                if task is not None
-            ]
+            if exclude_param_patterns:
+                tasks = self.megatron_bridge.get_conversion_tasks(
+                    [self.model], exclude_param_patterns=exclude_param_patterns
+                )
+            else:
+                tasks = self.megatron_bridge.get_conversion_tasks([self.model])
+            return [task for task in tasks if task is not None]
 
     def _generation_needs_logical_weights(self) -> bool:
         """Megatron's existing non-bulk export consumes logical model weights."""

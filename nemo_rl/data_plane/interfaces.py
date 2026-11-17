@@ -40,8 +40,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt, model_validator
+from pydantic import (
+    AllowInfNan,
+    BaseModel,
+    Field,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    model_validator,
+)
 from tensordict import TensorDict
+
+from nemo_rl.data_plane.checkpoint import CheckpointCapture
 
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
 
@@ -95,6 +105,18 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
     # placement over every Ray node.
     storage_unit_placement: list[str] | Literal["all"] | None = None
     ssd_offload: SsdOffloadConfig = Field(default_factory=SsdOffloadConfig)
+    # Retain an in-memory cut and persist it after rollout dispatch resumes.
+    async_checkpoint: bool = False
+    # RPC wait budget for each retained-view persist/release operation.
+    checkpoint_io_timeout_s: Annotated[PositiveFloat, AllowInfNan(False)] = 600.0
+
+    @model_validator(mode="after")
+    def _validate_async_checkpoint(self) -> "SimpleStorageConfig":
+        if self.async_checkpoint and self.ssd_offload.enabled:
+            raise ValueError(
+                "SimpleStorage async_checkpoint does not support SSD offload"
+            )
+        return self
 
 
 class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
@@ -831,6 +853,21 @@ class DataPlaneClient(ABC):
         """
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
+
+    def capture_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> CheckpointCapture | None:
+        """Retain a stable checkpoint view under the caller's mutation barrier.
+
+        The caller may resume mutations before persisting the returned handle,
+        but must release it after writes settle, including on failure. Return
+        None to request the synchronous save_checkpoint path instead. Raise
+        CheckpointReleaseError when a failed capture cannot release its view.
+        """
+        return None
 
     @abstractmethod
     def save_checkpoint(
