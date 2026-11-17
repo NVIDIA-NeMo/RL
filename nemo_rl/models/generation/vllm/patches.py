@@ -13,12 +13,14 @@
 # limitations under the License.
 
 import asyncio
+import functools
 import os
 import time
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib.util import find_spec
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     import torch
@@ -26,6 +28,68 @@ if TYPE_CHECKING:
 # Keep this module free of NeMo RL imports, including lazy ones inside
 # functions: tools/external_gym_vllm/serve_vllm_on_ray.py loads it by path and
 # calls _apply_vllm_patches in serving containers that do not install NeMo RL.
+
+
+class PackedCaptureLogprobs:
+    """Install packed histories for captured, selected-token FINAL_ONLY requests."""
+
+    def __init__(
+        self,
+        processor: Any,
+        is_captured: Callable[[], bool],
+        *,
+        history_factory: Callable[..., Any],
+    ) -> None:
+        # vLLM is optional outside the generation worker's environment.
+        from vllm.logprobs import FlatLogprobs, Logprob
+        from vllm.sampling_params import RequestOutputKind
+
+        self._processor = processor
+        self._original = processor.add_request
+        self._closed = False
+
+        @functools.wraps(self._original)
+        def add_request(request: Any, *args: Any, **kwargs: Any) -> Any:
+            result = self._original(request, *args, **kwargs)
+            if not is_captured():
+                return result
+            state = processor.request_states[request.request_id]
+            lp = state.logprobs_processor
+            if (
+                lp is None
+                or not isinstance(lp.logprobs, FlatLogprobs)
+                or lp.num_logprobs != 0
+                or lp.num_prompt_logprobs is not None
+                or state.output_kind != RequestOutputKind.FINAL_ONLY
+            ):
+                return result
+            if len(lp.logprobs):
+                raise RuntimeError("Install packed capture before the first token")
+            history = history_factory(Logprob)
+            lp.logprobs = history
+            reference = weakref.ref(lp)
+
+            def update(lists: Any) -> None:
+                current = reference()
+                if current is None:
+                    raise RuntimeError("Captured logprob processor was released")
+                token_ids, values, ranks, _ = lists
+                before = len(history)
+                history.append_arrays(token_ids, values, ranks)
+                current.cumulative_logprob = history.cumulative_after(
+                    current.cumulative_logprob, start=before
+                )
+
+            lp._update_sample_logprobs = update
+            return result
+
+        self._wrapper = add_request
+        processor.add_request = add_request
+
+    def close(self) -> None:
+        if not self._closed and self._processor.add_request is self._wrapper:
+            self._processor.add_request = self._original
+        self._closed = True
 
 
 def _get_vllm_file(relative_path: str) -> str:
