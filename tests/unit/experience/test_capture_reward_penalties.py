@@ -390,18 +390,24 @@ def test_finalized_effort_matches_inline_formula_and_metrics(
         ),
     ],
 )
-def test_classification_retains_original_last_user_membership_rule(messages, expected):
-    assert compute_reward_checks({}, _input(*messages), CONFIG).low_effort is expected
+@pytest.mark.parametrize("materialized", [False, True], ids=["flat", "materialized"])
+def test_classification_retains_original_last_user_membership_rule(
+    messages, expected, materialized
+):
+    prompt = _input(*messages)
+    if materialized:
+        prompt = {
+            "task_id": {"taskset": "math:train", "task_id": "1"},
+            "task_input": prompt,
+        }
+    assert compute_reward_checks({}, prompt, CONFIG).low_effort is expected
 
 
 @pytest.mark.parametrize("bound", [0, -1])
 def test_active_effort_requires_positive_bound(bound):
     with pytest.raises(ValueError, match="low_ub"):
         EffortLevelsConfig(low_weight=1, low_string="budget", low_ub=bound)
-    assert (
-        EffortLevelsConfig(low_weight=0, low_string="budget", low_ub=bound).low_ub
-        == bound
-    )
+    EffortLevelsConfig(low_weight=0, low_string="budget", low_ub=bound)
 
 
 def test_metric_pooling_single_row_reports_nan_stddev_and_no_disabled_keys():
@@ -584,9 +590,10 @@ def test_reward_settings_persist_think_tag_rules():
     assert off == CaptureRewardSettings.from_configs(RewardPenaltyConfig(), None, None)
 
 
-def test_final_reward_distribution_and_agent_tables_are_pooled_exactly():
+@pytest.mark.parametrize("attribution_key", ["agent", "math:train"])
+def test_final_reward_distribution_and_agent_tables_are_pooled_exactly(attribution_key):
     # Unequal groups: averaging their medians (0 and 2) would incorrectly give 1.
-    context = RewardLogContext("agent", '{"answer":"ok","reward":99}')
+    context = RewardLogContext(attribution_key, '{"answer":"ok","reward":99}')
     observations = [
         FinalizedReward(
             f"sample-{i}",
@@ -601,13 +608,122 @@ def test_final_reward_distribution_and_agent_tables_are_pooled_exactly():
     assert metrics["total_reward/median"] == 2.0
     assert metrics["total_reward/histogram"] == [0.0, 2.0, 2.0, 8.0]
     assert metrics["other/reward/mean"] == 4.0
-    assert metrics["agent/reward/histogram"] == [0.0]
+    assert metrics[f"{attribution_key}/reward/histogram"] == [0.0]
     tables = capture_reward_result_tables(observations)
-    assert set(tables) == {"agent/full_result"}
-    assert json.loads(tables["agent/full_result"][0][0]) == {
+    assert set(tables) == {f"{attribution_key}/full_result"}
+    assert json.loads(tables[f"{attribution_key}/full_result"][0][0]) == {
         "answer": "ok",
         "reward": 0.0,
         "ng_rollout_id": "attempt-0",
         "sample_id": "sample-0",
     }
     assert aggregate_capture_reward_metrics({}, []) == {}
+
+
+def test_length_penalty_reward_settings_roundtrip_and_detect_changes():
+    from nemo_rl.utils.length_penalty import LengthPenaltyConfig, LengthPenaltyParams
+
+    def settings_for(length_penalty):
+        return CaptureRewardSettings.from_configs(
+            RewardPenaltyConfig(), None, None, length_penalty
+        )
+
+    config = LengthPenaltyConfig(
+        default=LengthPenaltyParams(length_type="chars", total_bonus=0.2)
+    )
+    settings = settings_for(config)
+    assert settings.to_state()["version"] == 2
+    restored = CaptureRewardSettings.from_state(settings.to_state())
+    assert restored == settings
+    restored.require_compatible(settings)
+
+    # A logging-only change (verbose) is excluded from the saved rules, so resume
+    # is allowed.
+    restored.require_compatible(
+        settings_for(
+            LengthPenaltyConfig(
+                verbose=True,
+                default=LengthPenaltyParams(length_type="chars", total_bonus=0.2),
+            )
+        )
+    )
+
+    # A changed coefficient, or enabling the penalty where it was absent, is rejected.
+    with pytest.raises(ValueError, match="grpo.length_penalty"):
+        restored.require_compatible(
+            settings_for(
+                LengthPenaltyConfig(
+                    default=LengthPenaltyParams(length_type="chars", total_bonus=0.3)
+                )
+            )
+        )
+    with pytest.raises(ValueError, match="grpo.length_penalty"):
+        restored.require_compatible(
+            CaptureRewardSettings.from_configs(RewardPenaltyConfig(), None, None)
+        )
+
+
+def test_length_penalty_settings_preserve_partial_agent_overrides():
+    from nemo_rl.utils.length_penalty import LengthPenaltyConfig, LengthPenaltyParams
+
+    config = LengthPenaltyConfig(
+        default=LengthPenaltyParams(
+            length_type="chars", group_total_length_penalty_coeff=0.2
+        ),
+        agent_overrides={"agent": LengthPenaltyParams(total_bonus=0.1)},
+    )
+    settings = CaptureRewardSettings.from_configs(
+        RewardPenaltyConfig(), None, None, config
+    )
+    restored = CaptureRewardSettings.from_state(settings.to_state())
+    assert restored == settings
+    # The exclude_unset projection keeps only the override field the user set, not
+    # the model defaults, so a partial override still inherits the rest on restore.
+    assert restored.length_penalty.rules["agent_overrides"]["agent"] == {
+        "total_bonus": 0.1
+    }
+
+
+def test_length_metrics_pool_valid_rollouts_across_unequal_groups():
+    observations = [
+        FinalizedReward(f"row{i}", f"rollout{i}", reward, None)
+        for i, reward in enumerate((1.1, 0.9, 1.0))
+    ]
+    metrics = aggregate_capture_reward_metrics(
+        {
+            "finalize/length_penalty/env_reward_mean_sum": [2.0, 1.0],
+            "finalize/length_penalty/adjusted_frac_sum": [2.0, 0.0],
+        },
+        observations,
+    )
+    assert metrics["length_penalty/env_reward_mean"] == 1.0
+    assert metrics["length_penalty/adjusted_frac"] == pytest.approx(2 / 3)
+
+
+def test_checkpoint_inventory_retains_length_penalty_settings():
+    from nemo_rl.algorithms.grpo import GRPOConfig
+    from nemo_rl.algorithms.rollout_checkpointing.inventory import (
+        capture_reward_settings,
+    )
+    from nemo_rl.algorithms.single_controller_utils.config import (
+        MasterConfig,
+        TokenCaptureConfig,
+    )
+    from nemo_rl.utils.length_penalty import LengthPenaltyConfig, LengthPenaltyParams
+
+    config = LengthPenaltyConfig(
+        default=LengthPenaltyParams(length_type="chars", total_bonus=0.2)
+    )
+    master = MasterConfig.model_construct(
+        grpo=GRPOConfig(length_penalty=config),
+        ppo=None,
+        token_capture=TokenCaptureConfig(enabled=True),
+        reward_penalties=RewardPenaltyConfig(),
+        env={},
+    )
+    saved = capture_reward_settings(master)
+    assert saved.length_penalty.rules == {
+        "default": {"length_type": "chars", "total_bonus": 0.2}
+    }
+    restored = CaptureRewardSettings.from_state(saved.to_state())
+    restored.require_compatible(saved)

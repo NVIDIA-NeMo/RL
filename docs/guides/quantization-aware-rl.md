@@ -11,10 +11,7 @@ There are two vLLM rollout modes:
 - **Fake-quant rollout**: vLLM receives folded full-precision weights and runs fake-quantized layers. This is the default when `policy.generation.quant_cfg` is set.
 - **Real-quant rollout**: vLLM receives canonical packed weights and format-owned sidecars during every refit. Enable this with `policy.generation.real_quant: true`; `policy.quant_cfg` is the sole source of the rollout quantization format. ModelOpt owns packing and scale semantics, Megatron-Bridge owns distributed topology and Hugging Face naming, and vLLM selects the native runtime method.
 
-Real-quant rollout is supported by the non-streaming GRPO and distillation
-entrypoints. PPO and SingleController do not yet initialize the policy before
-the rollout engine to obtain its deployment metadata; those entrypoints reject
-real-quant mode at setup. This restriction does not apply to fake quantization.
+Real-quant rollout is supported by the non-streaming GRPO and distillation entrypoints. PPO and SingleController do not yet initialize the policy before the rollout engine to obtain its deployment metadata; those entrypoints reject real-quant mode at setup. This restriction does not apply to fake quantization.
 
 See [Verified Configurations](#verified-configurations) for the workflow + recipe combinations that have been empirically validated, and [Supported Quantization Formats](#supported-quantization-formats) for the full set of available formats. Results are recipe- and model-specific: the generic W4A4 `NVFP4_DEFAULT_CFG` has known GRPO convergence issues, while the routed-expert Qwen3 W4A4 real-quant recipe below completed the documented single-seed campaign.
 
@@ -38,15 +35,30 @@ The following table records prior recipe campaigns and the validation level reac
 
 The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout. The Nano3 `nano3_nvfp4_weightonly.yaml` recipe applies the same W4A16 weight-only format to supported MLP/MoE weights while its authored quantizer selection keeps sensitive paths in BF16.
 
+## Dynamic FP8 KV Cache
+
+For vLLM rollouts with FP8 precision (including MXFP8 weights), configure:
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      precision: fp8
+      kv_cache_dtype: fp8_per_token_head
+    vllm_kwargs:
+      attention_backend: TRITON_ATTN
+```
+
+K and V scales are computed independently for each token and KV head when writing the cache, and stored alongside the FP8 cache. Static policy KV scales are not synchronized during weight refits. This requires a vLLM build supporting `fp8_per_token_head`. Explicitly incompatible attention backends raise an error; when no backend is specified, vLLM selects or rejects the backend. NeMo RL does not override the configured backend.
+
+DeepSeek's specialized MLA cache and ModelOpt `real_quant` rollout are not supported. Mamba state caches are unaffected. This configures rollout cache storage; it does not change policy training attention.
+
+For command-line overrides, use `policy.generation.vllm_cfg.kv_cache_dtype=fp8_per_token_head` and `++policy.generation.vllm_kwargs.attention_backend=TRITON_ATTN`.
+The default `kv_cache_dtype: auto` preserves the existing cache behavior.
+
 ## Simulated KV-Cache Quantization
 
-QARL can apply ModelOpt fake quantization to the attention K/V tensors in both
-the Megatron policy and the vLLM rollout model. Use the same quantization recipe
-for both workers so calibrated K/V amax values from the policy can be
-transferred to matching rollout quantizers during refit. The only supported
-exception is rollout-only FP8 K/V fake quantization with
-`use_constant_amax: true`; vLLM computes the constant amax locally, so no
-policy-side K/V quantization or amax transfer is required.
+QARL can apply ModelOpt fake quantization to the attention K/V tensors in both the Megatron policy and the vLLM rollout model. Use the same quantization recipe for both workers so calibrated K/V amax values from the policy can be transferred to matching rollout quantizers during refit. The only supported exception is rollout-only FP8 K/V fake quantization with `use_constant_amax: true`; vLLM computes the constant amax locally, so no policy-side K/V quantization or amax transfer is required.
 
 ```yaml
 policy:
@@ -60,31 +72,18 @@ policy:
 The KV-only examples are:
 
 - `kv_cache_fp8.yaml`: FP8 E4M3 K/V fake quantization with constant amax.
-- `kv_cache_nvfp4.yaml`: calibrated NVFP4 K/V fake quantization with dynamic
-  per-block scales and a calibrated global amax.
+- `kv_cache_nvfp4.yaml`: calibrated NVFP4 K/V fake quantization with dynamic per-block scales and a calibrated global amax.
 
-NVFP4 K/V quantization has shown training-quality degradation in current
-experiments. It is intended for studying QARL-based recovery of PTQ accuracy
-and alternative recipes, including mixed formats and quantizing K/V in only
-selected layers.
+NVFP4 K/V quantization has shown training-quality degradation in current experiments. It is intended for studying QARL-based recovery of PTQ accuracy and alternative recipes, including mixed formats and quantizing K/V in only selected layers.
 
-These recipes enable only the attention K/V quantizers, isolating K/V fake
-quantization from weight and other activation quantization. To combine K/V
-quantization with other formats, define all required quantizers in a single
-recipe.
+These recipes enable only the attention K/V quantizers, isolating K/V fake quantization from weight and other activation quantization. To combine K/V quantization with other formats, define all required quantizers in a single recipe.
 
-This path does not enable vLLM's native FP8 KV-cache storage. Set neither
-`policy.generation.real_quant` nor a native vLLM KV-cache dtype for these
-simulated recipes.
+This path does not enable vLLM's native FP8 KV-cache storage. Set neither `policy.generation.real_quant` nor a native vLLM KV-cache dtype for these simulated recipes.
 
 ## ModelOpt Layer Spec Toggle
 
 For QARL configs, try setting `policy.disable_modelopt_layer_spec=true` first.
-This keeps ModelOpt quantization enabled while using the standard Megatron layer
-specs instead of ModelOpt's custom layer specs. This is usually faster and works
-for most models, but it is not guaranteed for every architecture or recipe. If
-you encounter errors with the standard Megatron layer specs, leave it unset or
-set it to `false` to exercise ModelOpt's Megatron layer-spec path.
+This keeps ModelOpt quantization enabled while using the standard Megatron layer specs instead of ModelOpt's custom layer specs. This is usually faster and works for most models, but it is not guaranteed for every architecture or recipe. If you encounter errors with the standard Megatron layer specs, leave it unset or set it to `false` to exercise ModelOpt's Megatron layer-spec path.
 
 ## Quantization-Aware GRPO (QA-GRPO)
 
@@ -172,7 +171,7 @@ policy:
 
 ModelOpt derives the canonical configuration from `policy.quant_cfg`, and vLLM selects the corresponding native method. NeMo RL does not infer W4A4, W4A16, or another format from recipe names, and it does not translate unsupported schemas. Depending on vLLM, an unsupported format or fused-layer combination may be rejected or may select an unquantized fallback. Inspect representative native methods before treating a recipe as qualified.
 
-For the pinned vLLM 0.29.0 loader, see the [ModelOpt schema support table](../design-docs/modelopt-real-quant-architecture.md#formats). `FP8_PB_WO` is supported inside mixed schemas for dense linear layers, but not MoE. ModelOpt can export MXFP4 beyond GPT-OSS; the limitation is consuming that schema through this real-quant rollout/refit path, not ModelOpt export itself. vLLM's separate GPT-OSS MXFP4 weight-only loader is not interchangeable with this path. Loader support is source-checked; only the validation matrix above describes empirically validated workflows.
+For the pinned vLLM 0.33.0 loader, see the [ModelOpt schema support table](../design-docs/modelopt-real-quant-architecture.md#formats). `FP8_PER_CHANNEL_PER_TOKEN` and `FP8_PB_WO` cover dense linear layers only in uniform schemas; inside mixed schemas, `FP8_PB_WO` also covers MoE when all block-FP8 MoE layers share one group size. ModelOpt can export MXFP4 beyond GPT-OSS; the limitation is consuming that schema through this real-quant rollout/refit path, not ModelOpt export itself. vLLM's separate GPT-OSS MXFP4 weight-only loader is not interchangeable with this path. Loader support is source-checked; only the validation matrix above describes empirically validated workflows.
 
 For Nano3 W4A16 real-quant rollout, use the Nano3 weight-only policy recipe. The recipe itself selects supported tensors and leaves sensitive paths in BF16:
 
@@ -208,16 +207,9 @@ examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real.
 
 This recipe contains the 300-step, 256-example-validation campaign settings.
 The GB200 nightly driver overrides it to a two-step, 32-example smoke test.
-Before running this MoE recipe, use jointly compatible ModelOpt and embedded
-Megatron-Bridge revisions. ModelOpt must provide
-`modelopt.torch.export.quantized_weight_export`; Megatron-Bridge must import the
-functional APIs from that module and provide
-`AutoBridge.export_hf_weight_groups_modelopt`. Older or independently selected
-revisions are unsupported.
+Before running this MoE recipe, use jointly compatible ModelOpt and embedded Megatron-Bridge revisions. ModelOpt must provide `modelopt.torch.export.quantized_weight_export`; Megatron-Bridge must import the functional APIs from that module and provide `AutoBridge.export_hf_weight_groups_modelopt`. Older or independently selected revisions are unsupported.
 
-For a BF16 baseline, copy the recipe, remove `policy.quant_cfg`,
-`policy.generation.quant_cfg`, and `policy.generation.real_quant`, and use distinct
-checkpoint and log directories.
+For a BF16 baseline, copy the recipe, remove `policy.quant_cfg`, `policy.generation.quant_cfg`, and `policy.generation.real_quant`, and use distinct checkpoint and log directories.
 
 ### Running the Example
 
@@ -271,9 +263,8 @@ For long runs on queues with short wall times, enable periodic checkpointing and
 A healthy W4A16 real-rollout run should include these lines or equivalent vLLM logs:
 
 ```text
-quantization=modelopt
-Detected ModelOpt NVFP4 checkpoint
-Using NvFp4LinearBackend.MARLIN for NVFP4 GEMM
+quantization=modelopt_fp4
+Weight-only FP4 compression will be used leveraging the Marlin kernel
 MegatronQuantPolicyWorker[rank=0]: Packed ... groups of tensors
 ```
 
@@ -408,5 +399,5 @@ uv run --extra mcore --extra modelopt \
 - **Real-quant refit transport**: NIXL, custom checkpoint engines, `nccl_reshard`, and remote sparse-delta transports are not supported because they bypass vLLM's native layerwise reload lifecycle.
 - **Router Replay (R3)**: R3 is supported on the Megatron policy path.
 - **Real-quant activation formats**: Runtime support is the intersection of formats emitted by ModelOpt and complete fused-layer combinations accepted by the pinned vLLM. The architecture supports mixed formats without downstream format branches, but only entries in the validation table above should be treated as empirically validated.
-- **Pinned vLLM format limits**: The [vLLM 0.29.0 ModelOpt schema support table](../design-docs/modelopt-real-quant-architecture.md#formats) distinguishes uniform and mixed schemas, including dense-versus-MoE limits. MXFP4 export support and vLLM's separate GPT-OSS loader do not imply support through this ModelOpt rollout/refit path.
+- **Pinned vLLM format limits**: The [vLLM 0.33.0 ModelOpt schema support table](../design-docs/modelopt-real-quant-architecture.md#formats) distinguishes uniform and mixed schemas, including dense-versus-MoE limits. MXFP4 export support and vLLM's separate GPT-OSS loader do not imply support through this ModelOpt rollout/refit path.
 - **Model support**: Dense Transformer, MoE (Mixture of Experts), and hybrid MoE/Mamba models are supported on the Megatron policy + vLLM generation path when Megatron-Bridge and ModelOpt support the model architecture and quantization recipe.

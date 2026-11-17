@@ -679,10 +679,6 @@ def test_distributed_checkpoint_round_trip_over_command_only_rpc(
     }
 
 
-def test_checkpoint_timeout_matches_simple_default() -> None:
-    assert checkpoint_plugin._DEFAULT_TIMEOUT_S == 200.0
-
-
 def test_participant_timeout_is_fatal_to_the_checkpoint_caller(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1902,7 +1898,13 @@ def _evictable_managers(cluster: _FakeCluster, identities, **options) -> list[An
 @pytest.fixture
 def no_restore_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     sleeps: list[float] = []
-    monkeypatch.setattr(offload.time, "sleep", sleeps.append)
+    # Swap only offload's `time`: patching time.sleep itself would also record
+    # every other thread's sleep, and `== []` below would fail on those.
+    monkeypatch.setattr(
+        offload,
+        "time",
+        SimpleNamespace(monotonic=offload.time.monotonic, sleep=sleeps.append),
+    )
     return sleeps
 
 

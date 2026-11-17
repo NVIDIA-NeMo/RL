@@ -17,17 +17,17 @@ Worker-level tests use a tiny Qwen2 model on a small Ray cluster, mirroring
 `test_megatron_value_worker.py`. They cover:
 
   * value head (regression head, `num_labels=1`) on the Automodel backbone
-  * `get_values` forward pass (shape + finiteness), incl. TP / SP /
+  * `get_values` forward pass (shape + finiteness), incl. TP / SP / CP /
     dynamic batching
   * `train` step with `MseValueLossFn` (loss is finite + non-negative)
-  * Sequence-parallel / dynamic-batching equivalence (must not change values)
+  * Sequence/context-parallel and dynamic-batching equivalence
   * Seeded fresh-head equivalence without a shared checkpoint
   * Multi-step training drives loss down
   * Checkpoint save+load round-trip preserves the trained value head
 
-Automodel value worker does not support pipeline parallelism (lm_value.py)
-or sequence packing (setup.validate_and_prepare_config disallows packing for
-reward models), so those parallelism modes are not exercised here.
+Automodel value workers do not support pipeline parallelism. Sequence packing
+and context parallelism are exercised separately because they are incompatible
+with each other.
 """
 
 import os
@@ -53,7 +53,7 @@ pytestmark = pytest.mark.automodel
 
 
 def test_right_shift_values_aligns_value_predictions_to_state_tokens():
-    from nemo_rl.models.value.workers.automodel_value_worker import right_shift_values
+    from nemo_rl.models.value.utils import right_shift_values
 
     values = torch.tensor(
         [
@@ -118,6 +118,63 @@ def test_right_shift_loss_wrapper_shifts_logits_and_delegates_attributes():
     assert wrapper.aggregation_type == inner.aggregation_type
 
 
+def test_cp_value_postprocessors_gather_before_right_shift():
+    """Inference and loss paths shift only after the CP sharder restores order."""
+    from nemo_rl.models.automodel.train import LossPostProcessor, ScorePostProcessor
+    from nemo_rl.models.value.utils import right_shift_values
+    from nemo_rl.models.value.workers.automodel_value_worker import (
+        RightShiftLossWrapper,
+    )
+
+    local_logits = torch.tensor([[[10.0], [40.0]]])
+    full_logits = torch.tensor([[[10.0], [20.0], [30.0], [40.0]]])
+    cp_sharder = MagicMock()
+    cp_sharder.gather_token_tensor.return_value = full_logits
+
+    scores = ScorePostProcessor(cfg={})(
+        logits=local_logits,
+        cp_sharder=cp_sharder,
+    )
+    inference_values = right_shift_values(scores)
+    torch.testing.assert_close(
+        inference_values, torch.tensor([[0.0, 10.0, 20.0, 30.0]])
+    )
+
+    class RecordingLoss:
+        loss_type = LossType.TOKEN_LEVEL
+        input_type = LossInputType.LOGIT
+
+        def __init__(self):
+            self.seen_logits = None
+
+        def __call__(self, *, logits, **kwargs):
+            self.seen_logits = logits
+            return logits.sum(), {"num_valid_samples": 1}
+
+    inner = RecordingLoss()
+    cp_mesh = MagicMock()
+    cp_mesh.get_group.return_value = "cp-group"
+    processor = LossPostProcessor(
+        loss_fn=RightShiftLossWrapper(inner),
+        cfg={},
+        cp_mesh=cp_mesh,
+        cp_size=2,
+        dp_size=1,
+    )
+    loss, _ = processor(
+        logits=local_logits,
+        data_dict=BatchedDataDict({}),
+        processed_inputs=MagicMock(),
+        global_valid_seqs=torch.tensor(1),
+        global_valid_toks=torch.tensor(4),
+        cp_sharder=cp_sharder,
+    )
+    expected = torch.tensor([[[0.0], [10.0], [20.0], [30.0]]])
+    torch.testing.assert_close(inner.seen_logits, expected)
+    torch.testing.assert_close(loss, expected.sum())
+    assert cp_sharder.gather_token_tensor.call_count == 2
+
+
 def _create_value_test_config(
     model_name: str,
     tp: int = 1,
@@ -153,7 +210,7 @@ def _create_value_test_config(
         },
         "dynamic_batching": {"enabled": False},
         "sequence_packing": {"enabled": False},
-        "make_sequence_length_divisible_by": tp,
+        "make_sequence_length_divisible_by": tp * (2 * cp if cp > 1 else 1),
         "max_total_sequence_length": 128,
         "max_grad_norm": 1.0,
         "optimizer": {
@@ -172,30 +229,6 @@ def _create_value_test_config(
             "kwargs": {"factor": 1.0, "total_iters": 1_000_000},
         },
     }
-
-
-def test_value_worker_init_rejects_cp_scoring_before_setup(monkeypatch):
-    from nemo_rl.models.value.workers import automodel_value_worker
-
-    config = _create_value_test_config(model_name="unused", cp=2)
-    apply_transformer_engine_patch = MagicMock()
-    monkeypatch.setattr(
-        automodel_value_worker,
-        "apply_transformer_engine_patch",
-        apply_transformer_engine_patch,
-    )
-
-    with pytest.raises(
-        NotImplementedError,
-        match=r"get_values\(\) scoring path does not support context parallelism",
-    ):
-        automodel_value_worker.AutomodelValueWorkerImpl(
-            config=config,
-            tokenizer=MagicMock(),
-            seed=42,
-        )
-
-    apply_transformer_engine_patch.assert_not_called()
 
 
 def test_value_worker_sets_seed_before_model_setup(monkeypatch):
@@ -295,7 +328,7 @@ def _state_has_key(state: Any, expected_key: str) -> bool:
 
 
 def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
-    """Apply test config overrides in place (precision / SP / dynamic batching)."""
+    """Apply test config overrides in place."""
     for k, v in config_updates.items():
         if k == "precision":
             config["precision"] = v
@@ -310,6 +343,22 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
                 "logprob_mb_tokens": lbt,
                 "sequence_length_round": 64,
             }
+        elif k == "sequence_packing":
+            config["precision"] = "bfloat16"
+            mbt = config["max_total_sequence_length"] * config["train_micro_batch_size"]
+            lbt = config["max_total_sequence_length"] * config["logprob_batch_size"]
+            config["sequence_packing"] = {
+                "enabled": v,
+                "train_mb_tokens": mbt,
+                "logprob_mb_tokens": lbt,
+                "algorithm": "modified_first_fit_decreasing",
+            }
+        elif k == "context_parallel":
+            config["automodel_cfg"]["context_parallel_size"] = 2
+            config["precision"] = "bfloat16"
+            config["make_sequence_length_divisible_by"] = (
+                4 * config["automodel_cfg"]["tensor_parallel_size"]
+            )
         else:
             raise ValueError(f"Unknown config_updates key: {k!r}")
 
@@ -358,7 +407,9 @@ def value_setup(request, tiny_qwen2_model_path, tmp_path):
         )
 
         torch.manual_seed(42)
-        batch, seq_len = 8, 64
+        # CP=2 requires padding by the value worker because PPO rollout batches
+        # are shaped by the policy topology, not the value topology.
+        batch, seq_len = 8, 66 if cp > 1 else 64
         input_ids = torch.randint(0, 151000, (batch, seq_len))
         attention_mask = torch.ones(batch, seq_len)
         input_lengths = attention_mask.sum(dim=1).to(torch.int32)
@@ -403,7 +454,10 @@ def value_setup(request, tiny_qwen2_model_path, tmp_path):
         (2, 2, 1, {}),
         (2, 1, 1, {"precision": "bfloat16"}),
         (2, 2, 1, {"sequence_parallel": True}),
+        (2, 1, 2, {"precision": "bfloat16"}),
+        (2, 1, 2, {"precision": "bfloat16", "dynamic_batching": True}),
         (2, 1, 1, {"dynamic_batching": True}),
+        (2, 2, 1, {"sequence_packing": True}),
     ],
     indirect=True,
     ids=[
@@ -411,7 +465,10 @@ def value_setup(request, tiny_qwen2_model_path, tmp_path):
         "2gpu_tp2",
         "2gpu_dp2_bf16",
         "2gpu_tp2sp",
+        "2gpu_cp2",
+        "2gpu_cp2_dynbatch",
         "2gpu_dp2_dynbatch",
+        "2gpu_tp2_seqpack",
     ],
 )
 def test_value_worker_init_and_get_values(value_setup):
@@ -449,14 +506,20 @@ def test_value_worker_init_and_get_values(value_setup):
         (2, 1, 1, {}),
         (2, 2, 1, {}),
         (2, 2, 1, {"sequence_parallel": True}),
+        (2, 1, 2, {"precision": "bfloat16"}),
+        (2, 1, 2, {"precision": "bfloat16", "dynamic_batching": True}),
         (2, 1, 1, {"dynamic_batching": True}),
+        (2, 2, 1, {"sequence_packing": True}),
     ],
     indirect=True,
     ids=[
         "2gpu_dp2",
         "2gpu_tp2",
         "2gpu_tp2sp",
+        "2gpu_cp2",
+        "2gpu_cp2_dynbatch",
         "2gpu_dp2_dynbatch",
+        "2gpu_tp2_seqpack",
     ],
 )
 def test_value_worker_train_step(value_setup):
@@ -487,11 +550,17 @@ def test_value_worker_train_step(value_setup):
     ("tp", "feature_updates"),
     [
         (2, {"sequence_parallel": True}),
+        (1, {"context_parallel": True}),
+        (1, {"context_parallel": True, "dynamic_batching": True}),
         (1, {"dynamic_batching": True}),
+        (2, {"sequence_packing": True}),
     ],
     ids=[
         "sequence_parallel",
+        "context_parallel",
+        "context_parallel_dynamic_batching",
         "dynamic_batching",
+        "sequence_packing",
     ],
 )
 def test_value_worker_parallelism_equivalence(
@@ -506,24 +575,41 @@ def test_value_worker_parallelism_equivalence(
       * sequence parallelism — guards the head's sequence-parallel all-gather
         reassembles the sequence correctly (a wrong gather still yields finite
         values, so finiteness alone would not catch it);
+      * context parallelism — guards load-balanced CP de-interleaving followed
+        by the cross-shard value right shift;
       * dynamic batching — guards the microbatch reorder + ``reorder_data``
-        restore round-trips back to the original sample order.
+        restore round-trips back to the original sample order;
+      * sequence packing — guards packed-value unpacking and per-sequence
+        temporal alignment.
     """
     cluster = None
     ref = None
     feat = None
+
+    def _base_config() -> ValueConfig:
+        config = _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
+        if feature_updates.get("sequence_packing") or feature_updates.get(
+            "context_parallel"
+        ):
+            config["precision"] = "bfloat16"
+        return config
+
     try:
-        feature_id = next(iter(feature_updates))
+        feature_id = "-".join(
+            key for key, enabled in feature_updates.items() if enabled
+        )
+        _equiv_gpus = max(tp, 2 if feature_updates.get("context_parallel") else 1)
         cluster = RayVirtualCluster(
             name=f"test-automodel-value-equiv-{feature_id}",
-            bundle_ct_per_node_list=[2],
+            bundle_ct_per_node_list=[_equiv_gpus],
             use_gpus=True,
-            num_gpus_per_node=2,
+            num_gpus_per_node=_equiv_gpus,
             max_colocated_worker_groups=1,
         )
 
         torch.manual_seed(42)
-        batch, max_seq_len = 8, 64
+        batch = 8
+        max_seq_len = 66 if feature_updates.get("context_parallel") else 64
         # Non-uniform input_lengths so dynamic batching actually reorders samples.
         input_lengths = torch.randint(
             max_seq_len // 2, max_seq_len + 1, (batch,), dtype=torch.int32
@@ -540,7 +626,7 @@ def test_value_worker_parallelism_equivalence(
         )
 
         # Reference worker: feature OFF.
-        ref_config = _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
+        ref_config = _base_config()
         tokenizer = get_tokenizer(ref_config["tokenizer"])
         ref = Value(
             cluster=cluster,
@@ -560,7 +646,7 @@ def test_value_worker_parallelism_equivalence(
         ref.shutdown()
         ref = None
 
-        feat_config = _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
+        feat_config = _base_config()
         _apply_config_updates(feat_config, feature_updates)
         feat = Value(
             cluster=cluster,
@@ -575,8 +661,13 @@ def test_value_worker_parallelism_equivalence(
         # Padded positions can differ legitimately; the contract is only that
         # valid token values match.
         mask = attention_mask.bool()
+        # Allow BF16 ring-reduction noise; ordering is checked separately.
+        cp_enabled = feature_updates.get("context_parallel", False)
         torch.testing.assert_close(
-            values_feat[mask], values_ref[mask], rtol=1e-3, atol=1e-3
+            values_feat[mask],
+            values_ref[mask],
+            rtol=1e-2 if cp_enabled else 1e-3,
+            atol=3e-3 if cp_enabled else 1e-3,
         )
     finally:
         if ref is not None:
@@ -585,6 +676,157 @@ def test_value_worker_parallelism_equivalence(
             feat.shutdown()
         if cluster is not None:
             cluster.shutdown()
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize(
+    ("tp", "feature_updates"),
+    [
+        (1, {"context_parallel": True}),
+        (1, {"context_parallel": True, "dynamic_batching": True}),
+        (2, {"sequence_packing": True}),
+    ],
+    ids=[
+        "context_parallel",
+        "context_parallel_dynamic_batching",
+        "sequence_packing",
+    ],
+)
+def test_value_worker_train_forward_equivalence(
+    tiny_qwen2_model_path, tmp_path, tp, feature_updates
+):
+    """A perf/sharding feature must not change ``train()`` forward/loss results.
+
+    The parallelism equivalence test above only exercises ``get_values`` (the
+    inference/forward path). This test pins the weights the same way (save a
+    feature-OFF worker, reload into both a feature-OFF and a feature-ON worker)
+    and instead runs the ``train()`` loss/metric path with ``MseValueLossFn`` on
+    an identical batch, then asserts the training signal matches:
+
+      * ``loss`` — the aggregated MSE value loss;
+      * ``values_mean`` / ``residual_sq_mean`` — the value-prediction stats that
+        drive the critic;
+      * ``returns_mean`` — must match trivially (same data); a sanity check that
+        the mask / normalization align across backends.
+
+    The context-parallel case compares CP=2 against a pinned CP=1 reference and
+    covers full-sequence returns, old values, masks, and loss normalization.
+
+    ``eval_mode=True`` drives the full train forward + right-shift + loss +
+    global normalization chain under ``model.eval()`` / ``no_grad`` so the
+    value head's ``Dropout(p=0.1)`` is disabled and the comparison is
+    deterministic. It intentionally does not claim backward or optimizer-step
+    equivalence. Weights are pinned via save/reload so any divergence is
+    attributable to the covered path, not value-head initialization.
+    """
+    feature_id = "-".join(key for key, enabled in feature_updates.items() if enabled)
+    equiv_gpus = max(tp, 2 if feature_updates.get("context_parallel") else 1)
+    weights_path = os.path.join(str(tmp_path), "value", "weights")
+    loss_fn = MseValueLossFn(MseValueLossConfig(scale=1.0, cliprange=0.5))
+
+    def _base_config() -> ValueConfig:
+        config = _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
+        if feature_updates.get("sequence_packing") or feature_updates.get(
+            "context_parallel"
+        ):
+            config["precision"] = "bfloat16"
+        return config
+
+    # Fixed variable-length batch exercises packing and CP padding/masking.
+    torch.manual_seed(42)
+    batch = 8
+    max_seq_len = 66 if feature_updates.get("context_parallel") else 64
+    input_lengths = torch.randint(
+        max_seq_len // 2, max_seq_len + 1, (batch,), dtype=torch.int32
+    )
+    attention_mask = (torch.arange(max_seq_len)[None, :] < input_lengths[:, None]).to(
+        torch.float32
+    )
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.randint(0, 151000, (batch, max_seq_len)),
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "returns": torch.randn(batch, max_seq_len) * 0.1,
+            "values": torch.randn(batch, max_seq_len) * 0.1,
+            "token_mask": attention_mask.clone(),
+            "sample_mask": torch.ones(batch),
+        }
+    )
+
+    def _train_once(config: ValueConfig, cluster, tokenizer, *, load: bool):
+        worker = Value(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            weights_path=Path(weights_path) if load else None,
+            seed=42,
+            name_prefix=f"lm_value_{'feat' if load else 'src'}",
+        )
+        try:
+            if not load:
+                # Source worker: persist its fresh init before touching weights.
+                worker.prepare_for_inference()
+                worker.save_checkpoint(
+                    weights_path=weights_path,
+                    is_final_checkpoint=False,
+                )
+                return None
+            worker.prepare_for_training()
+            # eval_mode: exercise the forward + right-shift + loss + reorder +
+            # normalization chain deterministically (dropout off, no grad step).
+            results = worker.train(data, loss_fn, eval_mode=True)
+            worker.finish_training()
+            return _summarize_train_metrics(results)
+        finally:
+            worker.shutdown()
+
+    cluster = None
+    try:
+        cluster = RayVirtualCluster(
+            name=f"test-automodel-value-train-equiv-{feature_id}",
+            bundle_ct_per_node_list=[equiv_gpus],
+            use_gpus=True,
+            num_gpus_per_node=equiv_gpus,
+            max_colocated_worker_groups=1,
+        )
+        tokenizer = get_tokenizer(_base_config()["tokenizer"])
+
+        # 1) Save a fresh feature-OFF worker's weights.
+        _train_once(
+            _base_config(),
+            cluster,
+            tokenizer,
+            load=False,
+        )
+
+        # 2) Evaluate the train forward/loss path with the feature OFF.
+        metrics_off = _train_once(
+            _base_config(),
+            cluster,
+            tokenizer,
+            load=True,
+        )
+
+        # 3) Evaluate the same path with the feature ON and pinned weights.
+        feat_config = _base_config()
+        _apply_config_updates(feat_config, feature_updates)
+        metrics_on = _train_once(feat_config, cluster, tokenizer, load=True)
+    finally:
+        if cluster is not None:
+            cluster.shutdown()
+
+    for key in ("returns_mean", "values_mean", "residual_sq_mean", "loss"):
+        cp_enabled = feature_updates.get("context_parallel", False)
+        torch.testing.assert_close(
+            torch.tensor(metrics_on[key]),
+            torch.tensor(metrics_off[key]),
+            rtol=1e-2,
+            atol=3e-3 if cp_enabled else 1e-3,
+            msg=f"{feature_id}: train-step {key} diverged "
+            f"(on={metrics_on[key]}, off={metrics_off[key]})",
+        )
 
 
 @pytest.mark.hf_gated

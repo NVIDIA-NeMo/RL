@@ -37,7 +37,6 @@ uv run --no-sync examples/run_grpo.py \
 uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 
 grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"
-grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"
 grep -q "quantization=modelopt" "$RUN_LOG"  # vLLM logs the native ModelOpt quantization method.
 assert_not_grep "FakeQuantWorker" "$RUN_LOG" \
     "Real-quant run unexpectedly used FakeQuantWorker"

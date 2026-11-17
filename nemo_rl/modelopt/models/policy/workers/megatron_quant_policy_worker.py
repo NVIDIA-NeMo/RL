@@ -22,6 +22,7 @@ from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import ray
 import torch
@@ -49,6 +50,9 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
 )
+
+if TYPE_CHECKING:
+    from megatron.bridge.models.conversion.modelopt_utils import ModelOptExportPlan
 
 
 def _quant_checkpoint_cache_suffix(config: Mapping[str, object]) -> str:
@@ -487,12 +491,17 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
         return self._get_modelopt_export_plan().conversion_tasks
 
-    def _get_modelopt_export_plan(self):
+    def _get_modelopt_export_plan(self) -> "ModelOptExportPlan":
         plan = getattr(self, "_modelopt_export_plan", None)
         if plan is not None:
             return plan
 
-        plan = self.megatron_bridge.build_hf_modelopt_export_plan([self.model])
+        from nemo_rl.models.megatron.draft import draft_model_detached
+
+        # The canonical planner reads scales from the owning weights and excludes
+        # quantizer modules before Bridge validates the HF parameter mappings.
+        with draft_model_detached([self.model]):
+            plan = self.megatron_bridge.build_hf_modelopt_export_plan([self.model])
         self.refit_conversion_tasks = plan.conversion_tasks
         self._modelopt_export_plan = plan
         return plan

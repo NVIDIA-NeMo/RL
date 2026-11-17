@@ -1,42 +1,29 @@
 # ModelOpt Real-Quant Refit Architecture
 
-NeMo RL can train a ModelOpt-quantized Megatron policy while vLLM runs native
-real-quant kernels for rollout generation. Each refit exports the current policy
-into ModelOpt's canonical Hugging Face schema and loads those tensors into the
-existing vLLM engine without writing an intermediate checkpoint.
+NeMo RL can train a ModelOpt-quantized Megatron policy while vLLM runs native real-quant kernels for rollout generation. Each refit exports the current policy into ModelOpt's canonical Hugging Face schema and loads those tensors into the existing vLLM engine without writing an intermediate checkpoint.
 
 ## Relationship to NeMo RL
 
-Real-quant refit extends the standard policy-generation workflow. Algorithms
-continue to use the existing policy and generation interfaces. BF16 and
-fake-quantized weight updates keep their existing behavior.
+Real-quant refit extends the standard policy-generation workflow. Algorithms continue to use the existing policy and generation interfaces. BF16 and fake-quantized weight updates keep their existing behavior.
 
 This design builds on:
 
-- [Design and Philosophy](design-and-philosophy.md), which defines NeMo RL's
-  controller, worker, isolation, and communication model;
-- [Generation Interface](generation.md), which defines generation backends and
-  their weight-update lifecycle; and
-- [Quantization-Aware RL](../guides/quantization-aware-rl.md), which documents
-  configuration and validated recipes.
+- [Design and Philosophy](design-and-philosophy.md), which defines NeMo RL's controller, worker, isolation, and communication model;
+- [Generation Interface](generation.md), which defines generation backends and their weight-update lifecycle; and
+- [Quantization-Aware RL](../guides/quantization-aware-rl.md), which documents configuration and validated recipes.
 
 ## Canonical Contract
 
-The online path emits loader-equivalent artifacts using ModelOpt Hugging Face
-packing semantics:
+The online path emits loader-equivalent artifacts using ModelOpt Hugging Face packing semantics:
 
 - canonical Hugging Face parameter names;
 - packed weight tensors;
 - format-owned sidecar tensors; and
 - a canonical `quantization_config`.
 
-The sidecar schema is open-ended. NeMo RL and Megatron-Bridge do not maintain a
-format-specific list of scale names or packing rules.
+The sidecar schema is open-ended. NeMo RL and Megatron-Bridge do not maintain a format-specific list of scale names or packing rules.
 
-Dense tensors use the ordinary ModelOpt Hugging Face representation. For a
-grouped Hugging Face MoE mapping, online refit may use canonical per-expert
-names accepted by the native loader while offline export retains one grouped
-tensor.
+Dense tensors use the ordinary ModelOpt Hugging Face representation. For a grouped Hugging Face MoE mapping, online refit may use canonical per-expert names accepted by the native loader while offline export retains one grouped tensor.
 
 | Component | Responsibility |
 |---|---|
@@ -47,16 +34,10 @@ tensor.
 
 ## Future Offline Export
 
-Offline export can later reuse the same functional per-weight boundary without
-reusing the online refit lifecycle. Megatron-Bridge keeps topology conversion
-and its streaming checkpoint writer. The Transformers exporter keeps its
-resident and layerwise writers. Both delegate supported weight formats and the
-deployment configuration to ModelOpt.
+Offline export can later reuse the same functional per-weight boundary without reusing the online refit lifecycle. Megatron-Bridge keeps topology conversion and its streaming checkpoint writer. The Transformers exporter keeps its resident and layerwise writers. Both delegate supported weight formats and the deployment configuration to ModelOpt.
 
 This is a proposed follow-up, not part of the current online-refit change.
-Formats whose state is not yet represented by the functional API, including
-AWQ and SmoothQuant, continue through the existing Transformers export handlers
-until that state is supported.
+Formats whose state is not yet represented by the functional API, including AWQ and SmoothQuant, continue through the existing Transformers export handlers until that state is supported.
 
 ## Startup
 
@@ -68,28 +49,20 @@ Real quantization requires policy-first startup:
 4. Pass it to vLLM through `hf_overrides.quantization_config`.
 5. Construct vLLM with its native ModelOpt loader.
 
-The configuration is immutable for the lifetime of the vLLM engine. Changing
-the quantization recipe requires rebuilding the engine.
+The configuration is immutable for the lifetime of the vLLM engine. Changing the quantization recipe requires rebuilding the engine.
 
 ## Refit
 
-For each refit, Megatron-Bridge reconstructs one logical Hugging Face weight
-from its distributed Megatron representation. ModelOpt captures current
-quantizer state, applies the same merge or selection operation as the weight,
-and emits the packed weight plus its sidecars. NeMo RL transports those named
-tensors without interpreting their format.
+For each refit, Megatron-Bridge reconstructs one logical Hugging Face weight from its distributed Megatron representation. ModelOpt captures current quantizer state, applies the same merge or selection operation as the weight, and emits the packed weight plus its sidecars. NeMo RL transports those named tensors without interpreting their format.
 
-Real-quant parameters have already been transformed into inference layouts, so
-IPC and collective refits use vLLM's native layerwise reload lifecycle:
+Real-quant parameters have already been transformed into inference layouts, so IPC and collective refits use vLLM's native layerwise reload lifecycle:
 
 1. `initialize_layerwise_reload()` restores loadable checkpoint-form state.
 2. The native vLLM model loader consumes the canonical tensors.
 3. `finalize_layerwise_reload()` rebuilds runtime layouts and kernels.
 4. NeMo RL synchronizes before transport storage can be reused.
 
-Initialization invalidates the previous runtime layout. A failed native reload
-therefore makes that generation worker unusable. Deferred loader tensors are
-detached only when they still alias a reusable transport buffer.
+Initialization invalidates the previous runtime layout. A failed native reload therefore makes that generation worker unusable. Deferred loader tensors are detached only when they still alias a reusable transport buffer.
 
 ## Formats
 
@@ -98,41 +71,25 @@ The architecture is format-neutral. Runtime support is the intersection of:
 1. formats exported by ModelOpt's functional export API; and
 2. canonical ModelOpt formats accepted by the pinned vLLM version.
 
-This permits mixed real-quant and unquantized leaves, and mixed real-quant
-formats when vLLM supports the complete fused-layer combination. NeMo RL does
-not translate unsupported schemas. vLLM may reject an unsupported combination
-or select an unquantized fallback, so native-method inspection is required
-before a schema is considered qualified.
+This permits mixed real-quant and unquantized leaves, and mixed real-quant formats when vLLM supports the complete fused-layer combination. NeMo RL does not translate unsupported schemas. vLLM may reject an unsupported combination or select an unquantized fallback, so native-method inspection is required before a schema is considered qualified.
 
-The following schema support was source-checked against the pinned
-[vLLM 0.29.0 ModelOpt loader](https://github.com/vllm-project/vllm/blob/v0.29.0/vllm/model_executor/layers/quantization/modelopt.py).
-These entries describe loader support, not end-to-end refit validation. Recheck
-native methods when using another version:
+The following schema support was source-checked against the pinned [vLLM 0.33.0 ModelOpt loader](https://github.com/vllm-project/vllm/blob/v0.33.0/vllm/model_executor/layers/quantization/modelopt.py).
+These entries describe loader support, not end-to-end refit validation. Recheck native methods when using another version:
 
 | ModelOpt format | Uniform schema | Inside `MIXED_PRECISION` |
 |---|---:|---:|
 | `FP8`, `NVFP4`, `W4A16_NVFP4`, `MXFP8` | Supported | Supported |
-| `FP8_PER_CHANNEL_PER_TOKEN` | Supported | **Not supported** |
-| `FP8_PB_WO` | Supported | Dense linear layers only; **not MoE** |
+| `FP8_PER_CHANNEL_PER_TOKEN` | Dense linear layers only; **not MoE** | Dense linear layers only; **not MoE** |
+| `FP8_PB_WO` | Dense linear layers only; **not MoE** | Supported; block-FP8 MoE layers must share one group size |
 | `MXFP4`, `W4A8_MXFP4_FP8`, `W4A8_NVFP4_FP8` | **Not supported** | **Not supported** |
 
-These limits apply to the ModelOpt schema used by this refit path, not to
-ModelOpt export or every vLLM quantization loader. ModelOpt's
-[generic exporter](https://github.com/NVIDIA/Model-Optimizer/blob/0.48.0rc1/modelopt/torch/export/quant_utils.py)
-supports MXFP4 beyond GPT-OSS, but the pinned vLLM ModelOpt loader does not
-consume that format. ModelOpt's separate
-[GPT-OSS MXFP4 weight-only conversion example](https://github.com/NVIDIA/Model-Optimizer/tree/0.48.0rc1/examples/gpt-oss#deployment)
-emits a different checkpoint schema (`quant_method: "mxfp4"`) for vLLM's
-GPT-OSS loader; it does not establish generic ModelOpt MXFP4 refit support.
+These limits apply to the ModelOpt schema used by this refit path, not to ModelOpt export or every vLLM quantization loader. ModelOpt's [generic exporter](https://github.com/NVIDIA/Model-Optimizer/blob/0.48.0rc1/modelopt/torch/export/quant_utils.py) supports MXFP4 beyond GPT-OSS, but the pinned vLLM ModelOpt loader does not consume that format. ModelOpt's separate [GPT-OSS MXFP4 weight-only conversion example](https://github.com/NVIDIA/Model-Optimizer/tree/0.48.0rc1/examples/gpt-oss#deployment) emits a different checkpoint schema (`quant_method: "mxfp4"`) for vLLM's GPT-OSS loader; it does not establish generic ModelOpt MXFP4 refit support.
 
-NVFP4 W4A4 and W4A16 are supported recipe examples, not downstream mode
-branches. See [Quantization-Aware RL](../guides/quantization-aware-rl.md) for
-their current validation status.
+NVFP4 W4A4 and W4A16 are supported recipe examples, not downstream mode branches. See [Quantization-Aware RL](../guides/quantization-aware-rl.md) for their current validation status.
 
 ## Configuration
 
-`policy.quant_cfg` is the only source of the real-quant rollout schema. Do not
-set a generation-side fake-quant recipe:
+`policy.quant_cfg` is the only source of the real-quant rollout schema. Do not set a generation-side fake-quant recipe:
 
 ```yaml
 policy:
@@ -148,8 +105,6 @@ policy:
 
 - Real-quant rollout requires a Megatron policy and vLLM generation.
 - Runtime support remains recipe-, model-, and pinned-vLLM-version specific.
-- IPC and collective transports are supported. NIXL, custom checkpoint
-  engines, `nccl_reshard`, and sparse-delta refit bypass the native layerwise
-  lifecycle and are rejected.
+- IPC and collective transports are supported. NIXL, custom checkpoint engines, `nccl_reshard`, and sparse-delta refit bypass the native layerwise lifecycle and are rejected.
 - Real-quant KV-cache export and refit are outside this design.
 - A partial refit requires generation-worker restart.
