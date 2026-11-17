@@ -378,6 +378,9 @@ tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2-cp2.sh
 # Megatron PPO with value sequence parallelism (TP2+SP) and dynamic batching (Qwen2.5-1.5B, GSM8K)
 tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch.sh
 
+# Megatron PPO with dedicated policy/value training pools (Qwen2.5-1.5B, Math)
+tests/test_suites/llm/ppo-qwen2.5-1.5b-math-3n8g-megatron-dedicated-value.sh
+
 # Non-colocated Megatron PPO with dedicated training and vLLM nodes (Qwen2.5-1.5B, GSM8K)
 tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-noncolocated.sh
 
