@@ -1,14 +1,10 @@
 # Nemotron 3 Super Omni Image MOPD
 
-This recipe distills a non-colocated Nemotron 3 Super Omni teacher into a
-Super Omni policy over multimodal NeMo Gym trajectories. It extends the
-MTP-disabled Super Omni GRPO recipe with OPD advantages, teacher resources,
-and image-aware teacher log-probability computation.
+This recipe distills a non-colocated Nemotron 3 Super Omni teacher into a Super Omni policy over multimodal NeMo Gym trajectories. It extends the MTP-disabled Super Omni GRPO recipe with OPD advantages, teacher resources, and image-aware teacher log-probability computation.
 
 ## Data
 
-Generate deterministic circle-count examples from the pinned NeMo Gym
-submodule:
+Generate deterministic circle-count examples from the pinned NeMo Gym submodule:
 
 ```bash
 uv run python \
@@ -17,9 +13,7 @@ uv run python \
   --num-samples 512
 ```
 
-Each row contains one structured `input_image` data URL and an `agent_ref`
-routing it to `circle_count_simple_agent`. The verifier metadata remains
-outside `responses_create_params` and is not included in the model prompt.
+Each row contains one structured `input_image` data URL and an `agent_ref` routing it to `circle_count_simple_agent`. The verifier metadata remains outside `responses_create_params` and is not included in the model prompt.
 
 ## Launch
 
@@ -45,13 +39,9 @@ WANDB_API_KEY=<key> \
 examples/nemo_gym/nemotron-3-super-omni/run_mopd_circle_count.sh
 ```
 
-`TEACHER_MODEL_PATH` is optional. When omitted, the recipe uses
-`MODEL_PATH` for self-distillation. A self-distillation run should have a
-near-zero mean OPD advantage while retaining non-zero token-level spread.
+`TEACHER_MODEL_PATH` is optional. When omitted, the recipe uses `MODEL_PATH` for self-distillation. A self-distillation run should have a near-zero mean OPD advantage while retaining non-zero token-level spread.
 
-The recipe disables in-flight weight updates and enables vLLM encoder-cache
-invalidation. This orders each encoder-cache reset after refit and before the
-next image request when the vision tower is trainable.
+The recipe disables in-flight weight updates and enables vLLM encoder-cache invalidation. This orders each encoder-cache reset after refit and before the next image request when the vision tower is trainable.
 
 ## Three-step smoke
 
@@ -63,6 +53,4 @@ EXP_NAME=mopd-super-omni-circle-count-smoke \
 examples/nemo_gym/nemotron-3-super-omni/run_mopd_circle_count.sh
 ```
 
-The smoke runs three optimizer/refit steps. With one-step asynchronous
-trajectory staleness, the third step uses trajectories generated after the
-first weight update.
+The smoke runs three optimizer/refit steps. With one-step asynchronous trajectory staleness, the third step uses trajectories generated after the first weight update.

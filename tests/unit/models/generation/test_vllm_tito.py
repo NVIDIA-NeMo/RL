@@ -20,7 +20,6 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from nemo_gym.token_id_capture.staging.records import GenerationCutContinuation
 from transformers import AutoTokenizer
 
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
@@ -28,6 +27,7 @@ from nemo_rl.models.generation.vllm.tito import (
     QWEN3_TEMPLATE_SHA256,
     CapturedQwen3Renderer,
     TitoNotApplicable,
+    preprocess_captured_qwen3,
     qwen3_suffix_text,
 )
 
@@ -111,15 +111,18 @@ def test_suffix_rejects_non_observations(messages):
 def parser_stub(monkeypatch):
     # Only the optional vLLM parser/renderer boundary is substituted; capture
     # admission, tokenization, staging, and reconstruction use production code.
-    chat = ModuleType("vllm.entrypoints.chat_utils")
+    chat = ModuleType("vllm.renderers.chat_utils")
 
     async def parse(messages, model_config, **kwargs):
         return [dict(m, content=m.get("content") or "") for m in messages], None, None
 
     chat.parse_chat_messages_async = parse
     hf = ModuleType("vllm.renderers.hf")
+    hf.resolve_chat_template = lambda tokenizer, **kwargs: tokenizer.get_chat_template(
+        kwargs.get("chat_template"), tools=kwargs.get("tools")
+    )
     hf.resolve_chat_template_content_format = lambda **kwargs: "string"
-    monkeypatch.setitem(sys.modules, "vllm.entrypoints.chat_utils", chat)
+    monkeypatch.setitem(sys.modules, "vllm.renderers.chat_utils", chat)
     monkeypatch.setitem(sys.modules, "vllm.renderers.hf", hf)
     return chat
 
@@ -174,6 +177,7 @@ def make_adapter(tokenizer, *, prefix, template=None):
     return adapter, params, messages
 
 
+@pytest.mark.nemo_gym
 def test_capture_adapter_encodes_only_suffix(tokenizer, parser_stub, monkeypatch):
     prefix = [42, tokenizer.eos_token_id]
     adapter, params, messages = make_adapter(tokenizer, prefix=prefix)
@@ -202,7 +206,10 @@ def test_capture_adapter_encodes_only_suffix(tokenizer, parser_stub, monkeypatch
     assert adapter.prefix_token_ids == prefix
 
 
-@pytest.mark.parametrize("case", ["template", "unfinished", "media", "generation_cut"])
+@pytest.mark.parametrize(
+    "case", ["template", "unfinished", "media", "generation_cut", "effective_template"]
+)
+@pytest.mark.nemo_gym
 def test_capture_adapter_falls_back_without_staging(tokenizer, parser_stub, case):
     prefix = [42, tokenizer.eos_token_id] if case != "unfinished" else [42]
     adapter, params, messages = make_adapter(
@@ -210,7 +217,14 @@ def test_capture_adapter_falls_back_without_staging(tokenizer, parser_stub, case
         prefix=prefix,
         template="custom template" if case == "template" else None,
     )
+    if case == "effective_template":
+        sys.modules["vllm.renderers.hf"].resolve_chat_template = (
+            lambda *args, **kwargs: "processor-specific template"
+        )
     if case == "generation_cut":
+        # Gym is installed only in the dedicated optional-dependency test lane.
+        from nemo_gym.token_id_capture.staging.records import GenerationCutContinuation
+
         adapter.admission.generation_cut = GenerationCutContinuation(
             source_capture_key="saved-rollout",
             source_model_call_id="saved-call",
@@ -234,6 +248,7 @@ def test_capture_adapter_falls_back_without_staging(tokenizer, parser_stub, case
     adapter.renderer.render_cmpl_async.assert_not_called()
 
 
+@pytest.mark.nemo_gym
 def test_capture_storage_failure_is_not_a_fallback(tokenizer, parser_stub):
     adapter, params, messages = make_adapter(
         tokenizer, prefix=[42, tokenizer.eos_token_id]
@@ -263,6 +278,151 @@ def test_qwen3_template_contract(tokenizer):
     )
 
 
+@pytest.fixture
+def online_stub(monkeypatch, parser_stub):
+    """Exercise request-local dispatch without importing optional engine binaries."""
+    runtime = ModuleType("vllm")
+    runtime.__version__ = "0.33.0"
+    protocol = ModuleType("vllm.entrypoints.openai.chat_completion.protocol")
+    protocol.ChatCompletionRequest = type(
+        "ChatCompletionRequest", (SimpleNamespace,), {}
+    )
+    hf = sys.modules["vllm.renderers.hf"]
+    hf.HfRenderer = type("HfRenderer", (SimpleNamespace,), {})
+    online = ModuleType("vllm.renderers.online_renderer")
+    online.OnlineRenderer = type("OnlineRenderer", (SimpleNamespace,), {})
+    online.OnlineRenderer.preprocess_chat = AsyncMock()
+    monkeypatch.setitem(sys.modules, "vllm", runtime)
+    monkeypatch.setitem(sys.modules, protocol.__name__, protocol)
+    monkeypatch.setitem(sys.modules, online.__name__, online)
+    renderer = online.OnlineRenderer(
+        renderer=hf.HfRenderer(),
+        model_config=SimpleNamespace(enable_prompt_embeds=False),
+    )
+    return SimpleNamespace(
+        request=protocol.ChatCompletionRequest(),
+        worker=SimpleNamespace(_capture_admission=lambda request: None),
+        online_renderer=renderer,
+        native=online.OnlineRenderer.preprocess_chat,
+    )
+
+
+def run_preprocess(state, messages=None):
+    return asyncio.run(
+        preprocess_captured_qwen3(
+            worker=state.worker,
+            online_renderer=state.online_renderer,
+            request=state.request,
+            messages=messages or [],
+            default_template=None,
+            default_template_content_format="auto",
+            default_template_kwargs={"enable_thinking": False},
+            tool_dicts=None,
+            parser=None,
+            skip_mm_cache=False,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("stream", True),
+        ("echo", True),
+        ("continue_final_message", True),
+        ("return_assistant_tokens_mask", True),
+        ("add_special_tokens", True),
+        ("return_prompt_text", True),
+        ("return_token_offsets", True),
+        ("truncate_prompt_tokens", 0),
+        ("truncate_prompt_tokens", 8),
+        ("kv_transfer_params", {"remote_decode": True}),
+        ("n", 2),
+    ],
+)
+def test_preprocess_leaves_unsupported_requests_to_native(online_stub, option, value):
+    setattr(online_stub.request, option, value)
+    assert run_preprocess(online_stub) is None
+    online_stub.native.assert_not_called()
+    assert getattr(online_stub.request, option) == value
+
+
+@pytest.mark.parametrize(
+    "case", ["request", "renderer", "embeds", "uncaptured", "root"]
+)
+def test_preprocess_requires_qualified_capture(online_stub, case):
+    if case == "request":
+        online_stub.request = object()
+    elif case == "renderer":
+        online_stub.online_renderer.renderer = object()
+    elif case == "embeds":
+        online_stub.online_renderer.model_config.enable_prompt_embeds = True
+    elif case == "root":
+        online_stub.worker._capture_admission = lambda request: SimpleNamespace(
+            mode="text"
+        )
+    assert run_preprocess(online_stub) is None
+    online_stub.native.assert_not_called()
+
+
+def test_preprocess_rejects_unqualified_runtime(online_stub):
+    sys.modules["vllm"].__version__ = "0.29.0"
+    with pytest.raises(ValueError, match="requires vLLM 0.33.0"):
+        run_preprocess(online_stub)
+    online_stub.native.assert_not_called()
+
+
+@pytest.mark.nemo_gym
+@pytest.mark.parametrize("outcome", ["incremental", "fallback", "storage_error"])
+def test_preprocess_is_request_local(tokenizer, online_stub, outcome):
+    adapter, params, messages = make_adapter(
+        tokenizer, prefix=[42, tokenizer.eos_token_id]
+    )
+    online_stub.worker = adapter.worker
+    online_stub.worker._capture_admission = lambda request: adapter.admission
+    renderer = online_stub.online_renderer.renderer
+    renderer.__dict__.update(adapter.renderer.__dict__)
+    if outcome == "fallback":
+        params.chat_template = "custom template"
+        params.get_apply_chat_template_kwargs = lambda: {
+            "chat_template": "custom template",
+            "add_generation_prompt": True,
+        }
+    elif outcome == "storage_error":
+
+        def broken(admission):
+            raise ValueError("capture digest mismatch")
+
+        online_stub.worker._resolve_admission_prefix = broken
+
+    async def native(local, request, native_messages, **kwargs):
+        assert local is not online_stub.online_renderer
+        assert isinstance(local.renderer, CapturedQwen3Renderer)
+        return await local.renderer.render_chat_async(
+            [native_messages], params, object(), prompt_extras={}, skip_mm_cache=False
+        )
+
+    online_stub.native.side_effect = native
+    if outcome == "storage_error":
+        with pytest.raises(ValueError, match="capture digest mismatch"):
+            run_preprocess(online_stub, messages)
+    else:
+        result = run_preprocess(online_stub, messages)
+        if outcome == "fallback":
+            assert result is None
+            renderer.render_cmpl_async.assert_not_called()
+        else:
+            native_result, captured = result
+            assert native_result[1][0]["prompt_token_ids"][:2] == [
+                42,
+                tokenizer.eos_token_id,
+            ]
+            assert captured.decision.storage.mode == "token_in"
+    assert online_stub.online_renderer.renderer is renderer
+    online_stub.native.assert_awaited_once()
+
+
+@pytest.mark.nemo_gym
 def test_incremental_swe_tokens_round_trip_through_gym_capture(tokenizer):
     from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
     from nemo_gym.token_id_capture.staging.rebuild import verify_and_linearize

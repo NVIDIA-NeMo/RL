@@ -90,8 +90,11 @@ class CapturedQwen3Renderer:
         skip_mm_cache: bool,
     ) -> Any:
         # vLLM is optional outside the serving worker.
-        from vllm.entrypoints.chat_utils import parse_chat_messages_async
-        from vllm.renderers.hf import resolve_chat_template_content_format
+        from vllm.renderers.chat_utils import parse_chat_messages_async
+        from vllm.renderers.hf import (
+            resolve_chat_template,
+            resolve_chat_template_content_format,
+        )
 
         # Checkpoint restore owns interrupted output tokens and remaining budgets.
         if self.admission.generation_cut is not None:
@@ -100,10 +103,16 @@ class CapturedQwen3Renderer:
             raise TitoNotApplicable("Expected one conversation")
         messages = conversations[0]
         kwargs = params.get_apply_chat_template_kwargs()
-        template = self.tokenizer.get_chat_template(
-            kwargs.get("chat_template"), tools=kwargs.get("tools")
+        template = resolve_chat_template(
+            self.tokenizer,
+            chat_template=kwargs.get("chat_template"),
+            tools=kwargs.get("tools"),
+            model_config=self.renderer.model_config,
         )
-        if hashlib.sha256(template.encode()).hexdigest() != QWEN3_TEMPLATE_SHA256:
+        if (
+            template is None
+            or hashlib.sha256(template.encode()).hexdigest() != QWEN3_TEMPLATE_SHA256
+        ):
             raise TitoNotApplicable("Unqualified Qwen3 template")
         if kwargs.get("tokenize") or kwargs.get("continue_final_message"):
             raise TitoNotApplicable("Non-text or continuing-final-message template")
@@ -195,8 +204,8 @@ async def preprocess_captured_qwen3(
     from vllm.renderers.hf import HfRenderer
     from vllm.renderers.online_renderer import OnlineRenderer
 
-    if vllm.__version__ != "0.29.0":
-        raise ValueError("Captured Qwen3 TITO requires vLLM 0.29.0")
+    if vllm.__version__ != "0.33.0":
+        raise ValueError("Captured Qwen3 TITO requires vLLM 0.33.0")
     if not isinstance(request, ChatCompletionRequest):
         return None
     if type(online_renderer.renderer) is not HfRenderer:
@@ -212,6 +221,7 @@ async def preprocess_captured_qwen3(
             "return_assistant_tokens_mask",
             "add_special_tokens",
             "return_prompt_text",
+            "return_token_offsets",
             "truncate_prompt_tokens",
             "kv_transfer_params",
         )

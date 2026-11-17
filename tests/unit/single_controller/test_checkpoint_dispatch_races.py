@@ -559,6 +559,8 @@ def _reserve_controller() -> Any:
     controller._rollout_runtime = RolloutRuntimeState()
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     controller._rollout_runtime.sampler_stamps_target_steps = True
+    # Pooled replacements: the fault-tolerance reserve path reads this directly.
+    controller._sampler = SimpleNamespace(uses_pooled_replacements=True)
     controller._rollout_recovery_enabled = True
     # Dynamic sampling off: these fixtures exercise the fault-tolerance path.
     controller._dynamic_sampling_enabled = False
@@ -623,7 +625,7 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(
             max_num_epochs=1,
             data_plane_checkpoint=True,
         )
-        config.checkpointing["metric_name"] = "train:loss"
+        config.checkpointing.metric_name = "train:loss"
         actor_args = _make_actor_args(
             save_state=save_state,
             dataloader=dataloader,

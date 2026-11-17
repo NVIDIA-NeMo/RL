@@ -1,6 +1,6 @@
 # Captured TITO
 
-Captured TITO reuses Gym's source-history matching and NeMo RL's exact token capture to construct subsequent model inputs from a stored prefix plus newly encoded observations. The initial implementation supports the official Qwen3-0.6B chat template on native async vLLM 0.29.0. It renders only appended user/tool messages, including grouped tool responses and the assistant opener. It preserves captured reasoning and tool-call tokens even when the harness's text representation differs.
+Captured TITO reuses Gym's source-history matching and NeMo RL's exact token capture to construct subsequent model inputs from a stored prefix plus newly encoded observations. The initial implementation supports the official Qwen3-0.6B chat template on native async vLLM 0.33.0. It renders only appended user/tool messages, including grouped tool responses and the assistant opener. It preserves captured reasoning and tool-call tokens even when the harness's text representation differs.
 
 ## Configuration
 
@@ -56,6 +56,8 @@ Confirm that the worker logs `Captured Qwen3 TITO reused ... prefix tokens`; a s
 
 The focused CPU tests use the real Qwen tokenizer, compare incremental prompts against the existing splice path, verify only suffix text is encoded, and round-trip two synthetic SWE-style calls through Gym's production capture and receipt reconstruction. The optional vLLM parser boundary is substituted in the adapter unit tests.
 
-A separate real run used Qwen3-0.6B, vLLM 0.29.0, two H100 GPUs and two SWE-bench Verified astropy tasks through sandboxed OpenCode. Both the enabled recipe and the `tito_model=null` control completed two training steps. The enabled run recorded five incremental renderer hits, reusing 8,216–8,358 prefix tokens across real tool continuations. The control retained existing capture-selected `token_in` behavior without incremental renderer hits. These short sampled runs establish path compatibility, not output equivalence, speedup or issue-resolution quality.
+After updating to main’s vLLM 0.33.0, a native HfRenderer/OnlineRenderer GPU probe with Qwen3-0.6B reused the original 21-token prefix and completed a second generation. That probe used a seeded capture admission; it does not replace live Gym matching or SWE training validation on the updated dependencies.
 
-That validation used Apptainer with an independent Gym compatibility patch to propagate serialized sandbox descriptors from the SWE resource server to OpenCode. The pinned Gym submodule is unchanged; this is not evidence that an unpatched Apptainer deployment works. The default recipe still requires configured OpenSandbox infrastructure. Full supported-environment CI remains required before marking the PR ready.
+An earlier separate real run used Qwen3-0.6B, vLLM 0.29.0, two H100 GPUs and two SWE-bench Verified astropy tasks through sandboxed OpenCode. Both the enabled recipe and the `tito_model=null` control completed two training steps. The enabled run recorded five incremental renderer hits, reusing 8,216–8,358 prefix tokens across real tool continuations. The control retained existing capture-selected `token_in` behavior without incremental renderer hits. These short sampled runs establish path compatibility, not output equivalence, speedup or issue-resolution quality.
+
+That validation used Apptainer with an independent Gym compatibility patch to propagate serialized sandbox descriptors from the SWE resource server to OpenCode. The PR uses the Gym submodule pin from main without adding that patch; this is not evidence that an unpatched Apptainer deployment works. The default recipe still requires configured OpenSandbox infrastructure. Full supported-environment CI remains required before marking the PR ready.
