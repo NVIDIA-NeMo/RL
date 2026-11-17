@@ -127,8 +127,15 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         "options",
         actor_options,
     )
-    # No dedicated head in these tests, so the driver takes the unpinned path.
+    # No dedicated head in these tests, so pin to the mocked driver node.
     monkeypatch.setattr(run_grpo_single_controller.ray, "cluster_resources", lambda: {})
+    monkeypatch.setattr(
+        run_grpo_single_controller.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(
+            get_node_id=lambda: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
+    )
     monkeypatch.setattr(run_grpo_single_controller.ray, "get", ray_get)
     monkeypatch.setattr(run_grpo_single_controller.ray, "wait", ray_wait)
     monkeypatch.setattr(
@@ -200,21 +207,28 @@ def test_a_dedicated_ray_head_claims_the_whole_unit(
     }
 
 
-def test_no_dedicated_head_leaves_the_controller_unpinned(
+def test_no_dedicated_head_pins_the_controller_to_the_driver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ray.sub advertises ray_head only under DEDICATED_RAY_HEAD=1.
-
-    Read from the live cluster rather than the env var, so a launcher that asked
-    for a head it did not get falls back instead of pinning to nothing.
-    """
+    """Without a dedicated head, retain driver-local dataset cache access."""
     monkeypatch.setattr(
         run_grpo_single_controller.ray,
         "cluster_resources",
         lambda: {"GPU": 8.0},
     )
 
-    assert run_grpo_single_controller._controller_placement() == {}
+    monkeypatch.setattr(
+        run_grpo_single_controller.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(
+            get_node_id=lambda: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
+    )
+    strategy = run_grpo_single_controller._controller_placement()["scheduling_strategy"]
+    assert (
+        strategy.node_id == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    )
+    assert strategy.soft is False
 
 
 def test_main_applies_the_placement_when_launching_the_controller(
@@ -233,13 +247,19 @@ def test_main_applies_the_placement_when_launching_the_controller(
     main_context.actor_options.assert_called_once_with(resources={"ray_head": 1})
 
 
-def test_main_requests_no_resource_without_a_dedicated_head(
+def test_main_pins_to_driver_without_a_dedicated_head(
     main_context: SimpleNamespace,
 ) -> None:
     """The fixture's cluster has no head, which is every non-ray.sub run."""
     run_grpo_single_controller.main()
 
-    main_context.actor_options.assert_called_once_with()
+    main_context.actor_options.assert_called_once()
+    strategy = main_context.actor_options.call_args.kwargs["scheduling_strategy"]
+    assert (
+        strategy.node_id
+        == run_grpo_single_controller.ray.get_runtime_context().get_node_id()
+    )
+    assert strategy.soft is False
 
 
 def _watch_a_controller_that_never_finishes(

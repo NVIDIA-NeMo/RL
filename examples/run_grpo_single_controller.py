@@ -29,6 +29,7 @@ from typing import Any
 
 import ray
 from omegaconf import OmegaConf
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
@@ -79,14 +80,19 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 
 def _controller_placement() -> dict[str, Any]:
-    """Pin the controller to ray.sub's dedicated head (the ``ray_head`` resource) when the cluster has one.
+    """Place the controller on the dedicated head, or otherwise on the driver node.
 
     Returns:
-        ``SingleControllerActor.options`` kwargs; empty when there is no ``ray_head``.
+        ``SingleControllerActor.options`` kwargs for the selected placement.
     """
     if ray.cluster_resources().get("ray_head", 0) >= 1:
         return {"resources": {"ray_head": 1}}
-    return {}
+    # Dataset arguments can reference files in the driver's node-local cache.
+    return {
+        "scheduling_strategy": NodeAffinitySchedulingStrategy(
+            node_id=ray.get_runtime_context().get_node_id(), soft=False
+        )
+    }
 
 
 def main() -> None:
