@@ -1164,7 +1164,7 @@ def setup_single_controller(
     # Only GRPO has end-to-end coverage here; the other algorithms warn.
     if is_ppo_run(master_config):
         nvfp4_entry_point = "single_controller_ppo"
-    elif master_config.on_policy_distillation is not None:
+    elif opd_module.is_opd_enabled(master_config):
         nvfp4_entry_point = "single_controller_distillation"
     else:
         nvfp4_entry_point = "single_controller"
