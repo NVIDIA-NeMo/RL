@@ -3103,15 +3103,25 @@ class MegatronPolicyWorkerImpl(
 
         Args:
             source_state_dict: State dict to apply (e.g. reference_state_dict or saved model_state_dict).
-            raise_if_key_missing: If True, raise when a key in self.model.state_dict() is missing
+            raise_if_key_missing: If True, raise when a selected model state key is missing
                 from source_state_dict; if False, skip such keys.
             non_blocking: Passed to the in-place copies; callers staging from
                 pinned CPU memory must synchronize afterwards.
         """
-        for state_dict_key, param_or_buf in self.model.state_dict().items():
+        peft_enabled = self.cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
+        for state_dict_key, param_or_buf in self.model.state_dict(
+            keep_vars=True
+        ).items():
             if (
                 not isinstance(param_or_buf, torch.Tensor)
                 or "draft_model." in state_dict_key
+            ):
+                continue
+            # PEFT shares frozen parameters; buffers and extra state can change.
+            if (
+                peft_enabled
+                and isinstance(param_or_buf, torch.nn.Parameter)
+                and not param_or_buf.requires_grad
             ):
                 continue
             if state_dict_key not in source_state_dict:
@@ -3146,71 +3156,74 @@ class MegatronPolicyWorkerImpl(
 
     @contextmanager
     def use_reference_model(self):
-        """Context manager that temporarily swaps the reference model and active model.
+        """Temporarily load reference state and disable top-k/top-p filtering.
 
-        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references.
-                  Also disables top-k/top-p filtering since the reference policy's distribution
-                  is different from the current policy, making filtered logprobs incompatible.
-        On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
+        PEFT swaps trainable parameters and persistent state while retaining frozen
+        base parameters on the GPU. Policy state, sampling parameters, and forward
+        hooks are restored on exit.
         """
-        ## disable overlap param gather when swapping weights
-        if self.should_disable_forward_pre_hook:
+        # Parameter gathering must not overwrite the temporarily loaded reference.
+        restore_forward_pre_hook = (
+            self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled()
+        )
+        if restore_forward_pre_hook:
             self.disable_forward_pre_hook()
 
-        with torch.no_grad():
-            # Save original references
-            model_state_dict = {}
-            for name, item in self.model.state_dict().items():
-                if isinstance(item, torch.Tensor):
-                    item = item.detach().to(device="cpu", non_blocking=True, copy=True)
-                model_state_dict[name] = item
-
-            # Swap reference state into self.model. Use _apply_state_dict_to_model
-            # (rather than load_state_dict) so FP8 _extra_state with mismatched shape
-            # is routed through set_extra_state() correctly.
-            self._apply_state_dict_to_model(
-                self.reference_state_dict,
-                raise_if_key_missing=True,
-            )
-
-            if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
-                gc.collect()
-                torch.cuda.empty_cache()
-
-            # Temporarily disable top-k/top-p filtering for reference policy logprobs.
-            # The reference policy has different weights, so its top-k/top-p set is
-            # inherently different from the current policy. Using filtered logprobs
-            # would cause -inf mismatches that cannot be resolved by masking.
-            # Note: We keep temperature scaling since it was applied to prev_logprobs.
-            saved_sampling_params = self.sampling_params
-            if saved_sampling_params is not None:
-                self.sampling_params = TrainingSamplingParams(
-                    top_k=None,
-                    top_p=1.0,
-                    temperature=saved_sampling_params.temperature,
+        try:
+            with torch.no_grad():
+                peft_enabled = (
+                    self.cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
                 )
-            else:
-                self.sampling_params = None
+                model_state_dict = {}
+                for name, item in self.model.state_dict(keep_vars=True).items():
+                    # PEFT shares frozen parameters; buffers and extra state can change.
+                    if (
+                        peft_enabled
+                        and isinstance(item, torch.nn.Parameter)
+                        and not item.requires_grad
+                    ):
+                        continue
+                    if isinstance(item, torch.Tensor):
+                        item = item.detach().to(
+                            device="cpu", non_blocking=True, copy=True
+                        )
+                    model_state_dict[name] = item
 
-            # - self.model is the original reference_model, now on CUDA
-            # - self.reference_model is the original model, now on CPU
-            yield
+                saved_sampling_params = self.sampling_params
+                try:
+                    # set_extra_state() handles FP8 metadata with mismatched shapes.
+                    self._apply_state_dict_to_model(
+                        self.reference_state_dict,
+                        raise_if_key_missing=True,
+                    )
 
-            # Restore sampling_params
-            self.sampling_params = saved_sampling_params
+                    if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                        gc.collect()
+                        torch.cuda.empty_cache()
 
-            # Restore original policy state (weights + FP8 extra_state) from saved model_state_dict
-            self._apply_state_dict_to_model(
-                model_state_dict,
-                raise_if_key_missing=True,
-            )
+                    # Reference top-k/top-p sets differ; keep the policy temperature.
+                    if saved_sampling_params is not None:
+                        self.sampling_params = TrainingSamplingParams(
+                            top_k=None,
+                            top_p=1.0,
+                            temperature=saved_sampling_params.temperature,
+                        )
+                    else:
+                        self.sampling_params = None
 
-            if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
-                gc.collect()
-                torch.cuda.empty_cache()
+                    yield
+                finally:
+                    self.sampling_params = saved_sampling_params
+                    self._apply_state_dict_to_model(
+                        model_state_dict,
+                        raise_if_key_missing=True,
+                    )
 
-            ## re-enable overlap param gather after weight swap
-            if self.should_disable_forward_pre_hook:
+                    if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                        gc.collect()
+                        torch.cuda.empty_cache()
+        finally:
+            if restore_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")

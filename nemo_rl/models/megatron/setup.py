@@ -3109,7 +3109,14 @@ def setup_reference_model_state(
             reference_model = reference_model[0]
             reference_model.eval()
             # Store reference state dict on CPU
-            for name, item in reference_model.state_dict().items():
+            for name, item in reference_model.state_dict(keep_vars=True).items():
+                # PEFT shares frozen parameters; buffers and extra state can change.
+                if (
+                    use_peft
+                    and isinstance(item, torch.nn.Parameter)
+                    and not item.requires_grad
+                ):
+                    continue
                 if isinstance(item, torch.Tensor):
                     cpu_item = item.detach().to(
                         device="cpu", non_blocking=True, copy=True

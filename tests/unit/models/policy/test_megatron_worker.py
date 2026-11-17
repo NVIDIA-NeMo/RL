@@ -31,6 +31,7 @@ import pytest
 import ray
 import torch
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
@@ -3034,38 +3035,139 @@ def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
     assert exported[scale_name].shape == (64, 2)
 
 
-def test_reference_model_swap_restores_state():
+@pytest.mark.parametrize(
+    "peft_enabled", [False, True, None], ids=["full", "peft", "omitted-peft"]
+)
+@pytest.mark.parametrize("scoring_fails", [False, True])
+@pytest.mark.parametrize("hook_enabled", [False, True])
+def test_reference_model_swap_restores_state(
+    monkeypatch: pytest.MonkeyPatch,
+    peft_enabled: Optional[bool],
+    scoring_fails: bool,
+    hook_enabled: bool,
+) -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     class Model(torch.nn.Module):
-        def __init__(self):
+        def __init__(self) -> None:
             super().__init__()
-            self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+            self.weight = torch.nn.Parameter(torch.tensor([1.0]), requires_grad=False)
+            self.adapter = torch.nn.Parameter(torch.tensor([3.0]))
             self.register_buffer("extra_state_cache", torch.tensor([2.0]))
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.model = Model()
     worker.reference_state_dict = {
-        "weight": torch.tensor([11.0]),
+        "adapter": torch.tensor([13.0]),
         "extra_state_cache": torch.tensor([12.0]),
     }
+    if not peft_enabled:
+        worker.reference_state_dict["weight"] = torch.tensor([11.0])
     worker.cfg = {
         "megatron_cfg": {
             "empty_unused_memory_level": 0,
         }
     }
-    worker.should_disable_forward_pre_hook = False
-    worker.sampling_params = None
+    if peft_enabled is not None:
+        worker.cfg["megatron_cfg"]["peft"] = {"enabled": peft_enabled}
+    worker.should_disable_forward_pre_hook = True
+    worker._forward_pre_hook_enabled = MagicMock(return_value=hook_enabled)
+    worker.disable_forward_pre_hook = MagicMock()
+    worker.enable_forward_pre_hook = MagicMock()
+    sampling_params = TrainingSamplingParams(top_k=3, top_p=0.9, temperature=0.6)
+    worker.sampling_params = sampling_params
+    base_version = worker.model.weight._version
+    cpu_backup_ptrs = []
+    tensor_to = torch.Tensor.to
+
+    def track_cpu_copy(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        if kwargs.get("device") == "cpu" and kwargs.get("copy"):
+            cpu_backup_ptrs.append(tensor.data_ptr())
+        return tensor_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", track_cpu_copy)
     for _ in range(2):
-        with worker.use_reference_model():
-            torch.testing.assert_close(worker.model.weight, torch.tensor([11.0]))
-            torch.testing.assert_close(
-                worker.model.extra_state_cache, torch.tensor([12.0])
-            )
+        with (
+            pytest.raises(RuntimeError, match="reference scoring failed")
+            if scoring_fails
+            else nullcontext()
+        ):
+            with worker.use_reference_model():
+                torch.testing.assert_close(
+                    worker.model.weight, torch.tensor([1.0 if peft_enabled else 11.0])
+                )
+                torch.testing.assert_close(worker.model.adapter, torch.tensor([13.0]))
+                torch.testing.assert_close(
+                    worker.model.extra_state_cache, torch.tensor([12.0])
+                )
+                assert worker.sampling_params.top_k is None
+                assert worker.sampling_params.top_p == 1.0
+                assert worker.sampling_params.temperature == sampling_params.temperature
+                if scoring_fails:
+                    raise RuntimeError("reference scoring failed")
         torch.testing.assert_close(worker.model.weight, torch.tensor([1.0]))
+        torch.testing.assert_close(worker.model.adapter, torch.tensor([3.0]))
         torch.testing.assert_close(worker.model.extra_state_cache, torch.tensor([2.0]))
+        assert worker.sampling_params is sampling_params
+
+    expected_backup_ptrs = {
+        worker.model.adapter.data_ptr(),
+        worker.model.extra_state_cache.data_ptr(),
+    }
+    if peft_enabled:
+        assert worker.model.weight._version == base_version
+    else:
+        expected_backup_ptrs.add(worker.model.weight.data_ptr())
+    assert set(cpu_backup_ptrs) == expected_backup_ptrs
+    assert len(cpu_backup_ptrs) == 2 * len(expected_backup_ptrs)
+    assert worker.disable_forward_pre_hook.call_count == (2 if hook_enabled else 0)
+    assert worker.enable_forward_pre_hook.call_count == (2 if hook_enabled else 0)
+
+
+@pytest.mark.parametrize("missing_key", ["bias", "running_state"])
+def test_reference_model_swap_rejects_missing_peft_state(missing_key: str) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = torch.nn.Linear(1, 1)
+    worker.model.weight.requires_grad_(False)
+    worker.model.register_buffer("scale", torch.tensor([5.0]))
+    worker.model.register_buffer("running_state", torch.tensor([2.0]))
+    original_state = {
+        name: value.clone() for name, value in worker.model.state_dict().items()
+    }
+    worker.cfg = {
+        "megatron_cfg": {
+            "empty_unused_memory_level": 0,
+            "peft": {"enabled": True},
+        }
+    }
+    worker.should_disable_forward_pre_hook = True
+    worker._forward_pre_hook_enabled = MagicMock(return_value=True)
+    worker.disable_forward_pre_hook = MagicMock()
+    worker.enable_forward_pre_hook = MagicMock()
+    sampling_params = TrainingSamplingParams(top_k=3, top_p=0.9, temperature=0.6)
+    worker.sampling_params = sampling_params
+    worker.reference_state_dict = {
+        "bias": torch.tensor([3.0]),
+        "scale": torch.tensor([6.0]),
+        "running_state": torch.tensor([4.0]),
+    }
+    del worker.reference_state_dict[missing_key]
+
+    with pytest.raises(ValueError, match=f"Key '{missing_key}'"):
+        with worker.use_reference_model():
+            pytest.fail("Missing reference state must fail before scoring")
+
+    for name, value in worker.model.state_dict().items():
+        torch.testing.assert_close(value, original_state[name])
+    assert worker.sampling_params is sampling_params
+    worker.disable_forward_pre_hook.assert_called_once_with()
+    worker.enable_forward_pre_hook.assert_called_once_with()
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
@@ -3862,6 +3964,19 @@ def create_megatron_test_config(
                 "fp8": "hybrid",
                 "fp8_recipe": "tensorwise",
                 "fp8_param": True,
+            },
+            "peft": {
+                "enabled": False,
+                "target_modules": [],
+                "exclude_modules": [],
+                "dim": 8,
+                "alpha": 32,
+                "dropout": 0.0,
+                "dropout_position": "post",
+                "lora_A_init_method": "xavier",
+                "lora_B_init_method": "zero",
+                "a2a_experimental": False,
+                "lora_dtype": None,
             },
             "attention_backend": attention_backend,
         },
@@ -4733,7 +4848,10 @@ def test_megatron_grad_norm_invariant_to_number_of_microbatches(tiny_llama_model
 
 @pytest.mark.timeout(300)
 @pytest.mark.hf_gated
-def test_megatron_reference_policy_functionality(tiny_llama_model_path):
+@pytest.mark.parametrize("peft_enabled", [False, True])
+def test_megatron_reference_policy_functionality(
+    tiny_llama_model_path: str, peft_enabled: bool
+) -> None:
     """Test Megatron reference policy functionality."""
     num_gpus = 2
 
@@ -4746,11 +4864,15 @@ def test_megatron_reference_policy_functionality(tiny_llama_model_path):
     )
 
     config = create_megatron_test_config(tiny_llama_model_path)
+    config["megatron_cfg"]["peft"]["enabled"] = peft_enabled
     config["megatron_cfg"]["optimizer"]["lr"] = 1e-2  # Increase from 5e-6 to 1e-2
     config["megatron_cfg"]["optimizer"]["min_lr"] = 1e-3  # Increase min_lr as well
 
     tokenizer = get_tokenizer(config["tokenizer"])
     config["generation"] = configure_generation_config(config["generation"], tokenizer)
+    if peft_enabled:
+        # DPO reference scoring has no rollout backend to refit.
+        config["generation"] = None
 
     # Create policy with reference model
     policy = Policy(
