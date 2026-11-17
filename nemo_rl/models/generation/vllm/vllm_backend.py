@@ -2334,7 +2334,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         assert self.state_dict_info is not None
         # One buffer, as for native layerwise refit below: the preparer's copies
         # must finish before the next broadcast refills the receive buffer.
-        weight_iterator = packed_broadcast_consumer(
+        received = packed_broadcast_consumer(
             iterator=iter(self.state_dict_info.items()),
             group=self.model_update_group,
             src=0,
@@ -2342,7 +2342,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             return_iterator=True,
             num_buffers=1,
         )
-        assert weight_iterator is not None
+        assert received is not None
+        weight_iterator: Iterator[tuple[str, torch.Tensor]] = received
         exhausted = False
 
         def iter_prepared_weights() -> Iterator[tuple[str, torch.Tensor]]:
