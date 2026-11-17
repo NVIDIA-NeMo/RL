@@ -1810,6 +1810,26 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    def set_discard_refits(self, shard_indices: list[int], discard: bool) -> None:
+        """Make the given DP shards drop (True) or load later collective refits.
+
+        The flag lives on each shard's leader worker rather than here, because
+        the trajectory collector pauses and resumes engines through its own
+        copy of this object.
+        """
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError("set_discard_refits requires async_engine=True")
+        workers = self.worker_group.workers
+        per_shard = len(workers) // self.dp_size
+        ray.get(
+            [
+                workers[shard_idx * per_shard].set_discard_refits.remote(discard)
+                for shard_idx in shard_indices
+            ]
+        )
+
     def update_weights_from_collective(
         self, refit_timeout_s: Optional[float] = None
     ) -> list[ray.ObjectRef]:
