@@ -571,7 +571,7 @@ def test_bulk_param_check_rejects_dense_mlp_for_trtllm():
 
 @pytest.mark.parametrize("fails", [False, True])
 def test_nccl_reshard_refit_runs_weight_update_lifecycle(monkeypatch, fails):
-    """Bulk, then misc, inside begin/finish; a failure aborts the update."""
+    """Token, bulk, then misc, inside begin/finish; a failure aborts the update."""
     from nemo_rl.models.generation.trtllm import trtllm_backend
 
     ext = trtllm_backend.NcclExtension.__new__(trtllm_backend.NcclExtension)
@@ -583,7 +583,13 @@ def test_nccl_reshard_refit_runs_weight_update_lifecycle(monkeypatch, fails):
     ext.nccl_reshard_refit_info = {"layer_names": [], "per_layer_params": {}}
     ext.pp_comm_groups = {0: object()}
     ext.hf_to_local_param_map = object()
+    ext.model_update_group = object()
     calls = []
+    monkeypatch.setattr(
+        trtllm_backend,
+        "packed_broadcast_preflight_consumer",
+        lambda group, src: calls.append(("token", group, src)),
+    )
     ext.begin_weight_update = lambda: calls.append("begin")
     ext._recv_bulk_params = lambda: calls.append("bulk")
 
@@ -598,14 +604,22 @@ def test_nccl_reshard_refit_runs_weight_update_lifecycle(monkeypatch, fails):
         trtllm_backend.torch.cuda, "empty_cache", lambda: calls.append("empty_cache")
     )
 
+    token = ("token", ext.model_update_group, 0)
     if fails:
         with pytest.raises(RuntimeError, match="misc failed"):
             ext.nccl_reshard_refit(drain=False, recompute_kv=True)
-        assert calls == ["begin", "bulk", "empty_cache", "misc"]
+        assert calls == ["begin", token, "bulk", "empty_cache", "misc"]
         model_loader.abort_update_weights.assert_called_once_with()
     else:
         assert ext.nccl_reshard_refit(drain=False, recompute_kv=True) is True
-        assert calls == ["begin", "bulk", "empty_cache", "misc", ("finish", True)]
+        assert calls == [
+            "begin",
+            token,
+            "bulk",
+            "empty_cache",
+            "misc",
+            ("finish", True),
+        ]
         model_loader.abort_update_weights.assert_not_called()
     engine.control_action.assert_called_once_with(drain=False)
 
@@ -739,3 +753,29 @@ def test_synchronizer_builds_one_bulk_group_and_plan_per_trtllm_layout(monkeypat
         build(dense)
     with pytest.raises(RuntimeError, match="cover 24 ranks but the inference world"):
         build(empty, world_size=8 + 20)
+
+
+@pytest.mark.parametrize("has_misc", [False, True])
+def test_misc_params_skip_the_readiness_token(monkeypatch, has_misc):
+    """Misc broadcast must not read the token again; refit already read it."""
+    from nemo_rl.models.generation.trtllm import trtllm_backend
+
+    ext = trtllm_backend.NcclExtension.__new__(trtllm_backend.NcclExtension)
+    ext.model_update_group = object()
+    ext.misc_state_dict_info = {"norm.weight": object()} if has_misc else {}
+    ext._reload_bucket = lambda *_args, **_kwargs: None
+    calls = []
+    monkeypatch.setattr(
+        trtllm_backend,
+        "packed_broadcast_consumer",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    ext._receive_and_load_misc_params()
+
+    if has_misc:
+        assert len(calls) == 1
+        assert calls[0]["group"] is ext.model_update_group
+        assert calls[0]["preflight_checked"] is True
+    else:
+        assert calls == []

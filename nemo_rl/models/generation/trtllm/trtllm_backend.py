@@ -40,7 +40,10 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     rebuild_cuda_tensor_from_ipc,
 )
-from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
+from nemo_rl.utils.packed_tensor import (
+    packed_broadcast_consumer,
+    packed_broadcast_preflight_consumer,
+)
 
 # Disable TRT-LLM weight loader's ThreadPoolExecutor: serial loading keeps
 # all copies on the caller's stream (same as NCCL writes), so the existing
@@ -780,6 +783,7 @@ class NcclExtension(WorkerExtension):
             group=self.model_update_group,
             src=0,
             post_unpack_func=self._reload_bucket,
+            preflight_checked=True,
         )
 
     def nccl_reshard_refit(
@@ -806,6 +810,11 @@ class NcclExtension(WorkerExtension):
         with self.engine.control_action(drain=drain):
             try:
                 self.begin_weight_update()
+                # The trainer posts the readiness token before the bulk reshard.
+                # Read it here, so collectives on model_update_group and the
+                # per-stage groups run in the same order on every rank. Read it
+                # also when there are no misc params.
+                packed_broadcast_preflight_consumer(self.model_update_group, 0)
                 self._recv_bulk_params()
                 torch.cuda.empty_cache()
                 self._receive_and_load_misc_params()
