@@ -362,6 +362,8 @@ class RolloutSnapshotter(_UsesRolloutParts):
         only; the live trainer keeps accumulating gradients without modification.
         """
         cut.require_live()
+        if self._rollout_runtime.shortfall_reconciliation_pending:
+            raise RuntimeError("cannot checkpoint unreconciled selection shortfalls")
         snapshot = kind == "rollout_snapshot"
         dataloader_state = self._dataloader.state_dict()
         next_nemo_gym_task_index = self._rollout_manager.get_next_nemo_gym_task_index()
@@ -377,7 +379,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
         training_owned_groups: list[TQReplayGroupMetadata] = []
         staging_row_count = 0
         tq_save_seconds = 0.0
-        if snapshot or self._master_config.checkpointing.get("save_data_plane"):
+        if snapshot or self._master_config.checkpointing.save_data_plane:
             training_owned_groups = self._buffer.training_owned_replay_groups()
             if training_owned_groups and not snapshot:
                 raise RuntimeError(
@@ -624,6 +626,10 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 step_N never appears.
         """
         async with self._save_lock:
+            if self._rollout_runtime.shortfall_reconciliation_pending:
+                return RolloutCheckpointSaveResult(
+                    saved=False, reason="shortfall_reconciliation_pending"
+                )
             if self._optimizer_commit_in_progress:
                 return RolloutCheckpointSaveResult(
                     saved=False,
@@ -709,6 +715,12 @@ class RolloutSnapshotter(_UsesRolloutParts):
                             return RolloutCheckpointSaveResult(
                                 saved=False,
                                 reason="trainer_state_changed",
+                            )
+                        if self._rollout_runtime.shortfall_reconciliation_pending:
+                            await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
+                            return RolloutCheckpointSaveResult(
+                                saved=False,
+                                reason="shortfall_reconciliation_pending",
                             )
                         snapshot_epoch = self._read_progress().current_epoch
                         environment_staging_keys: frozenset[str] = frozenset()

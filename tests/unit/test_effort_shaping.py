@@ -94,6 +94,35 @@ def test_no_shaping_when_low_string_is_empty():
 
 
 # ---------------------------------------------------------------------------
+# Low-effort marker the group length penalty reads
+# ---------------------------------------------------------------------------
+
+
+def test_writes_low_effort_marker_per_rollout():
+    """Capture bypasses low-effort rollouts via RewardChecks.low_effort; the ordinary
+    and legacy paths must write the same marker so they bypass the same rollouts."""
+    cfg = EffortLevelsConfig(
+        low_weight=1.0, low_penalty=1.0, low_ub=1000, low_string="<budget>"
+    )
+    results = [
+        _make_result(reward=1.0, response_tokens=100),
+        _make_result(reward=1.0, response_tokens=100),
+    ]
+    rows = [_make_row("<budget> solve this"), _make_row("solve this")]
+    _apply_effort_shaping(results, rows, effort_config=cfg)
+    assert results[0]["low_effort_applied"] is True
+    assert results[1]["low_effort_applied"] is False
+
+
+def test_no_low_effort_marker_when_shaping_disabled():
+    """Disabled shaping writes no marker; the length penalty reads a default False."""
+    results = [_make_result(reward=1.0, response_tokens=100)]
+    rows = [_make_row("<budget> solve this")]
+    _apply_effort_shaping(results, rows, effort_config=None)
+    assert "low_effort_applied" not in results[0]
+
+
+# ---------------------------------------------------------------------------
 # Reward formula
 # ---------------------------------------------------------------------------
 
@@ -355,6 +384,8 @@ def test_run_rollouts_shapes_completion_reward_and_emits_low_metrics():
 
     # length_reward = min(1, 1.0 * (1 - 100/1000)) = 0.9 -> 1.0 + 1.0 * 0.9 = 1.9
     assert completions[0].reward == pytest.approx(1.9)
+    # Dynamic sampling filters on the reward from before shaping.
+    assert completions[0].reward_original == pytest.approx(1.0)
     # Downstream reward metrics are computed from the shaped Completion.
     assert metrics["total_reward/mean"] == pytest.approx(1.9)
     assert metrics["mean_length_reward_low"] == pytest.approx(0.9)
