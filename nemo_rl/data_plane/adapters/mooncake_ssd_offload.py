@@ -294,16 +294,16 @@ def _patch_tq_retry(
     harm: str,
     what: str,
 ) -> None:
-    """Wrap TQ's ``client_cls.<method>`` so ``wait.code`` waits; other codes
-    still go through TQ's own retry."""
+    """Wrap TQ's ``client_cls.<method>`` so ``wait.code`` waits.
+
+    Other codes still go through TQ's own retry.
+    """
     if getattr(client_cls, flag, False):
         return
     if not hasattr(client_cls, method):
         from nemo_rl.data_plane.adapters.transfer_queue import _tq_shape_drift_error
 
-        raise _tq_shape_drift_error(
-            f"MooncakeStoreClient.{method} is gone", harm, what
-        )
+        raise _tq_shape_drift_error(f"MooncakeStoreClient.{method} is gone", harm, what)
     tq_retry = getattr(client_cls, method)
 
     def patched(self, keys, ptrs, sizes):  # type: ignore[no-untyped-def]
