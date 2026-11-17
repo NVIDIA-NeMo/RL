@@ -30,6 +30,7 @@ from pydantic import (
 )
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.advantage_estimator import create_advantage_estimator
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
@@ -346,11 +347,11 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # wedge lasts longer before it is broken.
     #
     # DEFAULTED, not None, because the deadline is what makes reactive recovery possible
-    # at all rather than a nicety on top of it. A Ray actor runs one task at a time
-    # (nothing here raises max_concurrency) and this group is a raw StatelessProcessGroup
-    # with no torch process-group watchdog behind it, so a shard dying mid-collective
-    # leaves every trainer blocked inside NCCL. The driver sees RayActorError and calls
-    # _recover_from_failed_refit, whose init_collective then queues behind the still-blocked
+    # at all rather than a nicety on top of it. A sync method on an async Ray actor holds
+    # its event loop until it returns, regardless of max_concurrency, and this group is a
+    # raw StatelessProcessGroup with no torch process-group watchdog behind it, so a shard
+    # dying mid-collective leaves every trainer blocked inside NCCL. The driver sees
+    # RayActorError and calls _recover_from_failed_refit, whose init_collective then queues behind the still-blocked
     # task and never runs: the recovery itself wedges and the run ends on stall_timeout_s.
     # Only the abort releases those ranks. With None as the default, a config that turned
     # fleet health on got detection and quarantine but no refit recovery, silently.
@@ -550,8 +551,8 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # holds a whole cohort's advantage inputs in the controller's heap and
     # blocks the controller's event loop for the duration of the computation --
     # long enough at Ultra scale to miss Ray's actor liveness ping. A positive
-    # value moves both costs onto dedicated CPU actors. Only grpo and opd are
-    # sharded across the pool; other estimators run as one call on one actor.
+    # value moves both costs onto dedicated CPU actors. requires_global_batch
+    # keeps the batch on one actor; otherwise whole prompt groups may be sharded.
     # Under data_plane.backend=mooncake_cpu each worker is its own TQ client and
     # mounts a full global_segment_size + local_buffer_size, like each
     # token-capture finalizer; budget it on top of
@@ -1132,6 +1133,11 @@ def rollout_snapshots_enabled(master_config: MasterConfig) -> bool:
     )
 
 
+def dedicated_value_enabled(master_config: MasterConfig) -> bool:
+    value_config = getattr(master_config, "value", None)
+    return bool(value_config and value_config.get("dedicated"))
+
+
 def algo_config(master_config: MasterConfig) -> GRPOConfig | PPOConfig:
     """The active algorithm block: ``ppo`` on a PPO run, else ``grpo``.
 
@@ -1605,6 +1611,26 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 f"(got {algo_cfg.num_generations_per_prompt})."
             )
 
+    estimator = create_advantage_estimator(
+        algo_cfg.adv_estimator, master_config.loss_fn
+    )
+    if (
+        estimator.requires_global_batch
+        and async_config.min_groups_for_streaming_train < algo_cfg.num_prompts_per_step
+    ):
+        algo_prefix = "ppo" if is_ppo_run(master_config) else "grpo"
+        raise ValueError(
+            f"{algo_prefix}.adv_estimator.name={algo_cfg.adv_estimator.name!r} "
+            "requires the whole step's batch with its current settings "
+            "(reinforce_plus_plus always; gae and raw_reward with "
+            "normalize_advantages=true; opd with subtract_global_baseline=true). "
+            "Set async_rl.min_groups_for_streaming_train "
+            f"({async_config.min_groups_for_streaming_train}) == "
+            f"{algo_prefix}.num_prompts_per_step ({algo_cfg.num_prompts_per_step}). "
+            "To stream with gae/raw_reward, set normalize_advantages=false; "
+            "with opd, set subtract_global_baseline=false."
+        )
+
     if not is_ppo_run(master_config):
         # A value block without `ppo` is inert -- nothing builds the critic --
         # and a config carrying one is asking for PPO by every reading except
@@ -1682,13 +1708,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "share storage even when overlap_param_gather=false. Disable "
                 "policy.megatron_cfg.fp8_cfg.fp8_param or use full-batch PPO."
             )
-        if algo_cfg.adv_estimator.normalize_advantages:
-            warnings.warn(
-                "Streaming PPO with ppo.adv_estimator.normalize_advantages=true "
-                "normalizes GAE advantages per chunk instead of across the full "
-                "batch. Changing chunk boundaries can change normalized advantages.",
-                stacklevel=2,
-            )
 
     # A forced ratio equals the true one only on the first optimizer step taken
     # on a batch; later epochs would train without any trust region.
@@ -1715,6 +1734,32 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "Shortened PPO steps are not supported yet."
         )
 
+    value_resources = master_config.value.get("resources")  # type: ignore
+    if dedicated_value_enabled(master_config):
+        if not policy_megatron_cfg or not policy_megatron_cfg.get("enabled"):
+            raise ValueError(
+                "value.dedicated=true requires policy.megatron_cfg.enabled=true"
+            )
+        generation_config = master_config.policy["generation"]
+        if generation_config["colocated"]["enabled"]:
+            raise ValueError("value.dedicated=true requires non-colocated generation")
+        value_nodes = value_resources.num_nodes if value_resources is not None else None
+        if value_nodes is None or value_nodes < 1:
+            raise ValueError(
+                "value.dedicated=true requires value.resources.num_nodes >= 1"
+            )
+        cluster_gpus = master_config.cluster.gpus_per_node
+        inference_resources = generation_config["colocated"]["resources"]
+        if inference_resources["gpus_per_node"] != cluster_gpus:
+            raise ValueError(
+                "value.dedicated=true requires generation to use full nodes"
+            )
+        inference_nodes = inference_resources["num_nodes"] or 1
+        if master_config.cluster.num_nodes - value_nodes - inference_nodes < 1:
+            raise ValueError(
+                "cluster.num_nodes must leave at least one full policy node after "
+                "reserving generation and dedicated value nodes"
+            )
     if (
         getattr(algo_cfg, "policy_training_start_step", 0) > 0
         and master_config.checkpointing.enabled
@@ -2308,20 +2353,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         opd_module.assert_prev_logprobs_available(master_config)
         opd_module.assert_trust_region_supported(master_config)
         _validate_opd_full_config(master_config, opd_config)
-        if (
-            algo_cfg.adv_estimator.subtract_global_baseline
-            and async_config.min_groups_for_streaming_train
-            != algo_cfg.num_prompts_per_step
-        ):
-            # The advantage stage runs once per streaming chunk, so a smaller
-            # chunk would center each chunk on its own mean, not the step's.
-            raise ValueError(
-                "grpo.adv_estimator.subtract_global_baseline=true requires "
-                "async_rl.min_groups_for_streaming_train "
-                f"({async_config.min_groups_for_streaming_train}) == "
-                f"grpo.num_prompts_per_step ({algo_cfg.num_prompts_per_step}) "
-                "so the baseline covers the whole step."
-            )
 
     if (
         reference_policy_kl_penalty == 0

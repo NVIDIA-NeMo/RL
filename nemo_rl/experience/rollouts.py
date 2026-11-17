@@ -17,6 +17,7 @@
 
 import asyncio
 import copy
+import itertools
 import json
 import statistics
 import uuid
@@ -2402,18 +2403,28 @@ def apply_reward_penalties(
     return counts
 
 
+# Task indices for flat prompt groups that arrive without one, as on the synchronous path. Gym builds a flat row's task
+# from ``_ng_task_index``. This counter restarts with each process and counts apart from the async collector's, so the
+# rows it numbers also name their episode with ``_ng_rollout_id``: unless a row sets it, Gym names the episode
+# "{_ng_task_index}-{_ng_rollout_index}" and keys its captures and exports on that name. Materialized rows carry their
+# own task ID, and the NeMo-Gym actor names their synchronous episodes by prompt group in the same format.
+_unstamped_nemo_gym_task_indices = itertools.count()
+
+
 def _prepare_nemo_gym_rows(
     rows: list[dict],
     generation_config: GenerationConfig,
     sampling_params: GenerationSamplingParams,
     num_generations: int,
 ) -> None:
-    """Apply NeMo-RL sampling parameters and stable row indices in place."""
+    """Apply NeMo-RL sampling parameters and stable row indices in place, plus task indices for flat rows."""
     if num_generations <= 0 or len(rows) % num_generations != 0:
         raise ValueError("NeMo-Gym rows must contain complete prompt groups")
 
     group_ids: dict[int, str] = {}
     group_attempts: dict[int, int] = {}
+    group_task_indices: dict[int, int | None] = {}
+    counter_groups: set[int] = set()
     for group_index, group_start in enumerate(range(0, len(rows), num_generations)):
         group_rows = rows[group_start : group_start + num_generations]
         existing_group_ids = {
@@ -2449,6 +2460,25 @@ def _prepare_nemo_gym_rows(
         group_attempts[group_index] = (
             existing_group_attempts.pop() if existing_group_attempts else 0
         )
+        existing_task_indices = {
+            int(row[NEMO_GYM_TASK_INDEX_KEY])
+            for row in group_rows
+            if row.get(NEMO_GYM_TASK_INDEX_KEY) is not None
+        }
+        if len(existing_task_indices) > 1 or any(
+            task_index < 0 for task_index in existing_task_indices
+        ):
+            raise ValueError(
+                f"NeMo-Gym prompt group {group_index} contains inconsistent or negative "
+                f"{NEMO_GYM_TASK_INDEX_KEY} values"
+            )
+        if existing_task_indices:
+            group_task_indices[group_index] = existing_task_indices.pop()
+        elif any(not is_nemo_gym_task(row) for row in group_rows):
+            group_task_indices[group_index] = next(_unstamped_nemo_gym_task_indices)
+            counter_groups.add(group_index)
+        else:
+            group_task_indices[group_index] = None
 
     for row_index, row in enumerate(rows):
         group_index = row_index // num_generations
@@ -2473,6 +2503,13 @@ def _prepare_nemo_gym_rows(
         row["_rowidx"] = row_index
         row[NEMO_GYM_GROUP_ID_KEY] = group_ids[group_index]
         row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempts[group_index]
+        if group_task_indices[group_index] is not None:
+            row[NEMO_GYM_TASK_INDEX_KEY] = group_task_indices[group_index]
+        if group_index in counter_groups:
+            row.setdefault(
+                "_ng_rollout_id",
+                f"{group_ids[group_index]}-g{rollout_index}-t{group_attempts[group_index]}",
+            )
         row[NEMO_GYM_ROLLOUT_INDEX_KEY] = rollout_index
 
 
@@ -3041,6 +3078,34 @@ def run_nemo_gym_rollout_sync(
     return asyncio.run(_consume_rollout())
 
 
+def _nemo_gym_group_task_index(rows: list[dict], group_size: int | None) -> int | None:
+    """Return the task index of a single prompt group, or None for unstamped rows or several groups.
+
+    Every prompt group of ``group_size`` contiguous rows must share one ``_ng_task_index``. The synchronous path
+    hands in a whole batch of several groups, so its result carries no single task index.
+    """
+    if not rows or NEMO_GYM_TASK_INDEX_KEY not in rows[0]:
+        return None
+    if group_size is None:
+        group_size = len(rows)
+    task_indices: list[int] = []
+    for row in rows:
+        task_index = row.get(NEMO_GYM_TASK_INDEX_KEY)
+        if task_index is None:
+            raise ValueError(
+                "Expected one _ng_task_index per prompt group, got "
+                f"{[row.get(NEMO_GYM_TASK_INDEX_KEY) for row in rows]}"
+            )
+        task_indices.append(int(task_index))
+    for group_start in range(0, len(task_indices), group_size):
+        group = task_indices[group_start : group_start + group_size]
+        if len(set(group)) != 1:
+            raise ValueError(
+                f"Expected one _ng_task_index per prompt group, got {group}"
+            )
+    return task_indices[0] if len(rows) == group_size else None
+
+
 def _single_group_reward_diagnostics(results: list[dict]) -> dict[str, float]:
     """Summarize reward variation within one prompt's generations."""
     metrics: dict[str, float] = {}
@@ -3512,17 +3577,7 @@ def _postprocess_single_nemo_gym_group(
         # contract instead and fail fast on a real mismatch.
         validate_reward_components_match_scalar([r["full_result"] for r in results])
 
-    group_task_index = None
-    if nemo_gym_rows and NEMO_GYM_TASK_INDEX_KEY in nemo_gym_rows[0]:
-        group_task_index = int(nemo_gym_rows[0][NEMO_GYM_TASK_INDEX_KEY])
-        task_indices = [row.get(NEMO_GYM_TASK_INDEX_KEY) for row in nemo_gym_rows]
-        if any(
-            task_index is None or int(task_index) != group_task_index
-            for task_index in task_indices
-        ):
-            raise ValueError(
-                f"Expected one _ng_task_index per prompt group, got {task_indices}"
-            )
+    group_task_index = _nemo_gym_group_task_index(nemo_gym_rows, group_size)
 
     return NemoGymRolloutResult(
         input_ids=input_ids,
