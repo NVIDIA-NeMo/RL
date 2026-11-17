@@ -242,12 +242,15 @@ def test_a_gym_call_is_rendered_spliced_and_routed_with_its_capture_plan() -> No
         _call(
             {"required_prefix_token_ids": PREFIX},
             chat_template_args={"enable_thinking": True},
+            stop_token_ids=[7],
         ),
     )
 
     # The worker renders the call without Dynamo's None fields, with the
     # profile's exact sampling and Gym's extras as the native request fields.
     (body,) = pool.bodies
+    # A vLLM token-level field the frontend passes through is rendered as sent.
+    assert body["stop_token_ids"] == [7]
     assert body["messages"][0]["content"][1] == {
         "type": "image_url",
         "image_url": {"url": "u"},

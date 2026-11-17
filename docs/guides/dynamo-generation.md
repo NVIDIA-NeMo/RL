@@ -91,7 +91,6 @@ Startup rejects these with `dynamo: true`:
 - `async_rl.generation_fleet_health.enabled`: the frontend picks engines itself, and a restarted shard does not register with it yet.
 - `async_rl.generation_router`: the frontend already routes the fleet behind one URL.
 - `bad_words` in `extra_body` or `sampling_overrides` on the policy model (`env.nemo_gym.policy_model.responses_api_models.vllm_model`): the frontend answers every request carrying it with HTTP 400. Startup checks only this overlay, not Gym's own YAMLs.
-- `stop_token_ids`, `allowed_token_ids`, `bad_words_token_ids`, `cache_salt`, `logprob_token_ids` or `detokenize` in either block on the policy model: the frontend accepts them but drops them before NeMo RL's chat engine sees them.
 - `vllm_cfg.skip_tokenizer_init: true` with NeMo-Gym: the engine detokenizes the replies Gym's calls get through the frontend.
 - `vllm_cfg.expert_parallel_size > tensor_parallel_size`: that runs data parallelism inside vLLM, which Dynamo does not serve yet. Above data-parallel rank 0, vLLM rejects each engine's `ipc://` KV-event endpoint.
 - `vllm_cfg.http_server_api_key_required`: the frontend serves the same engines on 0.0.0.0 and checks no bearer token.
