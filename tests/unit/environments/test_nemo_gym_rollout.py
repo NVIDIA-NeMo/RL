@@ -531,6 +531,16 @@ def l0_nemo_gym(scripted_openai_base_url):
         {
             "nemo_gym": {
                 "config_paths": config_paths,
+                "code_gen": {
+                    "resources_servers": {
+                        "code_gen": {
+                            # GitHub CI has no sandbox service. Gym's local provider runs the
+                            # checker as a host subprocess and ignores the image.
+                            "sandbox_provider": {"local": {}},
+                            "sandbox_config": {"image": "local"},
+                        }
+                    }
+                },
                 "skip_venv_if_present": True,
             }
         },
