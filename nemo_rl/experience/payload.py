@@ -37,7 +37,7 @@ from nemo_rl.data_plane.schema import (
     TRUNCATED,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 
 VIOLATION_TAG_KEYS = (
     "num_invalid_tool_calls",
@@ -93,6 +93,43 @@ def _add_message_violation_masks(
             message[MALFORMED_THINKING_MASK] = torch.full_like(
                 token_ids, is_malformed, dtype=torch.bool
             )
+
+
+def _reward_component_columns(
+    completions: list[Completion],
+) -> dict[str, torch.Tensor]:
+    """Return one ``[N]`` column per reward component of a multi-reward prompt group.
+
+    Args:
+        completions: The prompt group's completions.
+
+    Returns:
+        A float32 column per component name, or an empty dict for a
+        single-reward group.
+
+    Raises:
+        ValueError: If the completions disagree on their component names, or a
+            name lacks the ``reward/`` prefix that keeps it apart from the
+            other payload fields.
+    """
+    if all(c.reward_components is None for c in completions):
+        return {}
+    components = [c.reward_components or {} for c in completions]
+    names = sorted(components[0])
+    if any(sorted(c) != names for c in components):
+        raise ValueError(
+            "Completions of one prompt group must share the same reward "
+            f"components, got {[sorted(c) for c in components]}."
+        )
+    unprefixed = [name for name in names if not name.startswith("reward/")]
+    if unprefixed:
+        raise ValueError(
+            f"Reward component names must start with 'reward/', got {unprefixed}."
+        )
+    return {
+        name: torch.tensor([c[name] for c in components], dtype=torch.float32)
+        for name in names
+    }
 
 
 def record_to_train_batch(
@@ -182,6 +219,7 @@ def record_to_train_batch(
         TRUNCATED: truncated,
         "total_reward": total_reward,
         _VIOLATION_COUNTS_KEY: violation_counts,
+        **_reward_component_columns(completions),
     }
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]

@@ -192,6 +192,80 @@ def test_generate_response_forwards_all_vllm_media_to_generation() -> None:
     assert assistant_message["token_ids"].tolist() == [42]
 
 
+def test_run_single_rollout_accumulates_reward_components(monkeypatch) -> None:
+    turn_rewards = [
+        {"reward/correctness": 1.0, "reward/format": 0.5},
+        {"reward/correctness": 0.0, "reward/format": 0.25},
+    ]
+
+    async def generate_response(
+        _message_log,
+        _stop_strings,
+        *,
+        native_generation_data=None,
+    ):
+        return (
+            {
+                "role": "assistant",
+                "content": "answer",
+                "token_ids": torch.tensor([42]),
+                "generation_logprobs": torch.tensor([0.0]),
+            },
+            torch.tensor(1),
+            {},
+        )
+
+    def calculate_rewards(_batch, _task_to_env):
+        rewards = turn_rewards.pop(0)
+        return EnvironmentReturn(
+            observations=[{"role": "user", "content": "next"}],
+            metadata=[None],
+            next_stop_strings=[None],
+            rewards={name: torch.tensor([value]) for name, value in rewards.items()},
+            terminateds=torch.tensor([not turn_rewards]),
+            answers=[None],
+        )
+
+    class _Tokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return SimpleNamespace(input_ids=torch.tensor([[7]]))
+
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollout_manager.calculate_rewards", calculate_rewards
+    )
+    manager = object.__new__(AsyncRolloutImpl)
+    manager._generate_response = generate_response
+    manager._tokenizer = _Tokenizer()
+    manager._task_to_env = {}
+    manager._max_seq_len = 32
+    manager._max_rollout_turns = 2
+    manager._timeouts = SimpleNamespace(env_s=10.0)
+
+    completion, _ = _run(
+        manager._run_single_rollout(
+            {
+                "idx": 0,
+                "message_log": [
+                    {
+                        "role": "user",
+                        "content": "",
+                        "token_ids": torch.tensor([1]),
+                    }
+                ],
+                "extra_env_info": None,
+                "task_name": "math_multi_reward",
+            },
+            traj_idx=0,
+        )
+    )
+
+    assert completion.reward_components == {
+        "reward/correctness": 1.0,
+        "reward/format": 0.75,
+    }
+    assert completion.reward == 1.75
+
+
 def test_run_single_rollout_preserves_native_media_across_turns(monkeypatch) -> None:
     calls: list[dict] = []
     image = object()
