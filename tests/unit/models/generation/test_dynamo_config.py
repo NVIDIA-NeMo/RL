@@ -195,7 +195,7 @@ def test_frontend_argv_is_runtime_owned() -> None:
     assert argv[-2:] == ["--foo", "1"]
     # One frontend has no replicas to sync with; several share in-flight load.
     assert "--router-replica-sync" not in argv
-    replicas = DynamoCfg.model_validate({"frontend_args": {"num_frontends": 2}})
+    replicas = DynamoCfg(frontend_args=DynamoFrontendArgs(num_frontends=2))
     assert "--router-replica-sync" in _frontend_argv(replicas)
     no_affinity = DynamoCfg.model_validate(
         {"frontend_args": {"session_affinity_ttl_secs": None}}

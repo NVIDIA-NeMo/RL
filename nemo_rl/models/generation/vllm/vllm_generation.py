@@ -792,7 +792,7 @@ class VllmGeneration(GenerationInterface):
     def client_base_urls(self) -> list[Optional[str]]:
         """Where OpenAI clients such as NeMo-Gym send requests.
 
-        The Dynamo frontend when it serves this fleet (``policy.generation.dynamo``);
+        The Dynamo frontends when they serve this fleet (``policy.generation.dynamo``);
         otherwise every data-parallel shard's own server, as
         ``dp_openai_server_base_urls``. Known before a deferred model load.
         """

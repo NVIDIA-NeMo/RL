@@ -366,7 +366,7 @@ class FrontendHost:
             self._chat_dir = None
 
 
-_FrontendHostActor = ray.remote(num_cpus=0.001)(FrontendHost)
+_FrontendHostActor = ray.remote(num_cpus=0)(FrontendHost)
 
 
 def _service_env(managed_env: dict[str, str]) -> dict[str, str]:

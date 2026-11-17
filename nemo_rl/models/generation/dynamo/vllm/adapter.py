@@ -371,6 +371,9 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
             }
         else:
             engine_prompt = TokensPrompt(prompt_token_ids=plan.prompt_token_ids)
+            if chat.cache_salt is not None:
+                # vLLM's render puts the request's salt on the engine prompt.
+                engine_prompt["cache_salt"] = chat.cache_salt
         await start_capture(
             host, chat, engine_prompt, plan, max_model_len=self._max_model_len
         )
@@ -594,8 +597,9 @@ def _refusal(status: int, message: str, *, acknowledge: bool = False) -> Generat
     """A Gym call the engine refused before it ran, answered in the chunk.
 
     An error the engine raises reaches the frontend's chat engine with its
-    status, but only a 400 keeps its message and none carries ``acknowledge``;
-    the chat engine answers this with all three, as the native server does.
+    status, but only a 400 keeps its message and none carries ``acknowledge``.
+    The chat engine answers this with ``status`` and ``acknowledge`` as the
+    native server does, and with ``message`` when the status is 400.
     """
     reply: GymEngineReply = {
         "refusal": {

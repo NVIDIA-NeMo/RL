@@ -36,7 +36,7 @@ With `dynamo: true`:
 | `frontend_args.router_mode` | `kv` | Frontend routing policy |
 | `frontend_args.session_affinity_ttl_secs` | 300 | Keeps a NeMo-Gym token-capture rollout on one engine while it is idle for up to this many seconds; null disables it |
 | `frontend_args.session_affinity_max_entries` | 16,777,216 | Most sessions the frontends hold at once, across all of them; a new one past it gets HTTP 529. Entries are allocated as sessions start, so a high cap costs nothing until it is used |
-| `frontend_args.num_frontends` | 1 | Frontends, each with its own router, spread round-robin over the generation nodes. More than one adds `--router-replica-sync`, so each router sees the requests the others have in flight; NeMo-Gym keeps each session on one frontend, and NeMo RL's own rollouts pick one at random |
+| `frontend_args.num_frontends` | 1 | Frontends, each with its own router, spread round-robin over the generation nodes. More than one adds `--router-replica-sync`: with `router_mode: kv`, each router then sees the requests the others have in flight; the other router modes balance only the requests of their own frontend. NeMo-Gym keeps each session on one frontend, and NeMo RL's own rollouts pick one at random |
 | `frontend_args.render_workers` | 8 | Processes in each frontend that render NeMo-Gym's chat calls and build their replies; every Gym call that frontend serves shares them. Each holds its own tokenizer and processor, about 1.7–2.3 GB. On one Grace core of a GB200, one serves about 640 single-turn calls/s, 45 for a 21K-token agentic history (22 with its prefix splice), or 200 with 1–4 images |
 | `frontend_args.extra_cli_args` | `[]` | Extra `dynamo.frontend` flags. `--dyn-chat-processor` and `--custom-jinja-template` are rejected: NeMo RL renders chat itself |
 | `frontend_args.extra_env` | `{}` | Extra frontend environment, for settings Dynamo reads only from the environment, such as `DYN_TCP_LISTEN_BACKLOG`. Variables the runtime manages are rejected |
@@ -69,7 +69,7 @@ The frontend serves chat with NeMo RL's chat engine instead of Dynamo's own rend
 
 Where the behavior differs from the native endpoint:
 
-- The frontend refuses more than 32 `stop` strings, and vLLM request fields its own request type lacks (for example `structured_outputs`, `return_token_ids`, `truncate_prompt_tokens`, `priority`, `chat_template`), with HTTP 400.
+- The frontend refuses more than 32 `stop` strings or 32 `stop_token_ids`, and vLLM request fields its own request type lacks (for example `structured_outputs`, `return_token_ids`, `truncate_prompt_tokens`, `priority`, `chat_template`), with HTTP 400.
 - gpt-oss (Harmony) chat calls are refused with HTTP 400.
 - A call that streams (`stream: true`) or asks for more than one choice (`n`) is refused with HTTP 400. The native endpoint serves both, and fails the capture of a streamed token-capture call. NeMo-Gym sends neither.
 - A call refused with a status other than 400 (a full queue's 503, for example) is answered with that status and the status's standard text. The engine's own message is only in the frontend's log. A 400 keeps its message, and a refused token-capture call is acknowledged in the `x-ng-capture-refused` header, both as on the native endpoint.
@@ -89,7 +89,7 @@ Startup rejects these with `dynamo: true`:
 
 - `colocated.enabled: true`: a colocated engine sleeps while the policy trains, and the frontend would keep routing to it.
 - `async_rl.generation_fleet_health.enabled`: the frontend picks engines itself, and a restarted shard does not register with it yet.
-- `async_rl.generation_router`: the frontend already routes the fleet behind one URL.
+- `async_rl.generation_router`: each frontend already routes to the whole fleet.
 - `bad_words` in `extra_body` or `sampling_overrides` on the policy model (`env.nemo_gym.policy_model.responses_api_models.vllm_model`): the frontend answers every request carrying it with HTTP 400. Startup checks only this overlay, not Gym's own YAMLs.
 - `vllm_cfg.skip_tokenizer_init: true` with NeMo-Gym: the engine detokenizes the replies Gym's calls get through the frontend.
 - `vllm_cfg.expert_parallel_size > tensor_parallel_size`: that runs data parallelism inside vLLM, which Dynamo does not serve yet. Above data-parallel rank 0, vLLM rejects each engine's `ipc://` KV-event endpoint.

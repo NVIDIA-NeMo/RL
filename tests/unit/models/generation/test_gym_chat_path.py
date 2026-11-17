@@ -253,7 +253,7 @@ class _Engine:
         self.errored = False
         self._kit = kit
         self._refuse = refuse
-        self.runs: list[tuple[list[int], Any, Any]] = []
+        self.runs: list[tuple[list[int], Any, Any, Any]] = []
         # The reasoning_ended each run was handed.
         self.reasoning_ended: list[Optional[bool]] = []
         # How many of REPLY's tokens the prompt already ends with: a call
@@ -266,7 +266,8 @@ class _Engine:
         # As the worker's engine client does before it submits the call.
         take_reasoning_ended(sampling_params, kwargs)
         prompt_token_ids = list(prompt["prompt_token_ids"])
-        self.runs.append((prompt_token_ids, sampling_params, _media(prompt)))
+        salt = prompt.get("cache_salt")
+        self.runs.append((prompt_token_ids, sampling_params, _media(prompt), salt))
         self.reasoning_ended.append(kwargs.get("reasoning_ended"))
         if self._refuse is not None and self._refuse[0] == "running":
             raise self._refuse[1]
@@ -391,7 +392,7 @@ class _Outcome:
     # None when the client went away: nobody is answered.
     status: Optional[int]
     reply: dict[str, Any]
-    runs: list[tuple[list[int], Any, Any]]
+    runs: list[tuple[list[int], Any, Any, Any]]
     staged: list[tuple[Any, Any]]
     failed: list[str] = field(default_factory=list)
     # The capture call Gym is told was refused before it was staged, if any.
@@ -976,6 +977,7 @@ CASES = [
         mode="text",
         kit="router_replay",
     ),
+    _Case("cache_salt", fields={"cache_salt": "tenant-a"}),
 ]
 
 
@@ -1038,9 +1040,10 @@ def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(kits, case) 
         assert native.acknowledged == dynamo.acknowledged == acknowledged
         return
     # The engine ran the same prompt, media and SamplingParams.
-    ((native_prompt, native_params, native_media),) = native.runs
-    ((dynamo_prompt, dynamo_params, dynamo_media),) = dynamo.runs
+    ((native_prompt, native_params, native_media, native_salt),) = native.runs
+    ((dynamo_prompt, dynamo_params, dynamo_media, dynamo_salt),) = dynamo.runs
     assert dynamo_prompt == native_prompt
+    assert dynamo_salt == native_salt
     _assert_same_media(dynamo_media, native_media)
     assert (native_media is not None) == (case.kit == "vlm")
     assert dynamo_params == native_params
@@ -1241,7 +1244,7 @@ def test_a_call_cut_at_a_checkpoint_resumes_to_the_uninterrupted_reply(
     # Each path in a task of its own, as each request has on a server: a
     # finished prefix is marked in a context variable.
     whole = asyncio.run(_native(kit, *_host(kit, {}, 0), body, measure=False))
-    ((prompt, params, _),) = whole.runs
+    ((prompt, params, _, _),) = whole.runs
     ((whole_record, _),) = whole.staged
     records, continuation = _cut_call(
         kit, prompt, saved, output_limit=params.max_tokens
@@ -1267,8 +1270,8 @@ def test_a_call_cut_at_a_checkpoint_resumes_to_the_uninterrupted_reply(
 
     assert (native.status, dynamo.status) == (200, 200), (native.reply, dynamo.reply)
     # The engine ran the saved rows as its prompt, with the budget that is left.
-    ((native_prompt, native_params, _),) = native.runs
-    ((dynamo_prompt, dynamo_params, _),) = dynamo.runs
+    ((native_prompt, native_params, _, _),) = native.runs
+    ((dynamo_prompt, dynamo_params, _, _),) = dynamo.runs
     assert native_prompt == dynamo_prompt == prompt + reply_ids[:resumed]
     assert dynamo_params == native_params
     if resumed < len(reply_ids):

@@ -44,7 +44,7 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
     # Most sessions the affinity table holds; a new one past it gets HTTP 529.
     # Every frontend holds the whole fleet's sessions, so size it for all of them.
     # Entries are allocated as sessions start and reaped after the TTL, so the cap
-    # only bounds memory; Dynamo's own 65,536 is below NT4-scale concurrency.
+    # only bounds memory; a large run holds more sessions than Dynamo's own 65,536.
     session_affinity_max_entries: PositiveInt = 16_777_216
     # Frontends, spread round-robin over the generation nodes, each with its own
     # router. More than one adds --router-replica-sync, so every router sees the

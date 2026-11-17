@@ -76,7 +76,7 @@ The resolve is in the engine, not the frontend, because the check needs the engi
 
 ## Driver
 
-`VllmGeneration` starts `ManagedDynamoRuntime`, which runs etcd, NATS and `dynamo.frontend`. After the engines load, it asks every DP leader to register and waits until the frontend routes to all of them. Each poll also asks the leaders whether their endpoint task stopped, so a failed registration fails with its cause instead of a timeout.
+`VllmGeneration` starts `ManagedDynamoRuntime`. It runs etcd and NATS on the driver, and each `dynamo.frontend` from a small Ray actor on a generation node (`FrontendHost`). A watchdog process stops a service whose starter was killed (`service_watchdog.py`). After the engines load, it asks every DP leader to register and waits until every frontend routes to all of them. Each poll also asks the leaders whether their endpoint task stopped, so a failed registration fails with its cause instead of a timeout.
 
 `generate_async` on text prompts posts a token-prompt completion to the frontend (`dynamo/rollout_client.py`). It sets top-level `ignore_eos` and a context-sized `max_tokens`, so the frontend's own stop rules never end a stream before the engine reports its result. Everything else keeps native dispatch; the guide lists what goes where.
 
