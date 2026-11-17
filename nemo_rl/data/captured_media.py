@@ -34,6 +34,35 @@ if TYPE_CHECKING:
     from nemo_rl.data_plane.tq_token_sink import FetchedStagedCall, StagedMediaTensors
     from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 
+# HF processor class name -> media capture family. The driver picks the family
+# from the run's processor and passes it to the serving workers, which only
+# confirm that the engine built the matching processor. This answers a different
+# question from multimodal_utils.uses_image_placeholder (does the processor
+# expand image placeholders in __call__), so the two lists are kept apart.
+#   "omni":    Nemotron VL / Omni (vLLM's dynamic-resolution tiler)
+#   "pixtral": Mistral3 (vLLM's Mistral3 / Pixtral processor)
+_MEDIA_CAPTURE_FAMILY_BY_PROCESSOR: dict[str, str] = {
+    "NemotronNanoVLV2Processor": "omni",
+    "NemotronH_Nano_Omni_Reasoning_V3Processor": "omni",
+    "NemotronH_Omni_Reasoning_V3Processor": "omni",
+    "NemotronH_Super_Omni_Reasoning_V3Processor": "omni",
+    "PixtralProcessor": "pixtral",
+}
+MEDIA_CAPTURE_FAMILIES = frozenset(_MEDIA_CAPTURE_FAMILY_BY_PROCESSOR.values())
+
+
+def media_capture_family(processor: Any) -> str | None:
+    """Return the media capture family for a run's HF processor.
+
+    Args:
+        processor: The run's HF processor.
+
+    Returns:
+        ``"omni"`` or ``"pixtral"``, or ``None`` when token capture cannot stage
+        this processor's media.
+    """
+    return _MEDIA_CAPTURE_FAMILY_BY_PROCESSOR.get(type(processor).__name__)
+
 
 class MediaCaptureRejected(ValueError):
     """A captured call's media cannot be staged; the request is rejected before inference.
@@ -449,7 +478,7 @@ def capture_processed_media(
     image geometry. ``cast_pixel_dtype`` (Pixtral only) is the staging
     column's pinned pixel dtype.
     """
-    if media_family not in ("omni", "pixtral"):
+    if media_family not in MEDIA_CAPTURE_FAMILIES:
         raise MediaCaptureRejected(f"Unsupported media family {media_family!r}")
     tokens = engine_prompt["prompt_token_ids"]
     placeholders = engine_prompt.get("mm_placeholders") or {}

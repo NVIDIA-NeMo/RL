@@ -21,7 +21,11 @@ import torch
 
 pytest.importorskip("nemo_gym.token_id_capture.staging")
 
-from nemo_rl.data.captured_media import MediaCaptureRejected, capture_processed_media
+from nemo_rl.data.captured_media import (
+    MediaCaptureRejected,
+    capture_processed_media,
+    media_capture_family,
+)
 from nemo_rl.data.multimodal_utils import _patchify_segments
 
 pytestmark = pytest.mark.nemo_gym
@@ -123,10 +127,11 @@ def test_embedding_positions_must_be_image_tokens():
         capture(prompt)
 
 
-def test_image_size_must_be_whole_merge_cells():
-    # 42 pixels is 3 patches but 1.5 merge cells; the row and column counts
-    # (1 x 3) still match the 3 image tokens.
-    pixels = torch.rand(3, 42, 84)
+@pytest.mark.parametrize(("height", "width"), [(42, 84), (56, 42)])
+def test_image_size_must_be_whole_merge_cells(height, width):
+    # One side is 42 pixels: 3 patches but 1.5 merge cells. The row and column
+    # counts still match the image tokens, so only the modulus check rejects.
+    pixels = torch.rand(3, height, width)
     with pytest.raises(MediaCaptureRejected, match="geometry"):
         capture(prompt_with_image(pixels))
 
@@ -213,6 +218,21 @@ def test_omni_still_requires_one_contiguous_run():
     )
     with pytest.raises(MediaCaptureRejected, match="contiguous"):
         capture(prompt, media_family="omni", spatial_merge_size=None)
+
+
+@pytest.mark.parametrize(
+    ("processor_name", "family"),
+    [
+        ("NemotronNanoVLV2Processor", "omni"),
+        ("NemotronH_Nano_Omni_Reasoning_V3Processor", "omni"),
+        ("NemotronH_Omni_Reasoning_V3Processor", "omni"),
+        ("NemotronH_Super_Omni_Reasoning_V3Processor", "omni"),
+        ("PixtralProcessor", "pixtral"),
+        ("Qwen2VLProcessor", None),
+    ],
+)
+def test_media_capture_family_follows_the_processor_class(processor_name, family):
+    assert media_capture_family(type(processor_name, (), {})()) == family
 
 
 def test_unknown_family_is_rejected():
