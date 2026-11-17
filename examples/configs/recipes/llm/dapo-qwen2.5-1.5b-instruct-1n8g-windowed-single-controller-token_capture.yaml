@@ -18,6 +18,15 @@ grpo:
   # budget before a step fills.
   dynamic_sampling_max_gen_batches: 30
   calculate_advantages_on_gpu: false
+  overlong_filtering: true
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    # Longest response that fits: max_total_sequence_length minus max_input_seq_length.
+    max_response_length: 6144
 loss_fn:
   reference_policy_kl_penalty: 0.0
   ratio_clip_max: 0.28

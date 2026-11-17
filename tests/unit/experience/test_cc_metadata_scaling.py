@@ -75,7 +75,7 @@ def test_ledger_growth_and_restart_preserve_segment_chains(
         async def reopen() -> None:
             ledger = FileLineageStore(tmp_path / "lineage")
             context = CaptureContext(
-                rollout_id="attempt",
+                capture_key="attempt",
                 model_call_id="after-restart",
                 token_sink=None,
                 lineage_store=ledger,
