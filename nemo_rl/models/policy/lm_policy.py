@@ -15,6 +15,7 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
+from functools import lru_cache
 from typing import Any, Iterable, Optional, Union
 
 import numpy as np
@@ -211,7 +212,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
             if megatron_enabled:
                 # Megatron-specific guards (main #3463).
-                if config["megatron_cfg"]["context_parallel_size"] > 1:
+                if config["megatron_cfg"]["context_parallel_size"] > 1 or config[
+                    "megatron_cfg"
+                ].get("dynamic_context_parallel"):
                     # Sequence packing itself is supported with the draft; CP
                     # is not: the hidden-state capture and the per-segment
                     # shifts assume each packed sequence lives whole on one
@@ -219,8 +222,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     raise ValueError(
                         "policy.draft.enabled=true does not support context "
                         "parallelism yet. Set "
-                        "policy.megatron_cfg.context_parallel_size=1 or disable "
-                        "policy.draft."
+                        "policy.megatron_cfg.context_parallel_size=1 and "
+                        "policy.megatron_cfg.dynamic_context_parallel=false, or "
+                        "disable policy.draft."
                     )
                 if (
                     # sequence_packing is NotRequired in PolicyConfig, so
@@ -321,6 +325,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
+            if config["megatron_cfg"].get("dynamic_context_parallel"):
+                # MCore's scheduler forms the packs and their order; these
+                # options steer the packer it replaces.
+                packing_cfg = config["sequence_packing"]
+                unsupported = [
+                    key
+                    for key in ("pair_grouping_key", "max_sequences_per_bin")
+                    if packing_cfg.get(key) is not None
+                ]
+                if packing_cfg.get("microbatch_order") == "largest_first":
+                    unsupported.append("microbatch_order=largest_first")
+                if unsupported:
+                    raise ValueError(
+                        "policy.megatron_cfg.dynamic_context_parallel=true does not "
+                        f"support policy.sequence_packing: {', '.join(unsupported)}."
+                    )
 
             env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
 
@@ -527,6 +547,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 self.sequence_packing_args["max_sequences_per_bin"] = (
                     max_sequences_per_bin
                 )
+            if megatron_enabled and config["megatron_cfg"].get(
+                "dynamic_context_parallel"
+            ):
+                # A GRPO step schedules the same batch for its logprob, reference
+                # logprob and training calls; the scheduler slows fast with rank count.
+                self.sequence_packing_args["dynamic_cp_schedule"] = lru_cache(
+                    maxsize=1
+                )(self._schedule_dynamic_cp)
             assert not config["dynamic_batching"]["enabled"], (
                 "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
             )
@@ -539,6 +567,30 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def data_parallel_size(self) -> int:
         """Data-parallel degree, read from the policy's sharding annotations."""
         return self.sharding_annotations.get_axis_size("data_parallel")
+
+    def _schedule_dynamic_cp(
+        self, seq_lengths: tuple[int, ...], max_tokens_per_rank: int
+    ) -> list[list[list[int]]]:
+        """Schedule one global batch for dynamic context parallelism.
+
+        A worker answers because the scheduler ships with Megatron-Core, which
+        the driver's environment does not install.
+
+        Args:
+            seq_lengths: Padded length of every sequence in the global batch.
+            max_tokens_per_rank: Token capacity of one rank per microbatch.
+
+        Returns:
+            Rounds holding one pack of sequence indices per data-parallel rank.
+        """
+        return ray.get(
+            self.worker_group.run_single_worker_single_data(
+                "schedule_dynamic_cp",
+                worker_idx=0,
+                seq_lengths=seq_lengths,
+                max_tokens_per_rank=max_tokens_per_rank,
+            )
+        )
 
     def run_all_workers_single_data(self, method_name: str, *args, **kwargs) -> Any:
         """Run a method on all workers in parallel with the same data.
@@ -1019,9 +1071,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()
-            for shard in sharded_data:
-                input_lengths = shard["input_lengths"]
-                self.flops_tracker.track_batch(input_lengths.tolist())
+            # Not the shards: dynamic CP replicates a pack on every rank of its group.
+            self.flops_tracker.track_batch(data["input_lengths"].tolist())
 
         # Train each shard in parallel
         with (

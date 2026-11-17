@@ -2649,6 +2649,286 @@ class TestMakeProcessedMicrobatchIterator:
         assert call_kwargs["mtp_enabled"] is True
 
 
+def _dynamic_cp_group(*, rank: int, size: int) -> MagicMock:
+    group = MagicMock()
+    group.rank.return_value = rank
+    group.size.return_value = size
+    return group
+
+
+@pytest.mark.mcore
+class TestDynamicContextParallel:
+    """Microbatches whose context-parallel group is chosen by the schedule."""
+
+    def test_process_microbatch_shards_over_the_scheduled_group(self):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        cp_group = _dynamic_cp_group(rank=1, size=2)
+        data_dict = BatchedDataDict(
+            {
+                "input_ids": torch.tensor(
+                    [[10, 11, 12, 13, 14, 0, 0, 0], [20, 21, 22, 0, 0, 0, 0, 0]]
+                ),
+                "input_lengths": torch.tensor([5, 3]),
+            }
+        )
+        with patch(
+            "nemo_rl.models.megatron.data.get_dynamic_data_context_parallel_groups",
+            return_value=cp_group,
+        ) as get_cp_group:
+            result = process_microbatch(
+                data_dict,
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=4,
+                pack_sequences=True,
+                dynamic_cp_size=2,
+            )
+
+        get_cp_group.assert_called_once_with(group_size=2)
+        # Rank 1 of 2 owns the two middle quarters of every padded sequence.
+        assert result.input_ids_cp_sharded.tolist() == [[12, 13, 14, 0, 21, 22]]
+        assert result.input_ids.tolist() == [
+            [10, 11, 12, 13, 14, 0, 0, 0, 20, 21, 22, 0]
+        ]
+        assert result.packed_seq_params.local_cp_size == 2
+        assert result.packed_seq_params.cp_group is cp_group
+        assert result.cu_seqlens_padded.tolist() == [0, 8, 12]
+
+    def test_router_padding_mask_is_sharded_over_the_scheduled_group(self):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        cp_group = _dynamic_cp_group(rank=1, size=2)
+        data_dict = BatchedDataDict(
+            {
+                "input_ids": torch.tensor(
+                    [[10, 11, 12, 13, 14, 0, 0, 0], [20, 21, 22, 0, 0, 0, 0, 0]]
+                ),
+                "input_lengths": torch.tensor([5, 3]),
+            }
+        )
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.get_dynamic_data_context_parallel_groups",
+                return_value=cp_group,
+            ),
+            patch(
+                "nemo_rl.models.megatron.data.get_packed_seq_cp_partition_indices",
+                # Rank 1 of 2: the middle quarters of the 8- and 4-token slots.
+                return_value=torch.tensor([2, 3, 4, 5, 9, 10]),
+            ) as partition_indices,
+        ):
+            result = process_microbatch(
+                data_dict,
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=4,
+                pack_sequences=True,
+                create_packed_seq_padding_mask=True,
+                dynamic_cp_size=2,
+            )
+
+        # Bridge would otherwise fall back to the static CP group of size 1.
+        assert partition_indices.call_args.kwargs["cp_group"] is cp_group
+        assert result.padding_mask.tolist() == [
+            [False, False, False, True, False, False]
+        ]
+
+    @patch("nemo_rl.models.megatron.data.process_microbatch")
+    def test_microbatches_are_padded_for_their_group_size(self, process_microbatch):
+        from nemo_rl.models.megatron.data import (
+            ProcessedInputs,
+            make_processed_microbatch_iterator,
+        )
+
+        process_microbatch.return_value = ProcessedInputs(
+            input_ids=torch.zeros(1, 8, dtype=torch.long),
+            input_ids_cp_sharded=torch.zeros(1, 8, dtype=torch.long),
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=MagicMock(),
+            cu_seqlens_padded=torch.tensor([0, 8]),
+        )
+        microbatches = [MagicMock(), MagicMock(), MagicMock()]
+        for microbatch in microbatches:
+            microbatch.__contains__.return_value = False
+            microbatch.to.return_value = microbatch
+
+        list(
+            make_processed_microbatch_iterator(
+                raw_iterator=iter(microbatches),
+                cfg={"sequence_packing": {"enabled": True}},
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=2,
+                pad_packed_seq_to_multiple_of=16,
+                straggler_timer=MagicMock(),
+                pad_full_seq_to=None,
+                dynamic_cp_sizes=[1, 2, 4],
+            )
+        )
+
+        assert [
+            (
+                call.kwargs["dynamic_cp_size"],
+                call.kwargs["pad_individual_seqs_to_multiple_of"],
+                call.kwargs["pad_packed_seq_to_multiple_of"],
+            )
+            for call in process_microbatch.call_args_list
+        ] == [(1, 2, 16), (2, 8, 64), (4, 16, 128)]
+
+    @pytest.mark.parametrize("prepacked", [False, True])
+    def test_microbatch_iterator_requires_the_driver_schedule(self, prepacked):
+        from nemo_rl.models.megatron.data import get_microbatch_iterator
+
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(1, 8, dtype=torch.long),
+                "input_lengths": torch.tensor([8]),
+            }
+        )
+        if prepacked:
+            boundaries = [torch.tensor([0, 8], dtype=torch.int32)]
+            data["cu_seqlens"] = boundaries
+            data["cu_seqlens_padded"] = boundaries
+            data.micro_batch_cp_sizes = [[1]]
+        cfg = {
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": True, "fuse_loss": True},
+            "megatron_cfg": {"dynamic_context_parallel": True},
+            "make_sequence_length_divisible_by": 1,
+        }
+
+        with pytest.raises(ValueError, match="carries no schedule"):
+            get_microbatch_iterator(data, cfg, mbs=1, straggler_timer=MagicMock())
+
+    def test_schedule_packs_within_the_capacity_of_every_group(self):
+        from nemo_rl.models.megatron.data import schedule_dynamic_cp
+
+        unit, capacity, lanes = 4, 64, 4
+        cfg = {
+            "make_sequence_length_divisible_by": unit,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": 1,
+            },
+        }
+        seq_lengths = [200, 100, 60, 44, 40, 32, 20, 12, 8, 8, 4, 4]
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.get_data_parallel_world_size",
+                return_value=lanes,
+            ),
+            patch(
+                "nemo_rl.models.megatron.data."
+                "get_dynamic_data_context_parallel_group_map",
+                return_value={1: MagicMock(), 2: MagicMock(), 4: MagicMock()},
+            ),
+        ):
+            rounds = schedule_dynamic_cp(seq_lengths, capacity, cfg)
+
+        cp_size_of = {}
+        for packs in rounds:
+            assert len(packs) == lanes
+            for lane, pack in enumerate(packs):
+                cp_size = packs.count(pack)
+                # MCore's runtime groups are aligned blocks of adjacent ranks.
+                first_lane = lane - lane % cp_size
+                assert packs[first_lane : first_lane + cp_size] == [pack] * cp_size
+                padded = [
+                    -(-seq_lengths[i] // (unit * 2 * cp_size)) * unit * 2 * cp_size
+                    if cp_size > 1
+                    else seq_lengths[i]
+                    for i in pack
+                ]
+                assert sum(padded) // cp_size <= capacity
+                for i in pack:
+                    assert cp_size_of.setdefault(i, (id(packs), cp_size)) == (
+                        id(packs),
+                        cp_size,
+                    )
+        assert sorted(cp_size_of) == list(range(len(seq_lengths)))
+        # 200 tokens exceed two ranks once padded to the CP-2 alignment of 16,
+        # and 100 tokens exceed one rank.
+        assert cp_size_of[0][1] == 4
+        assert cp_size_of[1][1] >= 2
+
+    def test_schedule_keeps_every_group_on_an_aligned_block_of_ranks(self):
+        from nemo_rl.models.megatron.data import schedule_dynamic_cp
+
+        lanes = 8
+        cfg = {
+            "make_sequence_length_divisible_by": 1,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": 1,
+            },
+        }
+        # MCore's scheduler alone returns the CP-2 pack [6, 8] on ranks 5 and 6,
+        # across the blocks {4, 5} and {6, 7} its groups of two are built from.
+        seq_lengths = [5, 1, 7, 7, 1, 4, 5, 1, 1]
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.get_data_parallel_world_size",
+                return_value=lanes,
+            ),
+            patch(
+                "nemo_rl.models.megatron.data."
+                "get_dynamic_data_context_parallel_group_map",
+                return_value={size: MagicMock() for size in (1, 2, 4, 8)},
+            ),
+        ):
+            (packs,) = schedule_dynamic_cp(seq_lengths, 8, cfg)
+
+        assert sorted(i for pack in set(map(tuple, packs)) for i in pack) == list(
+            range(len(seq_lengths))
+        )
+        for rank, pack in enumerate(packs):
+            cp_size = packs.count(pack)
+            first_rank = rank - rank % cp_size
+            assert packs[first_rank : first_rank + cp_size] == [pack] * cp_size
+
+    def test_global_counts_take_a_pack_from_one_rank_of_its_group(self):
+        from nemo_rl.models.megatron.data import process_global_batch
+
+        batch = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(3, 4, dtype=torch.long),
+                "sample_mask": torch.ones(3),
+                "token_mask": torch.tensor(
+                    [[0.0, 1.0, 1.0, 1.0], [0.0, 1.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+                ),
+            }
+        )
+        batch.micro_batch_indices = [[[0, 2], [2, 3]]]
+        batch.micro_batch_cp_sizes = [[2, 1]]
+        data = MagicMock()
+        data.get_batch.return_value = batch
+        groups = {
+            1: _dynamic_cp_group(rank=0, size=1),
+            2: _dynamic_cp_group(rank=1, size=2),
+        }
+        reduced = []
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.get_dynamic_data_context_parallel_groups",
+                side_effect=lambda group_size: groups[group_size],
+            ),
+            patch(
+                "torch.distributed.all_reduce",
+                side_effect=lambda tensor, group: reduced.append(tensor.tolist()),
+            ),
+        ):
+            process_global_batch(
+                data, MagicMock(spec=[]), MagicMock(), batch_idx=0, batch_size=3
+            )
+
+        # The CP-2 pack (rows 0 and 1) is counted by the group's other rank.
+        assert reduced == [[1.0, 1.0]]
+
+
 PACK_SEQUENCES_TEST_ACTOR_FQN = (
     f"{PackSequencesTestActor.__module__}.PackSequencesTestActor"
 )

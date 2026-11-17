@@ -1470,6 +1470,100 @@ def test_sequence_packing_rejects_oversized_preference_pair():
         batch.shard_by_batch_size(shards=2, sequence_packing_args=packing_args)
 
 
+def _dynamic_cp_packing_args(schedule) -> SequencePackingArgs:
+    return SequencePackingArgs(
+        max_tokens_per_microbatch=100,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=4,
+        dynamic_cp_schedule=schedule,
+    )
+
+
+def test_dynamic_cp_schedule_shards_packs_to_their_cp_groups():
+    """Shards sharing a pack hold the same rows and learn the CP group size."""
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(16).unsqueeze(1).repeat(1, 8),
+            "sequence_lengths": torch.tensor(
+                [7, 5, 3, 2, 1, 1, 1, 1, 6, 4, 2, 2, 1, 1, 1, 1]
+            ),
+        }
+    )
+    # One global batch of eight rows per call: a CP-2 pack next to two CP-1
+    # packs, then a round of the whole domain.
+    rounds = [[[0], [0], [1, 2], [3, 4]], [[5, 6, 7]] * 4]
+    calls = []
+
+    def schedule(
+        seq_lengths: tuple[int, ...], max_tokens: int
+    ) -> list[list[list[int]]]:
+        calls.append((seq_lengths, max_tokens))
+        return rounds
+
+    shards, sorted_indices = batch.shard_by_batch_size(
+        shards=4, batch_size=8, sequence_packing_args=_dynamic_cp_packing_args(schedule)
+    )
+
+    # The schedule sees every global batch's lengths padded to the alignment.
+    assert calls == [
+        ((8, 8, 4, 4, 4, 4, 4, 4), 100),
+        ((8, 4, 4, 4, 4, 4, 4, 4), 100),
+    ]
+    assert [shard.micro_batch_cp_sizes for shard in shards] == [
+        [[2, 4], [2, 4]],
+        [[2, 4], [2, 4]],
+        [[1, 4], [1, 4]],
+        [[1, 4], [1, 4]],
+    ]
+    expected_rows = [
+        [[0], [5, 6, 7], [8], [13, 14, 15]],
+        [[0], [5, 6, 7], [8], [13, 14, 15]],
+        [[1, 2], [5, 6, 7], [9, 10], [13, 14, 15]],
+        [[3, 4], [5, 6, 7], [11, 12], [13, 14, 15]],
+    ]
+    for shard, shard_rows in zip(shards, expected_rows, strict=True):
+        rows = []
+        for global_batch_idx in range(2):
+            global_batch = shard.get_batch(global_batch_idx)
+            assert global_batch.micro_batch_cp_sizes == [
+                shard.micro_batch_cp_sizes[global_batch_idx]
+            ]
+            rows.extend(
+                microbatch["input_ids"][:, 0].tolist()
+                for microbatch in (
+                    global_batch.make_microbatch_iterator_for_packable_sequences()
+                )
+            )
+        assert rows == shard_rows
+
+    # Rows replicated over a CP group come back once, in the original order.
+    gathered = BatchedDataDict.from_batches(shards)
+    assert gathered.size == 36
+    gathered.reorder_data(sorted_indices)
+    assert torch.equal(gathered["input_ids"], batch["input_ids"])
+
+
+def test_dynamic_cp_schedule_must_cover_every_shard():
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(2, 8, dtype=torch.long),
+            "sequence_lengths": torch.tensor([4, 4]),
+        }
+    )
+
+    # A round short of a shard, and a shard left without a pack.
+    for rounds in ([[[0, 1]]], [[[0, 1], []]]):
+        with pytest.raises(AssertionError, match="one non-empty pack per shard"):
+            batch.shard_by_batch_size(
+                shards=2,
+                sequence_packing_args=_dynamic_cp_packing_args(
+                    lambda seq_lengths, max_tokens: rounds
+                ),
+            )
+
+
 def test_truncate_tensors_narrows_opd_full_payloads_but_never_widens_them():
     """The teacher payload follows the microbatch seqlen, but only downwards.
 

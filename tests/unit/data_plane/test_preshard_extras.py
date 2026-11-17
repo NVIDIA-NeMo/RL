@@ -27,6 +27,7 @@ identity preserved across shards).
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
@@ -126,6 +127,17 @@ def test_shard_meta_for_dp_partitions_keys_disjointly():
     assert len(metas) == dp
     flat = [k for m in metas for k in m.sample_ids]
     assert sorted(flat) == sorted(_meta(n).sample_ids)  # same set, no dups, no minting
+
+
+def test_shard_meta_for_dp_rejects_dynamic_context_parallelism():
+    """A pack held by a whole CP group has no per-rank key list on the data plane."""
+    with pytest.raises(NotImplementedError, match="dynamic_context_parallel"):
+        shard_meta_for_dp(
+            _meta(4),
+            dp_world=2,
+            batch_size=4,
+            sequence_packing_args={"dynamic_cp_schedule": lambda lengths, tokens: []},
+        )
 
 
 def test_shard_meta_for_dp_preserves_partition_id():
