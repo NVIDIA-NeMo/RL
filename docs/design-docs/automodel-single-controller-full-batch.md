@@ -35,7 +35,7 @@ Model-specific examples inherit the same exemplar:
 
 | Recipe | Training resources | Rollout resources |
 | --- | --- | --- |
-| [Gemma4 E2B IT](../../examples/configs/recipes/llm/grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch.yaml) | 4 GPUs, EP=1 | 4 GPUs |
+| [Gemma4 E2B IT, lookahead one](../../examples/configs/recipes/llm/grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch-la1.yaml) | 4 GPUs, EP=1 | 4 GPUs |
 | [Qwen3.5-35B-A3B Base](../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-base-3n8g-automodel-ep16-single-controller-full-batch.yaml) | 16 GPUs, EP=16 with HybridEP | 8 GPUs, TP=8 |
 
 One rollout batch must supply exactly one global training batch:
@@ -52,7 +52,7 @@ The full-batch restriction describes the dispatch boundary, not the number of mo
 
 ### Enabling lookahead one
 
-The exemplar defaults to lookahead zero.
+The exemplar defaults to lookahead zero; the Gemma4 E2B recipe below ships with lookahead one.
 To overlap a future rollout batch with training while keeping one complete RL batch per optimizer update, apply these overrides to an AutoModel single-controller configuration:
 
 ```yaml
@@ -222,11 +222,14 @@ Each run uses four training and four rollout H100 GPUs, with EP=1.
 The figure uses the shared first 150 updates of the larger-batch comparison.
 Mean reward increases from 0.3653 in updates 1–50 for both paths to 0.4494 for V1 and 0.4452 for SC in updates 101–150.
 
-To reproduce the SC batch configuration with the Gemma4 recipe above, use:
+To reproduce the SC batch configuration with the Gemma4 recipe above, return it to lookahead zero and widen the batch:
 
 ```bash
 uv run examples/run_grpo_single_controller.py \
-  --config examples/configs/recipes/llm/grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch.yaml \
+  --config examples/configs/recipes/llm/grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch-la1.yaml \
+  async_rl.sampler.max_lookahead_versions=0 \
+  async_rl.max_inflight_prompts=32 \
+  async_rl.max_buffered_rollouts=32 \
   grpo.num_prompts_per_step=32 \
   grpo.num_generations_per_prompt=16 \
   grpo.max_num_steps=150
