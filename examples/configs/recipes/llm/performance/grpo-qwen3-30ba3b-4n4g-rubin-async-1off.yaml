@@ -7,3 +7,5 @@ logger:
     name: grpo-qwen3-30ba3b-4n4g-rubin-async-1off
 policy:
   logprob_batch_size: 16
+  megatron_cfg:
+    activation_checkpointing: false
