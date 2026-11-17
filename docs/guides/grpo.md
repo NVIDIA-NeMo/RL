@@ -608,6 +608,7 @@ For Megatron GRPO, enable `loss_fn.seq_logprob_error_in_loss` to apply the absol
 grpo:
   seq_logprob_error_threshold: 2.0
   skip_reference_policy_logprobs_calculation: true
+  masked_reward_policy: include
 loss_fn:
   seq_logprob_error_in_loss: true
   force_on_policy_ratio: true
@@ -615,7 +616,20 @@ loss_fn:
   reference_policy_kl_penalty: 0.0
 ```
 
-The default is `false`, retaining the existing pre-training check. This mode requires the `grpo` advantage estimator and one optimizer update per rollout batch (`force_on_policy_ratio`'s existing constraint). It supports synchronous and legacy asynchronous training, including synchronous data-plane training, sequence packing, and gradient accumulation, and SingleController GRPO without `token_capture.forest_training`. In every trainer, rows the loss rejects still vote in their group's advantage baseline, because the baseline is computed before the training forward. With `grpo.masked_reward_policy: exclude`, the separate-pass filter (used when this flag is off) drops those rows from the baseline instead, in every trainer, so turning this flag on changes which rows vote. SingleController PPO is also supported with `ppo.ppo_epochs: 1` (streaming or full-batch); the legacy PPO trainer rejects this mode. For PPO, the policy step writes its rejections into `sample_mask`, so the critic trains on the same rows as with the separate pass, and critic-warmup steps (`ppo.policy_training_start_step`) run the separate pass because the policy loss does not run then. Rejected rows still enter the `normalize_advantages` statistics, since those are computed before the training forward. Automodel, KL-in-reward, MTP, draft training, positive-example NLL, and distillation are not supported by this mode. A reference-model forward is still needed if reference KL is enabled; the example disables it. Existing recipes using MTP (such as the NeMo-Gym Nemotron recipes), distillation (`mopd`), or Automodel must first satisfy these constraints; setting the flag alone does not make them compatible.
+The default is `false`, retaining the existing pre-training check. This mode requires the `grpo` advantage estimator and one optimizer update per rollout batch (`force_on_policy_ratio`'s existing constraint). It supports synchronous and legacy asynchronous training, including synchronous data-plane training, sequence packing, and gradient accumulation, and SingleController GRPO without `token_capture.forest_training`.
+
+Setup rejects combinations that would change surviving samples' advantage statistics when filtering moves into the loss:
+
+| Algorithm | Required with `loss_fn.seq_logprob_error_in_loss: true` | To retain the other setting |
+|---|---|---|
+| GRPO, any supported trainer | `grpo.masked_reward_policy: include` | Set `seq_logprob_error_in_loss: false` to use `exclude`. |
+| SingleController PPO | `ppo.adv_estimator.normalize_advantages: false` and `ppo.ppo_epochs: 1` | Set `seq_logprob_error_in_loss: false` to normalize advantages over the filtered batch. |
+
+GRPO computes its baseline before the training forward. Under `include`, rejected rows intentionally still contribute their rewards; under `exclude`, the rejected rows must be known before computing that baseline. PPO uses GAE rather than GRPO's reward-participation setting: its optional normalization needs the final response-token mask, so late rejection is incompatible with normalization even for full-batch execution. Disabling in-loss filtering keeps the threshold enabled and restores the separate policy-logprob pass.
+
+SingleController PPO supports in-loss filtering with streaming or full-batch execution when the table's requirements hold; the legacy PPO trainer rejects this mode. The policy step writes its rejections into `sample_mask`, so the critic trains on the same rows as with the separate pass. Critic-warmup steps (`ppo.policy_training_start_step`) run the separate pass because the policy loss does not run then. Automodel, KL-in-reward, MTP, draft training, positive-example NLL, and distillation are not supported by this mode. A reference-model forward is still needed if reference KL is enabled; the example disables it. Existing recipes using MTP, distillation (`mopd`), or Automodel must first satisfy these constraints.
+
+Environment rejection, overlong filtering, zero dataset weights and empty responses are known before advantage calculation. They do not require an additional restriction. Importance-sampling rejection (`seq-mask-tis`, ICEPOP and adaptive clipping) and policy-support filtering remain loss-local in both modes; they do not retroactively remove rewards from advantage statistics. `masked_reward_policy: exclude` therefore refers to masks available before advantage calculation, not every token later assigned zero actor loss.
 
 The [Qwen2.5-Math-1.5B single-forward recipe](../../examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-forward.yaml) provides a complete configuration for one node with eight GPUs. The comparison below used two GB300 nodes with four GPUs each, with overrides `cluster.num_nodes=2 cluster.gpus_per_node=4 cluster.segment_size=2`. The reported step times therefore do not describe the recipe's default topology and also depend on the benchmark hardware and runtime.
 

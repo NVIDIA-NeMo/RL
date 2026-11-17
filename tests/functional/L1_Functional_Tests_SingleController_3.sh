@@ -34,6 +34,8 @@ run_test() {
     fi
 }
 
+# Two-phase SimpleStorage capture on real Ray/ZMQ actors (CPU only).
+run_test fast uv run --no-sync bash ./tests/functional/data_plane_simple_checkpoint_cpu.sh
 # Native TQ + metadata-only completed replay recovery (#3480).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh
 # Same recovery flow with Mooncake CPU storage and SSD offload on; skips
