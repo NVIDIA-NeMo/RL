@@ -252,7 +252,9 @@ def test_nemo_gym_url_uses_stable_router():
 
 
 @pytest.mark.timeout(30)
-def test_pickle_copy_preserves_driver_placement_group(monkeypatch):
+def test_pickle_copy_preserves_driver_placement_group(
+    monkeypatch: pytest.MonkeyPatch, ray_cluster: None
+) -> None:
     cluster = RayVirtualCluster(
         bundle_ct_per_node_list=[1], use_gpus=False, num_gpus_per_node=0
     )
