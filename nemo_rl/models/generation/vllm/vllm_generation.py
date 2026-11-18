@@ -43,7 +43,11 @@ from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_
 from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
-from nemo_rl.models.generation.dynamo.config import dynamo_cfg, dynamo_enabled
+from nemo_rl.models.generation.dynamo.config import (
+    dynamo_cfg,
+    dynamo_enabled,
+    trace_export_env,
+)
 from nemo_rl.models.generation.fleet_health import (
     GenerationFleetHealth,
     HealthyShardSelector,
@@ -461,9 +465,10 @@ class VllmGeneration(GenerationInterface):
         if draft_module_sharing_disable_required(self.cfg):
             env_vars[DRAFT_DISABLE_MODULE_SHARING_ENV] = "1"
         if dynamo_enabled(self.cfg):
-            # dynamo._core fixes its log format when the engine first imports it,
-            # before engine_env is applied, so it must be in the actor's env.
+            # dynamo._core fixes its log format and its trace context when the engine
+            # first imports it, before engine_env is applied: both go in the actor's env.
             env_vars["DYN_SDK_DISABLE_ANSI_LOGGING"] = "1"
+            env_vars.update(trace_export_env())
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:

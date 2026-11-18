@@ -20,9 +20,15 @@ carries its default. NeMo-Gym's chat calls are rendered and parsed with the
 native server's own settings (``vllm_cfg.http_server_serving_chat_kwargs``).
 """
 
+import os
 from typing import Annotated, Any, Literal, Mapping
 
 from pydantic import BaseModel, Field, PositiveFloat, PositiveInt, model_validator
+
+from nemo_rl.telemetry.setup import (
+    telemetry_enabled_in_env,
+    vllm_native_tracing_requested,
+)
 
 
 class DynamoFrontendArgs(BaseModel, extra="forbid"):
@@ -102,3 +108,23 @@ def dynamo_enabled(generation_config: Mapping[str, Any]) -> bool:
 def dynamo_cfg(generation_config: Mapping[str, Any]) -> DynamoCfg:
     """The validated ``dynamo_cfg`` block; an absent block means all defaults."""
     return DynamoCfg.model_validate(generation_config.get("dynamo_cfg") or {})
+
+
+def trace_export_env() -> dict[str, str]:
+    """Dynamo's trace-context switch, on when the engines trace natively.
+
+    Dynamo carries a call's trace context from the frontend to the engine only
+    while its OTLP export is on, and reads the switch when a process first loads
+    it, so the frontends and the vLLM workers need it in their environment from
+    the start. The condition is the one that turns on vLLM's own tracing
+    (``_maybe_enable_vllm_native_tracing``), so the engine has a tracer for the
+    trace headers it is handed. Dynamo reads the collector from the same
+    ``OTEL_EXPORTER_OTLP_*`` variables.
+    """
+    endpoint = (
+        os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+        or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    )
+    if telemetry_enabled_in_env() and vllm_native_tracing_requested() and endpoint:
+        return {"OTEL_EXPORT_ENABLED": "1"}
+    return {}

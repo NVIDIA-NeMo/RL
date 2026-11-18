@@ -79,11 +79,17 @@ IMAGE_TOKEN, IMAGE_TOKENS = 91, 3
 
 
 class _Context:
+    def __init__(self, trace_headers: dict[str, str] | None = None) -> None:
+        self._trace_headers = trace_headers
+
     def id(self) -> str:
         return "request-0"
 
     def is_stopped(self) -> bool:
         return False
+
+    def trace_headers(self) -> dict[str, str] | None:
+        return self._trace_headers
 
 
 def _logprob(value: float, rank: int = 1):
@@ -542,7 +548,11 @@ def test_gym_calls_generate_with_the_native_servers_sampling_params(
     )
     assert params.output_kind == vllm.sampling_params.RequestOutputKind.FINAL_ONLY
     # What vLLM's chat serving hands the engine besides the prompt.
-    assert kwargs == {"reasoning_ended": False, "reasoning_parser_kwargs": reasoning}
+    assert kwargs == {
+        "reasoning_ended": False,
+        "reasoning_parser_kwargs": reasoning,
+        "trace_headers": None,
+    }
     # The output the frontend builds the reply from, and the call's result.
     assert chunk["engine_data"] == {
         "output": {
@@ -559,6 +569,18 @@ def test_gym_calls_generate_with_the_native_servers_sampling_params(
         },
     }
     assert chunk["completion_usage"]["prompt_tokens"] == 3
+
+
+def test_a_gym_call_that_carries_a_trace_hands_it_to_vllm() -> None:
+    llm = _FakeLLM([_output([1, 3, 4], _completion([10, 11], "stop"))])
+    engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
+    trace = {"traceparent": f"00-{'ab' * 16}-{'cd' * 8}-01"}
+
+    _collect(engine, _gym_call([1, 3, 4]), _Context(trace_headers=trace))
+
+    ((_, _, _, kwargs),) = llm.calls
+    # vLLM starts its span under the caller's trace, as on the native path.
+    assert kwargs["trace_headers"] == trace
 
 
 def test_an_uncaptured_gym_call_carries_its_routes() -> None:

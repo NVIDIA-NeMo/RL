@@ -46,7 +46,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
-from nemo_rl.models.generation.dynamo.config import DynamoCfg
+from nemo_rl.models.generation.dynamo.config import DynamoCfg, trace_export_env
 
 # The engines register on this component and endpoint (see engine_adapter).
 DYNAMO_COMPONENT = "backend"
@@ -157,7 +157,7 @@ _KV_EVENTS_APPLIED = re.compile(
 
 
 # The frontend's own gauges, one sample per model: calls that wait for their first
-# token, and calls in flight.
+# response, and calls in flight.
 _FRONTEND_LOAD = re.compile(
     r"^(?P<name>dynamo_frontend_(?:queued|inflight)_requests)(?:\{[^}]*\})?"
     r"\s+(?P<value>\S+)$",
@@ -284,6 +284,35 @@ def read_chat_settings(path: str) -> dict[str, Any] | None:
         return json.load(settings_file)
 
 
+# Launches of one frontend: a launch is repeated when another process took the port.
+_FRONTEND_LAUNCHES = 3
+
+
+def _answers_health(port: int) -> bool:
+    """Whether an HTTP server on this node's ``port`` answers ``/health``."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2):
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return False
+
+
+def _frontend_answers(process: _ServiceProcess, port: int, deadline: float) -> bool:
+    """Wait for a launched frontend: True once it answers, False if it exited."""
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return False
+        # Whichever process holds the port answers, so ours must still run.
+        if _answers_health(port) and process.poll() is None:
+            return True
+        time.sleep(0.2)
+    raise RuntimeError(
+        f"The Dynamo frontend did not answer on port {port} within its startup timeout."
+    )
+
+
 class FrontendHost:
     """One frontend on the node a Ray actor (``_FrontendHostActor``) runs on.
 
@@ -311,34 +340,57 @@ class FrontendHost:
         """Launch the frontend on a free port of this node; return its base URL.
 
         ``port_range`` is this frontend's slice ``[low, high)`` of Dynamo's port band.
+        The port is free when it is picked, not held until the frontend binds it:
+        a frontend that exits before it answers lost the port to another process,
+        and is launched again on another one.
         """
-        port = _get_free_port_local(*port_range, max_retries=None)
-        self._chat_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_chat_")
-        capture_file = os.path.join(self._chat_dir, "capture.pkl")
-        argv = frontend_argv(
-            host="0.0.0.0",
-            port=port,
-            namespace=namespace,
-            dynamo_cfg=dynamo_cfg,
-            chat_options=ChatProcessorOptions(
-                render_workers=dynamo_cfg.frontend_args.render_workers,
-                ray_address=ray_address,
-                capture_file=capture_file,
-                chat_settings_file=(
-                    os.path.join(self._chat_dir, "chat_settings.json")
-                    if serves_chat
-                    else None
-                ),
-            ),
-        )
-        command = [frontend_python, "-m", "dynamo.frontend", *argv]
-        print(f"  [Dynamo] launching frontend argv={command!r}", flush=True)
+        chat_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_chat_")
+        self._chat_dir = chat_dir
+        capture_file = os.path.join(chat_dir, "capture.pkl")
         frontend_env = _service_env(env)
         frontend_env[CAPTURE_FILE_ENV] = capture_file
-        self._process = _ServiceProcess(command, env=frontend_env, label="frontend")
-        host = _get_node_ip_local()
-        host = f"[{host}]" if ":" in host else host
-        return f"http://{host}:{port}/v1"
+        deadline = time.monotonic() + dynamo_cfg.startup_timeout_s
+        tried: set[int] = set()
+        for _ in range(_FRONTEND_LAUNCHES):
+            port = _get_free_port_local(
+                *port_range, max_retries=None, excluded_ports=tried
+            )
+            tried.add(port)
+            argv = frontend_argv(
+                host="0.0.0.0",
+                port=port,
+                namespace=namespace,
+                dynamo_cfg=dynamo_cfg,
+                chat_options=ChatProcessorOptions(
+                    render_workers=dynamo_cfg.frontend_args.render_workers,
+                    ray_address=ray_address,
+                    capture_file=capture_file,
+                    chat_settings_file=(
+                        os.path.join(chat_dir, "chat_settings.json")
+                        if serves_chat
+                        else None
+                    ),
+                ),
+            )
+            command = [frontend_python, "-m", "dynamo.frontend", *argv]
+            print(f"  [Dynamo] launching frontend argv={command!r}", flush=True)
+            process = _ServiceProcess(command, env=frontend_env, label="frontend")
+            self._process = process
+            if _frontend_answers(process, port, deadline):
+                host = _get_node_ip_local()
+                host = f"[{host}]" if ":" in host else host
+                return f"http://{host}:{port}/v1"
+            print(
+                f"  [Dynamo] frontend exited with code {process.returncode} "
+                f"before it answered on port {port}",
+                flush=True,
+            )
+            process.stop()
+            self._process = None
+        raise RuntimeError(
+            "The Dynamo frontend exited before it answered on each of the ports "
+            f"{sorted(tried)}."
+        )
 
     def publish_chat_capture(self, capture: dict[str, Any]) -> None:
         """Write the token-capture config this frontend's chat engine reads."""
@@ -493,6 +545,7 @@ class ManagedDynamoRuntime:
             # is the Ray actor's, as for every other vLLM worker.
             "DYN_HEALTH_CHECK_ENABLED": "false",
             "DYN_SDK_DISABLE_ANSI_LOGGING": "1",
+            **trace_export_env(),
         }
         print(
             f"  [Dynamo] managed environment={self._manager_env!r}",
@@ -630,6 +683,8 @@ class ManagedDynamoRuntime:
                 for index, host in enumerate(self._frontend_hosts)
             ]
         )
+        # The telemetry names a frontend by its place in this list.
+        print(f"  [Dynamo] frontends, by index: {self._frontend_urls}", flush=True)
 
     def publish_chat_capture(
         self,

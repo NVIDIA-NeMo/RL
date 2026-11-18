@@ -23,6 +23,7 @@ from nemo_rl.models.generation.dynamo.config import (
     DynamoCfg,
     DynamoFrontendArgs,
     dynamo_cfg,
+    trace_export_env,
 )
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     ChatProcessorOptions,
@@ -232,3 +233,21 @@ def test_dynamos_parser_accepts_the_frontend_arguments_for_every_router_mode() -
         text=True,
     )
     assert parsed.returncode == 0, parsed.stderr[-400:]
+
+
+def test_dynamo_carries_trace_context_only_when_the_engines_trace_natively(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4317")
+    monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "true")
+    monkeypatch.setenv("NEMO_RL_OTEL_VLLM_NATIVE_TRACING", "false")
+    assert trace_export_env() == {}
+
+    # vLLM's own tracing is on: the frontends and engines carry the trace to it.
+    monkeypatch.setenv("NEMO_RL_OTEL_VLLM_NATIVE_TRACING", "true")
+    assert trace_export_env() == {"OTEL_EXPORT_ENABLED": "1"}
+
+    # vLLM skips its tracing without a collector, so there is nothing to join.
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+    assert trace_export_env() == {}

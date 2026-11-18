@@ -2624,6 +2624,9 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["vllm_kv_cache_usage_mean"] == pytest.approx(0.6)
         assert logged["dynamo_frontend_requests_queued"] == 7
         assert logged["dynamo_frontend_requests_inflight"] == 10
+        # Each frontend's own counts show which one the calls pile up in.
+        assert logged["dynamo_frontend_0_requests_queued"] == 5
+        assert logged["dynamo_frontend_1_requests_inflight"] == 1
         assert logged["group_completion_seconds_p50"] == pytest.approx(2.0)
         assert logged["group_completion_seconds_p95"] == pytest.approx(4.0)
         assert logged["group_queue_wait_seconds_p95"] == pytest.approx(3.0)

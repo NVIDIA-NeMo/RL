@@ -468,6 +468,9 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
             context.id(),
             reasoning_ended=wire["reasoning_ended"],
             reasoning_parser_kwargs=wire["reasoning_parser_kwargs"],
+            # As the native server does with the call's traceparent, so vLLM's
+            # span joins the caller's trace.
+            trace_headers=context.trace_headers(),
         ):
             # Recorded before asking for the next output, which releases
             # vLLM's finished state for this request.

@@ -48,13 +48,15 @@ def _runtime(serves_chat: bool = False, **frontend_args) -> ManagedDynamoRuntime
 
 
 class _FakeProcess:
-    @staticmethod
-    def poll():
-        return None
+    def __init__(self, returncode: int | None = None) -> None:
+        self.returncode = returncode
+        self.stopped = False
 
-    @staticmethod
-    def stop():
-        return None
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def stop(self) -> None:
+        self.stopped = True
 
 
 class _Remote:
@@ -478,6 +480,7 @@ def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
     monkeypatch.setattr(
         managed_runtime, "_get_free_port_local", lambda low, high, **kwargs: 3000
     )
+    monkeypatch.setattr(managed_runtime, "_answers_health", lambda port: True)
     monkeypatch.setattr(managed_runtime, "_get_node_ip_local", lambda: "10.0.0.2")
     monkeypatch.setattr(managed_runtime.tempfile, "tempdir", str(tmp_path))
     monkeypatch.setenv("DYN_STALE_SETTING", "remove-me")
@@ -535,6 +538,48 @@ def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
         assert managed_runtime.read_chat_settings(chat_options.chat_settings_file) == {
             "nemo_rl_chat": {"engine_args": {}}
         }
+
+
+def test_a_frontend_that_loses_its_port_is_launched_on_another(
+    monkeypatch, tmp_path
+) -> None:
+    launched: list[_FakeProcess] = []
+    excluded: list[set[int]] = []
+    ports = iter([1320, 1330])
+
+    def launch(command, *, env, label):
+        # Dynamo exits when another process took the port it was told to bind.
+        port = command[command.index("--http-port") + 1]
+        launched.append(_FakeProcess(returncode=1 if port == "1320" else None))
+        return launched[-1]
+
+    def free_port(low, high, *, max_retries, excluded_ports):
+        excluded.append(set(excluded_ports))
+        return next(ports)
+
+    monkeypatch.setattr(managed_runtime, "_ServiceProcess", launch)
+    monkeypatch.setattr(managed_runtime, "_get_free_port_local", free_port)
+    monkeypatch.setattr(managed_runtime, "_answers_health", lambda port: port == 1330)
+    monkeypatch.setattr(managed_runtime, "_get_node_ip_local", lambda: "10.0.0.2")
+    monkeypatch.setattr(managed_runtime.tempfile, "tempdir", str(tmp_path))
+    host = FrontendHost()
+
+    base_url = host.start(
+        frontend_python="/venvs/vllm/bin/python",
+        namespace="nemo-rl-test",
+        dynamo_cfg=DynamoCfg(),
+        env={},
+        ray_address="10.0.0.1:6379",
+        serves_chat=False,
+        port_range=(1313, 1400),
+    )
+
+    assert base_url == "http://10.0.0.2:1330/v1"
+    # The second pick leaves out the port the first launch lost.
+    assert excluded == [set(), {1320}]
+    first, second = launched
+    assert first.stopped and not second.stopped
+    assert host.returncode() is None
 
 
 def test_shutdown_logs_the_kv_events_the_router_applied(

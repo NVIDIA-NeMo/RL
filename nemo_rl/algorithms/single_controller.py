@@ -4695,6 +4695,8 @@ class SingleControllerActor:
                 metrics[f"dynamo_frontend_requests_{state}"] = sum(
                     frontend_calls.values()
                 )
+            for frontend, calls in frontend_calls.items():
+                metrics[f"dynamo_frontend_{frontend}_requests_{state}"] = calls
         if generated_tokens is not None:
             metrics["generation_output_tokens"] = float(generated_tokens)
 

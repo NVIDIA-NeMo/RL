@@ -504,6 +504,9 @@ class _Context:
     def is_stopped(self) -> bool:
         return self._stopped
 
+    def trace_headers(self) -> None:
+        return None
+
     def set_response_header(self, name: str, value: str) -> bool:
         self.response_headers[name] = value
         return True
