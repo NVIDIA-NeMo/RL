@@ -35,6 +35,10 @@ from nemo_rl.models.megatron.draft.hidden_capture import (  # noqa: E402
     get_capture_context,
     get_eagle3_aux_hidden_state_layers,
 )
+from nemo_rl.models.megatron.draft.utils import (  # noqa: E402
+    resolve_draft_aux_layer_ids,
+)
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig  # noqa: E402
 
 requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA (parallel_state init)"
@@ -95,3 +99,31 @@ def test_capture_hooks_follow_configured_aux_layers(tmp_path):
         parallel_state.destroy_model_parallel()
         if created_process_group and dist.is_initialized():
             dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    ("model_name", "checkpoint_config", "aux_layer_indices", "expected"),
+    [
+        # The checkpoint's ids win over policy.draft.aux_layer_indices.
+        ("draft", {"eagle_aux_hidden_state_layer_ids": [1, 5, 9]}, [2, 4], (1, 5, 9)),
+        # Without a checkpoint, the configured ids.
+        (None, None, [2, 4], (2, 4)),
+        # A checkpoint without ids falls back to modelopt's defaults...
+        ("draft", {}, None, tuple(get_eagle3_aux_hidden_state_layers(28))),
+        # ...unless it disables aux hidden states.
+        ("draft", {"use_aux_hidden_state": False}, None, ()),
+    ],
+)
+def test_resolve_draft_aux_layer_ids(
+    monkeypatch, model_name, checkpoint_config, aux_layer_indices, expected
+):
+    def from_pretrained(name):
+        assert name == model_name
+        return types.SimpleNamespace(to_dict=lambda: checkpoint_config)
+
+    monkeypatch.setattr("transformers.AutoConfig.from_pretrained", from_pretrained)
+    draft_config = Eagle3DraftConfig(
+        enabled=True, model_name=model_name, aux_layer_indices=aux_layer_indices
+    )
+
+    assert resolve_draft_aux_layer_ids(draft_config, num_layers=28) == expected

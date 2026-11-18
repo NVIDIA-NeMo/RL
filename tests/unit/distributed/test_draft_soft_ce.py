@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.loss.draft import streaming_vocab_parallel_soft_ce
+from nemo_rl.algorithms.loss.utils import map_teacher_logits_to_draft_vocab
 
 
 def _run_tp2_soft_ce(
@@ -111,3 +112,43 @@ def test_tp2_streaming_soft_ce_forward_and_backward(
         partial(_run_tp2_soft_ce, token_chunk_size=token_chunk_size),
         world_size=2,
     )
+
+
+def _run_tp2_d2t_gather(rank: int, world_size: int) -> None:
+    tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
+    batch_size, sequence_length, vocab_size = 2, 5, 16
+    local_vocab_size = vocab_size // world_size
+    generator = torch.Generator(device="cuda").manual_seed(1357)
+    full_teacher = torch.randn(
+        batch_size, sequence_length, vocab_size, generator=generator, device="cuda"
+    )
+    # Draft ids map into both vocab shards.
+    target_ids = torch.tensor([0, 3, 7, 8, 12, 15], device="cuda")
+    d2t = target_ids - torch.arange(len(target_ids), device="cuda")
+    local_draft_size = len(target_ids) // world_size
+    local_target_ids = target_ids[
+        rank * local_draft_size : (rank + 1) * local_draft_size
+    ]
+    local_teacher = full_teacher[
+        ..., rank * local_vocab_size : (rank + 1) * local_vocab_size
+    ]
+
+    # 10 tokens: unchunked, uneven tiles of 3, and a single oversized tile.
+    for token_chunk_size in (None, 3, 100):
+        draft_teacher = map_teacher_logits_to_draft_vocab(
+            local_teacher,
+            d2t,
+            vocab_parallel_rank=rank,
+            vocab_parallel_group=tp_group,
+            token_chunk_size=token_chunk_size,
+        )
+        torch.testing.assert_close(
+            draft_teacher, full_teacher[..., local_target_ids], rtol=0, atol=0
+        )
+
+
+@pytest.mark.mcore
+def test_tp2_chunked_d2t_gather_matches_full_vocab_slice(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(_run_tp2_d2t_gather, world_size=2)
