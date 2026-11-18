@@ -50,6 +50,23 @@ def adaptive_ppo_clip_kept_mask(
     )
 
 
+def _masked_extreme(
+    values: torch.Tensor, valid_mask: torch.Tensor, *, largest: bool
+) -> torch.Tensor:
+    """Max (or min) of the valid entries; -inf (or +inf) when there are none.
+
+    A microbatch can hold no tokens at all: a failed rollout is published as an
+    empty placeholder row, and a rank may receive only that row. torch's min()
+    and max() reject an empty tensor, so return the same sentinel a fully
+    masked microbatch already yields.
+    """
+    fill = float("-inf") if largest else float("inf")
+    if values.numel() == 0:
+        return values.new_full((), fill)
+    filled = torch.where(valid_mask, values, values.new_full((), fill))
+    return filled.max() if largest else filled.min()
+
+
 @torch.no_grad()
 def clipped_pg_diagnostic_metrics(
     *,
@@ -106,8 +123,6 @@ def clipped_pg_diagnostic_metrics(
     )
 
     valid_mask = mask.bool()
-    inf = torch.full_like(ratios, float("inf"))
-    neg_inf = torch.full_like(ratios, float("-inf"))
     return {
         "probs_ratio": masked_mean(
             ratios, mask, global_normalization_factor=global_valid_toks
@@ -115,12 +130,14 @@ def clipped_pg_diagnostic_metrics(
         "probs_ratio_clamped": masked_mean(
             ratios_clamped, mask, global_normalization_factor=global_valid_toks
         ),
-        "probs_ratio_min": torch.where(valid_mask, ratios, inf).min(),
-        "probs_ratio_max": torch.where(valid_mask, ratios, neg_inf).max(),
-        "probs_ratio_clamped_min": torch.where(valid_mask, ratios_clamped, inf).min(),
-        "probs_ratio_clamped_max": torch.where(
-            valid_mask, ratios_clamped, neg_inf
-        ).max(),
+        "probs_ratio_min": _masked_extreme(ratios, valid_mask, largest=False),
+        "probs_ratio_max": _masked_extreme(ratios, valid_mask, largest=True),
+        "probs_ratio_clamped_min": _masked_extreme(
+            ratios_clamped, valid_mask, largest=False
+        ),
+        "probs_ratio_clamped_max": _masked_extreme(
+            ratios_clamped, valid_mask, largest=True
+        ),
         "gen_kl_error": gen_kl_error,
         "policy_kl_error": policy_kl_error,
         "js_divergence_error": js_divergence_error,
