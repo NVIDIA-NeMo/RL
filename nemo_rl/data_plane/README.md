@@ -786,9 +786,10 @@ Use the capture as a context manager, or always call `release()` in `finally`.
 `persist()` is single-attempt, including after a partial failure. Reusing the
 handle raises a clear error; release it, discard the failed directory, and
 capture again. Exclusive file creation remains an overwrite guard.
-`persist(metadata)` adds fields computed after capture, such as the hash of
-state serialized once traffic resumes, to the capture's metadata. It rejects a
-key given at capture before writing anything.
+`persist(extra_metadata=...)` adds fields computed after capture, such as the
+hash of state serialized once traffic resumes, to the capture's metadata. It
+rejects a key given at capture, or a value JSON cannot record, before writing
+anything.
 
 ```python
 capture = client.capture_checkpoint(checkpoint_dir, metadata=metadata)

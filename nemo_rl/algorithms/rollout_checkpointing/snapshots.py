@@ -165,7 +165,7 @@ class SnapshotCapture:
         if self.data_plane is None:
             raise RuntimeError("only a retained data-plane view persists later")
         state = self.state
-        metadata = None
+        extra_metadata = None
         if self.recovery_state is not None:
             started = time.monotonic()
             payload, digest = await asyncio.to_thread(
@@ -176,10 +176,12 @@ class SnapshotCapture:
                 rollout_recovery_payload=payload,
                 recovery_state_serialize_seconds=time.monotonic() - started,
             )
-            metadata = _rollout_recovery_metadata(
+            extra_metadata = _rollout_recovery_metadata(
                 digest, state.rollout_recovery_group_count
             )
-        await checkpoint_io(partial(self.data_plane.persist, metadata))
+        await checkpoint_io(
+            partial(self.data_plane.persist, extra_metadata=extra_metadata)
+        )
         return state
 
 

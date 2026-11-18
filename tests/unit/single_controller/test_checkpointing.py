@@ -2011,7 +2011,7 @@ class TestPeriodicRolloutCheckpoint:
             yield _FakeEnvironmentSnapshot()
 
         class Capture(CheckpointCapture):
-            def persist(self, metadata=None) -> None:
+            def persist(self, *, extra_metadata=None) -> None:
                 events.append("persist")
                 raise TimeoutError("persistence is still running")
 
@@ -2060,7 +2060,7 @@ class TestPeriodicRolloutCheckpoint:
                 raise OSError("resume failed")
 
         class Capture(CheckpointCapture):
-            def persist(self, metadata=None) -> None:
+            def persist(self, *, extra_metadata=None) -> None:
                 assert events == ["pause", "capture", "resume"]
                 with pytest.raises(RuntimeError):
                     environment_snapshot.checked_cuts[0].require_live()
@@ -2135,9 +2135,9 @@ class TestPeriodicRolloutCheckpoint:
         )
 
         class Capture(CheckpointCapture):
-            def persist(self, metadata=None) -> None:
+            def persist(self, *, extra_metadata=None) -> None:
                 events.append("persist")
-                persisted_metadata.append(metadata)
+                persisted_metadata.append(extra_metadata)
 
             def release(self) -> None:
                 events.append("release")
@@ -3668,7 +3668,7 @@ class TestDataPlaneCheckpoint:
         actor._rollout_snapshots.capture = capture
 
         class Capture(CheckpointCapture):
-            def persist(self, metadata=None) -> None:
+            def persist(self, *, extra_metadata=None) -> None:
                 with pytest.raises(RuntimeError):
                     cuts[0].require_live()
                 events.append("persist")

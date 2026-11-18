@@ -57,12 +57,13 @@ class CheckpointCapture(ABC):
         self.release()
 
     @abstractmethod
-    def persist(self, metadata: Mapping[str, Any] | None = None) -> None:
+    def persist(self, *, extra_metadata: Mapping[str, Any] | None = None) -> None:
         """Write the captured view, without reading mutable live state.
 
         Args:
-            metadata: Fields computed after capture, added to the metadata given
-                at capture. A key given at capture cannot be replaced.
+            extra_metadata: Metadata known only after capture, such as the digest
+                of state serialized once the barrier opened. It is added to the
+                capture's metadata and must not repeat any of its keys.
         """
 
     @abstractmethod
