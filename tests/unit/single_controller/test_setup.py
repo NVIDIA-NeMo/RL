@@ -2988,6 +2988,108 @@ class TestSetup:
             is expected
         )
 
+    @pytest.mark.parametrize("with_teachers", [False, True])
+    def test_teachers_move_the_communicator_from_the_builds_to_the_tail(
+        self, patched_factories, capsys, with_teachers: bool
+    ):
+        """The real predicate decides where the rendezvous runs: OPD teachers keep it
+        out of the builds, whose teacher LM-head collectives it must not interleave
+        with. Started early, it runs on a daemon thread and is reported apart from
+        the tail lanes it does not belong to."""
+        mc = self._setup_tail_config(patched_factories)
+        teacher_patches: list[Any] = []
+        if with_teachers:
+            mc.grpo.adv_estimator = AdvEstimatorConfig(name="opd")
+            mc.on_policy_distillation = OnPolicyDistillationConfig(
+                enabled=True,
+                teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+                default_teacher_alias="teacher",
+                non_colocated_teachers={"enabled": True},
+            )
+            teacher_patches = [
+                patch.object(
+                    sc_setup_mod.opd_module,
+                    "reserve_teacher_clusters",
+                    return_value={"teacher": MagicMock()},
+                ),
+                patch.object(
+                    sc_setup_mod.opd_module,
+                    "create_teacher_worker_groups",
+                    return_value=({"teacher": MagicMock()}, {"teacher": "teacher"}),
+                ),
+            ]
+        communicator_threads: list[threading.Thread] = []
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = lambda: communicator_threads.append(
+            threading.current_thread()
+        )
+
+        with contextlib.ExitStack() as stack:
+            for teacher_patch in teacher_patches:
+                stack.enter_context(teacher_patch)
+            stack.enter_context(
+                patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(
+                    sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+                )
+            )
+            stack.enter_context(
+                patch.object(sc_setup_mod, "validate_dataset_agent_coverage")
+            )
+            stack.enter_context(
+                patch.object(sc_setup_mod, "router_replay_enabled", return_value=False)
+            )
+            stack.enter_context(patch.object(sc_setup_mod, "AdvantageStageConfig"))
+            stack.enter_context(
+                patch(
+                    "nemo_rl.experience.rollout_reassembler_actor."
+                    "create_rollout_reassembler_actors",
+                    return_value=[MagicMock()],
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.advantage_actor.create_advantage_actors",
+                    return_value=[MagicMock()],
+                )
+            )
+            setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+        (thread,) = communicator_threads
+        tail_line = next(
+            line
+            for line in capsys.readouterr().out.splitlines()
+            if "Setup tail:" in line
+        )
+        if with_teachers:
+            assert thread.name.startswith("setup-tail")
+            assert "refit communicator" in tail_line
+        else:
+            assert thread.name == "refit-communicator"
+            assert thread.daemon
+            assert "refit communicator" not in tail_line
+
+    def test_start_on_daemon_thread_returns_the_result_or_the_error(self):
+        threads: list[threading.Thread] = []
+
+        def _record() -> int:
+            threads.append(threading.current_thread())
+            return 7
+
+        assert (
+            sc_setup_mod._start_on_daemon_thread(_record, name="lane").result(10) == 7
+        )
+        assert threads[0].daemon and threads[0].name == "lane"
+
+        def _fail() -> None:
+            raise RuntimeError("lane boom")
+
+        future = sc_setup_mod._start_on_daemon_thread(_fail, name="lane")
+        with pytest.raises(RuntimeError, match="lane boom"):
+            future.result(10)
+
     @pytest.mark.parametrize("think_tag_penalty", [False, True])
     @pytest.mark.parametrize("with_processor", [True, False])
     @pytest.mark.parametrize("with_opd", [True, False])

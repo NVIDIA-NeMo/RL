@@ -22,6 +22,7 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 from __future__ import annotations
 
 import os
+import threading
 import time
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -29,7 +30,7 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, Optional, TypeVar, cast
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -1103,6 +1104,30 @@ def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
     )
 
 
+_T = TypeVar("_T")
+
+
+def _start_on_daemon_thread(fn: Callable[[], _T], name: str) -> Future[_T]:
+    """Run ``fn`` on a new daemon thread and return a future for its result.
+
+    A ``ThreadPoolExecutor`` worker is joined at interpreter exit, so a task left
+    running by a failed setup (such as a rendezvous waiting on a dead peer) would
+    keep the process alive; a daemon thread does not.
+    """
+    future: Future[_T] = Future()
+
+    def run() -> None:
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            future.set_result(fn())
+        except BaseException as error:
+            future.set_exception(error)
+
+    threading.Thread(target=run, name=name, daemon=True).start()
+    return future
+
+
 def _start_communicator_early(
     generation_backend: str, *, colocated: bool, has_teachers: bool
 ) -> bool:
@@ -2106,13 +2131,14 @@ def setup_single_controller(
         has_teachers=bool(teacher_clusters),
     )
     tail_lane_secs: dict[str, float] = {}
-    communicator_executor = ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix="refit-communicator"
-    )
     communicator_future: Optional[Future[WeightSynchronizer]] = None
 
     def _init_communicator() -> WeightSynchronizer:
-        """Refit communicator rendezvous; needs only the trainer and generation."""
+        """Refit communicator rendezvous; needs only the trainer and generation.
+
+        Started with the builds, it overlaps them, so its time is printed on its
+        own line rather than as a setup-tail lane.
+        """
         existing_synchronizer = weight_synchronizer
         if existing_synchronizer is not None:
             return existing_synchronizer
@@ -2129,8 +2155,16 @@ def setup_single_controller(
         )
         generation.weight_synchronizer = new_synchronizer
         new_synchronizer.init_communicator()
-        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
-        tail_lane_secs["refit communicator"] = time.perf_counter() - t0
+        elapsed = time.perf_counter() - t0
+        setup_timing_metrics.collective_init_time_s = elapsed
+        if start_communicator_early:
+            print(
+                f"  ✓ Refit communicator ready in {elapsed:.1f}s "
+                "(started when the trainer and generation builds returned)",
+                flush=True,
+            )
+        else:
+            tail_lane_secs["refit communicator"] = elapsed
         return new_synchronizer
 
     # Submit build tasks and get results
@@ -2215,7 +2249,9 @@ def setup_single_controller(
                 generation, gen_load_time = submitted["generation"].result()
                 trainer, value, time_metrics = submitted["trainer"].result()
             if start_communicator_early:
-                communicator_future = communicator_executor.submit(_init_communicator)
+                communicator_future = _start_on_daemon_thread(
+                    _init_communicator, name="refit-communicator"
+                )
             if megatron_reserved_urls:
                 # Gym initialization needs a live URL that will respond to health checks.
                 # Megatron generation can only respond to health checks once initialized.
@@ -2258,8 +2294,6 @@ def setup_single_controller(
                 nemo_gym_shards.shutdown()
         raise
     finally:
-        # A running communicator is joined at the tail; this only stops new work.
-        communicator_executor.shutdown(wait=False)
         for megatron_port_holder in megatron_port_holders:
             # The frontend ranks adopted (or will never adopt) the held sockets;
             # drop the holders.
