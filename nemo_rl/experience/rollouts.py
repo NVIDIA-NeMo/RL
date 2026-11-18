@@ -17,6 +17,7 @@
 
 import asyncio
 import copy
+import itertools
 import json
 import statistics
 import uuid
@@ -78,6 +79,7 @@ from nemo_rl.experience.failures import GymRowFailure
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
 )
@@ -2407,18 +2409,33 @@ def apply_reward_penalties(
     return counts
 
 
+# Task indices for flat prompt groups that arrive without one, as on the synchronous path. Gym builds a flat row's task
+# from ``_ng_task_index``. This counter restarts with each process and counts apart from the async collector's, so the
+# rows it numbers also name their episode with ``_ng_rollout_id``: unless a row sets it, Gym names the episode
+# "{_ng_task_index}-{_ng_rollout_index}" and keys its captures and exports on that name. Materialized rows carry their
+# own task ID, and the NeMo-Gym actor names their synchronous episodes by prompt group in the same format.
+_unstamped_nemo_gym_task_indices = itertools.count()
+
+
 def _prepare_nemo_gym_rows(
     rows: list[dict],
     generation_config: GenerationConfig,
     sampling_params: GenerationSamplingParams,
     num_generations: int,
 ) -> None:
-    """Apply NeMo-RL sampling parameters and stable row indices in place."""
+    """Stamp NeMo-RL sampling values, stable row indices and flat rows' task indices onto rows in place.
+
+    The values go beside the task, under ``_ng_model_sampling``, and the task is
+    left unchanged. Gym applies them to the model calls that the trained agent
+    makes through Gym's model servers.
+    """
     if num_generations <= 0 or len(rows) % num_generations != 0:
         raise ValueError("NeMo-Gym rows must contain complete prompt groups")
 
     group_ids: dict[int, str] = {}
     group_attempts: dict[int, int] = {}
+    group_task_indices: dict[int, int | None] = {}
+    counter_groups: set[int] = set()
     for group_index, group_start in enumerate(range(0, len(rows), num_generations)):
         group_rows = rows[group_start : group_start + num_generations]
         existing_group_ids = {
@@ -2454,30 +2471,46 @@ def _prepare_nemo_gym_rows(
         group_attempts[group_index] = (
             existing_group_attempts.pop() if existing_group_attempts else 0
         )
+        existing_task_indices = {
+            int(row[NEMO_GYM_TASK_INDEX_KEY])
+            for row in group_rows
+            if row.get(NEMO_GYM_TASK_INDEX_KEY) is not None
+        }
+        if len(existing_task_indices) > 1 or any(
+            task_index < 0 for task_index in existing_task_indices
+        ):
+            raise ValueError(
+                f"NeMo-Gym prompt group {group_index} contains inconsistent or negative "
+                f"{NEMO_GYM_TASK_INDEX_KEY} values"
+            )
+        if existing_task_indices:
+            group_task_indices[group_index] = existing_task_indices.pop()
+        elif any(not is_nemo_gym_task(row) for row in group_rows):
+            group_task_indices[group_index] = next(_unstamped_nemo_gym_task_indices)
+            counter_groups.add(group_index)
+        else:
+            group_task_indices[group_index] = None
 
     for row_index, row in enumerate(rows):
         group_index = row_index // num_generations
         rollout_index = row_index % num_generations
-        responses_create_params = get_nemo_gym_task_input(row).get(
-            "responses_create_params"
-        )
-        if not isinstance(responses_create_params, dict):
-            raise TypeError(
-                "Each NeMo-Gym task input must contain a responses_create_params dict"
-            )
-
-        responses_create_params["temperature"] = sampling_params.temperature
-        responses_create_params["top_p"] = sampling_params.top_p
-        configured_max_tokens = generation_config["max_new_tokens"]
-        row_max_tokens = responses_create_params.get("max_output_tokens")
-        responses_create_params["max_output_tokens"] = (
-            min(row_max_tokens, configured_max_tokens)
-            if row_max_tokens is not None
-            else configured_max_tokens
-        )
+        # Gym's model server caps each call at the smaller of its own limit and
+        # max_new_tokens, so a task's smaller max_output_tokens is kept.
+        row[NEMO_GYM_MODEL_SAMPLING_KEY] = {
+            "temperature": sampling_params.temperature,
+            "top_p": sampling_params.top_p,
+            "max_output_tokens": generation_config["max_new_tokens"],
+        }
         row["_rowidx"] = row_index
         row[NEMO_GYM_GROUP_ID_KEY] = group_ids[group_index]
         row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempts[group_index]
+        if group_task_indices[group_index] is not None:
+            row[NEMO_GYM_TASK_INDEX_KEY] = group_task_indices[group_index]
+        if group_index in counter_groups:
+            row.setdefault(
+                "_ng_rollout_id",
+                f"{group_ids[group_index]}-g{rollout_index}-t{group_attempts[group_index]}",
+            )
         row[NEMO_GYM_ROLLOUT_INDEX_KEY] = rollout_index
 
 
@@ -2750,8 +2783,7 @@ async def run_async_nemo_gym_rollout(
 
     Raises:
         AssertionError: If an unsupported generation option is requested.
-        TypeError: If a row lacks a valid ``responses_create_params`` dictionary or
-            the actor returns a non-integer row index.
+        TypeError: If the actor returns a non-integer row index.
         ValueError: If either generation count is not positive, the batch is empty
             or not divisible by the relevant generation count,
             ``returns_entire_batch`` has an incompatible size, a streamed row index
@@ -3005,7 +3037,7 @@ def run_nemo_gym_rollout_sync(
 
     Raises:
         AssertionError: If an unsupported generation option is requested.
-        TypeError: If a NeMo-Gym row or streamed row index has an invalid type.
+        TypeError: If the actor returns a non-integer row index.
         ValueError: If streamed rows violate the ordering, uniqueness, grouping,
             or task-index invariants documented by
             :func:`run_async_nemo_gym_rollout`.
@@ -3044,6 +3076,34 @@ def run_nemo_gym_rollout_sync(
         return rollout_result
 
     return asyncio.run(_consume_rollout())
+
+
+def _nemo_gym_group_task_index(rows: list[dict], group_size: int | None) -> int | None:
+    """Return the task index of a single prompt group, or None for unstamped rows or several groups.
+
+    Every prompt group of ``group_size`` contiguous rows must share one ``_ng_task_index``. The synchronous path
+    hands in a whole batch of several groups, so its result carries no single task index.
+    """
+    if not rows or NEMO_GYM_TASK_INDEX_KEY not in rows[0]:
+        return None
+    if group_size is None:
+        group_size = len(rows)
+    task_indices: list[int] = []
+    for row in rows:
+        task_index = row.get(NEMO_GYM_TASK_INDEX_KEY)
+        if task_index is None:
+            raise ValueError(
+                "Expected one _ng_task_index per prompt group, got "
+                f"{[row.get(NEMO_GYM_TASK_INDEX_KEY) for row in rows]}"
+            )
+        task_indices.append(int(task_index))
+    for group_start in range(0, len(task_indices), group_size):
+        group = task_indices[group_start : group_start + group_size]
+        if len(set(group)) != 1:
+            raise ValueError(
+                f"Expected one _ng_task_index per prompt group, got {group}"
+            )
+    return task_indices[0] if len(rows) == group_size else None
 
 
 def _single_group_reward_diagnostics(results: list[dict]) -> dict[str, float]:
@@ -3517,17 +3577,7 @@ def _postprocess_single_nemo_gym_group(
         # contract instead and fail fast on a real mismatch.
         validate_reward_components_match_scalar([r["full_result"] for r in results])
 
-    group_task_index = None
-    if nemo_gym_rows and NEMO_GYM_TASK_INDEX_KEY in nemo_gym_rows[0]:
-        group_task_index = int(nemo_gym_rows[0][NEMO_GYM_TASK_INDEX_KEY])
-        task_indices = [row.get(NEMO_GYM_TASK_INDEX_KEY) for row in nemo_gym_rows]
-        if any(
-            task_index is None or int(task_index) != group_task_index
-            for task_index in task_indices
-        ):
-            raise ValueError(
-                f"Expected one _ng_task_index per prompt group, got {task_indices}"
-            )
+    group_task_index = _nemo_gym_group_task_index(nemo_gym_rows, group_size)
 
     return NemoGymRolloutResult(
         input_ids=input_ids,

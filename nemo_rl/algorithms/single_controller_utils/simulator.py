@@ -269,7 +269,7 @@ def validate_simulator_config(
             f"vllm_cfg.kv_cache_dtype={kv_cache_dtype!r} calibrates its KV scales "
             "on the trainer at every refit, which rollout_only has no trainer for."
         )
-    if master_config.checkpointing["enabled"]:
+    if master_config.checkpointing.enabled:
         raise ValueError(
             "rollout_only requires checkpointing.enabled=false: the cpu train "
             "backend has no model state to save, and the replay-buffer "
