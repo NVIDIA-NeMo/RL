@@ -87,6 +87,9 @@ def fake_store(monkeypatch, tmp_path):
             calls.append((args, kwargs))
             return 0
 
+        def batch_is_exist(self, keys):
+            return [1] * len(keys)  # the sweep thread finds nothing cleared
+
     class FakeClient:
         """A fresh TQ store-client class with the retries install() patches."""
 
