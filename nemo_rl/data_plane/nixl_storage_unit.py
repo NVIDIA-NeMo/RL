@@ -214,6 +214,8 @@ class NixlStorageUnit:  # pragma: no cover
         io_threads: int = 1,  # tq_nixl.ssd_config passes the configured value
         alloc_lease_s: float | None = None,
     ) -> None:
+        # A configured path on RAM only warns; a default that lands there stops.
+        ssd_dir_explicit = ssd_dir is not None
         if ssd_enabled:
             # Resolved here, on the unit's own node: /raid on one node says
             # nothing about another's.
@@ -252,6 +254,7 @@ class NixlStorageUnit:  # pragma: no cover
             int(staging_bytes),
             float(pickup_s),
             int(io_threads),
+            ssd_dir_explicit=ssd_dir_explicit,
         )
         self.ep = NixlEndpoint(
             f"unit-{self.unit_id}-{uuid.uuid4().hex[:6]}",
@@ -308,6 +311,7 @@ class NixlStorageUnit:  # pragma: no cover
         staging_bytes: int,
         pickup_s: float,
         io_threads: int,
+        ssd_dir_explicit: bool = True,  # False: ssd_dir is the node default
     ) -> None:
         self.ssd_dir = None
         self.staging_ = None
@@ -338,7 +342,11 @@ class NixlStorageUnit:  # pragma: no cover
         if not ssd_dir:
             return
         self.staging_ = SlabAllocator(io_area_bytes(ssd_dir, staging_bytes))
-        require_disk_backed(ssd_dir, setting="data_plane.nixl.ssd.path")
+        require_disk_backed(
+            ssd_dir,
+            setting="data_plane.nixl.ssd.path",
+            explicit=ssd_dir_explicit,
+        )
         self.ssd_dir = os.path.join(
             ssd_dir, f"nixl-unit-{self.unit_id}-{uuid.uuid4().hex[:6]}"
         )

@@ -19,14 +19,17 @@ DGX nodes mount their NVMe RAID, when the node has it, else ``/tmp``. On some ho
 tier "spilling" there would consume the memory it is meant to relieve and lose
 the data with the node. The owner of the directory calls
 :func:`require_disk_backed` once, before it writes, on the node where the
-directory lives.
+directory lives: a default on RAM stops the run, a configured path only warns.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
+
+LOGGER = logging.getLogger(__name__)
 
 _RAM_FILESYSTEMS = frozenset({"tmpfs", "ramfs", "devtmpfs"})
 NVME_MOUNT = "/raid"  # DGX nodes mount the NVMe RAID here
@@ -127,11 +130,23 @@ def _mount_of(path: str, mounts_text: str | None = None) -> tuple[str, str]:
     return best
 
 
-def require_disk_backed(path: str, *, setting: str) -> None:
-    """Refuse a RAM-backed ``path``; ``setting`` names the config key for the error."""
+def require_disk_backed(path: str, *, setting: str, explicit: bool = False) -> None:
+    """Refuse a RAM-backed ``path``, or only warn when the config named it.
+
+    A default that landed on RAM (``/tmp`` as tmpfs) would silently turn the
+    SSD tier into a second copy in memory, so it stops the run. A path the
+    config sets (``explicit``) is a choice, for example a small test
+    filesystem: it runs, with a warning that says what it costs. ``setting``
+    names the config key in the message.
+    """
     fs = filesystem_of(path)
-    if fs in _RAM_FILESYSTEMS:
-        raise ValueError(
-            f"{setting}={path!r} is on a {fs} filesystem (RAM, not a disk) on "
-            f"host {os.uname().nodename}; point it at a node-local SSD."
-        )
+    if fs not in _RAM_FILESYSTEMS:
+        return
+    where = (
+        f"{setting}={path!r} is on a {fs} filesystem (RAM, not a disk) on "
+        f"host {os.uname().nodename}"
+    )
+    if explicit:
+        LOGGER.warning("%s; the SSD tier there spends memory, not disk.", where)
+        return
+    raise ValueError(f"{where}; point it at a node-local SSD.")

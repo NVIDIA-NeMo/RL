@@ -46,6 +46,16 @@ def test_disk_backed_path_passes(monkeypatch):
     local_disk.require_disk_backed("/tmp/nrl", setting="data_plane.nixl.ssd.path")
 
 
+def test_a_configured_ram_backed_path_runs_with_a_warning(monkeypatch, caplog):
+    """The default must not land on RAM unnoticed; a path the config sets may."""
+    monkeypatch.setattr(local_disk, "filesystem_of", lambda path, text=None: "tmpfs")
+    with caplog.at_level("WARNING", logger=local_disk.LOGGER.name):
+        local_disk.require_disk_backed(
+            "/mnt/small-tmpfs", setting="data_plane.nixl.ssd.path", explicit=True
+        )
+    assert "tmpfs" in caplog.text and "spends memory" in caplog.text
+
+
 @pytest.mark.parametrize(
     ("raid_line", "writable", "expected"),
     [
