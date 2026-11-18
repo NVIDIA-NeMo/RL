@@ -102,7 +102,7 @@ def test_from_master_config_uses_typed_logger(
         logger=LoggerConfig(log_dir=str(tmp_path)),
         async_rl=SimpleNamespace(
             log_full_train_data=log_full_train_data,
-            debug_writer=DebugWriterConfig(),
+            debug_writer=DebugWriterConfig(target="json"),
         ),
     )
 
