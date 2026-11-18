@@ -1,0 +1,6 @@
+diff --git a/setup.py b/setup.py
+index 2c91c6e..2fbb894 100644
+--- a/setup.py
++++ b/setup.py
+@@ -57 +56,0 @@ def get_extension_hybrid_ep_cpp():
+-            "-std=c++17",
