@@ -4,7 +4,7 @@ This guide covers the Flow-GRPO implementation in NeMo RL — an adaptation of [
 
 > **Scope note**: this is *image* diffusion (continuous flow-matching over latents), not diffusion *language* models (dLLMs). The research package `flow_grpo` implements text-to-image training.
 
-For foundational GRPO concepts (group-relative advantages, clipped policy gradients), see the [GRPO guide](grpo.md). Flow-GRPO mirrors `nemo_rl.algorithms.grpo.grpo_train` in phase ordering but replaces token-level concepts (vLLM rollouts, token log-probs, token KL) with their continuous counterparts.
+For foundational GRPO concepts (group-relative advantages, clipped policy gradients), see the [GRPO guide](../../docs/guides/grpo.md). Flow-GRPO mirrors `nemo_rl.algorithms.grpo.grpo_train` in phase ordering but replaces token-level concepts (vLLM rollouts, token log-probs, token KL) with their continuous counterparts.
 
 ## How It Works
 
