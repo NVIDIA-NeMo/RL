@@ -452,3 +452,138 @@ def test_plan_builder_has_no_host_sync_or_python_row_anchor_loops() -> None:
 
     assert not used_forbidden_attributes
     assert not any(isinstance(node, loop_nodes) for node in ast.walk(tree))
+
+
+def _two_row_inputs() -> tuple[Tensor, Tensor]:
+    return (
+        torch.ones((2, 8), dtype=torch.bool),
+        torch.tensor([11, 22], dtype=torch.int64),
+    )
+
+
+@pytest.mark.parametrize(
+    ("sample_ids", "token_valid_mask", "message"),
+    [
+        (
+            torch.tensor([11], dtype=torch.int64),
+            torch.ones((1, 8), dtype=torch.bool),
+            "every logical sample row",
+        ),
+        (
+            torch.tensor([22, 11], dtype=torch.int64),
+            torch.ones((2, 8), dtype=torch.bool),
+            "sample IDs must match",
+        ),
+        (
+            torch.tensor([11, 22], dtype=torch.int64),
+            torch.ones((2, 4), dtype=torch.bool),
+            "exceeds the logical plan width",
+        ),
+    ],
+)
+def test_partitioned_plan_rejects_layout_that_disagrees_with_rows(
+    sample_ids: Tensor,
+    token_valid_mask: Tensor,
+    message: str,
+) -> None:
+    """Catches a CP layout built for another microbatch or row order."""
+    with pytest.raises(ValueError, match=message):
+        _build_plan(
+            token_valid_mask,
+            sample_ids,
+            anchors_per_sample=1,
+            gamma=1,
+            optimizer_step=0,
+            seed=0,
+            sequence_layout=_build_layout(cp_rank=0),
+        )
+
+
+def test_partitioned_plan_rejects_layout_on_another_device() -> None:
+    """Catches a CPU layout paired with device-resident plan inputs."""
+    layout = dataclasses.replace(
+        _build_layout(cp_rank=0),
+        logical_sample_ids=torch.tensor([11, 22], dtype=torch.int64, device="meta"),
+    )
+    token_valid_mask, sample_ids = _two_row_inputs()
+
+    with pytest.raises(ValueError, match="share a device"):
+        _build_plan(
+            token_valid_mask,
+            sample_ids,
+            anchors_per_sample=1,
+            gamma=1,
+            optimizer_step=0,
+            seed=0,
+            sequence_layout=layout,
+        )
+
+
+@pytest.mark.parametrize("partitioned", [False, True])
+def test_rows_shorter_than_one_block_emit_no_valid_slots(partitioned: bool) -> None:
+    """Catches unfold errors or stray anchors when no full window fits."""
+    token_valid_mask = torch.ones((2, 3), dtype=torch.bool)
+    sample_ids = torch.tensor([11, 22], dtype=torch.int64)
+    layout = (
+        _build_layout(
+            cp_rank=0,
+            cp_size=1,
+            cu_seqlens_q=[0, 3, 6],
+            cu_seqlens_q_padded=[0, 3, 6],
+        )
+        if partitioned
+        else None
+    )
+
+    plan = _build_plan(
+        token_valid_mask,
+        sample_ids,
+        anchors_per_sample=2,
+        gamma=3,
+        optimizer_step=0,
+        seed=0,
+        sequence_layout=layout,
+    )
+
+    assert not plan.slot_valid.any()
+    assert not plan.loss_mask.any()
+
+
+def test_partitioned_plan_with_empty_packed_stream_emits_no_valid_slots() -> None:
+    """Catches out-of-range owner lookups when every packed segment is empty."""
+    layout = _build_layout(
+        cp_rank=0,
+        cp_size=1,
+        cu_seqlens_q=[0, 0, 0],
+        cu_seqlens_q_padded=[0, 0, 0],
+    )
+    token_valid_mask, sample_ids = _two_row_inputs()
+
+    plan = _build_plan(
+        token_valid_mask,
+        sample_ids,
+        anchors_per_sample=2,
+        gamma=1,
+        optimizer_step=0,
+        seed=0,
+        sequence_layout=layout,
+    )
+
+    assert not plan.slot_valid.any()
+    assert not plan.loss_mask.any()
+    assert torch.all(plan.owner_cp_ranks == -1)
+
+
+def test_dspark_plan_rejects_non_positive_block_size() -> None:
+    """Catches a zero-slot DSpark plan that would train on nothing."""
+    token_valid_mask, sample_ids = _two_row_inputs()
+
+    with pytest.raises(ValueError, match="block_size must be positive"):
+        _load_plan_module().build_dspark_batch_plan(
+            token_valid_mask,
+            sample_ids,
+            anchors_per_sample=1,
+            block_size=0,
+            optimizer_step=0,
+            seed=0,
+        )

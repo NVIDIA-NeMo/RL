@@ -20,6 +20,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import torch
@@ -126,3 +127,106 @@ def test_capture_hooks_keep_detached_views_without_per_tap_clones() -> None:
     assert captured_hidden.requires_grad is False
     assert captured_embeds.requires_grad is False
     assert captured_output_hidden.requires_grad is False
+
+
+def _local_capture(module: ModuleType, captured: dict[str, torch.Tensor]) -> Any:
+    capture = object.__new__(module.HiddenStateCapture)
+    capture.pp_size = 1
+    capture.aux_layer_indices = (1,)
+    capture._captured = captured
+    return capture
+
+
+def test_capture_without_layout_returns_local_states_unchanged() -> None:
+    module = _load_hidden_capture_module()
+    hidden = torch.randn(2, 1, 3)
+    capture = _local_capture(module, {"layer_1": hidden})
+
+    states = capture.get_captured_states()
+
+    assert torch.equal(states.hidden_states, hidden)
+    assert states.sequence_layout is None
+    assert states.sequence_is_reconstructed is False
+
+
+def test_empty_capture_with_layout_skips_reconstruction() -> None:
+    module = _load_hidden_capture_module()
+    module._reconstruct_tp_sequence = MagicMock()
+    capture = _local_capture(module, {})
+    layout = SimpleNamespace(tp_size=2)
+
+    states = capture.get_captured_states(sequence_layout=layout)
+
+    assert states.hidden_states is None
+    assert states.inputs_embeds is None
+    assert states.output_hidden is None
+    assert states.sequence_layout is layout
+    module._reconstruct_tp_sequence.assert_not_called()
+
+
+def test_output_hidden_hook_ignores_calls_without_positional_input() -> None:
+    module = _load_hidden_capture_module()
+    capture = _local_capture(module, {})
+
+    capture._make_output_hidden_hook()(None, ())
+
+    assert "output_hidden" not in capture._captured
+
+
+def test_registered_hooks_capture_first_and_last_stage_tensors_then_detach() -> None:
+    module = _load_hidden_capture_module()
+    capture = _local_capture(module, {})
+    capture.is_first_stage = True
+    capture.is_last_stage = True
+    capture._local_aux_indices = []
+    capture._hooks = []
+    capture.model = SimpleNamespace(
+        embedding=torch.nn.Identity(),
+        output_layer=torch.nn.Identity(),
+    )
+    embeds = torch.randn(2, 1, 3)
+    output_hidden = torch.randn(2, 1, 3)
+
+    with capture.capture_context():
+        capture.model.embedding(embeds)
+        capture.model.output_layer(output_hidden)
+        assert torch.equal(capture._captured["embeds"], embeds)
+        assert torch.equal(capture._captured["output_hidden"], output_hidden)
+    capture._captured.clear()
+    capture.model.embedding(embeds)
+
+    assert capture._hooks == []
+    assert capture._captured == {}
+
+
+def test_reconstruct_wrapper_forwards_to_sequence_parallel() -> None:
+    module = _load_hidden_capture_module()
+    sp_module_name = "nemo_rl.models.megatron.draft.sequence_parallel"
+    prior = sys.modules.get(sp_module_name)
+    sp_module = ModuleType(sp_module_name)
+    sp_module.reconstruct_tp_sequence = MagicMock(return_value="rebuilt")
+    sys.modules[sp_module_name] = sp_module
+    try:
+        local = torch.randn(4, 2)
+        layout = SimpleNamespace(tp_size=2)
+        group = object()
+
+        result = module._reconstruct_tp_sequence(
+            local,
+            sequence_layout=layout,
+            tp_group=group,
+            sequence_dim=0,
+        )
+    finally:
+        if prior is None:
+            sys.modules.pop(sp_module_name, None)
+        else:
+            sys.modules[sp_module_name] = prior
+
+    assert result == "rebuilt"
+    sp_module.reconstruct_tp_sequence.assert_called_once_with(
+        local,
+        sequence_layout=layout,
+        tp_group=group,
+        sequence_dim=0,
+    )

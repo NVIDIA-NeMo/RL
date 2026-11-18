@@ -205,6 +205,16 @@ def test_sequence_parallel_shards_reconstruct_one_cp_local_stream() -> None:
         ),
         ({"cp_rank": 2, "cp_size": 2}, "cp_rank"),
         ({"tp_rank": 2, "tp_size": 2}, "tp_rank"),
+        ({"cp_size": 0}, "cp_size must be positive"),
+        ({"cu_seqlens_q": [0, 2, 4]}, "cu_seqlens_q must have one boundary"),
+        (
+            {"cu_seqlens_q_padded": [0, 4, 4]},
+            "cu_seqlens_q_padded must have one boundary",
+        ),
+        (
+            {"cu_seqlens_q": [0, 3], "cu_seqlens_q_padded": [0, 3], "tp_size": 2},
+            "divisible by tp_size",
+        ),
     ],
 )
 def test_layout_rejects_malformed_metadata_before_mapping(
@@ -225,3 +235,51 @@ def test_layout_rejects_malformed_metadata_before_mapping(
 
     with pytest.raises((TypeError, ValueError), match=message):
         _build_layout(**cast(Any, values))
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value", "error", "message"),
+    [
+        (
+            "logical_sample_ids",
+            torch.tensor([[1]], dtype=torch.int64),
+            ValueError,
+            "one-dimensional",
+        ),
+        (
+            "cu_seqlens_q",
+            torch.tensor([0, 4], dtype=torch.int32),
+            TypeError,
+            "torch.int64",
+        ),
+        (
+            "cu_seqlens_q_padded",
+            torch.tensor([0, 4], dtype=torch.int64, device="meta"),
+            ValueError,
+            "must be on device",
+        ),
+    ],
+)
+def test_layout_rejects_metadata_tensor_with_wrong_shape_dtype_or_device(
+    field: str,
+    bad_value: torch.Tensor,
+    error: type[Exception],
+    message: str,
+) -> None:
+    """Catches metadata that would silently cast or move across devices."""
+    tensors = {
+        "logical_sample_ids": torch.tensor([1], dtype=torch.int64),
+        "cu_seqlens_q": torch.tensor([0, 4], dtype=torch.int64),
+        "cu_seqlens_q_padded": torch.tensor([0, 4], dtype=torch.int64),
+    }
+    tensors[field] = bad_value
+
+    with pytest.raises(error, match=message):
+        _load_layout_module().build_draft_sequence_layout(
+            **tensors,
+            cp_rank=0,
+            cp_size=1,
+            tp_rank=0,
+            tp_size=1,
+            device=torch.device("cpu"),
+        )
