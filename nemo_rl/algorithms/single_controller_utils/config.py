@@ -2002,6 +2002,21 @@ def validate_grpo_chunk_cap_alignment(
             "and into complete microbatches when sequence packing and dynamic "
             "batching are both off -- so the last chunk of a step shards evenly"
         )
+    failure_config = master_config.async_rl.rollout_failure
+    drop_budget = (
+        failure_config.max_skipped_prompts
+        + failure_config.max_consecutive_dropped_prompts
+    )
+    if group_multiple > 1 and drop_budget:
+        warnings.warn(
+            f"GRPO chunks are selected in multiples of {group_multiple} prompt groups, "
+            "but async_rl.rollout_failure permits dropped prompts. A step shrunk by a "
+            f"drop that is not a multiple of {group_multiple} fails with "
+            "'No multiple of N fits selection bounds'. Set both drop budgets to 0, or "
+            "use on_dropped_prompt='replace' with enough spare prompts.",
+            stacklevel=2,
+        )
+
     chunk_cap = master_config.async_rl.max_groups_for_streaming_train
     if chunk_cap is None or chunk_cap >= algo_cfg.num_prompts_per_step:
         return
