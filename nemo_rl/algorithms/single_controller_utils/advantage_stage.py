@@ -708,6 +708,12 @@ class AdvantageComputer:
                 sequences["prev_logprobs"] = data[adv_cfg.policy_logprobs_field]
             if cfg.teacher_logprobs_required:
                 sequences["teacher_logprobs"] = kwargs["teacher_logprobs"]
+            if cfg.reference_logprobs_required:
+                sequences["reference_logprobs"] = kwargs["logprobs_reference"]
+            if cfg.is_ppo:
+                sequences["values"] = kwargs["values"]
+            if returns is not None:
+                sequences["returns"] = returns
             train_data_dump_receipt = await asyncio.to_thread(
                 self._train_data_dump.add_chunk,
                 TrainChunk(

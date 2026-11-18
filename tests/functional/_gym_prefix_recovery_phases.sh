@@ -14,9 +14,11 @@
 
 # Phase control shared by the prefix-recovery functional tests. Source it after
 # setting PROJECT_ROOT and TEST_DIR; a test starts phase one in its own process
-# group and keeps its PID in PHASE1_PID.
+# group and keeps its PID in PHASE1_PID. A test that also runs behind Dynamo
+# keeps the log phase one writes in PHASE1_RUN_LOG.
 
 PHASE1_PID=""
+PHASE1_RUN_LOG=""
 
 # Hard-kill phase one and wait until its controller can no longer write
 # snapshots.
@@ -37,6 +39,17 @@ stop_phase1() {
         fi
         sleep 1
     done
+    # Behind Dynamo, the kill orphans etcd, NATS and the frontend: they run in
+    # their own sessions. Each carries phase one's DYN_NAMESPACE in its environment.
+    local namespace="" pid
+    if [[ -n "${PHASE1_RUN_LOG}" ]]; then
+        namespace=$(grep -aoE "'DYN_NAMESPACE': '[^']+'" "${PHASE1_RUN_LOG}" | head -1 | cut -d"'" -f4 || true)
+    fi
+    if [[ -n "${namespace}" ]]; then
+        for pid in $(grep -lsxz "DYN_NAMESPACE=${namespace}" /proc/[0-9]*/environ | cut -d/ -f3 || true); do
+            kill -KILL "${pid}" 2>/dev/null || true
+        done
+    fi
 }
 
 # Recover exactly the selected prefix: keep only the selected snapshot and no
