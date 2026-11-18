@@ -23,13 +23,15 @@ After context compaction, handoff, disconnect, or a long gap, reload this skill 
 2. Use a shared branch prefix. Prefer a user-provided one; otherwise create a suggestive default such as `autoresearch/2026-03-24-dapo-qwen2p5`.
 3. Read the target recipe, its parents, and the relevant code paths in `examples/run_grpo.py`, `nemo_rl/models/`, `nemo_rl/algorithms/`, `nemo_rl/environments/`, and `docs/`. For NeMo-gym recipes, also inspect `examples/nemo_gym/` entrypoints, configs, and launch scripts.
 4. Translate any user stop rule into explicit values you can monitor, such as the requested number of experiments as `target_experiment_count`, `campaign_deadline`, `per_experiment_timeout`, or `target_metric`.
-5. Verify required data, checkpoints, runtime inputs, and the launcher.
+5. Verify required data, checkpoints, runtime inputs, and the launcher. On Brev, complete the storage discovery described below before creating the TSV or experiment directories.
 6. Create an untracked TSV log and per-experiment log directory.
 7. Run a baseline first on `<prefix>/baseline` if none exists.
 
 For GPU, CPU-heavy, distributed, or long-running work, choose the execution environment deliberately. Run locally when the current machine has suitable GPUs and capacity; otherwise follow the user's requested environment, use `launch-nemo-rl` for nrl-k8s/Kubernetes, use the environment's native launcher for Slurm, or clarify with the user before launching. Use CPU-only local runs only for light inspection, dry runs, and short non-GPU checks.
 
-If the user mentions Brev, or if `/home/ubuntu/RL` exists and `/ephemeral` is available as a volume, treat the machine as a Brev instance and use `nemo-rl-brev-etiquette` before creating experiment directories, caches, logs, checkpoints, or authenticated runtime state.
+When the selected execution environment is Brev, use [nemo-rl-brev-etiquette](../nemo-rl-brev-etiquette/SKILL.md) before creating experiment directories, caches, logs, checkpoints, or authenticated runtime state. If the environment is unspecified and `/home/ubuntu/RL` exists, load that skill to inspect storage as a potential Brev environment; the checkout path alone does not establish that the machine is Brev. Do not gate loading the skill on the existence of `/ephemeral`, `/data`, or any particular mount name.
+
+Let Brev etiquette honor user-specified storage or discover and verify a suitable data volume, set `DATA_VOLUME`, and inform the user of the selected path, backing filesystem, available space, and rationale. If storage is ambiguous or no suitable volume exists, resolve it with the user before starting a large run. Use the skill's per-experiment `EXP_DIR` and shared cache root for bulky outputs, and record their resolved absolute paths in the campaign ledger. Keep small reproducibility and session records in the repo.
 
 ## Branching
 
@@ -48,7 +50,7 @@ See `references/git-workflow.md` for the exact pattern.
 3. Edit the smallest set of files needed.
 4. Commit the hypothesis.
 5. Before launching the run, check the monitored stop conditions. Do not stop early unless one is already clearly met.
-6. Identify the authoritative metric source from the recipe or logging code, then run with a unique log path:
+6. Identify the authoritative metric source from the recipe or logging code, then run with a unique log path. The example below is for local runs; on Brev, use `LOG_DIR="$EXP_DIR/logs"` with `EXP_DIR` prepared by Brev etiquette on the verified data volume instead of the repo-relative path:
 
 ```bash
 LOG_DIR=reports/auto_research/<campaign>/<experiment>
