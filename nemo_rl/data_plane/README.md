@@ -786,6 +786,9 @@ Use the capture as a context manager, or always call `release()` in `finally`.
 `persist()` is single-attempt, including after a partial failure. Reusing the
 handle raises a clear error; release it, discard the failed directory, and
 capture again. Exclusive file creation remains an overwrite guard.
+`persist(metadata)` adds fields computed after capture, such as the hash of
+state serialized once traffic resumes, to the capture's metadata. It rejects a
+key given at capture before writing anything.
 
 ```python
 capture = client.capture_checkpoint(checkpoint_dir, metadata=metadata)
@@ -816,7 +819,9 @@ bash tests/functional/data_plane_simple_checkpoint_cpu.sh
 With `data_plane.simple.async_checkpoint: true`, `RolloutSnapshotter` captures
 the TQ view and matching controller metadata under its mutation barrier, then
 resumes the environment and dispatch before persisting the retained shards.
-Recovery validation and controller serialization remain inside capture. The
+Recovery validation and the rollout-recovery state build remain inside capture.
+That state shares no containers with the live ledger, so `SnapshotCapture.persist`
+serializes and hashes it after resume and adds the hash to the TQ metadata. The
 snapshot is published only after persistence and all recovery sidecars finish.
 
 Full trainer checkpoints use the same retained-view path when
@@ -848,17 +853,18 @@ The `timing/rollout_checkpoint` metrics split `tq_capture_seconds`,
 and persistence. Compare these with `environment_paused_seconds` and
 `exclusive_hold_seconds` to measure time removed from the pause.
 
-The rest of the barrier hold is split into the checks and recovery state that
-stay inside it:
+The rest of the save is split into the checks and recovery state around the
+barrier:
 
 | Metric | Phase |
 |---|---|
 | `replay_inventory_seconds` | Compare TQ replay keys with the replay index |
 | `recovery_state_build_seconds` | Copy and validate the rollout-recovery ledger |
-| `recovery_state_serialize_seconds` | `torch.save` and sha256 of that state |
+| `recovery_state_serialize_seconds` | `torch.save` and sha256 of that state; after the barrier with a retained view, inside it otherwise |
 | `staging_inventory_seconds` | Compare TQ staging keys with recovery ownership |
 
-A phase that does not run for the configuration logs 0.
+A phase that does not run for the configuration logs 0. `tq_persist_seconds`
+excludes the recovery serialization that precedes the write.
 
 ## Async path (proposed)
 

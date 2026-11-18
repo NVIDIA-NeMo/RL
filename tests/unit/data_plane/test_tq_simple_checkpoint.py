@@ -497,6 +497,24 @@ def test_distributed_capture_native_layout_and_metadata_detachment(
     assert not client.controller._controller_snapshot_views
 
 
+def test_persist_adds_late_metadata_but_never_replaces_captured_keys(
+    fake_cluster, tmp_path
+):
+    path = tmp_path / "data_plane"
+    captured = snapshot.capture_simple_checkpoint(
+        path, num_storage_units=2, timeout_s=5.0, metadata={"step": 5}
+    )
+    with pytest.raises(ValueError, match="cannot replace captured keys"):
+        captured.persist({"step": 6})
+    assert not (path / "controller_state.pkl").exists()
+    captured.persist({"payload_sha256": "abc"})
+    assert json.loads((path / "metadata.json").read_text())["user_metadata"] == {
+        "step": 5,
+        "payload_sha256": "abc",
+    }
+    captured.release()
+
+
 def test_partial_capture_failure_releases_every_unit(fake_cluster, tmp_path):
     units, client = fake_cluster
     # One already-retained snapshot must not be disturbed by failed new capture.

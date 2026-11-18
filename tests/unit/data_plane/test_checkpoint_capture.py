@@ -32,7 +32,7 @@ class _Capture(CheckpointCapture):
         self.token = "token-1"
         self.released = False
 
-    def persist(self):
+    def persist(self, metadata=None):
         pass
 
     def release(self):

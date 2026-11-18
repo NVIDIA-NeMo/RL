@@ -80,6 +80,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.rollout_checkpointing import snapshots as snapshots_module
 from nemo_rl.algorithms.rollout_checkpointing.inventory import (
     capture_reward_settings,
     validate_rollout_recovery_inventory,
@@ -2010,7 +2011,7 @@ class TestPeriodicRolloutCheckpoint:
             yield _FakeEnvironmentSnapshot()
 
         class Capture(CheckpointCapture):
-            def persist(self) -> None:
+            def persist(self, metadata=None) -> None:
                 events.append("persist")
                 raise TimeoutError("persistence is still running")
 
@@ -2059,7 +2060,7 @@ class TestPeriodicRolloutCheckpoint:
                 raise OSError("resume failed")
 
         class Capture(CheckpointCapture):
-            def persist(self) -> None:
+            def persist(self, metadata=None) -> None:
                 assert events == ["pause", "capture", "resume"]
                 with pytest.raises(RuntimeError):
                     environment_snapshot.checked_cuts[0].require_live()
@@ -2107,6 +2108,75 @@ class TestPeriodicRolloutCheckpoint:
                 published[0] / "train_dataloader.pt", weights_only=True
             )
             assert saved_cursor["cursor"]["offset"] == 1
+
+    def test_deferred_snapshot_serializes_recovery_state_after_resume(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._rollout_runtime.batch_shortfall = {3: 1}
+        events = []
+        persisted_metadata = []
+
+        @contextlib.asynccontextmanager
+        async def snapshot(_path):
+            events.append("pause")
+            yield _FakeEnvironmentSnapshot()
+            events.append("resume")
+            actor._rollout_runtime.batch_shortfall[3] = 2
+
+        serialize = snapshots_module._serialize_recovery_state
+
+        def recording_serialize(state):
+            events.append("serialize")
+            return serialize(state)
+
+        monkeypatch.setattr(
+            snapshots_module, "_serialize_recovery_state", recording_serialize
+        )
+
+        class Capture(CheckpointCapture):
+            def persist(self, metadata=None) -> None:
+                events.append("persist")
+                persisted_metadata.append(metadata)
+
+            def release(self) -> None:
+                events.append("release")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            events.append("capture")
+            assert "rollout_recovery_payload_sha256" not in metadata
+            return Capture()
+
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        attach_rollout_checkpointing(actor)
+        try:
+            assert asyncio.run(actor._rollout_snapshots.save_snapshot(force=True)).saved
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events == [
+            "pause",
+            "capture",
+            "resume",
+            "serialize",
+            "persist",
+            "release",
+        ]
+        snapshots = tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        (published,) = snapshots.glob("snapshot_*")
+        recovery_path = published / ROLLOUT_RECOVERY_STATE_FILENAME
+        state = torch.load(recovery_path, weights_only=True)
+        assert state["batch_shortfall"] == {3: 1}
+        assert persisted_metadata == [
+            {
+                "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+                "rollout_recovery_payload_sha256": hashlib.sha256(
+                    recovery_path.read_bytes()
+                ).hexdigest(),
+                "rollout_recovery_group_count": len(state["groups"]),
+            }
+        ]
 
     @pytest.mark.parametrize("anchor_step", [0, 1])
     @pytest.mark.parametrize("claimed", [False, True])
@@ -3598,7 +3668,7 @@ class TestDataPlaneCheckpoint:
         actor._rollout_snapshots.capture = capture
 
         class Capture(CheckpointCapture):
-            def persist(self) -> None:
+            def persist(self, metadata=None) -> None:
                 with pytest.raises(RuntimeError):
                     cuts[0].require_live()
                 events.append("persist")
@@ -3829,28 +3899,25 @@ class TestDataPlaneCheckpoint:
         dp_client = _FakeDPClient()
         mc.token_capture.forest_training = forest_training
 
-        async def _main() -> None:
-            actor = _ACTOR_CLS(
-                mc,
-                _make_actor_args(save_state=save_state, dp_client=dp_client),
-                SetupTimingMetrics(),
-            )
-            # The helper receives one explicit identity instead of reading
-            # mutable controller fields after checkpoint I/O has started.
-            actor._trainer_version = 11
-            actor._current_epoch = 5
-            actor._rollout_manager.execution_row_multiple = 4
-            await actor._rollout_snapshots._save_data_plane_checkpoint(
-                str(tmp_path / "tmp_step_3"),
+        actor = _ACTOR_CLS(
+            mc,
+            _make_actor_args(save_state=save_state, dp_client=dp_client),
+            SetupTimingMetrics(),
+        )
+        # The helper receives one explicit identity instead of reading
+        # mutable controller fields after checkpoint I/O has started.
+        actor._trainer_version = 11
+        actor._current_epoch = 5
+        actor._rollout_manager.execution_row_multiple = 4
+        try:
+            metadata = actor._rollout_snapshots._data_plane_checkpoint_metadata(
                 train_steps=3,
                 trainer_version=7,
                 current_epoch=2,
             )
+        finally:
             actor._checkpointer.shutdown()
 
-        asyncio.run(_main())
-
-        metadata = dp_client.save_calls[0]["metadata"]
         assert metadata["single_controller_train_steps"] == 3
         assert metadata["single_controller_trainer_version"] == 7
         assert metadata["single_controller_epoch"] == 2

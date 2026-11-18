@@ -33,13 +33,14 @@ import shutil
 import time
 import warnings
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import (
     Any,
     Callable,
     Optional,
+    TypedDict,
 )
 
 import torch
@@ -104,6 +105,7 @@ from nemo_rl.environments.checkpointing.interfaces import (
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
+    RolloutRecoveryState,
     build_rollout_recovery_state,
 )
 from nemo_rl.utils.checkpoint import (
@@ -116,12 +118,69 @@ from nemo_rl.utils.path_utils import (
 from nemo_rl.utils.timer import TimeoutChecker
 
 
+def _serialize_recovery_state(state: RolloutRecoveryState) -> tuple[bytes, str]:
+    """Return the ``rollout_recovery.pt`` payload and its sha256."""
+    payload_buffer = io.BytesIO()
+    torch.save(state, payload_buffer)
+    payload = payload_buffer.getvalue()
+    return payload, hashlib.sha256(payload).hexdigest()
+
+
+class _RolloutRecoveryMetadata(TypedDict):
+    """The data-plane metadata fields that bind TQ to its recovery sidecar."""
+
+    rollout_recovery_schema_version: int
+    rollout_recovery_payload_sha256: str
+    rollout_recovery_group_count: int
+
+
+def _rollout_recovery_metadata(
+    payload_sha256: str, group_count: Optional[int]
+) -> _RolloutRecoveryMetadata:
+    """Bind the data-plane checkpoint to its recovery sidecar."""
+    if group_count is None:
+        raise ValueError("rollout recovery payload hash requires a group count")
+    return {
+        "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+        "rollout_recovery_payload_sha256": payload_sha256,
+        "rollout_recovery_group_count": group_count,
+    }
+
+
 @dataclass(frozen=True)
 class SnapshotCapture:
     """Captured recovery state and its temporary data-plane ownership."""
 
     state: CapturedRolloutState
     data_plane: CheckpointCapture | None
+    # Detached from the live ledger under the barrier; serialized once it opens.
+    recovery_state: RolloutRecoveryState | None = None
+
+    async def persist(self) -> CapturedRolloutState:
+        """Serialize the recovery state, then write the retained TQ view.
+
+        Runs after the barrier opens. The recovery hash goes into the data-plane
+        metadata, which is written last. Returns the state with its payload.
+        """
+        if self.data_plane is None:
+            raise RuntimeError("only a retained data-plane view persists later")
+        state = self.state
+        metadata = None
+        if self.recovery_state is not None:
+            started = time.monotonic()
+            payload, digest = await asyncio.to_thread(
+                _serialize_recovery_state, self.recovery_state
+            )
+            state = replace(
+                state,
+                rollout_recovery_payload=payload,
+                recovery_state_serialize_seconds=time.monotonic() - started,
+            )
+            metadata = _rollout_recovery_metadata(
+                digest, state.rollout_recovery_group_count
+            )
+        await checkpoint_io(partial(self.data_plane.persist, metadata))
+        return state
 
 
 async def write_controller_sidecars(
@@ -271,30 +330,22 @@ class RolloutSnapshotter(_UsesRolloutParts):
         ):
             self._wakeup.set()
 
-    async def _save_data_plane_checkpoint(
+    def _data_plane_checkpoint_metadata(
         self,
-        checkpoint_path: PathLike,
         *,
         train_steps: int,
         trainer_version: int,
         current_epoch: int,
         replay_metadata: Optional[TQReplayMetadataState] = None,
-        rollout_recovery_payload_sha256: Optional[str] = None,
-        rollout_recovery_group_count: Optional[int] = None,
-        allow_deferred: bool = False,
-    ) -> CheckpointCapture | None:
-        """Save a required TQ snapshot inside an SC checkpoint bundle.
+        rollout_recovery: Optional[_RolloutRecoveryMetadata] = None,
+    ) -> DataPlaneCheckpointMetadata:
+        """Describe the TQ snapshot inside an SC checkpoint bundle.
 
         A sampler with replay-buffer recovery writes an authoritative native
         TQ snapshot bound to its metadata-only replay index by a digest. Other
         samplers retain shadow-mode snapshots until their recovery contract is
-        defined. Failures propagate so a finalized bundle never silently omits
-        the advertised data-plane component.
+        defined.
         """
-        checkpoint_dir = os.path.join(
-            checkpoint_path,
-            DATA_PLANE_CHECKPOINT_DIR,
-        )
         metadata: DataPlaneCheckpointMetadata = {
             "data_plane_checkpoint_schema_version": (
                 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
@@ -318,18 +369,16 @@ class RolloutSnapshotter(_UsesRolloutParts):
             )
             metadata["replay_manifest_digest"] = replay_metadata["manifest_digest"]
             metadata["replay_group_count"] = len(replay_metadata["groups"])
-        if rollout_recovery_payload_sha256 is not None:
-            if rollout_recovery_group_count is None:
-                raise ValueError("rollout recovery payload hash requires a group count")
-            metadata["rollout_recovery_schema_version"] = (
-                ROLLOUT_RECOVERY_SCHEMA_VERSION
-            )
-            metadata["rollout_recovery_payload_sha256"] = (
-                rollout_recovery_payload_sha256
-            )
-            metadata["rollout_recovery_group_count"] = rollout_recovery_group_count
-        elif rollout_recovery_group_count is not None:
-            raise ValueError("rollout recovery group count requires a payload hash")
+        if rollout_recovery is not None:
+            metadata["rollout_recovery_schema_version"] = rollout_recovery[
+                "rollout_recovery_schema_version"
+            ]
+            metadata["rollout_recovery_payload_sha256"] = rollout_recovery[
+                "rollout_recovery_payload_sha256"
+            ]
+            metadata["rollout_recovery_group_count"] = rollout_recovery[
+                "rollout_recovery_group_count"
+            ]
         if self._teacher_coordinator is not None:
             # The rows in this checkpoint are tagged with a teacher_index each;
             # record what those indices meant so a restore can reject a config
@@ -339,17 +388,35 @@ class RolloutSnapshotter(_UsesRolloutParts):
             )
             if teacher_checkpoints is not None:
                 metadata["opd_full_teacher_checkpoints"] = teacher_checkpoints
+        return metadata
+
+    async def _save_data_plane_checkpoint(
+        self,
+        checkpoint_path: PathLike,
+        metadata: DataPlaneCheckpointMetadata,
+        *,
+        capture_only: bool = False,
+    ) -> CheckpointCapture | None:
+        """Save the required TQ snapshot inside an SC checkpoint bundle.
+
+        With ``capture_only``, retain a view to persist after the barrier
+        instead, or return None without saving when the backend cannot; the
+        caller then saves. Failures propagate so a finalized bundle never
+        silently omits the advertised data-plane component.
+        """
+        checkpoint_dir = os.path.join(
+            checkpoint_path,
+            DATA_PLANE_CHECKPOINT_DIR,
+        )
         started = time.monotonic()
         print(f"data-plane checkpoint save started: {checkpoint_dir}", flush=True)
         try:
-            if allow_deferred:
-                captured = await capture_checkpoint(
+            if capture_only:
+                return await capture_checkpoint(
                     self._dp_client,
                     checkpoint_dir=checkpoint_dir,
                     metadata=metadata,
                 )
-                if captured is not None:
-                    return captured
             await call_data_plane(
                 self._dp_client,
                 "save_checkpoint",
@@ -369,6 +436,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
             f"{checkpoint_dir} ({time.monotonic() - started:.2f}s)",
             flush=True,
         )
+        return None
 
     async def capture(
         self,
@@ -386,9 +454,10 @@ class RolloutSnapshotter(_UsesRolloutParts):
         snapshot always saves TQ and re-indexes those rows in the persisted cut
         only; the live trainer keeps accumulating gradients without modification.
 
-        With ``allow_deferred``, a supporting backend retains a stable TQ view.
-        The caller must persist it before publication and release it after all
-        persistence work settles. Other backends save inside this call.
+        With ``allow_deferred``, a supporting backend retains a stable TQ view
+        and the recovery state is serialized after the barrier opens. The caller
+        must ``persist`` the capture before publication and release its view
+        after all persistence work settles. Other backends save inside this call.
         """
         cut.require_live()
         if self._rollout_runtime.shortfall_reconciliation_pending:
@@ -403,6 +472,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
             "filtered": list(self._rollout_runtime.filtered_reserve),
         }
         replay_metadata: Optional[TQReplayMetadataState] = None
+        recovery_state: Optional[RolloutRecoveryState] = None
         recovery_payload: Optional[bytes] = None
         recovery_group_count: Optional[int] = None
         training_owned_groups: list[TQReplayGroupMetadata] = []
@@ -433,7 +503,6 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 )
                 replay_inventory_seconds = time.monotonic() - replay_inventory_started
 
-            recovery_digest: Optional[str] = None
             if snapshot or self._records_prompt_groups():
                 recovery_state_build_started = time.monotonic()
                 recovery_state = build_rollout_recovery_state(
@@ -450,16 +519,8 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     if replay_metadata is not None
                     else set(),
                 )
-                recovery_state_serialize_started = time.monotonic()
                 recovery_state_build_seconds = (
-                    recovery_state_serialize_started - recovery_state_build_started
-                )
-                payload_buffer = io.BytesIO()
-                await asyncio.to_thread(torch.save, recovery_state, payload_buffer)
-                recovery_payload = payload_buffer.getvalue()
-                recovery_digest = hashlib.sha256(recovery_payload).hexdigest()
-                recovery_state_serialize_seconds = (
-                    time.monotonic() - recovery_state_serialize_started
+                    time.monotonic() - recovery_state_build_started
                 )
                 recovery_group_count = len(recovery_state["groups"])
 
@@ -475,18 +536,38 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     additional_expected_staging_keys=additional_expected_staging_keys,
                 )
                 staging_inventory_seconds = time.monotonic() - staging_inventory_started
-            tq_save_started = time.monotonic()
-            data_plane_capture = await self._save_data_plane_checkpoint(
-                checkpoint_path,
+            data_plane_metadata = partial(
+                self._data_plane_checkpoint_metadata,
                 train_steps=self._read_progress().train_steps,
                 trainer_version=self._read_progress().trainer_version,
                 current_epoch=self._read_progress().current_epoch,
                 replay_metadata=replay_metadata,
-                rollout_recovery_payload_sha256=recovery_digest,
-                rollout_recovery_group_count=recovery_group_count,
-                allow_deferred=allow_deferred,
             )
-            tq_save_seconds = time.monotonic() - tq_save_started
+            tq_save_started = time.monotonic()
+            if allow_deferred:
+                data_plane_capture = await self._save_data_plane_checkpoint(
+                    checkpoint_path, data_plane_metadata(), capture_only=True
+                )
+            if data_plane_capture is None:
+                rollout_recovery = None
+                if recovery_state is not None:
+                    serialize_started = time.monotonic()
+                    recovery_payload, recovery_digest = await asyncio.to_thread(
+                        _serialize_recovery_state, recovery_state
+                    )
+                    recovery_state_serialize_seconds = (
+                        time.monotonic() - serialize_started
+                    )
+                    rollout_recovery = _rollout_recovery_metadata(
+                        recovery_digest, recovery_group_count
+                    )
+                await self._save_data_plane_checkpoint(
+                    checkpoint_path,
+                    data_plane_metadata(rollout_recovery=rollout_recovery),
+                )
+            tq_save_seconds = (
+                time.monotonic() - tq_save_started - recovery_state_serialize_seconds
+            )
             if data_plane_capture is not None:
                 try:
                     # These containers outlive the barrier while dispatch advances.
@@ -525,7 +606,11 @@ class RolloutSnapshotter(_UsesRolloutParts):
             recovery_state_serialize_seconds=recovery_state_serialize_seconds,
             staging_inventory_seconds=staging_inventory_seconds,
         )
-        return SnapshotCapture(state=state, data_plane=data_plane_capture)
+        return SnapshotCapture(
+            state=state,
+            data_plane=data_plane_capture,
+            recovery_state=recovery_state if data_plane_capture is not None else None,
+        )
 
     def _begin_optimizer_commit(self) -> None:
         """Mark the step's optimizer update as applied until its counters publish."""
@@ -816,8 +901,12 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 # tmp_path, which holds the captured data-plane directory.
                 if captured.data_plane is not None:
                     persist_started = time.monotonic()
-                    await checkpoint_io(captured.data_plane.persist)
-                    tq_persist_seconds = time.monotonic() - persist_started
+                    snapshot_cut = await captured.persist()
+                    tq_persist_seconds = (
+                        time.monotonic()
+                        - persist_started
+                        - snapshot_cut.recovery_state_serialize_seconds
+                    )
                     release_started = time.monotonic()
                     await checkpoint_io(captured.data_plane.release)
                     tq_release_seconds = time.monotonic() - release_started
