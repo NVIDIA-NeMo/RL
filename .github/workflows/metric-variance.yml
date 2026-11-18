@@ -1,0 +1,145 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: Metric variance
+
+# Runs one functional test N times and reports mean / median / std / min / max / CV
+# of every value its check_metrics.py call evaluates, to show how much the metrics
+# vary from run to run.
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: "Functional test script name without .sh (a file in tests/functional/, e.g. grpo)"
+        required: true
+        type: string
+      runs:
+        description: "Number of times to run the test (2-50)"
+        required: false
+        default: 10
+        type: number
+      image_tag:
+        description: "Container image tag to reuse (venvs are prefetched at startup)"
+        required: false
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      run_ids: ${{ steps.plan.outputs.run_ids }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Validate inputs and build run matrix
+        id: plan
+        env:
+          SCRIPT: ${{ inputs.script }}
+          RUNS: ${{ inputs.runs }}
+        run: |
+          if [[ ! "$SCRIPT" =~ ^[A-Za-z0-9_.-]+$ || ! -f "tests/functional/$SCRIPT.sh" ]]; then
+            echo "::error::tests/functional/$SCRIPT.sh does not exist"
+            exit 1
+          fi
+          if ! grep -q "check_metrics.py" "tests/functional/$SCRIPT.sh"; then
+            echo "::error::$SCRIPT.sh has no check_metrics.py call, so there are no metrics to summarize"
+            exit 1
+          fi
+          if [[ ! "$RUNS" =~ ^[0-9]+$ ]] || (( RUNS < 2 || RUNS > 50 )); then
+            echo "::error::runs must be an integer between 2 and 50, got '$RUNS'"
+            exit 1
+          fi
+          echo "run_ids=$(jq -cn --argjson n "$RUNS" '[range(1; $n + 1)]')" | tee -a "$GITHUB_OUTPUT"
+
+  ephemeral-runner-routing:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@4fe957d4ea5816af1d67fae130bbab4b434c10b3 # v1.9.2
+    with:
+      lane: ${{ vars.NEMO_CI_EPHEMERAL_LANE }}
+      legacy_label: ${{ vars.NON_NVIDIA_H100_RUNNER }}
+      run_id: ${{ github.run_id }}
+      run_attempt: ${{ github.run_attempt }}
+
+  org-member-pre-flight:
+    needs: [ephemeral-runner-routing]
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
+    with:
+      default_runner_prefix: ${{ vars.DEFAULT_H100_RUNNER }}
+      non_nvidia_runner_prefix: ${{ needs.ephemeral-runner-routing.outputs.runner_label_base }}
+      default_test_data_path: ${{ vars.DEFAULT_H100_TEST_DATA_PATH }}
+      non_nvidia_test_data_path: ${{ vars.NON_NVIDIA_H100_TEST_DATA_PATH }}
+      default_registry: ${{ vars.DEFAULT_H100_CONTAINER_REGISTRY }}
+      non_nvidia_registry: ${{ vars.NON_NVIDIA_H100_CONTAINER_REGISTRY }}
+      sso_users_filename: ${{ vars.SSO_USERS_FILENAME }}
+    secrets:
+      NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
+
+  repeat-test:
+    needs: [plan, org-member-pre-flight]
+    strategy:
+      fail-fast: false
+      matrix:
+        run: ${{ fromJSON(needs.plan.outputs.run_ids) }}
+    runs-on: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
+    name: ${{ inputs.script }} run ${{ matrix.run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: main
+        uses: ./.github/actions/test-template
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        with:
+          runner: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
+          script: ${{ inputs.script }}
+          image-tag: ${{ inputs.image_tag }}
+          registry: ${{ needs.org-member-pre-flight.outputs.registry }}
+          image: ${{ vars.CI_CONTAINER_NAME }}
+          test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
+          test-commit-sha: ${{ github.sha }}
+          metrics-artifact-name: metrics-run-${{ matrix.run }}
+
+  aggregate:
+    needs: [plan, repeat-test]
+    if: ${{ always() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: Download per-run metrics
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: metrics-run-*
+          path: metrics
+      - name: Compute stats
+        env:
+          SCRIPT: ${{ inputs.script }}
+        run: |
+          uv run tests/aggregate_metric_stats.py \
+            --script "tests/functional/$SCRIPT.sh" \
+            --metrics-dir metrics \
+            --output-md metric_stats.md \
+            --output-json metric_stats.json
+          cat metric_stats.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload stats
+        uses: actions/upload-artifact@v6
+        with:
+          name: metric-stats-${{ inputs.script }}
+          path: |
+            metric_stats.md
+            metric_stats.json

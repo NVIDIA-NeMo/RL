@@ -68,6 +68,10 @@ inputs:
     description: "Run-scoped artifact containing the lockfile for the requested Megatron-LM commit"
     required: false
     default: ""
+  metrics-artifact-name:
+    description: "If set, upload the functional test's metrics.json as an artifact with this name"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -308,6 +312,15 @@ runs:
         path: |
           ${{ github.workspace }}/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl/tests/unit/environments/nemo_gym_test_data/actual_test_nemo_gym_sanity.json
         if-no-files-found: ignore
+
+    - name: Upload metrics
+      uses: actions/upload-artifact@v6
+      if: ${{ always() && inputs.metrics-artifact-name != '' }}
+      with:
+        name: ${{ inputs.metrics-artifact-name }}
+        path: |
+          ${{ github.workspace }}/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl/tests/functional/${{ inputs.script }}/metrics.json
+        if-no-files-found: warn
 
     - name: Container shutdown
       if: always()
