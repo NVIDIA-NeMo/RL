@@ -587,6 +587,7 @@ def test_open_value_step_preserves_gradients_during_resident_inference():
     )
     worker = SimpleNamespace(
         _train_step_state=state,
+        _keep_resident=True,
         model=model,
         optimizer=MagicMock(),
         move_model=MagicMock(side_effect=AssertionError("model moved")),
