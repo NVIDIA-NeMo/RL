@@ -15,6 +15,7 @@
 import pytest
 
 from nemo_rl.models.generation.vllm.draft_utils import (
+    draft_lm_head_sharing_disable_required,
     draft_module_sharing_disable_required,
 )
 
@@ -61,3 +62,33 @@ def test_draft_module_sharing_disable_required(
 def test_draft_module_sharing_disable_required_no_speculative_config():
     config = {"vllm_cfg": {"load_format": "dummy"}, "vllm_kwargs": {}}
     assert draft_module_sharing_disable_required(config) is False
+
+
+@pytest.mark.parametrize(
+    ("method", "weights_from_refit", "draft_full_refit", "expected"),
+    [
+        # Megatron eagle3 co-training streams a trained lm_head.
+        ("eagle3", True, False, True),
+        # Automodel co-training disables all module sharing instead.
+        ("eagle3", True, True, False),
+        # A static drafter keeps vLLM's sharing.
+        ("eagle3", False, False, False),
+        # Block drafters are not eagle3.
+        ("dspark", True, False, False),
+    ],
+)
+def test_draft_lm_head_sharing_disable_required(
+    method, weights_from_refit, draft_full_refit, expected
+):
+    config = {
+        "vllm_cfg": {"load_format": "dummy"},
+        "vllm_kwargs": {"speculative_config": {"method": method}},
+        "_draft_weights_from_refit": weights_from_refit,
+        "_draft_full_refit": draft_full_refit,
+    }
+    assert draft_lm_head_sharing_disable_required(config) == expected
+
+
+def test_draft_lm_head_sharing_disable_required_no_speculative_config():
+    config = {"vllm_cfg": {"load_format": "dummy"}, "vllm_kwargs": {}}
+    assert draft_lm_head_sharing_disable_required(config) is False
