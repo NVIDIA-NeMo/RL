@@ -172,6 +172,12 @@ class DraftCrossEntropyLossFn(LossFunction):
 
 
 class ClippedPGLossConfig(BaseModel, extra="allow"):
+    # Tag that selects this config among the policy-gradient loss configs (see
+    # PolicyGradientLossConfig). Optional: an untagged ``loss_fn`` block is this
+    # config. Excluded from dumps so serialized configs, and the checkpoint
+    # fingerprints derived from them, are unchanged.
+    kind: Literal["legacy_pg"] = Field(default="legacy_pg", exclude=True)
+
     # --- Loss type ---
     disable_ppo_ratio: bool = False
     token_level_loss: bool = True

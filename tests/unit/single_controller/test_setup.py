@@ -314,7 +314,9 @@ def patched_factories():
             return_value=MagicMock(name="adv"),
         ) as mock_adv,
         patch.object(
-            sc_setup_mod, "ClippedPGLossFn", return_value=MagicMock(name="loss_fn")
+            sc_setup_mod,
+            "build_policy_gradient_loss",
+            return_value=MagicMock(name="loss_fn"),
         ) as mock_loss,
         patch.object(
             sc_setup_mod,
@@ -332,7 +334,7 @@ def patched_factories():
             "build_data_plane_client": mock_dp_client,
             "create_weight_synchronizer": mock_weight_sync,
             "_create_advantage_estimator": mock_adv,
-            "ClippedPGLossFn": mock_loss,
+            "build_policy_gradient_loss": mock_loss,
             "dataloader": fake_dataloader,
             "env_handles": fake_env_handles,
             "fake_gen": fake_gen,
@@ -2120,7 +2122,10 @@ class TestSetup:
         assert actor_args.advantage_estimator is (
             patched_factories["_create_advantage_estimator"].return_value
         )
-        assert actor_args.loss_fn is patched_factories["ClippedPGLossFn"].return_value
+        assert (
+            actor_args.loss_fn
+            is patched_factories["build_policy_gradient_loss"].return_value
+        )
         # tq_buffer + rollout_manager are constructed inline (not mocked).
         assert actor_args.tq_buffer is not None
         assert actor_args.rollout_manager is not None
@@ -3668,8 +3673,8 @@ class TestAdaptiveLossRestore:
         checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
         checkpointer.load_training_info.return_value = vars(save_state)
         checkpointer.get_resume_paths.return_value = (None, None)
-        patched_factories["ClippedPGLossFn"].side_effect = lambda cfg, **kwargs: (
-            ClippedPGLossFn(cfg, **kwargs)
+        patched_factories["build_policy_gradient_loss"].side_effect = (
+            lambda cfg, **kwargs: (ClippedPGLossFn(cfg, **kwargs))
         )
         mc = _make_master_config(
             loss_cfg=ClippedPGLossConfig(

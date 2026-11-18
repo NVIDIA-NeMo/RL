@@ -50,7 +50,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
 )
-from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig, PolicyGradientLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
@@ -1001,7 +1001,7 @@ class MasterConfig(BaseModel, extra="allow"):
     ppo: Optional[PPOConfig] = None
     policy: PolicyConfig
     value: Optional[ValueConfig] = None  # PPO extras
-    loss_fn: ClippedPGLossConfig
+    loss_fn: PolicyGradientLossConfig
     value_loss_fn: Optional[MseValueLossConfig] = None  # PPO extras
     # common configs
     env: dict[str, Any]

@@ -35,6 +35,10 @@ from nemo_rl.algorithms.loss.loss_input import (
     prepare_loss_input,
     prepare_packed_loss_input,
 )
+from nemo_rl.algorithms.loss.policy_gradient import (
+    PolicyGradientLossConfig,
+    build_policy_gradient_loss,
+)
 from nemo_rl.algorithms.loss.wrapper import (
     DraftLossWrapper,
     DraftRuntimeLossWrapper,
@@ -58,8 +62,10 @@ __all__ = [
     "MseValueLossConfig",
     "MseValueLossFn",
     "NLLLossFn",
+    "PolicyGradientLossConfig",
     "PreferenceLossDataDict",
     "PreferenceLossFn",
+    "build_policy_gradient_loss",
     "prepare_loss_input",
     "prepare_packed_loss_input",
     "SequencePackingFusionLossWrapper",
