@@ -864,9 +864,10 @@ class TestFinish:
         mtp_param, policy_param = self._mtp_params()
         worker.model.parameters.return_value = [mtp_param, policy_param]
 
-        def scale_gradients(factor: float) -> None:
+        def scale_gradients(factor: torch.Tensor) -> None:
+            scale = factor.item()
             for param in (mtp_param, policy_param):
-                param.main_grad.mul_(factor)
+                param.main_grad.mul_(scale)
 
         worker.model.scale_gradients.side_effect = scale_gradients
         loss_fn = _normalization_loss_fn("group_token_mean")
@@ -897,7 +898,10 @@ class TestFinish:
         mock_module_symbols["all_reduce"].side_effect = reduce_counts
         worker.finish_train_step()
         mock_module_symbols["all_reduce"].assert_called_once()
-        worker.model.scale_gradients.assert_called_once_with(0.5)
+        worker.model.scale_gradients.assert_called_once()
+        assert worker.model.scale_gradients.call_args.args[0].item() == pytest.approx(
+            0.5
+        )
         # Two chunks contribute 4096 tokens and one group; the other DP rank
         # contributes 1024 tokens and one group. MTP still uses 1/T, policy 1/G.
         expected_mtp = torch.full((4,), 1 / 5120)
