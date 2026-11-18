@@ -51,7 +51,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import replace
 from functools import cached_property, partial
 from pathlib import Path
@@ -186,7 +186,8 @@ from nemo_rl.environments.checkpointing import build_environment_checkpoint
 from nemo_rl.environments.checkpointing.interfaces import (
     EnvironmentCheckpoint,
 )
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import NemoGymShardSet, should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.reward_penalties import (
@@ -4505,11 +4506,24 @@ class SingleControllerActor:
         it was needed. A probe that does not answer within one tick IS the unhealthy
         signal; it is not a reason to stop watching.
 
+        A ``NemoGymShardSet`` groups the NeMo-Gym actors and is not an actor itself, so
+        every actor it holds is asked; see ``_check_shard_set_health``.
+
         Environments without the method are skipped rather than treated as unhealthy;
         only NeMo-Gym has subprocess servers to lose.
         """
         problems: list[str] = []
-        for env_name, handle in self._env_handles.items():
+        # Setup stores the NeMo-Gym shard set among the handles, which their annotation
+        # does not say.
+        handles: Mapping[str, EnvironmentInterface | NemoGymShardSet] = (
+            self._env_handles
+        )
+        for env_name, handle in handles.items():
+            if isinstance(handle, NemoGymShardSet):
+                problems.extend(
+                    await self._check_shard_set_health(env_name, handle, timeout_s)
+                )
+                continue
             health_check = getattr(handle, "health_check", None)
             if health_check is None:
                 continue
@@ -4525,6 +4539,51 @@ class SingleControllerActor:
             except Exception as error:
                 problems.append(f"environment {env_name!r} reported unhealthy: {error}")
         return problems
+
+    async def _check_shard_set_health(
+        self, env_name: str, shard_set: NemoGymShardSet, timeout_s: float
+    ) -> list[str]:
+        """Ask every NeMo-Gym actor of one shard set whether its servers are alive.
+
+        The actors are asked concurrently and each call has its own timeout. The check
+        therefore takes at most ``timeout_s`` however many actors stay silent, and an
+        actor that fails or stays silent does not keep the others from being asked.
+
+        Args:
+            env_name: Key of the shard set in the environment handles, used in the
+                messages.
+            shard_set: The NeMo-Gym actors to ask.
+            timeout_s: Seconds each actor has to answer.
+
+        Returns:
+            One message per actor that raised or did not answer in time, in the order of
+            ``shard_set.all_handles``. Each message names the actor by its instance
+            label. The list is empty when every actor answered without raising.
+        """
+
+        async def check_actor(actor: Any) -> str | None:
+            """Return the problem found on one actor, or None when it is healthy."""
+            label = shard_set.instance_label(actor)
+            try:
+                await asyncio.wait_for(
+                    self._ray_get(actor.health_check.remote()), timeout=timeout_s
+                )
+            except asyncio.TimeoutError:
+                return (
+                    f"environment {env_name!r} instance {label!r} did not answer its "
+                    f"health check within {timeout_s}s"
+                )
+            except Exception as error:
+                return (
+                    f"environment {env_name!r} instance {label!r} reported unhealthy: "
+                    f"{error}"
+                )
+            return None
+
+        results = await asyncio.gather(
+            *(check_actor(actor) for actor in shard_set.all_handles)
+        )
+        return [problem for problem in results if problem is not None]
 
     async def _abort_stale_inflight(self) -> int:
         """Abort in-flight rollouts that the sampler can no longer select."""
