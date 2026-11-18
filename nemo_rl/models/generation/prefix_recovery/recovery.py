@@ -26,7 +26,6 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
-import json
 import logging
 import threading
 import time
@@ -38,13 +37,8 @@ from typing import Any, Literal
 
 import torch
 
-from nemo_rl.data_plane.prefix_pipeline import (
-    BatchReleased,
-    CutSteps,
-    PrefixWrite,
-    PrefixWritePipeline,
-    PrefixWritePipelineConfig,
-)
+from nemo_rl.data_plane.direct_prefix_batch import estimate_prefix_row_bytes
+from nemo_rl.data_plane.prefix_writer_actor import PrefixWriterDiedError
 from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_FIELD,
     SAMPLER_TOPK_LOGPROBS_FIELD,
@@ -62,6 +56,12 @@ from nemo_rl.models.generation.prefix_recovery.routes import (
 from nemo_rl.models.generation.prefix_recovery.state import (
     _CompletedCaptureState,
     _RequestCaptureState,
+)
+from nemo_rl.models.generation.prefix_recovery.write_pipeline import (
+    BatchReleased,
+    CutSteps,
+    PrefixWrite,
+    PrefixWritePipeline,
 )
 from nemo_rl.models.generation.score_centering import extract_score_centering_slice
 from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
@@ -168,12 +168,7 @@ def _ends_inside_character(tokenizer: Any, generated_token_ids: list[int]) -> bo
 class PrefixRecovery:
     """Generation-prefix cuts and restores for one worker's captured calls."""
 
-    def __init__(
-        self,
-        parts: PrefixRecoveryParts,
-        *,
-        pipeline_config: PrefixWritePipelineConfig | None = None,
-    ) -> None:
+    def __init__(self, parts: PrefixRecoveryParts) -> None:
         self._parts = parts
         self._registry = parts.registry
         # Guards this object's own state below; never held across TQ I/O.
@@ -205,18 +200,26 @@ class PrefixRecovery:
             if parts.prefix_read_max_rows > 1
             else None
         )
-        self._pipeline_config = pipeline_config
         self._pipeline = (
             PrefixWritePipeline(
-                config=pipeline_config,
+                config=parts.prefix_writes,
+                max_batch_rows=parts.prefix_write_max_rows,
+                max_batch_tokens=parts.prefix_write_max_tokens,
                 sink=parts.sink,
                 prepare=lambda inventory, deadline: self._checkpoint_steps(
                     inventory, deadline=deadline
                 ),
             )
-            if pipeline_config is not None and pipeline_config.enabled
+            if parts.prefix_writes.pipeline
             else None
         )
+        if self._pipeline is not None:
+            LOGGER.info(
+                "generation-prefix write pipeline started: max_batch_payload_bytes=%d "
+                "max_buffered_payload_bytes=%d",
+                parts.prefix_writes.max_batch_payload_bytes,
+                parts.prefix_writes.max_buffered_payload_bytes,
+            )
 
     @property
     def control_token(self) -> str | None:
@@ -350,14 +353,22 @@ class PrefixRecovery:
         Returns:
             ``restored_calls`` and their total ``restored_prefix_tokens``, plus
             ``progress_reads``, ``progress_read_calls`` and the microseconds
-            they waited for and held the engine's output lock.
+            they waited for and held the engine's output lock. With the write
+            pipeline on, also its ``pipeline_*`` counts (see
+            :meth:`PrefixWritePipeline.counts`).
         """
         with self._lock:
-            return {
+            counts = {
                 "restored_calls": self._restored_calls,
                 "restored_prefix_tokens": self._restored_tokens,
                 **self._counts,
             }
+        if self._pipeline is not None:
+            counts.update(
+                (f"pipeline_{name}", value)
+                for name, value in self._pipeline.counts().items()
+            )
+        return counts
 
     def shutdown(self) -> None:
         if self._pipeline is not None:
@@ -820,7 +831,14 @@ class PrefixRecovery:
             steps.close()
 
     def _checkpoint_steps(self, inventory: Any, *, deadline: float | None) -> CutSteps:
-        """Prepare transactions, then seal their rows after durable write replies."""
+        """Prepare transactions, then seal their rows after durable write replies.
+
+        ``deadline`` is a ``time.monotonic()`` bound. Gym stops waiting for the
+        receipt at its own control deadline, so calls not reached by then are
+        acknowledged as failures (they regenerate after restore) instead of
+        holding the cut-control or pipeline preparation thread for the next
+        checkpoint.
+        """
         from nemo_gym._checkpoint.generation_cut import (
             GenerationCutReceipt,
         )
@@ -885,12 +903,13 @@ class PrefixRecovery:
         failed batch write is retried one row per write, so one bad row fails
         only its own call. Past ``deadline`` no further write starts, and the
         calls not yet written are acknowledged as failures.
+
+        With the write pipeline, a batch also stays within
+        ``max_batch_payload_bytes`` (estimated), unless one row alone is
+        larger; that row is written alone.
         """
         max_rows = self._parts.prefix_write_max_rows
         max_tokens = self._parts.prefix_write_max_tokens
-        if self._pipeline_config is not None and self._pipeline_config.enabled:
-            max_rows = min(max_rows, self._pipeline_config.max_batch_rows)
-            max_tokens = min(max_tokens, self._pipeline_config.max_batch_tokens)
         checkpoint_id = inventory.checkpoint_id
         call_ids = [prefix.model_call_id for prefix in inventory.active_prefixes]
         if len(set(call_ids)) != len(call_ids):
@@ -902,11 +921,9 @@ class PrefixRecovery:
         pending: list[tuple[Generator[Any, Any, Any], Any, int, Any, Any]] = []
         pending_tokens = 0
         pending_bytes = 0
-        config = self._pipeline_config
+        prefix_writes = self._parts.prefix_writes
         byte_limit = (
-            None
-            if config is None or not config.enabled
-            else config.max_batch_payload_bytes
+            prefix_writes.max_batch_payload_bytes if prefix_writes.pipeline else None
         )
         late: list[Any] = []
 
@@ -936,7 +953,7 @@ class PrefixRecovery:
             keys: list[str | None] = []
             if past_deadline():
                 late.extend(prefix for _, _, _, _, prefix in batch)
-                return [None] * len(batch)
+                return [None for _ in batch]
             try:
                 keys.extend(
                     sink.stage_generation_prefix_batch(
@@ -947,6 +964,10 @@ class PrefixRecovery:
                     )
                 )
                 return keys
+            except PrefixWriterDiedError:
+                # Every later write fails too: fail the whole cut loudly
+                # instead of acknowledging each call as a failure.
+                raise
             except Exception:
                 # The sink has already discarded the batch's keys.
                 if len(batch) == 1:
@@ -1053,31 +1074,12 @@ class PrefixRecovery:
                     fail(prefix)
                     continue
                 tokens = len(record.token_ids_delta)
+                # Only the write pipeline bounds bytes.
                 size = (
-                    tokens * 16
-                    + 512
-                    + len(record.capture_key.encode("utf-8"))
-                    + len(record.model_call_id.encode("utf-8"))
+                    0
+                    if byte_limit is None
+                    else estimate_prefix_row_bytes(record, attachments)
                 )
-                if byte_limit is not None and record.parent_call_id is not None:
-                    size += len(record.parent_call_id.encode("utf-8"))
-                if byte_limit is not None and record.extras is not None:
-                    size += len(
-                        json.dumps(record.extras, ensure_ascii=False).encode("utf-8")
-                    )
-                if attachments:
-                    size += sum(
-                        value.numel() * value.element_size()
-                        for value in attachments.values()
-                    )
-                if byte_limit is not None and size > byte_limit:
-                    transaction.close()
-                    acknowledgements.append(
-                        self._failed_ack(
-                            prefix, reason="prefix_payload_limit", uncut=uncut
-                        )
-                    )
-                    continue
                 if pending and (
                     pending_tokens + tokens > max_tokens
                     or (byte_limit is not None and pending_bytes + size > byte_limit)
@@ -1090,7 +1092,12 @@ class PrefixRecovery:
                 pending.append((transaction, record, sequence, attachments, prefix))
                 pending_tokens += tokens
                 pending_bytes += size
-                if len(pending) >= max_rows or pending_tokens >= max_tokens:
+                if (
+                    len(pending) >= max_rows
+                    or pending_tokens >= max_tokens
+                    or (byte_limit is not None and pending_bytes >= byte_limit)
+                ):
+                    # An oversized single row is written alone, never split.
                     yield from flush()
             yield from flush()
         finally:

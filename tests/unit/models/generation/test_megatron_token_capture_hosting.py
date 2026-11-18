@@ -22,6 +22,7 @@ from nemo_rl.models.generation.megatron.megatron_generation import (  # noqa: E4
 from nemo_rl.models.generation.megatron.megatron_worker import (  # noqa: E402
     MegatronGenerationMixin,
 )
+from nemo_rl.models.generation.prefix_recovery.write_pipeline import PrefixWritesConfig
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -30,6 +31,7 @@ _PREFIX_BATCH_LIMITS = {
     "prefix_write_max_rows": 256,
     "prefix_write_max_tokens": 4_194_304,
     "prefix_read_max_rows": 256,
+    "prefix_writes": PrefixWritesConfig(),
 }
 
 

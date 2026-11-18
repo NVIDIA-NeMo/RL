@@ -56,6 +56,7 @@ from nemo_rl.models.generation.interfaces import (
     sampler_replay_enabled,
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
+from nemo_rl.models.generation.prefix_recovery.write_pipeline import PrefixWritesConfig
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS,
@@ -1815,6 +1816,7 @@ def _generation_cut_route(
                 prefix_write_max_rows=256,
                 prefix_write_max_tokens=4_194_304,
                 prefix_read_max_rows=256,
+                prefix_writes=PrefixWritesConfig(),
             )
         )
         recovery.checkpoint_cut = checkpoint_cut

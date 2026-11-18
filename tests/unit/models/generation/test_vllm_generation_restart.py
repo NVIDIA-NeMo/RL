@@ -18,6 +18,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from nemo_rl.models.generation.prefix_recovery.write_pipeline import PrefixWritesConfig
+
 pytestmark = pytest.mark.vllm
 
 
@@ -101,6 +103,7 @@ class TestRestartShardTokenCapture:
         "prefix_write_max_rows": 256,
         "prefix_write_max_tokens": 4_194_304,
         "prefix_read_max_rows": 256,
+        "prefix_writes": PrefixWritesConfig(pipeline=True),
     }
 
     @staticmethod

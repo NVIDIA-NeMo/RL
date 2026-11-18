@@ -81,29 +81,35 @@ Every attempt logs its outcome under `rollout/checkpoint_outcome`, and every sav
 
 ## Pipelined Generation-Prefix Writes
 
-Generation-prefix writes can use direct column encoding, bounded preparation/write
-overlap, and a separate colocated CPU TQ writer actor. All are opt-in under
-`policy.generation.vllm_cfg` and require async HTTP serving with text-only prefix
-capture. Router-replay tensors are supported. The writer actor requires the
-TransferQueue `simple` backend; terminal writes and restore reads retain their
-existing client. Checkpoint records and digests are unchanged.
+Generation-prefix writes can use a pipeline, which encodes text/router columns
+directly and overlaps preparation with one bounded write stream, and a separate
+colocated CPU TQ writer actor. Both are opt-in under `rollout_recovery.prefix_writes`
+and require `token_capture.enabled: true`, `rollout_recovery.target_level: prefix`,
+the vLLM backend with async HTTP serving, and text-only capture (a model without
+a VLM processor). Router-replay tensors are supported. The writer actor also
+requires `data_plane.impl: transfer_queue` with `data_plane.backend: simple`;
+terminal writes and restore reads retain their existing client. Checkpoint records and digests are unchanged. A merged write
+holds at most `rollout_recovery.prefix_write_max_rows` rows and
+`rollout_recovery.prefix_write_max_tokens` tokens, as without the pipeline.
 
-| Key under `policy.generation.vllm_cfg` | Type / default | Purpose |
+| Key under `rollout_recovery.prefix_writes` | Type / default | Purpose |
 |---|---|---|
-| `prefix_writer_actor` | bool / `false` | Run prefix PUTs in one CPU actor on the generation node. |
-| `prefix_write_pipeline.enabled` | bool / `false` | Overlap preparation with one write stream; requires direct column encoding. |
-| `prefix_write_pipeline.direct_column_encoding` | bool / `false` | Build owned batch columns directly; independent of pipeline/actor enablement. |
-| `prefix_write_pipeline.max_pending_inventories` | positive int / `128` | Reject admission beyond this many pending inventories. |
-| `prefix_write_pipeline.max_buffered_payload_bytes` | positive int / `536870912` | Bound estimated queued/in-flight numeric payload plus a preparation reservation. |
-| `prefix_write_pipeline.max_batch_payload_bytes` | positive int / `134217728` | Bound one merged write; a larger single row fails its cut and regenerates. |
-| `prefix_write_pipeline.max_batch_rows` | positive int / `256` | Bound rows per merged write. |
-| `prefix_write_pipeline.max_batch_tokens` | positive int / `4194304` | Bound token positions per merged write. |
-| `prefix_write_pipeline.coalesce_wait_seconds` | nonnegative float / `0.01` | Coalescing window for compatible prepared rows. |
+| `pipeline` | bool / `false` | Encode columns directly and overlap preparation with one write stream. |
+| `writer_actor` | bool / `false` | Run prefix PUTs in one CPU actor on the generation node. |
+| `max_pending_inventories` | positive int / `128` | Reject admission beyond this many pending inventories. |
+| `max_buffered_payload_bytes` | positive int / `536870912` | Bound estimated queued/in-flight numeric payload plus a preparation reservation. |
+| `max_batch_payload_bytes` | positive int / `134217728` | Bound one merged write; a larger single row is written alone. |
+| `coalesce_wait_seconds` | nonnegative float / `0.01` | Coalescing window for compatible prepared rows. |
 
-The buffer must hold at least two maximum batches. It does not bound total RSS:
+The buffer must hold at least two maximum batches. A single row above
+`max_batch_payload_bytes` is written alone, as a row above
+`prefix_write_max_tokens` is; its estimated size may take the buffer past
+`max_buffered_payload_bytes`, and while it does no further batch is prepared.
+The buffer does not bound total RSS:
 live token histories, Python records, temporary encoding buffers and transport
 copies occupy additional memory. Preparation retains each call's lifecycle until
-its write is acknowledged and the cut seals. Duplicate in-flight inventories
+its write is acknowledged and the cut seals, so at most one write
+(`prefix_write_max_rows` rows) is prepared ahead of the write in flight. Duplicate in-flight inventories
 share a result; inventories sharing calls serialize. Closing an HTTP waiter does
 not cancel an admitted write. No receipt advertises a prefix before TQ durability.
 

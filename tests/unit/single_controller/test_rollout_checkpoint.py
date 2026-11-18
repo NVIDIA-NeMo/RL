@@ -265,6 +265,7 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
             "prefix_write_max_rows": 64,
             "prefix_write_max_tokens": 1_048_576,
             "prefix_read_max_rows": 1,
+            "prefix_writes": {"pipeline": True, "writer_actor": True},
         },
         "cluster": {"num_nodes": 8},
         "logger": LoggerConfig(log_dir="/run/two"),

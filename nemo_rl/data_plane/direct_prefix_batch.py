@@ -25,6 +25,7 @@ from tensordict import TensorDict
 
 from nemo_rl.data_plane.codec import stack_or_nest
 from nemo_rl.data_plane.schema import (
+    CAPTURE_MODE_TO_CODE,
     ROUTE_ENCODING_NONE,
     ROUTE_ENCODING_TENSOR,
     ROUTED_EXPERTS_ENCODING_FIELD,
@@ -32,6 +33,24 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXTRAS_METADATA_FIELD,
     ROUTED_LEN_FIELD,
 )
+
+# token_ids_delta (int64) plus token_mask_delta and generation_logprobs_delta
+# (float32), as encode_prefix_groups builds them.
+_TOKEN_BYTES = np.dtype(np.int64).itemsize + 2 * np.dtype(np.float32).itemsize
+# Rough per-row allowance for the scalar, digest and offset columns.
+_ROW_BYTES = 512
+
+
+def _dense_or_jagged(values: torch.Tensor, lengths: np.ndarray) -> torch.Tensor:
+    """Rows of equal length as a dense 2D tensor, otherwise a jagged one."""
+    if np.all(lengths == lengths[0]):
+        return values.reshape(len(lengths), int(lengths[0]))
+    offsets = np.empty(len(lengths) + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(lengths, out=offsets[1:])
+    return torch.nested.nested_tensor_from_jagged(
+        values, offsets=torch.from_numpy(offsets)
+    )
 
 
 def _numeric_column(
@@ -44,15 +63,7 @@ def _numeric_column(
         end = cursor + len(row)
         values[cursor:end] = row
         cursor = end
-    tensor = torch.from_numpy(values)
-    if np.all(lengths == lengths[0]):
-        return tensor.reshape(len(rows), int(lengths[0]))
-    offsets = np.empty(len(rows) + 1, dtype=np.int64)
-    offsets[0] = 0
-    np.cumsum(lengths, out=offsets[1:])
-    return torch.nested.nested_tensor_from_jagged(
-        tensor, offsets=torch.from_numpy(offsets)
-    )
+    return _dense_or_jagged(torch.from_numpy(values), lengths)
 
 
 def _byte_column(rows: list[bytes]) -> torch.Tensor:
@@ -60,27 +71,47 @@ def _byte_column(rows: list[bytes]) -> torch.Tensor:
     if np.any(lengths == 0):
         raise ValueError("Staging byte fields must be nonempty")
     values = torch.from_numpy(np.frombuffer(bytearray().join(rows), dtype=np.uint8))
-    if np.all(lengths == lengths[0]):
-        return values.reshape(len(rows), int(lengths[0]))
-    offsets = np.empty(len(rows) + 1, dtype=np.int64)
-    offsets[0] = 0
-    np.cumsum(lengths, out=offsets[1:])
-    return torch.nested.nested_tensor_from_jagged(
-        values, offsets=torch.from_numpy(offsets)
+    return _dense_or_jagged(values, lengths)
+
+
+def estimate_prefix_row_bytes(
+    record: Any, attachments: Mapping[str, torch.Tensor] | None
+) -> int:
+    """Estimated encoded size of one cut row, for the write pipeline's byte bounds."""
+    size = len(record.token_ids_delta) * _TOKEN_BYTES + _ROW_BYTES
+    for text in (record.capture_key, record.model_call_id, record.parent_call_id):
+        if text is not None:
+            size += len(text.encode("utf-8"))
+    if record.extras is not None:
+        size += len(json.dumps(record.extras, ensure_ascii=False).encode("utf-8"))
+    if attachments:
+        size += sum(
+            value.numel() * value.element_size() for value in attachments.values()
+        )
+    return size
+
+
+def can_encode_directly(record: Any, attached: Mapping[str, Any] | None) -> bool:
+    """Whether a row has only text and tensor-routed columns.
+
+    Media, sampler top-k and legacy route envelopes use the general sink
+    encoder.
+    """
+    descriptor = (record.extras or {}).get(ROUTED_EXPERTS_FIELD)
+    return (descriptor is None or isinstance(descriptor, dict)) and not (
+        attached and set(attached) - {ROUTED_EXPERTS_FIELD}
     )
 
 
 def encode_prefix_groups(
     records: Sequence[Any],
     attachments: Sequence[Mapping[str, Any] | None],
-    *,
-    mode_codes: Mapping[str, int],
 ) -> list[tuple[list[int], TensorDict, list[dict[str, Any]]]]:
     """Validate all rows, then encode homogeneous text/router groups.
 
-    Route descriptors and tensors use the existing staging schema. Media,
-    sampler top-k and legacy route envelopes use the general sink encoder.
-    Returned columns own their numeric buffers through the PUT acknowledgement.
+    Every row must pass :func:`can_encode_directly`. Route descriptors and
+    tensors use the existing staging schema. Returned columns own their
+    numeric buffers through the PUT acknowledgement.
     """
     if not records or len(records) != len(attachments):
         raise ValueError(
@@ -141,7 +172,7 @@ def encode_prefix_groups(
             "delta_len": [r.delta_len for r in rows],
             "cum_len": [r.cum_len for r in rows],
             "weight_version": [r.weight_version for r in rows],
-            "capture_mode": [mode_codes[r.mode] for r in rows],
+            "capture_mode": [CAPTURE_MODE_TO_CODE[r.mode] for r in rows],
             ROUTED_EXPERTS_ENCODING_FIELD: [
                 ROUTE_ENCODING_NONE if signature is None else ROUTE_ENCODING_TENSOR
             ]

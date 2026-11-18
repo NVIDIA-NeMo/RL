@@ -62,8 +62,15 @@ if TYPE_CHECKING:
     )
 
 from nemo_rl.data_plane.codec import stack_or_nest
-from nemo_rl.data_plane.direct_prefix_batch import encode_prefix_groups
+from nemo_rl.data_plane.direct_prefix_batch import (
+    can_encode_directly,
+    encode_prefix_groups,
+)
+from nemo_rl.data_plane.prefix_writer_actor import PrefixWriterDiedError
 from nemo_rl.data_plane.schema import (
+    CAPTURE_CODE_TO_MODE,
+    CAPTURE_MODE_TO_CODE,
+    GENERATION_CUT_STAGING_PREFIX,
     PER_TOKEN_STAGING_FIELDS,
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
@@ -140,10 +147,6 @@ STAGING_FIELDS = [
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_LEN_FIELD,
 ]
-
-_MODE_TO_CODE = {"text": 0, "token_in": 1}
-_CODE_TO_MODE = {code: mode for mode, code in _MODE_TO_CODE.items()}
-GENERATION_CUT_STAGING_PREFIX = "__generation_cut__/"
 
 
 def generation_cut_staging_key(
@@ -504,10 +507,16 @@ class TQTokenSink:
         staging_partition: str,
         capture_media: bool = False,
         media_pixel_dtype: torch.dtype | None = None,
+        direct_prefix_columns: bool = False,
     ) -> None:
+        if direct_prefix_columns and capture_media:
+            raise ValueError(
+                "Direct prefix columns require a text-only staging partition"
+            )
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
         self._prefix_store: TQStagingStore | None = None
-        self._direct_prefix_columns = False
+        # Build text/router cut batches directly in owned column buffers.
+        self._direct_prefix_columns = direct_prefix_columns
         self._capture_media = capture_media
         # Pixel dtype every media row of this partition must carry (the engine
         # model dtype). Fixes the ``media_imgs`` column dtype so text-call
@@ -525,14 +534,6 @@ class TQTokenSink:
         self._prefix_store = TQStagingStore(
             dp_client, staging_partition=self._store._staging_partition
         )
-
-    def enable_direct_prefix_columns(self) -> None:
-        """Build text/router cut batches directly in owned column buffers."""
-        if self._capture_media:
-            raise ValueError(
-                "Direct prefix columns require a text-only staging partition"
-            )
-        self._direct_prefix_columns = True
 
     @property
     def media_pixel_dtype(self) -> torch.dtype | None:
@@ -665,7 +666,7 @@ class TQTokenSink:
                 [record.parent_call_id is not None], dtype=torch.bool
             ),
             "capture_mode": torch.tensor(
-                [_MODE_TO_CODE[record.mode]], dtype=torch.int64
+                [CAPTURE_MODE_TO_CODE[record.mode]], dtype=torch.int64
             ),
             "prev_len": torch.tensor([record.prev_len], dtype=torch.int64),
             "delta_len": torch.tensor([record.delta_len], dtype=torch.int64),
@@ -805,55 +806,65 @@ class TQTokenSink:
             for record, sequence in zip(records, chunk_sequences, strict=True)
         ]
         store = self._store if self._prefix_store is None else self._prefix_store
-        if self._direct_prefix_columns and all(
-            (
-                (record.extras or {}).get(ROUTED_EXPERTS_FIELD) is None
-                or isinstance(record.extras[ROUTED_EXPERTS_FIELD], dict)
-            )
-            and not (attached and set(attached) - {ROUTED_EXPERTS_FIELD})
-            for record, attached in zip(records, attachments, strict=True)
-        ):
-            encoded = encode_prefix_groups(
-                records, attachments, mode_codes=_MODE_TO_CODE
-            )
-        else:
-            rows = [
-                self._encode_record(
-                    record, attachments=row_attachments, generation_cut_chunk=True
-                )
-                for record, row_attachments in zip(records, attachments, strict=True)
-            ]
-            # The TensorDict takes row 0's column names, and stack_or_nest promotes
-            # mismatched dtypes and nests mismatched trailing dims without raising.
-            layouts = {
-                tuple(
-                    (name, fields[name].dtype, tuple(fields[name].shape[2:]))
-                    for name in sorted(fields)
-                )
-                for fields, _ in rows
-            }
-            if len(layouts) > 1:
-                raise ValueError("generation-prefix batch rows have different layouts")
-            encoded = [
-                (
-                    list(range(len(rows))),
-                    TensorDict(
-                        {
-                            name: stack_or_nest([row[name][0] for row, _ in rows])
-                            for name in rows[0][0]
-                        },
-                        batch_size=[len(rows)],
-                    ),
-                    [tags for _, tags in rows],
-                )
-            ]
+        direct = self._direct_prefix_columns and all(
+            map(can_encode_directly, records, attachments)
+        )
+        encoded = (
+            encode_prefix_groups(records, attachments)
+            if direct
+            else self._encode_prefix_groups_general(records, attachments)
+        )
         try:
             for indices, fields, tags in encoded:
                 store.put_many([keys[index] for index in indices], fields, tags=tags)
-        except Exception:
-            self._discard_failed_writes(keys, store=store)
+        except Exception as error:
+            # A dead writer cannot discard its own partial write; the local
+            # client can.
+            self._discard_failed_writes(
+                keys,
+                store=self._store
+                if isinstance(error, PrefixWriterDiedError)
+                else store,
+            )
             raise
         return keys
+
+    def _encode_prefix_groups_general(
+        self,
+        records: Sequence[StagedCallRecord],
+        attachments: Sequence[Mapping[str, Any] | None],
+    ) -> list[tuple[list[int], TensorDict, list[dict[str, Any]]]]:
+        """Encode each row alone, then stack every row into one group."""
+        rows = [
+            self._encode_record(
+                record, attachments=row_attachments, generation_cut_chunk=True
+            )
+            for record, row_attachments in zip(records, attachments, strict=True)
+        ]
+        # The TensorDict takes row 0's column names, and stack_or_nest promotes
+        # mismatched dtypes and nests mismatched trailing dims without raising.
+        layouts = {
+            tuple(
+                (name, fields[name].dtype, tuple(fields[name].shape[2:]))
+                for name in sorted(fields)
+            )
+            for fields, _ in rows
+        }
+        if len(layouts) > 1:
+            raise ValueError("generation-prefix batch rows have different layouts")
+        return [
+            (
+                list(range(len(rows))),
+                TensorDict(
+                    {
+                        name: stack_or_nest([row[name][0] for row, _ in rows])
+                        for name in rows[0][0]
+                    },
+                    batch_size=[len(rows)],
+                ),
+                [tags for _, tags in rows],
+            )
+        ]
 
     def _discard_failed_writes(
         self, keys: Sequence[str], *, store: TQStagingStore | None = None
@@ -1321,7 +1332,7 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
     )
     mode_code = int(_row_leaf(row, "capture_mode")[0].item())
     try:
-        mode = _CODE_TO_MODE[mode_code]
+        mode = CAPTURE_CODE_TO_MODE[mode_code]
     except KeyError as error:
         raise ValueError(f"unknown capture_mode code {mode_code}") from error
     routed_encoding = int(_row_leaf(row, ROUTED_EXPERTS_ENCODING_FIELD)[0].item())

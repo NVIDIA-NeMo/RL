@@ -26,7 +26,6 @@ import math
 import os
 import sys
 import threading
-import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,8 +36,12 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
+from nemo_rl.data_plane.observability import is_metrics_client
+from nemo_rl.data_plane.schema import GENERATION_CUT_STAGING_PREFIX
 
 G_LOGGER = logging.getLogger(__name__)
+# A writer hard-pinned to a node with no free CPU would otherwise wait forever.
+_WRITER_STARTUP_TIMEOUT_S = 180
 G_DTYPES = {
     str(dtype): dtype
     for dtype in (
@@ -72,24 +75,6 @@ class PrefixPut:
     partition_id: str
     columns: dict[str, PackedColumn]
     tags: tuple[dict[str, Any], ...]
-
-    @property
-    def payload_bytes(self) -> int:
-        return sum(
-            column.data.nbytes
-            + (0 if column.offsets is None else column.offsets.nbytes)
-            for column in self.columns.values()
-        )
-
-
-@dataclass(frozen=True)
-class PrefixWriteReply:
-    sample_ids: tuple[str, ...]
-    unpack_s: float
-    unpack_cpu_s: float
-    put_s: float
-    put_cpu_s: float
-    put_process_cpu_s: float
 
 
 def pack_columns(fields: TensorDict) -> dict[str, PackedColumn]:
@@ -170,20 +155,6 @@ def unpack_columns(columns: dict[str, PackedColumn], rows: int) -> TensorDict:
     return TensorDict(fields, batch_size=[rows])
 
 
-def validate_prefix_writer_setup(
-    config: DataPlaneConfig, *, prefix_cuts: bool, capture_media: bool
-) -> None:
-    """Reject unsupported writer deployments before starting an actor."""
-    if not prefix_cuts:
-        raise ValueError("prefix_writer_actor requires generation-prefix cuts")
-    if capture_media:
-        raise ValueError(
-            "prefix_writer_actor currently supports text and routes, not media"
-        )
-    if config["impl"] != "transfer_queue" or config["backend"] != "simple":
-        raise ValueError("prefix_writer_actor currently requires transfer_queue/simple")
-
-
 class PrefixWriterService:
     """Execute one PUT or failed-write cleanup at a time in the writer actor."""
 
@@ -197,67 +168,35 @@ class PrefixWriterService:
         if (
             not sample_ids
             or len(set(sample_ids)) != len(sample_ids)
-            or any(not key.startswith("__generation_cut__/") for key in sample_ids)
+            or any(
+                not key.startswith(GENERATION_CUT_STAGING_PREFIX) for key in sample_ids
+            )
         ):
             raise ValueError("Prefix writer requires distinct generation-cut keys")
 
-    def put(self, batch: PrefixPut) -> PrefixWriteReply:
+    def put(self, batch: PrefixPut) -> tuple[str, ...]:
+        """Write one batch and return its keys once TQ acknowledges it."""
         self._validate_keys(batch.partition_id, batch.sample_ids)
         if len(batch.tags) != len(batch.sample_ids):
             raise ValueError("Prefix IDs and tags have different lengths")
-        started, cpu = time.perf_counter(), time.thread_time()
-        fields = unpack_columns(batch.columns, len(batch.sample_ids))
-        unpack_s, unpack_cpu_s = time.perf_counter() - started, time.thread_time() - cpu
-        started, cpu, process_cpu = (
-            time.perf_counter(),
-            time.thread_time(),
-            time.process_time(),
+        self._client.put_samples(
+            sample_ids=list(batch.sample_ids),
+            partition_id=batch.partition_id,
+            fields=unpack_columns(batch.columns, len(batch.sample_ids)),
+            tags=list(batch.tags),
         )
-        G_LOGGER.info(
-            "prefix_writer event=put_start writer_pid=%d rows=%d bytes=%d unix_s=%.6f",
-            os.getpid(),
-            len(batch.sample_ids),
-            batch.payload_bytes,
-            time.time(),
-        )
-        success = False
-        try:
-            self._client.put_samples(
-                sample_ids=list(batch.sample_ids),
-                partition_id=batch.partition_id,
-                fields=fields,
-                tags=list(batch.tags),
-            )
-            success = True
-        finally:
-            put_s = time.perf_counter() - started
-            put_cpu_s = time.thread_time() - cpu
-            put_process_cpu_s = time.process_time() - process_cpu
-            G_LOGGER.info(
-                "prefix_writer event=put_complete writer_pid=%d rows=%d elapsed_s=%.6f "
-                "thread_cpu_s=%.6f process_cpu_s=%.6f success=%s unix_s=%.6f",
-                os.getpid(),
-                len(batch.sample_ids),
-                put_s,
-                put_cpu_s,
-                put_process_cpu_s,
-                success,
-                time.time(),
-            )
-        return PrefixWriteReply(
-            batch.sample_ids,
-            unpack_s,
-            unpack_cpu_s,
-            put_s,
-            put_cpu_s,
-            put_process_cpu_s,
-        )
+        return batch.sample_ids
 
     def clear(self, partition_id: str, sample_ids: tuple[str, ...]) -> None:
         self._validate_keys(partition_id, sample_ids)
         self._client.clear_samples(
             sample_ids=list(sample_ids), partition_id=partition_id
         )
+
+    def get_data_plane_snapshot(self) -> dict[str, Any] | None:
+        if not is_metrics_client(self._client):
+            return None
+        return self._client.snapshot(reset_step_window=True)
 
 
 class PrefixWriterActor(PrefixWriterService):
@@ -269,7 +208,7 @@ class PrefixWriterActor(PrefixWriterService):
 
         torch.set_num_threads(1)
         super().__init__(
-            build_data_plane_client(config, bootstrap=False, segment_size=0),
+            build_data_plane_client(config, bootstrap=False),
             partition_id,
         )
 
@@ -277,11 +216,17 @@ class PrefixWriterActor(PrefixWriterService):
         return {"pid": os.getpid(), "node_id": ray.get_runtime_context().get_node_id()}
 
 
+class PrefixWriterDiedError(RuntimeError):
+    """The writer actor is gone; it is never restarted."""
+
+
 class RayPrefixWriterClient:
     """Synchronous, one-flight facade; no automatic retries or early ACKs.
 
     Close is teardown-only: it kills the actor rather than waiting forever on
     a stalled PUT. Outstanding callers fail; they must not publish receipts.
+    Once the actor dies, every later call raises ``PrefixWriterDiedError``
+    rather than falling back to another client.
     """
 
     def __init__(self, actor: Any, *, writer_pid: int) -> None:
@@ -290,12 +235,31 @@ class RayPrefixWriterClient:
         self._write_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._closed = False
-        self._totals: dict[str, int | float] = {}
+        self._dead = False
 
     def _require_open(self) -> None:
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("Prefix writer is closed")
+            if self._dead:
+                raise self._died_error()
+
+    def _died_error(self) -> PrefixWriterDiedError:
+        return PrefixWriterDiedError(
+            f"Prefix writer actor (pid {self._writer_pid}) died; generation-prefix "
+            "cuts on this engine fail until the run restarts"
+        )
+
+    def _get(self, reference: Any) -> Any:
+        """Resolve one actor call, marking the writer dead if the actor is gone."""
+        try:
+            return ray.get(reference)
+        except ray.exceptions.RayActorError as error:
+            # A close kills the actor on purpose; report that, not a death.
+            self._require_open()
+            with self._state_lock:
+                self._dead = True
+            raise self._died_error() from error
 
     def put_samples(
         self,
@@ -307,62 +271,38 @@ class RayPrefixWriterClient:
     ) -> None:
         with self._write_lock:
             self._require_open()
-            started, cpu = time.perf_counter(), time.thread_time()
             batch = PrefixPut(
                 tuple(sample_ids),
                 partition_id,
                 pack_columns(fields),
                 tuple(dict(tag) for tag in tags),
             )
-            pack_s, pack_cpu_s = time.perf_counter() - started, time.thread_time() - cpu
-            started, cpu = time.perf_counter(), time.thread_time()
-            reference = ray.put(batch)
-            handoff_s, handoff_cpu_s = (
-                time.perf_counter() - started,
-                time.thread_time() - cpu,
-            )
-            started, cpu = time.perf_counter(), time.thread_time()
-            reply = ray.get(self._actor.put.remote(reference))
-            wait_s, wait_cpu_s = time.perf_counter() - started, time.thread_time() - cpu
+            keys = self._get(self._actor.put.remote(ray.put(batch)))
             self._require_open()
-            if (
-                not isinstance(reply, PrefixWriteReply)
-                or reply.sample_ids != batch.sample_ids
-            ):
+            if keys != batch.sample_ids:
                 raise RuntimeError("Prefix writer returned different durable keys")
-            metrics = {
-                "batches": 1,
-                "rows": len(sample_ids),
-                "payload_bytes": batch.payload_bytes,
-                "pack_s": pack_s,
-                "pack_cpu_s": pack_cpu_s,
-                "handoff_s": handoff_s,
-                "handoff_cpu_s": handoff_cpu_s,
-                "reply_wait_s": wait_s,
-                "reply_wait_cpu_s": wait_cpu_s,
-                "unpack_s": reply.unpack_s,
-                "unpack_cpu_s": reply.unpack_cpu_s,
-                "put_s": reply.put_s,
-                "put_cpu_s": reply.put_cpu_s,
-                "put_process_cpu_s": reply.put_process_cpu_s,
-            }
-            with self._state_lock:
-                for key, value in metrics.items():
-                    self._totals[key] = self._totals.get(key, 0) + value
-            G_LOGGER.info(
-                "prefix_writer event=put writer_pid=%d metrics=%s",
-                self._writer_pid,
-                metrics,
-            )
 
     def clear_samples(self, *, sample_ids: list[str], partition_id: str) -> None:
         with self._write_lock:
             self._require_open()
-            ray.get(self._actor.clear.remote(partition_id, tuple(sample_ids)))
+            self._get(self._actor.clear.remote(partition_id, tuple(sample_ids)))
 
-    def snapshot(self) -> dict[str, int | float]:
+    async def get_data_plane_snapshot(self) -> dict[str, Any] | None:
+        """The writer client's data-plane counters.
+
+        ``None`` when observability is off or the writer is closed or dead; the
+        cuts report a dead writer. Waits behind an in-flight PUT, since the
+        actor runs one call at a time.
+        """
         with self._state_lock:
-            return {"writer_pid": self._writer_pid, **self._totals}
+            if self._closed or self._dead:
+                return None
+        try:
+            return await self._actor.get_data_plane_snapshot.remote()
+        except ray.exceptions.RayActorError:
+            with self._state_lock:
+                self._dead = True
+            return None
 
     def close(self) -> None:
         with self._state_lock:
@@ -370,7 +310,7 @@ class RayPrefixWriterClient:
                 return
             self._closed = True
         ray.kill(self._actor, no_restart=True)
-        G_LOGGER.info("prefix_writer event=closed metrics=%s", self.snapshot())
+        G_LOGGER.info("prefix_writer event=closed writer_pid=%d", self._writer_pid)
 
 
 async def create_prefix_writer(
@@ -392,9 +332,17 @@ async def create_prefix_writer(
         .remote(config, partition_id)
     )
     try:
-        ready = await asyncio.wait_for(actor.ready.remote(), timeout=180)
+        ready = await asyncio.wait_for(
+            actor.ready.remote(), timeout=_WRITER_STARTUP_TIMEOUT_S
+        )
         if ready["node_id"] != node_id:
             raise RuntimeError("Prefix writer was scheduled off its generation node")
+    except TimeoutError as e:
+        ray.kill(actor, no_restart=True)
+        raise RuntimeError(
+            f"Prefix writer did not start on node {node_id} within "
+            f"{_WRITER_STARTUP_TIMEOUT_S}s; it needs 1 free CPU there"
+        ) from e
     except BaseException:
         ray.kill(actor, no_restart=True)
         raise

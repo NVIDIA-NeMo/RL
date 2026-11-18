@@ -27,6 +27,9 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
     from nemo_rl.data.captured_media import MediaColumnSpec
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
+    from nemo_rl.models.generation.prefix_recovery.write_pipeline import (
+        PrefixWritesConfig,
+    )
 
 # Routed-expert index tensors ([seq, layers, topk]) are carried in the narrowest
 # signed dtype that fits ids 0..num_experts-1 plus the -1 missing-route sentinel:
@@ -714,6 +717,7 @@ class GenerationInterface(ABC):
         prefix_write_max_rows: int,
         prefix_write_max_tokens: int,
         prefix_read_max_rows: int,
+        prefix_writes: "PrefixWritesConfig",
     ) -> "Optional[MediaColumnSpec]":
         """Install token capture in the serving workers (``token_capture.enabled``).
 
@@ -744,6 +748,8 @@ class GenerationInterface(ABC):
                 cut; a single larger row is written alone.
             prefix_read_max_rows: Maximum rows per TQ read at restore; 1 reads
                 each restore on its own.
+            prefix_writes: How cut rows are written: the write pipeline, the
+                writer actor and their bounds.
 
         Returns:
             With ``capture_media``, the pixel dtype and patch size the workers

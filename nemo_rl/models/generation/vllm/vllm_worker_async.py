@@ -47,11 +47,10 @@ from nemo_rl.data.captured_media import (
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
-from nemo_rl.data_plane.prefix_pipeline import PrefixWritePipelineConfig
+from nemo_rl.models.generation.prefix_recovery.write_pipeline import PrefixWritesConfig
 from nemo_rl.data_plane.prefix_writer_actor import (
     RayPrefixWriterClient,
     create_prefix_writer,
-    validate_prefix_writer_setup,
 )
 from nemo_rl.data_plane.tq_token_sink import MediaMetadataIntegrityError
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -892,6 +891,7 @@ class VllmAsyncGenerationWorkerImpl(
         prefix_write_max_rows: int,
         prefix_write_max_tokens: int,
         prefix_read_max_rows: int,
+        prefix_writes: PrefixWritesConfig,
     ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
@@ -912,38 +912,9 @@ class VllmAsyncGenerationWorkerImpl(
             raise ValueError(
                 "Multiple HTTP API servers do not support generation-prefix cuts"
             )
-        writer_enabled = self.cfg["vllm_cfg"].get("prefix_writer_actor")
-        pipeline_raw = self.cfg["vllm_cfg"].get("prefix_write_pipeline")
-        pipeline_config = (
-            PrefixWritePipelineConfig()
-            if pipeline_raw is None
-            else PrefixWritePipelineConfig.model_validate(pipeline_raw)
-        )
-        if pipeline_config.enabled and not pipeline_config.direct_column_encoding:
-            raise ValueError("Prefix write pipeline requires direct column encoding")
-        if (pipeline_config.enabled or pipeline_config.direct_column_encoding) and (
-            not generation_prefix_cuts_enabled or capture_media
-        ):
-            raise ValueError(
-                "Prefix write pipeline/encoder requires text-only prefix capture"
-            )
-        if (
-            pipeline_config.enabled
-            and pipeline_config.max_buffered_payload_bytes
-            < 2 * pipeline_config.max_batch_payload_bytes
-        ):
-            raise ValueError(
-                "Prefix pipeline buffer must hold a write and one preparation reservation"
-            )
         if self._prefix_writer is not None:
             raise RuntimeError(
                 "Token capture with a prefix writer is already installed"
-            )
-        if writer_enabled:
-            validate_prefix_writer_setup(
-                dp_cfg,
-                prefix_cuts=generation_prefix_cuts_enabled,
-                capture_media=capture_media,
             )
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
@@ -965,9 +936,8 @@ class VllmAsyncGenerationWorkerImpl(
             staging_partition=staging_partition,
             capture_media=capture_media,
             media_pixel_dtype=pixel_dtype,
+            direct_prefix_columns=prefix_writes.pipeline,
         )
-        if pipeline_config.direct_column_encoding:
-            sink.enable_direct_prefix_columns()
         self._capture_top_logprobs = int(top_logprobs)
         if generation_prefix_cuts_enabled and not generation_cut_control_token:
             raise ValueError(
@@ -1076,10 +1046,10 @@ class VllmAsyncGenerationWorkerImpl(
                     prefix_write_max_rows=prefix_write_max_rows,
                     prefix_write_max_tokens=prefix_write_max_tokens,
                     prefix_read_max_rows=prefix_read_max_rows,
+                    prefix_writes=prefix_writes,
                 ),
-                pipeline_config=pipeline_config,
             )
-        if writer_enabled:
+        if prefix_writes.writer_actor:
             try:
                 writer = await create_prefix_writer(
                     dp_cfg, partition_id=staging_partition
@@ -1132,12 +1102,18 @@ class VllmAsyncGenerationWorkerImpl(
         """Collect each frontend's capture counters and reset its step window.
 
         Returns:
-            One snapshot per frontend with data-plane observability enabled.
+            One snapshot per frontend, plus the prefix writer actor's, with
+            data-plane observability enabled.
         """
         snapshots = []
         local_snapshot = self.get_data_plane_snapshot()
         if local_snapshot is not None:
             snapshots.append(local_snapshot)
+        if self._prefix_writer is not None:
+            # The writer actor owns its own client; prefix PUTs count there.
+            writer_snapshot = await self._prefix_writer.get_data_plane_snapshot()
+            if writer_snapshot is not None:
+                snapshots.append(writer_snapshot)
         if self._api_server_pool is not None:
             snapshots.extend(
                 snapshot

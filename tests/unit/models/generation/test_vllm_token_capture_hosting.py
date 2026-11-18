@@ -106,6 +106,7 @@ from nemo_rl.models.generation.prefix_recovery.state import (  # noqa: E402
     _FrozenCut,
     _RequestCaptureState,
 )
+from nemo_rl.models.generation.prefix_recovery.write_pipeline import PrefixWritesConfig
 from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
     GENERATION_CUT_ROUTE as RL_GENERATION_CUT_ROUTE,
 )
@@ -133,6 +134,7 @@ _PREFIX_BATCH_LIMITS = {
     "prefix_write_max_rows": 256,
     "prefix_write_max_tokens": 4_194_304,
     "prefix_read_max_rows": 256,
+    "prefix_writes": PrefixWritesConfig(),
 }
 
 
@@ -281,6 +283,7 @@ def _cuts(
             prefix_write_max_rows=batch_size or 256,
             prefix_write_max_tokens=batch_max_tokens or 4_194_304,
             prefix_read_max_rows=read_max_rows or 256,
+            prefix_writes=PrefixWritesConfig(),
         )
     )
     worker._prefix_recovery = recovery
@@ -303,9 +306,12 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client, *, staging_partition, capture_media, media_pixel_dtype=None: (
-            sink
-        ),
+        lambda dp_client,
+        *,
+        staging_partition,
+        capture_media,
+        media_pixel_dtype=None,
+        direct_prefix_columns: sink,
     )
     worker = _fake_worker()
 
@@ -356,9 +362,12 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client, *, staging_partition, capture_media, media_pixel_dtype=None: (
-            sink
-        ),
+        lambda dp_client,
+        *,
+        staging_partition,
+        capture_media,
+        media_pixel_dtype=None,
+        direct_prefix_columns: sink,
     )
     worker = _fake_worker()
     asyncio.run(
