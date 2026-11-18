@@ -14,6 +14,7 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     DebugWriter,
     DebugWriterConfig,
     JsonDebugWriter,
+    ParquetDebugWriter,
     TrainChunk,
     make_debug_writer,
 )
@@ -451,12 +452,18 @@ class _Unrelated:
 _NOT_A_CLASS = 5
 
 
-@pytest.mark.parametrize("cfg", [DebugWriterConfig(), DebugWriterConfig(target="json")])
-def test_make_debug_writer_selects_json_writer_by_default_and_by_name(
-    tmp_path: Path, cfg: DebugWriterConfig
+@pytest.mark.parametrize(
+    ("cfg", "writer_cls"),
+    [
+        (DebugWriterConfig(), ParquetDebugWriter),
+        (DebugWriterConfig(target="json"), JsonDebugWriter),
+    ],
+)
+def test_make_debug_writer_selects_parquet_by_default_and_json_by_name(
+    tmp_path: Path, cfg: DebugWriterConfig, writer_cls: type[DebugWriter]
 ) -> None:
     writer = make_debug_writer(cfg, str(tmp_path), shard_id="3")
-    assert type(writer) is JsonDebugWriter
+    assert type(writer) is writer_cls
     assert writer.log_dir == tmp_path
     assert writer.shard_id == "3"
 
@@ -639,3 +646,63 @@ def test_custom_writer_gets_shared_storage_from_the_base_class(
     _, submitted = executor.submitted[0]
     assert advantages.is_shared()
     assert submitted.sequences["advantages"].is_shared()
+
+
+def test_parquet_writer_trims_rows_and_publishes_a_manifest(
+    tmp_path: Path, chunk: TrainChunk
+) -> None:
+    pq = pytest.importorskip("pyarrow.parquet")
+    writer = make_debug_writer(DebugWriterConfig(target="parquet"), str(tmp_path))
+    receipt = writer.add_chunk(chunk)
+    directory = tmp_path / "train_data_parquet" / "step-00000001"
+    assert not (directory / "_manifest.json").exists()
+
+    writer.finish_step(0, [receipt])
+    manifest = json.loads((directory / "_manifest.json").read_text())
+    assert manifest == {"step": 1, "files": [receipt.ref]}
+    table = pq.read_table(directory / receipt.ref).to_pydict()
+    assert table["sample_id"] == ["a", "b"]
+    assert table["token_ids"] == [[10, 11], [20]]
+    assert table["rewards"] == [0.5, -1.0]
+    assert table["values"] == [None, None]
+
+
+def test_parquet_writer_rejects_a_short_dump_and_a_missing_chunk(
+    tmp_path: Path, chunk: TrainChunk
+) -> None:
+    pytest.importorskip("pyarrow.parquet")
+    writer = make_debug_writer(DebugWriterConfig(target="parquet"), str(tmp_path))
+    receipt = writer.add_chunk(chunk)
+    with pytest.raises(RuntimeError, match="receipts report"):
+        writer.finish_step(0, [replace(receipt, rows=3)])
+    with pytest.raises(RuntimeError, match="not found"):
+        writer.finish_step(0, [replace(receipt, ref="missing.parquet")])
+
+
+def test_parquet_writer_republishes_a_retried_step_without_losing_the_old_dump(
+    tmp_path: Path, chunk: TrainChunk
+) -> None:
+    pytest.importorskip("pyarrow.parquet")
+    cfg = DebugWriterConfig(target="parquet")
+    first = make_debug_writer(cfg, str(tmp_path))
+    old = first.add_chunk(chunk)
+    first.finish_step(0, [old])
+    directory = tmp_path / "train_data_parquet" / "step-00000001"
+
+    retry = make_debug_writer(cfg, str(tmp_path))
+    new = retry.add_chunk(chunk)
+    # The published dump stays readable until the retry publishes.
+    assert json.loads((directory / "_manifest.json").read_text())["files"] == [old.ref]
+    assert (directory / old.ref).is_file()
+
+    # A write that died after creating its `.partial` file leaves it behind.
+    orphan = directory / ".step-00000001-shard-0-dead.parquet.partial"
+    orphan.write_bytes(b"torn")
+
+    retry.finish_step(0, [new])
+    assert json.loads((directory / "_manifest.json").read_text())["files"] == [new.ref]
+    assert not (directory / old.ref).exists()
+    assert not orphan.exists()
+    assert sorted(p.name for p in directory.iterdir()) == sorted(
+        ["_manifest.json", new.ref]
+    )

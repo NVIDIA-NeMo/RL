@@ -290,6 +290,7 @@ def patched_factories():
                 MagicMock(name="train_cluster"),
                 MagicMock(name="inference_cluster"),
                 None,
+                None,
             ),
         ) as mock_clusters,
         patch.object(
@@ -554,11 +555,12 @@ def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
 
     monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", FakeCluster)
 
-    _, _, teacher_topology = sc_setup_mod._build_clusters(master_config)
+    _, _, value_cluster, teacher_topology = sc_setup_mod._build_clusters(master_config)
 
     assert constructed[0]["bundle_ct_per_node_list"] == [8]
     assert constructed[1]["bundle_ct_per_node_list"] == [8]
     assert teacher_topology is None
+    assert value_cluster is None
 
 
 def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
@@ -587,13 +589,14 @@ def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
 
     monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", FakeCluster)
 
-    train_cluster, inference_cluster, teacher_topology = sc_setup_mod._build_clusters(
-        master_config
+    train_cluster, inference_cluster, value_cluster, teacher_topology = (
+        sc_setup_mod._build_clusters(master_config)
     )
 
     assert train_cluster.kwargs["bundle_ct_per_node_list"] == [4]
     assert inference_cluster.kwargs["bundle_ct_per_node_list"] == [4]
     assert teacher_topology is None
+    assert value_cluster is None
 
 
 def test_single_controller_mopd_recipe_builds_tropd_estimator(monkeypatch):
@@ -855,7 +858,7 @@ def _patched_gym_token_capture(finalizer_actors):
             sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
         ) as spinup,
         patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
-        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(sc_setup_mod, "media_capture_family", return_value="omni"),
         patch(
             "nemo_rl.experience.rollout_reassembler_actor."
             "create_rollout_reassembler_actors",
@@ -1567,6 +1570,7 @@ class TestSetup:
         generation, _ = patched_factories["_build_generation"].return_value
         _, setup_kwargs = generation.setup_token_capture.call_args
         assert setup_kwargs["capture_media"] is True
+        assert setup_kwargs["media_family"] == "omni"
         assert setup_kwargs["generation_prefix_cuts_enabled"] is True
 
     def test_disabled_periodic_checkpointing_ignores_existing_snapshots(
@@ -2917,6 +2921,7 @@ class TestSetup:
         generation, _ = patched_factories["_build_generation"].return_value
         _, setup_kwargs = generation.setup_token_capture.call_args
         assert setup_kwargs["capture_media"] is with_processor
+        assert setup_kwargs["media_family"] == ("omni" if with_processor else None)
         # Workers bound a generation cut by Gym's control timeout, counted
         # from when the cut request reaches them.
         assert setup_kwargs["generation_cut_control_timeout_s"] == (
@@ -4504,7 +4509,7 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
 
     with (
         patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(sc_setup_mod, "media_capture_family", return_value="omni"),
         patch.object(
             sc_setup_mod.opd_module,
             "get_opd_full_config",
@@ -4524,6 +4529,33 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
         mock_gate.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    ("processor_name", "message"),
+    [
+        ("Qwen2VLProcessor", "got Qwen2VLProcessor"),
+        ("PixtralProcessor", "no learner yet"),
+    ],
+    ids=["unknown-processor", "pixtral"],
+)
+def test_token_capture_media_family_is_picked_by_the_driver(
+    patched_factories, processor_name, message
+):
+    """The driver picks the media family from the processor class. A processor
+    without one is rejected by name, and Pixtral until a learner reads its
+    captured layout; both before any data or cluster setup."""
+    mc = _make_gym_megatron_capture_config()
+    processor = type(processor_name, (MagicMock,), {})()
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        pytest.raises(ValueError, match=message),
+    ):
+        setup_single_controller(mc, MagicMock(pad_token_id=0), processor=processor)
+
+    patched_factories["setup_response_data"].assert_not_called()
+    patched_factories["_build_clusters"].assert_not_called()
+
+
 @pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])
 def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
     patched_factories, multimodal
@@ -4538,7 +4570,7 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
 
     with (
         patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(sc_setup_mod, "media_capture_family", return_value="omni"),
         patch.object(
             sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_actor
         ) as mock_spinup,
@@ -4582,6 +4614,7 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
     setup_args, setup_kwargs = actor_args.gen_handle.setup_token_capture.call_args
     assert setup_args[1] == mc.token_capture.staging_partition
     assert setup_kwargs["capture_media"] is multimodal
+    assert setup_kwargs["media_family"] == ("omni" if multimodal else None)
     assert setup_kwargs["top_logprobs"] == 0
     # What the workers pinned the media column to is what the finalizers get.
     assert (
