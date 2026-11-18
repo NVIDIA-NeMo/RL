@@ -18,7 +18,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 ### AutoModel full-batch baseline
 
-AutoModel supports the initial text GRPO baseline: dense and MoE full-parameter FSDP2, TP=CP=1, fixed microbatches, disaggregated async vLLM, `in_order` with `max_lookahead_versions` 0 or 1, and a streaming threshold equal to `grpo.num_prompts_per_step`.
+AutoModel supports the initial text GRPO baseline: dense and MoE full-parameter FSDP2, TP=CP=1, fixed microbatches, disaggregated async vLLM, `in_order` at any `max_lookahead_versions`, and a streaming threshold equal to `grpo.num_prompts_per_step`.
 Packing, dynamic batching, CPU offload, HSDP, LoRA, draft training, VLM, PPO, distillation, dynamic sampling, and token capture are not enabled in this stage.
 Both prompt-drop budgets must be zero. Explicit unsupported settings fail at
 setup; the worker also rejects unsupported model properties before training.

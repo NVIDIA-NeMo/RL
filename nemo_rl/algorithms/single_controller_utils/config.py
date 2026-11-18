@@ -1958,10 +1958,6 @@ def _validate_automodel_single_controller_config(master_config: MasterConfig) ->
         "grpo.use_dynamic_sampling": algo_cfg.use_dynamic_sampling,
         "token_capture.enabled": master_config.token_capture.enabled,
         "async_rl.sampler.name": not isinstance(sampler, InOrderSamplerConfig),
-        "async_rl.sampler.max_lookahead_versions": (
-            isinstance(sampler, InOrderSamplerConfig)
-            and sampler.max_lookahead_versions not in (0, 1)
-        ),
         "async_rl.sampler.warmup_lookahead_versions": (
             isinstance(sampler, InOrderSamplerConfig)
             and sampler.warmup_lookahead_versions is not None
@@ -2009,9 +2005,9 @@ def _validate_automodel_single_controller_config(master_config: MasterConfig) ->
     rejected = [key for key, is_unsupported in unsupported.items() if is_unsupported]
     if rejected:
         raise ValueError(
-            "AutoModel SC supports text GRPO on in_order sampling with "
-            "max_lookahead_versions in (0, 1), full-batch streaming, no prompt "
-            "drops, disaggregated async vLLM, fixed microbatches, FSDP2 with "
+            "AutoModel SC supports text GRPO on in_order sampling, full-batch "
+            "streaming, no prompt drops, disaggregated async vLLM, fixed "
+            "microbatches, FSDP2 with "
             "TP=CP=1, and unquantized bf16/fp32 full-parameter training. "
             f"Unsupported: {', '.join(rejected)}"
         )
