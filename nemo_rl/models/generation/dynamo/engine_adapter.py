@@ -18,8 +18,9 @@
 request kinds served, how errors reach the driver, and the endpoint's
 registration. A backend implements four methods over its worker's engine
 (``serve_rollout``, ``start``, ``abort`` and ``kv_event_sources``);
-``vllm_adapter.DynamoVllmAdapter`` is the vLLM one. The engine only ever receives
-token IDs, on ``/v1/completions``. This module imports no generation backend.
+``vllm.adapter.DynamoVllmAdapter`` is the vLLM one. The engine only ever receives
+token IDs: NeMo RL's rollouts on ``/v1/completions``, and NeMo-Gym's chat calls
+once NeMo RL's chat engine in the frontend has rendered them. This module imports no generation backend.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from dynamo._core import Context
+from dynamo._core import Context, fetch_model
 from dynamo.common.backend import (
     EngineConfig,
     GenerateChunk,
@@ -114,7 +115,7 @@ class DynamoEngineAdapter(LLMEngine):
                 break
         else:
             raise InvalidArgument(
-                "NeMo RL's engines serve only NeMo RL rollouts through Dynamo "
+                "NeMo RL's engines serve only NeMo RL's own requests through Dynamo "
                 f"(requests annotated {', '.join(map(repr, handlers))})."
             )
         try:
@@ -180,6 +181,17 @@ class DynamoEngineAdapter(LLMEngine):
         """Nothing to release: the worker owns its engine and shuts it down."""
 
 
+async def weight_free_model_path(model: str) -> str:
+    """A local directory with ``model``'s config and tokenizer files.
+
+    ``model`` itself when it is a local path; for a Hub ID, Dynamo's snapshot
+    of it without the weights.
+    """
+    if os.path.exists(model):
+        return model
+    return await fetch_model(model, ignore_weights=True)
+
+
 def start_dynamo_endpoint(
     adapter: DynamoEngineAdapter,
     *,
@@ -191,7 +203,9 @@ def start_dynamo_endpoint(
     """Register ``adapter``'s engine with Dynamo and serve it on the running loop.
 
     ``model_path`` is a local directory with the model's config and tokenizer
-    files; the engine is served under ``served_model_name``.
+    files; the engine is served under ``served_model_name``. Chat calls are
+    rendered by NeMo RL's chat engine in the frontend, not Dynamo's renderer,
+    so no template or parser is registered.
 
     The Rust Worker serves until the process gets SIGTERM. It installs a chained
     handler, so Ray's actor handler still runs and the actor exits as usual;
@@ -207,8 +221,8 @@ def start_dynamo_endpoint(
         endpoint=DYNAMO_ENDPOINT,
         model_name=model_path,
         served_model_name=served_model_name,
-        # NeMo RL's rollouts go to /v1/completions only.
-        endpoint_types="completions",
+        # NeMo RL's rollouts go to /v1/completions; NeMo-Gym calls chat.
+        endpoint_types="chat,completions",
         discovery_backend=engine_env["DYN_DISCOVERY_BACKEND"],
         request_plane=engine_env["DYN_REQUEST_PLANE"],
         event_plane=engine_env["DYN_EVENT_PLANE"],
