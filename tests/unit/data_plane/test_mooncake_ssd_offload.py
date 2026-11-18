@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import atexit
 import functools
 import http.client
 import http.server
@@ -71,46 +70,8 @@ def test_owned_segment_size(unit_segment_size, segment_size, owned) -> None:
     assert cfg.owned_segment_size(segment_size) == owned
 
 
-@pytest.fixture
-def fake_store(monkeypatch, tmp_path):
-    """A fake mooncake store class, fresh offload state, and a clean env."""
-    import ray
-    from transfer_queue.storage.clients import mooncake_client
-
-    calls = []
-
-    class FakeStore:
-        def setup(self, *args, **kwargs):
-            calls.append((args, kwargs))
-            return 0
-
-    FakeClient = _client_cls([])
-    monkeypatch.setattr(mooncake_client, "MooncakeDistributedStore", FakeStore)
-    monkeypatch.setattr(mooncake_client, "MooncakeStoreClient", FakeClient)
-    monkeypatch.setattr(
-        ray,
-        "get_runtime_context",
-        lambda: SimpleNamespace(get_job_id=lambda: "05000000"),
-    )
-    for var in offload.REQUIRED_ENV:
-        # setenv first so monkeypatch restores the var even if it was unset.
-        monkeypatch.setenv(var, "")
-        monkeypatch.delenv(var)
-    monkeypatch.setattr(offload, "_dir", None)
-    monkeypatch.setattr(offload, "_lock_fd", None)
-    monkeypatch.setattr(offload, "_offloading_store_set_up", False)
-    monkeypatch.setattr(offload, "_sweep_stop", None)
-    exit_hooks = []
-    monkeypatch.setattr(atexit, "register", exit_hooks.append)
-    yield SimpleNamespace(
-        module=mooncake_client,
-        cls=FakeStore,
-        client_cls=FakeClient,
-        calls=calls,
-        exit_hooks=exit_hooks,
-    )
-    if offload._sweep_stop is not None:
-        offload._sweep_stop.set()  # a fake store has nothing to sweep
+# ``fake_store`` (conftest.py): a recording fake Mooncake store class, fresh
+# offload module state, and a clean environment.
 
 
 @pytest.mark.parametrize(
