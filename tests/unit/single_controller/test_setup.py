@@ -106,6 +106,7 @@ from nemo_rl.utils.config import (
     load_config,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig, WandbConfig
 
 # Captured at import, before the patched_factories fixture swaps it for a mock.
@@ -657,6 +658,18 @@ def test_gdpo_rejects_reward_shaping():
         max_response_length=4096,
     )
     with pytest.raises(NotImplementedError, match="reward_shaping.enabled=false"):
+        validate_single_controller_config(mc)
+
+
+def test_gdpo_rejects_length_penalty():
+    mc = _make_master_config(megatron_enabled=True, env={"should_use_nemo_gym": True})
+    mc.policy["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+    mc.grpo.adv_estimator = AdvEstimatorConfig(name="gdpo")
+    mc.grpo.length_penalty = LengthPenaltyConfig()
+    with pytest.raises(NotImplementedError, match="Remove grpo.length_penalty"):
         validate_single_controller_config(mc)
 
 
