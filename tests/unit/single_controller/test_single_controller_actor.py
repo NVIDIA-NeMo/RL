@@ -73,9 +73,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     TokenCaptureConfig,
     logprob_passes_required,
+    resolve_grpo_chunk_alignment,
     resolve_grpo_group_multiple,
     resolve_ppo_chunk_alignment,
-    validate_grpo_chunk_cap_alignment,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
@@ -461,7 +461,7 @@ def test_grpo_rejects_a_step_size_that_cannot_shard_across_policy_dp() -> None:
     multiple of three groups, so no selection can fill the last chunk.
     """
     with pytest.raises(ValueError, match="num_prompts_per_step"):
-        validate_grpo_chunk_cap_alignment(_grpo_chunk_cap_config(None), 6)
+        resolve_grpo_chunk_alignment(_grpo_chunk_cap_config(None), 6)
 
 
 def test_grpo_group_multiple_ignores_logprob_batch_size_without_a_logprob_pass() -> (
@@ -494,7 +494,7 @@ def test_grpo_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp() -> None:
     dispatch shards without allow_uneven_shards, so six cannot split four ways.
     """
     with pytest.raises(ValueError, match="max_groups_for_streaming_train"):
-        validate_grpo_chunk_cap_alignment(_grpo_chunk_cap_config(3), 4)
+        resolve_grpo_chunk_alignment(_grpo_chunk_cap_config(3), 4)
 
 
 def test_grpo_rejects_a_cap_that_leaves_each_rank_a_partial_microbatch() -> None:
@@ -512,7 +512,7 @@ def test_grpo_rejects_a_cap_that_leaves_each_rank_a_partial_microbatch() -> None
     )
 
     with pytest.raises(ValueError, match="max_groups_for_streaming_train"):
-        validate_grpo_chunk_cap_alignment(config, 2)
+        resolve_grpo_chunk_alignment(config, 2)
 
 
 @pytest.mark.parametrize("chunk_cap", [None, 2, 4, 8, 9])
@@ -521,7 +521,7 @@ def test_grpo_accepts_shardable_and_nonbinding_chunk_caps(
 ) -> None:
     # 2 and 4 shard evenly across DP 4; 8 and 9 are at or above
     # num_prompts_per_step and so never bind; None is the unbounded default.
-    validate_grpo_chunk_cap_alignment(_grpo_chunk_cap_config(chunk_cap), 4)
+    assert resolve_grpo_chunk_alignment(_grpo_chunk_cap_config(chunk_cap), 4) == 2
 
 
 @pytest.mark.parametrize(
@@ -543,7 +543,7 @@ def test_grpo_ignores_microbatch_sizes_when_the_consumer_bins_its_own(
         sequence_packing=sequence_packing,
     )
 
-    validate_grpo_chunk_cap_alignment(config, 2)
+    resolve_grpo_chunk_alignment(config, 2)
 
 
 def test_forest_is_exempt_because_its_groups_are_padded_to_execution_rows() -> None:
@@ -552,9 +552,7 @@ def test_forest_is_exempt_because_its_groups_are_padded_to_execution_rows() -> N
     Its logical group count is therefore not its physical row count, so the
     sample arithmetic this guard does would be measuring the wrong thing.
     """
-    validate_grpo_chunk_cap_alignment(
-        _grpo_chunk_cap_config(3, forest_training=True), 4
-    )
+    resolve_grpo_chunk_alignment(_grpo_chunk_cap_config(3, forest_training=True), 4)
 
 
 def test_the_grpo_chunk_cap_guard_leaves_ppo_to_its_own_alignment() -> None:
@@ -572,7 +570,7 @@ def test_the_grpo_chunk_cap_guard_leaves_ppo_to_its_own_alignment() -> None:
         ),
     )
 
-    validate_grpo_chunk_cap_alignment(config, 4)
+    resolve_grpo_chunk_alignment(config, 4)
 
 
 def _one_group_tags(count: int, *, weight_version: int = 0) -> list[dict[str, object]]:

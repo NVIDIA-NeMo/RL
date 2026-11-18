@@ -1689,6 +1689,10 @@ class TestSetup:
             )
         )
 
+        assert actor_args.grpo_group_multiple == 2
+        assert len(chunk.sample_ids) == 20 * 16, (
+            "the 21st group waits for the next chunk"
+        )
         batch = BatchedDataDict({"x": torch.zeros(len(chunk.sample_ids))})
         assert len(batch.shard_by_batch_size(32)) == 32
 
@@ -3606,8 +3610,6 @@ def test_grpo_setup_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp(
     mc.async_rl.min_groups_for_streaming_train = 1
     # 3 groups x 2 generations is 6 samples, which DP 4 cannot shard.
     mc.async_rl.max_groups_for_streaming_train = 3
-    # The guard reads the batching mode, which the shared fixture leaves out.
-    mc.policy["dynamic_batching"] = {"enabled": True}
     trainer = patched_factories["fake_policy"]
     trainer.cfg = mc.policy
     trainer.sharding_annotations.get_axis_size.return_value = 4

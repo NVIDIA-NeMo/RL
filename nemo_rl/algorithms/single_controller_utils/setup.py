@@ -85,10 +85,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     forest_execution_row_multiple,
     is_ppo_run,
     logprob_passes_required,
-    resolve_grpo_group_multiple,
+    resolve_grpo_chunk_alignment,
     resolve_ppo_chunk_alignment,
     rollout_snapshots_enabled,
-    validate_grpo_chunk_cap_alignment,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.utils import set_seed
@@ -1882,8 +1881,7 @@ def setup_single_controller(
         )
         if not is_ppo_run(master_config):
             policy_dp = trainer.sharding_annotations.get_axis_size("data_parallel")
-            validate_grpo_chunk_cap_alignment(master_config, policy_dp)
-            grpo_group_multiple = resolve_grpo_group_multiple(master_config, policy_dp)
+            grpo_group_multiple = resolve_grpo_chunk_alignment(master_config, policy_dp)
             return trainer, None, time_metrics
 
         if not dedicated_value:

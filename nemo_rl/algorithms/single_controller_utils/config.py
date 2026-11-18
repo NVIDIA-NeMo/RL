@@ -1816,7 +1816,8 @@ def sample_multiple(
         config: Policy or value configuration of the consuming trainer.
         dp_size: Data-parallel size of that trainer.
         logprob_required: Whether a logprob pass splits the dispatch. When False,
-            the logprob microbatch size does not constrain it.
+            the logprob microbatch size does not constrain it. FP8 KV-scale
+            calibration still reuses ``logprob_batch_size`` on the whole step.
 
     Returns:
         The sample count both splits divide.
@@ -1911,10 +1912,8 @@ def resolve_grpo_group_multiple(master_config: MasterConfig, policy_dp: int) -> 
     )
 
 
-def validate_grpo_chunk_cap_alignment(
-    master_config: MasterConfig, policy_dp: int
-) -> None:
-    """Reject a GRPO step size or chunk cap that cannot split across the policy.
+def resolve_grpo_chunk_alignment(master_config: MasterConfig, policy_dp: int) -> int:
+    """Validate GRPO step and chunk-cap alignment and return the group multiple.
 
     The sampler claims whole multiples of :func:`resolve_grpo_group_multiple`
     groups. A step size that is not a multiple would leave a last chunk that no
@@ -1930,12 +1929,15 @@ def validate_grpo_chunk_cap_alignment(
         master_config: The run configuration.
         policy_dp: Data-parallel size of the policy trainer.
 
+    Returns:
+        The group multiple to pass to the sampler; 1 imposes no alignment.
+
     Raises:
         ValueError: ``num_prompts_per_step`` or the chunk cap is not a multiple
             of the group multiple.
     """
     if is_ppo_run(master_config) or master_config.token_capture.forest_training:
-        return
+        return 1
     algo_cfg = algo_config(master_config)
     group_multiple = resolve_grpo_group_multiple(master_config, policy_dp)
     if algo_cfg.num_prompts_per_step % group_multiple:
@@ -1960,11 +1962,12 @@ def validate_grpo_chunk_cap_alignment(
             "use on_dropped_prompt='replace' with enough spare prompts.",
             stacklevel=2,
         )
-
     chunk_cap = master_config.async_rl.max_groups_for_streaming_train
-    if chunk_cap is None or chunk_cap >= algo_cfg.num_prompts_per_step:
-        return
-    if chunk_cap % group_multiple:
+    if (
+        chunk_cap is not None
+        and chunk_cap < algo_cfg.num_prompts_per_step
+        and chunk_cap % group_multiple
+    ):
         raise ValueError(
             "GRPO async_rl.max_groups_for_streaming_train "
             f"({chunk_cap}) must be divisible by {group_multiple} -- the prompt "
@@ -1973,6 +1976,7 @@ def validate_grpo_chunk_cap_alignment(
             "packing and dynamic batching are both off -- so each capped chunk "
             "shards evenly"
         )
+    return group_multiple
 
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
