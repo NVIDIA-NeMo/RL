@@ -126,7 +126,9 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
 )
-from nemo_rl.models.generation.dynamo.config import dynamo_enabled
+from nemo_rl.models.generation.dynamo.config import (
+    dynamo_enabled,
+)
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -495,12 +497,6 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         return False
 
     generation_config = master_config.policy["generation"]
-    if dynamo_enabled(generation_config):
-        raise ValueError(
-            "policy.generation.dynamo=true does not serve NeMo-Gym rollouts yet. "
-            "Set policy.generation.dynamo=false to run this NeMo-Gym config on "
-            "NeMo RL's vLLM servers."
-        )
     if generation_config["backend"] == "coreweave":
         return True
     assert should_use_async_rollouts(generation_config), (
@@ -819,9 +815,11 @@ def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
         return "vllm_worker"
     if generation_backend == "megatron":
         return "megatron_worker"
+    if generation_backend == "dynamo":
+        return "dynamo_worker"
     raise ValueError(
         "token_capture.enabled requires setup-derived generation_backend to be "
-        f"'vllm' or 'megatron'; got {generation_backend!r}"
+        f"'vllm', 'megatron' or 'dynamo'; got {generation_backend!r}"
     )
 
 
@@ -1248,6 +1246,7 @@ class NemoGym(EnvironmentInterface):
         self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
+        from nemo_gym.config import MODEL_CALL_SAMPLING_BLOCK
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import (
             HEAD_SERVER_KEY_NAME,
@@ -1349,6 +1348,38 @@ Depending on your data shape, you may want to change these values."""
             "port": self.head_server_port,
         }
 
+        # Gym applies each row's _ng_model_sampling to these servers' calls and
+        # refuses one without them: policy_model, servers that _copy it, and any
+        # the recipe lists. Resources servers keep their own sampling.
+        sampling_block = dict(
+            initial_global_config_dict.get(MODEL_CALL_SAMPLING_BLOCK) or {}
+        )
+        required = [_POLICY_SERVER_NAME] + [
+            name
+            for name, block in initial_global_config_dict.items()
+            if isinstance(block, Mapping) and block.get("_copy") == _POLICY_SERVER_NAME
+        ]
+        for name in sampling_block.get("required_model_servers") or []:
+            if name not in required:
+                required.append(name)
+        initial_global_config_dict[MODEL_CALL_SAMPLING_BLOCK] = {
+            **sampling_block,
+            "required_model_servers": required,
+        }
+        policy_model_server = (
+            (initial_global_config_dict.get(_POLICY_SERVER_NAME) or {})
+            .get("responses_api_models", {})
+            .get("vllm_model", {})
+        )
+        if policy_model_server.get("sampling_overrides"):
+            raise ValueError(
+                f"env.nemo_gym.{_POLICY_SERVER_NAME} sets sampling_overrides, but the "
+                "agent NeMo-RL trains samples with policy.generation: temperature and "
+                "top_p, val_temperature and val_top_p for validation, and "
+                "max_new_tokens. Remove sampling_overrides; to pin an untrained "
+                "agent such as a judge, give it a model server of its own."
+            )
+
         # Ledger-authoritative token capture: enable external staging in the
         # policy model server (via the policy_model global-config override
         # block the env yamls already use) and disable the legacy token echo.
@@ -1369,7 +1400,8 @@ Depending on your data shape, you may want to change these values."""
             )
             policy_overrides["return_token_id_information"] = False
             if (
-                _external_staging_backend(token_capture) == "vllm_worker"
+                _external_staging_backend(token_capture)
+                in ("vllm_worker", "dynamo_worker")
                 and token_capture.get("top_logprobs", 0) > 0
             ):
                 policy_overrides.setdefault("sampling_overrides", {}).update(
@@ -2973,6 +3005,12 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
 
+    if dynamo_enabled(generation_config):
+        # Gym's policy model calls the Dynamo frontend in Gym's Dynamo dialect.
+        # Each actor applies it to its own composed config (_apply_dynamo_dialect),
+        # so it never becomes a policy_model overlay that a shard must claim.
+        config.env.setdefault("nemo_gym", {})["dynamo_dialect"] = True
+
     # For VLM runs, plumb the tokenizer config into the gym env config so the
     # NemoGym actor can reconstruct the processor inside itself (needed for
     # multi-turn multimodal postprocessing).
@@ -2990,6 +3028,7 @@ def build_nemo_gym_config(
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
     generation_prefix_cuts_enabled: bool = False,
+    generation_cut_control_urls: Optional[list[str]] = None,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
@@ -3014,6 +3053,10 @@ def build_nemo_gym_config(
         generation_prefix_cuts_enabled: Let Gym cut active model calls at a
             checkpoint so a restore resumes them from their decoded prefix.
             Requires ``turn_checkpointing_enabled``.
+        generation_cut_control_urls: Where Gym sends those cuts, one per entry
+            of ``base_urls``; None when each base URL takes its own, as a
+            vLLM server does. A Dynamo frontend takes them on another port
+            (VllmGeneration.generation_cut_control_urls).
         policy_api_key: The bearer token the generation server requires on its
             OpenAI routes (VllmGeneration.http_server_api_key), or None when it
             checks none.
@@ -3049,9 +3092,57 @@ def build_nemo_gym_config(
         ),
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+        generation_cut_control_urls=generation_cut_control_urls,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     )
+
+
+def _apply_dynamo_dialect(nemo_gym_dict: dict[str, Any]) -> None:
+    """Point Gym's `policy_model` server in one NemoGym actor's config at the Dynamo frontend.
+
+    The frontend takes token data in nvext instead of vLLM's request extensions.
+    Applied to the actor's composed config (a shard's overrides included), so
+    settings the user wrote there win. Sets ``policy_model`` on ``nemo_gym_dict``
+    in place, so pass a per-actor copy; the nested policy_model levels are
+    copied, so dicts shared with the user's config are not mutated.
+    """
+    policy_model = dict(nemo_gym_dict.get("policy_model") or {})
+    models = dict(policy_model.get("responses_api_models") or {})
+    vllm_model = dict(models.get("vllm_model") or {})
+    # Dynamo accepts these vLLM fields (its PASSTHROUGH_EXTRA_FIELDS) but never
+    # serializes them to a Python chat engine, so ours would never see them.
+    dropped_by_frontend = {
+        "allowed_token_ids",
+        "bad_words_token_ids",
+        "cache_salt",
+        "detokenize",
+        "logprob_token_ids",
+        "stop_token_ids",
+    }
+    # Gym puts the keys of both blocks on every request as top-level fields.
+    for block in ("extra_body", "sampling_overrides"):
+        fields = vllm_model.get(block) or {}
+        if "bad_words" in fields:
+            raise ValueError(
+                f"vllm_model.{block}.bad_words is not supported with "
+                "policy.generation.dynamo=true: the Dynamo frontend answers every "
+                "request carrying it with HTTP 400."
+            )
+        dropped = sorted(dropped_by_frontend & fields.keys())
+        if dropped:
+            raise ValueError(
+                f"vllm_model.{block} {dropped} is not supported with "
+                "policy.generation.dynamo=true: the Dynamo frontend accepts these "
+                "fields but drops them before NeMo RL's chat engine sees them."
+            )
+    vllm_model["dynamo_frontend"] = True
+    # The frontend reads `reasoning` as another name for `reasoning_content` and
+    # refuses an echoed assistant turn that carries both, Gym's default.
+    vllm_model.setdefault("reasoning_field", "reasoning_content")
+    models["vllm_model"] = vllm_model
+    policy_model["responses_api_models"] = models
+    nemo_gym_dict["policy_model"] = policy_model
 
 
 def _build_gym_actor_config(
@@ -3064,6 +3155,7 @@ def _build_gym_actor_config(
     checkpoint_instance: GymCheckpointInstance,
     turn_checkpointing_enabled: bool,
     generation_prefix_cuts_enabled: bool,
+    generation_cut_control_urls: Optional[list[str]],
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
@@ -3101,6 +3193,8 @@ def _build_gym_actor_config(
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    if nemo_gym_dict.pop("dynamo_dialect", False):
+        _apply_dynamo_dialect(nemo_gym_dict)
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
         key: value
@@ -3173,6 +3267,11 @@ def _build_gym_actor_config(
         policy_overrides["checkpoint"] = {"policy": True}
         if generation_prefix_cuts_enabled:
             policy_overrides["checkpoint"]["generation_cuts"] = True
+            if generation_cut_control_urls is not None:
+                # The base URLs do not take cuts themselves (a Dynamo frontend).
+                policy_overrides["generation_cut_control_url"] = list(
+                    generation_cut_control_urls
+                )
 
     return NemoGymConfig(
         model_name=model_name,
@@ -3478,6 +3577,7 @@ def build_nemo_gym_actors(
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
     generation_prefix_cuts_enabled: bool = False,
+    generation_cut_control_urls: Optional[list[str]] = None,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
     runtime_env: Optional[dict[str, Any]] = None,
@@ -3500,6 +3600,10 @@ def build_nemo_gym_actors(
         generation_prefix_cuts_enabled: Let Gym cut active model calls at a
             checkpoint so a restore resumes them from their decoded prefix.
             Requires ``turn_checkpointing_enabled``.
+        generation_cut_control_urls: Where Gym sends those cuts, one per entry
+            of ``base_urls``; None when each base URL takes its own, as a
+            vLLM server does. A Dynamo frontend takes them on another port
+            (VllmGeneration.generation_cut_control_urls).
         runtime_env: Explicit actor environment, for backends that supply
             credentials through mounted files instead of serialized variables.
 
@@ -3524,6 +3628,7 @@ def build_nemo_gym_actors(
             use_fastokens=use_fastokens,
             turn_checkpointing_enabled=turn_checkpointing_enabled,
             generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+            generation_cut_control_urls=generation_cut_control_urls,
             token_capture=token_capture,
             policy_api_key=policy_api_key,
             runtime_env=runtime_env,
@@ -3539,6 +3644,7 @@ def build_nemo_gym_actors(
         use_fastokens=use_fastokens,
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+        generation_cut_control_urls=generation_cut_control_urls,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
         runtime_env=runtime_env,
@@ -3557,6 +3663,7 @@ def _build_single_gym_actor(
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
     generation_prefix_cuts_enabled: bool,
+    generation_cut_control_urls: Optional[list[str]],
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
     runtime_env: Optional[dict[str, Any]] = None,
@@ -3574,6 +3681,7 @@ def _build_single_gym_actor(
         ),
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+        generation_cut_control_urls=generation_cut_control_urls,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     )
@@ -3626,6 +3734,7 @@ def _build_sharded_gym_actors(
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
     generation_prefix_cuts_enabled: bool,
+    generation_cut_control_urls: Optional[list[str]],
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
     runtime_env: Optional[dict[str, Any]] = None,
@@ -3721,6 +3830,7 @@ def _build_sharded_gym_actors(
                     ),
                     turn_checkpointing_enabled=turn_checkpointing_enabled,
                     generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+                    generation_cut_control_urls=generation_cut_control_urls,
                     token_capture=token_capture,
                     policy_api_key=policy_api_key,
                 )

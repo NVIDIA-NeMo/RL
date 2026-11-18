@@ -347,11 +347,11 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # wedge lasts longer before it is broken.
     #
     # DEFAULTED, not None, because the deadline is what makes reactive recovery possible
-    # at all rather than a nicety on top of it. A Ray actor runs one task at a time
-    # (nothing here raises max_concurrency) and this group is a raw StatelessProcessGroup
-    # with no torch process-group watchdog behind it, so a shard dying mid-collective
-    # leaves every trainer blocked inside NCCL. The driver sees RayActorError and calls
-    # _recover_from_failed_refit, whose init_collective then queues behind the still-blocked
+    # at all rather than a nicety on top of it. A sync method on an async Ray actor holds
+    # its event loop until it returns, regardless of max_concurrency, and this group is a
+    # raw StatelessProcessGroup with no torch process-group watchdog behind it, so a shard
+    # dying mid-collective leaves every trainer blocked inside NCCL. The driver sees
+    # RayActorError and calls _recover_from_failed_refit, whose init_collective then queues behind the still-blocked
     # task and never runs: the recovery itself wedges and the run ends on stall_timeout_s.
     # Only the abort releases those ranks. With None as the default, a config that turned
     # fleet health on got detection and quarantine but no refit recovery, silently.
@@ -727,9 +727,12 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # derived at setup
     # under the run's log dir.
     capture_dir: Optional[str] = None
-    # Generation backend hosting token capture. This is derived from
-    # policy.generation.backend during setup; users should not set it separately.
-    generation_backend: Optional[Literal["vllm", "megatron"]] = None
+    # How NeMo-Gym reaches the capture host; derived during setup, users should not
+    # set it. "dynamo" = vLLM served through the Dynamo frontend
+    # (policy.generation.dynamo): same workers and capture code, but Gym's
+    # dynamo_worker handler sends capture fields in nvext, because the frontend
+    # carries only OpenAI fields plus nvext.
+    generation_backend: Optional[Literal["vllm", "megatron", "dynamo"]] = None
     # Keep routed_experts out of canonical rows and assemble them on policy
     # workers from strict staged-fragment plans.
     defer_routed_experts_to_policy: bool = False
