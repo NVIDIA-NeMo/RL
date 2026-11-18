@@ -173,6 +173,7 @@ class NixlStorageUnit:  # pragma: no cover
     ssd_stats: dict[str, float]
     _io_jobs: int
     _max_io_jobs: int
+    _spill_error: str
     _staged: dict[str, BlobRec]
     alloc_: SlabAllocator
     _worker: ThreadPoolExecutor
