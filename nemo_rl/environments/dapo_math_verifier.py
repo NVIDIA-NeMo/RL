@@ -183,6 +183,18 @@ def is_correct_minerva(
     # Extract answer from solution
     match = re.findall(answer_pattern, solution_str)
     extracted_answer = match[-1] if match else "[INVALID]"
+    # "**Answer:** 42" and "Answer: **42**" keep the ** on the value
+    extracted_answer = extracted_answer.strip()
+    if (
+        extracted_answer.startswith("**")
+        and extracted_answer.endswith("**")
+        and len(extracted_answer) > 4
+    ):
+        extracted_answer = extracted_answer[2:-2].strip()
+    elif extracted_answer.startswith("**") and len(extracted_answer) > 2:
+        extracted_answer = extracted_answer[2:].strip()
+    elif extracted_answer.endswith("**") and len(extracted_answer) > 2:
+        extracted_answer = extracted_answer[:-2].strip()
     pred = normalize_final_answer(extracted_answer)
 
     # Process ground truth
