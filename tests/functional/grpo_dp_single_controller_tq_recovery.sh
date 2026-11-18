@@ -9,6 +9,7 @@ BASE_TEST=$SCRIPT_DIR/grpo_dp_single_controller.sh
 # simple / mooncake_cpu / nixl, or a variant of one:
 #   simple_placed   simple with SimpleStorageUnits pinned (storage_unit_placement=all)
 #   mooncake_units  mooncake_cpu with CPU storage units as the only memory owners
+#   mooncake_gdr    mooncake_cpu with GDR clients (use_gdr=true), SSD under pressure
 #   nixl_ssd        nixl with its units' SSD tier under memory pressure
 # The mooncake_cpu and nixl SSD tiers are on by default and spill only under
 # memory pressure. mooncake_units and nixl run the defaults (path: null, the
@@ -19,14 +20,22 @@ VARIANT=${1:-simple}
 VARIANT_OVERRIDES=()
 # check_metrics.py expressions run on both phases' metrics.
 VARIANT_CHECKS=()
+# 1: Mooncake SSD offload must write files under SSD_DIR during the run.
+EXPECT_SSD_FILES=0
 case "$VARIANT" in
     simple) BACKEND=simple; TEST_NAME=grpo_dp_single_controller_tq_recovery ;;
-    mooncake_cpu)
+    mooncake_cpu|mooncake_gdr)
         BACKEND=mooncake_cpu
         TEST_NAME=grpo_dp_mooncake_tq_recovery
+        if [[ "$VARIANT" == "mooncake_gdr" ]]; then
+            TEST_NAME=grpo_dp_mooncake_gdr_tq_recovery
+            # Policy workers are CUDA clients: their puts take the GDR path.
+            VARIANT_OVERRIDES=(data_plane.mooncake_cpu.use_gdr=true)
+        fi
         SSD_DIR=$SCRIPT_DIR/$TEST_NAME/ssd
+        EXPECT_SSD_FILES=1
         # Offload past 1e-6 of the clients' 4 GiB segments: a few KB each.
-        VARIANT_OVERRIDES=(
+        VARIANT_OVERRIDES+=(
             data_plane.mooncake_cpu.ssd_offload.path="$SSD_DIR"
             data_plane.mooncake_cpu.ssd_offload.offload_threshold=0.000001
         )
@@ -116,7 +125,7 @@ if [[ "$BACKEND" == "mooncake_cpu" ]]; then
     )
 fi
 
-if [[ "$VARIANT" == "mooncake_cpu" ]]; then
+if (( EXPECT_SSD_FILES )); then
     # Offload files are deleted once their keys are cleared, so record the
     # peak count while both phases run (not Mooncake's .lock).
     SSD_PEAK=$TEST_DIR/ssd_peak
@@ -188,7 +197,7 @@ if [[ "$BACKEND" == "mooncake_cpu" ]]; then
     test -s "$CHECKPOINT_DIR/step_2/data_plane/mooncake_storage/manifest.json"
 fi
 
-if [[ "$VARIANT" == "mooncake_cpu" ]]; then
+if (( EXPECT_SSD_FILES )); then
     PEAK=$(cat "$SSD_PEAK")
     if (( PEAK == 0 )); then
         echo "FAIL: Mooncake SSD offload never wrote a file under $SSD_DIR" >&2
@@ -206,6 +215,19 @@ if [[ "$VARIANT" == "mooncake_units" ]]; then
         exit 1
     fi
     echo "✓ Mooncake owners use the default NVMe offload directory"
+fi
+
+if [[ "$VARIANT" == "mooncake_gdr" ]]; then
+    # The adapter logs this once per CUDA client whose tensor PUT took the GDR
+    # path; without it the run silently used the CPU path (workers' lines
+    # reach the run log through Ray).
+    for PHASE in phase1 phase2; do
+        if ! grep -q "TransferQueue GDR tensor PUT active" "$TEST_DIR/$PHASE.log"; then
+            echo "FAIL: no client used GDR in $PHASE" >&2
+            exit 1
+        fi
+    done
+    echo "✓ GDR clients put through GPU memory while SSD offload ran"
 fi
 
 # Hash guard: rows were checked, and no process logged a mismatch or a guard
