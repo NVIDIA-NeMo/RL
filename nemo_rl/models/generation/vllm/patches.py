@@ -683,13 +683,13 @@ def _patch_vllm_radio_native_loader(logger) -> None:
 def _patch_vllm_radio_final_layernorm(logger) -> None:
     """Make vLLM's Super Omni final vision LayerNorm match the Megatron scoring path.
 
-    vLLM 0.33 builds the layer itself, but runs it in the LLM dtype after the
+    vLLM 0.34 builds the layer itself, but runs it in the LLM dtype after the
     BF16 cast, applies it even when no checkpoint weights were loaded, and only
     reads the ``vision_projector.`` weight names. This patch runs it in FP32
     before the cast, turns it on only once both affine parameters have loaded
     (so dummy startup + refit stays a no-op until then), and also reads the bare
     ``vision_final_layernorm.`` names.
-    Supports stock vLLM 0.33 source or this patch's complete output; unexpected
+    Supports stock vLLM 0.34 source or this patch's complete output; unexpected
     source layouts fail before writing rather than being skipped.
     References: RL #4036.
     """
@@ -726,13 +726,10 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
 """,
         ),
         (
-            """        return x
-
-    def extract_feature_dynamic(
+            """    def extract_feature_dynamic(
+        self, pixel_values: torch.Tensor, imgs_sizes: list[tuple[int, int]]
 """,
-            """        return x
-
-    def _apply_vision_final_layernorm(
+            """    def _apply_vision_final_layernorm(
         self, vit_embeds: torch.Tensor
     ) -> torch.Tensor:
         if not self._vision_final_layernorm_enabled:
@@ -742,6 +739,7 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
         return self.vision_final_layernorm(vit_embeds.float()).to(output_dtype)
 
     def extract_feature_dynamic(
+        self, pixel_values: torch.Tensor, imgs_sizes: list[tuple[int, int]]
 """,
         ),
         (
@@ -819,7 +817,7 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
             return
         if any(content.count(old) != 1 for old, _ in replacements):
             raise RuntimeError(
-                "Final vision LayerNorm patch requires the vLLM 0.33 model source "
+                "Final vision LayerNorm patch requires the vLLM 0.34 model source "
                 f"or its fully patched equivalent: {file_to_patch}"
             )
         for old, new in replacements:

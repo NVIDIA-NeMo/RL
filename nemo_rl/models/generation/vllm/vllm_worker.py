@@ -809,6 +809,13 @@ class BaseVllmGenerationWorker:
             enable_sleep_mode=True,
             # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
+            # vLLM 0.34 defaults: block_size 64 (was 16), extensible KV cache on
+            # (driver-mapped memory outside the CuMem pool, sized after warmup)
+            # and numa_bind auto (vLLM wraps workers in numactl). Keep the 0.33
+            # behavior; NeMo-RL binds NUMA itself. vllm_kwargs can override.
+            block_size=16,
+            enable_extensible_kv_cache=False,
+            numa_bind=False,
             **vllm_kwargs,
         )
 

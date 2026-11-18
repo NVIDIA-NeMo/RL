@@ -4116,9 +4116,9 @@ def test_mtp_drafter_refit_enabled_warns_once_without_drafter(caplog):
 
 @pytest.mark.vllm
 def test_installed_vllm_runners_keep_the_drafter_under_a_known_attribute():
-    """Trip-wire: both installed vLLM model runners assign the proposer under a name
+    """Trip-wire: the installed vLLM model runner assigns the proposer under a name
     ``_get_drafter_model`` looks at, so a future rename fails here, not as 0% MTP
-    acceptance in a nightly."""
+    acceptance in a nightly. vLLM 0.34 removed the legacy ``gpu_model_runner``."""
     import inspect
 
     from nemo_rl.models.generation.vllm.speculator_runtime import (
@@ -4126,11 +4126,10 @@ def test_installed_vllm_runners_keep_the_drafter_under_a_known_attribute():
     )
 
     pytest.importorskip("vllm")
-    from vllm.v1.worker import gpu_model_runner as legacy_runner_module
     from vllm.v1.worker.gpu import model_runner as v2_runner_module
 
     known = tuple(attr for attr, _ in DRAFTER_OWNER_ATTRS)
-    for module in (legacy_runner_module, v2_runner_module):
+    for module in (v2_runner_module,):
         source = inspect.getsource(module.GPUModelRunner)
         assigned = {
             attr for attr in ("drafter", "speculator") if f"self.{attr} = " in source

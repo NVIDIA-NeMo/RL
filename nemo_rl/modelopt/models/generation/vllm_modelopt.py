@@ -249,8 +249,6 @@ def register_nemo_modelopt_nvfp4() -> None:
                 params_dtype,
                 **extra_weight_attrs,
             )
-            del layer.w13_input_scale
-            del layer.w2_input_scale
 
         def process_weights_after_loading(self, layer: Any) -> None:
             reload_kernel = self.moe_kernel
@@ -265,9 +263,9 @@ def register_nemo_modelopt_nvfp4() -> None:
                 _canonicalize_nvfp4_scale_(layer.w2_weight_scale)
             # W4A16 checkpoint metadata deliberately omits activation scales so
             # layerwise reload never waits for tensors that do not exist. The
-            # native Marlin converter accepts None and removes these attributes.
-            layer.w13_input_scale = None
-            layer.w2_input_scale = None
+            # placeholder input_scale params vLLM registers stay on the layer:
+            # vLLM 0.34's weight-only path retires them itself and passes None
+            # to the kernel.
             super().process_weights_after_loading(layer)
             if reload_kernel is not None:
                 self.moe_kernel = reload_kernel
