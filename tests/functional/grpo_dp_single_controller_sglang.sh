@@ -2,7 +2,8 @@
 # SC training smoke with SGLang generation: examples/run_grpo_single_controller.py on
 # examples/configs/grpo_math_1B_sglang_single_controller.yaml (Megatron trainer on one
 # GPU, one SGLang engine on the other). Same shape and metric gates as
-# grpo_dp_single_controller.sh; the generation handle is pickled into the
+# grpo_dp_single_controller.sh, plus the logprob gate of the legacy
+# grpo_sglang_async.sh; the generation handle is pickled into the
 # SingleControllerActor, which is the SGLang-specific path this exercises.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
@@ -55,6 +56,7 @@ if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
     uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
     uv run tests/check_metrics.py $JSON_METRICS \
+        'max(data["train/token_mult_prob_error"]) < 1.05' \
         'max(data["train/num_masked_seqs_by_logprob_error"]) == 0' \
         'max(data["train/max_seq_mult_prob_error"]) < 1000' \
         'max(data["train/gen_kl_error"]) < 0.002' \
