@@ -412,6 +412,18 @@ def test_gym_calls_nemo_rl_cannot_serve_are_refused_with_a_400(
     assert router.requests == []
 
 
+def test_an_untrained_callers_call_keeps_its_own_sampling() -> None:
+    """Gym marks a call from an agent NeMo RL does not train, such as an LLM
+    judge, with ``ng_sampling: null``; unmarked, the same call is refused above."""
+    pool = _Pool(_rendered())
+    router = _Router()
+
+    _serve(pool, router, _call({"ng_sampling": "null"}, temperature=0.5))
+
+    assert pool.bodies[0]["temperature"] == 0.5
+    assert len(router.requests) == 1
+
+
 @pytest.mark.nemo_gym
 @pytest.mark.parametrize("captured", [True, False])
 @pytest.mark.parametrize("refused_by", ["render", "clamp", "engine"])

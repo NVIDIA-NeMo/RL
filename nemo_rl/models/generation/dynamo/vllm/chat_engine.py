@@ -339,7 +339,8 @@ class NemoRLChatEngine:
     async def _serve(
         self, request: dict[str, Any], extras: GymCallExtras, context: Any
     ) -> dict[str, Any]:
-        # Deferred: prompt_and_capture imports vLLM.
+        # Deferred: interfaces imports torch, and prompt_and_capture vLLM.
+        from nemo_rl.experience.interfaces import NEMO_GYM_MODEL_SAMPLING_NULL
         from nemo_rl.models.generation.vllm.prompt_and_capture import prepare_prompt
         from nemo_rl.models.generation.vllm.utils import (
             OffPolicySamplingError,
@@ -361,19 +362,21 @@ class NemoRLChatEngine:
             raise OffPolicySamplingError(
                 "request stream=true is not supported; NeMo-Gym calls do not stream"
             )
-        body.update(
-            on_policy_sampling(
-                temperature=body.get("temperature"),
-                top_p=body.get("top_p"),
-                top_k=body.get("top_k"),
-                min_p=body.get("min_p"),
-                repetition_penalty=body.get("repetition_penalty"),
-                presence_penalty=body.get("presence_penalty"),
-                frequency_penalty=body.get("frequency_penalty"),
-                logit_bias=body.get("logit_bias"),
-                generation_config=self._generation,
+        # Gym marks an untrained caller's call, such as an LLM judge's, which keeps its own sampling.
+        if extras.ng_sampling != NEMO_GYM_MODEL_SAMPLING_NULL:
+            body.update(
+                on_policy_sampling(
+                    temperature=body.get("temperature"),
+                    top_p=body.get("top_p"),
+                    top_k=body.get("top_k"),
+                    min_p=body.get("min_p"),
+                    repetition_penalty=body.get("repetition_penalty"),
+                    presence_penalty=body.get("presence_penalty"),
+                    frequency_penalty=body.get("frequency_penalty"),
+                    logit_bias=body.get("logit_bias"),
+                    generation_config=self._generation,
+                )
             )
-        )
         request_fields: set[str] = set(GymRequestFields.model_fields)
         body.update(extras.model_dump(include=request_fields))
         first_call, self._first_call = self._first_call, False

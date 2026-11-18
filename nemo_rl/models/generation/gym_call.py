@@ -18,7 +18,7 @@ The native vLLM server's request classes inherit :class:`GymRequestFields`, and
 it answers with :class:`GymCallResult`'s fields on the message. Dynamo's
 frontend carries only OpenAI fields plus ``nvext``, so through it NeMo-Gym's
 Dynamo dialect packs :class:`GymCallExtras` (those request fields, plus the
-measure flag) into one ``nemo_rl:gym:<json>`` annotation. NeMo RL's chat engine
+measure flag and the sampling marker) into one ``nemo_rl:gym:<json>`` annotation. NeMo RL's chat engine
 hands the request fields to the same render and returns the result as
 ``nvext["nemo_rl"]``. A field added to :class:`GymRequestFields` reaches both
 paths.
@@ -54,6 +54,9 @@ class GymCallExtras(GymRequestFields):
     # Return only the prompt's length (Gym's /context/measure); no generation.
     # Natively Gym calls /tokenize for this instead.
     ng_measure: bool = False
+    # Gym's x-ng-sampling value, a header natively, which Dynamo's frontend does
+    # not forward. "null" marks an untrained caller's call.
+    ng_sampling: Optional[str] = None
 
     @classmethod
     def from_annotations(cls, annotations: Iterable[str]) -> "GymCallExtras | None":
