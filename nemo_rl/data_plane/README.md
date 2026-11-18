@@ -649,36 +649,9 @@ Registered memory is pinned once per RDMA NIC, so per-process buffers add up qui
 
 `mooncake_cpu.ssd_offload.enabled: true` (the default) lets Mooncake move objects from memory to node-local SSD. Once memory use across all segments passes `offload_threshold`, Mooncake's master writes objects to the SSD of the process owning their segment and drops them from memory, 10% of the memory per round. Reads of an offloaded object go through that owner transparently.
 
-While memory suffices nothing is written, so the default costs nothing. With
-`path: null` each owner writes under its node's NVMe: `/raid` (where DGX nodes
-mount the NVMe RAID) when it is mounted, a disk and writable, else `/tmp`.
-`ray.sub` mounts a per-user NVMe directory at the container's `/raid` by
-itself: `NRL_NVME_DIR` when set (for example `/raid/scratch/$USER` on a
-cluster whose RAID root is root-owned), else `/raid/$USER` (created when the
-user owns `/raid`), listed before `MOUNTS` so a bind of your own at or under
-`/raid` (such as `/raid/scratch`) stays visible. Nothing is mounted otherwise, and the driver logs one
-note saying the tiers use `/tmp` and what `/tmp` is (in an enroot container
-`/tmp` is often the node's NVMe already). Other launchers mount the directory
-at `/raid` the same way, or set `path`. The directory must be on a disk: an owner
-refuses to start when it is on a RAM-backed filesystem (tmpfs), since spilling
-there would consume the memory it is meant to relieve.
+On by default; nothing is written while memory use stays under `offload_threshold`. With `path: null` each owner writes under its node's NVMe: `/raid` when the node mounts a writable disk there, else `/tmp`. A RAM-backed directory (tmpfs) is refused, since spilling there would use the memory it is meant to free. `ray.sub` mounts `NRL_NVME_DIR` (default `/raid/$USER`) at `/raid` when it exists, and the driver logs one note when the tiers use `/tmp`. With other launchers, mount an NVMe directory at `/raid` or set `path`.
 
-The single controller reads the master's `/metrics` every step and logs, under
-`data_plane/mooncake/`: `mem_used_mb`, `mem_capacity_mb`, `mem_used_ratio`
-(compare with `offload_threshold`), `keys`, `offload_rounds_total` (eviction
-rounds the master ran; each wrote objects to the owners' SSD),
-`mem_evicted_keys_total`, `mem_evicted_mb_total` (objects whose memory copy was
-dropped, so their reads go through the SSD) and `disk_evictions_total` (always
-0 in a healthy run, see below). Mooncake 0.3.x has no per-object offload
-counter: past the threshold with memory to spare it writes SSD copies and
-keeps the memory copies, so `offload_rounds_total` rises while
-`mem_evicted_*` stay 0; under memory pressure both rise. The first step with
-`offload_rounds_total > 0` logs one warning: the workload's data-plane
-footprint passed the threshold. Raise `storage_unit_segment_size` (or
-`global_segment_size`), or `offload_threshold`, if that trade-off is not
-wanted. The nixl backend's SSD tier (`nixl.ssd`, also on by default) spills
-only when a unit's put area is full and logs the same kind of warning when
-`data_plane/nixl/ssd_spills_sum` first rises above 0.
+Each step the single controller logs the master's counters under `data_plane/mooncake/`. Watch `mem_used_ratio` (compare with `offload_threshold`) and `offload_rounds_total`; the first offload logs one warning. `disk_evictions_total` must stay 0 (see the warning below). To keep data in memory, raise `storage_unit_segment_size` (or `global_segment_size`) or `offload_threshold`.
 
 ```
 memory > offload_threshold ──> SSD copy written ──> memory copy dropped
@@ -711,7 +684,7 @@ The existing `checkpointing.enabled=true` and `checkpointing.save_data_plane=tru
 No additional Mooncake-specific checkpoint setting is needed. Ordinary PUTs remain in Mooncake memory and perform no checkpoint-related filesystem I/O.
 
 On `tq.save_checkpoint(...)`, existing workers query disjoint slices of the controller's object keys and group their location metadata by destination.
-Ray object references route those groups directly to the storage processes; the coordinator forwards references, not per-object addresses or sizes. Each storage process writes its objects into one packed shard and an offset/size index. With hard-pinned replicas (the default) it writes directly from its own CPU memory: no native GET, staging-buffer copy, or buffer registration. With `mooncake_cpu.ssd_offload` the replicas are evictable, so a borrowed address could be freed mid-write. Each storage process instead copies its objects through native `batch_get_into` into one registered buffer. The read holds a lease per object and also serves objects already offloaded to SSD. Python cannot see which process holds an SSD-only object, so the process that discovered it saves it. Payload bytes then cross processes over Mooncake's own transfers (never through Ray); with pinned replicas only metadata moves between processes. For multiple complete replicas, a canonical live storage process is selected; this prioritizes locality, not global byte balancing. The coordinator publishes the small shard manifest after every storage process has flushed, fsynced, and acknowledged its shard.
+Ray object references route those groups directly to the storage processes; the coordinator forwards references, not per-object addresses or sizes. Each storage process writes its objects into one packed shard and an offset/size index. With hard-pinned replicas (`mooncake_cpu.ssd_offload.enabled: false`) it writes directly from its own CPU memory: no native GET, staging-buffer copy, or buffer registration. With `ssd_offload` on (the default) the replicas are evictable, so a borrowed address could be freed mid-write. Each storage process instead copies its objects through native `batch_get_into` into one registered buffer. The read holds a lease per object and also serves objects already offloaded to SSD. Python cannot see which process holds an SSD-only object, so the process that discovered it saves it. Payload bytes then cross processes over Mooncake's own transfers (never through Ray); with pinned replicas only metadata moves between processes. For multiple complete replicas, a canonical live storage process is selected; this prioritizes locality, not global byte balancing. The coordinator publishes the small shard manifest after every storage process has flushed, fsynced, and acknowledged its shard.
 
 SingleController supplies its candidate actor handles: policy/value/teacher workers, finalizer and advantage actors, and the `MooncakeStorageUnit` actors when storage units are on. Only candidates that hold a segment take part, so generation workers (which attach with segment 0) never do. Their Ray methods carry checkpoint commands and completion metadata only; each method uses its process's existing Mooncake store. No registry, listener threads, or additional socket protocol are created; the storage units are the only actors added for checkpointing. The calling actor handles its own shard directly, so constructor-time restore never waits for an RPC back to itself.
 

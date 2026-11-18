@@ -81,15 +81,8 @@ EVICTION_COUNTER = "master_evict_disk_replica_requests_total"
 # The running watcher in this process, if any.
 _watch_stop: threading.Event | None = None
 
-# Master gauges and counters the driver logs every step (step_metrics), by
-# their name in Mooncake 0.3.x's /metrics -> (logged name, divisor). The master
-# has no per-object offload counter. With master_args (offload on eviction, no
-# forced eviction) each successful eviction round wrote at least one object to
-# an owner's SSD, so "successful evictions mem" counts offload rounds; the
-# "evicted ... mem" counters are the objects whose memory copy was then
-# dropped, whose reads go through the SSD. Measured: a run past the threshold
-# with memory to spare ran 11 rounds (112 files) and dropped 0 memory copies;
-# one under memory pressure dropped 34,693 objects, about its file count.
+# Master /metrics names (Mooncake 0.3.x) -> (logged name, divisor). The master
+# has no per-object offload counter: "successful evictions mem" counts offload rounds.
 MASTER_METRICS = {
     "master_allocated_bytes": ("mem_used_mb", 2**20),
     "master_total_capacity_bytes": ("mem_capacity_mb", 2**20),

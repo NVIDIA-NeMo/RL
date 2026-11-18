@@ -13,9 +13,9 @@
 # limitations under the License.
 """The node-local directory an SSD tier writes to: on NVMe, and a disk.
 
-Both SSD tiers (``mooncake_cpu.ssd_offload`` and ``nixl.ssd``) default to
-:func:`default_ssd_dir`: ``/raid``, where DGX nodes mount their NVMe RAID, when
-the node has it, else ``/tmp``. On some hosts ``/tmp`` is a RAM-backed tmpfs; a
+The three SSD tiers (``mooncake_cpu.ssd_offload``, ``nixl.ssd`` and
+``simple.ssd_offload``) default to :func:`default_ssd_dir`: ``/raid``, where
+DGX nodes mount their NVMe RAID, when the node has it, else ``/tmp``. On some hosts ``/tmp`` is a RAM-backed tmpfs; a
 tier "spilling" there would consume the memory it is meant to relieve and lose
 the data with the node. The owner of the directory calls
 :func:`require_disk_backed` once, before it writes, on the node where the
@@ -34,14 +34,16 @@ FALLBACK_BASE = "/tmp"
 
 
 def default_ssd_dir(name: str, mounts_text: str | None = None) -> str:
-    """``/raid/<name>`` when ``/raid`` is a mounted disk this process can write to, else ``/tmp/<name>``.
+    """``/raid/<name>-<uid>`` when ``/raid`` is a mounted disk this process can write to, else ``/tmp/<name>-<uid>``.
 
     Resolve it on the node that creates the directory; the result still goes
     through :func:`require_disk_backed` there. ``mounts_text`` as in
     :func:`filesystem_of`.
     """
     base = FALLBACK_BASE if nvme_fallback_reason(mounts_text) else NVME_MOUNT
-    return os.path.join(base, name)
+    # One folder per user: the first run creates it 0755, so a shared name
+    # would stop every other user's run on this node.
+    return os.path.join(base, f"{name}-{os.getuid()}")
 
 
 def nvme_fallback_reason(mounts_text: str | None = None) -> str | None:

@@ -24,7 +24,7 @@ import time
 
 import pytest
 
-from nemo_rl.data_plane import local_disk, nixl_storage_unit
+from nemo_rl.data_plane import nixl_storage_unit
 from nemo_rl.data_plane.adapters import tq_nixl
 from nemo_rl.data_plane.nixl import blob_format, blobstore
 from nemo_rl.data_plane.nixl.errors import DataPlaneBusy, UnitFull
@@ -664,13 +664,13 @@ def test_deadline_during_commit_aborts_the_blob():
 # ------------------------------------------------------------------ config
 def test_ssd_config_validation():
     assert tq_nixl.ssd_config({"ssd": {"enabled": False}}) is None
-    # On by default, under the node's NVMe.
-    assert tq_nixl.ssd_config({})["ssd_dir"] == local_disk.default_ssd_dir(
-        "nrl_nixl_ssd"
-    )
+    # On by default; a null path is resolved by each unit on its own node.
+    assert tq_nixl.ssd_config({})["ssd_dir"] is None
+    assert tq_nixl.ssd_config({})["ssd_enabled"] is True
     ssd = {"enabled": True, "path": "/x"}
     on = {"unit_slab_bytes": 1 << 30, "ssd": ssd}
     assert tq_nixl.ssd_config(on) == {
+        "ssd_enabled": True,
         "ssd_dir": "/x",
         "staging_bytes": 1 << 28,
         "pickup_s": 10.0,

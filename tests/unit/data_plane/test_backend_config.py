@@ -320,21 +320,14 @@ def test_simple_storage_units_skip_nodes_without_cpu(monkeypatch) -> None:
     assert [s.node_id for s in strategies] == [worker["NodeID"]] * 3
 
 
-def test_mooncake_and_nixl_ssd_offload_are_on_by_default() -> None:
-    """Spill-on-pressure tiers cost nothing while memory suffices, so they are on.
-
-    simple's offload is by value size (every value >= threshold_bytes goes to
-    SSD), which is a real cost, so it stays off.
-    """
+def test_a_null_ssd_path_is_the_node_nvme() -> None:
+    """``path: null`` resolves to local_disk.default_ssd_dir on the node; a set path wins."""
     from nemo_rl.data_plane import local_disk
-    from nemo_rl.data_plane.interfaces import MooncakeCpuConfig, NixlStoreConfig
+    from nemo_rl.data_plane.interfaces import MooncakeCpuConfig
 
-    mc = MooncakeCpuConfig().ssd_offload
-    assert mc.enabled is True and mc.path is None
-    assert mc.dir() == local_disk.default_ssd_dir("nrl_mooncake_ssd_offload")
-    nx = NixlStoreConfig().ssd
-    assert nx.enabled is True and nx.path is None
-    assert nx.dir() == local_disk.default_ssd_dir("nrl_nixl_ssd")
+    assert MooncakeCpuConfig().ssd_offload.dir() == local_disk.default_ssd_dir(
+        "nrl_mooncake_ssd_offload"
+    )
     assert MooncakeCpuConfig(ssd_offload={"path": "/x"}).ssd_offload.dir() == "/x"
 
 
@@ -354,8 +347,8 @@ def test_simple_ssd_offload_reaches_tq_config(monkeypatch) -> None:
     assert storage["ssd_offload"]["threshold_bytes"] == 4096
 
 
-@pytest.mark.parametrize("path", [None, "", "relative/ssd"])
-def test_ssd_offload_requires_absolute_path_when_enabled(path) -> None:
+@pytest.mark.parametrize("path", ["", "relative/ssd"])
+def test_ssd_offload_requires_an_absolute_path(path) -> None:
     """Fails at config load, not later inside driver bootstrap."""
     with pytest.raises(pydantic.ValidationError, match="ssd_offload.path"):
         TypeAdapter(DataPlaneConfig).validate_python(
@@ -367,6 +360,16 @@ def test_ssd_offload_requires_absolute_path_when_enabled(path) -> None:
                 },
             )
         )
+
+
+def test_simple_ssd_offload_null_path_is_the_node_nvme(monkeypatch) -> None:
+    """TQ raises on an empty path, so the overlay carries the resolved default."""
+    from nemo_rl.data_plane import local_disk
+
+    storage = _simple_overlay(monkeypatch, ssd_offload={"enabled": True})
+    assert storage["ssd_offload"]["path"] == local_disk.default_ssd_dir(
+        "nrl_simple_ssd_offload"
+    )
 
 
 def test_simple_backend_num_storage_units_has_no_default() -> None:

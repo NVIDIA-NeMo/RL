@@ -696,7 +696,7 @@ data_plane:
     storage_units_per_node: null     # set N to place N units on every node instead
     storage_unit_placement: all      # all, or clusters [inference] / [train]: which nodes get units, in both modes above
     node_ids: null                   # explicit unit nodes; null: resolved from storage_unit_placement
-    unit_slab_bytes: 17179869184     # 16 GiB pinned per unit
+    unit_slab_bytes: 17179869184     # 16 GiB put area; 20 GiB pinned with the default SSD tier
     max_blob_bytes: null             # a put over this is split; null: a quarter of the put area
     numa: auto                       # pin unit k on a multi-socket node to socket k % sockets
     client_staging_bytes: 1073741824 # client pool: 2 x 1 GiB registered buffers

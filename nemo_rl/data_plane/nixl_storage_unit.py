@@ -41,11 +41,12 @@ import msgspec
 import numpy as np
 import ray
 
+from nemo_rl.data_plane.interfaces import NIXL_SSD_DIRNAME
+from nemo_rl.data_plane.local_disk import default_ssd_dir, require_disk_backed
 from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.allocator import SlabAllocator, align_up
 from nemo_rl.data_plane.nixl.control import UnitServer
 from nemo_rl.data_plane.nixl.errors import DataPlaneBusy, UnitFull
-from nemo_rl.data_plane.local_disk import require_disk_backed
 from nemo_rl.data_plane.nixl.nixl_io import NixlEndpoint
 from nemo_rl.distributed import numa_utils
 
@@ -205,12 +206,17 @@ class NixlStorageUnit:  # pragma: no cover
         directory: Any = None,
         numa_mode: str = "auto",
         numa_index: int = 0,
+        ssd_enabled: bool = False,
         ssd_dir: str | None = None,
         staging_bytes: int = 0,
         pickup_s: float = 10.0,
         io_threads: int = 1,  # tq_nixl.ssd_config passes the configured value
         alloc_lease_s: float | None = None,
     ) -> None:
+        if ssd_enabled:
+            # Resolved here, on the unit's own node: /raid on one node says
+            # nothing about another's.
+            ssd_dir = ssd_dir or default_ssd_dir(NIXL_SSD_DIRNAME)
         self.unit_id = int(unit_id)
         self.read_pin_s = float(read_pin_s)
         # An allocation not committed within this long belongs to a writer that
