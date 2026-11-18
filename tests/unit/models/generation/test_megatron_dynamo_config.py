@@ -292,7 +292,7 @@ def test_engine_width_must_hold_the_expert_parallel_grid(layout, decode, match) 
         ),
         pytest.param(
             _set("refit_transport", value="nccl_reshard"),
-            "refit_transport must be null",
+            r"refit_transport must be null \(packed collective\) or 'mcore'",
             id="refit_transport",
         ),
         pytest.param(
@@ -329,6 +329,37 @@ def test_validation_rejects_unsupported_shapes(mutate, match) -> None:
 def test_validation_accepts_the_reference_shape_and_null_colocated() -> None:
     validate_megatron_dynamo_generation(_megatron_config())
     validate_megatron_dynamo_generation(_megatron_config(colocated=None))
+
+
+@pytest.mark.parametrize("refit_backend", ["nccl", "gloo"])
+def test_validation_accepts_the_native_mcore_refit(refit_backend) -> None:
+    # The aggregated Megatron engines' refit: each training rank sends its own
+    # shards to the engine ranks that hold them.
+    config = _megatron_config(refit_transport="mcore")
+    config["mcore_generation_config"]["refit_backend"] = refit_backend
+    validate_megatron_dynamo_generation(config)
+
+
+@pytest.mark.parametrize(
+    "refit_backend",
+    [
+        pytest.param(None, id="unset"),
+        pytest.param(_DELETE, id="absent"),
+        pytest.param("nccl_m2n", id="nccl_m2n"),
+        pytest.param("nvshmem", id="nvshmem"),
+    ],
+)
+def test_validation_rejects_native_refit_backends_the_engines_cannot_use(
+    refit_backend,
+) -> None:
+    config = _megatron_config(refit_transport="mcore")
+    # The base config carries no refit_backend; "absent" leaves it that way.
+    if refit_backend is not _DELETE:
+        config["mcore_generation_config"]["refit_backend"] = refit_backend
+    with pytest.raises(
+        ValueError, match=r"refit_backend must be one of \['nccl', 'gloo'\]"
+    ):
+        validate_megatron_dynamo_generation(config)
 
 
 def _master_config(generation: dict) -> SimpleNamespace:
