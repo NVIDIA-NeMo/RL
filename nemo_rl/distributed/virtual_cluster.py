@@ -154,10 +154,10 @@ def uv_py_executable(extras: Sequence[str]) -> str:
 #                                                 allocation: metadata server, master RPC,
 #                                                 master metrics)
 #   [1202, 1300) SingleController gen. router    (driver-local allocation)
-#   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation)
+#   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation), and the
+#                Dynamo frontends' HTTP endpoints on the generation nodes
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
 #   [3000, 4999) Shared NeMo RL generation range (policy.generation.port_range_low/high)
-#     [3000, 4000) Dynamo frontend HTTP endpoint
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
 #   6000         NeMo-Skills sandbox Nginx       (NEMO_SKILLS_SANDBOX_PORT; ray.sub starts one
 #                                                 sidecar per allocated node, driver included)
@@ -176,8 +176,6 @@ DEFAULT_GENERATION_PORT_RANGE_LOW = 3000
 DEFAULT_GENERATION_PORT_RANGE_HIGH = 4999
 DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW = 1313
 DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH = 1400
-DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW = 3000
-DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH = 4000
 DEFAULT_GYM_PORT_RANGE_LOW = 5000
 DEFAULT_GYM_PORT_RANGE_HIGH = 5999
 # vLLM TP/DP rendezvous ports.  Each engine gets PORTS_PER_ENGINE ports starting

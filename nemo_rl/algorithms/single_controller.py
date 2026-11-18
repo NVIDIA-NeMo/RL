@@ -4687,6 +4687,14 @@ class SingleControllerActor:
             metrics["vllm_requests_waiting"] = sum(waiting.values())
         if kv_usage:
             metrics["vllm_kv_cache_usage_mean"] = sum(kv_usage.values()) / len(kv_usage)
+        for state in ("queued", "inflight"):
+            frontend_calls = _latest_generation_values(
+                generation_metrics, f"dynamo_frontend_{state}_requests"
+            )
+            if frontend_calls:
+                metrics[f"dynamo_frontend_requests_{state}"] = sum(
+                    frontend_calls.values()
+                )
         if generated_tokens is not None:
             metrics["generation_output_tokens"] = float(generated_tokens)
 

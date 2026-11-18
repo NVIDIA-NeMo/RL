@@ -1010,6 +1010,8 @@ def test_gym_actor_config_dynamo_turns_on_gyms_dynamo_dialect(
     assert gym_model.dynamo_frontend is True
     # The frontend refuses reasoning under both of Gym's keys.
     assert gym_model.reasoning_field == "reasoning_content"
+    # One frontend: Gym keeps its unlimited connection retries.
+    assert "route_around_failing_endpoints" not in composed
     assert gym_model.chat_template_kwargs == expected
     assert "dynamo_dialect" not in gym_config
     # The user's overlay is left as written.

@@ -2129,7 +2129,11 @@ class VllmGeneration(GenerationInterface):
 
     def drain_latest_logger_metrics(self) -> dict[str, Any]:
         """Consume latest values without transferring full worker histories."""
-        return self.drain_latest_vllm_logger_metrics()
+        metrics = self.drain_latest_vllm_logger_metrics()
+        if metrics and self._dynamo_runtime is not None:
+            # A call waiting in a frontend is in no engine's counts.
+            metrics.update(self._dynamo_runtime.frontend_load())
+        return metrics
 
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.

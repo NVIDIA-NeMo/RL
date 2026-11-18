@@ -43,8 +43,6 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
     DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
-    DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
-    DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
     _get_free_port_local,
     _get_node_ip_local,
 )
@@ -156,6 +154,20 @@ _KV_EVENTS_APPLIED = re.compile(
     r"[^}]*\}\s+(?P<value>\S+)$",
     re.MULTILINE,
 )
+
+
+# The frontend's own gauges, one sample per model: calls that wait for their first
+# token, and calls in flight.
+_FRONTEND_LOAD = re.compile(
+    r"^(?P<name>dynamo_frontend_(?:queued|inflight)_requests)(?:\{[^}]*\})?"
+    r"\s+(?P<value>\S+)$",
+    re.MULTILINE,
+)
+
+
+def _read_metrics(url: str) -> str:
+    with urllib.request.urlopen(url, timeout=5) as response:
+        return response.read().decode()
 
 
 def _managed_namespace() -> str:
@@ -294,13 +306,13 @@ class FrontendHost:
         env: dict[str, str],
         ray_address: str,
         serves_chat: bool,
+        port_range: tuple[int, int],
     ) -> str:
-        """Launch the frontend on a free port of this node; return its base URL."""
-        port = _get_free_port_local(
-            DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
-            DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
-            max_retries=None,
-        )
+        """Launch the frontend on a free port of this node; return its base URL.
+
+        ``port_range`` is this frontend's slice ``[low, high)`` of Dynamo's port band.
+        """
+        port = _get_free_port_local(*port_range, max_retries=None)
         self._chat_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_chat_")
         capture_file = os.path.join(self._chat_dir, "capture.pkl")
         argv = frontend_argv(
@@ -574,13 +586,19 @@ class ManagedDynamoRuntime:
             "UV_PROJECT_ENVIRONMENT": dynamo_venv,
         }
         extra_env = self._dynamo_cfg.frontend_args.extra_env
-        if clashing := sorted(extra_env.keys() & env.keys()):
+        if clashing := sorted(extra_env.keys() & (env.keys() | {CAPTURE_FILE_ENV})):
             raise ValueError(
                 f"Dynamo frontend environment {clashing} is set by both the managed "
                 "runtime and dynamo_cfg.frontend_args.extra_env."
             )
-        env.update(extra_env)
-        for index in range(self._dynamo_cfg.frontend_args.num_frontends):
+        # The driver's environment as it is now, as the engines get it
+        # (RayWorkerGroup): an actor has only what the driver had at init_ray().
+        env = _service_env({**env, **extra_env})
+        # ray.init() raises a driver's open-file limit to 65,536, but not a Ray
+        # worker's: a frontend started from one would stop at Dynamo's 8,192.
+        env.setdefault("DYN_FRONTEND_FD_LIMIT_TARGET", "65536")
+        num_frontends = self._dynamo_cfg.frontend_args.num_frontends
+        for index in range(num_frontends):
             node_id = node_ids[index % len(node_ids)]
             self._frontend_hosts.append(
                 _FrontendHostActor.options(
@@ -589,6 +607,12 @@ class ManagedDynamoRuntime:
                     )
                 ).remote()
             )
+        # Frontends that share a node pick from separate slices of Dynamo's port
+        # band, so two of them never pick the same port.
+        low = DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW
+        ports = (DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH - low) // -(
+            -num_frontends // len(node_ids)
+        )
         self._frontend_urls = ray.get(
             [
                 host.start.remote(
@@ -598,8 +622,12 @@ class ManagedDynamoRuntime:
                     env=env,
                     ray_address=self._ray_address,
                     serves_chat=self.serves_chat,
+                    port_range=(
+                        low + (index // len(node_ids)) * ports,
+                        low + (index // len(node_ids) + 1) * ports,
+                    ),
                 )
-                for host in self._frontend_hosts
+                for index, host in enumerate(self._frontend_hosts)
             ]
         )
 
@@ -703,6 +731,8 @@ class ManagedDynamoRuntime:
                 pending.pop(0)
                 if not pending:
                     return
+                # The timeout error reports the counts of the frontend it names.
+                registered, served = 0, set()
                 continue
             time.sleep(1)
         raise RuntimeError(
@@ -741,8 +771,7 @@ class ManagedDynamoRuntime:
     def _log_router_kv_events_of(self, frontend_url: str) -> None:
         url = f"{frontend_url.removesuffix('/v1')}/metrics"
         try:
-            with urllib.request.urlopen(url, timeout=5) as response:
-                metrics = response.read().decode()
+            metrics = _read_metrics(url)
         except (urllib.error.URLError, TimeoutError) as error:
             print(
                 f"  [Dynamo] router KV events: metrics unavailable ({error})",
@@ -758,6 +787,25 @@ class ManagedDynamoRuntime:
             f"  [Dynamo] router applied KV events: {json.dumps(applied)} ({url})",
             flush=True,
         )
+
+    def frontend_load(self) -> dict[str, dict[int, list[float]]]:
+        """Every frontend's queued and in-flight calls, shaped as the vLLM logger metrics.
+
+        Keyed by metric name, then by frontend index. A frontend that does not
+        answer is left out.
+        """
+        load: dict[str, dict[int, list[float]]] = {
+            f"dynamo_frontend_{name}_requests": {} for name in ("queued", "inflight")
+        }
+        for index, frontend_url in enumerate(self._frontend_urls):
+            try:
+                metrics = _read_metrics(f"{frontend_url.removesuffix('/v1')}/metrics")
+            except (urllib.error.URLError, TimeoutError):
+                continue
+            for match in _FRONTEND_LOAD.finditer(metrics):
+                samples = load[match["name"]].setdefault(index, [0.0])
+                samples[0] += float(match["value"])
+        return load
 
     def shutdown(self) -> None:
         """Best-effort, idempotent teardown of every owned resource."""

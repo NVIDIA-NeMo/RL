@@ -978,6 +978,12 @@ CASES = [
         kit="router_replay",
     ),
     _Case("cache_salt", fields={"cache_salt": "tenant-a"}),
+    # vLLM's token-level fields, which the frontend hands over as the client
+    # sent them: the engine samples with them as it does natively.
+    _Case(
+        "token_level_fields",
+        fields={"stop_token_ids": [7], "allowed_token_ids": [1, 2, 3]},
+    ),
 ]
 
 

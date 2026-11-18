@@ -47,8 +47,9 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
     # only bounds memory; a large run holds more sessions than Dynamo's own 65,536.
     session_affinity_max_entries: PositiveInt = 16_777_216
     # Frontends, spread round-robin over the generation nodes, each with its own
-    # router. More than one adds --router-replica-sync, so every router sees the
-    # requests the others have in flight. NeMo-Gym keeps each session on one.
+    # router. More than one adds --router-replica-sync; with router_mode kv, every
+    # router then sees the requests the others have in flight. NeMo-Gym keeps each
+    # session on one.
     num_frontends: PositiveInt = 1
     # Processes that render NeMo-Gym's chat calls and build their replies (the
     # checkpoint's template, tokenizer, HF processor and vLLM's parsers); each

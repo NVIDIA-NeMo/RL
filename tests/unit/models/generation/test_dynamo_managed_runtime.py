@@ -407,6 +407,8 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
         extra_env={"DYN_TCP_LISTEN_BACKLOG": "8192"},
     )
     runtime._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
+    # What the driver sets after init_ray() is only in its own environment.
+    monkeypatch.setenv("VLLM_USE_FASTOKENS", "1")
 
     node_a, node_b = "a" * 56, "b" * 56  # Ray node IDs are hex
     runtime._start_frontends([node_a, node_b])
@@ -426,10 +428,19 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
         assert started["env"]["DYN_TCP_LISTEN_BACKLOG"] == "8192"
         assert started["env"]["DYN_NAMESPACE"] == "nemo-rl-test"
         assert started["env"]["VIRTUAL_ENV"] == "/venvs/vllm"
+        assert started["env"]["VLLM_USE_FASTOKENS"] == "1"
+        # The open-file limit a frontend had as the driver's child.
+        assert started["env"]["DYN_FRONTEND_FD_LIMIT_TARGET"] == "65536"
         # The Ray cluster its chat engine reads token-capture prefixes through.
         assert started["ray_address"] == "10.0.0.1:6379"
         # It starts its render workers at launch.
         assert started["serves_chat"] is True
+    # The two frontends on node_a pick their ports from separate slices.
+    assert [started["port_range"] for started in hosts.started] == [
+        (1313, 1356),
+        (1313, 1356),
+        (1356, 1399),
+    ]
     # Every frontend's chat engine reads token-capture prefixes, and checks a
     # cut's bearer token, the same way.
     assert hosts.captures == 3 * [
@@ -446,10 +457,11 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
     # sends before it loads.
     assert hosts.chat_settings == 3 * [{"nemo_rl_chat": {"engine_args": {}}}]
 
-    clashing = _runtime(extra_env={"DYN_NAMESPACE": "mine"})
-    clashing._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
-    with pytest.raises(ValueError, match=r"\['DYN_NAMESPACE'\] is set by both"):
-        clashing._start_frontends([node_a])
+    for managed in ("DYN_NAMESPACE", managed_runtime.CAPTURE_FILE_ENV):
+        clashing = _runtime(extra_env={managed: "mine"})
+        clashing._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
+        with pytest.raises(ValueError, match=rf"\['{managed}'\] is set by both"):
+            clashing._start_frontends([node_a])
 
 
 @pytest.mark.parametrize("serves_chat", [True, False])
@@ -474,10 +486,11 @@ def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
     base_url = host.start(
         frontend_python="/venvs/vllm/bin/python",
         namespace="nemo-rl-test",
-        dynamo_cfg=DynamoCfg(),
+        dynamo_cfg=DynamoCfg(frontend_args=DynamoFrontendArgs(render_workers=3)),
         env={"DYN_NAMESPACE": "nemo-rl-test"},
         ray_address="10.0.0.1:6379",
         serves_chat=serves_chat,
+        port_range=(1313, 1400),
     )
     host.publish_chat_capture({"staging_partition": "staging"})
 
@@ -494,7 +507,7 @@ def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
         **json.loads(command[command.index("--dyn-chat-processor-config") + 1])
     )
     assert (chat_options.render_workers, chat_options.ray_address) == (
-        DynamoCfg().frontend_args.render_workers,
+        3,
         "10.0.0.1:6379",
     )
     # NeMo-Gym's checkpoint generation cuts are a route on the same port.
@@ -536,6 +549,9 @@ def test_shutdown_logs_the_kv_events_the_router_applied(
         # Every prefix-cache reset applies one; it says nothing about block events.
         'dynamo_component_kv_cache_events_applied{event_type="cleared",status="ok",worker_id="1"} 5\n'
         'dynamo_component_requests_total{status="ok"} 9\n'
+        'dynamo_frontend_queued_requests{model="a"} 4\n'
+        'dynamo_frontend_queued_requests{model="b"} 3\n'
+        'dynamo_frontend_inflight_requests{model="a"} 9\n'
     )
 
     class _Metrics(_FakeHttpResponse):
@@ -548,9 +564,14 @@ def test_shutdown_logs_the_kv_events_the_router_applied(
         lambda url, timeout: urls.append(url) or _Metrics(None),
     )
 
+    # Calls waiting in a frontend are in no engine's counts.
+    assert runtime.frontend_load() == {
+        "dynamo_frontend_queued_requests": {0: [7.0]},
+        "dynamo_frontend_inflight_requests": {0: [9.0]},
+    }
     runtime.shutdown()
 
-    assert urls == ["http://10.0.0.2:3000/metrics"]
+    assert urls == 2 * ["http://10.0.0.2:3000/metrics"]
     assert (
         '[Dynamo] router applied KV events: {"ok": 42.0, "parent_block_not_found": 3.0}'
         in capsys.readouterr().out

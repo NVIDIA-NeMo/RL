@@ -3084,10 +3084,11 @@ def build_nemo_gym_config(
     )
 
 
-def _apply_dynamo_dialect(nemo_gym_dict: dict[str, Any]) -> None:
+def _apply_dynamo_dialect(nemo_gym_dict: dict[str, Any], *, frontends: int) -> None:
     """Point Gym's `policy_model` server in one NemoGym actor's config at the Dynamo frontend.
 
     The frontend takes token data in nvext instead of vLLM's request extensions.
+    With more than one frontend, Gym moves a failing frontend's sessions to the others.
     Applied to the actor's composed config (a shard's overrides included), so
     settings the user wrote there win. Sets ``policy_model`` on ``nemo_gym_dict``
     in place, so pass a per-actor copy; the nested policy_model levels are
@@ -3109,6 +3110,11 @@ def _apply_dynamo_dialect(nemo_gym_dict: dict[str, Any]) -> None:
     # The frontend reads `reasoning` as another name for `reasoning_content` and
     # refuses an echoed assistant turn that carries both, Gym's default.
     vllm_model.setdefault("reasoning_field", "reasoning_content")
+    if frontends > 1:
+        # Nothing restarts a dead frontend, and Gym retries a refused connection
+        # without limit by default: the calls of its sessions would never return.
+        vllm_model.setdefault("route_around_failing_endpoints", True)
+        vllm_model.setdefault("endpoint_connection_retry_timeout_s", 60.0)
     models["vllm_model"] = vllm_model
     policy_model["responses_api_models"] = models
     nemo_gym_dict["policy_model"] = policy_model
@@ -3162,7 +3168,7 @@ def _build_gym_actor_config(
     # (where the detector reads them), not part of Gym's global config.
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
     if nemo_gym_dict.pop("dynamo_dialect", False):
-        _apply_dynamo_dialect(nemo_gym_dict)
+        _apply_dynamo_dialect(nemo_gym_dict, frontends=len(base_urls))
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
         key: value

@@ -1370,7 +1370,7 @@ def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
     with _patched_cluster(cluster):
         nemo_gym_mod.build_nemo_gym_actors(
             config.env,
-            base_urls=["http://frontend"],
+            base_urls=["http://frontend-0", "http://frontend-1"],
             model_name="test-model",
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
@@ -1395,6 +1395,9 @@ def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
         vllm_model = gym_config["policy_model"]["responses_api_models"]["vllm_model"]
         assert vllm_model["dynamo_frontend"] is True
         assert vllm_model["reasoning_field"] == "reasoning_content"
+        # Several frontends: Gym moves the sessions of one that stops answering.
+        assert vllm_model["route_around_failing_endpoints"] is True
+        assert vllm_model["endpoint_connection_retry_timeout_s"] == 60.0
         assert "dynamo_dialect" not in gym_config
 
 

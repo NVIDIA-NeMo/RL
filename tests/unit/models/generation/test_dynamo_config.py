@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+import subprocess
+import sys
+import typing
+
 import pytest
 
 from nemo_rl.models.generation import configure_generation_config
@@ -196,3 +201,34 @@ def test_frontend_argv_is_runtime_owned() -> None:
     )
     with pytest.raises(ValueError, match="--http-port is set by both"):
         _frontend_argv(clashing)
+
+
+# Dynamo's own parser, in a fresh interpreter: importing dynamo.frontend.main
+# replaces the process's logging.
+_PARSE = """
+import json, sys
+import dynamo.frontend.main as frontend
+for argv in json.loads(sys.stdin.read()):
+    sys.argv = ["dynamo.frontend", *argv]
+    frontend.parse_args()
+"""
+
+
+@pytest.mark.vllm
+def test_dynamos_parser_accepts_the_frontend_arguments_for_every_router_mode() -> None:
+    modes = typing.get_args(DynamoFrontendArgs.model_fields["router_mode"].annotation)
+    argvs = [
+        _frontend_argv(
+            DynamoCfg(
+                frontend_args=DynamoFrontendArgs(router_mode=mode, num_frontends=2)
+            )
+        )
+        for mode in modes
+    ]
+    parsed = subprocess.run(
+        [sys.executable, "-c", _PARSE],
+        input=json.dumps(argvs),
+        capture_output=True,
+        text=True,
+    )
+    assert parsed.returncode == 0, parsed.stderr[-400:]
