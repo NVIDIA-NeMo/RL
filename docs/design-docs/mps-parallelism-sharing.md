@@ -8,6 +8,10 @@ are represented by native shard metadata, with one model chunk per worker. Virtu
 pipeline chunks, GTP rematerialization, quantized refit tensors, differing tensor
 dtypes, and unequal worker worlds are rejected.
 
+The default `sm_partition_backend: mps_gemm` gives both processes full SM access. `engine_sm_fraction` controls only the learner Transformer Engine grouped-GEMM margin: `0.42` targets approximately 58% of the SMs for those GEMMs, while other kernels can use the whole GPU. This hint does not reserve SMs. Use `mps_percentage` explicitly to cap the learner process instead. A zero fraction leaves both processes and learner GEMMs uncapped. Startup verifies that the uncapped learner is registered with the MPS daemon. The Nano recipe gives the learner lower MPS client priority (`1`) than inference (`0`), matching the benchmarked scheduling setup.
+
+Streaming GRPO aligns prompt-group dispatches to the learner data-parallel and static microbatch sizes so every learner shard receives complete work. Forest training retains its execution-row padding rules.
+
 Use the existing MPS configuration with `refit_transport: ipc` and
 `engine_weights: shared`. Set inference parallelism in
 `policy.generation.mcore_generation_config`. With `inference_optimized` and TP>1,

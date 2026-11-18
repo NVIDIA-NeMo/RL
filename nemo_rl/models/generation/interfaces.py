@@ -226,10 +226,10 @@ class ColocationConfig(TypedDict):
     enabled: bool
     resources: OptionalResourcesConfig
     # Co-resident Megatron generation uses dedicated processes on the training GPUs. With the default MPS backend,
-    # this fraction determines the learner's cap; inference remains uncapped (see sm_partition.py).
+    # this fraction determines the learner TE grouped-GEMM margin; both clients remain uncapped.
     engine_sm_fraction: NotRequired[float | None]
-    # How the SMs are split (nemo_rl/models/megatron/sm_partition.py BACKENDS): "mps_percentage" (default, a soft
-    # cap) or "mps_static" (disjoint SM sets; needs driver support, verified at setup).
+    # Scheduling backend: "mps_gemm" (default, advisory learner GEMM budget),
+    # "mps_percentage" (learner cap), or "mps_static" (requires pre-created driver partitions).
     sm_partition_backend: NotRequired[str | None]
     # Co-resident engine weights: "copy" (default; own copy, per-step refit copy) or "shared" (maps the learner's
     # weights where the local shards match; pauses only around the optimizer step).

@@ -880,7 +880,8 @@ class MegatronGenerationMixin:
             self._wake_engine(), self._inference_loop
         )
         future.result()
-        torch.distributed.barrier()
+        # After RUNNING, EP forwards may already issue collectives; a barrier
+        # on this thread can race their collective order across ranks.
         self._inference_engine_asleep = False
         print(f"[Rank {self.rank}] resumed inference engine")
 
@@ -892,6 +893,29 @@ class MegatronGenerationMixin:
         if torch.distributed.get_rank() == 0:
             self.inference_client.unpause_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
+
+    def shutdown(self) -> bool:
+        """Drain inference before Ray kills workers holding CUDA IPC weights."""
+        if self._inference_engine_initialized:
+            future = asyncio.run_coroutine_threadsafe(
+                self._shutdown_inference_engine(), self._inference_loop
+            )
+            future.result(timeout=20)
+            self._inference_engine_initialized = False
+            self._inference_engine_asleep = True
+        return super().shutdown()
+
+    async def _shutdown_inference_engine(self) -> None:
+        if not self._inference_engine_asleep:
+            await self._sleep_engine()
+        # An MPS client must finish its CUDA work before Ray terminates it;
+        # otherwise its failure can fault peers and the next MPS session.
+        torch.cuda.synchronize()
+        if torch.distributed.get_rank() == 0:
+            self.inference_client.stop_engines()
+        await self.dynamic_inference_engine.wait_until(EngineState.STOPPED)
+        if torch.distributed.get_rank() == 0:
+            self.inference_client.shutdown_coordinator()
 
     def _start_inference_loop_thread(self):
         """Start a background thread with a persistent event loop for inference."""
@@ -1700,10 +1724,10 @@ class MegatronGenerationRefitMixin:
         local_rank = torch.distributed.get_rank()
         global_rank = local_rank + rank_offset
 
-        # port+1 to avoid collision with the caller's rendezvous on `port`.
+        # The caller reserves this port; its neighbor may already host a store.
         store = torch.distributed.TCPStore(
             host_name=ip,
-            port=port + 1,
+            port=port,
             world_size=world_size,
             is_master=(global_rank == 0),
         )

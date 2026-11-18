@@ -1919,6 +1919,16 @@ def _apply_precision_config(
         )
 
 
+def _disable_activation_recompute(model_cfg: Any) -> None:
+    """Clear training checkpoint controls before finalizing an inference provider."""
+    model_cfg.recompute_granularity = None
+    model_cfg.recompute_method = None
+    model_cfg.recompute_num_layers = None
+    model_cfg.recompute_modules = []
+    if hasattr(model_cfg, "residual_stream_recompute_num_layers"):
+        model_cfg.residual_stream_recompute_num_layers = None
+
+
 def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply performance optimization configuration."""
     model_cfg.parallel_output = True
@@ -1945,6 +1955,9 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 f"Invalid recompute_granularity: {granularity!r}. "
                 "Valid options are 'full' or 'selective'."
             )
+
+    else:
+        _disable_activation_recompute(model_cfg)
 
     # Activation function validation
     if not model_cfg.gated_linear_unit:
@@ -2481,9 +2494,7 @@ def build_inference_model(
         and inference_provider.tensor_model_parallel_size > 1
     )
     # Inference never trains: disable recompute.
-    inference_provider.recompute_granularity = None
-    inference_provider.recompute_method = None
-    inference_provider.recompute_num_layers = None
+    _disable_activation_recompute(inference_provider)
     if inference_provider.transformer_impl == "inference_optimized":
         inference_provider.moe_pad_experts_for_cuda_graph_inference = False
     # Re-run the deferred MCore post-init (virtual, idempotent).

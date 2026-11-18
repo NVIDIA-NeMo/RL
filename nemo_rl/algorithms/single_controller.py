@@ -415,8 +415,8 @@ class SingleControllerActor:
             and self._async_cfg.min_groups_for_streaming_train
             < self._algo_cfg.num_prompts_per_step
         )
-        self._ppo_group_multiple = actor_args.ppo_group_multiple
-        self._ppo_min_remaining_groups = actor_args.ppo_min_remaining_groups
+        self._train_group_multiple = actor_args.train_group_multiple
+        self._train_min_remaining_groups = actor_args.train_min_remaining_groups
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -2789,10 +2789,10 @@ class SingleControllerActor:
         forest_training = self._master_config.token_capture.forest_training
         selection_kwargs = (
             {
-                "group_multiple": self._ppo_group_multiple,
-                "min_remaining_groups": self._ppo_min_remaining_groups,
+                "group_multiple": self._train_group_multiple,
+                "min_remaining_groups": self._train_min_remaining_groups,
             }
-            if self._streaming_ppo
+            if self._train_group_multiple > 1 or self._streaming_ppo
             else {}
         )
 

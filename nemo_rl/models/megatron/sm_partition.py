@@ -14,9 +14,9 @@
 """Concurrent Megatron training and inference with shared GPU weight storage.
 
 Each GPU runs one learner and one inference process under MPS. The default
-percentage backend caps the learner at ``100 - round(100 * engine_sm_fraction)``
-and leaves inference uncapped. This is a scheduling ceiling, not a reservation
-of disjoint SMs; the driver determines which ready kernels execute.
+``mps_gemm`` backend gives both clients full SM access and applies an advisory
+Transformer Engine grouped-GEMM budget to the learner. Explicit
+``mps_percentage`` caps the learner instead. Neither reserves disjoint SMs.
 
 With ``engine_weights=shared``, compatible contiguous parameter views alias
 learner storage through same-GPU CUDA IPC. Strided/packed weights and persistent
@@ -46,6 +46,8 @@ and full-model validation before performance or deployment claims.
 from __future__ import annotations
 
 import os
+import subprocess
+import time
 from collections import defaultdict, deque
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -129,9 +131,9 @@ def validate(
     if frac is None:
         return
     env = os.environ if env is None else env
-    if not 0.0 < frac < 1.0:
+    if not 0.0 <= frac < 1.0:
         raise ValueError(
-            f"policy.generation.colocated.engine_sm_fraction must be in (0, 1), got {frac}"
+            f"policy.generation.colocated.engine_sm_fraction must be in [0, 1), got {frac}"
         )
     gen = policy_cfg["generation"]
     if gen.get("backend") != "megatron":
@@ -148,6 +150,15 @@ def validate(
             "policy.generation.colocated.engine_weights must be 'copy' or 'shared'"
         )
     backend = partition_backend(policy_cfg)
+    if backend == "mps_gemm":
+        worker_env = policy_cfg["megatron_cfg"].get("env_vars") or {}
+        for key in ("NVTE_EXT_MARGIN_SM", "CUDA_MPS_SM_PARTITION"):
+            if key in env or key in worker_env:
+                raise ValueError(
+                    f"mps_gemm manages its GEMM budget and requires full SM visibility; remove {key}"
+                )
+    if backend == "mps_static" and frac == 0.0:
+        raise ValueError("mps_static requires a positive engine_sm_fraction")
     if backend not in BACKENDS:
         raise ValueError(
             f"policy.generation.colocated.sm_partition_backend must be one of {BACKENDS}, got {backend!r}"
@@ -179,24 +190,18 @@ def validate(
             raise ValueError(f"engine_sm_fraction with {what} is not built yet")
 
 
-#: The SM-partition backend, the one swap point (``policy.generation.colocated.sm_partition_backend``):
-#:   "mps_percentage" (default): an MPS active-thread percentage on the learner only, a soft cap; the engine is
-#:                     uncapped. Measured 11-09 on driver 580 / CUDA 13.2: capped SM sets are not disjoint (all 62 of a
-#:                     42 %-capped engine's SMs also ran learner kernels).
-#:   "mps_static":     MPS static SM partitions (driver R590+, CUDA 13.1+; daemon started with -S): the job creates two
-#:                     partitions per GPU before Ray, in 8-SM chunks (engine round(f x chunks), learner the rest), and
-#:                     writes their ids to the node-local JSON map named by NRL_MPS_SM_PARTITION_MAP
-#:                     ({gpu index: {"engine": id, "learner": id, "engine_sms": n, "learner_sms": m}}); each worker
-#:                     selects its partition (CUDA_MPS_SM_PARTITION) before CUDA init; ``check_worker`` refuses a
-#:                     process whose SM count is not its partition's. Disjoint by construction. Untested on
-#:                     hardware (needs R590+).
-BACKENDS = ("mps_percentage", "mps_static")
+#: Worker scheduling backends selected by ``colocated.sm_partition_backend``.
+#: ``mps_gemm``: full SM access with a learner TE grouped-GEMM hint (default).
+#: ``mps_percentage``: learner active-thread cap; inference stays uncapped.
+#: ``mps_static``: pre-created partitions from NRL_MPS_SM_PARTITION_MAP;
+#: requires an R590+ daemon started with -S and remains hardware-unqualified.
+BACKENDS = ("mps_percentage", "mps_static", "mps_gemm")
 MPS_PARTITION_MAP_ENV = "NRL_MPS_SM_PARTITION_MAP"
 
 
 def partition_backend(policy_cfg: Any) -> str:
     gen = (policy_cfg or {}).get("generation") or {}
-    return (gen.get("colocated") or {}).get("sm_partition_backend") or "mps_percentage"
+    return (gen.get("colocated") or {}).get("sm_partition_backend") or "mps_gemm"
 
 
 def engine_weights_mode(policy_cfg: Any) -> str:
@@ -210,10 +215,21 @@ def engine_weights_mode(policy_cfg: Any) -> str:
 
 
 def mps_percentage(frac: float, role: Role) -> Optional[int]:
-    """The process's MPS active-thread percentage: the learner 100 - round(100 f) (1..99); the engine None (uncapped)."""
+    """Return the learner cap; zero fraction leaves both MPS clients uncapped."""
     if role == "engine":
         return None
+    if frac == 0.0:
+        return 100
     return 100 - max(1, min(99, round(100 * frac)))
+
+
+def _worker_percentage(policy_cfg: Any, role: Role) -> Optional[int]:
+    backend = partition_backend(policy_cfg)
+    if backend == "mps_gemm":
+        return mps_percentage(0.0, role)
+    if backend == "mps_percentage":
+        return mps_percentage(engine_sm_fraction(policy_cfg), role)
+    return None
 
 
 def actor_env(
@@ -225,11 +241,7 @@ def actor_env(
         return {}
     env = os.environ if env is None else env
     out = {}
-    pct = (
-        mps_percentage(frac, role)
-        if partition_backend(policy_cfg) == "mps_percentage"
-        else None
-    )
+    pct = _worker_percentage(policy_cfg, role)
     if pct is not None:
         out[MPS_PCT_ENV] = str(pct)
     for k in ("CUDA_MPS_PIPE_DIRECTORY", MPS_PARTITION_MAP_ENV):
@@ -263,12 +275,7 @@ def select_static_partition(
 def check_worker(
     policy_cfg: Any, role: Role, *, rank: int = 0
 ) -> Optional[dict[str, Any]]:
-    """In a co-resident worker after CUDA init: its SM share must be in effect. Logs and returns what it sees.
-
-    Proof (capped learner): the process sees fewer SMs than the GPU has (NVML's count is unaffected by MPS). Without an
-    MPS daemon the percentage is silently ignored and the two processes time-slice the whole GPU. The uncapped engine
-    sees the whole GPU; the learner's check on the same GPU proves the daemon.
-    """
+    """Verify the worker cap or uncapped MPS registration after CUDA init."""
     if engine_sm_fraction(policy_cfg) is None:
         return None
     seen = torch.cuda.get_device_properties(
@@ -289,7 +296,7 @@ def check_worker(
         print(f"[sm_partition] rank={rank} {info}", flush=True)
         return info
     pct = os.environ.get(MPS_PCT_ENV)
-    expected_pct = mps_percentage(engine_sm_fraction(policy_cfg), role)
+    expected_pct = _worker_percentage(policy_cfg, role)
     if (role == "engine" and pct not in (None, "100")) or (
         role == "learner" and pct != str(expected_pct)
     ):
@@ -302,7 +309,72 @@ def check_worker(
         info = {"role": role, "mps_pct": pct, "sms_seen": seen}
         print(f"[sm_partition] rank={rank} {info}", flush=True)
         return info
-    return _check_limit(role, pct, seen, _device_sm_count(), rank)
+    full = _device_sm_count()
+    if expected_pct == 100:
+        info = _check_uncapped_client(role, pct, seen=seen, full=full, rank=rank)
+        if partition_backend(policy_cfg) == "mps_gemm":
+            margin = min(full - 1, max(0, round(full * engine_sm_fraction(policy_cfg))))
+            os.environ["NVTE_EXT_MARGIN_SM"] = str(margin)
+            info["te_grouped_gemm_target_sms"] = full - margin
+            print(f"[sm_partition] rank={rank} {info}", flush=True)
+        return info
+    return _check_limit(role, pct, seen, full, rank)
+
+
+def _check_uncapped_client(
+    role: Role, pct: Optional[str], *, seen: int, full: int, rank: int
+) -> dict[str, Any]:
+    """Verify daemon registration when an uncapped client cannot prove MPS by its SM count."""
+    if seen != full:
+        raise RuntimeError(
+            f"uncapped co-resident {role} worker sees {seen} SMs, expected {full}"
+        )
+    torch.cuda.current_stream().synchronize()
+
+    def control(command: str) -> list[str]:
+        result = subprocess.run(
+            ["nvidia-cuda-mps-control"],
+            input=command + "\n",
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        return result.stdout.split()
+
+    for attempt in range(5):
+        try:
+            servers = control("get_server_list")
+            registered = any(
+                str(os.getpid()) in control(f"get_client_list {server}")
+                for server in servers
+            )
+        except subprocess.CalledProcessError as error:
+            if attempt == 4:
+                raise RuntimeError(
+                    "Cannot verify uncapped learner registration with its MPS daemon"
+                ) from error
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise RuntimeError(
+                "Cannot verify uncapped learner registration with its MPS daemon"
+            ) from error
+        else:
+            if registered:
+                break
+            if attempt == 4:
+                raise RuntimeError(
+                    "Uncapped learner is not registered with its MPS daemon"
+                )
+        time.sleep(0.1)
+    info = {
+        "role": role,
+        "mps_pct": pct,
+        "sms_seen": seen,
+        "sms_device": full,
+        "mps_client_registered": True,
+    }
+    print(f"[sm_partition] rank={rank} {info}", flush=True)
+    return info
 
 
 def _check_limit(
@@ -324,7 +396,6 @@ def _device_sm_count() -> int:
     without the percentage (under MPS the CUDA attribute shows the limit; NVML's attribute query is MIG-only and raises
     NotSupported on a full GB200).
     """
-    import subprocess
     import sys
 
     env = {k: v for k, v in os.environ.items() if k != MPS_PCT_ENV}

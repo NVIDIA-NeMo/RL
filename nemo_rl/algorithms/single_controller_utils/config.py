@@ -1804,34 +1804,37 @@ def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
     return dp_size * math.lcm(train_micro_batch_size, logprob_batch_size)
 
 
-def resolve_ppo_chunk_alignment(
-    master_config: MasterConfig, policy_dp: int, value_dp: int
+def resolve_streaming_chunk_alignment(
+    master_config: MasterConfig, *, policy_dp: int, value_dp: Optional[int] = None
 ) -> tuple[int, int]:
-    """Validate PPO batch alignment and return sampler group and tail multiples."""
-    if not is_ppo_run(master_config):
-        return 1, 0
-    value_config = master_config.value
-    if value_config is None:
-        raise ValueError("PPO requires a value model configuration")
-
-    sample_alignment = math.lcm(
-        sample_multiple(master_config.policy, policy_dp),
-        sample_multiple(value_config, value_dp),
-    )
-    ppo_config = master_config.ppo
-    assert ppo_config is not None
+    """Return sampler alignment that fills every policy and value DP shard."""
+    ppo = is_ppo_run(master_config)
+    algorithm_name = "PPO" if ppo else "GRPO"
+    if not ppo:
+        validate_grpo_chunk_cap_alignment(master_config, policy_dp)
+        if master_config.token_capture.forest_training:
+            return 1, 0
+    sample_alignment = sample_multiple(master_config.policy, policy_dp)
+    if ppo:
+        value_config = master_config.value
+        if value_config is None or value_dp is None:
+            raise ValueError("PPO requires a value model configuration and DP size")
+        sample_alignment = math.lcm(
+            sample_alignment, sample_multiple(value_config, value_dp)
+        )
+    algorithm = algo_config(master_config)
     group_multiple = sample_alignment // math.gcd(
-        sample_alignment, ppo_config.num_generations_per_prompt
+        sample_alignment, algorithm.num_generations_per_prompt
     )
-    if ppo_config.num_prompts_per_step % group_multiple:
+    if algorithm.num_prompts_per_step % group_multiple:
         raise ValueError(
-            "PPO num_prompts_per_step must be divisible by the policy/value "
+            f"{algorithm_name} num_prompts_per_step must be divisible by the policy/value "
             f"group multiple ({group_multiple}) to avoid an incomplete final chunk"
         )
     min_groups = master_config.async_rl.min_groups_for_streaming_train
     if min_groups < group_multiple:
         raise ValueError(
-            "PPO min_groups_for_streaming_train must be at least the "
+            f"{algorithm_name} min_groups_for_streaming_train must be at least the "
             f"policy/value group multiple ({group_multiple}) so each chunk "
             "contains complete microbatches on every DP rank"
         )
@@ -1839,8 +1842,9 @@ def resolve_ppo_chunk_alignment(
     # produce one: the uncapped max is the already-aligned step remainder.
     chunk_cap = master_config.async_rl.max_groups_for_streaming_train
     if (
-        chunk_cap is not None
-        and chunk_cap < ppo_config.num_prompts_per_step
+        ppo
+        and chunk_cap is not None
+        and chunk_cap < algorithm.num_prompts_per_step
         and chunk_cap % group_multiple != 0
     ):
         raise ValueError(
@@ -1849,7 +1853,9 @@ def resolve_ppo_chunk_alignment(
             "chunk contains complete microbatches on every DP rank"
         )
     min_remaining_groups = (
-        (min_groups + 1) // 2 if min_groups < ppo_config.num_prompts_per_step else 0
+        (min_groups + 1) // 2
+        if ppo and min_groups < algorithm.num_prompts_per_step
+        else 0
     )
     return group_multiple, min_remaining_groups
 
@@ -1857,29 +1863,10 @@ def resolve_ppo_chunk_alignment(
 def validate_grpo_chunk_cap_alignment(
     master_config: MasterConfig, policy_dp: int
 ) -> None:
-    """Reject a GRPO chunk cap whose samples cannot split across the policy.
+    """Validate the GRPO chunk cap against policy dispatch sample alignment.
 
-    GRPO passes no ``group_multiple`` to the sampler, so a chunk can be any size
-    from the floor up to the cap, and the training dispatch shards it without
-    ``allow_uneven_shards``. The chunk therefore has to satisfy the same
-    ``sample_multiple`` PPO aligns to: the DP split, and under static batching the
-    microbatch split inside each rank as well. This guards the full-cap chunk
-    only: a cap of 3 at 2 generations per prompt is 6 samples, which fails on a
-    DP of 4. An unaligned chunk below the cap stays reachable, as it already is
-    from an unaligned ``min_groups_for_streaming_train``, which no validator
-    covers today.
-
-    Only a cap below ``num_prompts_per_step`` can bind, and Forest is exempt: its
-    producer pads each group to the policy execution row multiple, so the logical
-    group count is not the physical row count.
-
-    Args:
-        master_config: The run configuration.
-        policy_dp: Data-parallel size of the policy trainer.
-
-    Raises:
-        ValueError: The capped chunk's sample count is not a multiple of the
-            policy's ``sample_multiple``.
+    Forest groups already carry execution-row padding, so their logical group
+    counts do not determine physical training shard sizes.
     """
     if is_ppo_run(master_config):
         return

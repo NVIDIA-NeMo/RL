@@ -50,7 +50,7 @@ policy:
     env_vars:
       OMP_NUM_THREADS: '2'
       MKL_NUM_THREADS: '2'
-      CUDA_MPS_CLIENT_PRIORITY: '0'
+      CUDA_MPS_CLIENT_PRIORITY: '1'
     recompute_granularity: selective
     recompute_modules:
     - moe_act
@@ -101,10 +101,10 @@ policy:
       resources:
         gpus_per_node: null
         num_nodes: null
-      # Caps the learner at 58%; the engine remains uncapped under mps_percentage.
+      # Both MPS clients have full SM access; learner TE grouped GEMMs target ~58%.
       engine_sm_fraction: 0.42
       engine_weights: shared
-      sm_partition_backend: mps_percentage
+      sm_partition_backend: mps_gemm
     refit_transport: ipc
 logger:
   log_dir: results/nemotron-nano-mps

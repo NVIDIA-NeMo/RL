@@ -2375,6 +2375,23 @@ class TestApplyPerformanceConfig:
             megatron_cfg["attention_backend"] = attention_backend
         return {"megatron_cfg": megatron_cfg}
 
+    def test_disabled_checkpointing_clears_wide_residual_training_state(self) -> None:
+        """Inference graphs must not inherit residual-stream replay controls."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(
+            gated_linear_unit=True,
+            recompute_granularity="selective",
+            recompute_method=None,
+            recompute_num_layers=None,
+            recompute_modules=["residual_stream", "gdp_in_proj", "gdp_qkv"],
+            residual_stream_recompute_num_layers=1,
+        )
+        _apply_performance_config(model_cfg, self._config())
+        assert model_cfg.recompute_granularity is None
+        assert model_cfg.recompute_modules == []
+        assert model_cfg.residual_stream_recompute_num_layers is None
+
     def test_cuda_graph_training_values_are_forwarded(self):
         """Explicit training CUDA Graph settings are normalized on assignment."""
         from megatron.core.transformer.enums import CudaGraphModule

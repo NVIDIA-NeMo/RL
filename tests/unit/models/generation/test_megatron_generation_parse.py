@@ -27,9 +27,10 @@ The same reasoning covers the NeMo-Gym port-reservation wiring
 socket/plumbing contracts, pinned here without a GPU.
 """
 
+import asyncio
 import socket
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -49,6 +50,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.held_port import HeldPortReservation
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
+    MegatronGenerationRefitMixin,
     _apply_inference_cuda_graph_scope,
     _apply_optional_inference_config_kwargs,
     _resolve_coordinator_policy,
@@ -524,3 +526,108 @@ def test_http_server_defaults_follow_generation_sampling(
     started = _start_stubbed_http_server(monkeypatch, sampling_cfg=sampling)
 
     assert {key: started[key] for key in expected} == expected
+
+
+@pytest.mark.mcore
+def test_native_refit_uses_the_allocated_rendezvous_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Stop at store creation: constructing the remaining process group needs
+    # distributed workers. The adjacent port is not part of the allocation.
+    store = MagicMock(side_effect=RuntimeError("stop after rendezvous"))
+    monkeypatch.setattr(torch.distributed, "TCPStore", store)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    with pytest.raises(RuntimeError, match="stop after rendezvous"):
+        MegatronGenerationRefitMixin.init_collective_mcore_generation(
+            SimpleNamespace(), "127.0.0.1", 1882, 16, 0, 1024, "nccl"
+        )
+
+    store.assert_called_once_with(
+        host_name="127.0.0.1", port=1882, world_size=16, is_master=True
+    )
+
+
+@pytest.mark.mcore
+def test_wake_does_not_barrier_after_engine_starts_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RUNNING may already execute EP collectives on the inference thread."""
+    worker = object.__new__(MegatronGenerationMixin)
+    worker.rank = 0
+    worker._inference_engine_asleep = True
+    worker._inference_loop = object()
+    wake_call = object()
+    worker._wake_engine = lambda: wake_call
+    future = MagicMock()
+    run_coroutine = MagicMock(return_value=future)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.asyncio.run_coroutine_threadsafe",
+        run_coroutine,
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "barrier",
+        lambda: pytest.fail("A barrier after RUNNING can deadlock EP inference"),
+    )
+    MegatronGenerationMixin._wake(worker)
+    run_coroutine.assert_called_once_with(wake_call, worker._inference_loop)
+    future.result.assert_called_once_with()
+    assert not worker._inference_engine_asleep
+
+
+@pytest.mark.mcore
+def test_shutdown_drains_engine_before_policy_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+
+    class PolicyBase:
+        def shutdown(self):
+            events.append("policy_cleanup")
+            return True
+
+    class Worker(MegatronGenerationMixin, PolicyBase):
+        pass
+
+    worker = object.__new__(Worker)
+    worker._inference_engine_initialized = True
+    worker._inference_engine_asleep = False
+    worker._inference_loop = object()
+    stop_call = object()
+    worker._shutdown_inference_engine = lambda: stop_call
+    future = MagicMock()
+    future.result.side_effect = lambda **kwargs: events.append("engine_drained")
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.asyncio.run_coroutine_threadsafe",
+        MagicMock(return_value=future),
+    )
+    assert worker.shutdown()
+    assert events == ["engine_drained", "policy_cleanup"]
+    assert not worker._inference_engine_initialized
+    assert worker.shutdown()
+    assert events == ["engine_drained", "policy_cleanup", "policy_cleanup"]
+
+
+@pytest.mark.mcore
+def test_shutdown_synchronizes_cuda_before_stopping_coordinator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from megatron.core.inference.engines.dynamic_engine import EngineState
+
+    worker = object.__new__(MegatronGenerationMixin)
+    worker._inference_engine_asleep = False
+    worker._sleep_engine = AsyncMock()
+    worker.inference_client = MagicMock()
+    worker.dynamic_inference_engine = SimpleNamespace(wait_until=AsyncMock())
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    synchronize = MagicMock()
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+    asyncio.run(worker._shutdown_inference_engine())
+    worker._sleep_engine.assert_awaited_once()
+    synchronize.assert_called_once()
+    worker.inference_client.stop_engines.assert_called_once()
+    worker.dynamic_inference_engine.wait_until.assert_awaited_once_with(
+        EngineState.STOPPED
+    )
+    worker.inference_client.shutdown_coordinator.assert_called_once()

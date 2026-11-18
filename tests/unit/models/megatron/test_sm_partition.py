@@ -15,6 +15,8 @@
 the same-GPU CUDA IPC refit between two processes (GPU)."""
 
 import tempfile
+import os
+import subprocess
 import time
 from types import SimpleNamespace
 
@@ -37,7 +39,11 @@ def _cfg(**over):
         "generation": {
             "backend": "megatron",
             "refit_transport": "ipc",
-            "colocated": {"enabled": False, "engine_sm_fraction": 0.42},
+            "colocated": {
+                "enabled": False,
+                "engine_sm_fraction": 0.42,
+                "sm_partition_backend": "mps_percentage",
+            },
             "mcore_generation_config": {
                 "tensor_model_parallel_size": 1,
                 "expert_model_parallel_size": 4,
@@ -81,8 +87,8 @@ def test_validate_accepts_the_supported_config():
 @pytest.mark.parametrize(
     "over, env, match",
     [
-        ({"generation.colocated.engine_sm_fraction": 0.0}, MPS, r"\(0, 1\)"),
-        ({"generation.colocated.engine_sm_fraction": 1.0}, MPS, r"\(0, 1\)"),
+        ({"generation.colocated.engine_sm_fraction": -0.01}, MPS, r"\[0, 1\)"),
+        ({"generation.colocated.engine_sm_fraction": 1.0}, MPS, r"\[0, 1\)"),
         ({"generation.backend": "vllm"}, MPS, "Megatron generation backend"),
         ({"generation.colocated.enabled": True}, MPS, "colocated.enabled=false"),
         ({"generation.refit_transport": None}, MPS, "refit_transport=ipc"),
@@ -946,3 +952,122 @@ def test_joint_placement_matches_native_dense_and_expert_group_coordinates(
                 group.index(rank) for group in destination if rank in group
             )
             assert source_index == destination_index // ratio
+
+
+def test_uncapped_mps_configuration() -> None:
+    config = _cfg(**{"generation.colocated.engine_sm_fraction": 0.0})
+    smp.validate(config, env=MPS)
+    assert smp.actor_env(config, "learner", env=MPS) == {smp.MPS_PCT_ENV: "100", **MPS}
+    assert smp.actor_env(config, "engine", env=MPS) == MPS
+    config["generation"]["colocated"]["sm_partition_backend"] = "mps_static"
+    with pytest.raises(ValueError, match="positive engine_sm_fraction"):
+        smp.validate(config, env=MPS)
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_uncapped_client_requires_daemon_registration(
+    monkeypatch: pytest.MonkeyPatch, registered: bool
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda: SimpleNamespace(synchronize=lambda: None)
+    )
+
+    def control(command, **kwargs):
+        request = kwargs["input"].strip()
+        answer = (
+            "123\n"
+            if request == "get_server_list"
+            else f"{os.getpid() if registered else os.getpid() + 1}\n"
+        )
+        return SimpleNamespace(stdout=answer)
+
+    monkeypatch.setattr(subprocess, "run", control)
+    if registered:
+        assert smp._check_uncapped_client("learner", "100", seen=152, full=152, rank=0)[
+            "mps_client_registered"
+        ]
+    else:
+        with pytest.raises(RuntimeError, match="not registered"):
+            smp._check_uncapped_client("learner", "100", seen=152, full=152, rank=0)
+
+
+@pytest.mark.parametrize(
+    "fraction,target", [(0.0, 152), (0.21, 120), (0.42, 88), (0.63, 56), (0.999, 1)]
+)
+@pytest.mark.parametrize("backend", [None, "mps_gemm"])
+def test_gemm_budget_preserves_full_context(
+    monkeypatch: pytest.MonkeyPatch, fraction: float, target: int, backend: str | None
+) -> None:
+    config = _cfg(
+        **{
+            "generation.colocated.sm_partition_backend": "mps_gemm",
+            "generation.colocated.engine_sm_fraction": fraction,
+        }
+    )
+    if backend is None:
+        del config["generation"]["colocated"]["sm_partition_backend"]
+    smp.validate(config, env=MPS)
+    assert smp.actor_env(config, "learner", env=MPS) == {**MPS, smp.MPS_PCT_ENV: "100"}
+    assert smp.actor_env(config, "engine", env=MPS) == MPS
+    monkeypatch.setenv(smp.MPS_PCT_ENV, "100")
+    monkeypatch.setenv("NVTE_EXT_MARGIN_SM", "sentinel")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=152),
+    )
+    monkeypatch.setattr(smp, "_device_sm_count", lambda: 152)
+    registrations = []
+
+    def registered(*args: object, **kwargs: object) -> dict:
+        registrations.append(args)
+        return {"mps_client_registered": True}
+
+    monkeypatch.setattr(smp, "_check_uncapped_client", registered)
+    info = smp.check_worker(config, "learner")
+    assert registrations
+    assert info["te_grouped_gemm_target_sms"] == target
+    assert os.environ["NVTE_EXT_MARGIN_SM"] == str(152 - target)
+    monkeypatch.delenv("NVTE_EXT_MARGIN_SM")
+    smp.check_worker(config, "engine")
+    assert "NVTE_EXT_MARGIN_SM" not in os.environ
+
+
+@pytest.mark.parametrize("key", ["NVTE_EXT_MARGIN_SM", "CUDA_MPS_SM_PARTITION"])
+@pytest.mark.parametrize("source", ["process", "worker"])
+def test_gemm_budget_rejects_conflicting_environment(key: str, source: str) -> None:
+    config = _cfg(**{"generation.colocated.sm_partition_backend": "mps_gemm"})
+    env = dict(MPS)
+    if source == "process":
+        env[key] = "0"
+    else:
+        config["megatron_cfg"]["env_vars"] = {key: "0"}
+    with pytest.raises(ValueError, match=key):
+        smp.validate(config, env=env)
+
+
+def test_uncapped_client_retries_transient_control_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda: SimpleNamespace(synchronize=lambda: None)
+    )
+    monkeypatch.setattr(smp.time, "sleep", lambda _: None)
+    calls = []
+
+    def control(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(kwargs["input"])
+        if len(calls) == 1:
+            raise subprocess.CalledProcessError(1, command)
+        return SimpleNamespace(
+            stdout="123\n"
+            if kwargs["input"] == "get_server_list\n"
+            else f"{os.getpid()}\n"
+        )
+
+    monkeypatch.setattr(subprocess, "run", control)
+    assert smp._check_uncapped_client("learner", "100", seen=152, full=152, rank=0)[
+        "mps_client_registered"
+    ]
+    assert len(calls) == 3

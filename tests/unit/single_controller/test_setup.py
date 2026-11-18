@@ -166,6 +166,7 @@ def _make_master_config(
     }
     policy_config: dict = {
         "train_global_batch_size": num_prompts_per_step * 2,
+        "dynamic_batching": {"enabled": True},
         "max_total_sequence_length": 32,
         "tokenizer": {"use_fastokens": False},
         "megatron_cfg": {"enabled": megatron_enabled},
@@ -271,6 +272,7 @@ def patched_factories():
     # Real return objects; _build_generation and _build_trainer return (obj, elapsed_s) tuples.
     fake_gen = MagicMock(name="gen")
     fake_policy = MagicMock(name="policy")
+    fake_policy.sharding_annotations.get_axis_size.return_value = 1
 
     with (
         patch.object(
@@ -2512,6 +2514,7 @@ class TestSetup:
         )
         train_iters_at_build: list[int] = []
         stale_policy = MagicMock(name="stale_policy")
+        stale_policy.sharding_annotations.get_axis_size.return_value = 1
         final_policy = patched_factories["fake_policy"]
         policies = iter([stale_policy, final_policy])
         trainer_started = threading.Event()
