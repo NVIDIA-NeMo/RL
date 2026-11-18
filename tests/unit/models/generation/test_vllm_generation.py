@@ -68,6 +68,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
     BaseVllmGenerationWorker,
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
+    _engine_defaults_pinned_to_vllm_033,
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -1061,6 +1062,40 @@ def test_resolve_enable_prefix_caching_uses_cuda_capability_for_auto(monkeypatch
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
 
     assert _resolve_enable_prefix_caching({}) is False
+
+
+@pytest.mark.parametrize(
+    ("vllm_version", "expected"),
+    [
+        ("0.33.0", {"block_size": 16, "numa_bind": False}),
+        (
+            "0.34.0",
+            {"block_size": 16, "numa_bind": False, "enable_extensible_kv_cache": False},
+        ),
+    ],
+)
+def test_engine_defaults_pinned_to_vllm_033_follow_installed_vllm(
+    monkeypatch, vllm_version, expected
+):
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker.importlib.metadata.version",
+        lambda name: vllm_version,
+    )
+
+    assert _engine_defaults_pinned_to_vllm_033({}) == expected
+
+
+def test_engine_defaults_pinned_to_vllm_033_yield_to_user_vllm_kwargs(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker.importlib.metadata.version",
+        lambda name: "0.34.0",
+    )
+
+    pinned = _engine_defaults_pinned_to_vllm_033(
+        {"block_size": 32, "enable_extensible_kv_cache": True}
+    )
+
+    assert pinned == {"numa_bind": False}
 
 
 basic_lora_test_config: LoRAConfig = {

@@ -804,7 +804,7 @@ def test_finished_request_is_released_once_its_consumer_has_the_output(monkeypat
 
 
 def test_progress_reads_refuse_an_unchecked_vllm(monkeypatch):
-    with pytest.raises(RuntimeError, match="checked on vLLM 0.34.x"):
+    with pytest.raises(RuntimeError, match=r"checked on vLLM 0\.33\.x and 0\.34\.x"):
         _progress_reader(
             monkeypatch, _progress_client(_OutputProcessor()), vllm_version="0.35.1"
         )

@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import importlib.metadata
 import inspect
 import logging
 import os
@@ -21,6 +22,7 @@ from typing import Any, Optional, cast
 
 import ray
 import torch
+from packaging.version import Version
 from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -165,6 +167,22 @@ def _maybe_enable_vllm_native_tracing(llm_kwargs: dict[str, Any]) -> None:
         "per generation request; expect high span volume at rollout scale.",
         endpoint,
     )
+
+
+def _engine_defaults_pinned_to_vllm_033(vllm_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Engine defaults vLLM changed after 0.33, pinned to their 0.33 values.
+
+    vLLM 0.34 defaults ``block_size`` to 64 (was 16), turns the extensible KV
+    cache on (driver-mapped memory outside the CuMem pool, sized after warmup)
+    and sets ``numa_bind`` to auto, which wraps workers in numactl. Keep the
+    0.33 behavior; NeMo-RL binds NUMA itself. Keys the user sets in
+    ``vllm_kwargs`` win, and ``enable_extensible_kv_cache`` is only passed to
+    a vLLM that has it (0.34+).
+    """
+    defaults: dict[str, Any] = {"block_size": 16, "numa_bind": False}
+    if Version(importlib.metadata.version("vllm")) >= Version("0.34"):
+        defaults["enable_extensible_kv_cache"] = False
+    return {key: value for key, value in defaults.items() if key not in vllm_kwargs}
 
 
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
@@ -809,13 +827,7 @@ class BaseVllmGenerationWorker:
             enable_sleep_mode=True,
             # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
-            # vLLM 0.34 defaults: block_size 64 (was 16), extensible KV cache on
-            # (driver-mapped memory outside the CuMem pool, sized after warmup)
-            # and numa_bind auto (vLLM wraps workers in numactl). Keep the 0.33
-            # behavior; NeMo-RL binds NUMA itself. vllm_kwargs can override.
-            block_size=16,
-            enable_extensible_kv_cache=False,
-            numa_bind=False,
+            **_engine_defaults_pinned_to_vllm_033(vllm_kwargs),
             **vllm_kwargs,
         )
 

@@ -73,9 +73,14 @@ def disable_draft_module_sharing() -> None:
     value into the dspark/dflash utils modules, so each module's global must
     be rebound individually.
 
-    vLLM 0.34 removed the legacy ``v1/spec_decode`` proposers, so the eagle3
-    proposer now also decides through ``eagle_utils._should_share``; the
-    override below covers it.
+    On vLLM 0.33 a second, independent embed_tokens-sharing decision lives in
+    ``SpecDecodeBaseProposer._maybe_share_embeddings`` (used by the eagle3
+    proposer): it shares whenever ``self.model.has_own_embed_tokens`` is
+    falsy, a flag only ever set (to True) by ``process_eagle_weight`` when a
+    weight literally named "embed_tokens" is loaded -- which never happens
+    under ``load_format="dummy"``. vLLM 0.34 removed that legacy proposer
+    package; the eagle3 proposer then decides through
+    ``eagle_utils._should_share``, which the override below covers.
 
     Must run before engine creation (drafter load and CUDA-graph capture).
     """
@@ -89,6 +94,17 @@ def disable_draft_module_sharing() -> None:
     eagle_utils._should_share = _never_share
     dspark_utils._should_share = _never_share
     dflash_utils._should_share = _never_share
+
+    try:
+        from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+    except ImportError:
+        # vLLM >= 0.34: the legacy proposer package is gone.
+        return
+
+    def _never_share_embeddings(self: Any, target_language_model: Any) -> None:
+        return None
+
+    SpecDecodeBaseProposer._maybe_share_embeddings = _never_share_embeddings
 
 
 # Incoming draft stream keys each drafter's loader intentionally skips. They

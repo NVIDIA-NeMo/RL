@@ -35,9 +35,10 @@ from nemo_rl.models.generation.vllm.utils import extract_generation_logprobs
 if TYPE_CHECKING:
     from nemo_rl.models.generation.vllm.vllm_worker_async import _AsyncLLMHTTPClient
 
-# The vLLM release whose private OutputProcessor layout these reads were
-# checked against; see VllmProgressReader.
-_PROGRESS_READ_VLLM_RELEASE = (0, 34)
+# The vLLM releases whose private OutputProcessor layout these reads were
+# checked against; see VllmProgressReader. 0.34 only wrapped the same
+# methods in a gc_untrack helper.
+_PROGRESS_READ_VLLM_RELEASES = ((0, 33), (0, 34))
 
 
 @dataclass(frozen=True)
@@ -75,11 +76,14 @@ class VllmProgressReader:
                 "thread, which needs GIL-enabled CPython"
             )
         installed = importlib.metadata.version("vllm")
-        if Version(installed).release[:2] != _PROGRESS_READ_VLLM_RELEASE:
-            expected = ".".join(map(str, _PROGRESS_READ_VLLM_RELEASE))
+        if tuple(Version(installed).release[:2]) not in _PROGRESS_READ_VLLM_RELEASES:
+            expected = " and ".join(
+                ".".join(map(str, release)) + ".x"
+                for release in _PROGRESS_READ_VLLM_RELEASES
+            )
             raise RuntimeError(
                 "generation-prefix cuts read vLLM's private OutputProcessor state, "
-                f"checked on vLLM {expected}.x; vLLM {installed} is installed. "
+                f"checked on vLLM {expected}; vLLM {installed} is installed. "
                 "Re-check nemo_rl.models.generation.vllm.progress_reader."
             )
         try:
