@@ -119,8 +119,8 @@ class VllmSpecificArgs(TypedDict):
     prefix_writer_actor: NotRequired[bool]
     # Optional direct columns and bounded preparation/write overlap; default off.
     prefix_write_pipeline: NotRequired[PrefixWritePipelineConfig]
-    # Pack selected-token histories for captured FINAL_ONLY HTTP requests.
-    # Requires flat_logprobs and a single API server; off when absent.
+    # Pack selected-token histories for captured FINAL_ONLY HTTP requests; each
+    # HTTP frontend packs the requests it serves. Requires flat_logprobs; off when absent.
     packed_capture_logprobs: NotRequired[bool]
     # Bound how long vLLM's front-end output loops may hold the generation actor's
     # event loop under a backlog: output_handler yields once per engine step and the
@@ -440,10 +440,6 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
             raise ValueError(
                 "packed_capture_logprobs requires flat_logprobs, async_engine "
                 "and expose_http_server"
-            )
-        if api_server_count != 1:
-            raise ValueError(
-                "packed_capture_logprobs requires a single HTTP API server"
             )
     budget_ms = vllm_cfg.get("output_loop_yield_budget_ms")
     if budget_ms is None:
