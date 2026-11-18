@@ -129,15 +129,6 @@ def _seconds_left(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
 
 
-class PinnedHandoffTimeout(RuntimeError):
-    """Blocks were still pinned for decode handoffs when the suspend deadline passed.
-
-    Deliberately not a ``TimeoutError``: the controller's refit await treats any
-    ``TimeoutError`` escaping the refit as its own deadline and replaces it with
-    a "rank not answering" abort, dropping this message and its notes.
-    """
-
-
 @dataclasses.dataclass(frozen=True)
 class MegatronDynamoEngine:
     """One running Megatron engine, as the refit side sees it: its record and worker handles.
@@ -257,17 +248,14 @@ class MegatronDynamoEngine:
             "update_weights_from_collective", refit_timeout_s=refit_timeout_s
         )
 
-    def pause_for_refit(self) -> list[ray.ObjectRef]:
-        return self._all("pause_for_refit")
+    def swap_weights_via_reshard(self) -> list[ray.ObjectRef]:
+        return self._all("swap_weights_via_reshard", is_source=False)
 
     def suspend_for_refit(self) -> list[ray.ObjectRef]:
         return self._all("suspend_for_refit")
 
     def resume_after_refit(self) -> list[ray.ObjectRef]:
         return self._all("resume_after_refit")
-
-    def pinned_handoff_block_count(self) -> ray.ObjectRef:
-        return self.leader.pinned_handoff_block_count.remote()
 
     def prepare_for_generation(self, *, tags: list[str]) -> list[ray.ObjectRef]:
         return self._all("prepare_for_generation", tags=tags)
@@ -329,12 +317,6 @@ class MegatronDynamoGeneration(GenerationInterface):
     Rollouts are still not posted to the frontend, so :meth:`validate_settings`
     refuses the switch and ``generate_async`` raises.
     """
-
-    # How often the refit pause re-reads the prefill engines' pinned handoff
-    # blocks while waiting for them to drain.
-    _idle_poll_interval_s: float = 0.2
-    # How often that wait prints the counts it is still waiting on.
-    _pin_report_interval_s: float = 10.0
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
@@ -858,101 +840,6 @@ class MegatronDynamoGeneration(GenerationInterface):
     # Fence around the transfer
     # ------------------------------------------------------------------
 
-    def _wait_for_prefill_handoffs(
-        self, prefill: Sequence[int], deadline: float
-    ) -> None:
-        """Wait until no prefill engine holds a pinned handoff.
-
-        A pinned block is prompt KV a decode engine may still be pulling over
-        NIXL; suspending the prefill engine while any are pinned could corrupt
-        that transfer. Requests may still be in flight (nothing holds new ones
-        back), but the prefill engines are paused, so no new handoff starts.
-        The count decreases as a still-running decode engine finds room for a
-        handoff it claimed (free KV blocks, then a batch slot), pulls it and
-        releases it after its first streamed token, or as Megatron-LM's
-        prefill coordinator releases an offer no decode engine claimed once
-        its offer timeout (300 s by default) passes.
-
-        Every engine is probed on each poll, so a dead engine or endpoint
-        fails the wait as itself. The counts are printed on the first nonzero
-        read and then every ``_pin_report_interval_s``.
-
-        Raises:
-            PinnedHandoffTimeout: Blocks were still pinned when the deadline
-                passed, including a pin read or probe the deadline cut off.
-            ray.exceptions.GetTimeoutError: A pin read ran past the deadline
-                while every engine's latest count was zero (always so for the
-                first read).
-            ray.exceptions.RayActorError: A prefill worker died during a pin
-                read. Other errors from a pin read also propagate unchanged;
-                each carries a note naming the engine.
-            RuntimeError: The liveness probe found an engine dead or its
-                endpoint no longer serving.
-        """
-        # The last count read from each engine, kept across polls so a spent
-        # deadline reports what is still pinned.
-        pinned: dict[str, int] = {}
-        stuck = (
-            "prefill engines still hold KV blocks pinned for decode handoffs: "
-            "{pinned}. A decode engine releases a pin it claimed after it "
-            "admits the handoff and streams its first token; the prefill "
-            "coordinator releases an offer no decode engine claimed once "
-            "Megatron-LM's offer timeout (300 s by default) passes. So either a "
-            "decode engine that claimed a handoff has stalled or died (see its "
-            "rank-zero log), or this wait ended before an unclaimed offer "
-            "expired; raise policy.generation.dynamo_cfg.control_timeout_s "
-            "above that offer timeout."
-        )
-        next_report = float("-inf")
-        while True:
-            # Checked before a read: one issued with no time left cannot be
-            # answered (Ray's get at timeout 0 raises unless the value is ready).
-            if any(pinned.values()) and _seconds_left(deadline) <= 0:
-                raise PinnedHandoffTimeout(stuck.format(pinned=pinned))
-            pending = [
-                (index, self._engine_records[index].pinned_handoff_block_count())
-                for index in prefill
-            ]
-            for index, future in pending:
-                instance_id = self._engine_records[index].instance_id
-                try:
-                    pinned[instance_id] = int(
-                        ray.get(future, timeout=_seconds_left(deadline))
-                    )
-                except ray.exceptions.GetTimeoutError as error:
-                    if any(pinned.values()):
-                        raise PinnedHandoffTimeout(
-                            stuck.format(pinned=pinned)
-                        ) from error
-                    error.add_note(
-                        f"reading pinned handoff blocks failed on engine {instance_id}"
-                    )
-                    raise
-                except Exception as error:
-                    error.add_note(
-                        f"reading pinned handoff blocks failed on engine {instance_id}"
-                    )
-                    raise
-            if not any(pinned.values()):
-                return
-            if time.monotonic() >= next_report:
-                print(
-                    "  [Dynamo] Refit waiting for the KV blocks prefill pins "
-                    f"for decode handoffs to drain: {pinned}",
-                    flush=True,
-                )
-                next_report = time.monotonic() + self._pin_report_interval_s
-            # Only a running decode engine releases a pin it claimed, so a dead
-            # engine or endpoint must surface as itself, not as this wait
-            # running out.
-            # The probe shares the wait's deadline; one it cuts off is the
-            # wait running out.
-            try:
-                self.check_alive(timeout_s=_seconds_left(deadline))
-            except ray.exceptions.GetTimeoutError as error:
-                raise PinnedHandoffTimeout(stuck.format(pinned=pinned)) from error
-            time.sleep(min(self._idle_poll_interval_s, _seconds_left(deadline)))
-
     def _restore_engines(self, indices: Sequence[int], *, deadline: float) -> list[str]:
         """Resume ``indices`` in one wave, in record order; return the failures."""
         errors: list[str] = []
@@ -966,38 +853,36 @@ class MegatronDynamoGeneration(GenerationInterface):
         return errors
 
     def suspend_for_refit(self, *, timeout_s: float | None = None) -> None:
-        """Suspend every engine in the order that keeps prefill handoffs whole.
+        """Suspend every engine for the transfer, prefill first.
 
-        Prefill engines stop scheduling first, so no new handoff can start,
-        then this waits until decode has pulled every block prefill still
-        pins. Only then are the prefill engines suspended, then the decode
-        engines. The caller prepares the weights afterwards, as the Megatron
-        weight synchronizer does for one dedicated engine.
+        Prefill does not wait for decode to pull the KV blocks it still pins
+        for handoffs. Prefill/decode engines run with the ``persist`` KV cache
+        (the config refuses anything else), where suspend and resume leave the
+        KV and recurrent-state memory, the block allocator and the pinned
+        blocks untouched, and the weight transfer writes only parameters. A
+        decode engine can therefore pull a pinned block before, during or after
+        the refit and read the same bytes. Waiting for the pins instead tied the
+        refit to decode capacity: with a deep decode backlog the pins did not
+        drain for over an hour. A prompt prefilled before the refit is decoded
+        with the new weights, as an aggregated engine's in-flight request is.
 
         If any step fails or the deadline passes, the fleet attempts a
         best-effort resume of every engine the suspend reached (prefill after
-        a failed pause, pin wait or prefill suspend; every engine after a
-        failed decode suspend) and the original error still propagates, with
-        any resume failures added to it as notes. A worker that failed
-        mid-transition may need the next refit to recover.
+        a failed prefill suspend; every engine after a failed decode suspend)
+        and the original error still propagates, with any resume failures
+        added to it as notes. A worker that failed mid-transition may need the
+        next refit to recover.
 
         Args:
             timeout_s: One deadline for the whole suspend; ``None`` uses
                 ``dynamo_cfg.control_timeout_s``.
 
         Raises:
-            PinnedHandoffTimeout: Blocks were still pinned when the deadline
-                passed, including a pin read or liveness probe the deadline
-                cut off.
-            ray.exceptions.GetTimeoutError: A pause or suspend call ran past
-                the deadline, or a pin read did while every engine's latest
-                count was zero.
-            RuntimeError: An engine died or its endpoint stopped serving
-                while prefill still pinned blocks.
-            ray.exceptions.RayActorError: A worker died during a pause,
-                suspend or pin read. Other worker errors propagate unchanged;
-                every error from those calls carries a note naming the engine
-                and the step.
+            ray.exceptions.GetTimeoutError: A suspend call ran past the
+                deadline.
+            ray.exceptions.RayActorError: A worker died during a suspend.
+                Other worker errors propagate unchanged; every error from
+                those calls carries a note naming the engine and the step.
         """
         timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout_s
@@ -1007,13 +892,6 @@ class MegatronDynamoGeneration(GenerationInterface):
         # the call may have taken effect anyway.
         reached = list(prefill)
         try:
-            self._call_engines(
-                prefill,
-                lambda record: record.pause_for_refit(),
-                what="pause_for_refit",
-                deadline=deadline,
-            )
-            self._wait_for_prefill_handoffs(prefill, deadline)
             self._call_engines(
                 prefill,
                 lambda record: record.suspend_for_refit(),

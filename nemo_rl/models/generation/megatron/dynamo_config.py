@@ -87,11 +87,7 @@ class MegatronDynamoCfg(BaseModel, extra="forbid"):
     # Deadline for one rollout through the frontend. None waits as long as
     # generation takes, as the native generate_async does.
     request_timeout_s: PositiveFloat | None = None
-    # Bounds every control call to an engine: refit, pause, resume, shutdown.
-    # The refit pause's bound also covers waiting for decode to pull every KV
-    # block prefill still pins for a handoff. Keep it above Megatron-LM's 300 s
-    # offer timeout, after which prefill releases a handoff no decode engine
-    # claimed; a shorter bound can fail a refit on such a pin.
+    # Bounds every control call to an engine: refit, suspend, resume, shutdown.
     control_timeout_s: PositiveFloat = 600.0
     frontend_args: MegatronDynamoFrontendArgs = Field(
         default_factory=MegatronDynamoFrontendArgs

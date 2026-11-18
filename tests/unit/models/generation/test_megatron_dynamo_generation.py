@@ -17,6 +17,7 @@
 import asyncio
 import copy
 import pickle
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
 
@@ -36,7 +37,6 @@ from nemo_rl.models.generation.megatron.dynamo_config import (
 from nemo_rl.models.generation.megatron.dynamo_generation import (
     MegatronDynamoEngine,
     MegatronDynamoGeneration,
-    PinnedHandoffTimeout,
 )
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.weight_sync.membership import desired_membership
@@ -191,11 +191,8 @@ class _FakeEngine:
         self.endpoint_kwargs = None
         # What rank zero's dynamo_endpoint_error reports; None while serving.
         self.endpoint_error = None
-        # Refit fakes: rank zero's calls land in the log. ``pinned`` is a
-        # scripted sequence of pinned-handoff reads (the last value repeats);
-        # ``faults`` maps a worker method to an exception, or "hang", or (for
+        # Refit fakes: rank zero's calls land in the log. ``faults`` maps a worker method to an exception, or "hang", or (for
         # an endpoint method) "disconnected", which raises from ``.remote()``.
-        self.pinned = list(env.pinned.get(self.name, [0]))
         self.faults: dict[str, object] = {}
         # Every method rank zero was called with, in call order.
         self.calls: list[str] = []
@@ -243,16 +240,12 @@ class _FakeEngine:
             return _Ref(hang=True)
         if fault is not None:
             return _Ref(error=fault)
-        if method == "pinned_handoff_block_count":
-            return _Ref(self.pinned.pop(0) if len(self.pinned) > 1 else self.pinned[0])
         return _Ref(True)
 
     def _entry(self, method: str, kwargs: dict) -> str:
         short = {
-            "pause_for_refit": "pause",
             "suspend_for_refit": "suspend",
             "resume_after_refit": "resume",
-            "pinned_handoff_block_count": "pinned",
             "prepare_refit_info": "prepare",
             "update_weights_from_collective": "update",
         }
@@ -395,8 +388,6 @@ class _Env:
         self.runtimes: list[_FakeRuntime] = []
         self.fail_engine_at = None
         self.fail_endpoint_at = None
-        # instance id -> scripted pinned-handoff reads for that engine.
-        self.pinned: dict[str, list[int]] = {}
         self.ray = _FakeRay()
         # Every generation built here; torn down by close().
         self.generations: list[MegatronDynamoGeneration] = []
@@ -456,19 +447,11 @@ class _Env:
             tokenizer="tok",  # type: ignore[arg-type]
             cluster=SimpleNamespace(**cluster),  # type: ignore[arg-type]
         )
-        # The pin-drain poll must not sleep in tests.
-        generation._idle_poll_interval_s = 0.0
         self.generations.append(generation)
         return generation
 
-    def started(
-        self, pinned: list[int] | None = None, **kwargs
-    ) -> MegatronDynamoGeneration:
-        """A built generation object with the start-up log cleared.
-
-        ``pinned`` scripts the prefill engine's pinned-handoff reads.
-        """
-        self.pinned = {"prefill-0": pinned} if pinned is not None else {}
+    def started(self, **kwargs) -> MegatronDynamoGeneration:
+        """A built generation object with the start-up log cleared."""
         generation = self.generation(**kwargs)
         self.log.clear()
         self.ray.get_timeouts.clear()
@@ -1311,8 +1294,6 @@ def test_pickled_copy_drives_the_engines_but_owns_none(env):
     assert (
         env.log
         == [
-            "p0.pause",
-            "p0.pinned",
             "p0.suspend",
             "d0.suspend",
             "d1.suspend",
@@ -1376,24 +1357,194 @@ def test_collective_fans_out_in_record_order_with_rank_prefixes(
         generation.prepare_refit_info(None)
 
 
-def test_refit_sequence_suspends_prefill_pins_around_decode(env):
+# The two fleet shapes of the P/D A/B run, on 8 inference GPUs: arm C is one
+# prefill and three decode engines at TP 2; arm C2 is one prefill engine at TP 2
+# and six decode engines at TP 1.
+_ARMS = {
+    "tp2_tp2": dict(decode_tp=2, num_decode=3, widths=(2, 2, 2, 2)),
+    "tp2_tp1": dict(decode_tp=1, num_decode=6, widths=(2, 1, 1, 1, 1, 1, 1)),
+}
+_TRAIN_WORLD_SIZE = 16
+
+
+def _native_refit_config(*, decode_tp: int, num_decode: int) -> dict[str, Any]:
+    """A P/D generation config on the native MCore refit, as the A/B run sets it."""
+    generation = _with_layout(
+        {"tensor_model_parallel_size": 2}, {"tensor_model_parallel_size": decode_tp}
+    )
+    generation["refit_transport"] = "mcore"
+    generation["disaggregation"]["num_decode_engines"] = num_decode
+    generation["mcore_generation_config"].update(
+        refit_backend="nccl", refit_execution_batch_bytes=None
+    )
+    return generation
+
+
+@pytest.fixture
+def arm_fleet(monkeypatch, arm) -> Iterator[tuple[_Env, MegatronDynamoGeneration]]:
+    """A started fleet of one arm, one engine per fake node."""
+    shape = _ARMS[arm]
+    nodes = [f"10.0.1.{index}" for index in range(len(shape["widths"]))]
+    arm_env = _Env(monkeypatch, nodes)
+    generation = arm_env.started(
+        generation_config=_native_refit_config(
+            decode_tp=shape["decode_tp"], num_decode=shape["num_decode"]
+        ),
+        world_size=sum(shape["widths"]),
+    )
+    yield arm_env, generation
+    arm_env.close()
+
+
+def _offsets(widths: tuple[int, ...]) -> list[int]:
+    """Each engine starts after the trainers and the engines before it."""
+    return [_TRAIN_WORLD_SIZE + sum(widths[:index]) for index in range(len(widths))]
+
+
+@pytest.mark.parametrize("arm", list(_ARMS))
+def test_engine_rank_offsets_follow_each_engines_own_width(arm, arm_fleet):
+    _, generation = arm_fleet
+    widths = _ARMS[arm]["widths"]
+    assert generation.shard_widths == widths
+    assert generation.engine_rank_offsets(_TRAIN_WORLD_SIZE) == _offsets(widths)
+    # The ranks the engines cover are exactly the refit group after the trainers.
+    covered = [
+        offset + rank
+        for offset, width in zip(_offsets(widths), widths, strict=True)
+        for rank in range(width)
+    ]
+    assert covered == list(range(_TRAIN_WORLD_SIZE, _TRAIN_WORLD_SIZE + sum(widths)))
+
+
+@pytest.mark.parametrize("arm", list(_ARMS))
+def test_native_refit_joins_and_receives_on_every_engine_at_its_offset(arm, arm_fleet):
+    arm_env, generation = arm_fleet
+    widths = _ARMS[arm]["widths"]
+    world_size = _TRAIN_WORLD_SIZE + sum(widths)
+    shorts = [engine.short for engine in arm_env.engines]
+    assert generation.uses_native_refit
+    # A pickled copy (the SingleController actor's) picks the same transport.
+    assert pickle.loads(pickle.dumps(generation)).uses_native_refit
+
+    # Nothing to prepare: the native refit moves Megatron shards, not HF tensors.
+    assert generation.prepare_refit_info(None) is None
+    assert arm_env.log == []
+
+    futures = generation.init_collective(
+        "10.0.0.9", 1234, world_size, train_world_size=_TRAIN_WORLD_SIZE
+    )
+    assert len(futures) == sum(widths)
+    assert arm_env.log == [
+        f"{short}.mcore_init(ws={world_size},off={offset},backend=nccl,batch=None)"
+        for short, offset in zip(shorts, _offsets(widths), strict=True)
+    ]
+    arm_env.log.clear()
+
+    futures = generation.update_weights_from_collective(None)
+    assert len(futures) == sum(widths)
+    assert arm_env.log == [f"{short}.swap(source=False)" for short in shorts]
+    arm_env.log.clear()
+
+    # The native transfer cannot be aborted; refuse a deadline before any
+    # engine enters it.
+    with pytest.raises(NotImplementedError, match="cannot enforce a refit deadline"):
+        generation.update_weights_from_collective(5.0)
+    assert arm_env.log == []
+
+
+def test_packed_refit_stays_the_default_transport(env):
+    generation = env.started()
+    assert not generation.uses_native_refit
+
+
+@pytest.mark.parametrize("arm", list(_ARMS))
+def test_megatron_synchronizer_drives_the_native_refit_over_the_fleet(
+    monkeypatch, arm, arm_fleet
+):
+    """The Megatron weight synchronizer's native path, end to end over the fakes."""
+    from nemo_rl.weight_sync import megatron_weight_synchronizer
+
+    arm_env, generation = arm_fleet
+    monkeypatch.setattr(megatron_weight_synchronizer, "ray", arm_env.ray)
+    widths = _ARMS[arm]["widths"]
+    shorts = [engine.short for engine in arm_env.engines]
+    prefill, decode = shorts[0], shorts[1:]
+
+    policy = SimpleNamespace(
+        init_calls=[],
+        init_collective_mcore_generation=lambda *args, **kwargs: (
+            policy.init_calls.append((args, kwargs)) or []
+        ),
+        swap_weights_via_reshard=lambda *, is_source: (
+            arm_env.log.append(f"train.swap(source={is_source})") or []
+        ),
+    )
+    train_cluster = SimpleNamespace(
+        get_master_address_and_port=lambda: ("10.0.0.9", 1234),
+        world_size=lambda: _TRAIN_WORLD_SIZE,
+    )
+    inference_cluster = SimpleNamespace(world_size=lambda: sum(widths))
+    synchronizer = megatron_weight_synchronizer.MegatronWeightSynchronizer(
+        policy,
+        generation,
+        colocated=False,
+        train_cluster=train_cluster,
+        inference_cluster=inference_cluster,
+        refit_timeout_s=None,
+    )
+    world_size = _TRAIN_WORLD_SIZE + sum(widths)
+
+    synchronizer.init_communicator()
+    # The trainers take ranks 0 .. T-1 and build the same plan at the same time.
+    assert policy.init_calls == [
+        (
+            ("10.0.0.9", 1234, world_size),
+            dict(
+                rank_offset=0,
+                refit_execution_batch_bytes=None,
+                refit_backend="nccl",
+            ),
+        )
+    ]
+    assert arm_env.log == [
+        f"{short}.mcore_init(ws={world_size},off={offset},backend=nccl,batch=None)"
+        for short, offset in zip(shorts, _offsets(widths), strict=True)
+    ]
+    arm_env.log.clear()
+
+    synchronizer.sync_weights()
+    expected = (
+        # Prefill is suspended before decode, with no wait for its handoff pins.
+        [f"{prefill}.suspend"]
+        + [f"{short}.suspend" for short in decode]
+        + [f"{short}.prepare_for_generation(['weights'])" for short in shorts]
+        # Every engine is waiting to receive before the trainers send.
+        + [f"{short}.swap(source=False)" for short in shorts]
+        + ["train.swap(source=True)"]
+        + [f"{short}.prepare_for_generation(['kv_cache'])" for short in shorts]
+        # Every engine resumes in one wave, in record order.
+        + [f"{short}.resume" for short in shorts]
+    )
+    # What follows is the first resume starting the engines' endpoints.
+    assert arm_env.log[: len(expected)] == expected
+    assert not any(".update" in entry or ".init(" in entry for entry in arm_env.log)
+    assert not synchronizer.is_stale
+
+
+def test_refit_sequence_suspends_prefill_then_decode(env):
     """The Megatron weight synchronizer's sequence, phase by phase."""
-    generation = env.started(pinned=[3, 1, 0])
+    generation = env.started()
     log = env.log
     generation.suspend_for_refit()
-    assert log == [
-        "p0.pause",
-        # Prefill is suspended only after its pins drained, which takes three
-        # reads; decode keeps serving meanwhile and only answers the liveness
-        # probe after each nonzero read, which the log does not record.
-        "p0.pinned",
-        "p0.pinned",
-        "p0.pinned",
-        "p0.suspend",
-        "d0.suspend",
-        "d1.suspend",
-    ]
-    assert env.engine("d0").calls.count("is_alive") == 2
+    # Prefill is suspended straight away: the refit never waits for decode to
+    # pull the KV blocks prefill pins for handoffs, so neither the pins nor
+    # the engines' liveness are read.
+    assert log == ["p0.suspend", "d0.suspend", "d1.suspend"]
+    assert not any(
+        method in engine.calls
+        for engine in env.engines
+        for method in ("pause_for_refit", "pinned_handoff_block_count", "is_alive")
+    )
     log.clear()
     generation.prepare_for_generation(tags=["weights"])
     generation.prepare_for_generation(tags=["kv_cache"])
@@ -1409,124 +1560,13 @@ def test_refit_sequence_suspends_prefill_pins_around_decode(env):
     assert all(t <= _CONTROL_TIMEOUT_S for t in env.refit_timeouts())
 
 
-class _Clock:
-    """A fake ``time`` for the module under test: sleeping advances it."""
-
-    def __init__(self):
-        self.now = 1000.0
-        self.sleeps: list[float] = []
-
-    def monotonic(self) -> float:
-        return self.now
-
-    def sleep(self, seconds: float) -> None:
-        self.sleeps.append(seconds)
-        self.now += seconds
-
-
-def test_stuck_pins_time_out_after_bounded_polls_and_unpause_prefill(
-    env, monkeypatch, capsys
-):
-    generation = env.started(pinned=[2])
-    generation._idle_poll_interval_s = 0.2
-    generation._pin_report_interval_s = 0.3
-    clock = _Clock()
-    monkeypatch.setattr(generation_module, "time", clock)
-
-    with pytest.raises(PinnedHandoffTimeout, match="'prefill-0': 2"):
-        generation.suspend_for_refit(timeout_s=0.5)
-
-    # Polls at t=0, 0.2 and 0.4; the last sleep is cut to what is left, and the
-    # spent deadline is reported before a fourth read is issued.
-    assert clock.sleeps == [0.2, 0.2, pytest.approx(0.1)]
-    # Prefill was paused, then handed back to serving; nothing was suspended.
-    assert env.log == ["p0.pause"] + ["p0.pinned"] * 3 + ["p0.resume"]
-    # The counts are printed on the first nonzero read (t=0), then once the
-    # report interval has passed (t=0.4), not on every poll.
-    assert capsys.readouterr().out.count("{'prefill-0': 2}") == 2
-
-
-def test_a_dead_decode_engine_fails_the_pin_wait_as_itself(env, monkeypatch):
-    """Only decode releases a pin it claimed, so every poll probes the fleet."""
-    generation = env.started(pinned=[2])
-    generation._idle_poll_interval_s = 0.2
-    monkeypatch.setattr(generation_module, "time", _Clock())
-    env.engine("d0").actor_dead = True
-
-    with pytest.raises(RuntimeError, match="died: decode-0") as raised:
-        generation.suspend_for_refit(timeout_s=0.5)
-
-    assert isinstance(raised.value.__cause__, ray.exceptions.RayActorError)
-    # Found on the first poll, not when the deadline ran out.
-    assert env.log == ["p0.pause", "p0.pinned", "p0.resume"]
-
-
-def test_a_pin_read_cut_off_after_another_engine_reported_pins_times_out(env2):
-    """The deadline ending inside a read still reports the pins known so far."""
-    env2.pinned = {"prefill-0": [2]}
-    generation = env2.generation(_two_prefill_config(), world_size=8)
-    env2.engine("prefill-1").faults["pinned_handoff_block_count"] = "hang"
-    env2.log.clear()
-
-    with pytest.raises(PinnedHandoffTimeout, match="'prefill-0': 2") as raised:
-        generation.suspend_for_refit()
-
-    assert isinstance(raised.value.__cause__, GetTimeoutError)
-    assert env2.log == [
-        "p0.pause",
-        "prefill-1.pause",
-        "p0.pinned",
-        "prefill-1.pinned",
-        "p0.resume",
-        "prefill-1.resume",
-    ]
-
-
-@pytest.mark.parametrize(
-    ("short", "flags", "error", "match"),
-    [
-        pytest.param(
-            "d0",
-            {"faults": {"dynamo_endpoint_error": "hang"}},
-            PinnedHandoffTimeout,
-            "'prefill-0': 2",
-            id="probe_cut_off",
-        ),
-        pytest.param(
-            "d1",
-            {"endpoint_error": "RuntimeError('adapter failed')"},
-            RuntimeError,
-            "stopped serving: decode-1",
-            id="endpoint_stopped",
-        ),
-    ],
-)
-def test_the_pin_wait_probe_checks_the_endpoints_once_they_serve(
-    env, short, flags, error, match
-):
-    """A probe the deadline cuts off is the wait running out; a stopped endpoint is itself."""
-    generation = env.started(pinned=[2])
-    _start_endpoints(generation)
-    vars(env.engine(short)).update(flags)
-    env.log.clear()
-
-    with pytest.raises(error, match=match) as raised:
-        generation.suspend_for_refit()
-
-    if error is PinnedHandoffTimeout:
-        assert isinstance(raised.value.__cause__, GetTimeoutError)
-    assert env.log == ["p0.pause", "p0.pinned", "p0.resume"]
-
-
 @pytest.mark.parametrize(
     ("engine", "method", "restored"),
     [
-        ("p0", "pause_for_refit", ["p0.resume"]),
-        ("p0", "pinned_handoff_block_count", ["p0.resume"]),
         ("p0", "suspend_for_refit", ["p0.resume"]),
         ("d1", "suspend_for_refit", _RESUMED),
     ],
-    ids=["prefill_pause", "pin_read", "prefill_suspend", "decode_suspend"],
+    ids=["prefill_suspend", "decode_suspend"],
 )
 def test_any_suspend_failure_resumes_every_engine_it_reached(
     env, engine, method, restored
