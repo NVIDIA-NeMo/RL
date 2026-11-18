@@ -877,7 +877,7 @@ grpo:
 ```
 Note that this method only has an effect when training involves more than one reward function.
 
-GDPO also runs on the Single-Controller path for NeMo Gym rollouts with token capture disabled; see [Known Missing Features](single-controller.md#known-missing-features) for its limits there.
+GDPO also runs on the Single-Controller path, for multi-reward native environments and for NeMo Gym rollouts, with token capture disabled; see [Known Missing Features](single-controller.md#known-missing-features) for its limits there.
 
 #### Per-reward weights
 
