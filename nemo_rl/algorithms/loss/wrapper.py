@@ -405,10 +405,33 @@ class DraftLossWrapper:
         # strength and quietly keep perturbing the policy.
         if aux_loss is not None:
             draft_loss = draft_loss + aux_loss
-            metrics["draft_aux_loss"] = float(aux_loss.detach().item())
 
         combined_loss = policy_loss + self.loss_weight * draft_loss
-        draft_loss_value = float(draft_loss.detach().item())
+        draft_metrics = torch.stack(
+            [
+                draft_loss.detach().float().reshape(()),
+                (
+                    aux_loss.detach().float().reshape(())
+                    if aux_loss is not None
+                    else draft_loss.detach().new_zeros((), dtype=torch.float32)
+                ),
+            ]
+        )
+        cp_group = self.context_parallel_group
+        if (
+            not self.defer_normalization
+            and cp_group is not None
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(cp_group) > 1
+        ):
+            # Each CP rank holds only the draft windows it owns, but metrics are
+            # read from CP rank 0. Average over CP so the logged draft loss covers
+            # the whole microbatch (the split path reduces over CP at finish).
+            torch.distributed.all_reduce(draft_metrics, group=cp_group)
+            draft_metrics /= torch.distributed.get_world_size(cp_group)
+        draft_loss_value = float(draft_metrics[0].item())
+        if aux_loss is not None:
+            metrics["draft_aux_loss"] = float(draft_metrics[1].item())
         if not self.defer_normalization:
             metrics["total_loss"] = (
                 metrics["loss"] + self.loss_weight * draft_loss_value
