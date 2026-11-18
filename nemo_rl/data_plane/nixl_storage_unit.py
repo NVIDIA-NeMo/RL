@@ -81,7 +81,8 @@ class BlobRec:
     # SSD tier (only with ssd enabled). A blob lives in the put area (in_slab), or
     # in the IO area while its put is written to disk (staged_off set, disk None),
     # or on disk (disk = fd of an already unlinked file) with an optional staged
-    # copy in the IO area (staged_off).
+    # copy in the IO area (staged_off). Published with no file yet (disk None,
+    # spill_due): its IO copy is the only copy and is never evicted.
     in_slab: bool = True
     disk: int | None = None
     staged_off: int | None = (
@@ -298,6 +299,10 @@ class NixlStorageUnit:  # pragma: no cover
         }
         self._io_jobs = 0  # IO jobs queued or running
         self._max_io_jobs = _MAX_IO_JOBS
+        # The last spill write's error, "" once a write succeeds. While set, the
+        # IO area may be full of acked spills nothing will evict, so a put that
+        # needs it fails as UnitFull and a cold read as failed, not Busy/pending.
+        self._spill_error = ""
         self._staged = {}  # blobs with a staged copy
         if not ssd_dir:
             self.alloc_ = SlabAllocator(slab_bytes)
@@ -393,7 +398,8 @@ class NixlStorageUnit:  # pragma: no cover
         """IO-area region for a put the put area cannot take.
 
         Busy if something will free room (jobs, staged copies, pins, quarantine),
-        UnitFull if nothing will.
+        UnitFull if nothing will, or if the disk is failing: acked spills whose
+        write failed hold the IO area until the disk comes back.
         """
         io = self.staging_
         busy = False
@@ -406,6 +412,11 @@ class NixlStorageUnit:  # pragma: no cover
                 return io.alloc(nbytes)
             except UnitFull:
                 busy = io.used_bytes > 0
+        if busy and self._spill_error:
+            raise UnitFull(
+                f"unit {self.unit_id}: no room for {nbytes} B; the IO area holds "
+                f"spills whose disk write failed ({self._spill_error})"
+            )
         if busy or self.alloc_.quarantined_bytes:
             self.ssd_stats["busy_replies"] += 1
             raise DataPlaneBusy(
@@ -453,12 +464,14 @@ class NixlStorageUnit:  # pragma: no cover
         """IO worker: write a put's IO-area region to a file, then publish it as a disk blob."""
         fd = None
         ok = False
+        err = ""
         try:
             fd = self._new_file()
             _write_all(fd, self._io_view(rec))
             ok = True
         except Exception as e:  # noqa: BLE001 - anything else would leave the job owning the region
-            log.warning("unit %d: spilling %s failed: %s", self.unit_id, b, e)
+            err = f"{type(e).__name__}: {e}"
+            log.warning("unit %d: spilling %s failed: %s", self.unit_id, b, err)
         now = time.monotonic()
         with self._mu:
             rec.staging = False
@@ -469,6 +482,7 @@ class NixlStorageUnit:  # pragma: no cover
                 if rec.holds == 0:
                     self._drop_staged(b, rec, rec.pin_expiry(now), now)
             elif ok:
+                self._spill_error = ""
                 rec.disk = fd
                 self.ssd_stats["spilled_bytes"] += rec.nbytes
                 self.ssd_stats["spills"] += 1
@@ -482,6 +496,7 @@ class NixlStorageUnit:  # pragma: no cover
                 # keep it (never evicted while rec.disk is None) and retry.
                 rec.spill_due = True
                 rec.spill_failed_at = now
+                self._spill_error = err
                 self.ssd_stats["spill_failures"] += 1
         if fd is not None and not (ok and not gone):
             _close(fd)
@@ -501,12 +516,12 @@ class NixlStorageUnit:  # pragma: no cover
         os.unlink(path)
         return fd
 
-    def _start_stage(self, b: str, rec: BlobRec, now: float) -> None:
-        """Stage a disk blob into the IO area, if room can be found."""
+    def _start_stage(self, b: str, rec: BlobRec, now: float) -> bool:
+        """Stage a disk blob into the IO area; False if the IO area has no room."""
         if not rec.wait_since:
             rec.wait_since = now
         if self._io_jobs >= self._max_io_jobs:
-            return
+            return True  # a job slot frees shortly
         try:
             off = self.staging_.alloc(rec.nbytes)
         except UnitFull:
@@ -514,7 +529,7 @@ class NixlStorageUnit:  # pragma: no cover
             try:
                 off = self.staging_.alloc(rec.nbytes)
             except UnitFull:
-                return  # IO area full: stays pending until pins end / copies age
+                return False  # pending until pins end / copies age
         rec.staged_off = off
         try:
             self._submit_io(self._stage, b, rec)
@@ -523,6 +538,7 @@ class NixlStorageUnit:  # pragma: no cover
             self.staging_.free(off, rec.nbytes)
             raise
         self._staged[b] = rec
+        return True
 
     def _evict_staged(self, nbytes: int, now: float) -> None:
         """Drop unpinned staged copies, oldest first.
@@ -845,8 +861,10 @@ class NixlStorageUnit:  # pragma: no cover
                 rec.stage_failed = False  # reported once; the next resolve retries
                 failed.append(b)
                 continue
+            elif not self._start_stage(b, rec, now) and self._spill_error:
+                failed.append(b)  # the IO area is full of failed spills: no room soon
+                continue
             else:
-                self._start_stage(b, rec, now)
                 pending.append(b)
                 continue
             rec.pins[pin_id] = expiry
