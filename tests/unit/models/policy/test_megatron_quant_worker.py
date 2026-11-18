@@ -348,8 +348,8 @@ def test_real_quant_refit_reuses_plan_and_restores_draft(monkeypatch, planning_e
     else:
         worker.refit_conversion_tasks = worker._build_refit_conversion_tasks()
         # EP expert mappings have already been adapted; never re-plan them.
-        list(worker._iter_real_quant_refit_params())
-        list(worker._iter_real_quant_refit_params())
+        list(worker._iter_real_quant_refit_params(draft_weights=()))
+        list(worker._iter_real_quant_refit_params(draft_weights=()))
         assert len(worker.megatron_bridge.plan_calls) == 1
         plan = worker.megatron_bridge.plan_calls[0][2]
         assert all(
@@ -497,7 +497,7 @@ def test_iter_real_quant_refit_params_rejects_calibrated_format_mismatch() -> No
             "mode 'w4a16', but calibration produced NVFP4"
         ),
     ):
-        list(worker._iter_real_quant_refit_params())
+        list(worker._iter_real_quant_refit_params(draft_weights=()))
 
     assert not worker.megatron_bridge.calls
 
@@ -516,7 +516,7 @@ def test_iter_real_quant_refit_params_rejects_ignored_packed_weight(
         }
 
     with pytest.raises(ValueError, match="conflict with generation.real_quant_ignore"):
-        list(worker._iter_real_quant_refit_params())
+        list(worker._iter_real_quant_refit_params(draft_weights=()))
 
     assert not worker.megatron_bridge.calls
 
@@ -538,10 +538,10 @@ def test_real_quant_refit_respects_canonical_fused_output_exclusions(
         with pytest.raises(
             ValueError, match="conflict with generation.real_quant_ignore"
         ):
-            list(worker._iter_real_quant_refit_params())
+            list(worker._iter_real_quant_refit_params(draft_weights=()))
         assert not worker.megatron_bridge.calls
     else:
-        list(worker._iter_real_quant_refit_params())
+        list(worker._iter_real_quant_refit_params(draft_weights=()))
         assert len(worker.megatron_bridge.calls) == 1
 
 
@@ -563,7 +563,7 @@ def test_iter_real_quant_refit_params_rejects_remote_ignored_weight(
         megatron_quant_policy_worker, "gather_jagged_object_lists", gather
     )
     with pytest.raises(ValueError, match=remote_name):
-        list(worker._iter_real_quant_refit_params())
+        list(worker._iter_real_quant_refit_params(draft_weights=()))
 
     assert not worker.megatron_bridge.calls
 
@@ -1263,14 +1263,16 @@ def test_folded_refit_preserves_unquantized_output_rows(monkeypatch, dtype):
         )
     ]
 
-    def export_weights(self, kv_scales=None):
+    def export_weights(self, kv_scales=None, **_kwargs):
         for task in self.refit_conversion_tasks:
             yield task.param_name, task.param_weight
 
     monkeypatch.setattr(
         MegatronPolicyWorkerImpl, "_iter_params_with_optional_kv_scales", export_weights
     )
-    exported = dict(worker._iter_params_with_optional_kv_scales())["in_proj.weight"]
+    exported = dict(worker._iter_params_with_optional_kv_scales(draft_weights=()))[
+        "in_proj.weight"
+    ]
     torch.testing.assert_close(exported[:2], quantized[:2], rtol=0, atol=0)
     torch.testing.assert_close(exported[2:], unquantized, rtol=0, atol=0)
     assert not torch.equal(exported[2:], quantized[2:])
