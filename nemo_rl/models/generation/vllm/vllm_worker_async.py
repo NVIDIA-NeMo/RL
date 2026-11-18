@@ -928,9 +928,9 @@ class VllmAsyncGenerationWorkerImpl(
                 raise ValueError(
                     "Packed captured logprobs require text-only selected-token capture"
                 )
-            if self._http_engine_client is None or self._api_server_pool is not None:
+            if self._http_engine_client is None:
                 raise ValueError(
-                    "Packed captured logprobs require a single async HTTP API server"
+                    "Packed captured logprobs require an async HTTP API server"
                 )
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter

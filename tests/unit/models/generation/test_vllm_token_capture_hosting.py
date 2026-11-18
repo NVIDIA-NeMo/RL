@@ -36,7 +36,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
@@ -113,6 +113,9 @@ from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
 from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
     durable_prefixes,
     merge_cut_receipts,
+)
+from nemo_rl.models.generation.vllm.packed_logprobs import (  # noqa: E402
+    PackedSelectedLogprobs,
 )
 from nemo_rl.models.generation.vllm.progress_reader import (  # noqa: E402
     VllmProgressReader,
@@ -233,7 +236,6 @@ def _fake_worker(*, is_model_owner: bool = True) -> VllmAsyncGenerationWorkerImp
     worker._init_token_capture_state()
     worker.cfg = {"vllm_cfg": {}}
     worker.is_model_owner = is_model_owner
-    worker.cfg = {"vllm_cfg": {}}
     worker._http_engine_client = None
     worker._api_server_pool = None
     return worker
@@ -340,12 +342,11 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     assert payload["required_prefix_token_ids"] == [1, 2]
 
 
-@pytest.mark.parametrize("unsupported", ["media", "topk", "no_http", "pool"])
+@pytest.mark.parametrize("unsupported", ["media", "topk", "no_http"])
 def test_setup_packed_capture_rejects_unsupported_mode(unsupported: str) -> None:
     worker = _fake_worker()
     worker.cfg["vllm_cfg"]["packed_capture_logprobs"] = True
     worker._http_engine_client = None if unsupported == "no_http" else MagicMock()
-    worker._api_server_pool = MagicMock() if unsupported == "pool" else None
     with pytest.raises(ValueError, match="Packed captured logprobs require"):
         asyncio.run(
             worker.setup_token_capture(
@@ -353,12 +354,14 @@ def test_setup_packed_capture_rejects_unsupported_mode(unsupported: str) -> None
                 "staging",
                 capture_media=unsupported == "media",
                 top_logprobs=1 if unsupported == "topk" else 0,
+                **_PREFIX_BATCH_LIMITS,
             )
         )
 
 
+@pytest.mark.parametrize("child_frontends", [False, True])
 def test_setup_packed_capture_installs_on_engine_loop(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, child_frontends: bool
 ) -> None:
     worker = _fake_worker()
     worker.cfg["vllm_cfg"]["packed_capture_logprobs"] = True
@@ -395,8 +398,17 @@ def test_setup_packed_capture_installs_on_engine_loop(
     worker._http_engine_client = SimpleNamespace(
         output_processor=processor, _run_on_engine_loop=on_engine_loop
     )
-    assert asyncio.run(worker.setup_token_capture({}, "staging")) is None
-    assert installs[0] == "engine_loop"
+    if child_frontends:
+        # Each child frontend runs this same setup on its own output processor.
+        worker._api_server_pool = SimpleNamespace(
+            command=AsyncMock(side_effect=lambda name, *args: installs.append(name))
+        )
+    assert (
+        asyncio.run(worker.setup_token_capture({}, "staging", **_PREFIX_BATCH_LIMITS))
+        is None
+    )
+    assert installs[:2] == ["engine_loop", PackedSelectedLogprobs]
+    assert installs[2:] == (["capture"] if child_frontends else [])
     assert worker._packed_capture_hook is not None
 
 

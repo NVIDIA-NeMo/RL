@@ -320,7 +320,6 @@ def test_async_actor_settings_allow_omitted_vllm_cfg() -> None:
         {"flat_logprobs": False},
         {"async_engine": False, "flat_logprobs": False},
         {"expose_http_server": False, "flat_logprobs": False},
-        {"http_api_server_count": 2},
     ],
 )
 def test_packed_capture_rejects_unsupported_actor_settings(overrides: dict) -> None:
@@ -335,7 +334,8 @@ def test_packed_capture_rejects_unsupported_actor_settings(overrides: dict) -> N
         validate_vllm_async_actor_settings(cast(VllmConfig, {"vllm_cfg": settings}))
 
 
-def test_packed_capture_accepts_single_async_http_engine() -> None:
+@pytest.mark.parametrize("api_server_count", [1, 2])
+def test_packed_capture_accepts_async_http_frontends(api_server_count: int) -> None:
     validate_vllm_async_actor_settings(
         cast(
             VllmConfig,
@@ -345,6 +345,7 @@ def test_packed_capture_accepts_single_async_http_engine() -> None:
                     "flat_logprobs": True,
                     "async_engine": True,
                     "expose_http_server": True,
+                    "http_api_server_count": api_server_count,
                 }
             },
         )

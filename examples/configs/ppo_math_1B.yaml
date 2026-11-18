@@ -352,7 +352,7 @@ policy:
       enable_vllm_metrics_logger: true
       vllm_metrics_logger_interval: 0.5
       flat_logprobs: false # Requires async_engine: true and expose_http_server: true. Store logprobs in vLLM's FlatLogprobs (not for requests asking for prompt logprobs); avoids long GC pauses on the generation actor under large backlogs
-      packed_capture_logprobs: false # Text-only selected-token capture; requires flat_logprobs and a single async HTTP API server
+      packed_capture_logprobs: false # Text-only selected-token capture; requires flat_logprobs; each HTTP API server packs the requests it serves
       output_loop_yield_budget_ms: null # Requires async_engine: true. e.g. 20: make vLLM's output loops yield so refit/control calls are not starved under a backlog
     vllm_kwargs: {}
     colocated:
