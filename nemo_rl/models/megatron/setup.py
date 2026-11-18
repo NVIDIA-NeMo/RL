@@ -64,6 +64,7 @@ from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
+from megatron.core.config import set_experimental_flag
 from megatron.core.extensions.transformer_engine import TEQuantizationParams
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.num_microbatches_calculator import update_num_microbatches
@@ -2289,6 +2290,12 @@ def _create_megatron_config(
         dist_cfg.use_gloo_process_groups = config["megatron_cfg"][
             "use_gloo_process_groups"
         ]
+    if "enable_megatron_core_experimental" in config["megatron_cfg"]:
+        dist_cfg.enable_megatron_core_experimental = config["megatron_cfg"][
+            "enable_megatron_core_experimental"
+        ]
+    # Bridge's setup() applies this flag; NeMo RL builds models without that entry point.
+    set_experimental_flag(dist_cfg.enable_megatron_core_experimental)
 
     return ConfigContainer(
         model=model_cfg,
