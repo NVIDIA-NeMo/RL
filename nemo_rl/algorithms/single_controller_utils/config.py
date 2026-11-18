@@ -1152,6 +1152,19 @@ def algo_config(master_config: MasterConfig) -> GRPOConfig | PPOConfig:
     return master_config.grpo  # type: ignore
 
 
+def message_level_advantage_penalties_enabled(master_config: MasterConfig) -> bool:
+    """Whether the active algorithm block sets a message-level advantage override.
+
+    Single source of truth for the flag: setup registers the mask columns and asks
+    Gym and the finalizer for them, and the advantage stage fetches them.
+    """
+    algo_cfg = algo_config(master_config)
+    return (
+        algo_cfg.invalid_tool_call_advantage is not None
+        or algo_cfg.malformed_thinking_advantage is not None
+    )
+
+
 def validate_sampler_buffer_capacity(
     async_config: AsyncRLConfig,
     *,
@@ -2292,12 +2305,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     # configs can omit it. Only apply rollout-path validation when it is present.
     env_config = getattr(master_config, "env", None)
 
-    # With token capture, the finalizer builds the masks from the last output
-    # item Gym records for each call (token_id_capture.record_last_output_item).
-    penalties_enabled = (
-        algo_cfg.invalid_tool_call_advantage is not None
-        or algo_cfg.malformed_thinking_advantage is not None
-    )
+    penalties_enabled = message_level_advantage_penalties_enabled(master_config)
     if penalties_enabled and not should_use_nemo_gym(master_config):
         raise ValueError(
             "invalid_tool_call_advantage and malformed_thinking_advantage on the "

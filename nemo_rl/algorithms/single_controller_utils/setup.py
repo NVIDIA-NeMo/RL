@@ -85,6 +85,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     forest_execution_row_multiple,
     is_ppo_run,
     logprob_passes_required,
+    message_level_advantage_penalties_enabled,
     resolve_ppo_chunk_alignment,
     rollout_snapshots_enabled,
     validate_grpo_chunk_cap_alignment,
@@ -372,7 +373,7 @@ def _register_single_controller_partitions(
             partition_fields.extend(SAMPLER_TOPK_FIELDS)
         if (
             not token_capture_cfg.forest_training
-            and _message_level_advantage_penalties_enabled(master_config)
+            and message_level_advantage_penalties_enabled(master_config)
         ):
             partition_fields.extend([INVALID_TOOL_CALL_MASK, MALFORMED_THINKING_MASK])
     if include_multimodal_fields:
@@ -884,7 +885,7 @@ def _spinup_gym(
             {
                 **master_config.token_capture.model_dump(),
                 "top_logprobs": generation_config["top_logprobs"],
-                "record_last_output_item": _message_level_advantage_penalties_enabled(
+                "record_last_output_item": message_level_advantage_penalties_enabled(
                     master_config
                 ),
             }
@@ -893,15 +894,6 @@ def _spinup_gym(
         ),
     )
     return shard_set, time.perf_counter() - t0
-
-
-def _message_level_advantage_penalties_enabled(master_config: MasterConfig) -> bool:
-    """Return whether invalid_tool_call_advantage or malformed_thinking_advantage is set."""
-    algo_cfg = algo_config(master_config)
-    return (
-        algo_cfg.invalid_tool_call_advantage is not None
-        or algo_cfg.malformed_thinking_advantage is not None
-    )
 
 
 def _generation_max_seq_len(generation_config) -> int:
@@ -2396,7 +2388,7 @@ def setup_single_controller(
         per_token_multimodal_fields=(
             () if token_capture_cfg.enabled else per_token_multimodal_schema(processor)
         ),
-        include_message_violation_fields=_message_level_advantage_penalties_enabled(
+        include_message_violation_fields=message_level_advantage_penalties_enabled(
             master_config
         ),
         require_routed_experts=router_replay_enabled(policy_config),
@@ -2411,7 +2403,7 @@ def setup_single_controller(
             create_rollout_reassembler_actors,
         )
 
-        message_penalties = _message_level_advantage_penalties_enabled(master_config)
+        message_penalties = message_level_advantage_penalties_enabled(master_config)
         nemo_gym_env_config = master_config.env.get("nemo_gym") or {}
         # The resolver sets the think tags only for the think-tag penalty; the
         # message-level detector reads the same env.nemo_gym tags.

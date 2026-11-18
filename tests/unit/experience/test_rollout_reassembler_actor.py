@@ -170,6 +170,36 @@ def test_actor_forwards_capture_media_to_the_reassembler(
     assert finalizer._staging._capture_media is capture_media
 
 
+def test_actor_forwards_message_violation_settings_to_the_reassembler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setup's detector settings reach the RolloutReassembler the actor builds."""
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    monkeypatch.setattr(
+        actor_module, "build_data_plane_client", lambda cfg, bootstrap: MagicMock()
+    )
+    config = RolloutReassemblerActorConfig(
+        partition_id="canonical",
+        staging_partition="staging",
+        pad_token_id=0,
+        router_replay_enabled=False,
+        defer_routed_experts_to_policy=False,
+        max_seq_len=4096,
+        top_logprobs=0,
+        capture_media=False,
+        media_columns=None,
+        thinking_tags=("<reason>", "</reason>"),
+        message_violation_masks=True,
+        invalid_tool_call_patterns=["[[BAD]]"],
+    )
+    actor = object.__new__(actor_cls)
+    actor.__init__({"enabled": True, "impl": "transfer_queue"}, config)
+    finalizer = actor._finalizer
+    assert finalizer._message_violation_masks is True
+    assert finalizer._invalid_tool_call_patterns == ["[[BAD]]"]
+    assert finalizer._thinking_tags == ("<reason>", "</reason>")
+
+
 @pytest.mark.parametrize(
     "payload",
     [

@@ -47,7 +47,7 @@ VIOLATION_TAG_KEYS = (
 )
 # Per-row violation counts ride ``tags`` rather than the tensor fields, so this
 # key is carried on the train batch and consumed by pack_payload.
-_VIOLATION_COUNTS_KEY = "violation_counts"
+VIOLATION_COUNTS_KEY = "violation_counts"
 
 
 def _violation_counts(
@@ -181,7 +181,7 @@ def record_to_train_batch(
         MASK_SAMPLE: mask_sample,
         TRUNCATED: truncated,
         "total_reward": total_reward,
-        _VIOLATION_COUNTS_KEY: violation_counts,
+        VIOLATION_COUNTS_KEY: violation_counts,
     }
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
@@ -232,7 +232,7 @@ def pack_payload(
         tensor_fields, lengths=lengths, token_aligned_fields=TOKEN_ALIGNED_FIELDS
     )
     sample_ids = [f"{group_id}_g{i}" for i in range(n)]
-    violations = train_batch.get(_VIOLATION_COUNTS_KEY, [{}] * n)
+    violations = train_batch.get(VIOLATION_COUNTS_KEY, [{}] * n)
     multimodal_tags = multimodal_row_tags(multimodal, n) or [{} for _ in range(n)]
     tags = [
         {

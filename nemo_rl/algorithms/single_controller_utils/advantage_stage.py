@@ -126,6 +126,7 @@ class AdvantageStageConfig:
         from nemo_rl.algorithms.single_controller_utils.config import (
             algo_config,
             is_ppo_run,
+            message_level_advantage_penalties_enabled,
         )
 
         is_ppo = is_ppo_run(master_config)
@@ -149,8 +150,7 @@ class AdvantageStageConfig:
             teacher_logprobs_required=opd_module.is_opd_enabled(master_config),
             opd_full_enabled=opd_module.get_opd_full_config(master_config) is not None,
             message_level_advantage_penalties_enabled=(
-                algo_cfg.invalid_tool_call_advantage is not None
-                or algo_cfg.malformed_thinking_advantage is not None
+                message_level_advantage_penalties_enabled(master_config)
             ),
             shardable=not create_advantage_estimator(
                 algo_cfg.adv_estimator, loss_cfg

@@ -47,6 +47,9 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StagedCallRecord,
 )
 
+from nemo_rl.algorithms.single_controller_utils.utils import (  # noqa: E402
+    reduce_advantage_pump_metrics,
+)
 from nemo_rl.data.captured_media import MediaColumnSpec  # noqa: E402
 from nemo_rl.data.multimodal_utils import (  # noqa: E402
     WIRE_MULTIMODAL_FIELDS,
@@ -68,6 +71,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQTokenSource,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
+from nemo_rl.experience.payload import VIOLATION_TAG_KEYS  # noqa: E402
 from nemo_rl.experience.reward_penalties import RewardLogContext  # noqa: E402
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler  # noqa: E402
 from nemo_rl.experience.route_assembly import RouteLayout  # noqa: E402
@@ -614,10 +618,15 @@ def test_finalize_group_masks_flagged_calls_from_last_output_items(
         tq_client, "worked_example", rollout_id=rollout_ids[0]
     )
     # c1 leaks a thinking tag into its answer; c2 writes a tool call as text.
-    receipt["manifest"][0]["last_output_item"] = _message("answer </think>")
-    receipt["manifest"][1]["last_output_item"] = _message("<tool_call>x</tool_call>")
+    # Non-default tags and patterns: setup passes env.nemo_gym's settings.
+    receipt["manifest"][0]["last_output_item"] = _message("answer </reason>")
+    receipt["manifest"][1]["last_output_item"] = _message("[[BAD]]x")
     finalizer = _finalizer(
-        tq_client, partition_id=_VIOLATION_PARTITION, message_violation_masks=True
+        tq_client,
+        partition_id=_VIOLATION_PARTITION,
+        message_violation_masks=True,
+        thinking_tags=("<reason>", "</reason>"),
+        invalid_tool_call_patterns=["[[BAD]]"],
     )
     finalized = finalizer.finalize_group(
         group_id,
@@ -629,8 +638,17 @@ def test_finalize_group_masks_flagged_calls_from_last_output_items(
         prompt_idx=0,
     )
     assert finalized.valid_row_count == 1
-    assert finalized.metrics["finalize/malformed_thinking_rate"] == 0.5
-    assert finalized.metrics["finalize/invalid_tool_call_rate"] == 0.5
+    assert not any("thinking_rate" in name for name in finalized.metrics)
+    tags = finalized.meta.tags
+    assert tags[0]["num_assistant_messages"] == 2
+    assert tags[0]["num_malformed_thinking"] == 1
+    assert tags[0]["num_invalid_tool_calls"] == 1
+    assert "num_assistant_messages" not in tags[1]  # rejected placeholder
+    # The controller's own reducer pools the same keys as the echo path.
+    step_log = {key: [t.get(key, 0) for t in tags] for key in VIOLATION_TAG_KEYS}
+    reduced = reduce_advantage_pump_metrics([], [], [], **step_log)
+    assert reduced["malformed_thinking_rate"] == 0.5
+    assert reduced["invalid_tool_call_rate"] == 0.5
     rows = tq_client.get_samples(
         sample_ids=rollout_ids,
         partition_id=_VIOLATION_PARTITION,

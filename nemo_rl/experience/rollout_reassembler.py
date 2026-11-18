@@ -70,7 +70,7 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSource,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
-from nemo_rl.experience.payload import pack_payload
+from nemo_rl.experience.payload import VIOLATION_COUNTS_KEY, pack_payload
 from nemo_rl.experience.reward_penalties import (
     CAPTURE_PENALTIES,
     FinalizedReward,
@@ -136,7 +136,8 @@ class FinalizedRollout:
     sampler_topk_token_ids: Optional[torch.Tensor] = None
     sampler_topk_logprobs: Optional[torch.Tensor] = None
     output_masks: dict[str, list[bool]] = field(default_factory=dict)
-    # Ordinary rows with message-level penalties: detector counts over chain calls.
+    # Ordinary rows with message-level penalties: payload.VIOLATION_TAG_KEYS counts
+    # over the chain calls, published in the row tags as on the echo path.
     violation_counts: dict[str, int] = field(default_factory=dict)
     # One length per owned call, even when adjacent generations have no input gap.
     generation_lengths: tuple[int, ...] = ()
@@ -742,9 +743,13 @@ class RolloutReassembler:
                 for item in last_items
             )
             violation_counts = {
-                "assistant_calls": len(action_flags),
-                "invalid_tool_calls": sum(f.invalid_tool_call for f in action_flags),
-                "malformed_thinking": sum(f.malformed_thinking for f in action_flags),
+                "num_assistant_messages": len(action_flags),
+                "num_invalid_tool_calls": sum(
+                    f.invalid_tool_call for f in action_flags
+                ),
+                "num_malformed_thinking": sum(
+                    f.malformed_thinking for f in action_flags
+                ),
             }
         output_masks = {}
         if action_flags is not None:
@@ -1037,20 +1042,6 @@ class RolloutReassembler:
                     metrics[f"finalize/penalty_count/{spec.name}"] = float(
                         sum(row.penalty_counts.get(spec.name, 0) for row in valid_rows)
                     )
-        # The echo path's per-step invalid_tool_call_rate / malformed_thinking_rate,
-        # per group over the valid rows' chain calls.
-        assistant_calls = sum(
-            row.violation_counts.get("assistant_calls", 0) for row in valid_rows
-        )
-        if assistant_calls:
-            for name, key in (
-                ("invalid_tool_call_rate", "invalid_tool_calls"),
-                ("malformed_thinking_rate", "malformed_thinking"),
-            ):
-                metrics[f"finalize/{name}"] = (
-                    sum(row.violation_counts.get(key, 0) for row in valid_rows)
-                    / assistant_calls
-                )
         # Ledger-derived admission counters (per group): each manifest row
         # carries its admission mode. token_in_rate near 1.0 is the capture
         # health signal (a text root only opens each chain); this replaces the
@@ -1447,6 +1438,8 @@ class RolloutReassembler:
                             row.output_masks[key], dtype=torch.bool
                         )
                 train_batch[key] = values
+        if logical is None and self._message_violation_masks:
+            train_batch[VIOLATION_COUNTS_KEY] = [row.violation_counts for row in rows]
         if self._router_replay_enabled and not self._defer_routed_experts_to_policy:
             has_routed_row = any(r.valid and r.routed_experts is not None for r in rows)
             if not has_routed_row and self._routed_dims is None and not valid_rows:
