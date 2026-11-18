@@ -145,6 +145,7 @@ env:
     - resources_servers/circle_click/configs/circle_click.yaml
     circle_click_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:

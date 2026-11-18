@@ -59,6 +59,8 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.models.value.config import ValueResourcesConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig
 
@@ -139,15 +141,15 @@ def _make_master_config(
                 "colocated": {"enabled": False, "resources": {}},
             },
         },
-        checkpointing={
-            "enabled": False,
-            "checkpoint_dir": "results/_sc_ppo_setup_test_ckpt",
-            "metric_name": None,
-            "higher_is_better": False,
-            "keep_top_k": None,
-            "save_period": 10,
-            "save_optimizer": False,
-        },
+        checkpointing=CheckpointingConfig(
+            enabled=False,
+            checkpoint_dir="results/_sc_ppo_setup_test_ckpt",
+            metric_name=None,
+            higher_is_better=False,
+            keep_top_k=None,
+            save_period=10,
+            save_optimizer=False,
+        ),
         logger=LoggerConfig.model_construct(),
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
@@ -247,6 +249,46 @@ class TestAlgoConfigSelection:
 
 
 class TestPPOValidation:
+    @pytest.mark.parametrize(
+        ("invalid_setting", "message"),
+        [
+            ("policy_backend", "policy.megatron_cfg.enabled=true"),
+            ("colocated", "colocated.enabled=false"),
+            ("missing_value_nodes", "value.resources.num_nodes >= 1"),
+            ("missing_resources", "value.resources.num_nodes >= 1"),
+            ("partial_generation_node", "generation to use full nodes"),
+            ("no_policy_node", "at least one full policy node"),
+        ],
+    )
+    def test_rejects_invalid_dedicated_value_layout(
+        self, invalid_setting: str, message: str
+    ) -> None:
+        mc = _ppo_master_config()
+        mc.cluster = ClusterConfig(num_nodes=3, gpus_per_node=8)
+        mc.policy["megatron_cfg"]["enabled"] = True
+        mc.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 1,
+        }
+        mc.value["dedicated"] = True
+        mc.value["resources"] = ValueResourcesConfig(num_nodes=1)
+
+        if invalid_setting == "policy_backend":
+            mc.policy["megatron_cfg"]["enabled"] = False
+        elif invalid_setting == "colocated":
+            mc.policy["generation"]["colocated"]["enabled"] = True
+        elif invalid_setting == "missing_value_nodes":
+            mc.value["resources"].num_nodes = None
+        elif invalid_setting == "missing_resources":
+            del mc.value["resources"]
+        elif invalid_setting == "partial_generation_node":
+            mc.policy["generation"]["colocated"]["resources"]["gpus_per_node"] = 4
+        else:
+            mc.cluster = ClusterConfig(num_nodes=2, gpus_per_node=8)
+
+        with pytest.raises(ValueError, match=message):
+            validate_single_controller_config(mc)
+
     @pytest.mark.parametrize(
         "make_config",
         [
@@ -459,12 +501,12 @@ class TestPPOValidation:
         validate_single_controller_config(mc)
 
     @pytest.mark.parametrize(
-        ("min_groups", "normalize_advantages", "expect_warning"),
+        ("min_groups", "normalize_advantages", "expect_error"),
         [(1, True, True), (1, False, False), (_NUM_PROMPTS_PER_STEP, True, False)],
         ids=["streaming-normalized", "streaming-unnormalized", "full-batch"],
     )
-    def test_chunk_normalization_warning(
-        self, min_groups: int, normalize_advantages: bool, expect_warning: bool
+    def test_chunk_normalization_requires_full_batch(
+        self, min_groups: int, normalize_advantages: bool, expect_error: bool
     ) -> None:
         mc = _ppo_master_config(
             min_groups_for_streaming_train=min_groups, megatron_enabled=True
@@ -472,15 +514,11 @@ class TestPPOValidation:
         mc.ppo.ppo_epochs = 1
         mc.ppo.adv_estimator.normalize_advantages = normalize_advantages
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        if expect_error:
+            with pytest.raises(ValueError, match="normalize_advantages.*min_groups"):
+                validate_single_controller_config(mc)
+        else:
             validate_single_controller_config(mc)
-
-        assert len(caught) == int(expect_warning)
-        if expect_warning:
-            assert caught[0].category is UserWarning
-            assert "normalizes GAE advantages per chunk" in str(caught[0].message)
-            assert "instead of across the full batch" in str(caught[0].message)
 
     def test_rejects_streaming_without_megatron_policy(self):
         mc = _ppo_master_config(min_groups_for_streaming_train=1)
@@ -615,8 +653,8 @@ class TestPPOValidation:
         mc.policy["megatron_cfg"]["checkpoint"] = {
             "ckpt_assume_constant_structure": constant_structure
         }
-        mc.checkpointing["enabled"] = True
-        mc.checkpointing["save_optimizer"] = True
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_optimizer = True
         return mc
 
     def test_rejects_constant_ckpt_structure_with_warmup(self):
@@ -1125,6 +1163,7 @@ def patched_ppo_factories():
                 MagicMock(name="train"),
                 MagicMock(name="inference"),
                 None,
+                None,
             ),
         ),
         patch.object(
@@ -1156,6 +1195,54 @@ def patched_ppo_factories():
 
 
 class TestSetupBuildsTheCritic:
+    @pytest.mark.parametrize("shared_node", [False, True])
+    def test_dedicated_value_claims_distinct_nodes_and_resident_worker(
+        self, patched_ppo_factories, shared_node: bool
+    ) -> None:
+        mc = _ppo_master_config()
+        mc.cluster = ClusterConfig(num_nodes=3, gpus_per_node=8)
+        mc.policy["megatron_cfg"]["enabled"] = True
+        mc.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 1,
+        }
+        mc.value["dedicated"] = True
+        mc.value["resources"] = ValueResourcesConfig(num_nodes=1)
+        train_cluster = MagicMock(name="train_cluster")
+        inference_cluster = MagicMock(name="inference_cluster")
+        value_cluster = MagicMock(name="value_cluster")
+        train_cluster.node_count.return_value = 1
+        value_cluster.node_count.return_value = 1
+        train_cluster.get_available_addresses_and_ports_batch.return_value = [
+            ("policy-node", 1000)
+        ]
+        value_cluster.get_available_addresses_and_ports_batch.return_value = [
+            ("policy-node" if shared_node else "value-node", 1000)
+        ]
+
+        with (
+            patch.object(
+                sc_setup_mod,
+                "_build_clusters",
+                return_value=(train_cluster, inference_cluster, value_cluster, None),
+            ),
+            patch(
+                "nemo_rl.data_plane.mooncake_storage_unit.plan_storage_unit_nodes",
+                return_value=None,
+            ) as plan_storage,
+        ):
+            if shared_node:
+                with pytest.raises(RuntimeError, match="share physical nodes"):
+                    setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+                patched_ppo_factories["_build_value"].assert_not_called()
+                return
+            setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        assert patched_ppo_factories["_build_value"].call_args.args[0] is value_cluster
+        patched_ppo_factories["value"].prepare_for_training.assert_called_once_with()
+        patched_ppo_factories["policy"].offload_to_cpu.assert_not_called()
+        assert plan_storage.call_args.args[1]["value"] is value_cluster
+
     def test_actor_args_carry_the_critic_and_its_loss(self, patched_ppo_factories):
         mc = _ppo_master_config()
 
@@ -1223,7 +1310,7 @@ class TestValueWarmStart:
                 **_STEP_CONFIG,
             )
         )
-        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+        mc.checkpointing.checkpoint_dir = str(tmp_path / "run")
 
         setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
 
@@ -1236,7 +1323,7 @@ class TestValueWarmStart:
 
     def test_unset_leaves_the_critic_cold(self, patched_ppo_factories, tmp_path):
         mc = _ppo_master_config()
-        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+        mc.checkpointing.checkpoint_dir = str(tmp_path / "run")
 
         setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
 
@@ -1266,7 +1353,7 @@ class TestValueWarmStart:
                 **_STEP_CONFIG,
             )
         )
-        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+        mc.checkpointing.checkpoint_dir = str(tmp_path / "run")
 
         with pytest.raises(ValueError, match=message):
             setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
@@ -1291,7 +1378,7 @@ class TestValueWarmStart:
                 **_STEP_CONFIG,
             )
         )
-        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+        mc.checkpointing.checkpoint_dir = str(tmp_path / "run")
 
         with patch.object(sc_setup_mod, "load_dataloader_state"):
             setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
@@ -1327,6 +1414,26 @@ class TestTrainClusterSizesForTheCritic:
             cls.side_effect = lambda **kwargs: MagicMock(kwargs=kwargs)
             yield cls
 
+    def test_dedicated_value_uses_separate_cluster(self, fake_cluster):
+        master_config = _cluster_config(
+            _ppo_master_config(), colocated=False, backend="vllm"
+        )
+        master_config.cluster = ClusterConfig(num_nodes=5, gpus_per_node=8)
+        master_config.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 1,
+        }
+        master_config.value["dedicated"] = True
+        master_config.value["resources"] = ValueResourcesConfig(num_nodes=2)
+
+        train, inference, value, _ = sc_setup_mod._build_clusters(master_config)
+
+        assert train.kwargs["bundle_ct_per_node_list"] == [8, 8]
+        assert inference.kwargs["bundle_ct_per_node_list"] == [8]
+        assert value.kwargs["bundle_ct_per_node_list"] == [8, 8]
+        assert train.kwargs["max_colocated_worker_groups"] == 1
+        assert value.kwargs["max_colocated_worker_groups"] == 1
+
     @pytest.mark.parametrize(
         ("make_config", "colocated", "backend", "expected_train_groups"),
         [
@@ -1350,9 +1457,10 @@ class TestTrainClusterSizesForTheCritic:
     ):
         mc = _cluster_config(make_config(), colocated=colocated, backend=backend)
 
-        train, inference, _teacher_topology = sc_setup_mod._build_clusters(mc)
+        train, inference, value, _teacher_topology = sc_setup_mod._build_clusters(mc)
 
         assert train.kwargs["max_colocated_worker_groups"] == expected_train_groups
+        assert value is None
         if colocated:
             assert train is inference
         else:
@@ -1370,10 +1478,22 @@ def _in_loss_ppo_config(*, streaming: bool = False) -> MasterConfig:
     mc.loss_fn.seq_logprob_error_in_loss = True
     mc.loss_fn.force_on_policy_ratio = True
     mc.loss_fn.token_level_loss = True
+    mc.ppo.adv_estimator.normalize_advantages = False
     return mc
 
 
 class TestInLossSeqFilterForPPO:
+    def test_rejects_normalization_before_in_loss_filtering(self) -> None:
+        mc = _in_loss_ppo_config()
+        mc.ppo.adv_estimator.normalize_advantages = True
+
+        with pytest.raises(ValueError, match="normalize_advantages"):
+            validate_single_controller_config(mc)
+
+        mc.loss_fn.seq_logprob_error_in_loss = False
+        validate_single_controller_config(mc)
+        assert logprob_passes_required(mc, mc.ppo)[0]
+
     @pytest.mark.parametrize("streaming", [False, True])
     def test_accepts_one_policy_epoch_and_skips_policy_logprobs(
         self, streaming: bool

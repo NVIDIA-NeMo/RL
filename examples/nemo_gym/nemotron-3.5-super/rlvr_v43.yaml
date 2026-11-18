@@ -94,6 +94,8 @@ env:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/math_with_judge/configs/math_with_judge.yaml
     - resources_servers/code_gen/configs/code_gen.yaml
+    # code_gen grades in OpenSandbox. Set CODE_GEN_SANDBOX_IMAGE, OPENSANDBOX_DOMAIN and OPENSANDBOX_API_KEY.
+    - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
     - resources_servers/scicode/configs/scicode.yaml
     - resources_servers/competitive_coding_challenges/configs/competitive_coding_challenges.yaml
     - resources_servers/finance_sec_search/configs/finance_sec_search.yaml

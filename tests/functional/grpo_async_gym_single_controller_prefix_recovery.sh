@@ -151,9 +151,10 @@ COMMON_OVERRIDES=(
     ++async_rl.stall_watchdog.interval_s=10
     ++async_rl.stall_watchdog.stall_timeout_s=600
     ++async_rl.stall_watchdog.stall_action=abort
-    # Each run dumps its trained rows (train_data_step*.jsonl in its log dir)
+    # Each run dumps its trained rows (train_data_step*.jsonl in its log dir, so the json writer)
     # for the parity comparison.
     ++async_rl.log_full_train_data=true
+    ++async_rl.debug_writer.target=json
     grpo.seed=1234
     grpo.num_prompts_per_step="$NUM_PROMPTS"
     grpo.num_generations_per_prompt="$NUM_GENERATIONS"
@@ -204,6 +205,7 @@ setsid env \
         logger.log_dir="$PHASE1_LOG_DIR" \
         "$@" &
 PHASE1_PID=$!
+PHASE1_RUN_LOG=$BASE_RUN_LOG
 
 uv run --directory "$PROJECT_ROOT" --no-sync python "$SNAPSHOT_HELPER" select \
     "$CHECKPOINT_DIR/bootstrap/rollout_snapshots" \

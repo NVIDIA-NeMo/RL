@@ -11,6 +11,9 @@ checkpointing:
 
 ppo:
   ppo_epochs: 1
+  adv_estimator:
+    # Batch-wide normalization would change when chunk boundaries change.
+    normalize_advantages: false
   # Keep the full-batch recipe's critic epochs when reducing policy epochs.
   critic_ppo_epochs: 4
 

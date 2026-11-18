@@ -138,7 +138,11 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
 )
 from nemo_rl.telemetry.vocabulary import TELEMETRY_WALL_TIME_METRIC
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+    PretrainedCheckpointConfig,
+)
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker
 
@@ -965,19 +969,19 @@ def _actor_master_config(
         ),
         logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
         cluster=ClusterConfig(num_nodes=1, gpus_per_node=1),
-        checkpointing={
-            "enabled": enabled,
-            "checkpoint_dir": str(tmp_path / "checkpoints"),
-            "metric_name": metric_name,
-            "higher_is_better": True,
-            "keep_top_k": None,
-            "save_period": save_period,
-            "save_optimizer": save_optimizer,
-            "save_data_plane": data_plane_checkpoint,
-            "load_replay_buffer": load_replay_buffer,
-            "checkpoint_must_save_by": checkpoint_must_save_by,
-            "ft_save_period": ft_save_period,
-        },
+        checkpointing=CheckpointingConfig(
+            enabled=enabled,
+            checkpoint_dir=str(tmp_path / "checkpoints"),
+            metric_name=metric_name,
+            higher_is_better=True,
+            keep_top_k=None,
+            save_period=save_period,
+            save_optimizer=save_optimizer,
+            save_data_plane=data_plane_checkpoint,
+            load_replay_buffer=load_replay_buffer,
+            checkpoint_must_save_by=checkpoint_must_save_by,
+            ft_save_period=ft_save_period,
+        ),
         data_plane={
             "enabled": True,
             "impl": "transfer_queue",
@@ -4002,16 +4006,25 @@ class _OrderRecordingCritic:
 
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
+        self._keep_resident = False
 
     def prepare_for_training(self) -> None:
-        self.calls.append("critic.prepare_for_training")
+        self.calls.append(
+            "critic.prepare_for_training:resident"
+            if self._keep_resident
+            else "critic.prepare_for_training"
+        )
 
     def save_checkpoint(self, **kwargs: Any) -> None:
         self.save_kwargs = kwargs
         self.calls.append("critic.save_checkpoint")
 
     def finish_training(self) -> None:
-        self.calls.append("critic.finish_training")
+        self.calls.append(
+            "critic.finish_training:resident"
+            if self._keep_resident
+            else "critic.finish_training"
+        )
 
 
 def _ppo_save_actor(tmp_path: Path, calls: list[str]):
@@ -4040,7 +4053,9 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     )
     actor._sampler = _FakeSampler()
     actor._master_config = SimpleNamespace(
-        checkpointing={"metric_name": None, "save_data_plane": False},
+        checkpointing=CheckpointingConfig.model_construct(
+            metric_name=None, save_data_plane=False
+        ),
         data_plane={},
     )
     actor._dataloader = SimpleNamespace(state_dict=lambda: {})
@@ -4052,12 +4067,85 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     attach_rollout_checkpointing(actor)
     actor._is_ppo = True
     actor._loss_fn = object()
+    actor._value_dedicated = False
     actor._trainer = _OrderRecordingPolicy(calls)
     actor._value = _OrderRecordingCritic(calls)
     return actor
 
 
 class TestPPOSaveOrder:
+    def test_dedicated_models_save_without_migration(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.single_controller._write_latest_checkpoint_status",
+            lambda *args, **kwargs: None,
+        )
+        calls: list[str] = []
+        actor = _ppo_save_actor(tmp_path, calls)
+        actor._value_dedicated = True
+        actor._value._keep_resident = True
+
+        asyncio.run(
+            actor._save_checkpoint(
+                {}, is_policy_training_step=True, is_final_checkpoint=True
+            )
+        )
+
+        assert calls == [
+            "critic.prepare_for_training:resident",
+            "critic.save_checkpoint",
+            "critic.finish_training:resident",
+            "policy.save_checkpoint",
+        ]
+
+    def test_failed_dedicated_critic_save_does_not_start_cleanup(self, tmp_path):
+        calls: list[str] = []
+        actor = _ppo_save_actor(tmp_path, calls)
+        actor._value_dedicated = True
+        actor._value._keep_resident = True
+        actor._value.save_checkpoint = MagicMock(
+            side_effect=RuntimeError("critic save failed")
+        )
+
+        with pytest.raises(RuntimeError, match="critic save failed"):
+            asyncio.run(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=True, is_final_checkpoint=True
+                )
+            )
+
+        assert calls == ["critic.prepare_for_training:resident"]
+
+    def test_cancelled_critic_save_does_not_start_cleanup(self, tmp_path):
+        calls: list[str] = []
+        actor = _ppo_save_actor(tmp_path, calls)
+        actor._value_dedicated = True
+        actor._value._keep_resident = True
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_save(**kwargs: Any) -> None:
+            started.set()
+            release.wait(timeout=5)
+
+        actor._value.save_checkpoint = blocked_save
+
+        async def cancel_save() -> None:
+            task = asyncio.create_task(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=True, is_final_checkpoint=True
+                )
+            )
+            try:
+                assert await asyncio.to_thread(started.wait, 2)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 1)
+            finally:
+                release.set()
+
+        asyncio.run(cancel_save())
+        assert "critic.finish_training:resident" not in calls
+
     def test_the_policy_is_offloaded_across_the_critic_save(
         self, tmp_path, monkeypatch
     ):
@@ -4154,7 +4242,7 @@ class TestPPOWarmupCheckpoint:
 
     def test_warmup_step_skips_the_top_k_metric(self, actor):
         """No policy metrics exist yet, so the checkpoint just is not a candidate."""
-        actor._master_config.checkpointing["metric_name"] = "train:loss"
+        actor._master_config.checkpointing.metric_name = "train:loss"
         # Seed it so the delattr in the warmup branch is observable; the bare
         # namespace never had the attribute, so the assertion would be vacuous.
         setattr(actor._save_state, "train:loss", 1.23)
@@ -4170,7 +4258,7 @@ class TestPPOWarmupCheckpoint:
 
     def test_a_training_step_still_raises_on_a_missing_metric(self, actor):
         """The warmup branch must not soften the misconfiguration error."""
-        actor._master_config.checkpointing["metric_name"] = "train:loss"
+        actor._master_config.checkpointing.metric_name = "train:loss"
 
         with pytest.raises(ValueError, match="not found in train metrics"):
             asyncio.run(
@@ -4383,17 +4471,17 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             min_groups_for_streaming_train=4,
             max_buffered_rollouts=8,
         ),
-        checkpointing={
-            "enabled": True,
-            "checkpoint_dir": checkpoint_dir,
-            "metric_name": None,
-            "higher_is_better": True,
-            "keep_top_k": None,
-            "save_period": 2,
-            "save_optimizer": True,
-            "save_data_plane": True,
-            "checkpoint_must_save_by": None,
-        },
+        checkpointing=CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_dir,
+            metric_name=None,
+            higher_is_better=True,
+            keep_top_k=None,
+            save_period=2,
+            save_optimizer=True,
+            save_data_plane=True,
+            checkpoint_must_save_by=None,
+        ),
     )
 
 
@@ -4464,7 +4552,7 @@ class TestSetupResumeWiring:
     ):
         ckpt_dir = tmp_path / "ckpts"
         mc = _setup_master_config(str(ckpt_dir))
-        mc.checkpointing["save_period"] = 1
+        mc.checkpointing.save_period = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=120.0
         )
@@ -4604,8 +4692,10 @@ class TestSetupResumeWiring:
         tmp_path,
     ):
         mc = _setup_master_config(str(tmp_path / "ckpts"))
-        pretrained = {"path": "/some/ckpt", "format": "megatron_bridge"}
-        mc.checkpointing["pretrained_checkpoint"] = pretrained
+        pretrained = PretrainedCheckpointConfig(
+            path="/some/ckpt", format="megatron_bridge"
+        )
+        mc.checkpointing.pretrained_checkpoint = pretrained
 
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
