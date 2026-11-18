@@ -724,10 +724,6 @@ def print_performance_metrics(
                 break
             timeline = []
             length = len(metric_values)
-            if timeline_interval is not None:
-                count_zeros = lambda x: sum(v == 0 for v in x)
-                idle = count_zeros(metric_values) * timeline_interval
-                active = length * timeline_interval - idle
             if length > max_timeline_length:
                 resized_metric_values = resize_timeline(
                     metric_values, max_timeline_length
@@ -743,6 +739,9 @@ def print_performance_metrics(
                 )
                 timeline.append(m)
             if timeline_interval is not None:
+                count_zeros = lambda x: sum(v == 0 for v in x)
+                idle = count_zeros(metric_values) * timeline_interval
+                active = length * timeline_interval - idle
                 print(
                     f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)} (Active: {active:.2f} s, Idle: {idle:.2f} s)"
                 )

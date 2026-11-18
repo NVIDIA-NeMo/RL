@@ -105,6 +105,8 @@ from nemo_rl.data_plane import (
     data_plane_supports_checkpointing,
 )
 from nemo_rl.data_plane.schema import (
+    DP_TRAIN_FIELDS,
+    SAMPLER_TOPK_FIELDS,
     SC_ROLLOUT_SCHEMA_FIELDS,
     fields_with_optional_routed_experts,
 )
@@ -355,8 +357,6 @@ def _register_single_controller_partitions(
             enabled=r3_enabled,
         )
     else:
-        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, SAMPLER_TOPK_FIELDS
-
         partition_fields = fields_with_optional_routed_experts(
             SC_ROLLOUT_SCHEMA_FIELDS
             if token_capture_cfg.forest_training
