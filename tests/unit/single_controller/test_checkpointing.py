@@ -2110,7 +2110,10 @@ class TestPeriodicRolloutCheckpoint:
             assert saved_cursor["cursor"]["offset"] == 1
 
     def test_deferred_snapshot_serializes_recovery_state_after_resume(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         actor = self._actor(tmp_path)
         actor._rollout_runtime.batch_shortfall = {3: 1}
@@ -2177,6 +2180,9 @@ class TestPeriodicRolloutCheckpoint:
                 "rollout_recovery_group_count": len(state["groups"]),
             }
         ]
+        output = capsys.readouterr().out
+        assert "data-plane checkpoint captured:" in output
+        assert "data-plane checkpoint save started:" not in output
 
     @pytest.mark.parametrize("anchor_step", [0, 1])
     @pytest.mark.parametrize("claimed", [False, True])
@@ -3749,7 +3755,9 @@ class TestDataPlaneCheckpoint:
                 "cursor": {"offset": 1}
             }
 
-    def test_trainer_native_fallback_stays_inside_barrier(self, tmp_path: Path) -> None:
+    def test_trainer_native_fallback_stays_inside_barrier(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         actor = _ACTOR_CLS(
             _actor_master_config(tmp_path),
             _make_actor_args(),
@@ -3782,6 +3790,9 @@ class TestDataPlaneCheckpoint:
             actor._checkpointer.shutdown()
         assert len(actor._dp_client.save_calls) == 1
         assert (tmp_path / "checkpoints" / "step_1").exists()
+        output = capsys.readouterr().out
+        assert output.count("data-plane checkpoint save started:") == 1
+        assert "data-plane checkpoint captured:" not in output
 
     @pytest.mark.nemo_gym
     @pytest.mark.parametrize(
