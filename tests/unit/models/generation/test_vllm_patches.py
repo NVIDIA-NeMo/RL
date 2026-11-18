@@ -966,6 +966,13 @@ class _PackedLogprob:
     decoded_token: str | None
 
 
+def _installed_vllm(monkeypatch: pytest.MonkeyPatch, version: str = "0.33.0") -> None:
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.patches.importlib.metadata.version",
+        lambda name: version,
+    )
+
+
 @pytest.mark.parametrize(
     "eligible", ["yes", "uncaptured", "not_flat", "topk", "prompt", "stream"]
 )
@@ -982,6 +989,7 @@ def test_hook_only_changes_eligible_requests(
     params.RequestOutputKind = SimpleNamespace(FINAL_ONLY="final")
     monkeypatch.setitem(sys.modules, "vllm.logprobs", logprob_module)
     monkeypatch.setitem(sys.modules, "vllm.sampling_params", params)
+    _installed_vllm(monkeypatch)
 
     class Processor:
         def __init__(self) -> None:
@@ -1087,6 +1095,7 @@ def test_packed_capture_close_preserves_later_installer(
     params.RequestOutputKind = SimpleNamespace(FINAL_ONLY="final")
     monkeypatch.setitem(sys.modules, "vllm.logprobs", module)
     monkeypatch.setitem(sys.modules, "vllm.sampling_params", params)
+    _installed_vllm(monkeypatch)
     processor = SimpleNamespace(add_request=lambda request: None)
     hook = patches.PackedCaptureLogprobs(
         processor, lambda: False, history_factory=PackedSelectedLogprobs
@@ -1096,3 +1105,17 @@ def test_packed_capture_close_preserves_later_installer(
     hook.close()
     hook.close()
     assert processor.add_request is later
+
+
+@pytest.mark.parametrize("version", ["0.32.1", "0.34.0"])
+def test_packed_capture_refuses_an_unchecked_vllm(
+    monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    _installed_vllm(monkeypatch, version)
+    original_add = lambda request: None
+    processor = SimpleNamespace(add_request=original_add)
+    with pytest.raises(RuntimeError, match=f"vLLM {version} is installed"):
+        patches.PackedCaptureLogprobs(
+            processor, lambda: True, history_factory=PackedSelectedLogprobs
+        )
+    assert processor.add_request is original_add
