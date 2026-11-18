@@ -341,6 +341,7 @@ model-quirks.md
 guides/async-grpo.md
 guides/single-controller.md
 guides/context-compaction.md
+guides/captured-tito.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/automodel-speculative-decoding.md

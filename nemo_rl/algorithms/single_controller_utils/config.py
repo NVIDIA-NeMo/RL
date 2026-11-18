@@ -1977,6 +1977,18 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
 
     generation_cfg = master_config.policy["generation"]
+    vllm_cfg = generation_cfg.get("vllm_cfg")
+    if vllm_cfg and vllm_cfg.get("tito_model") is not None:
+        if not (
+            generation_cfg["backend"] == "vllm"
+            and master_config.env.get("should_use_nemo_gym")
+            and master_config.token_capture.enabled
+            and master_config.token_capture.forest_training
+        ):
+            raise ValueError(
+                "vllm_cfg.tito_model requires Gym, vLLM, token_capture.enabled "
+                "and token_capture.forest_training for source-history matching"
+            )
     if (
         generation_cfg["backend"] == "vllm"
         and cast(VllmConfig, generation_cfg)["vllm_cfg"].get("http_api_server_count", 1)
