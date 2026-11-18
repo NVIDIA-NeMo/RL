@@ -85,10 +85,6 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # and a resumed row trains with it. Score centering needs token-level IS on full
 # logits, so this turns off the config's GSPO and the fused linear logprobs.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh ++policy.generation.top_logprobs=4 ++loss_fn.score_centering=true ++policy.generation.sampler_replay.enabled=true ++policy.generation.top_k=4 ++loss_fn.force_on_policy_ratio=false loss_fn.sequence_level_importance_ratios=false loss_fn.token_level_loss=true loss_fn.reference_policy_kl_penalty=0 grpo.skip_reference_policy_logprobs_calculation=true policy.sequence_packing.enabled=false ++policy.megatron_cfg.use_fused_linear_logprobs=false policy.logprob_chunk_size=128
-# The same recovery with cut rows written by the prefix write pipeline (direct
-# column encoder) through the writer actor. Without sampler top-k, so the rows
-# take the direct encoder; the script checks that both started.
-run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh ++rollout_recovery.prefix_writes.pipeline=true ++rollout_recovery.prefix_writes.writer_actor=true
 # The same active-decode recovery with MoE router replay, on a tiny random MoE:
 # each restored call must stage the routes it restored for training.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_router_replay_prefix_recovery_single_controller_1n2g.sh

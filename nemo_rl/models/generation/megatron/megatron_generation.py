@@ -44,9 +44,6 @@ if TYPE_CHECKING:
     from nemo_rl.data.captured_media import MediaColumnSpec
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
     from nemo_rl.distributed.worker_groups import RayWorkerGroup
-    from nemo_rl.models.generation.prefix_recovery.write_pipeline import (
-        PrefixWritesConfig,
-    )
     from nemo_rl.models.policy.lm_policy import Policy
     from nemo_rl.weight_sync.membership import RefitMembership
 
@@ -665,7 +662,6 @@ class MegatronGeneration(GenerationInterface):
         prefix_write_max_rows: int,
         prefix_write_max_tokens: int,
         prefix_read_max_rows: int,
-        prefix_writes: "PrefixWritesConfig",
     ) -> "Optional[MediaColumnSpec]":
         """Install MInf's canonical prompt and completion capture hooks.
 

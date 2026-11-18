@@ -25,20 +25,25 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from nemo_rl.data_plane.tq_token_sink import TQTokenSink
+from nemo_rl.data.captured_media import MEDIA_TENSOR_DIGESTS_FIELD, CapturedMediaItem
+from nemo_rl.data_plane.prefix_writer_actor import (
+    PrefixWriterService,
+    RayPrefixWriterClient,
+)
+from nemo_rl.data_plane.tq_token_sink import MEDIA_IMGS_FIELD, TQTokenSink
 from nemo_rl.models.generation.prefix_recovery import PrefixRecovery
 from nemo_rl.models.generation.prefix_recovery import recovery as recovery_module
 from nemo_rl.models.generation.prefix_recovery import (
     write_pipeline as write_pipeline_module,
 )
 from nemo_rl.models.generation.prefix_recovery.write_pipeline import (
-    BatchReleased,
-    CutSteps,
+    PREFIX_WRITE_LIMITS,
+    CutWrites,
     PrefixWrite,
+    PrefixWriteLimits,
     PrefixWritePipeline,
-    PrefixWritesConfig,
+    WriteSettled,
 )
-from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
 from tests.unit.models.generation.test_vllm_token_capture_hosting import (
     _assert_rolled_back,
     _batch_worker_fixture,
@@ -49,166 +54,109 @@ pytestmark = pytest.mark.nemo_gym
 
 
 def _pipeline(recovery: PrefixRecovery, **kwargs: Any) -> PrefixRecovery:
-    prefix_writes = PrefixWritesConfig(pipeline=True, **kwargs)
-    return PrefixRecovery(replace(recovery._parts, prefix_writes=prefix_writes))
+    limits = replace(PREFIX_WRITE_LIMITS, **kwargs)
+    return PrefixRecovery(replace(recovery._parts, write_limits=limits))
 
 
-def test_prefix_writes_buffer_must_hold_two_batches() -> None:
+def test_prefix_write_buffer_must_hold_two_batches() -> None:
     with pytest.raises(ValueError, match=r">= 2 \* max_batch_payload_bytes"):
-        PrefixWritesConfig(max_buffered_payload_bytes=3, max_batch_payload_bytes=2)
-
-
-def test_direct_prefix_columns_require_a_text_only_partition() -> None:
-    with pytest.raises(ValueError, match="text-only staging partition"):
-        TQTokenSink(
-            MagicMock(),
-            staging_partition="staging",
-            capture_media=True,
-            direct_prefix_columns=True,
+        PrefixWriteLimits(
+            max_pending_inventories=1,
+            max_buffered_payload_bytes=3,
+            max_batch_payload_bytes=2,
+            coalesce_wait_seconds=0.0,
         )
 
 
-@pytest.mark.parametrize("routed", [False, True])
-def test_direct_columns_match_general_sink_and_preserve_owned_buffers(
-    routed: bool,
+def _media_cut_rows(
+    monkeypatch: pytest.MonkeyPatch, writer_actor: bool
+) -> dict[str, tuple[dict[str, Any], dict[str, torch.Tensor]]]:
+    """Cut two media calls on a media partition; return every written row by key."""
+    from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+
+    item = CapturedMediaItem(
+        modality="image",
+        placeholder_offset=0,
+        placeholder_length=2,
+        placeholder_digest="a" * 64,
+        token_id=7,
+        embedding_spans=((0, 2),),
+        imgs_sizes=((2, 2),),
+    )
+    extras = {
+        MEDIA_SPANS_FIELD: [item.to_dict()],
+        MEDIA_TENSOR_DIGESTS_FIELD: {
+            "imgs": {"dtype": "bfloat16", "shape": [4, 8], "sha256": "0" * 64}
+        },
+    }
+    monkeypatch.setattr("ray.get", lambda reference: reference)
+    recovery, _, _, inventory = _batch_worker_fixture([2, 3])
+
+    def client() -> SimpleNamespace:
+        return SimpleNamespace(
+            put_samples=MagicMock(spec=lambda **kwargs: None),
+            clear_samples=MagicMock(spec=lambda **kwargs: None),
+        )
+
+    local = client()
+    sink = TQTokenSink(
+        local,
+        staging_partition="staging",
+        capture_media=True,
+        media_pixel_dtype=torch.bfloat16,
+    )
+    written = local
+    if writer_actor:
+        written = client()
+        service = PrefixWriterService(written)
+        actor = SimpleNamespace(
+            put_samples=SimpleNamespace(remote=service.put_samples),
+            clear_samples=SimpleNamespace(remote=service.clear_samples),
+        )
+        sink.set_prefix_writer(RayPrefixWriterClient(actor, writer_pid=1))
+    recovery = PrefixRecovery(
+        replace(
+            recovery._parts,
+            sink=sink,
+            prefix_row_extras=lambda state: extras,
+        )
+    )
+    try:
+        receipt = asyncio.run(recovery.run_cut(inventory))
+        receipt.validate_for(inventory)
+        assert all(ack.disposition == "durable_prefix" for ack in receipt.prefixes)
+    finally:
+        asyncio.run(recovery.aclose())
+        recovery.shutdown()
+    if written is not local:
+        local.put_samples.assert_not_called()
+    rows = {}
+    for call in written.put_samples.call_args_list:
+        kwargs = call.kwargs
+        for index, key in enumerate(kwargs["sample_ids"]):
+            rows[key] = (
+                kwargs["tags"][index],
+                {
+                    name: kwargs["fields"][name][index]
+                    for name in kwargs["fields"].keys()
+                },
+            )
+    return rows
+
+
+def test_media_cut_rows_match_with_the_writer_actor(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    recovery, memory, _, inventory = _batch_worker_fixture([2, 4, 3])
-    recovery.checkpoint_cut(inventory)
-    records = [record for _, record in memory.generation_prefix_records]
-    recovery.shutdown()
-    attached = [None] * len(records)
-    if routed:
-        attached = []
-        routed_records = []
-        for record in records:
-            tensor = torch.arange(record.delta_len * 4, dtype=torch.int16).reshape(
-                record.delta_len, 2, 2
-            )
-            routed_records.append(
-                record.model_copy(
-                    update={
-                        "extras": {
-                            "routed_experts": routed_experts_tensor_metadata(tensor)
-                        }
-                    }
-                )
-            )
-            attached.append({"routed_experts": tensor})
-        records = routed_records
-    clients = [
-        SimpleNamespace(put_samples=MagicMock(spec=lambda **kwargs: None))
-        for _ in range(2)
-    ]
-    sinks = [
-        TQTokenSink(client, staging_partition="staging", direct_prefix_columns=direct)
-        for client, direct in zip(clients, [False, True], strict=True)
-    ]
-    for sink in sinks:
-        sink.stage_generation_prefix_batch(
-            records,
-            checkpoint_id="cut",
-            chunk_sequences=[0] * len(records),
-            attachments=attached,
-        )
-    old, new = [client.put_samples.call_args.kwargs for client in clients]
-    assert old["sample_ids"] == new["sample_ids"]
-    assert old["tags"] == new["tags"]
-    assert set(old["fields"].keys()) == set(new["fields"].keys())
-    for name in old["fields"].keys():
-        for index in range(len(records)):
-            torch.testing.assert_close(
-                old["fields"][name][index], new["fields"][name][index], rtol=0, atol=0
-            )
-    if routed:
-        saved = new["fields"]["routed_experts"][0].clone()
-        attached[0]["routed_experts"].zero_()
-        torch.testing.assert_close(new["fields"]["routed_experts"][0], saved)
-
-
-def test_direct_columns_match_general_sink_for_mixed_groups_and_optional_fields() -> (
-    None
-):
-    """Dense token rows, ragged byte rows, mixed route groups, optional fields."""
-    recovery, memory, _, inventory = _batch_worker_fixture([3, 3, 3, 3])
-    recovery.checkpoint_cut(inventory)
-    records = [record for _, record in memory.generation_prefix_records]
-    recovery.shutdown()
-    assert len({record.delta_len for record in records}) == 1
-    attached: list[dict[str, torch.Tensor] | None] = []
-    varied = []
-    for index, record in enumerate(records):
-        update: dict[str, Any] = {
-            "model_call_id": record.model_call_id + "é" * index,
-            "parent_call_id": None if index % 2 else f"parent-{'x' * index}",
-            "extras": None if index == 0 else {"note": "ü" * index},
-        }
-        if index % 2:
-            tensor = torch.arange(record.delta_len * 4, dtype=torch.int16).reshape(
-                record.delta_len, 2, 2
-            )
-            update["extras"] = {
-                **(update["extras"] or {}),
-                "routed_experts": routed_experts_tensor_metadata(tensor),
-            }
-            attached.append({"routed_experts": tensor})
-        else:
-            attached.append(None)
-        varied.append(record.model_copy(update=update))
-    clients = [
-        SimpleNamespace(put_samples=MagicMock(spec=lambda **kwargs: None))
-        for _ in range(2)
-    ]
-    general, direct = (
-        TQTokenSink(client, staging_partition="staging", direct_prefix_columns=flag)
-        for client, flag in zip(clients, [False, True], strict=True)
-    )
-    # The general encoder takes one layout per batch; the cut then writes each
-    # row alone. The direct encoder writes one PUT per route group.
-    with pytest.raises(ValueError, match="different layouts"):
-        general.stage_generation_prefix_batch(
-            varied,
-            checkpoint_id="cut",
-            chunk_sequences=[0] * len(varied),
-            attachments=attached,
-        )
-    for record, row_attachments in zip(varied, attached, strict=True):
-        general.stage_generation_prefix_batch(
-            [record],
-            checkpoint_id="cut",
-            chunk_sequences=[0],
-            attachments=[row_attachments],
-        )
-    direct.stage_generation_prefix_batch(
-        varied,
-        checkpoint_id="cut",
-        chunk_sequences=[0] * len(varied),
-        attachments=attached,
-    )
-
-    def rows(client: Any) -> dict[str, tuple[dict[str, Any], dict[str, torch.Tensor]]]:
-        found = {}
-        for call in client.put_samples.call_args_list:
-            kwargs = call.kwargs
-            for index, key in enumerate(kwargs["sample_ids"]):
-                found[key] = (
-                    kwargs["tags"][index],
-                    {
-                        name: kwargs["fields"][name][index]
-                        for name in kwargs["fields"].keys()
-                    },
-                )
-        return found
-
-    old, new = rows(clients[0]), rows(clients[1])
-    assert clients[0].put_samples.call_count == len(varied)
-    assert clients[1].put_samples.call_count == 2
-    assert old.keys() == new.keys() and len(old) == len(varied)
-    for key, (old_tags, old_fields) in old.items():
-        new_tags, new_fields = new[key]
-        assert old_tags == new_tags
-        assert old_fields.keys() == new_fields.keys()
-        for name, value in old_fields.items():
-            torch.testing.assert_close(new_fields[name], value, rtol=0, atol=0)
+    """Media capture writes the same cut rows through the writer actor as without."""
+    expected = _media_cut_rows(monkeypatch, writer_actor=False)
+    actual = _media_cut_rows(monkeypatch, writer_actor=True)
+    assert actual.keys() == expected.keys() and len(expected) == 2
+    for key, (tags, fields) in expected.items():
+        assert actual[key][0] == tags
+        assert actual[key][1].keys() == fields.keys()
+        assert MEDIA_IMGS_FIELD in fields
+        for name, value in fields.items():
+            torch.testing.assert_close(actual[key][1][name], value, rtol=0, atol=0)
 
 
 def _inventory(identity: str, calls: list[str]) -> SimpleNamespace:
@@ -275,18 +223,18 @@ def test_cross_inventory_merge_duplicates_and_overlap_barrier() -> None:
 
     sink.stage_generation_prefix_batch.side_effect = write
 
-    def prepare(inventory: Any, *, deadline: float | None) -> CutSteps:
+    def prepare(inventory: Any, *, deadline: float | None) -> CutWrites:
         events.append(("prepare", inventory.inventory_digest, threading.get_ident()))
         record = SimpleNamespace(key=inventory.inventory_digest, delta_len=1)
         keys = yield PrefixWrite(
-            "cut", (record,), (0,), (None,), 100, lambda: [record.key]
+            "cut", (record,), (0,), (None,), 100, lambda error: [record.key]
         )
         events.append(("seal", inventory.inventory_digest, threading.get_ident()))
-        yield BatchReleased()
+        yield WriteSettled()
         return keys
 
     pipeline = PrefixWritePipeline(
-        config=PrefixWritesConfig(pipeline=True, coalesce_wait_seconds=0.05),
+        limits=replace(PREFIX_WRITE_LIMITS, coalesce_wait_seconds=0.05),
         max_batch_rows=256,
         max_batch_tokens=4_194_304,
         sink=sink,
@@ -387,8 +335,8 @@ def test_oversize_row_between_small_rows_is_written_alone() -> None:
 
 def test_an_oversize_reservation_blocks_growth_but_not_release() -> None:
     pipeline = PrefixWritePipeline(
-        config=PrefixWritesConfig(
-            pipeline=True, max_batch_payload_bytes=1, max_buffered_payload_bytes=2
+        limits=replace(
+            PREFIX_WRITE_LIMITS, max_batch_payload_bytes=1, max_buffered_payload_bytes=2
         ),
         max_batch_rows=256,
         max_batch_tokens=4_194_304,
@@ -410,16 +358,16 @@ def test_an_oversize_reservation_blocks_growth_but_not_release() -> None:
 def test_only_a_single_row_may_exceed_the_batch_byte_limit() -> None:
     sink = MagicMock()
 
-    def prepare(inventory: Any, *, deadline: float | None) -> CutSteps:
+    def prepare(inventory: Any, *, deadline: float | None) -> CutWrites:
         records = tuple(
             SimpleNamespace(key=f"{inventory.inventory_digest}-{index}", delta_len=1)
             for index in range(2)
         )
-        yield PrefixWrite("cut", records, (0, 0), (None, None), 2, lambda: [None])
+        yield PrefixWrite("cut", records, (0, 0), (None, None), 2, lambda error: [None])
 
     pipeline = PrefixWritePipeline(
-        config=PrefixWritesConfig(
-            pipeline=True, max_batch_payload_bytes=1, max_buffered_payload_bytes=2
+        limits=replace(
+            PREFIX_WRITE_LIMITS, max_batch_payload_bytes=1, max_buffered_payload_bytes=2
         ),
         max_batch_rows=256,
         max_batch_tokens=4_194_304,
@@ -461,14 +409,16 @@ def test_admission_limit_rejects_new_inventories_but_shares_duplicates() -> None
         [record.key for record in records],
     )[1]
 
-    def prepare(inventory: Any, *, deadline: float | None) -> CutSteps:
+    def prepare(inventory: Any, *, deadline: float | None) -> CutWrites:
         record = SimpleNamespace(key=inventory.inventory_digest, delta_len=1)
-        keys = yield PrefixWrite("cut", (record,), (0,), (None,), 1, lambda: [None])
-        yield BatchReleased()
+        keys = yield PrefixWrite(
+            "cut", (record,), (0,), (None,), 1, lambda error: [None]
+        )
+        yield WriteSettled()
         return keys
 
     pipeline = PrefixWritePipeline(
-        config=PrefixWritesConfig(pipeline=True, max_pending_inventories=1),
+        limits=replace(PREFIX_WRITE_LIMITS, max_pending_inventories=1),
         max_batch_rows=256,
         max_batch_tokens=4_194_304,
         sink=sink,

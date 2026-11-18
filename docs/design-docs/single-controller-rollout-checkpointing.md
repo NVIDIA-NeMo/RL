@@ -81,25 +81,27 @@ Every attempt logs its outcome under `rollout/checkpoint_outcome`, and every sav
 
 ## Pipelined Generation-Prefix Writes
 
-Generation-prefix writes can use a pipeline, which encodes text/router columns
-directly and overlaps preparation with one bounded write stream, and a separate
-colocated CPU TQ writer actor. Both are opt-in under `rollout_recovery.prefix_writes`
-and require `token_capture.enabled: true`, `rollout_recovery.target_level: prefix`,
-the vLLM backend with async HTTP serving, and text-only capture (a model without
-a VLM processor). Router-replay tensors are supported. The writer actor also
-requires `data_plane.impl: transfer_queue` with `data_plane.backend: simple`;
-terminal writes and restore reads retain their existing client. Checkpoint records and digests are unchanged. A merged write
-holds at most `rollout_recovery.prefix_write_max_rows` rows and
-`rollout_recovery.prefix_write_max_tokens` tokens, as without the pipeline.
+Generation-prefix cut rows always go through a write pipeline, which overlaps
+preparing cut rows with one bounded write stream. With `data_plane.impl:
+transfer_queue` (any backend), the PUTs run in a colocated CPU writer actor on
+the generation node; it needs one free Ray CPU there, and on `mooncake_cpu` its
+client owns no memory segment, like the worker's capture client. A local data
+plane lives inside each process, so there the worker writes itself.
+Router-replay tensors and media capture are supported: a media call's cut rows
+carry its media digests and placeholder media columns. Terminal writes and
+restore reads use the worker's own client. Checkpoint records and digests are
+unchanged. A merged write holds at most `rollout_recovery.prefix_write_max_rows`
+rows and `rollout_recovery.prefix_write_max_tokens` tokens.
 
-| Key under `rollout_recovery.prefix_writes` | Type / default | Purpose |
+The pipeline's bounds are fixed (`PREFIX_WRITE_LIMITS` in
+`nemo_rl/models/generation/prefix_recovery/write_pipeline.py`):
+
+| Bound | Value | Purpose |
 |---|---|---|
-| `pipeline` | bool / `false` | Encode columns directly and overlap preparation with one write stream. |
-| `writer_actor` | bool / `false` | Run prefix PUTs in one CPU actor on the generation node. |
-| `max_pending_inventories` | positive int / `128` | Reject admission beyond this many pending inventories. |
-| `max_buffered_payload_bytes` | positive int / `536870912` | Bound estimated queued/in-flight numeric payload plus a preparation reservation. |
-| `max_batch_payload_bytes` | positive int / `134217728` | Bound one merged write; a larger single row is written alone. |
-| `coalesce_wait_seconds` | nonnegative float / `0.01` | Coalescing window for compatible prepared rows. |
+| `max_pending_inventories` | `128` | Reject admission beyond this many pending inventories. |
+| `max_buffered_payload_bytes` | 512 MiB | Bound estimated queued/in-flight numeric payload plus a preparation reservation. |
+| `max_batch_payload_bytes` | 128 MiB | Bound one merged write; a larger single row is written alone. |
+| `coalesce_wait_seconds` | `0.01` | Coalescing window for compatible prepared rows. |
 
 The buffer must hold at least two maximum batches. A single row above
 `max_batch_payload_bytes` is written alone, as a row above

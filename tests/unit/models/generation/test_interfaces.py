@@ -22,14 +22,12 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     agreed_media_columns,
 )
-from nemo_rl.models.generation.prefix_recovery.write_pipeline import PrefixWritesConfig
 
 # ``setup_token_capture`` takes these from ``rollout_recovery`` with no defaults.
 _PREFIX_BATCH_LIMITS = {
     "prefix_write_max_rows": 256,
     "prefix_write_max_tokens": 4_194_304,
     "prefix_read_max_rows": 256,
-    "prefix_writes": PrefixWritesConfig(),
 }
 
 

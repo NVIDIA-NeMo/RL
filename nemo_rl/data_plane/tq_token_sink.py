@@ -62,10 +62,6 @@ if TYPE_CHECKING:
     )
 
 from nemo_rl.data_plane.codec import stack_or_nest
-from nemo_rl.data_plane.direct_prefix_batch import (
-    can_encode_directly,
-    encode_prefix_groups,
-)
 from nemo_rl.data_plane.prefix_writer_actor import PrefixWriterDiedError
 from nemo_rl.data_plane.schema import (
     CAPTURE_CODE_TO_MODE,
@@ -507,16 +503,9 @@ class TQTokenSink:
         staging_partition: str,
         capture_media: bool = False,
         media_pixel_dtype: torch.dtype | None = None,
-        direct_prefix_columns: bool = False,
     ) -> None:
-        if direct_prefix_columns and capture_media:
-            raise ValueError(
-                "Direct prefix columns require a text-only staging partition"
-            )
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
         self._prefix_store: TQStagingStore | None = None
-        # Build text/router cut batches directly in owned column buffers.
-        self._direct_prefix_columns = direct_prefix_columns
         self._capture_media = capture_media
         # Pixel dtype every media row of this partition must carry (the engine
         # model dtype). Fixes the ``media_imgs`` column dtype so text-call
@@ -786,10 +775,9 @@ class TQTokenSink:
     ) -> list[str]:
         """Publish generation-cut chunks; return their keys in order.
 
-        Direct column encoding writes one put per compatible text/route group.
-        Otherwise rows must share column names, dtypes and trailing dims (one
-        worker's cut does) and go in one put; mismatched rows raise before
-        writing and the caller writes each row alone. A failed put discards
+        Rows must share column names, dtypes and trailing dims (one worker's
+        cut does) and go in one put; mismatched rows raise before writing and
+        the caller writes each row alone. A failed put discards
         every key of the batch, then raises.
         """
         if not records:
@@ -806,14 +794,7 @@ class TQTokenSink:
             for record, sequence in zip(records, chunk_sequences, strict=True)
         ]
         store = self._store if self._prefix_store is None else self._prefix_store
-        direct = self._direct_prefix_columns and all(
-            map(can_encode_directly, records, attachments)
-        )
-        encoded = (
-            encode_prefix_groups(records, attachments)
-            if direct
-            else self._encode_prefix_groups_general(records, attachments)
-        )
+        encoded = self._encode_prefix_batch(records, attachments)
         try:
             for indices, fields, tags in encoded:
                 store.put_many([keys[index] for index in indices], fields, tags=tags)
@@ -829,12 +810,12 @@ class TQTokenSink:
             raise
         return keys
 
-    def _encode_prefix_groups_general(
+    def _encode_prefix_batch(
         self,
         records: Sequence[StagedCallRecord],
         attachments: Sequence[Mapping[str, Any] | None],
     ) -> list[tuple[list[int], TensorDict, list[dict[str, Any]]]]:
-        """Encode each row alone, then stack every row into one group."""
+        """Encode each row, then stack the rows into one batch."""
         rows = [
             self._encode_record(
                 record, attachments=row_attachments, generation_cut_chunk=True

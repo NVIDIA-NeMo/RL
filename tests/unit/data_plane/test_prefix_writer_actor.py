@@ -17,6 +17,7 @@ import asyncio
 import threading
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
@@ -27,18 +28,16 @@ from tensordict import TensorDict
 
 from nemo_rl.data_plane.observability import MetricsDataPlaneClient
 from nemo_rl.data_plane.prefix_writer_actor import (
-    PackedColumn,
-    PrefixPut,
+    PrefixWriterActor,
     PrefixWriterDiedError,
     PrefixWriterService,
     RayPrefixWriterClient,
     create_prefix_writer,
-    pack_columns,
-    unpack_columns,
+    from_bytes,
+    to_bytes,
 )
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink
 from nemo_rl.models.generation.prefix_recovery import PrefixRecovery
-from nemo_rl.models.generation.prefix_recovery.write_pipeline import PrefixWritesConfig
 from tests.unit.models.generation.test_vllm_token_capture_hosting import (
     _assert_rolled_back,
     _batch_worker_fixture,
@@ -69,126 +68,34 @@ def _fields() -> TensorDict:
     )
 
 
-def _batch() -> PrefixPut:
-    return PrefixPut(
-        ("__generation_cut__/s/a/c/0", "__generation_cut__/s/b/d/0"),
-        "staging",
-        pack_columns(_fields()),
-        ({"a": 1}, {"b": 2}),
-    )
+def _put(**update: Any) -> dict[str, Any]:
+    """Keyword arguments of one service ``put_samples`` call."""
+    return {
+        "sample_ids": ["__generation_cut__/s/a/c/0", "__generation_cut__/s/b/d/0"],
+        "partition_id": "staging",
+        "columns": {name: to_bytes(tensor) for name, tensor in _fields().items()},
+        "tags": [{"a": 1}, {"b": 2}],
+        **update,
+    }
 
 
-def test_transport_preserves_ragged_routes_bf16_and_empty_columns() -> None:
-    original = _fields()
-    packed = pack_columns(original)
-    restored = unpack_columns(packed, 2)
-    for name, tensor in original.items():
-        for index in range(2):
+def test_byte_columns_round_trip_exactly() -> None:
+    """Dense, jagged, bf16, empty, strided and grad columns survive the hop."""
+    fields = _fields()
+    fields["strided"] = torch.arange(6, dtype=torch.int64).reshape(3, 2).t()
+    bits = torch.tensor([[0, -2147483648], [2143289345, -8388608]], dtype=torch.int32)
+    fields["float_bits"] = bits.view(torch.float32).requires_grad_()
+    for name, tensor in fields.items():
+        data, dtype, shape, offsets = to_bytes(tensor)
+        assert data.dtype == np.uint8
+        restored = from_bytes(data, dtype, shape, offsets)
+        assert not restored.requires_grad
+        for row in range(2):
             torch.testing.assert_close(
-                restored[name][index], tensor[index], rtol=0, atol=0
+                restored[row], tensor[row], rtol=0, atol=0, equal_nan=True
             )
-    assert all(column.data.dtype == np.uint8 for column in packed.values())
-
-
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        torch.bool,
-        torch.uint8,
-        torch.int8,
-        torch.int16,
-        torch.int32,
-        torch.int64,
-        torch.float16,
-        torch.bfloat16,
-        torch.float32,
-        torch.float64,
-    ],
-)
-@pytest.mark.parametrize("layout", ["dense", "strided", "empty", "jagged"])
-def test_packed_columns_preserve_exact_bytes(dtype: torch.dtype, layout: str) -> None:
-    values = torch.arange(6).to(dtype)
-    if layout == "jagged":
-        tensor = torch.nested.nested_tensor_from_jagged(
-            values, offsets=torch.tensor([0, 2, 6])
-        )
-    elif layout == "strided":
-        tensor = values.reshape(3, 2).t()
-    elif layout == "empty":
-        tensor = torch.empty((2, 0), dtype=dtype)
-    else:
-        tensor = values.reshape(2, 3)
-    batch = TensorDict({"column": tensor}, batch_size=[2])
-    column = pack_columns(batch)["column"]
-    source = tensor.values() if tensor.is_nested else tensor
-    expected = source.detach().contiguous().reshape(-1).view(torch.uint8).numpy()
-    np.testing.assert_array_equal(column.data, expected)
-    assert column.shape == tuple(source.shape)
-    assert column.dtype == str(dtype)
-    assert column.data.flags.c_contiguous
-    if tensor.is_nested:
-        np.testing.assert_array_equal(column.offsets, tensor.offsets().numpy())
-    else:
-        assert column.offsets is None
-    restored = unpack_columns({"column": column}, 2)["column"]
-    for row in range(2):
-        torch.testing.assert_close(restored[row], tensor[row], rtol=0, atol=0)
-
-
-def test_packing_detaches_grad_and_preserves_float_bit_patterns() -> None:
-    bits = torch.tensor(
-        [[0, -2147483648, 2139095040], [2143289345, -4194303, -8388608]],
-        dtype=torch.int32,
-    )
-    values = bits.view(torch.float32).requires_grad_()
-    batch = TensorDict({"column": values}, batch_size=[2])
-    column = pack_columns(batch)["column"]
-    np.testing.assert_array_equal(
-        column.data, bits.reshape(-1).view(torch.uint8).numpy()
-    )
-    restored = unpack_columns({"column": column}, 2)["column"]
-    assert not restored.requires_grad
+    restored = from_bytes(*to_bytes(fields["float_bits"]))
     assert torch.equal(restored.view(torch.int32), bits)
-    assert values.requires_grad
-
-
-@pytest.mark.parametrize("defect", ["size", "dtype", "offsets", "rows"])
-def test_bad_transport_is_rejected_before_put(defect: str) -> None:
-    batch = _batch()
-    columns = dict(batch.columns)
-    if defect == "size":
-        columns["metadata"] = replace(
-            columns["metadata"], data=np.zeros(1, dtype=np.uint8)
-        )
-    elif defect == "dtype":
-        columns["metadata"] = replace(columns["metadata"], dtype="bogus")
-    elif defect == "offsets":
-        columns["tokens"] = replace(columns["tokens"], offsets=np.array([0, 4, 2]))
-    else:
-        columns["metadata"] = PackedColumn(
-            np.zeros(2, dtype=np.uint8), "torch.uint8", (1, 2), None
-        )
-    client = MagicMock()
-    with pytest.raises(ValueError):
-        PrefixWriterService(client, "staging").put(replace(batch, columns=columns))
-    client.put_samples.assert_not_called()
-
-
-@pytest.mark.parametrize("defect", ["partition", "canonical", "duplicate", "tags"])
-def test_service_rejects_wrong_identity(defect: str) -> None:
-    batch = _batch()
-    if defect == "partition":
-        batch = replace(batch, partition_id="another")
-    elif defect == "canonical":
-        batch = replace(batch, sample_ids=("a/c", "b/d"))
-    elif defect == "duplicate":
-        batch = replace(batch, sample_ids=(batch.sample_ids[0],) * 2)
-    else:
-        batch = replace(batch, tags=())
-    client = MagicMock()
-    with pytest.raises(ValueError):
-        PrefixWriterService(client, "staging").put(batch)
-    client.put_samples.assert_not_called()
 
 
 def test_service_ack_waits_for_tq_and_preserves_keys_and_tags() -> None:
@@ -200,10 +107,10 @@ def test_service_ack_waits_for_tq_and_preserves_keys_and_tags() -> None:
         assert release.wait(5)
 
     client.put_samples.side_effect = put
-    batch = _batch()
+    batch = _put()
     replies = []
     thread = threading.Thread(
-        target=lambda: replies.append(PrefixWriterService(client, "staging").put(batch))
+        target=lambda: replies.append(PrefixWriterService(client).put_samples(**batch))
     )
     thread.start()
     try:
@@ -213,26 +120,17 @@ def test_service_ack_waits_for_tq_and_preserves_keys_and_tags() -> None:
         release.set()
         thread.join(5)
     assert not thread.is_alive()
-    assert replies == [batch.sample_ids]
-    assert client.put_samples.call_args.kwargs["tags"] == list(batch.tags)
+    assert replies == [None]
+    call = client.put_samples.call_args.kwargs
+    assert call["sample_ids"] == batch["sample_ids"]
+    assert call["tags"] == batch["tags"]
 
 
-def test_client_refuses_bad_ack_and_closed_writer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    actor = SimpleNamespace(put=MagicMock())
+def test_client_refuses_a_closed_writer(monkeypatch: pytest.MonkeyPatch) -> None:
+    actor = SimpleNamespace(put_samples=SimpleNamespace(remote=MagicMock()))
     client = RayPrefixWriterClient(actor, writer_pid=99)
-    monkeypatch.setattr("ray.put", lambda batch: batch)
-    monkeypatch.setattr("ray.get", lambda ref: ("wrong",))
     kill = MagicMock()
     monkeypatch.setattr("ray.kill", kill)
-    with pytest.raises(RuntimeError, match="different durable keys"):
-        client.put_samples(
-            sample_ids=list(_batch().sample_ids),
-            partition_id="staging",
-            fields=_fields(),
-            tags=[{}, {}],
-        )
     client.close()
     client.close()
     kill.assert_called_once_with(actor, no_restart=True)
@@ -246,22 +144,21 @@ def test_client_orders_failed_write_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     data = MagicMock()
-    service = PrefixWriterService(data, "staging")
+    service = PrefixWriterService(data)
     actor = SimpleNamespace(
-        put=SimpleNamespace(remote=service.put),
-        clear=SimpleNamespace(remote=service.clear),
+        put_samples=SimpleNamespace(remote=service.put_samples),
+        clear_samples=SimpleNamespace(remote=service.clear_samples),
     )
-    monkeypatch.setattr("ray.put", lambda batch: batch)
     monkeypatch.setattr("ray.get", lambda result: result)
     client = RayPrefixWriterClient(actor, writer_pid=99)
-    batch = _batch()
+    batch = _put()
     client.put_samples(
-        sample_ids=list(batch.sample_ids),
+        sample_ids=batch["sample_ids"],
         partition_id="staging",
         fields=_fields(),
-        tags=list(batch.tags),
+        tags=batch["tags"],
     )
-    client.clear_samples(sample_ids=list(batch.sample_ids), partition_id="staging")
+    client.clear_samples(sample_ids=batch["sample_ids"], partition_id="staging")
     assert data.method_calls[0][0] == "put_samples"
     assert data.method_calls[1][0] == "clear_samples"
 
@@ -279,7 +176,7 @@ def test_native_cut_uses_prefix_client_and_terminal_remains_local(fail: bool) ->
     local, prefix = client(), client()
     sink = TQTokenSink(local, staging_partition="staging")
     sink.set_prefix_writer(prefix)
-    recovery._parts = replace(recovery._parts, sink=sink)
+    recovery = PrefixRecovery(replace(recovery._parts, sink=sink))
     if fail:
         prefix.put_samples.side_effect = RuntimeError("injected failed PUT")
     try:
@@ -309,43 +206,41 @@ def test_client_marks_a_dead_writer_and_stops_calling_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     actor = SimpleNamespace(
-        put=SimpleNamespace(remote=MagicMock()),
-        clear=SimpleNamespace(remote=MagicMock()),
+        put_samples=SimpleNamespace(remote=MagicMock()),
+        clear_samples=SimpleNamespace(remote=MagicMock()),
         get_data_plane_snapshot=SimpleNamespace(remote=MagicMock()),
     )
     client = RayPrefixWriterClient(actor, writer_pid=99)
-    monkeypatch.setattr("ray.put", lambda batch: batch)
 
     def actor_died(reference: object) -> None:
         raise ray.exceptions.RayActorError()
 
     monkeypatch.setattr("ray.get", actor_died)
-    batch = _batch()
+    batch = _put()
     with pytest.raises(PrefixWriterDiedError, match="pid 99"):
         client.put_samples(
-            sample_ids=list(batch.sample_ids),
+            sample_ids=batch["sample_ids"],
             partition_id="staging",
             fields=_fields(),
-            tags=list(batch.tags),
+            tags=batch["tags"],
         )
-    actor.put.remote.reset_mock()
+    actor.put_samples.remote.reset_mock()
     with pytest.raises(PrefixWriterDiedError):
         client.put_samples(
-            sample_ids=list(batch.sample_ids),
+            sample_ids=batch["sample_ids"],
             partition_id="staging",
             fields=_fields(),
-            tags=list(batch.tags),
+            tags=batch["tags"],
         )
     with pytest.raises(PrefixWriterDiedError):
-        client.clear_samples(sample_ids=list(batch.sample_ids), partition_id="staging")
+        client.clear_samples(sample_ids=batch["sample_ids"], partition_id="staging")
     assert asyncio.run(client.get_data_plane_snapshot()) is None
-    actor.put.remote.assert_not_called()
-    actor.clear.remote.assert_not_called()
+    actor.put_samples.remote.assert_not_called()
+    actor.clear_samples.remote.assert_not_called()
     actor.get_data_plane_snapshot.remote.assert_not_called()
 
 
-@pytest.mark.parametrize("pipeline", [False, True])
-def test_dead_writer_fails_the_whole_cut_and_discards_locally(pipeline: bool) -> None:
+def test_dead_writer_fails_the_whole_cut_and_discards_locally() -> None:
     """A dead writer fails the cut loudly; no call is acknowledged as cut."""
     recovery, _, states, inventory = _batch_worker_fixture([2, 3], batch_size=2)
     local = SimpleNamespace(
@@ -364,13 +259,7 @@ def test_dead_writer_fails_the_whole_cut_and_discards_locally(pipeline: bool) ->
     )
     sink = TQTokenSink(local, staging_partition="staging")
     sink.set_prefix_writer(writer)
-    recovery = PrefixRecovery(
-        replace(
-            recovery._parts,
-            sink=sink,
-            prefix_writes=PrefixWritesConfig(pipeline=pipeline),
-        )
-    )
+    recovery = PrefixRecovery(replace(recovery._parts, sink=sink))
     try:
         with pytest.raises(PrefixWriterDiedError, match="writer died"):
             asyncio.run(recovery.run_cut(inventory))
@@ -431,17 +320,12 @@ def test_factory_pins_writer_and_cleans_failed_startup(
     if failure:
         with pytest.raises(RuntimeError, match=match):
             asyncio.run(
-                create_prefix_writer(
-                    {"impl": "transfer_queue", "backend": "simple"},
-                    partition_id="staging",
-                )
+                create_prefix_writer({"impl": "transfer_queue", "backend": "simple"})
             )
         kill.assert_called_once_with(actor, no_restart=True)
     else:
         client = asyncio.run(
-            create_prefix_writer(
-                {"impl": "transfer_queue", "backend": "simple"}, partition_id="staging"
-            )
+            create_prefix_writer({"impl": "transfer_queue", "backend": "simple"})
         )
         assert client._writer_pid == 99
         kill.assert_not_called()
@@ -452,18 +336,16 @@ def test_factory_pins_writer_and_cleans_failed_startup(
 
 
 @pytest.mark.parametrize(
-    "writer_enabled,pipeline_enabled",
-    [(True, False), (False, False), (False, True), (True, True)],
+    "dp_cfg",
+    [{"impl": "local"}, {"impl": "transfer_queue", "backend": "simple"}],
+    ids=["local", "transfer_queue"],
 )
 def test_worker_setup_installs_only_prefix_transport(
-    monkeypatch: pytest.MonkeyPatch,
-    writer_enabled: bool,
-    pipeline_enabled: bool,
+    monkeypatch: pytest.MonkeyPatch, dp_cfg: dict[str, str]
 ) -> None:
+    """A TransferQueue data plane gets a writer actor; a local one writes itself."""
     worker = _fake_worker()
-    prefix_writes = PrefixWritesConfig(
-        pipeline=pipeline_enabled, writer_actor=writer_enabled
-    )
+    writer_enabled = dp_cfg["impl"] == "transfer_queue"
     worker._http_engine_client = object()
     worker._progress_reader = MagicMock()
     worker.llm = SimpleNamespace(
@@ -481,14 +363,13 @@ def test_worker_setup_installs_only_prefix_transport(
     try:
         asyncio.run(
             worker.setup_token_capture(
-                {"impl": "transfer_queue", "backend": "simple"},
+                dp_cfg,
                 "staging",
                 generation_prefix_cuts_enabled=True,
                 generation_cut_control_token="secret",
                 prefix_write_max_rows=256,
                 prefix_write_max_tokens=4096,
                 prefix_read_max_rows=1,
-                prefix_writes=prefix_writes,
             )
         )
         if writer_enabled:
@@ -499,21 +380,19 @@ def test_worker_setup_installs_only_prefix_transport(
             assert worker._prefix_writer is None
             assert worker._capture_sink._prefix_store is None
             create.assert_not_awaited()
-        assert (worker._prefix_recovery._pipeline is not None) == pipeline_enabled
-        assert worker._capture_sink._direct_prefix_columns is pipeline_enabled
+        assert worker._prefix_recovery._pipeline is not None
         assert worker._capture_sink._store._dp_client is client
         if writer_enabled:
             with pytest.raises(RuntimeError, match="already installed"):
                 asyncio.run(
                     worker.setup_token_capture(
-                        {"impl": "transfer_queue", "backend": "simple"},
+                        dp_cfg,
                         "staging",
                         generation_prefix_cuts_enabled=True,
                         generation_cut_control_token="secret",
                         prefix_write_max_rows=256,
                         prefix_write_max_tokens=4096,
                         prefix_read_max_rows=1,
-                        prefix_writes=prefix_writes,
                     )
                 )
     finally:
@@ -550,7 +429,6 @@ def test_worker_setup_stops_the_pipeline_when_the_writer_fails_to_start(
                 prefix_write_max_rows=256,
                 prefix_write_max_tokens=4096,
                 prefix_read_max_rows=1,
-                prefix_writes=PrefixWritesConfig(pipeline=True, writer_actor=True),
             )
         )
     pipeline = worker._prefix_recovery._pipeline
@@ -570,9 +448,8 @@ def test_close_unblocks_pending_call_without_ack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entered, stopped = threading.Event(), threading.Event()
-    actor = SimpleNamespace(put=MagicMock())
+    actor = SimpleNamespace(put_samples=SimpleNamespace(remote=MagicMock()))
     client = RayPrefixWriterClient(actor, writer_pid=99)
-    monkeypatch.setattr("ray.put", lambda batch: batch)
 
     def get(reference: object) -> object:
         entered.set()
@@ -586,7 +463,7 @@ def test_close_unblocks_pending_call_without_ack(
     def put() -> None:
         try:
             client.put_samples(
-                sample_ids=list(_batch().sample_ids),
+                sample_ids=_put()["sample_ids"],
                 partition_id="staging",
                 fields=_fields(),
                 tags=[{}, {}],
@@ -606,11 +483,23 @@ def test_close_unblocks_pending_call_without_ack(
     assert errors == ["actor terminated"]
 
 
+def test_writer_actor_client_owns_no_segment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On mooncake_cpu a save would otherwise wait on the writer actor."""
+    calls = []
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client",
+        lambda *args, **kwargs: calls.append(kwargs) or MagicMock(),
+    )
+    monkeypatch.setattr("torch.set_num_threads", lambda threads: None)
+    PrefixWriterActor({"impl": "transfer_queue", "backend": "mooncake_cpu"})
+    assert calls == [{"bootstrap": False, "segment_size": 0}]
+
+
 def test_writer_reports_only_a_metrics_client_snapshot() -> None:
-    assert PrefixWriterService(MagicMock(), "staging").get_data_plane_snapshot() is None
+    assert PrefixWriterService(MagicMock()).get_data_plane_snapshot() is None
     metrics = MagicMock(spec=MetricsDataPlaneClient)
     metrics.snapshot.return_value = {"n_ops": 1}
-    service = PrefixWriterService(metrics, "staging")
+    service = PrefixWriterService(metrics)
     assert service.get_data_plane_snapshot() == {"n_ops": 1}
     metrics.snapshot.assert_called_once_with(reset_step_window=True)
 

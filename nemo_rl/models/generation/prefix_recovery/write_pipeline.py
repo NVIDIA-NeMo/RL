@@ -15,42 +15,70 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Annotated, Any
-
-from pydantic import BaseModel, Field, model_validator
+from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 
 
-class PrefixWritesConfig(BaseModel, extra="forbid"):
-    """How a generation worker writes saved partial responses to TQ."""
+@dataclass(frozen=True)
+class PrefixWriteLimits:
+    """Bounds of the write pipeline every generation-prefix cut goes through."""
 
-    # Encode text/router columns directly and overlap preparation with one
-    # write stream, bounded by the byte limits below.
-    pipeline: bool = False
-    # Run prefix PUTs in one CPU actor on the generation node (TQ simple only).
-    writer_actor: bool = False
-    max_pending_inventories: Annotated[int, Field(gt=0, strict=True)] = 128
-    max_buffered_payload_bytes: Annotated[int, Field(gt=0, strict=True)] = 536870912
-    # A larger single row is written alone.
-    max_batch_payload_bytes: Annotated[int, Field(gt=0, strict=True)] = 134217728
-    coalesce_wait_seconds: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.01
+    # Admission fails beyond this many pending inventories.
+    max_pending_inventories: int
+    # Estimated queued and in-flight payload, plus one preparation reservation.
+    max_buffered_payload_bytes: int
+    # One merged write; a larger single row is written alone.
+    max_batch_payload_bytes: int
+    # How long a prepared batch waits for compatible rows to merge with.
+    coalesce_wait_seconds: float
 
-    @model_validator(mode="after")
-    def _buffer_holds_two_batches(self) -> "PrefixWritesConfig":
-        """Leave room for one write in flight plus one preparation reservation."""
+    def __post_init__(self) -> None:
+        # Room for one write in flight plus one preparation reservation.
         if self.max_buffered_payload_bytes < 2 * self.max_batch_payload_bytes:
             raise ValueError(
                 "max_buffered_payload_bytes must be >= 2 * max_batch_payload_bytes"
             )
-        return self
+
+
+PREFIX_WRITE_LIMITS = PrefixWriteLimits(
+    max_pending_inventories=128,
+    max_buffered_payload_bytes=512 * 1024 * 1024,
+    max_batch_payload_bytes=128 * 1024 * 1024,
+    coalesce_wait_seconds=0.01,
+)
+
+
+# token_ids_delta (int64) plus token_mask_delta and generation_logprobs_delta
+# (float32), as the sink encodes them.
+_TOKEN_BYTES = 8 + 2 * 4
+# Rough per-row allowance for the scalar, digest and offset columns.
+_ROW_BYTES = 512
+
+
+def estimate_prefix_row_bytes(
+    record: Any, attachments: Mapping[str, Any] | None
+) -> int:
+    """Estimated encoded size of one cut row, for the write pipeline's byte bounds."""
+    size = len(record.token_ids_delta) * _TOKEN_BYTES + _ROW_BYTES
+    for text in (record.capture_key, record.model_call_id, record.parent_call_id):
+        if text is not None:
+            size += len(text.encode("utf-8"))
+    if record.extras is not None:
+        size += len(json.dumps(record.extras, ensure_ascii=False).encode("utf-8"))
+    if attachments:
+        size += sum(
+            value.numel() * value.element_size() for value in attachments.values()
+        )
+    return size
 
 
 @dataclass(frozen=True)
@@ -62,7 +90,8 @@ class PrefixWrite:
     sequences: tuple[int, ...]
     attachments: tuple[Any, ...]
     payload_bytes: int
-    fallback: Callable[[], list[str | None]]
+    # Called with the failed batch write's error; writes what it can row by row.
+    fallback: Callable[[BaseException], list[str | None]]
 
     @property
     def tokens(self) -> int:
@@ -70,11 +99,11 @@ class PrefixWrite:
 
 
 @dataclass(frozen=True)
-class BatchReleased:
+class WriteSettled:
     """All transactions of the preceding write have sealed or rolled back."""
 
 
-CutSteps = Generator[PrefixWrite | BatchReleased, list[str | None], Any]
+CutWrites = Generator[PrefixWrite | WriteSettled, list[str | None], Any]
 
 
 @dataclass(eq=False)
@@ -82,7 +111,7 @@ class _Job:
     inventory: Any
     deadline: float | None
     future: Future[Any]
-    iterator: CutSteps | None = None
+    iterator: CutWrites | None = None
     request: PrefixWrite | None = None
     reservation: int = 0
 
@@ -99,13 +128,13 @@ class PrefixWritePipeline:
     def __init__(
         self,
         *,
-        config: PrefixWritesConfig,
+        limits: PrefixWriteLimits,
         max_batch_rows: int,
         max_batch_tokens: int,
         sink: Any,
-        prepare: Callable[..., CutSteps],
+        prepare: Callable[..., CutWrites],
     ) -> None:
-        self._config = config
+        self._limits = limits
         self._max_batch_rows = max_batch_rows
         self._max_batch_tokens = max_batch_tokens
         self._sink = sink
@@ -139,7 +168,7 @@ class PrefixWritePipeline:
                 raise RuntimeError("Prefix write pipeline is closed")
             if key in self._jobs:
                 return self._jobs[key].future
-            if len(self._jobs) >= self._config.max_pending_inventories:
+            if len(self._jobs) >= self._limits.max_pending_inventories:
                 raise RuntimeError("Prefix pipeline inventory admission limit reached")
             future: Future[Any] = Future()
             future.set_running_or_notify_cancel()
@@ -169,7 +198,7 @@ class PrefixWritePipeline:
             if self._buffered < 0 or (
                 growth > 0
                 and not allow_overflow
-                and self._buffered > self._config.max_buffered_payload_bytes
+                and self._buffered > self._limits.max_buffered_payload_bytes
             ):
                 raise RuntimeError("Prefix pipeline exceeded its byte reservation")
             self._counts["peak_buffered_payload_bytes"] = max(
@@ -202,7 +231,7 @@ class PrefixWritePipeline:
             job.future.set_exception(error)
 
     def _advance(self, job: _Job) -> None:
-        self._reserve(job, self._config.max_batch_payload_bytes)
+        self._reserve(job, self._limits.max_batch_payload_bytes)
         try:
             if job.iterator is None:
                 job.iterator = self._prepare(job.inventory, deadline=job.deadline)
@@ -214,7 +243,7 @@ class PrefixWritePipeline:
                 raise TypeError("Prefix preparation must yield a write request")
             if request.checkpoint_id != job.inventory.checkpoint_id:
                 raise ValueError("Prefix write changed checkpoint identity")
-            oversized = request.payload_bytes > self._config.max_batch_payload_bytes
+            oversized = request.payload_bytes > self._limits.max_batch_payload_bytes
             if request.payload_bytes <= 0:
                 raise ValueError("Prefix write must carry a positive payload")
             if oversized and len(request.records) != 1:
@@ -259,11 +288,11 @@ class PrefixWritePipeline:
             if len(keys) != len(records):
                 self._sink.clear(keys)
                 raise ValueError("Prefix sink returned the wrong number of keys")
-        except Exception:
+        except Exception as error:
             results = []
             for request in requests:
                 try:
-                    results.append(request.fallback())
+                    results.append(request.fallback(error))
                 except BaseException as error:
                     results.append(error)
         else:
@@ -294,7 +323,7 @@ class PrefixWritePipeline:
                 request.checkpoint_id != first.request.checkpoint_id
                 or rows + len(request.records) > self._max_batch_rows
                 or tokens + request.tokens > self._max_batch_tokens
-                or size + request.payload_bytes > self._config.max_batch_payload_bytes
+                or size + request.payload_bytes > self._limits.max_batch_payload_bytes
             ):
                 break
             group.append(self._prepared.popleft())
@@ -317,8 +346,8 @@ class PrefixWritePipeline:
             try:
                 assert job.iterator is not None
                 marker = job.iterator.send(keys)
-                if not isinstance(marker, BatchReleased):
-                    raise TypeError("Prefix owner must release a completed batch")
+                if not isinstance(marker, WriteSettled):
+                    raise TypeError("Prefix owner must settle a completed write")
             except StopIteration as completed:
                 self._finish(job, result=completed.value)
             except BaseException as error:
@@ -373,8 +402,8 @@ class PrefixWritePipeline:
                 prepared_rows = sum(len(job.request.records) for job in self._prepared)
                 can_prepare = (
                     candidate is not None
-                    and self._buffered + self._config.max_batch_payload_bytes
-                    <= self._config.max_buffered_payload_bytes
+                    and self._buffered + self._limits.max_batch_payload_bytes
+                    <= self._limits.max_buffered_payload_bytes
                     # Text rows rarely reach the byte bound. Preparing at most one
                     # write ahead of the write in flight keeps calls frozen for
                     # about two writes, not the whole queue.
@@ -384,7 +413,7 @@ class PrefixWritePipeline:
                     not can_prepare
                     or prepared_at is None
                     or time.monotonic() - prepared_at
-                    >= self._config.coalesce_wait_seconds
+                    >= self._limits.coalesce_wait_seconds
                     or prepared_rows >= self._max_batch_rows
                 )
                 if not closed and flight is None and should_write:
@@ -411,7 +440,7 @@ class PrefixWritePipeline:
                     timeout = (
                         max(
                             0.0,
-                            self._config.coalesce_wait_seconds
+                            self._limits.coalesce_wait_seconds
                             - (time.monotonic() - prepared_at),
                         )
                         if flight is None and prepared_at is not None

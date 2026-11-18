@@ -79,7 +79,6 @@ from nemo_rl.experience.rollout_recovery import (
     RecoveryTargetLevel,
 )
 from nemo_rl.models.generation.interfaces import sampler_replay_enabled
-from nemo_rl.models.generation.prefix_recovery.write_pipeline import PrefixWritesConfig
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
@@ -845,10 +844,6 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     prefix_write_max_tokens: Annotated[int, Field(gt=0)] = 4_194_304
     # Rows per TQ read at restore. 1 = each restore reads on its own.
     prefix_read_max_rows: Annotated[int, Field(gt=0)] = 256
-    # How cut rows are written: the write pipeline, the writer actor and their
-    # bounds. Both are off by default and need token capture and the vLLM
-    # async HTTP server.
-    prefix_writes: PrefixWritesConfig = Field(default_factory=PrefixWritesConfig)
 
     @model_validator(mode="after")
     def _validate_restart_only_opt_in(self) -> "RolloutRecoveryConfig":
@@ -2242,34 +2237,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "token_capture.enabled=true; without token capture, unfinished Gym "
             "siblings have no durable receipts to recover"
         )
-    prefix_writes = recovery_config.prefix_writes
-    if prefix_writes.pipeline or prefix_writes.writer_actor:
-        if not (
-            token_capture_config.enabled
-            and recovery_config.generation_prefix_cuts_enabled
-        ):
-            raise ValueError(
-                "rollout_recovery.prefix_writes.pipeline and .writer_actor require "
-                "token_capture.enabled=true and rollout_recovery.target_level='prefix'"
-            )
-        vllm_cfg = cast(VllmConfig, generation_cfg).get("vllm_cfg")
-        if (
-            generation_cfg["backend"] != "vllm"
-            or vllm_cfg is None
-            or not (vllm_cfg["async_engine"] and vllm_cfg.get("expose_http_server"))
-        ):
-            raise ValueError(
-                "rollout_recovery.prefix_writes.pipeline and .writer_actor require "
-                "the vllm backend with async_engine=true and expose_http_server=true"
-            )
-        data_plane = master_config.data_plane
-        if prefix_writes.writer_actor and (
-            data_plane["impl"] != "transfer_queue" or data_plane["backend"] != "simple"
-        ):
-            raise ValueError(
-                "rollout_recovery.prefix_writes.writer_actor requires "
-                "data_plane.impl='transfer_queue' and data_plane.backend='simple'"
-            )
     if token_capture_config.forest_training:
         if master_config.grpo is None:
             raise ValueError("forest training requires GRPO")

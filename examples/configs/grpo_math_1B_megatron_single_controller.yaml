@@ -301,22 +301,6 @@ rollout_recovery:
   prefix_write_max_tokens: 4194304
   # Rows per TQ read at restore. 1 = each restore reads on its own.
   prefix_read_max_rows: 256
-  # How cut rows are written. Both switches need token_capture.enabled: true and
-  # the vllm backend with async_engine: true and expose_http_server: true.
-  prefix_writes:
-    # Encode text/router columns directly and overlap preparation with one write
-    # stream. Text-only capture.
-    pipeline: false
-    # Run prefix PUTs in one CPU actor on the generation node. TQ simple only.
-    writer_actor: false
-    # Pipeline bounds. Admission fails beyond this many pending inventories.
-    max_pending_inventories: 128
-    # Queued and in-flight payload; must be >= 2 * max_batch_payload_bytes.
-    max_buffered_payload_bytes: 536870912
-    # One merged write; a larger single row is written alone.
-    max_batch_payload_bytes: 134217728
-    # Coalescing window for compatible prepared rows.
-    coalesce_wait_seconds: 0.01
 
 # Leaving either map above non-empty requires the top-level token_capture section
 # to set enabled: true.

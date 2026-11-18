@@ -103,7 +103,6 @@ from nemo_rl.experience.rollout_recovery import RecoveryTargetLevel
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.interfaces import SamplerReplayConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
-from nemo_rl.models.generation.prefix_recovery.write_pipeline import PrefixWritesConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.config import (
     load_config,
@@ -639,41 +638,6 @@ def test_generation_top_logprobs_requires_capture():
         validate_single_controller_config(mc)
     mc.token_capture.enabled = True
     validate_single_controller_config(mc)
-
-
-@pytest.mark.parametrize("switch", ["pipeline", "writer_actor"])
-def test_prefix_writes_require_prefix_capture_on_async_vllm(switch: str):
-    """A prefix-write switch with no prefix cut to serve is rejected, not ignored."""
-    mc = _make_master_config()
-    mc.rollout_recovery.prefix_writes = PrefixWritesConfig(**{switch: True})
-    with pytest.raises(ValueError, match="token_capture.enabled=true and"):
-        validate_single_controller_config(mc)
-    mc.token_capture.enabled = True
-    with pytest.raises(ValueError, match="target_level='prefix'"):
-        validate_single_controller_config(mc)
-    mc.rollout_recovery.target_level = RecoveryTargetLevel.PREFIX
-    vllm_cfg = mc.policy["generation"]["vllm_cfg"]
-    vllm_cfg.update(async_engine=True, expose_http_server=False)
-    with pytest.raises(ValueError, match="expose_http_server=true"):
-        validate_single_controller_config(mc)
-    vllm_cfg["expose_http_server"] = True
-    validate_single_controller_config(mc)
-
-
-def test_prefix_writer_actor_requires_tq_simple():
-    """The writer actor writes through TQ SimpleStorage; the pipeline alone does not."""
-    mc = _make_master_config()
-    mc.token_capture.enabled = True
-    mc.rollout_recovery.target_level = RecoveryTargetLevel.PREFIX
-    mc.policy["generation"]["vllm_cfg"].update(
-        async_engine=True, expose_http_server=True
-    )
-    mc.data_plane["backend"] = "mooncake_cpu"
-    mc.rollout_recovery.prefix_writes = PrefixWritesConfig(pipeline=True)
-    validate_single_controller_config(mc)
-    mc.rollout_recovery.prefix_writes = PrefixWritesConfig(writer_actor=True)
-    with pytest.raises(ValueError, match="data_plane.backend='simple'"):
-        validate_single_controller_config(mc)
 
 
 def test_token_capture_top_logprobs_rejects_megatron_generation():
@@ -2103,31 +2067,6 @@ class TestSetup:
         patched_factories["_build_trainer"].assert_not_called()
         mock_spinup.assert_not_called()
 
-    @pytest.mark.parametrize("switch", ["pipeline", "writer_actor"])
-    def test_prefix_writes_reject_media_capture(self, switch: str, patched_factories):
-        """Prefix writes are text-only; a VLM processor fails setup before any factory."""
-        mc = _make_master_config(backend="vllm", megatron_enabled=True)
-        mc.token_capture.enabled = True
-        mc.rollout_recovery.target_level = RecoveryTargetLevel.PREFIX
-        mc.policy["generation"]["vllm_cfg"].update(
-            async_engine=True, expose_http_server=True
-        )
-        mc.rollout_recovery.prefix_writes = PrefixWritesConfig(**{switch: True})
-        mc.env = {"should_use_nemo_gym": True}
-
-        with (
-            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-            patch.object(sc_setup_mod, "build_nemo_gym_actors") as mock_spinup,
-            pytest.raises(ValueError, match="text-only token capture, not media"),
-        ):
-            setup_single_controller(
-                mc, MagicMock(pad_token_id=0), processor=MagicMock()
-            )
-
-        patched_factories["setup_response_data"].assert_not_called()
-        patched_factories["_build_generation"].assert_not_called()
-        mock_spinup.assert_not_called()
-
     @pytest.mark.parametrize(
         ("loss_overrides", "match"),
         [
@@ -3298,7 +3237,6 @@ class TestSetup:
         assert setup_kwargs["prefix_write_max_rows"] == 17
         assert setup_kwargs["prefix_write_max_tokens"] == 4096
         assert setup_kwargs["prefix_read_max_rows"] == 5
-        assert setup_kwargs["prefix_writes"] is mc.rollout_recovery.prefix_writes
 
     @pytest.mark.parametrize("with_overrides", [False, True])
     def test_finalizers_stamp_agent_names_only_with_agent_overrides(

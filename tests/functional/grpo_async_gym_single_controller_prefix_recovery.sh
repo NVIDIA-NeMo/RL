@@ -3,9 +3,8 @@
 # decode. It compares an uninterrupted reference run with a hard-kill/restore
 # run, where the restored attempt must reuse the exact durable prefix and
 # generate only the remaining suffix before the rollout is finalized/trained.
-# Passing ++rollout_recovery.prefix_writes.pipeline=true and/or
-# ++rollout_recovery.prefix_writes.writer_actor=true runs the same parity check
-# with the prefix write pipeline and/or writer actor, and checks that each started.
+# Cut rows always go through the prefix write pipeline and, on TransferQueue,
+# its writer actor; the run checks that both started.
 
 set -eou pipefail
 
@@ -72,14 +71,6 @@ for list_length in "${LIST_LENGTHS[@]}"; do
     fi
 done
 LIST_LENGTHS_JSON=$(printf '%s\n' "${LIST_LENGTHS[@]}" | jq -s -c 'map(tonumber)')
-EXPECT_WRITE_PIPELINE=0
-EXPECT_WRITER_ACTOR=0
-for arg in "$@"; do
-    case "$arg" in
-        *rollout_recovery.prefix_writes.pipeline=true) EXPECT_WRITE_PIPELINE=1 ;;
-        *rollout_recovery.prefix_writes.writer_actor=true) EXPECT_WRITER_ACTOR=1 ;;
-    esac
-done
 
 rm -rf "$TEST_DIR"
 mkdir -p "$TEST_DIR"
@@ -230,12 +221,8 @@ uv run --directory "$PROJECT_ROOT" --no-sync python "$SNAPSHOT_HELPER" select \
 stop_phase1
 cp "$BASE_RUN_LOG" "$PHASE1_LOG"
 # The selected snapshot holds cut rows, so they went through these paths.
-if [[ "$EXPECT_WRITE_PIPELINE" == "1" ]]; then
-    grep -q "generation-prefix write pipeline started" "$PHASE1_LOG"
-fi
-if [[ "$EXPECT_WRITER_ACTOR" == "1" ]]; then
-    grep -q "prefix_writer event=ready" "$PHASE1_LOG"
-fi
+grep -q "generation-prefix write pipeline started" "$PHASE1_LOG"
+grep -q "prefix_writer event=ready" "$PHASE1_LOG"
 restore_selected_snapshot "$SELECTION_FILE" "$SELECTED_BACKUP" "$CHECKPOINT_DIR"
 
 # Avoid cutting the replacement request again while verifying that it consumes
