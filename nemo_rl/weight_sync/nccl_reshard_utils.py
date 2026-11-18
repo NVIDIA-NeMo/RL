@@ -1152,7 +1152,5 @@ def build_nccl_reshard_refit_info(
         "train_world_size": train_world_size,
         "gen_world_size": gen_world_size,
         "pp_size": pp_size,
-        "train_cp_size": cp_size,
-        "gen_cp_size": gen_parallelism.get("cp_size", 1),
         "gen_tp_size": gen_parallelism.get("tp_size", 1),
     }

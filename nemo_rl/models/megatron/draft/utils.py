@@ -384,14 +384,6 @@ class DraftRefitTensorSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class DraftRefitLane:
-    cp_rank: int
-    pp_ranks: tuple[int, ...]
-    owner_global_rank: int
-    manifest: tuple[DraftRefitTensorSpec, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class _DraftRefitOwnerExport:
     status: int
     detail: str
@@ -976,18 +968,12 @@ def broadcast_draft_weights_from_pp_owner(
             pp_ranks=pp_ranks,
         )
 
-    lane = DraftRefitLane(
-        cp_rank=cp_rank,
-        pp_ranks=pp_ranks,
-        owner_global_rank=owner_global_rank,
-        manifest=manifest,
-    )
     if metadata_only:
         return [
             (spec.name, torch.empty(spec.shape, dtype=spec.dtype, device="meta"))
-            for spec in lane.manifest
+            for spec in manifest
         ]
-    if any(spec.device_type == "meta" for spec in lane.manifest):
+    if any(spec.device_type == "meta" for spec in manifest):
         raise _draft_refit_error(
             "MANIFEST_INVALID",
             "real draft refit export cannot contain meta tensors",
@@ -995,7 +981,7 @@ def broadcast_draft_weights_from_pp_owner(
             pp_ranks=pp_ranks,
         )
     expected_device_type = "cuda" if device.type == "cuda" else "cpu"
-    if any(spec.device_type != expected_device_type for spec in lane.manifest):
+    if any(spec.device_type != expected_device_type for spec in manifest):
         raise _draft_refit_error(
             "MANIFEST_INVALID",
             f"payload device must be {expected_device_type} for the PP backend",
@@ -1005,14 +991,14 @@ def broadcast_draft_weights_from_pp_owner(
 
     tensors_by_name = dict(owner_export.tensors) if owner_export is not None else {}
     specs_by_dtype: dict[torch.dtype, list[DraftRefitTensorSpec]] = {}
-    for spec in lane.manifest:
+    for spec in manifest:
         specs_by_dtype.setdefault(spec.dtype, []).append(spec)
 
     buckets: list[tuple[list[DraftRefitTensorSpec], Tensor]] = []
     payload_failed = 0
     try:
         for dtype_specs in specs_by_dtype.values():
-            if global_rank == lane.owner_global_rank:
+            if global_rank == owner_global_rank:
                 bucket = torch.cat(
                     [
                         tensors_by_name[spec.name].contiguous().view(-1)
@@ -1051,7 +1037,7 @@ def broadcast_draft_weights_from_pp_owner(
 
     received_by_name: dict[str, Tensor] = {}
     for dtype_specs, bucket in buckets:
-        dist.broadcast(bucket, src=lane.owner_global_rank, group=pp_group)
+        dist.broadcast(bucket, src=owner_global_rank, group=pp_group)
         offset = 0
         for spec in dtype_specs:
             numel = 1
@@ -1061,9 +1047,9 @@ def broadcast_draft_weights_from_pp_owner(
                 spec.shape
             )
             offset += numel
-    if lane.manifest[0].device_type == "cuda":
+    if manifest[0].device_type == "cuda":
         torch.cuda.current_stream().synchronize()
-    return [(spec.name, received_by_name[spec.name]) for spec in lane.manifest]
+    return [(spec.name, received_by_name[spec.name]) for spec in manifest]
 
 
 def _gather_tp_qkv_weight(

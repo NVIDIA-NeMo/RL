@@ -15,6 +15,7 @@ import __future__
 
 import ast
 import asyncio
+import contextlib
 import math
 import os
 import tempfile
@@ -269,7 +270,7 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     )
 
     worker.cfg = {"generation": {"backend": "vllm"}}
-    list(worker._iter_params_with_optional_kv_scales())
+    list(worker._iter_params_with_optional_kv_scales(draft_weights=()))
     forwarded = worker.megatron_bridge.export_hf_weights.call_args.kwargs[
         "conversion_tasks"
     ]
@@ -278,7 +279,7 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     assert forwarded[0].param_weight.dtype == torch.float8_e4m3fn
 
     worker.cfg = {"generation": {"backend": "megatron"}}
-    list(worker._iter_params_with_optional_kv_scales())
+    list(worker._iter_params_with_optional_kv_scales(draft_weights=()))
     megatron_forwarded = worker.megatron_bridge.export_hf_weights.call_args.kwargs[
         "conversion_tasks"
     ]
@@ -678,15 +679,38 @@ def test_m2n_destination_refreshes_flashinfer_after_misc_import(
     from nemo_rl.models.generation.megatron import megatron_worker as worker_module
 
     worker = object.__new__(worker_module.MegatronGenerationRefitMixin)
-    worker.nccl_reshard_refit_info = {
-        "layer_names": [],
-        "per_layer_params": {},
+    param_info = {
+        "name": "layer.weight",
+        "global_shape": (2, 2),
+        "src_mesh_info": None,
+        "src_placements": None,
+        "dst_mesh_info": None,
+        "dst_placements": None,
     }
-    worker._generation_nccl_reshard_groups = {}
-    worker._update_destination_weights_from_collective = MagicMock(return_value=True)
+    worker.nccl_reshard_refit_info = {
+        "layer_names": ["layer"],
+        "per_layer_params": {"layer": [param_info]},
+    }
+    spec = MagicMock(post=None)
+    worker.hf_to_local_param_map = {"layer.weight": spec}
+    worker.model_update_group = MagicMock()
+    worker._generation_nccl_reshard_groups = {0: MagicMock()}
     worker._refresh_flashinfer_mxfp8_weights = MagicMock()
 
+    order: list[str] = []
+    worker._update_destination_weights_from_collective = MagicMock(
+        side_effect=lambda **_: order.append("packed") or True
+    )
+    preflight = MagicMock(side_effect=lambda *_: order.append("token"))
+    monkeypatch.setattr(worker_module, "packed_broadcast_preflight_consumer", preflight)
+    monkeypatch.setattr(
+        "nemo_rl.weight_sync.xferdtensor.xferdtensor",
+        lambda *_: order.append("bulk"),
+    )
+    monkeypatch.setattr("nemo_rl.weight_sync.xferdtensor.DTensorRef", MagicMock())
     monkeypatch.setattr(torch.cuda, "Stream", MagicMock)
+    monkeypatch.setattr(torch.cuda, "Event", MagicMock)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: contextlib.nullcontext())
     monkeypatch.setattr(torch.cuda, "current_stream", MagicMock)
     monkeypatch.setattr(torch.cuda, "empty_cache", MagicMock())
     monkeypatch.setattr(
@@ -694,9 +718,13 @@ def test_m2n_destination_refreshes_flashinfer_after_misc_import(
     )
 
     assert worker._destination_nccl_reshard_refit(refit_timeout_s=30.0)
+    # Same order as the trainer: readiness token, bulk reshard, packed misc.
+    assert order == ["token", "bulk", "packed"]
+    preflight.assert_called_once_with(worker.model_update_group, 0)
     worker._update_destination_weights_from_collective.assert_called_once_with(
         refit_timeout_s=30.0,
         refresh_mxfp8=False,
+        preflight_checked=True,
     )
     worker._refresh_flashinfer_mxfp8_weights.assert_called_once_with()
 
@@ -3232,7 +3260,8 @@ def test_prepare_source_refit_info_resets_previous_prequantization_selection():
     worker._refit_prequant_names = {name}
     worker._calculate_refit_param_info = lambda: {}
 
-    def _iter_params():
+    def _iter_params(*, draft_weights):
+        assert draft_weights == ()
         dtype = (
             torch.float8_e4m3fn
             if name in worker._refit_prequant_names
@@ -3241,6 +3270,7 @@ def test_prepare_source_refit_info_resets_previous_prequantization_selection():
         yield name, torch.ones(2, 64, dtype=dtype)
 
     worker._iter_params_with_optional_kv_scales = _iter_params
+    worker._draft_weights_for_refit = lambda *, metadata_only: ()
 
     info = worker._prepare_source_refit_info()
 

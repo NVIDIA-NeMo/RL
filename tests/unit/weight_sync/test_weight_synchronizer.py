@@ -968,7 +968,6 @@ class TestNcclReshardWeightSynchronizer:
                 "tp_size": 4,
                 "ep_size": 1,
                 "etp_size": 4,
-                "cp_size": 1,
                 "pp_size": 1,
                 "world_size": None,
             }
@@ -1112,13 +1111,7 @@ class TestNcclReshardWeightSynchronizer:
                 "cp_size": 1,
                 "pp_size": 1,
             },
-            {
-                "tp_size": 4,
-                "ep_size": 1,
-                "etp_size": 4,
-                "cp_size": 1,
-                "pp_size": 1,
-            },
+            {"tp_size": 4, "ep_size": 1, "etp_size": 4, "pp_size": 1},
             2,
             4,
             layout_index=0,
@@ -1570,7 +1563,6 @@ class TestFactory:
                 "tp_size": 8,
                 "ep_size": 2,
                 "etp_size": 8,
-                "cp_size": 1,
                 "pp_size": 1,
                 "world_size": None,
             }

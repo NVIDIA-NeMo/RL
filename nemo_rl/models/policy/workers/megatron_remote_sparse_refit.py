@@ -14,6 +14,7 @@
 
 """Canonical Hugging Face sparse-refit state for a Megatron policy worker."""
 
+from collections.abc import Iterator
 from typing import Any
 
 import torch
@@ -35,6 +36,11 @@ class MegatronRemoteSparseRefit:
         self._worker = worker
         self._tracker = DeltaCompressionTracker(refit_config)
 
+    def _iter_worker_params(self) -> Iterator[tuple[str, torch.Tensor]]:
+        return self._worker._iter_params_with_optional_kv_scales(
+            draft_weights=self._worker._draft_weights_for_refit(),
+        )
+
     def initialize_baseline(
         self,
         *,
@@ -43,7 +49,7 @@ class MegatronRemoteSparseRefit:
         transport: VllmRefitTransportName,
     ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
         init_sparse_delta_baseline_from_iterator(
-            self._worker._iter_params_with_optional_kv_scales(),
+            self._iter_worker_params(),
             delta_tracker=self._tracker,
             shard_rank=shard_rank,
             shard_count=shard_count,
@@ -72,7 +78,7 @@ class MegatronRemoteSparseRefit:
         }[transport]
         self._tracker.overwrite_names = frozenset(overwrite_names)
         result = streamer(
-            self._worker._iter_params_with_optional_kv_scales(),
+            self._iter_worker_params(),
             delta_tracker=self._tracker,
             transfer_id=transfer_id,
             refit_targets=targets,

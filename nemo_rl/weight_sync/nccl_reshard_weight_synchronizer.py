@@ -179,7 +179,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                     "tp_size": tp_size,
                     "ep_size": ep_size,
                     "etp_size": tp_size if ep_size == 1 else 1,
-                    "cp_size": 1,
                     "pp_size": vllm_cfg.get("pipeline_parallel_size", 1),
                     "world_size": None,
                 }
@@ -197,7 +196,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                     "ep_size": megatron_cfg["expert_model_parallel_size"],
                     # Match MCore's effective default: an omitted/None ETP uses TP.
                     "etp_size": tp_size if etp_size is None else etp_size,
-                    "cp_size": 1,
                     "pp_size": megatron_cfg["pipeline_model_parallel_size"],
                     "world_size": None,
                 }
@@ -209,7 +207,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                     "tp_size": layout["tp_size"],
                     "ep_size": layout["ep_size"],
                     "etp_size": layout["etp_size"],
-                    "cp_size": 1,
                     "pp_size": layout["pp_size"],
                     "world_size": layout["world_size"],
                 }
@@ -419,7 +416,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         ):
             gen_parallelism = {
                 key: layout[key]
-                for key in ("tp_size", "ep_size", "etp_size", "cp_size", "pp_size")
+                for key in ("tp_size", "ep_size", "etp_size", "pp_size")
             }
             nccl_reshard_refit_info = self._policy.prepare_nccl_reshard_refit_info(
                 train_parallelism,

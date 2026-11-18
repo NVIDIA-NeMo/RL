@@ -362,9 +362,9 @@ def test_packed_broadcast_legacy_packing_keeps_oversized_tensor_in_prefix_buffer
             src=0,
             post_iter_func=lambda x: x[1],
             use_legacy_packing=True,
-            preflight_checked=True,
         )
 
+    # vLLM's native consumer has no readiness token, so none is sent.
     assert [t.numel() for t in group.broadcasted_tensors] == [
         sum(t.nbytes for _, t in params)
     ]
@@ -529,7 +529,12 @@ def test_packed_broadcast_preflight_checked_mismatch_is_detected(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_packed_broadcast_preflight_checked_error_raises_without_broadcast():
+@pytest.mark.parametrize(
+    "skip_token",
+    [{"preflight_checked": True}, {"use_legacy_packing": True}],
+    ids=["preflight_checked", "legacy_packing"],
+)
+def test_packed_broadcast_skipped_token_error_raises_without_broadcast(skip_token):
     group = MockCommunicationGroup()
     with pytest.raises(RuntimeError, match="^local draft export failed$"):
         packed_broadcast_producer(
@@ -538,7 +543,7 @@ def test_packed_broadcast_preflight_checked_error_raises_without_broadcast():
             src=0,
             post_iter_func=lambda x: x[1],
             preflight_error=ValueError("local draft export failed"),
-            preflight_checked=True,
+            **skip_token,
         )
     assert group.broadcast_count == 0
 

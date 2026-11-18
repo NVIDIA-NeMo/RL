@@ -101,7 +101,7 @@ In the grouped decode, encoded weights are concatenated without padding or shape
 
 Bulk preparation describes logical weights in the source's transfer dtype, regardless of the generation backend. Bulk conversion tasks are kept separate from the existing misc export tasks so changing the bulk contract does not change attention, embedding, router, or other misc payloads. Megatron workers are assigned an explicit source or destination refit role and expose the same `prepare_refit_info`, `build_hf_to_local_param_map`, `prepare_nccl_reshard_refit_info`, and `nccl_reshard_refit` entry points in either role.
 
-1. **`init_collective()`** — creates the `model_update_group`, a NCCL group spanning all training and generation ranks. The bulk path does not use it; it carries the misc packed-broadcast, including FP8 KV-cache scales for backend combinations that support them, identical to the conventional collective transport.
+1. **`init_collective()`** — creates the `model_update_group`, a NCCL group spanning all training and generation ranks. The bulk path does not use it; it carries the misc packed-broadcast, including FP8 KV-cache scales for backend combinations that support them, identical to the conventional collective transport. It also carries the readiness token, the first collective of every refit. Each rank sends or reads the token **before** the bulk reshard. All ranks must use the two kinds of communicators in the same order, or NCCL can deadlock.
 2. **`init_nccl_reshard_comm_group()`** — creates the bulk-path communicator(s): **one NCCL group per training PP stage**, each spanning that stage's training ranks plus *all* generation ranks (non-PP is simply `pp_size == 1`, a single group over everything). Keeping the bulk path on its own communicators decouples it from the misc broadcast.
 3. **`prepare_nccl_reshard_refit_info()`** — the metadata exchange. The **training side builds a backend-agnostic description** of every bulk parameter (`build_nccl_reshard_refit_info()` in `nemo_rl/weight_sync/nccl_reshard_utils.py`), keyed strictly by **HuggingFace parameter names**, and ships it to the generation side. Before shipping, `make_nccl_reshard_refit_info_wire_safe()` converts the `MeshInfo` rank tensors and `Shard`/`Replicate` placements into plain dicts/lists — Megatron patches torch's storage unpickler, so raw tensor pickles would require `import megatron` inside the vLLM worker. The generation side rebuilds the objects with `restore_refit_info_placements()`.
 
@@ -136,7 +136,9 @@ Every training step (with in-flight weight updates, concurrently with generation
 
 ### The Misc Path
 
-After the bulk reshard completes, the misc parameters are transferred.
+After the bulk reshard completes, the misc parameters are transferred. The misc
+broadcast does not read the readiness token again, because every rank already read it
+before the bulk reshard.
 This part is reusing the same code implementation as the conventional packed_tensor refit.
 Its representation is unchanged. Only source scale entries belonging to quantized bulk weights are removed; the receiver must retain its newly generated scales for those weights. This also keeps unrelated weight scales and KV-cache scales on their existing load path.
 

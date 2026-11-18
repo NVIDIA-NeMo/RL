@@ -927,15 +927,11 @@ def test_build_refit_info_top_level_and_param_fields():
         "train_world_size",
         "gen_world_size",
         "pp_size",
-        "train_cp_size",
-        "gen_cp_size",
         "gen_tp_size",
     }
     assert info["train_world_size"] == 2
     assert info["gen_world_size"] == 4
     assert info["pp_size"] == 1
-    assert info["train_cp_size"] == 1
-    assert info["gen_cp_size"] == 1
     assert info["gen_tp_size"] == 4
 
     # Every param carries the canonical fields; no pp_stage when pp_size == 1.
@@ -1060,8 +1056,6 @@ def test_build_refit_info_replicates_train_context_parallelism():
     assert expert["src_mesh_info"].mesh.flatten().tolist() == [0, 1, 2, 3, 4, 5, 6, 7]
     assert isinstance(expert["src_placements"][0], Replicate)
     assert expert["src_placements"][1] == Shard(0)
-    assert info["train_cp_size"] == 2
-    assert info["gen_cp_size"] == 1
 
 
 def test_build_refit_info_tp2_pp2_cp2_stage_mesh_keeps_both_cp_replicas():
@@ -1081,7 +1075,6 @@ def test_build_refit_info_tp2_pp2_cp2_stage_mesh_keeps_both_cp_replicas():
         layer_to_pp_stage={"model.layers.0": 0, "model.layers.1": 1},
     )
 
-    assert info["train_cp_size"] == 2
     assert info["pp_size"] == 2
     for layer_name in ("model.layers.0", "model.layers.1"):
         parameter = info["per_layer_params"][layer_name][0]
