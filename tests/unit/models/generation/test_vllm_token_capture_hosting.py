@@ -26,12 +26,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -59,6 +60,7 @@ from nemo_rl.data.captured_media import (  # noqa: E402
     MEDIA_TENSOR_DIGESTS_FIELD,
     CapturedMedia,
     CapturedMediaItem,
+    MediaCaptureRejected,
     MediaColumnSpec,
     media_tensor_digests,
 )
@@ -326,12 +328,36 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         dp_cfg={"backend": "simple"},
         staging_partition="rollout_staging",
         capture_media=False,
+        media_family=None,
         top_logprobs=4,
         generation_prefix_cuts_enabled=False,
         generation_cut_control_token=None,
         generation_cut_control_timeout_s=60.0,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
+
+
+def test_generation_setup_token_capture_forwards_the_media_family(monkeypatch):
+    spec = MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=14)
+    gen = _generation_with_mock_group()
+    gen.worker_group.run_all_workers_single_data.return_value = [spec, None]
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
+        lambda futures: futures,
+    )
+    assert (
+        gen.setup_token_capture(
+            {"backend": "simple"},
+            "rollout_staging",
+            capture_media=True,
+            media_family="omni",
+        )
+        is spec
+    )
+    _, kwargs = gen.worker_group.run_all_workers_single_data.call_args
+    assert kwargs["media_family"] == "omni"
+    # restart_shard replays the same family to a replacement leader.
+    assert gen._token_capture_setup.media_family == "omni"
 
 
 def test_generation_setup_token_capture_requires_async_engine():
@@ -1131,6 +1157,7 @@ def test_generation_setup_token_capture_keeps_its_arguments_for_restarts(
         "dp_cfg": {"backend": "simple"},
         "staging_partition": "rollout_staging",
         "capture_media": False,
+        "media_family": None,
         "top_logprobs": top_logprobs,
         **cut_arguments,
     }
@@ -1540,6 +1567,22 @@ def test_generation_cut_past_its_deadline_fails_uncut_calls_without_staging(capl
     assert state.snapshot().generated_token_ids == [11, 12]
     assert "uncut=1 of 1 model_call_ids=['c1']" in caplog.text
     assert _uncut_reasons(caplog) == {"control_deadline": 1}
+
+
+def test_a_cut_runs_to_the_deadline_its_caller_gives_it():
+    """The Dynamo frontend hands every engine the deadline it waits to itself."""
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    _live_call(worker, [11, 12], [-0.1, -0.2], prompt_token_ids=(10,))
+    inventory = _single_call_inventory()
+
+    # This worker sets no control timeout of its own.
+    receipt = asyncio.run(
+        _cuts(worker).run_cut(inventory, deadline=time.monotonic() - 1.0)
+    )
+
+    assert [ack.disposition for ack in receipt.prefixes] == ["durable_failure"]
+    assert sink.generation_prefix_records == []
 
 
 def _active_call_inventory(
@@ -2461,9 +2504,12 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
     )
     # vLLM's processed tail: EOS and any matched stop string already stripped.
     output = SimpleNamespace(token_ids=[14, 151645], text=" tail")
-    resumed_worker._prefix_recovery.restore_reply_text(
+    resumed = resumed_worker._capture_registry.get(request)
+    restore_reply_text(
         request,
         SimpleNamespace(outputs=[output]),
+        prefix_token_ids=resumed.resumed_generation_token_ids,
+        engine_prompt_token_ids=resumed.prompt_token_ids,
         tokenizer=_ByteTokenizer(),
     )
     (replay_kwargs,) = replays
@@ -2475,7 +2521,6 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
     # A second checkpoint taken before the resumed call finishes must retain
     # the original cut key and append the newly generated tail. Gym v2 stores
     # this complete key list in the replacement attempt's model record.
-    resumed = resumed_worker._capture_registry.get(request)
     resumed.record([14], [-0.3])
     second_receipt = _cuts(resumed_worker).checkpoint_cut(
         _single_call_inventory("c2", checkpoint_id="checkpoint-2", attempt=1)
@@ -2594,7 +2639,7 @@ def _staging_chain_request(prev_len: int = 3) -> _FakeRequest:
 
 
 def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
-    """The resolved prefix reaches both the engine request and capture admission."""
+    """The prefix resolved from the staging chain is the one begin_call checks."""
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": [12]})
@@ -2604,7 +2649,6 @@ def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
 
     admission = worker._capture_admission(request)
     prefix = worker._resolve_admission_prefix(admission)
-    worker._enter_request_prefix(request, prefix)
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
         worker,
         request,
@@ -2618,8 +2662,6 @@ def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
     # Never patched back into the wire context.
     assert request.ng_capture == context_before
     assert admission.required_prefix_token_ids == []
-    # enter_prefix is the production writer of the request field.
-    assert request.required_prefix_token_ids == prefix
     state = worker._capture_registry.get(request)
     assert state.call.prefix_token_ids == prefix
     assert state.prompt_token_ids == [10, 11, 12, 20]
@@ -2963,7 +3005,11 @@ def test_omni_capture_setup_rejects_video_pruning(
         "nemo_rl.data_plane.build_data_plane_client",
         lambda dp_cfg, bootstrap, segment_size=None: MagicMock(),
     )
-    kwargs = {"staging_partition": "staging", "capture_media": True}
+    kwargs = {
+        "staging_partition": "staging",
+        "capture_media": True,
+        "media_family": "omni",
+    }
     if prefix_cuts:
         kwargs.update(
             generation_prefix_cuts_enabled=True,
@@ -2985,6 +3031,151 @@ def test_omni_capture_setup_rejects_video_pruning(
         # The engine's model dtype and the HF patch size, as pinned on the sink.
         assert spec == MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=2)
         assert worker._capture_image_token_id == 18
+
+
+@pytest.mark.vllm
+def test_pixtral_capture_setup_reads_the_mistral3_config(monkeypatch):
+    # Both dependency markers select the combined vLLM + Gym lane.
+    pytest.importorskip("vllm")
+    from vllm.model_executor.models.mistral3 import Mistral3ProcessingInfo
+
+    info = object.__new__(Mistral3ProcessingInfo)
+    # Values other than Mistral3Config's defaults, so each one is read.
+    monkeypatch.setattr(
+        Mistral3ProcessingInfo,
+        "get_hf_config",
+        lambda self: SimpleNamespace(
+            image_token_index=11,
+            spatial_merge_size=3,
+            vision_config=SimpleNamespace(patch_size=7),
+        ),
+    )
+    worker = _fake_worker()
+    worker.llm = SimpleNamespace(
+        renderer=SimpleNamespace(get_mm_processor=lambda: SimpleNamespace(info=info)),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client",
+        lambda dp_cfg, bootstrap, segment_size=None: MagicMock(),
+    )
+    spec = asyncio.run(
+        VllmAsyncGenerationWorkerImpl.setup_token_capture(
+            worker,
+            {},
+            staging_partition="staging",
+            capture_media=True,
+            media_family="pixtral",
+        )
+    )
+    # The engine's model dtype and the vision tower's patch size, as pinned on the sink.
+    assert spec == MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=7)
+    assert worker._capture_media_family == "pixtral"
+    assert worker._capture_image_token_id == 11
+    assert worker._capture_spatial_merge_size == 3
+    # Captured pixels are cast to the same pinned dtype.
+    assert worker._capture_cast_pixel_dtype == torch.bfloat16
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("media_family", "info_class", "message"),
+    [
+        (
+            "omni",
+            "Mistral3ProcessingInfo",
+            "requires vLLM's NanoNemotronVL processor; got Mistral3ProcessingInfo",
+        ),
+        (
+            "pixtral",
+            "NanoNemotronVLProcessingInfo",
+            "requires vLLM's Mistral3 processor; got NanoNemotronVLProcessingInfo",
+        ),
+        (None, "Mistral3ProcessingInfo", "Unsupported media capture family None"),
+    ],
+    ids=["omni-on-mistral3", "pixtral-on-omni", "no-family"],
+)
+def test_media_capture_setup_checks_the_driver_family(
+    monkeypatch, media_family, info_class, message
+):
+    """The worker does not pick the family: one that disagrees with the engine's
+    processor fails setup, naming the processor vLLM built."""
+    pytest.importorskip("vllm")
+    from vllm.model_executor.models.mistral3 import Mistral3ProcessingInfo
+    from vllm.model_executor.models.nano_nemotron_vl import NanoNemotronVLProcessingInfo
+
+    info_type = {
+        "Mistral3ProcessingInfo": Mistral3ProcessingInfo,
+        "NanoNemotronVLProcessingInfo": NanoNemotronVLProcessingInfo,
+    }[info_class]
+    info = object.__new__(info_type)
+    worker = _fake_worker()
+    worker.llm = SimpleNamespace(
+        renderer=SimpleNamespace(get_mm_processor=lambda: SimpleNamespace(info=info)),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client",
+        lambda dp_cfg, bootstrap, segment_size=None: MagicMock(),
+    )
+    with pytest.raises(ValueError, match=re.escape(message)):
+        asyncio.run(
+            VllmAsyncGenerationWorkerImpl.setup_token_capture(
+                worker,
+                {},
+                staging_partition="staging",
+                capture_media=True,
+                media_family=media_family,
+            )
+        )
+    assert worker.token_capture is None
+
+
+@dataclass(frozen=True)
+class _ImageSpan:
+    """The fields capture_processed_media reads from vLLM's PlaceholderRange."""
+
+    offset: int
+    length: int
+    is_embed: torch.Tensor | None = None
+
+
+def test_pixtral_request_media_forwards_family_dtype_and_merge_size():
+    img, brk, end = 18, 12, 13
+    worker = _fake_worker()
+    worker._capture_media = True
+    worker._capture_media_family = "pixtral"
+    worker._capture_image_token_id = img
+    worker._capture_patch_size = 14
+    worker._capture_spatial_merge_size = 2
+    worker._capture_cast_pixel_dtype = torch.bfloat16
+    admission = SimpleNamespace(parent_call_id=None, prev_len=0)
+    pixels = torch.rand(3, 56, 84)  # 2 rows x 3 columns of 28-pixel merge cells
+
+    def prompt(drop_first_embedding=False):
+        image = [img, img, img, brk, img, img, img, end]
+        mask = torch.tensor([t == img for t in image])
+        mask[0] = not drop_first_embedding
+        item = SimpleNamespace(get_data=lambda: {"pixel_values": pixels})
+        return {
+            "prompt_token_ids": [1, 2, 3, *image, 4],
+            "mm_placeholders": {"image": [_ImageSpan(3, len(image), mask)]},
+            "mm_kwargs": {"image": [item]},
+        }
+
+    media = VllmAsyncGenerationWorkerImpl._capture_request_media(
+        worker, prompt(), admission=admission
+    )
+    (item,) = media.items
+    # One embedding run per row: the Omni family would reject this image.
+    assert item.embedding_spans == ((3, 3), (7, 3))
+    # Cast to the dtype setup pinned on the staging column.
+    assert media.tensors["imgs"].dtype == torch.bfloat16
+    # The merge size reaches the embedding-count geometry check.
+    with pytest.raises(MediaCaptureRejected, match="geometry"):
+        VllmAsyncGenerationWorkerImpl._capture_request_media(
+            worker, prompt(drop_first_embedding=True), admission=admission
+        )
 
 
 def test_request_capture_text_call_in_media_run_stages_without_attachments():

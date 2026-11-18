@@ -130,6 +130,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
     algo_config,
+    dedicated_value_enabled,
     is_ppo_run,
     rollout_snapshots_enabled,
     validate_forest_objective,
@@ -423,6 +424,7 @@ class SingleControllerActor:
         )
         self._ppo_group_multiple = actor_args.ppo_group_multiple
         self._ppo_min_remaining_groups = actor_args.ppo_min_remaining_groups
+        self._value_dedicated: bool = dedicated_value_enabled(master_config)
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -456,8 +458,8 @@ class SingleControllerActor:
         self._dp_backend = master_config.data_plane["backend"]
         if self._dp_backend == "mooncake_cpu":
             if actor_args.last_checkpoint_path is not None or (
-                master_config.checkpointing["enabled"]
-                and master_config.checkpointing.get("save_data_plane")
+                master_config.checkpointing.enabled
+                and master_config.checkpointing.save_data_plane
             ):
                 checkpoint_workers = list(
                     actor_args.trainer_handle.worker_group.workers
@@ -661,7 +663,7 @@ class SingleControllerActor:
             master_config.async_rl.defer_async_checkpoint_finalize
         )
         self._timeout = TimeoutChecker(
-            timeout=master_config.checkpointing["checkpoint_must_save_by"],
+            timeout=master_config.checkpointing.checkpoint_must_save_by,
             fit_last_save_time=True,
         )
         self._timeout.start_iterations()
@@ -702,12 +704,12 @@ class SingleControllerActor:
         else:
             self._sampler.restore_dispatch_index(restored_dispatch_index)
         if (
-            self._master_config.checkpointing["enabled"]
+            self._master_config.checkpointing.enabled
             and self._sampler.supports_buffer_checkpoint
-            and not self._master_config.checkpointing.get("save_data_plane")
+            and not self._master_config.checkpointing.save_data_plane
             # msc:// cannot hold data-plane snapshots; setup warns that buffered
             # rollouts are then discarded on resume.
-            and not is_msc_path(self._master_config.checkpointing["checkpoint_dir"])
+            and not is_msc_path(self._master_config.checkpointing.checkpoint_dir)
         ):
             raise ValueError(
                 "SingleController checkpointing with a replay-checkpoint-capable "
@@ -722,8 +724,8 @@ class SingleControllerActor:
         self._rollout_recovery_enabled = bool(
             restoring_rollout_recovery
             or (
-                self._master_config.checkpointing["enabled"]
-                and self._master_config.checkpointing.get("save_data_plane")
+                self._master_config.checkpointing.enabled
+                and self._master_config.checkpointing.save_data_plane
                 and self._sampler.supports_buffer_checkpoint
             )
         )
@@ -3169,7 +3171,7 @@ class SingleControllerActor:
                         # per model, which is saving the offload/onloading cost.
                         # Keep accumulated policy gradients resident while
                         # offloading policy parameters/optimizer for the critic.
-                        if not value_inference_prepared:
+                        if not value_inference_prepared and not self._value_dedicated:
                             with (
                                 self._timer.time("value_inference_prep"),
                                 managed_span(
@@ -3227,7 +3229,7 @@ class SingleControllerActor:
                             # normalizer still counts all of them.
                             await asyncio.to_thread(
                                 self._trainer.prepare_for_lp_inference,
-                                keep_train_buffers=step_open,
+                                keep_train_buffers=step_open or self._value_dedicated,
                             )
                         with (
                             self._timer.time("policy_and_reference_logprobs"),
@@ -3246,7 +3248,6 @@ class SingleControllerActor:
                                     self._trainer.get_reference_policy_logprobs_from_meta,
                                     train_meta,
                                 )
-
                     # Compute advantages
                     with (
                         self._timer.time("advantage_calculation"),
@@ -3449,12 +3450,15 @@ class SingleControllerActor:
                                 tracer=self._tracer,
                             ),
                         ):
-                            if step_open:
-                                await asyncio.to_thread(
-                                    self._trainer.pause_train_step_with_offloading
-                                )
-                            else:
-                                await asyncio.to_thread(self._trainer.offload_to_cpu)
+                            if not self._value_dedicated:
+                                if step_open:
+                                    await asyncio.to_thread(
+                                        self._trainer.pause_train_step_with_offloading
+                                    )
+                                else:
+                                    await asyncio.to_thread(
+                                        self._trainer.offload_to_cpu
+                                    )
                             await asyncio.to_thread(self._value.prepare_for_inference)
                         value_inference_prepared = True
 
@@ -3578,7 +3582,8 @@ class SingleControllerActor:
                             await asyncio.to_thread(
                                 self._trainer.sync_params_before_refit
                             )
-                        await asyncio.to_thread(self._trainer.offload_to_cpu)
+                        if not self._value_dedicated:
+                            await asyncio.to_thread(self._trainer.offload_to_cpu)
                         if self._gen.blocks_training():
                             await asyncio.to_thread(self._trainer.finish_inference)
                     # GAE has produced the frozen predictions and targets for
@@ -3806,13 +3811,12 @@ class SingleControllerActor:
                 is_last_step = self._train_steps >= self._algo_cfg.max_num_steps or (
                     self._rollout_exhausted.is_set() and len(self._buffer) == 0
                 )
-                ft_save_period = self._master_config.checkpointing.get("ft_save_period")
+                ft_save_period = self._master_config.checkpointing.ft_save_period
                 # _train_steps was already incremented above, so it equals
                 # the legacy loop's 1-indexed `step + 1`.
                 should_save_by_step = (
                     is_last_step
-                    or self._train_steps
-                    % self._master_config.checkpointing["save_period"]
+                    or self._train_steps % self._master_config.checkpointing.save_period
                     == 0
                     or (
                         ft_save_period is not None
@@ -3821,9 +3825,9 @@ class SingleControllerActor:
                 )
                 # Call once per step and reuse the bool.
                 should_save_by_timeout = self._timeout.check_save()
-                will_save_checkpoint = self._master_config.checkpointing[
-                    "enabled"
-                ] and (should_save_by_step or should_save_by_timeout)
+                will_save_checkpoint = self._master_config.checkpointing.enabled and (
+                    should_save_by_step or should_save_by_timeout
+                )
                 # A colocated Megatron wake is itself the refit (prepare_for_generation reshards or
                 # shares the trainer's tensors), so a save-bound step skips _sync_weights and
                 # splits it: offload before the save, wake after it.
@@ -4003,7 +4007,7 @@ class SingleControllerActor:
             )
 
             if should_save_by_timeout:
-                if self._master_config.checkpointing["enabled"]:
+                if self._master_config.checkpointing.enabled:
                     # The trainer checkpoint holds no environment state, and no
                     # later step will wake the pump to snapshot it. step_N is
                     # already being published in the background, so the snapshot
@@ -4883,7 +4887,7 @@ class SingleControllerActor:
 
         # validate_single_controller_config already rejected anything but a
         # "train:" prefix, so step_metrics is the only source to consult.
-        full_metric_name = self._master_config.checkpointing["metric_name"]
+        full_metric_name = self._master_config.checkpointing.metric_name
         if full_metric_name is not None:
             metric_name = full_metric_name.split(":", 1)[1]
             if not is_policy_training_step or step_metrics.get("skipped_step", 0):
@@ -4947,7 +4951,8 @@ class SingleControllerActor:
             # serialized. The critic goes first because offloading the policy runs
             # finalize_async_save, which would block on the policy's own write if
             # that had already been staged.
-            await asyncio.to_thread(self._trainer.offload_to_cpu)
+            if not self._value_dedicated:
+                await asyncio.to_thread(self._trainer.offload_to_cpu)
             # The value model writes synchronously, so unlike the policy below it is
             # fully on disk when this returns and needs no finalize wait.
             await asyncio.to_thread(self._value.prepare_for_training)
@@ -4963,7 +4968,8 @@ class SingleControllerActor:
             await asyncio.to_thread(self._value.finish_training)
             # Also covers a warmup step, which never ran prepare_for_training in
             # the pump and would otherwise save from CPU-resident params.
-            await asyncio.to_thread(self._trainer.prepare_for_training)
+            if not self._value_dedicated:
+                await asyncio.to_thread(self._trainer.prepare_for_training)
 
         # Save policy model
         # With async_save this returns after D2H staging; disk writes finish
@@ -5347,9 +5353,9 @@ class SingleControllerActor:
 
         Tensors never touch SC: workers fetch the sequence columns from
         DataPlane and commit the per-token prediction back under ``values``,
-        which the advantage stage then reads alongside the rewards. The model is
-        offloaded after the forward. Streaming may prepare it before the chunk's
-        rollout data is ready to overlap the residency switch with generation.
+        which the advantage stage then reads alongside the rewards. Shared
+        workers offload after the forward; dedicated workers keep it resident.
+        Streaming may prepare it before the chunk's rollout data is ready.
 
         Args:
             meta: Selected chunk's metadata.
@@ -5381,8 +5387,8 @@ class SingleControllerActor:
                     self._value.train_from_meta, full_meta, value_loss_fn
                 )
         else:
-            # Split prepares the API for per-chunk value streaming in a later PR;
-            # this controller still trains the critic after policy refit.
+            # Split exposes the per-chunk API, but this controller still collects
+            # all step chunks before training the critic.
             for _ in range(num_epochs):
                 await asyncio.to_thread(self._value.begin_train_step, value_loss_fn)
                 for meta in metas:
@@ -5432,7 +5438,7 @@ class SingleControllerActor:
             return meta, True
 
         # Split on prompt-group boundaries so the pool works a chunk in
-        # parallel. SHARD_INVARIANT_ESTIMATORS says which estimators allow it.
+        # parallel when the estimator does not require the global batch.
         stage_cfg = self._advantage_stage_config
         num_actors = len(self._advantage_actors)
         shards = (

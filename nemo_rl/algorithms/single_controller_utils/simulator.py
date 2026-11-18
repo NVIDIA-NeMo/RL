@@ -300,7 +300,7 @@ def validate_simulator_config(
                 "the KV cache, as the SGLang weight synchronizers require. Use "
                 "'abort' or 'retract'."
             )
-    if master_config.checkpointing["enabled"]:
+    if master_config.checkpointing.enabled:
         raise ValueError(
             "rollout_only requires checkpointing.enabled=false: the cpu train "
             "backend has no model state to save, and the replay-buffer "

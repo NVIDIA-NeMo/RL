@@ -53,6 +53,7 @@ from nemo_rl.algorithms.single_controller_utils.simulator import (
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.observability import MetricsDataPlaneClient
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.config import load_config
 
 _SIMULATOR_EXEMPLAR = (
@@ -231,7 +232,9 @@ def _master_config(
         }
     return MasterConfig.model_construct(
         policy={"generation": generation},
-        checkpointing={"enabled": checkpointing_enabled},
+        checkpointing=CheckpointingConfig.model_construct(
+            enabled=checkpointing_enabled
+        ),
         async_rl=AsyncRLConfig(),
         grpo=None if ppo else GRPOConfig(async_grpo=None),
         ppo=SimpleNamespace() if ppo else None,
