@@ -26,10 +26,12 @@ side.
 
 import copy
 import dataclasses
+import functools
 import logging
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -317,6 +319,10 @@ class MegatronDynamoGeneration(GenerationInterface):
     Rollouts are still not posted to the frontend, so :meth:`validate_settings`
     refuses the switch and ``generate_async`` raises.
     """
+
+    # Engines built at once. Building a 64-engine fleet one engine at a time
+    # took about two hours; the refit rank order does not depend on it.
+    _engine_build_concurrency: int = 8
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
@@ -1175,6 +1181,8 @@ class MegatronDynamoGeneration(GenerationInterface):
             policy_config_by_role[role] = role_policy_config(
                 self._policy_config, role, self._dynamo_cfg.role_overrides(role)
             )
+        # One call per engine, in launch order, that starts it.
+        starts: list[Callable[[], tuple[MegatronGeneration, MegatronDynamoEngine]]] = []
         role_counts: dict[str, int] = {}
         for engine_index, role in enumerate[MegatronDynamoRole](roles):
             ordinal = role_counts.get(role, 0)
@@ -1196,6 +1204,8 @@ class MegatronDynamoGeneration(GenerationInterface):
                     else [constraints[pin_index_by_engine[engine_index]]]
                 ),
             )
+            # Owned from here on, so a failed build still removes every
+            # placement group at shutdown.
             self._clusters.append(cluster)
             # Reserved the way the engine will reserve them (always PACK,
             # since Dynamo engines are never colocated; idempotent), so a
@@ -1204,28 +1214,92 @@ class MegatronDynamoGeneration(GenerationInterface):
                 cluster, engine_policy_config
             )
             node_ip = self._engine_node_ip(cluster, instance_id)
-            engine = MegatronGeneration(
-                config=engine_policy_config,
-                tokenizer=self._tokenizer,
-                cluster=cluster,
-                name_prefix=f"dynamo_{instance_id}",
-                skip_weight_load=True,
-            )
-            self._engines.append(engine)
-            self._engine_records.append(
-                MegatronDynamoEngine.of(
-                    engine,
+            starts.append(
+                functools.partial(
+                    self._start_engine,
                     role=role,
-                    world_size=width,
                     instance_id=instance_id,
+                    width=width,
+                    config=engine_policy_config,
+                    cluster=cluster,
                     node_ip=node_ip,
                 )
             )
+
+        # A build mostly waits on Ray actors and the model construction, so
+        # engines are built several at a time, in rounds; a failed round
+        # submits nothing more, so a bad engine stops the fleet instead of
+        # occupying every node first.
+        started: dict[int, tuple[MegatronGeneration, MegatronDynamoEngine]] = {}
+        first_error: Optional[BaseException] = None
+        workers = max(1, min(self._engine_build_concurrency, len(starts)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for round_start in range(0, len(starts), workers):
+                futures = {
+                    pool.submit(starts[index]): index
+                    for index in range(
+                        round_start, min(round_start + workers, len(starts))
+                    )
+                }
+                for future in as_completed(futures):
+                    try:
+                        started[futures[future]] = future.result()
+                    except BaseException as error:  # noqa: BLE001 - re-raised below
+                        first_error = first_error or error
+                if first_error is not None:
+                    break
+        # Registered in launch order (the refit rank order), including what was
+        # built before a failure, so shutdown stops those engines too.
+        for index in sorted(started):
+            engine, record = started[index]
+            self._engines.append(engine)
+            self._engine_records.append(record)
             print(
-                f"  [Dynamo:{instance_id}] engine ready for refit on "
-                f"{node_ip} ({width} ranks)",
+                f"  [Dynamo:{record.instance_id}] engine ready for refit on "
+                f"{record.node_ip} ({record.world_size} ranks)",
                 flush=True,
             )
+        if first_error is not None:
+            raise first_error
+
+    def _start_engine(
+        self,
+        *,
+        role: MegatronDynamoRole,
+        instance_id: str,
+        width: int,
+        config: PolicyConfig,
+        cluster: RayVirtualCluster,
+        node_ip: str,
+    ) -> tuple[MegatronGeneration, MegatronDynamoEngine]:
+        """Start one engine on its placed cluster, without weights until the first refit.
+
+        Args:
+            role: ``prefill`` or ``decode``.
+            instance_id: ``<role>-<ordinal>``, the engine's name in logs and errors.
+            width: Ranks the engine spans.
+            config: The engine's role-specific policy config.
+            cluster: The engine's cluster, placement groups already reserved.
+            node_ip: The node every rank of the engine sits on.
+
+        Returns:
+            The engine and its record.
+        """
+        engine = MegatronGeneration(
+            config=config,
+            tokenizer=self._tokenizer,
+            cluster=cluster,
+            name_prefix=f"dynamo_{instance_id}",
+            skip_weight_load=True,
+        )
+        record = MegatronDynamoEngine.of(
+            engine,
+            role=role,
+            world_size=width,
+            instance_id=instance_id,
+            node_ip=node_ip,
+        )
+        return engine, record
 
     def _engine_node_ip(self, cluster: RayVirtualCluster, instance_id: str) -> str:
         """Node every bundle of an engine's cluster sits on.

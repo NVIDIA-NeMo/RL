@@ -17,6 +17,7 @@
 import asyncio
 import copy
 import pickle
+import threading
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -413,6 +414,9 @@ class _Env:
 
         # The per-engine MegatronGeneration is looked up by name at build time.
         monkeypatch.setattr(generation_module, "MegatronGeneration", make_engine)
+        # One build at a time keeps the fakes' engine order (and
+        # fail_engine_at) deterministic; the concurrent build has its own test.
+        monkeypatch.setattr(MegatronDynamoGeneration, "_engine_build_concurrency", 1)
         monkeypatch.setattr(generation_module, "RayVirtualCluster", make_cluster)
         monkeypatch.setattr(generation_module, "cluster_node_ip", _NodeIpTask())
         monkeypatch.setattr(generation_module, "ray", self.ray)
@@ -552,11 +556,13 @@ def test_builds_one_cluster_and_engine_per_role(env):
     assert generation.get_inference_world_size() == 6
     assert generation.num_engines == 3
     assert generation.expected_components() == {"prefill": 1, "backend": 2}
-    # Engines first, then the runtime from their environment, as for vLLM. No
+    # Every engine's cluster is placed before any engine is built; then the
+    # engines, then the runtime from their environment, as for vLLM. No
     # endpoint yet: the engines have no weights until the first refit.
     expected_log = []
     for name in _IDS:
-        expected_log += [f"cluster {name} up", f"placement {name}", f"engine {name} up"]
+        expected_log += [f"cluster {name} up", f"placement {name}"]
+    expected_log += [f"engine {name} up" for name in _IDS]
     assert env.log == expected_log + ["runtime up"] and env.endpoints == []
     assert env.runtime.frontend_python == "/venvs/mcore/bin/python"
     assert env.runtime.model_name == "Qwen/Qwen3-0.6B"
@@ -810,6 +816,48 @@ def test_too_few_pinned_nodes_for_the_engines_is_rejected(
     assert env.log == []
 
 
+@pytest.mark.parametrize("concurrency", [2, 8])
+def test_engines_built_concurrently_keep_the_refit_rank_order(
+    env, monkeypatch, concurrency
+):
+    monkeypatch.setattr(
+        MegatronDynamoGeneration, "_engine_build_concurrency", concurrency
+    )
+    release = threading.Event()
+    started: list[str] = []
+    make_engine = generation_module.MegatronGeneration
+
+    def slow_first_engine(**kwargs):
+        # The first engine finishes last, so completion order is not launch order.
+        name = kwargs["name_prefix"]
+        started.append(name)
+        if name == "dynamo_prefill-0":
+            assert release.wait(timeout=5)
+        elif len(started) >= min(concurrency, len(_IDS)):
+            release.set()
+        return make_engine(**kwargs)
+
+    slow_first_engine.init_cluster_placement_groups = (
+        make_engine.init_cluster_placement_groups
+    )
+    monkeypatch.setattr(generation_module, "MegatronGeneration", slow_first_engine)
+
+    generation = env.generation()
+
+    assert [r.instance_id for r in generation.engine_records] == _IDS
+    assert [r.role for r in generation.engine_records] == _ROLES
+
+
+def test_a_failed_build_round_submits_no_more_engines(env, monkeypatch):
+    monkeypatch.setattr(MegatronDynamoGeneration, "_engine_build_concurrency", 2)
+    env.fail_engine_at = 0
+    with pytest.raises(RuntimeError, match="failed to start"):
+        env.generation()
+    # The first round held prefill-0 (failed) and decode-0; decode-1 never ran.
+    assert "engine decode-1 up" not in env.log
+    assert "cluster decode-1 down" in env.log
+
+
 def test_start_failure_tears_down_what_exists(env, caplog):
     # The third engine fails to come up.
     env.fail_engine_at = 2
@@ -838,8 +886,8 @@ def test_engine_split_across_nodes_is_rejected(env):
     env.bundle_nodes[1] = ["10.0.0.1", "10.0.0.2"]
     with pytest.raises(RuntimeError, match=r"decode-0 spans multiple nodes"):
         env.generation()
-    # Rejected before the engine's workers exist.
-    assert [engine.name for engine in env.engines] == ["prefill-0"]
+    # Rejected while placing clusters, before any engine's workers exist.
+    assert env.engines == []
     assert "cluster decode-0 down" in env.log
 
 
