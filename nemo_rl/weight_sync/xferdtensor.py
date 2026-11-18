@@ -22,7 +22,7 @@ import torch
 from torch.distributed._tensor import Shard
 
 try:
-    from nccl.m2n import (  # pyrefly: ignore[import-error]
+    from nccl.m2n import (  # pyrefly: ignore[missing-import]
         reshard as _reshard,
     )
 except ImportError:

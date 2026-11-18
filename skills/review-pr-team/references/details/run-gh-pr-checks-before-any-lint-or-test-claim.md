@@ -1,6 +1,8 @@
 # run-gh-pr-checks-before-any-lint-or-test-claim
 
-> Run `gh pr checks` early — a local tool run is not the CI job, and NeMo-RL's Lint job also runs pyrefly plus a whitelist rule that a passing local ruff will never show you
+> Run `gh pr checks` early — a local tool run is not the CI job, and NeMo-RL's Lint job also runs pyrefly, which a passing local ruff will never show you
+
+> The whitelist step this note describes was removed when `pyrefly` moved to a baseline file (`pyrefly-baseline.json`): every file is checked now and only new errors fail. The incident below is kept as the reason for the rule.
 
 **Run `gh pr checks <n> --repo NVIDIA-NeMo/RL` in the setup phase, before saying anything about lint or tests.** It costs one call and it is the only thing that tells you what the repo's own gates think.
 
