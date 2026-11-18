@@ -174,6 +174,7 @@ class NixlStorageUnit:  # pragma: no cover
     _io_jobs: int
     _max_io_jobs: int
     _spill_error: str
+    _failed_spill_bytes: int
     _staged: dict[str, BlobRec]
     alloc_: SlabAllocator
     _worker: ThreadPoolExecutor
@@ -300,9 +301,12 @@ class NixlStorageUnit:  # pragma: no cover
         }
         self._io_jobs = 0  # IO jobs queued or running
         self._max_io_jobs = _MAX_IO_JOBS
-        # The last spill write's error, "" once a write succeeds. While set, the
-        # IO area may be full of acked spills nothing will evict, so a put that
-        # needs it fails as UnitFull and a cold read as failed, not Busy/pending.
+        # IO-area bytes held by live spills whose file write failed (their IO copy
+        # is the only copy and is never evicted). While > 0, a put or cold read
+        # that finds the IO area full fails (UnitFull / failed), not Busy / pending.
+        # It drops when such a blob's retry succeeds or the blob is released.
+        # _spill_error is only the last error text, for the message.
+        self._failed_spill_bytes = 0
         self._spill_error = ""
         self._staged = {}  # blobs with a staged copy
         if not ssd_dir:
@@ -413,7 +417,7 @@ class NixlStorageUnit:  # pragma: no cover
                 return io.alloc(nbytes)
             except UnitFull:
                 busy = io.used_bytes > 0
-        if busy and self._spill_error:
+        if busy and self._failed_spill_bytes > 0:
             raise UnitFull(
                 f"unit {self.unit_id}: no room for {nbytes} B; the IO area holds "
                 f"spills whose disk write failed ({self._spill_error})"
@@ -483,7 +487,7 @@ class NixlStorageUnit:  # pragma: no cover
                 if rec.holds == 0:
                     self._drop_staged(b, rec, rec.pin_expiry(now), now)
             elif ok:
-                self._spill_error = ""
+                self._uncount_failed_spill(rec)
                 rec.disk = fd
                 self.ssd_stats["spilled_bytes"] += rec.nbytes
                 self.ssd_stats["spills"] += 1
@@ -496,6 +500,8 @@ class NixlStorageUnit:  # pragma: no cover
                 # The blob is published and its IO copy is now the only copy:
                 # keep it (never evicted while rec.disk is None) and retry.
                 rec.spill_due = True
+                if not rec.spill_failed_at:  # a failed retry must not count twice
+                    self._failed_spill_bytes += rec.nbytes
                 rec.spill_failed_at = now
                 self._spill_error = err
                 self.ssd_stats["spill_failures"] += 1
@@ -503,6 +509,17 @@ class NixlStorageUnit:  # pragma: no cover
             _close(fd)
         with self._mu:
             self._io_jobs -= 1  # last: the job owned the file until here
+
+    def _uncount_failed_spill(self, rec: BlobRec) -> None:
+        """A blob whose write failed stops holding failed room (caller holds ``_mu``).
+
+        Called when its retry succeeds or it is released; a no-op if it never failed.
+        """
+        if rec.spill_failed_at:
+            self._failed_spill_bytes -= rec.nbytes
+            rec.spill_failed_at = 0.0
+            if not self._failed_spill_bytes:
+                self._spill_error = ""
 
     def _new_file(self) -> int:
         """Open a fresh file in the SSD dir and unlink it at once; the fd keeps it.
@@ -811,6 +828,7 @@ class NixlStorageUnit:  # pragma: no cover
         """
         now = time.monotonic()
         at = rec.pin_expiry(now)
+        self._uncount_failed_spill(rec)  # a released blob holds no failed room
         if rec.in_slab:
             _free_at(self.alloc_, rec.off, rec.nbytes, at, now)
             rec.in_slab = False
@@ -862,7 +880,7 @@ class NixlStorageUnit:  # pragma: no cover
                 rec.stage_failed = False  # reported once; the next resolve retries
                 failed.append(b)
                 continue
-            elif not self._start_stage(b, rec, now) and self._spill_error:
+            elif not self._start_stage(b, rec, now) and self._failed_spill_bytes > 0:
                 failed.append(b)  # the IO area is full of failed spills: no room soon
                 continue
             else:

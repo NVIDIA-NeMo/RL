@@ -303,6 +303,35 @@ def test_a_disk_that_stays_broken_fails_puts_and_cold_reads_at_once(
     assert set(_read(u, "s0")[0]) == {7}
 
 
+def test_a_released_failed_spill_does_not_make_a_healthy_unit_fail_reads(
+    tmp_path, monkeypatch
+):
+    """One write fails, its blob is released before the retry, the disk is fine:
+    a full IO area is ordinary pressure again, so a cold read waits (pending)."""
+    u = _unit(tmp_path)
+    _fill(u)
+    _put(u, "s0", 7)  # an older spill with a healthy file
+    _disk_only(u, "s0")
+    real = os.pwrite
+    monkeypatch.setattr(
+        nixl_storage_unit.os,
+        "pwrite",
+        lambda *a: (_ for _ in ()).throw(OSError(5, "Input/output error")),
+    )
+    _write(u, "s1", u.alloc("s1", BLOB, 1), 5)
+    assert u.commit("s1") == "done"
+    _wait(lambda: u.stats()["spill_failures"] == 1 and u._io_jobs == 0)
+    assert u._failed_spill_bytes == u.blobs["s1"].nbytes
+    monkeypatch.setattr(nixl_storage_unit.os, "pwrite", real)
+    assert u.release_rows([gidx_of("s1")]) == 1  # released before its retry
+    assert u._failed_spill_bytes == 0 and u._spill_error == ""
+    u.alloc("t", u.staging_.capacity, 1)  # a put in progress fills the IO area
+    r = u.resolve(["s0"])
+    assert r["pending"] == ["s0"] and not r["failed"]
+    with pytest.raises(DataPlaneBusy):  # and a put is Busy, not UnitFull
+        u.alloc("v", BLOB, 1)
+
+
 def test_alloc_without_spill_is_unitfull_and_leaves_the_io_area_alone(tmp_path):
     u = _unit(tmp_path)
     _fill(u)
