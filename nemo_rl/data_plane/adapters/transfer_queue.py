@@ -1624,7 +1624,7 @@ class TQDataPlaneClient(DataPlaneClient):
         controller = ray.get_actor(
             "TransferQueueController", namespace="transfer_queue"
         )
-        return sorted(ray.get(controller.nrl_list_keys.remote(partition_id)))
+        return list(ray.get(controller.nrl_list_keys.remote(partition_id)))
 
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         cleared_via_none = sample_ids is None

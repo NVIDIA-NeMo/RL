@@ -563,7 +563,6 @@ class SingleControllerActor:
                 master_config,
                 env_handles=self._env_handles,
                 rollout_manager=self._rollout_manager,
-                dp_client=self._dp_client,
                 generation=self._gen,
             )
         )

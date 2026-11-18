@@ -375,7 +375,8 @@ def test_list_sample_ids_uses_keys_only_controller_listing(monkeypatch) -> None:
 
     sample_ids = client.list_sample_ids("rollout_data")
 
-    assert sample_ids == ["sample-a", "sample-b"]
+    # Callers compare key sets, so the listing is returned unsorted.
+    assert sample_ids == ["sample-b", "sample-a"]
     assert client._data_operations_started
     get_actor.assert_called_once_with(
         "TransferQueueController", namespace="transfer_queue"

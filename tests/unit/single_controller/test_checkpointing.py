@@ -83,6 +83,7 @@ from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.rollout_checkpointing import snapshots as snapshots_module
 from nemo_rl.algorithms.rollout_checkpointing.inventory import (
     capture_reward_settings,
+    list_staging_keys,
     validate_rollout_recovery_inventory,
 )
 from nemo_rl.algorithms.rollout_checkpointing.manifest import (
@@ -180,9 +181,13 @@ class _FakeEnvironmentSnapshot:
 
     def __init__(self) -> None:
         self.checked_cuts: list[Any] = []
+        self.checked_staging_keys: list[frozenset[str]] = []
 
-    async def check_against_cut(self, cut: Any) -> frozenset[str]:
+    async def check_against_cut(
+        self, cut: Any, tq_staging_keys: frozenset[str]
+    ) -> frozenset[str]:
         self.checked_cuts.append(cut)
+        self.checked_staging_keys.append(tq_staging_keys)
         return frozenset()
 
     def metrics(self, paused_seconds: float) -> dict[str, float]:
@@ -581,6 +586,7 @@ def _validate_staging(dp_client: Any, **kwargs: Any) -> int:
                 dp_client=dp_client,
                 recovery_ledger=ledger,
                 staging_partition=_STAGING,
+                actual_staging_keys=await list_staging_keys(dp_client, _STAGING),
                 **kwargs,
             )
 
@@ -2049,6 +2055,7 @@ class TestPeriodicRolloutCheckpoint:
         live_cursor = {"cursor": {"offset": 1}}
         actor._dataloader.state_dict = lambda: live_cursor
         environment_snapshot = _FakeEnvironmentSnapshot()
+        cuts = []
 
         @contextlib.asynccontextmanager
         async def snapshot(_path):
@@ -2063,7 +2070,7 @@ class TestPeriodicRolloutCheckpoint:
             def persist(self, *, extra_metadata=None) -> None:
                 assert events == ["pause", "capture", "resume"]
                 with pytest.raises(RuntimeError):
-                    environment_snapshot.checked_cuts[0].require_live()
+                    cuts[0].require_live()
                 events.append("persist")
                 if failure == "persist":
                     raise OSError("persist failed")
@@ -2073,13 +2080,20 @@ class TestPeriodicRolloutCheckpoint:
 
         def capture_checkpoint(checkpoint_dir, *, metadata):
             assert events == ["pause"]
-            environment_snapshot.checked_cuts[0].require_live()
+            cuts[0].require_live()
             events.append("capture")
             return Capture()
 
         actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
         actor._dp_client.capture_checkpoint = capture_checkpoint
         attach_rollout_checkpointing(actor)
+        capture = actor._rollout_snapshots.capture
+
+        async def recording_capture(cut, *args, **kwargs):
+            cuts.append(cut)
+            return await capture(cut, *args, **kwargs)
+
+        actor._rollout_snapshots.capture = recording_capture
         if failure == "publish":
 
             async def fail_publish(*args, **kwargs):
@@ -2183,6 +2197,61 @@ class TestPeriodicRolloutCheckpoint:
         output = capsys.readouterr().out
         assert "data-plane checkpoint captured:" in output
         assert "data-plane checkpoint save started:" not in output
+
+    def test_snapshot_lists_staging_once_and_checks_the_environment_beside_capture(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        listings = []
+        list_sample_ids = actor._dp_client.list_sample_ids
+
+        def listing(partition_id: str) -> list[str]:
+            listings.append(partition_id)
+            if partition_id == _STAGING_PARTITION_ID:
+                return ["environment-key"]
+            return list_sample_ids(partition_id)
+
+        capture_started = threading.Event()
+        environment_checked = threading.Event()
+        checked_staging_keys = []
+
+        class EnvironmentSnapshot(_FakeEnvironmentSnapshot):
+            async def check_against_cut(self, cut, tq_staging_keys):
+                checked_staging_keys.append(tq_staging_keys)
+                # Run one after another, the capture would never start.
+                assert await asyncio.to_thread(capture_started.wait, 10)
+                environment_checked.set()
+                return frozenset({"environment-key"})
+
+        @contextlib.asynccontextmanager
+        async def snapshot(_path):
+            yield EnvironmentSnapshot()
+
+        class Capture(CheckpointCapture):
+            token = "capture-1"
+
+            def persist(self, *, extra_metadata=None) -> None:
+                pass
+
+            def release(self) -> None:
+                pass
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            capture_started.set()
+            assert environment_checked.wait(timeout=10)
+            return Capture()
+
+        actor._dp_client.list_sample_ids = listing
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        attach_rollout_checkpointing(actor)
+        try:
+            assert asyncio.run(actor._rollout_snapshots.save_snapshot(force=True)).saved
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert listings.count(_STAGING_PARTITION_ID) == 1
+        assert checked_staging_keys == [frozenset({"environment-key"})]
 
     def test_capture_phases_overlap_under_the_barrier(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

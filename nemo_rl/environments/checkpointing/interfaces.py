@@ -25,9 +25,10 @@ A rollout snapshot uses the interface in this order::
 
     async with env_checkpoint.snapshot(path) as snapshot:  # backend paused
         async with data_plane_barrier.checkpoint() as cut:
+            staging_keys = ...  # TQ's staging rows, listed once under the cut
             kept = set()
             if snapshot is not None:
-                kept = await snapshot.check_against_cut(cut)
+                kept = await snapshot.check_against_cut(cut, staging_keys)
             ...  # RL saves TQ, holding the ``kept`` staging rows, and its own state
     # backend resumed
 """
@@ -112,11 +113,15 @@ class EnvironmentSnapshot(Protocol):
         """Rollouts the backend could not capture; they start over after a crash."""
         ...
 
-    async def check_against_cut(self, cut: DataPlaneMutationCut) -> frozenset[str]:
+    async def check_against_cut(
+        self, cut: DataPlaneMutationCut, tq_staging_keys: frozenset[str]
+    ) -> frozenset[str]:
         """Under the data-plane cut, require the captured state to match RL's.
 
         Raises when the backend's rollouts and RL's ledger disagree, which
-        would make the snapshot unrestorable.
+        would make the snapshot unrestorable, or when the saved backend state
+        references a staging row missing from ``tq_staging_keys``, TQ's
+        staging listing under ``cut``.
 
         Returns:
             Token-capture staging rows the saved backend state references,

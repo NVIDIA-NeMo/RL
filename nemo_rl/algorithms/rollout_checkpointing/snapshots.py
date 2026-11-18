@@ -68,6 +68,7 @@ from nemo_rl.algorithms.metric_utils import (
 )
 from nemo_rl.algorithms.rollout_checkpointing.inventory import (
     capture_reward_settings,
+    list_staging_keys,
     validate_replay_inventory,
     validate_rollout_recovery_inventory,
 )
@@ -501,13 +502,52 @@ class RolloutSnapshotter(_UsesRolloutParts):
         if captured is not None:
             await self._release_failed_capture(captured)
 
+    async def _check_staging(
+        self,
+        cut: DataPlaneMutationCut,
+        *,
+        replay_metadata: Optional[TQReplayMetadataState],
+        environment_snapshot: Optional[EnvironmentSnapshot],
+    ) -> int:
+        """List TQ's staging rows once; check the environment's and RL's references.
+
+        Returns:
+            The staging rows RL references, or 0 without token capture.
+        """
+        token_capture = self._master_config.token_capture
+        staging_keys: frozenset[str] = frozenset()
+        if token_capture.enabled:
+            staging_keys = await list_staging_keys(
+                self._dp_client, token_capture.staging_partition
+            )
+        environment_keys: frozenset[str] = frozenset()
+        if environment_snapshot is not None:
+            # The environment's saved state can reference rows RL's ledger does
+            # not own, such as a generation prefix; the TQ capture must hold
+            # those too.
+            environment_keys = await environment_snapshot.check_against_cut(
+                cut, staging_keys
+            )
+        if not token_capture.enabled:
+            return 0
+        return await validate_rollout_recovery_inventory(
+            cut,
+            dp_client=self._dp_client,
+            recovery_ledger=self._rollout_recovery_ledger,
+            staging_partition=token_capture.staging_partition,
+            actual_staging_keys=staging_keys,
+            replay_metadata=replay_metadata,
+            clear_unreferenced=False,
+            additional_expected_staging_keys=set(environment_keys),
+        )
+
     async def capture(
         self,
         cut: DataPlaneMutationCut,
         checkpoint_path: PathLike,
         kind: CheckpointKind,
         *,
-        additional_expected_staging_keys: Optional[set[str]] = None,
+        environment_snapshot: Optional[EnvironmentSnapshot] = None,
         allow_deferred: bool = False,
     ) -> SnapshotCapture:
         """Capture restart-facing controller state under the mutation barrier.
@@ -519,7 +559,9 @@ class RolloutSnapshotter(_UsesRolloutParts):
 
         The inventory checks, the recovery-state build and, with
         ``allow_deferred``, the TQ capture run concurrently: nothing they read
-        can change while the barrier is held.
+        can change while the barrier is held. ``environment_snapshot``, a
+        rollout snapshot's paused environment, is checked against the same
+        staging listing as RL's ledger.
 
         With ``allow_deferred``, a supporting backend retains a stable TQ view
         and the recovery state is serialized after the barrier opens. The caller
@@ -602,15 +644,14 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     if replay_metadata is not None
                     else set(),
                 )
-            if self._master_config.token_capture.enabled:
-                phases["staging_inventory"] = validate_rollout_recovery_inventory(
+            if (
+                self._master_config.token_capture.enabled
+                or environment_snapshot is not None
+            ):
+                phases["staging_inventory"] = self._check_staging(
                     cut,
-                    dp_client=self._dp_client,
-                    recovery_ledger=self._rollout_recovery_ledger,
-                    staging_partition=self._master_config.token_capture.staging_partition,
                     replay_metadata=replay_metadata,
-                    clear_unreferenced=False,
-                    additional_expected_staging_keys=additional_expected_staging_keys,
+                    environment_snapshot=environment_snapshot,
                 )
             if allow_deferred:
                 phases["tq_capture"] = self._capture_data_plane_checkpoint(
@@ -948,21 +989,11 @@ class RolloutSnapshotter(_UsesRolloutParts):
                                 reason="shortfall_reconciliation_pending",
                             )
                         snapshot_epoch = self._read_progress().current_epoch
-                        environment_staging_keys: frozenset[str] = frozenset()
-                        if environment_snapshot is not None:
-                            # The environment's saved state can reference rows
-                            # RL's ledger does not own, such as a generation
-                            # prefix; the TQ capture must hold those too.
-                            environment_staging_keys = (
-                                await environment_snapshot.check_against_cut(cut)
-                            )
                         captured = await self.capture(
                             cut,
                             tmp_path,
                             "rollout_snapshot",
-                            additional_expected_staging_keys=set(
-                                environment_staging_keys
-                            ),
+                            environment_snapshot=environment_snapshot,
                             allow_deferred=True,
                         )
                         snapshot_cut = captured.state
