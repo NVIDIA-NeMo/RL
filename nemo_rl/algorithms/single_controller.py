@@ -3475,6 +3475,10 @@ class SingleControllerActor:
                     if step_open:
                         await asyncio.to_thread(self._trainer.abort_train_step)
                         step_open = False
+                    if value_step_open:
+                        await self._ppo_worker_call(self._value.abort_train_step)
+                        await self._ppo_worker_call(self._value.finish_training)
+                        value_step_open = False
                     await self._rollout_snapshots.begin_optimizer_commit(
                         drain_snapshot=False
                     )
@@ -5453,20 +5457,19 @@ class SingleControllerActor:
                 self._value.prepare_for_inference, **resident_kwargs
             )
         await self._ppo_worker_call(self._value.get_values_from_meta, meta)
-        await self._ppo_worker_call(
-            self._value.finish_inference, **resident_kwargs
-        )
+        await self._ppo_worker_call(self._value.finish_inference, **resident_kwargs)
         return meta.with_fields([self._advantage_cfg.values_field])
 
     async def _stream_value_chunk(
         self, meta: KVBatchMeta, *, first_chunk: bool
     ) -> None:
+        value_loss_fn = self._value_loss_fn
+        if value_loss_fn is None:
+            raise RuntimeError("PPO value training requires a value loss function")
         with self._timer.time("value_training_streamed"):
             if first_chunk:
                 await self._ppo_worker_call(self._value.prepare_for_training)
-                await self._ppo_worker_call(
-                    self._value.begin_train_step, self._value_loss_fn
-                )
+                await self._ppo_worker_call(self._value.begin_train_step, value_loss_fn)
             await self._ppo_worker_call(self._value.train_microbatches_from_meta, meta)
 
     async def _ppo_worker_call(
@@ -5508,9 +5511,7 @@ class SingleControllerActor:
                     value_result = await self._ppo_worker_call(
                         self._value.finish_train_step
                     )
-                await self._ppo_worker_call(
-                    self._value.finish_training, keep_resident=True
-                )
+                await self._ppo_worker_call(self._value.finish_training)
                 if self._critic_ppo_epochs > 1:
                     value_result = await self._value_train_epochs(
                         metas, num_epochs=self._critic_ppo_epochs - 1
