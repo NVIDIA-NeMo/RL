@@ -91,11 +91,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.data.captured_media import media_capture_family
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.multimodal_utils import (
     WIRE_MULTIMODAL_FIELDS,
     per_token_multimodal_schema,
-    uses_image_placeholder,
 )
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
@@ -1378,6 +1378,9 @@ def setup_single_controller(
             "MInf routing indices can be joined with Gym lineage"
         )
     capture_media = token_capture_cfg.enabled and processor is not None
+    # The driver picks the media family from the processor; the serving workers
+    # only confirm that their engine built the matching processor.
+    media_family = media_capture_family(processor) if capture_media else None
     generation_prefix_cuts_enabled = (
         master_config.rollout_recovery.generation_prefix_cuts_enabled
     )
@@ -1388,10 +1391,15 @@ def setup_single_controller(
                 "generation-prefix recovery does not yet support router replay"
             )
     if capture_media:
-        if not uses_image_placeholder(processor):
+        if media_family is None:
             raise ValueError(
-                "VLM token capture currently supports Omni dynamic images and native video"
+                "VLM token capture supports the Nemotron Omni and Pixtral (Mistral3) "
+                f"processors; got {type(processor).__name__}"
             )
+        if media_family == "pixtral":
+            # The vLLM worker captures Pixtral images, but no learner reads that
+            # captured layout yet.
+            raise ValueError("Pixtral (Mistral3) media capture has no learner yet")
         if not policy_config["megatron_cfg"]["enabled"]:
             raise ValueError(
                 "Omni media token capture currently requires the Megatron learner"
@@ -2301,6 +2309,7 @@ def setup_single_controller(
             dp_config,
             token_capture_cfg.staging_partition,
             capture_media=capture_media,
+            media_family=media_family,
             top_logprobs=master_config.policy["generation"]["top_logprobs"],
             generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
             generation_cut_control_token=token_capture_cfg.control_auth_token,

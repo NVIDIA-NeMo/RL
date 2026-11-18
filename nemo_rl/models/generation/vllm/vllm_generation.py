@@ -207,6 +207,7 @@ class _TokenCaptureSetup:
     dp_cfg: "DataPlaneConfig"
     staging_partition: str
     capture_media: bool
+    media_family: str | None
     top_logprobs: int
     generation_prefix_cuts_enabled: bool
     generation_cut_control_token: str | None
@@ -907,6 +908,7 @@ class VllmGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        media_family: str | None = None,
         top_logprobs: int = 0,
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
@@ -929,6 +931,7 @@ class VllmGeneration(GenerationInterface):
             dp_cfg,
             staging_partition,
             capture_media,
+            media_family,
             top_logprobs,
             generation_prefix_cuts_enabled,
             generation_cut_control_token,

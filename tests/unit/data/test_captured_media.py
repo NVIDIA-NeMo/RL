@@ -741,6 +741,9 @@ def test_worker_restart_validates_retained_media(
         _hash_captured_media=False,
         _capture_image_token_id=18,
         _capture_patch_size=1,
+        _capture_media_family="omni",
+        _capture_spatial_merge_size=None,
+        _capture_cast_pixel_dtype=None,
         _staging_source=source,
         _chain_prefix=ChainPrefixCache(source),
     )
@@ -795,6 +798,9 @@ def _stage_media_prefix(dp, tokens, prompt):
         _hash_captured_media=True,
         _capture_image_token_id=18,
         _capture_patch_size=1,
+        _capture_media_family="omni",
+        _capture_spatial_merge_size=None,
+        _capture_cast_pixel_dtype=None,
     )
     admission = CaptureAdmission(
         rollout_id="r0", model_call_id="c1", prev_len=0, mode="text"
@@ -1325,6 +1331,9 @@ def retained_call(dp):
         _hash_captured_media=False,
         _capture_image_token_id=18,
         _capture_patch_size=1,
+        _capture_media_family="omni",
+        _capture_spatial_merge_size=None,
+        _capture_cast_pixel_dtype=None,
         _staging_source=source,
         _chain_prefix=ChainPrefixCache(source),
     )
@@ -2122,6 +2131,9 @@ def test_worker_rejects_uncommitted_retained_offsets_before_splice(dp, reseal_me
         _capture_media=True,
         _capture_image_token_id=18,
         _capture_patch_size=1,
+        _capture_media_family="omni",
+        _capture_spatial_merge_size=None,
+        _capture_cast_pixel_dtype=None,
         _staging_source=TQTokenSource(
             dp, staging_partition="staging", capture_media=True
         ),

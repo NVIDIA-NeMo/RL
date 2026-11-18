@@ -457,6 +457,13 @@ class VllmAsyncGenerationWorkerImpl(
         self._hash_captured_media = False
         self._capture_patch_size: int | None = None
         self._capture_image_token_id: int | None = None
+        # "omni" (Nemotron Omni dynamic tiler) or "pixtral" (vLLM Mistral3): the
+        # family the driver picked, set by setup_token_capture with media.
+        self._capture_media_family: str = "omni"
+        self._capture_spatial_merge_size: int | None = None
+        # Pixtral: the staging column's pinned dtype, which captured pixels are
+        # cast to. None for Omni, whose pixels already arrive in it.
+        self._capture_cast_pixel_dtype: torch.dtype | None = None
         # TQTokenSource installed by setup_token_capture. The media path reads
         # parent-chain rows through it directly; prefix resolution goes through
         # the shared ChainPrefixCache below.
@@ -864,6 +871,7 @@ class VllmAsyncGenerationWorkerImpl(
         staging_partition: str,
         *,
         capture_media: bool = False,
+        media_family: str | None = None,
         top_logprobs: int = 0,
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
@@ -877,7 +885,10 @@ class VllmAsyncGenerationWorkerImpl(
         vLLM adapter into this worker. Returns the media column spec this
         worker pinned the staging column to (``None`` for text-only capture
         and on non-model-owner ranks, which serve no HTTP and install nothing).
-        ``top_logprobs`` > 0 stages sampler top-k log-probs.
+        ``top_logprobs`` > 0 stages sampler top-k log-probs. With
+        ``capture_media``, ``media_family`` is the family the driver picked from
+        the run's processor; this worker only checks that vLLM built the
+        matching processor.
         """
         if not self.is_model_owner:
             return None
@@ -912,35 +923,60 @@ class VllmAsyncGenerationWorkerImpl(
                 "generation-prefix cuts require a non-empty control bearer token"
             )
         if capture_media:
-            # Omni-only: a new processor family must also change setup.py (driver
-            # checks), captured_media.py (_processed_omni_tensors, pack_images,
-            # capture_processed_media), tq_token_sink.py (MEDIA_TENSOR_COLUMNS,
-            # validate_media_tensors, fetch_media) and rollout_reassembler.py
-            # (_concat_media, _trainer_media).
+            # The driver picks the family from the run's processor
+            # (captured_media.media_capture_family); this only checks that vLLM
+            # built the matching processor. Both families stage the same packed
+            # imgs / imgs_sizes columns, so tq_token_sink.py and
+            # rollout_reassembler.py are shared. The driver rejects Pixtral
+            # until a learner reads that layout, so the Pixtral branch below is
+            # not reachable from a run yet.
             # Optional engine/Gym capabilities are checked only on VLM workers.
+            from vllm.model_executor.models.mistral3 import Mistral3ProcessingInfo
             from vllm.model_executor.models.nano_nemotron_vl import (
                 NanoNemotronVLProcessingInfo,
             )
 
             info = self.llm.renderer.get_mm_processor().info
-            if (
-                not isinstance(info, NanoNemotronVLProcessingInfo)
-                or not info.is_dynamic_tiler
-            ):
-                raise ValueError(
-                    "Media capture requires vLLM's Omni dynamic-resolution processor"
-                )
-            if info.get_video_pruning_rate():
-                raise ValueError(
-                    "Omni media capture does not support video token pruning"
-                )
-            context_ids = info.get_hf_processor()._img_context_token_ids
-            if len(context_ids) != 1:
-                raise ValueError(
-                    "Omni media capture requires one image-context token ID"
-                )
-            self._capture_image_token_id = int(context_ids[0])
-            self._capture_patch_size = int(info.get_hf_config().patch_size)
+            if media_family == "pixtral":
+                if not isinstance(info, Mistral3ProcessingInfo):
+                    raise ValueError(
+                        "Pixtral media capture requires vLLM's Mistral3 processor; "
+                        f"got {type(info).__name__}"
+                    )
+                # Pixtral vision tower: the same packed patches and imgs_sizes as
+                # Omni (captured_media._processed_pixtral_tensors).
+                hf_config = info.get_hf_config()
+                self._capture_media_family = "pixtral"
+                self._capture_image_token_id = int(hf_config.image_token_index)
+                self._capture_patch_size = int(hf_config.vision_config.patch_size)
+                self._capture_spatial_merge_size = int(hf_config.spatial_merge_size)
+                # vLLM's Pixtral processor emits float32 pixels; the vision tower
+                # casts them to the model dtype the staging column is pinned to.
+                self._capture_cast_pixel_dtype = pixel_dtype
+            elif media_family == "omni":
+                if not isinstance(info, NanoNemotronVLProcessingInfo):
+                    raise ValueError(
+                        "Omni media capture requires vLLM's NanoNemotronVL processor; "
+                        f"got {type(info).__name__}"
+                    )
+                if not info.is_dynamic_tiler:
+                    raise ValueError(
+                        "Omni media capture requires the dynamic-resolution tiler"
+                    )
+                if info.get_video_pruning_rate():
+                    raise ValueError(
+                        "Omni media capture does not support video token pruning"
+                    )
+                context_ids = info.get_hf_processor()._img_context_token_ids
+                if len(context_ids) != 1:
+                    raise ValueError(
+                        "Omni media capture requires one image-context token ID"
+                    )
+                self._capture_media_family = "omni"
+                self._capture_image_token_id = int(context_ids[0])
+                self._capture_patch_size = int(info.get_hf_config().patch_size)
+            else:
+                raise ValueError(f"Unsupported media capture family {media_family!r}")
         self._capture_media = capture_media
         self._hash_captured_media = capture_media and generation_prefix_cuts_enabled
         self._capture_sink = sink
@@ -1244,6 +1280,10 @@ class VllmAsyncGenerationWorkerImpl(
             image_token_id=self._capture_image_token_id,
             patch_size=self._capture_patch_size,
             retained_tensors=retained_tensors,
+            media_family=self._capture_media_family,
+            # Pinned at setup to the staging column's dtype (None for Omni).
+            cast_pixel_dtype=self._capture_cast_pixel_dtype,
+            spatial_merge_size=self._capture_spatial_merge_size,
         )
         if self._hash_captured_media:
             # Hash once per call here, off the event loop, so a prefix cut can
