@@ -4639,7 +4639,7 @@ requires-dist = [
     { name = "nemo-gym", marker = "extra == 'nemo-gym'", editable = "3rdparty/Gym-workspace/Gym" },
     { name = "nemo-lens", extras = ["aiohttp", "fastapi", "sdk"], git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=4d045c03186b90afdc815db46b671f6a21bc7e98" },
     { name = "ninja" },
-    { name = "nixl", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==1.3.0" },
+    { name = "nixl", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==1.5.2" },
     { name = "num2words", specifier = ">=0.5.14" },
     { name = "num2words", marker = "extra == 'vllm'", specifier = ">=0.5.14" },
     { name = "numpy" },
@@ -4796,19 +4796,19 @@ wheels = [
 
 [[package]]
 name = "nixl"
-version = "1.3.0"
+version = "1.5.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "nixl-cu12" },
     { name = "nixl-cu13" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fa/a8/1e956af6efd181f44d0a94bfc9d883f1b19788467357018fbffe1fbe7a2d/nixl-1.3.0-py3-none-any.whl", hash = "sha256:000e2852040bce7863420c98f2c8ca675dc24066099c746fdbfe2bed3593ec9e", size = 10297, upload-time = "2026-06-15T23:22:51.093Z" },
+    { url = "https://files.pythonhosted.org/packages/07/25/670a0913285e12d3682520ecb10e50fb4fc01cbbb107e192a6666b6f5731/nixl-1.5.2-py3-none-any.whl", hash = "sha256:e4ef5e16f60be11622030e23333387bd73101102fc9f62efa1c99021d51550a6", size = 11806, upload-time = "2026-10-29T19:48:26.861Z" },
 ]
 
 [[package]]
 name = "nixl-cu12"
-version = "1.3.0"
+version = "1.5.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -4817,13 +4817,13 @@ dependencies = [
     { name = "torch", version = "2.14.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-nemo-gym') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-modelopt' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-nvrx' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-trtllm') or (extra != 'extra-7-nemo-rl-modelopt' and extra != 'extra-7-nemo-rl-nemo-gym' and extra != 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/36/f8/9ac816a23a35da5c79ce1e1da80933a013112073a00f4da52eb576a3ee68/nixl_cu12-1.3.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:9a275d532ddb45ecdc5af00f7f47f8945a027d9a1c7a3184d688e151764da2dc", size = 49104015, upload-time = "2026-06-15T23:17:23.474Z" },
-    { url = "https://files.pythonhosted.org/packages/cf/1a/2c11c42f71c0acf164c953291ec28297caeab02f571d9a97e7eca2034b3b/nixl_cu12-1.3.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:60eef38ee2b62957de8ba7d3178618b8bb099663bfd111cb19174b5010c7bd77", size = 50558141, upload-time = "2026-06-15T23:15:00.616Z" },
+    { url = "https://files.pythonhosted.org/packages/de/59/b2b4776d3e3b879b403d51bc312cba7f7bbda47ca3764675f646171fad73/nixl_cu12-1.5.2-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:deb477622a1e82326030d658563340c1e36102d6c6241f9689912ef540028aa4", size = 66932281, upload-time = "2026-10-29T19:47:12.454Z" },
+    { url = "https://files.pythonhosted.org/packages/d5/d0/530d7357df5c4fa664bb417d83a08c4f0658e60f07b235bd866f822295a2/nixl_cu12-1.5.2-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:dd9301bc09038d543c14e8dc77f915d7c57294e4f722febc03ff56643611db2e", size = 68655754, upload-time = "2026-10-29T19:44:14.509Z" },
 ]
 
 [[package]]
 name = "nixl-cu13"
-version = "1.3.0"
+version = "1.5.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -4832,8 +4832,8 @@ dependencies = [
     { name = "torch", version = "2.14.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-nemo-gym') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-modelopt' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-nvrx' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-trtllm') or (extra != 'extra-7-nemo-rl-modelopt' and extra != 'extra-7-nemo-rl-nemo-gym' and extra != 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ea/ff/9f462e977a40128c088bdc698ab855635caa5d7511fca245365ebf5d5e45/nixl_cu13-1.3.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:7c42f8546cfbe4595669212d4bbf596590f61494f0ae1a3bfbd3fb4fe4abf84f", size = 43678469, upload-time = "2026-06-15T23:21:58.728Z" },
-    { url = "https://files.pythonhosted.org/packages/67/96/d01c466193e88fcc4afeb2dc29ff35512b4af497db7a2e76e95f3f75b821/nixl_cu13-1.3.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:2363d3922402f7f3b7302254c3b44cc71520e5ad6a9dc43898fa59a6ee0620a3", size = 45134021, upload-time = "2026-06-15T23:19:50.763Z" },
+    { url = "https://files.pythonhosted.org/packages/00/d9/1ba9016611e3f9d773ed55fbf37fc6bb92c0d0dac6386f37e7228c76cdd1/nixl_cu13-1.5.2-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:ac83c16b59aa0027c0604ad636bd5b8a172512db09af73038be8fefdb3eca16c", size = 75548014, upload-time = "2026-10-29T19:46:56.288Z" },
+    { url = "https://files.pythonhosted.org/packages/fd/be/e398acacfbd26dba4c720215942681746418b2999013f8a7116744f6a4b8/nixl_cu13-1.5.2-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:f1137c583df7f98997e411f386286c045b7e5c251c08198ce4f55e3f2b464fc5", size = 77375091, upload-time = "2026-10-29T19:43:42.902Z" },
 ]
 
 [[package]]
