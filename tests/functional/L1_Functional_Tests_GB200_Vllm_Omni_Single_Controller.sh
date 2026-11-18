@@ -50,6 +50,8 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
 run_test fast uv run --no-sync bash ./tests/functional/nemotron_omni_clevr_vllm_token_capture_single_controller_1n2g.sh
 run_test fast uv run --no-sync bash ./tests/functional/nemotron_omni_gym_video_vllm_token_capture_single_controller_1n2g.sh
+# Kills and restores a run mid-decode on image prompts; full mode only.
+run_test uv run --no-sync bash ./tests/functional/nemotron_omni_clevr_vllm_prefix_recovery_single_controller_1n2g.sh
 
 cd "${PROJECT_ROOT}/tests"
 if compgen -G ".coverage*" > /dev/null; then

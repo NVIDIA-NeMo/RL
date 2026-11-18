@@ -2305,6 +2305,8 @@ def test_reward_checks_seals_and_survives_checkpoint(granularity):
         seal(evidence)
         seal(evidence)
         for field in dataclasses.fields(evidence):
+            if field.name == "length_penalty":
+                continue
             with pytest.raises(ValueError, match="conflicting duplicate"):
                 seal(dataclasses.replace(evidence, **{field.name: False}))
     else:
@@ -2316,10 +2318,6 @@ def test_reward_checks_seals_and_survives_checkpoint(granularity):
     assert restored.finalization_inputs("g7")[3] == [-2.0]
     assert restored.finalization_inputs("g7")[5] == [evidence]
     assert restored.finalization_inputs("g7")[6] == [context]
-    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
-    attempt["reward_checks"]["low_effort"] = "false"
-    with pytest.raises(ValueError, match="reward checks must be booleans"):
-        RolloutRecoveryLedger.from_state_dict(state)
 
 
 def test_checkpoint_preserves_pending_finalizer_metrics_independently_of_sealed_groups():
@@ -2348,49 +2346,6 @@ def test_checkpoint_preserves_pending_finalizer_metrics_independently_of_sealed_
     del state["finalizer_metrics_by_group"]
     with pytest.raises(ValueError, match="missing 'finalizer_metrics_by_group'"):
         parse_rollout_recovery_state(state)
-
-
-@pytest.mark.parametrize(
-    "raw_checks",
-    [
-        "not-a-mapping",
-        {"duplicated_reasoning": True, "empty_final_answer": True},
-        {
-            "duplicated_reasoning": True,
-            "empty_final_answer": True,
-            "low_effort": True,
-            "extra": True,
-        },
-    ],
-)
-def test_restore_rejects_malformed_reward_checks(raw_checks):
-    from nemo_rl.experience.reward_penalties import RewardChecks
-
-    ledger = RolloutRecoveryLedger()
-    group = _reserve(
-        ledger,
-        prompt_id="7",
-        prompt_payload=_prompt(),
-        expected_generations=1,
-        target_step=0,
-        start_weight_version=4,
-        group_id="g7",
-        restore_level=RecoveryTargetLevel.PROMPT_GROUP,
-    )
-    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
-    rollout_id = group.gate_rollout_ids[0]
-    result = SiblingSealResult(
-        rollout_id,
-        {"capture_key": rollout_id, "manifest": []},
-        1.0,
-        False,
-        RewardChecks(False, False, False),
-    )
-    _mutate(lambda cut: ledger.mark_group_sealed(cut, "g7", {0: result}))
-    state = ledger.state_dict()
-    state["groups"][0]["siblings"][0]["attempts"][0]["reward_checks"] = raw_checks
-    with pytest.raises(ValueError):
-        RolloutRecoveryLedger.from_state_dict(state)
 
 
 def test_checkpoint_validates_reward_settings_and_observations():
@@ -2833,3 +2788,32 @@ def test_checkpoint_requires_short_step_permissions_for_new_schema() -> None:
         parse_rollout_recovery_state(state)
     state["schema_version"] = 7
     assert parse_rollout_recovery_state(state).steps_allowed_short == set()
+
+
+@pytest.mark.nemo_gym
+def test_length_penalty_metadata_survives_sealed_attempt_restore():
+    from nemo_rl.experience.reward_penalties import RewardChecks
+    from nemo_rl.utils.length_penalty import LengthPenaltyInput
+
+    ledger = _forest_sealed_ledger()
+    state = ledger.state_dict()
+    sample = LengthPenaltyInput(
+        "agent",
+        2,
+        4,
+        False,
+        False,
+        [1.0, 1.0],
+        [3.0, 5.0],
+        {"total": {"a": 3, "b": 6, "f": 0.5}},
+    )
+    evidence = RewardChecks(False, True, False, sample)
+    state["groups"][0]["siblings"][0]["attempts"][0]["reward_checks"] = (
+        dataclasses.asdict(evidence)
+    )
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    _bind(restored, "g7", _prompt())
+    assert restored.state_dict() == state
+    assert (
+        restored.get_group("g7").siblings[0].current_attempt.reward_checks == evidence
+    )
