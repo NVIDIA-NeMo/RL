@@ -92,9 +92,19 @@ docker buildx build -f docker/Dockerfile \
 > [!NOTE]
 > On a long-lived local builder, BuildKit's cache mount (keyed by base image, uv version, and the HybridEP setting) persists across builds regardless of `STRIP_UV_CACHE` -- it just controls whether a copy also ships in the image layers. To reset that mount, run `docker buildx prune --filter type=exec.cachemount`.
 
+## Apptainer
+
+The image does not include [apptainer](https://apptainer.org/) by default. The SWE sandbox environments need it. To install it (with a `singularity` symlink), build with `BUILD_APPTAINER=1`:
+
+```sh
+docker buildx build --build-arg BUILD_APPTAINER=1 -f docker/Dockerfile --tag <registry>/nemo-rl:latest .
+```
+
+The install script is `docker/install_apptainer.sh`. To avoid anonymous GitHub rate limits during its downloads, pass a read-only token as the `APPTAINER_GITHUB_TOKEN` build secret.
+
 ## Custom Setup Commands
 
-By default, the Docker image installs [apptainer](https://apptainer.org/) (with a `singularity` symlink) via a pluggable `custom-setup` build stage. The default script is `docker/install_apptainer.sh`. You can override or skip this step at build time.
+The Docker image can run an extra setup script through a pluggable `custom-setup` build stage. The step is skipped unless `CUSTOM_SETUP_FNAME` is set.
 
 ### Override with a custom script
 
@@ -113,12 +123,4 @@ docker buildx build \
   --build-context custom-setup=my-setup-dir/ \
   --build-arg CUSTOM_SETUP_FNAME=my_script.sh \
   -f docker/Dockerfile --tag <registry>/nemo-rl:latest .
-```
-
-### Skip custom setup entirely
-
-To build without any custom setup commands, set `CUSTOM_SETUP_FNAME` to empty:
-
-```sh
-docker buildx build --build-arg CUSTOM_SETUP_FNAME= -f docker/Dockerfile --tag <registry>/nemo-rl:latest .
 ```

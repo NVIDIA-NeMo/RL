@@ -456,7 +456,7 @@ jobs:
             ${{ steps.trtllm_cache_seed.outputs.ccache_context }}
             ${{ steps.trtllm_cache_seed.outputs.wheel_context }}
           build-args: ${{ inputs.build-args }}
-          # Mounted by the Dockerfile's custom-setup layer (hermetic stage) only;
+          # Mounted by the Dockerfile's Apptainer layer (hermetic stage, BUILD_APPTAINER=1) only;
           # the cache-image steps below build from `base` and do not need it.
           secrets: |
             APPTAINER_GITHUB_TOKEN=${{ secrets.APPTAINER_GITHUB_TOKEN }}
