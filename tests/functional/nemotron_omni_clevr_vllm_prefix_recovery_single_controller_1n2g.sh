@@ -210,9 +210,10 @@ COMMON_OVERRIDES=(
     # Omni save writes the full 30B model.
     checkpointing.save_period="${MAX_STEPS}"
     ++checkpointing.save_data_plane=true
-    # Each run dumps its trained rows (train_data_step*.jsonl in its log dir)
+    # Each run dumps its trained rows (train_data_step*.jsonl in its log dir, so the json writer)
     # for verify-completion.
     ++async_rl.log_full_train_data=true
+    ++async_rl.debug_writer.target=json
 )
 
 OMNI_CMD=(
