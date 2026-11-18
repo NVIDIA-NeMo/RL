@@ -896,9 +896,11 @@ class TestFinish:
         policy_param.main_grad = torch.tensor(5.0)
         w.model.parameters.return_value = [draft_param, policy_param]
 
-        def scale_gradients(factor: float) -> None:
+        def scale_gradients(factor: torch.Tensor) -> None:
+            # The worker's scale is on CUDA in CI, but these mock grads are on CPU.
+            scale = factor.item()
             for param in (draft_param, policy_param):
-                param.main_grad.mul_(factor)
+                param.main_grad.mul_(scale)
 
         w.model.scale_gradients.side_effect = scale_gradients
         w.optimizer.grad_norms_by_group = {"draft": 0.25}
