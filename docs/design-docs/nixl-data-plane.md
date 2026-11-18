@@ -38,6 +38,8 @@ nemo_rl/utils/checkpoint_engines/nixl.py   shared NIXL agent factory
 
 ## Enabling it
 
+The SSD tier (`nixl.ssd`) is on by default: a unit spills only when its put area is full, and the driver logs one warning when `data_plane/nixl/ssd_spills_sum` first rises above 0 in a run.
+
 ```yaml
 data_plane:
   enabled: true
@@ -45,7 +47,7 @@ data_plane:
   backend: nixl
   nixl:
     num_storage_units: null        # default: one per Ray node (2x measured no faster)
-    unit_slab_bytes: 17179869184   # 16 GiB pinned per unit
+    unit_slab_bytes: 17179869184   # 16 GiB put area; 20 GiB pinned with the default SSD tier
 ```
 
 The transport is RDMA only. Every client and unit checks the UCX environment before creating a NIXL backend and refuses TCP:

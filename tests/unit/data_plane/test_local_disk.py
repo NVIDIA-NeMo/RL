@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+
 import pytest
 
 from nemo_rl.data_plane import local_disk
@@ -66,7 +68,9 @@ def test_default_ssd_dir_prefers_a_writable_mounted_raid(
 ):
     # The same device as / is fine: in an enroot container / itself lives on /raid.
     monkeypatch.setattr(local_disk.os, "access", lambda p, mode: writable)
-    assert local_disk.default_ssd_dir("nrl_x", _MOUNTS + raid_line) == expected
+    assert local_disk.default_ssd_dir("nrl_x", _MOUNTS + raid_line) == (
+        f"{expected}-{os.getuid()}"  # one folder per user
+    )
 
 
 def test_the_fallback_is_noted_once_with_what_tmp_is(monkeypatch):

@@ -1749,7 +1749,7 @@ class SingleControllerActor:
             await self._log_data_plane_metrics_impl(total_step_time)
 
     async def _log_data_plane_metrics_impl(self, total_step_time: float) -> None:
-        """Log this step's data-plane cost. No-op unless observability is enabled.
+        """Log this step's data-plane cost.
 
         This client's share depends on the configuration: it writes the rollout
         rows unless token capture moves that to the finalizer actors, and it
