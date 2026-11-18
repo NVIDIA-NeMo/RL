@@ -10,6 +10,7 @@ MAX_STEPS=5
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=90
 USES_SANDBOX=1
+USES_OPENSANDBOX=1
 USE_GYM_CONTAINER=true
 JOB_REAPER_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"120","reason":"disproportionate_resource_requirement","description":"6-node GRPO with vLLM has long GPU-idle phases during Ray init and model loading"}}'
 # ===== END CONFIG =====

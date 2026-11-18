@@ -68,6 +68,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQTokenSource,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
+from nemo_rl.experience.reward_penalties import RewardLogContext  # noqa: E402
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler  # noqa: E402
 from nemo_rl.experience.route_assembly import RouteLayout  # noqa: E402
 from nemo_rl.experience.route_plan import decode_route_plan  # noqa: E402
@@ -252,6 +253,7 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         fallback_weight_version=9,
         prompt_idx=17,
         loss_multiplier=0.25,
+        reward_log_contexts=[RewardLogContext("agent", None)] * 2,
     )
     assert not finalized.dropped
     assert finalized.meta is not None
@@ -260,6 +262,9 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     # Group staleness comes from the valid rollout's calls (wv 4), not the fallback.
     assert (finalized.group_min_wv, finalized.group_max_wv) == (4, 4)
     assert finalized.metrics["finalize/invalid_row_rate"] == 0.5
+    # Only the valid row counts toward truncation; it fills max_seq_len.
+    assert finalized.metrics["finalize/truncated_count"] == 1.0
+    assert finalized.metrics["finalize/truncated_count/agent"] == 1.0
     # Text-only rollouts never carry media.
     assert finalized.metrics["finalize/media_row_rate"] == 0.0
     assert finalized.metrics["finalize/terminal_selection_heuristic_count"] == 1.0
@@ -1856,6 +1861,47 @@ def test_penalties_use_only_verified_selected_generations(
         assert row.penalty_counts["unwanted_token"] == int(expected_reward == 0.0)
 
 
+class _TagTokenizer:
+    """Decodes every generation to ``text``; records what it was asked to decode."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.decoded: list[list[int]] = []
+
+    def decode(self, token_ids, skip_special_tokens: bool) -> str:
+        assert skip_special_tokens is False
+        self.decoded.append(list(token_ids))
+        return self.text
+
+
+@pytest.mark.parametrize(
+    "decoded_text,expected_reward", [("plain answer", -2.0), ("<think>", 0.0)]
+)
+def test_malformed_think_tag_penalty_decodes_each_generation(
+    tq_client, partitions, decoded_text, expected_reward
+):
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+
+    receipt, expected = _stage_fixture(tq_client, "worked_example", rollout_id="r")
+    tokenizer = _TagTokenizer(decoded_text)
+    finalizer = _finalizer(
+        tq_client,
+        reward_penalty_config=RewardPenaltyConfig(penalize_malformed_think_tag=True),
+        tokenizer=tokenizer,
+        thinking_tags=("<think>", "</think>"),
+    )
+    row = finalizer.finalize_rollout("r", receipt, reward=-2.0)
+    assert row.valid, row.rejection_reason
+    assert row.reward == expected_reward
+    assert row.penalty_counts["malformed_think_tag"] == int(expected_reward == 0.0)
+    # Only generated spans are decoded, never the carried prompt tokens.
+    generated = {
+        token for token, mask in zip(expected.token_ids, expected.token_mask) if mask
+    }
+    assert tokenizer.decoded
+    assert all(set(ids) <= generated for ids in tokenizer.decoded)
+
+
 def test_penalized_rewards_reach_grpo_advantages_without_token_changes(
     tq_client, partitions
 ):
@@ -2115,3 +2161,94 @@ def test_effort_uses_terminal_call_with_carries_and_abandoned_branch(
         assert actual.token_ids == full_tokens
         assert actual.token_mask == masks
         assert actual.logprobs == logprobs
+
+
+@pytest.mark.parametrize("length_type", ["chars", "all_generated_tokens"])
+def test_length_penalty_published_rewards_match_shared_hook(
+    tq_client, partitions, length_type
+):
+    from nemo_rl.experience.reward_penalties import RewardChecks
+    from nemo_rl.utils.length_penalty import (
+        LengthPenaltyConfig,
+        LengthPenaltyParams,
+        apply_group_length_penalties,
+        prepare_length_penalty_input,
+    )
+
+    group_id = "length-penalty"
+    rollout_ids = [f"{group_id}_g{i}" for i in range(3)]
+    receipts, rows, results = [], [], []
+    for i in range(2):
+        receipt, _ = _stage_fixture(
+            tq_client, "worked_example", rollout_id=rollout_ids[i]
+        )
+        receipts.append(receipt)
+        rows.append(
+            _finalizer(tq_client).finalize_rollout(rollout_ids[i], receipt, reward=1.0)
+        )
+        results.append(
+            {
+                "agent_ref": {"name": "agent"},
+                "full_result": {
+                    "reward": 1.0,
+                    "response": {
+                        "output": [
+                            {
+                                "type": "message",
+                                "content": [{"text": "x" * (i + 1) * 10}],
+                            }
+                        ]
+                    },
+                },
+                "message_log": [
+                    {
+                        "role": "assistant",
+                        "token_ids": [
+                            token
+                            for token, mask in zip(
+                                rows[-1].token_ids, rows[-1].token_mask
+                            )
+                            if mask
+                        ],
+                    }
+                ],
+            }
+        )
+    config = LengthPenaltyConfig(
+        default=LengthPenaltyParams(
+            length_type=length_type, group_total_length_penalty_coeff=0.2
+        )
+    )
+    checks = [
+        RewardChecks(
+            False,
+            False,
+            False,
+            prepare_length_penalty_input(result, result, config, None),
+        )
+        for result in results
+    ]
+    expected_metrics = apply_group_length_penalties(results, config, 2)
+    finalizer = _finalizer(tq_client, length_penalty_config=config)
+    finalized = finalizer.finalize_group(
+        group_id,
+        rollout_ids,
+        receipts + [None],
+        [1.0, 1.0, 0.0],
+        mask_sample=[False] * 3,
+        fallback_weight_version=0,
+        prompt_idx=7,
+        reward_checks=checks + [None],
+    )
+    batch = _fetch_rows(tq_client, rollout_ids)
+    expected = [result["full_result"]["reward"] for result in results]
+    assert batch["total_reward"].flatten().tolist() == pytest.approx(expected + [0.0])
+    assert [
+        observation.reward for observation in finalized.reward_observations
+    ] == pytest.approx(expected)
+    assert {
+        key: finalized.metrics[f"finalize/{key}_sum"] / len(results)
+        for key in expected_metrics
+    } == pytest.approx(expected_metrics)
+    assert finalized.valid_row_count == 2
+    assert finalized.total_row_count == 3

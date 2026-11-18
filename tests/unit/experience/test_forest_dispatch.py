@@ -5,6 +5,7 @@
 import asyncio
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -193,7 +194,7 @@ def test_forest_seals_failed_owner_without_claiming_its_pending_write():
         return record
 
     manager._impl.run_rollout = completed
-    request = asyncio.run(manager.generate_for_finalization({"idx": 1}))
+    request, _ = asyncio.run(manager.generate_for_finalization({"idx": 1}))
     assert request.receipts[1]["pending_call_ids"] == ["failed"]
     group = manager._recovery_ledger.get_group(request.group_id)
     assert group.siblings[0].current_attempt.staging_keys == [
@@ -227,8 +228,10 @@ def test_actor_creation_preserves_foundation_no_replay_defaults(
         tokenizer=None,
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
         token_capture={
             "enabled": True,
+            "capture_dir": "/capture",
             "forest_training": forest_training,
             "selection_policy": "returned_history",
         },
@@ -360,7 +363,7 @@ def test_forest_retry_and_restart_reuse_durable_selection(
         manager = _make_capture_manager(
             _FakeCaptureBuffer(),
             retry_policy=policy,
-            recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+            recovery_config=RolloutRecoveryConfig(target_level=granularity),
         )
         manager._forest_training = True
         manager._execution_row_multiple = 1
@@ -370,7 +373,14 @@ def test_forest_retry_and_restart_reuse_durable_selection(
     calls, observed = [], {}
 
     async def run(
-        _sample, *, rollout_ids, generation_indices, on_completion, recovery_granularity
+        _sample,
+        *,
+        rollout_ids,
+        generation_indices,
+        on_completion,
+        recovery_granularity,
+        environment_instance_id=None,
+        dispatch_recorder=None,
     ):
         calls.append((list(rollout_ids), list(generation_indices)))
         for index in generation_indices:
@@ -400,6 +410,7 @@ def test_forest_retry_and_restart_reuse_durable_selection(
                     raise ValueError("invalid unfinished sibling")
                 if interruption == "cold" or index == 1:
                     raise asyncio.CancelledError()
+        return SimpleNamespace(rollout_metrics={})
 
     async def exercise():
         nonlocal manager
@@ -426,7 +437,7 @@ def test_forest_retry_and_restart_reuse_durable_selection(
             )
         return await manager.generate_for_finalization({"idx": 99})
 
-    request = asyncio.run(exercise())
+    request, _ = asyncio.run(exercise())
     assert_metadata_only(request)
     if interruption == "sealed_cold":
         assert len(calls) == 1
@@ -467,13 +478,20 @@ def test_forest_unsafe_custody_never_reaches_cleanup(
     harness, plane, _ = recovery_stack
     buffer = _FakeCaptureBuffer()
     manager = _make_capture_manager(
-        buffer, recovery_config=RolloutRecoveryConfig(default_granularity=granularity)
+        buffer, recovery_config=RolloutRecoveryConfig(target_level=granularity)
     )
     manager._forest_training = True
     calls = []
 
     async def run(
-        _sample, *, rollout_ids, generation_indices, on_completion, recovery_granularity
+        _sample,
+        *,
+        rollout_ids,
+        generation_indices,
+        on_completion,
+        recovery_granularity,
+        environment_instance_id=None,
+        dispatch_recorder=None,
     ):
         calls.append(rollout_ids)
         for index in generation_indices:

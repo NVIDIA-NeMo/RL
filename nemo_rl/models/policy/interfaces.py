@@ -302,6 +302,7 @@ class ColocatablePolicyInterface(PolicyInterface):
         gen_parallelism: dict[str, int],
         train_world_size: int,
         gen_world_size: int,
+        layout_index: int = 0,
     ) -> Any:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""
         raise NotImplementedError

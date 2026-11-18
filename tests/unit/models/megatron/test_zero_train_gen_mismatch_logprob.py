@@ -84,14 +84,16 @@ def _run_logprob_contract(rank, world_size, *, dtype, chunk_size):
         )
         rows = full.reshape(-1, _VOCAB).float()
         generation = (
-            DynamicInferenceContext._processed_log_probs(
-                stub, rows, rows.shape[0], None, None
-            )
+            DynamicInferenceContext._processed_log_probs(stub, rows, sampling=None)
             .gather(-1, target.reshape(-1, 1))
             .reshape(_BATCH, _SEQ)
         )
 
-        shim = zgm._FullVocabLogprob(original, chunked=chunk_size is not None)
+        shim = (
+            zgm._DistributedFullVocabLogprob(original)
+            if chunk_size is None
+            else zgm._ChunkedFullVocabLogprob(original)
+        )
         on_logits = local.clone().requires_grad_()
         on_out = shim.apply(on_logits, target, *original_args, False)
         on_out.backward(grad_output)

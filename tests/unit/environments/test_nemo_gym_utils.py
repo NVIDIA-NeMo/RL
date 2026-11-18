@@ -45,7 +45,7 @@ from nemo_rl.environments.nemo_gym import (
 )
 
 
-@pytest.mark.parametrize("backend", ["vllm", "dynamo", "megatron", "trtllm"])
+@pytest.mark.parametrize("backend", ["vllm", "megatron", "trtllm"])
 def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
     generation = {
         "backend": backend,
@@ -59,10 +59,9 @@ def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
 
     setup_nemo_gym_config(config, tokenizer=None)
 
-    is_vllm_like = backend in ("vllm", "dynamo")
     assert generation["vllm_cfg"] == {
-        "async_engine": is_vllm_like,
-        "expose_http_server": is_vllm_like,
+        "async_engine": backend == "vllm",
+        "expose_http_server": backend == "vllm",
     }
     assert generation["mcore_generation_config"] == {
         "expose_http_server": backend == "megatron"
@@ -282,9 +281,20 @@ def detected_uv_dirs(monkeypatch):
     )
 
 
-def test_build_nemo_gym_config_splits_nemo_rl_keys(detected_uv_dirs):
+@pytest.mark.parametrize(
+    "truncate_noncontiguous_episodes",
+    [None, False, True],
+    ids=["absent", "disabled", "enabled"],
+)
+def test_build_nemo_gym_config_splits_nemo_rl_keys(
+    detected_uv_dirs, truncate_noncontiguous_episodes
+):
     """NeMo-RL-only knobs become top-level fields; the rest is Gym's global config."""
     env_configs = _env_configs()
+    if truncate_noncontiguous_episodes is not None:
+        env_configs["nemo_gym"]["truncate_noncontiguous_episodes"] = (
+            truncate_noncontiguous_episodes
+        )
     env_configs_before = copy.deepcopy(env_configs)
 
     cfg = build_nemo_gym_config(
@@ -293,12 +303,16 @@ def test_build_nemo_gym_config_splits_nemo_rl_keys(detected_uv_dirs):
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
     )
 
     assert cfg["model_name"] == "test-model"
     assert cfg["base_urls"] == ["http://vllm-0"]
     assert cfg["invalid_tool_call_patterns"] == ["bad_call"]
     assert cfg["thinking_tags"] == ["<think>"]
+    assert cfg["truncate_noncontiguous_episodes"] is (
+        truncate_noncontiguous_episodes is True
+    )
     assert cfg["tokenizer_config"] == {"name": "test-tokenizer"}
     assert cfg["pad_dynamic_image_shapes"] is True
     assert cfg["initial_global_config_dict"] == {
@@ -329,6 +343,7 @@ def test_build_nemo_gym_config_uv_dirs(detected_uv_dirs, configured, expected):
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
     )
     global_config = cfg["initial_global_config_dict"]
     assert (global_config["uv_cache_dir"], global_config["uv_venv_dir"]) == expected
@@ -357,6 +372,7 @@ def test_build_nemo_gym_config_moves_external_service_readiness_to_actor_field(
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
     )
 
     readiness = cfg["external_service_readiness"]
@@ -387,6 +403,7 @@ def test_build_nemo_gym_config_rejects_invalid_external_service_readiness(
             model_name="test-model",
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )
 
 
@@ -396,6 +413,8 @@ def _stub_gym_spinup(run_helper):
     cli = types.ModuleType("nemo_gym.cli")
     cli.GlobalConfigDictParserConfig = MagicMock
     cli.RunHelper = lambda: run_helper
+    config = types.ModuleType("nemo_gym.config")
+    config.MODEL_CALL_SAMPLING_BLOCK = "model_call_sampling"
     rollout_collection = types.ModuleType("nemo_gym.rollout_collection")
     rollout_collection.RolloutCollectionHelper = MagicMock
     server_utils = types.ModuleType("nemo_gym.server_utils")
@@ -408,6 +427,7 @@ def _stub_gym_spinup(run_helper):
             {
                 "nemo_gym": types.ModuleType("nemo_gym"),
                 "nemo_gym.cli": cli,
+                "nemo_gym.config": config,
                 "nemo_gym.rollout_collection": rollout_collection,
                 "nemo_gym.server_utils": server_utils,
             },
@@ -549,30 +569,124 @@ def test_spinup_stops_local_gym_servers_when_external_services_time_out():
     calls.wait.assert_called_once_with(readiness)
 
 
-def test_build_nemo_gym_config_moves_port_range_to_actor_fields(detected_uv_dirs):
+@pytest.mark.parametrize("truncate_noncontiguous_episodes", [False, True])
+def test_build_nemo_gym_config_moves_port_range_to_actor_fields(
+    detected_uv_dirs, truncate_noncontiguous_episodes
+):
     cfg = build_nemo_gym_config(
-        _env_configs(port_range_low=6000, port_range_high=6999),
+        _env_configs(
+            port_range_low=6000,
+            port_range_high=6999,
+            truncate_noncontiguous_episodes=truncate_noncontiguous_episodes,
+        ),
         base_urls=[],
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
     )
 
     assert (cfg["port_range_low"], cfg["port_range_high"]) == (6000, 6999)
     assert "port_range_low" not in cfg["initial_global_config_dict"]
     assert "port_range_high" not in cfg["initial_global_config_dict"]
+    assert cfg["truncate_noncontiguous_episodes"] is truncate_noncontiguous_episodes
+    assert "truncate_noncontiguous_episodes" not in cfg["initial_global_config_dict"]
 
 
-def test_build_nemo_gym_config_router_replay_off_uses_default_dtype(detected_uv_dirs):
+@pytest.mark.parametrize("truncate_noncontiguous_episodes", [False, True])
+@pytest.mark.parametrize("valid_shards", [False, True])
+def test_truncation_preserves_shard_setup_validation(
+    detected_uv_dirs, truncate_noncontiguous_episodes, valid_shards
+):
+    env_configs = _env_configs(
+        truncate_noncontiguous_episodes=truncate_noncontiguous_episodes,
+        shards=[{"name": "math", "config_paths": ["math.yaml"]}],
+    )
+    if valid_shards:
+        env_configs["nemo_gym"].pop("config_paths")
+    original = copy.deepcopy(env_configs)
+    error = (
+        "entrypoint dispatches rollouts to one actor handle"
+        if valid_shards
+        else "cannot be combined with 'shards'"
+    )
+    with (
+        patch.object(nemo_gym_mod, "NemoGym") as mock_actor,
+        patch.object(nemo_gym_mod, "make_actor_runtime_env") as mock_runtime_env,
+        pytest.raises(nemo_gym_mod.ShardConfigError, match=error),
+    ):
+        spinup_nemo_gym_actor(
+            env_configs,
+            base_urls=[],
+            model_name="test-model",
+            tokenizer=MagicMock(),
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+        )
+    mock_actor.options.assert_not_called()
+    mock_runtime_env.assert_not_called()
+    assert env_configs == original
+
+
+@pytest.mark.parametrize(
+    "token_capture", [None, {"enabled": True, "capture_dir": "/capture"}]
+)
+def test_build_nemo_gym_config_router_replay_off_uses_default_dtype(
+    detected_uv_dirs, token_capture
+):
     cfg = build_nemo_gym_config(
         _env_configs(),
         base_urls=[],
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        token_capture=token_capture,
+        turn_checkpointing_enabled=False,
     )
     assert cfg["require_routed_experts"] is False
     assert cfg["routed_experts_dtype"] == "int16"
+    assert cfg["truncate_noncontiguous_episodes"] is False
+    expected_capture = (
+        {
+            **token_capture,
+            "capture_dir": "/capture/gym-instances/nemo_gym/replica-0",
+        }
+        if token_capture is not None
+        else None
+    )
+    assert cfg["token_capture"] == expected_capture
+
+
+@pytest.mark.parametrize("capture_enabled", [False, True])
+def test_spinup_nemo_gym_truncation_token_capture_guard(
+    detected_uv_dirs, capture_enabled
+):
+    token_capture = {"enabled": capture_enabled}
+    kwargs = dict(
+        env_configs=_env_configs(truncate_noncontiguous_episodes=True),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=False,
+        token_capture=token_capture,
+    )
+    if not capture_enabled:
+        cfg = build_nemo_gym_config(**kwargs)
+        assert cfg["truncate_noncontiguous_episodes"] is True
+        assert cfg["token_capture"] == token_capture
+        return
+
+    with (
+        patch.object(nemo_gym_mod, "NemoGym") as mock_cls,
+        patch.object(nemo_gym_mod, "make_actor_runtime_env") as mock_runtime_env,
+        pytest.raises(ValueError, match="not compatible with token_capture.enabled"),
+    ):
+        spinup_nemo_gym_actor(**kwargs, tokenizer=MagicMock())
+
+    mock_cls.options.assert_not_called()
+    mock_runtime_env.assert_not_called()
 
 
 def test_build_nemo_gym_config_router_replay_resolves_dtype(detected_uv_dirs):
@@ -587,6 +701,7 @@ def test_build_nemo_gym_config_router_replay_resolves_dtype(detected_uv_dirs):
             model_name="test-model",
             enable_router_replay=True,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )
 
     mock_resolve.assert_called_once_with("test-model")
@@ -614,6 +729,7 @@ def test_an_unsharded_job_gets_the_registry_runtime_env(
     ):
         mock_cls.options.return_value.remote.return_value = actor
         mock_ray.get_runtime_context.return_value.get_node_id.return_value = "a" * 56
+        mock_ray.get.side_effect = [None, [None, {}]]
 
         result = build_nemo_gym_actors(
             _env_configs(num_gpu_nodes=num_gpu_nodes),
@@ -622,6 +738,7 @@ def test_an_unsharded_job_gets_the_registry_runtime_env(
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=True,
+            turn_checkpointing_enabled=False,
             token_capture=token_capture,
         )
 
@@ -644,27 +761,40 @@ def test_an_unsharded_job_gets_the_registry_runtime_env(
     assert cfg["use_fastokens"] is True
     # The ledger config must ride through to the actor; a refactor of this
     # wrapper once dropped it without any type or test catching it.
-    assert cfg["token_capture"] == token_capture
+    assert cfg["token_capture"] == {
+        **token_capture,
+        "capture_dir": "/tmp/cap/gym-instances/nemo_gym/replica-0",
+    }
+    assert token_capture == {"enabled": True, "capture_dir": "/tmp/cap"}
+    assert cfg["checkpoint_instance"].instance_id == "nemo_gym/replica-0"
 
-    # Spinup is deferred from __init__, so the factory must await it. The
-    # tokenizer install has to follow it, not race it.
+    # Wait for spinup before submitting tokenizer installation and route
+    # retrieval together.
     actor._spinup.remote.assert_called_once_with()
     actor.set_tokenizer.remote.assert_called_once_with(_TOKENIZER)
     assert mock_ray.get.call_args_list == [
         call("spinup-ref"),
-        call(actor.set_tokenizer.remote.return_value),
+        call(
+            [
+                actor.set_tokenizer.remote.return_value,
+                actor.list_environment_server_routes.remote.return_value,
+            ]
+        ),
     ]
 
 
-@pytest.mark.parametrize("failed_ref", ["spinup-ref", "tokenizer-ref"])
+@pytest.mark.parametrize("failed_ref", ["spinup-ref", "tokenizer-ref", "routes-ref"])
 def test_spinup_nemo_gym_actor_cleans_up_after_startup_failure(
     detected_uv_dirs, failed_ref
 ):
     actor = MagicMock()
     actor._spinup.remote.return_value = "spinup-ref"
     actor.set_tokenizer.remote.return_value = "tokenizer-ref"
+    actor.list_environment_server_routes.remote.return_value = "routes-ref"
 
     def get_or_fail(ref, **_kwargs):
+        if isinstance(ref, list):
+            return [get_or_fail(item, **_kwargs) for item in ref]
         if ref == failed_ref:
             raise RuntimeError("startup failed")
         return None
@@ -686,6 +816,7 @@ def test_spinup_nemo_gym_actor_cleans_up_after_startup_failure(
                 tokenizer=MagicMock(),
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     shutdown.assert_called_once()
@@ -731,6 +862,7 @@ def test_spinup_nemo_gym_actor_preserves_startup_error_when_cleanup_fails(
                 tokenizer=MagicMock(),
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     assert exc_info.value is startup_error
@@ -776,11 +908,11 @@ def _stub_gym_resolved_config(resolved):
     """Stand in for nemo_gym.global_config, which lives in the actor's venv."""
     package = types.ModuleType("nemo_gym")
     module = types.ModuleType("nemo_gym.global_config")
-    module.get_global_config_dict = lambda: resolved
+    module.get_global_config_dict = MagicMock(return_value=resolved)
     with patch.dict(
         sys.modules, {"nemo_gym": package, "nemo_gym.global_config": module}
     ):
-        yield
+        yield module.get_global_config_dict
 
 
 def _spun_up_actor():
@@ -798,6 +930,9 @@ def test_list_entries_reports_entry_names_and_server_types():
                 "responses_api_agents": {"simple_agent": {"entrypoint": "app.py"}}
             },
             "math_env": {"resources_servers": {"math": {"entrypoint": "app.py"}}},
+            "math_environment": {
+                "environment_servers": {"single_agent_turn": {"entrypoint": "app.py"}}
+            },
             # An entry can carry more than one server type.
             "judge": {
                 "responses_api_models": {"local_vllm_model": {"entrypoint": "app.py"}},
@@ -816,6 +951,7 @@ def test_list_entries_reports_entry_names_and_server_types():
     assert entries == {
         "math_agent": ["responses_api_agents"],
         "math_env": ["resources_servers"],
+        "math_environment": ["environment_servers"],
         "judge": ["responses_api_models", "resources_servers"],
     }
 
@@ -858,6 +994,102 @@ def test_list_entries_before_spinup_raises():
         actor.list_entries()
 
 
+@pytest.mark.parametrize(
+    "routes", [None, {}, {"workplace:train": "workplace_environment"}]
+)
+def test_list_environment_server_routes_caches_the_resolved_gym_config(routes):
+    resolved = DictConfig(
+        {
+            "environment_server_routes": routes,
+            "workplace_environment": {
+                "environment_servers": {
+                    "single_agent_turn": {
+                        "entrypoint": "app.py",
+                        "agent_server": {
+                            "type": "responses_api_agents",
+                            "name": "workplace_agent",
+                        },
+                    }
+                }
+            },
+        }
+    )
+    with _stub_gym_resolved_config(resolved) as get_config:
+        actor = _spun_up_actor()
+        first_routes = actor.list_environment_server_routes()
+        assert first_routes == (routes or {})
+
+        # Discovery callers must not mutate the map used by later rollouts.
+        first_routes["extra:train"] = "other_environment"
+        assert actor.list_environment_server_routes() == (routes or {})
+        get_config.assert_called_once_with()
+
+        actor.shutdown()
+        with pytest.raises(RuntimeError, match="call _spinup"):
+            actor.list_environment_server_routes()
+
+
+@pytest.mark.parametrize(
+    "routes", [["environment"], {"tasks": ""}, {"": "environment"}, {"tasks": 3}]
+)
+def test_list_environment_server_routes_rejects_malformed_routes(routes):
+    with _stub_gym_resolved_config(DictConfig({"environment_server_routes": routes})):
+        with pytest.raises(nemo_gym_mod.ShardConfigError, match="must map non-empty"):
+            _spun_up_actor().list_environment_server_routes()
+
+
+def test_list_environment_server_routes_accepts_multi_agent_servers():
+    resolved = DictConfig(
+        {
+            "environment_server_routes": {"tasks": "environment"},
+            "environment": {
+                "environment_servers": {
+                    "nemo_user_sim_environment": {
+                        "entrypoint": "app.py",
+                        "user_agent": {"type": "responses_api_agents", "name": "user"},
+                        "assistant_agent": {
+                            "type": "responses_api_agents",
+                            "name": "assistant",
+                        },
+                    }
+                }
+            },
+        }
+    )
+    with _stub_gym_resolved_config(resolved):
+        actor = _spun_up_actor()
+        assert actor.list_environment_server_routes() == {"tasks": "environment"}
+
+
+def test_list_environment_server_routes_skips_remote_and_unrouted_servers():
+    routes = {"tasks": "remote_environment", "other_tasks": "missing_locally"}
+    resolved = DictConfig(
+        {
+            "environment_server_routes": routes,
+            # An entry without an entrypoint does not start a local server.
+            "remote_environment": {
+                "environment_servers": {"single_agent_turn": {"host": "10.0.0.1"}}
+            },
+            # Agent internals do not affect route discovery.
+            "unrouted_environment": {
+                "environment_servers": {
+                    "nemo_user_sim_environment": {"entrypoint": "app.py"}
+                }
+            },
+        }
+    )
+    with _stub_gym_resolved_config(resolved):
+        assert _spun_up_actor().list_environment_server_routes() == routes
+
+
+def test_list_environment_server_routes_before_spinup_raises():
+    cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    actor = cls.__new__(cls)
+    actor.__init__({})
+    with pytest.raises(RuntimeError, match="call _spinup"):
+        actor.list_environment_server_routes()
+
+
 class TestUnresolvedAgentRefsAreDiagnosable:
     """A Gym older than the checkout that prepared the data must say so.
 
@@ -869,7 +1101,11 @@ class TestUnresolvedAgentRefsAreDiagnosable:
     """
 
     def test_resolved_rows_pass_through(self):
-        rows = [{"agent_ref": {"name": "a"}}, {"agent_ref": {"name": "b"}}]
+        rows = [
+            {"agent_ref": {"name": "a"}},
+            {"agent_ref": {"name": "b"}},
+            {"task_id": {"taskset": "tasks", "task_id": "1"}, "task_input": {}},
+        ]
         nemo_gym_mod._require_resolved_agent_refs(rows)  # must not raise
 
     def test_a_stale_gym_is_named_along_with_the_remedy(self):
@@ -906,17 +1142,21 @@ class _FakeGymCluster:
         self,
         *,
         entries_by_index=None,
+        environment_routes_by_index=None,
         spinup_failures=None,
         spinup_timeouts=None,
         wedged_spinups=None,
         tokenizer_timeouts=None,
+        checkpoint_failures=None,
         pg_ready_error=None,
     ):
         self.entries_by_index = entries_by_index or {}
+        self.environment_routes_by_index = environment_routes_by_index or {}
         self.spinup_failures = spinup_failures or {}
         self.spinup_timeouts = set(spinup_timeouts or ())
         self.wedged_spinups = set(wedged_spinups or ())
         self.tokenizer_timeouts = set(tokenizer_timeouts or ())
+        self.checkpoint_failures = checkpoint_failures or {}
         self.timed_out_spinups = set()
         self.pg_ready_error = pg_ready_error
         self.actors = []
@@ -952,7 +1192,15 @@ class _FakeGymCluster:
                 actor = MagicMock(name=f"gym-actor-{index}")
                 actor._spinup.remote.return_value = ("spinup", index)
                 actor.set_tokenizer.remote.return_value = ("tokenizer", index)
+                actor.initialize_checkpoint_adapter.remote.return_value = (
+                    "checkpoint",
+                    index,
+                )
                 actor.list_entries.remote.return_value = ("entries", index)
+                actor.list_environment_server_routes.remote.return_value = (
+                    "environment_routes",
+                    index,
+                )
                 self.actors.append(actor)
                 self.actor_options.append(option_kwargs)
                 self.actor_configs.append(config)
@@ -966,6 +1214,8 @@ class _FakeGymCluster:
 
     def ray_get(self, reference, timeout=None):
         self.ray_get_calls.append((reference, timeout))
+        if isinstance(reference, list):
+            return [self.ray_get(item, timeout=timeout) for item in reference]
         if reference == "pg-ready":
             if self.pg_ready_error is not None:
                 raise self.pg_ready_error
@@ -989,6 +1239,12 @@ class _FakeGymCluster:
             if index in self.tokenizer_timeouts and timeout is not None:
                 raise TimeoutError("startup budget expired")
             return None
+        if kind == "checkpoint":
+            if index in self.checkpoint_failures:
+                raise self.checkpoint_failures[index]
+            return None
+        if kind == "environment_routes":
+            return self.environment_routes_by_index.get(index, {})
         return self.entries_by_index.get(index, {})
 
 
@@ -1033,23 +1289,37 @@ def _shard_env_configs(**overrides):
     return {"nemo_gym": nemo_gym}
 
 
-def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(detected_uv_dirs):
+@pytest.mark.parametrize("truncate_noncontiguous_episodes", [False, True])
+def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(
+    detected_uv_dirs, truncate_noncontiguous_episodes
+):
     """The pre-sharding path must stay identical: one actor, no placement group."""
     cluster = _FakeGymCluster()
 
     with _patched_cluster(cluster):
         shard_set = nemo_gym_mod.build_nemo_gym_actors(
-            _env_configs(),
+            _env_configs(
+                truncate_noncontiguous_episodes=truncate_noncontiguous_episodes
+            ),
             base_urls=["http://vllm-0"],
             model_name="test-model",
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )
 
     assert not shard_set.is_sharded
     assert shard_set.all_handles == [cluster.actors[0]]
     assert cluster.placement_group_calls == []
+    assert (
+        cluster.actor_configs[0]["truncate_noncontiguous_episodes"]
+        is truncate_noncontiguous_episodes
+    )
+    assert (
+        "truncate_noncontiguous_episodes"
+        not in cluster.actor_configs[0]["initial_global_config_dict"]
+    )
     # Node affinity still applies when the actor has colocated GPUs.
     assert isinstance(
         cluster.actor_options[0]["scheduling_strategy"],
@@ -1068,6 +1338,7 @@ def test_build_nemo_gym_config_keeps_the_policy_api_key_out_of_gyms_config(
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
         policy_api_key="per-job-key",
     )
 
@@ -1093,11 +1364,343 @@ def test_build_nemo_gym_actors_hands_every_actor_the_policy_api_key(
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
             policy_api_key="per-job-key",
         )
 
     assert cluster.actor_configs
     assert all(cfg["policy_api_key"] == "per-job-key" for cfg in cluster.actor_configs)
+
+
+def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
+    detected_uv_dirs,
+):
+    """With Dynamo, each actor's composed config speaks Gym's Dynamo dialect.
+
+    The dialect is not a policy_model overlay, which a sharded plan would reject
+    as unowned. The frontend applies the native default template kwargs, so only
+    a shard's own kwargs reach Gym.
+    """
+    from nemo_rl.algorithms.grpo import MasterConfig
+
+    env = _shard_env_configs()
+    env["nemo_gym"]["shards"][1]["overrides"] = {
+        "policy_model": {
+            "responses_api_models": {
+                "vllm_model": {"chat_template_kwargs": {"enable_thinking": False}}
+            }
+        }
+    }
+    config = MasterConfig.model_construct(
+        env=env,
+        data={},
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "dynamo": True,
+                "vllm_cfg": {
+                    "http_server_serving_chat_kwargs": {
+                        "default_chat_template_kwargs": {"enable_thinking": True}
+                    }
+                },
+            }
+        },
+    )
+    setup_nemo_gym_config(config, tokenizer=None)
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            config.env,
+            base_urls=["http://frontend"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+        )
+
+    template_kwargs = [
+        cfg["initial_global_config_dict"]["policy_model"]["responses_api_models"][
+            "vllm_model"
+        ].get("chat_template_kwargs")
+        for cfg in cluster.actor_configs
+    ]
+    # judged, then the tools shard's two replicas with their own override.
+    assert template_kwargs == [
+        None,
+        {"enable_thinking": False},
+        {"enable_thinking": False},
+    ]
+    for cfg in cluster.actor_configs:
+        gym_config = cfg["initial_global_config_dict"]
+        vllm_model = gym_config["policy_model"]["responses_api_models"]["vllm_model"]
+        assert vllm_model["dynamo_frontend"] is True
+        assert vllm_model["reasoning_field"] == "reasoning_content"
+        assert "dynamo_dialect" not in gym_config
+
+
+def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs):
+    cluster = _FakeGymCluster()
+    token_capture = {
+        "enabled": True,
+        "capture_dir": "/capture",
+        "control_auth_token": "secret",
+    }
+
+    with _patched_cluster(cluster):
+        shard_set = nemo_gym_mod.build_nemo_gym_actors(
+            _env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=True,
+            token_capture=token_capture,
+        )
+
+    actor = shard_set.sole_handle()
+    actor.initialize_checkpoint_adapter.remote.assert_called_once_with()
+    config = cluster.actor_configs[0]
+    assert config["checkpoint_instance"].instance_id == "nemo_gym/replica-0"
+    assert config["token_capture"]["capture_dir"] == (
+        "/capture/gym-instances/nemo_gym/replica-0"
+    )
+    checkpoint = config["initial_global_config_dict"]["checkpoint"]
+    assert checkpoint["enabled"] is True
+    # Gym serves its global config unauthenticated: never the capture secret.
+    assert checkpoint["control_auth_token"] not in {"", "secret"}
+    # A lost resume reopens Gym after three control timeouts, not Gym's 600s.
+    assert checkpoint["lease_grace_seconds"] == 180.0
+    assert (
+        config["initial_global_config_dict"]["policy_model"]["responses_api_models"][
+            "vllm_model"
+        ]["checkpoint"]["policy"]
+        is True
+    )
+    assert token_capture["capture_dir"] == "/capture"
+
+
+@pytest.mark.nemo_gym
+def test_checkpoint_lease_grace_follows_the_control_timeout(detected_uv_dirs):
+    """A lost resume reopens Gym after three control timeouts; Gym accepts it."""
+    from nemo_gym._checkpoint.settings import CheckpointSettings
+
+    cluster = _FakeGymCluster()
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            _env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=True,
+            token_capture={
+                "enabled": True,
+                "capture_dir": "/capture",
+                "control_auth_token": "secret",
+                "control_timeout_s": 20.0,
+            },
+        )
+
+    checkpoint = cluster.actor_configs[0]["initial_global_config_dict"]["checkpoint"]
+    assert checkpoint["lease_grace_seconds"] == 60.0
+    assert CheckpointSettings.model_validate(checkpoint).lease_grace_seconds == 60.0
+
+
+def test_checkpointing_leaves_the_callers_policy_model_untouched(detected_uv_dirs):
+    env_configs = _env_configs()
+    env_configs["nemo_gym"]["policy_model"] = {
+        "responses_api_models": {"vllm_model": {"uses_reasoning_parser": False}}
+    }
+    env_configs_before = copy.deepcopy(env_configs)
+
+    cfg = build_nemo_gym_config(
+        env_configs,
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=True,
+        token_capture={
+            "enabled": True,
+            "capture_dir": "/capture",
+            "control_auth_token": "secret",
+        },
+    )
+
+    vllm_model = cfg["initial_global_config_dict"]["policy_model"][
+        "responses_api_models"
+    ]["vllm_model"]
+    assert vllm_model == {
+        "uses_reasoning_parser": False,
+        "checkpoint": {"policy": True},
+    }
+    assert env_configs == env_configs_before
+
+
+@pytest.mark.parametrize("as_omegaconf", [False, True])
+def test_turn_recovery_rejects_typed_environment_servers(as_omegaconf):
+    """A typed environment server rejects the attempt-qualified ``<id>-a<N>``."""
+    from omegaconf import OmegaConf
+
+    relay = {
+        "policy_model": {"responses_api_models": {"vllm_model": {}}},
+        "env": {"environment_servers": {"legacy_agent": {"entrypoint": "app.py"}}},
+    }
+    typed = {
+        **relay,
+        "tool_env": {"environment_servers": {"single_agent_turn_legacy": {}}},
+    }
+
+    def as_config(config):
+        return OmegaConf.create(config) if as_omegaconf else config
+
+    nemo_gym_mod._reject_typed_environment_servers(as_config(relay))
+    with pytest.raises(ValueError, match="tool_env=single_agent_turn_legacy"):
+        nemo_gym_mod._reject_typed_environment_servers(as_config(typed))
+
+
+@pytest.mark.parametrize("control_urls", [None, ["http://frontend:2400"]])
+def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
+    detected_uv_dirs, control_urls
+):
+    config = build_nemo_gym_config(
+        _env_configs(),
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=True,
+        generation_prefix_cuts_enabled=True,
+        generation_cut_control_urls=control_urls,
+        token_capture={
+            "enabled": True,
+            "capture_dir": "/capture",
+            "control_auth_token": "secret",
+        },
+    )
+
+    model = config["initial_global_config_dict"]["policy_model"][
+        "responses_api_models"
+    ]["vllm_model"]
+    assert model["checkpoint"] == {"policy": True, "generation_cuts": True}
+    # Only a backend that takes cuts elsewhere (a Dynamo frontend) names where.
+    assert model.get("generation_cut_control_url") == control_urls
+
+
+@pytest.mark.nemo_gym
+def test_prefix_checkpointing_policy_overrides_are_gym_fields(detected_uv_dirs):
+    """Gym accepts unknown config keys, so a renamed field would silently turn cuts off."""
+    # Deferred: Gym's model servers ship with the optional nemo_gym extra.
+    from responses_api_models.vllm_model.app import VLLMModelConfig
+
+    config = build_nemo_gym_config(
+        _env_configs(),
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=True,
+        generation_prefix_cuts_enabled=True,
+        generation_cut_control_urls=["http://frontend:2400"],
+        token_capture={
+            "enabled": True,
+            "capture_dir": "/capture",
+            "control_auth_token": "secret",
+        },
+    )
+
+    model = config["initial_global_config_dict"]["policy_model"][
+        "responses_api_models"
+    ]["vllm_model"]
+    assert "generation_cut_control_url" in model
+    assert set(model) - set(VLLMModelConfig.model_fields) == set()
+    checkpoint_config = VLLMModelConfig.model_fields["checkpoint"].annotation
+    assert set(model["checkpoint"]) == {"policy", "generation_cuts"}
+    assert set(model["checkpoint"]) <= set(checkpoint_config.model_fields)
+
+
+def test_checkpointing_requires_token_capture(detected_uv_dirs):
+    with pytest.raises(ValueError, match="requires token capture"):
+        build_nemo_gym_config(
+            _env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=True,
+        )
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+def test_actor_factory_reads_environment_server_routes_from_resolved_configs(
+    detected_uv_dirs, sharded
+):
+    routes = {"workplace:train": "workplace_environment"}
+    cluster = _FakeGymCluster(
+        entries_by_index={
+            0: {
+                "workplace_environment": ["environment_servers"],
+                "unused_environment": ["environment_servers"],
+            },
+            1: {"unused_environment": ["environment_servers"]},
+        },
+        environment_routes_by_index={0: routes},
+    )
+    # The route is absent from the input config, as when loaded via config_paths.
+    config = _shard_env_configs() if sharded else _env_configs()
+    with _patched_cluster(cluster):
+        shard_set = nemo_gym_mod.build_nemo_gym_actors(
+            config,
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+        )
+        row = {
+            "task_id": {"taskset": "workplace:train", "task_id": "1"},
+            "task_input": {},
+        }
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            shard_set, {"train": [{"extra_env_info": json.dumps(row)}]}
+        )
+
+    assert shard_set.environment_server_routes == routes
+    if sharded:
+        assert shard_set.route_to_shard == {"workplace_environment": "judged"}
+    route_name = nemo_gym_mod.get_nemo_gym_route_name(
+        row, shard_set.environment_server_routes
+    )
+    assert shard_set.pick_handle(route_name) is cluster.actors[0]
+
+
+def test_actor_factory_cleans_up_when_environment_server_route_target_is_not_an_environment(
+    detected_uv_dirs,
+):
+    cluster = _FakeGymCluster(
+        entries_by_index={0: {"agent": ["responses_api_agents"]}},
+        environment_routes_by_index={0: {"workplace:train": "agent"}},
+    )
+    with _patched_cluster(cluster):
+        with pytest.raises(
+            nemo_gym_mod.ShardSetupError, match="a running Environment Server"
+        ):
+            nemo_gym_mod.build_nemo_gym_actors(
+                _env_configs(),
+                base_urls=["http://vllm-0"],
+                model_name="test-model",
+                tokenizer=_TOKENIZER,
+                enable_router_replay=False,
+                use_fastokens=False,
+                turn_checkpointing_enabled=False,
+            )
+
+    cluster.ray.kill.assert_called_once_with(cluster.actors[0])
 
 
 def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(
@@ -1118,6 +1721,7 @@ def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )
 
     # Two shards, one with replicas: 2, so three actors on three nodes.
@@ -1140,17 +1744,23 @@ def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(
     assert cluster.events[:2] == ["runtime_env", "placement_group"]
 
 
-def test_shards_get_their_own_config_paths_and_log_directories(detected_uv_dirs):
+@pytest.mark.parametrize("truncate_noncontiguous_episodes", [False, True])
+def test_shards_get_their_own_config_paths_and_log_directories(
+    detected_uv_dirs, truncate_noncontiguous_episodes
+):
     cluster = _FakeGymCluster()
 
     with _patched_cluster(cluster):
         nemo_gym_mod.build_nemo_gym_actors(
-            _shard_env_configs(),
+            _shard_env_configs(
+                truncate_noncontiguous_episodes=truncate_noncontiguous_episodes
+            ),
             base_urls=["http://vllm-0"],
             model_name="test-model",
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )
 
     gym_configs = [
@@ -1172,6 +1782,117 @@ def test_shards_get_their_own_config_paths_and_log_directories(detected_uv_dirs)
     for config in gym_configs:
         assert "shards" not in config
         assert "allowed_duplicate_entries" not in config
+        assert "truncate_noncontiguous_episodes" not in config
+    assert all(
+        config["truncate_noncontiguous_episodes"] is truncate_noncontiguous_episodes
+        for config in cluster.actor_configs
+    )
+
+
+@pytest.mark.parametrize("guard", ["router_replay", "token_capture"])
+@pytest.mark.parametrize("override_source", ["common", "shard"])
+def test_sharded_actor_config_rejects_incompatible_truncation(
+    detected_uv_dirs, guard, override_source
+):
+    cluster = _FakeGymCluster()
+    env_configs = _shard_env_configs()
+    if override_source == "common":
+        env_configs["nemo_gym"]["common_overrides"] = {
+            "truncate_noncontiguous_episodes": True
+        }
+    else:
+        env_configs["nemo_gym"]["shards"][0]["overrides"] = {
+            "truncate_noncontiguous_episodes": True
+        }
+    original = copy.deepcopy(env_configs)
+    with (
+        _patched_cluster(cluster),
+        patch.object(
+            nemo_gym_mod, "resolve_routed_experts_dtype_name_for_model"
+        ) as mock_resolve_dtype,
+        pytest.raises(ValueError, match="not compatible with"),
+    ):
+        build_nemo_gym_actors(
+            env_configs,
+            base_urls=[],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=guard == "router_replay",
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+            token_capture={"enabled": guard == "token_capture"},
+        )
+
+    assert cluster.actors == []
+    mock_resolve_dtype.assert_not_called()
+    assert cluster.removed_placement_groups == [cluster.placement_group]
+    assert env_configs == original
+
+
+def test_shards_get_stable_isolated_checkpoint_namespaces(detected_uv_dirs):
+    cluster = _FakeGymCluster()
+    token_capture = {
+        "enabled": True,
+        "capture_dir": "/capture",
+        "control_auth_token": "secret",
+    }
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            _shard_env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=True,
+            token_capture=token_capture,
+        )
+
+    assert [
+        config["checkpoint_instance"].instance_id for config in cluster.actor_configs
+    ] == ["judged/replica-0", "tools/replica-0", "tools/replica-1"]
+    assert [
+        config["token_capture"]["capture_dir"] for config in cluster.actor_configs
+    ] == [
+        "/capture/gym-instances/judged/replica-0",
+        "/capture/gym-instances/tools/replica-0",
+        "/capture/gym-instances/tools/replica-1",
+    ]
+    for actor in cluster.actors:
+        actor.initialize_checkpoint_adapter.remote.assert_called_once_with()
+
+
+def test_checkpoint_discovery_failure_tears_down_every_shard(detected_uv_dirs):
+    cluster = _FakeGymCluster(
+        checkpoint_failures={1: RuntimeError("participant unavailable")}
+    )
+    token_capture = {
+        "enabled": True,
+        "capture_dir": "/capture",
+        "control_auth_token": "secret",
+    }
+
+    with (
+        _patched_cluster(cluster),
+        pytest.raises(
+            nemo_gym_mod.ShardSetupError,
+            match="tools.*replica 0.*participant unavailable",
+        ),
+    ):
+        nemo_gym_mod.build_nemo_gym_actors(
+            _shard_env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=True,
+            token_capture=token_capture,
+        )
+
+    cluster.shutdown_environments.assert_called_once()
+    assert len(cluster.removed_placement_groups) == 1
 
 
 def test_every_replica_gets_the_tokenizer_installed(detected_uv_dirs):
@@ -1190,6 +1911,7 @@ def test_every_replica_gets_the_tokenizer_installed(detected_uv_dirs):
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )
 
     assert len(cluster.actors) == 3
@@ -1214,6 +1936,7 @@ def test_actor_cpus_override_sizes_that_shards_bundle(detected_uv_dirs):
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )
 
     (pg_kwargs,) = cluster.placement_group_calls
@@ -1266,6 +1989,53 @@ def test_shard_spinup_timeout_is_one_global_deadline():
     ]
 
 
+def test_checkpoint_discovery_shares_the_startup_deadline():
+    """Discovery is part of the second pass: no fresh budget of its own."""
+    actors = []
+    for name in ("first", "second"):
+        actor = MagicMock(name=name)
+        actor._spinup.remote.return_value = f"{name}-ref"
+        actor.set_tokenizer.remote.return_value = f"{name}-tokenizer-ref"
+        actor.initialize_checkpoint_adapter.remote.return_value = f"{name}-discover-ref"
+        actors.append(actor)
+    shard_set = nemo_gym_mod.NemoGymShardSet(
+        handles={"first": [actors[0]], "second": [actors[1]]}
+    )
+
+    with (
+        patch.object(
+            nemo_gym_mod,
+            "monotonic",
+            side_effect=[100.0, 101.0, 102.0, 103.0, 103.5, 104.0, 104.5],
+        ),
+        patch.object(nemo_gym_mod.ray, "get") as ray_get,
+    ):
+        nemo_gym_mod._spinup_shards_concurrently(
+            shard_set,
+            spinup_timeout=5.0,
+            tokenizer=_TOKENIZER,
+            turn_checkpointing_enabled=True,
+        )
+
+    # Each replica discovers its deployment after its own tokenizer install.
+    assert [invocation.args[0] for invocation in ray_get.call_args_list] == [
+        "first-ref",
+        "second-ref",
+        "first-tokenizer-ref",
+        "first-discover-ref",
+        "second-tokenizer-ref",
+        "second-discover-ref",
+    ]
+    assert [invocation.kwargs["timeout"] for invocation in ray_get.call_args_list] == [
+        4.0,
+        3.0,
+        2.0,
+        1.5,
+        1.0,
+        0.5,
+    ]
+
+
 def test_a_shard_that_fails_to_start_names_itself_and_tears_everything_down(
     detected_uv_dirs,
 ):
@@ -1285,6 +2055,7 @@ def test_a_shard_that_fails_to_start_names_itself_and_tears_everything_down(
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     # Gym names the offending entry; we add the shard it belongs to.
@@ -1308,6 +2079,7 @@ def test_unsharded_startup_failure_tears_down_the_actor(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     cluster.shutdown_environments.assert_called_once()
@@ -1327,6 +2099,7 @@ def test_timed_out_shard_startup_is_drained_before_teardown(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     spinup_zero_calls = [
@@ -1355,6 +2128,7 @@ def test_wedged_shard_startup_cannot_block_forced_teardown(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     cluster.shutdown_environments.assert_called_once()
@@ -1374,7 +2148,7 @@ def test_tokenizer_timeout_reports_exhausted_shared_startup_budget(
     with _patched_cluster(cluster):
         with pytest.raises(
             nemo_gym_mod.ShardSetupError,
-            match="used the whole 1.0s startup budget before the tokenizer",
+            match="used the whole 1.0s startup budget before every replica finished",
         ):
             nemo_gym_mod.build_nemo_gym_actors(
                 _shard_env_configs(),
@@ -1383,6 +2157,7 @@ def test_tokenizer_timeout_reports_exhausted_shared_startup_budget(
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
                 spinup_timeout=1.0,
             )
 
@@ -1401,6 +2176,7 @@ def test_unplaceable_bundles_fail_fast_and_release_the_group(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     assert cluster.actors == []
@@ -1424,6 +2200,7 @@ def test_duplicate_agent_across_shards_tears_the_set_down(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     cluster.shutdown_environments.assert_called_once()
@@ -1460,6 +2237,24 @@ def test_a_replicated_shard_labels_each_instance_apart():
         shard_set.instance_label(MagicMock())
 
 
+def test_checkpoint_instance_identity_round_trips_to_the_same_replica():
+    first, second = MagicMock(), MagicMock()
+    shard_set = nemo_gym_mod.NemoGymShardSet(handles={"tools": [first, second]})
+
+    assert shard_set.checkpoint_instance_for_handle(first).instance_id == (
+        "tools/replica-0"
+    )
+    assert shard_set.checkpoint_instance_for_handle(second).instance_id == (
+        "tools/replica-1"
+    )
+    assert shard_set.handle_for_checkpoint_instance("tools/replica-0") is first
+    assert shard_set.handle_for_checkpoint_instance("tools/replica-1") is second
+    assert shard_set.checkpoint_handles == {
+        "tools/replica-0": first,
+        "tools/replica-1": second,
+    }
+
+
 def test_an_unreplicated_shard_is_labelled_by_its_name_alone():
     """Names a metric and its log directory the same way."""
     handle = MagicMock()
@@ -1482,6 +2277,84 @@ def _sharded_set(route_to_shard):
         route_to_shard=dict(route_to_shard),
         placement_group=MagicMock(),
     )
+
+
+def test_materialized_taskset_routing_takes_precedence_over_agent_ref():
+    row = {
+        "task_id": {"taskset": "workplace:train", "task_id": "1"},
+        "task_input": {},
+        "agent_ref": {"name": "workplace_agent"},
+        "task_source": "workplace_assistant",
+    }
+    assert (
+        nemo_gym_mod.get_nemo_gym_route_name(
+            row, {"workplace:train": "workplace_environment"}
+        )
+        == "workplace_environment"
+    )
+
+
+def test_materialized_taskset_without_route_fails_even_if_agent_ref_is_present():
+    with pytest.raises(
+        ValueError, match="No environment server route.*workplace:train"
+    ):
+        nemo_gym_mod.get_nemo_gym_route_name(
+            {
+                "task_id": {"taskset": "workplace:train", "task_id": "1"},
+                "task_input": {},
+                "agent_ref": {"name": "workplace_agent"},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "task_id", [{}, {"taskset": ""}, {"taskset": ["workplace:train"]}]
+)
+def test_malformed_taskset_does_not_fall_back_to_agent_ref(task_id):
+    with pytest.raises(ValueError, match="non-empty task_id.taskset"):
+        nemo_gym_mod.get_nemo_gym_route_name(
+            {
+                "task_id": task_id,
+                "task_input": {},
+                "agent_ref": {"name": "fallback_agent"},
+            },
+            {"workplace:train": "workplace_environment"},
+        )
+
+
+@pytest.mark.parametrize("cached_source", [False, True])
+def test_materialized_dataset_coverage_resolves_tasksets_before_matching_shards(
+    tmp_path, cached_source
+):
+    raw_row = {
+        "task_id": {"taskset": "workplace:train", "task_id": "1"},
+        "task_input": {},
+    }
+    rows = [{"extra_env_info": json.dumps(raw_row)}]
+    if cached_source:
+        source_path = tmp_path / "materialized_tasks.jsonl"
+        source_path.write_text(json.dumps(raw_row) + "\n")
+        source = nemo_gym_mod.NemoGymSourceIdentity.from_stat(
+            str(source_path), source_path.stat()
+        )
+        dataset = SimpleNamespace(dataset=rows, agent_name_sources=frozenset({source}))
+    else:
+        dataset = rows
+    shard_set = _sharded_set({"workplace_environment": "tools"})
+    shard_set.environment_server_routes = {"workplace:train": "workplace_environment"}
+
+    nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
+
+    # Reusing the source cache under another route map must revalidate the target.
+    shard_set.environment_server_routes = {"workplace:train": "missing_environment"}
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="missing_environment"):
+        nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
+
+    shard_set.environment_server_routes = {}
+    with pytest.raises(
+        nemo_gym_mod.ShardSetupError, match="train.*No environment server route"
+    ):
+        nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
 
 
 def test_an_agent_no_shard_hosts_is_caught_before_the_first_step():

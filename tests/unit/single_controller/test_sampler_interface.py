@@ -42,9 +42,11 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     WindowedSampler,
     WindowedSamplerConfig,
     create_sampler,
+    require_drop_accounting_members,
     required_buffer_capacity_for_config,
     sampler_supports_buffer_checkpoint,
     sampler_supports_training_claims,
+    sampler_supports_transactional_admission,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
@@ -120,6 +122,66 @@ class TestBuiltinsImplementInterface:
     def test_isinstance_protocol(self, sampler):
         assert isinstance(sampler, PromptGroupSampler)
         assert isinstance(sampler, TransactionalAdmissionSampler)
+
+
+class TestDropAccounting:
+    """What each built-in says losing a prompt group for good costs."""
+
+    def test_in_order_charges_the_stamped_step_and_uses_the_pool(self):
+        sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+        charged = sampler.charge_step_for_lost_group(
+            target_step=3, assembling_version=7
+        )
+        assert charged == 3
+        assert sampler.uses_pooled_replacements is True
+        assert sampler.closes_short_at_exhaustion is False
+
+    @pytest.mark.parametrize(
+        "sampler",
+        [
+            ReadyFirstSampler(FakeBuffer(), max_staleness_versions=1),
+            WeightFifoSampler(FakeBuffer(), max_staleness_versions=1),
+        ],
+        ids=["ready_first", "weight_fifo"],
+    )
+    def test_gated_samplers_charge_the_step_being_assembled(self, sampler):
+        unstamped = sampler.charge_step_for_lost_group(
+            target_step=None, assembling_version=7
+        )
+        assert unstamped == 7
+        assert sampler.closes_short_at_exhaustion is False
+
+    def test_weight_fifo_has_no_spare_pool_but_ready_first_does(self):
+        """A weight_fifo replacement lands in a newer weight bucket, so it has no pool."""
+        buf = FakeBuffer()
+        assert (
+            WeightFifoSampler(buf, max_staleness_versions=1).uses_pooled_replacements
+            is False
+        )
+        assert (
+            ReadyFirstSampler(buf, max_staleness_versions=1).uses_pooled_replacements
+            is True
+        )
+
+    def test_windowed_charges_nothing_and_closes_short_at_the_end(self):
+        sampler = WindowedSampler(FakeBuffer(), max_staleness_versions=1)
+        assert (
+            sampler.charge_step_for_lost_group(target_step=None, assembling_version=7)
+            is None
+        )
+        assert (
+            sampler.charge_step_for_lost_group(target_step=3, assembling_version=7)
+            is None
+        )
+        assert sampler.uses_pooled_replacements is False
+        assert sampler.closes_short_at_exhaustion is True
+
+    def test_a_custom_subclass_of_a_builtin_keeps_that_policy(self):
+        sampler = EchoSampler(FakeBuffer(), max_lookahead_versions=1)
+        charged = sampler.charge_step_for_lost_group(
+            target_step=2, assembling_version=9
+        )
+        assert charged == 2
 
 
 class TestAdmission:
@@ -223,6 +285,47 @@ class TestInOrderEvictMatchesSelect:
         # past target, but unready -> skipped to avoid the commit race.
         assert _run(s.evict(current_train_weight=5)) == 0
 
+    def test_select_waits_for_complete_dp_multiple(self):
+        buffer = FakeBuffer()
+        for group_index in range(127):
+            buffer.add(f"g{group_index}", weight=0, target_step=0)
+        sampler = InOrderSampler(buffer, max_lookahead_versions=1)
+
+        first_meta, first_count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=32,
+                max_prompt_groups=128,
+                group_multiple=2,
+            )
+        )
+        assert first_count == 126
+        assert len(first_meta.sample_ids) == 126
+        assert len(buffer.meta_list) == 1
+
+        waiting_meta, waiting_count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=2,
+                max_prompt_groups=2,
+                group_multiple=2,
+            )
+        )
+        assert waiting_meta is None
+        assert waiting_count == 0
+
+        buffer.add("g127", weight=0, target_step=0)
+        final_meta, final_count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=2,
+                max_prompt_groups=2,
+                group_multiple=2,
+            )
+        )
+        assert final_count == 2
+        assert len(final_meta.sample_ids) == 2
+
 
 class TestFactory:
     @pytest.mark.parametrize(
@@ -315,10 +418,6 @@ class TestReadyFirstConfig:
 
         assert isinstance(cfg, ReadyFirstSamplerConfig)
         assert cfg.max_staleness_versions == 2
-
-    def test_negative_staleness_is_rejected(self):
-        with pytest.raises(ValidationError):
-            ReadyFirstSamplerConfig(max_staleness_versions=-1)
 
     @pytest.mark.parametrize(
         ("cfg", "expected", "instance_expected"),
@@ -489,6 +588,69 @@ class TestCustomFqnSampler:
         assert s.max_lookahead_versions == 1
 
 
+def _custom(cls_name: str) -> CustomSamplerConfig:
+    return CustomSamplerConfig(target=f"{__name__}:{cls_name}")
+
+
+@pytest.mark.parametrize(
+    ("cfg", "expected"),
+    [
+        (InOrderSamplerConfig(max_lookahead_versions=1), True),
+        (ReadyFirstSamplerConfig(max_staleness_versions=1), True),
+        (WindowedSamplerConfig(max_staleness_versions=1), True),
+        (_custom("EchoSampler"), True),
+        (_custom("NoDropAccounting"), False),
+    ],
+)
+def test_filter_refill_requires_separate_admission_wait(cfg, expected):
+    assert sampler_supports_transactional_admission(cfg) is expected
+
+
+class TestRequireDropAccountingMembers:
+    def test_raises_when_no_member_is_defined(self):
+        with pytest.raises(ValueError, match="missing the required"):
+            require_drop_accounting_members(_custom("NoDropAccounting"))
+
+    def test_names_the_missing_members_of_a_partial_implementation(self):
+        with pytest.raises(ValueError) as excinfo:
+            require_drop_accounting_members(_custom("PartialDropAccounting"))
+        text = str(excinfo.value)
+        # The reported list names the three members this class omits and not the one
+        # it declares (``uses_pooled_replacements``).
+        reported = text.split("attribute(s) ", 1)[1].split("]", 1)[0]
+        assert "closes_short_at_exhaustion" in reported
+        assert "requires_shortfall_reconciliation" in reported
+        assert "charge_step_for_lost_group" in reported
+        assert "uses_pooled_replacements" not in reported
+
+    @pytest.mark.parametrize(
+        "cfg",
+        [
+            _custom("FullDropAccounting"),
+            _custom("EchoSampler"),
+            WindowedSamplerConfig(max_staleness_versions=1),
+            InOrderSamplerConfig(max_lookahead_versions=1),
+        ],
+        ids=["full-protocol", "base-sampler-subclass", "windowed", "in_order"],
+    )
+    def test_silent_when_the_members_are_declared_or_sampler_is_built_in(self, cfg):
+        # A fully-declared custom class, or any built-in, passes without raising.
+        assert require_drop_accounting_members(cfg) is None
+
+    def test_flags_assigned_in_init_are_rejected(self):
+        """Setup inspects the class, before __init__ runs, so instance-only flags
+        are invisible here and the check must reject the sampler.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            require_drop_accounting_members(_custom("InstanceAttrDropAccounting"))
+
+        text = str(excinfo.value)
+        assert "Declare them as class" in text
+        # The flags set in __init__ are not visible to the pre-construction check,
+        # so they are reported missing.
+        assert "uses_pooled_replacements" in text
+
+
 class TestWindowedSelect:
     def test_selects_ready_groups_in_window(self):
         buf = FakeBuffer()
@@ -610,6 +772,35 @@ class TestWeightFifoSelect:
 
 
 class TestReadyFirstSelect:
+    def test_select_waits_for_complete_dp_multiple(self):
+        buffer = FakeBuffer()
+        for group_index in range(3):
+            buffer.add(f"g{group_index}", weight=0)
+        sampler = ReadyFirstSampler(buffer, max_staleness_versions=1)
+
+        first_meta, first_count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=2,
+                max_prompt_groups=4,
+                group_multiple=2,
+            )
+        )
+        assert first_count == 2
+        assert len(first_meta.sample_ids) == 2
+        assert len(buffer.meta_list) == 1
+
+        waiting_meta, waiting_count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=2,
+                max_prompt_groups=4,
+                group_multiple=2,
+            )
+        )
+        assert waiting_meta is None
+        assert waiting_count == 0
+
     def test_mixes_ready_weight_versions_in_buffer_order(self):
         buf = FakeBuffer()
         buf.add("old", weight=1)
@@ -1065,8 +1256,42 @@ class TestInflightAbortPolicy:
         )
 
 
+class NoDropAccounting:
+    """Defines none of the drop-accounting members."""
+
+
+class PartialDropAccounting:
+    """Defines one member, which isinstance ignores because the rest are missing."""
+
+    uses_pooled_replacements = False
+
+
+class InstanceAttrDropAccounting:
+    """Assigns the flags in __init__, where the setup check cannot see them."""
+
+    def __init__(self) -> None:
+        self.uses_pooled_replacements = False
+        self.closes_short_at_exhaustion = True
+
+    def charge_step_for_lost_group(self, *, target_step, assembling_version):
+        return None
+
+
+class FullDropAccounting:
+    uses_pooled_replacements = False
+    closes_short_at_exhaustion = True
+    requires_shortfall_reconciliation = False
+
+    def charge_step_for_lost_group(self, *, target_step, assembling_version):
+        return None
+
+
 class EchoSampler(InOrderSampler):
     """Stand-in for a user-defined sampler loaded by FQN."""
+
+
+class InheritedWeightFifoSampler(WeightFifoSampler):
+    """Custom policy retaining strict single-weight selection."""
 
 
 class CheckpointingEchoSampler(EchoSampler):

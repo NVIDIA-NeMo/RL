@@ -1048,10 +1048,10 @@ class AsyncTrajectoryCollector:
     def prepare_for_refit(self) -> None:
         """Pause new generation starts and optionally wait for pending generations.
 
-        Every async backend configured for in-flight weight updates, except managed
-        Dynamo, is asked to pause generation. vLLM preserves in-flight request state
-        with its native keep-mode pause. Backends without pause support warn and
-        retain their existing behavior. Managed Dynamo drains active trajectories.
+        Every async backend configured for in-flight weight updates is asked to
+        pause generation. vLLM preserves in-flight request state with its native
+        keep-mode pause. Backends without pause support warn and retain their
+        existing behavior.
 
         For non-async engines, waits for all pending generations to complete before refit.
         """
@@ -1067,16 +1067,7 @@ class AsyncTrajectoryCollector:
         # Check if we're using async engine
         generation_cfg = self.master_config.policy["generation"]
         backend = generation_cfg["backend"]
-        if backend == "dynamo":
-            # Dynamo's native layerwise reload temporarily materializes model
-            # parameters while the NCCL update is in progress.  It is not safe
-            # to execute an already-issued vLLM request concurrently with that
-            # reload (in particular for NemotronH/Mamba parameters), even when
-            # the update route accepts allow_unpaused=True.  Stop new trajectory
-            # starts above and drain every active trajectory before refitting.
-            is_async_engine = False
-        else:
-            is_async_engine = should_use_async_rollouts(generation_cfg)
+        is_async_engine = should_use_async_rollouts(generation_cfg)
         in_flight_weight_updates = self.async_config.in_flight_weight_updates
 
         if is_async_engine and in_flight_weight_updates:
@@ -1144,10 +1135,6 @@ class AsyncTrajectoryCollector:
                     )
             except Exception as e:
                 print(f"⚠️ Failed to invalidate generation backend KV caches: {e}")
-                if self.master_config.policy["generation"]["backend"] == "dynamo":
-                    raise RuntimeError(
-                        "Managed Dynamo KV cache invalidation failed after refit"
-                    ) from e
             finally:
                 self._generation_pause_requested_for_refit = False
                 self._generation_paused_for_refit = False
@@ -1377,7 +1364,7 @@ class AsyncTrajectoryCollector:
     def _compute_teacher_logprobs(
         self,
         input_ids: torch.Tensor,
-        agent_refs: list[dict[str, Any]],
+        agent_refs: list[dict[str, Any]] | list[str],
         input_lengths: Optional[torch.Tensor] = None,
         multimodal_data: Optional[dict[str, Any]] = None,
     ) -> tuple[torch.Tensor, float]:
@@ -1387,7 +1374,7 @@ class AsyncTrajectoryCollector:
 
         Args:
             input_ids: [B, S] tokenized input tensor
-            agent_refs: list of B agent reference dicts
+            agent_refs: B attribution keys or legacy agent reference dicts
             input_lengths: [B] per-sample lengths (required for sequence packing)
             multimodal_data: batch-level multimodal inputs, row-aligned with
                 ``input_ids`` and sliced per teacher
@@ -1400,9 +1387,8 @@ class AsyncTrajectoryCollector:
         default_teacher_alias = opd_cfg.get("default_teacher_alias")
         strict = opd_cfg.get("strict_agent_name_match", False)
 
-        # Resolve each sample's agent -> the teacher alias it should be distilled
-        # from: the agent name is looked up in teacher_model_by_agent_name; unmapped
-        # agents fall back to default_teacher_alias (or raise if strict_agent_name_match).
+        # Route tasksets and flat-row agent names through the existing teacher map.
+        # Unmapped keys fall back to default_teacher_alias (or raise if strict_agent_name_match).
         # Returns one alias per sample, index-aligned with agent_refs.
         reference_aliases = resolve_reference_aliases(
             agent_refs,
@@ -1712,8 +1698,12 @@ class AsyncTrajectoryCollector:
 
         # Teacher inference is blocking. Keep it off this worker's event loop so
         # other completed prompt groups can continue moving toward the buffer.
-        if self._has_distillation_teachers and "agent_ref" in final_batch_cpu:
-            agent_refs = final_batch_cpu["agent_ref"]
+        if self._has_distillation_teachers and (
+            "attribution_key" in final_batch_cpu or "agent_ref" in final_batch_cpu
+        ):
+            agent_refs = final_batch_cpu.get(
+                "attribution_key", final_batch_cpu.get("agent_ref")
+            )
             if isinstance(agent_refs, list):
                 from nemo_rl.data.llm_message_utils import (
                     batched_message_log_to_flat_message,

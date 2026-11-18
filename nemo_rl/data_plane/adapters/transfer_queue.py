@@ -42,7 +42,7 @@ import weakref
 from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import psutil
 import torch
@@ -54,7 +54,8 @@ from tensordict import TensorDict
 
 from nemo_rl.data_plane.adapters import mooncake_ssd_offload
 from nemo_rl.data_plane.adapters.tq_controller_patch import configure_controller_patch
-from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
+from nemo_rl.data_plane.adapters.transfer_queue_env import rdma_rails
+from nemo_rl.data_plane.checkpoint import CheckpointCapture
 from nemo_rl.data_plane.codec import timed_codec
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
@@ -62,6 +63,7 @@ from nemo_rl.data_plane.interfaces import (
     KVBatchMeta,
     backend_config,
     data_plane_supports_checkpointing,
+    gdr_enabled,
     storage_unit_placement,
 )
 from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
@@ -114,7 +116,8 @@ def rdma_devices() -> str:
     fabric where each rail is its own subnet, a cross-rail draw has no route and
     dies with "transport retry counter exceeded".
 
-    IB and RoCE are never mixed; InfiniBand is preferred when present.
+    Device choice is ``transfer_queue_env.rdma_rails``: IB over RoCE, never
+    mixed, and without the management interface's RDMA function.
 
     Also the skip predicate for the mooncake tests — ``mooncake_cpu`` is
     RDMA-only, so they cannot run without a device.
@@ -128,11 +131,8 @@ def rdma_devices() -> str:
     # well after setup has begun — so treat a missing verbs node as no device.
     if not glob.glob("/dev/infiniband/uverbs*"):
         return ""
-    layers = rail_link_layers()
-    ib = [n for n, layer in layers.items() if layer == "InfiniBand"]
-    roce = [n for n, layer in layers.items() if layer == "Ethernet"]
     # No space after the comma: mooncake splits on "," only.
-    return ",".join(ib or roce)
+    return ",".join(rdma_rails())
 
 
 def _mooncake_transport_config() -> dict:
@@ -917,6 +917,35 @@ def _pin_simple_storage_units(node_ids: list[str]) -> None:
     )
 
 
+def _nixl_storage_node_ids(
+    placement: list[Literal["train", "inference"]] | Literal["all"],
+) -> list[str]:
+    """Ray node IDs for a NIXL storage_unit_placement.
+
+    ``all``: every alive GPU node; else the union of the named clusters
+    (``train`` / ``inference``).
+    """
+    from ray.util.placement_group import placement_group_table
+
+    from nemo_rl.data_plane.adapters.tq_nixl import alive_node_ids
+
+    if placement == "all":
+        return alive_node_ids("GPU")
+    prefixes = {
+        "train": ("sc_train_cluster", "sc_policy_cluster"),
+        "inference": ("sc_inference_cluster", "sc_policy_cluster"),
+    }
+    wanted = tuple(p for name in placement for p in prefixes[name])
+    return sorted(
+        {
+            node_id
+            for pg in placement_group_table().values()
+            if pg["name"].startswith(wanted) and pg["state"] == "CREATED"
+            for node_id in pg["bundles_to_node_id"].values()
+        }
+    )
+
+
 def _init_tq(
     cfg: DataPlaneConfig,
     *,
@@ -966,6 +995,13 @@ def _init_tq(
                 },
             },
         }
+        if simple_cfg.async_checkpoint:
+            # Load the SimpleStorage-only hook only when it is requested.
+            from nemo_rl.data_plane.adapters.tq_simple_checkpoint import (
+                configure_simple_checkpoint,
+            )
+
+            configure_simple_checkpoint()
         if storage_unit_node_ids is not None:
             _pin_simple_storage_units(storage_unit_node_ids)
         ssd = simple_cfg.ssd_offload
@@ -1057,6 +1093,25 @@ def _init_tq(
                 hard_pin=not mooncake_cfg.ssd_offload.enabled,
                 offload={"enabled": False},
             )
+    elif backend == "nixl":
+        # The NIXL data plane's TransferQueue backend (adapters/tq_nixl.py): CPU NixlStorageUnit actors own
+        # pinned-DRAM slabs, every other process is a client doing one-sided
+        # NIXL RDMA. Importing the plug-in registers "NixlStore" with TQ's
+        # manager / client / bootstrap registries; the bootstrap provider
+        # starts the units and the BlobDirectory inside tq.init.
+        import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
+
+        nixl_cfg = backend_config(cfg)
+        block = nixl_cfg.model_dump()
+        placement = block.pop("storage_unit_placement")
+        if not block.get("node_ids"):
+            block["node_ids"] = _nixl_storage_node_ids(placement)
+            if not block["node_ids"]:
+                raise RuntimeError(f"no nodes for storage_unit_placement={placement!r}")
+        overlay = {
+            **controller_overlay,
+            "backend": {"storage_backend": "NixlStore", "NixlStore": block},
+        }
     else:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
@@ -1227,13 +1282,14 @@ class TQDataPlaneClient(DataPlaneClient):
             # Before the store is set up; a no-op unless this process owns memory.
             mooncake_ssd_offload.install(mooncake_cfg, segment_size)
 
+        if cfg["backend"] == "nixl":
+            # Workers attach with tq.init() and need TQ's registries to know
+            # "NixlStore" before the client's storage manager is built.
+            import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
+
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
-        # GDR is a mooncake_cpu-only transport knob, so key it off the backend
-        # directly rather than off any incidental per-backend flag.
-        self._gdr_requested = self._backend == "mooncake_cpu" and bool(
-            backend_config(cfg).use_gdr
-        )
+        self._gdr_requested = gdr_enabled(cfg)
         self._gdr_put_confirmed = False
 
         if bootstrap:
@@ -1596,6 +1652,31 @@ class TQDataPlaneClient(DataPlaneClient):
         tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
+
+    def capture_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> CheckpointCapture | None:
+        if self._backend != "simple":
+            return None
+        simple_cfg = backend_config(self._cfg)
+        if not simple_cfg.async_checkpoint:
+            return None
+        # The capture implementation depends on pinned SimpleStorage internals.
+        from nemo_rl.data_plane.adapters.tq_simple_checkpoint import (
+            capture_simple_checkpoint,
+        )
+
+        self._require_checkpointing_support()
+        _connect_existing()
+        return capture_simple_checkpoint(
+            checkpoint_dir,
+            num_storage_units=simple_cfg.num_storage_units,
+            metadata=metadata,
+            timeout_s=simple_cfg.checkpoint_io_timeout_s,
+        )
 
     def save_checkpoint(
         self,

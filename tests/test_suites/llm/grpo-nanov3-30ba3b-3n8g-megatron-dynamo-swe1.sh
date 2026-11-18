@@ -59,8 +59,8 @@ refit_count=$(grep -c "✅ Ready for refit" "${RUN_LOG}" || true)
 cache_invalidation_count=$(grep -c \
     "✅ Invalidated generation backend KV caches after weight update" \
     "${RUN_LOG}" || true)
-cache_invalidation_failure_count=$(grep -cE \
-    "Failed to invalidate generation backend KV caches|Dynamo KV cache invalidation failed" \
+cache_invalidation_failure_count=$(grep -c \
+    "Failed to invalidate generation backend KV caches" \
     "${RUN_LOG}" || true)
 if [[ ${cache_invalidation_failure_count} -ne 0 ]]; then
     echo "[ERROR] Found ${cache_invalidation_failure_count} cache invalidation failure(s)"

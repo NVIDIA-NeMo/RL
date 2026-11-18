@@ -201,6 +201,72 @@ def reject_outdated_dynamo_router_reset_states(config: dict[str, Any]) -> None:
         )
 
 
+# Keys of the managed dynamo.vllm backend's dynamo_cfg with no counterpart now that
+# Dynamo serves NeMo RL's own vLLM workers, and what replaces each.
+_REMOVED_DYNAMO_CFG_KEYS = {
+    "engine": "Dynamo always serves the vLLM backend's workers",
+    "control_timeout_s": "refit and pause use the vLLM backend's own controls",
+    "metrics_include_prefixes": "set vllm_cfg.enable_vllm_metrics_logger instead",
+    "metrics_exclude_prefixes": "set vllm_cfg.enable_vllm_metrics_logger instead",
+    "worker_args": (
+        "NeMo RL's chat engine in the frontend renders and parses NeMo-Gym's calls "
+        "with the native server's vllm_cfg.http_server_serving_chat_kwargs and "
+        "parser plugins, and engines are configured through vllm_cfg and "
+        "vllm_kwargs"
+    ),
+}
+_REMOVED_DYNAMO_FRONTEND_KEYS = (
+    "tokenizer",
+    "tokenizer_cache",
+    "tokenizer_cache_bytes",
+)
+
+
+def reject_outdated_dynamo_backend(config: dict[str, Any]) -> None:
+    """Fail on the removed ``backend: dynamo`` and its dynamo_cfg keys.
+
+    Dynamo now serves NeMo RL's own vLLM workers: ``backend: vllm`` plus
+    ``dynamo: true``. One migration, so the backend is reported first and the
+    dynamo_cfg keys that no longer exist with it.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    policy = config.get("policy")
+    if not isinstance(policy, dict):
+        return
+    generation = policy.get("generation")
+    if not isinstance(generation, dict):
+        return
+    problems = []
+    if generation.get("backend") == "dynamo":
+        problems.append(
+            "policy.generation.backend='dynamo' was removed: Dynamo now serves NeMo "
+            "RL's own vLLM workers. Set policy.generation.backend=vllm and "
+            "policy.generation.dynamo=true; vllm_cfg and vllm_kwargs keep their "
+            "meaning."
+        )
+    dynamo_cfg = generation.get("dynamo_cfg")
+    if isinstance(dynamo_cfg, dict):
+        for key, replacement in _REMOVED_DYNAMO_CFG_KEYS.items():
+            if key in dynamo_cfg:
+                problems.append(
+                    f"policy.generation.dynamo_cfg.{key} was removed: {replacement}."
+                )
+        frontend_args = dynamo_cfg.get("frontend_args")
+        if isinstance(frontend_args, dict):
+            for key in _REMOVED_DYNAMO_FRONTEND_KEYS:
+                if key in frontend_args:
+                    problems.append(
+                        f"policy.generation.dynamo_cfg.frontend_args.{key} was "
+                        "removed: NeMo RL never uses the frontend's tokenizer: "
+                        "rollouts send token IDs, and NeMo-Gym's chat calls are "
+                        "rendered by NeMo RL's own chat engine."
+                    )
+    if problems:
+        raise ValueError(" ".join(problems))
+
+
 def reject_outdated_context_compaction(config: dict[str, Any]) -> None:
     """Reject the old forest-training switch before schema validation."""
     capture = config.get("token_capture")
@@ -212,13 +278,53 @@ def reject_outdated_context_compaction(config: dict[str, Any]) -> None:
         )
 
 
+# Removed rollout_recovery key -> the key that replaced it.
+_RENAMED_ROLLOUT_RECOVERY_KEYS = {
+    "default_granularity": "target_level",
+    "task_granularity_overrides": "task_source_target_level_overrides",
+    "task_source_granularity_overrides": "task_source_target_level_overrides",
+    "agent_granularity_overrides": "agent_target_level_overrides",
+}
+
+
+def reject_outdated_rollout_recovery_granularity(config: dict[str, Any]) -> None:
+    """Fail when rollout_recovery still uses the *_granularity keys.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    rollout_recovery = config.get("rollout_recovery")
+    if not isinstance(rollout_recovery, dict):
+        return
+
+    removed = sorted(_RENAMED_ROLLOUT_RECOVERY_KEYS.keys() & rollout_recovery.keys())
+    if not removed:
+        return
+
+    renames = ", ".join(
+        f"rollout_recovery.{key} -> rollout_recovery.{_RENAMED_ROLLOUT_RECOVERY_KEYS[key]}"
+        for key in removed
+    )
+    message = (
+        f"rollout_recovery no longer accepts {removed!r}. Rename them ({renames}); "
+        f"the values ('sibling', 'prompt_group') are unchanged."
+    )
+    if "task_granularity_overrides" in removed:
+        message += (
+            " task_granularity_overrides was keyed by task name; its replacement is "
+            "keyed by extra_env_info.task_source."
+        )
+    raise ValueError(message)
+
+
 def check_outdated_config(config: dict[str, Any]) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
     Call this from every entrypoint on the resolved config, before the MasterConfig is
     built. Validation rejects a missing required key on its own terms, so a check that
     runs after it can never explain a removal that changed such a key's shape. Add a
-    check here whenever a key is removed or the shape it accepts changes.
+    check here when a previously supported key is removed or its accepted shape changes.
+    Spellings or shapes introduced and replaced within the same unmerged PR need no check.
 
     Args:
         config: The config as the user wrote it, resolved by OmegaConf.to_container.
@@ -229,4 +335,6 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     reject_outdated_metric_name_format(config)
     reject_outdated_mcore_generation_keys(config)
     reject_outdated_dynamo_router_reset_states(config)
+    reject_outdated_dynamo_backend(config)
     reject_outdated_context_compaction(config)
+    reject_outdated_rollout_recovery_granularity(config)

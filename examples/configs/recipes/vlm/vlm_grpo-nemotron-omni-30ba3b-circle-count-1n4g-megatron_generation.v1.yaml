@@ -10,10 +10,6 @@ grpo:
     enabled: true
     max_trajectory_age_steps: 2
     in_flight_weight_updates: true
-async_rl:
-  generation_fleet_health:
-    # Native MCore refit has no worker-side abort hook for a deadline.
-    refit_timeout_s: null
 loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
@@ -93,6 +89,7 @@ env:
     - resources_servers/circle_count/configs/circle_count.yaml
     circle_count_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:

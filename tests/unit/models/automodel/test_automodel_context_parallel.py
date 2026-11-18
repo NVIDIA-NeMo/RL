@@ -190,7 +190,6 @@ class TestPrepareModelForward:
                 device_mesh=None,
                 cp_size=1,
                 padding_token_id=0,
-                is_reward_model=False,
                 allow_flash_attn_args=True,
             )
 
@@ -234,7 +233,6 @@ class TestPrepareModelForward:
                 device_mesh=device_mesh,
                 cp_size=2,
                 padding_token_id=7,
-                is_reward_model=False,
                 allow_flash_attn_args=True,
             )
 

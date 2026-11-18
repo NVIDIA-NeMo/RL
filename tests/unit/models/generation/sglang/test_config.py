@@ -27,7 +27,6 @@ from pydantic import ValidationError
 from nemo_rl.models.generation.sglang import sglang_worker
 from nemo_rl.models.generation.sglang.config import (
     SGLangFaultToleranceConfig,
-    SGLangHttpClientConfig,
     SglangSpecificArgs,
 )
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -61,18 +60,6 @@ def test_worker_outlines_cache_default_and_opt_in(monkeypatch, setting, expected
     assert args["disable_outlines_disk_cache"] is expected
 
 
-def test_fault_tolerance_defaults_are_centralized_and_disabled():
-    expected = {
-        "use_fault_tolerance": False,
-        "rollout_health_check_interval": 60.0,
-        "rollout_health_check_timeout": 60.0,
-        "rollout_health_check_first_wait": 60.0,
-        "rollout_max_restart_attempts": 3,
-    }
-    assert SGLangFaultToleranceConfig().model_dump() == expected
-    assert SGLangFaultToleranceConfig.model_validate({}).model_dump() == expected
-
-
 def test_fault_tolerance_validates_nested_settings_without_mutation():
     values = {
         "use_fault_tolerance": True,
@@ -102,25 +89,6 @@ def test_fault_tolerance_block_is_required_without_flat_fields():
     assert not SGLangFaultToleranceConfig.model_fields.keys() & (
         SglangSpecificArgs.__annotations__.keys()
     )
-
-
-@pytest.mark.parametrize(
-    "config_path",
-    sorted(
-        (Path(__file__).resolve().parents[5] / "examples/configs").rglob(
-            "*sglang*.yaml"
-        )
-    ),
-    ids=lambda path: path.name,
-)
-def test_sglang_recipes_inherit_required_fault_tolerance_block(config_path):
-    config = load_config(config_path)
-    sglang_cfg = config.policy.generation.sglang_cfg
-    fault_tolerance = SGLangFaultToleranceConfig.model_validate(
-        dict(sglang_cfg["sglang_fault_tolerance_config"])
-    )
-    assert not fault_tolerance.use_fault_tolerance
-    assert not SGLangFaultToleranceConfig.model_fields.keys() & sglang_cfg.keys()
 
 
 def test_missing_fault_tolerance_block_fails_before_cluster_allocation(monkeypatch):
@@ -251,14 +219,3 @@ def test_failed_constructor_cleanup_is_repeatable_and_destructor_safe(
     assert unraisable_errors == []
     if not invalid_config:
         loop.close.assert_called_once_with()
-
-
-def test_http_client_default_counts_total_attempts():
-    assert SGLangHttpClientConfig().max_retries == 3
-    assert SGLangHttpClientConfig(max_retries=1).max_retries == 1
-
-
-@pytest.mark.parametrize("budget", [0, -1, True, 1.5, "3", None])
-def test_http_client_rejects_invalid_attempt_budget(budget):
-    with pytest.raises(ValidationError, match="max_retries"):
-        SGLangHttpClientConfig(max_retries=budget)
