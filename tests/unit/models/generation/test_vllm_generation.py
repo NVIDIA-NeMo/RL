@@ -1067,11 +1067,8 @@ def test_resolve_enable_prefix_caching_uses_cuda_capability_for_auto(monkeypatch
 @pytest.mark.parametrize(
     ("vllm_version", "expected"),
     [
-        ("0.33.0", {"block_size": 16, "numa_bind": False}),
-        (
-            "0.34.0",
-            {"block_size": 16, "numa_bind": False, "enable_extensible_kv_cache": False},
-        ),
+        ("0.33.0", {"numa_bind": False}),
+        ("0.34.0", {"numa_bind": False, "enable_extensible_kv_cache": False}),
     ],
 )
 def test_engine_defaults_pinned_to_vllm_033_follow_installed_vllm(
@@ -1092,10 +1089,10 @@ def test_engine_defaults_pinned_to_vllm_033_yield_to_user_vllm_kwargs(monkeypatc
     )
 
     pinned = _engine_defaults_pinned_to_vllm_033(
-        {"block_size": 32, "enable_extensible_kv_cache": True}
+        {"numa_bind": True, "enable_extensible_kv_cache": True}
     )
 
-    assert pinned == {"numa_bind": False}
+    assert pinned == {}
 
 
 basic_lora_test_config: LoRAConfig = {

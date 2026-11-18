@@ -69,9 +69,10 @@ def disable_draft_module_sharing() -> None:
     drafter keep the modules it built in ``__init__``; refit fills them before
     the first generation, and CUDA graphs capture drafter-owned storage.
 
-    ``_should_share`` is defined in the eagle utils module and imported by
-    value into the dspark/dflash utils modules, so each module's global must
-    be rebound individually.
+    ``_should_share`` is defined in the eagle utils module. vLLM 0.33 imports
+    it by value into the dspark/dflash utils modules, so each module's global
+    is rebound individually; on 0.34 dspark calls eagle's helpers directly and
+    its rebind is a harmless no-op.
 
     On vLLM 0.33 a second, independent embed_tokens-sharing decision lives in
     ``SpecDecodeBaseProposer._maybe_share_embeddings`` (used by the eagle3

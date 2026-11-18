@@ -72,7 +72,11 @@ def patch_snippets(
 
 
 def write_unpatched_copy(
-    relative_source: str, patch_fn_name: str, destination: Path
+    relative_source: str,
+    patch_fn_name: str,
+    destination: Path,
+    old_name: str = "old_snippet",
+    new_name: str = "new_snippet",
 ) -> Path:
     """Copy an installed vLLM file to `destination` with its patch reversed.
 
@@ -82,11 +86,13 @@ def write_unpatched_copy(
         patch_fn_name: Name of the patch function in ``patches.py`` whose edit
             should be undone.
         destination: File to write.
+        old_name: Name of the anchor variable in the patch function.
+        new_name: Name of the replacement variable in the patch function.
 
     Returns:
         ``destination``.
     """
-    old_snippet, new_snippet = patch_snippets(patch_fn_name)
+    old_snippet, new_snippet = patch_snippets(patch_fn_name, old_name, new_name)
     content = Path(patches._get_vllm_file(relative_source)).read_text()
 
     if new_snippet in content:

@@ -256,7 +256,14 @@ def register_nemo_modelopt_nvfp4() -> None:
                 params_dtype,
                 **extra_weight_attrs,
             )
-            if not _vllm_retires_unused_input_scales():
+            if _vllm_retires_unused_input_scales():
+                # vLLM 0.34 retires these placeholders itself after loading
+                # (getattr(layer, name).retired = True), so they must stay
+                # registered. W4A16 refits never send them: tell layerwise
+                # reload they load zero elements so it does not wait for them.
+                layer.w13_input_scale.weight_loader_numel = 0
+                layer.w2_input_scale.weight_loader_numel = 0
+            else:
                 del layer.w13_input_scale
                 del layer.w2_input_scale
 

@@ -34,16 +34,19 @@ source-sensitive compatibility patches:
 
 import ast
 import asyncio
+import importlib.metadata
 import inspect
 import logging
 import os
 import shutil
 import sys
+import textwrap
 import types
 from types import SimpleNamespace
 
 import pytest
 import torch
+from packaging.version import Version
 
 from nemo_rl.models.generation.vllm import patches
 from tests.unit.models.generation.vllm_patch_source_utils import (
@@ -227,10 +230,23 @@ def test_modelopt_moe_amax_aliases_satisfy_installed_vllm_loader(
     assert not hasattr(experts, "w2_input_quantizer._amax")
 
 
+def _installed_vllm_is_at_least_034() -> bool:
+    return tuple(Version(importlib.metadata.version("vllm")).release[:2]) >= (0, 34)
+
+
+def _radio_snippet_names() -> tuple[str, str]:
+    """The LayerScale patch's anchor/replacement variables for the installed vLLM."""
+    if _installed_vllm_is_at_least_034():
+        return "old_snippet_034", "new_snippet_034"
+    return "old_snippet", "new_snippet"
+
+
 @pytest.fixture
 def patched_radio_source(tmp_path, monkeypatch):
     """The installed vLLM RADIO loader, unpatched then patched in tmp."""
-    copied = write_unpatched_copy(_RADIO_SOURCE, _RADIO_PATCH_FN, tmp_path / "radio.py")
+    copied = write_unpatched_copy(
+        _RADIO_SOURCE, _RADIO_PATCH_FN, tmp_path / "radio.py", *_radio_snippet_names()
+    )
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
     patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
     return copied
@@ -276,10 +292,15 @@ def test_radio_layerscale_patch_loads_explicit_and_initializes_folded_weights(
     patched_radio_source,
 ):
     content = patched_radio_source.read_text()
-    assert 'vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"' in content
-    assert 'ls_name.endswith((".ls1", ".ls2"))' in content
     assert "ls_param.data.fill_(initializer_factor)" in content
-    assert "loaded_params.add(ls_name)" in content
+    if _installed_vllm_is_at_least_034():
+        # AutoWeightsLoader-based loader: LayerScale lives in layer_scale{1,2}.lambda1.
+        assert 'ls_name.endswith(".lambda1")' in content
+        assert "loaded.add(ls_name)" in content
+    else:
+        assert 'vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"' in content
+        assert 'ls_name.endswith((".ls1", ".ls2"))' in content
+        assert "loaded_params.add(ls_name)" in content
 
 
 @pytest.mark.vllm
@@ -287,6 +308,10 @@ def test_radio_layerscale_patch_keeps_values_loaded_by_earlier_refit_batches(
     patched_radio_source,
 ):
     """Refit calls load_weights once per batch; a later batch must not reset LayerScale."""
+    if _installed_vllm_is_at_least_034():
+        _check_layerscale_fill_keeps_values_loaded_by_earlier_batches_034()
+        return
+
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
     tree = ast.parse(patched_radio_source.read_text())
@@ -342,6 +367,60 @@ def test_radio_layerscale_patch_keeps_values_loaded_by_earlier_refit_batches(
         namespace["load_weights"](model, [])
     assert torch.allclose(layer.ls1, torch.full((4,), 0.1))
     assert torch.allclose(layer.ls2, torch.ones(4))
+
+
+def _check_layerscale_fill_keeps_values_loaded_by_earlier_batches_034() -> None:
+    """Run the 0.34 fill block (the lines the patch inserts before ``return loaded``)
+    against a module shaped like vLLM 0.34's RadioModel."""
+    _, new_snippet = patch_snippets(
+        _RADIO_PATCH_FN, "old_snippet_034", "new_snippet_034"
+    )
+    fill_block = textwrap.dedent(new_snippet.split("        return loaded\n", 1)[0])
+
+    class _Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_scale1 = torch.nn.Module()
+            self.layer_scale1.lambda1 = torch.nn.Parameter(
+                torch.full((4,), float("nan"))
+            )
+            self.layer_scale2 = torch.nn.Module()
+            self.layer_scale2.lambda1 = torch.nn.Parameter(
+                torch.full((4,), float("nan"))
+            )
+
+    class _Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = torch.nn.ModuleList([_Layer()])
+
+    class _Radio(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(layerscale_value=1.0)
+            self.encoder = _Encoder()
+
+    model = _Radio()
+    layer = model.encoder.layer[0]
+
+    def run_fill(loaded: set[str]) -> set[str]:
+        namespace = {"self": model, "loaded": loaded}
+        exec(compile(fill_block, "<radio-fill>", "exec"), namespace)
+        return namespace["loaded"]
+
+    with torch.no_grad():
+        # Batch 1 loaded ls1 explicitly (AutoWeightsLoader reports the vLLM name).
+        layer.layer_scale1.lambda1.fill_(0.1)
+        loaded = run_fill({"encoder.layer.0.layer_scale1.lambda1"})
+        assert "encoder.layer.0.layer_scale2.lambda1" in loaded
+        assert torch.allclose(layer.layer_scale1.lambda1, torch.full((4,), 0.1))
+        assert torch.allclose(layer.layer_scale2.lambda1, torch.ones(4))
+
+        # A later batch carrying no vision weights (e.g. LLM-only) must not
+        # reset the explicitly loaded ls1 back to layerscale_value.
+        run_fill(set())
+    assert torch.allclose(layer.layer_scale1.lambda1, torch.full((4,), 0.1))
+    assert torch.allclose(layer.layer_scale2.lambda1, torch.ones(4))
 
 
 @pytest.mark.vllm

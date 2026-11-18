@@ -172,14 +172,16 @@ def _maybe_enable_vllm_native_tracing(llm_kwargs: dict[str, Any]) -> None:
 def _engine_defaults_pinned_to_vllm_033(vllm_kwargs: dict[str, Any]) -> dict[str, Any]:
     """Engine defaults vLLM changed after 0.33, pinned to their 0.33 values.
 
-    vLLM 0.34 defaults ``block_size`` to 64 (was 16), turns the extensible KV
-    cache on (driver-mapped memory outside the CuMem pool, sized after warmup)
-    and sets ``numa_bind`` to auto, which wraps workers in numactl. Keep the
-    0.33 behavior; NeMo-RL binds NUMA itself. Keys the user sets in
-    ``vllm_kwargs`` win, and ``enable_extensible_kv_cache`` is only passed to
-    a vLLM that has it (0.34+).
+    vLLM 0.34 turns the extensible KV cache on (driver-mapped memory outside
+    the CuMem pool, sized after warmup) and sets ``numa_bind`` to auto, which
+    wraps the mp/uni executors' workers in numactl. Keep the 0.33 behavior;
+    NeMo-RL binds NUMA itself. ``block_size`` is deliberately NOT pinned: an
+    explicit value counts as user-specified and stops vLLM from picking the
+    attention backend's preferred size (MLA backends need 64 or 128). Keys the
+    user sets in ``vllm_kwargs`` win, and ``enable_extensible_kv_cache`` is
+    only passed to a vLLM that has it (0.34+).
     """
-    defaults: dict[str, Any] = {"block_size": 16, "numa_bind": False}
+    defaults: dict[str, Any] = {"numa_bind": False}
     if Version(importlib.metadata.version("vllm")) >= Version("0.34"):
         defaults["enable_extensible_kv_cache"] = False
     return {key: value for key, value in defaults.items() if key not in vllm_kwargs}

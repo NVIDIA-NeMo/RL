@@ -9,9 +9,10 @@ defaults: ../../vlm_grpo_3B.yaml
 #   - Automodel r0.6.0 @ b916107a5 or later (the submodule pin on main).
 #   - Stock vLLM 0.34.0 (pyproject pin) plus NeMo RL's vLLM source patches:
 #     the RADIO final vision LayerNorm (_patch_vllm_radio_final_layernorm) and
-#     the transformers-native RADIO weight-name loader
-#     (_patch_vllm_radio_native_loader). Both apply automatically when the
-#     generation workers start.
+#     the RADIO LayerScale fill (_patch_vllm_radio_layerscale_loader). Both
+#     apply automatically when the generation workers start. vLLM 0.34's
+#     RadioModel maps transformers-native weight names itself; the native-name
+#     loader patch only runs on older vLLM.
 #
 # Model-specific notes:
 #   - vLLM loads the checkpoint's vision weights from disk (load_format=auto via
