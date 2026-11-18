@@ -91,8 +91,12 @@ def test_dynamo_worker_builds_the_handoff_engine(engine_modules, role):
 
     assert worker._dynamo_role == role
     # The peer role lives in other processes: NIXL carries the handoff and the
-    # coordinator must listen on a routable address.
-    assert worker._inference_config_overrides() == {"kv_transport_backend": "nixl"}
+    # coordinator must listen on a routable address. The role reaches
+    # Megatron-LM, which drops the Mamba prefix cache for decode.
+    assert worker._inference_config_overrides() == {
+        "kv_transport_backend": "nixl",
+        "disaggregation_role": role,
+    }
     assert worker._coordinator_kwargs() == {"hostname": "10.0.0.5"}
 
     engine = worker._build_dynamic_inference_engine(controller, context)

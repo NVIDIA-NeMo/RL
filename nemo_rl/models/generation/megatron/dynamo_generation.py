@@ -38,6 +38,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    reject_unenforceable_refit_deadline,
 )
 from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
 from nemo_rl.models.generation.megatron.dynamo_config import (
@@ -77,7 +78,7 @@ def role_policy_config(
     A deep copy of ``policy_config`` with the role in
     ``generation._dynamo_role`` (what makes the worker build the handoff
     engine for that role) and ``overrides`` (the role's
-    ``dynamo_cfg.prefill_engine`` / ``decode_engine`` layout keys) merged into
+    ``dynamo_cfg.prefill_engine`` / ``decode_engine`` keys) merged into
     ``generation.mcore_generation_config``, which is where the dedicated
     inference policy takes its layout from. ``generation.dynamo`` is turned
     off: each engine is a plain Megatron engine sized by its own layout, and
@@ -87,8 +88,8 @@ def role_policy_config(
     Args:
         policy_config: The full ``policy`` config.
         role: ``prefill`` or ``decode``.
-        overrides: Layout keys from ``MegatronDynamoCfg.role_overrides``; empty for
-            a role that keeps the shared layout.
+        overrides: Keys from ``MegatronDynamoCfg.role_overrides``; empty for
+            a role that keeps the shared ``mcore_generation_config``.
 
     Returns:
         A fresh config for one engine of ``role``.
@@ -207,6 +208,28 @@ class MegatronDynamoEngine:
             )
             for worker in self.workers
         ]
+
+    def init_collective_mcore_generation(
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        rank_offset: int,
+        refit_execution_batch_bytes: int | None,
+        refit_backend: str,
+    ) -> list[ray.ObjectRef]:
+        # As init_collective: every worker gets the engine's offset and adds
+        # its own rank inside the engine to it.
+        return self._all(
+            "init_collective_mcore_generation",
+            ip=ip,
+            port=port,
+            world_size=world_size,
+            rank_offset=rank_offset,
+            refit_execution_batch_bytes=refit_execution_batch_bytes,
+            refit_backend=refit_backend,
+        )
 
     def update_weights_from_collective(
         self, refit_timeout_s: float | None
@@ -427,11 +450,12 @@ class MegatronDynamoGeneration(GenerationInterface):
 
     @property
     def uses_native_refit(self) -> bool:
-        """Never: the engines take the packed collective, as ``refit_transport`` must be null.
+        """Whether the engines refit through Megatron-Core's native path (``refit_transport: mcore``).
 
-        Read by the Megatron weight synchronizer to pick its transport.
+        Read by the Megatron weight synchronizer to pick its transport. False
+        is the packed collective.
         """
-        return False
+        return self.cfg.get("refit_transport") == "mcore"
 
     @property
     def worker_group(self) -> "RayWorkerGroup":
@@ -551,10 +575,21 @@ class MegatronDynamoGeneration(GenerationInterface):
         *,
         train_world_size: int,
     ) -> list[ray.ObjectRef]:
-        """Join every engine to the NeMo RL ``model_update_group`` at its rank prefix.
+        """Join every engine to the refit group at its rank prefix.
 
         Engine ``i``'s workers are offset to the absolute rank where its shard
-        starts: the trainers plus its prefix within the generation block.
+        starts: the trainers plus its prefix within the generation block. The
+        packed collective joins NeMo RL's ``model_update_group``; the native
+        refit (``refit_transport: mcore``) builds Megatron-Core's refit group
+        and its transfer plan, with every training rank joining at the same
+        time.
+
+        The native plan needs no per-engine pools. Each engine is its own
+        torch.distributed world, and Megatron-Core shifts every group rank an
+        engine reports by that engine's offset, so one plan sees each engine at
+        its true ranks with its own tensor-parallel group. The plan is worked
+        out per receiving rank from that rank's own layout, so a TP 2 prefill
+        engine and TP 1 decode engines are refit in the same transfer.
         """
         expected = train_world_size + self.inference_world_size
         if world_size != expected:
@@ -562,26 +597,59 @@ class MegatronDynamoGeneration(GenerationInterface):
                 f"NCCL world_size={world_size} does not match expected {expected} "
                 f"(train={train_world_size} + engines={self.inference_world_size})"
             )
-        membership = self.full_fleet_membership(train_world_size)
-        self.check_full_fleet(membership)
+        self.check_full_fleet(self.full_fleet_membership(train_world_size))
+        offsets = self.engine_rank_offsets(train_world_size)
         futures: list[ray.ObjectRef] = []
-        for index, record in enumerate(self._engine_records):
+        if self.uses_native_refit:
+            mcore_cfg = self.cfg["mcore_generation_config"]
+            for record, offset in zip(self._engine_records, offsets, strict=True):
+                futures.extend(
+                    record.init_collective_mcore_generation(
+                        ip,
+                        port,
+                        world_size,
+                        rank_offset=offset,
+                        refit_execution_batch_bytes=mcore_cfg[
+                            "refit_execution_batch_bytes"
+                        ],
+                        refit_backend=mcore_cfg["refit_backend"],
+                    )
+                )
+            return futures
+        for record, offset in zip(self._engine_records, offsets, strict=True):
             futures.extend(
                 record.init_collective(
                     ip,
                     port,
-                    membership.world_size,
-                    train_world_size=membership.train_world_size,
-                    rank_offset=membership.train_world_size
-                    + membership.shard_prefixes[index],
+                    world_size,
+                    train_world_size=train_world_size,
+                    rank_offset=offset,
                 )
             )
         return futures
 
+    def engine_rank_offsets(self, train_world_size: int) -> list[int]:
+        """Refit-group rank of each engine's rank zero, in record order.
+
+        The trainers take ranks ``0 .. train_world_size - 1``; engine ``i``
+        starts right after the trainers and the engines before it.
+        """
+        membership = self.full_fleet_membership(train_world_size)
+        return [
+            membership.train_world_size + membership.shard_prefixes[index]
+            for index in range(self.num_engines)
+        ]
+
     def prepare_refit_info(
         self, state_dict_info: Optional[dict[str, Any]]
     ) -> Optional[list[str]]:
-        """Prepare Bridge conversion tasks on every engine."""
+        """Prepare Bridge conversion tasks on every engine.
+
+        A no-op with the native refit, which moves Megatron shards and never
+        imports HF tensors (as on ``MegatronGeneration``).
+        """
+        if self.uses_native_refit:
+            return None
         if state_dict_info is None:
             raise ValueError("state_dict_info must not be None for Megatron refit")
         # Stored once; every worker resolves the same object.
@@ -597,8 +665,19 @@ class MegatronDynamoGeneration(GenerationInterface):
     def update_weights_from_collective(
         self, refit_timeout_s: Optional[float] = None
     ) -> list[ray.ObjectRef]:
-        """Receive one collective refit on every engine: a packed broadcast into the live parameters."""
+        """Receive one refit on every engine, into the live parameters.
+
+        The packed collective is a broadcast of HF tensors from train rank
+        zero. The native refit is Megatron-Core's ``swap_model_weights``, with
+        every engine rank receiving its own shards; it cannot be aborted, so a
+        deadline is refused before any engine enters it.
+        """
         futures: list[ray.ObjectRef] = []
+        if self.uses_native_refit:
+            reject_unenforceable_refit_deadline("Megatron", refit_timeout_s)
+            for record in self._engine_records:
+                futures.extend(record.swap_weights_via_reshard())
+            return futures
         for record in self._engine_records:
             futures.extend(record.update_weights_from_collective(refit_timeout_s))
         return futures
@@ -810,7 +889,7 @@ class MegatronDynamoGeneration(GenerationInterface):
                 f"than the {len(constraints)} pinned inference nodes."
             )
         # Each role's engines are built from the policy config with that
-        # role and its layout overrides.
+        # role and its overrides.
         policy_config_by_role: dict[str, dict[str, Any]] = {}
         for role in distinct_roles:
             policy_config_by_role[role] = role_policy_config(
