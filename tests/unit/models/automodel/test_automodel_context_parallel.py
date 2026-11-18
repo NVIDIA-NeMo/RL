@@ -43,6 +43,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     get_cp_sharded_next_token_logprobs,
     get_distillation_topk_logprobs_from_logits,
+    get_student_topk_logprobs,
 )
 from nemo_rl.models.automodel.data import ProcessedInputs
 from nemo_rl.models.automodel.train import (
@@ -319,6 +320,29 @@ def test_standard_distillation_statistics_follow_automodel_sequence_layout() -> 
     torch.testing.assert_close(student_logprobs, expected_student)
     torch.testing.assert_close(teacher_logprobs, expected_teacher)
     torch.testing.assert_close(entropy, expected_entropy)
+
+
+@pytest.mark.automodel
+def test_student_topk_follows_automodel_sequence_layout() -> None:
+    torch.manual_seed(19)
+    order = torch.tensor([0, 3, 1, 2])
+    layout = _PermutationTokenLayout(order)
+    canonical_student_logits = torch.randn(1, 4, 6)
+    local_student_logits = canonical_student_logits.index_select(1, order)
+
+    with patch("torch.distributed.get_world_size") as get_world_size:
+        logprobs, token_ids = get_student_topk_logprobs(
+            local_student_logits,
+            k=2,
+            seq_len=4,
+            context_parallel_group=object(),
+            cp_sharder=layout,
+        )
+
+    get_world_size.assert_not_called()
+    expected = torch.log_softmax(canonical_student_logits, dim=-1)[:, :-1].topk(2)
+    torch.testing.assert_close(logprobs, expected.values)
+    torch.testing.assert_close(token_ids, expected.indices)
 
 
 @pytest.mark.automodel

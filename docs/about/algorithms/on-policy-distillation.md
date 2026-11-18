@@ -51,6 +51,24 @@ env:
 
 NeMo Gym controls the rollout turn count from its environment and agent configuration. The standard distillation `distillation.max_rollout_turns` setting is not used by the NeMo Gym rollout path.
 
+## Monitoring a Run
+
+The loss logs top-k overlap diagnostics from [Rethinking On-Policy Distillation of Large Language Models](https://arxiv.org/abs/2604.13016) (Sections 2.3 and 4.1, Appendix B). They compare the student's own top-k tokens with the teacher's at every position of the student's rollouts. No config is needed: k is `distillation.topk_logits_k`, the same top-k the teacher sends for the loss. The paper uses k = 16, and changing `topk_logits_k` also changes the support the loss is computed on.
+
+Every metric is averaged over the tokens the loss trains on. `I` is the set of tokens in both the student's and the teacher's top-k.
+
+| Metric | Definition | Healthy run |
+|---|---|---|
+| `train/topk_overlap_ratio` | `\|I\| / k` | Rises steadily. Flat from the start means the student is not finding the teacher's high-probability tokens; a sudden drop is a collapse. |
+| `train/topk_overlap_token_advantage` | Mean over `I` of `p̄(v) (log q̄(v) − log p̄(v))`, with the student `p` and teacher `q` renormalized on `I`; 0 when `I` is empty | Never positive. Moves toward 0; staying strongly negative means the student is overconfident on the shared tokens. |
+| `train/topk_overlap_student_mass` | Student probability mass on `I` | Stays high. The paper reports 97–99%. |
+| `train/topk_overlap_teacher_mass` | Teacher probability mass on `I` | Stays high. Low values mean the overlap misses tokens the teacher cares about, even when the advantage looks good. |
+| `train/topk_student_entropy` | Entropy of the student renormalized over its top-k | Spikes come with collapses. |
+| `train/topk_teacher_entropy` | Entropy of the teacher renormalized over its top-k | Reference for the student entropy. |
+| `train/topk_entropy_gap` | `\|H(teacher) − H(student)\|` per token | Narrows. |
+
+The student mass is exact. The teacher side sends only its top-k, so the teacher mass and both entropies are computed over the top-k distributions renormalized: the teacher mass overestimates the true one, and the entropies differ from the full-vocabulary ones, becoming exact as k approaches the vocabulary size. Both entropies are computed the same way, so the gap compares like with like. Read them as trends. `train/loss` and `train/grad_norm` complete the picture: in a healthy run the loss falls and the gradient norm stays substantial, while a failing run starts with a small loss that barely moves and a weak gradient.
+
 ## On-policy Distillation Multi-node
 
 ```sh

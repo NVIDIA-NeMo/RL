@@ -44,6 +44,7 @@ from nemo_rl.distributed.model_utils import (
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
     get_policy_logprobs_at_sampler_topk,
+    get_student_topk_logprobs,
     sampled_logprobs_from_support,
     sampler_support_ids,
 )
@@ -473,11 +474,24 @@ def prepare_loss_input(
                 cp_sharder=cp_sharder,
             )
         )
+        teacher_topk_indices = data["teacher_topk_indices"]
+        student_own_topk_logprobs, student_own_topk_ids = get_student_topk_logprobs(
+            logits,
+            k=int(teacher_topk_indices.shape[-1]),
+            seq_len=int(teacher_topk_indices.shape[1]),
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            cp_sharder=cp_sharder,
+            chunk_size=chunk_size,
+        )
 
         loss_input = {
             "student_topk_logprobs": student_topk_logprobs,
             "teacher_topk_logprobs": teacher_topk_logprobs,
             "H_all": H_all,
+            "student_own_topk_logprobs": student_own_topk_logprobs,
+            "student_own_topk_ids": student_own_topk_ids,
         }
 
     elif loss_fn.input_type == LossInputType.DISTILLATION_CROSS_TOKENIZER:
