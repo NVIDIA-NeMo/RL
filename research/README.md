@@ -60,20 +60,12 @@ Authors are encouraged to write tests for their research projects. This template
 2. **Functional tests** - End-to-end tests with minimal configurations
 3. **Test suites** (nightlies) - Longer-running comprehensive validation tests
 
-Unit and functional tests are discovered under `research/*/tests/unit/` and
-`research/*/tests/functional/*.sh`. Before running them, CI changes into the
-project directory and runs `uv sync --locked --inexact --group test`. Declare
-runtime dependencies and a `test` dependency group in the project's
-`pyproject.toml`, add the project to the root uv workspace, and update `uv.lock`.
+Unit and functional tests are discovered under `research/*/tests/unit/` and `research/*/tests/functional/*.sh`. Before running them, CI changes into the project directory and runs `uv sync --locked --group test`. Declare runtime dependencies and a `test` dependency group in the project's `pyproject.toml`, add the project to the root uv workspace, and update `uv.lock`.
 
-Suite scripts under `research/<project>/tests/test_suites/**/*.sh` must be
-listed by their repository-relative path in one of the core
-`tests/test_suites/*.txt` lists (for example, `nightly.txt` or `disabled.txt`).
-Each script must have a matching `configs/recipes/**/*.yaml` in the same
-research project, with the same relative directory and basename. Discovery
-checks accounting; the selected suite list determines scheduling. Suite
-scripts must select their project environment and prepare dependencies before
-running training.
+Each research project can pin a different torch. When you switch projects in one venv, run the exact `uv sync --locked --group test` (no `--inexact`) or use a fresh environment; otherwise packages built for the previous project's torch (for example TransformerEngine) stay behind and fail with an `undefined symbol` error.
+
+Suite scripts under `research/<project>/tests/test_suites/**/*.sh` must be listed by their repository-relative path in one of the core `tests/test_suites/*.txt` lists (for example, `nightly.txt` or `disabled.txt`).
+Each script must have a matching `configs/recipes/**/*.yaml` in the same research project, with the same relative directory and basename. Discovery checks accounting; the selected suite list determines scheduling. Suite scripts must select their project environment and prepare dependencies before running training.
 
 These tests will be included in our automation. When changes occur in nemo-rl "core", the expectation is that it should not break tests that are written.
 
