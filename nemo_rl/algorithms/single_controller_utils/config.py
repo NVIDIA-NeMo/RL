@@ -1624,6 +1624,16 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "grpo.reward_shaping.enabled=false to use GDPO."
         )
 
+    if (
+        algo_cfg.adv_estimator.name == "gdpo"
+        and getattr(algo_cfg, "length_penalty", None) is not None
+    ):
+        raise NotImplementedError(
+            "grpo.length_penalty adjusts only the scalar reward, which GDPO does "
+            "not read -- the run would silently skip the penalty. Remove "
+            "grpo.length_penalty to use GDPO."
+        )
+
     async_config = master_config.async_rl
     generation_config = master_config.policy["generation"]
     if (
