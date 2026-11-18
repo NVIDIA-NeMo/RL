@@ -1,0 +1,14 @@
+defaults: ./grpo-qwen3-1.7b-1n8g-megatron-eagle3.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-1.7b-1n8g-megatron-eagle3-ttt3
+
+policy:
+  draft:
+    # One TTT pass per speculative token served by vLLM.
+    ttt_steps: 3
+
+logger:
+  log_dir: logs/grpo-qwen3-1.7b-1n8g-megatron-eagle3-ttt3
+  wandb:
+    name: grpo-qwen3-1.7b-1n8g-megatron-eagle3-ttt3

@@ -64,11 +64,11 @@ class _DraftConfigBase(BaseModel, extra="allow"):
 class Eagle3DraftConfig(_DraftConfigBase):
     """Configuration for EAGLE-3 draft-model co-training with the policy.
 
-    Runs on the Megatron backend (single-step distillation) or the Automodel
-    backend (TTT training). num_layers/aux_layer_indices apply to the
-    Megatron path only; architecture fields for the Automodel path (hidden
-    sizes, draft vocab, d2t/t2d maps) are read from the draft checkpoint's
-    config.json instead.
+    Runs on the Megatron or the Automodel backend; both train with TTT
+    (ttt_steps). num_layers/aux_layer_indices apply to the Megatron path
+    only; architecture fields for the Automodel path (hidden sizes, draft
+    vocab, d2t/t2d maps) are read from the draft checkpoint's config.json
+    instead.
     """
 
     speculator_type: Literal["eagle3"] = "eagle3"
@@ -86,11 +86,14 @@ class Eagle3DraftConfig(_DraftConfigBase):
     # distribution drift.
     learning_rate: float = 1.0e-4
     # Test-time-training unroll depth: the draft re-consumes its own context
-    # for this many steps per training forward (speculators default).
-    ttt_steps: int = 3
-    # Per-unroll-step loss decay factor (1.0 keeps all steps equally
-    # weighted, matching the speculators default).
-    ttt_step_loss_decay: float = 1.0
+    # for this many steps per training forward (speculators default). On
+    # Megatron, 1 is single-pass training; >1 requires
+    # sequence_parallel=false and no sequence packing.
+    ttt_steps: Annotated[int, Field(ge=1)] = 3
+    # Per-unroll-step loss decay factor: step k (0-indexed) is weighted by
+    # ttt_step_loss_decay**k (1.0 keeps all steps equally weighted, matching
+    # the speculators default).
+    ttt_step_loss_decay: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 1.0
     # Train the draft's embed_tokens/lm_head (streamed on every refit)
     # instead of keeping the checkpoint copies frozen.
     train_embed_and_head: bool = True

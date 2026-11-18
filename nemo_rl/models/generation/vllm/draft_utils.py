@@ -28,6 +28,8 @@ COTRAINED_SPECULATIVE_METHODS = SPECULATOR_TYPES
 # spawned vLLM executor workers, which import it for worker_extension_cls
 # before loading the model).
 DRAFT_DISABLE_MODULE_SHARING_ENV = "NRL_DRAFT_DISABLE_MODULE_SHARING"
+# Same mechanism for disable_draft_lm_head_sharing().
+DRAFT_DISABLE_LM_HEAD_SHARING_ENV = "NRL_DRAFT_DISABLE_LM_HEAD_SHARING"
 
 
 def draft_module_sharing_disable_required(config: dict[str, Any]) -> bool:
@@ -100,6 +102,53 @@ def disable_draft_module_sharing() -> None:
     dspark_utils._should_share = _never_share
     dflash_utils._should_share = _never_share
     SpecDecodeBaseProposer._maybe_share_embeddings = _never_share_embeddings
+
+
+def draft_lm_head_sharing_disable_required(config: dict[str, Any]) -> bool:
+    """Whether this worker's engine must keep the eagle3 drafter's own lm_head.
+
+    The Megatron eagle3 exporter streams a trained ``draft.lm_head`` but no
+    embed_tokens, so the drafter keeps sharing the target's embedding and only
+    the head must stay its own. vLLM aliases a drafter head that is unowned
+    (``load_format="dummy"``) or identical to the target's to the target
+    module at load, before the draft decode CUDA graphs are captured, so the
+    head has to stay separate from engine creation on: swapping it in at
+    refit leaves the graphs reading the target's head. (Truncated-vocab heads
+    are never aliased.) Automodel co-training disables all module sharing via
+    ``draft_module_sharing_disable_required`` instead.
+    """
+    spec_cfg = config.get("vllm_kwargs", {}).get("speculative_config")
+    if spec_cfg is None:
+        return False
+    return (
+        spec_cfg.get("method") == "eagle3"
+        and bool(config.get("_draft_weights_from_refit"))
+        and not config.get("_draft_full_refit")
+    )
+
+
+def disable_draft_lm_head_sharing() -> None:
+    """Keep the eagle3 drafter's lm_head separate from the target's.
+
+    Covers both runners' lm_head decision: ``load_eagle_model`` (V2), whose
+    ``_should_share`` also decides embed_tokens sharing and so is wrapped to
+    refuse only the lm_head, and ``SpecDecodeBaseProposer._maybe_share_lm_head``
+    (V1). Must run before engine creation (drafter load and CUDA-graph
+    capture).
+    """
+    from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+    from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
+
+    should_share = eagle_utils._should_share
+
+    def _share_all_but_lm_head(eagle: Any, flag: str, draft: Any, target: Any) -> bool:
+        return flag != "has_own_lm_head" and should_share(eagle, flag, draft, target)
+
+    def _never_share_lm_head(self: Any, target_language_model: Any) -> None:
+        return None
+
+    eagle_utils._should_share = _share_all_but_lm_head
+    SpecDecodeBaseProposer._maybe_share_lm_head = _never_share_lm_head
 
 
 # Incoming draft stream keys each drafter's loader intentionally skips. They

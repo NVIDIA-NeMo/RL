@@ -115,3 +115,20 @@ def test_automodel_dspark_draft_config_passes_backend_guards():
     except Exception:
         # Reaching config plumbing beyond the draft guards is sufficient.
         pass
+
+
+def test_ttt_draft_with_sequence_packing_is_rejected():
+    """Multi-pass TTT slices the unpacked [B, S] layout per pass."""
+    config = _draft_config()
+    config["draft"]["ttt_steps"] = 2
+    with pytest.raises(ValueError, match="does not support sequence packing"):
+        _init_policy(config)
+
+
+def test_ttt_draft_with_sequence_parallel_is_rejected():
+    """The TTT attention needs every rank to see the full sequence."""
+    config = _draft_config(sequence_packing_enabled=False)
+    config["megatron_cfg"]["sequence_parallel"] = True
+    config["draft"]["ttt_steps"] = 2
+    with pytest.raises(ValueError, match="sequence_parallel=false"):
+        _init_policy(config)

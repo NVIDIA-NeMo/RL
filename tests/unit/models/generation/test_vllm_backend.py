@@ -4757,6 +4757,39 @@ def test_disable_draft_module_sharing_forces_ownership():
                 module._should_share = original
 
 
+@pytest.mark.vllm
+def test_disable_draft_lm_head_sharing_keeps_embed_sharing(monkeypatch):
+    from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+    from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
+
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        disable_draft_lm_head_sharing,
+    )
+
+    # Registered so monkeypatch restores what the disable rebinds.
+    monkeypatch.setattr(eagle_utils, "_should_share", eagle_utils._should_share)
+    monkeypatch.setattr(
+        SpecDecodeBaseProposer,
+        "_maybe_share_lm_head",
+        SpecDecodeBaseProposer._maybe_share_lm_head,
+    )
+    disable_draft_lm_head_sharing()
+
+    # A dummy-loaded drafter owns neither module, so vLLM would share both.
+    unowned = SimpleNamespace()
+    assert eagle_utils._should_share(unowned, "has_own_lm_head", None, None) is False
+    assert eagle_utils._should_share(unowned, "has_own_embed_tokens", None, None)
+
+    own_head = object()
+    proposer = SimpleNamespace(
+        model=SimpleNamespace(has_own_lm_head=False, lm_head=own_head)
+    )
+    SpecDecodeBaseProposer._maybe_share_lm_head(
+        proposer, SimpleNamespace(lm_head=object())
+    )
+    assert proposer.model.lm_head is own_head
+
+
 class _FakeHfToVllmMapper:
     """Stands in for vLLM's WeightsMapper: only `_map_name` is consulted."""
 

@@ -32,11 +32,13 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 )
 from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
 from nemo_rl.models.generation.vllm.draft_utils import (
+    DRAFT_DISABLE_LM_HEAD_SHARING_ENV,
     DRAFT_DISABLE_MODULE_SHARING_ENV,
     _assert_drafter_owns_modules,
     _draft_owns_speculator,
     _is_full_draft_stream,
     _validate_draft_refit_info,
+    disable_draft_lm_head_sharing,
     disable_draft_module_sharing,
 )
 from nemo_rl.models.generation.vllm.lora_utils import (
@@ -93,6 +95,8 @@ WeightUpdateFinalizer = Callable[[], None]
 
 if os.environ.get(DRAFT_DISABLE_MODULE_SHARING_ENV) == "1":
     disable_draft_module_sharing()
+if os.environ.get(DRAFT_DISABLE_LM_HEAD_SHARING_ENV) == "1":
+    disable_draft_lm_head_sharing()
 
 
 class IPCWeightManifestError(RuntimeError):
