@@ -1428,6 +1428,7 @@ def _setup_fake_vllm_app(
     worker._capture_registry = CaptureRegistry()
     worker._prefix_recovery = NoPrefixRecovery()
     worker._capture_top_logprobs = 0
+    worker._cut_routes_dtype = None
     worker.token_capture = None
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(

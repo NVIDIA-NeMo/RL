@@ -161,6 +161,12 @@ COMMON_OVERRIDES=(
     '~env.nemo_gym.workplace_assistant_environment_server'
     "env.nemo_gym.config_paths=[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/string_match/configs/string_match.yaml]"
     ++env.nemo_gym.string_match_simple_agent.responses_api_agents.simple_agent.max_steps=1
+    # Prefix recovery refuses a typed environment server: serve string_match's
+    # through legacy_agent, as the Omni token-capture configs do.
+    ++env.nemo_gym.string_match_environment_server.environment_servers._delete_key=single_agent_turn_legacy
+    ++env.nemo_gym.string_match_environment_server.environment_servers.legacy_agent.entrypoint=app.py
+    ++env.nemo_gym.string_match_environment_server.environment_servers.legacy_agent.agent_server.type=responses_api_agents
+    ++env.nemo_gym.string_match_environment_server.environment_servers.legacy_agent.agent_server.name=string_match_simple_agent
     env.should_log_nemo_gym_responses=false
     ++data_plane.enabled=true
     ++data_plane.impl=transfer_queue

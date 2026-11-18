@@ -2791,16 +2791,11 @@ def _rebuild_from_chunks(
     return PrefixRecovery(parts)._rebuild_prefix(admission, prefix_token_ids)
 
 
-def _resume(
-    sink: _MemorySink,
-    ack: GenerationCutPrefixAck,
-    *,
-    source: dict[str, Any] = _ROUTER_REPLAY_CALL,
-    prefix_token_ids: tuple[int, ...] = (),
-) -> tuple[VllmAsyncGenerationWorkerImpl, _FakeRequest, _ResolvedGenerationCut]:
-    """Restore a cut on a new worker and begin its resumed call."""
-    worker = _router_replay_worker(sink, weight_version=9)
-    request = _FakeRequest(
+def _resumed_request(
+    ack: GenerationCutPrefixAck, source: dict[str, Any], **fields: Any
+) -> _FakeRequest:
+    """The re-sent call Gym makes to resume ``source`` from the cut ``ack`` saved."""
+    return _FakeRequest(
         ng_capture={
             **source,
             "rollout_id": f"{source['rollout_id']}-a1",
@@ -2816,7 +2811,67 @@ def _resume(
             },
         },
         stream=False,
+        **fields,
     )
+
+
+def _restore_through_start_capture(
+    worker: VllmAsyncGenerationWorkerImpl, request: _FakeRequest
+) -> tuple[_ResolvedGenerationCut, Any]:
+    """Restore ``request`` through ``start_capture``, as native and Dynamo serving do.
+
+    Returns the verified cut and the terminal ``start_capture`` served for a
+    prefix that had already finished (None when the call decodes on).
+    """
+    from nemo_rl.models.generation.vllm.prompt_and_capture import (
+        PreparedPrompt,
+        start_capture,
+    )
+
+    recovery = _cuts(worker)
+    resolve_restore = recovery.resolve_restore
+    resolved = []
+
+    def recording_resolve_restore(admission, prefix_token_ids):
+        served, cut = resolve_restore(admission, prefix_token_ids)
+        resolved.append(cut)
+        return served, cut
+
+    recovery.resolve_restore = recording_resolve_restore
+    # The re-sent call's budget fields, which a restore rewrites.
+    request.max_tokens = request.max_completion_tokens = request.min_tokens = None
+    admission = worker._capture_admission(request)
+    plan = PreparedPrompt(
+        prompt_token_ids=[],
+        splice=None,
+        prefix_len=0,
+        measure_only=False,
+        request_max_tokens=None,
+        max_tokens=None,
+        admission=admission,
+        serving_admission=admission,
+        verify_retained_media=False,
+    )
+    asyncio.run(
+        start_capture(
+            worker, request, {"prompt_token_ids": []}, plan, max_model_len=4096
+        )
+    )
+    (cut,) = resolved
+    assert cut is not None
+    return cut, getattr(request, "_restored_prefix_terminal", None)
+
+
+def _resume(
+    sink: _MemorySink,
+    ack: GenerationCutPrefixAck,
+    *,
+    source: dict[str, Any] = _ROUTER_REPLAY_CALL,
+    prefix_token_ids: tuple[int, ...] = (),
+) -> tuple[VllmAsyncGenerationWorkerImpl, _FakeRequest, _ResolvedGenerationCut]:
+    """Restore a cut on a new worker and begin its resumed call."""
+    worker = _router_replay_worker(sink, weight_version=9)
+    request = _resumed_request(ack, source)
     admission = worker._capture_admission(request)
     resolved = _rebuild_from_chunks(
         worker,
@@ -3289,6 +3344,66 @@ def test_router_replay_prefix_resume_keeps_the_parent_boundary_route() -> None:
     assert validating_sink.stage(staged, attachments=attachments).ok
 
 
+@pytest.mark.vllm
+@pytest.mark.parametrize("finished", [False, True])
+def test_router_replay_restore_through_start_capture_stages_the_saved_routes(
+    finished,
+) -> None:
+    """Native and Dynamo serving both restore through ``start_capture``. The
+    trained row keeps the saved prefix's routes, and a prefix that had already
+    finished stages them instead of failing for want of engine routes."""
+    # Both dependency markers select the combined vLLM + Gym lane.
+    pytest.importorskip("vllm")
+    sink = _MemorySink()
+    worker, request, engine_routes = _router_replay_call(sink)
+    if finished:
+        # The cut lands after vLLM's final token, before terminal staging.
+        final_output = _cumulative_output([12, 13])
+        final_output.outputs[0].finish_reason = "length"
+        final_output.outputs[0].stop_reason = None
+        final_output.outputs[0].routed_experts = _routes(1, 2, 3)
+        _cuts(worker).observe(request, final_output)
+        ack = _cut(worker, "checkpoint-1")
+    else:
+        _observe(worker, request, [12, 13])
+        engine_routes.by_call["c1"] = _routes(1, 2, 3, 4)
+        _cut(worker, "checkpoint-1")
+        _observe(worker, request, [12, 13, 14])
+        ack = _cut(worker, "checkpoint-2")
+
+    resumed = _router_replay_worker(sink, weight_version=9)
+    _cuts(
+        resumed,
+        staging_source=_FetchedChunks(_staged_route_chunks(sink, ack.staging_keys)),
+    )
+    resumed_request = _resumed_request(ack, _ROUTER_REPLAY_CALL)
+    resolved, terminal = _restore_through_start_capture(resumed, resumed_request)
+
+    if finished:
+        assert resolved.routed_experts.flatten().tolist() == [1, 2, 3, -1]
+        # The engine never runs: start_capture gave the answer the saved routes.
+        assert terminal is not None
+        choice = SimpleNamespace(index=0, message=SimpleNamespace(routed_experts=None))
+        attach_routed_experts_to_chat_response_choices(
+            SimpleNamespace(choices=[choice]),
+            _build_restored_prefix_terminal_output("request", terminal),
+            device=torch.device("cpu"),
+            routed_experts_dtype=torch.int16,
+            encode_for_wire=False,
+        )
+        _, attachments = _finish_with_routes(
+            resumed, resumed_request, [], choice.message.routed_experts
+        )
+        assert _staged_routes(attachments) == [1, 2, 3, -1]
+    else:
+        assert terminal is None
+        _, attachments = _finish_with_routes(
+            resumed, resumed_request, [15], _routes(90, 91, 92, 93, 5, 0)
+        )
+        # The restored prefix keeps the routes it was sampled under.
+        assert _staged_routes(attachments) == [1, 2, 3, 4, 5, 0]
+
+
 @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32])
 def test_request_capture_token_in_prev_len_chains_without_codec(monkeypatch, dtype):
     def reject_codec(*args, **kwargs):
@@ -3752,6 +3867,70 @@ def test_score_centering_survives_prefix_cuts_and_resume():
         -3.0,
         -5.0,
     ]
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("finished", [False, True])
+def test_score_centering_restore_through_start_capture_stages_the_saved_top_k(
+    finished,
+):
+    """The trained row's sampler top-k starts with the saved prefix's rows; a
+    prefix that had already finished stages those rows alone."""
+    # Both dependency markers select the combined vLLM + Gym lane.
+    pytest.importorskip("vllm")
+    sink = _MemorySink()
+    worker = _score_centering_worker(sink, weight_version=7)
+    source = {"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
+    request = _score_centering_request(dict(source))
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    worker._capture_registry.get(request).set_effective_output_limit(128)
+    output = SimpleNamespace(token_ids=[12, 13], logprobs=_sampler_rows([12, 13]))
+    if finished:
+        output.finish_reason = "length"
+        output.stop_reason = None
+    _cuts(worker).observe(request, SimpleNamespace(outputs=[output]))
+    ack = _cut(worker, "checkpoint-1")
+    assert ack.terminal_finish_reason == ("length" if finished else None)
+
+    records, sampler_topk = {}, {}
+    for key, (_, record), attachments in zip(
+        sink.generation_prefix_keys,
+        sink.generation_prefix_records,
+        sink.generation_prefix_attachments,
+        strict=True,
+    ):
+        records[key] = record
+        sampler_topk[key] = (
+            attachments["sampler_topk_token_ids"],
+            attachments["sampler_topk_logprobs"],
+        )
+    resumed = _score_centering_worker(
+        sink,
+        weight_version=9,
+        staging_source=_MemoryPrefixSource(
+            {}, records=records, sampler_topk=sampler_topk
+        ),
+    )
+    resumed_request = _resumed_request(ack, source, logprobs=True, top_logprobs=2)
+    _, terminal = _restore_through_start_capture(resumed, resumed_request)
+
+    if finished:
+        assert terminal is not None
+        # The engine never runs, so the call adds no top-k rows of its own.
+        content = _served_content([], [])
+        content["choices"][0]["message"].update(
+            sampler_topk_token_ids=torch.empty((0, 2), dtype=torch.int32),
+            sampler_topk_logprobs=torch.empty((0, 2)),
+        )
+        expected = [[12, 112], [13, 113]]
+    else:
+        assert terminal is None
+        content = _content_with_topk([15], [-0.4])
+        expected = [[12, 112], [13, 113], [15, 1]]
+    VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        resumed, resumed_request, content
+    )
+    assert _staged_topk_ids(sink.attachments[-1]) == expected
 
 
 def test_score_centering_cut_without_the_tokens_top_k_fails_that_call():

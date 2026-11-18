@@ -179,6 +179,8 @@ run_prefix_recovery_phases() {
     shift 3
 
     echo "=== Phase 1: ${phase1_banner} ==="
+    # stop_phase1 reads it to clean up phase one's Dynamo services.
+    PHASE1_RUN_LOG=${PHASE1_LOG}
     command -v setsid >/dev/null
     setsid env \
         SC_GYM_RECOVERY_TEST_EVENTS="${PHASE1_EVENTS}" \
@@ -186,7 +188,6 @@ run_prefix_recovery_phases() {
             logger.log_dir="${PHASE1_LOG_DIR}" \
             "$@" >"${PHASE1_LOG}" 2>&1 &
     PHASE1_PID=$!
-    PHASE1_RUN_LOG=${PHASE1_LOG}
 
     # Every prompt group must hold a recoverable prefix.
     uv run --no-sync python "${SNAPSHOT_HELPER}" select \
