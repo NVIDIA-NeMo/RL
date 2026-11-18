@@ -230,6 +230,14 @@ class _FakeEngine:
                 f"{self.short}.init(ws={kwargs['world_size']},"
                 f"train={kwargs['train_world_size']},off={kwargs['rank_offset']})"
             )
+        if method == "init_collective_mcore_generation":
+            return (
+                f"{self.short}.mcore_init(ws={kwargs['world_size']},"
+                f"off={kwargs['rank_offset']},backend={kwargs['refit_backend']},"
+                f"batch={kwargs['refit_execution_batch_bytes']})"
+            )
+        if method == "swap_weights_via_reshard":
+            return f"{self.short}.swap(source={kwargs['is_source']})"
         if method in ("prepare_for_generation", "set_rollout_weight_version"):
             (value,) = kwargs.values()
             return f"{self.short}.{method}({value})"
@@ -589,6 +597,22 @@ def test_role_policy_config_merges_overrides_into_a_copy(
     assert merged["generation"]["_dynamo_role"] == "decode"
     assert shared == before
     assert merged["generation"] is not shared["generation"]
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_prefill_max_requests_caps_only_prefill(role):
+    generation = _megatron_config()
+    generation["mcore_generation_config"] = {"max_requests": 64}
+    generation["dynamo_cfg"]["prefill_engine"] = {"max_requests": 256}
+    shared = {**MEGATRON_POLICY, "generation": generation}
+
+    engine_config = generation_module.role_policy_config(
+        shared, role, megatron_dynamo_cfg(generation).role_overrides(role)
+    )
+
+    expected = 256 if role == "prefill" else 64
+    mcore_generation_config = engine_config["generation"]["mcore_generation_config"]
+    assert mcore_generation_config["max_requests"] == expected
 
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])

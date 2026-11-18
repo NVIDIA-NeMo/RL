@@ -108,8 +108,13 @@ class MegatronDynamoGenerationMixin:
 
     def _inference_config_overrides(self) -> dict[str, Any]:
         # Prefill and decode engines are separate process groups, so the
-        # handoff must cross them; NIXL is the only transport that does.
-        return {"kv_transport_backend": "nixl"}
+        # handoff must cross them; NIXL is the only transport that does. The
+        # role sizes role-specific buffers: a decode context drops the Mamba
+        # prefix cache that prefix_caching_mamba_gb gives prefill.
+        return {
+            "kv_transport_backend": "nixl",
+            "disaggregation_role": self._dynamo_role,
+        }
 
     def _build_dynamic_inference_engine(
         self,
