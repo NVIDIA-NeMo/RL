@@ -78,6 +78,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    DebugWriterConfig,
     JsonDebugWriter,
     TrainChunk,
 )
@@ -556,6 +557,8 @@ def _stamp_advantage_stage_config(
         message_level_advantage_penalties_enabled=penalties_enabled,
         shardable=shardable,
         train_data_dump_dir=str(dump.log_dir) if dump is not None else None,
+        # The dumps installed here are JsonDebugWriters, so the stage writes JSONL.
+        debug_writer=DebugWriterConfig(target="json"),
     )
     ctrl._advantage_computer = AdvantageComputer(
         ctrl._dp_client,
