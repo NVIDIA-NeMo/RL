@@ -15,13 +15,14 @@
 """Configuration for serving NeMo RL's vLLM workers behind Dynamo.
 
 ``policy.generation.dynamo: true`` on any vLLM config is the whole switch;
-``policy.generation.dynamo_cfg`` only tunes the frontend and registration, and
-every field below carries its default.
+``policy.generation.dynamo_cfg`` only tunes the frontend, and every field below
+carries its default. NeMo-Gym's chat calls are rendered and parsed with the
+native server's own settings (``vllm_cfg.http_server_serving_chat_kwargs``).
 """
 
-from typing import Any, Literal, Mapping
+from typing import Annotated, Any, Literal, Mapping
 
-from pydantic import BaseModel, Field, PositiveFloat
+from pydantic import BaseModel, Field, PositiveFloat, PositiveInt, model_validator
 
 
 class DynamoFrontendArgs(BaseModel, extra="forbid"):
@@ -38,17 +39,41 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
         "least-loaded",
         "device-aware-weighted",
     ] = "kv"
+    # Idle seconds a NeMo-Gym token-capture session stays on one engine, as native
+    # pins each Gym session to one server; None disables it. Needs Dynamo 1.7
+    # (ai-dynamo/dynamo#15333): 1.5.1 drops a chat call's session id. Dynamo keeps
+    # at most 65,536 sessions (HTTP 529 past that).
+    session_affinity_ttl_secs: Annotated[int, Field(gt=0, le=31_536_000)] | None = 300
+    # Processes that render NeMo-Gym's chat calls and build their replies (the
+    # checkpoint's template, tokenizer, HF processor and vLLM's parsers); each
+    # uses one core. See docs/guides/dynamo-generation.md for sizing.
+    render_workers: PositiveInt = 8
     extra_cli_args: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _chat_is_nemo_rls(self) -> "DynamoFrontendArgs":
+        # NeMo-Gym's chat calls are rendered and parsed by NeMo RL's chat
+        # engine, never by Dynamo's own renderer or chat processor.
+        for flag in ("--dyn-chat-processor", "--custom-jinja-template"):
+            if any(arg.split("=", 1)[0] == flag for arg in self.extra_cli_args):
+                raise ValueError(
+                    f"dynamo_cfg.frontend_args.extra_cli_args may not set {flag}: "
+                    "NeMo RL's chat engine renders and parses chat calls with "
+                    "vllm_cfg.http_server_serving_chat_kwargs, as the native server "
+                    "does."
+                )
+        return self
 
 
 class DynamoCfg(BaseModel, extra="forbid"):
-    """``policy.generation.dynamo_cfg``: the frontend and engine registration."""
+    """``policy.generation.dynamo_cfg``: the managed frontend."""
 
     # Bounds etcd/NATS/frontend start-up and every engine's registration.
     startup_timeout_s: PositiveFloat = 600.0
     # Deadline for one NeMo RL rollout through the frontend. None waits as long
     # as generation takes, as native generate_async does; on the SingleController,
     # async_rl.rollout_failure.native.generation_timeout_s bounds both paths.
+    # NeMo-Gym's own calls keep Gym's timeouts.
     request_timeout_s: PositiveFloat | None = None
     frontend_args: DynamoFrontendArgs = Field(default_factory=DynamoFrontendArgs)
 

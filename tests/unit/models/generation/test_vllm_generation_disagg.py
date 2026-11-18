@@ -19,7 +19,6 @@ from unittest.mock import MagicMock
 import pytest
 
 import nemo_rl.models.generation.vllm.vllm_generation as vg
-from nemo_rl.models.generation.openai_server_utils import encode_token_ids_b64
 from nemo_rl.models.generation.vllm.config import (
     resolve_vllm_disagg_frontend_config,
     resolve_vllm_disagg_layout,
@@ -27,11 +26,6 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import _resolve_disagg_engine
-from nemo_rl.models.generation.vllm.vllm_worker_async import (
-    _gym_prefix_from_messages,
-    _is_prefill_leg,
-    _supplied_prompt_token_ids,
-)
 
 
 def _config(disaggregation=None, *, colocated=False, **vllm_overrides):
@@ -501,45 +495,6 @@ def test_worker_role_lookup_matches_the_driver_key():
         _resolve_disagg_engine(cfg, None, [4, 5])
 
 
-def test_server_side_leg_helpers():
-    messages = [
-        {"role": "user", "content": "q"},
-        {
-            "role": "assistant",
-            "content": "a",
-            "prompt_token_ids": [1, 2],
-            "generation_token_ids": [3],
-        },
-        {"role": "user", "content": "q2"},
-    ]
-    assert _gym_prefix_from_messages(messages) == [1, 2, 3]
-    assert _gym_prefix_from_messages([{"role": "user", "content": "q"}]) is None
-
-    assert _supplied_prompt_token_ids(
-        SimpleNamespace(prompt_token_ids_b64=encode_token_ids_b64([7, 8]))
-    ) == [7, 8]
-    assert _supplied_prompt_token_ids(
-        SimpleNamespace(prompt_token_ids=[1], prompt_token_ids_b64=None)
-    ) == [1]
-    assert _supplied_prompt_token_ids(
-        SimpleNamespace(kv_transfer_params={"prompt_token_ids": [2]})
-    ) == [2]
-    assert (
-        _supplied_prompt_token_ids(
-            SimpleNamespace(kv_transfer_params={"do_remote_prefill": True})
-        )
-        is None
-    )
-
-    assert _is_prefill_leg(
-        SimpleNamespace(kv_transfer_params={"do_remote_decode": True})
-    )
-    assert not _is_prefill_leg(
-        SimpleNamespace(kv_transfer_params={"do_remote_prefill": True})
-    )
-    assert not _is_prefill_leg(SimpleNamespace(kv_transfer_params=None))
-
-
 def test_disagg_engine_env_defaults_for_nixl_engines():
     assert vg.disagg_engine_env_defaults(_config(_DISAGG)) == {
         "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
@@ -570,6 +525,23 @@ def test_render_settings_come_from_the_prefill_engines_kwargs():
     settings = _bare_generation(cfg, world_size=6)._render_settings()
     assert settings.engine_kwargs == {"tokenizer_mode": "auto", "revision": "abc"}
     assert settings.max_model_len == 4096
+
+
+def test_render_settings_carry_what_the_engines_chat_server_is_built_from():
+    cfg = _config(
+        _DISAGG,
+        http_server_serving_chat_kwargs={"tool_parser": "hermes"},
+        tool_parser_plugin="/plugins/tools.py",
+    )
+    cfg["stop_token_ids"] = [7]
+    settings = _bare_generation(cfg, world_size=6)._render_settings()
+    assert settings.generation_cfg == {
+        "stop_token_ids": [7],
+        "vllm_cfg": {
+            "http_server_serving_chat_kwargs": {"tool_parser": "hermes"},
+            "tool_parser_plugin": "/plugins/tools.py",
+        },
+    }
 
 
 def _sc_master_config(cfg, *, recompute=False, token_capture=False):

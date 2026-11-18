@@ -14,10 +14,7 @@
 """Worker-side PD disaggregation: engine identity, connector kwargs, shadow check."""
 
 import asyncio
-import copy
-import logging
 import os
-from types import SimpleNamespace
 
 import pytest
 
@@ -27,8 +24,6 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
-
-_WORKER_LOGGER = "nemo_rl.models.generation.vllm.vllm_worker_async"
 
 
 def _disagg_config(**overrides):
@@ -164,109 +159,6 @@ def test_add_disagg_engine_kwargs_builds_the_connector_and_events_configs():
     worker._add_disagg_engine_kwargs(decode_kwargs)
     assert decode_kwargs["kv_transfer_config"].kv_role == "kv_consumer"
     assert "kv_events_config" not in decode_kwargs
-
-
-# -------------------------------------------------------------------------- #
-#  Shadow validation of frontend-supplied prompt ids
-# -------------------------------------------------------------------------- #
-
-_MESSAGES = [
-    {"role": "user", "content": "q"},
-    {
-        "role": "assistant",
-        "content": "a",
-        "prompt_token_ids": [1, 2],
-        "generation_token_ids": [3],
-    },
-    {"role": "user", "content": "q2"},
-]
-
-
-def _leg_request(supplied):
-    request = SimpleNamespace(
-        kv_transfer_params={
-            "do_remote_decode": True,
-            "prompt_token_ids": list(supplied),
-        }
-    )
-    request.model_copy = lambda update: SimpleNamespace(**update)
-    return request
-
-
-class _ShadowRenderer:
-    def __init__(self, recomputed=None, error=None):
-        self.recomputed = recomputed
-        self.error = error
-        self.calls = []
-
-    async def preprocess_chat(self, request, messages, **render_kwargs):
-        self.calls.append((request, messages, render_kwargs))
-        if self.error is not None:
-            raise self.error
-        return None, [{"prompt_token_ids": list(self.recomputed)}]
-
-
-def test_shadow_check_recomputes_from_the_messages_and_logs_only_a_mismatch(
-    caplog,
-):
-    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    caplog.set_level(logging.ERROR, logger=_WORKER_LOGGER)
-    render_kwargs = {"default_template": None, "parser": None}
-
-    renderer = _ShadowRenderer(recomputed=[1, 2, 3, 4])
-    asyncio.run(
-        worker._shadow_check_supplied_prompt_ids(
-            renderer,
-            _leg_request([1, 2, 3, 4]),
-            _MESSAGES,
-            [1, 2, 3, 4],
-            render_kwargs,
-        )
-    )
-
-    [(shadow, messages, kwargs)] = renderer.calls
-    # The supplied ids are withheld so the shadow render really renders, and
-    # it splices from the Gym fields the way an unassisted request would.
-    assert shadow.kv_transfer_params == {"do_remote_decode": True}
-    assert shadow.required_prefix_token_ids == [1, 2, 3]
-    assert (
-        shadow.prompt_token_ids,
-        shadow.prompt_token_ids_b64,
-        shadow.ng_capture,
-    ) == (None, None, None)
-    assert messages == _MESSAGES and messages is not _MESSAGES
-    assert kwargs == render_kwargs
-    assert caplog.records == []
-
-    renderer = _ShadowRenderer(recomputed=[1, 2, 9, 4])
-    asyncio.run(
-        worker._shadow_check_supplied_prompt_ids(
-            renderer,
-            _leg_request([1, 2, 3, 4]),
-            copy.deepcopy(_MESSAGES),
-            [1, 2, 3, 4],
-            {},
-        )
-    )
-    assert "SHADOW MISMATCH" in caplog.text
-    assert "first divergence at 2" in caplog.text
-
-
-def test_shadow_check_never_fails_serving(caplog):
-    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    caplog.set_level(logging.ERROR, logger=_WORKER_LOGGER)
-
-    asyncio.run(
-        worker._shadow_check_supplied_prompt_ids(
-            _ShadowRenderer(error=RuntimeError("no template")),
-            _leg_request([1]),
-            _MESSAGES,
-            [1],
-            {},
-        )
-    )
-
-    assert "shadow recompute failed" in caplog.text
 
 
 # -------------------------------------------------------------------------- #

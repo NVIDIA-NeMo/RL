@@ -33,10 +33,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
-    GDPOAdvantageEstimator,
-    GRPOAdvantageEstimator,
-    OPDAdvantageEstimator,
-    ReinforcePlusPlusAdvantageEstimator,
+    create_advantage_estimator,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -228,7 +225,7 @@ def _maybe_restore_async_replay_buffer_checkpoint(
     replay_buffer: Any,
     checkpoint_path: str,
     *,
-    load_replay_buffer: bool | None,
+    load_replay_buffer: bool,
     num_prompts_per_step: int,
     current_training_step: int,
     max_age_steps: int,
@@ -247,7 +244,7 @@ def _maybe_restore_async_replay_buffer_checkpoint(
         The restore metadata from ``load_from_path``, or ``None`` when the
         restore was skipped or no checkpoint file exists.
     """
-    if load_replay_buffer is False:
+    if not load_replay_buffer:
         print(
             "📦 Skipping replay buffer restore (checkpointing.load_replay_buffer=false)"
         )
@@ -662,6 +659,19 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
             "loss_fn.seq_logprob_error_in_loss requires ppo.ppo_epochs=1, got "
             f"ppo.ppo_epochs={ppo.ppo_epochs}"
         )
+    # The loss cannot remove rejected rows from statistics already computed.
+    if ppo is None and algo.masked_reward_policy == "exclude":
+        raise ValueError(
+            "grpo.masked_reward_policy=exclude is incompatible with "
+            "loss_fn.seq_logprob_error_in_loss=true. Set masked_reward_policy=include "
+            "or seq_logprob_error_in_loss=false to filter before advantage calculation."
+        )
+    if ppo is not None and ppo.adv_estimator.normalize_advantages:
+        raise ValueError(
+            "ppo.adv_estimator.normalize_advantages=true is incompatible with "
+            "loss_fn.seq_logprob_error_in_loss=true. Set normalize_advantages=false "
+            "or seq_logprob_error_in_loss=false to normalize over the filtered batch."
+        )
     policy = master_config.policy
     if "megatron_cfg" not in policy or not policy["megatron_cfg"]["enabled"]:
         raise ValueError(
@@ -784,7 +794,7 @@ def setup(
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
 
-    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
+    checkpointing_pretrained = checkpointing_config.pretrained_checkpoint
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
@@ -1863,8 +1873,8 @@ def setup(
             )
             vllm_reserve_time = time.perf_counter() - vllm_reserve_t0
             print(
-                f"  ✓ Reserved {len(deferred_vllm.dp_openai_server_base_urls)} vLLM server URLs: "
-                f"{deferred_vllm.dp_openai_server_base_urls}",
+                f"  ✓ Reserved {len(deferred_vllm.client_base_urls)} vLLM server URLs: "
+                f"{deferred_vllm.client_base_urls}",
                 flush=True,
             )
 
@@ -1878,7 +1888,7 @@ def setup(
             def init_nemo_gym():
                 """Spin up NeMo Gym servers with the pre-assigned vLLM URLs."""
                 return _spinup_nemo_gym(
-                    deferred_vllm.dp_openai_server_base_urls,
+                    deferred_vllm.client_base_urls,
                     generation_config["model_name"],
                     policy_api_key=deferred_vllm.http_server_api_key,
                 )
@@ -3108,7 +3118,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
         master_config: The master configuration dictionary.
 
     Returns:
-        An advantage estimator instance (GRPO, GDPO, or ReinforcePlusPlus).
+        An advantage estimator instance (GRPO, GDPO, OPD, or ReinforcePlusPlus).
 
     Raises:
         ValueError: If the advantage estimator name is not recognized.
@@ -3119,17 +3129,9 @@ def _create_advantage_estimator(master_config: MasterConfig):
     adv_estimator_config = grpo_config.adv_estimator
 
     adv_estimator_name = adv_estimator_config.name
-    if adv_estimator_name == "gdpo":
-        adv_estimator = GDPOAdvantageEstimator(adv_estimator_config, loss_config)
-        print("  ✓ Using GDPO advantage estimator (multi-reward)")
-    elif adv_estimator_name == "grpo":
-        adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
-        print("  ✓ Using GRPO advantage estimator")
-    elif adv_estimator_name == "opd":
+    if adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
         opd_module.assert_trust_region_supported(master_config)
-        adv_estimator = OPDAdvantageEstimator(adv_estimator_config, loss_config)
-        print("  ✓ Using OPD advantage estimator")
         # Warn if loss_fn is not configured per MOPD paper recommendations.
         if not loss_config.disable_ppo_ratio:
             warnings.warn(
@@ -3144,14 +3146,8 @@ def _create_advantage_estimator(master_config: MasterConfig):
                 "OPD recommends loss_fn.truncated_importance_sampling_type: 'icepop' "
                 "(hard gate, MOPD Eq. 8)"
             )
-    elif adv_estimator_name == "reinforce_plus_plus":
-        adv_estimator = ReinforcePlusPlusAdvantageEstimator(
-            adv_estimator_config, loss_config
-        )
-        print("  ✓ Using Reinforce++ advantage estimator")
-    else:
-        raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
-
+    adv_estimator = create_advantage_estimator(adv_estimator_config, loss_config)
+    print(f"  ✓ Using {adv_estimator_name} advantage estimator")
     return adv_estimator
 
 
@@ -3613,7 +3609,7 @@ def _grpo_train_impl(
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -3712,7 +3708,7 @@ def _grpo_train_impl(
             "See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details."
         )
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     while (
         max_num_epochs is None or current_epoch < max_num_epochs
@@ -4568,8 +4564,7 @@ def _grpo_train_impl(
                     is_last_step
                     # Early stop saves the final state like a last step.
                     or early_stop_message is not None
-                    or (total_steps + 1) % master_config.checkpointing["save_period"]
-                    == 0
+                    or (total_steps + 1) % master_config.checkpointing.save_period == 0
                     or (
                         ft_save_period is not None
                         and (total_steps + 1) % ft_save_period == 0
@@ -4579,7 +4574,7 @@ def _grpo_train_impl(
                 should_save_by_timeout = timeout.check_save()
 
                 memory_tracker.snapshot_start_of_stage("Checkpointing", dir())
-                if master_config.checkpointing["enabled"] and (
+                if master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     policy.prepare_for_training()
@@ -4596,7 +4591,7 @@ def _grpo_train_impl(
                     grpo_save_state.consumed_samples = consumed_samples
                     _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
@@ -5361,7 +5356,7 @@ def async_grpo_train(
     _tracer = _telemetry.tracer if _telemetry is not None else None
     training_wall_start = time.perf_counter()
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -5447,7 +5442,7 @@ def async_grpo_train(
         replay_buffer_restore_metadata = _maybe_restore_async_replay_buffer_checkpoint(
             replay_buffer,
             last_checkpoint_path,
-            load_replay_buffer=master_config.checkpointing.get("load_replay_buffer"),
+            load_replay_buffer=master_config.checkpointing.load_replay_buffer,
             num_prompts_per_step=num_prompts_per_step,
             current_training_step=step,
             max_age_steps=max_trajectory_age_steps,
@@ -5780,7 +5775,7 @@ def async_grpo_train(
         init_total_s = timer.stop(INIT_TOTAL_CATEGORY)
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     # Main training loop
     try:
@@ -6269,13 +6264,13 @@ def async_grpo_train(
                 is_last_step = step + 1 == max_num_steps
                 should_save_by_step = (
                     is_last_step
-                    or (step + 1) % master_config.checkpointing["save_period"] == 0
+                    or (step + 1) % master_config.checkpointing.save_period == 0
                     or (ft_save_period is not None and (step + 1) % ft_save_period == 0)
                 )
                 # Checked pre-validation so the wake-deferral below can see it.
                 # A crossing during refit/validation is caught by the lookahead in check_save.
                 should_save_by_timeout = timeout.check_save()
-                will_save_checkpoint = master_config.checkpointing["enabled"] and (
+                will_save_checkpoint = master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 )
                 # An early stop (known only after validation) also saves.
@@ -6406,7 +6401,7 @@ def async_grpo_train(
                             stop_at_validation_metric,
                         )
                         saving_this_step = will_save_checkpoint or (
-                            master_config.checkpointing["enabled"]
+                            master_config.checkpointing.enabled
                             and early_stop_message is not None
                         )
                         # Save-bound steps need the GPUs for checkpointing,
@@ -6537,7 +6532,7 @@ def async_grpo_train(
                     grpo_save_state.consumed_samples = consumed_samples
                     _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics

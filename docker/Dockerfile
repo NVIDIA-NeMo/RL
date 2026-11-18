@@ -244,7 +244,7 @@ ENV HYBRID_EP_MULTINODE=${HYBRID_EP_MULTINODE}
 ENV CUDA_HOME=/usr/local/cuda
 
 ## CUDA 13 moved standard library headers under include/cccl; expose that path so
-## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
+## builds that include <cuda/std/...> (e.g., deep_ep) can find them.
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 
 # Point TE at the pip-installed cuDNN instead of the system one.
@@ -266,7 +266,9 @@ ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/z3/lib:/opt/
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
-COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
+# transformers_compat.py comes along because __init__.py imports it, and setuptools imports the
+# package to resolve the dynamic version whenever `uv lock --check` below has to build root metadata.
+COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py nemo_rl/transformers_compat.py ./nemo_rl/
 # The single source of truth for which extras each Ray actor's venv needs. Run as a
 # script by the prefetch below; imported by nemo_rl.distributed.ray_actor_environment_registry
 # at runtime. Kept dependency-free so it can be copied in without the rest of the source.
@@ -660,6 +662,9 @@ ARG NATS_VERSION=v2.11.6
 # Space-separated config paths whose NeMo Gym venvs are prefetched into the image
 # (empty default = skip). Consumed by the gym prefetch RUN below.
 ARG NEMO_GYM_PREFETCH_CONFIGS=
+# Sandbox image for Gym's code_gen server, whose config rejects a null image. The prefetch
+# dry run below starts it, so builds whose prefetch configs include code_gen must pass one.
+ARG CODE_GEN_SANDBOX_IMAGE
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF

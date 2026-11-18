@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -27,9 +28,9 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    GAEConfig,
     GeneralizedAdvantageEstimator,
-    GRPOAdvantageEstimator,
-    OPDAdvantageEstimator,
+    create_advantage_estimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import (
@@ -39,11 +40,11 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import REWARD_KEY
+from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
-    SHARD_INVARIANT_ESTIMATORS,
     AdvantageComputer,
     AdvantageOutcome,
     AdvantageRequest,
@@ -101,7 +102,7 @@ def test_from_master_config_uses_typed_logger(
         logger=LoggerConfig(log_dir=str(tmp_path)),
         async_rl=SimpleNamespace(
             log_full_train_data=log_full_train_data,
-            debug_writer=DebugWriterConfig(),
+            debug_writer=DebugWriterConfig(target="json"),
         ),
     )
 
@@ -440,7 +441,7 @@ class TestGroupIdIsTheBaselineKey:
         return torch.cat(pieces)
 
     def test_sharding_is_exact_under_the_group_id_key(self) -> None:
-        """What SHARD_INVARIANT_ESTIMATORS claims, as an equality."""
+        """Whole-group shards must preserve group baselines."""
         whole = _baseline(group_index_column(row_group_ids(self.meta)), self.rewards)
         shardwise = self._shardwise(
             lambda shard, start, stop: group_index_column(row_group_ids(shard))
@@ -455,39 +456,6 @@ class TestGroupIdIsTheBaselineKey:
         whole = _baseline(token_key, self.rewards)
         shardwise = self._shardwise(lambda shard, start, stop: token_key[start:stop])
         assert not torch.equal(shardwise, whole)
-
-
-class TestShardInvariantEstimators:
-    """Splitting a batch is only sound for estimators that do not reduce over it."""
-
-    @pytest.mark.parametrize(
-        "name",
-        [
-            # advantage_estimator.py: `advantages.std()` / `.mean()` over the
-            # whole batch, unconditionally.
-            "gdpo",
-            # advantage_estimator.py: "global normalization across the batch",
-            # unconditionally.
-            "reinforce_plus_plus",
-            # Both normalize over the batch whenever normalize_advantages is
-            # set, and it defaults to True for both.
-            "gae",
-            "raw_reward",
-        ],
-    )
-    def test_batch_normalizing_estimators_are_not_shardable(self, name: str) -> None:
-        assert name not in SHARD_INVARIANT_ESTIMATORS
-
-    def test_only_the_row_and_group_local_estimators_are_shardable(self) -> None:
-        """Membership is opt-in, so a new estimator defaults to unshardable.
-
-        grpo's baseline is per prompt group, which the split preserves now that
-        the key is GROUP_ID_TAG rather than the prompt tokens two groups can
-        share, and opd's advantage is a per-token teacher/student difference
-        that reads no other row. Everything else has to be checked before it is
-        added here.
-        """
-        assert SHARD_INVARIANT_ESTIMATORS == {"grpo", "opd"}
 
 
 def test_rpc_dataclass_fields_are_classified() -> None:
@@ -623,6 +591,7 @@ class _InlineActor:
             return outcome
 
         self.run = SimpleNamespace(remote=_run)
+        self.computer = computer
 
 
 def _controller(
@@ -636,6 +605,7 @@ def _controller(
     seq_logprob_error_threshold: float | None = None,
     reward_scaling: RewardScalingConfig | None = None,
     reward_shaping: RewardShapingConfig | None = None,
+    stage_config: AdvantageStageConfig | None = None,
 ):
     """Build the controller stub _advantage_stage needs, and nothing more.
 
@@ -643,21 +613,20 @@ def _controller(
     set is enumerated from the source rather than guessed, because the two
     previous versions of these stubs each shipped missing one.
     """
-    algo = GRPOConfig(
-        num_generations_per_prompt=GROUP_SIZE,
-        adv_estimator=AdvEstimatorConfig(name=estimator_name),
-        seq_logprob_error_threshold=seq_logprob_error_threshold,
-        **({} if reward_scaling is None else {"reward_scaling": reward_scaling}),
-        **({} if reward_shaping is None else {"reward_shaping": reward_shaping}),
+    algo = (
+        stage_config.algo
+        if stage_config is not None
+        else GRPOConfig(
+            num_generations_per_prompt=GROUP_SIZE,
+            adv_estimator=AdvEstimatorConfig(name=estimator_name),
+            seq_logprob_error_threshold=seq_logprob_error_threshold,
+            **({} if reward_scaling is None else {"reward_scaling": reward_scaling}),
+            **({} if reward_shaping is None else {"reward_shaping": reward_shaping}),
+        )
     )
     is_opd = estimator_name == "opd"
-    estimator = (
-        OPDAdvantageEstimator(algo.adv_estimator, None)
-        if is_opd
-        # Deliberately a GRPO estimator for every other name: these tests read
-        # `shardable` and the call distribution, never the numerics of an
-        # estimator whose own constructor needs a real loss config.
-        else GRPOAdvantageEstimator(algo.adv_estimator, None)
+    estimator = create_advantage_estimator(
+        algo.adv_estimator, ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
     )
     config = AdvantageStageConfig(
         advantage=AdvantageConfig(),
@@ -668,9 +637,11 @@ def _controller(
         teacher_logprobs_required=is_opd,
         opd_full_enabled=opd_full_enabled,
         message_level_advantage_penalties_enabled=False,
-        shardable=estimator_name in SHARD_INVARIANT_ESTIMATORS,
+        shardable=not estimator.requires_global_batch,
         train_data_dump_dir=dump_dir,
     )
+    if stage_config is not None:
+        config = stage_config
     ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
     ctrl._advantage_estimator = estimator
     ctrl._advantage_stage_config = config
@@ -732,11 +703,11 @@ def _run(estimator_name: str, num_actors: int):
     return ctrl, advantages, metrics, has_valid, opd
 
 
-@pytest.mark.parametrize("estimator_name", sorted(SHARD_INVARIANT_ESTIMATORS))
+@pytest.mark.parametrize("estimator_name", ["grpo", "opd"])
 def test_sharded_pool_matches_in_process(estimator_name: str) -> None:
     """num_advantage_workers=3 must write and log what the in-process path does.
 
-    Exactly, for every row -- that is what SHARD_INVARIANT_ESTIMATORS claims,
+    Exactly, for every row -- these estimators need only intact prompt groups,
     and nothing else in this file checks it end to end. It holds for groups
     that share prompt text too, now that the baseline keys on GROUP_ID_TAG
     rather than on the prompt tokens.
@@ -749,6 +720,89 @@ def test_sharded_pool_matches_in_process(estimator_name: str) -> None:
     assert metrics_pool == pytest.approx(metrics_local)
     assert valid_pool == valid_local
     assert opd_pool == pytest.approx(opd_local)
+
+
+def test_opd_global_baseline_pool_matches_full_batch() -> None:
+    """A global baseline must use the whole batch even with multiple actors."""
+    master_config = SimpleNamespace(
+        grpo=GRPOConfig(
+            num_prompts_per_step=NUM_GROUPS,
+            num_generations_per_prompt=GROUP_SIZE,
+            adv_estimator=AdvEstimatorConfig(name="opd", subtract_global_baseline=True),
+        ),
+        ppo=None,
+        loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
+        on_policy_distillation=OnPolicyDistillationConfig(enabled=True),
+        policy={"generation": {"top_k": None, "top_p": 1.0}},
+        logger=LoggerConfig(log_dir="/tmp/test-logs"),
+        async_rl=SimpleNamespace(
+            log_full_train_data=False, debug_writer=DebugWriterConfig()
+        ),
+    )
+    config = AdvantageStageConfig.from_master_config(master_config)
+    gaps = torch.tensor([1.0, 3.0, 5.0, 9.0, 11.0, 13.0]).repeat_interleave(GROUP_SIZE)
+    expected = gaps - 7.0
+    for num_actors in (0, 1, 2):
+        rows = _rows()
+        for i, row in enumerate(rows.values()):
+            row["token_mask"] = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0])
+            row["teacher_reference_logprobs"] = torch.full((SEQ,), -1.0)
+            row["prev_logprobs"] = torch.full((SEQ,), -1.0 - gaps[i].item())
+            row["generation_logprobs"] = row["prev_logprobs"].clone()
+        store = _RowStore(rows)
+        ctrl = _controller("opd", num_actors, store, stage_config=config)
+        asyncio.run(ctrl._advantage_stage(_pool_meta()))
+        advantages = torch.stack(
+            [store.rows[f"s{i}"]["advantages"][1] for i in range(len(rows))]
+        )
+        torch.testing.assert_close(advantages, expected)
+
+
+@pytest.mark.parametrize("normalize_advantages", [False, True])
+def test_ppo_pool_preserves_advantages_and_returns(normalize_advantages: bool) -> None:
+    """Only unnormalized GAE may split; both modes must preserve the answers."""
+    master_config = SimpleNamespace(
+        grpo=None,
+        ppo=PPOConfig(
+            num_prompts_per_step=NUM_GROUPS,
+            num_generations_per_prompt=GROUP_SIZE,
+            adv_estimator=GAEConfig(normalize_advantages=normalize_advantages),
+        ),
+        loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
+        on_policy_distillation=None,
+        policy={"generation": {"top_k": None, "top_p": 1.0}},
+        logger=LoggerConfig(log_dir="/tmp/test-logs"),
+        async_rl=SimpleNamespace(
+            log_full_train_data=False, debug_writer=DebugWriterConfig()
+        ),
+    )
+    config = AdvantageStageConfig.from_master_config(master_config)
+    rewards = torch.arange(NUM_GROUPS * GROUP_SIZE, dtype=torch.float32)
+    expected = (
+        (rewards - rewards.mean()) / rewards.std() if normalize_advantages else rewards
+    )
+    for num_actors in (0, 2):
+        rows = _rows()
+        for i, row in enumerate(rows.values()):
+            row["total_reward"] = rewards[i]
+            row["values"] = torch.zeros(SEQ)
+            row["token_mask"] = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0])
+        store = _RowStore(rows)
+        ctrl = _controller("gae", num_actors, store, stage_config=config)
+        asyncio.run(ctrl._advantage_stage(_pool_meta()))
+        advantages = torch.stack(
+            [store.rows[f"s{i}"]["advantages"][1] for i in range(len(rows))]
+        )
+        returns = torch.stack(
+            [store.rows[f"s{i}"]["returns"][1] for i in range(len(rows))]
+        )
+        torch.testing.assert_close(advantages, expected)
+        torch.testing.assert_close(returns, rewards)
+        if num_actors:
+            expected_calls = [24] if normalize_advantages else [12, 12]
+            assert [
+                call for actor in ctrl._advantage_actors for call in actor.calls
+            ] == expected_calls
 
 
 @pytest.mark.parametrize("full_vocab", [False, True])
@@ -812,6 +866,11 @@ def test_training_dump_is_complete_however_the_stage_was_split(
     store = _RowStore(_rows())
     ctrl = _controller("grpo", num_actors, store, dump_dir=str(tmp_path))
     asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    # The stage writes in the background; the controller flushes before merging.
+    for computer in [ctrl._advantage_computer] + [
+        actor.computer for actor in ctrl._advantage_actors
+    ]:
+        computer.flush_train_data_dump()
     ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_receipts)
 
     rows = [
@@ -833,6 +892,67 @@ def test_training_dump_is_complete_however_the_stage_was_split(
     # The serialization is timed wherever it ran, and reported back as a
     # number so the controller's metric survives the move onto the pool.
     assert len(ctrl._timer.get_elapsed("train_data_dump")) == max(num_actors, 1)
+
+
+class _JaggedRowStore(_RowStore):
+    """A store that returns the sequence columns jagged, as the data plane does for mixed lengths."""
+
+    def get_samples(self, *, sample_ids, select_fields, **kwargs) -> TensorDict:
+        data = super().get_samples(
+            sample_ids=sample_ids, select_fields=select_fields, **kwargs
+        )
+        lengths = [int(self.rows[sid]["input_lengths"]) for sid in sample_ids]
+        for name in ("input_ids", "generation_logprobs", "prev_logprobs"):
+            if name not in data.keys():
+                continue
+            data[name] = torch.nested.as_nested_tensor(
+                [data[name][i, :n] for i, n in enumerate(lengths)],
+                layout=torch.jagged,
+            )
+        return data
+
+
+@pytest.mark.parametrize("estimator_name", ["grpo", "opd"])
+def test_training_dump_takes_jagged_columns_without_padding(
+    tmp_path: Path, estimator_name: str
+) -> None:
+    """The chunk carries the jagged columns as fetched, and the dump rows match them.
+
+    ``opd`` needs the policy logprobs, so only it puts ``prev_logprobs`` in the dump.
+    """
+    rows = _rows()
+    lengths = {sid: SEQ - (i % 3) for i, sid in enumerate(rows)}
+    for sid, length in lengths.items():
+        rows[sid]["input_lengths"] = torch.tensor(length)
+    store = _JaggedRowStore(rows)
+    ctrl = _controller(estimator_name, 0, store, dump_dir=str(tmp_path))
+    writer = ctrl._advantage_computer._train_data_dump
+    with patch.object(writer, "add_chunk", wraps=writer.add_chunk) as add_chunk:
+        asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    ctrl._advantage_computer.flush_train_data_dump()
+    ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_receipts)
+
+    chunk = add_chunk.call_args.args[0]
+    source_column = {
+        "token_ids": "input_ids",
+        "generation_logprobs": "generation_logprobs",
+        "prev_logprobs": "prev_logprobs",
+    }
+    expected_columns = ["token_ids", "generation_logprobs"] + (
+        ["prev_logprobs"] if estimator_name == "opd" else []
+    )
+    for column in expected_columns:
+        assert chunk.sequences[column].is_nested
+    dumped = [
+        json.loads(line)
+        for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
+    ]
+    assert len(dumped) == len(rows)
+    for row in dumped:
+        sid = row["sample_id"][0]
+        for column in expected_columns:
+            source = rows[sid][source_column[column]]
+            assert row[column][0] == source[: lengths[sid]].tolist()
 
 
 def _rows_with_response_lengths(

@@ -281,9 +281,20 @@ def detected_uv_dirs(monkeypatch):
     )
 
 
-def test_build_nemo_gym_config_splits_nemo_rl_keys(detected_uv_dirs):
+@pytest.mark.parametrize(
+    "truncate_noncontiguous_episodes",
+    [None, False, True],
+    ids=["absent", "disabled", "enabled"],
+)
+def test_build_nemo_gym_config_splits_nemo_rl_keys(
+    detected_uv_dirs, truncate_noncontiguous_episodes
+):
     """NeMo-RL-only knobs become top-level fields; the rest is Gym's global config."""
     env_configs = _env_configs()
+    if truncate_noncontiguous_episodes is not None:
+        env_configs["nemo_gym"]["truncate_noncontiguous_episodes"] = (
+            truncate_noncontiguous_episodes
+        )
     env_configs_before = copy.deepcopy(env_configs)
 
     cfg = build_nemo_gym_config(
@@ -299,6 +310,9 @@ def test_build_nemo_gym_config_splits_nemo_rl_keys(detected_uv_dirs):
     assert cfg["base_urls"] == ["http://vllm-0"]
     assert cfg["invalid_tool_call_patterns"] == ["bad_call"]
     assert cfg["thinking_tags"] == ["<think>"]
+    assert cfg["truncate_noncontiguous_episodes"] is (
+        truncate_noncontiguous_episodes is True
+    )
     assert cfg["tokenizer_config"] == {"name": "test-tokenizer"}
     assert cfg["pad_dynamic_image_shapes"] is True
     assert cfg["initial_global_config_dict"] == {
@@ -399,6 +413,8 @@ def _stub_gym_spinup(run_helper):
     cli = types.ModuleType("nemo_gym.cli")
     cli.GlobalConfigDictParserConfig = MagicMock
     cli.RunHelper = lambda: run_helper
+    config = types.ModuleType("nemo_gym.config")
+    config.MODEL_CALL_SAMPLING_BLOCK = "model_call_sampling"
     rollout_collection = types.ModuleType("nemo_gym.rollout_collection")
     rollout_collection.RolloutCollectionHelper = MagicMock
     server_utils = types.ModuleType("nemo_gym.server_utils")
@@ -411,6 +427,7 @@ def _stub_gym_spinup(run_helper):
             {
                 "nemo_gym": types.ModuleType("nemo_gym"),
                 "nemo_gym.cli": cli,
+                "nemo_gym.config": config,
                 "nemo_gym.rollout_collection": rollout_collection,
                 "nemo_gym.server_utils": server_utils,
             },
@@ -510,9 +527,16 @@ def test_spinup_stops_local_gym_servers_when_external_services_time_out():
     calls.wait.assert_called_once_with(readiness)
 
 
-def test_build_nemo_gym_config_moves_port_range_to_actor_fields(detected_uv_dirs):
+@pytest.mark.parametrize("truncate_noncontiguous_episodes", [False, True])
+def test_build_nemo_gym_config_moves_port_range_to_actor_fields(
+    detected_uv_dirs, truncate_noncontiguous_episodes
+):
     cfg = build_nemo_gym_config(
-        _env_configs(port_range_low=6000, port_range_high=6999),
+        _env_configs(
+            port_range_low=6000,
+            port_range_high=6999,
+            truncate_noncontiguous_episodes=truncate_noncontiguous_episodes,
+        ),
         base_urls=[],
         model_name="test-model",
         enable_router_replay=False,
@@ -523,19 +547,104 @@ def test_build_nemo_gym_config_moves_port_range_to_actor_fields(detected_uv_dirs
     assert (cfg["port_range_low"], cfg["port_range_high"]) == (6000, 6999)
     assert "port_range_low" not in cfg["initial_global_config_dict"]
     assert "port_range_high" not in cfg["initial_global_config_dict"]
+    assert cfg["truncate_noncontiguous_episodes"] is truncate_noncontiguous_episodes
+    assert "truncate_noncontiguous_episodes" not in cfg["initial_global_config_dict"]
 
 
-def test_build_nemo_gym_config_router_replay_off_uses_default_dtype(detected_uv_dirs):
+@pytest.mark.parametrize("truncate_noncontiguous_episodes", [False, True])
+@pytest.mark.parametrize("valid_shards", [False, True])
+def test_truncation_preserves_shard_setup_validation(
+    detected_uv_dirs, truncate_noncontiguous_episodes, valid_shards
+):
+    env_configs = _env_configs(
+        truncate_noncontiguous_episodes=truncate_noncontiguous_episodes,
+        shards=[{"name": "math", "config_paths": ["math.yaml"]}],
+    )
+    if valid_shards:
+        env_configs["nemo_gym"].pop("config_paths")
+    original = copy.deepcopy(env_configs)
+    error = (
+        "entrypoint dispatches rollouts to one actor handle"
+        if valid_shards
+        else "cannot be combined with 'shards'"
+    )
+    with (
+        patch.object(nemo_gym_mod, "NemoGym") as mock_actor,
+        patch.object(nemo_gym_mod, "make_actor_runtime_env") as mock_runtime_env,
+        pytest.raises(nemo_gym_mod.ShardConfigError, match=error),
+    ):
+        spinup_nemo_gym_actor(
+            env_configs,
+            base_urls=[],
+            model_name="test-model",
+            tokenizer=MagicMock(),
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+        )
+    mock_actor.options.assert_not_called()
+    mock_runtime_env.assert_not_called()
+    assert env_configs == original
+
+
+@pytest.mark.parametrize(
+    "token_capture", [None, {"enabled": True, "capture_dir": "/capture"}]
+)
+def test_build_nemo_gym_config_router_replay_off_uses_default_dtype(
+    detected_uv_dirs, token_capture
+):
     cfg = build_nemo_gym_config(
         _env_configs(),
         base_urls=[],
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        token_capture=token_capture,
         turn_checkpointing_enabled=False,
     )
     assert cfg["require_routed_experts"] is False
     assert cfg["routed_experts_dtype"] == "int16"
+    assert cfg["truncate_noncontiguous_episodes"] is False
+    expected_capture = (
+        {
+            **token_capture,
+            "capture_dir": "/capture/gym-instances/nemo_gym/replica-0",
+        }
+        if token_capture is not None
+        else None
+    )
+    assert cfg["token_capture"] == expected_capture
+
+
+@pytest.mark.parametrize("capture_enabled", [False, True])
+def test_spinup_nemo_gym_truncation_token_capture_guard(
+    detected_uv_dirs, capture_enabled
+):
+    token_capture = {"enabled": capture_enabled}
+    kwargs = dict(
+        env_configs=_env_configs(truncate_noncontiguous_episodes=True),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=False,
+        token_capture=token_capture,
+    )
+    if not capture_enabled:
+        cfg = build_nemo_gym_config(**kwargs)
+        assert cfg["truncate_noncontiguous_episodes"] is True
+        assert cfg["token_capture"] == token_capture
+        return
+
+    with (
+        patch.object(nemo_gym_mod, "NemoGym") as mock_cls,
+        patch.object(nemo_gym_mod, "make_actor_runtime_env") as mock_runtime_env,
+        pytest.raises(ValueError, match="not compatible with token_capture.enabled"),
+    ):
+        spinup_nemo_gym_actor(**kwargs, tokenizer=MagicMock())
+
+    mock_cls.options.assert_not_called()
+    mock_runtime_env.assert_not_called()
 
 
 def test_build_nemo_gym_config_router_replay_resolves_dtype(detected_uv_dirs):
@@ -1138,13 +1247,18 @@ def _shard_env_configs(**overrides):
     return {"nemo_gym": nemo_gym}
 
 
-def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(detected_uv_dirs):
+@pytest.mark.parametrize("truncate_noncontiguous_episodes", [False, True])
+def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(
+    detected_uv_dirs, truncate_noncontiguous_episodes
+):
     """The pre-sharding path must stay identical: one actor, no placement group."""
     cluster = _FakeGymCluster()
 
     with _patched_cluster(cluster):
         shard_set = nemo_gym_mod.build_nemo_gym_actors(
-            _env_configs(),
+            _env_configs(
+                truncate_noncontiguous_episodes=truncate_noncontiguous_episodes
+            ),
             base_urls=["http://vllm-0"],
             model_name="test-model",
             tokenizer=_TOKENIZER,
@@ -1156,6 +1270,14 @@ def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(detected_uv_dir
     assert not shard_set.is_sharded
     assert shard_set.all_handles == [cluster.actors[0]]
     assert cluster.placement_group_calls == []
+    assert (
+        cluster.actor_configs[0]["truncate_noncontiguous_episodes"]
+        is truncate_noncontiguous_episodes
+    )
+    assert (
+        "truncate_noncontiguous_episodes"
+        not in cluster.actor_configs[0]["initial_global_config_dict"]
+    )
     # Node affinity still applies when the actor has colocated GPUs.
     assert isinstance(
         cluster.actor_options[0]["scheduling_strategy"],
@@ -1286,6 +1408,74 @@ def test_build_nemo_gym_actors_rejects_gyms_conversation_ids_turned_off(
             )
 
 
+def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
+    detected_uv_dirs,
+):
+    """With Dynamo, each actor's composed config speaks Gym's Dynamo dialect.
+
+    The dialect is not a policy_model overlay, which a sharded plan would reject
+    as unowned. The frontend applies the native default template kwargs, so only
+    a shard's own kwargs reach Gym.
+    """
+    from nemo_rl.algorithms.grpo import MasterConfig
+
+    env = _shard_env_configs()
+    env["nemo_gym"]["shards"][1]["overrides"] = {
+        "policy_model": {
+            "responses_api_models": {
+                "vllm_model": {"chat_template_kwargs": {"enable_thinking": False}}
+            }
+        }
+    }
+    config = MasterConfig.model_construct(
+        env=env,
+        data={},
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "dynamo": True,
+                "vllm_cfg": {
+                    "http_server_serving_chat_kwargs": {
+                        "default_chat_template_kwargs": {"enable_thinking": True}
+                    }
+                },
+            }
+        },
+    )
+    setup_nemo_gym_config(config, tokenizer=None)
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            config.env,
+            base_urls=["http://frontend"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+        )
+
+    template_kwargs = [
+        cfg["initial_global_config_dict"]["policy_model"]["responses_api_models"][
+            "vllm_model"
+        ].get("chat_template_kwargs")
+        for cfg in cluster.actor_configs
+    ]
+    # judged, then the tools shard's two replicas with their own override.
+    assert template_kwargs == [
+        None,
+        {"enable_thinking": False},
+        {"enable_thinking": False},
+    ]
+    for cfg in cluster.actor_configs:
+        gym_config = cfg["initial_global_config_dict"]
+        vllm_model = gym_config["policy_model"]["responses_api_models"]["vllm_model"]
+        assert vllm_model["dynamo_frontend"] is True
+        assert vllm_model["reasoning_field"] == "reasoning_content"
+        assert "dynamo_dialect" not in gym_config
+
+
 def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs):
     cluster = _FakeGymCluster()
     token_capture = {
@@ -1409,8 +1599,9 @@ def test_turn_recovery_rejects_typed_environment_servers(as_omegaconf):
         nemo_gym_mod._reject_typed_environment_servers(as_config(typed))
 
 
+@pytest.mark.parametrize("control_urls", [None, ["http://frontend:2400"]])
 def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
-    detected_uv_dirs,
+    detected_uv_dirs, control_urls
 ):
     config = build_nemo_gym_config(
         _env_configs(),
@@ -1420,6 +1611,7 @@ def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
         use_fastokens=False,
         turn_checkpointing_enabled=True,
         generation_prefix_cuts_enabled=True,
+        generation_cut_control_urls=control_urls,
         token_capture={
             "enabled": True,
             "capture_dir": "/capture",
@@ -1431,6 +1623,8 @@ def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
         "responses_api_models"
     ]["vllm_model"]
     assert model["checkpoint"] == {"policy": True, "generation_cuts": True}
+    # Only a backend that takes cuts elsewhere (a Dynamo frontend) names where.
+    assert model.get("generation_cut_control_url") == control_urls
 
 
 @pytest.mark.nemo_gym
@@ -1447,6 +1641,7 @@ def test_prefix_checkpointing_policy_overrides_are_gym_fields(detected_uv_dirs):
         use_fastokens=False,
         turn_checkpointing_enabled=True,
         generation_prefix_cuts_enabled=True,
+        generation_cut_control_urls=["http://frontend:2400"],
         token_capture={
             "enabled": True,
             "capture_dir": "/capture",
@@ -1457,6 +1652,7 @@ def test_prefix_checkpointing_policy_overrides_are_gym_fields(detected_uv_dirs):
     model = config["initial_global_config_dict"]["policy_model"][
         "responses_api_models"
     ]["vllm_model"]
+    assert "generation_cut_control_url" in model
     assert set(model) - set(VLLMModelConfig.model_fields) == set()
     checkpoint_config = VLLMModelConfig.model_fields["checkpoint"].annotation
     assert set(model["checkpoint"]) == {"policy", "generation_cuts"}
@@ -1584,12 +1780,17 @@ def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(
     assert cluster.events[:2] == ["runtime_env", "placement_group"]
 
 
-def test_shards_get_their_own_config_paths_and_log_directories(detected_uv_dirs):
+@pytest.mark.parametrize("truncate_noncontiguous_episodes", [False, True])
+def test_shards_get_their_own_config_paths_and_log_directories(
+    detected_uv_dirs, truncate_noncontiguous_episodes
+):
     cluster = _FakeGymCluster()
 
     with _patched_cluster(cluster):
         nemo_gym_mod.build_nemo_gym_actors(
-            _shard_env_configs(),
+            _shard_env_configs(
+                truncate_noncontiguous_episodes=truncate_noncontiguous_episodes
+            ),
             base_urls=["http://vllm-0"],
             model_name="test-model",
             tokenizer=_TOKENIZER,
@@ -1617,6 +1818,51 @@ def test_shards_get_their_own_config_paths_and_log_directories(detected_uv_dirs)
     for config in gym_configs:
         assert "shards" not in config
         assert "allowed_duplicate_entries" not in config
+        assert "truncate_noncontiguous_episodes" not in config
+    assert all(
+        config["truncate_noncontiguous_episodes"] is truncate_noncontiguous_episodes
+        for config in cluster.actor_configs
+    )
+
+
+@pytest.mark.parametrize("guard", ["router_replay", "token_capture"])
+@pytest.mark.parametrize("override_source", ["common", "shard"])
+def test_sharded_actor_config_rejects_incompatible_truncation(
+    detected_uv_dirs, guard, override_source
+):
+    cluster = _FakeGymCluster()
+    env_configs = _shard_env_configs()
+    if override_source == "common":
+        env_configs["nemo_gym"]["common_overrides"] = {
+            "truncate_noncontiguous_episodes": True
+        }
+    else:
+        env_configs["nemo_gym"]["shards"][0]["overrides"] = {
+            "truncate_noncontiguous_episodes": True
+        }
+    original = copy.deepcopy(env_configs)
+    with (
+        _patched_cluster(cluster),
+        patch.object(
+            nemo_gym_mod, "resolve_routed_experts_dtype_name_for_model"
+        ) as mock_resolve_dtype,
+        pytest.raises(ValueError, match="not compatible with"),
+    ):
+        build_nemo_gym_actors(
+            env_configs,
+            base_urls=[],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=guard == "router_replay",
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+            token_capture={"enabled": guard == "token_capture"},
+        )
+
+    assert cluster.actors == []
+    mock_resolve_dtype.assert_not_called()
+    assert cluster.removed_placement_groups == [cluster.placement_group]
+    assert env_configs == original
 
 
 def test_shards_get_stable_isolated_checkpoint_namespaces(detected_uv_dirs):

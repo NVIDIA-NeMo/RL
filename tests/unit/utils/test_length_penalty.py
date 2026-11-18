@@ -23,6 +23,7 @@ import pytest
 import nemo_rl.utils.length_penalty as length_penalty_mod
 from nemo_rl.utils.length_penalty import (
     LengthPenaltyConfig,
+    LengthPenaltyParams,
     _band_multiplier,
     apply_group_length_penalties,
 )
@@ -1600,3 +1601,101 @@ class TestNemoGymPostprocessHook:
         # env_reward is the reward as handed to the length hook, i.e. after the
         # reward penalties already zeroed row 2.
         assert rollout_result.final_batch["env_reward"].tolist() == [1.0, 1.0, 0.0]
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        LengthPenaltyParams(length_type="chars", group_total_length_penalty_coeff=0.2),
+        LengthPenaltyParams(
+            length_type="chars", group_reasoning_length_penalty_coeff=0.2
+        ),
+        LengthPenaltyParams(length_type="chars", total_bonus=0.2),
+        LengthPenaltyParams(
+            length_type="all_generated_tokens", group_total_length_penalty_coeff=0.2
+        ),
+        LengthPenaltyParams(
+            length_type="chars", profiled_length_penalty_type="zero_over_max"
+        ),
+        LengthPenaltyParams(length_type="chars", profile_band_total=True),
+        LengthPenaltyParams(length_type="chars", enabled=False),
+    ],
+)
+@pytest.mark.parametrize("rewards", [(1.0, 1.0), (1.0, 0.0), (0.2, 0.8)])
+def test_precomputed_group_matches_response_path(params, rewards):
+    from copy import deepcopy
+
+    from nemo_rl.utils.length_penalty import (
+        apply_group_length_penalties_from_inputs,
+        prepare_length_penalty_input,
+    )
+
+    config = LengthPenaltyConfig(default=params)
+    rows = [
+        make_result("r" * n, "a" * (n * 2), reward)
+        for n, reward in zip((2, 8), rewards)
+    ]
+    for row, n in zip(rows, (2, 8)):
+        row.update(
+            message_log=[
+                {"role": "user", "token_ids": [0] * 100},
+                {"role": "assistant", "token_ids": [1] * n},
+            ],
+            profiled_rewards=[1.0, 1.0],
+            profiled_output_lengths=[3.0, 5.0],
+            profile_band={"total": {"a": 3.0, "b": 20.0, "f": 1.0}},
+        )
+    expected = deepcopy(rows)
+    expected_metrics = apply_group_length_penalties(expected, config, 2)
+    inputs = [prepare_length_penalty_input(row, row, config, None) for row in rows]
+    adjusted, metrics = apply_group_length_penalties_from_inputs(
+        inputs,
+        list(rewards),
+        generated_lengths=[2, 8],
+        low_effort=[False, False],
+        config=config,
+    )
+    assert adjusted == pytest.approx([row["full_result"]["reward"] for row in expected])
+    assert metrics == pytest.approx(expected_metrics)
+    assert [row["full_result"]["reward"] for row in rows] == list(rewards)
+
+
+@pytest.mark.parametrize("input_override,expected_reward", [(False, 0.0), (True, 1.0)])
+def test_capture_metadata_reads_materialized_task_profiles(
+    input_override, expected_reward
+):
+    from nemo_rl.utils.length_penalty import (
+        apply_group_length_penalties_from_inputs,
+        prepare_length_penalty_input,
+    )
+
+    config = LengthPenaltyConfig(
+        default=LengthPenaltyParams(enabled=False),
+        agent_overrides={
+            "dataset": LengthPenaltyParams(
+                enabled=True,
+                length_type="chars",
+                profiled_length_penalty_type="zero_over_max",
+            )
+        },
+    )
+    row = {
+        "task_id": {"taskset": "dataset"},
+        "task_input": {
+            "task_data": {
+                "profiled_rewards": [1.0, 1.0],
+                "profiled_output_lengths": [5.0, 5.0],
+            }
+        },
+    }
+    if input_override:
+        row["task_input"]["profiled_output_lengths"] = [7.0, 7.0]
+    result = make_result("", "xxxxxx", 1.0)
+    result.pop("agent_ref")
+    result["attribution_key"] = "dataset"
+    sample = prepare_length_penalty_input(result, row, config, None)
+    adjusted, _ = apply_group_length_penalties_from_inputs(
+        [sample], [1.0], generated_lengths=[6], low_effort=[False], config=config
+    )
+    assert sample.agent_name == "dataset"
+    assert adjusted == [expected_reward]

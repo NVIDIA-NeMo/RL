@@ -252,6 +252,12 @@ def test_validation_refuses_dynamo_serving():
         validate_vllm_disaggregation(resolve_vllm_role_overrides(cfg))
 
 
+def test_validation_refuses_multiple_api_servers():
+    cfg = _config(disaggregation={"enabled": True}, http_api_server_count=2)
+    with pytest.raises(ValueError, match="http_api_server_count"):
+        validate_vllm_disaggregation(resolve_vllm_role_overrides(cfg))
+
+
 def test_validation_refuses_a_non_default_refit_transport():
     cfg = _config(disaggregation={"enabled": True})
     cfg["refit_transport"] = "nixl"

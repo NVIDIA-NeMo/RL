@@ -1,28 +1,14 @@
 # NemoRL Disaggregation Rollout (Experimental)
 
-> **Experimental**: PD disaggregation is wired for the TensorRT-LLM and vLLM backends
-> on the NeMo-Gym rollout path only, and for the SGLang backend on its native
-> (non-Gym) rollout path.
+> **Experimental**: PD disaggregation is wired for the TensorRT-LLM and vLLM backends on the NeMo-Gym rollout path only, and for the SGLang backend on its native (non-Gym) rollout path.
 
-NeMo RL owns the *replica* (which engines exist, how they are placed, and their
-lifecycle) and the *refit safety* (what happens when weights change mid-request). It
-delegates both the *KV handshake* and the *routing inside a replica* to the inference
-backend's own disaggregation front-end — for TensorRT-LLM, `OpenAIDisaggServer`; for
-vLLM, NeMo RL's own frontend (`nemo_rl/models/generation/vllm/vllm_disagg_frontend.py`)
-over vLLM's `KVTransferConfig` connector (NixlConnector by default); for SGLang, the
-sglang router in PD mode. The layout is the shared `generation.disaggregation` block for
-all three backends; the vLLM specifics live under `vllm_cfg.prefill_engine`,
-`vllm_cfg.decode_engine`, `vllm_cfg.disagg_frontend` and `vllm_cfg.kv_transfer`, and the
-SGLang ones under `sglang_cfg.prefill_engine`, `sglang_cfg.decode_engine` and
-`sglang_cfg.disagg` (see Configuration below).
+NeMo RL owns the *replica* (which engines exist, how they are placed, and their lifecycle) and the *refit safety* (what happens when weights change mid-request). It delegates both the *KV handshake* and the *routing inside a replica* to the inference backend's own disaggregation front-end — for TensorRT-LLM, `OpenAIDisaggServer`; for vLLM, NeMo RL's own frontend (`nemo_rl/models/generation/vllm/vllm_disagg_frontend.py`) over vLLM's `KVTransferConfig` connector (NixlConnector by default); for SGLang, the sglang router in PD mode. The layout is the shared `generation.disaggregation` block for all three backends; the vLLM specifics live under `vllm_cfg.prefill_engine`, `vllm_cfg.decode_engine`, `vllm_cfg.disagg_frontend` and `vllm_cfg.kv_transfer`, and the SGLang ones under `sglang_cfg.prefill_engine`, `sglang_cfg.decode_engine` and `sglang_cfg.disagg` (see Configuration below).
 
 ## Design
 
 ### Topology
 
-A **replica** is a self-contained disaggregated fleet — M prefill engines plus K
-decode engines — fronted by F `OpenAIDisaggServer` instances
-(`num_frontend_workers`, default 1). N replicas are created, and each exposes F URLs:
+A **replica** is a self-contained disaggregated fleet — M prefill engines plus K decode engines — fronted by F `OpenAIDisaggServer` instances (`num_frontend_workers`, default 1). N replicas are created, and each exposes F URLs:
 
 ```
                                replica 0  OpenAIDisaggServer fe_0 (one URL) --.
@@ -34,56 +20,21 @@ NeMo-Gym --session affinity-->                                                |-
                                           ...                                 `-- ...
 ```
 
-Every frontend of a replica is handed the *same* two address pools, so F changes nothing
-about the engine layout — it only widens the relay in front of it. The frontend is a
-single-process ASGI relay that terminates HTTP, strips the Gym-only request fields,
-re-serializes the body, asks the routers, and makes two engine calls per turn.
+Every frontend of a replica is handed the *same* two address pools, so F changes nothing about the engine layout — it only widens the relay in front of it. The frontend is a single-process ASGI relay that terminates HTTP, strips the Gym-only request fields, re-serializes the body, asks the routers, and makes two engine calls per turn.
 
-Chat-template rendering and tokenization are the expensive part of serving a turn on
-the CPU side, and they scale badly with conversation length: `build_spliced_prompt_ids`
-runs over the *whole* conversation, so a turn-30 request re-renders and re-tokenizes all
-30 turns. By default that work lands in the prefill adapter, which is one thread inside
-each prefill engine's worker process — it can only be grown by adding prefill engines,
-i.e. GPUs.
+Chat-template rendering and tokenization are the expensive part of serving a turn on the CPU side, and they scale badly with conversation length: `build_spliced_prompt_ids` runs over the *whole* conversation, so a turn-30 request re-renders and re-tokenizes all 30 turns. By default that work lands in the prefill adapter, which is one thread inside each prefill engine's worker process — it can only be grown by adding prefill engines, i.e. GPUs.
 
-Disaggregation makes a cheaper place available. `frontend_tokenize` moves the rendering
-and tokenization onto the frontends, which attach `prompt_token_ids_b64` to the prefill
-leg so the adapter does no template work at all (a sample is shadow-validated prefill-side
-under `NRL_TOKENIZE_SHADOW_RATE`, since the ids have to be bit-identical to what
-the adapter would have produced). Frontends are CPU-only actors with no GPU in their
-budget, so raising F spreads the tokenization cost over F processes at no GPU cost — this
-is what F is for, and what to size it against.
+Disaggregation makes a cheaper place available. `frontend_tokenize` moves the rendering and tokenization onto the frontends, which attach `prompt_token_ids_b64` to the prefill leg so the adapter does no template work at all (a sample is shadow-validated prefill-side under `NRL_TOKENIZE_SHADOW_RATE`, since the ids have to be bit-identical to what the adapter would have produced). Frontends are CPU-only actors with no GPU in their budget, so raising F spreads the tokenization cost over F processes at no GPU cost — this is what F is for, and what to size it against.
 
-`TrtllmGeneration.dp_openai_server_base_urls` reports all N×F frontend URLs as one flat
-list, so NeMo-Gym sees "N×F instances" exactly as it sees N without disaggregation. Its
-existing per-session affinity (`responses_api_models/vllm_model/app.py::_resolve_client`,
-a `session_id -> client` map seeded by `sha256(session_id) % len(clients)`) binds a
-trajectory to one frontend — and therefore to one replica — for its whole lifetime. Since
-each replica contributes exactly F of the N×F slots, replicas stay uniformly loaded.
+`TrtllmGeneration.dp_openai_server_base_urls` reports all N×F frontend URLs as one flat list, so NeMo-Gym sees "N×F instances" exactly as it sees N without disaggregation. Its existing per-session affinity (`responses_api_models/vllm_model/app.py::_resolve_client`, a `session_id -> client` map seeded by `sha256(session_id) % len(clients)`) binds a trajectory to one frontend — and therefore to one replica — for its whole lifetime. Since each replica contributes exactly F of the N×F slots, replicas stay uniformly loaded.
 
-That stickiness matters for performance, not just load-spreading. Each frontend holds
-its own `ctx_router` state in-process, so two frontends of the same replica have no
-shared view of which prefill engine holds a given conversation's prefix. If a trajectory's
-later turn reached a different frontend, that frontend would route it to a prefill engine
-that never saw the prefix — correct output, but a full re-prefill and the whole point of
-`ctx_router: conversation` lost.
+That stickiness matters for performance, not just load-spreading. Each frontend holds its own `ctx_router` state in-process, so two frontends of the same replica have no shared view of which prefill engine holds a given conversation's prefix. If a trajectory's later turn reached a different frontend, that frontend would route it to a prefill engine that never saw the prefix — correct output, but a full re-prefill and the whole point of `ctx_router: conversation` lost.
 
-Replicas are disjoint: no engine belongs to two of them. That is what lets every frontend
-keep its routing state in-process and removes any need for cross-replica coordination —
-`coordinator_url` is `None`, even with F > 1.
+Replicas are disjoint: no engine belongs to two of them. That is what lets every frontend keep its routing state in-process and removes any need for cross-replica coordination — `coordinator_url` is `None`, even with F > 1.
 
-**Everything below the replica boundary is opaque to NeMo RL.** Once a request reaches a
-replica's `OpenAIDisaggServer`, that server alone decides which of its prefill engines
-serves the prefill, which of its decode engines serves the decode, whether a prefill leg
-is needed at all, and how the KV handshake between them is carried. NeMo RL never sees an
-individual engine on the request path; it only composes each replica's two pools and
-selects the router policies through `DisaggServerConfig` (see
-[Configuration](#configuration)).
+**Everything below the replica boundary is opaque to NeMo RL.** Once a request reaches a replica's `OpenAIDisaggServer`, that server alone decides which of its prefill engines serves the prefill, which of its decode engines serves the decode, whether a prefill leg is needed at all, and how the KV handshake between them is carried. NeMo RL never sees an individual engine on the request path; it only composes each replica's two pools and selects the router policies through `DisaggServerConfig` (see [Configuration](#configuration)).
 
-The cost of that boundary is that context affinity is no longer free. When a replica had
-exactly one prefill engine, Gym's choice of URL *was* the choice of prefill engine. Now
-`ctx_router` has to provide it, which is why it must be configured with a stateful policy
-while `gen_router` need not be.
+The cost of that boundary is that context affinity is no longer free. When a replica had exactly one prefill engine, Gym's choice of URL *was* the choice of prefill engine. Now `ctx_router` has to provide it, which is why it must be configured with a stateful policy while `gen_router` need not be.
 
 Affinity is therefore established at three levels, and NeMo RL controls only the first:
 
@@ -93,92 +44,42 @@ Affinity is therefore established at three levels, and NeMo RL controls only the
 | frontend → prefill engine | which of the replica's M prefill engines | `ctx_router` | in that frontend's process |
 | prefill engine → ADP rank | which attention-DP rank holds the prefix | `ConversationParams.conversation_id` relayed on the request | none — a function of the id |
 
-The third row is why `trtllm_http_server` forwards the conversation id (Gym's session id,
-sent as `conversation_params`; needs NVIDIA-NeMo/Gym#3582) to `llm.generate_async`: under
-attention-DP each rank owns a separate KV pool, so without the id a turn lands on an
-effectively random rank and re-prefills its history.
+The third row is why `trtllm_http_server` forwards the conversation id (Gym's session id, sent as `conversation_params`; needs NVIDIA-NeMo/Gym#3582) to `llm.generate_async`: under attention-DP each rank owns a separate KV pool, so without the id a turn lands on an effectively random rank and re-prefills its history.
 
 ### Forming a replica
 
-`TrtllmGeneration` lays engines out replica by replica, contexts before generations, so
-membership is positional and needs no negotiation. Once every engine has initialised and
-reported its address, it builds the address pools for each replica — TRT-LLM still spells
-the two legs ctx/gen on the wire, so `type='ctx'` entries for that replica's prefill
-engines and `type='gen'` for its decode engines — and starts F `DisaggServerActor`s
-against them, collecting one URL each. Those N×F URLs become `dp_openai_server_base_urls`.
+`TrtllmGeneration` lays engines out replica by replica, contexts before generations, so membership is positional and needs no negotiation. Once every engine has initialised and reported its address, it builds the address pools for each replica — TRT-LLM still spells the two legs ctx/gen on the wire, so `type='ctx'` entries for that replica's prefill engines and `type='gen'` for its decode engines — and starts F `DisaggServerActor`s against them, collecting one URL each. Those N×F URLs become `dp_openai_server_base_urls`.
 
-Each frontend is a CPU-only Ray actor in its own process rather than a thread inside an
-engine worker: it is the request hot path for the whole replica, and sharing a process
-with an engine would couple the replica's routing latency to that one engine's load. Three
-properties are worth noting, all of which exist so a crashed frontend can come back at the
-*same* URL and Gym's sticky clients recover after their 5xx retries:
+Each frontend is a CPU-only Ray actor in its own process rather than a thread inside an engine worker: it is the request hot path for the whole replica, and sharing a process with an engine would couple the replica's routing latency to that one engine's load. Three properties are worth noting, all of which exist so a crashed frontend can come back at the *same* URL and Gym's sticky clients recover after their 5xx retries:
 
-- **Serving starts in `__init__`, not in `start()`.** Ray re-runs `__init__` on actor
-  restart but never replays method calls. `start()` only waits for `/health` and asserts
-  the serving thread is still alive.
-- **The node pin is hard.** Frontends spread round-robin over their own replica's engine
-  nodes (`addrs[base + fe_idx % per_replica]`), so a frontend sits beside engines it talks
-  to, and restarts are unlimited.
-- **Ports are deterministic**: `frontend_base_port + replica_idx * num_frontend_workers +
-  frontend_idx`. Both indices are needed — several replicas can share a node, and an
-  offset carrying only `frontend_idx` would have every replica's frontend 0 ask for the
-  same port. That failure is silent: `uvicorn`'s bind failure calls `sys.exit(1)`, which
-  only unwinds the daemon thread, and the `/health` probe is then answered 200 by
-  whichever frontend won the bind. Hence the liveness assert in `start()`.
+- **Serving starts in `__init__`, not in `start()`.** Ray re-runs `__init__` on actor restart but never replays method calls. `start()` only waits for `/health` and asserts the serving thread is still alive.
+- **The node pin is hard.** Frontends spread round-robin over their own replica's engine nodes (`addrs[base + fe_idx % per_replica]`), so a frontend sits beside engines it talks to, and restarts are unlimited.
+- **Ports are deterministic**: `frontend_base_port + replica_idx * num_frontend_workers + frontend_idx`. Both indices are needed — several replicas can share a node, and an offset carrying only `frontend_idx` would have every replica's frontend 0 ask for the same port. That failure is silent: `uvicorn`'s bind failure calls `sys.exit(1)`, which only unwinds the daemon thread, and the `/health` probe is then answered 200 by whichever frontend won the bind. Hence the liveness assert in `start()`.
 
-Every engine — context and generation alike — therefore has to run its own HTTP server,
-because an address is the only way `OpenAIDisaggServer` can reach one. That is the sole
-thing it is given about an engine.
+Every engine — context and generation alike — therefore has to run its own HTTP server, because an address is the only way `OpenAIDisaggServer` can reach one. That is the sole thing it is given about an engine.
 
-NeMo RL still created those engines and still holds their Ray actor handles, so refit does
-not go through the disagg server at all: `TrtllmGeneration` drives the engines directly,
-as it does without disaggregation. The same is true of sleep/wake, prefix-cache reset and
-profiling. Delegation is confined to the request path; the control plane is unchanged.
+NeMo RL still created those engines and still holds their Ray actor handles, so refit does not go through the disagg server at all: `TrtllmGeneration` drives the engines directly, as it does without disaggregation. The same is true of sleep/wake, prefix-cache reset and profiling. Delegation is confined to the request path; the control plane is unchanged.
 
 ### Node affinity
 
-Placement matters at two scales. Keeping a replica together is a preference; keeping an
-engine together is a rule wherever it is possible.
+Placement matters at two scales. Keeping a replica together is a preference; keeping an engine together is a rule wherever it is possible.
 
-**An engine that fits in a node is never split across nodes.** An engine's width is
-whatever its parallelism multiplies out to — tensor parallelism alone on the TRT-LLM path,
-which asserts `pp == 1`; TP × PP on a backend with pipeline stages. Tensor-parallel
-collectives are the bandwidth-hungry part, so TP is the dimension that most wants to stay
-node-local, while pipeline stages only pass activations between neighbours and tolerate a
-slower link. Engines are therefore packed node by node, and a layout whose engines do not
-tile each node exactly is rejected at startup rather than having one engine straddle a
-node boundary. Only an engine wider than a node spans nodes (TRT-LLM runs TP across
-nodes), and it should at least stay inside one *segment* — the `segment_size` nodes of a
-single NVLink domain that `RayVirtualCluster` aligns placement to.
+**An engine that fits in a node is never split across nodes.** An engine's width is whatever its parallelism multiplies out to — tensor parallelism alone on the TRT-LLM path, which asserts `pp == 1`; TP × PP on a backend with pipeline stages. Tensor-parallel collectives are the bandwidth-hungry part, so TP is the dimension that most wants to stay node-local, while pipeline stages only pass activations between neighbours and tolerate a slower link. Engines are therefore packed node by node, and a layout whose engines do not tile each node exactly is rejected at startup rather than having one engine straddle a node boundary. Only an engine wider than a node spans nodes (TRT-LLM runs TP across nodes), and it should at least stay inside one *segment* — the `segment_size` nodes of a single NVLink domain that `RayVirtualCluster` aligns placement to.
 
-**A replica should fit inside one node, or failing that one segment.** The prefill→decode
-KV transfer happens entirely within a replica, so its cost is set by the slowest link any
-of that replica's engines has to cross. A replica straddling a segment boundary pays
-network bandwidth on every handoff, and it pays it per turn.
+**A replica should fit inside one node, or failing that one segment.** The prefill→decode KV transfer happens entirely within a replica, so its cost is set by the slowest link any of that replica's engines has to cross. A replica straddling a segment boundary pays network bandwidth on every handoff, and it pays it per turn.
 
-Engines are laid out replica by replica with same-role engines contiguous, which keeps
-each role's GPUs adjacent.
+Engines are laid out replica by replica with same-role engines contiguous, which keeps each role's GPUs adjacent.
 
 Which of the two boundaries actually costs depends on the platform:
 
-- **HGX, 8 GPUs per node** — the NVLink domain *is* the node, so crossing one drops
-  straight to the network. The node boundary is what matters.
-- **GB200 NVL72** — Ray sees 4 GPUs per node and 18 of those nodes share one NVLink
-  domain, so crossing a node is cheap. The segment is the boundary worth respecting.
+- **HGX, 8 GPUs per node** — the NVLink domain *is* the node, so crossing one drops straight to the network. The node boundary is what matters.
+- **GB200 NVL72** — Ray sees 4 GPUs per node and 18 of those nodes share one NVLink domain, so crossing a node is cheap. The segment is the boundary worth respecting.
 
 ## Refit safety
 
-**TODO — re-prefill a mid-decode request after an in-flight update.** With
-`in_flight_weight_updates`, a request that is already decoding keeps decoding against KV
-built under the old weights; the correct handling is to send it back to a prefill engine
-and re-prefill its prefix under the new ones. That is not implemented, so the tokens a
-request emits across an update boundary are produced from a mix of weights.
+**TODO — re-prefill a mid-decode request after an in-flight update.** With `in_flight_weight_updates`, a request that is already decoding keeps decoding against KV built under the old weights; the correct handling is to send it back to a prefill engine and re-prefill its prefix under the new ones. That is not implemented, so the tokens a request emits across an update boundary are produced from a mix of weights.
 
-Multi-turn bounds how far this propagates. `reset_prefix_cache()` runs on every engine
-after the update, so the next turn's prefill cannot reuse any pre-update block and
-re-prefills the whole conversation under the new weights — the staleness is confined to
-the turn that was in flight, rather than being carried forward by the prefix cache for
-the rest of the trajectory.
+Multi-turn bounds how far this propagates. `reset_prefix_cache()` runs on every engine after the update, so the next turn's prefill cannot reuse any pre-update block and re-prefills the whole conversation under the new weights — the staleness is confined to the turn that was in flight, rather than being carried forward by the prefix cache for the rest of the trajectory.
 
 ## Configuration
 
@@ -231,12 +132,9 @@ policy:
         backend: NIXL                 # DEFAULT | UCX | NIXL | MOONCAKE | MPI
 ```
 
-With `backend: NIXL`, run with `export UCX_NET_DEVICES=all` so the KV transfer uses the
-RDMA HCAs instead of the image's management NIC (see
-`tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1.sh`).
+With `backend: NIXL`, run with `export UCX_NET_DEVICES=all` so the KV transfer uses the RDMA HCAs instead of the image's management NIC (see `tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1.sh`).
 
-The same layout behind the vLLM backend (a runnable version is
-`examples/configs/recipes/llm/grpo-qwen3-1.7b-2n4g-megatron-vllm-disagg-swe1.yaml`):
+The same layout behind the vLLM backend (a runnable version is `examples/configs/recipes/llm/grpo-qwen3-1.7b-2n4g-megatron-vllm-disagg-swe1.yaml`):
 
 ```yaml
 policy:
@@ -271,53 +169,17 @@ policy:
         kv_load_failure_policy: fail
 ```
 
-vLLM-specific requirements, checked at setup: `colocated.enabled: false`, no Dynamo
-serving (`policy.generation.dynamo`), `async_engine` with `expose_http_server`,
-`pipeline_parallel_size: 1`, no `refit_transport` override, and, with in-flight weight updates
-(`grpo.async_grpo.in_flight_weight_updates`, or any SingleController run), neither
-`bidirectional_kv_xfer` nor `recompute_kv_cache_after_weight_updates`: vLLM's cache
-reset at the pause raises while a decode request still holds blocks for KV in transit,
-so in-flight requests keep their KV and the prefix caches are left to eviction. Between
-steps (`finish_generation`, and `invalidate_kv_cache` after a drained update) the
-frontends drop their remembered handshakes first, then every engine expires the blocks
-its connector still pins for a remote reader (prefill leases, and under
-`bidirectional_kv_xfer` the finished turns the decode engines keep for
-`decoder_kv_blocks_ttl`) and resets its prefix cache. vLLM refuses that reset while any
-block is allocated, so a reset that still fails stops the step rather than letting the
-next one reuse KV computed under the previous weights.
-SingleController additionally refuses `token_capture.enabled` (the prefill leg never
-sees the ledger prefix the decode leg splices in). Which layer types a connector can
-move, and at which TP ratios, is vLLM's own check at engine start. Engines get
-`VLLM_SSM_CONV_STATE_LAYOUT=DS` by default (NixlConnector asserts it for Mamba layers;
-inert otherwise) and, with GPU-staged KV, `NCCL_NET_PLUGIN=none` (HPC-X's NCCL plugin
-loads a UCX without CUDA support into TP>1 engines, which breaks NIXL's VRAM
-registration); `vllm_cfg.env_vars` overrides both. The training workers adopt the engines'
-`NCCL_NET_PLUGIN`: the refit collective is one NCCL communicator over the training ranks and
-every engine rank, and it cannot form when the two sides pick different network transports
-(`megatron_cfg.env_vars` / `automodel_cfg.env_vars` choose one for the trainer explicitly).
-Besides the frontend band, vLLM engines use two further per-node port
-bands from `virtual_cluster.py`: the NIXL side channel (8556-8571) and the KV-events
-publishers of the `kv_cache_aware` router (8572-8587), one port per engine on a node.
+vLLM-specific requirements, checked at setup: `colocated.enabled: false`, no Dynamo serving (`policy.generation.dynamo`), `async_engine` with `expose_http_server`, `pipeline_parallel_size: 1`, `http_api_server_count: 1`, no `refit_transport` override, and, with in-flight weight updates (`grpo.async_grpo.in_flight_weight_updates`, or any SingleController run), neither `bidirectional_kv_xfer` nor `recompute_kv_cache_after_weight_updates`: vLLM's cache reset at the pause raises while a decode request still holds blocks for KV in transit, so in-flight requests keep their KV and the prefix caches are left to eviction. Between steps (`finish_generation`, and `invalidate_kv_cache` after a drained update) the frontends drop their remembered handshakes first, then every engine expires the blocks its connector still pins for a remote reader (prefill leases, and under `bidirectional_kv_xfer` the finished turns the decode engines keep for `decoder_kv_blocks_ttl`) and resets its prefix cache. vLLM refuses that reset while any block is allocated, so a reset that still fails stops the step rather than letting the next one reuse KV computed under the previous weights. SingleController additionally refuses `token_capture.enabled` (the prefill leg never sees the ledger prefix the decode leg splices in). Which layer types a connector can move, and at which TP ratios, is vLLM's own check at engine start. Engines get `VLLM_SSM_CONV_STATE_LAYOUT=DS` by default (NixlConnector asserts it for Mamba layers; inert otherwise) and, with GPU-staged KV, `NCCL_NET_PLUGIN=none` (HPC-X's NCCL plugin loads a UCX without CUDA support into TP>1 engines, which breaks NIXL's VRAM registration); `vllm_cfg.env_vars` overrides both. The training workers adopt the engines' `NCCL_NET_PLUGIN`: the refit collective is one NCCL communicator over the training ranks and every engine rank, and it cannot form when the two sides pick different network transports (`megatron_cfg.env_vars` / `automodel_cfg.env_vars` choose one for the trainer explicitly). Besides the frontend band, vLLM engines use two further per-node port bands from `virtual_cluster.py`: the NIXL side channel (8556-8571) and the KV-events publishers of the `kv_cache_aware` router (8572-8587), one port per engine on a node.
 
-The `conversation` and `kv_cache_aware` prefill routers (and the bidirectional
-conversation cache) key on `conversation_params.conversation_id`, NeMo-Gym's per-rollout
-session id. NeMo RL turns the Gym knob that sends it,
-`policy_model.responses_api_models.vllm_model.forward_session_id_as_conversation_id`, on
-whenever the vLLM frontends are in use (`build_nemo_gym_actors`) and refuses a config that
-sets it to false. A request without the id (another client) is routed by a hash of the
-conversation's opening exchange (system prompt plus first user turn; the samples of one
-prompt share it) and gets nothing from the bidirectional cache; the frontend warns once.
+The `conversation` and `kv_cache_aware` prefill routers (and the bidirectional conversation cache) key on `conversation_params.conversation_id`, NeMo-Gym's per-rollout session id. NeMo RL turns the Gym knob that sends it, `policy_model.responses_api_models.vllm_model.forward_session_id_as_conversation_id`, on whenever the vLLM frontends are in use (`build_nemo_gym_actors`) and refuses a config that sets it to false. A request without the id (another client) is routed by a hash of the conversation's opening exchange (system prompt plus first user turn; the samples of one prompt share it) and gets nothing from the bidirectional cache; the frontend warns once.
+
+A leg that carries prompt ids is not rendered by its engine, and the ids hold the model's earlier turns with their reasoning, so the engine cannot tell from them whether reasoning is over before the turn generates (what vLLM's reasoning parser starts from). The render that produced the ids answers it: the frontend's under `frontend_tokenize`, else the prefill engine's, which returns it with the prefill response; the frontend hands it to the decode leg as `template_reasoning_ended`. The frontend also forwards NeMo-Gym's `x-ng-sampling` header to both legs, so a call that keeps its own sampling (an LLM judge's) is served as it is without disaggregation.
 
 Colocated generation is not supported yet; set `colocated.enabled: false`.
 
 ### SGLang
 
-SGLang needs no frontend of NeMo RL's: the sglang router's PD mode is the disagg
-server. It pairs every `/generate` request with one prefill and one decode engine,
-stamps the prefill engine's bootstrap host/port/room on it (the KV handshake), and
-relays the decode output. The rollout therefore keeps posting token ids to
-`/generate` exactly as without disaggregation, which is why the SGLang path needs no
-NeMo-Gym and is in fact refused with it (`env.should_use_nemo_gym` must be false).
+SGLang needs no frontend of NeMo RL's: the sglang router's PD mode is the disagg server. It pairs every `/generate` request with one prefill and one decode engine, stamps the prefill engine's bootstrap host/port/room on it (the KV handshake), and relays the decode output. The rollout therefore keeps posting token ids to `/generate` exactly as without disaggregation, which is why the SGLang path needs no NeMo-Gym and is in fact refused with it (`env.should_use_nemo_gym` must be false).
 
 ```yaml
 policy:
@@ -340,38 +202,11 @@ policy:
         decode_policy: round_robin
 ```
 
-Engines are laid out per replica as on the other backends
-(`nemo_rl/models/generation/sglang/utils/layout.py`); widths may differ per role.
-With `router_scope: replica` every replica gets its own router, so a request's KV
-never leaves the replica's placement domain, and NeMo RL spreads prompts over the
-routers: the samples of one prompt share a router, and so a replica, and a new prompt
-goes to the usable router with the fewest requests in flight; a router whose replica has
-lost an engine is skipped (`nemo_rl/models/generation/sglang/utils/disagg_dispatch.py`).
-Inside a router, `cache_aware` does not pick the prefill engine by prefix: NeMo RL sends
-token ids only, so the policy has no text to match and takes the least-loaded engine.
-`global` pools every
-engine behind one router, which balances decode fleet-wide at the price of
-cross-replica KV transfers. Routers start with empty pools and the engines register
-with their role and, for prefill, their bootstrap port; `power_of_two` is refused
-because sglang-router 0.3.2 validates it against the workers configured at startup.
+Engines are laid out per replica as on the other backends (`nemo_rl/models/generation/sglang/utils/layout.py`); widths may differ per role. With `router_scope: replica` every replica gets its own router, so a request's KV never leaves the replica's placement domain, and NeMo RL spreads prompts over the routers: the samples of one prompt share a router, and so a replica, and a new prompt goes to the usable router with the fewest requests in flight; a router whose replica has lost an engine is skipped (`nemo_rl/models/generation/sglang/utils/disagg_dispatch.py`). Inside a router, `cache_aware` does not pick the prefill engine by prefix: NeMo RL sends token ids only, so the policy has no text to match and takes the least-loaded engine. `global` pools every engine behind one router, which balances decode fleet-wide at the price of cross-replica KV transfers. Routers start with empty pools and the engines register with their role and, for prefill, their bootstrap port; `power_of_two` is refused because sglang-router 0.3.2 validates it against the workers configured at startup.
 
-`abort` is the pause mode SGLang allows in PD mode, and it is safe only when no rollout
-is in flight at refit: GRPO refits between steps (async GRPO does not support SGLang),
-and `SGLangGeneration.validate_settings` refuses the SingleController entrypoint, which
-refits with rollouts in flight. Prefill engines pause before decode engines and resume
-after them. Checked at setup: `colocated.enabled: false`, no external router,
-`pp_size: 1`, `pause_generation_mode: abort`, default `frontend_*` keys, and
-`needs_offload: false` under `transfer_backend: nixl` (the memory saver cannot re-acquire
-the KV cache it released for a refit there; the engines exit at the first refit). A runnable
-recipe is `examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-pd-disagg.yaml`.
+`abort` is the pause mode SGLang allows in PD mode, and it is safe only when no rollout is in flight at refit: GRPO refits between steps (async GRPO does not support SGLang), and `SGLangGeneration.validate_settings` refuses the SingleController entrypoint, which refits with rollouts in flight. Prefill engines pause before decode engines and resume after them. Checked at setup: `colocated.enabled: false`, no external router, `pp_size: 1`, `pause_generation_mode: abort`, default `frontend_*` keys, and `needs_offload: false` under `transfer_backend: nixl` (the memory saver cannot re-acquire the KV cache it released for a refit there; the engines exit at the first refit). A runnable recipe is `examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-pd-disagg.yaml`.
 
-Engines get the environment their KV transport needs (`disagg_transport_env`), with
-values already in the environment taking precedence: with `nixl`, `NCCL_NET_PLUGIN=none`
-as on the vLLM path, which the training workers adopt for the same reason as there (one
-refit process group, one NCCL transport); with `mooncake`, `WITH_NVIDIA_PEERMEM=0` when
-the nvidia-peermem kernel module is not loaded, so Mooncake registers GPU memory through
-DMA-BUF instead of `ibv_reg_mr` (without it every engine logs "Failed to register memory
-...: Bad address" and every KV transfer fails; GB200 containers are the known case).
+Engines get the environment their KV transport needs (`disagg_transport_env`), with values already in the environment taking precedence: with `nixl`, `NCCL_NET_PLUGIN=none` as on the vLLM path, which the training workers adopt for the same reason as there (one refit process group, one NCCL transport); with `mooncake`, `WITH_NVIDIA_PEERMEM=0` when the nvidia-peermem kernel module is not loaded, so Mooncake registers GPU memory through DMA-BUF instead of `ibv_reg_mr` (without it every engine logs "Failed to register memory ...: Bad address" and every KV transfer fails; GB200 containers are the known case).
 
 GPU budget:
 
@@ -380,28 +215,15 @@ replica width  = M * prefill_width + K * decode_width
 inference GPUs = num_replicas * replica width
 ```
 
-`num_frontend_workers` does not appear here: frontends are CPU-only actors
-(`num_cpus=1, num_gpus=0`), so F never changes the GPU budget or the engine layout.
+`num_frontend_workers` does not appear here: frontends are CPU-only actors (`num_cpus=1, num_gpus=0`), so F never changes the GPU budget or the engine layout.
 
-`TrtllmGeneration._plan_engines()` turns this into a per-engine `(role, width)` list — the
-single source of truth everything else derives from:
+`TrtllmGeneration._plan_engines()` turns this into a per-engine `(role, width)` list — the single source of truth everything else derives from:
 
 ```
 [prefill_width × M, decode_width × K,   prefill_width × M, ...]
  \___________ replica 0 ___________/  \____ replica 1 ...
 ```
 
-Same-role engines are contiguous within a replica, which keeps each role's block of GPUs
-adjacent. The replica *count* is derived from the inference cluster's size rather than
-configured — `num_replicas = inference_GPUs / replica_width`, the same rule the DP-shard
-count follows without disaggregation — so `replica_width` must divide the inference GPU
-count.
+Same-role engines are contiguous within a replica, which keeps each role's block of GPUs adjacent. The replica *count* is derived from the inference cluster's size rather than configured — `num_replicas = inference_GPUs / replica_width`, the same rule the DP-shard count follows without disaggregation — so `replica_width` must divide the inference GPU count.
 
-Each frontend's `DisaggServerConfig.node_id` must be set explicitly, and must be distinct
-across *all* of them — not just across replicas. Its default is `uuid.getnode() % 256`,
-documented as assuming one disagg server per machine, and we run N×F of them. It keys the
-snowflake request-id mint (`process_id` is hardwired to 0 without a coordinator, and
-`time.monotonic()` shares an origin across processes on one node), so a collision would
-let two frontends mint the same `ctx_request_id`. We use
-`replica_idx * num_frontend_workers + frontend_idx`; the field is 8 bits, hence the
-asserted `num_replicas * num_frontend_workers <= 256`.
+Each frontend's `DisaggServerConfig.node_id` must be set explicitly, and must be distinct across *all* of them — not just across replicas. Its default is `uuid.getnode() % 256`, documented as assuming one disagg server per machine, and we run N×F of them. It keys the snowflake request-id mint (`process_id` is hardwired to 0 without a coordinator, and `time.monotonic()` shares an origin across processes on one node), so a collision would let two frontends mint the same `ctx_request_id`. We use `replica_idx * num_frontend_workers + frontend_idx`; the field is 8 bits, hence the asserted `num_replicas * num_frontend_workers <= 256`.
