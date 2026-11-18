@@ -77,6 +77,24 @@ def test_selection_restore_preserves_new_defaulted_fields(
     assert _selection_from_state(dataclasses.asdict(selection)) == selection
 
 
+def test_selection_restore_keeps_call_rewards_and_reads_states_without_them() -> None:
+    selection = RolloutSelection(
+        ("response0", "response1"),
+        (ActionOutputFlags(False, False),) * 2,
+        call_rewards=(0.5, None),
+    )
+    state = dataclasses.asdict(selection)
+    assert _selection_from_state(state) == selection
+    del state["call_rewards"]
+    assert _selection_from_state(state) == dataclasses.replace(
+        selection, call_rewards=None
+    )
+    with pytest.raises(ValueError, match="call rewards"):
+        _selection_from_state(state | {"call_rewards": (0.5,)})
+    with pytest.raises(ValueError, match="call rewards"):
+        _selection_from_state(state | {"call_rewards": (float("nan"), None)})
+
+
 def _forest_sealed_ledger() -> RolloutRecoveryLedger:
     from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 
