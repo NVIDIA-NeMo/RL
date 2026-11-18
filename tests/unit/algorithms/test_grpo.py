@@ -70,7 +70,6 @@ from nemo_rl.algorithms.grpo import (
     _save_async_replay_buffer_checkpoint,
     _shutdown_completed_nemo_gym_startup,
     _startup_pipeline_ready,
-    _validate_draft_trainer_entrypoint,
     _validate_multimodal_dedup_capability,
     _validate_seq_logprob_error_in_loss,
     _validate_use_kl_in_reward_compat,
@@ -2056,52 +2055,6 @@ def test_draft_needs_sample_ids_for_block_drafts(speculator_type: str) -> None:
 )
 def test_draft_needs_sample_ids_skips_other_drafts(draft: Any) -> None:
     assert not _draft_needs_sample_ids({"draft": draft})
-
-
-@pytest.mark.parametrize("speculator_type", ["dflash", "dspark"])
-@pytest.mark.parametrize(
-    ("cp_size", "data_plane", "async_enabled", "error"),
-    [
-        (1, False, False, None),
-        (1, True, False, None),
-        (1, True, True, None),
-        (2, True, False, None),
-        (2, False, False, "synchronous TransferQueue trainer"),
-        (2, True, True, "synchronous TransferQueue trainer"),
-        (1, False, True, None),
-    ],
-)
-def test_draft_trainer_entrypoint_fails_at_setup(
-    mock_grpo_components: dict[str, Any],
-    speculator_type: str,
-    cp_size: int,
-    data_plane: bool,
-    async_enabled: bool,
-    error: str | None,
-) -> None:
-    master_config = mock_grpo_components["master_config"]
-    master_config.policy["draft"] = _block_draft_config(speculator_type)
-    master_config.policy["megatron_cfg"] = {"context_parallel_size": cp_size}
-    master_config.data_plane = {"enabled": data_plane}
-    master_config.grpo.async_grpo.enabled = async_enabled
-
-    if error is None:
-        _validate_draft_trainer_entrypoint(master_config)
-    else:
-        with pytest.raises(ValueError, match=error):
-            _validate_draft_trainer_entrypoint(master_config)
-
-
-def test_draft_trainer_entrypoint_ignores_disabled_draft(
-    mock_grpo_components: dict[str, Any],
-) -> None:
-    master_config = mock_grpo_components["master_config"]
-    master_config.policy["draft"] = {"enabled": False}
-    master_config.policy["megatron_cfg"] = {"context_parallel_size": 2}
-    master_config.data_plane = None
-    master_config.grpo.async_grpo.enabled = True
-
-    _validate_draft_trainer_entrypoint(master_config)
 
 
 def test_grpo_sync_seq_logprob_error_helper_accepts_dict_result(monkeypatch):

@@ -668,31 +668,6 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
         )
 
 
-def _validate_draft_trainer_entrypoint(master_config: MasterConfig) -> None:
-    """Reject draft layouts that the selected GRPO trainer cannot feed.
-
-    The worker repeats the CP check at train time; this copy fails before
-    vLLM starts and before the first rollout.
-    """
-    draft = coerce_draft_config(master_config.policy.get("draft"))
-    if draft is None or not draft.enabled:
-        return
-    data_plane_enabled = bool((master_config.data_plane or {}).get("enabled", False))
-    async_config = master_config.grpo.async_grpo
-    async_enabled = bool(async_config is not None and async_config.enabled)
-    megatron_cfg = master_config.policy.get("megatron_cfg") or {}
-    cp_size = int(megatron_cfg.get("context_parallel_size", 1))
-    if cp_size > 1 and (async_enabled or not data_plane_enabled):
-        # Only grpo_train_sync drives the split begin/train_microbatch/finish
-        # API that context-parallel draft normalization needs.
-        raise ValueError(
-            "policy.draft with policy.megatron_cfg.context_parallel_size > 1 "
-            "requires the synchronous TransferQueue trainer. Set "
-            "data_plane.enabled=true and grpo.async_grpo.enabled=false, or set "
-            "context_parallel_size=1."
-        )
-
-
 def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
     """Reject configurations whose media transfer path is not qualified."""
     if not master_config.grpo.deduplicate_multimodal_data:
@@ -876,7 +851,6 @@ def setup(
 
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
-    _validate_draft_trainer_entrypoint(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
 
     _validate_val_sampling(master_config)

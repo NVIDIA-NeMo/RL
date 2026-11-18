@@ -381,20 +381,6 @@ def _validate_draft_training_setup(
         )
 
 
-def _validate_draft_training_entrypoint(
-    *,
-    draft_provider: DraftTrainingProvider | None,
-    context_parallel_size: int,
-    split_api: bool,
-) -> None:
-    """Fail before CP draft training can use globally normalized sync counts."""
-    if draft_provider is not None and context_parallel_size > 1 and not split_api:
-        raise ValueError(
-            "context-parallel draft co-training requires the split "
-            "begin/train_microbatch/finish API"
-        )
-
-
 def _should_use_router_replay(
     *,
     enabled: bool,
@@ -1638,6 +1624,66 @@ class MegatronPolicyWorkerImpl(
         return start_draft_update_probe(self.draft_model)
 
     @wrap_with_nvtx_name("megatron_policy_worker/train")
+    def _context_parallel_draft_normalization_counts(
+        self,
+        batch: BatchedDataDict,
+        *,
+        draft_provider: DraftTrainingProvider,
+        mbs: int,
+        cp_size: int,
+    ) -> torch.Tensor | None:
+        """Draft denominator for one global batch under context parallelism.
+
+        Policy rows are replicated across CP ranks, so the loss wrapper divides
+        every microbatch loss by ``cp_size``. Draft windows are not: each is
+        owned by exactly one CP rank, and windows straddling a CP boundary are
+        dropped. The denominator therefore has to count the windows the CP
+        ranks actually own, under the same packed layout the forward pass uses,
+        once each. Counting the unpacked batch on every CP rank instead would
+        overcount by ``cp_size`` and include the dropped windows.
+
+        The owned counts are reduced over DP x CP and divided by ``cp_size`` to
+        cancel the wrapper's division, so each rank's draft gradient is its
+        owned sum over the global count -- what ``finish_train_step`` produces on
+        the split path.
+        """
+        data_iterator, *_ = get_microbatch_iterator(
+            batch,
+            self.cfg,
+            mbs,
+            straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            mtp_enabled=self.mtp_enabled,
+            create_router_padding_mask=self.create_router_padding_mask,
+            allow_unmasked_chunkwise_cp=self.allow_unmasked_chunkwise_cp,
+        )
+        optimizer_step = int(self.scheduler.num_steps)
+        local_counts = None
+        for microbatch in data_iterator:
+            if microbatch.draft_sequence_layout is None:
+                raise RuntimeError(
+                    "context-parallel draft training needs the packed draft "
+                    "sequence layout; enable sequence_packing and keep "
+                    "draft_sample_ids in the train batch"
+                )
+            counts = draft_provider.normalization_counts(
+                microbatch.data_dict,
+                optimizer_step=optimizer_step,
+                sequence_layout=microbatch.draft_sequence_layout,
+            )
+            if counts is None:
+                return None
+            local_counts = counts if local_counts is None else local_counts + counts
+        if local_counts is None:
+            raise RuntimeError("draft normalization found no microbatches")
+        global_counts = _all_reduce_draft_normalization_counts(
+            local_counts,
+            group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+        )
+        return global_counts / cp_size
+
     def train(
         self,
         data: BatchedDataDict,
@@ -1657,11 +1703,6 @@ class MegatronPolicyWorkerImpl(
         assert check_dim_skip_keys is None, (
             "check_dim_skip_keys is only supported by the Automodel worker; "
             "Megatron does not run cross-tokenizer distillation."
-        )
-        _validate_draft_training_entrypoint(
-            draft_provider=getattr(self, "draft_provider", None),
-            context_parallel_size=parallel_state.get_context_parallel_world_size(),
-            split_api=False,
         )
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
@@ -1764,23 +1805,28 @@ class MegatronPolicyWorkerImpl(
                 draft_normalization_counts = None
                 draft_provider = getattr(self, "draft_provider", None)
                 if draft_provider is not None:
-                    draft_normalization_counts = draft_provider.normalization_counts(
-                        batch,
-                        optimizer_step=int(self.scheduler.num_steps),
-                    )
-                    if draft_normalization_counts is not None:
-                        # Unreachable with draft+CP>1 today (the entrypoint
-                        # validator rejects it), but reduce over DP x CP like
-                        # the deferred path so a future gate change cannot
-                        # silently shrink this denominator.
+                    cp_size = parallel_state.get_context_parallel_world_size()
+                    if cp_size > 1:
                         draft_normalization_counts = (
-                            _all_reduce_draft_normalization_counts(
-                                draft_normalization_counts,
-                                group=parallel_state.get_data_parallel_group(
-                                    with_context_parallel=True
-                                ),
+                            self._context_parallel_draft_normalization_counts(
+                                batch,
+                                draft_provider=draft_provider,
+                                mbs=mbs,
+                                cp_size=cp_size,
                             )
                         )
+                    else:
+                        draft_normalization_counts = draft_provider.normalization_counts(
+                            batch,
+                            optimizer_step=int(self.scheduler.num_steps),
+                        )
+                        if draft_normalization_counts is not None:
+                            draft_normalization_counts = (
+                                _all_reduce_draft_normalization_counts(
+                                    draft_normalization_counts,
+                                    group=parallel_state.get_data_parallel_group(),
+                                )
+                            )
 
                 loss_post_processor = LossPostProcessor(
                     loss_fn=loss_fn,

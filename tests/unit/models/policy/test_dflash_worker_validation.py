@@ -33,7 +33,6 @@ from nemo_rl.models.policy.draft_config import (  # noqa: E402
 from nemo_rl.models.policy.workers.megatron_policy_worker import (  # noqa: E402
     MegatronPolicyWorkerImpl,
     _all_reduce_draft_normalization_counts,
-    _validate_draft_training_entrypoint,
     _validate_draft_training_setup,
 )
 
@@ -283,21 +282,6 @@ def test_dflash_setup_rejects_vpp_and_generation_cp() -> None:
 
     assert "virtual_pipeline_model_parallel_size must be 1" in str(error.value)
     assert "generation context_parallel_size must be 1" in str(error.value)
-
-
-def test_packed_cp_draft_training_requires_split_entrypoint() -> None:
-    with pytest.raises(ValueError, match="split begin/train_microbatch/finish API"):
-        _validate_draft_training_entrypoint(
-            draft_provider=_provider(),
-            context_parallel_size=2,
-            split_api=False,
-        )
-
-    _validate_draft_training_entrypoint(
-        draft_provider=_provider(),
-        context_parallel_size=4,
-        split_api=True,
-    )
 
 
 def test_dspark_setup_allows_packed_cp4_target_sp_and_matching_generation() -> None:

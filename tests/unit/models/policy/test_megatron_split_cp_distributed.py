@@ -169,3 +169,142 @@ def test_context_parallel_finish_metric_and_draft_grad_parity(
         _run_context_parallel_finish_parity,
         world_size=context_parallel_size,
     )
+
+
+def _run_monolithic_context_parallel_draft_denominator(
+    rank: int, world_size: int
+) -> None:
+    """The async/non-TQ train() path must give CP draft grads the CP1 value.
+
+    Each CP rank owns different draft windows (two microbatches here). A draft
+    parameter scales every owned numerator, so with a correct denominator the
+    CP-summed gradient of ``normalized(counts) / cp`` -- the loss train() feeds
+    backward -- equals the CP1 gradient total_numerator / total_count.
+    """
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    singleton_groups = [
+        torch.distributed.new_group(ranks=[group_rank])
+        for group_rank in range(world_size)
+    ]
+    dp_group = singleton_groups[rank]
+    cp_group = torch.distributed.group.WORLD
+    device = torch.device("cuda")
+
+    # Owned (numerator, count) per microbatch for each CP rank; two slot bins.
+    owned = {
+        1: [[([30.0, 10.0], [6.0, 4.0]), ([20.0, 0.0], [5.0, 0.0])]],
+        2: [
+            [([30.0, 10.0], [6.0, 4.0]), ([0.0, 0.0], [0.0, 0.0])],
+            [([20.0, 0.0], [5.0, 0.0]), ([0.0, 0.0], [0.0, 0.0])],
+        ],
+        4: [
+            [([30.0, 0.0], [6.0, 0.0]), ([0.0, 0.0], [0.0, 0.0])],
+            [([0.0, 10.0], [0.0, 4.0]), ([0.0, 0.0], [0.0, 0.0])],
+            [([20.0, 0.0], [5.0, 0.0]), ([0.0, 0.0], [0.0, 0.0])],
+            [([0.0, 0.0], [0.0, 0.0]), ([0.0, 0.0], [0.0, 0.0])],
+        ],
+    }[world_size][rank]
+    total_numerator = 60.0
+    total_count = 15.0
+
+    microbatches = [
+        SimpleNamespace(
+            data_dict={"index": index},
+            draft_sequence_layout=SimpleNamespace(cp_rank=rank),
+        )
+        for index in range(len(owned))
+    ]
+    provider = SimpleNamespace(
+        normalization_counts=lambda data, *, optimizer_step, sequence_layout: (
+            torch.tensor(owned[data["index"]][1], device=device)
+        )
+    )
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {}
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
+    worker.delegate_pack_to_model = False
+    worker.delegate_mtp_loss_mask_to_model = False
+    worker.model_slices_context_parallel_inputs = False
+    worker.mtp_enabled = False
+    worker.create_router_padding_mask = False
+    worker.allow_unmasked_chunkwise_cp = False
+    worker.scheduler = SimpleNamespace(num_steps=3)
+
+    def data_parallel_group(*, with_context_parallel: bool = False):
+        return cp_group if with_context_parallel else dp_group
+
+    with (
+        patch(
+            f"{WORKER_MOD}.get_microbatch_iterator",
+            return_value=(iter(microbatches), len(microbatches), 1, 8, 8),
+        ),
+        patch(
+            f"{WORKER_MOD}.parallel_state.get_data_parallel_group",
+            side_effect=data_parallel_group,
+        ),
+    ):
+        counts = worker._context_parallel_draft_normalization_counts(
+            object(), draft_provider=provider, mbs=1, cp_size=world_size
+        )
+
+    assert counts is not None
+    assert counts.sum().item() == pytest.approx(total_count / world_size)
+
+    draft_param = torch.nn.Parameter(torch.tensor(1.0, device=device))
+    weights = torch.ones(2, device=device)
+    loss = torch.zeros((), device=device)
+    for numerators, mb_counts in owned:
+        stats = DraftLossStats(
+            numerators=torch.tensor(numerators, device=device) * draft_param,
+            counts=torch.tensor(mb_counts, device=device),
+            weights=weights,
+        )
+        # train(): wrapper normalizes, then cp_normalize divides by cp_size.
+        loss = loss + stats.normalized(normalization_counts=counts) / world_size
+    loss.backward()
+    grad = draft_param.grad.detach().clone()
+    torch.distributed.all_reduce(grad, group=cp_group)
+    assert grad.item() == pytest.approx(total_numerator / total_count, rel=1e-5), (
+        f"CP{world_size} monolithic draft gradient {grad.item()} != CP1 "
+        f"{total_numerator / total_count}"
+    )
+
+
+@pytest.mark.parametrize("context_parallel_size", [1, 2, 4])
+def test_monolithic_train_context_parallel_draft_denominator(
+    distributed_test_runner,
+    context_parallel_size: int,
+) -> None:
+    distributed_test_runner(
+        _run_monolithic_context_parallel_draft_denominator,
+        world_size=context_parallel_size,
+    )
+
+
+def test_monolithic_context_parallel_draft_requires_packed_layout() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {}
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
+    worker.delegate_pack_to_model = False
+    worker.delegate_mtp_loss_mask_to_model = False
+    worker.model_slices_context_parallel_inputs = False
+    worker.mtp_enabled = False
+    worker.create_router_padding_mask = False
+    worker.allow_unmasked_chunkwise_cp = False
+    worker.scheduler = SimpleNamespace(num_steps=0)
+    unpacked = SimpleNamespace(data_dict={}, draft_sequence_layout=None)
+    with patch(
+        f"{WORKER_MOD}.get_microbatch_iterator",
+        return_value=(iter([unpacked]), 1, 1, 8, 8),
+    ):
+        with pytest.raises(RuntimeError, match="packed draft sequence layout"):
+            worker._context_parallel_draft_normalization_counts(
+                object(), draft_provider=SimpleNamespace(), mbs=1, cp_size=2
+            )
