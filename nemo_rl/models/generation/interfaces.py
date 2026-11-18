@@ -706,6 +706,7 @@ class GenerationInterface(ABC):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        media_family: str | None = None,
         top_logprobs: int = 0,
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
@@ -725,6 +726,10 @@ class GenerationInterface(ABC):
             capture_media: Whether the staging partition carries media columns and
                 the workers must stage the media the engine consumed beside each
                 call's tokens.
+            media_family: With ``capture_media``, the family the driver picked from
+                the run's processor (``captured_media.media_capture_family``); the
+                workers check that their engine built the matching processor.
+                ``None`` for text-only capture.
             generation_prefix_cuts_enabled: Allow checkpoint-time cuts of active
                 model calls for prefix recovery.
             generation_cut_control_token: Bearer token used by Gym's checkpoint

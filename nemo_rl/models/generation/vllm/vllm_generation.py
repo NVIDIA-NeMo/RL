@@ -32,6 +32,8 @@ from typing import (
 import numpy as np
 import ray
 from ray.util.placement_group import PlacementGroup
+from ray.util.queue import Empty
+from ray.util.queue import Queue as RayQueue
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nemo_rl.data.multimodal_utils import VLLM_PROMPT_KEYS
@@ -75,7 +77,6 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.rollout_result import rollout_result_from_wire
 from nemo_rl.models.generation.vllm.chat_render import RenderSettings
 from nemo_rl.models.generation.vllm.config import (
-    HTTP_SERVING_CHAT_DEFAULT_KWARGS,
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
     VllmDisaggFrontendConfig,
@@ -277,6 +278,7 @@ class _TokenCaptureSetup:
     dp_cfg: "DataPlaneConfig"
     staging_partition: str
     capture_media: bool
+    media_family: str | None
     top_logprobs: int
     generation_prefix_cuts_enabled: bool
     generation_cut_control_token: str | None
@@ -296,22 +298,36 @@ class VllmGeneration(GenerationInterface):
     # defaults, so shutdown() also works when __init__ failed before starting them.
     _dynamo_runtime: Optional["ManagedDynamoRuntime"] = None
     dynamo_frontend_url: Optional[str] = None
+    dynamo_generation_cut_url: Optional[str] = None
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
         """Reject pure-config vLLM settings the SC entrypoint cannot honor."""
         generation_config = cast(VllmConfig, master_config.policy["generation"])
         assert_reload_refit_config_supported(generation_config)
-        if (
-            dynamo_enabled(generation_config)
-            and master_config.async_rl.generation_fleet_health.enabled
-        ):
-            raise ValueError(
-                "async_rl.generation_fleet_health.enabled=true is not supported "
-                "with policy.generation.dynamo=true yet: the Dynamo frontend "
-                "picks engines itself, and a restarted shard does not register "
-                "with it. Disable fleet health."
-            )
+        if dynamo_enabled(generation_config):
+            if master_config.async_rl.generation_router.enabled:
+                raise ValueError(
+                    "async_rl.generation_router.enabled=true does not apply with "
+                    "policy.generation.dynamo=true: NeMo-Gym calls the Dynamo "
+                    "frontend, which routes the whole fleet behind one URL. "
+                    "Disable the generation router."
+                )
+            if master_config.async_rl.generation_fleet_health.enabled:
+                raise ValueError(
+                    "async_rl.generation_fleet_health.enabled=true is not supported "
+                    "with policy.generation.dynamo=true yet: the Dynamo frontend "
+                    "picks engines itself, and a restarted shard does not register "
+                    "with it. Disable fleet health."
+                )
+            if master_config.env.get("should_use_nemo_gym") and generation_config[
+                "vllm_cfg"
+            ].get("skip_tokenizer_init"):
+                raise ValueError(
+                    "vllm_cfg.skip_tokenizer_init=true does not work with NeMo-Gym "
+                    "and policy.generation.dynamo=true: the engine detokenizes the "
+                    "replies Gym's chat calls get through the frontend."
+                )
         if not resolve_vllm_disagg_layout(generation_config).enabled:
             return
         # SingleController has no drain-before-refit mode: every weight update
@@ -1126,14 +1142,6 @@ class VllmGeneration(GenerationInterface):
     def _render_settings(self) -> RenderSettings:
         """What the frontends need to render exactly like the engines' servers."""
         vllm_cfg = self.cfg["vllm_cfg"]
-        serving = HTTP_SERVING_CHAT_DEFAULT_KWARGS | dict(
-            vllm_cfg.get("http_server_serving_chat_kwargs") or {}
-        )
-        # Same normalization as vllm_worker_async._setup_vllm_openai_api_server:
-        # vLLM's spelling first, the older recipe spelling as the fallback.
-        template_kwargs = serving.get("default_chat_template_kwargs")
-        if template_kwargs is None:
-            template_kwargs = serving.get("chat_template_kwargs")
         # The prefill engines' kwargs, role overrides and late-added shared
         # keys included: the renderer's ModelConfig must come from the same
         # AsyncEngineArgs the engine builds (tokenizer, tokenizer_mode,
@@ -1143,14 +1151,19 @@ class VllmGeneration(GenerationInterface):
         )
         return RenderSettings(
             model_name=self.cfg["model_name"],
-            chat_template=serving["chat_template"],
-            chat_template_content_format=serving["chat_template_content_format"],
-            default_chat_template_kwargs=dict(template_kwargs or {}),
-            enable_auto_tools=bool(serving["enable_auto_tools"]),
-            tool_parser=serving.get("tool_parser"),
-            reasoning_parser=serving.get("reasoning_parser"),
-            tool_parser_plugin=vllm_cfg.get("tool_parser_plugin"),
-            reasoning_parser_plugin=vllm_cfg.get("reasoning_parser_plugin"),
+            # What chat_server builds the engines' chat serving from.
+            generation_cfg={
+                "stop_token_ids": self.cfg.get("stop_token_ids"),
+                "vllm_cfg": {
+                    key: vllm_cfg[key]
+                    for key in (
+                        "http_server_serving_chat_kwargs",
+                        "tool_parser_plugin",
+                        "reasoning_parser_plugin",
+                    )
+                    if key in vllm_cfg
+                },
+            },
             engine_kwargs=engine_kwargs,
             max_model_len=int(vllm_cfg["max_model_len"]),
         )
@@ -1421,8 +1434,22 @@ class VllmGeneration(GenerationInterface):
         the frontend URLs do not change; the frontends are told the engines are
         up and start relaying.
         """
+        chat_settings: Optional[RayQueue] = None
+        if self._dynamo_runtime is not None and self._dynamo_runtime.serves_chat:
+            # The frontend builds its render workers from one engine's chat
+            # settings while the engines load, so NeMo-Gym's first calls do
+            # not wait for them.
+            chat_settings = RayQueue(actor_options={"num_cpus": 0})
+            leader = self.worker_group.workers[
+                self.worker_group.get_dp_leader_worker_idx(0)
+            ]
+            ray.get(leader.announce_dynamo_chat_settings_to.remote(chat_settings))
+
         # Call load_model() on all model-owner workers
-        ray.get(self._fan_out("load_model"))
+        futures = self._fan_out("load_model")
+        if chat_settings is not None:
+            self._publish_dynamo_chat_settings(chat_settings, futures)
+        ray.get(futures)
 
         # Post-init (collective rpc functions needed for async engine)
         self._post_init()
@@ -1447,6 +1474,29 @@ class VllmGeneration(GenerationInterface):
         self.device_uuids = self._report_device_id()
         self._register_dynamo_engines()
 
+    @property
+    def client_base_urls(self) -> list[Optional[str]]:
+        """Where OpenAI clients such as NeMo-Gym send requests.
+
+        The Dynamo frontend when it serves this fleet (``policy.generation.dynamo``);
+        otherwise every data-parallel shard's own server, as
+        ``dp_openai_server_base_urls``. Known before a deferred model load.
+        """
+        if self.dynamo_frontend_url is not None:
+            return [self.dynamo_frontend_url]
+        return self.dp_openai_server_base_urls
+
+    @property
+    def generation_cut_control_urls(self) -> Optional[list[str]]:
+        """Where NeMo-Gym sends checkpoint generation cuts, one per ``client_base_urls`` entry.
+
+        None when each base URL takes its own cuts, as every shard's server
+        does. The Dynamo frontend takes them on a port of its own.
+        """
+        if self.dynamo_generation_cut_url is not None:
+            return [self.dynamo_generation_cut_url]
+        return None
+
     def _start_dynamo_services(self) -> None:
         """Start the etcd, NATS and frontend this fleet's engines register with."""
         from nemo_rl.models.generation.dynamo.managed_runtime import (
@@ -1459,10 +1509,38 @@ class VllmGeneration(GenerationInterface):
             # The workers' venv carries ai-dynamo, so the frontend runs the same
             # release as every engine.
             frontend_python=self.worker_group.py_executable,
+            ray_address=ray.get_runtime_context().gcs_address,
+            # NeMo-Gym's chat calls need the flag, and the native worker starts
+            # its chat server on it.
+            serves_chat=bool(self.cfg["vllm_cfg"].get("expose_http_server")),
         )
         runtime.start()
         self._dynamo_runtime = runtime
         self.dynamo_frontend_url = runtime.frontend_url
+        self.dynamo_generation_cut_url = runtime.generation_cut_control_url
+
+    def _publish_dynamo_chat_settings(
+        self, chat_settings: RayQueue, loads: list[ray.ObjectRef]
+    ) -> None:
+        """Hand the frontend the chat settings an engine sends before it loads.
+
+        Returns without them once any of ``loads`` has ended: registration
+        then gives the frontend its settings, as without this.
+        """
+        assert self._dynamo_runtime is not None
+        try:
+            while True:
+                try:
+                    settings = chat_settings.get(timeout=1)
+                except Empty:
+                    ended, _ = ray.wait(loads, num_returns=1, timeout=0)
+                    if ended:
+                        return
+                    continue
+                self._dynamo_runtime.publish_chat_settings(settings)
+                return
+        finally:
+            chat_settings.shutdown()
 
     def _register_dynamo_engines(self) -> None:
         """Serve every shard's engine through Dynamo; wait until it routes to all."""
@@ -1523,6 +1601,7 @@ class VllmGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        media_family: str | None = None,
         top_logprobs: int = 0,
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
@@ -1545,6 +1624,7 @@ class VllmGeneration(GenerationInterface):
             dp_cfg,
             staging_partition,
             capture_media,
+            media_family,
             top_logprobs,
             generation_prefix_cuts_enabled,
             generation_cut_control_token,
@@ -1553,12 +1633,26 @@ class VllmGeneration(GenerationInterface):
         futures = self._fan_out("setup_token_capture", **asdict(setup))
         self._token_capture_media = agreed_media_columns(ray.get(futures))
         self._token_capture_setup = setup
+        if self._dynamo_runtime is not None:
+            # NeMo-Gym's calls through Dynamo read their prefix in the frontend,
+            # which also takes Gym's generation cuts for the engines.
+            self._dynamo_runtime.publish_chat_capture(
+                dp_cfg=dp_cfg,
+                staging_partition=staging_partition,
+                capture_media=capture_media,
+                generation_cut_control_token=(
+                    generation_cut_control_token
+                    if generation_prefix_cuts_enabled
+                    else None
+                ),
+                generation_cut_control_timeout_s=generation_cut_control_timeout_s,
+            )
         return self._token_capture_media
 
     def get_data_plane_snapshots(self) -> list[dict[str, Any]]:
-        """Capture-client counters from every DP-leader worker that has one."""
-        futures = self._fan_out("get_data_plane_snapshot")
-        return [s for s in ray.get(futures) if s]
+        """Capture-client counters from every frontend on each DP-leader worker."""
+        futures = self._fan_out("get_data_plane_snapshots")
+        return [snapshot for snapshots in ray.get(futures) for snapshot in snapshots]
 
     def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version refit members stamp on captured model calls.

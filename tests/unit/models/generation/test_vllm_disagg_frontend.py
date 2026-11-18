@@ -20,10 +20,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from nemo_rl.experience.interfaces import NEMO_GYM_MODEL_SAMPLING_HEADER
 from nemo_rl.models.generation.openai_server_utils import (
     decode_token_ids_b64,
     encode_token_ids_b64,
 )
+from nemo_rl.models.generation.vllm.chat_render import FrontendRender
 from nemo_rl.models.generation.vllm.kv_connector_profiles import NIXL_PROFILE
 from nemo_rl.models.generation.vllm.vllm_disagg_frontend import (
     CHAT_PATH,
@@ -270,6 +272,19 @@ def test_decode_leg_b64_and_history_stripping():
     assert decode_token_ids_b64(leg["prompt_token_ids_b64"]) == [5, 6]
     assert "prompt_token_ids" not in leg["kv_transfer_params"]
     assert leg["messages"] == [{"role": "user", "content": "more"}]
+
+
+def test_decode_leg_takes_the_reasoning_verdict_from_the_prefill_response():
+    kwargs = dict(prefill_host="p", ids_as_b64=False, strip_message_history=False)
+    leg = build_decode_leg(
+        _gym_body(),
+        prefill_response=_prefill_response(template_reasoning_ended=False),
+        **kwargs,
+    )
+    assert leg["template_reasoning_ended"] is False
+    # An engine without a reasoning parser reports none.
+    leg = build_decode_leg(_gym_body(), prefill_response=_prefill_response(), **kwargs)
+    assert "template_reasoning_ended" not in leg
 
 
 def test_decode_leg_requires_a_handshake_and_prompt_ids():
@@ -624,27 +639,38 @@ def test_relay_forwards_the_bearer_token_to_both_legs():
     assert engines.headers[2:] == [None, None]
 
 
+def test_relay_forwards_gyms_sampling_header_to_both_legs():
+    # The engines read from it which calls keep their own sampling (a judge's).
+    engines = _FakeEngines()
+    relay = _relay(engines)
+    asyncio.run(relay.relay(CHAT_PATH, _gym_body(), model_sampling="null"))
+    assert engines.headers == [{NEMO_GYM_MODEL_SAMPLING_HEADER: "null"}] * 2
+
+
 def test_relay_uses_the_frontend_renderer_and_falls_back_on_failure():
     class _Renderer:
         def __init__(self, fail=False):
             self.fail = fail
 
-        async def prompt_token_ids(self, body):
+        async def render(self, body):
             if self.fail:
                 raise RuntimeError("no tokenizer")
-            return [4, 2]
+            return FrontendRender(token_ids=[4, 2], reasoning_ended=False)
 
     engines = _FakeEngines()
     relay = _relay(engines)
     relay.install_renderer(_Renderer())
     asyncio.run(relay.relay(CHAT_PATH, _gym_body()))
     assert engines.calls[0][2]["kv_transfer_params"]["prompt_token_ids"] == [4, 2]
+    # The frontend's render says whether reasoning is over; the ids cannot.
+    assert engines.calls[0][2]["template_reasoning_ended"] is False
     assert "required_prefix_token_ids" not in engines.calls[0][2]
     assert relay.stats["frontend_tokenized"] == 1
 
     relay.install_renderer(_Renderer(fail=True))
     asyncio.run(relay.relay(CHAT_PATH, _gym_body()))
     assert "prompt_token_ids" not in engines.calls[2][2]["kv_transfer_params"]
+    assert "template_reasoning_ended" not in engines.calls[2][2]
     assert engines.calls[2][2]["required_prefix_token_ids"] == [1, 2, 3, 4, 5]
     assert relay.stats["frontend_tokenize_fallbacks"] == 1
 

@@ -45,6 +45,7 @@ RolloutCheckpointAttemptReason = Literal[
     "missing_trainer_anchor",
     "no_data_plane_mutations",
     "optimizer_commit_in_progress",
+    "shortfall_reconciliation_pending",
     "timeout",
     "trainer_state_changed",
 ]

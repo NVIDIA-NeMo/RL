@@ -38,7 +38,10 @@ from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+from nemo_rl.algorithms.advantage_estimator import (
+    GRPOAdvantageEstimator,
+    create_advantage_estimator,
+)
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     _apply_async_sample_masks,
@@ -84,20 +87,6 @@ if TYPE_CHECKING:
     # Annotation-only: importing ppo at runtime here would close a cycle
     # back through the controller.
     from nemo_rl.algorithms.ppo import PPOConfig
-
-
-# Estimators whose advantages for a row depend only on that row and the rest
-# of its prompt group, so a whole-group shard produces the same numbers as the
-# whole batch. That holds because the baseline keys on GROUP_ID_TAG: while it
-# keyed on prompt tokens, two groups sharing prompt text merged into one
-# baseline when they landed in the same call and separated when a shard split
-# them, which made grpo's advantages a function of num_advantage_workers.
-# Everything else reachable from _build_advantage_estimator reduces over the
-# entire batch -- gdpo and reinforce_plus_plus always, gae and raw_reward
-# whenever normalize_advantages is set -- and a shard is not that batch.
-# Membership is opt-in for exactly that reason: a new estimator counts as
-# unshardable until someone checks it.
-SHARD_INVARIANT_ESTIMATORS = frozenset({"grpo", "opd"})
 
 
 @dataclass(frozen=True)
@@ -163,7 +152,9 @@ class AdvantageStageConfig:
                 algo_cfg.invalid_tool_call_advantage is not None
                 or algo_cfg.malformed_thinking_advantage is not None
             ),
-            shardable=algo_cfg.adv_estimator.name in SHARD_INVARIANT_ESTIMATORS,
+            shardable=not create_advantage_estimator(
+                algo_cfg.adv_estimator, loss_cfg
+            ).requires_global_batch,
             # Use the resolved logger config shared by controller and pool.
             train_data_dump_dir=(
                 master_config.logger.log_dir
@@ -304,9 +295,7 @@ class AdvantageOutcome:
     opd_stat_sumsq: float = 0.0
     opd_stat_count: int = 0
     opd_gap_sum: float = 0.0
-    # Seconds this call spent serializing the training dump. Reported back
-    # because the writing moved off the controller with the rest of the
-    # stage, and the controller still owns the timer the metric lands in.
+    # Seconds spent preparing and submitting this chunk, including backpressure.
     train_data_dump_s: float = 0.0
     # What this call stored in the dump, so the controller's publish can tell a
     # missing chunk from an empty one.
@@ -334,15 +323,23 @@ class AdvantageComputer:
         self._dp_client = dp_client
         self._config = config
         self._advantage_estimator = advantage_estimator
-        # One writer per shard: the pool runs these concurrently, so they must
-        # not share a file. The controller merges them on publish.
+        # One writer per shard, so concurrent shards never share a file; the
+        # controller merges them after flush_train_data_dump.
         self._train_data_dump = (
             make_debug_writer(
-                config.debug_writer, config.train_data_dump_dir, shard_id=shard_id
+                config.debug_writer,
+                config.train_data_dump_dir,
+                shard_id=shard_id,
+                background=True,
             )
             if config.train_data_dump_dir is not None
             else None
         )
+
+    def flush_train_data_dump(self) -> None:
+        """Wait until this process's dump chunks are written (before the merge)."""
+        if self._train_data_dump is not None:
+            self._train_data_dump.flush()
 
     async def run(self, request: AdvantageRequest) -> AdvantageOutcome:
         """Run one call's advantage stage and return its reduced results."""
@@ -700,20 +697,23 @@ class AdvantageComputer:
         if self._train_data_dump is not None:
             assert request.train_step is not None
             dump_started = time.perf_counter()
+            # Jagged on purpose: the writer trims each row to input_lengths itself.
             sequences = {
-                "token_ids": tensor_field(data, INPUT_IDS),
+                "token_ids": data[INPUT_IDS],
                 "token_loss_mask": token_mask,
                 "advantages": advantages,
-                "generation_logprobs": tensor_field(
-                    data, adv_cfg.generation_logprobs_field
-                ),
+                "generation_logprobs": data[adv_cfg.generation_logprobs_field],
             }
             if cfg.policy_logprobs_required:
-                sequences["prev_logprobs"] = tensor_field(
-                    data, adv_cfg.policy_logprobs_field
-                )
+                sequences["prev_logprobs"] = data[adv_cfg.policy_logprobs_field]
             if cfg.teacher_logprobs_required:
                 sequences["teacher_logprobs"] = kwargs["teacher_logprobs"]
+            if cfg.reference_logprobs_required:
+                sequences["reference_logprobs"] = kwargs["logprobs_reference"]
+            if cfg.is_ppo:
+                sequences["values"] = kwargs["values"]
+            if returns is not None:
+                sequences["returns"] = returns
             train_data_dump_receipt = await asyncio.to_thread(
                 self._train_data_dump.add_chunk,
                 TrainChunk(

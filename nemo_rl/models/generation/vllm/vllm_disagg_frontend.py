@@ -49,12 +49,14 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
+from nemo_rl.experience.interfaces import NEMO_GYM_MODEL_SAMPLING_HEADER
 from nemo_rl.models.generation.openai_server_utils import (
     decode_token_ids_b64,
     encode_token_ids_b64,
 )
 from nemo_rl.models.generation.vllm.chat_render import (
     FrontendChatRenderer,
+    FrontendRender,
     RenderSettings,
 )
 
@@ -225,6 +227,7 @@ def build_prefill_leg(
     initial_params: dict[str, Any],
     cached_decode_params: Optional[dict[str, Any]] = None,
     frontend_prompt_ids: Optional[list[int]] = None,
+    template_reasoning_ended: Optional[bool] = None,
     ids_as_b64: bool,
     return_prompt_ids_b64: bool,
 ) -> dict[str, Any]:
@@ -235,6 +238,9 @@ def build_prefill_leg(
     prompt ids the decode leg reuses. ``kv_transfer_params`` is the connector's
     cold marker, or -- bidirectional KV transfer -- the decode engine's handshake
     from the previous turn re-flagged so the prefill engine pulls that KV back.
+    ``template_reasoning_ended`` is the verdict of the frontend's render, when
+    it rendered: the engine cannot read it off the ids it is handed, and
+    answers with it (or its own render's) for the decode leg.
     """
     leg = copy.deepcopy(body)
     for name in _PREFILL_LEG_DROPPED_FIELDS:
@@ -261,6 +267,8 @@ def build_prefill_leg(
             as_b64=ids_as_b64,
             strip_message_token_fields=False,
         )
+        if template_reasoning_ended is not None:
+            leg["template_reasoning_ended"] = template_reasoning_ended
     return leg
 
 
@@ -323,6 +331,13 @@ def build_decode_leg(
         _attach_prompt_ids(
             leg, prompt_ids, as_b64=ids_as_b64, strip_message_token_fields=True
         )
+        if prefill_response.get("template_reasoning_ended") is not None:
+            # Whether reasoning is over before this turn generates comes from
+            # the render of the messages; the relayed ids hold the model's
+            # earlier turns, reasoning included, and would answer wrongly.
+            leg["template_reasoning_ended"] = prefill_response[
+                "template_reasoning_ended"
+            ]
         messages = leg.get("messages")
         if strip_message_history and isinstance(messages, list) and len(messages) > 1:
             # The relayed ids carry the whole prefix; the decode engine only
@@ -923,11 +938,11 @@ class FrontendRelay:
 
     # -- the two legs ----------------------------------------------------- #
 
-    async def _frontend_prompt_ids(self, body: dict[str, Any]) -> Optional[list[int]]:
+    async def _frontend_render(self, body: dict[str, Any]) -> Optional[FrontendRender]:
         if self.renderer is None or "messages" not in body:
             return None
         try:
-            ids = await self.renderer.prompt_token_ids(body)
+            rendered = await self.renderer.render(body)
         except Exception:  # noqa: BLE001 - fall back to engine-side rendering
             logger.exception(
                 "frontend tokenize failed; rendering on the prefill engine"
@@ -935,7 +950,7 @@ class FrontendRelay:
             self.stats["frontend_tokenize_fallbacks"] += 1
             return None
         self.stats["frontend_tokenized"] += 1
-        return ids
+        return rendered
 
     async def relay(
         self,
@@ -943,15 +958,25 @@ class FrontendRelay:
         body: dict[str, Any],
         *,
         authorization: Optional[str] = None,
+        model_sampling: Optional[str] = None,
     ) -> tuple[int, Any, bool]:
         """Serve one request. Returns ``(status, payload, streaming)``.
 
         ``payload`` is a dict for JSON responses, or an async byte iterator when
         the client asked to stream and the decode leg is being streamed through.
         ``authorization`` is the client's header, forwarded to both engines,
-        which check the same bearer token the frontend does.
+        which check the same bearer token the frontend does. ``model_sampling``
+        is NeMo-Gym's sampling header, forwarded too: the engines read from it
+        which calls keep their own sampling (an LLM judge's).
         """
-        headers = {"Authorization": authorization} if authorization else None
+        headers = {
+            name: value
+            for name, value in (
+                ("Authorization", authorization),
+                (NEMO_GYM_MODEL_SAMPLING_HEADER, model_sampling),
+            )
+            if value
+        } or None
         self.stats["requests"] += 1
         if not self._engines_ready:
             return (
@@ -988,9 +1013,10 @@ class FrontendRelay:
             self.stats["bidirectional_uncached_turns"] = (
                 self.stats.get("bidirectional_uncached_turns", 0) + 1
             )
-        frontend_ids = (
-            await self._frontend_prompt_ids(body) if path == CHAT_PATH else None
+        frontend_render = (
+            await self._frontend_render(body) if path == CHAT_PATH else None
         )
+        frontend_ids = None if frontend_render is None else frontend_render.token_ids
         cached = (
             self.conversation_cache.get(cache_key)
             if self.conversation_cache is not None and cache_key is not None
@@ -1001,6 +1027,9 @@ class FrontendRelay:
             initial_params=self.settings.initial_prefill_params,
             cached_decode_params=cached,
             frontend_prompt_ids=frontend_ids,
+            template_reasoning_ended=(
+                None if frontend_render is None else frontend_render.reasoning_ended
+            ),
             ids_as_b64=self.settings.decode_tokids_b64,
             return_prompt_ids_b64=self.settings.decode_tokids_b64,
         )
@@ -1207,7 +1236,10 @@ def create_frontend_app(relay: FrontendRelay) -> Any:
         if not isinstance(body, dict):
             return JSONResponse(_error_body("request body must be an object", 400), 400)
         status, payload, streaming = await relay.relay(
-            path, body, authorization=request.headers.get("Authorization")
+            path,
+            body,
+            authorization=request.headers.get("Authorization"),
+            model_sampling=request.headers.get(NEMO_GYM_MODEL_SAMPLING_HEADER),
         )
         if streaming:
             return StreamingResponse(payload, media_type="text/event-stream")

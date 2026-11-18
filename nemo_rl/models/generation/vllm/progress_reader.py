@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 # The vLLM release whose private OutputProcessor layout these reads were
 # checked against; see VllmProgressReader.
-_PROGRESS_READ_VLLM_RELEASE = (0, 29)
+_PROGRESS_READ_VLLM_RELEASE = (0, 33)
 
 
 @dataclass(frozen=True)

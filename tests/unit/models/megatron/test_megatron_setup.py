@@ -6049,6 +6049,7 @@ class TestPeftWarmStart:
             "megatron.bridge.training.checkpointing",
             reason="requires the mcore extra (Megatron-Bridge)",
         )
+        from megatron.bridge.training.config import OptimizerConfig
         from megatron.bridge.training.state import TrainState
 
         load_dir = "/donor/iter_0000005"
@@ -6072,7 +6073,7 @@ class TestPeftWarmStart:
                 fp16=False,
                 bf16=False,
             ),
-            optimizer=SimpleNamespace(use_distributed_optimizer=False),
+            optimizer=OptimizerConfig(use_distributed_optimizer=False),
             rng=SimpleNamespace(data_parallel_random_init=False),
             ddp=SimpleNamespace(
                 use_megatron_fsdp=False,

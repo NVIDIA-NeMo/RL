@@ -20,6 +20,7 @@ import multistorageclient as msc
 import pytest
 
 from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
     CheckpointManager,
     _load_checkpoint_history,
     validate_warm_start_checkpoint,
@@ -58,15 +59,16 @@ def manager(tmp_path, monkeypatch):
     monkeypatch.setenv("MSC_CONFIG", str(config))
     (tmp_path / "objects").mkdir()
     with CheckpointManager(
-        {
-            "checkpoint_dir": f"msc://{profile}/run",
-            "metric_name": None,
-            "higher_is_better": True,
-            "keep_top_k": None,
-            "save_period": 1,
-            "save_optimizer": False,
-            "save_data_plane": False,
-        }
+        CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=f"msc://{profile}/run",
+            metric_name=None,
+            higher_is_better=True,
+            keep_top_k=None,
+            save_period=1,
+            save_optimizer=False,
+            save_data_plane=False,
+        )
     ) as checkpointer:
         yield checkpointer
 
