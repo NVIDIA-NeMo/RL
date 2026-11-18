@@ -14,6 +14,7 @@
 
 import asyncio
 import functools
+import importlib.metadata
 import os
 import time
 import weakref
@@ -22,12 +23,18 @@ from contextlib import contextmanager
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, Callable
 
+from packaging.version import Version
+
 if TYPE_CHECKING:
     import torch
 
 # Keep this module free of NeMo RL imports, including lazy ones inside
 # functions: tools/external_gym_vllm/serve_vllm_on_ray.py loads it by path and
 # calls _apply_vllm_patches in serving containers that do not install NeMo RL.
+
+# PackedCaptureLogprobs replaces private OutputProcessor/LogprobsProcessor state
+# that was checked on this vLLM release.
+_PACKED_CAPTURE_VLLM_RELEASE = (0, 33)
 
 
 class PackedCaptureLogprobs:
@@ -40,6 +47,14 @@ class PackedCaptureLogprobs:
         *,
         history_factory: Callable[..., Any],
     ) -> None:
+        installed = importlib.metadata.version("vllm")
+        if Version(installed).release[:2] != _PACKED_CAPTURE_VLLM_RELEASE:
+            expected = ".".join(map(str, _PACKED_CAPTURE_VLLM_RELEASE))
+            raise RuntimeError(
+                "packed_capture_logprobs replaces vLLM's private request state, "
+                f"checked on vLLM {expected}.x; vLLM {installed} is installed. "
+                "Re-check nemo_rl.models.generation.vllm.patches.PackedCaptureLogprobs."
+            )
         # vLLM is optional outside the generation worker's environment.
         from vllm.logprobs import FlatLogprobs, Logprob
         from vllm.sampling_params import RequestOutputKind
