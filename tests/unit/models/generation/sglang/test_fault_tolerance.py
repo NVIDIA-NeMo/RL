@@ -48,9 +48,8 @@ STOP_JOIN_TIMEOUT = CHECK_TIMEOUT + CHECK_INTERVAL + 5
 
 
 def test_worker_reads_effective_context_length(monkeypatch) -> None:
-    worker = sglang_worker.SGLangGenerationWorker.__new__(
-        sglang_worker.SGLangGenerationWorker
-    )
+    worker_class = sglang_worker.SGLangGenerationWorker.__ray_metadata__.modified_class
+    worker = worker_class.__new__(worker_class)
     worker.server_base_url = "http://engine:3001"
     response = MagicMock()
     response.json.return_value = {
@@ -66,9 +65,8 @@ def test_worker_reads_effective_context_length(monkeypatch) -> None:
 
 @pytest.mark.parametrize("context_length", [None, 0, -1, True, "8192"])
 def test_worker_rejects_invalid_context_length(monkeypatch, context_length) -> None:
-    worker = sglang_worker.SGLangGenerationWorker.__new__(
-        sglang_worker.SGLangGenerationWorker
-    )
+    worker_class = sglang_worker.SGLangGenerationWorker.__ray_metadata__.modified_class
+    worker = worker_class.__new__(worker_class)
     worker.server_base_url = "http://engine:3001"
     response = MagicMock()
     response.json.return_value = {"data": [{"max_model_len": context_length}]}
