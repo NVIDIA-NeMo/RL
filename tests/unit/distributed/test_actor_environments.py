@@ -22,12 +22,16 @@ import ast
 import hashlib
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
+import zipfile
+from email.message import Message
 from pathlib import Path
 
 import pytest
 
+from nemo_rl.distributed import ray_actor_environment_registry as registry
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS, _build_stage
 from nemo_rl.distributed.ray_actor_environment_registry import (
     ACTOR_ENVIRONMENT_REGISTRY,
@@ -302,3 +306,33 @@ def test_script_skips_by_extra_not_by_name():
         "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
         in listed
     )
+
+
+def test_wheel_contains_training_packages_and_resources(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    shutil.copytree(Path(git_root) / "nemo_rl", source / "nemo_rl")
+    for name in ("pyproject.toml", "README.md"):
+        shutil.copyfile(Path(git_root) / name, source / name)
+    subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(tmp_path), str(source)], check=True
+    )
+    with zipfile.ZipFile(next(tmp_path.glob("*.whl"))) as wheel:
+        assert {
+            "nemo_rl/algorithms/grpo.py",
+            "nemo_rl/distributed/ray_actor_environment_registry.py",
+            "nemo_rl/utils/cache_sync.sh",
+        } <= set(wheel.namelist())
+
+
+def test_registry_validates_installed_extras(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    installed = Message()
+    installed["Provides-Extra"] = "nemo-gym"
+    monkeypatch.setattr(registry, "git_root", str(tmp_path))
+    monkeypatch.setattr(registry, "metadata", lambda _: installed)
+    monkeypatch.setattr(registry, "ACTOR_ENVIRONMENTS", {"example.Actor": ["nemo_gym"]})
+    registry._reject_undeclared_extras()
+    monkeypatch.setattr(registry, "ACTOR_ENVIRONMENTS", {"example.Actor": ["unknown"]})
+    with pytest.raises(ValueError, match="unknown"):
+        registry._reject_undeclared_extras()
