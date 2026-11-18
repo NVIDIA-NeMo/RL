@@ -70,7 +70,7 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSource,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
-from nemo_rl.experience.payload import pack_payload
+from nemo_rl.experience.payload import VIOLATION_COUNTS_KEY, pack_payload
 from nemo_rl.experience.reward_penalties import (
     CAPTURE_PENALTIES,
     FinalizedReward,
@@ -136,6 +136,9 @@ class FinalizedRollout:
     sampler_topk_token_ids: Optional[torch.Tensor] = None
     sampler_topk_logprobs: Optional[torch.Tensor] = None
     output_masks: dict[str, list[bool]] = field(default_factory=dict)
+    # Ordinary rows with message-level penalties: payload.VIOLATION_TAG_KEYS counts
+    # over the chain calls, published in the row tags as on the echo path.
+    violation_counts: dict[str, int] = field(default_factory=dict)
     # One length per owned call, even when adjacent generations have no input gap.
     generation_lengths: tuple[int, ...] = ()
     # (model call ID, weight version stamped when it began, tokens it generated)
@@ -412,13 +415,21 @@ class RolloutReassembler:
         tokenizer: Any = None,
         thinking_tags: Sequence[str] | None = None,
         top_logprobs: int = 0,
+        message_violation_masks: bool = False,
+        invalid_tool_call_patterns: Optional[list[str]] = None,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
         self._length_penalty_config = length_penalty_config
         # Decodes generations for the malformed-think-tag string check.
         self._tokenizer = tokenizer
+        # The resolved think tags. The malformed-think-tag reward penalty and
+        # the message-level malformed-thinking detector both read them.
         self._thinking_tags = thinking_tags
         self._effort_config = effort_config
+        # Message-level advantage penalties: ordinary rows run the NeMo-Gym
+        # detector on each call's recorded last output item to build the masks.
+        self._message_violation_masks = message_violation_masks
+        self._invalid_tool_call_patterns = invalid_tool_call_patterns
         self._dp_client = dp_client
         self._partition_id = partition_id
         # Whether the staging partition carries media columns (setup's
@@ -702,6 +713,44 @@ class RolloutReassembler:
         for span in row.weight_version_spans:
             if span.model_call_id in loss_excluded_call_ids:
                 token_mask[span.start : span.end] = [0.0] * (span.end - span.start)
+        violation_counts: dict[str, int] = {}
+        if self._message_violation_masks and not forest_training:
+            # Gym records the item the echo path's detector reads
+            # (record_last_output_item); a missing one would skip the penalty.
+            last_items = []
+            for call_id, _, _ in row.link_spans:
+                record = records_by_call.get(call_id)
+                if record is None or record.last_output_item is None:
+                    return rejected(f"missing_last_output_item:{call_id}", staging_keys)
+                last_items.append(dict(record.last_output_item))
+            # Deferred: the detector lives with the NeMo-Gym environment.
+            from nemo_rl.environments.nemo_gym import (
+                _detect_invalid_tool_call_and_malformed_thinking,
+            )
+
+            action_flags = tuple(
+                ActionOutputFlags(
+                    *_detect_invalid_tool_call_and_malformed_thinking(
+                        item,
+                        invalid_tool_call_patterns=self._invalid_tool_call_patterns,
+                        thinking_tags=(
+                            list(self._thinking_tags)
+                            if self._thinking_tags is not None
+                            else None
+                        ),
+                    )
+                )
+                for item in last_items
+            )
+            violation_counts = {
+                "num_assistant_messages": len(action_flags),
+                "num_invalid_tool_calls": sum(
+                    f.invalid_tool_call for f in action_flags
+                ),
+                "num_malformed_thinking": sum(
+                    f.malformed_thinking for f in action_flags
+                ),
+            }
         output_masks = {}
         if action_flags is not None:
             if len(action_flags) != len(row.link_spans) or any(
@@ -754,6 +803,7 @@ class RolloutReassembler:
             media=media,
             model_call_ids=tuple(row.model_call_ids),
             output_masks=output_masks,
+            violation_counts=violation_counts,
             penalty_counts=penalty_counts,
             reward_metrics=reward_metrics,
             sampler_topk_token_ids=sampler_topk_token_ids,
@@ -1379,7 +1429,7 @@ class RolloutReassembler:
         if sampler_topk_token_ids is not None:
             train_batch[SAMPLER_TOPK_TOKEN_IDS_FIELD] = sampler_topk_token_ids
             train_batch[SAMPLER_TOPK_LOGPROBS_FIELD] = sampler_topk_logprobs
-        if logical is not None:
+        if logical is not None or self._message_violation_masks:
             for key in (INVALID_TOOL_CALL_MASK, MALFORMED_THINKING_MASK):
                 values = torch.zeros((n, max_len), dtype=torch.bool)
                 for index, row in enumerate(rows):
@@ -1388,6 +1438,8 @@ class RolloutReassembler:
                             row.output_masks[key], dtype=torch.bool
                         )
                 train_batch[key] = values
+        if logical is None and self._message_violation_masks:
+            train_batch[VIOLATION_COUNTS_KEY] = [row.violation_counts for row in rows]
         if self._router_replay_enabled and not self._defer_routed_experts_to_policy:
             has_routed_row = any(r.valid and r.routed_experts is not None for r in rows)
             if not has_routed_row and self._routed_dims is None and not valid_rows:

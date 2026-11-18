@@ -1152,6 +1152,19 @@ def algo_config(master_config: MasterConfig) -> GRPOConfig | PPOConfig:
     return master_config.grpo  # type: ignore
 
 
+def message_level_advantage_penalties_enabled(master_config: MasterConfig) -> bool:
+    """Whether the active algorithm block sets a message-level advantage override.
+
+    Single source of truth for the flag: setup registers the mask columns and asks
+    Gym and the finalizer for them, and the advantage stage fetches them.
+    """
+    algo_cfg = algo_config(master_config)
+    return (
+        algo_cfg.invalid_tool_call_advantage is not None
+        or algo_cfg.malformed_thinking_advantage is not None
+    )
+
+
 def validate_sampler_buffer_capacity(
     async_config: AsyncRLConfig,
     *,
@@ -2292,25 +2305,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     # configs can omit it. Only apply rollout-path validation when it is present.
     env_config = getattr(master_config, "env", None)
 
-    penalties_enabled = (
-        algo_cfg.invalid_tool_call_advantage is not None
-        or algo_cfg.malformed_thinking_advantage is not None
-    )
-    if penalties_enabled and token_capture_config.enabled:
-        # TODO(token-capture): thread the per-message violation flags through
-        # capture receipts/staging so RolloutReassembler can emit
-        # invalid_tool_call_mask/malformed_thinking_mask; then drop this guard.
-        # Checked before the gym-path validation: the conflict exists
-        # regardless of how the rollout path is configured.
-        raise NotImplementedError(
-            "invalid_tool_call_advantage/malformed_thinking_advantage require "
-            "the invalid_tool_call_mask/malformed_thinking_mask train-batch "
-            "columns, which the token-capture finalizer does not emit — the "
-            "first streamed group would crash the train pump with a KeyError "
-            "at the advantage stage. Set grpo.invalid_tool_call_advantage=null "
-            "and grpo.malformed_thinking_advantage=null to run with token "
-            "capture; mask support on the capture path is a follow-up."
-        )
+    penalties_enabled = message_level_advantage_penalties_enabled(master_config)
     if penalties_enabled and not should_use_nemo_gym(master_config):
         raise ValueError(
             "invalid_tool_call_advantage and malformed_thinking_advantage on the "

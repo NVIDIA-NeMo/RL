@@ -47,6 +47,9 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StagedCallRecord,
 )
 
+from nemo_rl.algorithms.single_controller_utils.utils import (  # noqa: E402
+    reduce_advantage_pump_metrics,
+)
 from nemo_rl.data.captured_media import MediaColumnSpec  # noqa: E402
 from nemo_rl.data.multimodal_utils import (  # noqa: E402
     WIRE_MULTIMODAL_FIELDS,
@@ -68,6 +71,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQTokenSource,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
+from nemo_rl.experience.payload import VIOLATION_TAG_KEYS  # noqa: E402
 from nemo_rl.experience.reward_penalties import RewardLogContext  # noqa: E402
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler  # noqa: E402
 from nemo_rl.experience.route_assembly import RouteLayout  # noqa: E402
@@ -560,6 +564,128 @@ def test_finalize_group_reports_valid_and_total_row_counts(tq_client, partitions
     rows = _fetch_rows(tq_client, rollout_ids)
     sample_mask = torch.as_tensor(rows["sample_mask"]).flatten()
     assert sample_mask.tolist() == [0.0, 0.0]  # published as placeholders, not dropped
+
+
+# ---------------------------------------------------------------------------
+# Message-level advantage penalties: masks from Gym's recorded last output items
+# ---------------------------------------------------------------------------
+
+_VIOLATION_PARTITION = "rollout_data_fin_violation_test"
+_VIOLATION_FIELDS = ["invalid_tool_call_mask", "malformed_thinking_mask"]
+
+
+@pytest.fixture()
+def violation_partitions(tq_client):
+    tq_client.register_partition(
+        partition_id=STAGING_PARTITION,
+        fields=list(STAGING_FIELDS),
+        num_samples=64,
+        consumer_tasks=["finalize"],
+    )
+    tq_client.register_partition(
+        partition_id=_VIOLATION_PARTITION,
+        fields=[
+            "input_ids",
+            "input_lengths",
+            "generation_logprobs",
+            "token_mask",
+            "sample_mask",
+            "prompt_ids_for_adv",
+            "total_reward",
+            "mask_sample",
+            "truncated",
+            *_VIOLATION_FIELDS,
+        ],
+        num_samples=64,
+        consumer_tasks=["train"],
+    )
+    yield
+    tq_client.clear_samples(sample_ids=None, partition_id=STAGING_PARTITION)
+    tq_client.clear_samples(sample_ids=None, partition_id=_VIOLATION_PARTITION)
+
+
+def _message(text: str) -> dict:
+    return {"type": "message", "content": [{"text": text}]}
+
+
+def test_finalize_group_masks_flagged_calls_from_last_output_items(
+    tq_client, violation_partitions
+):
+    """Each chain call's recorded last item drives the echo path's detector."""
+    group_id = "grpviol"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt, expected = _stage_fixture(
+        tq_client, "worked_example", rollout_id=rollout_ids[0]
+    )
+    # c1 leaks a thinking tag into its answer; c2 writes a tool call as text.
+    # Non-default tags and patterns: setup passes env.nemo_gym's settings.
+    receipt["manifest"][0]["last_output_item"] = _message("answer </reason>")
+    receipt["manifest"][1]["last_output_item"] = _message("[[BAD]]x")
+    finalizer = _finalizer(
+        tq_client,
+        partition_id=_VIOLATION_PARTITION,
+        message_violation_masks=True,
+        thinking_tags=("<reason>", "</reason>"),
+        invalid_tool_call_patterns=["[[BAD]]"],
+    )
+    finalized = finalizer.finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],
+        [1.0, 0.0],
+        mask_sample=[False] * 2,
+        fallback_weight_version=3,
+        prompt_idx=0,
+    )
+    assert finalized.valid_row_count == 1
+    assert not any("thinking_rate" in name for name in finalized.metrics)
+    tags = finalized.meta.tags
+    assert tags[0]["num_assistant_messages"] == 2
+    assert tags[0]["num_malformed_thinking"] == 1
+    assert tags[0]["num_invalid_tool_calls"] == 1
+    assert "num_assistant_messages" not in tags[1]  # rejected placeholder
+    # The controller's own reducer pools the same keys as the echo path.
+    step_log = {key: [t.get(key, 0) for t in tags] for key in VIOLATION_TAG_KEYS}
+    reduced = reduce_advantage_pump_metrics([], [], [], **step_log)
+    assert reduced["malformed_thinking_rate"] == 0.5
+    assert reduced["invalid_tool_call_rate"] == 0.5
+    rows = tq_client.get_samples(
+        sample_ids=rollout_ids,
+        partition_id=_VIOLATION_PARTITION,
+        select_fields=_VIOLATION_FIELDS,
+    )
+    length = len(expected.token_ids)
+    # Row [10, 11 | 12, 13 | 20 | 21, 22]: c1 generates 12, 13 and c2 generates 21, 22.
+    malformed = torch.as_tensor(rows["malformed_thinking_mask"][0]).flatten()
+    invalid = torch.as_tensor(rows["invalid_tool_call_mask"][0]).flatten()
+    assert malformed[:length].tolist() == [
+        False,
+        False,
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert invalid[:length].tolist() == [False, False, False, False, False, True, True]
+    assert not torch.as_tensor(rows["malformed_thinking_mask"][1]).any()
+    assert not torch.as_tensor(rows["invalid_tool_call_mask"][1]).any()
+
+
+def test_finalize_rollout_rejects_a_chain_call_without_last_output_item(
+    tq_client, violation_partitions
+):
+    receipt, _ = _stage_fixture(tq_client, "worked_example")
+    receipt["manifest"][0]["last_output_item"] = _message("answer")
+    finalizer = _finalizer(
+        tq_client, partition_id=_VIOLATION_PARTITION, message_violation_masks=True
+    )
+    row = finalizer.finalize_rollout("g7_r0", receipt, reward=1.0)
+    assert row.rejection_reason == "missing_last_output_item:c2"
+    # Without the penalties the same receipt is valid and carries no masks.
+    receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id="g7_r1")
+    row = _finalizer(tq_client).finalize_rollout("g7_r1", receipt, reward=1.0)
+    assert row.valid and row.output_masks == {} and row.violation_counts == {}
 
 
 # ---------------------------------------------------------------------------

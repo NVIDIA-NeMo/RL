@@ -313,6 +313,20 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
+    def test_accepts_message_penalties_with_token_capture(self):
+        mc = _ppo_master_config()
+        assert mc.ppo is not None
+        mc.env = {"should_use_nemo_gym": True}
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
+        mc.token_capture.enabled = True
+        mc.ppo.invalid_tool_call_advantage = -5.0
+        mc.ppo.malformed_thinking_advantage = -5.0
+
+        validate_single_controller_config(mc)
+
     @pytest.mark.parametrize("missing", ["value", "value_loss_fn"])
     def test_rejects_ppo_without_its_critic_blocks(self, missing):
         mc = _ppo_master_config(**{missing: None})

@@ -90,6 +90,8 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import (
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
     OPD_FULL_TEACHER_INDEX_FIELD,
     SC_ROLLOUT_SCHEMA_FIELDS,
 )
@@ -964,20 +966,20 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
 
-    def test_token_capture_rejects_message_level_advantage_penalties(
+    def test_token_capture_allows_message_level_advantage_penalties(
         self, patched_factories
     ):
-        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc = _make_master_config()
+        mc.env["should_use_nemo_gym"] = True
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
         mc.token_capture.enabled = True
         mc.grpo.invalid_tool_call_advantage = -5.0
+        mc.grpo.malformed_thinking_advantage = -5.0
 
-        with pytest.raises(
-            NotImplementedError, match="token-capture finalizer does not emit"
-        ):
-            setup_single_controller(mc, MagicMock(pad_token_id=0))
-
-        patched_factories["setup_response_data"].assert_not_called()
-        patched_factories["_build_clusters"].assert_not_called()
+        validate_single_controller_config(mc)
 
     def test_capture_allows_malformed_thinking_reward_penalty(self, patched_factories):
         mc = _make_master_config()
@@ -4791,6 +4793,69 @@ def test_token_capture_top_logprobs_reaches_partitions_workers_and_finalizers(
     _, setup_kwargs = generation.setup_token_capture.call_args
     assert setup_kwargs.get("top_logprobs", 0) == top_logprobs
     assert mock_finalizers.call_args.args[1].top_logprobs == top_logprobs
+
+
+@pytest.mark.parametrize("penalties", [False, True])
+def test_token_capture_message_penalties_reach_partitions_gym_and_finalizers(
+    patched_factories, penalties
+):
+    mc = _make_master_config(backend="vllm")
+    mc.policy["generation"].update(
+        {
+            "model_name": "test-model",
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": None,
+            "vllm_cfg": {"async_engine": True, "expose_http_server": True},
+        }
+    )
+    mc.token_capture.enabled = True
+    mc.env = {
+        "should_use_nemo_gym": True,
+        "nemo_gym": {
+            "invalid_tool_call_patterns": ["[[BAD]]"],
+            "thinking_tags": ["<reason>", "</reason>"],
+        },
+    }
+    if penalties:
+        mc.grpo.invalid_tool_call_advantage = -5.0
+        mc.grpo.malformed_thinking_advantage = -5.0
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(
+            sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+        ) as mock_gym,
+        patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+        patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[MagicMock(name="finalizer_0")],
+        ) as mock_finalizers,
+    ):
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+    # The rollout partition carries the mask columns only when a penalty is on.
+    partitions = {
+        call.kwargs["partition_id"]: set(call.kwargs["fields"])
+        for call in actor_args.dp_client.register_partition.call_args_list
+    }
+    masks = {INVALID_TOOL_CALL_MASK, MALFORMED_THINKING_MASK}
+    assert (masks <= partitions["rollout_data"]) is penalties
+    # Gym records each call's last output item only when a penalty is on.
+    token_capture = mock_gym.call_args.kwargs["token_capture"]
+    assert token_capture["record_last_output_item"] is penalties
+    # The finalizer runs the echo path's detector with the env.nemo_gym settings.
+    finalizer_config = mock_finalizers.call_args.args[1]
+    assert finalizer_config.message_violation_masks is penalties
+    if penalties:
+        assert finalizer_config.thinking_tags == ("<reason>", "</reason>")
+        assert finalizer_config.invalid_tool_call_patterns == ["[[BAD]]"]
+    else:
+        assert finalizer_config.thinking_tags is None
 
 
 @pytest.mark.parametrize("count", [-1, 1.5, True])

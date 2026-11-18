@@ -152,10 +152,15 @@ class RolloutReassemblerActorConfig:
     reward_penalty_config: RewardPenaltyConfig | None = None
     length_penalty_config: LengthPenaltyConfig | None = None
     effort_config: EffortLevelsConfig | None = None
-    # Policy tokenizer and resolved think tags, set only when
-    # penalize_malformed_think_tag needs to decode generations.
+    # Policy tokenizer, set only when penalize_malformed_think_tag needs to
+    # decode generations.
     tokenizer_config: TokenizerConfig | None = None
+    # Resolved think tags, set when penalize_malformed_think_tag or a
+    # message-level advantage penalty is on.
     thinking_tags: tuple[str, ...] | None = None
+    # Message-level advantage penalties; the patterns come from env.nemo_gym.
+    message_violation_masks: bool = False
+    invalid_tool_call_patterns: Optional[list[str]] = None
 
 
 @ray.remote(
@@ -196,6 +201,8 @@ class RolloutReassemblerActor:  # pragma: no cover
             tokenizer=tokenizer,
             thinking_tags=config.thinking_tags,
             top_logprobs=config.top_logprobs,
+            message_violation_masks=config.message_violation_masks,
+            invalid_tool_call_patterns=config.invalid_tool_call_patterns,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
