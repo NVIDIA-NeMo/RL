@@ -1058,7 +1058,7 @@ class VllmGeneration(GenerationInterface):
         """Get vLLM engine metric deltas for the current window.
 
         Covers the speculative-decoding family plus the engine's token,
-        sequence-length and request-outcome series, all derived from the same
+        sequence-length, request-outcome, prefix-cache and preemption series, all derived from the same
         pair of snapshots so the wider coverage costs no extra RPC.
 
         Args:
