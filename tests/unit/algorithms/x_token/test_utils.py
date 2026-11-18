@@ -67,6 +67,8 @@ class TestAssertXtokenIpcNodeLocal:
             teacher_cp=2,
             student_dp=1,
             teacher_dp=1,
+            student_pp=1,
+            teacher_pp=1,
         )
         args.update(kw)
         assert_xtoken_ipc_node_local(**args)
@@ -97,6 +99,19 @@ class TestAssertXtokenIpcNodeLocal:
             self._check(
                 gpus_per_node=6, student_tp=2, student_cp=2, teacher_tp=2, teacher_cp=2
             )  # 6 % 4 != 0
+
+    def test_pp_counts_toward_the_model_parallel_group(self):
+        # tp*cp*pp = 8 > gpus_per_node = 4: the producing last stage would land
+        # on another node from the student ranks importing its IPC buffers.
+        with pytest.raises(AssertionError):
+            self._check(student_pp=2, teacher_pp=2)
+
+    def test_pp_mismatch_between_teacher_and_student_raises(self):
+        with pytest.raises(AssertionError):
+            self._check(gpus_per_node=8, student_pp=2, teacher_pp=1)
+
+    def test_multinode_matched_grid_with_pp_ok(self):
+        self._check(gpus_per_node=8, student_pp=2, teacher_pp=2)
 
 
 class TestPadDistillationValBatch:

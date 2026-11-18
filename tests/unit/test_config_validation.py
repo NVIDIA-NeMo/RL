@@ -46,6 +46,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
+    CSDMasterConfig,
+)
+from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig as XTokenOffPolicyDistillationMasterConfig,
 )
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
@@ -203,6 +206,9 @@ def _check_required_keys(config_file: str, config: DictConfig) -> None:
         # SingleController configs also carry a grpo or ppo block, so match them first.
         master_config_class = SingleControllerMasterConfig
         config_type = "single_controller"
+    elif config_dict.get("algorithm") == "csd":
+        master_config_class = CSDMasterConfig
+        config_type = "csd"
     elif "teachers" in config_dict or (
         "loss_fn" in config_dict and "projection_matrix_path" in config_dict["loss_fn"]
     ):

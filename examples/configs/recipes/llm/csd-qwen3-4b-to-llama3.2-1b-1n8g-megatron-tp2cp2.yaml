@@ -1,0 +1,153 @@
+defaults: ../../csd.yaml
+distillation:
+  num_prompts_per_step: 8
+  max_num_steps: 20
+  val_period: 10
+  val_at_start: true
+data:
+  train:
+    split_validation_size: 64
+    seed: 42
+policy:
+  train_global_batch_size: 8
+  max_total_sequence_length: 1024
+  make_sequence_length_divisible_by: 8
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    context_parallel_size: 2
+    scheduler:
+      lr_decay_style: constant
+      lr_warmup_iters: 5
+teachers:
+- model_name: Qwen/Qwen3-4B
+  aligner:
+    projection_matrix_path: null
+    drop_first_assistant_chunk_kl: false
+    student_to_teacher_table_path: cross_tokenizer_data/csd/student_to_teacher.pt
+    teacher_to_student_table_path: cross_tokenizer_data/csd/teacher_to_student.pt
+  weight: 1.0
+  tokenizer:
+    name: Qwen/Qwen3-4B
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 1024
+  make_sequence_length_divisible_by: 8
+  precision: bfloat16
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
+  automodel_cfg:
+    enabled: false
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    load_precision: float32
+    shard_before_load: false
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 0
+    activation_checkpointing: false
+    recompute_granularity: full
+    recompute_modules: null
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 2
+    pipeline_dtype: bfloat16
+    sequence_parallel: false
+    freeze_moe_router: true
+    moe_router_dtype: fp64
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: true
+    apply_rope_fusion: true
+    bias_activation_fusion: true
+    defer_fp32_logits: false
+    moe_per_layer_logging: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+    gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+    force_reconvert_from_hf: false
+    optimizer:
+      optimizer: adam
+      lr: 5.0e-05
+      min_lr: 5.0e-05
+      weight_decay: 0.001
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.95
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      clip_grad: 1.0
+    scheduler:
+      start_weight_decay: 0.001
+      end_weight_decay: 0.001
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: 1000
+      lr_warmup_iters: 10
+      lr_warmup_init: 5.0e-06
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_recipe: blockwise
+      fp8_param: false
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: modified_first_fit_decreasing
+    microbatch_order: packer
+    sequence_length_round: 64
+    fuse_loss: false
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 5.0e-05
+      weight_decay: 0.001
+      betas:
+      - 0.9
+      - 0.95
+      eps: 1e-8
+      foreach: false
+      fused: false
+logger:
+  log_dir: logs/csd-qwen3-4b-to-llama3.2-1b-1n8g-megatron-tp2cp2
+  wandb:
+    project: nemo-rl
+    name: csd-qwen3-4b-to-llama3.2-1b-1n8g-megatron-tp2cp2
