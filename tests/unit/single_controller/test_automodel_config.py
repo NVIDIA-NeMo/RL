@@ -40,11 +40,14 @@ def config():
     return OmegaConf.to_container(raw, resolve=True)
 
 
-def test_full_batch_lookahead_one_supported(config: dict[str, Any]) -> None:
+@pytest.mark.parametrize("lookahead", [1, 2, 4])
+def test_full_batch_lookahead_supported(
+    config: dict[str, Any], lookahead: int
+) -> None:
     prompts = config["grpo"]["num_prompts_per_step"]
-    config["async_rl"]["sampler"]["max_lookahead_versions"] = 1
-    config["async_rl"]["max_inflight_prompts"] = 2 * prompts
-    config["async_rl"]["max_buffered_rollouts"] = 2 * prompts
+    config["async_rl"]["sampler"]["max_lookahead_versions"] = lookahead
+    config["async_rl"]["max_inflight_prompts"] = (lookahead + 1) * prompts
+    config["async_rl"]["max_buffered_rollouts"] = (lookahead + 1) * prompts
     config["loss_fn"]["use_importance_sampling_correction"] = True
     config["loss_fn"]["force_on_policy_ratio"] = False
     validate_single_controller_config(MasterConfig(**config))
@@ -57,7 +60,6 @@ def test_full_batch_lookahead_one_supported(config: dict[str, Any]) -> None:
         ("grpo.use_dynamic_sampling", True),
         ("token_capture.enabled", True),
         ("async_rl.sampler.name", "ready_first"),
-        ("async_rl.sampler.max_lookahead_versions", 2),
         ("async_rl.sampler.warmup_lookahead_versions", 1),
         ("async_rl.min_groups_for_streaming_train", 1),
         ("async_rl.rollout_failure.max_skipped_prompts", 1),
@@ -105,5 +107,5 @@ def test_disabled_opd_block_supported(config):
 
 def test_megatron_unchanged(config):
     config["policy"]["automodel_cfg"]["enabled"] = False
-    config["async_rl"]["sampler"]["max_lookahead_versions"] = 2
+    config["policy"]["sequence_packing"]["enabled"] = True
     _validate_automodel_single_controller_config(MasterConfig(**config))

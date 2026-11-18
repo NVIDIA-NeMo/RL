@@ -7,7 +7,8 @@ This lets the shared controller own rollout admission, training dispatch, and we
 The [single-controller guide](../guides/single-controller.md) describes the controller, sampler, and rollout architecture shared with the Megatron backend.
 This document describes the AutoModel worker contract and its full-batch execution.
 
-Supported scope is text GRPO, full-parameter FSDP2, TP=CP=1, fixed microbatches, disaggregated async vLLM, `in_order`, and lookahead zero or one.
+Supported scope is text GRPO, full-parameter FSDP2, TP=CP=1, fixed microbatches, disaggregated async vLLM, and `in_order` sampling at any lookahead.
+Lookahead zero and one are covered by nightly recipes; lookahead four has been exercised in a 50-step functional run (see [Enabling lookahead](#enabling-lookahead)).
 Dense and MoE models use the same lifecycle.
 Expert parallelism uses AutoModel's existing MoE mesh, dispatcher, gradient synchronization, and distributed clipping.
 Configure expert parallelism and the dispatcher through the existing AutoModel settings.
@@ -50,10 +51,10 @@ The worker then accumulates gradients over its local microbatches.
 For example, GBS=32, DP=16, and MBS=1 gives two forward/backward microbatches per rank and one optimizer update.
 The full-batch restriction describes the dispatch boundary, not the number of model forward/backward calls.
 
-### Enabling lookahead one
+### Enabling lookahead
 
 The exemplar defaults to lookahead zero; the Gemma4 E2B recipe below ships with lookahead one.
-To overlap a future rollout batch with training while keeping one complete RL batch per optimizer update, apply these overrides to an AutoModel single-controller configuration:
+To overlap up to `N` future rollout batches with training while keeping one complete RL batch per optimizer update, apply these overrides to an AutoModel single-controller configuration, shown here for `N = 1`:
 
 ```yaml
 async_rl:
@@ -67,9 +68,14 @@ loss_fn:
   use_importance_sampling_correction: true
 ```
 
-The capacities cover the current and lookahead prompt batches; each prompt group contains `num_generations_per_prompt` responses.
+The capacities must cover the current and the `N` lookahead prompt batches, so both are `(N + 1) × num_prompts_per_step`; each prompt group contains `num_generations_per_prompt` responses.
+The worker is unaware of lookahead: it always receives one complete batch, and `train/weight_version_lag` reports how many policy versions behind the trainer each batch was generated, at most `N`.
 Selection remains in target-step order and waits for every prompt group in the current batch.
 Training still accumulates the complete batch before one optimizer step.
+
+The Gemma4 E2B recipe above was also run for 50 steps at `max_lookahead_versions: 4` with both capacities at `5 × num_prompts_per_step`.
+The lag climbed one version per step and held at four from step five onward; mean `gen_kl_error` was 4.6e-4 and the median token-multiplier error 1.009, matching the lookahead-one nightly.
+This is a functional check, not a convergence study.
 Lookahead values above one, sampler warmup overrides, and partial streaming dispatch remain unsupported for AutoModel SC.
 
 ## Interfaces and ownership
@@ -257,7 +263,7 @@ Use the Qwen3.5 recipe above with `grpo.max_num_steps=500` for this run length.
 Lookahead one (LA1) overlaps collection of the next rollout batch with training on the current batch.
 The controller admits samples up to one policy version behind the trainer, in target-step order.
 Each optimizer update still consumes one complete global batch through the same AutoModel lifecycle.
-The [LA1 overrides above](#enabling-lookahead-one) enable importance-sampling correction and allocate capacity for the current and lookahead prompt batches.
+The [LA1 overrides above](#enabling-lookahead) enable importance-sampling correction and allocate capacity for the current and lookahead prompt batches.
 
 The following comparisons use full-batch LA0 and LA1 with the same model, seed 42, batch configuration, learning rate, and resource layout within each model pair.
 All runs use GRPO on DAPOMath17K, microbatch size 1, a 4,096-token total sequence limit, and at most 2,048 generated tokens.
