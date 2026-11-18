@@ -891,7 +891,9 @@ def test_training_dump_is_complete_however_the_stage_was_split(
     assert not list(tmp_path.glob("*.part-*"))
     # The serialization is timed wherever it ran, and reported back as a
     # number so the controller's metric survives the move onto the pool.
-    assert len(ctrl._timer.get_elapsed("train_data_dump")) == max(num_actors, 1)
+    assert len(ctrl._timer.get_elapsed("advantage_calculation/train_data_dump")) == max(
+        num_actors, 1
+    )
 
 
 class _JaggedRowStore(_RowStore):

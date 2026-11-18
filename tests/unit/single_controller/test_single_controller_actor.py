@@ -2152,7 +2152,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
     assert logged.minimum == pytest.approx(0.1)
     assert logged.maximum == pytest.approx(0.1)
 
-    dump_timings = ctrl._timer.get_elapsed("train_data_dump")
+    dump_timings = ctrl._timer.get_elapsed("advantage_calculation/train_data_dump")
     assert len(dump_timings) == 1
     assert math.isfinite(dump_timings[0]) and dump_timings[0] > 0
 
@@ -5639,8 +5639,8 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
                 scalars={},
             )
         )
-        # Seed chunk-write time to verify publication adds to the per-step sum.
-        ctrl._timer.record("train_data_dump", 2.0)
+        # Seed chunk-write time to verify publication is timed apart from it.
+        ctrl._timer.record("advantage_calculation/train_data_dump", 2.0)
         # The chunk above stands in for the stage's write, so stand in for the
         # receipt it would have reported alongside it too.
         ctrl._train_data_dump_receipts = [receipt]
@@ -5665,7 +5665,8 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
     assert final.exists() is dump_enabled
     if dump_enabled:
         assert math.isfinite(logged_timings[0]["train_data_dump"])
-        assert logged_timings[0]["train_data_dump"] > 2.0
+        assert logged_timings[0]["train_data_dump"] < 2.0
+        assert logged_timings[0]["advantage_calculation/train_data_dump"] == 2.0
         assert not final.with_suffix(".jsonl.partial").exists()
     assert "train_data_dump" not in ctrl._timer.get_timing_metrics()
 

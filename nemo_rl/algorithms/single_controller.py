@@ -5471,8 +5471,11 @@ class SingleControllerActor:
         if outcome.train_data_dump_s:
             # Recorded rather than timed here: the serialization ran wherever
             # the stage ran, which with a pool is not this process.
+            # Part of advantage_calculation, so not a sibling of train_data_dump.
             self._timer.record(
-                "train_data_dump", outcome.train_data_dump_s, should_log=False
+                "advantage_calculation/train_data_dump",
+                outcome.train_data_dump_s,
+                should_log=False,
             )
         if outcome.train_data_dump_receipt is not None:
             self._train_data_dump_receipts.append(outcome.train_data_dump_receipt)
