@@ -7,11 +7,12 @@
 # also hosts Megatron-LM's Dynamo adapter, which registers the engine with the
 # frontend.
 #
-# Weight updates use the collective transport, as for backend: megatron with
-# colocated.enabled: false. Before each refit the prefill engines stop
-# scheduling first, decode keeps running until every handed-off prefill block
-# is pulled, then every engine is suspended; after the refit every engine
-# resumes in one wave. dynamo_cfg.control_timeout_s bounds each step.
+# Weight updates use the packed collective by default, as for backend: megatron
+# with colocated.enabled: false; refit_transport: mcore selects Megatron-Core's
+# native refit, as the aggregated Megatron engines use. Before each refit the
+# prefill engines are suspended, then decode, without waiting for decode to
+# pull handed-off prefill blocks; after the refit every engine resumes in one
+# wave. dynamo_cfg.control_timeout_s bounds each step.
 defaults: grpo_math_1B_megatron_single_controller.yaml
 
 async_rl:
@@ -26,12 +27,17 @@ async_rl:
 policy:
   # Training uses the Megatron backend inherited from
   # grpo_math_1B_megatron_single_controller.yaml; the engines receive its
-  # logical weights through the collective refit.
+  # logical weights through the refit.
   generation:
     backend: megatron
     # Serve the engines through a managed Dynamo frontend (prefill/decode only).
     dynamo: true
-    # Collective refit only.
+    # null: packed collective (train rank zero broadcasts HF tensors; every
+    # engine rank imports them). mcore: Megatron-Core's native refit, with
+    # mcore_generation_config.refit_backend nccl or gloo; it sends each
+    # engine rank its own shards in one transfer, also when prefill and
+    # decode use different tensor-parallel sizes, and needs
+    # async_rl.generation_fleet_health.refit_timeout_s: null.
     refit_transport: null
     dynamo_cfg:
       # Bounds etcd/NATS/frontend start-up and the engines' registration,
@@ -39,21 +45,24 @@ policy:
       startup_timeout_s: 600
       # null waits as long as generation takes, as the direct path does.
       request_timeout_s: null
-      # Bounds every control call to an engine: the pre-refit pin wait, the
-      # refit phases, and the shutdown handshake that releases handoff pins.
+      # Bounds every control call to an engine: the refit phases and the
+      # shutdown handshake that releases handoff pins.
       control_timeout_s: 900
       frontend_args:
         router_mode: kv
         extra_cli_args: []
-      # Per-role layouts. null = use mcore_generation_config; set to give
-      # prefill and decode different layouts; Megatron reshards the KV handoff
-      # between them.
+      # Per-role overrides. null = use mcore_generation_config; set to give
+      # prefill and decode different layouts (Megatron reshards the KV handoff
+      # between them) or request caps. Prefill holds each finished prompt until
+      # decode claims it, so a shared max_requests can throttle prefill.
       prefill_engine:
         tensor_model_parallel_size: null
         pipeline_model_parallel_size: null
+        max_requests: null
       decode_engine:
         tensor_model_parallel_size: null
         pipeline_model_parallel_size: null
+        max_requests: null
     # One prefill and one decode engine per replica; every engine has the
     # layout of policy.megatron_cfg with mcore_generation_config applied, plus
     # its role's dynamo_cfg overrides above.
@@ -68,7 +77,7 @@ policy:
       kv_cache_management_mode: persist
       # The Dynamo frontend is the HTTP surface.
       expose_http_server: false
-      # Only read by refit_transport: mcore.
+      # Only read by refit_transport: mcore (then nccl or gloo).
       refit_backend: null
     colocated:
       enabled: false
