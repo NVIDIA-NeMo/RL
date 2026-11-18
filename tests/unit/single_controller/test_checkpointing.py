@@ -70,6 +70,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSampler,
     ReadyFirstSamplerConfig,
+    WindowedSampler,
     WindowedSamplerConfig,
     sampler_supports_buffer_checkpoint,
 )
@@ -1545,6 +1546,35 @@ def test_grpo_pump_trains_only_chunks_that_shard_across_policy_dp(tmp_path) -> N
     )
 
     assert trainer.chunk_sizes == [20 * 16, 12 * 16]
+
+
+@pytest.mark.parametrize("use_dynamic_sampling", [False, True])
+def test_windowed_eof_tail_below_group_multiple(
+    tmp_path: Path, use_dynamic_sampling: bool
+) -> None:
+    """An exhausted windowed tail below the group multiple drains cleanly."""
+    mc = _actor_master_config(tmp_path, max_num_steps=3, num_prompts_per_step=32)
+    mc.grpo.num_generations_per_prompt = 16
+    mc.grpo.use_dynamic_sampling = use_dynamic_sampling
+    mc.async_rl.min_groups_for_streaming_train = 1
+    trainer = _ShardCheckedTrainer(policy_dp=32)
+    buffer = _ReadyGroupBuffer(generations=16)
+    buffer.add_groups(31)
+
+    def seed_exhausted_tail(actor: Any) -> None:
+        actor._buffer = buffer
+        actor._sampler = WindowedSampler(buffer, max_staleness_versions=1)
+        actor._rollout_exhausted.set()
+
+    actor = _run_train_pump(
+        mc,
+        _make_actor_args(trainer=trainer, grpo_group_multiple=2),
+        seed=seed_exhausted_tail,
+    )
+
+    assert trainer.chunk_sizes == [30 * 16]
+    assert actor._train_steps == 1
+    assert len(buffer) == 1
 
 
 # ── save trigger + write path ────────────────────────────────────────────────
