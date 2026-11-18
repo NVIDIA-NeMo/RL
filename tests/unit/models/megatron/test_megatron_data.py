@@ -905,6 +905,9 @@ class TestProcessMicrobatch:
 
         assert torch.equal(result.input_ids, full_tokens)
         assert torch.equal(result.input_ids_cp_sharded, full_tokens)
+        # The model slices its own CP inputs, but the drafter reads CP-local
+        # captures and must get the CP-local ids.
+        assert torch.equal(result.draft_input_ids_cp_local, local_tokens)
         assert torch.equal(result.packed_seq_params.cu_seqlens_q, cu_seqlens)
         assert torch.equal(
             result.packed_seq_params.cu_seqlens_q_padded, cu_seqlens_padded

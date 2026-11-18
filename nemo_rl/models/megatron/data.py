@@ -155,6 +155,10 @@ class ProcessedInputs:
     original_seq_length: Optional[int] = None
     media_token_validity_mask: Optional[torch.Tensor] = None
     draft_sequence_layout: Optional[DraftSequenceLayout] = None
+    # CP-local token IDs for the drafter when ``input_ids_cp_sharded`` holds the
+    # full row because the model selects its own CP slice (VL models insert
+    # media first). None means ``input_ids_cp_sharded`` is already CP-local.
+    draft_input_ids_cp_local: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -214,6 +218,7 @@ class ProcessedMicrobatch:
     original_seq_length: Optional[int] = None
     media_token_validity_mask: Optional[torch.Tensor] = None
     draft_sequence_layout: Optional[DraftSequenceLayout] = None
+    draft_input_ids_cp_local: Optional[torch.Tensor] = None
 
 
 def _validate_direct_packed_microbatch(
@@ -404,6 +409,7 @@ def make_processed_microbatch_iterator(
                 if draft_sequence_layout is not None
                 else processed_inputs.draft_sequence_layout
             ),
+            draft_input_ids_cp_local=processed_inputs.draft_input_ids_cp_local,
         )
 
 
@@ -904,6 +910,7 @@ def process_microbatch(
             data_dict["routed_experts"] if "routed_experts" in data_dict else None
         )
         token_identity_cp_sharded = None
+        draft_input_ids_cp_local = None
         if routed_experts is not None and routed_experts.dim() != 4:
             raise ValueError(
                 "routed_experts must have shape [batch, seq, num_moe_layers, topk] "
@@ -1141,6 +1148,9 @@ def process_microbatch(
                     # the model needs the full THD row so it can insert media
                     # before selecting its CP-owned embeddings.
                     input_ids_cp_sharded = input_ids
+                    # The drafter reads CP-local captures, so it needs the
+                    # CP-local ids the model's own slice will select.
+                    draft_input_ids_cp_local = local_input_ids
                 else:
                     input_ids_cp_sharded = local_input_ids
                 if create_packed_seq_padding_mask:
@@ -1432,6 +1442,7 @@ def process_microbatch(
         routed_experts_cp_sharded=routed_experts_cp_sharded,
         original_seq_length=original_seq_length,
         media_token_validity_mask=media_token_validity_mask,
+        draft_input_ids_cp_local=draft_input_ids_cp_local,
     )
 
 

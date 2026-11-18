@@ -434,7 +434,11 @@ def forward_with_post_processing_fn(
             policy_model=model,
             draft_model=draft_model,
             captured_states=captured_states,
-            input_ids_cp_local=input_ids_cp_sharded,
+            input_ids_cp_local=(
+                processed_mb.draft_input_ids_cp_local
+                if processed_mb.draft_input_ids_cp_local is not None
+                else input_ids_cp_sharded
+            ),
             attention_mask=attention_mask,
             data=data_dict,
             optimizer_step=draft_optimizer_step,
