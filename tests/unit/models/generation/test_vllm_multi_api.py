@@ -224,6 +224,7 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             listener.getsockname.return_value = ("localhost", 8100)
             http_client = Mock()
             install_yield = Mock()
+            tune_interpreter = Mock()
             modules = {
                 "ray": SimpleNamespace(is_initialized=lambda: False, init=Mock()),
                 "nemo_rl.models.generation.vllm.config": SimpleNamespace(
@@ -247,6 +248,7 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                 "nemo_rl.models.generation.vllm.vllm_worker_async": SimpleNamespace(
                     VllmAsyncGenerationWorkerImpl=Host,
                     _AsyncLLMHTTPClient=http_client,
+                    _tune_actor_interpreter=tune_interpreter,
                 ),
                 "nemo_rl.telemetry.setup": SimpleNamespace(
                     init_telemetry_worker=init_telemetry,
@@ -279,6 +281,7 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                 register_video_loader.assert_not_called()
             self.assertTrue(http_client.call_args.kwargs["flat_logprobs"])
             install_yield.assert_called_once_with(engine, reader_budget_s=0.02)
+            tune_interpreter.assert_called_once_with(hosts[0].cfg["vllm_cfg"])
             hosts[0].setup_token_capture.assert_awaited_once_with(
                 {"impl": "transfer_queue"},
                 "stage",
