@@ -555,7 +555,8 @@ def test_copied_mooncake_names_exist_in_the_installed_mooncake() -> None:
         assert name.encode() in store, name
     backend = offload.REQUIRED_ENV["MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR"]
     assert backend.encode() in store, backend
-    assert offload.EVICTION_COUNTER.encode() in master, offload.EVICTION_COUNTER
+    for metric in offload.MASTER_METRICS:  # includes EVICTION_COUNTER
+        assert metric.encode() in master, metric
     for arg in offload.master_args(_cfg(ssd_offload=_SSD)):
         flag = arg.removeprefix("--").split("=", 1)[0]
         assert flag.encode() in master, flag

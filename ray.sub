@@ -235,7 +235,7 @@ if [[ -n "${UV_CACHE_DIR_OVERRIDE:-}" ]]; then
   fi
 fi
 
-# The node's NVMe for the data plane's SSD tiers: they default to /raid/<name>
+# The node's NVMe for the data plane's SSD tiers: they default to /raid/<name>-<uid>
 # inside the container when /raid is mounted there, and to /tmp otherwise
 # (nemo_rl/data_plane/local_disk.py; the driver logs which one it took). The
 # mount source is a per-user directory, never the shared RAID root, so users on

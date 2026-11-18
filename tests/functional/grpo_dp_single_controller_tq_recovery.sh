@@ -67,9 +67,9 @@ case "$VARIANT" in
         BACKEND=nixl
         TEST_NAME=grpo_dp_nixl_ssd_tq_recovery
         SSD_DIR=$SCRIPT_DIR/$TEST_NAME/ssd
-        # 256 KiB slab per unit: a 128 KiB put area and a 128 KiB SSD IO area.
+        # 128 KiB put area per unit, plus a 128 KiB SSD IO area pinned beside it.
         VARIANT_OVERRIDES=(
-            data_plane.nixl.unit_slab_bytes=262144
+            data_plane.nixl.unit_slab_bytes=131072
             data_plane.nixl.ssd.path="$SSD_DIR"
             data_plane.nixl.ssd.staging_bytes=131072
         )
@@ -201,7 +201,7 @@ if [[ "$VARIANT" == "mooncake_units" ]]; then
     # path: null -> each owner writes under the node's NVMe default
     # (local_disk.default_ssd_dir: /raid when mounted and writable, else /tmp).
     # The owners' lines reach the run log through Ray.
-    if ! grep -Eq "SSD offload for this process under /(raid|tmp)/nrl_mooncake_ssd_offload/" "$PHASE1_LOG"; then
+    if ! grep -Eq "SSD offload for this process under /(raid|tmp)/nrl_mooncake_ssd_offload-[0-9]+/" "$PHASE1_LOG"; then
         echo "FAIL: no Mooncake owner used the default offload directory" >&2
         exit 1
     fi
