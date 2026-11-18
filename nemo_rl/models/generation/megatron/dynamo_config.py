@@ -16,7 +16,7 @@
 
 ``policy.generation.dynamo: true`` on a ``backend: megatron`` config is the
 switch. ``policy.generation.dynamo_cfg`` tunes the frontend, the timeouts and
-the per-role engine layouts; every field carries its default. The replica shape
+the per-role engine overrides; every field carries its default. The replica shape
 comes from the backend-neutral ``policy.generation.disaggregation`` block.
 """
 
@@ -35,17 +35,31 @@ MegatronDynamoRole = Literal["prefill", "decode"]
 # sends the prefill leg to "prefill" and the decode leg to "backend".
 DYNAMO_COMPONENT_BY_ROLE: dict[str, str] = {"prefill": "prefill", "decode": "backend"}
 
+# How the engines take new weights. None is NeMo RL's packed collective: train
+# rank zero exports HF tensors and broadcasts them to every engine rank, which
+# imports them into Megatron. "mcore" is Megatron-Core's native refit, where
+# each training rank sends its own shards straight to the engine ranks that
+# hold them, as the aggregated Megatron engines do.
+DYNAMO_REFIT_TRANSPORTS: tuple[str | None, ...] = (None, "mcore")
+# Copy services the native refit may use behind Dynamo.
+DYNAMO_MCORE_REFIT_BACKENDS: tuple[str, ...] = ("nccl", "gloo")
 
-class EngineLayoutOverrides(BaseModel, extra="forbid"):
-    """Parallel layout a prefill or decode engine uses instead of the shared one.
 
-    A field left ``None`` keeps the shared layout for that dimension. The KV
-    handoff reshards the cache between the two sides, so prefill and decode
-    engines may span different numbers of GPUs.
+class EngineRoleOverrides(BaseModel, extra="forbid"):
+    """``mcore_generation_config`` keys a prefill or decode engine sets for itself.
+
+    A field left ``None`` keeps the shared ``mcore_generation_config`` value.
+    The KV handoff reshards the cache between the two sides, so prefill and
+    decode engines may span different numbers of GPUs.
     """
 
     tensor_model_parallel_size: PositiveInt | None = None
     pipeline_model_parallel_size: PositiveInt | None = None
+    # Cap on the requests one engine holds at once. A prefill engine keeps each
+    # finished prompt in a request slot until a decode engine claims it, so
+    # with every decode slot busy a shared cap also throttles prefill; set it
+    # here to size prefill's slots on their own.
+    max_requests: PositiveInt | None = None
 
 
 class MegatronDynamoFrontendArgs(BaseModel, extra="forbid"):
@@ -73,21 +87,17 @@ class MegatronDynamoCfg(BaseModel, extra="forbid"):
     # Deadline for one rollout through the frontend. None waits as long as
     # generation takes, as the native generate_async does.
     request_timeout_s: PositiveFloat | None = None
-    # Bounds every control call to an engine: refit, pause, resume, shutdown.
-    # The refit pause's bound also covers waiting for decode to pull every KV
-    # block prefill still pins for a handoff. Keep it above Megatron-LM's 300 s
-    # offer timeout, after which prefill releases a handoff no decode engine
-    # claimed; a shorter bound can fail a refit on such a pin.
+    # Bounds every control call to an engine: refit, suspend, resume, shutdown.
     control_timeout_s: PositiveFloat = 600.0
     frontend_args: MegatronDynamoFrontendArgs = Field(
         default_factory=MegatronDynamoFrontendArgs
     )
-    # Per-role layouts, as trtllm_cfg keeps its own prefill_engine / decode_engine.
-    prefill_engine: EngineLayoutOverrides = Field(default_factory=EngineLayoutOverrides)
-    decode_engine: EngineLayoutOverrides = Field(default_factory=EngineLayoutOverrides)
+    # Per-role overrides, as trtllm_cfg keeps its own prefill_engine / decode_engine.
+    prefill_engine: EngineRoleOverrides = Field(default_factory=EngineRoleOverrides)
+    decode_engine: EngineRoleOverrides = Field(default_factory=EngineRoleOverrides)
 
     def role_overrides(self, role: MegatronDynamoRole) -> dict[str, int]:
-        """Layout keys an engine of ``role`` sets on top of the shared layout."""
+        """Keys an engine of ``role`` sets on top of ``mcore_generation_config``."""
         overrides = self.prefill_engine if role == "prefill" else self.decode_engine
         return {
             key: value
@@ -247,11 +257,23 @@ def validate_megatron_dynamo_generation(generation_cfg: Mapping[str, Any]) -> No
             "policy.generation.dynamo=true; the engines are dedicated inference "
             "policies"
         )
-    if generation_cfg.get("refit_transport") is not None:
+    refit_transport = generation_cfg.get("refit_transport")
+    if refit_transport not in DYNAMO_REFIT_TRANSPORTS:
         raise ValueError(
-            "policy.generation.refit_transport must be null when "
-            "policy.generation.dynamo=true; the engines refit through the "
-            "collective transport"
+            "policy.generation.refit_transport must be null (packed collective) "
+            "or 'mcore' (native Megatron-Core refit) when "
+            f"policy.generation.dynamo=true, got {refit_transport!r}"
+        )
+    refit_backend = generation_cfg["mcore_generation_config"].get("refit_backend")
+    if refit_transport == "mcore" and refit_backend not in DYNAMO_MCORE_REFIT_BACKENDS:
+        # nccl_m2n and nvshmem are left out: neither has been run against
+        # engines of different widths, and nvshmem also needs a pre-transfer
+        # initialization step these engines do not have.
+        raise ValueError(
+            "policy.generation.mcore_generation_config.refit_backend must be "
+            f"one of {list(DYNAMO_MCORE_REFIT_BACKENDS)} when "
+            "policy.generation.dynamo=true and refit_transport='mcore', got "
+            f"{refit_backend!r}"
         )
     for quantization_field in ("quant_cfg", "real_quant"):
         if generation_cfg.get(quantization_field):

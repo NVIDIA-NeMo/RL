@@ -26,10 +26,12 @@ side.
 
 import copy
 import dataclasses
+import functools
 import logging
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -49,6 +51,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    reject_unenforceable_refit_deadline,
 )
 from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
 from nemo_rl.models.generation.megatron.dynamo_config import (
@@ -92,7 +95,7 @@ def role_policy_config(
     A deep copy of ``policy_config`` with the role in
     ``generation._dynamo_role`` (what makes the worker build the handoff
     engine for that role) and ``overrides`` (the role's
-    ``dynamo_cfg.prefill_engine`` / ``decode_engine`` layout keys) merged into
+    ``dynamo_cfg.prefill_engine`` / ``decode_engine`` keys) merged into
     ``generation.mcore_generation_config``, which is where the dedicated
     inference policy takes its layout from. ``generation.dynamo`` is turned
     off: each engine is a plain Megatron engine sized by its own layout, and
@@ -102,8 +105,8 @@ def role_policy_config(
     Args:
         policy_config: The full ``policy`` config.
         role: ``prefill`` or ``decode``.
-        overrides: Layout keys from ``MegatronDynamoCfg.role_overrides``; empty for
-            a role that keeps the shared layout.
+        overrides: Keys from ``MegatronDynamoCfg.role_overrides``; empty for
+            a role that keeps the shared ``mcore_generation_config``.
 
     Returns:
         A fresh config for one engine of ``role``.
@@ -187,15 +190,6 @@ def cluster_node_ip() -> str:  # pragma: no cover
 
 def _seconds_left(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
-
-
-class PinnedHandoffTimeout(RuntimeError):
-    """Blocks were still pinned for decode handoffs when the suspend deadline passed.
-
-    Deliberately not a ``TimeoutError``: the controller's refit await treats any
-    ``TimeoutError`` escaping the refit as its own deadline and replaces it with
-    a "rank not answering" abort, dropping this message and its notes.
-    """
 
 
 @dataclasses.dataclass(frozen=True)
@@ -288,6 +282,28 @@ class MegatronDynamoEngine:
             for worker in self.workers
         ]
 
+    def init_collective_mcore_generation(
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        rank_offset: int,
+        refit_execution_batch_bytes: int | None,
+        refit_backend: str,
+    ) -> list[ray.ObjectRef]:
+        # As init_collective: every worker gets the engine's offset and adds
+        # its own rank inside the engine to it.
+        return self._all(
+            "init_collective_mcore_generation",
+            ip=ip,
+            port=port,
+            world_size=world_size,
+            rank_offset=rank_offset,
+            refit_execution_batch_bytes=refit_execution_batch_bytes,
+            refit_backend=refit_backend,
+        )
+
     def update_weights_from_collective(
         self, refit_timeout_s: float | None
     ) -> list[ray.ObjectRef]:
@@ -295,17 +311,14 @@ class MegatronDynamoEngine:
             "update_weights_from_collective", refit_timeout_s=refit_timeout_s
         )
 
-    def pause_for_refit(self) -> list[ray.ObjectRef]:
-        return self._all("pause_for_refit")
+    def swap_weights_via_reshard(self) -> list[ray.ObjectRef]:
+        return self._all("swap_weights_via_reshard", is_source=False)
 
     def suspend_for_refit(self) -> list[ray.ObjectRef]:
         return self._all("suspend_for_refit")
 
     def resume_after_refit(self) -> list[ray.ObjectRef]:
         return self._all("resume_after_refit")
-
-    def pinned_handoff_block_count(self) -> ray.ObjectRef:
-        return self.leader.pinned_handoff_block_count.remote()
 
     def prepare_for_generation(self, *, tags: list[str]) -> list[ray.ObjectRef]:
         return self._all("prepare_for_generation", tags=tags)
@@ -368,11 +381,9 @@ class MegatronDynamoGeneration(GenerationInterface):
     completions, one request per prompt.
     """
 
-    # How often the refit pause re-reads the prefill engines' pinned handoff
-    # blocks while waiting for them to drain.
-    _idle_poll_interval_s: float = 0.2
-    # How often that wait prints the counts it is still waiting on.
-    _pin_report_interval_s: float = 10.0
+    # Engines built at once. Building a 64-engine fleet one engine at a time
+    # took about two hours; the refit rank order does not depend on it.
+    _engine_build_concurrency: int = 8
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
@@ -756,11 +767,12 @@ class MegatronDynamoGeneration(GenerationInterface):
 
     @property
     def uses_native_refit(self) -> bool:
-        """Never: the engines take the packed collective, as ``refit_transport`` must be null.
+        """Whether the engines refit through Megatron-Core's native path (``refit_transport: mcore``).
 
-        Read by the Megatron weight synchronizer to pick its transport.
+        Read by the Megatron weight synchronizer to pick its transport. False
+        is the packed collective.
         """
-        return False
+        return self.cfg.get("refit_transport") == "mcore"
 
     @property
     def worker_group(self) -> "RayWorkerGroup":
@@ -880,10 +892,21 @@ class MegatronDynamoGeneration(GenerationInterface):
         *,
         train_world_size: int,
     ) -> list[ray.ObjectRef]:
-        """Join every engine to the NeMo RL ``model_update_group`` at its rank prefix.
+        """Join every engine to the refit group at its rank prefix.
 
         Engine ``i``'s workers are offset to the absolute rank where its shard
-        starts: the trainers plus its prefix within the generation block.
+        starts: the trainers plus its prefix within the generation block. The
+        packed collective joins NeMo RL's ``model_update_group``; the native
+        refit (``refit_transport: mcore``) builds Megatron-Core's refit group
+        and its transfer plan, with every training rank joining at the same
+        time.
+
+        The native plan needs no per-engine pools. Each engine is its own
+        torch.distributed world, and Megatron-Core shifts every group rank an
+        engine reports by that engine's offset, so one plan sees each engine at
+        its true ranks with its own tensor-parallel group. The plan is worked
+        out per receiving rank from that rank's own layout, so a TP 2 prefill
+        engine and TP 1 decode engines are refit in the same transfer.
         """
         expected = train_world_size + self.inference_world_size
         if world_size != expected:
@@ -891,25 +914,58 @@ class MegatronDynamoGeneration(GenerationInterface):
                 f"NCCL world_size={world_size} does not match expected {expected} "
                 f"(train={train_world_size} + engines={self.inference_world_size})"
             )
-        membership = self.full_fleet_membership(train_world_size)
+        offsets = self.engine_rank_offsets(train_world_size)
         futures: list[ray.ObjectRef] = []
-        for index, record in enumerate(self._engine_records):
+        if self.uses_native_refit:
+            mcore_cfg = self.cfg["mcore_generation_config"]
+            for record, offset in zip(self._engine_records, offsets, strict=True):
+                futures.extend(
+                    record.init_collective_mcore_generation(
+                        ip,
+                        port,
+                        world_size,
+                        rank_offset=offset,
+                        refit_execution_batch_bytes=mcore_cfg[
+                            "refit_execution_batch_bytes"
+                        ],
+                        refit_backend=mcore_cfg["refit_backend"],
+                    )
+                )
+            return futures
+        for record, offset in zip(self._engine_records, offsets, strict=True):
             futures.extend(
                 record.init_collective(
                     ip,
                     port,
-                    membership.world_size,
-                    train_world_size=membership.train_world_size,
-                    rank_offset=membership.train_world_size
-                    + membership.shard_prefixes[index],
+                    world_size,
+                    train_world_size=train_world_size,
+                    rank_offset=offset,
                 )
             )
         return futures
 
+    def engine_rank_offsets(self, train_world_size: int) -> list[int]:
+        """Refit-group rank of each engine's rank zero, in record order.
+
+        The trainers take ranks ``0 .. train_world_size - 1``; engine ``i``
+        starts right after the trainers and the engines before it.
+        """
+        membership = self.full_fleet_membership(train_world_size)
+        return [
+            membership.train_world_size + membership.shard_prefixes[index]
+            for index in range(self.num_engines)
+        ]
+
     def prepare_refit_info(
         self, state_dict_info: Optional[dict[str, Any]]
     ) -> Optional[list[str]]:
-        """Prepare Bridge conversion tasks on every engine."""
+        """Prepare Bridge conversion tasks on every engine.
+
+        A no-op with the native refit, which moves Megatron shards and never
+        imports HF tensors (as on ``MegatronGeneration``).
+        """
+        if self.uses_native_refit:
+            return None
         if state_dict_info is None:
             raise ValueError("state_dict_info must not be None for Megatron refit")
         # Stored once; every worker resolves the same object.
@@ -925,8 +981,19 @@ class MegatronDynamoGeneration(GenerationInterface):
     def update_weights_from_collective(
         self, refit_timeout_s: Optional[float] = None
     ) -> list[ray.ObjectRef]:
-        """Receive one collective refit on every engine: a packed broadcast into the live parameters."""
+        """Receive one refit on every engine, into the live parameters.
+
+        The packed collective is a broadcast of HF tensors from train rank
+        zero. The native refit is Megatron-Core's ``swap_model_weights``, with
+        every engine rank receiving its own shards; it cannot be aborted, so a
+        deadline is refused before any engine enters it.
+        """
         futures: list[ray.ObjectRef] = []
+        if self.uses_native_refit:
+            reject_unenforceable_refit_deadline("Megatron", refit_timeout_s)
+            for record in self._engine_records:
+                futures.extend(record.swap_weights_via_reshard())
+            return futures
         for record in self._engine_records:
             futures.extend(record.update_weights_from_collective(refit_timeout_s))
         return futures
@@ -944,101 +1011,6 @@ class MegatronDynamoGeneration(GenerationInterface):
     # Fence around the transfer
     # ------------------------------------------------------------------
 
-    def _wait_for_prefill_handoffs(
-        self, prefill: Sequence[int], deadline: float
-    ) -> None:
-        """Wait until no prefill engine holds a pinned handoff.
-
-        A pinned block is prompt KV a decode engine may still be pulling over
-        NIXL; suspending the prefill engine while any are pinned could corrupt
-        that transfer. Requests may still be in flight (nothing holds new ones
-        back), but the prefill engines are paused, so no new handoff starts.
-        The count decreases as a still-running decode engine finds room for a
-        handoff it claimed (free KV blocks, then a batch slot), pulls it and
-        releases it after its first streamed token, or as Megatron-LM's
-        prefill coordinator releases an offer no decode engine claimed once
-        its offer timeout (300 s by default) passes.
-
-        Every engine is probed on each poll, so a dead engine or endpoint
-        fails the wait as itself. The counts are printed on the first nonzero
-        read and then every ``_pin_report_interval_s``.
-
-        Raises:
-            PinnedHandoffTimeout: Blocks were still pinned when the deadline
-                passed, including a pin read or probe the deadline cut off.
-            ray.exceptions.GetTimeoutError: A pin read ran past the deadline
-                while every engine's latest count was zero (always so for the
-                first read).
-            ray.exceptions.RayActorError: A prefill worker died during a pin
-                read. Other errors from a pin read also propagate unchanged;
-                each carries a note naming the engine.
-            RuntimeError: The liveness probe found an engine dead or its
-                endpoint no longer serving.
-        """
-        # The last count read from each engine, kept across polls so a spent
-        # deadline reports what is still pinned.
-        pinned: dict[str, int] = {}
-        stuck = (
-            "prefill engines still hold KV blocks pinned for decode handoffs: "
-            "{pinned}. A decode engine releases a pin it claimed after it "
-            "admits the handoff and streams its first token; the prefill "
-            "coordinator releases an offer no decode engine claimed once "
-            "Megatron-LM's offer timeout (300 s by default) passes. So either a "
-            "decode engine that claimed a handoff has stalled or died (see its "
-            "rank-zero log), or this wait ended before an unclaimed offer "
-            "expired; raise policy.generation.dynamo_cfg.control_timeout_s "
-            "above that offer timeout."
-        )
-        next_report = float("-inf")
-        while True:
-            # Checked before a read: one issued with no time left cannot be
-            # answered (Ray's get at timeout 0 raises unless the value is ready).
-            if any(pinned.values()) and _seconds_left(deadline) <= 0:
-                raise PinnedHandoffTimeout(stuck.format(pinned=pinned))
-            pending = [
-                (index, self._engine_records[index].pinned_handoff_block_count())
-                for index in prefill
-            ]
-            for index, future in pending:
-                instance_id = self._engine_records[index].instance_id
-                try:
-                    pinned[instance_id] = int(
-                        ray.get(future, timeout=_seconds_left(deadline))
-                    )
-                except ray.exceptions.GetTimeoutError as error:
-                    if any(pinned.values()):
-                        raise PinnedHandoffTimeout(
-                            stuck.format(pinned=pinned)
-                        ) from error
-                    error.add_note(
-                        f"reading pinned handoff blocks failed on engine {instance_id}"
-                    )
-                    raise
-                except Exception as error:
-                    error.add_note(
-                        f"reading pinned handoff blocks failed on engine {instance_id}"
-                    )
-                    raise
-            if not any(pinned.values()):
-                return
-            if time.monotonic() >= next_report:
-                print(
-                    "  [Dynamo] Refit waiting for the KV blocks prefill pins "
-                    f"for decode handoffs to drain: {pinned}",
-                    flush=True,
-                )
-                next_report = time.monotonic() + self._pin_report_interval_s
-            # Only a running decode engine releases a pin it claimed, so a dead
-            # engine or endpoint must surface as itself, not as this wait
-            # running out.
-            # The probe shares the wait's deadline; one it cuts off is the
-            # wait running out.
-            try:
-                self.check_alive(timeout_s=_seconds_left(deadline))
-            except ray.exceptions.GetTimeoutError as error:
-                raise PinnedHandoffTimeout(stuck.format(pinned=pinned)) from error
-            time.sleep(min(self._idle_poll_interval_s, _seconds_left(deadline)))
-
     def _restore_engines(self, indices: Sequence[int], *, deadline: float) -> list[str]:
         """Resume ``indices`` in one wave, in record order; return the failures."""
         errors: list[str] = []
@@ -1052,38 +1024,36 @@ class MegatronDynamoGeneration(GenerationInterface):
         return errors
 
     def suspend_for_refit(self, *, timeout_s: float | None = None) -> None:
-        """Suspend every engine in the order that keeps prefill handoffs whole.
+        """Suspend every engine for the transfer, prefill first.
 
-        Prefill engines stop scheduling first, so no new handoff can start,
-        then this waits until decode has pulled every block prefill still
-        pins. Only then are the prefill engines suspended, then the decode
-        engines. The caller prepares the weights afterwards, as the Megatron
-        weight synchronizer does for one dedicated engine.
+        Prefill does not wait for decode to pull the KV blocks it still pins
+        for handoffs. Prefill/decode engines run with the ``persist`` KV cache
+        (the config refuses anything else), where suspend and resume leave the
+        KV and recurrent-state memory, the block allocator and the pinned
+        blocks untouched, and the weight transfer writes only parameters. A
+        decode engine can therefore pull a pinned block before, during or after
+        the refit and read the same bytes. Waiting for the pins instead tied the
+        refit to decode capacity: with a deep decode backlog the pins did not
+        drain for over an hour. A prompt prefilled before the refit is decoded
+        with the new weights, as an aggregated engine's in-flight request is.
 
         If any step fails or the deadline passes, the fleet attempts a
         best-effort resume of every engine the suspend reached (prefill after
-        a failed pause, pin wait or prefill suspend; every engine after a
-        failed decode suspend) and the original error still propagates, with
-        any resume failures added to it as notes. A worker that failed
-        mid-transition may need the next refit to recover.
+        a failed prefill suspend; every engine after a failed decode suspend)
+        and the original error still propagates, with any resume failures
+        added to it as notes. A worker that failed mid-transition may need the
+        next refit to recover.
 
         Args:
             timeout_s: One deadline for the whole suspend; ``None`` uses
                 ``dynamo_cfg.control_timeout_s``.
 
         Raises:
-            PinnedHandoffTimeout: Blocks were still pinned when the deadline
-                passed, including a pin read or liveness probe the deadline
-                cut off.
-            ray.exceptions.GetTimeoutError: A pause or suspend call ran past
-                the deadline, or a pin read did while every engine's latest
-                count was zero.
-            RuntimeError: An engine died or its endpoint stopped serving
-                while prefill still pinned blocks.
-            ray.exceptions.RayActorError: A worker died during a pause,
-                suspend or pin read. Other worker errors propagate unchanged;
-                every error from those calls carries a note naming the engine
-                and the step.
+            ray.exceptions.GetTimeoutError: A suspend call ran past the
+                deadline.
+            ray.exceptions.RayActorError: A worker died during a suspend.
+                Other worker errors propagate unchanged; every error from
+                those calls carries a note naming the engine and the step.
         """
         timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout_s
@@ -1093,13 +1063,6 @@ class MegatronDynamoGeneration(GenerationInterface):
         # the call may have taken effect anyway.
         reached = list(prefill)
         try:
-            self._call_engines(
-                prefill,
-                lambda record: record.pause_for_refit(),
-                what="pause_for_refit",
-                deadline=deadline,
-            )
-            self._wait_for_prefill_handoffs(prefill, deadline)
             self._call_engines(
                 prefill,
                 lambda record: record.suspend_for_refit(),
@@ -1397,12 +1360,14 @@ class MegatronDynamoGeneration(GenerationInterface):
             num_pinned_nodes=None if constraints is None else len(constraints),
         )
         # Each role's engines are built from the policy config with that
-        # role and its layout overrides.
+        # role and its overrides.
         policy_config_by_role: dict[str, dict[str, Any]] = {}
         for role in distinct_roles:
             policy_config_by_role[role] = role_policy_config(
                 self._policy_config, role, self._dynamo_cfg.role_overrides(role)
             )
+        # One call per engine, in launch order, that starts it.
+        starts: list[Callable[[], tuple[MegatronGeneration, MegatronDynamoEngine]]] = []
         role_counts: dict[str, int] = {}
         for engine_index, role in enumerate[MegatronDynamoRole](roles):
             ordinal = role_counts.get(role, 0)
@@ -1424,6 +1389,8 @@ class MegatronDynamoGeneration(GenerationInterface):
                     else [constraints[pin_index_by_engine[engine_index]]]
                 ),
             )
+            # Owned from here on, so a failed build still removes every
+            # placement group at shutdown.
             self._clusters.append(cluster)
             # Reserved the way the engine will reserve them (always PACK,
             # since Dynamo engines are never colocated; idempotent), so a
@@ -1435,31 +1402,99 @@ class MegatronDynamoGeneration(GenerationInterface):
             # The engine's rank zero (its single model-parallel coordinator)
             # serves NeMo-Gym on the port reserved for this engine, if any.
             reserved_port = self._reserved_http_server_ports.get(engine_index)
-            engine = MegatronGeneration(
-                config=engine_policy_config,
-                tokenizer=self._tokenizer,
-                cluster=cluster,
-                name_prefix=f"dynamo_{instance_id}",
-                skip_weight_load=True,
-                reserved_http_server_ports=(
-                    None if reserved_port is None else {0: reserved_port}
-                ),
-            )
-            self._engines.append(engine)
-            self._engine_records.append(
-                MegatronDynamoEngine.of(
-                    engine,
+            starts.append(
+                functools.partial(
+                    self._start_engine,
                     role=role,
-                    world_size=width,
                     instance_id=instance_id,
+                    width=width,
+                    config=engine_policy_config,
+                    cluster=cluster,
                     node_ip=node_ip,
+                    reserved_port=reserved_port,
                 )
             )
+
+        # A build mostly waits on Ray actors and the model construction, so
+        # engines are built several at a time, in rounds; a failed round
+        # submits nothing more, so a bad engine stops the fleet instead of
+        # occupying every node first.
+        started: dict[int, tuple[MegatronGeneration, MegatronDynamoEngine]] = {}
+        first_error: Optional[BaseException] = None
+        workers = max(1, min(self._engine_build_concurrency, len(starts)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for round_start in range(0, len(starts), workers):
+                futures = {
+                    pool.submit(starts[index]): index
+                    for index in range(
+                        round_start, min(round_start + workers, len(starts))
+                    )
+                }
+                for future in as_completed(futures):
+                    try:
+                        started[futures[future]] = future.result()
+                    except BaseException as error:  # noqa: BLE001 - re-raised below
+                        first_error = first_error or error
+                if first_error is not None:
+                    break
+        # Registered in launch order (the refit rank order), including what was
+        # built before a failure, so shutdown stops those engines too.
+        for index in sorted(started):
+            engine, record = started[index]
+            self._engines.append(engine)
+            self._engine_records.append(record)
             print(
-                f"  [Dynamo:{instance_id}] engine ready for refit on "
-                f"{node_ip} ({width} ranks)",
+                f"  [Dynamo:{record.instance_id}] engine ready for refit on "
+                f"{record.node_ip} ({record.world_size} ranks)",
                 flush=True,
             )
+        if first_error is not None:
+            raise first_error
+
+    def _start_engine(
+        self,
+        *,
+        role: MegatronDynamoRole,
+        instance_id: str,
+        width: int,
+        config: PolicyConfig,
+        cluster: RayVirtualCluster,
+        node_ip: str,
+        reserved_port: Optional[int],
+    ) -> tuple[MegatronGeneration, MegatronDynamoEngine]:
+        """Start one engine on its placed cluster, without weights until the first refit.
+
+        Args:
+            role: ``prefill`` or ``decode``.
+            instance_id: ``<role>-<ordinal>``, the engine's name in logs and errors.
+            width: Ranks the engine spans.
+            config: The engine's role-specific policy config.
+            cluster: The engine's cluster, placement groups already reserved.
+            node_ip: The node every rank of the engine sits on.
+            reserved_port: The NeMo-Gym port reserved for the engine's rank
+                zero, or ``None`` if it serves none.
+
+        Returns:
+            The engine and its record.
+        """
+        engine = MegatronGeneration(
+            config=config,
+            tokenizer=self._tokenizer,
+            cluster=cluster,
+            name_prefix=f"dynamo_{instance_id}",
+            skip_weight_load=True,
+            reserved_http_server_ports=(
+                None if reserved_port is None else {0: reserved_port}
+            ),
+        )
+        record = MegatronDynamoEngine.of(
+            engine,
+            role=role,
+            world_size=width,
+            instance_id=instance_id,
+            node_ip=node_ip,
+        )
+        return engine, record
 
     def _engine_node_ip(self, cluster: RayVirtualCluster, instance_id: str) -> str:
         """Node every bundle of an engine's cluster sits on.

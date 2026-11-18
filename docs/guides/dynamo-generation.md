@@ -156,7 +156,7 @@ policy:
   generation:
     backend: megatron
     dynamo: true             # serve the engines through a managed Dynamo frontend
-    refit_transport: null    # collective refit only
+    refit_transport: null    # packed collective; or mcore (see below)
     dynamo_cfg: {}           # frontend args, timeouts, per-role layouts; all defaulted
     disaggregation:
       enabled: true
@@ -203,7 +203,10 @@ Prefill and decode engines may use different layouts. `dynamo_cfg.prefill_engine
 and `dynamo_cfg.decode_engine` override `tensor_model_parallel_size` and
 `pipeline_model_parallel_size` for one role (a `null` field keeps the shared
 layout); Megatron reshards the KV cache during the handoff, so the two sides
-need not match. For example, one prefill engine at TP 4 next to two decode
+need not match. They also take `max_requests`, the cap on requests one engine
+holds at once: a prefill engine keeps each finished prompt in a request slot
+until a decode engine claims it, so while decode is full a shared cap also
+throttles prefill. For example, one prefill engine at TP 4 next to two decode
 engines at TP 2 is an 8-GPU replica:
 
 ```yaml
@@ -220,6 +223,10 @@ policy:
       tensor_model_parallel_size: 2
 ```
 
+For hybrid (Mamba) models, `mcore_generation_config.prefix_caching_mamba_gb`
+sets the Mamba prefix-cache budget of the prefill engines only. Decode engines
+always run without one: they import each handoff straight into live SSM state.
+
 With `T` trainer ranks, the refit collective places the trainer ranks first,
 then the engines in launch order, each starting where the previous one ended:
 the prefill engine at `T..T+3`, the decode engines at `T+4..T+5` and
@@ -234,18 +241,28 @@ the fleet standing in for one dedicated engine:
   first refit, and the first resume waits for the frontend to list every
   engine and the model before rollouts start. `dynamo_cfg.startup_timeout_s`
   bounds the services' start-up and that registration.
-- A request spans two engines, and a prefill engine must not be suspended while
-  a decode engine may still be pulling one of its KV blocks (a "handoff pin").
-  So the suspend stops the prefill engines from scheduling first, keeps decode
-  running until every pin on prefill has cleared, then suspends prefill, then
-  decode, all within `dynamo_cfg.control_timeout_s`. If the pins do not clear
-  in time the prefill engines are unpaused again and the refit fails rather
-  than leaving the fleet half stopped. Resume brings every engine back in one
-  wave: the engines keep their KV on the GPU across suspend and resume, and a
-  handoff that reaches a decode engine still waking is queued, so no role
-  order is needed.
-- The collective is one NCCL group over the trainers plus all engines. The
-  engines receive logical (unfused) weights, as the Megatron backend does.
+- The suspend takes the prefill engines down first, then decode, within
+  `dynamo_cfg.control_timeout_s`; if a step fails, every engine it reached is
+  resumed and the refit fails rather than leaving the fleet half stopped. It
+  does not wait for decode to pull the KV blocks prefill still holds for
+  handoffs (the "handoff pins"): the engines run the `persist` KV cache, so
+  suspend and resume leave the KV memory and the pinned blocks untouched and
+  the transfer writes only parameters, and a decode engine reads the same
+  bytes whether it pulls a block before, during or after the refit. Waiting
+  for the pins would tie the refit to decode capacity. Resume brings every
+  engine back in one wave: the engines keep their KV on the GPU across suspend
+  and resume, and a handoff that reaches a decode engine still waking is
+  queued, so no role order is needed.
+- The collective is one group over the trainers plus all engines.
+  `refit_transport: null` broadcasts HF tensors from train rank zero and every
+  engine rank imports them into Megatron. `refit_transport: mcore` with
+  `mcore_generation_config.refit_backend: nccl` (or `gloo`) uses
+  Megatron-Core's native refit instead, as the aggregated Megatron engines
+  do: each training rank sends its own shards straight to the engine ranks
+  that hold them. One transfer covers every engine even when prefill and
+  decode use different tensor-parallel sizes, because each engine reports its
+  layout at its own ranks in the group. Like the aggregated native refit, it
+  needs `async_rl.generation_fleet_health.refit_timeout_s: null`.
 - Shutdown stops decode engines first, confirms their termination to every
   prefill coordinator so pinned blocks are released, then stops prefill, then
   the frontend, NATS and etcd.
@@ -265,7 +282,8 @@ Limits:
   (`token_capture.enabled`) is not yet supported on this path: the capture
   admission does not travel through the frontend to the engines.
 - Text prompts only (`policy.is_vlm` false); no router replay.
-- Each engine fits on one node; `refit_transport` must be null;
+- Each engine fits on one node; `refit_transport` must be null or `mcore`
+  (with `refit_backend` `nccl` or `gloo`);
   `recompute_kv_cache_after_weight_updates` must be false (the engines keep
   their caches, mode `persist`); setup rejects these otherwise.
 - Data-plane storage units cannot be placed on the `inference` cluster
