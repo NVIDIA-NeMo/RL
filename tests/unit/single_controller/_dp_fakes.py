@@ -175,6 +175,19 @@ class _ReadyGroupBuffer:
         self.target_step_list: list[int] = []
         self.ready_list: list[bool] = []
 
+    def __len__(self) -> int:
+        return len(self.meta_list)
+
+    @property
+    def start_weight_list(self) -> list[int]:
+        return [0] * len(self.meta_list)
+
+    def training_owned_group_ids(self) -> set[str]:
+        return set()
+
+    def release_training_claims(self, group_ids: list[str]) -> None:
+        del group_ids
+
     def add_groups(self, count: int) -> None:
         for _ in range(count):
             group = f"group-{self._groups_added}"
