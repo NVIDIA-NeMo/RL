@@ -77,12 +77,10 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # Gym-v2 active-decode recovery: checkpoint a nonterminal vLLM prefix, restart
 # the process, restore that exact prefix, and generate only its remaining tail.
 # Three launches on 2 GPUs: an uninterrupted reference, the interrupted run and
-# the recovery (7-9 minutes locally). Full tier: it depends on three runs making
-# the same near-greedy choices, and local runs have failed for reasons outside
-# recovery, so it stays out of fast lanes until a CI-GPU pass rate is shown.
+# the recovery (7-9 minutes locally).
 # Score centering with sampler replay: each cut also stages the sampler top-k,
 # and a resumed row trains with it (the settings of the H100 verification run).
-run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh ++policy.generation.top_logprobs=4 ++loss_fn.score_centering=true ++policy.generation.sampler_replay.enabled=true ++policy.generation.top_k=4
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh ++policy.generation.top_logprobs=4 ++loss_fn.score_centering=true ++loss_fn.sequence_level_importance_ratios=false ++policy.generation.sampler_replay.enabled=true ++policy.generation.top_k=4
 # The same active-decode recovery with MoE router replay, on a tiny random MoE:
 # each restored call must stage the routes it restored for training.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_router_replay_prefix_recovery_single_controller_1n2g.sh
