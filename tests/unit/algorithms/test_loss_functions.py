@@ -46,52 +46,6 @@ from nemo_rl.distributed.model_utils import (
 )
 
 
-def _clipped_pg_diagnostics(
-    ratios: torch.Tensor, mask: torch.Tensor
-) -> dict[str, torch.Tensor]:
-    logprobs = torch.zeros_like(ratios)
-    return clipped_pg_diagnostic_metrics(
-        curr_logprobs=logprobs,
-        prev_logprobs=logprobs,
-        generation_logprobs=logprobs,
-        ratios=ratios,
-        ratios_clamped=ratios.clamp(0.8, 1.2),
-        mask=mask,
-        global_valid_toks=torch.tensor(1.0),
-        reference_policy_kl_type="k3",
-    )
-
-
-def test_clipped_pg_diagnostics_take_an_empty_microbatch() -> None:
-    """A rank whose microbatch is only a failed rollout's empty placeholder row
-    gets zero-size ratios; min/max must not raise on them."""
-    empty = torch.zeros(1, 0)
-
-    metrics = _clipped_pg_diagnostics(empty, empty)
-
-    assert metrics["probs_ratio_min"].item() == float("inf")
-    assert metrics["probs_ratio_max"].item() == float("-inf")
-    assert metrics["probs_ratio_clamped_min"].item() == float("inf")
-    assert metrics["probs_ratio_clamped_max"].item() == float("-inf")
-
-
-def test_clipped_pg_diagnostics_min_max_follow_the_mask() -> None:
-    ratios = torch.tensor([[0.5, 1.1, 3.0, 9.0]])
-    mask = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
-
-    metrics = _clipped_pg_diagnostics(ratios, mask)
-
-    assert metrics["probs_ratio_min"].item() == pytest.approx(0.5)
-    assert metrics["probs_ratio_max"].item() == pytest.approx(3.0)
-    assert metrics["probs_ratio_clamped_min"].item() == pytest.approx(0.8)
-    assert metrics["probs_ratio_clamped_max"].item() == pytest.approx(1.2)
-
-    # A fully masked microbatch yields the same sentinels as an empty one.
-    masked_out = _clipped_pg_diagnostics(ratios, torch.zeros_like(mask))
-    assert masked_out["probs_ratio_min"].item() == float("inf")
-    assert masked_out["probs_ratio_max"].item() == float("-inf")
-
-
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
     seq_len = 4
     data = {
@@ -719,6 +673,52 @@ def test_clipped_pg_loss_tokenless_rows_are_not_survivors(seq_logprob_error_in_l
     if seq_logprob_error_in_loss:
         assert metrics["seq_logprob_error_valid_tokens"] == 0
         assert metrics["seq_logprob_error_valid_seqs"] == 0
+
+
+def _clipped_pg_diagnostics(
+    ratios: torch.Tensor, mask: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    logprobs = torch.zeros_like(ratios)
+    return clipped_pg_diagnostic_metrics(
+        curr_logprobs=logprobs,
+        prev_logprobs=logprobs,
+        generation_logprobs=logprobs,
+        ratios=ratios,
+        ratios_clamped=ratios.clamp(0.8, 1.2),
+        mask=mask,
+        global_valid_toks=torch.tensor(1.0),
+        reference_policy_kl_type="k3",
+    )
+
+
+def test_clipped_pg_diagnostics_take_an_empty_microbatch() -> None:
+    """A rank whose microbatch is only a failed rollout's empty placeholder row
+    gets zero-size ratios; min/max must not raise on them."""
+    empty = torch.zeros(1, 0)
+
+    metrics = _clipped_pg_diagnostics(empty, empty)
+
+    assert metrics["probs_ratio_min"].item() == float("inf")
+    assert metrics["probs_ratio_max"].item() == float("-inf")
+    assert metrics["probs_ratio_clamped_min"].item() == float("inf")
+    assert metrics["probs_ratio_clamped_max"].item() == float("-inf")
+
+
+def test_clipped_pg_diagnostics_min_max_follow_the_mask() -> None:
+    ratios = torch.tensor([[0.5, 1.1, 3.0, 9.0]])
+    mask = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
+
+    metrics = _clipped_pg_diagnostics(ratios, mask)
+
+    assert metrics["probs_ratio_min"].item() == pytest.approx(0.5)
+    assert metrics["probs_ratio_max"].item() == pytest.approx(3.0)
+    assert metrics["probs_ratio_clamped_min"].item() == pytest.approx(0.8)
+    assert metrics["probs_ratio_clamped_max"].item() == pytest.approx(1.2)
+
+    # A fully masked microbatch yields the same sentinels as an empty one.
+    masked_out = _clipped_pg_diagnostics(ratios, torch.zeros_like(mask))
+    assert masked_out["probs_ratio_min"].item() == float("inf")
+    assert masked_out["probs_ratio_max"].item() == float("-inf")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

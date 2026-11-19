@@ -17,6 +17,7 @@ from typing import Optional
 import torch
 
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.utils.tensor_ops import masked_max, masked_min
 
 
 def materialize_scalar_metrics(
@@ -48,23 +49,6 @@ def adaptive_ppo_clip_kept_mask(
         & ((advantages >= 0) | (importance_weights >= lower_bound))
         & ((advantages <= 0) | (importance_weights <= upper_bound))
     )
-
-
-def _masked_extreme(
-    values: torch.Tensor, valid_mask: torch.Tensor, *, largest: bool
-) -> torch.Tensor:
-    """Max (or min) of the valid entries; -inf (or +inf) when there are none.
-
-    A microbatch can hold no tokens at all: a failed rollout is published as an
-    empty placeholder row, and a rank may receive only that row. torch's min()
-    and max() reject an empty tensor, so return the same sentinel a fully
-    masked microbatch already yields.
-    """
-    fill = float("-inf") if largest else float("inf")
-    if values.numel() == 0:
-        return values.new_full((), fill)
-    filled = torch.where(valid_mask, values, values.new_full((), fill))
-    return filled.max() if largest else filled.min()
 
 
 @torch.no_grad()
@@ -122,7 +106,6 @@ def clipped_pg_diagnostic_metrics(
         global_normalization_factor=global_valid_toks,
     )
 
-    valid_mask = mask.bool()
     return {
         "probs_ratio": masked_mean(
             ratios, mask, global_normalization_factor=global_valid_toks
@@ -130,14 +113,10 @@ def clipped_pg_diagnostic_metrics(
         "probs_ratio_clamped": masked_mean(
             ratios_clamped, mask, global_normalization_factor=global_valid_toks
         ),
-        "probs_ratio_min": _masked_extreme(ratios, valid_mask, largest=False),
-        "probs_ratio_max": _masked_extreme(ratios, valid_mask, largest=True),
-        "probs_ratio_clamped_min": _masked_extreme(
-            ratios_clamped, valid_mask, largest=False
-        ),
-        "probs_ratio_clamped_max": _masked_extreme(
-            ratios_clamped, valid_mask, largest=True
-        ),
+        "probs_ratio_min": masked_min(ratios, mask),
+        "probs_ratio_max": masked_max(ratios, mask),
+        "probs_ratio_clamped_min": masked_min(ratios_clamped, mask),
+        "probs_ratio_clamped_max": masked_max(ratios_clamped, mask),
         "gen_kl_error": gen_kl_error,
         "policy_kl_error": policy_kl_error,
         "js_divergence_error": js_divergence_error,
