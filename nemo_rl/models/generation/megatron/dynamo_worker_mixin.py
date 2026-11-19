@@ -19,7 +19,6 @@ import os
 import uuid
 from concurrent.futures import CancelledError
 from concurrent.futures import Future as ConcurrentFuture
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
@@ -32,10 +31,6 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.models.generation.megatron.dynamo_config import DYNAMO_COMPONENT_BY_ROLE
-from nemo_rl.models.generation.megatron.megatron_worker import _http_sampling_defaults
-
-# Bound on the NeMo-Gym proxy server answering its health check after it starts.
-GYM_PROXY_START_TIMEOUT_S = 300.0
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts.dynamic_context import (
@@ -47,21 +42,13 @@ if TYPE_CHECKING:
     )
     from megatron.inference.integrations.dynamo.telemetry import EngineEventReporter
 
+    from nemo_rl.data.captured_media import MediaColumnSpec
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
+    from nemo_rl.models.generation.megatron.token_capture import (
+        TQMegatronTokenStager,
+    )
+
 LOGGER = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class GymProxyTarget:
-    """Where a rank's NeMo-Gym proxy server sends its completions.
-
-    Attributes:
-        frontend_url: The frontend's ``/v1`` URL.
-        request_timeout_s: Deadline for one completion through the frontend;
-            None waits as long as generation takes.
-    """
-
-    frontend_url: str
-    request_timeout_s: Optional[float]
 
 
 def require_megatron_dynamo_integration() -> None:
@@ -98,8 +85,15 @@ class MegatronDynamoGenerationMixin:
      - _inference_loop: the engine's asyncio loop.
      - _inference_engine_initialized: whether the engine is built.
      - _start_inference_loop_thread(): starts the loop when it is not up yet.
-     - megatron_tokenizer, inference_wrapped_model, _reserved_http_server_port:
-       what the NeMo-Gym proxy server is built from.
+     - _token_capture_enabled: set once token capture is set up, which
+       set_rollout_weight_version checks.
+
+    Token capture behind Dynamo installs none of the engine-side Megatron-LM
+    hooks the base class does (``engine.prompt_preparer`` and
+    ``engine.payload_stager``): the frontend reads the capture prefix and
+    splices it, and the decode engine's adapter stages each finished call
+    through ``stage_dynamo_gym_call``. So no engine prepares or stages a
+    request itself, and a call never carries ``offload_params``.
     """
 
     cfg: dict[str, Any]
@@ -108,15 +102,7 @@ class MegatronDynamoGenerationMixin:
     coordinator_addr: Optional[str]
     _inference_loop: Optional[asyncio.AbstractEventLoop]
     _inference_engine_initialized: bool
-    megatron_tokenizer: Any
-    inference_wrapped_model: Any
-    _reserved_http_server_port: Optional[int]
-    # Where NeMo-Gym's proxy server sends completions, once the owner has
-    # started the frontend (configure_dynamo_gym_proxy). Survives engine
-    # rebuilds, so it is not reset with the engine state.
-    _dynamo_gym_frontend: Optional[GymProxyTarget] = None
-    # Rank zero only: the proxy server task on the inference loop.
-    _dynamo_gym_proxy_future: Optional[ConcurrentFuture] = None
+    _token_capture_enabled: bool
 
     @property
     def _dynamo_role(self) -> str:
@@ -140,6 +126,9 @@ class MegatronDynamoGenerationMixin:
         # What start_dynamo_endpoint returned; kept so a repeat call and the
         # owner's teardown read the same ports and handoff owner.
         self._dynamo_endpoint_metadata: Optional[dict[str, Any]] = None
+        # Decode rank zero only: the stager setup_token_capture builds for
+        # stage_dynamo_gym_call. Never attached to the engine.
+        self._dynamo_gym_stager: Optional["TQMegatronTokenStager"] = None
 
     def _inference_config_overrides(self) -> dict[str, Any]:
         # Prefill and decode engines are separate process groups, so the
@@ -309,8 +298,9 @@ class MegatronDynamoGenerationMixin:
         from dynamo.common.backend import Worker
         from dynamo.common.model_fetch import fetch_model
         from megatron.inference.integrations.dynamo.args import Config
-        from megatron.inference.integrations.dynamo.llm_engine import (
-            MegatronLLMEngine,
+
+        from nemo_rl.models.generation.dynamo.megatron.adapter import (
+            NemoRLMegatronLLMEngine,
         )
 
         node_ip = _get_node_ip_local()
@@ -369,8 +359,12 @@ class MegatronDynamoGenerationMixin:
                 if model_path.exists()
                 else str(await fetch_model(model_name, ignore_weights=True))
             )
-            engine = MegatronLLMEngine(config, registration_model)
-            worker_config = MegatronLLMEngine.worker_config(config, registration_model)
+            # Megatron-LM's adapter, serving NeMo-Gym's chat calls too: they
+            # are staged here, on the rank that holds the capture stager.
+            engine = NemoRLMegatronLLMEngine(config, registration_model, host=self)
+            worker_config = NemoRLMegatronLLMEngine.worker_config(
+                config, registration_model
+            )
             # Dynamo's Worker installs SIGTERM/SIGINT handlers in this actor
             # process and, on those signals, shuts the adapter down its own way
             # (it force-exits the process if that overruns its deadline).
@@ -416,97 +410,111 @@ class MegatronDynamoGenerationMixin:
             return None
         return dict(self._dynamo_endpoint_metadata)
 
-    def configure_dynamo_gym_proxy(
-        self, *, frontend_url: str, request_timeout_s: Optional[float]
-    ) -> None:
-        """Tell this worker where its NeMo-Gym proxy server sends completions.
+    def _setup_openai_api_server(self) -> Optional[str]:
+        """Start no server: NeMo-Gym calls the Dynamo frontend, never an engine.
 
-        Called by the owner once the frontend runs, before the first refit
-        builds the engine; the proxy itself starts with the engine's HTTP
-        server (``_setup_openai_api_server``), on the rank that would host
-        Megatron-LM's server without Dynamo.
-
-        Args:
-            frontend_url: The frontend's ``/v1`` URL.
-            request_timeout_s: Deadline for one completion through the
-                frontend; None waits as long as generation takes.
+        The frontend's chat engine renders each call and sends it to the
+        engines through Dynamo (``dynamo/megatron/adapter.py``), so the base
+        class's per-engine Megatron-LM server, which would call this engine's
+        coordinator directly and bypass the prefill/decode split, is not
+        started.
         """
-        self._dynamo_gym_frontend = GymProxyTarget(
-            frontend_url=frontend_url, request_timeout_s=request_timeout_s
+        return None
+
+    def dynamo_chat_spec(self) -> dict[str, Any]:
+        """The chat settings this engine registers with the frontend."""
+        # Deferred: the Dynamo chat backend is only loaded behind Dynamo.
+        from nemo_rl.models.generation.dynamo.megatron.chat_backend import (
+            megatron_chat_spec,
         )
 
-    def _setup_openai_api_server(self) -> str:
-        """Start NeMo-Gym's OpenAI server: Megatron-LM's endpoints over the frontend.
+        return megatron_chat_spec(self.cfg["generation"])
 
-        Replaces the base class's server, which would call this engine's
-        coordinator directly and bypass the prefill/decode split. The server
-        runs on the inference loop and adopts the port the driver reserved for
-        this rank, so the URL NeMo-Gym was handed resolves here.
+    def setup_token_capture(
+        self,
+        dp_cfg: "DataPlaneConfig",
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
+    ) -> Optional["MediaColumnSpec"]:
+        """Build the stager ``stage_dynamo_gym_call`` uses; attach nothing to the engine.
+
+        Unlike the base class, no ``prompt_preparer`` or ``payload_stager``
+        goes on the engine: behind Dynamo the frontend splices the capture
+        prefix and the adapter stages the finished call, so an engine-side
+        hook would only see calls it must not touch. Only a decode engine's
+        rank zero builds the stager (and its TQ client): prefill engines
+        generate nothing and never stage. Every rank still marks capture set
+        up, so ``set_rollout_weight_version`` stamps prefill engines too.
 
         Raises:
-            RuntimeError: The owner never passed the frontend URL
-                (``configure_dynamo_gym_proxy``), or the server died at start.
+            NotImplementedError: For media capture, which these engines do not serve.
+            RuntimeError: The engine is not built yet.
         """
-        # Deferred: Quart and hypercorn are Megatron-LM's server dependencies.
-        from nemo_rl.distributed.held_port import receive_held_socket
-        from nemo_rl.models.generation.megatron.dynamo_gym_proxy import (
-            FrontendInferenceClient,
-            bind_server_socket,
-            build_gym_proxy_app,
-            serve_app,
-            wait_until_healthy,
+        if capture_media:
+            raise NotImplementedError(
+                "Megatron engines behind Dynamo serve text prompts only"
+            )
+        engine = self.dynamic_inference_engine
+        if engine is None:
+            raise RuntimeError(
+                "Megatron token capture requires an initialized inference engine"
+            )
+        self._token_capture_enabled = True
+        if self._dynamo_role != "decode" or not engine.is_mp_coordinator:
+            return None
+        if self._dynamo_gym_stager is not None:
+            return None
+
+        from nemo_rl.data_plane import build_data_plane_client
+        from nemo_rl.data_plane.tq_token_sink import TQTokenSink
+        from nemo_rl.models.generation.megatron.token_capture import (
+            TQMegatronTokenStager,
         )
 
-        frontend = self._dynamo_gym_frontend
-        if frontend is None:
+        # Own no segment, as the base class's capture does.
+        dp_client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
+        self._dynamo_gym_stager = TQMegatronTokenStager(
+            TQTokenSink(dp_client, staging_partition=staging_partition),
+            # Router replay is refused behind Dynamo
+            # (MegatronDynamoGeneration.validate_settings).
+            require_routed_experts=False,
+        )
+        return None
+
+    def stage_dynamo_gym_call(
+        self,
+        admission: dict[str, Any],
+        *,
+        prompt_token_ids: list[int],
+        generated_token_ids: list[int],
+        generated_log_probs: list[float],
+        final_record: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Stage a NeMo-Gym call this engine's Dynamo adapter served; return its coords.
+
+        Runs on a decode engine's rank zero, off the inference loop, with the
+        stager ``setup_token_capture`` built.
+
+        Raises:
+            RuntimeError: Token capture was never set up on this engine.
+        """
+        stager = self._dynamo_gym_stager
+        if stager is None:
             raise RuntimeError(
-                "mcore_generation_config.expose_http_server=true with "
-                "policy.generation.dynamo=true needs the frontend URL before the "
-                "engine starts; MegatronDynamoGeneration passes it with "
-                "configure_dynamo_gym_proxy"
+                "a captured NeMo-Gym call reached a Megatron engine behind Dynamo "
+                "before token capture was set up on it"
             )
-        if self._inference_loop is None:
-            raise RuntimeError("the inference loop must run before the proxy server")
-        generation_cfg = self.cfg["generation"]
-        mcore_cfg = generation_cfg["mcore_generation_config"]
-        client = FrontendInferenceClient(
-            frontend_url=frontend.frontend_url,
-            model_name=str(generation_cfg["model_name"]),
-            request_timeout_s=frontend.request_timeout_s,
+        return stager.stage_completed(
+            admission,
+            prompt_token_ids=prompt_token_ids,
+            generated_token_ids=generated_token_ids,
+            generated_log_probs=generated_log_probs,
+            # DRAFT: assumes the engine's serialized final record carries the
+            # request's policy_epoch boundaries, as DynamicInferenceRequest's
+            # dataclass fields do.
+            policy_epoch=final_record.get("policy_epoch"),
         )
-        # Built before the socket is bound, so a failure here leaves no socket open.
-        app = build_gym_proxy_app(
-            client,
-            tokenizer=self.megatron_tokenizer,
-            parsers=mcore_cfg["parsers"],
-            multimodal_prompt_config=self.inference_wrapped_model.multimodal_prompt_config,
-            **_http_sampling_defaults(generation_cfg),
-        )
-        reserved_port = self._reserved_http_server_port
-        if reserved_port is not None:
-            # Adopt the driver's reservation: bind into its reuse group first,
-            # then take (and drop) the holder's socket, so the port is never
-            # free in between.
-            sock = bind_server_socket(reserved_port)
-            receive_held_socket(reserved_port).close()
-        else:
-            sock = bind_server_socket(0)
-        port = sock.getsockname()[1]
-        self._dynamo_gym_proxy_future = asyncio.run_coroutine_threadsafe(
-            serve_app(app, sock), self._inference_loop
-        )
-        base_url = f"http://{_get_node_ip_local()}:{port}/v1"
-        wait_until_healthy(
-            base_url,
-            server=self._dynamo_gym_proxy_future,
-            timeout_s=GYM_PROXY_START_TIMEOUT_S,
-        )
-        print(
-            f"[Rank {self.rank}] NeMo-Gym proxy serving {base_url} over the Dynamo "
-            f"frontend {frontend.frontend_url}",
-            flush=True,
-        )
-        return base_url
 
     def stop_dynamo_endpoint(self) -> None:
         """Cancel the Dynamo endpoint task and stop the engine's event reporter.
@@ -514,15 +522,11 @@ class MegatronDynamoGenerationMixin:
         Cancelling drops Dynamo's ``Worker.run`` without its graceful path: no
         request drain and no adapter cleanup. The engine's discovery entry
         lapses when this process exits, so callers stop the engine next. The
-        stopped task stays recorded, so a later start is refused. The NeMo-Gym
-        proxy server, if this rank runs one, stops with it.
+        stopped task stays recorded, so a later start is refused.
         """
         future = self._dynamo_endpoint_future
         if future is not None:
             future.cancel()
-        proxy = self._dynamo_gym_proxy_future
-        if proxy is not None:
-            proxy.cancel()
         # Only rank zero's reporter runs a thread; stopping it closes the
         # socket to the adapter.
         reporter = self._dynamo_event_reporter

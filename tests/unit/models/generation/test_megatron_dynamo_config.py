@@ -117,6 +117,9 @@ def test_dynamo_cfg_defaults_and_rejects_unknown_keys() -> None:
     cfg = megatron_dynamo_cfg({})
     assert cfg == MegatronDynamoCfg()
     assert cfg.frontend_args.router_mode == "kv" and cfg.request_timeout_s is None
+    # The managed runtime reads these for every backend's frontend.
+    assert cfg.frontend_args.render_workers == 8
+    assert cfg.frontend_args.session_affinity_ttl_secs is None
     assert cfg.role_overrides("prefill") == {} and cfg.role_overrides("decode") == {}
     with pytest.raises(ValidationError, match="extra_forbidden"):
         megatron_dynamo_cfg({"dynamo_cfg": {"engine": "megatron"}})

@@ -216,10 +216,13 @@ def dynamo_endpoint_env(monkeypatch):
             self.__dict__.update(kwargs)
             records.configs.append(self)
 
-    class MegatronLLMEngine:
-        def __init__(self, config, registration_model=None):
+    class NemoRLMegatronLLMEngine:
+        """NeMo RL's subclass of Megatron-LM's adapter, which the worker hosts."""
+
+        def __init__(self, config, registration_model, *, host):
             self.config = config
             self.registration_model = registration_model
+            self.host = host
             records.engines.append(self)
 
         @staticmethod
@@ -296,8 +299,8 @@ def dynamo_endpoint_env(monkeypatch):
     module("megatron.inference.integrations.dynamo")
     module("megatron.inference.integrations.dynamo.args", Config=Config)
     module(
-        "megatron.inference.integrations.dynamo.llm_engine",
-        MegatronLLMEngine=MegatronLLMEngine,
+        "nemo_rl.models.generation.dynamo.megatron.adapter",
+        NemoRLMegatronLLMEngine=NemoRLMegatronLLMEngine,
     )
     module(
         "megatron.inference.integrations.dynamo.handoff_recovery",
@@ -437,6 +440,8 @@ def test_dynamo_endpoint_registers_the_model_with_the_adapter(
     assert env.records.fetched == fetched
     (engine,) = env.records.engines
     assert engine.registration_model == registered.format(tmp_path=local)
+    # NeMo-Gym's calls are staged on this rank, so the adapter calls back here.
+    assert engine.host is env.worker
     (dynamo_worker,) = env.records.workers
     assert dynamo_worker.engine is engine
     assert dynamo_worker.config == (
@@ -606,123 +611,159 @@ def test_confirm_decode_terminated_attests_to_every_prefill_coordinator(
 
 
 # ---------------------------------------------------------------------------
-# Rank zero serves NeMo-Gym from Megatron-LM's endpoints over the frontend
+# NeMo-Gym goes through the frontend; rank zero stages captured calls
 # ---------------------------------------------------------------------------
 
 
-def test_setup_openai_api_server_needs_the_frontend_url():
-    worker = _bare_worker(role="prefill")
-    worker._inference_loop = object()
-
-    with pytest.raises(RuntimeError, match="configure_dynamo_gym_proxy"):
-        worker._setup_openai_api_server()
+def test_no_engine_serves_http_behind_dynamo():
+    # The base class would start Megatron-LM's server on the coordinator.
+    assert _bare_worker(role="decode")._setup_openai_api_server() is None
 
 
-@pytest.mark.parametrize("reserved_port", [5000, None])
-def test_setup_openai_api_server_serves_gym_over_the_frontend(
-    monkeypatch, reserved_port
-):
-    import asyncio
-
-    from nemo_rl.distributed import held_port
-    from nemo_rl.models.generation.megatron import dynamo_gym_proxy as proxy
-
-    records = SimpleNamespace(received=[], bound=[], apps=[], served=[], healthy=[])
-
-    class _Sock:
-        def __init__(self, port):
-            self.port = port or 6000
-            self.closed = False
-
-        def getsockname(self):
-            return ("0.0.0.0", self.port)
-
-        def close(self):
-            self.closed = True
-
-    def receive_held_socket(port):
-        records.received.append(port)
-        return _Sock(port)
-
-    def bind_server_socket(port):
-        records.bound.append(port)
-        return _Sock(port)
-
-    def build_gym_proxy_app(client, **kwargs):
-        records.apps.append((client, kwargs))
-        return "app"
-
-    async def serve_app(app, sock):
-        records.served.append((app, sock, asyncio.get_running_loop()))
-        await asyncio.Event().wait()
-
-    def wait_until_healthy(base_url, *, server, timeout_s):
-        records.healthy.append((base_url, server, timeout_s))
-
-    monkeypatch.setattr(held_port, "receive_held_socket", receive_held_socket)
-    monkeypatch.setattr(proxy, "bind_server_socket", bind_server_socket)
-    monkeypatch.setattr(proxy, "build_gym_proxy_app", build_gym_proxy_app)
-    monkeypatch.setattr(proxy, "serve_app", serve_app)
-    monkeypatch.setattr(proxy, "wait_until_healthy", wait_until_healthy)
-    monkeypatch.setattr(dynamo_worker_mixin, "_get_node_ip_local", lambda: "10.0.0.5")
-
-    loop_thread = _LoopThread()
-    worker = _bare_worker(role="decode")
-    worker.rank = 0
-    worker.cfg["generation"].update(
-        model_name="Qwen/Qwen3-0.6B",
-        temperature=0.6,
-        top_p=0.95,
-        top_k=None,
-        mcore_generation_config={"parsers": ["nano_v3"], "expose_http_server": True},
+def test_dynamo_chat_spec_is_the_same_on_every_role():
+    from nemo_rl.models.generation.dynamo.megatron.chat_backend import (
+        megatron_chat_spec,
     )
-    worker.megatron_tokenizer = "tok"
-    worker.inference_wrapped_model = SimpleNamespace(multimodal_prompt_config="mm")
-    worker._reserved_http_server_port = reserved_port
-    worker._inference_loop = loop_thread.loop
-    worker._dynamo_endpoint_future = None
-    worker._dynamo_event_reporter = None
-    try:
-        worker.configure_dynamo_gym_proxy(
-            frontend_url="http://10.0.0.1:3000/v1", request_timeout_s=120.0
+
+    generation = {
+        "model_name": "Qwen/Qwen3-0.6B",
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": None,
+        "mcore_generation_config": {
+            "expose_http_server": True,
+            "parsers": [],
+            "max_model_len": 4096,
+            "tensor_model_parallel_size": 4,
+        },
+    }
+    specs = []
+    for role in ("prefill", "decode"):
+        worker = _bare_worker(role=role)
+        worker.cfg["generation"].update(generation)
+        specs.append(worker.dynamo_chat_spec())
+
+    assert specs[0] == specs[1] == megatron_chat_spec(generation)
+    assert "_dynamo_role" not in specs[0]["generation"]
+    assert "tensor_model_parallel_size" not in str(specs[0])
+
+
+def test_stage_dynamo_gym_call_uses_the_capture_stager():
+    worker = _bare_worker(role="decode")
+    worker._dynamo_gym_stager = None
+    with pytest.raises(RuntimeError, match="before token capture was set up"):
+        worker.stage_dynamo_gym_call(
+            {},
+            prompt_token_ids=[1],
+            generated_token_ids=[2],
+            generated_log_probs=[-0.1],
+            final_record={},
         )
-        base_url = worker._setup_openai_api_server()
 
-        if reserved_port is not None:
-            # The driver's reservation is adopted: its socket is taken (and
-            # released), and the server binds the same port.
-            assert records.received == [5000] and records.bound == [5000]
-            assert base_url == "http://10.0.0.5:5000/v1"
-        else:
-            assert records.received == [] and records.bound == [0]
-            assert base_url == "http://10.0.0.5:6000/v1"
-        ((client, app_kwargs),) = records.apps
-        assert client.completions_url == "http://10.0.0.1:3000/v1/completions"
-        assert client._request_timeout_s == 120.0
-        assert client._model_name == "Qwen/Qwen3-0.6B"
-        assert app_kwargs == {
-            "tokenizer": "tok",
-            "parsers": ["nano_v3"],
-            "multimodal_prompt_config": "mm",
-            "default_temperature": 0.6,
-            "default_top_p": 0.95,
-            "default_top_k": 0,
-        }
-        _wait_until(lambda: records.served)
-        ((app, sock, loop),) = records.served
-        assert app == "app" and loop is loop_thread.loop
-        assert sock.port == (reserved_port or 6000)
-        ((healthy_url, server, timeout_s),) = records.healthy
-        assert healthy_url == base_url
-        assert server is worker._dynamo_gym_proxy_future
-        assert timeout_s == dynamo_worker_mixin.GYM_PROXY_START_TIMEOUT_S
-        assert not server.done()
+    stager = MagicMock()
+    stager.stage_completed.return_value = {"row": 3}
+    worker._dynamo_gym_stager = stager
+    coords = worker.stage_dynamo_gym_call(
+        {"mode": "text"},
+        prompt_token_ids=[1],
+        generated_token_ids=[2],
+        generated_log_probs=[-0.1],
+        final_record={"policy_epoch": [[0, 7]]},
+    )
 
-        # Stopping the endpoint stops the proxy server with it.
-        worker.stop_dynamo_endpoint()
-        _wait_until(lambda: server.done())
-        assert server.cancelled()
-        # Let the cancelled server task unwind before the loop closes.
-        asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop_thread.loop).result()
-    finally:
-        loop_thread.close()
+    assert coords == {"row": 3}
+    stager.stage_completed.assert_called_once_with(
+        {"mode": "text"},
+        prompt_token_ids=[1],
+        generated_token_ids=[2],
+        generated_log_probs=[-0.1],
+        policy_epoch=[[0, 7]],
+    )
+
+
+@pytest.fixture
+def capture_env(monkeypatch):
+    """A built engine and faked TQ pieces for setup_token_capture."""
+    import nemo_rl.data_plane as data_plane
+    import nemo_rl.data_plane.tq_token_sink as tq_token_sink
+    import nemo_rl.models.generation.megatron.token_capture as token_capture
+
+    clients: list = []
+    stagers: list = []
+
+    def build_client(dp_cfg, **kwargs):
+        clients.append((dp_cfg, kwargs))
+        return MagicMock(name="dp_client")
+
+    def stager_cls(sink, **kwargs):
+        stagers.append((sink, kwargs))
+        return MagicMock(name="TQMegatronTokenStager")
+
+    monkeypatch.setattr(data_plane, "build_data_plane_client", build_client)
+    monkeypatch.setattr(tq_token_sink, "TQTokenSink", MagicMock(name="TQTokenSink"))
+    monkeypatch.setattr(token_capture, "TQMegatronTokenStager", stager_cls)
+
+    def make(role, *, coordinator=True):
+        worker = _bare_worker(role=role)
+        worker._init_inference_engine_state()
+        # A spec'd engine: an attribute the base class would set is visible.
+        engine = types.SimpleNamespace(is_mp_coordinator=coordinator)
+        worker.dynamic_inference_engine = engine
+        return worker, engine
+
+    return SimpleNamespace(make=make, clients=clients, stagers=stagers)
+
+
+def test_token_capture_attaches_no_engine_hooks_behind_dynamo(capture_env):
+    worker, engine = capture_env.make("decode")
+
+    assert worker.setup_token_capture({"dp": 1}, "staging") is None
+
+    # Megatron-LM's engine-side prompt preparer and payload stager stay off:
+    # the frontend splices and the adapter stages through stage_dynamo_gym_call.
+    assert not hasattr(engine, "prompt_preparer")
+    assert not hasattr(engine, "payload_stager")
+    assert worker._request_prompt_preparer is None
+    assert worker._request_payload_stager is None
+    # The decode leader keeps one stager, for stage_dynamo_gym_call only.
+    assert len(capture_env.stagers) == 1
+    assert worker._dynamo_gym_stager is not None
+    assert capture_env.clients == [({"dp": 1}, {"bootstrap": False, "segment_size": 0})]
+    assert worker._token_capture_enabled
+
+    # A repeat call builds nothing more.
+    worker.setup_token_capture({"dp": 1}, "staging")
+    assert len(capture_env.stagers) == 1
+
+
+@pytest.mark.parametrize(
+    ("role", "coordinator"),
+    [
+        pytest.param("prefill", True, id="prefill_leader"),
+        pytest.param("prefill", False, id="prefill_follower"),
+        pytest.param("decode", False, id="decode_follower"),
+    ],
+)
+def test_only_the_decode_leader_builds_a_stager(capture_env, role, coordinator):
+    worker, engine = capture_env.make(role, coordinator=coordinator)
+
+    worker.setup_token_capture({"dp": 1}, "staging")
+
+    # Prefill never stages, so it opens no TQ client; capture is still on, so
+    # set_rollout_weight_version stamps its requests.
+    assert capture_env.clients == [] and capture_env.stagers == []
+    assert worker._dynamo_gym_stager is None
+    assert not hasattr(engine, "prompt_preparer")
+    assert not hasattr(engine, "payload_stager")
+    assert worker._token_capture_enabled
+
+
+def test_token_capture_behind_dynamo_refuses_media_and_needs_an_engine(capture_env):
+    worker, _ = capture_env.make("decode")
+    with pytest.raises(NotImplementedError, match="text prompts only"):
+        worker.setup_token_capture({}, "staging", capture_media=True)
+
+    worker.dynamic_inference_engine = None
+    with pytest.raises(RuntimeError, match="initialized inference engine"):
+        worker.setup_token_capture({}, "staging")
+    assert capture_env.stagers == []

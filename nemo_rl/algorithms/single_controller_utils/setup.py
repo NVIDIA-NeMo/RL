@@ -1834,6 +1834,9 @@ def setup_single_controller(
     generation_router = None
     megatron_backend = generation_config["backend"] == "megatron"
     megatron_reserved_urls: list[str] = []
+    # Megatron serves NeMo-Gym only once its engines hold weights, so these
+    # runs refit in setup, before Gym spins up.
+    refit_before_gym = False
     megatron_port_holders: list[Any] = []
     reserved_http_server_ports = None
     weight_synchronizer: Optional[WeightSynchronizer] = None
@@ -1989,7 +1992,22 @@ def setup_single_controller(
     if use_nemo_gym:
         # Before the Gym build task below reads master_config.env.
         set_nemo_gym_log_dir(master_config.env, master_config.logger.log_dir)
-        if megatron_backend:
+        if megatron_backend and dynamo_enabled(generation_config):
+            # Behind Dynamo, Gym calls the managed frontend, which the
+            # generation object starts with its engines; their weights still
+            # load at the first refit.
+            # DRAFT: this builds the engines before Gym and the trainer start,
+            # where the per-engine servers it replaces let all three build in
+            # parallel; starting the frontend on its own first would keep that.
+            generation, gen_reserve_time = _build_generation(
+                inference_cluster,
+                master_config=master_config,
+                tokenizer=tokenizer,
+                processor=processor,
+            )
+            gym_base_urls = generation.client_base_urls
+            refit_before_gym = True
+        elif megatron_backend:
             # Megatron serves one frontend per model-parallel group; pre-publish
             # every address so Gym can spread sessions over all of them.
             t0 = time.perf_counter()
@@ -2008,6 +2026,7 @@ def setup_single_controller(
                 flush=True,
             )
             gym_base_urls: list[Optional[str]] = list(megatron_reserved_urls)
+            refit_before_gym = True
         else:
             # defer generation, only get base_urls for nemo_gym spinup
             generation, gen_reserve_time = _build_generation(
@@ -2038,10 +2057,13 @@ def setup_single_controller(
             master_config=master_config,
             base_urls=cast(list[str], gym_spinup_base_urls),
             tokenizer=tokenizer,
-            # Only the deferred vLLM backend exists at this point and can carry a
-            # key; a Megatron generation server is built later and checks none.
+            # Only the deferred vLLM backend can carry a key; a Megatron
+            # generation server, or the Dynamo frontend before Megatron
+            # engines, checks none.
             policy_api_key=(
-                generation.http_server_api_key if generation is not None else None
+                generation.http_server_api_key
+                if generation is not None and not megatron_backend
+                else None
             ),
             generation_cut_control_urls=(
                 generation.generation_cut_control_urls
@@ -2068,6 +2090,10 @@ def setup_single_controller(
                 _finish_deferred_generation,
                 generation=generation,
             )
+        elif generation is not None:
+            # Built before Gym (Megatron behind Dynamo); nothing is left to load.
+            built_generation = generation
+            build_tasks["generation"] = lambda: (built_generation, 0.0)
         else:
             build_tasks["generation"] = partial(
                 _build_generation,
@@ -2160,7 +2186,7 @@ def setup_single_controller(
             else:
                 generation, gen_load_time = submitted["generation"].result()
                 trainer, value, time_metrics = submitted["trainer"].result()
-            if megatron_reserved_urls:
+            if refit_before_gym:
                 # Gym initialization needs a live URL that will respond to health checks.
                 # Megatron generation can only respond to health checks once initialized.
                 # The Megatron engine cannot be initialized with dummy weights.

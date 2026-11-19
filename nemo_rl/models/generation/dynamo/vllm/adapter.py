@@ -63,14 +63,14 @@ from nemo_rl.models.generation.dynamo.engine_adapter import (
     RequestHandler,
     ServedRollout,
 )
-from nemo_rl.models.generation.dynamo.vllm.chat_engine import (
+from nemo_rl.models.generation.dynamo.chat_engine import (
     CALL_KEY,
     GYM_CALL_ANNOTATION,
     RUNTIME_DATA_KEY,
     ForwardedCall,
     GymEngineReply,
 )
-from nemo_rl.models.generation.dynamo.vllm.generation_cut import (
+from nemo_rl.models.generation.dynamo.generation_cut import (
     CUT_PREFIXES_KEY,
     CUT_REPLY_MARGIN_S,
     DEADLINE_KEY,
@@ -224,7 +224,7 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         """Cut the calls of a checkpoint's inventory that this engine holds.
 
         The frontend sends every engine the whole inventory
-        (:mod:`~nemo_rl.models.generation.dynamo.vllm.generation_cut`), so the
+        (:mod:`~nemo_rl.models.generation.dynamo.generation_cut`), so the
         answer names only the calls cut here.
         """
         del annotation, context

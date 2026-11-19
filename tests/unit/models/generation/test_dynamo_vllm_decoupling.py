@@ -16,7 +16,8 @@
 The engines run NeMo RL's own vLLM and use Dynamo only through its
 engine-agnostic backend SDK, and the frontend serves chat with NeMo RL's own
 chat engine, so a vLLM bump can break Dynamo serving only in NeMo RL's own
-``dynamo/vllm/`` package. These guards fail if NeMo RL starts importing
+``dynamo/vllm/`` package (and a Megatron-LM bump only in ``dynamo/megatron/``).
+These guards fail if NeMo RL starts importing
 Dynamo's vLLM integration (or any other Dynamo module), if the Dynamo modules
 it imports start importing vLLM, or if the Dynamo side shared by every backend
 starts importing one.
@@ -64,6 +65,8 @@ def _backend_neutral_modules() -> list[str]:
     paths += [
         NEMO_RL_ROOT / "models/generation/rollout_result.py",
         NEMO_RL_ROOT / "models/generation/gym_call.py",
+        NEMO_RL_ROOT / "models/generation/gym_prompt.py",
+        NEMO_RL_ROOT / "models/generation/generation_cut_route.py",
     ]
     return sorted(str(path.relative_to(NEMO_RL_ROOT)) for path in paths)
 
@@ -110,6 +113,14 @@ def test_nemo_rl_imports_only_dynamos_backend_sdk() -> None:
 def test_the_shared_dynamo_side_imports_no_generation_backend() -> None:
     modules = _backend_neutral_modules()
     assert "models/generation/dynamo/engine_adapter.py" in modules
+    # The chat engine, its render pool, the frontend and the cut fan-out serve
+    # every backend; each backend's part is loaded by name.
+    assert {
+        "models/generation/dynamo/chat_engine.py",
+        "models/generation/dynamo/render_pool.py",
+        "models/generation/dynamo/frontend.py",
+        "models/generation/dynamo/generation_cut.py",
+    } <= set(modules)
     backends = {
         path: sorted(
             module

@@ -30,6 +30,8 @@ from ray.exceptions import GetTimeoutError
 import nemo_rl.models.generation.megatron.dynamo_generation as generation_module
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation import resolve_generation_class
+from nemo_rl.models.generation.dynamo.managed_runtime import RUNTIME_DATA_KEY
+from nemo_rl.models.generation.dynamo.megatron.chat_backend import megatron_chat_spec
 from nemo_rl.models.generation.megatron.dynamo_config import (
     dynamo_enabled,
     engine_width,
@@ -185,10 +187,6 @@ class _FakeEngine:
         # The probe raises RayActorError, as Ray does for a dead actor.
         self.actor_dead = False
         self.coordinator = None
-        # NeMo-Gym proxy: what rank zero was configured with, and the URL it
-        # reports once its server runs (None until the env scripts it).
-        self.gym_proxy = None
-        self.served_url = None
         self.fail_shutdown = False
         self.unclean_shutdown = False
         self.fail_calls = False
@@ -221,16 +219,6 @@ class _FakeEngine:
             if self.actor_dead:
                 return _Ref(error=ray.exceptions.RayActorError())
             return _Ref(self.alive)
-        if method == "configure_dynamo_gym_proxy":
-            assert rank == 0
-            if self.env.fail_gym_proxy_at == self.name:
-                return _Ref(error=RuntimeError("leader is gone"))
-            self.gym_proxy = kwargs
-            self.log.append(f"gym-proxy {self.name}")
-            return _Ref(None)
-        if method == "report_dp_openai_server_base_url":
-            assert rank == 0
-            return _Ref(self.served_url)
         if method in (
             "start_dynamo_endpoint",
             "attach_dynamo_events",
@@ -284,6 +272,8 @@ class _FakeEngine:
         if method in ("prepare_for_generation", "set_rollout_weight_version"):
             (value,) = kwargs.values()
             return f"{self.short}.{method}({value})"
+        if method == "setup_token_capture":
+            return f"{self.short}.setup_token_capture({kwargs['staging_partition']})"
         return f"{self.short}.{short[method]}"
 
     @property
@@ -369,11 +359,16 @@ class _FakeRuntime:
         model_name,
         frontend_python,
         ray_address,
+        chat_backend,
         serves_chat,
     ):
         self.dynamo_cfg = dynamo_cfg
         self.ray_address = ray_address
+        self.chat_backend = chat_backend
         self.serves_chat = serves_chat
+        # What publish_chat_settings / publish_chat_capture were handed.
+        self.chat_settings: list[dict] = []
+        self.chat_capture: list[dict] = []
         self.model_name = model_name
         self.frontend_python = frontend_python
         self.log = env.log
@@ -386,32 +381,18 @@ class _FakeRuntime:
     def start(self):
         self.log.append("runtime up")
 
+    def publish_chat_settings(self, settings):
+        self.chat_settings.append(settings)
+
+    def publish_chat_capture(self, **kwargs):
+        self.chat_capture.append(kwargs)
+
     def wait_for_engines(self, expected_components, check_engines):
         check_engines()
         self.waits.append(dict(expected_components))
 
     def shutdown(self):
         self.log.append("runtime down")
-
-
-class _FakeHolder:
-    """A ``RemoteHeldPortReservation`` actor: node from its pin, a fresh port."""
-
-    def __init__(self, env: "_Env", resources: dict):
-        ((resource, _),) = resources.items()
-        self.node_ip = resource.removeprefix("node:")
-        self.port = 5000 + len(env.holders)
-        self.resources = resources
-        env.holders.append(self)
-        self.address = _Remote(lambda: (self.node_ip, self.port))
-
-
-class _FakeHolderClass:
-    def __init__(self, env: "_Env"):
-        self.env = env
-
-    def options(self, *, resources):
-        return SimpleNamespace(remote=lambda: _FakeHolder(self.env, resources))
 
 
 class _NodeIpTask:
@@ -438,8 +419,6 @@ class _Env:
         self.runtimes: list[_FakeRuntime] = []
         self.fail_engine_at = None
         self.fail_endpoint_at = None
-        # Instance id whose rank zero refuses its NeMo-Gym proxy configuration.
-        self.fail_gym_proxy_at = None
         self.ray = _FakeRay()
         # Every generation built here; torn down by close().
         self.generations: list[MegatronDynamoGeneration] = []
@@ -475,11 +454,6 @@ class _Env:
             generation_module,
             "ManagedDynamoRuntime",
             lambda **kwargs: _FakeRuntime(self, **kwargs),
-        )
-        # NeMo-Gym server reservation: one holder per engine, on the pinned node.
-        self.holders: list[_FakeHolder] = []
-        monkeypatch.setattr(
-            generation_module, "RemoteHeldPortReservation", _FakeHolderClass(self)
         )
 
     def generation(
@@ -637,10 +611,12 @@ def test_builds_one_cluster_and_engine_per_role(env):
     assert env.runtime.model_name == "Qwen/Qwen3-0.6B"
     assert generation._dynamo_namespace == "ns"
     assert generation._dynamo_frontend_url == "http://10.0.0.1:3000/v1"
-    # No NeMo-Gym server: the engines expose none, so there is no URL to list.
+    # No NeMo-Gym: the frontend starts no render workers and gets no settings.
+    assert env.runtime.chat_backend == "megatron"
+    assert env.runtime.serves_chat is False
+    assert env.runtime.chat_settings == []
     assert generation.dp_openai_server_base_urls == []
-    assert all(e.gym_proxy is None for e in env.engines)
-    assert all(e.kwargs["reserved_http_server_ports"] is None for e in env.engines)
+    assert "reserved_http_server_ports" not in env.engines[0].kwargs
 
     cluster = env.clusters[0]
     assert cluster.kwargs == {
@@ -1360,133 +1336,88 @@ def test_pickled_copy_awaits_the_frontend_over_http(env, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# NeMo-Gym: a server per engine, reserved up front, serving over the frontend
+# NeMo-Gym: through the frontend's chat engine
 # ---------------------------------------------------------------------------
-
-
-_PINNED = [{"node:10.0.0.1": 0.001}, {"node:10.0.0.2": 0.001}]
 
 
 def _gym_config() -> dict[str, Any]:
     config = _megatron_config()
-    config["mcore_generation_config"]["expose_http_server"] = True
+    config["mcore_generation_config"].update(
+        expose_http_server=True, parsers=["deepseek-r1-reasoning"], max_model_len=4096
+    )
+    config.update(temperature=1.0, top_p=1.0, top_k=None)
     return config
 
 
-def test_reservation_holds_one_port_per_engine_on_its_pinned_node(env):
-    policy = {**MEGATRON_POLICY, "generation": _gym_config()}
-    cluster = SimpleNamespace(
-        world_size=lambda: 6,
-        num_gpus_per_node=4,
-        node_resource_constraints=_PINNED,
-    )
+def test_gym_calls_the_frontend_which_gets_the_chat_settings_up_front(env):
+    generation = env.generation(_gym_config())
 
-    urls, ports, holders = MegatronDynamoGeneration.reserve_http_server_addresses(
-        cluster,  # type: ignore[arg-type]
-        policy,  # type: ignore[arg-type]
-    )
-
-    # TP 2 engines tile two per node: prefill-0 and decode-0 on the first
-    # pinned node, decode-1 on the second; the same tiling _start_engines uses.
-    assert [h.node_ip for h in holders] == ["10.0.0.1", "10.0.0.1", "10.0.0.2"]
-    assert urls == [
-        "http://10.0.0.1:5000/v1",
-        "http://10.0.0.1:5001/v1",
-        "http://10.0.0.2:5002/v1",
-    ]
-    assert ports == {0: 5000, 1: 5001, 2: 5002}
-    assert holders == env.holders
-
-
-def test_reservation_needs_node_pins(env):
-    policy = {**MEGATRON_POLICY, "generation": _gym_config()}
-    cluster = SimpleNamespace(
-        world_size=lambda: 6, num_gpus_per_node=8, node_resource_constraints=None
-    )
-    with pytest.raises(ValueError, match="node pins"):
-        MegatronDynamoGeneration.reserve_http_server_addresses(
-            cluster,  # type: ignore[arg-type]
-            policy,  # type: ignore[arg-type]
-        )
-    assert env.holders == []
-
-
-def test_plain_megatron_reservation_dispatches_to_the_dynamo_class(env, monkeypatch):
-    # Setup reserves through MegatronGeneration; with dynamo on, the Dynamo
-    # class's per-engine reservation answers.
-    seen = []
-    monkeypatch.setattr(
-        MegatronDynamoGeneration,
-        "reserve_http_server_addresses",
-        classmethod(lambda cls, cluster, config: seen.append((cluster, config)) or "r"),
-    )
-    policy = {**MEGATRON_POLICY, "generation": _gym_config()}
-    assert MegatronGeneration.reserve_http_server_addresses("cluster", policy) == "r"  # type: ignore[arg-type]
-    assert seen == [("cluster", policy)]
-
-
-def test_engines_take_their_reserved_ports_and_the_frontend_url(env):
-    generation = env.generation(
-        _gym_config(),
-        node_resource_constraints=_PINNED,
-        num_gpus_per_node=4,
-        reserved_http_server_ports={0: 5000, 1: 5001, 2: 5002},
-    )
-
-    # Rank zero of each engine (its one model-parallel coordinator) gets the
-    # engine's port; the proxy is pointed at the frontend once the runtime runs.
-    assert [e.kwargs["reserved_http_server_ports"] for e in env.engines] == [
-        {0: 5000},
-        {0: 5001},
-        {0: 5002},
-    ]
-    assert env.log[-3:] == [f"gym-proxy {name}" for name in _IDS]
-    assert all(
-        e.gym_proxy
-        == {"frontend_url": "http://10.0.0.1:3000/v1", "request_timeout_s": None}
-        for e in env.engines
-    )
-    # Nothing serves until the first refit builds the engines.
+    # One URL for the whole fleet; Megatron engines take no generation cuts.
+    assert generation.client_base_urls == ["http://10.0.0.1:3000/v1"]
+    assert generation.generation_cut_control_urls is None
+    assert env.runtime.serves_chat is True
+    # The settings come from the config, before any engine has weights, and
+    # are what every engine registers (megatron_chat_spec).
+    (settings,) = env.runtime.chat_settings
+    assert settings == {RUNTIME_DATA_KEY: megatron_chat_spec(_gym_config())}
+    assert settings[RUNTIME_DATA_KEY]["generation"]["mcore_generation_config"] == {
+        "expose_http_server": True,
+        "parsers": ["deepseek-r1-reasoning"],
+        "max_model_len": 4096,
+    }
+    # No engine serves HTTP of its own.
     assert generation.dp_openai_server_base_urls == []
 
-    # prepare_for_generation lists the servers once every rank zero reports one.
-    generation.prepare_for_generation(tags=["weights"])
-    assert generation.dp_openai_server_base_urls == []
-    for engine, url in zip(env.engines, ["http://10.0.0.1:5000/v1", None, None]):
-        engine.served_url = url
-    generation.prepare_for_generation(tags=["kv_cache"])
-    assert generation.dp_openai_server_base_urls == [], "every engine must serve"
-    for engine, port in zip(env.engines, [5000, 5001, 5002]):
-        engine.served_url = f"http://{engine.kwargs['cluster'].placement_group.bundle_nodes[0]}:{port}/v1"
-    generation.prepare_for_generation(tags=["kv_cache"])
-    assert generation.dp_openai_server_base_urls == [
-        "http://10.0.0.1:5000/v1",
-        "http://10.0.0.1:5001/v1",
-        "http://10.0.0.2:5002/v1",
+
+def test_engines_take_no_reserved_http_ports(env):
+    with pytest.raises(ValueError, match="no HTTP server of their own"):
+        env.generation(_gym_config(), reserved_http_server_ports={0: 5000})
+
+
+def test_plain_megatron_reservation_refuses_engines_behind_dynamo():
+    policy = {**MEGATRON_POLICY, "generation": _gym_config()}
+    with pytest.raises(ValueError, match="through the Dynamo frontend"):
+        MegatronGeneration.reserve_http_server_addresses("cluster", policy)  # type: ignore[arg-type]
+
+
+def test_token_capture_installs_on_every_engine_and_tells_the_frontend(env):
+    generation = env.started(generation_config=_gym_config())
+
+    assert generation.setup_token_capture({"backend": "simple"}, "staging") is None  # type: ignore[arg-type]
+
+    assert env.log == [f"{short}.setup_token_capture(staging)" for short in _NAMES]
+    assert env.runtime.chat_capture == [
+        {
+            "dp_cfg": {"backend": "simple"},
+            "staging_partition": "staging",
+            "capture_media": False,
+            "generation_cut_control_token": None,
+            "generation_cut_control_timeout_s": None,
+        }
     ]
-    # Known for good: later calls do not ask again.
-    env.engines[0].served_url = None
-    generation.prepare_for_generation(tags=["kv_cache"])
-    assert len(generation.dp_openai_server_base_urls) == 3
 
 
-def test_a_failed_proxy_configuration_tears_the_fleet_down(env):
-    env.fail_gym_proxy_at = "decode-0"
-    with pytest.raises(RuntimeError, match="leader is gone") as info:
-        env.generation(
-            _gym_config(), node_resource_constraints=_PINNED, num_gpus_per_node=4
-        )
-    assert (
-        "configure_dynamo_gym_proxy failed on engine decode-0" in info.value.__notes__
-    )
-    down = [line for line in env.log if line.endswith(" down")]
-    assert {"engine prefill-0 down", "engine decode-1 down", "runtime down"} <= set(
-        down
-    )
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        pytest.param({"top_logprobs": 2}, "sampler top-k", id="top_logprobs"),
+        pytest.param(
+            {"generation_prefix_cuts_enabled": True},
+            "generation-prefix recovery",
+            id="cuts",
+        ),
+        pytest.param({"capture_media": True}, "text prompts only", id="media"),
+    ],
+)
+def test_token_capture_refuses_what_the_engines_cannot_stage(env, kwargs, match):
+    generation = env.started(generation_config=_gym_config())
+    with pytest.raises(NotImplementedError, match=match):
+        generation.setup_token_capture({}, "staging", **kwargs)  # type: ignore[arg-type]
+    assert env.log == [] and env.runtime.chat_capture == []
 
 
 # ---------------------------------------------------------------------------
-# The refit side: fan-out, rank placement, ordered pause, one-wave resume
+# The refit side# The refit side: fan-out, rank placement, ordered pause, one-wave resume
 # ---------------------------------------------------------------------------
 
 
@@ -1944,8 +1875,6 @@ def test_rollouts_go_through_the_frontend(env, monkeypatch):
     assert output["gen_leader_worker_idx"] == [0]
     assert requests[0][0] == "http://10.0.0.1:3000/v1/completions"
     assert requests[0][2] is None, "request_timeout_s defaults to no deadline"
-    with pytest.raises(NotImplementedError, match="Token capture is not yet"):
-        generation.setup_token_capture({}, "staging")  # type: ignore[arg-type]
     assert generation.get_inference_world_size() == 6
 
 
@@ -2068,22 +1997,12 @@ def test_validate_settings(settings, match) -> None:
             MegatronDynamoGeneration.validate_settings(master_config)  # type: ignore[arg-type]
 
 
-def test_validate_settings_accepts_gym_on_the_engines_servers() -> None:
-    # A Gym config exposes the HTTP server; each engine's rank zero serves Gym
-    # from it, over the frontend.
-    master_config = _master_config(gym=True)
+@pytest.mark.parametrize("token_capture", [False, True])
+def test_validate_settings_accepts_gym_through_the_frontend(token_capture) -> None:
+    # A Gym config exposes chat; the frontend's chat engine serves it, and
+    # the decode engines stage captured calls.
+    master_config = _master_config(gym=True, token_capture=token_capture)
     master_config.policy["generation"]["mcore_generation_config"][
         "expose_http_server"
     ] = True
     MegatronDynamoGeneration.validate_settings(master_config)  # type: ignore[arg-type]
-
-
-def test_validate_settings_refuses_token_capture() -> None:
-    # The capture admission is request metadata, which a completion through
-    # the frontend does not carry; refused up front, before Gym is built.
-    master_config = _master_config(gym=True, token_capture=True)
-    master_config.policy["generation"]["mcore_generation_config"][
-        "expose_http_server"
-    ] = True
-    with pytest.raises(NotImplementedError, match="token_capture.enabled=true"):
-        MegatronDynamoGeneration.validate_settings(master_config)  # type: ignore[arg-type]

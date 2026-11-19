@@ -41,12 +41,13 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.data_plane.interfaces import storage_unit_placement
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.held_port import RemoteHeldPortReservation
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, _get_node_ip_local
 from nemo_rl.models.generation.dynamo.managed_runtime import (
+    RUNTIME_DATA_KEY,
     ManagedDynamoRuntime,
     wait_for_engine_registrations,
 )
+from nemo_rl.models.generation.dynamo.megatron.chat_backend import megatron_chat_spec
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -331,6 +332,13 @@ class MegatronDynamoEngine:
     def set_rollout_weight_version(self, version: int) -> list[ray.ObjectRef]:
         return self._all("set_rollout_weight_version", version=version)
 
+    def setup_token_capture(
+        self, dp_cfg: "DataPlaneConfig", staging_partition: str
+    ) -> list[ray.ObjectRef]:
+        return self._all(
+            "setup_token_capture", dp_cfg=dp_cfg, staging_partition=staging_partition
+        )
+
     def liveness_ref(self) -> ray.ObjectRef:
         return self.leader.is_alive.remote()
 
@@ -390,16 +398,6 @@ class MegatronDynamoGeneration(GenerationInterface):
         """Reject what prefill/decode engines behind the Dynamo frontend cannot serve."""
         MegatronGeneration.validate_settings(master_config)
         policy_config = master_config.policy
-        if master_config.token_capture.enabled:
-            # The capture admission reaches the engine as request metadata,
-            # which a completion through the frontend does not carry; the
-            # proxy refuses such requests, so refuse the run up front.
-            raise NotImplementedError(
-                "token_capture.enabled=true is not yet supported with "
-                "policy.generation.dynamo=true: the capture admission does not "
-                "travel through the Dynamo frontend to the engines. Disable "
-                "token capture, or leave policy.generation.dynamo false."
-            )
         validate_megatron_dynamo_generation(policy_config["generation"])
         if (
             master_config.env.get("should_use_nemo_gym")
@@ -411,9 +409,8 @@ class MegatronDynamoGeneration(GenerationInterface):
         ):
             raise ValueError(
                 "env.should_use_nemo_gym=true with policy.generation.dynamo=true "
-                "needs mcore_generation_config.expose_http_server=true: each "
-                "engine's rank zero serves NeMo-Gym from that server, over the "
-                "Dynamo frontend."
+                "needs mcore_generation_config.expose_http_server=true: the "
+                "Dynamo frontend serves NeMo-Gym's chat calls only when it is set."
             )
         if policy_config.get("is_vlm"):
             raise ValueError(
@@ -441,65 +438,6 @@ class MegatronDynamoGeneration(GenerationInterface):
                 "on 'train' instead."
             )
 
-    @classmethod
-    def reserve_http_server_addresses(
-        cls,
-        cluster: RayVirtualCluster,
-        config: PolicyConfig,
-    ) -> tuple[list[str], dict[int, int], list[ray.actor.ActorHandle]]:
-        """Reserve one NeMo-Gym server address per engine before any engine exists.
-
-        The counterpart of ``MegatronGeneration.reserve_http_server_addresses``
-        for engines behind Dynamo: each engine's rank zero serves NeMo-Gym from
-        a proxy over the frontend, so one port is held per engine, on the
-        pinned node that engine will take (``engine_node_pins``, the tiling
-        ``_start_engines`` applies). The inference cluster must carry node pins;
-        without them the node an engine lands on is not known up front.
-
-        Args:
-            cluster: The inference cluster the engines take the place of.
-            config: The full ``PolicyConfig``.
-
-        Returns:
-            Tuple of (server base URLs, {engine index: reserved port},
-            port-holder actor handles). The caller keeps the handles until the
-            engines' workers have adopted the sockets, then ``ray.kill``s them.
-
-        Raises:
-            ValueError: The cluster has no node pins, or the engines do not fit
-                the pinned nodes.
-        """
-        generation_cfg = cast(MCoreGenerationConfig, config["generation"])
-        validate_megatron_dynamo_generation(generation_cfg)
-        constraints = cluster.node_resource_constraints
-        if constraints is None:
-            raise ValueError(
-                "NeMo-Gym with policy.generation.dynamo=true needs an inference "
-                "cluster with node pins (the SingleController's dedicated inference "
-                "nodes): each engine's server address is reserved on the node the "
-                "engine will take."
-            )
-        widths = engine_widths(config)
-        roles = engine_roles(
-            disaggregation_cfg(generation_cfg), cluster.world_size(), widths
-        )
-        pins = engine_node_pins(
-            roles,
-            widths,
-            num_gpus_per_node=cluster.num_gpus_per_node,
-            num_pinned_nodes=len(constraints),
-        )
-        # A holder per engine on that engine's node (num_cpus=0, so it schedules
-        # on a full node); the engine's rank zero adopts the live socket later.
-        holders = [
-            RemoteHeldPortReservation.options(resources=dict(constraints[pin])).remote()
-            for pin in pins
-        ]
-        addresses = ray.get([holder.address.remote() for holder in holders])
-        urls = [f"http://{node_ip}:{port}/v1" for node_ip, port in addresses]
-        ports = {index: port for index, (_, port) in enumerate(addresses)}
-        return urls, ports, holders
-
     def __init__(
         self,
         config: PolicyConfig,
@@ -524,10 +462,9 @@ class MegatronDynamoGeneration(GenerationInterface):
         unmaterialized, or the engines' GPUs would be booked twice. ``policy``
         (colocation) and ``processor`` (VLM prompts) are refused;
         ``name_prefix`` and ``skip_weight_load`` do not apply, since every engine
-        is built with ``skip_weight_load=True``. ``reserved_http_server_ports``
-        are NeMo-Gym's server ports, one per engine index as
-        :meth:`reserve_http_server_addresses` returned them; each engine's rank
-        zero serves NeMo-Gym there, over the frontend, once the engine runs.
+        is built with ``skip_weight_load=True``. NeMo-Gym calls the frontend
+        (:attr:`client_base_urls`), whose chat engine renders each call for the
+        engines.
 
         Args:
             config: PolicyConfig for the Megatron model.
@@ -537,9 +474,7 @@ class MegatronDynamoGeneration(GenerationInterface):
             name_prefix: Unused; each engine names its own worker group.
             processor: Must be None; the frontend serves text prompts only.
             skip_weight_load: Unused; every engine defers its weights to the refit.
-            reserved_http_server_ports: NeMo-Gym server ports keyed by engine
-                index, from :meth:`reserve_http_server_addresses`; None when
-                NeMo-Gym is not used.
+            reserved_http_server_ports: Must be None; no engine serves HTTP.
 
         Raises:
             ValueError: On an engine wider than a node, or more engines than
@@ -555,18 +490,17 @@ class MegatronDynamoGeneration(GenerationInterface):
             raise NotImplementedError(
                 "Megatron engines behind Dynamo serve text prompts only."
             )
+        if reserved_http_server_ports is not None:
+            raise ValueError(
+                "Megatron engines behind Dynamo serve no HTTP server of their own; "
+                "NeMo-Gym calls the Dynamo frontend (client_base_urls)."
+            )
         assert cluster is not None, "Megatron engines behind Dynamo need a cluster."
         # The state the weight synchronizer and setup read off a generation object.
         self._policy_config = config
         self.cfg: MCoreGenerationConfig = config["generation"]
-        # NeMo-Gym's server URLs, one per engine, once the engines serve
-        # (mcore_generation_config.expose_http_server); empty otherwise.
+        # No engine serves HTTP: NeMo-Gym calls the frontend (client_base_urls).
         self.dp_openai_server_base_urls: list[Optional[str]] = []
-        self._reserved_http_server_ports: dict[int, int] = (
-            {}
-            if reserved_http_server_ports is None
-            else dict(reserved_http_server_ports)
-        )
         # Installed by setup via create_weight_synchronizer.
         self.weight_synchronizer: Optional[WeightSynchronizer] = None
         self._tokenizer: Optional[PreTrainedTokenizerBase] = tokenizer
@@ -611,12 +545,22 @@ class MegatronDynamoGeneration(GenerationInterface):
                 # same release as every engine.
                 frontend_python=self.engine_python(),
                 ray_address=ray.get_runtime_context().gcs_address,
-                # NeMo-Gym reaches these engines through their own chat proxies,
-                # not the frontend's chat engine.
-                serves_chat=False,
+                chat_backend="megatron",
+                # NeMo-Gym's chat calls need the flag; the frontend's chat
+                # engine serves them.
+                serves_chat=bool(
+                    self.cfg["mcore_generation_config"]["expose_http_server"]
+                ),
             )
             self._dynamo_runtime = runtime
             runtime.start()
+            if runtime.serves_chat:
+                # Megatron's chat settings come from the config alone, so the
+                # frontend builds its render workers while the engines load;
+                # each engine registers the same settings.
+                runtime.publish_chat_settings(
+                    {RUNTIME_DATA_KEY: megatron_chat_spec(self.cfg)}
+                )
         except Exception:
             self.shutdown()
             raise
@@ -624,12 +568,6 @@ class MegatronDynamoGeneration(GenerationInterface):
         self._dynamo_engine_env = runtime.engine_env
         self._dynamo_frontend_url = runtime.frontend_url
         print(f"  [Dynamo] Forwarding rollouts to {runtime.frontend_url}", flush=True)
-        if self.cfg["mcore_generation_config"]["expose_http_server"]:
-            try:
-                self._configure_gym_proxies()
-            except Exception:
-                self.shutdown()
-                raise
 
     # ------------------------------------------------------------------
     # Pickling: the SingleController actor gets a handles-only copy
@@ -1112,45 +1050,7 @@ class MegatronDynamoGeneration(GenerationInterface):
             what=f"prepare_for_generation({list(tags)})",
             deadline=time.monotonic() + timeout_s,
         )
-        self._collect_gym_proxy_urls(deadline=time.monotonic() + timeout_s)
         return True
-
-    def _configure_gym_proxies(self) -> None:
-        """Hand every engine's rank zero the frontend URL its NeMo-Gym server posts to."""
-        deadline = time.monotonic() + self._control_timeout_s
-        self._call_engines(
-            range(self.num_engines),
-            lambda record: [
-                record.leader.configure_dynamo_gym_proxy.remote(
-                    frontend_url=self._dynamo_frontend_url,
-                    request_timeout_s=self._dynamo_cfg.request_timeout_s,
-                )
-            ],
-            what="configure_dynamo_gym_proxy",
-            deadline=deadline,
-        )
-
-    def _collect_gym_proxy_urls(self, *, deadline: float) -> None:
-        """Record NeMo-Gym's server URLs once every engine's rank zero serves one.
-
-        As ``MegatronGeneration.prepare_for_generation`` does after its workers
-        start the HTTP server; the engines come up at the first refit, so the
-        list stays empty until then.
-        """
-        if (
-            self.dp_openai_server_base_urls
-            or not (self.cfg["mcore_generation_config"]["expose_http_server"])
-        ):
-            return
-        urls = ray.get(
-            [
-                record.leader.report_dp_openai_server_base_url.remote()
-                for record in self._engine_records
-            ],
-            timeout=_seconds_left(deadline),
-        )
-        if all(url is not None for url in urls):
-            self.dp_openai_server_base_urls = list(urls)
 
     def resume_after_refit(self, *, timeout_s: float | None = None) -> None:
         """Resume every engine in one wave; the first resume is also the startup.
@@ -1309,20 +1209,77 @@ class MegatronDynamoGeneration(GenerationInterface):
         output["gen_leader_worker_idx"] = [0]
         yield 0, output
 
+    @property
+    def client_base_urls(self) -> list[Optional[str]]:
+        """Where OpenAI clients such as NeMo-Gym send requests: the Dynamo frontend."""
+        return [self._dynamo_frontend_url]
+
+    @property
+    def generation_cut_control_urls(self) -> Optional[list[str]]:
+        """None: Megatron engines take no generation cuts (see setup_token_capture)."""
+        return None
+
     def setup_token_capture(
         self,
         dp_cfg: "DataPlaneConfig",
         staging_partition: str,
         *,
         capture_media: bool = False,
+        media_family: str | None = None,
         top_logprobs: int = 0,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
+        generation_cut_control_timeout_s: float | None = None,
     ) -> "Optional[MediaColumnSpec]":
-        """Not served yet: the capture admission does not travel through the frontend."""
-        raise NotImplementedError(
-            "Token capture is not yet supported for Megatron engines behind Dynamo: "
-            "the capture admission does not travel through the frontend to the "
-            "engines."
+        """Stage NeMo-Gym's captured calls on the engines, prefixes read in the frontend.
+
+        The frontend's chat engine reads a call's token-capture prefix from TQ
+        and splices it before routing (``publish_chat_capture``); the decode
+        engine that generates the call stages it from its rank zero with the
+        stager the workers' ``setup_token_capture`` builds there (kept on the
+        worker, not attached to the engine).
+
+        Raises:
+            NotImplementedError: For media capture, sampler top-k or generation
+                cuts, none of which these engines serve.
+        """
+        del media_family
+        if top_logprobs != 0:
+            raise NotImplementedError(
+                "Megatron engines behind Dynamo do not capture sampler top-k"
+            )
+        if generation_prefix_cuts_enabled:
+            raise NotImplementedError(
+                "generation-prefix recovery is not implemented for Megatron inference"
+            )
+        if capture_media:
+            raise NotImplementedError(
+                "Megatron engines behind Dynamo serve text prompts only"
+            )
+        # Every engine marks capture set up, so set_rollout_weight_version
+        # stamps them all; only decode engines build a stager and TQ client
+        # (MegatronDynamoGenerationMixin.setup_token_capture), since prefill
+        # never stages. No engine gets Megatron-LM's engine-side hooks.
+        deadline = time.monotonic() + self._control_timeout_s
+        self._call_engines(
+            range(self.num_engines),
+            lambda record: record.setup_token_capture(dp_cfg, staging_partition),
+            what="setup_token_capture",
+            deadline=deadline,
         )
+        if self._dynamo_runtime is None:
+            raise RuntimeError(
+                "setup_token_capture runs on the driver's MegatronDynamoGeneration, "
+                "which owns the frontend; a pickled copy cannot publish to it"
+            )
+        self._dynamo_runtime.publish_chat_capture(
+            dp_cfg=dp_cfg,
+            staging_partition=staging_partition,
+            capture_media=False,
+            generation_cut_control_token=None,
+            generation_cut_control_timeout_s=generation_cut_control_timeout_s,
+        )
+        return None
 
     # ------------------------------------------------------------------
     # Engine lifecycle
@@ -1354,8 +1311,7 @@ class MegatronDynamoGeneration(GenerationInterface):
             if role not in distinct_roles:
                 distinct_roles.append(role)
         # Which pinned inference node each engine takes, when the shared
-        # inference cluster has node pins; the same tiling the NeMo-Gym server
-        # reservation used, so a reserved port sits on its engine's node.
+        # inference cluster has node pins.
         constraints = self._node_resource_constraints
         pin_index_by_engine = engine_node_pins(
             roles,
@@ -1403,9 +1359,6 @@ class MegatronDynamoGeneration(GenerationInterface):
                 cluster, engine_policy_config
             )
             node_ip = self._engine_node_ip(cluster, instance_id)
-            # The engine's rank zero (its single model-parallel coordinator)
-            # serves NeMo-Gym on the port reserved for this engine, if any.
-            reserved_port = self._reserved_http_server_ports.get(engine_index)
             starts.append(
                 functools.partial(
                     self._start_engine,
@@ -1415,7 +1368,6 @@ class MegatronDynamoGeneration(GenerationInterface):
                     config=engine_policy_config,
                     cluster=cluster,
                     node_ip=node_ip,
-                    reserved_port=reserved_port,
                 )
             )
 
@@ -1464,7 +1416,6 @@ class MegatronDynamoGeneration(GenerationInterface):
         config: PolicyConfig,
         cluster: RayVirtualCluster,
         node_ip: str,
-        reserved_port: Optional[int],
     ) -> tuple[MegatronGeneration, MegatronDynamoEngine]:
         """Start one engine on its placed cluster, without weights until the first refit.
 
@@ -1475,8 +1426,6 @@ class MegatronDynamoGeneration(GenerationInterface):
             config: The engine's role-specific policy config.
             cluster: The engine's cluster, placement groups already reserved.
             node_ip: The node every rank of the engine sits on.
-            reserved_port: The NeMo-Gym port reserved for the engine's rank
-                zero, or ``None`` if it serves none.
 
         Returns:
             The engine and its record.
@@ -1487,9 +1436,6 @@ class MegatronDynamoGeneration(GenerationInterface):
             cluster=cluster,
             name_prefix=f"dynamo_{instance_id}",
             skip_weight_load=True,
-            reserved_http_server_ports=(
-                None if reserved_port is None else {0: reserved_port}
-            ),
         )
         record = MegatronDynamoEngine.of(
             engine,

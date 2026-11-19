@@ -33,10 +33,13 @@ pytest.importorskip("vllm")
 
 from transformers import AutoTokenizer  # noqa: E402
 
-from nemo_rl.models.generation.dynamo.vllm.render_pool import (  # noqa: E402
+from nemo_rl.models.generation.dynamo.render_pool import (  # noqa: E402
     RenderPool,
     _wait_for_settings,
-    _Worker,
+)
+from nemo_rl.models.generation.dynamo.vllm.chat_backend import (  # noqa: E402
+    CHAT_BACKEND,
+    VllmRenderer,
 )
 from nemo_rl.models.generation.prefix_recovery.restore import (  # noqa: E402
     _classify_restored_prefix_terminal,
@@ -114,7 +117,7 @@ def _template_ids(tokenizer, messages, *, add_generation_prompt: bool) -> list[i
 
 
 def _pool(spec: dict, model_dir: str) -> RenderPool:
-    pool = RenderPool(workers=1)
+    pool = RenderPool(workers=1, renderer=CHAT_BACKEND.renderer)
     pool.build(spec, model_dir)
     return pool
 
@@ -183,7 +186,7 @@ def test_workers_start_before_their_settings_and_build_when_they_arrive(
     tiny_qwen3_model_path,
 ) -> None:
     async def serve():
-        pool = RenderPool(workers=2)
+        pool = RenderPool(workers=2, renderer=CHAT_BACKEND.renderer)
         try:
             start = asyncio.ensure_future(pool.start())
             # Both come up before any settings exist, as at the frontend's launch.
@@ -306,9 +309,9 @@ class _RecordingParser:
 
 
 @pytest.fixture(scope="module")
-def reply_worker(tiny_qwen3_model_path) -> _Worker:
+def reply_worker(tiny_qwen3_model_path) -> VllmRenderer:
     """One render worker, in this process, to build replies with."""
-    return _Worker(SPEC, tiny_qwen3_model_path)
+    return VllmRenderer(SPEC, tiny_qwen3_model_path)
 
 
 @pytest.mark.parametrize("style", ["metaspace", "byte_level"])

@@ -15,7 +15,8 @@
 """The steps of one Gym chat call after its render, shared by every serving path.
 
 1. :func:`prepare_prompt` turns a render into a :class:`PreparedPrompt`: the
-   token-capture prefix read from TQ, the splice, and the output budget.
+   token-capture prefix read from TQ, the splice, and the output budget
+   (:mod:`~nemo_rl.models.generation.gym_prompt`, with vLLM's clamp).
 2. On the engine's worker, :func:`start_capture` takes the prepared prompt to
    ``begin_call``: a restore from a checkpoint cut, the budget, the media
    snapshot, the placeholder remap and the final prompt; after generation,
@@ -36,7 +37,7 @@ This module imports vLLM; import it only where vLLM is installed.
 import asyncio
 import logging
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Collection, Optional, Protocol
+from typing import Any, Callable, Collection, Optional
 
 import torch
 from vllm.entrypoints.serve.exception_handling.error_response import (
@@ -45,10 +46,8 @@ from vllm.entrypoints.serve.exception_handling.error_response import (
 from vllm.exceptions import GracefulHTTPError, VLLMClientError, VLLMValidationError
 
 from nemo_rl.data.captured_media import MediaCaptureRejected
-from nemo_rl.models.generation.openai_server_utils import (
-    PrefixSplice,
-    splice_prefix_tokens,
-)
+from nemo_rl.models.generation import gym_prompt
+from nemo_rl.models.generation.gym_prompt import PreparedPrompt, RenderedPrompt
 from nemo_rl.models.generation.prefix_recovery.restore import (
     _classify_restored_prefix_terminal,
     _restored_prefix_terminal_routes,
@@ -240,115 +239,6 @@ async def abort_request_capture(host: Any, request: Any, reason: str) -> None:
     )
 
 
-class RenderedPrompt(Protocol):
-    """What :func:`prepare_prompt` reads from a call's render.
-
-    Read-only members, so each path's frozen render dataclass fits.
-    """
-
-    # The full render's token ids, in the template's coordinates.
-    @property
-    def template_token_ids(self) -> list[int]: ...
-
-    # The render up to the last assistant turn, when a prefix will be spliced.
-    @property
-    def history_token_ids(self) -> Optional[list[int]]: ...
-
-    # The request's own prefix (Gym's echo) after the capture decision.
-    @property
-    def required_prefix_token_ids(self) -> Optional[list[int]]: ...
-
-    # Capture admissions: what is stored, and how the prompt is served; None
-    # without capture.
-    @property
-    def admission(self) -> Any: ...
-
-    @property
-    def serving_admission(self) -> Any: ...
-
-    @property
-    def verify_retained_media(self) -> bool: ...
-
-    # The output budget the request asked for; None when it set none.
-    @property
-    def request_max_tokens(self) -> Optional[int]: ...
-
-
-@dataclass(frozen=True)
-class PreparedPrompt:
-    """A call's prompt as the engine runs it, its output budget, and how capture admits it."""
-
-    prompt_token_ids: list[int]
-    # How the model's own prefix replaced the template's history; None if not.
-    splice: Optional[PrefixSplice]
-    # The model's own prefix is the prompt's first ``prefix_len`` ids.
-    prefix_len: Optional[int]
-    # Whether Gym only measures the prompt; such a call never generates.
-    measure_only: bool
-    # The output budget the request asked for, and the one after the clamp;
-    # None when the request set none.
-    request_max_tokens: Optional[int]
-    max_tokens: Optional[int]
-    admission: Any
-    serving_admission: Any
-    verify_retained_media: bool
-
-    @property
-    def begin_call_prefix_token_ids(self) -> Optional[list[int]]:
-        """The prefix ``begin_call`` checks a token-in admission against."""
-        if self.admission is None or self.admission.mode != "token_in":
-            return None
-        return self.prompt_token_ids[: self.prefix_len]
-
-    def to_json(self) -> dict[str, Any]:
-        """As JSON, without the prompt (it rides as the call's token ids)."""
-        return {
-            "splice": None
-            if self.splice is None
-            else [self.splice.model_cut_end, self.splice.template_cut_start],
-            "prefix_len": self.prefix_len,
-            "request_max_tokens": self.request_max_tokens,
-            "max_tokens": self.max_tokens,
-            "admission": _admission_json(self.admission),
-            "serving_admission": _admission_json(self.serving_admission),
-            "verify_retained_media": self.verify_retained_media,
-        }
-
-    @classmethod
-    def from_json(
-        cls,
-        wire: dict[str, Any],
-        *,
-        prompt_token_ids: list[int],
-        parse_admission: Callable[[Any], Any],
-    ) -> "PreparedPrompt":
-        """What :meth:`to_json` sent, for the prompt it rides beside."""
-        splice = None
-        if wire["splice"] is not None:
-            splice = PrefixSplice(prompt_token_ids, *wire["splice"])
-        admission = parse_admission(wire["admission"])
-        # One object when storage and serving are one admission, as natively.
-        serving_admission = admission
-        if wire["serving_admission"] != wire["admission"]:
-            serving_admission = parse_admission(wire["serving_admission"])
-        return cls(
-            prompt_token_ids=prompt_token_ids,
-            splice=splice,
-            prefix_len=wire["prefix_len"],
-            # A measure call is answered where it is prepared.
-            measure_only=False,
-            request_max_tokens=wire["request_max_tokens"],
-            max_tokens=wire["max_tokens"],
-            admission=admission,
-            serving_admission=serving_admission,
-            verify_retained_media=wire["verify_retained_media"],
-        )
-
-
-def _admission_json(admission: Any) -> Optional[dict[str, Any]]:
-    return None if admission is None else admission.model_dump(mode="json")
-
-
 async def prepare_prompt(
     rendered: RenderedPrompt,
     *,
@@ -358,56 +248,21 @@ async def prepare_prompt(
     measure_only: bool,
     tokenizer: Any = None,
 ) -> PreparedPrompt:
-    """Prepare a rendered call's prompt: the ids the engine runs, and its output budget.
-
-    Args:
-        rendered: The call's render.
-        resolve_prefix: Reads a token-in admission's prefix from TQ. It blocks,
-            so it runs off the event loop.
-        turn_end_token_ids: Every id a turn can end on; the splice cuts by them.
-        max_model_len: The engine's context length.
-        measure_only: Whether Gym only measures the prompt. Such a call counts
-            a prompt of any length; a generating call's budget is clamped to
-            the context.
-        tokenizer: Only for the splice's error message; may be None.
+    """:func:`~nemo_rl.models.generation.gym_prompt.prepare_prompt` with vLLM's clamp.
 
     Raises:
         VLLMValidationError: A generating call's prompt leaves no room for
             output. Raised before any media check, so the length error is the
             one the call answers with.
     """
-    prefix = rendered.required_prefix_token_ids
-    serving = rendered.serving_admission
-    if serving is not None and serving.mode == "token_in":
-        prefix = await asyncio.to_thread(resolve_prefix, serving)
-    splice = None
-    prompt_token_ids = rendered.template_token_ids
-    if prefix is not None:
-        # The render includes the history whenever a prefix will be spliced.
-        assert rendered.history_token_ids is not None
-        splice = splice_prefix_tokens(
-            tokenizer=tokenizer,
-            model_prefix_token_ids=list(prefix),
-            template_prefix_token_ids=rendered.history_token_ids,
-            template_token_ids=rendered.template_token_ids,
-            eos_token_id=turn_end_token_ids,
-        )
-        prompt_token_ids = splice.token_ids
-    max_tokens = None
-    if not measure_only:
-        max_tokens = clamp_max_tokens(
-            rendered.request_max_tokens, len(prompt_token_ids), max_model_len
-        )
-    return PreparedPrompt(
-        prompt_token_ids=prompt_token_ids,
-        splice=splice,
-        prefix_len=None if prefix is None else len(prefix),
+    return await gym_prompt.prepare_prompt(
+        rendered,
+        resolve_prefix=resolve_prefix,
+        turn_end_token_ids=turn_end_token_ids,
+        max_model_len=max_model_len,
         measure_only=measure_only,
-        request_max_tokens=rendered.request_max_tokens,
-        max_tokens=max_tokens,
-        admission=rendered.admission,
-        serving_admission=rendered.serving_admission,
-        verify_retained_media=rendered.verify_retained_media,
+        clamp_max_tokens=clamp_max_tokens,
+        tokenizer=tokenizer,
     )
 
 

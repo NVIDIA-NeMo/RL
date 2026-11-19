@@ -80,12 +80,15 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     ChainPrefixCache,
     StagedPrefix,
 )
-from nemo_rl.models.generation.dynamo.vllm import chat_engine  # noqa: E402
+from nemo_rl.models.generation.dynamo import chat_engine  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm.adapter import (  # noqa: E402
     DynamoVllmAdapter,
     chat_runtime_data,
 )
-from nemo_rl.models.generation.dynamo.vllm.render_pool import RenderPool  # noqa: E402
+from nemo_rl.models.generation.dynamo.render_pool import RenderPool  # noqa: E402
+from nemo_rl.models.generation.dynamo.vllm.chat_backend import (  # noqa: E402
+    CHAT_BACKEND,
+)
 from nemo_rl.models.generation.gym_call import (  # noqa: E402
     GYM_EXTRAS_ANNOTATION_PREFIX,
 )
@@ -532,6 +535,7 @@ async def _dynamo(
             chat_engine.RUNTIME_DATA_KEY
         ],
         capture=capture,
+        backend=CHAT_BACKEND,
     )
     try:
         (chunk,) = [chunk async for chunk in engine.generate(request, None)]
@@ -653,7 +657,7 @@ def _build_kit(kit_spec: _KitSpec, path: str) -> _Kit:
             )
         )
     )[chat_engine.RUNTIME_DATA_KEY]
-    pool = RenderPool(workers=1)
+    pool = RenderPool(workers=1, renderer=CHAT_BACKEND.renderer)
     pool.build(spec, path)
     return _Kit(
         path=path,

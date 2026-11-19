@@ -42,6 +42,7 @@ def _runtime(serves_chat: bool = False, **frontend_args) -> ManagedDynamoRuntime
         model_name="model",
         frontend_python="/venvs/vllm/bin/python",
         ray_address="10.0.0.1:6379",
+        chat_backend="vllm",
         serves_chat=serves_chat,
     )
 
@@ -323,8 +324,9 @@ def test_frontend_launches_nemo_rls_chat_engine_from_the_given_interpreter(
     assert command[:3] == [
         "/venvs/vllm/bin/python",
         "-m",
-        "nemo_rl.models.generation.dynamo.vllm.frontend",
+        "nemo_rl.models.generation.dynamo.frontend",
     ]
+    assert env[managed_runtime.CHAT_BACKEND_ENV] == "vllm"
     assert env[managed_runtime.RENDER_WORKERS_ENV] == "3"
     assert env[managed_runtime.RAY_ADDRESS_ENV] == "10.0.0.1:6379"
     # NeMo-Gym's checkpoint generation cuts go to a port of the frontend's own.
@@ -395,6 +397,7 @@ def _megatron_runtime(**overrides) -> ManagedDynamoRuntime:
         model_name="model",
         frontend_python="/venvs/engine/bin/python",
         ray_address="10.0.0.1:6379",
+        chat_backend="megatron",
         serves_chat=False,
     )
 

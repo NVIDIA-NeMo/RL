@@ -825,6 +825,7 @@ class VllmGeneration(GenerationInterface):
             # release as every engine.
             frontend_python=self.worker_group.py_executable,
             ray_address=ray.get_runtime_context().gcs_address,
+            chat_backend="vllm",
             # NeMo-Gym's chat calls need the flag, and the native worker starts
             # its chat server on it.
             serves_chat=bool(self.cfg["vllm_cfg"].get("expose_http_server")),

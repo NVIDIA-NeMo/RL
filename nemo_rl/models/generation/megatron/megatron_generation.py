@@ -190,14 +190,12 @@ class MegatronGeneration(GenerationInterface):
             referenced until the workers have adopted the sockets (worker init
             complete), then `ray.kill` them.
         """
-        # Deferred: the package imports this module.
-        from nemo_rl.models.generation.megatron import megatron_generation_cls
-
-        owner = megatron_generation_cls(config["generation"])
-        if owner is not cls:
-            # Prefill/decode engines behind Dynamo reserve per engine, on the
-            # node each engine is pinned to.
-            return owner.reserve_http_server_addresses(cluster, config)  # type: ignore[attr-defined]
+        if dynamo_enabled(config["generation"]):
+            raise ValueError(
+                "Megatron engines behind Dynamo serve NeMo-Gym through the Dynamo "
+                "frontend (MegatronDynamoGeneration.client_base_urls); no engine "
+                "server address is reserved"
+            )
         # Colocated generation shares the training policy's cluster and uses the
         # default placement-group init, triggered lazily by the read below.
         if not config["generation"]["colocated"]["enabled"]:

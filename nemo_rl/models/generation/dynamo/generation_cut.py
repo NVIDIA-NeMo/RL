@@ -183,7 +183,7 @@ def start_generation_cut_server(runtime: Any, loop: asyncio.AbstractEventLoop) -
     import uvicorn
     from fastapi import FastAPI
 
-    from nemo_rl.models.generation.vllm.generation_cut_route import (
+    from nemo_rl.models.generation.generation_cut_route import (
         register_generation_cut_route,
     )
 

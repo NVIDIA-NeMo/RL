@@ -248,12 +248,18 @@ def wait_for_engine_registrations(
     )
 
 
+# The key an engine's chat settings ride under in its registration's
+# runtime_data, and in what publish_chat_settings writes.
+RUNTIME_DATA_KEY = "nemo_rl_chat"
+
 # The frontend process's environment for NeMo RL's chat engine
-# (dynamo/vllm/chat_engine.py): its render workers, where setup_token_capture
-# writes the capture config, the Ray cluster its TQ reads go through, and the
-# port it takes NeMo-Gym's generation cuts on (dynamo/vllm/generation_cut.py).
+# (dynamo/chat_engine.py): the generation backend it serves, its render
+# workers, where setup_token_capture writes the capture config, the Ray cluster
+# its TQ reads go through, and the port it takes NeMo-Gym's generation cuts on
+# (dynamo/generation_cut.py).
+CHAT_BACKEND_ENV = "NEMO_RL_DYNAMO_CHAT_BACKEND"
 RENDER_WORKERS_ENV = "NEMO_RL_DYNAMO_RENDER_WORKERS"
-# Where the driver writes the chat settings an engine sends before it loads.
+# Where the driver writes the chat settings the engines register with.
 # Set only for a run that serves chat: the frontend then starts its render
 # workers at launch.
 CHAT_SETTINGS_FILE_ENV = "NEMO_RL_DYNAMO_CHAT_SETTINGS_FILE"
@@ -290,6 +296,7 @@ class ManagedDynamoRuntime:
         model_name: str,
         frontend_python: str,
         ray_address: str,
+        chat_backend: str,
         serves_chat: bool,
     ) -> None:
         """Describe the services; nothing starts until :meth:`start`.
@@ -302,14 +309,17 @@ class ManagedDynamoRuntime:
                 as every engine.
             ray_address: The Ray cluster's GCS address; the frontend's chat
                 engine reads token-capture prefixes from TQ through it.
-            serves_chat: Whether the engines expose chat
-                (``vllm_cfg.expose_http_server``, which NeMo-Gym requires). The
-                frontend then starts its render workers at launch.
+            chat_backend: The generation backend the frontend's chat engine
+                renders and replies for (``"vllm"`` or ``"megatron"``).
+            serves_chat: Whether the engines expose chat (the backend's
+                ``expose_http_server``, which NeMo-Gym requires). The frontend
+                then starts its render workers at launch.
         """
         self._dynamo_cfg = dynamo_cfg
         self._model_name = model_name
         self._frontend_python = frontend_python
         self._ray_address = ray_address
+        self._chat_backend = chat_backend
         self.serves_chat = serves_chat
         self._chat_dir: str | None = None
         self._namespace = _managed_namespace()
@@ -525,12 +535,13 @@ class ManagedDynamoRuntime:
         command = [
             self._frontend_python,
             "-m",
-            "nemo_rl.models.generation.dynamo.vllm.frontend",
+            "nemo_rl.models.generation.dynamo.frontend",
             *argv,
         ]
         print(f"  [Dynamo] launching frontend argv={command!r}", flush=True)
         self._chat_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_chat_")
         frontend_env = self._service_env()
+        frontend_env[CHAT_BACKEND_ENV] = self._chat_backend
         frontend_env[RENDER_WORKERS_ENV] = str(
             self._dynamo_cfg.frontend_args.render_workers
         )
@@ -581,11 +592,13 @@ class ManagedDynamoRuntime:
         )
 
     def publish_chat_settings(self, settings: dict[str, Any]) -> None:
-        """Hand the frontend the chat settings an engine sent before it loaded.
+        """Hand the frontend the chat settings the engines register with, before they load.
 
-        ``settings`` is what the engine publishes at registration
-        (``chat_runtime_data``). The frontend builds its render workers from
-        them while the engines load, and registration confirms them.
+        ``settings`` is what the engines publish at registration: vLLM's
+        ``chat_runtime_data``, which one engine sends before it loads, or
+        Megatron's ``megatron_chat_spec``, which the driver reads from the
+        config. The frontend builds its render workers from them while the
+        engines load, and registration confirms them.
         """
         self._write_chat_file("chat_settings.json", json.dumps(settings).encode())
 

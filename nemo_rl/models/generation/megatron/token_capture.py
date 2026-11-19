@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -566,6 +567,56 @@ class TQMegatronTokenStager:
                 )
                 return self._stage_result(coords)
             return None
+
+    def stage_completed(
+        self,
+        admission: dict[str, Any],
+        *,
+        prompt_token_ids: list[int],
+        generated_token_ids: list[int],
+        generated_log_probs: list[float],
+        policy_epoch: Any,
+    ) -> dict[str, Any]:
+        """Stage a call the engine served outside its own stager; return its coords.
+
+        A Megatron engine behind Dynamo serves NeMo-Gym's calls as streams the
+        engine's stager skips, so its Dynamo adapter stages each finished call
+        here, from the engine's final record: the same ``begin_call`` with the
+        admission epoch and the same one TQ write as :meth:`stage`. Text calls
+        only; a failure fails the call's capture, as :meth:`stage` does.
+
+        Args:
+            admission: The call's capture admission, as JSON.
+            prompt_token_ids: The prompt the engine ran.
+            generated_token_ids: The tokens it generated.
+            generated_log_probs: Their log probabilities.
+            policy_epoch: The final record's ``(token_index, epoch)`` boundaries.
+        """
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+        call = self._capture.begin_call(
+            CaptureAdmission.model_validate(admission),
+            weight_version=self._weight_version(
+                SimpleNamespace(policy_epoch=policy_epoch)
+            ),
+        )
+        try:
+            # DRAFT: routing_indices are not staged; router replay stays refused
+            # for Megatron engines behind Dynamo.
+            coords = self._capture.complete_call(
+                call,
+                prompt_token_ids=prompt_token_ids,
+                generated_token_ids=generated_token_ids,
+                generated_logprobs=generated_log_probs,
+                extras=None,
+                attachments=None,
+            )
+        except (TypeError, ValueError, RuntimeError) as error:
+            coords = self._capture.fail_call(
+                call, reason=f"{type(error).__name__}: {error}"
+            )
+        return coords.model_dump(mode="json")
 
     def _cast_media_pixels(
         self, media_tensors: dict[str, Any] | None

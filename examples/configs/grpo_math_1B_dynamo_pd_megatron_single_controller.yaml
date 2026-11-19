@@ -50,6 +50,11 @@ policy:
       control_timeout_s: 900
       frontend_args:
         router_mode: kv
+        # Keep a NeMo-Gym rollout on one decode engine while it idles up to
+        # this many seconds (null disables it).
+        session_affinity_ttl_secs: null
+        # Processes that render NeMo-Gym's chat calls and build their replies.
+        render_workers: 8
         extra_cli_args: []
       # Per-role overrides. null = use mcore_generation_config; set to give
       # prefill and decode different layouts (Megatron reshards the KV handoff
