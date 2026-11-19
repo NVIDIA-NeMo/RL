@@ -14,11 +14,12 @@
 """Dynamo stays out of NeMo RL's vLLM engines.
 
 The engines run NeMo RL's own vLLM and use Dynamo only through its
-engine-agnostic backend SDK, so a vLLM bump can break Dynamo serving only in
-NeMo RL's own adapter (``dynamo/vllm_adapter.py``). These guards fail if
-NeMo RL starts importing Dynamo's vLLM integration (or any other Dynamo
-module), if the SDK itself starts importing vLLM, or if the Dynamo side shared
-by every backend starts importing one.
+engine-agnostic backend SDK, and the frontend serves chat with NeMo RL's own
+chat engine, so a vLLM bump can break Dynamo serving only in NeMo RL's own
+``dynamo/vllm/`` package. These guards fail if NeMo RL starts importing
+Dynamo's vLLM integration (or any other Dynamo module), if the Dynamo modules
+it imports start importing vLLM, or if the Dynamo side shared by every backend
+starts importing one.
 """
 
 import ast
@@ -38,16 +39,30 @@ DYNAMO_SDK_MODULES = {
     "dynamo.common.backend",
     "dynamo.common.backend.logprobs",
     "dynamo.common.backend.publisher",
+    # The frontend's entrypoint and chat-engine hook; the frontend loads Dynamo's
+    # own vLLM chat processor only for --dyn-chat-processor, which NeMo RL rejects.
+    "dynamo.frontend.main",
+    "dynamo.llm",
     "dynamo.llm.exceptions",
 }
 
-
-# The Dynamo side every generation backend builds on.
-BACKEND_NEUTRAL_MODULES = (
-    "models/generation/dynamo/engine_adapter.py",
-    "models/generation/rollout_result.py",
-)
 GENERATION_BACKENDS = {"vllm", "sglang", "trtllm", "megatron"}
+DYNAMO_ROOT = NEMO_RL_ROOT / "models/generation/dynamo"
+
+
+def _backend_neutral_modules() -> list[str]:
+    """The Dynamo side every generation backend builds on: all of ``dynamo/``
+    outside its per-backend packages, and the wire types it shares."""
+    paths = [
+        path
+        for path in DYNAMO_ROOT.rglob("*.py")
+        if path.relative_to(DYNAMO_ROOT).parts[0] not in GENERATION_BACKENDS
+    ]
+    paths += [
+        NEMO_RL_ROOT / "models/generation/rollout_result.py",
+        NEMO_RL_ROOT / "models/generation/gym_call.py",
+    ]
+    return sorted(str(path.relative_to(NEMO_RL_ROOT)) for path in paths)
 
 
 def _imports(path: Path) -> set[str]:
@@ -90,20 +105,22 @@ def test_nemo_rl_imports_only_dynamos_backend_sdk() -> None:
 
 
 def test_the_shared_dynamo_side_imports_no_generation_backend() -> None:
+    modules = _backend_neutral_modules()
+    assert "models/generation/dynamo/engine_adapter.py" in modules
     backends = {
         path: sorted(
             module
             for module in _imports(NEMO_RL_ROOT / path)
             if GENERATION_BACKENDS & set(module.split("."))
         )
-        for path in BACKEND_NEUTRAL_MODULES
+        for path in modules
     }
 
-    assert backends == {path: [] for path in BACKEND_NEUTRAL_MODULES}
+    assert backends == {path: [] for path in modules}
 
 
 @pytest.mark.vllm
-def test_dynamos_backend_sdk_imports_no_vllm() -> None:
+def test_the_dynamo_modules_nemo_rl_imports_import_no_vllm() -> None:
     pytest.importorskip("dynamo._core")
     # A fresh interpreter, so modules other tests imported do not count.
     code = (

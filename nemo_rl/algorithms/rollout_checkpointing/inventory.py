@@ -57,6 +57,7 @@ def capture_reward_settings(
         master_config.reward_penalties,
         get_effort_config(master_config.env),
         get_nemo_gym_thinking_tags(master_config.env),
+        master_config.grpo.length_penalty if master_config.grpo is not None else None,
     )
 
 

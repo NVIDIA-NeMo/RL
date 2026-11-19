@@ -18,8 +18,9 @@ WHY THIS HAS TO RUN INSIDE THE WORKER. A generation rank that dies mid-refit lea
 surviving ranks blocked in NCCL with no timeout and no error -- observed directly, both
 policy workers stuck in ``packed_broadcast_producer -> cuda stream synchronize`` while the
 run sat wedged for 1801s. The controller cannot rescue them by RPC: the collective blocks
-the worker actor's event loop, and the worker actors carry no ``max_concurrency``, so an
-incoming ``abort`` call would queue behind the very operation it is meant to interrupt.
+the worker actor's event loop. A call blocked in C never yields, regardless of the actor's
+``max_concurrency`` (see :func:`await_off_loop`), so an incoming ``abort`` call would queue
+behind the very operation it is meant to interrupt.
 The abort must therefore come from a thread already inside the process, which is exactly
 the arrangement the design's NCCL spike validated (a survivor released 0.15s after another
 thread called ``abort()``).
