@@ -76,8 +76,7 @@ docker buildx build \
   --push \
   --build-context nemo-rl=. \
   --build-arg MAX_JOBS=8 \
-  --build-arg SKIP_SGLANG_BUILD=1 \
-  --build-arg SKIP_TRTLLM_BUILD=1 \
+  --build-arg NRL_EXTRAS="vllm mcore automodel modelopt nemo_gym" \
   --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml" \
   .
 ```
@@ -85,8 +84,7 @@ docker buildx build \
 Build arguments:
 
 - `NEMO_GYM_PREFETCH_CONFIGS` builds the Gym virtual environments referenced by `rlvr.yaml` into the image.
-- `SKIP_SGLANG_BUILD=1` skips SGLang because this recipe uses vLLM.
-- `SKIP_TRTLLM_BUILD=1` skips TensorRT-LLM because this recipe does not use it.
+- `NRL_EXTRAS` lists the backends to build. It leaves out `sglang` and `trtllm` because this recipe uses vLLM and does not use TensorRT-LLM.
 - `MAX_JOBS` controls parallel build jobs; tune it for the build machine.
 - `--build-context nemo-rl=.` builds from the current checkout. Without it, the Dockerfile pulls `NVIDIA-NeMo/RL.git#main`.
 
