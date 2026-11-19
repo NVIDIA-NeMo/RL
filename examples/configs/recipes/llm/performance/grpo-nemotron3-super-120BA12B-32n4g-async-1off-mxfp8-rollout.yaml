@@ -6,6 +6,7 @@ policy:
     refit_transport: nccl_reshard
     vllm_cfg:
       precision: "fp8"
+      expert_parallel_size: 1
       is_mx: true
       quantization_ignore_patterns:
         - model.layers.*.mixer.in_proj

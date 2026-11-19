@@ -28,7 +28,6 @@ from types import MethodType
 from typing import Any
 
 import torch
-from torch.nn import Parameter
 
 NEMO_MODELOPT_W4A4 = "nemo_modelopt_nvfp4"
 NEMO_MODELOPT_W4A16 = "nemo_modelopt_w4a16_nvfp4"
@@ -122,9 +121,9 @@ def register_nemo_modelopt_nvfp4() -> None:
     )
     from vllm.model_executor.layers.quantization import register_quantization_config
     from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptLinearMethod,
         ModelOptNvFp4Config,
         ModelOptNvFp4FusedMoE,
-        ModelOptNvFp4LinearMethod,
     )
 
     class NemoModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
@@ -203,43 +202,23 @@ def register_nemo_modelopt_nvfp4() -> None:
             return None
 
     @register_weight_loader_v2_supported_method
-    class NemoModelOptW4A16LinearMethod(ModelOptNvFp4LinearMethod):
-        """ModelOpt NVFP4 weights with BF16/FP16 Marlin activations."""
+    class NemoModelOptW4A16LinearMethod(ModelOptLinearMethod):
+        """ModelOpt NVFP4 weights with BF16/FP16 Marlin activations.
 
-        def __init__(self, quant_config: object) -> None:
-            self.quant_config = quant_config
-            self.marlin_input_dtype = None
-            self.kernel = MarlinNvFp4LinearKernel(NvFp4LinearLayerConfig())
+        vLLM's generic ModelOpt linear method already handles weight-only
+        W4A16. This subclass pins the Marlin kernel and clears the E4M3 sign
+        bit ModelOpt exports leave on the block scales.
+        """
+
+        kernel: Any
 
         def create_weights(self, layer: Any, *args: Any, **kwargs: Any) -> None:
             super().create_weights(layer, *args, **kwargs)
-            del layer.input_scale
+            self.kernel = MarlinNvFp4LinearKernel(NvFp4LinearLayerConfig())
 
-        # Adapted from vLLM's ModelOptNvFp4LinearMethod
-        # .process_weights_after_loading/.apply with input-scale/alpha handling
-        # removed for weight-only W4A16.  vLLM 0.25.1 does now ship a native
-        # ModelOptNvFp4W4A16LinearMethod:
-        # https://github.com/vllm-project/vllm/blob/v0.25.1/vllm/model_executor/layers/quantization/modelopt.py#L1245
-        # This override is kept because 0.25's ModelOptNvFp4Config installs
-        # LinearMethodCls as an *instance* attribute keyed off the quant algo,
-        # which shadows a subclass override (see from_config below).
-        # Re-sync on vLLM bumps.
         def process_weights_after_loading(self, layer: Any) -> None:
-            layer.weight_global_scale = Parameter(
-                layer.weight_scale_2.max().to(torch.float32),
-                requires_grad=False,
-            )
-            del layer.weight_scale_2
             _canonicalize_nvfp4_scale_(layer.weight_scale)
-            self.kernel.process_weights_after_loading(layer)
-
-        def apply(
-            self,
-            layer: Any,
-            x: torch.Tensor,
-            bias: torch.Tensor | None = None,
-        ) -> torch.Tensor:
-            return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
+            super().process_weights_after_loading(layer)
 
     class NemoModelOptW4A16FusedMoE(ModelOptNvFp4FusedMoE):
         """ModelOpt W4A16 MoE using vLLM's NVFP4 Marlin implementation.
@@ -295,8 +274,15 @@ def register_nemo_modelopt_nvfp4() -> None:
                 self.moe_quant_config = reload_quant_config
 
     class NemoModelOptW4A16Config(ModelOptNvFp4Config):
-        LinearMethodCls = NemoModelOptW4A16LinearMethod
         FusedMoEMethodCls = NemoModelOptW4A16FusedMoE
+
+        def get_quant_method(self, layer: Any, prefix: str) -> Any:
+            method = super().get_quant_method(layer, prefix)
+            if isinstance(method, ModelOptLinearMethod):
+                # No format scheme: vLLM's W4A16 default registers an
+                # input_scale the weight-only export never provides.
+                return NemoModelOptW4A16LinearMethod(method.spec, method.ctx)
+            return method
 
         def get_name(self) -> str:
             return NEMO_MODELOPT_W4A16
@@ -318,13 +304,7 @@ def register_nemo_modelopt_nvfp4() -> None:
 
         @classmethod
         def from_config(cls, config: dict[str, Any]) -> Any:
-            instance = super().from_config(_validated_w4a16_config(config))
-            # vLLM 0.25's ModelOptNvFp4Config.__init__ selects LinearMethodCls
-            # from the quant algo as an *instance* attribute, which shadows
-            # the class attribute above; rebind the NeMo method explicitly so
-            # W4A16 linears keep the refit-friendly Marlin implementation.
-            instance.LinearMethodCls = NemoModelOptW4A16LinearMethod
-            return instance
+            return super().from_config(_validated_w4a16_config(config))
 
     register_quantization_config(NEMO_MODELOPT_W4A4)(NemoModelOptNvFp4Config)
     register_quantization_config(NEMO_MODELOPT_W4A16)(NemoModelOptW4A16Config)

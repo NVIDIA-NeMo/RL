@@ -20,8 +20,10 @@ import pytest
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym import openai_utils, rollout_observability
+from nemo_gym import rollout_observability
+from nemo_gym.client import openai_client
 from nemo_gym.config_types import ModelServerRef
+from nemo_gym.core import responses_api_types
 from nemo_gym.openai_utils import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
@@ -72,7 +74,7 @@ def response(index: int, text: str, **updates: Any) -> NeMoGymResponse:
 def namespace() -> dict:
     return {
         name: value
-        for module in (openai_utils, rollout_observability)
+        for module in (openai_client, responses_api_types, rollout_observability)
         for name, value in vars(module).items()
         if not name.startswith("_")
     }

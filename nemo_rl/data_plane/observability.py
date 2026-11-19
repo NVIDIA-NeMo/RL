@@ -66,6 +66,7 @@ import numpy as np
 import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict, TensorDictBase
 
+from nemo_rl.data_plane.checkpoint import CheckpointCapture
 from nemo_rl.data_plane.codec import drain_codec_ms
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.telemetry.instrumentation import (
@@ -1115,6 +1116,29 @@ def metrics_never_fail_the_step(step: int) -> Iterator[None]:
             )
 
 
+def backend_health_metrics(backend: str) -> tuple[str, dict[str, float]] | None:
+    """The backend's own counters for the driver to log every step, with their prefix.
+
+    Logged even with observability off, by both drivers (the single controller
+    and ``grpo_sync``): a leak only shows over a long run, and the first SSD
+    spill (nixl) or offload round (Mooncake) of a run logs its one warning
+    from inside these readers. ``None`` for the simple backend or a process
+    without the backend's TQ client. Blocking (Mooncake reads the master's
+    ``/metrics`` over HTTP), so an async caller runs it in a thread.
+    """
+    if backend == "nixl":
+        from nemo_rl.data_plane.adapters.tq_nixl import unit_metrics
+
+        unit = unit_metrics()
+        return ("data_plane/nixl", unit) if unit else None
+    if backend == "mooncake_cpu":
+        from nemo_rl.data_plane.adapters.mooncake_ssd_offload import step_metrics
+
+        master = step_metrics()
+        return ("data_plane/mooncake", master) if master else None
+    return None
+
+
 def log_step_metrics(
     logger: Any, metrics: dict[str, float], step: int, scope: str
 ) -> None:
@@ -2012,6 +2036,18 @@ class MetricsDataPlaneClient(DataPlaneClient):
         )
         self._record_clear(partition_id, sample_ids_list)
         self._bill_self(entered)
+
+    def capture_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> CheckpointCapture | None:
+        return self._run(
+            "capture_checkpoint",
+            "",
+            lambda: self._inner.capture_checkpoint(checkpoint_dir, metadata=metadata),
+        )
 
     def save_checkpoint(
         self,

@@ -1,6 +1,6 @@
 #!/bin/bash
-# Run native TQ recovery with the nixl backend. Pass nixl_ssd to turn the
-# units' SSD tier on.
+# Run native TQ recovery with the nixl backend. The units' SSD tier is on by
+# default; pass nixl_ssd for a put area so small that every step spills.
 
 set -eou pipefail
 
@@ -17,8 +17,5 @@ if ! rdma_device_available; then
     echo "[SKIP] no usable RDMA device; the nixl data plane requires RDMA."
     exit 0
 fi
-
-# HPC-X's NCCL net plugin breaks NIXL's UCX (docs/design-docs/nixl-data-plane.md).
-export NCCL_NET_PLUGIN=${NCCL_NET_PLUGIN:-none}
 
 exec bash "$SCRIPT_DIR/grpo_dp_single_controller_tq_recovery.sh" "${1:-nixl}"
