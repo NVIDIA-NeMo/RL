@@ -23,6 +23,16 @@ replace-imports-with-any = [
   "sphinx.*",
   "docutils.*",
   "zstandard.*",
+  # Optional dependencies that are not installed in the lint environment
+  # (backend extras and the docs group).
+  "modelopt.*",
+  "sglang.*",
+  "sglang_router.*",
+  "transformer_engine.*",
+  "nvidia_resiliency_ext.*",
+  "fla.*",
+  "sentence_transformers.*",
+  "myst_parser.*",
 ]
 project-includes = [
   "nemo_rl/**/*.py",

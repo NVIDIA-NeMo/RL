@@ -1,13 +1,6 @@
 {
   "errors": [
     {
-      "column": 1,
-      "path": "docs/autodoc2_docstrings_parser.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `myst_parser.parsers.sphinx_`",
-      "severity": "error"
-    },
-    {
       "column": 23,
       "path": "examples/nemo_gym/download_swe_images.py",
       "name": "not-callable",
@@ -5237,90 +5230,6 @@
       "severity": "error"
     },
     {
-      "column": 1,
-      "path": "nemo_rl/modelopt/models/generation/vllm_quant_backend.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization.nn.modules.tensor_quantizer`",
-      "severity": "error"
-    },
-    {
-      "column": 8,
-      "path": "nemo_rl/modelopt/models/generation/vllm_quant_patch.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization`",
-      "severity": "error"
-    },
-    {
-      "column": 1,
-      "path": "nemo_rl/modelopt/models/generation/vllm_quant_patch.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization.calib.max`",
-      "severity": "error"
-    },
-    {
-      "column": 1,
-      "path": "nemo_rl/modelopt/models/generation/vllm_quant_patch.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization.nn.modules.tensor_quantizer`",
-      "severity": "error"
-    },
-    {
-      "column": 1,
-      "path": "nemo_rl/modelopt/models/generation/vllm_quant_patch.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization.plugins.vllm`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/modelopt/models/generation/vllm_quant_patch.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization.nn`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/modelopt/models/generation/vllm_quant_patch.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization.nn`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/modelopt/models/generation/vllm_quant_patch.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization.plugins`",
-      "severity": "error"
-    },
-    {
-      "column": 1,
-      "path": "nemo_rl/modelopt/models/policy/workers/megatron_quant_policy_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization.nn`",
-      "severity": "error"
-    },
-    {
-      "column": 1,
-      "path": "nemo_rl/modelopt/models/policy/workers/megatron_quant_policy_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization.nn.modules.quant_module`",
-      "severity": "error"
-    },
-    {
-      "column": 1,
-      "path": "nemo_rl/modelopt/models/policy/workers/megatron_quant_policy_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization.nn.modules.tensor_quantizer`",
-      "severity": "error"
-    },
-    {
-      "column": 1,
-      "path": "nemo_rl/modelopt/models/policy/workers/megatron_quant_policy_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization.utils`",
-      "severity": "error"
-    },
-    {
       "column": 9,
       "path": "nemo_rl/modelopt/models/policy/workers/megatron_quant_policy_worker.py",
       "name": "bad-override",
@@ -5349,34 +5258,6 @@
       "severity": "error"
     },
     {
-      "column": 8,
-      "path": "nemo_rl/modelopt/models/policy/workers/utils.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization`",
-      "severity": "error"
-    },
-    {
-      "column": 1,
-      "path": "nemo_rl/modelopt/models/policy/workers/utils.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization.config`",
-      "severity": "error"
-    },
-    {
-      "column": 1,
-      "path": "nemo_rl/modelopt/models/policy/workers/utils.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.utils.dataset_utils`",
-      "severity": "error"
-    },
-    {
-      "column": 1,
-      "path": "nemo_rl/modelopt/models/policy/workers/utils.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.utils.plugins`",
-      "severity": "error"
-    },
-    {
       "column": 9,
       "path": "nemo_rl/modelopt/models/policy/workers/utils.py",
       "name": "bad-override-param-name",
@@ -5388,34 +5269,6 @@
       "path": "nemo_rl/modelopt/models/policy/workers/utils.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Module | Tensor | device` is not assignable to parameter `device` with type `device` in function `get_forward_loop_func`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/modelopt/utils.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.export.convert_hf_config`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/modelopt/utils.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization.config`",
-      "severity": "error"
-    },
-    {
-      "column": 12,
-      "path": "nemo_rl/modelopt/utils.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.quantization`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/modelopt/utils.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.recipe`",
       "severity": "error"
     },
     {
@@ -5552,13 +5405,6 @@
       "severity": "error"
     },
     {
-      "column": 9,
-      "path": "nemo_rl/models/automodel/setup.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `transformer_engine.pytorch.optimizers`",
-      "severity": "error"
-    },
-    {
       "column": 35,
       "path": "nemo_rl/models/automodel/setup.py",
       "name": "bad-index",
@@ -5689,13 +5535,6 @@
       "path": "nemo_rl/models/automodel/setup.py",
       "name": "bad-typed-dict-key",
       "concise_description": "TypedDict `AutomodelConfigDisabled` does not have key `activation_checkpointing`",
-      "severity": "error"
-    },
-    {
-      "column": 24,
-      "path": "nemo_rl/models/automodel/setup.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `fla`",
       "severity": "error"
     },
     {
@@ -6137,69 +5976,6 @@
       "path": "nemo_rl/models/generation/sglang/sglang_generation.py",
       "name": "bad-return",
       "concise_description": "Returned type `None` is not assignable to declared return type `bool`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/models/generation/sglang/sglang_router.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `sglang_router.launch_router`",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/models/generation/sglang/sglang_router.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `sglang_router.launch_router`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/models/generation/sglang/sglang_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `sglang.srt.server_args`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/models/generation/sglang/sglang_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `sglang.srt.entrypoints.http_server`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/models/generation/sglang/sglang_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `sglang.srt.utils`",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/models/generation/sglang/sglang_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `sglang.srt.server_args`",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/models/generation/sglang/sglang_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `sglang.srt.utils`",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/models/generation/sglang/sglang_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `sglang.srt.constants`",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/models/generation/sglang/sglang_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `sglang.srt.constants`",
       "severity": "error"
     },
     {
@@ -6921,13 +6697,6 @@
       "path": "nemo_rl/models/megatron/draft/dflash.py",
       "name": "unsupported-operation",
       "concise_description": "`None` is not subscriptable",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/models/megatron/draft/eagle.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `modelopt.torch.speculative.plugins.megatron_eagle`",
       "severity": "error"
     },
     {
@@ -8251,41 +8020,6 @@
       "path": "nemo_rl/models/policy/workers/base_policy_worker.py",
       "name": "bad-return",
       "concise_description": "Returned type `float` is not assignable to declared return type `int`",
-      "severity": "error"
-    },
-    {
-      "column": 1,
-      "path": "nemo_rl/models/policy/workers/megatron_policy_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/models/policy/workers/megatron_policy_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `transformer_engine.pytorch.constants`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/models/policy/workers/megatron_policy_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `transformer_engine.pytorch.tensor.storage.float8_blockwise_tensor_storage`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/models/policy/workers/megatron_policy_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `transformer_engine.pytorch.tensor.storage.float8_tensor_storage`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/models/policy/workers/megatron_policy_worker.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage`",
       "severity": "error"
     },
     {
@@ -11219,13 +10953,6 @@
       "path": "tools/x_token/minimal_projection_generator.py",
       "name": "unsupported-delete",
       "concise_description": "Invalid target for `del`",
-      "severity": "error"
-    },
-    {
-      "column": 17,
-      "path": "tools/x_token/minimal_projection_generator.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `sentence_transformers`",
       "severity": "error"
     },
     {
