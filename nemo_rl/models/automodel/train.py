@@ -68,6 +68,7 @@ from nemo_rl.models.automodel.data import (
     drop_explicit_only_kwargs_not_in_forward,
     filter_multimodal_kwargs_for_model,
 )
+from nemo_rl.models.automodel.fused_logprobs import FusedLogprobLMHead
 from nemo_rl.models.automodel.router_replay import (
     ReplayGate,
     microbatch_replay_context,
@@ -316,6 +317,7 @@ def forward_with_post_processing_fn(
     global_valid_toks: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     sequence_dim: int = 1,
+    fused_logprob_head: Optional[FusedLogprobLMHead] = None,
 ) -> Tuple[Any, dict[str, Any], ProcessedMicrobatch]:
     """Perform forward pass with pre-processed microbatch and apply post-processing.
 
@@ -335,6 +337,10 @@ def forward_with_post_processing_fn(
         global_valid_toks: Global valid token count for loss normalization
         sampling_params: Sampling parameters (top-k, top-p, temperature)
         sequence_dim: Sequence dimension
+        fused_logprob_head: The model's fused LM head when
+            policy.automodel_cfg.use_fused_linear_logprobs is enabled. Loss and
+            logprob post-processors then receive next-token logprobs from it
+            instead of logits.
 
     Returns:
         tuple: (result, metrics, processed_microbatch)
@@ -350,38 +356,62 @@ def forward_with_post_processing_fn(
         raise RuntimeError(
             "ContextParallelSharder is required when context_parallel_size > 1"
         )
-    # Model forward pass
-    outputs = model_forward(model, prepared.model_batch)
 
-    # Extract logits from model outputs
-    logits = extract_logits(model, outputs)
-    del outputs
-
-    # Draft co-training distills against the policy's raw logits; stash them
-    # before the (in-place) temperature scaling below mutates the tensor.
-    if (
-        isinstance(post_processing_fn, LossPostProcessor)
-        and post_processing_fn.draft_runtime is not None
+    if isinstance(post_processing_fn, (LossPostProcessor, LogprobsPostProcessor)) and (
+        post_processing_fn.fused_linear_logprobs != (fused_logprob_head is not None)
     ):
-        post_processing_fn.draft_runtime.stash_teacher_logits(
-            logits, need_clone=need_temperature_scaling(sampling_params)
+        raise RuntimeError(
+            f"{type(post_processing_fn).__name__} has fused_linear_logprobs="
+            f"{post_processing_fn.fused_linear_logprobs}, but the model "
+            f"{'has' if fused_logprob_head is not None else 'has no'} fused "
+            "LM head (policy.automodel_cfg.use_fused_linear_logprobs). Only GRPO "
+            "supports fused linear logprobs on the AutoModel backend."
         )
 
-    # Apply temperature scaling only for sampling-oriented post-processors
-    # Score computations should use unscaled logits
-    if isinstance(
-        post_processing_fn,
-        (
-            LossPostProcessor,
-            LogprobsPostProcessor,
-            TopkLogitsPostProcessor,
-            FullLogitsPostProcessor,
-        ),
+    if fused_logprob_head is not None and isinstance(
+        post_processing_fn, (LossPostProcessor, LogprobsPostProcessor)
     ):
-        # Temperature scaling is element-wise, directly applying it here.
-        # Other sampling parameters like top-k and top-p need the logits from whole vocabulary,
-        # so applying them when gathering logits from vocab parallel (called in LossPostProcessor and LogprobsPostProcessor).
-        logits = apply_temperature_scaling(logits, sampling_params)
+        # The LM head returns float32 [B, S-1] logprobs, already divided by the
+        # temperature, in place of logits.
+        temperature = 1.0 if sampling_params is None else sampling_params.temperature
+        with fused_logprob_head.capture(
+            prepared.model_batch["input_ids"], temperature=temperature
+        ) as capture:
+            model_forward(model, prepared.model_batch)
+        logits = capture.next_token_logprobs
+    else:
+        # Model forward pass
+        outputs = model_forward(model, prepared.model_batch)
+
+        # Extract logits from model outputs
+        logits = extract_logits(model, outputs)
+        del outputs
+
+        # Draft co-training distills against the policy's raw logits; stash them
+        # before the (in-place) temperature scaling below mutates the tensor.
+        if (
+            isinstance(post_processing_fn, LossPostProcessor)
+            and post_processing_fn.draft_runtime is not None
+        ):
+            post_processing_fn.draft_runtime.stash_teacher_logits(
+                logits, need_clone=need_temperature_scaling(sampling_params)
+            )
+
+        # Apply temperature scaling only for sampling-oriented post-processors
+        # Score computations should use unscaled logits
+        if isinstance(
+            post_processing_fn,
+            (
+                LossPostProcessor,
+                LogprobsPostProcessor,
+                TopkLogitsPostProcessor,
+                FullLogitsPostProcessor,
+            ),
+        ):
+            # Temperature scaling is element-wise, directly applying it here.
+            # Other sampling parameters like top-k and top-p need the logits from whole vocabulary,
+            # so applying them when gathering logits from vocab parallel (called in LossPostProcessor and LogprobsPostProcessor).
+            logits = apply_temperature_scaling(logits, sampling_params)
 
     # Apply the post-processing function directly based on type
     if isinstance(post_processing_fn, LossPostProcessor):
@@ -462,6 +492,7 @@ def automodel_forward_backward(
     num_valid_microbatches: Optional[int] = None,
     on_microbatch_start: Optional[Callable[[int], None]] = None,
     router_replay_gates: Optional[list[ReplayGate]] = None,
+    fused_logprob_head: Optional[FusedLogprobLMHead] = None,
 ) -> list[Tuple[Any, dict[str, Any]]]:
     """Execute forward and backward passes for automodel.
 
@@ -494,6 +525,9 @@ def automodel_forward_backward(
             with the microbatch index. Useful for cache clearing, etc.
         router_replay_gates: When given, replay each microbatch's rollout
             ``routed_experts`` on these MoE gates (R3) for both its forward and backward.
+        fused_logprob_head: The model's fused LM head when
+            policy.automodel_cfg.use_fused_linear_logprobs is enabled; see
+            :func:`forward_with_post_processing_fn`.
 
     Returns:
         List of (result, metrics) tuples from each microbatch
@@ -553,6 +587,7 @@ def automodel_forward_backward(
                     global_valid_toks=global_valid_toks,
                     sampling_params=sampling_params,
                     sequence_dim=sequence_dim,
+                    fused_logprob_head=fused_logprob_head,
                 )
 
                 # Check if this is a dummy batch
@@ -644,6 +679,11 @@ class LossPostProcessor:
         self.sampling_params = sampling_params
         self.draft_runtime = draft_runtime
         self.tp_mesh = tp_mesh
+        # The loss function decides whether it consumes precomputed next-token
+        # logprobs; the algorithm sets it from the backend config.
+        self.fused_linear_logprobs = bool(
+            getattr(loss_fn, "use_fused_linear_logprobs", False)
+        )
         self._cp_gradient_fanout = (
             cp_size
             if cp_size > 1
@@ -802,6 +842,8 @@ class LogprobsPostProcessor:
         cfg: PolicyConfig,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        *,
+        fused_linear_logprobs: bool = False,
     ):
         """Initialize LogprobsPostProcessor.
 
@@ -809,10 +851,22 @@ class LogprobsPostProcessor:
             cfg: Configuration dictionary
             enable_seq_packing: Whether sequence packing is enabled
             sampling_params: Sampling parameters
+            fused_linear_logprobs: Whether ``logits`` are the fused LM head's
+                temperature-scaled ``[batch, seq - 1]`` next-token logprobs.
         """
+        if fused_linear_logprobs and (
+            enable_seq_packing
+            or need_top_k_or_top_p_filtering(sampling_params)
+            or replays_sampler_support(sampling_params)
+        ):
+            raise ValueError(
+                "Fused linear logprobs support neither sequence packing nor "
+                "top-k/top-p filtering or sampler replay."
+            )
         self.cfg = cfg
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
+        self.fused_linear_logprobs = fused_linear_logprobs
         self.logprob_chunk_size = cfg.get("logprob_chunk_size", None)
 
     def __call__(
@@ -844,7 +898,22 @@ class LogprobsPostProcessor:
         """
         input_lengths = data_dict["input_lengths"]
 
-        if replays_sampler_support(self.sampling_params):
+        if self.fused_linear_logprobs:
+            if cp_sharder is not None:
+                raise ValueError(
+                    "Fused linear logprobs do not support context parallelism."
+                )
+            seq_len = processed_inputs.seq_len
+            token_logprobs = logits
+            if token_logprobs.shape != (
+                processed_inputs.input_ids.shape[0],
+                seq_len - 1,
+            ):
+                raise ValueError(
+                    "Fused linear logprobs must have shape [batch, seq_len - 1]; got "
+                    f"{tuple(token_logprobs.shape)} for seq_len={seq_len}."
+                )
+        elif replays_sampler_support(self.sampling_params):
             # Same support-renormalized log-probs as the actor loss (score
             # centering runs Automodel with TP=1, CP=1).
             cu_seqlens = None
@@ -871,8 +940,7 @@ class LogprobsPostProcessor:
             )
             mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
             return mask_filtered_logprobs_outside_tokens(token_logprobs, mask)
-
-        if cp_sharder is not None:
+        elif cp_sharder is not None:
             # ``data_dict`` stays canonical under CP: ``_build_model_batch`` clones
             # the model-facing tensors so Automodel's in-place buffer sharding
             # cannot reach the loss-side ones. Shift and gather against that

@@ -86,6 +86,7 @@ def mock_loss_fn():
     loss_fn.return_value = (torch.tensor(0.5), {"loss": 0.5})
     loss_fn.input_type = LossInputType.LOGIT
     loss_fn.score_centering = False
+    loss_fn.use_fused_linear_logprobs = False
     return loss_fn
 
 
@@ -2272,7 +2273,7 @@ class TestAutomodelForwardBackwardWithGradients:
 
         def run(*, cp_size: int, dp_size: int) -> torch.Tensor:
             model = ScaleModel()
-            loss_fn = MagicMock(input_type=input_type)
+            loss_fn = MagicMock(input_type=input_type, use_fused_linear_logprobs=False)
 
             def compute_loss(
                 *,
@@ -2484,3 +2485,197 @@ class TestAggregateTrainingStatistics:
 
         # Verify global_loss is on CPU
         assert metrics["global_loss"].device == torch.device("cpu")
+
+
+# =====================
+# Fused linear logprobs
+# =====================
+FUSED_BATCH, FUSED_SEQ, FUSED_VOCAB = 2, 11, 257
+
+
+class _WeightedTokenLoss:
+    """Signed, nonuniform per-token weights expose every logprob gradient."""
+
+    input_type = LossInputType.LOGPROB
+
+    def __init__(self, *, use_fused_linear_logprobs: bool) -> None:
+        self.use_fused_linear_logprobs = use_fused_linear_logprobs
+
+    def __call__(
+        self, *, data: Any, next_token_logprobs: torch.Tensor, **kwargs: Any
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        return (next_token_logprobs * data["weights"]).sum(), {}
+
+
+def _fused_test_model() -> torch.nn.Module:
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    torch.manual_seed(0)
+    config = LlamaConfig(
+        vocab_size=FUSED_VOCAB,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+    )
+    # float32 so that the logits path also divides float32 logits by the
+    # temperature, as FSDP2's float32 output dtype makes it do in training.
+    return LlamaForCausalLM(config).cuda()
+
+
+def _fused_test_microbatch() -> ProcessedMicrobatch:
+    generator = torch.Generator(device="cuda").manual_seed(1)
+    input_ids = torch.randint(
+        FUSED_VOCAB, (FUSED_BATCH, FUSED_SEQ), device="cuda", generator=generator
+    )
+    data_dict = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([FUSED_SEQ, FUSED_SEQ - 4], device="cuda"),
+            "weights": torch.randn(
+                FUSED_BATCH, FUSED_SEQ - 1, device="cuda", generator=generator
+            ),
+            "sample_mask": torch.ones(FUSED_BATCH, device="cuda"),
+        }
+    )
+    return ProcessedMicrobatch(
+        data_dict=data_dict,
+        processed_inputs=ProcessedInputs(input_ids=input_ids, seq_len=FUSED_SEQ),
+        original_batch_size=FUSED_BATCH,
+        original_seq_len=FUSED_SEQ,
+    )
+
+
+@pytest.fixture
+def _deterministic_bf16_matmul(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep cuBLAS from choosing a bf16 split-K reduction that depends on the chunk's row count."""
+    monkeypatch.setattr(
+        torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction", False
+    )
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.usefixtures("_deterministic_bf16_matmul")
+class TestFusedLinearLogprobs:
+    SAMPLING = TrainingSamplingParams(top_k=None, top_p=1.0, temperature=0.7)
+
+    def _train(self, *, fused: bool) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        from nemo_rl.models.automodel.fused_logprobs import FusedLogprobLMHead
+
+        model = _fused_test_model()
+        head = FusedLogprobLMHead(model, chunk_size=4) if fused else None
+        processor = LossPostProcessor(
+            loss_fn=_WeightedTokenLoss(use_fused_linear_logprobs=fused),
+            cfg={"logprob_chunk_size": None},
+            cp_mesh=None,
+            cp_size=1,
+            dp_size=1,
+            sampling_params=self.SAMPLING,
+        )
+        [(loss, _)] = automodel_forward_backward(
+            model=model,
+            data_iterator=iter([_fused_test_microbatch()]),
+            post_processing_fn=processor,
+            device_mesh=None,
+            padding_token_id=0,
+            autocast_context_factory=nullcontext,
+            allow_flash_attn_args=False,
+            global_valid_seqs=torch.tensor(FUSED_BATCH),
+            global_valid_toks=torch.tensor(FUSED_BATCH * (FUSED_SEQ - 1)),
+            sampling_params=self.SAMPLING,
+            fused_logprob_head=head,
+        )
+        grads = {name: p.grad.float() for name, p in model.named_parameters()}
+        return loss.detach(), grads
+
+    def _logprobs(self, *, fused: bool) -> torch.Tensor:
+        from nemo_rl.models.automodel.fused_logprobs import FusedLogprobLMHead
+
+        model = _fused_test_model()
+        head = FusedLogprobLMHead(model, chunk_size=4) if fused else None
+        processor = LogprobsPostProcessor(
+            cfg={"logprob_chunk_size": None},
+            sampling_params=self.SAMPLING,
+            fused_linear_logprobs=fused,
+        )
+        processed_mb = _fused_test_microbatch()
+        with torch.no_grad():
+            logprobs, _, _ = forward_with_post_processing_fn(
+                model=model,
+                prepared=_prepare_cp1(
+                    model, processed_mb.processed_inputs, allow_flash_attn_args=False
+                ),
+                post_processing_fn=processor,
+                processed_mb=processed_mb,
+                sampling_params=self.SAMPLING,
+                fused_logprob_head=head,
+            )
+        return logprobs
+
+    def test_training_loss_and_gradients_match_logits_path(self) -> None:
+        fused_loss, fused_grads = self._train(fused=True)
+        loss, grads = self._train(fused=False)
+
+        torch.testing.assert_close(fused_loss, loss, rtol=1e-5, atol=1e-5)
+        assert fused_grads.keys() == grads.keys()
+        for name in grads:
+            torch.testing.assert_close(fused_grads[name], grads[name], msg=name)
+
+    def test_logprobs_match_logits_path(self) -> None:
+        fused = self._logprobs(fused=True)
+        unfused = self._logprobs(fused=False)
+
+        assert fused.shape == (FUSED_BATCH, FUSED_SEQ)
+        torch.testing.assert_close(fused, unfused, rtol=1e-5, atol=1e-5)
+        # Positions past input_lengths stay zero, as on the logits path.
+        assert torch.all(fused[1, FUSED_SEQ - 4 :] == 0)
+
+    def test_post_processor_and_head_must_agree(self) -> None:
+        from nemo_rl.models.automodel.fused_logprobs import FusedLogprobLMHead
+
+        model = _fused_test_model()
+        processed_mb = _fused_test_microbatch()
+        prepared = _prepare_cp1(
+            model, processed_mb.processed_inputs, allow_flash_attn_args=False
+        )
+        logprobs_processor = LogprobsPostProcessor(
+            cfg={"logprob_chunk_size": None}, fused_linear_logprobs=True
+        )
+        with pytest.raises(RuntimeError, match="has no fused"):
+            forward_with_post_processing_fn(
+                model=model,
+                prepared=prepared,
+                post_processing_fn=logprobs_processor,
+                processed_mb=processed_mb,
+            )
+
+        loss_processor = LossPostProcessor(
+            loss_fn=_WeightedTokenLoss(use_fused_linear_logprobs=False),
+            cfg={"logprob_chunk_size": None},
+            cp_mesh=None,
+            cp_size=1,
+            dp_size=1,
+        )
+        with pytest.raises(RuntimeError, match="Only GRPO"):
+            forward_with_post_processing_fn(
+                model=model,
+                prepared=prepared,
+                post_processing_fn=loss_processor,
+                processed_mb=processed_mb,
+                global_valid_seqs=torch.tensor(FUSED_BATCH),
+                global_valid_toks=torch.tensor(FUSED_BATCH * (FUSED_SEQ - 1)),
+                fused_logprob_head=FusedLogprobLMHead(model, chunk_size=4),
+            )
+
+    def test_logprobs_post_processor_rejects_filtering(self) -> None:
+        with pytest.raises(ValueError, match="top-k/top-p"):
+            LogprobsPostProcessor(
+                cfg={"logprob_chunk_size": None},
+                sampling_params=TrainingSamplingParams(
+                    top_k=8, top_p=1.0, temperature=1.0
+                ),
+                fused_linear_logprobs=True,
+            )

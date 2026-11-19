@@ -87,6 +87,22 @@ def is_lora_enabled(policy_config: "PolicyConfig") -> bool:
     )
 
 
+def is_fused_linear_logprobs_enabled(policy_config: "PolicyConfig") -> bool:
+    """Return whether the enabled training backend computes fused linear logprobs."""
+    automodel_config = policy_config.get("automodel_cfg") or {}
+    megatron_config = policy_config.get("megatron_cfg") or {}
+    return bool(
+        (
+            automodel_config.get("enabled")
+            and automodel_config.get("use_fused_linear_logprobs")
+        )
+        or (
+            megatron_config.get("enabled")
+            and megatron_config.get("use_fused_linear_logprobs")
+        )
+    )
+
+
 def validate_lora_refit_policy_config(
     policy_config: "PolicyConfig",
 ) -> LoraRefitMode | None:

@@ -614,6 +614,7 @@ class AutomodelPolicyWorkerImpl(
         # setup_model_and_optimizer (mirrors Megatron, which attaches the
         # draft during its own setup and has the worker only read it back).
         self.draft_runtime = model_and_optimizer_state.draft_runtime
+        self.fused_logprob_head = model_and_optimizer_state.fused_logprob_head
 
         # R3: the policy's replayable MoE gates, fixed for the model's lifetime.
         self._router_replay_gates = (
@@ -788,6 +789,7 @@ class AutomodelPolicyWorkerImpl(
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
                     router_replay_gates=self._router_replay_gates,
+                    fused_logprob_head=self.fused_logprob_head,
                 )
 
                 # Extract losses and metrics from results
@@ -936,6 +938,7 @@ class AutomodelPolicyWorkerImpl(
             cfg=self.cfg,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
+            fused_linear_logprobs=self.fused_logprob_head is not None,
         )
 
         with torch.no_grad():
@@ -977,6 +980,7 @@ class AutomodelPolicyWorkerImpl(
                         processed_mb=processed_mb,
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
+                        fused_logprob_head=self.fused_logprob_head,
                     )
 
                 # skip keeping the logprobs for the dummy batches

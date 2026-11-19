@@ -156,7 +156,10 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.models.policy.utils import configure_lora_refit
+from nemo_rl.models.policy.utils import (
+    configure_lora_refit,
+    is_fused_linear_logprobs_enabled,
+)
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     RL_ITERATION_ATTR,
@@ -987,14 +990,9 @@ def setup(
     # Fused linear logprobs compute next-token logprobs directly from hidden states
     # (chunked over the sequence) and never materialize the full
     # [batch, seq_len, vocab_size] logit tensor, which significantly reduces peak
-    # memory. It is only available on the Megatron backend.
-    # Both megatron_cfg and use_fused_linear_logprobs are NotRequired, and many
-    # configs (e.g. nemo_gym, modelopt, non-megatron) omit them -- use .get() with
-    # a {} fallback to avoid a KeyError.
-    megatron_cfg = policy_config.get("megatron_cfg", {})
-    use_fused_linear_logprobs = bool(
-        megatron_cfg.get("enabled") and megatron_cfg.get("use_fused_linear_logprobs")
-    )
+    # memory. Megatron enables it with policy.megatron_cfg.use_fused_linear_logprobs
+    # and AutoModel with policy.automodel_cfg.use_fused_linear_logprobs.
+    use_fused_linear_logprobs = is_fused_linear_logprobs_enabled(policy_config)
     if use_fused_linear_logprobs:
         # Sequence packing is not yet validated with the fused path: the fused
         # forward rolls labels over the whole (packed) sequence and would mix
@@ -1002,8 +1000,9 @@ def setup(
         assert not policy_config["sequence_packing"]["enabled"], (
             "Linear CE fusion loss is not supported with sequence packing for GRPO. "
             "The fused path has not been validated with cu_seqlens-based logprob "
-            "aggregation. Set policy.megatron_cfg.use_fused_linear_logprobs=false "
-            "or policy.sequence_packing.enabled=false."
+            "aggregation. Set use_fused_linear_logprobs=false in "
+            "policy.megatron_cfg or policy.automodel_cfg, or "
+            "policy.sequence_packing.enabled=false."
         )
         # The fused forward gathers the logprob of the realized token from the raw
         # (unfiltered) logits, so top-k/top-p training-time filtering cannot be
@@ -1017,8 +1016,8 @@ def setup(
         ), (
             "Linear CE fusion loss is not supported with top-k/top-p training-time "
             "filtering for GRPO. The fused path computes logprobs from unfiltered "
-            "logits. Set policy.megatron_cfg.use_fused_linear_logprobs=false, or "
-            "disable filtering (policy.generation.top_k=null, "
+            "logits. Set use_fused_linear_logprobs=false in policy.megatron_cfg or "
+            "policy.automodel_cfg, or disable filtering (policy.generation.top_k=null, "
             "policy.generation.top_p=1.0)."
         )
 
