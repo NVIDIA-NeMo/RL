@@ -13,7 +13,9 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional, TypeVar, Union
+
+T = TypeVar("T")
 
 
 # lifted from NeMo/nemo/utils/flops_formulas.py
@@ -64,66 +66,108 @@ class FLOPSConfig:
     dsa_indexer_compute_layers: Optional[int] = None
 
 
+def _require(value: Optional[T], name: str) -> T:
+    """Return the value of a FLOPSConfig field that the calling formula needs.
+
+    Args:
+        value: The field value read from the config.
+        name: The field name, used in the error message.
+
+    Returns:
+        The field value.
+
+    Raises:
+        ValueError: If the field is unset.
+    """
+    if value is None:
+        raise ValueError(f"FLOPSConfig.{name} is required for this FLOPs calculation")
+    return value
+
+
 def gpt3(config: FLOPSConfig):
     """Model FLOPs for GPT3 family."""
+    enc_seq_len = _require(config.enc_seq_len, "enc_seq_len")
+    hs = _require(config.hs, "hs")
+    layers = _require(config.layers, "layers")
+    vocab_size = _require(config.vocab_size, "vocab_size")
     return (
-        24 * config.gbs * config.enc_seq_len * config.hs * config.hs
-        + 4 * config.gbs * config.enc_seq_len * config.enc_seq_len * config.hs
-    ) * (3 * config.layers) + (
-        6 * config.gbs * config.enc_seq_len * config.hs * config.vocab_size
-    )
+        24 * config.gbs * enc_seq_len * hs * hs
+        + 4 * config.gbs * enc_seq_len * enc_seq_len * hs
+    ) * (3 * layers) + (6 * config.gbs * enc_seq_len * hs * vocab_size)
 
 
 def llama(config: FLOPSConfig):
     """Model FLOPs for llama3 family."""
+    enc_seq_len = _require(config.enc_seq_len, "enc_seq_len")
+    hs = _require(config.hs, "hs")
+    layers = _require(config.layers, "layers")
+    ffn_hs = _require(config.ffn_hs, "ffn_hs")
+    attention_heads = _require(config.attention_heads, "attention_heads")
+    query_groups = _require(config.query_groups, "query_groups")
+    vocab_size = _require(config.vocab_size, "vocab_size")
     return (
         config.gbs
-        * config.enc_seq_len
-        * config.layers
-        * config.hs
-        * config.hs
+        * enc_seq_len
+        * layers
+        * hs
+        * hs
         * (
             12
-            + (12 * config.query_groups / config.attention_heads)
-            + (18 * config.ffn_hs / config.hs)
-            + (6 * config.enc_seq_len / config.hs)
-            + (6 * config.vocab_size / (config.layers * config.hs))
+            + (12 * query_groups / attention_heads)
+            + (18 * ffn_hs / hs)
+            + (6 * enc_seq_len / hs)
+            + (6 * vocab_size / (layers * hs))
         )
     )
 
 
 def nemotron(config: FLOPSConfig):
     """Model FLOPs for nemotron family."""
+    enc_seq_len = _require(config.enc_seq_len, "enc_seq_len")
+    hs = _require(config.hs, "hs")
+    layers = _require(config.layers, "layers")
+    ffn_hs = _require(config.ffn_hs, "ffn_hs")
+    attention_heads = _require(config.attention_heads, "attention_heads")
+    query_groups = _require(config.query_groups, "query_groups")
+    vocab_size = _require(config.vocab_size, "vocab_size")
     return (
         config.gbs
-        * config.enc_seq_len
-        * config.layers
-        * config.hs
-        * config.hs
+        * enc_seq_len
+        * layers
+        * hs
+        * hs
         * (
             12
-            + (12 * config.query_groups / config.attention_heads)
-            + (12 * config.ffn_hs / config.hs)
-            + (12 * config.enc_seq_len / config.hs)
-            + (6 * config.vocab_size / (config.layers * config.hs))
+            + (12 * query_groups / attention_heads)
+            + (12 * ffn_hs / hs)
+            + (12 * enc_seq_len / hs)
+            + (6 * vocab_size / (layers * hs))
         )
     )
 
 
 def mixtral(config: FLOPSConfig):
     """Model FLOPs for mixtral family."""
+    enc_seq_len = _require(config.enc_seq_len, "enc_seq_len")
+    hs = _require(config.hs, "hs")
+    layers = _require(config.layers, "layers")
+    ffn_hs = _require(config.ffn_hs, "ffn_hs")
+    attention_heads = _require(config.attention_heads, "attention_heads")
+    moe_router_topk = _require(config.moe_router_topk, "moe_router_topk")
+    query_groups = _require(config.query_groups, "query_groups")
+    vocab_size = _require(config.vocab_size, "vocab_size")
     return (
         config.gbs
-        * config.enc_seq_len
-        * config.layers
-        * config.hs
-        * config.hs
+        * enc_seq_len
+        * layers
+        * hs
+        * hs
         * (
             12
-            + (12 * config.query_groups / config.attention_heads)
-            + (18 * config.moe_router_topk * config.ffn_hs / config.hs)
-            + (12 * config.enc_seq_len / config.hs)
-            + (6 * config.vocab_size / (config.layers * config.hs))
+            + (12 * query_groups / attention_heads)
+            + (18 * moe_router_topk * ffn_hs / hs)
+            + (12 * enc_seq_len / hs)
+            + (6 * vocab_size / (layers * hs))
         )
     )
 
@@ -131,8 +175,11 @@ def mixtral(config: FLOPSConfig):
 def qwen2(config: FLOPSConfig):
     """Model FLOPs for Qwen2 family."""
     causal_self_attn = True
-    seq_len = config.enc_seq_len
-    hidden_size = config.hs
+    seq_len = _require(config.enc_seq_len, "enc_seq_len")
+    hidden_size = _require(config.hs, "hs")
+    layers = _require(config.layers, "layers")
+    ffn_hs = _require(config.ffn_hs, "ffn_hs")
+    vocab_size = _require(config.vocab_size, "vocab_size")
     gated_linear_multiplier = 2
 
     # attention flops for GQA
@@ -140,7 +187,7 @@ def qwen2(config: FLOPSConfig):
         3
         * 2
         * config.gbs
-        * config.layers
+        * layers
         * seq_len
         * hidden_size
         * hidden_size
@@ -158,15 +205,15 @@ def qwen2(config: FLOPSConfig):
         3
         * 2
         * config.gbs
-        * config.layers
+        * layers
         * seq_len
         * hidden_size
         * (1 + gated_linear_multiplier)
-        * config.ffn_hs
+        * ffn_hs
     )
 
     # vocab flops
-    vocab_flops = 3 * 2 * config.gbs * seq_len * hidden_size * config.vocab_size
+    vocab_flops = 3 * 2 * config.gbs * seq_len * hidden_size * vocab_size
 
     return attention_flops + mlp_flops + vocab_flops
 
@@ -174,8 +221,14 @@ def qwen2(config: FLOPSConfig):
 def qwen3(config: FLOPSConfig):
     """Model FLOPs for Qwen3 family."""
     causal_self_attn = True
-    seq_len = config.enc_seq_len
-    hidden_size = config.hs
+    seq_len = _require(config.enc_seq_len, "enc_seq_len")
+    hidden_size = _require(config.hs, "hs")
+    layers = _require(config.layers, "layers")
+    attention_heads = _require(config.attention_heads, "attention_heads")
+    moe_router_topk = _require(config.moe_router_topk, "moe_router_topk")
+    query_groups = _require(config.query_groups, "query_groups")
+    vocab_size = _require(config.vocab_size, "vocab_size")
+    moe_ffn_hidden_size = _require(config.moe_ffn_hidden_size, "moe_ffn_hidden_size")
     gated_linear_multiplier = 2
 
     # head_dim defaults to hidden_size / num_heads, but Qwen3 sets it explicitly and for some
@@ -186,17 +239,17 @@ def qwen3(config: FLOPSConfig):
     head_dim = (
         config.head_dim
         if config.head_dim is not None
-        else hidden_size // config.attention_heads
+        else hidden_size // attention_heads
     )
-    q_proj_size = config.attention_heads * head_dim
-    kv_proj_size = config.query_groups * head_dim
+    q_proj_size = attention_heads * head_dim
+    kv_proj_size = query_groups * head_dim
 
     # attention flops for GQA
     attention_flops = (
         3
         * 2
         * config.gbs
-        * config.layers
+        * layers
         * seq_len
         * (
             q_proj_size * hidden_size  # Q projection
@@ -213,33 +266,33 @@ def qwen3(config: FLOPSConfig):
         3
         * 2
         * config.gbs
-        * config.layers
+        * layers
         * seq_len
         * hidden_size
         * (1 + gated_linear_multiplier)
-        * (config.moe_ffn_hidden_size * config.moe_router_topk)  # MoE layers
+        * (moe_ffn_hidden_size * moe_router_topk)  # MoE layers
     )
 
     # vocab flops
-    vocab_flops = 3 * 2 * config.gbs * seq_len * hidden_size * config.vocab_size
+    vocab_flops = 3 * 2 * config.gbs * seq_len * hidden_size * vocab_size
 
     return attention_flops + mlp_flops + vocab_flops
 
 
 def bert(config: FLOPSConfig):
     """Model FLOPs for BERT family."""
+    enc_seq_len = _require(config.enc_seq_len, "enc_seq_len")
+    hs = _require(config.hs, "hs")
+    layers = _require(config.layers, "layers")
+    vocab_size = _require(config.vocab_size, "vocab_size")
     return (
         72
         * config.gbs
-        * config.layers
-        * config.enc_seq_len
-        * config.hs
-        * config.hs
-        * (
-            1
-            + (config.enc_seq_len / (6 * config.hs))
-            + (config.vocab_size / (12 * config.hs * config.layers))
-        )
+        * layers
+        * enc_seq_len
+        * hs
+        * hs
+        * (1 + (enc_seq_len / (6 * hs)) + (vocab_size / (12 * hs * layers)))
     )
 
 
@@ -250,15 +303,16 @@ def transformer(config: FLOPSConfig):
     """
     # Extract parameters from config
     batch_size = config.gbs
-    hidden_size = config.hs
-    seq_length = config.enc_seq_len
-    num_layers = config.layers
-    num_attention_heads = config.attention_heads
-    ffn_hidden_size = config.ffn_hs
     vocab_size = config.vocab_size
 
     if vocab_size is None:
         raise ValueError("vocab_size is required for transformer FLOPs calculation")
+
+    hidden_size = _require(config.hs, "hs")
+    seq_length = _require(config.enc_seq_len, "enc_seq_len")
+    num_layers = _require(config.layers, "layers")
+    num_attention_heads = _require(config.attention_heads, "attention_heads")
+    ffn_hidden_size = _require(config.ffn_hs, "ffn_hs")
 
     # Handle optional parameters with reasonable defaults
     query_groups = (
@@ -353,28 +407,33 @@ def transformer(config: FLOPSConfig):
 
 def flux(config: FLOPSConfig):
     """Model FLOPs for FLUX."""
-    hs = config.hs
-    seq_len = config.model_channels + config.inp_s
+    hs = _require(config.hs, "hs")
+    layers = _require(config.layers, "layers")
+    in_channels = _require(config.in_channels, "in_channels")
+    inp_s = _require(config.inp_s, "inp_s")
+    model_channels = _require(config.model_channels, "model_channels")
+    vec_in_dim = _require(config.vec_in_dim, "vec_in_dim")
+    seq_len = model_channels + inp_s
     base_factor = 6 * config.gbs  # common multiplier for most terms
 
     # Joint layer computations
     joint_layer_flops = (
         base_factor
-        * config.layers[0]
+        * layers[0]
         * (
             10 * hs * hs  # hidden size operations
             + 2
             * hs
-            * (config.model_channels + config.inp_s)
+            * (model_channels + inp_s)
             * (1 + hs * 7)  # channel and context joint attention
-            + 2 * (config.model_channels + config.inp_s) * hs  # final projection
+            + 2 * (model_channels + inp_s) * hs  # final projection
         )
     )
 
     # Single layer computations
     single_layer_flops = (
         base_factor
-        * config.layers[1]
+        * layers[1]
         * seq_len
         * hs
         * (
@@ -389,12 +448,12 @@ def flux(config: FLOPSConfig):
 
     # Embedding and projection layers
     other_flops = base_factor * (
-        config.inp_s * config.in_channels * hs  # image embedding
-        + config.inp_s * hs * config.model_channels  # text embedding
-        + config.vec_in_dim * hs
+        inp_s * in_channels * hs  # image embedding
+        + inp_s * hs * model_channels  # text embedding
+        + vec_in_dim * hs
         + hs * hs  # vector embedding
-        + 2 * (config.model_channels * hs + hs * hs)  # guidance + timestep embedding
-        + (config.inp_s * config.in_channels * hs) / config.gbs  # final projection
+        + 2 * (model_channels * hs + hs * hs)  # guidance + timestep embedding
+        + (inp_s * in_channels * hs) / config.gbs  # final projection
     )
 
     return joint_layer_flops + single_layer_flops + other_flops
@@ -402,81 +461,104 @@ def flux(config: FLOPSConfig):
 
 def _mla_projection_params(config: FLOPSConfig) -> int:
     """Return the per-layer MLA projection parameter count."""
+    hs = _require(config.hs, "hs")
+    attention_heads = _require(config.attention_heads, "attention_heads")
+    kv_lora_rank = _require(config.kv_lora_rank, "kv_lora_rank")
+    qk_head_dim = _require(config.qk_head_dim, "qk_head_dim")
+    qk_pos_emb_head_dim = _require(config.qk_pos_emb_head_dim, "qk_pos_emb_head_dim")
+    v_head_dim = _require(config.v_head_dim, "v_head_dim")
     if config.q_lora_rank is not None:
-        per_layer_mla_params = config.hs * config.q_lora_rank + config.q_lora_rank * (
-            (config.qk_head_dim + config.qk_pos_emb_head_dim) * config.attention_heads
+        per_layer_mla_params = hs * config.q_lora_rank + config.q_lora_rank * (
+            (qk_head_dim + qk_pos_emb_head_dim) * attention_heads
         )
     else:
-        per_layer_mla_params = config.hs * (
-            (config.qk_head_dim + config.qk_pos_emb_head_dim) * config.attention_heads
+        per_layer_mla_params = hs * (
+            (qk_head_dim + qk_pos_emb_head_dim) * attention_heads
         )
 
-    per_layer_mla_params += config.hs * config.qk_pos_emb_head_dim
-    per_layer_mla_params += config.hs * config.kv_lora_rank + config.kv_lora_rank * (
-        (config.qk_head_dim + config.v_head_dim) * config.attention_heads
+    per_layer_mla_params += hs * qk_pos_emb_head_dim
+    per_layer_mla_params += hs * kv_lora_rank + kv_lora_rank * (
+        (qk_head_dim + v_head_dim) * attention_heads
     )
-    per_layer_mla_params += config.v_head_dim * config.attention_heads * config.hs
+    per_layer_mla_params += v_head_dim * attention_heads * hs
     return per_layer_mla_params
 
 
 def _moe_ffn_params(config: FLOPSConfig) -> int:
     """Return activated dense/MoE FFN parameters for all model and MTP layers."""
-    dense_layer_ffn_params = config.hs * config.ffn_hs * 3  # gated linear unit
-    per_shared_expert_params = (
-        config.hs * config.moe_shared_expert_intermediate_size * 3
+    hs = _require(config.hs, "hs")
+    ffn_hs = _require(config.ffn_hs, "ffn_hs")
+    moe_shared_expert_intermediate_size = _require(
+        config.moe_shared_expert_intermediate_size,
+        "moe_shared_expert_intermediate_size",
     )
-    per_selected_expert_params = config.hs * config.moe_ffn_hidden_size * 3
+    moe_ffn_hidden_size = _require(config.moe_ffn_hidden_size, "moe_ffn_hidden_size")
+    dense_layer_ffn_params = hs * ffn_hs * 3  # gated linear unit
+    per_shared_expert_params = hs * moe_shared_expert_intermediate_size * 3
+    per_selected_expert_params = hs * moe_ffn_hidden_size * 3
     ffn_params = 0
 
-    if isinstance(config.moe_layer_freq, int):
+    moe_layer_freq = _require(config.moe_layer_freq, "moe_layer_freq")
+    if isinstance(moe_layer_freq, int):
+        layers = _require(config.layers, "layers")
         moe_layer_pattern = [
-            1 if (i % config.moe_layer_freq == 0) else 0 for i in range(config.layers)
+            1 if (i % moe_layer_freq == 0) else 0 for i in range(layers)
         ]
     else:
-        moe_layer_pattern = config.moe_layer_freq
+        moe_layer_pattern = moe_layer_freq
 
+    # moe_router_topk is read only where a MoE layer needs it: a config whose
+    # layers are all dense does not have to set it.
     for i in moe_layer_pattern:
         if i == 0:
             ffn_params += dense_layer_ffn_params
         else:
             ffn_params += per_shared_expert_params + (
-                per_selected_expert_params * config.moe_router_topk
+                per_selected_expert_params
+                * _require(config.moe_router_topk, "moe_router_topk")
             )
     for _ in range(config.mtp_num_layers or 0):
         ffn_params += per_shared_expert_params + (
-            per_selected_expert_params * config.moe_router_topk
+            per_selected_expert_params
+            * _require(config.moe_router_topk, "moe_router_topk")
         )
     return ffn_params
 
 
 def _mla_moe_linear_flops(config: FLOPSConfig) -> int:
     """Return MLA projection and activated FFN training FLOPs per input."""
-    mla_layers = config.layers + (config.mtp_num_layers or 0)
+    enc_seq_len = _require(config.enc_seq_len, "enc_seq_len")
+    layers = _require(config.layers, "layers")
+    mla_layers = layers + (config.mtp_num_layers or 0)
     mla_params = _mla_projection_params(config) * mla_layers
-    return 6 * (mla_params + _moe_ffn_params(config)) * config.enc_seq_len
+    return 6 * (mla_params + _moe_ffn_params(config)) * enc_seq_len
 
 
 def _vocab_and_mtp_flops(config: FLOPSConfig) -> int:
     """Return output projection and MTP embedding projection FLOPs per input."""
-    vocab_flops = 6 * config.vocab_size * config.hs * config.enc_seq_len
+    enc_seq_len = _require(config.enc_seq_len, "enc_seq_len")
+    hs = _require(config.hs, "hs")
+    vocab_size = _require(config.vocab_size, "vocab_size")
+    vocab_flops = 6 * vocab_size * hs * enc_seq_len
     for _ in range(config.mtp_num_layers or 0):
-        vocab_flops += 6 * config.vocab_size * config.hs * config.enc_seq_len
-        vocab_flops += 6 * config.hs * 2 * config.hs * config.enc_seq_len
+        vocab_flops += 6 * vocab_size * hs * enc_seq_len
+        vocab_flops += 6 * hs * 2 * hs * enc_seq_len
     return vocab_flops
 
 
 def deepseekv3(config: FLOPSConfig) -> float:
     """Model FLOPs for DeepSeek V3."""
+    enc_seq_len = _require(config.enc_seq_len, "enc_seq_len")
+    layers = _require(config.layers, "layers")
+    attention_heads = _require(config.attention_heads, "attention_heads")
+    qk_head_dim = _require(config.qk_head_dim, "qk_head_dim")
+    qk_pos_emb_head_dim = _require(config.qk_pos_emb_head_dim, "qk_pos_emb_head_dim")
+    v_head_dim = _require(config.v_head_dim, "v_head_dim")
     bmm1_flops = (
-        0.5
-        * (config.qk_head_dim + config.qk_pos_emb_head_dim)
-        * config.attention_heads
-        * (config.enc_seq_len**2)
+        0.5 * (qk_head_dim + qk_pos_emb_head_dim) * attention_heads * (enc_seq_len**2)
     )
-    bmm2_flops = (
-        0.5 * config.v_head_dim * config.attention_heads * (config.enc_seq_len**2)
-    )
-    per_input_attention_flops = 6 * (bmm1_flops + bmm2_flops) * config.layers
+    bmm2_flops = 0.5 * v_head_dim * attention_heads * (enc_seq_len**2)
+    per_input_attention_flops = 6 * (bmm1_flops + bmm2_flops) * layers
     if config.mtp_num_layers is not None:
         per_input_attention_flops += (
             6 * (bmm1_flops + bmm2_flops) * config.mtp_num_layers
@@ -506,27 +588,39 @@ def glm_moe_dsa(config: FLOPSConfig) -> float:
     its matmuls are counted with a single 2x FMA factor rather than the 6x
     forward+backward training factor used for trainable model-path GEMMs.
     """
-    seq_len = config.enc_seq_len
+    seq_len = _require(config.enc_seq_len, "enc_seq_len")
+    hs = _require(config.hs, "hs")
+    layers = _require(config.layers, "layers")
+    attention_heads = _require(config.attention_heads, "attention_heads")
+    q_lora_rank = _require(config.q_lora_rank, "q_lora_rank")
+    kv_lora_rank = _require(config.kv_lora_rank, "kv_lora_rank")
+    qk_pos_emb_head_dim = _require(config.qk_pos_emb_head_dim, "qk_pos_emb_head_dim")
+    dsa_indexer_n_heads = _require(config.dsa_indexer_n_heads, "dsa_indexer_n_heads")
+    dsa_indexer_head_dim = _require(config.dsa_indexer_head_dim, "dsa_indexer_head_dim")
+    dsa_indexer_topk = _require(config.dsa_indexer_topk, "dsa_indexer_topk")
+    dsa_indexer_compute_layers = _require(
+        config.dsa_indexer_compute_layers, "dsa_indexer_compute_layers"
+    )
 
     # DSA sparse attention. In absorbed MLA DSA, scores use latent KV + RoPE
     # channels and value aggregation uses latent KV channels.
-    sparse_pairs = _causal_topk_pairs(seq_len, config.dsa_indexer_topk)
-    sparse_score_dim = config.kv_lora_rank + config.qk_pos_emb_head_dim
-    sparse_value_dim = config.kv_lora_rank
+    sparse_pairs = _causal_topk_pairs(seq_len, dsa_indexer_topk)
+    sparse_score_dim = kv_lora_rank + qk_pos_emb_head_dim
+    sparse_value_dim = kv_lora_rank
     per_input_sparse_attention_flops = (
         6
-        * config.layers
+        * layers
         * sparse_pairs
-        * config.attention_heads
+        * attention_heads
         * (sparse_score_dim + sparse_value_dim)
     )
 
     # DSA indexer: q_lora -> index heads, hidden -> index key, hidden -> head weights,
     # then dense index-score matmul before top-k selection. Top-k itself is not counted.
     indexer_projection_params = (
-        config.q_lora_rank * config.dsa_indexer_n_heads * config.dsa_indexer_head_dim
-        + config.hs * config.dsa_indexer_head_dim
-        + config.hs * config.dsa_indexer_n_heads
+        q_lora_rank * dsa_indexer_n_heads * dsa_indexer_head_dim
+        + hs * dsa_indexer_head_dim
+        + hs * dsa_indexer_n_heads
     )
     # The indexer scores every causally valid query/key pair before selecting top-k.
     dense_causal_pairs = seq_len * (seq_len + 1) // 2
@@ -535,12 +629,10 @@ def glm_moe_dsa(config: FLOPSConfig) -> float:
     # enabling indexer loss also requires accounting for the backward pass.
     per_input_indexer_flops = (
         2
-        * config.dsa_indexer_compute_layers
+        * dsa_indexer_compute_layers
         * (
             seq_len * indexer_projection_params
-            + dense_causal_pairs
-            * config.dsa_indexer_n_heads
-            * config.dsa_indexer_head_dim
+            + dense_causal_pairs * dsa_indexer_n_heads * dsa_indexer_head_dim
         )
     )
 
@@ -554,28 +646,35 @@ def glm_moe_dsa(config: FLOPSConfig) -> float:
 
 def _mlp_layer_flops(config: FLOPSConfig):
     """Model FLOPs for MLP layer."""
+    enc_seq_len = _require(config.enc_seq_len, "enc_seq_len")
+    hs = _require(config.hs, "hs")
+    ffn_hs = _require(config.ffn_hs, "ffn_hs")
     return (
         6
         * config.gbs
-        * config.enc_seq_len
-        * config.hs
-        * config.ffn_hs
+        * enc_seq_len
+        * hs
+        * ffn_hs
         * (2 if config.gated_linear_unit else 1)
     )
 
 
 def _non_mla_attn_layer_flops(config: FLOPSConfig):
     """Model FLOPs for attention layer."""
+    enc_seq_len = _require(config.enc_seq_len, "enc_seq_len")
+    hs = _require(config.hs, "hs")
+    attention_heads = _require(config.attention_heads, "attention_heads")
+    query_groups = _require(config.query_groups, "query_groups")
     return (
         6
         * config.gbs
-        * config.enc_seq_len
-        * config.hs
+        * enc_seq_len
+        * hs
         * (
-            config.hs  # Q
-            + config.query_groups / config.attention_heads * config.hs * 2  # KV
-            + config.enc_seq_len / 2 * 2
-            + config.hs
+            hs  # Q
+            + query_groups / attention_heads * hs * 2  # KV
+            + enc_seq_len / 2 * 2
+            + hs
         )
     )
 
@@ -584,22 +683,25 @@ def _mamba_layer_flops(config: FLOPSConfig):
     """Model FLOPs for Mamba layer. We ignore part of the flops of scan because the chunk size is not known from model config."""
     assert config.mamba_state_dim is not None
     assert config.mamba_head_dim is not None
+    enc_seq_len = _require(config.enc_seq_len, "enc_seq_len")
+    hs = _require(config.hs, "hs")
+    mamba_num_groups = _require(config.mamba_num_groups, "mamba_num_groups")
 
     if config.mamba_num_heads:
         nheads = config.mamba_num_heads
     else:
-        nheads = 2 * config.hs // config.mamba_head_dim  # default expand is 2
+        nheads = 2 * hs // config.mamba_head_dim  # default expand is 2
     d_in = nheads * config.mamba_head_dim
     return (
         (
             6
             * config.gbs
-            * config.enc_seq_len
-            * config.hs
-            * (2 * d_in + 2 * config.mamba_num_groups * config.mamba_state_dim + nheads)
+            * enc_seq_len
+            * hs
+            * (2 * d_in + 2 * mamba_num_groups * config.mamba_state_dim + nheads)
         )
-        + (3 * 2 * config.gbs * config.enc_seq_len * d_in * config.mamba_state_dim)
-        + (6 * config.gbs * config.enc_seq_len * d_in * config.hs)
+        + (3 * 2 * config.gbs * enc_seq_len * d_in * config.mamba_state_dim)
+        + (6 * config.gbs * enc_seq_len * d_in * hs)
     )
 
 
@@ -620,7 +722,11 @@ def _hybrid_model_flops(config: FLOPSConfig):
         num_attn_layers * _non_mla_attn_layer_flops(config)
         + num_mamba_layers * _mamba_layer_flops(config)
         + num_mlp_layers * _mlp_layer_flops(config)
-        + 6 * config.gbs * config.enc_seq_len * config.hs * config.vocab_size
+        + 6
+        * config.gbs
+        * _require(config.enc_seq_len, "enc_seq_len")
+        * _require(config.hs, "hs")
+        * _require(config.vocab_size, "vocab_size")
     )
 
 
