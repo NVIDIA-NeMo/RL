@@ -70,7 +70,8 @@ def test_full_batch_split_parity(
     Reuse the standalone numerical harness so CI and larger model qualification
     execute the same assertions. Two updates per loss normalization exercise
     optimizer/scheduler progression, with two microbatches per rank and a masked
-    sample, with and without chunked training logprobs. Network TQ, Ray dispatch,
+    sample, with and without chunked training logprobs, and with the policy ratio
+    both forced to one and computed. Network TQ, Ray dispatch,
     and live refits are covered by L1.
     """
     if torch.cuda.device_count() < 2:
@@ -144,6 +145,12 @@ def test_full_batch_split_parity(
     assert returncode == 0, log_path.read_text()
     report = json.loads((tmp_path / "parity.json").read_text())
     assert report["passed"]
-    assert {(row["token_level"], row["step"]) for row in report["records"]} == {
-        (token_level, step) for token_level in (True, False) for step in range(2)
+    assert {
+        (row["token_level"], row["force_on_policy_ratio"], row["step"])
+        for row in report["records"]
+    } == {
+        (token_level, force_on_policy_ratio, step)
+        for token_level in (True, False)
+        for force_on_policy_ratio in (True, False)
+        for step in range(2)
     }

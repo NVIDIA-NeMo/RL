@@ -76,17 +76,20 @@ grep -qF "replay group(s) from checkpoint" "$EXP_DIR/run2.log"
 check_checkpoint 4
 
 # The stall watchdog logs rollout/* counters every tick under the current train
-# step, so a slow checkpoint save yields two values for one step. Merging keeps
-# the latest; the train/loss step-set below still catches a double-logged step.
+# step, so a slow checkpoint save yields two values for one step. Those keep the
+# latest value; any other metric logged twice for one step is still an error.
 for run in 1 2; do
     expected_steps='{"1"}'
     if [[ $run == 2 ]]; then expected_steps='{"2", "3", "4"}'; fi
     uv run tests/json_dump_tb_logs.py "$EXP_DIR/logs/run$run" \
-        --output_path "$EXP_DIR/metrics$run.json"
+        --output_path "$EXP_DIR/metrics$run.json" \
+        --error-on-conflicts --allow-conflicts-prefix rollout/
     uv run tests/check_metrics.py "$EXP_DIR/metrics$run.json" \
         "set(data[\"train/loss\"]) == $expected_steps" \
         'all_finite(data["train/loss"])' \
         'all_finite(data["train/grad_norm"])' \
+        'all_finite(data["train/gen_kl_error"])' \
+        'all_finite(data["train/max_seq_mult_prob_error"])' \
         'max(data["train/weight_version_lag"]) == 0' \
         'max(data["train/num_masked_seqs_by_logprob_error"]) == 0' \
         'max(data["train/max_seq_mult_prob_error"]) < 1000' \

@@ -280,6 +280,56 @@ class TestTensorboardLogger:
         assert missing.returncode == 1
         assert "No TensorBoard tag starts with 'missing/'" in missing.stderr
 
+    def test_json_dump_allow_conflicts_prefix(self, tmp_path):
+        """A timer-logged prefix may conflict; every other tag still errors."""
+        from torch.utils.tensorboard import SummaryWriter
+
+        log_dir = tmp_path / "tensorboard"
+        writer = SummaryWriter(log_dir=str(log_dir))
+        writer.add_scalar("rollout/committed_total", 2.0, global_step=2)
+        writer.add_scalar("rollout/committed_total", 4.0, global_step=2)
+        writer.add_scalar("train/loss", 1.0, global_step=2)
+        writer.close()
+
+        script = Path(__file__).parents[2] / "json_dump_tb_logs.py"
+        metrics_path = tmp_path / "metrics.json"
+        command = [
+            sys.executable,
+            str(script),
+            str(log_dir),
+            "--output_path",
+            str(metrics_path),
+            "--error-on-conflicts",
+        ]
+
+        strict = subprocess.run(command, capture_output=True, text=True, check=False)
+        assert strict.returncode == 1
+        assert "rollout/committed_total" in strict.stderr
+
+        tolerated = subprocess.run(
+            [*command, "--allow-conflicts-prefix", "rollout/"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert tolerated.returncode == 0, tolerated.stderr
+        assert json.loads(metrics_path.read_text()) == {
+            "rollout/committed_total": {"2": 4.0},
+            "train/loss": {"2": 1.0},
+        }
+
+        writer = SummaryWriter(log_dir=str(log_dir))
+        writer.add_scalar("train/loss", 3.0, global_step=2)
+        writer.close()
+        still_strict = subprocess.run(
+            [*command, "--allow-conflicts-prefix", "rollout/"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert still_strict.returncode == 1
+        assert "train/loss" in still_strict.stderr
+
     @patch("nemo_rl.utils.logger.SummaryWriter")
     def test_log_metrics_with_prefix(self, mock_summary_writer, temp_dir):
         """Test logging metrics with a prefix to TensorboardLogger."""
