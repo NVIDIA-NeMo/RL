@@ -798,6 +798,15 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
         from nemo_rl.models.generation.vllm.quantization import fp8
 
+        if self._uses_deepseek_v41_native_refit():
+            from nemo_rl.models.generation.vllm.quantization import deepseek_v41_native
+
+            self._load_full_hf_weights(
+                deepseek_v41_native.get_quantized_weight_iterator(
+                    policy_weights, self.model_runner.model
+                )
+            )
+            return
         if fp8.is_fp8_model(self.model_runner.vllm_config):
             fp8.load_weights(
                 policy_weights,
@@ -1484,11 +1493,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if "DeepseekV41ForCausalLM" in model_config.architectures:
             if self.model_runner.vllm_config.quant_config is not None:
                 config = model_config.hf_config
-                if config.expert_dtype != "fp8":
+                if getattr(config, "expert_dtype", "fp4") not in ("fp8", "fp4"):
                     raise ValueError(
-                        "DeepSeek v4.1 quantized refit supports block FP8 experts only; "
-                        "set generation.vllm_cfg.precision=fp8 and "
-                        "hf_overrides.expert_dtype=fp8. FP4 refit is not supported."
+                        "DeepSeek v4.1 quantized refit requires fp8 or fp4 expert weights."
                     )
             from nemo_rl.models.generation.vllm.quantization.fp8 import (
                 quantize_mxfp8_weight,
@@ -1725,10 +1732,20 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 and (
                     self._uses_deepseek_v4_fp8_refit()
                     or self._uses_deepseek_v41_fp8_refit()
+                    or self._uses_deepseek_v41_native_refit()
                 )
             )
             or bool(self._get_mxfp8_linear_reload_roots())
         )
+
+    def _uses_deepseek_v41_native_refit(self) -> bool:
+        """Return whether the rollout model holds native DSV4.1 MXFP8/MXFP4 weights."""
+        model = getattr(getattr(self, "model_runner", None), "model", None)
+        if model is None:
+            return False
+        from nemo_rl.models.generation.vllm.quantization import deepseek_v41_native
+
+        return deepseek_v41_native.is_native_model(model)
 
     def _uses_deepseek_v4_fp8_refit(self) -> bool:
         """Return whether the realized rollout model needs DSV4 FP8 reload hooks."""
@@ -1893,6 +1910,41 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         Native reload initialization invalidates the old runtime layout. Any
         subsequent exception therefore marks this worker permanently unusable.
         """
+        if self._uses_deepseek_v41_native_refit() and transport in ("ipc", "collective"):
+            # vLLM's own reload lifecycle handles native DSV4.1: it restores the
+            # checkpoint layout for the stream and rebuilds the kernel layout
+            # (MXFP4 expert packing, Mega Attention permutations) at the end.
+            previous_failure = self._nrl_layerwise_reload_failure
+            if previous_failure is not None:
+                raise RuntimeError(
+                    "The vLLM worker is unusable after a failed native layerwise refit"
+                ) from previous_failure
+            from vllm.config import set_current_vllm_config
+            from vllm.model_executor.model_loader.reload.lifecycle import (
+                finish_reload,
+                start_reload,
+            )
+
+            model = self.model_runner.model
+
+            def finalize_native() -> None:
+                with torch.device(self.device):
+                    finish_reload(model, self.model_config, torch.device(self.device))
+                torch.cuda.synchronize()
+
+            try:
+                with set_current_vllm_config(self.model_runner.vllm_config):
+                    with torch.device(self.device):
+                        start_reload(model)
+                    self._nrl_layerwise_reload_active = True
+                    yield finalize_native
+            except BaseException as error:
+                self._nrl_layerwise_reload_failure = error
+                raise
+            finally:
+                self._nrl_layerwise_reload_active = False
+            return
+
         if self._uses_native_layerwise_refit(transport):
             self._validate_native_layerwise_refit(transport)
             use_deepseek_v4_fp8 = self._uses_deepseek_v4_fp8_refit()
