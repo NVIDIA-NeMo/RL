@@ -91,7 +91,7 @@ class MegatronDynamoCfg(BaseModel, extra="forbid"):
     # Deadline for one rollout through the frontend. None waits as long as
     # generation takes, as the native generate_async does.
     request_timeout_s: PositiveFloat | None = None
-    # Bounds every control call to an engine: refit, pause, resume, shutdown.
+    # Bounds every control call to an engine: refit, suspend, resume, shutdown.
     control_timeout_s: PositiveFloat = 600.0
     frontend_args: MegatronDynamoFrontendArgs = Field(
         default_factory=MegatronDynamoFrontendArgs
