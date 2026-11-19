@@ -80,8 +80,7 @@ uv run ./examples/run_grpo.py
 
 ### Slurm Environment Variables
 
-All Slurm environment variables described below can be added to the `sbatch`
-invocation of `ray.sub`. For example, `GPUS_PER_NODE=8` can be specified as follows:
+All Slurm environment variables described below can be added to the `sbatch` invocation of `ray.sub`. For example, `GPUS_PER_NODE=8` can be specified as follows:
 
 ```sh
 GPUS_PER_NODE=8 \
@@ -128,115 +127,50 @@ sbatch ray.sub \
 ``````{list-table}
 :header-rows: 1
 
-* - Environment Variable
-    (and default)
+* - Environment Variable (and default)
   - Explanation
 * - `UV_CACHE_DIR_OVERRIDE`
-  - By default, this variable does not need to be set. If unset, `ray.sub` uses the 
-    `UV_CACHE_DIR` defined within the container (`/opt/nemo_rl_cache/uv` in images built from `docker/Dockerfile`; set `CONTAINER_UV_CACHE_DIR` for a container that uses another path). 
-    `ray.sub` intentionally avoids using the `UV_CACHE_DIR` from the user's host 
-    environment to prevent the host's cache from interfering with the container's cache. 
-    Set `UV_CACHE_DIR_OVERRIDE` if you have a customized `uv` environment (e.g., 
-    with pre-downloaded packages or specific configurations) that you want to persist 
-    and reuse across container runs. This variable should point to a path on a shared 
-    filesystem accessible by all nodes (head and workers). This path will be mounted 
-    into the container and will override the container's default `UV_CACHE_DIR`.
+  - By default, this variable does not need to be set. If unset, `ray.sub` uses the  `UV_CACHE_DIR` defined within the container (`/opt/nemo_rl_cache/uv` in images built from `docker/Dockerfile`; set `CONTAINER_UV_CACHE_DIR` for a container that uses another path).
+    `ray.sub` intentionally avoids using the `UV_CACHE_DIR` from the user's host  environment to prevent the host's cache from interfering with the container's cache.
+    Set `UV_CACHE_DIR_OVERRIDE` if you have a customized `uv` environment (e.g.,  with pre-downloaded packages or specific configurations) that you want to persist  and reuse across container runs. This variable should point to a path on a shared  filesystem accessible by all nodes (head and workers). This path will be mounted  into the container and will override the container's default `UV_CACHE_DIR`.
 * - `CPUS_PER_WORKER`
-  - CPUs each Ray worker node claims. If unset, `ray.sub` auto-detects this from
-    Slurm (the `CPUTot` of the first allocated node) so that Ray sees every CPU
-    on the node. Detection assumes a homogeneous allocation (all nodes have the
-    same CPU count) and only queries a single node to avoid hammering the Slurm
-    controller with one RPC per node; set this explicitly for a heterogeneous
-    allocation or to override detection.
+  - CPUs each Ray worker node claims. If unset, `ray.sub` auto-detects this from Slurm (the `CPUTot` of the first allocated node) so that Ray sees every CPU on the node. Detection assumes a homogeneous allocation (all nodes have the same CPU count) and only queries a single node to avoid hammering the Slurm controller with one RPC per node; set this explicitly for a heterogeneous allocation or to override detection.
 * - `GPUS_PER_NODE=8`
   - Number of GPUs each Ray worker node claims. To determine this, run `nvidia-smi` on a worker node.
 * - `DEDICATED_RAY_HEAD=0`
-  - Set to `1` to run the first allocated node as a GPU-free Ray head: it hosts
-    only the Ray control plane and the driver, advertises `--num-gpus=0`, and
-    carries neither `worker_units` nor the topology resources, so no GPU actor
-    or topology-constrained placement group can land on it. Use this when driver
-    or head-node memory pressure is destabilizing training.
+  - Set to `1` to run the first allocated node as a GPU-free Ray head: it hosts the Ray control plane and the driver, advertises `--num-gpus=0`, and carries neither `worker_units` nor the topology resources, so no GPU actor or topology-constrained placement group can land on it. Use this when driver or head-node memory pressure is destabilizing training.
 
-    **You must shrink the driver's node count yourself.** `ray.sub` cannot see
-    inside your `COMMAND`, so it only prints the effective GPU-node count. With
-    `--nodes=N` and `DEDICATED_RAY_HEAD=1`, `cluster.num_nodes` (plus
-    `env.nemo_gym.num_gpu_nodes` when set) must sum to `N - 1`. If you leave it
-    at `N`, cluster bringup still succeeds and the driver instead fails minutes
-    later with `Maximum number of retries reached (6). Cluster resources may be
-    insufficient...`.
+    The head also advertises a `ray_head: 1` resource. Single-controller GRPO and PPO runs (`examples/run_grpo_single_controller.py`) place the controller there, next to the control plane instead of beside GPU workers.
 
-    **The head's GPUs are idled, not freed.** Under `#SBATCH --exclusive` the
-    head node is still allocated with `--gres`, so this costs one node's worth
-    of GPUs.
+    **You must shrink the driver's node count yourself.** `ray.sub` cannot see inside your `COMMAND`, so it only prints the effective GPU-node count. With `--nodes=N` and `DEDICATED_RAY_HEAD=1`, `cluster.num_nodes` (plus `env.nemo_gym.num_gpu_nodes` when set) must sum to `N - 1`. If you leave it at `N`, cluster bringup still succeeds and the driver instead fails minutes later with `Maximum number of retries reached (6). Cluster resources may be insufficient...`.
 
-    **Watch segment divisibility.** With topology-aware placement the allocation
-    becomes `--nodes=N+1`, which can trip the "`SEGMENT_SIZE` must evenly divide
-    `NUM_NODES`" check in `tools/launch`.
+    **The head's GPUs are idled, not freed.** Under `#SBATCH --exclusive` the head node is still allocated with `--gres`, so this costs one node's worth of GPUs.
+
+    **Watch segment divisibility.** With topology-aware placement the allocation becomes `--nodes=N+1`, which can trip the "`SEGMENT_SIZE` must evenly divide `NUM_NODES`" check in `tools/launch`.
 * - `NRL_TARGET_NOFILE=131072`
-  - Open-file soft limit `ray.sub` asks for. Ray's documented 65535 is a floor,
-    not a target, so the soft limit is raised toward this value rather than
-    pinned at the floor: to this value when the hard limit permits it, to the
-    hard limit itself when that falls between 65535 and this value, and left
-    alone with a warning below 65535. A soft limit that already clears the
-    target is never lowered. Raise the target for a workload whose connection
-    pool is configured above it — NeMo-Gym's `global_aiohttp_connector_limit`
-    defaults to 102400, and a pool larger than the descriptor ceiling surfaces
-    as `OSError: [Errno 24]` mid-request rather than as backpressure. The
-    resolved pair is printed as `[INFO] file descriptor limit: soft=... hard=...`.
+  - Open-file soft limit `ray.sub` asks for. Ray's documented 65535 is a floor, not a target, so the soft limit is raised toward this value rather than pinned at the floor: to this value when the hard limit permits it, to the hard limit itself when that falls between 65535 and this value, and left alone with a warning below 65535. A soft limit that already clears the target is never lowered. Raise the target for a workload whose connection pool is configured above it — NeMo-Gym's `global_aiohttp_connector_limit` defaults to 102400, and a pool larger than the descriptor ceiling surfaces as `OSError: [Errno 24]` mid-request rather than as backpressure. The resolved pair is printed as `[INFO] file descriptor limit: soft=... hard=...`.
 * - `NRL_MOUNT_HOST_ENROOT`
-  - Unset by default; set to `1` to bind-mount the compute node's own enroot
-    installation (every `/usr/bin/enroot*` file and the enroot library, share
-    and configuration directories that exist) into the training container, so a
-    process inside it, such as a NeMo Gym agent server that runs each agent in
-    its own sandbox, can start containers. Any value other than unset, `0` or
-    `1` is rejected when the batch script starts on the first allocated node.
-    pyxis validates every mount source on each node where a step starts and
-    fails with `pyxis: --container-mounts: source path does not exist`, so every
-    allocated node needs the same enroot layout. Only enroot's own files are
-    mounted: the training container must still provide the tools enroot's
-    subcommands invoke (`unsquashfs` for `enroot create`, `squashfuse` and
-    `fuse-overlayfs` for starting a `.sqsh` image directly). With
-    `tools/launch`, pass the variable through `EXTRA_ENV`.
+  - Unset by default; set to `1` to bind-mount the compute node's own enroot installation (every `/usr/bin/enroot*` file and the enroot library, share and configuration directories that exist) into the training container, so a process inside it, such as a NeMo Gym agent server that runs each agent in its own sandbox, can start containers. Any value other than unset, `0` or `1` is rejected when the batch script starts on the first allocated node.
+    pyxis validates every mount source on each node where a step starts and fails with `pyxis: --container-mounts: source path does not exist`, so every allocated node needs the same enroot layout. Only enroot's own files are mounted: the training container must still provide the tools enroot's subcommands invoke (`unsquashfs` for `enroot create`, `squashfuse` and `fuse-overlayfs` for starting a `.sqsh` image directly). With `tools/launch`, pass the variable through `EXTRA_ENV`.
 * - `NRL_COMPILE_CACHE_SHARED_DIR`, `NRL_COMPILE_CACHE_LOCAL_DIR`
   - Keep vLLM's and Megatron's JIT compile caches between jobs. Unset by default.
     See [Persistent JIT Compile Caches](guides/persistent-jit-caches.md).
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
   - Base directory for storing Ray logs. Defaults to the Slurm submission directory ([SLURM_SUBMIT_DIR](https://slurm.schedmd.com/sbatch.html#OPT_SLURM_SUBMIT_DIR)).
 * - `LOKI_PUSH_URL`
-  - Set this to stream logs to a Loki endpoint with
-    [Grafana Alloy](https://grafana.com/docs/alloy/), which runs alongside each
-    Ray container. Unset by default, which leaves log export off. Four streams
-    are shipped, distinguished by the `log_kind` label: Ray's own logs under
-    `/tmp/ray/session_*/logs` (`ray-internal`), which are otherwise lost when
-    the container exits; this container's wrapper log (`wrapper`); the driver
-    log (`driver`); and the sandbox sidecar logs (`sandbox`). Unlike
-    `RAY_LOG_SYNC_FREQUENCY`, which copies the same files to `BASE_LOG_DIR`,
-    this sends them over the network and so does not add per-file writes to the
-    shared filesystem.
+  - Set this to stream logs to a Loki endpoint with [Grafana Alloy](https://grafana.com/docs/alloy/), which runs alongside each Ray container. Unset by default, which leaves log export off. Four streams are shipped, distinguished by the `log_kind` label: Ray's own logs under `/tmp/ray/session_*/logs` (`ray-internal`), which are otherwise lost when the container exits; this container's wrapper log (`wrapper`); the driver log (`driver`); and the sandbox sidecar logs (`sandbox`). Unlike `RAY_LOG_SYNC_FREQUENCY`, which copies the same files to `BASE_LOG_DIR`, this sends them over the network and so does not add per-file writes to the shared filesystem.
 
-    It is separate from `telemetry.logs_enabled`
-    ([observability](observability/observability-stack.md)), which sends Python
-    log records from NeMo-RL processes over OTLP and does not see these files.
+    It is separate from `telemetry.logs_enabled` ([observability](observability/observability-stack.md)), which sends Python log records from NeMo-RL processes over OTLP and does not see these files.
 
-    Requires an image providing `/usr/local/bin/alloy` (the included
-    `docker/Dockerfile` installs it) and a readable `alloy/config.alloy` under
-    the submission directory.
+    Requires an image providing `/usr/local/bin/alloy` (the included `docker/Dockerfile` installs it) and a readable `alloy/config.alloy` under the submission directory.
 
-    The shipped config authenticates with mTLS, so it also needs
-    `LOKI_CA_FILE`, `LOKI_CERT_FILE`, and `LOKI_KEY_FILE`. These are read inside
-    the container, so their directory must be listed in `MOUNTS`. For any other
-    scheme Loki supports, such as basic auth, a bearer token, or a tenant ID,
-    copy the config, edit its `loki.write` block, and point `ALLOY_CONFIG` at
-    the copy; the certificate variables are then not required.
+    The shipped config authenticates with mTLS, so it also needs `LOKI_CA_FILE`, `LOKI_CERT_FILE`, and `LOKI_KEY_FILE`. These are read inside the container, so their directory must be listed in `MOUNTS`. For any other scheme Loki supports, such as basic auth, a bearer token, or a tenant ID, copy the config, edit its `loki.write` block, and point `ALLOY_CONFIG` at the copy; the certificate variables are then not required.
 
-    If anything is missing, or if Alloy fails to start, `ray.sub` logs a warning
-    and the job runs normally without exporting logs.
+    If anything is missing, or if Alloy fails to start, `ray.sub` logs a warning and the job runs normally without exporting logs.
 * - `ALLOY_CONFIG=$SLURM_SUBMIT_DIR/alloy/config.alloy`
-  - Path to the Alloy configuration, read inside the container. Override it to
-    use a config with different auth or different log sources.
+  - Path to the Alloy configuration, read inside the container. Override it to use a config with different auth or different log sources.
 * - `CLUSTER_NAME=$SLURM_CLUSTER_NAME`
-  - Value of the `cluster` label on exported logs. Defaults to the cluster name
-    Slurm reports, so it only needs setting to label streams with something else.
+  - Value of the `cluster` label on exported logs. Defaults to the cluster name Slurm reports, so it only needs setting to label streams with something else.
 * - `NODE_MANAGER_PORT=1301`
   - Port for the Ray node manager on worker nodes.
 * - `OBJECT_MANAGER_PORT=1303`
@@ -254,8 +188,7 @@ sbatch ray.sub \
 * - `DASHBOARD_GRPC_PORT=52367`
   - gRPC port for the Ray dashboard on the head node.
 * - `DASHBOARD_PORT=8265`
-  - Port for the Ray dashboard UI on the head node. This is also the port
-    used by the Ray distributed debugger.
+  - Port for the Ray dashboard UI on the head node. This is also the port used by the Ray distributed debugger.
 * - `DASHBOARD_AGENT_LISTEN_PORT=1311`
   - Listening port for the dashboard agent on the head node.
 * - `MIN_WORKER_PORT=2000`
@@ -265,34 +198,20 @@ sbatch ray.sub \
 ``````
 
 > [!NOTE]
-> For the most part, you will not need to change ports unless these
-> are already taken by some other service backgrounded on your cluster.
-> The defaults above are the source-of-truth port layout defined in `ray.sub`;
-> keep this table in sync with that block if the defaults ever change.
+> For the most part, you will not need to change ports unless these are already taken by some other service backgrounded on your cluster.
+> The defaults above are the source-of-truth port layout defined in `ray.sub`; keep this table in sync with that block if the defaults ever change.
 
 ### Topology-Aware Placement for MoE (avoiding cross-rack stalls)
 
-On clusters where one NVLink domain spans a fixed set of nodes (e.g. a GB200
-NVL72 rack = 18 nodes = one fabric domain), a MoE job's expert-parallel (EP)
-`all_to_all` can intermittently stall under sustained load when an EP group is
-split across two NVLink domains (two racks). The fix is to keep every EP group
-inside a single NVLink domain. This requires **two coordinated knobs**, both
-sized to the EP group's node span:
+On clusters where one NVLink domain spans a fixed set of nodes (e.g. a GB200 NVL72 rack = 18 nodes = one fabric domain), a MoE job's expert-parallel (EP) `all_to_all` can intermittently stall under sustained load when an EP group is split across two NVLink domains (two racks). The fix is to keep every EP group inside a single NVLink domain. This requires **two coordinated knobs**, both sized to the EP group's node span:
 
 ```
 segment_size (nodes) = expert_model_parallel_size / gpus_per_node
 ```
 
-For example `expert_model_parallel_size=8` on a 4-GPU/node cluster spans 2
-nodes, so the segment size is `2`.
+For example `expert_model_parallel_size=8` on a 4-GPU/node cluster spans 2 nodes, so the segment size is `2`.
 
-* **`cluster.segment_size`** (recipe YAML) — application/Ray side. After the
-  Slurm allocation exists, NeMo RL selects topology-aligned nodes (complete
-  `segment_size`-node segments per NVLink domain) and orders global ranks so
-  each EP group lands on one segment. It is a *post-allocation selector*: it
-  cannot change what Slurm allocated, and raises `ResourceInsufficientError` if
-  the allocated nodes cannot form complete segments. The requested node count
-  must be evenly divisible by `segment_size`.
+* **`cluster.segment_size`** (recipe YAML) — application/Ray side. After the Slurm allocation exists, NeMo RL selects topology-aligned nodes (complete `segment_size`-node segments per NVLink domain) and orders global ranks so each EP group lands on one segment. It is a *post-allocation selector*: it cannot change what Slurm allocated, and raises `ResourceInsufficientError` if the allocated nodes cannot form complete segments. The requested node count must be evenly divisible by `segment_size`.
 
   ```yaml
   cluster:
@@ -301,12 +220,7 @@ nodes, so the segment size is `2`.
   ```
 
 * **`sbatch --segment=<size>`** (Slurm side, block topology) — allocation side.
-  Tells Slurm to allocate nodes in segments of `<size>` nodes, each segment
-  guaranteed within a single topology block (rack); segments themselves may
-  span blocks. This makes the physical allocation match what
-  `cluster.segment_size` expects (and forces an even node count per rack, so
-  odd splits like 5+3 cannot occur). The node count must be evenly divisible by
-  the segment size.
+  Tells Slurm to allocate nodes in segments of `<size>` nodes, each segment guaranteed within a single topology block (rack); segments themselves may span blocks. This makes the physical allocation match what `cluster.segment_size` expects (and forces an even node count per rack, so odd splits like 5+3 cannot occur). The node count must be evenly divisible by the segment size.
 
   ```sh
   ... \
@@ -315,18 +229,9 @@ nodes, so the segment size is `2`.
   ```
 
 > [!NOTE]
-> Set both to the same value. `--segment` alone guarantees the physical layout
-> but not the rank→node mapping; `cluster.segment_size` alone aligns ranks but
-> can fail (or silently fall back) if Slurm hands you a layout that cannot form
-> complete segments. The guarantee also relies on EP being the contiguous
-> (inner) parallel dimension in the global rank order, which is the default for
-> `tp-...-ep-dp-pp` layouts with TP/PP not interleaving EP.
+> Set both to the same value. `--segment` alone guarantees the physical layout but not the rank→node mapping; `cluster.segment_size` alone aligns ranks but can fail (or silently fall back) if Slurm hands you a layout that cannot form complete segments. The guarantee also relies on EP being the contiguous (inner) parallel dimension in the global rank order, which is the default for `tp-...-ep-dp-pp` layouts with TP/PP not interleaving EP.
 
-For nightly/release tests launched with `tools/launch`, you do not pass
-`--segment` by hand: add `SEGMENT_SIZE=<size>` to the script's
-`# ===== BEGIN CONFIG =====` block (mirroring `cluster.segment_size` in the
-recipe) and `tools/launch` validates divisibility and appends
-`--segment=<size>` to the `sbatch` invocation automatically.
+For nightly/release tests launched with `tools/launch`, you do not pass `--segment` by hand: add `SEGMENT_SIZE=<size>` to the script's `# ===== BEGIN CONFIG =====` block (mirroring `cluster.segment_size` in the recipe) and `tools/launch` validates divisibility and appends `--segment=<size>` to the `sbatch` invocation automatically.
 
 ```sh
 # ===== BEGIN CONFIG =====
@@ -352,7 +257,7 @@ Before beginning, ensure the following requirements are met:
 > [!IMPORTANT]
 > **Authentication Required**:
 > Simply installing `kubectl` on your local machine is not sufficient. You must work with your **Infrastructure Administrator** to obtain a valid `KUBECONFIG` file (usually placed at `~/.kube/config`) or authentication token. This file contains the endpoint and credentials required to connect your local client to the specific remote GPU cluster.
-> 
+>
 * **Operators:** The cluster must have the [**NVIDIA Operator**](https://github.com/NVIDIA/gpu-operator) (for GPU provisioning) and the [**KubeRay Operator**](https://github.com/ray-project/kuberay) (for Ray Cluster lifecycle management) installed.
 * **Registry Access:** Ability to push/pull Docker images to a registry (e.g., nvcr.io or Docker Hub).
 

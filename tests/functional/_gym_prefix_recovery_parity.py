@@ -281,54 +281,59 @@ _COMPLETED_PREFIX_LINE = re.compile(
     r"source_model_call_id=(?P<source_model_call_id>\S+) "
     r"prefix_tokens=(?P<prefix_tokens>\d+) tail_tokens=(?P<tail_tokens>\d+) "
     r"total_generation_tokens=(?P<total_tokens>\d+)"
+    # Router replay: whether the staged row kept the restored prefix's routes.
+    r"(?: prefix_routes=(?P<prefix_routes>kept|dropped|none))?"
 )
 
 
-def _check_cuts(
+def _restored_prefix_lines(
+    recovery_log: str,
+) -> dict[tuple[str, int], list[dict[str, Any]]]:
+    restored: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for line in restored_prefixes(recovery_log):
+        key = (line["source_model_call_id"], line["prefix_tokens"])
+        restored.setdefault(key, []).append(line)
+    return restored
+
+
+def _calls_by_generation(
+    recovery: RowIndex,
+) -> dict[tuple[str, int], tuple[int, int, int]]:
+    return {
+        (row["group_id"], int(row["generation_index"])): identity
+        for identity, row in recovery.items()
+    }
+
+
+def _assert_prefix_boundary(
     selection: Mapping[str, Any],
     recovery_log: str,
-    baseline: RowIndex,
     recovery: RowIndex,
-) -> tuple[dict[tuple[str, int], int], frozenset[tuple[int, int, int]]]:
-    """Check every restored call's trained row, and find rows to set aside.
+    *,
+    require_routes: bool = False,
+) -> dict[tuple[str, int], int]:
+    """Require each restored call to complete once and train on its restored prefix.
 
-    First, each restored call must complete once and train on its restored
-    prefix. A restored call closes its row, so the ``total_generation_tokens``
-    it logs on completion end the row: counting back finds where the call
-    starts. That holds even when the trainer masked positions inside the call
-    (top-k/top-p ``-inf`` logprobs drop out of ``token_mask``), which a search
-    for the last unmasked segment would mistake for the call's start. A dropped
-    or duplicated token moves that start, so the restored prefix no longer sits
-    there.
-
-    Then, vLLM sampling is not batch-invariant, so phase 1 can take the other
-    side of a near-tie before the cut. Recovery must then continue phase 1's
-    tokens, and the reference no longer predicts that row. A row is set aside
-    only when the reference's call opens differently at the restored prefix's
-    position, and everything before the closing call must still match. At
-    most one restored row may be set aside, and at least one must match the
-    reference outright: nothing checks that a set-aside row diverged rather
-    than restored the wrong tokens, so the cap bounds what a run can leave
-    unchecked.
+    A restored call closes its row, so the ``total_generation_tokens`` it logs
+    on completion end the row: counting back finds where the call starts. That
+    holds even when the trainer masked positions inside the call (top-k/top-p
+    ``-inf`` logprobs drop out of ``token_mask``), which a search for the last
+    unmasked segment would mistake for the call's start. A dropped or
+    duplicated token moves that start, so the restored prefix no longer sits
+    there. With ``require_routes`` (router replay), each completion must have
+    kept its restored prefix's routes in the row it staged.
 
     Returns:
         Each cut's ``(group_id, generation_index)`` mapped to the index in its
-        trained row where the restored call's generated tokens begin, and the
-        identities of the restored rows set aside.
+        trained row where the restored call's generated tokens begin.
     """
     completed: dict[tuple[str, int], list[dict[str, str]]] = {}
     for match in _COMPLETED_PREFIX_LINE.finditer(recovery_log):
         line = match.groupdict()
         key = (line["source_model_call_id"], int(line["prefix_tokens"]))
         completed.setdefault(key, []).append(line)
-    restored: dict[tuple[str, int], list[str]] = {}
-    for line in restored_prefixes(recovery_log):
-        key = (line["source_model_call_id"], line["prefix_tokens"])
-        restored.setdefault(key, []).append(line["prefix_ids_sha256"])
-    by_call = {
-        (row["group_id"], int(row["generation_index"])): identity
-        for identity, row in recovery.items()
-    }
+    restored = _restored_prefix_lines(recovery_log)
+    by_call = _calls_by_generation(recovery)
 
     starts: dict[tuple[str, int], int] = {}
     for cut in selection["cuts"]:
@@ -349,11 +354,16 @@ def _check_cuts(
                 "restored generation token accounting has a gap or overlap: "
                 f"prefix={prefix_tokens}, tail={tail_tokens}, total={total_tokens}"
             )
-        hashes = restored.get((source, prefix_tokens), [])
-        if len(hashes) != 1:
+        restores = restored.get((source, prefix_tokens), [])
+        if len(restores) != 1:
             raise AssertionError(
-                f"restored prefix {source!r} was logged {len(hashes)} times, "
+                f"restored prefix {source!r} was logged {len(restores)} times, "
                 "expected once"
+            )
+        if require_routes and matches[0]["prefix_routes"] != "kept":
+            raise AssertionError(
+                f"row staged for {source!r} did not keep its restored prefix "
+                f"routes: prefix_routes={matches[0]['prefix_routes']}"
             )
         key = (cut["group_id"], int(cut["generation_index"]))
         if key not in by_call:
@@ -367,12 +377,47 @@ def _check_cuts(
                 f"trained row for {source!r} does not end with its "
                 f"{total_tokens} generated tokens: row has {len(row['token_ids'])}"
             )
-        if _closing_prefix_sha256(row, start, prefix_tokens) != hashes[0]:
+        if (
+            _closing_prefix_sha256(row, start, prefix_tokens)
+            != restores[0]["prefix_ids_sha256"]
+        ):
             raise AssertionError(
                 f"row for {source!r} does not start its closing call with its "
                 f"{prefix_tokens} restored prefix tokens"
             )
         starts[key] = start
+    return starts
+
+
+def _check_cuts(
+    selection: Mapping[str, Any],
+    recovery_log: str,
+    baseline: RowIndex,
+    recovery: RowIndex,
+) -> tuple[dict[tuple[str, int], int], frozenset[tuple[int, int, int]]]:
+    """Check every restored call's trained row, and find rows to set aside.
+
+    First, each restored call must complete once and train on its restored
+    prefix (``_assert_prefix_boundary``).
+
+    Then, vLLM sampling is not batch-invariant, so phase 1 can take the other
+    side of a near-tie before the cut. Recovery must then continue phase 1's
+    tokens, and the reference no longer predicts that row. A row is set aside
+    only when the reference's call opens differently at the restored prefix's
+    position, and everything before the closing call must still match. At
+    most one restored row may be set aside, and at least one must match the
+    reference outright: nothing checks that a set-aside row diverged rather
+    than restored the wrong tokens, so the cap bounds what a run can leave
+    unchecked.
+
+    Returns:
+        Each cut's ``(group_id, generation_index)`` mapped to the index in its
+        trained row where the restored call's generated tokens begin, and the
+        identities of the restored rows set aside.
+    """
+    starts = _assert_prefix_boundary(selection, recovery_log, recovery)
+    restored = _restored_prefix_lines(recovery_log)
+    by_call = _calls_by_generation(recovery)
 
     diverged: set[tuple[int, int, int]] = set()
     for cut in selection["cuts"]:
@@ -381,7 +426,8 @@ def _check_cuts(
         start = starts[key]
         identity = by_call[key]
         right = recovery[identity]
-        (restored_hash,) = restored[(cut["model_call_id"], prefix_tokens)]
+        (restored_line,) = restored[(cut["model_call_id"], prefix_tokens)]
+        restored_hash = restored_line["prefix_ids_sha256"]
         left = baseline.get(identity)
         if (
             left is None

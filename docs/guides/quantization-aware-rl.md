@@ -44,31 +44,16 @@ policy:
       attention_backend: TRITON_ATTN
 ```
 
-K and V scales are computed independently for each token and KV head when
-writing the cache, and stored alongside the FP8 cache. Static policy KV scales
-are not synchronized during weight refits. This requires a vLLM build supporting
-`fp8_per_token_head`. Explicitly incompatible attention backends raise an error;
-when no backend is specified, vLLM selects or rejects the backend. NeMo RL does
-not override the configured backend.
+K and V scales are computed independently for each token and KV head when writing the cache, and stored alongside the FP8 cache. Static policy KV scales are not synchronized during weight refits. This requires a vLLM build supporting `fp8_per_token_head`. Explicitly incompatible attention backends raise an error; when no backend is specified, vLLM selects or rejects the backend. NeMo RL does not override the configured backend.
 
-DeepSeek's specialized MLA cache and ModelOpt `real_quant` rollout are not
-supported. Mamba state caches are unaffected. This configures rollout cache
-storage; it does not change policy training attention.
+DeepSeek's specialized MLA cache and ModelOpt `real_quant` rollout are not supported. Mamba state caches are unaffected. This configures rollout cache storage; it does not change policy training attention.
 
-For command-line overrides, use
-`policy.generation.vllm_cfg.kv_cache_dtype=fp8_per_token_head` and
-`++policy.generation.vllm_kwargs.attention_backend=TRITON_ATTN`.
+For command-line overrides, use `policy.generation.vllm_cfg.kv_cache_dtype=fp8_per_token_head` and `++policy.generation.vllm_kwargs.attention_backend=TRITON_ATTN`.
 The default `kv_cache_dtype: auto` preserves the existing cache behavior.
 
 ## Simulated KV-Cache Quantization
 
-QARL can apply ModelOpt fake quantization to the attention K/V tensors in both
-the Megatron policy and the vLLM rollout model. Use the same quantization recipe
-for both workers so calibrated K/V amax values from the policy can be
-transferred to matching rollout quantizers during refit. The only supported
-exception is rollout-only FP8 K/V fake quantization with
-`use_constant_amax: true`; vLLM computes the constant amax locally, so no
-policy-side K/V quantization or amax transfer is required.
+QARL can apply ModelOpt fake quantization to the attention K/V tensors in both the Megatron policy and the vLLM rollout model. Use the same quantization recipe for both workers so calibrated K/V amax values from the policy can be transferred to matching rollout quantizers during refit. The only supported exception is rollout-only FP8 K/V fake quantization with `use_constant_amax: true`; vLLM computes the constant amax locally, so no policy-side K/V quantization or amax transfer is required.
 
 ```yaml
 policy:
@@ -82,31 +67,18 @@ policy:
 The KV-only examples are:
 
 - `kv_cache_fp8.yaml`: FP8 E4M3 K/V fake quantization with constant amax.
-- `kv_cache_nvfp4.yaml`: calibrated NVFP4 K/V fake quantization with dynamic
-  per-block scales and a calibrated global amax.
+- `kv_cache_nvfp4.yaml`: calibrated NVFP4 K/V fake quantization with dynamic per-block scales and a calibrated global amax.
 
-NVFP4 K/V quantization has shown training-quality degradation in current
-experiments. It is intended for studying QARL-based recovery of PTQ accuracy
-and alternative recipes, including mixed formats and quantizing K/V in only
-selected layers.
+NVFP4 K/V quantization has shown training-quality degradation in current experiments. It is intended for studying QARL-based recovery of PTQ accuracy and alternative recipes, including mixed formats and quantizing K/V in only selected layers.
 
-These recipes enable only the attention K/V quantizers, isolating K/V fake
-quantization from weight and other activation quantization. To combine K/V
-quantization with other formats, define all required quantizers in a single
-recipe.
+These recipes enable only the attention K/V quantizers, isolating K/V fake quantization from weight and other activation quantization. To combine K/V quantization with other formats, define all required quantizers in a single recipe.
 
-This path does not enable vLLM's native FP8 KV-cache storage. Set neither
-`policy.generation.real_quant` nor a native vLLM KV-cache dtype for these
-simulated recipes.
+This path does not enable vLLM's native FP8 KV-cache storage. Set neither `policy.generation.real_quant` nor a native vLLM KV-cache dtype for these simulated recipes.
 
 ## ModelOpt Layer Spec Toggle
 
 For QARL configs, try setting `policy.disable_modelopt_layer_spec=true` first.
-This keeps ModelOpt quantization enabled while using the standard Megatron layer
-specs instead of ModelOpt's custom layer specs. This is usually faster and works
-for most models, but it is not guaranteed for every architecture or recipe. If
-you encounter errors with the standard Megatron layer specs, leave it unset or
-set it to `false` to exercise ModelOpt's Megatron layer-spec path.
+This keeps ModelOpt quantization enabled while using the standard Megatron layer specs instead of ModelOpt's custom layer specs. This is usually faster and works for most models, but it is not guaranteed for every architecture or recipe. If you encounter errors with the standard Megatron layer specs, leave it unset or set it to `false` to exercise ModelOpt's Megatron layer-spec path.
 
 ## Quantization-Aware GRPO (QA-GRPO)
 
@@ -258,12 +230,9 @@ examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real.
 
 This recipe contains the 300-step, 256-example-validation campaign settings.
 The GB200 nightly driver overrides it to a two-step, 32-example smoke test.
-Both paths require the standalone ModelOpt-enabled Megatron-Bridge checkout;
-the embedded NeMo RL checkout does not contain the grouped-MoE W4A4 exporter.
+Both paths require the standalone ModelOpt-enabled Megatron-Bridge checkout; the embedded NeMo RL checkout does not contain the grouped-MoE W4A4 exporter.
 
-For a BF16 baseline, copy the recipe, remove `policy.quant_cfg`,
-`policy.generation.quant_cfg`, and `policy.generation.real_quant`, and use distinct
-checkpoint and log directories.
+For a BF16 baseline, copy the recipe, remove `policy.quant_cfg`, `policy.generation.quant_cfg`, and `policy.generation.real_quant`, and use distinct checkpoint and log directories.
 
 ### Running the Example
 
@@ -317,13 +286,12 @@ For long runs on queues with short wall times, enable periodic checkpointing and
 A healthy W4A16 real-rollout run should include these lines or equivalent vLLM logs:
 
 ```text
-quantization=modelopt
-Detected ModelOpt NVFP4 checkpoint
-Using NvFp4LinearBackend.MARLIN for NVFP4 GEMM
+quantization=nemo_modelopt_w4a16_nvfp4
+Weight-only FP4 compression will be used leveraging the Marlin kernel
 MegatronQuantPolicyWorker[rank=0]: Packed ... groups of tensors
 ```
 
-A W4A4 run should show the same ModelOpt checkpoint/refit signals but must not select `NvFp4LinearBackend.MARLIN`; NeMo RL rejects that weight-only backend because it would leave activations unquantized.
+A W4A4 run should show the same ModelOpt checkpoint/refit signals but shows `quantization=nemo_modelopt_nvfp4` and must not use the Marlin kernel; NeMo RL rejects that weight-only backend because it would leave activations unquantized.
 
 It should not include:
 

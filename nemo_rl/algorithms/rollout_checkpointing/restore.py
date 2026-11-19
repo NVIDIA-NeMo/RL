@@ -335,7 +335,7 @@ class RolloutRestorer(_UsesRolloutParts):
             buffer_state, dp_client=self._dp_client, partition_id=self._partition_id
         )
 
-        if self._master_config.checkpointing.get("load_replay_buffer") is False:
+        if not self._master_config.checkpointing.load_replay_buffer:
             # Validate and load the native snapshot before discarding it. This keeps
             # replay-free resume fail-closed: a mismatched/corrupt checkpoint must
             # not silently turn into a different training stream.
@@ -478,13 +478,7 @@ class RolloutRestorer(_UsesRolloutParts):
         self._rollout_runtime.sampler_stamps_target_steps = (
             parsed_state.sampler_stamps_target_steps
             if parsed_state.sampler_stamps_target_steps is not None
-            else any(
-                group.target_step is not None for group in recovery_ledger.groups()
-            )
-            or any(
-                group.get("target_step") is not None
-                for group in canonical_state["groups"]
-            )
+            else bool(recovery_ledger.groups()) or bool(canonical_state["groups"])
         )
 
         groups_to_recover = recovery_ledger.groups()
