@@ -97,3 +97,29 @@ def gather_jagged_object_lists(
 
     # Flatten into single list while preserving order
     return [obj for sublist in gathered_lists for obj in sublist]
+
+
+def collective_device(
+    group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.device:
+    """Return the device that tensor collectives on ``group`` must use."""
+    backend = str(torch.distributed.get_backend(group)).lower()
+    if "nccl" in backend:
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def all_reduce_min_max(
+    values: list[int], group: Optional[torch.distributed.ProcessGroup] = None
+) -> tuple[list[int], list[int]]:
+    """Return the element-wise MIN and MAX of ``values`` across ``group``."""
+    local = torch.tensor(values, dtype=torch.int64, device=collective_device(group))
+    minimum = local.clone()
+    maximum = local.clone()
+    torch.distributed.all_reduce(
+        minimum, op=torch.distributed.ReduceOp.MIN, group=group
+    )
+    torch.distributed.all_reduce(
+        maximum, op=torch.distributed.ReduceOp.MAX, group=group
+    )
+    return minimum.tolist(), maximum.tolist()

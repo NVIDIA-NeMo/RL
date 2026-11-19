@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_rl.weight_sync.nccl_reshard_utils import (
@@ -33,6 +34,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     MeshInfo,
     RefitCtx,
     _extract_layer_name,
+    assert_refit_weight_manifest_rank_agreement,
     build_mesh_info,
     build_nccl_reshard_refit_info,
     check_nccl_reshard_refit_support,
@@ -1289,3 +1291,48 @@ def test_wire_safe_pickle_is_independent_of_a_patched_storage_loader(monkeypatch
 
     assert b"dummy_unpickler_module" in pickle.dumps(info)
     assert b"dummy_unpickler_module" not in pickle.dumps(wire)
+
+
+def _manifest(shape: tuple[int, ...]) -> list[tuple[str, str, tuple[int, ...], str]]:
+    return [("draft.w", "torch.float32", shape, "cuda")]
+
+
+@pytest.mark.parametrize("ranks_agree", [True, False])
+def test_manifest_rank_agreement_in_pytest_process(
+    monkeypatch: pytest.MonkeyPatch, ranks_agree: bool
+) -> None:
+    group = object()
+    ops: list[object] = []
+
+    def all_reduce(tensor: torch.Tensor, *, op: object, group: object) -> None:
+        assert group is expected_group
+        assert tensor.dtype == torch.int64 and tensor.device.type == "cpu"
+        ops.append(op)
+        # A peer rank with a different manifest moves only the MAX result.
+        if not ranks_agree and op == dist.ReduceOp.MAX:
+            tensor[-1] += 1
+
+    expected_group = group
+    monkeypatch.setattr(dist, "get_backend", lambda _group: "gloo")
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+
+    if ranks_agree:
+        assert_refit_weight_manifest_rank_agreement(_manifest((2,)), group=group)
+    else:
+        with pytest.raises(ValueError, match="differs across ranks"):
+            assert_refit_weight_manifest_rank_agreement(_manifest((2,)), group=group)
+    assert ops == [dist.ReduceOp.MIN, dist.ReduceOp.MAX]
+
+
+def _run_manifest_rank_agreement(rank: int, world_size: int) -> None:
+    assert world_size == 2
+    group = dist.new_group([0, 1], backend="gloo")
+    assert_refit_weight_manifest_rank_agreement(_manifest((2, 3)), group=group)
+    with pytest.raises(ValueError, match="differs across ranks"):
+        assert_refit_weight_manifest_rank_agreement(
+            _manifest((2, 3 + rank)), group=group
+        )
+
+
+def test_manifest_rank_agreement_two_ranks(distributed_test_runner) -> None:
+    distributed_test_runner(_run_manifest_rank_agreement, world_size=2, backend="gloo")

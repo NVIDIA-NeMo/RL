@@ -354,6 +354,7 @@ project-includes = [
   "nemo_rl/models/megatron/draft/optimizer.py",
   "nemo_rl/models/megatron/draft/sequence_layout.py",
   "nemo_rl/models/megatron/draft/sequence_parallel.py",
+  "nemo_rl/models/megatron/draft/refit.py",
   "nemo_rl/models/megatron/draft/context_parallel.py",
   "nemo_rl/models/megatron/draft/step_state.py",
   "nemo_rl/models/megatron/draft/training.py",

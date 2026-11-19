@@ -61,7 +61,7 @@ def test_disabled_typed_dflash_config_has_no_refit_metadata() -> None:
     }
     worker.draft_model = None
 
-    assert tuple(worker._iter_draft_weights_for_refit(metadata_only=True)) == ()
+    assert tuple(worker._draft_weights_for_refit(metadata_only=True)) == ()
 
 
 def _provider():

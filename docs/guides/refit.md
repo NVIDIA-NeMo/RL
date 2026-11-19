@@ -42,13 +42,18 @@ The reload API path currently supports only `policy.generation.backend: vllm`, `
 
 Non-colocated SGLang generation is supported with a Megatron policy and `refit_transport: null`; it creates its own NCCL weight-update group. The NIXL restrictions are on the generation backend; both Megatron and Automodel policy workers can send weights. Sparse delta is currently limited to GRPO. NIXL is initialized by the GRPO and distillation setup paths; PPO currently requires colocated generation.
 
-### Draft Weights with Context Parallel Training
+### Draft Weights in Megatron Refit
 
-The `nccl_reshard` transport can carry Megatron draft weights from the trainer's
-TP, PP, and CP lanes to vLLM. Setup does not enable this layout yet. Setup
-rejects `policy.draft.enabled=true` with `refit_transport: nccl_reshard`. Setup
-also rejects it when `policy.megatron_cfg.context_parallel_size` is greater
-than 1. With `nccl_reshard`, the vLLM generation layout must use CP1. Setup
+Only the last pipeline stage owns the Megatron draft model. During refit, the
+owner sends a small manifest of draft tensor names, shapes, and dtypes to its
+pipeline lane. Then the owner streams the draft tensors one at a time. Draft
+weights go after the policy weights. If the owner export fails, every rank in
+the lane raises the same error.
+
+Setup does not enable draft refit with `nccl_reshard` yet. Setup rejects
+`policy.draft.enabled=true` with `refit_transport: nccl_reshard`. Setup also
+rejects it when `policy.megatron_cfg.context_parallel_size` is greater than 1.
+With `nccl_reshard`, the vLLM generation layout must use CP1. Setup
 rejects a `decode_context_parallel_size` or `prefill_context_parallel_size`
 value other than 1 in `vllm_kwargs` or `vllm_cfg`. The vLLM reload API does not
 support trainer-owned draft weights.
