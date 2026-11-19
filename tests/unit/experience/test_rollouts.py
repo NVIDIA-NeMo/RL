@@ -987,6 +987,131 @@ def test_async_vlm_multiturn_drops_stale_vllm_content(
     assert [call["dedup"] for call in calls] == [deduplicate_multimodal_data] * 2
 
 
+# (truncated reported by the backend, expected sample truncated). The dummy
+# tokenizer yields a 1 token observation, so max_seq_len=3 with a 1 token prompt
+# and a 1 token response makes the terminating final observation overflow.
+_FINAL_OBS_OVERFLOW_CASES = [
+    pytest.param(False, False, id="reported_not_truncated"),
+    pytest.param(None, True, id="not_reported_falls_back_to_overflow"),
+    pytest.param(True, True, id="reported_truncated"),
+]
+
+
+def _terminating_rewards(batch, task_to_env):
+    return EnvironmentReturn(
+        observations=[{"role": "user", "content": "done"}],
+        metadata=[None],
+        next_stop_strings=[None],
+        rewards=torch.tensor([1.0]),
+        terminateds=torch.tensor([True]),
+        answers=[None],
+    )
+
+
+@pytest.mark.parametrize(("reported", "expected"), _FINAL_OBS_OVERFLOW_CASES)
+def test_sync_terminated_final_obs_overflow_truncation(monkeypatch, reported, expected):
+    class _Generation:
+        cfg = {"backend": "megatron"}
+
+        def generate(self, data, greedy=False):
+            input_length = int(data["input_lengths"][0])
+            output_ids = torch.cat(
+                (data["input_ids"][0, :input_length], torch.tensor([9]))
+            ).unsqueeze(0)
+            out = {
+                "output_ids": output_ids,
+                "logprobs": torch.zeros_like(output_ids, dtype=torch.float32),
+                "generation_lengths": torch.tensor([1], dtype=torch.long),
+                "unpadded_sequence_lengths": torch.tensor(
+                    [input_length + 1], dtype=torch.long
+                ),
+            }
+            if reported is not None:
+                out["truncated"] = torch.tensor([reported])
+            return BatchedDataDict(out)
+
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollouts.calculate_rewards", _terminating_rewards
+    )
+
+    final_batch, _ = run_multi_turn_rollout(
+        policy_generation=_Generation(),
+        input_batch=BatchedDataDict(
+            {
+                "message_log": [
+                    [{"role": "user", "content": "", "token_ids": torch.tensor([1])}]
+                ],
+                "extra_env_info": [None],
+                "task_name": ["math"],
+                "stop_strings": [None],
+                "idx": [0],
+            }
+        ),
+        tokenizer=_DummyTokenizer(),
+        task_to_env={},
+        max_seq_len=3,
+        max_rollout_turns=2,
+    )
+
+    assert final_batch["truncated"].tolist() == [expected]
+
+
+@pytest.mark.parametrize(("reported", "expected"), _FINAL_OBS_OVERFLOW_CASES)
+def test_async_terminated_final_obs_overflow_truncation(
+    monkeypatch, reported, expected
+):
+    async def fake_generate(
+        policy_generation,
+        sample_message_log,
+        sample_stop_strings,
+        tokenizer,
+        max_seq_len,
+        greedy=False,
+        *,
+        sample_multimodal_data=None,
+        deduplicate_multimodal_data=False,
+    ):
+        updated = deepcopy(sample_message_log)
+        updated.append(
+            {
+                "role": "assistant",
+                "content": "ok",
+                "token_ids": torch.tensor([9]),
+                "generation_logprobs": torch.tensor([0.0]),
+            }
+        )
+        gen_metrics = {} if reported is None else {"_response_truncated": [reported]}
+        return updated, torch.tensor([9]), torch.tensor(1), gen_metrics
+
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollouts.async_generate_response_for_sample_turn",
+        fake_generate,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollouts.calculate_rewards", _terminating_rewards
+    )
+
+    _, sample_metrics = asyncio.run(
+        run_sample_multi_turn_rollout(
+            sample_idx=0,
+            initial_sample_state={
+                "message_log": [
+                    {"role": "user", "content": "", "token_ids": torch.tensor([1])}
+                ],
+                "extra_env_info": None,
+                "task_name": "math",
+            },
+            policy_generation=object(),
+            tokenizer=_DummyTokenizer(),
+            task_to_env={},
+            max_seq_len=3,
+            max_rollout_turns=2,
+        )
+    )
+
+    assert sample_metrics["truncated"] is expected
+
+
 class _DummyDynamoGeneration(_DummySGLangGeneration):
     def __init__(self):
         self.cfg = {"backend": "dynamo"}

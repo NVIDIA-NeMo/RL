@@ -651,6 +651,7 @@ class AsyncRolloutImpl:
 
             # Check if response was truncated (hit max_tokens without stop token)
             response_truncated = gen_metrics.pop("_response_truncated", None)
+            truncation_reported = response_truncated is not None
             if response_truncated is not None and response_truncated[0]:
                 truncated = True
 
@@ -714,7 +715,9 @@ class AsyncRolloutImpl:
                     tokenized_obs = tokenized_obs[:max_env_tokens]
                 else:
                     tokenized_obs = torch.empty(0, dtype=tokenized_obs.dtype)
-                truncated = True
+                # Without backend truncation info the overflow is the only signal.
+                if not (truncation_reported and terminated):
+                    truncated = True
 
             env_message: dict[str, Any] = {
                 "role": env_output.observations[0]["role"],

@@ -1125,6 +1125,7 @@ def run_multi_turn_rollout(
 
         # Record response truncation (response hit max_tokens without stop token)
         response_truncated = gen_metrics.pop("_response_truncated", None)
+        truncation_reported = response_truncated is not None
         if response_truncated is not None:
             for i, global_idx in enumerate(active_indices.tolist()):
                 if response_truncated[i]:
@@ -1185,9 +1186,8 @@ def run_multi_turn_rollout(
                 # truncate
                 tokenized_obs = tokenized_obs[:tokens_left_for_obs]
                 truncation_mask[i] = True
-                # Record truncation. An episode that terminated on its own is not
-                # truncated just because its final observation was cut.
-                if not env_output.terminateds[i]:
+                # Without backend truncation info the overflow is the only signal.
+                if not (truncation_reported and env_output.terminateds[i]):
                     sample_truncated[active_indices[i]] = True
 
             tokenized_env_obs_message: dict[str, Any] = {
@@ -1448,6 +1448,7 @@ async def run_sample_multi_turn_rollout(
 
             # Check if response was truncated (hit max_tokens without stop token)
             response_truncated = gen_metrics.pop("_response_truncated", None)
+            truncation_reported = response_truncated is not None
             if response_truncated is not None and response_truncated[0]:
                 truncated = True
 
@@ -1513,9 +1514,8 @@ async def run_sample_multi_turn_rollout(
                 tokenized_obs = tokenized_obs[:max_env_tokens]
             else:
                 tokenized_obs = torch.empty(0, dtype=tokenized_obs.dtype)
-            # An episode that terminated on its own is not truncated just because
-            # its final observation was cut.
-            if not terminated:
+            # Without backend truncation info the overflow is the only signal.
+            if not (truncation_reported and terminated):
                 truncated = True
 
         env_message: dict[str, Any] = {

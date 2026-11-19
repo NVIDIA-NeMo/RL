@@ -266,6 +266,73 @@ def test_run_single_rollout_preserves_native_media_across_turns(monkeypatch) -> 
         assert "vllm_images" not in call
 
 
+@pytest.mark.parametrize(
+    ("reported", "expected"),
+    [
+        pytest.param(False, False, id="reported_not_truncated"),
+        pytest.param(None, True, id="not_reported_falls_back_to_overflow"),
+        pytest.param(True, True, id="reported_truncated"),
+    ],
+)
+def test_run_single_rollout_terminated_final_obs_overflow_truncation(
+    monkeypatch, reported, expected
+) -> None:
+    async def generate_response(_message_log, _stop_strings, **_kwargs):
+        gen_metrics = {} if reported is None else {"_response_truncated": [reported]}
+        return (
+            {
+                "role": "assistant",
+                "content": "answer",
+                "token_ids": torch.tensor([42]),
+                "generation_logprobs": torch.tensor([0.0]),
+            },
+            torch.tensor(1),
+            gen_metrics,
+        )
+
+    def calculate_rewards(_batch, _task_to_env):
+        return EnvironmentReturn(
+            observations=[{"role": "user", "content": "done"}],
+            metadata=[None],
+            next_stop_strings=[None],
+            rewards=torch.tensor([1.0]),
+            terminateds=torch.tensor([True]),
+            answers=[None],
+        )
+
+    class _Tokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return SimpleNamespace(input_ids=torch.tensor([[7]]))
+
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollout_manager.calculate_rewards", calculate_rewards
+    )
+    manager = object.__new__(AsyncRolloutImpl)
+    manager._generate_response = generate_response
+    manager._tokenizer = _Tokenizer()
+    manager._task_to_env = {}
+    # 1 token prompt + 1 token response + 1 token observation overflows.
+    manager._max_seq_len = 3
+    manager._max_rollout_turns = 2
+    manager._timeouts = SimpleNamespace(env_s=10.0)
+
+    completion, _ = _run(
+        manager._run_single_rollout(
+            {
+                "idx": 0,
+                "message_log": [
+                    {"role": "user", "content": "", "token_ids": torch.tensor([1])}
+                ],
+                "extra_env_info": None,
+                "task_name": "math",
+            },
+            traj_idx=0,
+        )
+    )
+
+    assert completion.truncated is expected
+
+
 class _FakeBuffer:
     """Minimal TQReplayBuffer stand-in that records reserve/commit calls."""
 
