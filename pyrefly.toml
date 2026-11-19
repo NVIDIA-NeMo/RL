@@ -323,6 +323,7 @@ project-includes = [
   "nemo_rl/models/generation/vllm/progress_reader.py",
   "nemo_rl/models/generation/vllm/prompt_and_capture.py",
   "nemo_rl/models/generation/vllm/quantization/deepseek_v4_fp8.py",
+  "nemo_rl/models/generation/vllm/quantization/deepseek_v41_fp8.py",
   "nemo_rl/models/generation/vllm/quantization/fp8_train_utils.py",
   "nemo_rl/models/generation/vllm/quantization/mxfp8_utils.py",
   "nemo_rl/models/generation/vllm/quantization/nvfp4_pertoken.py",

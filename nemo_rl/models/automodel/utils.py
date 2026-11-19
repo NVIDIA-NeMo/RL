@@ -114,3 +114,91 @@ def release_moe_dispatcher_state(model: nn.Module) -> int:
                 setattr(manager, attr, None)
                 cleared += 1
     return cleared
+
+
+# HybridEP pads each dispatch to the EP group's maximum token count rounded up
+# to this multiple (``_HYBRIDEP_TOKEN_ALIGNMENT`` in Automodel's token dispatcher).
+_HYBRIDEP_TOKEN_ALIGNMENT = 4
+
+
+def _dispatch_managers(model: nn.Module) -> list[tuple[nn.Module, Any]]:
+    """Return ``(experts module, manager)`` for each distinct flex dispatch manager."""
+    managers = {}
+    for module in model.modules():
+        # MoEFlexTokenDispatcher is a plain object held by the experts module,
+        # not a submodule, so model.modules() does not yield it.
+        dispatcher = getattr(module, "token_dispatcher", None)
+        if isinstance(dispatcher, MoEFlexTokenDispatcher):
+            manager = getattr(dispatcher, "_comm_manager", None)
+            if manager is not None:
+                managers.setdefault(id(manager), (module, manager))
+    return list(managers.values())
+
+
+def presize_hybrid_ep_buffer(model: nn.Module, max_tokens_per_rank: int) -> bool:
+    """Allocate the HybridEP buffer for the largest micro-batch before the first dispatch.
+
+    Automodel sizes the shared HybridEP buffer from the first dispatch and
+    reallocates it when a later micro-batch is larger. Reallocation is a
+    collective that rebuilds the communication buffers mid-step; across nodes it
+    also recreates the RDMA queue pairs, which has failed with
+    ``Failed to create ...th QP``. Allocating once for the configured maximum
+    keeps every later dispatch within the buffer.
+
+    Must be called on every rank of the expert-parallel group, after the model's
+    token dispatchers are initialized and before its first forward.
+
+    Args:
+        model: Model whose MoE layers use the HybridEP dispatcher.
+        max_tokens_per_rank: Largest number of tokens one rank dispatches in a
+            single forward (the micro-batch token budget).
+
+    Returns:
+        True if the buffer was allocated here, False if the model has no
+        HybridEP dispatcher.
+    """
+    if max_tokens_per_rank <= 0:
+        raise ValueError(
+            f"max_tokens_per_rank must be positive, got {max_tokens_per_rank}"
+        )
+    from nemo_automodel.components.moe.megatron import fused_a2a
+    from nemo_automodel.components.moe.megatron.token_dispatcher import (
+        _HybridEPManager,
+    )
+
+    hybrid = [
+        (experts, manager)
+        for experts, manager in _dispatch_managers(model)
+        if isinstance(manager, _HybridEPManager)
+    ]
+    if not hybrid:
+        return False
+    if fused_a2a._hybrid_ep_buffer is not None:
+        raise RuntimeError("The HybridEP buffer is already allocated")
+    # All HybridEP managers share Automodel's single module-level buffer, so
+    # their buffer-shaping arguments must agree.
+    shapes = {
+        (
+            manager.group,
+            experts.config.expert_dim,
+            manager.num_local_experts,
+            manager.moe_hybridep_num_sms,
+        )
+        for experts, manager in hybrid
+    }
+    if len(shapes) != 1:
+        raise ValueError(f"HybridEP managers disagree on the buffer shape: {shapes}")
+    group, hidden_dim, num_local_experts, num_sms = shapes.pop()
+    num_tokens = (
+        -(-max_tokens_per_rank // _HYBRIDEP_TOKEN_ALIGNMENT) * _HYBRIDEP_TOKEN_ALIGNMENT
+    )
+    fused_a2a.init_hybrid_ep_buffer(
+        group,
+        hidden_dim,
+        num_tokens,
+        num_local_experts,
+        num_sms,
+        num_sms,
+        False,
+    )
+    return True

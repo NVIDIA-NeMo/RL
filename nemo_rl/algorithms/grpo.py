@@ -806,6 +806,16 @@ def setup(
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
+    text_overrides = (policy_config.get("hf_config_overrides") or {}).get("text_config") or {}
+    host_engram = text_overrides.get("engram_host_checkpoint")
+    rollout_engram = (generation_config.get("vllm_cfg") or {}).get("frozen_engram_checkpoint")
+    if host_engram is not None or rollout_engram is not None:
+        if generation_config["backend"] != "vllm" or host_engram != rollout_engram:
+            raise ValueError("Trainer and vLLM frozen Engram must use the same checkpoint path")
+        if generation_config["vllm_cfg"]["precision"] != "bfloat16":
+            raise ValueError("Frozen Engram currently requires BF16 rollout")
+        if generation_config["vllm_cfg"].get("refit_with_reload_api"):
+            raise ValueError("Frozen Engram requires refit_with_reload_api=false")
 
     # generation.disaggregation is written in backend-agnostic terms, but only
     # the TRT-LLM backend implements it today: every other backend would
@@ -1821,8 +1831,12 @@ def setup(
         configure_vllm_for_router_replay(policy_config)
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
 
-        ## make vllm hf overrides match the training policy
-        vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
+        # Inherit policy overrides while preserving explicit rollout settings
+        # (e.g. BF16 rollout storage for a quantized training checkpoint).
+        vllm_kwargs["hf_overrides"] = {
+            **(policy_config.get("hf_config_overrides") or {}),
+            **(vllm_kwargs.get("hf_overrides") or {}),
+        }
 
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
@@ -3611,6 +3625,13 @@ def _grpo_train_impl(
     val_period = master_config.grpo.val_period
     val_start_at = master_config.grpo.val_start_at
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    # Level-2 sleep discards vLLM weights, even when the policy has not trained
+    # since the last refit (e.g. validation or a dynamic-sampling batch).
+    generation_discards_weights_on_finish = (
+        colocated_inference
+        and master_config.policy["generation"]["backend"] == "vllm"
+        and master_config.policy["generation"]["vllm_cfg"].get("sleep_level", 1) == 2
+    )
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
@@ -3645,6 +3666,12 @@ def _grpo_train_impl(
             processor=processor,
         )
         policy_generation.finish_generation()
+        if generation_discards_weights_on_finish:
+            POLICY_GENERATION_STALE = True
+            print(
+                "Generation weights discarded by sleep(level=2); refit required.",
+                flush=True,
+            )
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
         if master_config.grpo.debug_payload_metrics:
@@ -3929,6 +3956,12 @@ def _grpo_train_impl(
                     repeated_batch[PROMPT_GROUP_IDS_KEY] = prompt_group_ids
                     del prompt_group_ids
                     policy_generation.finish_generation()
+                    if generation_discards_weights_on_finish:
+                        POLICY_GENERATION_STALE = True
+                        print(
+                            "Generation weights discarded by sleep(level=2); refit required.",
+                            flush=True,
+                        )
                     # Collect generation logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each worker
                     if policy_generation is not None:
@@ -4414,6 +4447,12 @@ def _grpo_train_impl(
                         processor=processor,
                     )
                     policy_generation.finish_generation()
+                    if generation_discards_weights_on_finish:
+                        POLICY_GENERATION_STALE = True
+                        print(
+                            "Generation weights discarded by sleep(level=2); refit required.",
+                            flush=True,
+                        )
                     logger.log_metrics(
                         validation_timings, total_steps + 1, prefix="timing/validation"
                     )

@@ -59,7 +59,7 @@ dependencies = [
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range compatible with every backend-specific pin (5.5.4 through
   # 5.16.1). Environments without a backend extra resolve to the upper bound.
-  "transformers>=5.5.0,<=5.16.1",
+  "transformers>=5.5.0,<=5.18.0",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -150,18 +150,21 @@ automodel = [
   # flash-attn, mamba-ssm and causal-conv1d (built from source here) do not use.
   "torch==2.13.0",
   "torchvision==0.28.0",
-  "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # The pinned Automodel commit (main-based DeepSeek V4.1 branch) requires cuDNN frontend >=1.27.
+  "nvidia-cudnn-frontend==1.27.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "apache-tvm-ffi==0.1.11",
   "nemo-automodel[moe]",
-  # Keep AutoModel's existing TileLang versions independent of Megatron's pin.
-  "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "tilelang==0.1.12; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  # Automodel's FLA kernels require this TileLang version on Hopper, and
+  # tile-kernels 1.0.0 (V4.1 Sinkhorn) cannot import with TileLang 0.1.12
+  # (deepseek-ai/TileKernels#24). Keep this scoped to the automodel fork;
+  # vLLM requires TileLang 0.1.12.
+  "tilelang==0.1.11; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
-  # Mirrors nemo-automodel's own `transformers==5.12.1` pin (Automodel r0.6.0).
-  "transformers==5.12.1",
+  # Mirrors the pinned Automodel commit (main-based DeepSeek V4.1 branch).
+  "transformers==5.15.1",
   "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",
@@ -170,11 +173,12 @@ automodel = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
 ]
 vllm = [
-  # ABI of the vLLM 0.33.0 cu130 wheels.
+  # ABI of the vLLM 0.34.0 cu130 wheels.
   "torch==2.14.0",
   "torchvision==0.29.0",
   "apache-tvm-ffi==0.1.11",
-  "transformers==5.16.1",
+  # vLLM 0.34 needs huggingface-hub >= 2, which transformers allows from 5.18.0.
+  "transformers==5.18.0",
   "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "cuda-python",
   # No standalone deep_gemm: the vLLM wheel ships its own prebuilt DeepGEMM
@@ -184,24 +188,24 @@ vllm = [
   # headers reject, and NeMo-RL's vLLM engines use vLLM's default
   # allgather_reducescatter all2all backend, which does not need it.
   # PyPI publishes the default cu130 wheels for both supported architectures.
-  # https://github.com/vllm-project/vllm/releases/tag/v0.33.0
-  "vllm==0.33.0",
+  # https://github.com/vllm-project/vllm/releases/tag/v0.34.0
+  "vllm==0.34.0",
   "num2words>=0.5.14",
-  "flashinfer-python==0.7.2.post1",
-  "flashinfer-cubin==0.7.2.post1",
-  "flashinfer-jit-cache==0.7.2.post1",
+  "flashinfer-python==0.7.3",
+  "flashinfer-cubin==0.7.3",
+  "flashinfer-jit-cache==0.7.3",
   # flashinfer-jit-cache 0.7.2 is a meta package over one wheel per GPU arch. They only
   # exist on the flashinfer cu130 index, and [tool.uv.sources] index pins only apply to
   # direct requirements, so each one is named here.
   # sm110a and sm121a ship aarch64 wheels only (see the matching override-dependencies).
-  "flashinfer-jit-cache-sm80==0.7.2.post1",
-  "flashinfer-jit-cache-sm89==0.7.2.post1",
-  "flashinfer-jit-cache-sm90a==0.7.2.post1",
-  "flashinfer-jit-cache-sm100a==0.7.2.post1",
-  "flashinfer-jit-cache-sm103a==0.7.2.post1",
-  "flashinfer-jit-cache-sm110a==0.7.2.post1; platform_machine == 'aarch64'",
-  "flashinfer-jit-cache-sm120f==0.7.2.post1",
-  "flashinfer-jit-cache-sm121a==0.7.2.post1; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm80==0.7.3",
+  "flashinfer-jit-cache-sm89==0.7.3",
+  "flashinfer-jit-cache-sm90a==0.7.3",
+  "flashinfer-jit-cache-sm100a==0.7.3",
+  "flashinfer-jit-cache-sm103a==0.7.3",
+  "flashinfer-jit-cache-sm110a==0.7.3; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm120f==0.7.3",
+  "flashinfer-jit-cache-sm121a==0.7.3; platform_machine == 'aarch64'",
   "nvidia-cutlass-dsl[cu13]==4.8.0",
   # Dynamo serving (policy.generation.dynamo=true) hosts these vLLM workers behind
   # dynamo.frontend through Dynamo's engine-agnostic backend SDK. Only the base
@@ -502,8 +506,10 @@ link-mode = "copy"
 override-dependencies = [
   # uv reads flashinfer-jit-cache's requirements from its aarch64 wheel, which also lists
   # these two aarch64-only GPU-arch wheels; without the marker an x86_64 sync fails on them.
-  "flashinfer-jit-cache-sm110a==0.7.2.post1; platform_machine == 'aarch64'",
-  "flashinfer-jit-cache-sm121a==0.7.2.post1; platform_machine == 'aarch64'",
+  # Unpinned: vLLM 0.34 needs FlashInfer 0.7.3 while megatron-bridge still pins 0.7.2.post1,
+  # and an override cannot differ per extra.
+  "flashinfer-jit-cache-sm110a; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm121a; platform_machine == 'aarch64'",
   # Preserve TRT-LLM's existing frontend and TVM-FFI overrides without constraining Megatron.
   { package = { name = "tensorrt-llm" }, dependencies = [
     "nvidia-cudnn-frontend==1.25.0",
@@ -536,7 +542,7 @@ override-dependencies = [
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
-  "opentelemetry-api>=1.33.1",
+  "opentelemetry-api==1.45.2",
   # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3.
   # Floor raised to 0.2.1 for vLLM 0.25.1, whose tool-choice handling imports
   # xgrammar.normalize_tool_choice (vLLM requires xgrammar>=0.2.1,<1.0.0; the
@@ -582,6 +588,10 @@ override-dependencies = [
 
 # CVE fixes
 constraint-dependencies = [
+  # vLLM 0.34 needs OpenTelemetry >= 1.45.1. Pin the SDK to the same release as the
+  # `opentelemetry-api` override below: that override replaces the SDK's own API pin, so the two can
+  # otherwise drift apart on a re-resolve (a 1.45 SDK with a 1.44 API fails to import).
+  "opentelemetry-sdk==1.45.2",
   # emerging-optimizers / fast-hadamard-transform flow transitively from megatron-core[dev],
   # whose [tool.uv.sources] pins them to git. uv requires such URL deps to also appear as a
   # direct requirement or constraint of the root project. Keep these URLs/revs in sync with

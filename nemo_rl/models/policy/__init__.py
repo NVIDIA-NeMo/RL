@@ -50,6 +50,12 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
+    # Transformers 5.15.1 checks auto_map before applying the tokenizer-class
+    # fallback and honors explicit trust_remote_code. Leave its loader intact.
+    # https://github.com/huggingface/transformers/blob/v5.15.1/src/transformers/models/auto/tokenization_auto.py
+    if PkgVersion(transformers.__version__) >= PkgVersion("5.15.1"):
+        return
+
     # Transformers 5.16.1 still ships both registry entries, so the patch remains
     # load-bearing across the currently supported backend environments.
     # TODO: remove this patch (and the assert below) once the deepseek_v3
@@ -201,6 +207,13 @@ class AutomodelCheckpointConfig(TypedDict, total=False):
 class AutomodelConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
+    # Collective timeout (minutes) for the default process group and the FSDP2 /
+    # expert-parallel groups derived from it. None = torch default (10 for NCCL).
+    distributed_timeout_minutes: NotRequired[float | None]
+    # Allocate the HybridEP dispatch buffer for this many tokens per rank before the
+    # first forward instead of growing it at run time (set to the micro-batch token
+    # budget). Unset keeps Automodel's size-on-first-dispatch behavior.
+    hybridep_max_tokens_per_rank: NotRequired[int]
     # Distributed parallelism sizes
     # data_parallel_size is derived from world_size / (tp * cp * ep)
     tensor_parallel_size: int

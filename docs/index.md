@@ -336,7 +336,7 @@ guides/grpo-audio-visual.md
 guides/rm.md
 guides/environments.md
 guides/deepseek.md
-guides/models/index.md
+Model Guides (including DeepSeek V4.1 Flash) <guides/models/index.md>
 model-quirks.md
 guides/async-grpo.md
 guides/single-controller.md

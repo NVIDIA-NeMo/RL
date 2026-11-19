@@ -1780,8 +1780,9 @@ class VllmGeneration(GenerationInterface):
             results = ray.get(futures)
             return all(result for result in results if result is not None)
         except Exception as e:
-            print(f"Error during policy preparation: {e}")
-            return False
+            # Continuing after a failed sleep/wake can mask the original failure
+            # with RPC errors from an executor that has already shut down.
+            raise RuntimeError("vLLM sleep/wake transition failed") from e
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Sleep workers and reset prefix cache."""
@@ -1807,8 +1808,9 @@ class VllmGeneration(GenerationInterface):
             results = ray.get(futures)
             return all(result for result in results if result is not None)
         except Exception as e:
-            print(f"Error during policy preparation: {e}")
-            return False
+            # Continuing after a failed sleep/wake can mask the original failure
+            # with RPC errors from an executor that has already shut down.
+            raise RuntimeError("vLLM sleep/wake transition failed") from e
 
     def shutdown(self) -> bool:
         """Shut down all vLLM workers and clean up resources."""

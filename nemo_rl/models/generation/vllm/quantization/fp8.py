@@ -84,6 +84,7 @@ class FP8Config:
     # *_scale_from_checkpoint entries), so load_weights skips re-quantization.
     refit_prequantize: bool = False
     is_deepseek_v4: bool = False
+    is_deepseek_v41: bool = False
     refit_with_reload_api: bool = False
 
 
@@ -378,6 +379,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "kv_cache_dtype": kv_cache_dtype,
         "use_fp8_weights": use_fp8_weights,
         "is_deepseek_v4": getattr(config, "model_type", None) == "deepseek_v4",
+        "is_deepseek_v41": getattr(config, "model_type", None)
+        in ("deepseek_v41", "deepseek_v41_text"),
         "refit_with_reload_api": bool(vllm_cfg.get("refit_with_reload_api")),
     }
     if is_mx:
@@ -1434,13 +1437,17 @@ def process_weights_after_loading_moe(self, layer) -> None:
         w2_input_scale=w2_input_scale,
     )
 
+    # DeepSeek V4/V4.1 restore checkpoint layouts before refit.
+    restores_checkpoint_layout = (
+        global_fp8_config.is_deepseek_v4 or global_fp8_config.is_deepseek_v41
+    )
     converted_weights = (
         ("w13_weight", w13),
         ("w2_weight", w2),
         (f"w13_{self.weight_scale_name}", w13_scale),
         (f"w2_{self.weight_scale_name}", w2_scale),
     )
-    if not global_fp8_config.is_deepseek_v4:
+    if not restores_checkpoint_layout:
         for name, converted_weight in converted_weights:
             parameter = getattr(layer, name)
             if (
@@ -1451,7 +1458,7 @@ def process_weights_after_loading_moe(self, layer) -> None:
                     f"FP8 MoE refit does not support {name} layout changes with this model/backend"
                 )
     for name, converted_weight in converted_weights:
-        if global_fp8_config.is_deepseek_v4:
+        if restores_checkpoint_layout:
             replace_parameter(layer, name, converted_weight)
         else:
             getattr(layer, name).copy_(converted_weight)

@@ -296,6 +296,21 @@ def configure_generation_config(
         # set load_format
         if config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS:
             config["vllm_cfg"]["load_format"] = "auto"
+        hf_overrides = config.get("vllm_kwargs", {}).get("hf_overrides")
+        if isinstance(hf_overrides, dict):
+            quant_config = hf_overrides.get("quantization_config")
+            if (
+                isinstance(quant_config, dict)
+                and quant_config.get("quant_method") == "fp8"
+                and quant_config.get("weight_block_size") == [32, 32]
+                and quant_config.get("scale_fmt") == "ue8m0"
+                and quant_config.get("expert_dtype") == "fp4"
+            ):
+                # DeepSeek native MXFP8/MXFP4 needs checkpoint loading to apply
+                # MegaAttention permutations before backend scale packing.
+                # Dummy loading finalizes in the opposite order and fails before
+                # the initial refit. Resolve this after the training default above.
+                config["vllm_cfg"]["load_format"] = "auto"
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")
         if speculative_config and not is_eval and not has_refit_draft_weights:
             # Speculative decoding needs real draft weights at startup, since the

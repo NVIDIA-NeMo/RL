@@ -14,6 +14,7 @@
 
 """Setup utilities for automodel-based training in NeMo RL."""
 
+import datetime
 import importlib
 import inspect
 import json
@@ -496,6 +497,35 @@ def setup_reference_model_state(
     return get_cpu_state_dict(model.state_dict().items(), pin_memory=True)
 
 
+def _distributed_timeout_minutes(config: PolicyConfig) -> Optional[float]:
+    """Return ``automodel_cfg.distributed_timeout_minutes``, or None when unset."""
+    timeout_minutes = config["automodel_cfg"].get("distributed_timeout_minutes")
+    if timeout_minutes is not None and timeout_minutes <= 0:
+        raise ValueError(
+            "automodel_cfg.distributed_timeout_minutes must be positive, "
+            f"got {timeout_minutes}"
+        )
+    return timeout_minutes
+
+
+def _init_process_group(config: PolicyConfig, runtime_config: RuntimeConfig) -> None:
+    """Initialize the default process group, honoring the configured collective timeout.
+
+    ``automodel_cfg.distributed_timeout_minutes`` replaces torch's default (10 minutes
+    for NCCL) for the default group. The per-axis groups that ``DeviceMesh`` creates do
+    not inherit it, so ``setup_distributed`` also forwards the value to
+    ``MeshContext.build``. Unset keeps torch's default everywhere.
+    """
+    backend = "nccl" if not runtime_config.cpu_offload else "cuda:nccl,cpu:gloo"
+    timeout_minutes = _distributed_timeout_minutes(config)
+    if timeout_minutes is None:
+        torch.distributed.init_process_group(backend=backend)
+    else:
+        torch.distributed.init_process_group(
+            backend=backend, timeout=datetime.timedelta(minutes=timeout_minutes)
+        )
+
+
 def setup_distributed(
     config: PolicyConfig,
     runtime_config: RuntimeConfig,
@@ -513,8 +543,7 @@ def setup_distributed(
         DistributedContext containing device meshes and distributed configuration
     """
     # Initialize process group
-    backend = "nccl" if not runtime_config.cpu_offload else "cuda:nccl,cpu:gloo"
-    torch.distributed.init_process_group(backend=backend)
+    _init_process_group(config, runtime_config)
     world_size = torch.distributed.get_world_size()
 
     # Extract configuration values
@@ -542,15 +571,21 @@ def setup_distributed(
     # Build tp_plan from custom_parallel_plan config if set, else None (auto-select)
     tp_plan = config["automodel_cfg"].get("custom_parallel_plan", None)
 
+    # mHC carries FP32 mixing coefficients between BF16 compute blocks.
+    # FSDP must preserve each input/output tensor's own dtype at that boundary.
+    uses_mhc = runtime_config.model_config.model_type == "deepseek_v41"
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=dtype,
+        reduce_dtype=torch.float32,
+        output_dtype=None if uses_mhc else STRING_TO_DTYPE[fsdp_output_dtype],
+        cast_forward_inputs=not uses_mhc,
+    )
+
     # Create FSDP2Config
     fsdp2_config = FSDP2Config(
         sequence_parallel=sequence_parallel_enabled,
         tp_plan=tp_plan,
-        mp_policy=MixedPrecisionPolicy(
-            param_dtype=dtype,
-            reduce_dtype=torch.float32,
-            output_dtype=STRING_TO_DTYPE[fsdp_output_dtype],
-        ),
+        mp_policy=mp_policy,
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
         activation_checkpointing=config["automodel_cfg"]["activation_checkpointing"],
         defer_fsdp_grad_sync=config["automodel_cfg"].get("defer_fsdp_grad_sync", True),
@@ -559,6 +594,8 @@ def setup_distributed(
     # Create MoEParallelizerConfig from nested moe_parallelizer options
     moe_parallelizer_cfg = config["automodel_cfg"].get("moe_parallelizer", {})
     moe_config = MoEParallelizerConfig(**moe_parallelizer_cfg)
+    if uses_mhc:
+        moe_config.mp_policy = mp_policy
 
     # Handle world_size=1 + cpu_offload
     if world_size == 1 and cpu_offload:
@@ -567,7 +604,9 @@ def setup_distributed(
             "If you need this feature, please file an issue on https://github.com/NVIDIA-NeMo/Automodel."
         )
 
-    # Create device meshes (dp_size is derived from world_size / (tp * cp * ep))
+    # Create device meshes (dp_size is derived from world_size / (tp * cp * ep)).
+    # The mesh axes get their own NCCL groups, which keep torch's default timeout
+    # unless Automodel is told otherwise, so the configured timeout goes here too.
     mesh_context = MeshContext.build(
         fsdp2_config,
         ParallelismSizes(
@@ -578,6 +617,7 @@ def setup_distributed(
             ep_size=ep_size,
         ),
         world_size=world_size,
+        timeout_minutes=_distributed_timeout_minutes(config),
     )
     device_mesh, moe_mesh = mesh_context.device_mesh, mesh_context.moe_mesh
 
@@ -994,7 +1034,8 @@ def setup_model_and_optimizer(
     if cpu_offload:
         # Move buffers to CPU for FSDP modules
         for v in model.buffers():
-            v.data = v.data.to("cpu")
+            # Preserve DTensor wrapper metadata together with its local storage.
+            torch.utils.swap_tensors(v, v.to("cpu"))
         model = model.to("cpu")
 
     # Build the DSpark draft model before optimizer construction so its params
@@ -1099,6 +1140,9 @@ def setup_model_and_optimizer(
                 (p for p in model.parameters() if p.requires_grad),
                 **optimizer_kwargs,
             )
+        from nemo_rl.models.deferred_grad import validate_configuration
+
+        validate_configuration(cpu_offload, optimizer)
 
     # Initialize scheduler
     scheduler = None

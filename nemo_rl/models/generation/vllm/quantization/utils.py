@@ -19,7 +19,7 @@ import torch
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
-from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
+from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8, deepseek_v41_fp8
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,8 @@ def resolve_module_from_param_name(
         # DeepSeek V4's full mapper handles regex/suffix rules as well as prefixes.
         # Do not apply the generic prefix/substring mappings a second time.
         mapped_name = deepseek_v4_fp8.map_checkpoint_name(model, name)
+    elif deepseek_v41_fp8.is_model(model):
+        mapped_name = deepseek_v41_fp8.map_checkpoint_name(model, name)
     else:
         mapped_name = name
         mapper = getattr(model, "hf_to_vllm_mapper", None)
@@ -87,6 +89,7 @@ def resolve_module_from_param_name(
         module_path[-1] = reversed_mapping[leaf]
 
     module_path = deepseek_v4_fp8.remap_packed_module_path(model, module_path)
+    module_path = deepseek_v41_fp8.remap_packed_module_path(model, module_path)
 
     current_module: torch.nn.Module = model
     for index, part in enumerate(module_path):

@@ -2168,8 +2168,6 @@ class TestSetupModelAndOptimizer:
         )
 
         mock_buffer = MagicMock()
-        mock_buffer.data = MagicMock()
-        mock_buffer.data.to.return_value = mock_buffer.data
 
         mock_model = MagicMock()
         mock_model.state_dict.return_value = {}
@@ -2182,16 +2180,22 @@ class TestSetupModelAndOptimizer:
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
 
-        setup_model_and_optimizer(
-            config=mock_config,
-            tokenizer=mock_tokenizer,
-            runtime_config=runtime_config,
-            distributed_context=mock_distributed_context,
-            checkpoint_manager=mock_checkpoint_manager,
-        )
+        with patch(
+            "nemo_rl.models.automodel.setup.torch.utils.swap_tensors"
+        ) as mock_swap_tensors:
+            setup_model_and_optimizer(
+                config=mock_config,
+                tokenizer=mock_tokenizer,
+                runtime_config=runtime_config,
+                distributed_context=mock_distributed_context,
+                checkpoint_manager=mock_checkpoint_manager,
+            )
 
         # Verify buffers were moved to CPU
-        mock_buffer.data.to.assert_called_with("cpu")
+        mock_buffer.to.assert_called_with("cpu")
+        mock_swap_tensors.assert_called_once_with(
+            mock_buffer, mock_buffer.to.return_value
+        )
         # Verify model was moved to CPU
         mock_model.to.assert_called_with("cpu")
 
