@@ -61,10 +61,7 @@ from nemo_rl.models.policy.utils import (
     rebuild_cuda_tensor_from_ipc,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-from nemo_rl.utils.packed_tensor import (
-    packed_broadcast_consumer,
-    packed_broadcast_preflight_consumer,
-)
+from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     _STR_TO_DTYPE,
     HFToLocalParamMap,
@@ -2891,11 +2888,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             if spec.post is not None:
                 spec.post(ctx)
 
-        # Consume the train-side readiness token before any bulk receive. This
-        # keeps all generation ranks on the same collective schedule when draft
-        # export fails before payload transfer begins.
-        packed_broadcast_preflight_consumer(self.model_update_group, 0)
-
         # Group params by PP stage so different stages' bulk reshards run
         # concurrently on their own streams.  Non-PP = single stage 0 (params
         # carry no "pp_stage" key), so this collapses to one stage / one stream.
@@ -2981,7 +2973,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             post_unpack_func=lambda weights: self._load_weights(
                 weights, coverage=coverage
             ),
-            preflight_checked=True,
         )
         if coverage is not None:
             coverage.require_covered(misc_state_dict_info)

@@ -28,14 +28,25 @@ The transfer kernel (``xferdtensor``) and its ``DTensorRef`` src/dst wrapper
 live in ``nemo_rl/weight_sync/xferdtensor.py`` — import both from there.
 """
 
+import hashlib
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Protocol, cast, runtime_checkable
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    Optional,
+    Protocol,
+    cast,
+    runtime_checkable,
+)
 
 import torch
 from torch.distributed._tensor import Shard
 from torch.distributed.tensor.placement_types import Replicate
+
+from nemo_rl.distributed.collectives import all_reduce_min_max
 
 # =========================================================================
 # MeshInfo — lightweight mesh wrapper type
@@ -949,6 +960,32 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             "nccl_reshard_refit cannot be enabled with the current config:\n"
             + "\n".join(f"  - {v}" for v in violations)
         )
+
+
+def assert_refit_weight_manifest_rank_agreement(
+    ordered_manifest: Iterable[tuple[str, str, tuple[int, ...], str]],
+    *,
+    group: torch.distributed.ProcessGroup,
+) -> None:
+    """Fail on every rank when ranks disagree on refit names, order, or shapes.
+
+    Each rank reduces a fixed-size digest of its ``(route, name, shape, dtype)``
+    manifest, so the check costs two small all-reduces for any model size.
+    """
+    manifest = tuple(ordered_manifest)
+    encoded = repr(manifest).encode("utf-8")
+    digest = hashlib.sha256(encoded).digest()
+    descriptor = [
+        len(manifest),
+        len(encoded),
+        *(
+            int.from_bytes(digest[offset : offset + 8], "big", signed=True)
+            for offset in range(0, len(digest), 8)
+        ),
+    ]
+    minimum, maximum = all_reduce_min_max(descriptor, group=group)
+    if minimum != maximum:
+        raise ValueError("refit weight manifest differs across ranks")
 
 
 def build_nccl_reshard_refit_info(

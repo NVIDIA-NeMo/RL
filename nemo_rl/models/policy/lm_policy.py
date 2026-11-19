@@ -295,9 +295,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             # Draft co-training streams draft.* keys only through the full-param
             # refit paths (colocated CUDA-IPC, collective broadcast, and
             # checkpoint-engine). The sparse transports bypass the extension's
-            # draft split entirely and nccl_reshard's suffix-based bulk routing
-            # would misdirect draft FFN keys, leaving the serving drafter
-            # silently stale — reject those combinations up front.
+            # draft split entirely, and nccl_reshard draft refit is not enabled
+            # yet, so reject those combinations up front.
             from nemo_rl.models.generation.vllm.config import (
                 VLLM_SPARSE_REFIT_TRANSPORTS,
             )

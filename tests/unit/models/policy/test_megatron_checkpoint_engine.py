@@ -24,16 +24,13 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
 
 
 class _Worker(MegatronCheckpointEngineSendMixin):
-    def _draft_weights_for_refit(self):
-        return ()
+    pass
 
 
 def test_checkpoint_engine_weight_iterator_keeps_weights_without_target_layout():
     worker = _Worker()
     weights = [("weight", torch.ones(2))]
-    worker._iter_params_with_optional_kv_scales = (
-        lambda kv_scales=None, *, draft_weights: iter(weights)
-    )
+    worker._iter_params_with_optional_kv_scales = lambda kv_scales=None: iter(weights)
     worker.checkpoint_engine = SimpleNamespace(get_target_weight_layout=lambda: None)
 
     selected = list(worker._checkpoint_engine_weight_iterator())
@@ -52,9 +49,7 @@ def test_checkpoint_engine_weight_iterator_filters_for_vllm_layout():
         ("model.layers.0.self_attn.q_proj.weight", dense_weight),
         ("model.layers.1.self_attn.q_proj.weight", dense_weight),
     ]
-    worker._iter_params_with_optional_kv_scales = (
-        lambda kv_scales=None, *, draft_weights: iter(weights)
-    )
+    worker._iter_params_with_optional_kv_scales = lambda kv_scales=None: iter(weights)
     target_layout = {
         "expert_params": {
             "model.layers.0.mlp.experts.routed_experts.w13_weight": {

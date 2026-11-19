@@ -622,7 +622,6 @@ def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
     )
     ext.model_config = object()
     ext.device = object()
-    ext.model_update_group = object()
 
     class _ExplodingInfo:
         def __getitem__(self, key):
@@ -635,11 +634,6 @@ def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
     ext.hf_to_local_param_map = {}
     monkeypatch.setattr(
         "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
-    )
-    monkeypatch.setattr(
-        vllm_backend,
-        "packed_broadcast_preflight_consumer",
-        lambda _group, _src: None,
     )
 
     # A failure inside the bulk receive must not propagate (nonfatal contract,
@@ -743,12 +737,10 @@ def test_nccl_reshard_refit_watchdog_abort_raises_refit_aborted(monkeypatch):
     )
     monkeypatch.setattr(refit_watchdog, "RefitAbortWatchdog", _FiredWatchdog)
 
-    def aborted_preflight(_group, _src):
+    def aborted_receive(_finalize):
         raise RuntimeError("communicator aborted")
 
-    monkeypatch.setattr(
-        vllm_backend, "packed_broadcast_preflight_consumer", aborted_preflight
-    )
+    monkeypatch.setattr(ext, "_nccl_reshard_refit_impl", aborted_receive)
 
     # An abort by the watchdog is fatal even when weight update errors are not.
     monkeypatch.setattr(ext, "_weight_update_errors_are_fatal", lambda: False)
@@ -756,38 +748,6 @@ def test_nccl_reshard_refit_watchdog_abort_raises_refit_aborted(monkeypatch):
         ext.nccl_reshard_refit(refit_timeout_s=1.0)
     assert isinstance(excinfo.value.__cause__, RuntimeError)
     assert "communicator aborted" in str(excinfo.value.__cause__)
-
-
-@pytest.mark.vllm
-def test_nccl_reshard_preflight_failure_is_fail_closed_and_nonfatal(monkeypatch):
-    from nemo_rl.models.generation.vllm import vllm_backend
-
-    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
-        vllm_backend.VllmInternalWorkerExtension
-    )
-    ext.model_runner = SimpleNamespace(
-        model=torch.nn.Module(), vllm_config=SimpleNamespace(speculative_config=None)
-    )
-    ext.model_config = object()
-    ext.device = object()
-    ext.nccl_reshard_refit_info = {"layer_names": []}
-    ext.hf_to_local_param_map = {}
-    ext.model_update_group = object()
-    monkeypatch.setattr(
-        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
-    )
-
-    def failing_preflight(_group, _src):
-        raise RuntimeError("train-signaled preflight failure")
-
-    monkeypatch.setattr(
-        vllm_backend, "packed_broadcast_preflight_consumer", failing_preflight
-    )
-
-    assert ext.nccl_reshard_refit() is False
-    assert ext._refit_unusable_reason is not None
-    assert "preflight failure" in ext._refit_unusable_reason
-    assert ext.nccl_reshard_refit() is False
 
 
 @pytest.mark.vllm
