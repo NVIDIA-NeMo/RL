@@ -31,8 +31,9 @@ import torch
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.loss.score_centering import compute_score_centering_term
 from nemo_rl.algorithms.opd import OnPolicyDistillationFullConfig
-from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.algorithms.utils import calculate_kl
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.tensor_ops import masked_mean
 
 # Two prompt groups with unequal response lengths and unequal group masses:
 # group 0 holds 5 + 1 valid tokens, group 1 holds 2 + 3.

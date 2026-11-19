@@ -20,6 +20,7 @@ from typing import Any, ClassVar, Protocol
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.tensor_ops import masked_mean
 
 # Per-row result of in-loss sequence filtering: a list of 0/1 floats, one per row
 # in the loss's batch order. It is not a metric; workers pop it before reduction.
@@ -200,9 +201,6 @@ class GlobalTokenMeanReduction(ObjectiveReduction):
         denominator: torch.Tensor,
         per_response_weights: torch.Tensor | None,
     ) -> torch.Tensor:
-        # Keep the interface importable without the optional tokenizer dependencies.
-        from nemo_rl.algorithms.utils import masked_mean
-
         return masked_mean(values, mask, global_normalization_factor=denominator)
 
 
@@ -243,9 +241,6 @@ class SequenceMeanReduction(ObjectiveReduction):
         denominator: torch.Tensor,
         per_response_weights: torch.Tensor | None,
     ) -> torch.Tensor:
-        # Keep the interface importable without the optional tokenizer dependencies.
-        from nemo_rl.algorithms.utils import masked_mean
-
         # Keep sample weights outside the inner mean so fractional weights survive.
         return masked_mean(
             masked_mean(values, token_mask, dim=-1),
