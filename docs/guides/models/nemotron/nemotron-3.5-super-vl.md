@@ -60,6 +60,15 @@ uv run examples/nemo_gym/nemotron-3.5-super-vl/prepare_mm_coding_single.py \
 ```
 
 For an existing source Gym JSONL envelope, add `--input-format legacy-row`.
+
+Single-answer rows also carry `problem_id=<benchmark>:<source-task-id>` at the
+top level. Gym uses it to materialize stable task identity without the eval
+collector's positional task index. The source ID stays in `task.task_id`.
+Previously exported single-answer files must be regenerated with this adapter,
+or converted with Gym's `resources_servers.mm_coding_training.prepare_task_ids`
+tool, then selected in the training data configuration. Use a Gym revision that
+supports this field in MM-coding task data; adding it to data alone is not enough
+for older workers. OpenCode task rows already carry materialized task identity.
 This reads the original task metadata and rebuilds the agent-facing input; it
 does not reuse old harness instructions or completions. Run the adapter
 separately for an approved validation split. The adapter preserves

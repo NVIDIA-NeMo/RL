@@ -95,6 +95,40 @@ def test_adapter_rejects_eval_split_and_outside_root(tmp_path: Path) -> None:
         )
 
 
+def test_single_rows_materialize_without_eval_indexes_or_cross_benchmark_collisions(
+    tmp_path: Path,
+) -> None:
+    materialize = pytest.importorskip("nemo_gym.data").materialize_task
+    from nemo_gym.server_runtime import SingleAgentTurnTaskInput
+
+    image = tmp_path / "reference.png"
+    Image.new("RGB", (16, 16), "red").save(image)
+    rows = [
+        adapter.gym_row(
+            adapter.ExperimentTask(
+                benchmark=benchmark,
+                task_id="shared-source-id",
+                prompt="original task",
+                references=[] if benchmark == "mmsvg_text2svg" else [str(image)],
+            ),
+            reference_root=tmp_path,
+            split="train",
+            max_output_tokens=8192,
+        )
+        for benchmark in ("chart2code", "mmsvg_text2svg")
+    ]
+    tasks = [materialize(row, taskset="coding") for row in rows]
+    assert tasks[0]["task_id"] != tasks[1]["task_id"]
+    for row, task in zip(rows, tasks):
+        assert materialize(row | {"_ng_rollout_index": 17}, taskset="coding") == task
+        parsed = SingleAgentTurnTaskInput.model_validate(task["task_input"])
+        assert parsed.task_data["task"] == row["task"]
+        assert (
+            parsed.responses_create_params.input[0].content[0]["text"]
+            == "original task"
+        )
+
+
 def test_duplicate_tasks_leave_no_partial_output(tmp_path: Path) -> None:
     data = {"benchmark": "mmsvg_text2svg", "task_id": "1", "prompt": "task"}
     source, output = tmp_path / "input.jsonl", tmp_path / "output.jsonl"

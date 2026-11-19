@@ -265,6 +265,7 @@ def gym_row(
             },
         }
     return {
+        "problem_id": f"{task.benchmark}:{task.task_id}",
         "agent_ref": {
             "type": "responses_api_agents",
             "name": "mm_coding_training_simple_agent",
