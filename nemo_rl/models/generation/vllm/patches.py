@@ -818,10 +818,13 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
         if all(new in content for _, new in replacements):
             return
         if any(content.count(old) != 1 for old, _ in replacements):
-            raise RuntimeError(
-                "Final vision LayerNorm patch requires the vLLM 0.33 model source "
-                f"or its fully patched equivalent: {file_to_patch}"
+            logger.warning(
+                "Could not apply the final vision LayerNorm patch: expected vLLM 0.33 "
+                "source shape was not found in %s; Nemotron VL scoring parity is not "
+                "guaranteed on this vLLM.",
+                file_to_patch,
             )
+            return
         for old, new in replacements:
             content = content.replace(old, new, 1)
         write_back(content)
@@ -882,6 +885,48 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
         write_back(content.replace(old_snippet, new_snippet, 1))
 
     logger.info("Successfully disabled decoder-level SP-MoE for GLM DSA models.")
+
+
+def _patch_vllm_deepseek_v41_text_only_visual_router_bias(logger) -> None:
+    """Let a text-only DeepSeek V4.1 engine load a checkpoint that carries ``gate.bias_vl``.
+
+    vLLM allocates the visual router bias only when ``vision_n_layers > 0``, but
+    its loader still looks every checkpoint key up, so a text-only engine fails
+    with ``KeyError: '...ffn.gate.bias_vl'`` on a checkpoint that keeps the bias
+    (seen through vLLM 0.34). The bias only routes image tokens; drop it from the
+    stream when the model has no such parameter.
+    """
+    try:
+        file_to_patch = _get_vllm_file("models/deepseek_v41/nvidia/model.py")
+    except RuntimeError:
+        logger.warning("Could not locate the DeepSeek V4.1 model for the bias_vl patch.")
+        return
+
+    old_snippet = """        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+"""
+    new_snippet = (
+        """        if not any(n.endswith(".gate.bias_vl") for n, _ in self.named_parameters()):
+            weights = (
+                (n, w) for n, w in weights if not n.endswith(".ffn.gate.bias_vl")
+            )
+"""
+        + old_snippet
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if new_snippet in content:
+            return
+        if content.count(old_snippet) != 1:
+            logger.warning(
+                "Could not apply the DeepSeek V4.1 bias_vl loader patch: expected "
+                "vLLM 0.34 source shape was not found in %s.",
+                file_to_patch,
+            )
+            return
+        write_back(content.replace(old_snippet, new_snippet, 1))
+
+    logger.info("Patched DeepSeek V4.1 text-only loading of checkpoints with bias_vl.")
 
 
 def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) -> bool:
@@ -1182,6 +1227,7 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+    _patch_vllm_deepseek_v41_text_only_visual_router_bias(patch_logger)
 
 
 def _apply_vllm_patches(
@@ -1202,6 +1248,7 @@ def _apply_vllm_patches(
     _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+    _patch_vllm_deepseek_v41_text_only_visual_router_bias(patch_logger)
     _patch_vllm_moe_routed_experts_capture(
         patch_logger, required=require_moe_routed_experts_capture
     )
