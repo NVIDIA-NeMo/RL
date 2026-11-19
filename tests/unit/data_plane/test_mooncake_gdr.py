@@ -31,17 +31,42 @@ from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 
 
-def _gdr_cfg(*, staging_mb: int = 384) -> dict:
+def _gdr_cfg(*, staging_mb: int = 384, ssd_path: str | None = None) -> dict:
+    mooncake_cpu: dict = {"use_gdr": True, "gdr_staging_buffer_mb": staging_mb}
+    if ssd_path is not None:
+        mooncake_cpu["ssd_offload"] = {"path": ssd_path}
     return {
         "enabled": True,
         "impl": "transfer_queue",
         "backend": "mooncake_cpu",
         "claim_meta_poll_interval_s": 0.5,
-        "mooncake_cpu": {
-            "use_gdr": True,
-            "gdr_staging_buffer_mb": staging_mb,
-        },
+        "mooncake_cpu": mooncake_cpu,
     }
+
+
+@pytest.fixture
+def gdr_client_cfg(fake_store, monkeypatch, tmp_path) -> dict:
+    """A GDR config whose client attaches the way TQ does, over the fake store.
+
+    TQ builds the store class it looks up by name on ``mooncake_client`` and
+    calls its ``setup`` once per process; later attaches reuse that store. SSD
+    offload is on by default, so a client that owns memory swaps that class in
+    before attaching, and checks afterwards that the swapped class was the one
+    built. The offload directory is ``tmp_path``.
+    """
+    built = False
+
+    def attach() -> None:
+        nonlocal built
+        if built:
+            return
+        built = True
+        fake_store.module.MooncakeDistributedStore().setup(
+            "h", "m", 1, 2, "rdma", "", "a"
+        )
+
+    monkeypatch.setattr(tq_adapter, "_connect_existing", attach)
+    return _gdr_cfg(ssd_path=str(tmp_path))
 
 
 def test_init_tq_forwards_nested_gdr_config_and_keeps_rdma(
@@ -67,6 +92,12 @@ def test_init_tq_forwards_nested_gdr_config_and_keeps_rdma(
         "rdma_devices",
         lambda: "mlx5_0,mlx5_1,mlx5_2,mlx5_4",
     )
+    # No master runs here: nothing for the (default-on) offload's watcher to poll.
+    monkeypatch.setattr(
+        tq_adapter.mooncake_ssd_offload,
+        "watch_master_disk_evictions",
+        lambda url, path: None,
+    )
     captured: dict = {}
     monkeypatch.setattr(
         tq_adapter.tq,
@@ -87,10 +118,11 @@ class _ReceiverWorker(TQWorkerMixin):
     pass
 
 
-def test_cpu_only_client_may_attach_with_gdr_config(monkeypatch) -> None:
+def test_cpu_only_client_may_attach_with_gdr_config(
+    monkeypatch, fake_store, gdr_client_cfg, tmp_path
+) -> None:
     """The CUDA guard is receiver-specific; a CPU-only producer remains valid."""
     monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
-    monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
     monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "10.0.0.1")
     monkeypatch.setattr(tq_adapter, "_patch_mooncake_register_check", lambda: None)
     monkeypatch.setattr(
@@ -98,13 +130,35 @@ def test_cpu_only_client_may_attach_with_gdr_config(monkeypatch) -> None:
     )
     monkeypatch.setattr(tq_adapter.os, "environ", dict(tq_adapter.os.environ))
 
-    client = tq_adapter.TQDataPlaneClient(_gdr_cfg(), bootstrap=False)
+    client = tq_adapter.TQDataPlaneClient(gdr_client_cfg, bootstrap=False)
 
     assert client._closed is False
+    # The client owns the controller's segment, so the store TQ built got the
+    # (default-on) SSD offload arguments.
+    ((_, setup_kwargs),) = fake_store.calls
+    assert setup_kwargs["enable_ssd_offload"] is True
+    assert setup_kwargs["ssd_offload_path"].startswith(str(tmp_path))
+
+
+def test_a_client_that_owns_memory_must_attach_through_the_offloading_store(
+    monkeypatch, fake_store, tmp_path
+) -> None:
+    """If TQ builds a different store class, the attach fails instead of never offloading."""
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "10.0.0.1")
+    monkeypatch.setattr(tq_adapter, "_patch_mooncake_register_check", lambda: None)
+    monkeypatch.setattr(
+        tq_adapter, "_patch_mooncake_staging_buffers", lambda *_, **__: None
+    )
+    monkeypatch.setattr(tq_adapter.os, "environ", dict(tq_adapter.os.environ))
+    monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)  # no store built
+
+    with pytest.raises(RuntimeError, match="did not build its store"):
+        tq_adapter.TQDataPlaneClient(_gdr_cfg(ssd_path=str(tmp_path)), bootstrap=False)
 
 
 def test_gdr_tensor_put_is_confirmed_once_and_never_falls_back(
-    monkeypatch, caplog
+    monkeypatch, caplog, gdr_client_cfg
 ) -> None:
     """A CUDA client's tensor PUT must take GDR, and say so exactly once."""
     staging = SimpleNamespace()
@@ -113,14 +167,13 @@ def test_gdr_tensor_put_is_confirmed_once_and_never_falls_back(
         storage_manager=SimpleNamespace(storage_client=storage_client)
     )
     monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
-    monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
     monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "10.0.0.1")
     monkeypatch.setattr(tq_adapter, "_patch_mooncake_register_check", lambda: None)
     monkeypatch.setattr(
         tq_adapter, "_patch_mooncake_staging_buffers", lambda *_, **__: None
     )
     monkeypatch.setattr(tq_adapter.tq, "get_client", lambda: tq_client)
-    client = tq_adapter.TQDataPlaneClient(_gdr_cfg(), bootstrap=False)
+    client = tq_adapter.TQDataPlaneClient(gdr_client_cfg, bootstrap=False)
     fields = TensorDict(
         {"token_ids": torch.tensor([[1]], dtype=torch.int64)}, batch_size=[1]
     )
@@ -155,7 +208,7 @@ def test_gdr_tensor_put_is_confirmed_once_and_never_falls_back(
 @pytest.mark.parametrize("method_name", ["put", "get"])
 @pytest.mark.parametrize("gdr_active", [False, True])
 def test_gdr_transfers_stay_on_the_attaching_workers_gpu(
-    monkeypatch, method_name: str, gdr_active: bool
+    monkeypatch, gdr_client_cfg, method_name: str, gdr_active: bool
 ) -> None:
     """A worker on GPU 2 must not stage GDR transfers on TQ's thread-default GPU 0."""
     # CUDA's current device is per thread; emulate it so this runs without GPUs.
@@ -185,7 +238,6 @@ def test_gdr_transfers_stay_on_the_attaching_workers_gpu(
         torch.cuda, "current_device", lambda: getattr(current, "device", 0)
     )
     monkeypatch.setattr(torch.cuda, "device", cuda_device)
-    monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
     monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "10.0.0.1")
     monkeypatch.setattr(tq_adapter, "_patch_mooncake_register_check", lambda: None)
     monkeypatch.setattr(
@@ -200,11 +252,11 @@ def test_gdr_transfers_stay_on_the_attaching_workers_gpu(
         ),
     )
 
-    tq_adapter.TQDataPlaneClient(_gdr_cfg(), bootstrap=False)
+    tq_adapter.TQDataPlaneClient(gdr_client_cfg, bootstrap=False)
     bound = getattr(storage_client, method_name)
     # A later client in this process must not retarget the existing binding.
     current.device = 0
-    tq_adapter.TQDataPlaneClient(_gdr_cfg(), bootstrap=False)
+    tq_adapter.TQDataPlaneClient(gdr_client_cfg, bootstrap=False)
     assert getattr(storage_client, method_name) is bound
 
     def run_on_tq_thread() -> None:

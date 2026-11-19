@@ -274,7 +274,7 @@ def test_prefix_completion_retires_old_keys() -> None:
 
 
 def _dump_restored_run(
-    tmp_path: Path, *, flushed_keys: list[str]
+    tmp_path: Path, *, flushed_keys: list[str], phase2_log_text: str | None = None
 ) -> argparse.Namespace:
     """A phase-two trainer dump, log, and selection for ``verify-completion``."""
     from nemo_rl.algorithms.single_controller_utils.debug_writer import (
@@ -331,13 +331,14 @@ def _dump_restored_run(
         )
     )
     phase2_log = tmp_path / "phase2.log"
-    phase2_log.write_text(_completion_log("call-a"))
+    phase2_log.write_text(phase2_log_text or _completion_log("call-a"))
     return argparse.Namespace(
         selection_file=str(selection),
         recovery_log_dir=str(log_dir),
         recovery_staging_keys=str(staging_keys),
         recovery_flush_keys=str(flush_keys),
         phase2_log=str(phase2_log),
+        require_routes=False,
     )
 
 
@@ -764,3 +765,23 @@ def test_selected_snapshot_must_have_cut_every_active_call() -> None:
             snapshot,
             "rollout checkpoint save completed: /ckpt/snapshot_000002 (step=0)",
         )
+
+
+@pytest.mark.parametrize("prefix_routes", ["kept", "dropped", "none", None], ids=str)
+def test_verify_completion_requires_the_restored_routes_to_be_kept(
+    tmp_path: Path, prefix_routes: str | None
+) -> None:
+    log = "".join(
+        f"{line} prefix_routes={prefix_routes}\n"
+        if prefix_routes is not None and "prefix completed:" in line
+        else f"{line}\n"
+        for line in _completion_log("call-a").splitlines()
+    )
+    args = _dump_restored_run(tmp_path, flushed_keys=[], phase2_log_text=log)
+    args.require_routes = True
+
+    if prefix_routes == "kept":
+        _SNAPSHOT_HELPER.verify_completion(args)
+    else:
+        with pytest.raises(AssertionError, match="restored prefix routes"):
+            _SNAPSHOT_HELPER.verify_completion(args)

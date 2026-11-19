@@ -130,6 +130,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
     algo_config,
+    dedicated_value_enabled,
     is_ppo_run,
     rollout_snapshots_enabled,
     validate_forest_objective,
@@ -169,6 +170,7 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
 from nemo_rl.data_plane.observability import (
+    backend_health_metrics,
     log_step_metrics,
     metrics_never_fail_the_step,
 )
@@ -417,6 +419,7 @@ class SingleControllerActor:
         )
         self._ppo_group_multiple = actor_args.ppo_group_multiple
         self._ppo_min_remaining_groups = actor_args.ppo_min_remaining_groups
+        self._value_dedicated: bool = dedicated_value_enabled(master_config)
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -1741,7 +1744,7 @@ class SingleControllerActor:
             await self._log_data_plane_metrics_impl(total_step_time)
 
     async def _log_data_plane_metrics_impl(self, total_step_time: float) -> None:
-        """Log this step's data-plane cost. No-op unless observability is enabled.
+        """Log this step's data-plane cost.
 
         This client's share depends on the configuration: it writes the rollout
         rows unless token capture moves that to the finalizer actors, and it
@@ -1751,18 +1754,15 @@ class SingleControllerActor:
         cluster view. The fan-out blocks on ``ray.get``, so it runs off the
         event loop.
 
-        nixl's unit metrics (retired memory, SSD spills) are logged even with
-        observability off: a leak only shows over a long run, in the runs that
-        need it.
+        nixl's unit metrics (retired memory, SSD spills) and Mooncake's master
+        counters (memory use, SSD offload) are logged even with observability
+        off: a leak only shows over a long run, in the runs that need it, and
+        the first SSD spill / offload of a run logs its warning from here.
         """
-        if self._dp_backend == "nixl":
-            from nemo_rl.data_plane.adapters.tq_nixl import unit_metrics
-
-            unit = unit_metrics()
-            if unit:
-                self._logger.log_metrics(
-                    unit, self._train_steps, prefix="data_plane/nixl"
-                )
+        health = await asyncio.to_thread(backend_health_metrics, self._dp_backend)
+        if health:
+            prefix, metrics = health
+            self._logger.log_metrics(metrics, self._train_steps, prefix=prefix)
         result = await asyncio.to_thread(
             self._trainer.get_data_plane_step_metrics,
             total_step_time,
@@ -3102,7 +3102,7 @@ class SingleControllerActor:
                         # per model, which is saving the offload/onloading cost.
                         # Keep accumulated policy gradients resident while
                         # offloading policy parameters/optimizer for the critic.
-                        if not value_inference_prepared:
+                        if not value_inference_prepared and not self._value_dedicated:
                             with (
                                 self._timer.time("value_inference_prep"),
                                 managed_span(
@@ -3160,7 +3160,7 @@ class SingleControllerActor:
                             # normalizer still counts all of them.
                             await asyncio.to_thread(
                                 self._trainer.prepare_for_lp_inference,
-                                keep_train_buffers=step_open,
+                                keep_train_buffers=step_open or self._value_dedicated,
                             )
                         with (
                             self._timer.time("policy_and_reference_logprobs"),
@@ -3179,7 +3179,6 @@ class SingleControllerActor:
                                     self._trainer.get_reference_policy_logprobs_from_meta,
                                     train_meta,
                                 )
-
                     # Compute advantages
                     with (
                         self._timer.time("advantage_calculation"),
@@ -3382,12 +3381,15 @@ class SingleControllerActor:
                                 tracer=self._tracer,
                             ),
                         ):
-                            if step_open:
-                                await asyncio.to_thread(
-                                    self._trainer.pause_train_step_with_offloading
-                                )
-                            else:
-                                await asyncio.to_thread(self._trainer.offload_to_cpu)
+                            if not self._value_dedicated:
+                                if step_open:
+                                    await asyncio.to_thread(
+                                        self._trainer.pause_train_step_with_offloading
+                                    )
+                                else:
+                                    await asyncio.to_thread(
+                                        self._trainer.offload_to_cpu
+                                    )
                             await asyncio.to_thread(self._value.prepare_for_inference)
                         value_inference_prepared = True
 
@@ -3511,7 +3513,8 @@ class SingleControllerActor:
                             await asyncio.to_thread(
                                 self._trainer.sync_params_before_refit
                             )
-                        await asyncio.to_thread(self._trainer.offload_to_cpu)
+                        if not self._value_dedicated:
+                            await asyncio.to_thread(self._trainer.offload_to_cpu)
                         if self._gen.blocks_training():
                             await asyncio.to_thread(self._trainer.finish_inference)
                     # GAE has produced the frozen predictions and targets for
@@ -4864,7 +4867,8 @@ class SingleControllerActor:
             # serialized. The critic goes first because offloading the policy runs
             # finalize_async_save, which would block on the policy's own write if
             # that had already been staged.
-            await asyncio.to_thread(self._trainer.offload_to_cpu)
+            if not self._value_dedicated:
+                await asyncio.to_thread(self._trainer.offload_to_cpu)
             # The value model writes synchronously, so unlike the policy below it is
             # fully on disk when this returns and needs no finalize wait.
             await asyncio.to_thread(self._value.prepare_for_training)
@@ -4880,7 +4884,8 @@ class SingleControllerActor:
             await asyncio.to_thread(self._value.finish_training)
             # Also covers a warmup step, which never ran prepare_for_training in
             # the pump and would otherwise save from CPU-resident params.
-            await asyncio.to_thread(self._trainer.prepare_for_training)
+            if not self._value_dedicated:
+                await asyncio.to_thread(self._trainer.prepare_for_training)
 
         # Save policy model
         # With async_save this returns after D2H staging; disk writes finish
@@ -5264,9 +5269,9 @@ class SingleControllerActor:
 
         Tensors never touch SC: workers fetch the sequence columns from
         DataPlane and commit the per-token prediction back under ``values``,
-        which the advantage stage then reads alongside the rewards. The model is
-        offloaded after the forward. Streaming may prepare it before the chunk's
-        rollout data is ready to overlap the residency switch with generation.
+        which the advantage stage then reads alongside the rewards. Shared
+        workers offload after the forward; dedicated workers keep it resident.
+        Streaming may prepare it before the chunk's rollout data is ready.
 
         Args:
             meta: Selected chunk's metadata.
@@ -5298,8 +5303,8 @@ class SingleControllerActor:
                     self._value.train_from_meta, full_meta, value_loss_fn
                 )
         else:
-            # Split prepares the API for per-chunk value streaming in a later PR;
-            # this controller still trains the critic after policy refit.
+            # Split exposes the per-chunk API, but this controller still collects
+            # all step chunks before training the critic.
             for _ in range(num_epochs):
                 await asyncio.to_thread(self._value.begin_train_step, value_loss_fn)
                 for meta in metas:
@@ -5349,7 +5354,7 @@ class SingleControllerActor:
             return meta, True
 
         # Split on prompt-group boundaries so the pool works a chunk in
-        # parallel. SHARD_INVARIANT_ESTIMATORS says which estimators allow it.
+        # parallel when the estimator does not require the global batch.
         stage_cfg = self._advantage_stage_config
         num_actors = len(self._advantage_actors)
         shards = (

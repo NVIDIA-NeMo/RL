@@ -73,6 +73,7 @@ from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from nemo_rl.experience.route_assembly import verify_route_fragment_integrity
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
 from nemo_rl.models.generation.prefix_recovery import PrefixRecovery
+from nemo_rl.models.generation.prefix_recovery.recovery import _ResolvedGenerationCut
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
@@ -456,6 +457,7 @@ def test_splice_coordinates_handle_reasoning_shift_and_repeated_pad_runs():
         model_prefix_token_ids=original,
         template_prefix_token_ids=template[:6],
         template_token_ids=template,
+        eos_token_id=2,
     )
     prompt = engine_prompt(template, [(Span(1, 2), a), (Span(7, 2), b)])
     captured = capture_processed_media(
@@ -480,6 +482,7 @@ def test_continuation_captures_only_new_media_and_rejects_changed_pixels():
         model_prefix_token_ids=original,
         template_prefix_token_ids=template[:6],
         template_token_ids=template,
+        eos_token_id=2,
     )
     retained = (StagedMediaTensors(**first.tensors, num_frames=None),)
     prompt = engine_prompt(template, [(Span(1, 2), a), (Span(7, 2), b)])
@@ -549,6 +552,7 @@ def test_changed_retained_pad_run_cannot_steal_the_next_image():
         model_prefix_token_ids=original,
         template_prefix_token_ids=template_prefix,
         template_token_ids=template,
+        eos_token_id=2,
     )
     with pytest.raises(ValueError, match="Retained media"):
         capture_processed_media(
@@ -577,6 +581,7 @@ def test_span_mask_is_preserved_on_remap():
         model_prefix_token_ids=[10, 77, 31, 2],
         template_prefix_token_ids=[10, 31, 2],
         template_token_ids=[10, 31, 2, 11, 18, 18, 12],
+        eos_token_id=2,
     )
     prompt = engine_prompt(
         [10, 31, 2, 11, 18, 18, 12], [(Span(3, 4, mask), torch.ones(3, 2, 3))]
@@ -741,6 +746,9 @@ def test_worker_restart_validates_retained_media(
         _hash_captured_media=False,
         _capture_image_token_id=18,
         _capture_patch_size=1,
+        _capture_media_family="omni",
+        _capture_spatial_merge_size=None,
+        _capture_cast_pixel_dtype=None,
         _staging_source=source,
         _chain_prefix=ChainPrefixCache(source),
     )
@@ -795,6 +803,9 @@ def _stage_media_prefix(dp, tokens, prompt):
         _hash_captured_media=True,
         _capture_image_token_id=18,
         _capture_patch_size=1,
+        _capture_media_family="omni",
+        _capture_spatial_merge_size=None,
+        _capture_cast_pixel_dtype=None,
     )
     admission = CaptureAdmission(
         rollout_id="r0", model_call_id="c1", prev_len=0, mode="text"
@@ -927,8 +938,10 @@ def test_generation_cut_rebuild_rejects_extras_after_the_first_chunk(dp):
     recovery = SimpleNamespace(
         _parts=SimpleNamespace(
             staging_source=SimpleNamespace(
-                fetch_for_finalization=lambda keys: [chunk, later]
-            )
+                fetch_for_finalization=lambda keys, **include: [chunk, later]
+            ),
+            router_replay=False,
+            sampler_top_k=0,
         )
     )
     admission = SimpleNamespace(
@@ -1177,6 +1190,7 @@ def test_video_placeholder_remap_preserves_all_timestamp_tokens():
         model_prefix_token_ids=original,
         template_prefix_token_ids=template_prefix,
         template_token_ids=template,
+        eos_token_id=2,
     )
     prompt = video_prompt(template, [(Span(1, 4), frames), (Span(7, 4), frames)])
     added = capture_processed_media(
@@ -1324,6 +1338,9 @@ def retained_call(dp):
         _hash_captured_media=False,
         _capture_image_token_id=18,
         _capture_patch_size=1,
+        _capture_media_family="omni",
+        _capture_spatial_merge_size=None,
+        _capture_cast_pixel_dtype=None,
         _staging_source=source,
         _chain_prefix=ChainPrefixCache(source),
     )
@@ -1648,6 +1665,7 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     renderer.renderer = SimpleNamespace(
         tokenizer=SimpleNamespace(decode=str, eos_token_id=2)
     )
+    renderer.model_config = SimpleNamespace(max_model_len=4096)
     inference = AsyncMock()
 
     async def create_chat_completion(request, raw_request):
@@ -1767,11 +1785,14 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     restored_request = chat_request(
         restored_capture, max_tokens=8, max_completion_tokens=None, min_tokens=None
     )
-    # resolve_restore's verified snapshot, as on main.
+    # resolve_restore's verified prefix.
     monkeypatch.setattr(
         worker._prefix_recovery,
         "resolve_restore",
-        lambda admission, prefix_token_ids: (admission, cut),
+        lambda admission, prefix_token_ids: (
+            admission,
+            _ResolvedGenerationCut(snapshot=cut),
+        ),
     )
     monkeypatch.setattr(
         renderer, "model_config", SimpleNamespace(max_model_len=64), raising=False
@@ -2120,6 +2141,9 @@ def test_worker_rejects_uncommitted_retained_offsets_before_splice(dp, reseal_me
         _capture_media=True,
         _capture_image_token_id=18,
         _capture_patch_size=1,
+        _capture_media_family="omni",
+        _capture_spatial_merge_size=None,
+        _capture_cast_pixel_dtype=None,
         _staging_source=TQTokenSource(
             dp, staging_partition="staging", capture_media=True
         ),

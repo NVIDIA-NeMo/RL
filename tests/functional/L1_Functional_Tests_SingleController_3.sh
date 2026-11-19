@@ -34,17 +34,20 @@ run_test() {
     fi
 }
 
+# Two-phase SimpleStorage capture on real Ray/ZMQ actors (CPU only).
+run_test fast uv run --no-sync bash ./tests/functional/data_plane_simple_checkpoint_cpu.sh
 # Native TQ + metadata-only completed replay recovery (#3480).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh
-# Same recovery flow with Mooncake CPU storage and SSD offload on; skips
-# without an RDMA device.
+# Same recovery flow with Mooncake CPU storage, forced onto its SSD offload;
+# skips without an RDMA device.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake_tq_recovery.sh
 # Same flows with storage units: SimpleStorageUnits pinned by placement, and
-# Mooncake CPU storage units as the only memory owners (skips without RDMA).
+# Mooncake CPU storage units as the only memory owners, with the default SSD
+# offload settings and no spill expected (skips without RDMA).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh simple_placed
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake_tq_recovery.sh mooncake_units
-# Same recovery flow on the nixl data plane, with its SSD tier off and on
-# (skip without an RDMA device).
+# Same recovery flow on the nixl data plane: default SSD tier with no spill,
+# and forced onto the SSD tier (skip without an RDMA device).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_nixl_tq_recovery.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_nixl_tq_recovery.sh nixl_ssd
 # Deterministic process restart with an admitted group held before canonical TQ
@@ -78,7 +81,12 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # the recovery (7-9 minutes locally). Full tier: it depends on three runs making
 # the same near-greedy choices, and local runs have failed for reasons outside
 # recovery, so it stays out of fast lanes until a CI-GPU pass rate is shown.
-run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh
+# Score centering with sampler replay: each cut also stages the sampler top-k,
+# and a resumed row trains with it (the settings of the H100 verification run).
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh ++policy.generation.top_logprobs=4 ++loss_fn.score_centering=true ++policy.generation.sampler_replay.enabled=true ++policy.generation.top_k=4
+# The same active-decode recovery with MoE router replay, on a tiny random MoE:
+# each restored call must stage the routes it restored for training.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_router_replay_prefix_recovery_single_controller_1n2g.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
