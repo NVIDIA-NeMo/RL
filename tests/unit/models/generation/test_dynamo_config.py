@@ -51,7 +51,8 @@ def test_dynamo_true_alone_is_a_complete_config(dynamo: bool) -> None:
     config = configure_generation_config(_vllm_config(dynamo=dynamo), _Tokenizer())
 
     # Dynamo serves the AsyncLLM, so the switch selects the async engine.
-    # Rollouts read token IDs only, so the engine skips its tokenizer as natively.
+    # Rollouts read token IDs only, so the engine skips its tokenizer as natively;
+    # NeMo-Gym runs load it through expose_http_server, which Gym requires.
     assert config["vllm_cfg"]["async_engine"] is dynamo
     assert config["vllm_cfg"]["skip_tokenizer_init"] is True
     assert "dynamo_cfg" not in config
@@ -96,12 +97,37 @@ def test_dynamo_true_alone_is_a_complete_config(dynamo: bool) -> None:
             ),
             "checks no bearer token",
         ),
+        # Gym's calls go through the Dynamo frontend, not vLLM's HTTP frontends.
+        (
+            _vllm_config(
+                dynamo=True,
+                vllm_cfg={
+                    "async_engine": True,
+                    "expose_http_server": True,
+                    "max_model_len": 512,
+                    "tensor_parallel_size": 1,
+                    "expert_parallel_size": 1,
+                    "http_api_server_count": 2,
+                },
+            ),
+            "would serve none of them",
+        ),
         # Direct routing needs a worker ID that rollouts never carry.
         (
             _vllm_config(
                 dynamo=True, dynamo_cfg={"frontend_args": {"router_mode": "direct"}}
             ),
             "router_mode",
+        ),
+        # NeMo-Gym's chat calls are NeMo RL's chat engine's, never Dynamo's.
+        (
+            _vllm_config(
+                dynamo=True,
+                dynamo_cfg={
+                    "frontend_args": {"extra_cli_args": ["--dyn-chat-processor=vllm"]}
+                },
+            ),
+            "may not set --dyn-chat-processor",
         ),
     ],
 )
@@ -120,7 +146,15 @@ def test_frontend_argv_is_runtime_owned() -> None:
     )
     argv = frontend_argv(host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=cfg)
     assert argv[argv.index("--router-mode") + 1] == "kv"
+    # Gym names a token-capture call's session; keep the session on one engine.
+    assert argv[argv.index("--router-session-affinity-ttl-secs") + 1] == "300"
     assert argv[-2:] == ["--foo", "1"]
+    no_affinity = DynamoCfg.model_validate(
+        {"frontend_args": {"session_affinity_ttl_secs": None}}
+    )
+    assert "--router-session-affinity-ttl-secs" not in frontend_argv(
+        host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=no_affinity
+    )
 
     clashing = DynamoCfg(
         frontend_args=DynamoFrontendArgs(extra_cli_args=["--http-port", "9"])

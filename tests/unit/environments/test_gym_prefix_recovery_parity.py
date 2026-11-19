@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -270,6 +271,92 @@ def test_prefix_completion_retires_old_keys() -> None:
     _HELPER._assert_retired_prefix_keys(
         selection, trained, [{"epoch": 1, "staging_sample_ids": ["new-active-key"]}]
     )
+
+
+def _dump_restored_run(
+    tmp_path: Path, *, flushed_keys: list[str], phase2_log_text: str | None = None
+) -> argparse.Namespace:
+    """A phase-two trainer dump, log, and selection for ``verify-completion``."""
+    from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+        JsonDebugWriter,
+        TrainChunk,
+    )
+
+    log_dir = tmp_path / "recovery-logs"
+    token_ids = [1, 2] + list(range(100, 112))
+    dump = JsonDebugWriter(str(log_dir / "exp_001"))
+    receipt = dump.add_chunk(
+        TrainChunk(
+            step=0,
+            sample_ids=["group-a_g0"],
+            tags=[{"prompt_idx": 0}],
+            input_lengths=torch.tensor([len(token_ids)]),
+            sequences={
+                "token_ids": torch.tensor([token_ids]),
+                # The trainer masked one position inside the restored call.
+                "token_loss_mask": torch.tensor(
+                    [[0.0, 0.0] + [1.0] * 6 + [0.0] + [1.0] * 5]
+                ),
+                "advantages": torch.zeros(1, len(token_ids)),
+                "generation_logprobs": torch.zeros(1, len(token_ids)),
+                "prev_logprobs": torch.zeros(1, len(token_ids)),
+            },
+            scalars={
+                "sample_loss_mask": torch.tensor([1.0]),
+                "rewards": torch.tensor([1.0]),
+            },
+        )
+    )
+    dump.finish_step(0, [receipt])
+    staging_keys = tmp_path / "recovery-staging-keys.jsonl"
+    staging_keys.write_text(
+        json.dumps({"train_step": 1, "staging_sample_ids": ["prefix-key"]}) + "\n"
+    )
+    flush_keys = tmp_path / "recovery-flush-keys.jsonl"
+    flush_keys.write_text(
+        json.dumps({"epoch": 1, "staging_sample_ids": flushed_keys}) + "\n"
+    )
+    selection = tmp_path / "selected-snapshot.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "cuts": [
+                    {
+                        **_cut("call-a", 0, 5),
+                        "group_id": "group-a",
+                        "staging_keys": ["prefix-key"],
+                    }
+                ]
+            }
+        )
+    )
+    phase2_log = tmp_path / "phase2.log"
+    phase2_log.write_text(phase2_log_text or _completion_log("call-a"))
+    return argparse.Namespace(
+        selection_file=str(selection),
+        recovery_log_dir=str(log_dir),
+        recovery_staging_keys=str(staging_keys),
+        recovery_flush_keys=str(flush_keys),
+        phase2_log=str(phase2_log),
+        require_routes=False,
+    )
+
+
+def test_verify_completion_checks_a_reference_free_restore(tmp_path: Path, capsys):
+    _SNAPSHOT_HELPER.verify_completion(
+        _dump_restored_run(tmp_path, flushed_keys=["new-active-key"])
+    )
+
+    assert "('group-a', 0)" in capsys.readouterr().out
+
+
+def test_verify_completion_rejects_a_restored_prefix_that_outlived_the_snapshot(
+    tmp_path: Path,
+):
+    with pytest.raises(AssertionError, match="outlived the next snapshot"):
+        _SNAPSHOT_HELPER.verify_completion(
+            _dump_restored_run(tmp_path, flushed_keys=["prefix-key"])
+        )
 
 
 @pytest.mark.parametrize(
@@ -678,3 +765,23 @@ def test_selected_snapshot_must_have_cut_every_active_call() -> None:
             snapshot,
             "rollout checkpoint save completed: /ckpt/snapshot_000002 (step=0)",
         )
+
+
+@pytest.mark.parametrize("prefix_routes", ["kept", "dropped", "none", None], ids=str)
+def test_verify_completion_requires_the_restored_routes_to_be_kept(
+    tmp_path: Path, prefix_routes: str | None
+) -> None:
+    log = "".join(
+        f"{line} prefix_routes={prefix_routes}\n"
+        if prefix_routes is not None and "prefix completed:" in line
+        else f"{line}\n"
+        for line in _completion_log("call-a").splitlines()
+    )
+    args = _dump_restored_run(tmp_path, flushed_keys=[], phase2_log_text=log)
+    args.require_routes = True
+
+    if prefix_routes == "kept":
+        _SNAPSHOT_HELPER.verify_completion(args)
+    else:
+        with pytest.raises(AssertionError, match="restored prefix routes"):
+            _SNAPSHOT_HELPER.verify_completion(args)

@@ -22,6 +22,10 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import torch
+
+from nemo_rl.models.generation.prefix_recovery.routes import _EngineRouteCache
+
 
 @dataclass(frozen=True)
 class _CallProgress:
@@ -41,6 +45,8 @@ class _CallProgress:
     # Set when the request's sampling settings would not carry across a cut,
     # so the call regenerates after a restore instead of resuming its prefix.
     uncuttable_reason: str | None
+    # Router replay: the full-sequence routes of the call's final output.
+    terminal_routed_experts: torch.Tensor | None
 
 
 @dataclass(frozen=True)
@@ -67,8 +73,8 @@ class _RequestCaptureState:
     or rolling back a cut, starting the terminal write) exist only on the
     ``_CallLifecycle`` that ``lifecycle()`` yields while it holds
     ``_lifecycle_lock``, which a cut keeps across its TQ write. ``call``,
-    ``prompt_token_ids``, ``media`` and ``resumed_generation_token_ids`` never
-    change after ``begin_call``.
+    ``prompt_token_ids``, ``media``, ``resumed_generation_token_ids`` and the
+    router-replay settings never change after ``begin_call``.
 
     Each successful cut stages only the tokens past the last sealed one. The
     ordered TQ keys remain in Gym lineage; the full list is kept locally to
@@ -80,6 +86,12 @@ class _RequestCaptureState:
         "_prompt_token_ids",
         "_media",
         "_resumed_generation_token_ids",
+        "_routed_experts_dtype",
+        "_restored_routed_experts",
+        "_terminal_routed_experts",
+        "_engine_routes",
+        "_restored_sampler_topk",
+        "_sampler_logprobs",
         "_lock",
         "_lifecycle_lock",
         "_generated_token_ids",
@@ -105,15 +117,34 @@ class _RequestCaptureState:
         resumed_generation_token_ids: Sequence[int] = (),
         effective_output_limit: int | None = None,
         staging_keys: Sequence[str] = (),
+        routed_experts_dtype: torch.dtype | None = None,
+        restored_routed_experts: torch.Tensor | None = None,
+        restored_sampler_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         self._call = call
         self._prompt_token_ids = list(prompt_token_ids)
         # Backend-owned opaque state that must survive until the terminal row
-        # is staged. vLLM uses this for its processed-media snapshot; prefix
-        # recovery is setup-guarded to text-only, but ordinary terminal capture
-        # still shares this lifecycle container.
+        # is staged. vLLM uses this for its processed-media snapshot; the first
+        # generation-prefix row carries its tensor digests across recovery.
         self._media = media
         self._resumed_generation_token_ids = list(resumed_generation_token_ids)
+        # Router replay: the dtype a cut stages the routes of the tokens it
+        # freezes in; None when the call's cuts stage no routes.
+        self._routed_experts_dtype = routed_experts_dtype
+        # A resumed call's routes for its restored prefix, delta-aligned.
+        self._restored_routed_experts = restored_routed_experts
+        self._terminal_routed_experts: torch.Tensor | None = None
+        self._engine_routes = (
+            None
+            if routed_experts_dtype is None
+            else _EngineRouteCache(routed_experts_dtype)
+        )
+        # Score centering: a resumed call's sampler top-k for its restored
+        # prefix, one row per prefix token.
+        self._restored_sampler_topk = restored_sampler_topk
+        # vLLM's append-only logprobs container, which holds each position's
+        # sampler top-k; a cut slices the positions it stages.
+        self._sampler_logprobs: Any = None
         self._lock = threading.Lock()
         # Serializes lifecycle-changing TQ operations for this call. Token
         # recording uses ``_lock`` instead, so a finished output can be
@@ -151,6 +182,24 @@ class _RequestCaptureState:
         return self._resumed_generation_token_ids
 
     @property
+    def routed_experts_dtype(self) -> torch.dtype | None:
+        return self._routed_experts_dtype
+
+    @property
+    def restored_routed_experts(self) -> torch.Tensor | None:
+        return self._restored_routed_experts
+
+    @property
+    def restored_sampler_topk(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        return self._restored_sampler_topk
+
+    @property
+    def sampler_logprobs(self) -> Any:
+        """The logprobs container the call's recorded tokens were read from."""
+        with self._lock:
+            return self._sampler_logprobs
+
+    @property
     def recorded_token_count(self) -> int:
         with self._lock:
             return len(self._generated_token_ids)
@@ -163,6 +212,7 @@ class _RequestCaptureState:
         start: int | None = None,
         finish_reason: Any = None,
         stop_reason: Any = None,
+        logprobs_container: Any = None,
     ) -> None:
         """Record tokens read at position ``start`` (default: the end).
 
@@ -170,9 +220,12 @@ class _RequestCaptureState:
         recorded by the other are skipped rather than appended twice. Callers
         read ``start`` from ``recorded_token_count``, and tokens are never
         removed, so it never lies past the recorded end. ``finish_reason`` is
-        how vLLM finished the call, if it has.
+        how vLLM finished the call, if it has. ``logprobs_container`` is the
+        engine container the tokens were read from, kept for ``sampler_logprobs``.
         """
         with self._lock:
+            if logprobs_container is not None:
+                self._sampler_logprobs = logprobs_container
             skip = 0 if start is None else len(self._generated_token_ids) - start
             self._generated_token_ids.extend(generated_token_ids[skip:])
             self._generated_logprobs.extend(generated_logprobs[skip:])
@@ -197,6 +250,11 @@ class _RequestCaptureState:
             else:
                 self._terminal_finish_reason = finish_reason
                 self._terminal_stop_reason = stop_reason
+
+    def record_terminal_routes(self, routed_experts: torch.Tensor) -> None:
+        """Keep the full-sequence routes of the call's final output."""
+        with self._lock:
+            self._terminal_routed_experts = routed_experts
 
     def record_error(self, error: str) -> None:
         """Keep the call out of cuts: its recorded tokens disagree with vLLM's."""
@@ -258,6 +316,7 @@ class _RequestCaptureState:
             terminal_stop_reason=self._terminal_stop_reason,
             observation_error=self._observation_error,
             uncuttable_reason=self._uncuttable_reason,
+            terminal_routed_experts=self._terminal_routed_experts,
         )
 
 
@@ -348,6 +407,13 @@ class _CallLifecycle:
             state._frozen_cut = None
             if staged_key is not None:
                 state._staging_keys.append(staged_key)
+
+    def absorb_engine_route_pieces(self, pieces: Sequence[Any]) -> torch.Tensor:
+        """Join the engine's new route pieces; return the request's routes so far."""
+        engine_routes = self._require_live()._engine_routes
+        if engine_routes is None:
+            raise RuntimeError("this call's cuts stage no router-replay routes")
+        return engine_routes.absorb(pieces)
 
     def rollback(self, checkpoint_id: str) -> None:
         """Abandon a cut; its tokens stay unstaged for the next one."""
