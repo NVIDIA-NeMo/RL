@@ -16,8 +16,8 @@ from typing import Optional
 
 import torch
 
-from nemo_rl.algorithms.utils import calculate_kl, masked_mean
-from nemo_rl.utils.tensor_ops import masked_max, masked_min
+from nemo_rl.algorithms.utils import calculate_kl
+from nemo_rl.utils.tensor_ops import masked_max, masked_mean, masked_min
 
 
 def materialize_scalar_metrics(

@@ -290,21 +290,6 @@ def compute_seq_logprob_errors(
     return errors, valid
 
 
-def masked_mean(
-    values: torch.Tensor,
-    mask: torch.Tensor,
-    dim: Optional[int] = None,
-    global_normalization_factor: Optional[torch.Tensor | float] = None,
-):
-    """Computes the mean of a microbatch, using a global statistic as the normalization factor."""
-    normalization_factor = (
-        torch.sum(mask, dim=dim)
-        if global_normalization_factor is None
-        else global_normalization_factor
-    )
-    return torch.sum(values * mask, dim=dim) / (normalization_factor + 1e-8)
-
-
 def mask_filtered_logprobs_outside_tokens(
     logprobs: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
@@ -323,26 +308,6 @@ def mask_filtered_logprobs_outside_tokens(
         Log probabilities with zeros outside ``mask``.
     """
     return torch.where(mask.bool(), logprobs, 0.0)
-
-
-def masked_var(
-    values: torch.Tensor,
-    mask: torch.Tensor,
-    mean: Optional[torch.Tensor | float] = None,
-    unbiased: bool = True,
-) -> torch.Tensor:
-    if mean is None:
-        mean = masked_mean(values, mask)
-    centered_values = values - mean
-    variance = masked_mean(centered_values.pow(2), mask)
-
-    if unbiased:
-        normalization_factor = torch.sum(mask)
-        # A singleton has zero centered variance; avoid an undefined correction.
-        variance = variance * (
-            normalization_factor / (normalization_factor - 1).clamp(min=1)
-        )
-    return variance
 
 
 def set_seed(seed: int) -> None:
