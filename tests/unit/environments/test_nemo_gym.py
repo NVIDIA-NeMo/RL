@@ -190,6 +190,221 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
     assert "task-source:test_resources_server" not in captured.err
 
 
+_GYM_RECORDS = {
+    "include_payloads": True,
+    "delete_capture_after_merge": True,
+    "record_omitted_rollouts": True,
+}
+
+
+def test_gym_record_options_record_each_call_as_its_own_shard(tmp_path) -> None:
+    from nemo_rl.environments.nemo_gym import _gym_record_options
+
+    assert _gym_record_options(None) == {}
+    records = {"dir": str(tmp_path), **_GYM_RECORDS}
+    first, second = _gym_record_options(records), _gym_record_options(records)
+
+    # A label is never reused, so no call reopens (and so replaces) another's shard.
+    assert first["record_shard"] != second["record_shard"]
+    first.pop("record_shard")
+    assert first == {
+        "record_output_dir": str(tmp_path),
+        "record_omitted_rollouts": True,
+        "include_model_call_payloads": True,
+        "delete_model_call_capture": True,
+        "scope_rollout_ids": False,
+        "return_plain_results": True,
+    }
+
+
+def test_recording_gym_shards_leaves_what_rl_streams_unchanged(
+    tmp_path, monkeypatch
+) -> None:
+    """Through Gym's own run_examples: a recorded call streams what an unrecorded one does.
+
+    Row 0 is routed by task_source and scores; row 1 is refused while a
+    checkpoint has admission closed, which RL must still see as that refusal.
+    """
+    import nemo_gym.rollouts.rollout_collection as rollout_collection
+    from aiohttp import ClientResponseError
+    from omegaconf import OmegaConf
+
+    from nemo_rl.environments.nemo_gym import GymAdmissionClosed
+
+    refusal = json.dumps(
+        {"error": {"code": "checkpoint_admission_closed", "detail": "closed"}}
+    ).encode()
+
+    async def post(*, server_name, url_path, json, **kwargs):
+        del server_name, url_path, kwargs
+        if json["_rowidx"] == 1:
+            info = SimpleNamespace(
+                method="POST", url="http://agent/run", real_url="http://agent/run"
+            )
+            error = ClientResponseError(
+                request_info=info, history=(), status=409, message="Conflict"
+            )
+            error.response_content = refusal
+            raise error
+        return SimpleNamespace(
+            ok=True, headers=None, payload={"response": {"output": []}, "reward": 1.0}
+        )
+
+    async def raise_for_status(response):
+        del response
+
+    async def get_response_json(response):
+        return deepcopy(response.payload)
+
+    client = SimpleNamespace(
+        post=post,
+        global_config_dict=OmegaConf.create(
+            {
+                "my_agent": {"responses_api_agents": {"impl": {}}},
+                "my_environment_server": {
+                    "environment_servers": {
+                        "legacy_agent": {"agent_server": {"name": "my_agent"}}
+                    }
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        rollout_collection, "setup_server_client_utils", lambda *a, **k: client
+    )
+    monkeypatch.setattr(rollout_collection, "raise_for_status", raise_for_status)
+    monkeypatch.setattr(rollout_collection, "get_response_json", get_response_json)
+
+    def rows() -> list[dict]:
+        return [
+            {
+                "_rowidx": index,
+                "_ng_task_index": 5,
+                "_ng_rollout_index": index,
+                "task_source": "my_agent",
+                "responses_create_params": {"input": []},
+            }
+            for index in range(2)
+        ]
+
+    def mock_self(cfg: dict) -> object:
+        class _MockSelf:
+            rch = rollout_collection.RolloutCollectionHelper()
+            head_server_config = None
+            _token_capture_enabled = False
+            _forest_training = False
+            _tokenizer = object()
+            _stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
+
+            def _require_spinup(self):
+                pass
+
+            def _postprocess_nemo_gym_to_nemo_rl_result(
+                self, row, result, tokenizer, *, include_initial_multimodal_data
+            ):
+                del tokenizer, include_initial_multimodal_data
+                return {"message_log": [], "reward": result["reward"]}
+
+        instance = _MockSelf()
+        instance.cfg = cfg
+        return instance
+
+    async def stream(cfg: dict) -> dict[int, tuple]:
+        streamed = {}
+        async for item in NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            mock_self(cfg), rows(), "test"
+        ):
+            if isinstance(item, GymAdmissionClosed):
+                streamed[item.rowidx] = ("refused", item.rowidx)
+            else:
+                rowidx, agent_ref, result, _ = item
+                streamed[rowidx] = (agent_ref, result)
+        return streamed
+
+    records_dir = tmp_path / "gym_records"
+    unrecorded = asyncio.run(stream({}))
+    recorded = asyncio.run(
+        stream({"gym_records": {"dir": str(records_dir), **_GYM_RECORDS}})
+    )
+
+    assert recorded == unrecorded
+    assert recorded[0][0] == {"name": "my_agent"}
+    assert recorded[1] == ("refused", 1)
+    # One shard for the call: the scored rollout under RL's id, the refusal omitted.
+    [shard] = [
+        path
+        for path in records_dir.glob("rollouts-*.jsonl")
+        if not path.name.endswith("_failures.jsonl")
+        and not path.name.endswith("_materialized_inputs.jsonl")
+    ]
+    [scored] = [json.loads(line) for line in shard.read_text().splitlines()]
+    assert scored["_ng_rollout_id"] == "5-0" and scored["reward"] == 1.0
+    [refused] = [
+        json.loads(line)
+        for line in shard.with_name(shard.name.replace(".jsonl", "_failures.jsonl"))
+        .read_text()
+        .splitlines()
+    ]
+    assert refused["_ng_rollout_index"] == 1 and refused["_ng_omitted_rollout"] is True
+
+
+def test_a_stream_left_early_closes_gyms_results_without_token_capture() -> None:
+    """A recorded shard settles the rows a stream left early only once Gym's results are closed."""
+    closed = []
+
+    async def scored(row):
+        return row, {"response": {"output": []}, "reward": 1.0}
+
+    class Results:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def __iter__(self):
+            for row in self.rows:
+                yield scored(row)
+
+        async def aclose(self):
+            closed.append(True)
+
+    class _MockSelf:
+        cfg = {}
+        head_server_config = None
+        _token_capture_enabled = False
+        _forest_training = False
+        _tokenizer = object()
+        rch = SimpleNamespace(run_examples=lambda examples, **kwargs: Results(examples))
+        _stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
+
+        def _require_spinup(self):
+            pass
+
+        def _postprocess_nemo_gym_to_nemo_rl_result(
+            self, row, result, tokenizer, *, include_initial_multimodal_data
+        ):
+            del row, tokenizer, include_initial_multimodal_data
+            return {"message_log": [], "reward": result["reward"]}
+
+    rows = [
+        {
+            "_rowidx": index,
+            "agent_ref": {"name": "my_agent"},
+            "responses_create_params": {"input": []},
+        }
+        for index in range(2)
+    ]
+
+    async def first_only():
+        stream = NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            _MockSelf(), rows, "test"
+        )
+        first = await stream.__anext__()
+        await stream.aclose()
+        return first
+
+    assert asyncio.run(first_only())[0] == 0
+    assert closed == [True]
+
+
 def test_multimodal_content_types_cover_responses_media_aliases():
     assert {
         "input_image",

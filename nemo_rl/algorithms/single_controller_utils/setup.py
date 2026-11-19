@@ -877,8 +877,41 @@ def _spinup_gym(
             if master_config.token_capture.enabled
             else None
         ),
+        gym_records=resolve_gym_records(master_config),
     )
     return shard_set, time.perf_counter() - t0
+
+
+def resolve_gym_records(master_config: MasterConfig) -> Optional[dict[str, Any]]:
+    """Validate ``async_rl.gym_records`` and resolve it for the NemoGym actors.
+
+    Returns:
+        None when recording is off; otherwise the config's fields plus ``dir``,
+        the absolute ``<log_dir>/gym_records`` every actor writes its shards to.
+
+    Raises:
+        ValueError: Recording is on but the run does not use NeMo-Gym.
+    """
+    records_cfg = master_config.async_rl.gym_records
+    if not records_cfg.enabled:
+        return None
+    if not should_use_nemo_gym(master_config):
+        raise ValueError(
+            "async_rl.gym_records.enabled records NeMo-Gym rollouts, but this run "
+            "does not use NeMo-Gym (env.should_use_nemo_gym is false)."
+        )
+    if not (master_config.env.get("nemo_gym") or {}).get("observability_enabled"):
+        warnings.warn(
+            "async_rl.gym_records records no model calls without "
+            "env.nemo_gym.observability_enabled and model_call_capture_dir.",
+            stacklevel=2,
+        )
+    return {
+        **records_cfg.model_dump(),
+        "dir": os.path.abspath(
+            os.path.join(master_config.logger.log_dir or "logs", "gym_records")
+        ),
+    }
 
 
 def _generation_max_seq_len(generation_config) -> int:
@@ -1441,6 +1474,8 @@ def setup_single_controller(
                 UserWarning,
                 stacklevel=2,
             )
+    # Fails before anything is built; resolved again where the actors are made.
+    resolve_gym_records(master_config)
     if token_capture_cfg.enabled:
         if not should_use_nemo_gym(master_config):
             raise ValueError(
