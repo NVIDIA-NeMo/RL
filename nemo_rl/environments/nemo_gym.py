@@ -605,6 +605,29 @@ def _gym_error_code(response_body: object) -> Optional[str]:
     return code if isinstance(code, str) else None
 
 
+def _gym_record_options(gym_records: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+    """The ``run_examples`` options that record one call as its own Gym shard.
+
+    Empty when ``async_rl.gym_records`` is off. The shard label is new for every
+    call, so no call (on any actor, or after a restart) reopens, and so replaces,
+    another call's shard. Gym keeps RL's rollout ids (``scope_rollout_ids=False``),
+    which token capture and RL's logs key on, and returns what an unrecorded call
+    returns (``return_plain_results``), so failure rows, checkpoint refusals and
+    what RL ships over Ray are unchanged.
+    """
+    if not gym_records:
+        return {}
+    return {
+        "record_output_dir": gym_records["dir"],
+        "record_shard": f"nrl-{os.getpid()}-{secrets.token_hex(8)}",
+        "record_omitted_rollouts": gym_records["record_omitted_rollouts"],
+        "include_model_call_payloads": gym_records["include_payloads"],
+        "delete_model_call_capture": gym_records["delete_capture_after_merge"],
+        "scope_rollout_ids": False,
+        "return_plain_results": True,
+    }
+
+
 def _gym_failure_row_error(
     row: Mapping[str, Any], result: Mapping[str, Any]
 ) -> Optional[Exception]:
@@ -741,6 +764,9 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
+    # async_rl.gym_records, resolved by the driver: "dir" (absolute output
+    # directory) plus the GymRecordsConfig fields. None/absent = no records.
+    gym_records: NotRequired[Dict[str, Any] | None]
     # Internal checkpoint topology. These are derived by the actor builder,
     # never read from user YAML.
     checkpoint_instance: GymCheckpointInstance
@@ -1871,6 +1897,7 @@ Depending on your data shape, you may want to change these values."""
             head_server_config=self.head_server_config,
             **({"retry_requests": False} if self._forest_training else {}),
             route_failures_to_sidecar=True,
+            **_gym_record_options(self.cfg.get("gym_records")),
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
@@ -2035,11 +2062,12 @@ Depending on your data shape, you may want to change these values."""
                 task.cancel()
             if capture_tasks:
                 await asyncio.gather(*capture_tasks, return_exceptions=True)
-                # Older Gym returns a plain iterator; newer versions expose
-                # client-task cleanup. Neither acknowledges server-side writes.
-                close = getattr(nemo_gym_result_iterator, "aclose", None)
-                if close is not None:
-                    await close()
+            # Older Gym returns a plain iterator; newer versions expose
+            # client-task cleanup. Neither acknowledges server-side writes. A
+            # recorded shard keeps the rows a stream left early as omitted.
+            close = getattr(nemo_gym_result_iterator, "aclose", None)
+            if close is not None:
+                await close()
 
     async def _drained_manifest(self, rollout_id: str) -> dict:
         """Fetch the terminal ledger manifest, draining in-flight capture calls.
@@ -3150,6 +3178,7 @@ def _build_gym_actor_config(
     generation_cut_control_urls: Optional[list[str]],
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
+    gym_records: Optional[dict[str, Any]] = None,
 ) -> NemoGymConfig:
     """Turn one already-resolved Gym config mapping into a ``NemoGymConfig``.
 
@@ -3279,6 +3308,7 @@ def _build_gym_actor_config(
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=instance_token_capture,
+        gym_records=gym_records,
         checkpoint_instance=checkpoint_instance,
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         **port_range,
@@ -3572,6 +3602,7 @@ def build_nemo_gym_actors(
     generation_cut_control_urls: Optional[list[str]] = None,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
+    gym_records: Optional[dict[str, Any]] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
     spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
 ) -> NemoGymShardSet:
@@ -3620,6 +3651,7 @@ def build_nemo_gym_actors(
             generation_cut_control_urls=generation_cut_control_urls,
             token_capture=token_capture,
             policy_api_key=policy_api_key,
+            gym_records=gym_records,
         )
 
     return _build_sharded_gym_actors(
@@ -3635,6 +3667,7 @@ def build_nemo_gym_actors(
         generation_cut_control_urls=generation_cut_control_urls,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
+        gym_records=gym_records,
         pg_ready_timeout=pg_ready_timeout,
         spinup_timeout=spinup_timeout,
     )
@@ -3653,6 +3686,7 @@ def _build_single_gym_actor(
     generation_cut_control_urls: Optional[list[str]],
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
+    gym_records: Optional[dict[str, Any]] = None,
 ) -> NemoGymShardSet:
     """Start one actor and read its resolved taskset routes."""
     actor_config = _build_gym_actor_config(
@@ -3670,6 +3704,7 @@ def _build_single_gym_actor(
         generation_cut_control_urls=generation_cut_control_urls,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
+        gym_records=gym_records,
     )
 
     actor_options: dict[str, Any] = {
@@ -3721,6 +3756,7 @@ def _build_sharded_gym_actors(
     generation_cut_control_urls: Optional[list[str]],
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
+    gym_records: Optional[dict[str, Any]] = None,
     pg_ready_timeout: float,
     spinup_timeout: float,
 ) -> NemoGymShardSet:
@@ -3812,6 +3848,7 @@ def _build_sharded_gym_actors(
                     generation_cut_control_urls=generation_cut_control_urls,
                     token_capture=token_capture,
                     policy_api_key=policy_api_key,
+                    gym_records=gym_records,
                 )
             )
             shard_set.handles.setdefault(shard.name, []).append(actor)

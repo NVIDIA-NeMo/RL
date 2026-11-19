@@ -49,6 +49,14 @@ async_rl:
   # elsewhere (extra keys are passed to its constructor).
   debug_writer:
     target: parquet
+  # NeMo-Gym runs: Gym's record of every rollout, as Gym eval-run shards in
+  # <log_dir>/gym_records (read by gym eval status/aggregate and the health check).
+  gym_records:
+    enabled: false
+    # Model calls are recorded with env.nemo_gym.observability_enabled and model_call_capture_dir.
+    include_payloads: true
+    delete_capture_after_merge: true
+    record_omitted_rollouts: true
   # With policy.megatron_cfg.checkpoint.async_save: finalize async checkpoints at a
   # later step boundary so the disk write overlaps training (non-colocated generation).
   defer_async_checkpoint_finalize: false

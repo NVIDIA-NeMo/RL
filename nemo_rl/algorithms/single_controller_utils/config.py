@@ -493,6 +493,44 @@ class WatchdogConfig(BaseModel, extra="allow"):
         return self
 
 
+class GymRecordsConfig(BaseModel, extra="allow"):
+    """NeMo-Gym's own record of every rollout, written as Gym eval-run shards.
+
+    Each NemoGym actor records every ``run_examples`` call as one shard under
+    ``<log_dir>/gym_records``: ``rollouts-<shard>.jsonl``, its failures sidecar,
+    materialized inputs, run manifest and status, which ``gym eval status``,
+    ``gym eval aggregate``, the health check and the Gym Store read like an eval
+    run. Each record carries the rollout id RL dispatched (``_ng_rollout_id`` in
+    token-capture mode, else ``<_ng_task_index>-<_ng_rollout_index>``), so it
+    joins RL's own logs. What RL receives from Gym does not change. NeMo-Gym
+    runs only.
+    """
+
+    # Turn recording on.
+    enabled: bool = False
+    # Keep each model call's request/response bodies on the record. Model calls
+    # are recorded only with env.nemo_gym.observability_enabled and
+    # model_call_capture_dir.
+    include_payloads: bool = True
+    # Delete each rollout's model-call capture file once it is on the record.
+    # Needs include_payloads, since the file is otherwise the only copy of the bodies.
+    delete_capture_after_merge: bool = True
+    # Keep an omitted-rollout row for a try that produced no result: interrupted,
+    # never started, or refused while a checkpoint had admission closed.
+    record_omitted_rollouts: bool = True
+
+    @model_validator(mode="after")
+    def _bodies_have_a_home(self) -> "GymRecordsConfig":
+        if self.delete_capture_after_merge and not self.include_payloads:
+            raise ValueError(
+                "async_rl.gym_records.delete_capture_after_merge=true with "
+                "include_payloads=false would delete the only copy of every call's "
+                "request/response bodies. Set include_payloads=true, or "
+                "delete_capture_after_merge=false to keep them in model_call_capture_dir."
+            )
+        return self
+
+
 class AsyncRLConfig(BaseModel, extra="allow"):
     # Stream every consumed sample's untruncated token tensors to JSONL. Files
     # are published only after the optimizer step completes; disabled by default.
@@ -500,6 +538,8 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Where the dump above is written: the JSONL writer by default, or an external
     # DebugWriter selected by target.
     debug_writer: DebugWriterConfig = Field(default_factory=DebugWriterConfig)
+    # NeMo-Gym's record of every rollout, as Gym eval-run shards in the log dir.
+    gym_records: GymRecordsConfig = Field(default_factory=GymRecordsConfig)
     # Finalize async policy checkpoints (policy.megatron_cfg.checkpoint.async_save)
     # at a later step boundary, once every rank's background write is done, instead
     # of from a background thread whose blocking finalize holds the policy workers

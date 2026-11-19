@@ -2687,6 +2687,7 @@ class TestSetup:
             # The vLLM server's bearer token, handed to the Gym model server.
             policy_api_key=patched_factories["fake_gen"].http_server_api_key,
             token_capture=None,
+            gym_records=None,
         )
         mock_validate.assert_called_once_with(
             fake_gym_shards,
@@ -4806,3 +4807,44 @@ def test_generation_top_logprobs_requires_score_centering_or_replay():
     mc.policy["generation"]["top_logprobs"] = 4
     with pytest.raises(ValueError, match="only read by loss_fn.score_centering"):
         validate_single_controller_config(mc)
+
+
+def test_gym_records_are_off_by_default_and_resolve_to_the_log_dir(
+    monkeypatch,
+) -> None:
+    mc = _make_master_config()
+    assert sc_setup_mod.resolve_gym_records(mc) is None
+
+    mc.async_rl.gym_records.enabled = True
+    with pytest.raises(ValueError, match="does not use NeMo-Gym"):
+        sc_setup_mod.resolve_gym_records(mc)
+
+    monkeypatch.setattr(sc_setup_mod, "should_use_nemo_gym", lambda config: True)
+    with pytest.warns(UserWarning, match="records no model calls"):
+        resolved = sc_setup_mod.resolve_gym_records(mc)
+    assert resolved == {
+        "dir": "/tmp/test-logs/gym_records",
+        "enabled": True,
+        "include_payloads": True,
+        "delete_capture_after_merge": True,
+        "record_omitted_rollouts": True,
+    }
+
+    # The log dir decides where shards go, whatever else the block carries.
+    mc.async_rl.gym_records = type(mc.async_rl.gym_records)(enabled=True, dir="/x")
+    mc.env["nemo_gym"] = {"observability_enabled": True}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert (
+            sc_setup_mod.resolve_gym_records(mc)["dir"] == "/tmp/test-logs/gym_records"
+        )
+
+
+def test_gym_records_refuse_to_delete_the_only_copy_of_call_bodies() -> None:
+    from nemo_rl.algorithms.single_controller_utils.config import GymRecordsConfig
+
+    with pytest.raises(ValidationError, match="only copy"):
+        GymRecordsConfig(include_payloads=False)
+    assert not GymRecordsConfig(
+        include_payloads=False, delete_capture_after_merge=False
+    ).include_payloads
