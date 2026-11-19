@@ -468,6 +468,15 @@ class RolloutSnapshotter(_UsesRolloutParts):
         tasks: dict[str, asyncio.Task[tuple[Any, float]]] = {
             name: asyncio.create_task(_timed(phase)) for name, phase in phases.items()
         }
+
+        def raise_release_error(done: list[asyncio.Task[Any]]) -> None:
+            # A capture that could not release its view means "stop
+            # checkpointing", so it wins over a cancel or a retryable error.
+            for task in done:
+                error = None if task.cancelled() else task.exception()
+                if isinstance(error, CheckpointReleaseError):
+                    raise error
+
         try:
             await asyncio.wait(tasks.values())
         except asyncio.CancelledError:
@@ -480,6 +489,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     await asyncio.wait(tasks.values())
                 except asyncio.CancelledError:
                     continue
+            raise_release_error(list(tasks.values()))
             await self._release_captured_view(tasks.get("tq_capture"))
             raise
         failed = [
@@ -488,6 +498,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
             if task.cancelled() or task.exception() is not None
         ]
         if failed:
+            raise_release_error(failed)
             await self._release_captured_view(tasks.get("tq_capture"))
             # Re-raises the first failed phase's error.
             failed[0].result()

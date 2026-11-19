@@ -121,7 +121,7 @@ from nemo_rl.algorithms.single_controller_utils.step_assembly import (
 )
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
-from nemo_rl.data_plane.checkpoint import CheckpointCapture
+from nemo_rl.data_plane.checkpoint import CheckpointCapture, CheckpointReleaseError
 from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTE_PLAN_TAG
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
@@ -2342,6 +2342,68 @@ class TestPeriodicRolloutCheckpoint:
         snapshots = tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
         assert not list(snapshots.glob("tmp_snapshot_*"))
         assert not list(snapshots.glob("snapshot_*"))
+
+    def test_cancelled_capture_with_unconfirmed_release_raises_release_error(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        entered, proceed = threading.Event(), threading.Event()
+
+        class Capture(CheckpointCapture):
+            token = "capture-1"
+
+            def persist(self, *, extra_metadata=None) -> None:
+                pass
+
+            def release(self) -> None:
+                raise OSError("release timed out")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            entered.set()
+            assert proceed.wait(timeout=10)
+            return Capture()
+
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+
+        async def exercise() -> None:
+            task = asyncio.create_task(
+                actor._rollout_snapshots.save_snapshot(force=True)
+            )
+            assert await asyncio.to_thread(entered.wait, 10)
+            task.cancel()
+            proceed.set()
+            with pytest.raises(CheckpointReleaseError, match="capture-1"):
+                await task
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            proceed.set()
+            actor._checkpointer.shutdown()
+
+    def test_failed_phase_does_not_hide_a_capture_release_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        actor = self._actor(tmp_path)
+        failed = threading.Event()
+
+        async def fail_inventory(*args, **kwargs):
+            failed.set()
+            raise OSError("inventory failed")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            assert failed.wait(timeout=10)
+            raise CheckpointReleaseError("capture-1 still retained")
+
+        monkeypatch.setattr(
+            snapshots_module, "validate_replay_inventory", fail_inventory
+        )
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        try:
+            with pytest.raises(CheckpointReleaseError, match="capture-1"):
+                asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
+        finally:
+            actor._checkpointer.shutdown()
 
     def test_cancelled_capture_phases_release_the_captured_view(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
