@@ -423,6 +423,7 @@ class SingleControllerActor:
         self._stream_value_training: bool = (
             self._is_ppo and self._algo_cfg.stream_value_training
         )
+        self._value_chunk_task: asyncio.Task[None] | None = None
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
