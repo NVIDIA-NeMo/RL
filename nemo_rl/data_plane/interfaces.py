@@ -315,6 +315,10 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     debug_check_finite: bool = False
     ssd: NixlSsdConfig = Field(default_factory=NixlSsdConfig)
     nixl: NixlAgentConfig = Field(default_factory=NixlAgentConfig)
+    # Hold a cut of the units' blobs and write it after rollout dispatch resumes.
+    async_checkpoint: bool = False
+    # RPC wait budget for each held-cut persist/release operation.
+    checkpoint_io_timeout_s: Annotated[PositiveFloat, AllowInfNan(False)] = 600.0
 
 
 class DataPlaneConfig(TypedDict):

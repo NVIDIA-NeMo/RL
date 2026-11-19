@@ -36,16 +36,24 @@ guard, so no put/get/clear is in flight while a shard is written.
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import json
 import logging
 import os
+import threading
 import time
+import uuid
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import msgspec
 import ray
 
+from nemo_rl.data_plane.adapters.tq_simple_checkpoint import _wait_all
+from nemo_rl.data_plane.checkpoint import CheckpointCapture, CheckpointReleaseError
 from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.blobstore import UnitSlabStore
 from nemo_rl.data_plane.nixl.directory import ACTIVE
@@ -95,6 +103,10 @@ def _unit_actor(store: UnitSlabStore, unit_id: int):
     return ray.get_actor(f"NixlStorageUnit#{unit_id}", namespace=store.namespace)
 
 
+def _controller_actor():
+    return ray.get_actor("TransferQueueController", namespace="transfer_queue")
+
+
 def _active_units(store: UnitSlabStore) -> list[int]:
     store._refresh_units()
     return sorted(
@@ -104,25 +116,184 @@ def _active_units(store: UnitSlabStore) -> list[int]:
     )
 
 
+def _shard_entry(unit_id: int, result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "unit_id": unit_id,
+        "file": f"unit-{unit_id}.shard",
+        "nbytes": result["nbytes"],
+        "blobs": result["blobs"],
+        "clears_during_save": int(result.get("clears_during_save", 0)),
+    }
+
+
 def _save_units(store: UnitSlabStore, root: Path) -> dict[str, Any]:
     units = _active_units(store)
     futs = {
         u: _unit_actor(store, u).save_shard.remote(str(root / f"unit-{u}.shard"))
         for u in units
     }
-    shards = []
-    for u, f in futs.items():
-        r = ray.get(f)
-        shards.append(
-            {
-                "unit_id": u,
-                "file": f"unit-{u}.shard",
-                "nbytes": r["nbytes"],
-                "blobs": r["blobs"],
-                "clears_during_save": int(r.get("clears_during_save", 0)),
-            }
-        )
+    shards = [_shard_entry(u, ray.get(f)) for u, f in futs.items()]
     return {"version": VERSION, "shards": shards}
+
+
+# ============================================================================ two-phase save
+@dataclass
+class NixlCheckpointCapture(CheckpointCapture):
+    """One held cut per unit; ``persist`` writes the files of a synchronous save."""
+
+    checkpoint_dir: Path
+    token: str
+    controller: Any  # holds the controller bytes (see tq_controller_checkpoint)
+    unit_ids: list[int]  # the client's routing table, saved in the manifest
+    units: dict[int, Any]  # unit id -> actor
+    metadata: dict[str, Any]
+    timeout_s: float
+    _persist_started: bool = field(default=False, init=False, repr=False)
+    _released: bool = field(default=False, init=False, repr=False)
+    _persist_refs: list[Any] = field(default_factory=list, init=False, repr=False)
+    _operation_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+
+    @contextlib.contextmanager
+    def _operation(self) -> Iterator[float]:
+        deadline = time.monotonic() + self.timeout_s
+        if not self._operation_lock.acquire(timeout=self.timeout_s):
+            raise TimeoutError(
+                "A checkpoint persist/release operation is still running"
+            )
+        try:
+            yield deadline
+        finally:
+            self._operation_lock.release()
+
+    def persist(self) -> None:
+        with self._operation() as deadline:
+            if self._released:
+                raise RuntimeError("Cannot persist a released checkpoint capture")
+            if self._persist_started:
+                raise RuntimeError(
+                    "persist() is single-attempt: release the capture, discard the "
+                    "checkpoint directory and capture again"
+                )
+            self._persist_started = True
+            root = _root(self.checkpoint_dir)
+            refs = self._persist_refs
+            try:
+                refs.append(
+                    self.controller.nrl_persist_snapshot.remote(
+                        self.token, str(self.checkpoint_dir / "controller_state.pkl")
+                    )
+                )
+                for u, actor in self.units.items():
+                    refs.append(
+                        actor.persist_shard.remote(
+                            self.token, str(root / f"unit-{u}.shard")
+                        )
+                    )
+            finally:
+                # Partial submission still leaves owned writes to settle or release.
+                _, *results = _wait_all(
+                    refs, timeout_s=max(0.0, deadline - time.monotonic())
+                )
+            shards = [
+                _shard_entry(u, r) for u, r in zip(self.units, results, strict=True)
+            ]
+            _write_json(
+                root / MANIFEST,
+                {"version": VERSION, "shards": shards, "unit_ids": self.unit_ids},
+            )
+            # The completion marker is last, as in TQ's own save.
+            _write_json(
+                self.checkpoint_dir / "metadata.json",
+                {"storage_saved": True, "user_metadata": self.metadata},
+            )
+
+    def release(self) -> None:
+        with self._operation() as deadline:
+            if self._released:
+                return
+            # Completed write failures were reported by persist; holds can retire.
+            # A wait expiry is different: those RPCs must finish before release.
+            _wait_all(
+                self._persist_refs,
+                timeout_s=max(0.0, deadline - time.monotonic()),
+                raise_errors=False,
+            )
+            refs = []
+            first_error: Exception | None = None
+            methods = [
+                self.controller.nrl_release_snapshot,
+                *(a.release_shard for a in self.units.values()),
+            ]
+            for method in methods:
+                try:
+                    refs.append(method.remote(self.token))
+                except Exception as error:  # noqa: BLE001 - re-raised below
+                    first_error = first_error or error
+            try:
+                _wait_all(refs, timeout_s=max(0.0, deadline - time.monotonic()))
+            except Exception as error:  # noqa: BLE001 - re-raised below
+                first_error = first_error or error
+            if first_error is not None:
+                raise first_error
+            self._released = True
+            self._persist_refs.clear()
+
+
+def capture_nixl_checkpoint(
+    client: Any,
+    checkpoint_dir: str | os.PathLike,
+    *,
+    metadata: dict[str, Any] | None,
+    timeout_s: float,
+) -> NixlCheckpointCapture:
+    """Capture the controller and hold every unit's blobs; ``persist`` writes them later.
+
+    The controller side is the SimpleStorage one (``tq_controller_checkpoint``), so
+    ``configure_controller_checkpoint`` must have run before ``tq.init``. The caller
+    must keep puts and clears out until this returns. After that it may put new
+    keys, call ``persist``, and always call ``release``. It must not update or clear
+    a key of the cut before ``release``: ``persist`` would raise.
+    """
+    meta = copy.deepcopy(metadata) if metadata is not None else {}
+    json.dumps(meta)  # fail before touching disk
+    storage = client.storage_manager.storage_client
+    directory = Path(checkpoint_dir).resolve()
+    directory.mkdir(parents=True, exist_ok=False)  # never overwrite a saved cut
+    _root(directory).mkdir()
+    units = {u: _unit_actor(storage.store, u) for u in _active_units(storage.store)}
+    capture = NixlCheckpointCapture(
+        directory,
+        uuid.uuid4().hex,
+        _controller_actor(),
+        list(storage.unit_ids),
+        units,
+        meta,
+        timeout_s,
+    )
+    # The caller holds its mutation barrier, so a frozen actor must not stall it.
+    deadline = time.monotonic() + timeout_s
+    try:
+        _wait_all(
+            [capture.controller.nrl_capture_snapshot.remote(capture.token)],
+            timeout_s=timeout_s,
+        )
+        _wait_all(
+            [a.capture_shard.remote(capture.token) for a in units.values()],
+            timeout_s=max(0.0, deadline - time.monotonic()),
+        )
+        return capture
+    except BaseException:
+        # Release on every unit: one that did not capture ignores the token.
+        try:
+            capture.release()
+        except Exception as error:
+            raise CheckpointReleaseError(
+                f"Cannot confirm release of nixl capture {capture.token}; "
+                "storage actors may still retain it, so stop checkpointing"
+            ) from error
+        raise
 
 
 # ============================================================================ load

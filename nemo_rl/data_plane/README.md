@@ -747,6 +747,8 @@ For the no-data-plane path use the legacy `nemo_rl.algorithms.grpo.grpo_train`; 
 |---|---|---|
 | `data_plane.simple.async_checkpoint` | `false` | Enable the optional stable-view capture API for in-memory SimpleStorage. |
 | `data_plane.simple.checkpoint_io_timeout_s` | `600.0` | Positive, finite RPC wait budget per retained-view persist/release operation. Does not interrupt filesystem calls. |
+| `data_plane.nixl.async_checkpoint` | `false` | Enable the same API for the nixl backend. Works with `data_plane.nixl.ssd.enabled`. |
+| `data_plane.nixl.checkpoint_io_timeout_s` | `600.0` | Same RPC wait budget as the simple backend, per held-cut capture/persist/release operation. |
 
 `DataPlaneClient.capture_checkpoint` returns a temporary handle or `None` when
 the adapter requests synchronous fallback. The caller must hold a global mutation
@@ -759,7 +761,7 @@ cancellation; the caller has no handle to retry with and must stop
 checkpointing.
 
 This API requires caller integration: setting the flag alone does not change
-the existing synchronous `save_checkpoint` calls. Other backends return `None`.
+the existing synchronous `save_checkpoint` calls. Mooncake returns `None`.
 SimpleStorage capture requires SSD offload disabled and writes the existing
 native TQ checkpoint format, so restore does not need a new format.
 
@@ -810,6 +812,16 @@ failure cleanup and restore into fresh actors, runs in
 ```bash
 bash tests/functional/data_plane_simple_checkpoint_cpu.sh
 ```
+
+Nixl capture reuses the controller capture above, so the controller is not saved
+inside the barrier. It holds each unit's published blobs (the hold `save_shard`
+uses) and writes the existing `nixl_store/` layout. With
+`data_plane.nixl.async_checkpoint` true, the adapter patches the controller
+before `tq.init`, as it does for SimpleStorage. While a capture is retained, the caller
+may put new keys. It must not update or clear a key of the cut until `release()`:
+a unit notes such a call and `persist()` then fails, with no completion marker.
+A hold allocates nothing. Under this rule no blob is freed during a capture, so a
+capture needs no extra slab space. With the SSD tier on, new puts spill to disk.
 
 ## Async path (proposed)
 

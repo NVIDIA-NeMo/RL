@@ -139,3 +139,74 @@ def test_load_shard_short_read_frees_its_region(tmp_path):
     with pytest.raises(IOError, match="short read"):
         u.load_shard(str(tmp_path / "s"), {"a": [0, 4096, 1]})
     assert u.alloc_.free_bytes == free_before and "a" not in u.blobs
+
+
+def test_two_phase_capture_ignores_new_key_puts(tmp_path):
+    u = _unit()
+    _put(u, "a", 4096, 0xAA)
+    _put(u, "b", 4096, 0xBB)
+    assert u.capture_shard("t") == 0
+    _put(u, "c", 4096, 0xCC)  # a put of a new key after the cut is not in the cut
+    out = u.persist_shard("t", str(tmp_path / "unit-0.shard"))
+    assert set(out["blobs"]) == {"a", "b"}
+    assert out["clears_during_save"] == 0
+    data = (tmp_path / "unit-0.shard").read_bytes()
+    off_b, n_b, _ = out["blobs"]["b"]
+    assert set(_value(data[off_b : off_b + n_b])) == {0xBB}
+    rows = msgspec.msgpack.decode((tmp_path / "unit-0.shard.rows").read_bytes())
+    assert rows["a"] == [key_of("a")] and rows["b"] == [key_of("b")]
+    u.release_shard("t")
+    u.release_shard("t")  # idempotent
+    assert all(rec.holds == 0 for rec in u.blobs.values())
+    assert not u._captures and not u._released_held and not u._cut_disturbed
+
+
+def _update(u, blob_id: str, key_of_blob: str, fill: int) -> None:
+    """Put a new blob under the key of ``key_of_blob``: an update of that key."""
+    off = u.alloc(blob_id, 4096, 1)
+    write_blob(u.slab, off, 4096, key_of(key_of_blob), fill)
+    assert u.commit(blob_id) == "done"
+
+
+@pytest.mark.parametrize("how", ["clear", "update"])
+def test_clear_or_update_of_a_cut_key_fails_persist(tmp_path, how):
+    u = _unit()
+    _put(u, "a", 4096, 0xAA)
+    _put(u, "b", 4096, 0xBB)
+    u.capture_shard("t")
+    if how == "clear":
+        assert u.release_rows([gidx_of("b")]) == 1  # the clear itself is served
+    else:
+        _update(u, "b2", "b", 0xCC)
+    with pytest.raises(RuntimeError, match="updated or cleared"):
+        u.persist_shard("t", str(tmp_path / "bad"))
+    u.release_shard("t")
+    assert not u._captures and not u._released_held and not u._cut_disturbed
+    # a later capture starts clean
+    u.capture_shard("t2")
+    u.persist_shard("t2", str(tmp_path / "ok"))
+    u.release_shard("t2")
+
+
+def test_only_one_capture_and_none_during_a_sync_save():
+    u = _unit()
+    _put(u, "a", 4096, 1)
+    u.capture_shard("one")
+    with pytest.raises(RuntimeError, match="Only one"):
+        u.capture_shard("two")
+    u.release_shard("one")
+    u.checkpointing = True
+    with pytest.raises(RuntimeError, match="synchronous"):
+        u.capture_shard("two")
+    assert not u._captures
+
+
+def test_failed_persist_keeps_the_hold_until_release(tmp_path):
+    u = _unit()
+    _put(u, "a", 4096, 1)
+    u.capture_shard("t")
+    with pytest.raises(OSError):
+        u.persist_shard("t", str(tmp_path / "no-such-dir" / "s"))
+    assert u.blobs["a"].holds == 1
+    u.release_shard("t")
+    assert u.blobs["a"].holds == 0

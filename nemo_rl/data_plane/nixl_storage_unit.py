@@ -230,6 +230,12 @@ class NixlStorageUnit:  # pragma: no cover
         self._released_held: dict[str, BlobRec] = {}
         self.checkpointing = False
         self.clears_during_save = 0
+        # token -> (held blobs, live keys) of a two-phase capture (capture_shard).
+        self._captures: dict[
+            str, tuple[list[tuple[str, BlobRec, int]], dict[str, list[str]]]
+        ] = {}
+        # A key of a retained cut was updated or cleared (persist_shard refuses).
+        self._cut_disturbed = False
         self._directory = directory  # admin/restore only; never on the op path
         self.node_id = ray.get_runtime_context().get_node_id()
         self._server = UnitServer(
@@ -705,6 +711,8 @@ class NixlStorageUnit:  # pragma: no cover
         rec = self.blobs.get(blob_id)
         if rec is None:
             return
+        if rec.holds and self._captures:  # an update or clear of a key in the cut
+            self._cut_disturbed = True
         rec.refs -= 1
         if rec.refs > 0:
             return
@@ -908,59 +916,15 @@ class NixlStorageUnit:  # pragma: no cover
         published, so it is skipped.
         """
         held: list[tuple[str, BlobRec, int]] = []
-        live: dict[str, list[str]] = {}
         try:
             with self._mu:
                 self.checkpointing = True
                 self.clears_during_save = 0
-                for g, row in self.rows.items():
-                    for fld, ent in row.items():
-                        live.setdefault(ent[0], []).append(f"{g}@{fld}")
-                for b, rec in self.blobs.items():
-                    if not rec.published or (not rec.in_slab and rec.disk is None):
-                        continue
-                    rec.holds += 1
-                    held.append((b, rec, rec.refs))
-            index: dict[str, list[int]] = {}
-            tmp = path + ".tmp"
-            pos = 0
-            view = memoryview(self.slab)
-            with open(tmp, "wb") as f:
-                for b, rec, refs in held:
-                    if rec.in_slab:
-                        f.write(view[rec.off : rec.off + rec.nbytes])
-                    else:
-                        with self._mu:
-                            fd = None if rec.disk is None else os.dup(rec.disk)
-                        if fd is None:
-                            raise RuntimeError(
-                                f"unit {self.unit_id}: blob {b} was released during "
-                                "save_shard; TransferQueue does not support clears "
-                                "during a checkpoint"
-                            )
-                        try:
-                            _copy_out(fd, f, rec.nbytes)
-                        finally:
-                            _close(fd)
-                    index[b] = [pos, rec.nbytes, refs]
-                    pos += rec.nbytes
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-            rows = {b: live.get(b, []) for b, _, _ in held}
-            with open(tmp, "wb") as f:
-                f.write(msgspec.msgpack.encode(rows))
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path + ".rows")
+                held, live = self._take_holds()
+            index, pos = self._write_shard(path, held, live)
         finally:
             with self._mu:
-                for _, rec, _ in held:
-                    rec.holds -= 1
-                for b, rec in list(self._released_held.items()):
-                    if rec.holds == 0:
-                        del self._released_held[b]
-                        self._dispose(b, rec)
+                self._drop_holds(held)
                 self.checkpointing = False
                 clears = self.clears_during_save
         if clears:
@@ -971,6 +935,110 @@ class NixlStorageUnit:  # pragma: no cover
                 clears,
             )
         return {"blobs": index, "nbytes": pos, "clears_during_save": clears}
+
+    # Two-phase save_shard. After the cut the caller may put NEW keys, but must not
+    # update or clear a key of the cut until release (TQ does not support clears
+    # during a checkpoint). The unit cannot refuse such a call, as the controller
+    # has already changed, so it notes the call and persist_shard raises.
+    def capture_shard(self, token: str) -> int:
+        """Cut the live blobs now and hold them under ``token``; return the unit id."""
+        with self._mu:
+            if self._captures:
+                raise RuntimeError("Only one nixl snapshot may be retained")
+            if self.checkpointing:
+                raise RuntimeError("A synchronous save_shard is running")
+            self._captures[token] = self._take_holds()
+            self._cut_disturbed = False
+        return self.unit_id
+
+    def persist_shard(self, token: str, path: str) -> dict[str, Any]:
+        """Write the blobs held under ``token``; raises if a key of the cut changed."""
+        with self._mu:
+            held, live = self._captures[token]
+        index, pos = self._write_shard(path, held, live)
+        with self._mu:
+            if self._cut_disturbed:
+                raise RuntimeError(
+                    f"unit {self.unit_id}: a key of the checkpoint cut was updated "
+                    "or cleared before release(); callers must not do that while a "
+                    "capture is retained"
+                )
+        return {"blobs": index, "nbytes": pos, "clears_during_save": 0}
+
+    def release_shard(self, token: str) -> None:
+        """Drop the holds of ``token``; idempotent."""
+        with self._mu:
+            capture = self._captures.pop(token, None)
+            if capture is not None:
+                self._drop_holds(capture[0])
+            if not self._captures:
+                self._cut_disturbed = False
+
+    def _take_holds(
+        self,
+    ) -> tuple[list[tuple[str, BlobRec, int]], dict[str, list[str]]]:
+        """Hold every published blob; return them and each blob's live keys (caller holds ``_mu``)."""
+        live: dict[str, list[str]] = {}
+        held: list[tuple[str, BlobRec, int]] = []
+        for g, row in self.rows.items():
+            for fld, ent in row.items():
+                live.setdefault(ent[0], []).append(f"{g}@{fld}")
+        for b, rec in self.blobs.items():
+            if not rec.published or (not rec.in_slab and rec.disk is None):
+                continue
+            rec.holds += 1
+            held.append((b, rec, rec.refs))
+        return held, live
+
+    def _drop_holds(self, held: list[tuple[str, BlobRec, int]]) -> None:
+        """Drop the holds, then free blobs released while held (caller holds ``_mu``)."""
+        for _, rec, _ in held:
+            rec.holds -= 1
+        for b, rec in list(self._released_held.items()):
+            if rec.holds == 0:
+                del self._released_held[b]
+                self._dispose(b, rec)
+
+    def _write_shard(
+        self,
+        path: str,
+        held: list[tuple[str, BlobRec, int]],
+        live: dict[str, list[str]],
+    ) -> tuple[dict[str, list[int]], int]:
+        """Write the held blobs to ``path`` and their live keys to ``path + ".rows"``."""
+        index: dict[str, list[int]] = {}
+        tmp = path + ".tmp"
+        pos = 0
+        view = memoryview(self.slab)
+        with open(tmp, "wb") as f:
+            for b, rec, refs in held:
+                if rec.in_slab:
+                    f.write(view[rec.off : rec.off + rec.nbytes])
+                else:
+                    with self._mu:
+                        fd = None if rec.disk is None else os.dup(rec.disk)
+                    if fd is None:
+                        raise RuntimeError(
+                            f"unit {self.unit_id}: blob {b} was released during "
+                            "save_shard; TransferQueue does not support clears "
+                            "during a checkpoint"
+                        )
+                    try:
+                        _copy_out(fd, f, rec.nbytes)
+                    finally:
+                        _close(fd)
+                index[b] = [pos, rec.nbytes, refs]
+                pos += rec.nbytes
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        rows = {b: live.get(b, []) for b, _, _ in held}
+        with open(tmp, "wb") as f:
+            f.write(msgspec.msgpack.encode(rows))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path + ".rows")
+        return index, pos
 
     def load_shard(
         self, path: str, blobs: dict[str, list[int]], spill: bool = False
