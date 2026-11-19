@@ -47,6 +47,9 @@ ARG FLASH_MLA_DISABLE_SM90
 # uv cache and the prebuilt venvs. The image still runs as root by default.
 ARG RUNTIME_UID=65532
 ARG RUNTIME_GID=65532
+# Set to any non-empty value for an image that only ever runs as root: the runtime
+# identity above is not created and nothing is handed to it. Off by default.
+ARG ROOT_ONLY
 # Set to any non-empty value to delete the materialized uv cache from the final image
 # after every uv-writing layer, trading the RUNTIME_UID's offline `uv run --extra
 # <backend>` capability (see UV_CACHE_DIR below) for a smaller image. The BuildKit
@@ -249,6 +252,7 @@ ARG NRL_EXTRAS
 ARG NRL_GROUPS
 ARG RUNTIME_UID
 ARG RUNTIME_GID
+ARG ROOT_ONLY
 ARG STRIP_UV_CACHE
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
@@ -455,10 +459,12 @@ find "${UV_CACHE_DIR}" -type d \
 # Hand the cache and the venvs built from it to the runtime UID in the layer that creates
 # them. The venvs are hardlinked against the cache, so each inode changes owner once and
 # nothing is copied. A later layer could not do this without copying every file up, so this
-# stays unconditional even when STRIP_UV_CACHE is set -- the cache still exists at this
+# still runs under STRIP_UV_CACHE (only ROOT_ONLY skips it) -- the cache still exists at this
 # point (the trap above deletes it only on EXIT, after this chown has already run), and
 # skipping it here would force the final ownership sweep to copy up the whole venv instead.
-chown -R "${RUNTIME_UID}:${RUNTIME_GID}" "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
+if [[ -z "${ROOT_ONLY:-}" ]]; then
+    chown -R "${RUNTIME_UID}:${RUNTIME_GID}" "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
+fi
 EOF
 
 # Keep the frequently changing TRT-LLM build inputs after the other backend
@@ -672,9 +678,11 @@ find "${UV_CACHE_DIR}" -type d \
 
 # Hand this layer's new cache and venv entries to the runtime UID. Entries from the
 # dependency layer already belong to it, so only files created here change owner and none
-# is copied up. Stays unconditional even when STRIP_UV_CACHE is set -- see the dependency
+# is copied up. Runs under STRIP_UV_CACHE too (only ROOT_ONLY skips it) -- see the dependency
 # layer's chown above for why.
-find "${UV_CACHE_DIR}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
+if [[ -z "${ROOT_ONLY:-}" ]]; then
+    find "${UV_CACHE_DIR}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
+fi
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
@@ -719,6 +727,7 @@ ARG RC_DATE=00.00
 ARG TARGETARCH
 ARG RUNTIME_UID
 ARG RUNTIME_GID
+ARG ROOT_ONLY
 ARG STRIP_UV_CACHE
 ENV NEMO_RL_COMMIT=${NEMO_RL_COMMIT:-<unknown>}
 ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
@@ -794,11 +803,13 @@ export TRTLLM_REQUIRE_CACHED_WHEEL=1
 UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py \
     $(awk -F'\t' '{ print ($4 == "" ? $1 : $4) }' /opt/actor_venvs.tsv)
 # The editable installs, wrapper metadata, and build-backend wheels added above are new in
-# this layer; hand only those to the runtime UID so it can re-sync the venvs offline. Stays
-# unconditional even when STRIP_UV_CACHE is set -- see the dependency layer's chown above
+# this layer; hand only those to the runtime UID so it can re-sync the venvs offline. Runs
+# under STRIP_UV_CACHE too (only ROOT_ONLY skips it) -- see the dependency layer's chown above
 # for why.
-find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
-    -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
+if [[ -z "${ROOT_ONLY:-}" ]]; then
+    find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
+        -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
+fi
 EOF
 
 # Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)
@@ -866,6 +877,10 @@ RUN echo "This distribution includes open source which is archived at the follow
 # hardlinked venv file into this layer. The uv cache and the venv contents already belong to
 # it; the layers that created them set that.
 RUN <<"EOF" bash -exu
+if [[ -n "${ROOT_ONLY:-}" ]]; then
+    echo "ROOT_ONLY is set; skipping the runtime user setup"
+    exit 0
+fi
 getent group "${RUNTIME_GID}" >/dev/null || groupadd --gid "${RUNTIME_GID}" nemo-runtime
 getent passwd "${RUNTIME_UID}" >/dev/null || useradd --no-log-init --uid "${RUNTIME_UID}" \
     --gid "${RUNTIME_GID}" --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime
@@ -884,6 +899,10 @@ chmod -R a+rX /opt/nemo-rl
 EOF
 USER ${RUNTIME_UID}:${RUNTIME_GID}
 RUN <<"EOF" bash -exu
+if [[ -n "${ROOT_ONLY:-}" ]]; then
+    echo "ROOT_ONLY is set; there is no runtime user to check"
+    exit 0
+fi
 uv --version
 "${UV_PROJECT_ENVIRONMENT}/bin/python" --version
 for dir in /home/nemo-runtime /nemo_run /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" \
