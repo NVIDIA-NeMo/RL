@@ -25,7 +25,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     RefitActorConfig,
 )
-from nemo_rl.weight_sync.refit_actor import RemoteWeightSynchronizer, _disarm_copies
+from nemo_rl.weight_sync.factory import validate_refit_actor_transport
+from nemo_rl.weight_sync.refit_actor import (
+    RemoteWeightSynchronizer,
+    _disarm_synchronizer,
+)
 
 
 def _fakes():
@@ -33,7 +37,9 @@ def _fakes():
 
     class FakeGeneration:
         def __init__(self, workers):
-            self.worker_group = SimpleNamespace(workers=list(workers))
+            self.worker_group = SimpleNamespace(
+                workers=list(workers), cluster=SimpleNamespace()
+            )
             self.membership = None
             self.weight_synchronizer = None
 
@@ -43,6 +49,12 @@ def _fakes():
     class FakeSynchronizer:
         def __init__(self, generation):
             self._generation = generation
+            # The attributes the NCCL transports carry and the RefitActor disarms.
+            self._policy = SimpleNamespace(
+                worker_group=SimpleNamespace(cluster=SimpleNamespace())
+            )
+            self._train_cluster = self._policy.worker_group.cluster
+            self._inference_cluster = generation.worker_group.cluster
             self._built_membership = ("built", tuple(generation.worker_group.workers))
             self._stale = True
             self.syncs = 0
@@ -142,16 +154,40 @@ def test_dead_actor_is_replaced_on_reconcile(remote):
     assert proxy.sync_weights()["syncs"] == 1
 
 
-def test_setup_rejects_non_nccl_transport():
-    # Deferred: setup pulls in the whole controller stack, which only this test needs.
-    from nemo_rl.algorithms.single_controller_utils.setup import (
-        _move_synchronizer_to_refit_actor,
+@pytest.mark.parametrize(
+    ("backend", "refit_transport"),
+    [("vllm", None), ("vllm", "nccl_reshard"), ("trtllm", None)],
+)
+def test_nccl_transports_are_accepted(backend, refit_transport):
+    validate_refit_actor_transport(
+        generation_backend=backend, colocated=False, refit_transport=refit_transport
     )
 
-    FakeGeneration, FakeSynchronizer = _fakes()
-    generation = FakeGeneration(["w0"])
+
+@pytest.mark.parametrize(
+    ("backend", "refit_transport"),
+    [
+        ("vllm", "nixl"),
+        ("vllm", "vllm_zmq_sparse"),
+        ("megatron", None),
+        ("megatron", "mcore"),
+        ("sglang", None),
+    ],
+)
+def test_non_nccl_transports_are_rejected(backend, refit_transport):
     with pytest.raises(ValueError, match="NCCL refit transports"):
-        _move_synchronizer_to_refit_actor(FakeSynchronizer(generation), generation)
+        validate_refit_actor_transport(
+            generation_backend=backend,
+            colocated=False,
+            refit_transport=refit_transport,
+        )
+
+
+def test_colocated_generation_is_rejected():
+    with pytest.raises(ValueError, match="non-colocated"):
+        validate_refit_actor_transport(
+            generation_backend="vllm", colocated=True, refit_transport=None
+        )
 
 
 def _roundtrip(obj):
@@ -244,10 +280,25 @@ def _self_shutting_fakes(marker_dir):
         def __del__(self):
             self.shutdown()
 
+    class SelfShuttingPolicy:
+        def __init__(self):
+            self.worker_group = SimpleNamespace(cluster=FakeCluster())
+            self.marker_dir = marker_dir
+
+        def shutdown(self):
+            open(
+                os.path.join(self.marker_dir, f"policy-{os.getpid()}-{id(self)}"), "w"
+            ).close()
+            return True
+
+        def __del__(self):
+            self.shutdown()
+
     class SelfShuttingGeneration:
         def __init__(self, workers):
-            self.worker_group = SimpleNamespace(workers=list(workers))
-            self.cluster = FakeCluster()
+            self.worker_group = SimpleNamespace(
+                workers=list(workers), cluster=FakeCluster()
+            )
             self.membership = None
             self.weight_synchronizer = None
             self.marker_dir = marker_dir
@@ -266,16 +317,24 @@ def _self_shutting_fakes(marker_dir):
         def __del__(self):
             self.shutdown()
 
-    return SelfShuttingGeneration
+    def make_synchronizer(generation):
+        """A synchronizer whose policy, generation and clusters all shut down on GC."""
+        _, FakeSynchronizer = _fakes()
+        synchronizer = FakeSynchronizer(generation)
+        synchronizer._policy = SelfShuttingPolicy()
+        synchronizer._train_cluster = synchronizer._policy.worker_group.cluster
+        synchronizer._inference_cluster = generation.worker_group.cluster
+        return synchronizer
+
+    return SelfShuttingGeneration, make_synchronizer
 
 
 def test_resending_generation_never_shuts_anything_down(tmp_path):
     # Re-shipping the generation drops the actor's previous copy. Its __del__ ->
     # shutdown() must not stop the real workers or ray.kill the RefitActor itself.
-    _, FakeSynchronizer = _fakes()
-    SelfShuttingGeneration = _self_shutting_fakes(str(tmp_path))
+    SelfShuttingGeneration, make_synchronizer = _self_shutting_fakes(str(tmp_path))
     generation = SelfShuttingGeneration(["w0", "w1"])
-    proxy = RemoteWeightSynchronizer(FakeSynchronizer(generation), generation)
+    proxy = RemoteWeightSynchronizer(make_synchronizer(generation), generation)
     generation.weight_synchronizer = proxy
     copy = _roundtrip(proxy)
     copy.attach(generation)
@@ -290,28 +349,32 @@ def test_resending_generation_never_shuts_anything_down(tmp_path):
     proxy.shutdown()
 
 
-def test_disarm_copies_reaches_nested_objects_and_skips_handles(tmp_path):
-    SelfShuttingGeneration = _self_shutting_fakes(str(tmp_path))
-
-    class HandleLike:  # like ray.actor.ActorHandle: __del__, methods via __getattr__
-        __module__ = "ray.actor"
-
-        def __getattr__(self, name):
-            return name
-
-        def __del__(self):
-            pass
-
+def test_disarm_synchronizer_covers_every_self_shutting_copy(tmp_path):
+    SelfShuttingGeneration, make_synchronizer = _self_shutting_fakes(str(tmp_path))
     generation = SelfShuttingGeneration(["w0"])
-    generation.handles = [HandleLike()]
+    synchronizer = make_synchronizer(generation)
     generation.weight_synchronizer = object()
-    holder = SimpleNamespace(_generation=generation)
-    assert _disarm_copies(holder) == 2  # the generation and its nested cluster
+    _disarm_synchronizer(synchronizer)
     assert generation.weight_synchronizer is None
-    assert "shutdown" not in vars(generation.handles[0])
-    generation.shutdown()
-    generation.cluster.shutdown()
+    for copy in (
+        generation,
+        generation.worker_group.cluster,
+        synchronizer._policy,
+        synchronizer._policy.worker_group.cluster,
+        synchronizer._train_cluster,
+        synchronizer._inference_cluster,
+    ):
+        copy.shutdown()
     assert list(tmp_path.iterdir()) == []
+
+
+def test_disarm_synchronizer_fails_on_a_missing_attribute():
+    # A renamed attribute must not leave a copy armed without a signal.
+    FakeGeneration, FakeSynchronizer = _fakes()
+    synchronizer = FakeSynchronizer(FakeGeneration(["w0"]))
+    del synchronizer._train_cluster
+    with pytest.raises(AttributeError, match="_train_cluster"):
+        _disarm_synchronizer(synchronizer)
 
 
 def test_second_shutdown_of_the_same_actor_is_quiet(remote, capsys):

@@ -888,7 +888,8 @@ class SingleControllerActor:
         """Start the rollout / train / watchdog pumps and run until one finishes."""
         await self._environment_checkpoint.check_startup()
         # Synchronize weights before starting the pumps, unless setup already delivered them.
-        if self._weight_synchronizer.is_stale:
+        # The RefitActor proxy answers is_stale with blocking calls to the actor.
+        if await asyncio.to_thread(lambda: self._weight_synchronizer.is_stale):
             await self._sync_weights()
         self._rollout_manager.set_weight_version(self._trainer_version)
         self._rollout_manager.set_tally_step_provider(

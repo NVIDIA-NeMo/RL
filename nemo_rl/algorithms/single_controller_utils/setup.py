@@ -1155,26 +1155,9 @@ def _move_synchronizer_to_refit_actor(
     """Hand an initialized synchronizer to a RefitActor (async_rl.refit_actor.enabled).
 
     Done after ``init_communicator`` and the setup-time refit, so setup itself is
-    unchanged; from here on every call goes through the returned proxy.
+    unchanged; from here on every call goes through the returned proxy. The supported
+    transports are checked from config by ``validate_single_controller_config``.
     """
-    # Deferred like in weight_sync/factory.py: the transport modules pull in their
-    # backends' dependencies and are only needed when the refit actor is enabled.
-    from nemo_rl.weight_sync.collective_weight_synchronizer import (
-        CollectiveWeightSynchronizer,
-    )
-    from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
-        NcclReshardWeightSynchronizer,
-    )
-
-    if not isinstance(
-        weight_synchronizer,
-        (CollectiveWeightSynchronizer, NcclReshardWeightSynchronizer),
-    ):
-        raise ValueError(
-            "async_rl.refit_actor.enabled supports the NCCL refit transports "
-            "(collective, nccl_reshard), got "
-            f"{type(weight_synchronizer).__name__}."
-        )
     remote = RemoteWeightSynchronizer(weight_synchronizer, generation)
     generation.weight_synchronizer = remote
     print(

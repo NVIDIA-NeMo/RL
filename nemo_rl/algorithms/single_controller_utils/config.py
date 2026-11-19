@@ -88,6 +88,7 @@ from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.weight_sync.factory import validate_refit_actor_transport
 
 # ── User-facing SingleController configs ────────────────────────────────────
 
@@ -1958,14 +1959,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     # of dynamic sampling, so a custom sampler missing one must fail validation here.
     require_drop_accounting_members(async_config.sampler)
 
-    if (
-        async_config.refit_actor.enabled
-        and master_config.policy["generation"]["colocated"]["enabled"]
-    ):
-        raise ValueError(
-            "async_rl.refit_actor.enabled requires non-colocated generation: a colocated "
-            "refit is the engine's own wake-up and has to run where the engines are. "
-            "Set policy.generation.colocated.enabled=false or disable the refit actor."
+    if async_config.refit_actor.enabled:
+        generation_config = master_config.policy["generation"]
+        validate_refit_actor_transport(
+            generation_backend=generation_config["backend"],
+            colocated=generation_config["colocated"]["enabled"],
+            refit_transport=cast(VllmConfig, generation_config).get("refit_transport"),
         )
 
     if async_config.defer_async_checkpoint_finalize:

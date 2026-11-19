@@ -60,64 +60,38 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 _CONTROL_CALL_TIMEOUT_S = 120.0
 
 
-_NO_DESCENT_PACKAGES = frozenset({"ray", "torch", "numpy", "builtins"})
-
-
-def _noop_shutdown(*args: Any, **kwargs: Any) -> bool:
+def _noop_shutdown() -> bool:
     return True
 
 
-def _disarm_copies(root: Any, *, max_depth: int = 4) -> int:
-    """Stop the RefitActor's copies of driver objects from shutting the real ones down.
+# VllmGeneration, Policy and RayVirtualCluster each define ``__del__`` -> ``shutdown()``
+# as a safety net. Inside the RefitActor they are copies that hold handles to the real
+# vLLM workers, train workers and placement groups, so a copy that is garbage collected
+# (e.g. the old generation when ``update_generation`` replaces it) would shut those down
+# -- and, through ``generation.weight_synchronizer`` (the proxy), ``ray.kill`` the
+# RefitActor itself. The functions below give each such copy a no-op ``shutdown``
+# instance attribute, which ``__del__`` then resolves to. Shutting the real workers
+# down stays with the controller's own objects.
 
-    VllmGeneration, Policy and RayVirtualCluster each define ``__del__`` -> ``shutdown()``
-    as a safety net. Inside the RefitActor they are copies, but they hold handles to the
-    real vLLM workers, train workers and placement groups, so a copy that is garbage
-    collected (e.g. the old generation when ``update_generation`` replaces it) would shut
-    those down -- and, through ``generation.weight_synchronizer`` (the proxy), ``ray.kill``
-    the RefitActor itself.
 
-    Every object reachable from ``root`` (attributes, lists, tuples, dict values, up to
-    ``max_depth``) whose class defines both ``__del__`` and ``shutdown`` gets a no-op
-    ``shutdown`` instance attribute, which ``__del__`` then resolves to, and its
-    ``weight_synchronizer`` attribute, if any, is cleared. Shutting the real workers down
-    stays with the controller's own objects.
-    Returns the number of objects disarmed.
-    """
-    seen: set[int] = set()
+def _disarm_owner(owner: Any) -> None:
+    """Disarm a generation or policy copy and the cluster its worker group holds."""
+    owner.shutdown = _noop_shutdown
+    owner.worker_group.cluster.shutdown = _noop_shutdown
 
-    def visit(obj: Any, depth: int) -> int:
-        """Disarm ``obj`` and what it reaches; return the number disarmed."""
-        if obj is None or depth > max_depth or id(obj) in seen:
-            return 0
-        seen.add(id(obj))
-        if isinstance(obj, (list, tuple, set, frozenset)):
-            return sum(visit(item, depth + 1) for item in obj)
-        if isinstance(obj, dict):
-            return sum(visit(item, depth + 1) for item in obj.values())
-        # Ray handles define __del__ and expose every remote method (including a
-        # worker's `shutdown`) through __getattr__; leave them, and other heavy
-        # third-party objects, alone.
-        if type(obj).__module__.split(".", 1)[0] in _NO_DESCENT_PACKAGES:
-            return 0
-        attrs = getattr(obj, "__dict__", None)
-        if attrs is None:
-            return 0
-        disarmed = 0
-        mro = type(obj).__mro__[:-1]
-        if any("__del__" in vars(k) for k in mro) and any(
-            "shutdown" in vars(k) for k in mro
-        ):
-            try:
-                obj.shutdown = _noop_shutdown
-                disarmed = 1
-            except (AttributeError, TypeError):
-                pass
-        if "weight_synchronizer" in attrs:
-            attrs["weight_synchronizer"] = None
-        return disarmed + sum(visit(item, depth + 1) for item in list(attrs.values()))
 
-    return visit(root, 0)
+def _disarm_generation(generation: Any) -> None:
+    """Disarm the RefitActor's copy of the generation object."""
+    _disarm_owner(generation)
+    generation.weight_synchronizer = None
+
+
+def _disarm_synchronizer(synchronizer: Any) -> None:
+    """Disarm the copies an NCCL synchronizer brings into the RefitActor."""
+    _disarm_generation(synchronizer._generation)
+    _disarm_owner(synchronizer._policy)
+    synchronizer._train_cluster.shutdown = _noop_shutdown
+    synchronizer._inference_cluster.shutdown = _noop_shutdown
 
 
 @dataclass
@@ -142,8 +116,8 @@ class RefitActor:
 
     def __init__(self, synchronizer: WeightSynchronizer):
         # Copies of the policy, generation and clusters arrive with the synchronizer;
-        # none of them may shut the real ones down when collected (see _disarm_copies).
-        _disarm_copies(synchronizer)
+        # none of them may shut the real ones down when collected.
+        _disarm_synchronizer(synchronizer)
         self._sync = synchronizer
 
     def ping(self) -> bool:
@@ -152,7 +126,7 @@ class RefitActor:
     def update_generation(self, generation: Any) -> None:
         """Replace the synchronizer's generation object with the controller's current one."""
         # Disarm the new copy before the old one is dropped (both are copies here).
-        _disarm_copies(generation)
+        _disarm_generation(generation)
         self._sync._generation = generation
         built = self._sync._built_membership
         if built is not None:
@@ -238,8 +212,8 @@ class RemoteWeightSynchronizer(WeightSynchronizer):
                 )
             template = self._synchronizer_factory()
         actor = RefitActor.options(
-            # Same node as the controller: every forwarded call is controller <-> actor,
-            # so keep that hop local. Soft, so a full node does not block startup.
+            # Beside the controller (unlike AdvantageActor's SPREAD): it only waits on
+            # remote workers, so keep its round trips local. Soft: a full node can't block.
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=ray.get_runtime_context().get_node_id(), soft=True
             ),
