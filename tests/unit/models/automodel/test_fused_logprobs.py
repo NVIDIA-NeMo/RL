@@ -50,6 +50,21 @@ def _batch(seed: int) -> tuple[torch.Tensor, torch.Tensor]:
     return input_ids, token_weights
 
 
+def _use_te_lm_head(model: LlamaForCausalLM, *, bias: bool = False) -> None:
+    """Swap in a Transformer Engine Linear head, as AutoModel's linear="te" backend builds."""
+    te = pytest.importorskip("transformer_engine.pytorch")
+    old = model.lm_head
+    model.lm_head = te.Linear(
+        old.in_features,
+        old.out_features,
+        bias=bias,
+        params_dtype=old.weight.dtype,
+        device="cuda",
+    )
+    with torch.no_grad():
+        model.lm_head.weight.copy_(old.weight)
+
+
 def _fused_logprobs(
     model: nn.Module,
     head: FusedLogprobLMHead,
@@ -138,6 +153,34 @@ def test_capture_matches_logits_path(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.usefixtures("deterministic_bf16_matmul")
+def test_te_lm_head_matches_te_forward() -> None:
+    """A Transformer Engine LM head gives the same logprobs and gradients as its own forward."""
+    model = _tiny_llama(tie_word_embeddings=False).to(torch.bfloat16)
+    _use_te_lm_head(model)
+    head = FusedLogprobLMHead(model, chunk_size=5)
+    input_ids, token_weights = _batch(seed=1)
+
+    fused = _fused_logprobs(model, head, input_ids, 0.7)
+    (fused * token_weights).sum().backward()
+    fused_grads = _grads(model)
+    unfused = _unfused_logprobs(model, input_ids, 0.7)
+    (unfused * token_weights).sum().backward()
+    unfused_grads = _grads(model)
+
+    torch.testing.assert_close(fused, unfused.detach(), rtol=1e-5, atol=1e-5)
+    _assert_grads_close(fused_grads, unfused_grads)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_rejects_te_lm_head_with_bias() -> None:
+    model = _tiny_llama(tie_word_embeddings=False)
+    _use_te_lm_head(model, bias=True)
+    with pytest.raises(ValueError, match="use_bias"):
+        FusedLogprobLMHead(model, chunk_size=5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_head_runs_unchanged_outside_capture() -> None:
     model = _tiny_llama(tie_word_embeddings=False)
     input_ids, _ = _batch(seed=1)
@@ -203,6 +246,8 @@ def test_capture_misuse_fails_loudly() -> None:
 def _run_fsdp_matches_logits_path(rank: int, world_size: int, layout: str) -> None:
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     model = _tiny_llama(tie_word_embeddings=layout == "tied")
+    if layout == "te_lm_head_own_unit":
+        _use_te_lm_head(model)
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
         reduce_dtype=torch.float32,
@@ -210,7 +255,8 @@ def _run_fsdp_matches_logits_path(rank: int, world_size: int, layout: str) -> No
     )
     for layer in model.model.layers:
         fully_shard(layer, mp_policy=mp_policy)
-    if layout == "lm_head_own_unit":
+    own_unit = layout in ("lm_head_own_unit", "te_lm_head_own_unit")
+    if own_unit:
         fully_shard(model.lm_head, mp_policy=mp_policy)
     fully_shard(model, mp_policy=mp_policy)
     head = FusedLogprobLMHead(model, chunk_size=5)
@@ -221,7 +267,7 @@ def _run_fsdp_matches_logits_path(rank: int, world_size: int, layout: str) -> No
     # As in AutoModel: custom MoE models shard the LM head on its own and run
     # without autocast; HF models run under bf16 autocast.
     def autocast() -> AbstractContextManager[object]:
-        if layout == "lm_head_own_unit":
+        if own_unit:
             return nullcontext()
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
@@ -237,9 +283,13 @@ def _run_fsdp_matches_logits_path(rank: int, world_size: int, layout: str) -> No
     _assert_grads_close(fused_grads, unfused_grads)
 
 
-@pytest.mark.parametrize("layout", ["lm_head_own_unit", "lm_head_in_root", "tied"])
+@pytest.mark.parametrize(
+    "layout", ["lm_head_own_unit", "te_lm_head_own_unit", "lm_head_in_root", "tied"]
+)
 def test_fsdp2_gradients_match_logits_path(distributed_test_runner, layout: str):
     """Under FSDP2 DP=2 the LM-head and backbone gradients are reduced as on the logits path."""
+    if layout.startswith("te_"):
+        pytest.importorskip("transformer_engine.pytorch")
     distributed_test_runner(
         functools.partial(_run_fsdp_matches_logits_path, layout=layout), world_size=2
     )

@@ -32,7 +32,7 @@ afterwards does not change it.
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional, cast
 
 import torch
 from torch import nn
@@ -72,16 +72,17 @@ class FusedLogprobLMHead:
     """Computes next-token log-probabilities inside a model's LM head.
 
     Args:
-        model: Causal LM whose ``get_output_embeddings()`` returns a bias-free
-            ``nn.Linear`` (FSDP2-wrapped or not) that is not tensor-parallel.
+        model: Causal LM whose ``get_output_embeddings()`` returns a bias-free,
+            non-tensor-parallel ``nn.Linear`` or Transformer Engine ``Linear``
+            (FSDP2-wrapped or not).
         chunk_size: Tokens per chunk for the projection, normalization and
             backward.
 
     Raises:
-        ValueError: If the model has no linear LM head, the head has a bias or
-            a custom ``forward`` (for example a LoRA adapter), the model
-            transforms its logits after the head, or ``chunk_size`` is not a
-            positive int.
+        ValueError: If the model has no supported linear LM head, the head has
+            a bias or a custom ``forward`` (for example a LoRA adapter), the
+            model transforms its logits after the head, or ``chunk_size`` is not
+            a positive int.
     """
 
     def __init__(self, model: nn.Module, *, chunk_size: int) -> None:
@@ -93,26 +94,18 @@ class FusedLogprobLMHead:
 
         get_output_embeddings = getattr(model, "get_output_embeddings", None)
         lm_head = get_output_embeddings() if callable(get_output_embeddings) else None
-        if not isinstance(lm_head, nn.Linear):
+        if not isinstance(lm_head, nn.Module):
             raise ValueError(
-                "Fused linear logprobs need the model's output embeddings to be an "
-                f"nn.Linear LM head; got {type(lm_head).__name__}."
+                "Fused linear logprobs need the model's output embeddings to be a "
+                f"linear LM head; got {type(lm_head).__name__}."
             )
-        # FSDP2 swaps in a subclass that inherits nn.Linear.forward; a subclass
-        # that overrides forward (LoRA, quantization) computes something else.
-        if type(lm_head).forward is not nn.Linear.forward:
-            raise ValueError(
-                "Fused linear logprobs recompute hidden_states @ weight.T, which "
-                f"would bypass {type(lm_head).__name__}.forward."
-            )
-        if lm_head.bias is not None:
-            raise ValueError("Fused linear logprobs do not support an LM-head bias.")
+        self._fp8_enabled = _validate_lm_head(lm_head)
 
         self._lm_head = lm_head
         self._chunk_size = chunk_size
-        self._original_forward: Callable[[torch.Tensor], torch.Tensor] = lm_head.forward
+        self._original_forward: Callable[..., torch.Tensor] = lm_head.forward
         self._active: Optional[SelectedLogprobsCapture] = None
-        # pyrefly: ignore[bad-assignment]  Instance-level override of nn.Linear.forward.
+        # pyrefly: ignore[bad-assignment]  Instance-level override of the head's forward.
         lm_head.forward = self._forward
 
     @contextmanager
@@ -139,15 +132,27 @@ class FusedLogprobLMHead:
         finally:
             self._active = None
 
-    def _forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward(
+        self, hidden_states: torch.Tensor, *args: Any, **kwargs: Any
+    ) -> torch.Tensor:
         capture = self._active
         if capture is None:
-            return self._original_forward(hidden_states)
+            return self._original_forward(hidden_states, *args, **kwargs)
+        if args or kwargs:
+            raise RuntimeError(
+                "Fused linear logprobs support LM-head calls with only the hidden "
+                f"states; got extra arguments {args} {sorted(kwargs)}."
+            )
         if capture.logprobs is not None:
             raise RuntimeError(
                 "The LM head ran twice inside one FusedLogprobLMHead.capture()."
             )
-        weight = self._lm_head.weight
+        if self._fp8_enabled is not None and self._fp8_enabled():
+            raise RuntimeError(
+                "Fused linear logprobs compute the LM head in BF16/FP32; they do "
+                "not support Transformer Engine FP8 autocast."
+            )
+        weight = cast(torch.Tensor, self._lm_head.weight)
         if isinstance(weight, DTensor):
             raise RuntimeError(
                 "Fused linear logprobs need an unsharded LM-head weight inside the "
@@ -177,6 +182,61 @@ class FusedLogprobLMHead:
             )
         capture.logprobs = logprobs
         return logprobs
+
+
+def _validate_lm_head(lm_head: nn.Module) -> Optional[Callable[[], bool]]:
+    """Raise unless ``lm_head`` computes exactly ``hidden_states @ weight.T``.
+
+    Returns:
+        For a Transformer Engine head, a function reporting whether TE FP8
+        autocast is active; ``None`` for an ``nn.Linear`` head.
+    """
+    if isinstance(lm_head, nn.Linear):
+        # FSDP2 swaps in a subclass that inherits nn.Linear.forward; a subclass
+        # that overrides forward (LoRA, quantization) computes something else.
+        if type(lm_head).forward is not nn.Linear.forward:
+            raise ValueError(
+                "Fused linear logprobs recompute hidden_states @ weight.T, which "
+                f"would bypass {type(lm_head).__name__}.forward."
+            )
+        if lm_head.bias is not None:
+            raise ValueError("Fused linear logprobs do not support an LM-head bias.")
+        return None
+
+    # Transformer Engine is optional; AutoModel's linear="te" backend builds it.
+    try:
+        # pyrefly: ignore[import-error]  Not installed in every NeMo RL environment.
+        from transformer_engine.pytorch import Linear as TELinear
+
+        # pyrefly: ignore[import-error]  Not installed in every NeMo RL environment.
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+    except ImportError:
+        TELinear = None
+    if TELinear is None or not isinstance(lm_head, TELinear):
+        raise ValueError(
+            "Fused linear logprobs need an nn.Linear or Transformer Engine Linear "
+            f"LM head; got {type(lm_head).__name__}."
+        )
+    if type(lm_head).forward is not TELinear.forward:
+        raise ValueError(
+            "Fused linear logprobs recompute hidden_states @ weight.T, which "
+            f"would bypass {type(lm_head).__name__}.forward."
+        )
+    unsupported = {
+        "use_bias": lm_head.use_bias,
+        "return_bias": lm_head.return_bias,
+        "parallel_mode": lm_head.parallel_mode is not None,
+        "tp_size > 1": lm_head.tp_size > 1,
+        "fuse_wgrad_accumulation": lm_head.fuse_wgrad_accumulation,
+        "primary_weights_in_fp8": lm_head.primary_weights_in_fp8,
+    }
+    if any(unsupported.values()):
+        raise ValueError(
+            "Fused linear logprobs do not support a Transformer Engine LM head with "
+            + ", ".join(name for name, on in unsupported.items() if on)
+            + "."
+        )
+    return FP8GlobalStateManager.is_fp8_enabled
 
 
 def _reject_logit_post_processing(model: nn.Module) -> None:
