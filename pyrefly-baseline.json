@@ -7310,38 +7310,10 @@
       "severity": "error"
     },
     {
-      "column": 11,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `int`",
-      "severity": "error"
-    },
-    {
-      "column": 11,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `int`",
-      "severity": "error"
-    },
-    {
       "column": 16,
       "path": "nemo_rl/utils/flops_tracker.py",
       "name": "bad-return",
       "concise_description": "Returned type `bool | str` is not assignable to declared return type `bool`",
-      "severity": "error"
-    },
-    {
-      "column": 48,
-      "path": "nemo_rl/utils/flops_tracker.py",
-      "name": "bad-argument-type",
-      "concise_description": "Unpacked keyword argument `int | Any` is not assignable to parameter `projector_type` with type `str | None` in function `nemo_rl.utils.flops_formulas.FLOPSConfig.__init__`",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/utils/flops_tracker.py",
-      "name": "bad-assignment",
-      "concise_description": "`float` is not assignable to attribute `total_flops` with type `int`",
       "severity": "error"
     },
     {
