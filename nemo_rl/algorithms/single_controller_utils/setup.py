@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
 import ray
+import yaml
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
@@ -91,8 +92,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.data import DataConfig, ResponseDatasetConfig
 from nemo_rl.data.captured_media import media_capture_family
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.multimodal_utils import (
     WIRE_MULTIMODAL_FIELDS,
     per_token_multimodal_schema,
@@ -163,7 +166,7 @@ from nemo_rl.utils.checkpoint import (
     validate_warm_start_checkpoint,
 )
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
-from nemo_rl.utils.path_utils import is_msc_path
+from nemo_rl.utils.path_utils import is_msc_path, open_path
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
@@ -182,7 +185,7 @@ class SingleControllerActorArgs:
     train_cluster: RayVirtualCluster
     inference_cluster: RayVirtualCluster
     dp_client: DataPlaneClient
-    dataloader: StatefulDataLoader
+    dataloader: StatefulDataLoader | MultipleDataloaderWrapper
     weight_synchronizer: WeightSynchronizer
     advantage_estimator: Any
     loss_fn: LossFunction
@@ -905,6 +908,73 @@ def _generation_max_seq_len(generation_config) -> int:
 _TRAINER_BUILD_DATASET_WAIT_S = 20.0
 
 
+def _build_training_dataloader(
+    dataset: Any,
+    data_config: DataConfig,
+    *,
+    num_prompts_per_step: int,
+    recovery_checkpoint_path: str | None,
+) -> StatefulDataLoader | MultipleDataloaderWrapper:
+    """Build the SC input stream with any saved cursors loaded before iteration."""
+    multiple = data_config["use_multiple_dataloader"]
+    batch_size = (
+        data_config["num_prompts_per_dataloader"] if multiple else num_prompts_per_step
+    )
+
+    def build(source: Any, *, suffix: str = "") -> StatefulDataLoader:
+        dataloader = StatefulDataLoader(
+            source,
+            batch_size=batch_size,
+            shuffle=data_config["shuffle"],
+            collate_fn=rl_collate_fn,
+            drop_last=True,
+            num_workers=data_config["num_workers"],
+        )
+        if recovery_checkpoint_path is not None:
+            if suffix:
+                load_dataloader_state(
+                    dataloader,
+                    recovery_checkpoint_path,
+                    data_config,
+                    suffix=suffix,
+                    require_nonempty_state=True,
+                )
+            else:
+                load_dataloader_state(dataloader, recovery_checkpoint_path, data_config)
+        return dataloader
+
+    if not multiple:
+        return build(dataset)
+
+    train_configs = cast(list[ResponseDatasetConfig], data_config["train"])
+    if len(dataset) != 2 or len(train_configs) != 2:
+        raise ValueError(
+            "SingleController multiple dataloaders require two distinct tasks."
+        )
+    if recovery_checkpoint_path is not None:
+        with open_path(os.path.join(recovery_checkpoint_path, "config.yaml")) as f:
+            saved_config = cast(dict[str, Any], yaml.safe_load(f))
+        if saved_config["data"] != data_config:
+            raise ValueError(
+                "SingleController multiple dataloader resume requires matching data configuration."
+            )
+
+    dataloaders = {}
+    for task_name, source in dataset.items():
+        if not task_name or "/" in task_name or "\\" in task_name:
+            raise ValueError(f"Invalid dataloader checkpoint task name: {task_name!r}")
+        dataloader = build(source, suffix=f"_{task_name}")
+        if len(dataloader) == 0:
+            raise ValueError(f"Task {task_name!r} has no full dataloader batch.")
+        dataloaders[task_name] = dataloader
+    return MultipleDataloaderWrapper(
+        expected_num_prompts=num_prompts_per_step,
+        data_config=data_config,
+        dataloaders=dataloaders,
+        defer_iterator_creation=True,
+    )
+
+
 def _clamp_max_num_steps(
     master_config: MasterConfig, dataloader: StatefulDataLoader
 ) -> None:
@@ -1347,11 +1417,6 @@ def setup_single_controller(
                     stacklevel=2,
                 )
 
-    if data_config["use_multiple_dataloader"]:
-        raise NotImplementedError(
-            "single_controller_utils does not support "
-            "data.use_multiple_dataloader=True yet."
-        )
     if (
         opd_module.is_opd_enabled(master_config)
         and processor is not None
@@ -1670,7 +1735,10 @@ def setup_single_controller(
     resolve_generation_class(generation_config).validate_settings(master_config)
 
     def _load_training_data() -> tuple[
-        Any, Any, dict[str, EnvironmentInterface], StatefulDataLoader
+        Any,
+        Any,
+        dict[str, EnvironmentInterface],
+        StatefulDataLoader | MultipleDataloaderWrapper,
     ]:
         """Load the datasets, build the dataloader, and clamp max_num_steps to it.
 
@@ -1701,28 +1769,27 @@ def setup_single_controller(
             train_dataset, val_dataset, train_env_handles, _val_env_handles = (
                 response_data
             )
-        train_dataloader = StatefulDataLoader(
-            train_dataset,
-            batch_size=algo_cfg.num_prompts_per_step,
-            shuffle=data_config["shuffle"],
-            collate_fn=rl_collate_fn,
-            drop_last=True,
-            num_workers=data_config["num_workers"],
-        )
+        dataloader_load_started = time.monotonic()
         if recovery_checkpoint_path is not None:
             print(
                 f"📦 Restoring dataloader state from checkpoint: {recovery_checkpoint_path}"
             )
-            dataloader_load_started = time.monotonic()
-            load_dataloader_state(
-                train_dataloader, recovery_checkpoint_path, data_config
+        train_dataloader = _build_training_dataloader(
+            train_dataset,
+            data_config,
+            num_prompts_per_step=algo_cfg.num_prompts_per_step,
+            recovery_checkpoint_path=recovery_checkpoint_path,
+        )
+        if (
+            recovery_checkpoint_path is not None
+            and rollout_checkpoint_load_metrics is not None
+        ):
+            rollout_checkpoint_load_metrics["dataloader_load_seconds"] = (
+                time.monotonic() - dataloader_load_started
             )
-            if rollout_checkpoint_load_metrics is not None:
-                rollout_checkpoint_load_metrics["dataloader_load_seconds"] = (
-                    time.monotonic() - dataloader_load_started
-                )
 
-        _clamp_max_num_steps(master_config, train_dataloader)
+        if not isinstance(train_dataloader, MultipleDataloaderWrapper):
+            _clamp_max_num_steps(master_config, train_dataloader)
         return train_dataset, val_dataset, train_env_handles, train_dataloader
 
     # Loading a large dataset is minutes of single-threaded parsing on the driver,
@@ -1743,7 +1810,12 @@ def setup_single_controller(
         and trainer_checkpoint_path is None
     )
     preloaded_training_data: Optional[
-        tuple[Any, Any, dict[str, EnvironmentInterface], StatefulDataLoader]
+        tuple[
+            Any,
+            Any,
+            dict[str, EnvironmentInterface],
+            StatefulDataLoader | MultipleDataloaderWrapper,
+        ]
     ] = None
     speculative_train_iters: Optional[tuple[Optional[int], Optional[int]]] = None
     if overlap_dataset_load:

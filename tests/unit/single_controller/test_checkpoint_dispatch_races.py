@@ -42,6 +42,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_FILENAME,
@@ -58,6 +59,7 @@ from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
 )
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -523,6 +525,53 @@ def test_recovery_rehydration_accepts_an_identity_dict_collator() -> None:
     _run_rehydration(controller)
 
     assert ledger.get_group("rehydrate-7").prompt_payload["length"] == 99
+
+
+def test_recovery_rehydration_resolves_same_index_in_each_task() -> None:
+    controller, _ = _rehydration_controller(_identity_dict_collator)
+    prompts = {
+        task: {
+            **_reserve_prompt(0),
+            "task_name": task,
+            "message_log": [{"role": "user", "content": task}],
+        }
+        for task in ("short", "long")
+    }
+    source = RolloutRecoveryLedger()
+    for task, prompt in prompts.items():
+        _with_mutation_cut(
+            lambda cut, task=task, prompt=prompt: source.reserve_group(
+                cut,
+                group_id=task,
+                prompt_id="0",
+                prompt_payload=prompt,
+                expected_generations=2,
+                target_step=7,
+                start_weight_version=7,
+                admitted=True,
+            )
+        )
+    restored = RolloutRecoveryLedger()
+    _with_mutation_cut(lambda cut: restored.load_state_dict(cut, source.state_dict()))
+    controller._rollout_manager.recovery_ledger = restored
+    controller._dataloader = MultipleDataloaderWrapper(
+        expected_num_prompts=2,
+        data_config={
+            "custom_dataloader": "examples.custom_dataloader.custom_dataloader.example_custom_dataloader"
+        },
+        dataloaders={
+            task: StatefulDataLoader([prompt], collate_fn=rl_collate_fn)
+            for task, prompt in prompts.items()
+        },
+    )
+
+    _run_rehydration(controller)
+
+    for task in prompts:
+        restored_prompt = restored.get_group(task).prompt_payload
+        assert restored_prompt["idx"] == 0
+        assert restored_prompt["task_name"] == task
+        assert restored_prompt["message_log"][0]["content"] == task
 
 
 @pytest.mark.parametrize(

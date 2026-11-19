@@ -86,6 +86,7 @@ from nemo_rl.algorithms.rollout_checkpointing.state import (
     RolloutParts,
     _UsesRolloutParts,
 )
+from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.utils import save_dataloader_state
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -114,10 +115,14 @@ async def write_controller_sidecars(
     captured: CapturedRolloutState,
 ) -> list[str]:
     """Write the captured controller state beside TQ; return the files written."""
-    written_paths = [os.path.join(checkpoint_path, "train_dataloader.pt")]
-    await asyncio.to_thread(
-        save_dataloader_state, captured.dataloader_state, checkpoint_path
-    )
+    written_paths = []
+    for suffix, state in captured.dataloader_states_by_suffix.items():
+        await asyncio.to_thread(
+            save_dataloader_state, state, checkpoint_path, suffix=suffix
+        )
+        written_paths.append(
+            os.path.join(checkpoint_path, f"train_dataloader{suffix}.pt")
+        )
     objects = {
         REPLACEMENT_RESERVE_FILENAME: captured.replacement_reserve,
         REPLAY_BUFFER_METADATA_FILENAME: captured.replay_metadata,
@@ -365,7 +370,13 @@ class RolloutSnapshotter(_UsesRolloutParts):
         if self._rollout_runtime.shortfall_reconciliation_pending:
             raise RuntimeError("cannot checkpoint unreconciled selection shortfalls")
         snapshot = kind == "rollout_snapshot"
-        dataloader_state = self._dataloader.state_dict()
+        if isinstance(self._dataloader, MultipleDataloaderWrapper):
+            dataloader_states_by_suffix = {
+                f"_{task_name}": dataloader.state_dict()
+                for task_name, dataloader in self._dataloader.dataloaders.items()
+            }
+        else:
+            dataloader_states_by_suffix = {"": self._dataloader.state_dict()}
         next_nemo_gym_task_index = self._rollout_manager.get_next_nemo_gym_task_index()
         # The spare pool and dataloader advance together under the same mutation
         # cut in recovery-enabled dispatch, so preserve them in this cut too.
@@ -448,7 +459,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     self._data_plane_checkpoint_barrier.mutation_version
                 )
         return CapturedRolloutState(
-            dataloader_state=dataloader_state,
+            dataloader_states_by_suffix=dataloader_states_by_suffix,
             sampler_dispatch_index=self._sampler.dispatch_index,
             next_nemo_gym_task_index=next_nemo_gym_task_index,
             replacement_reserve=replacement_reserve,
