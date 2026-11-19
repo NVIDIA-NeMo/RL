@@ -66,16 +66,9 @@ NeMo RL supports multiple generation backends that implement the {py:class}`Gene
 
 ## SGLang Fault Tolerance
 
-SGLang fault tolerance is opt-in. Its serving-health monitor checks engines
-during generation; a separate bounded actor/process liveness probe covers the
-training and offloaded windows. The latter does not detect a live-but-wedged
-server, so both detectors are necessary. Replacements wait until the next refit
-to receive current policy weights before rollout resumes. Failure after a
-weight transfer starts is outside this recovery boundary.
+SGLang fault tolerance is opt-in. Its serving-health monitor checks engines during generation; a separate bounded actor/process liveness probe covers the training and offloaded windows. The latter does not detect a live-but-wedged server, so both detectors are necessary. Replacements wait until the next refit to receive current policy weights before rollout resumes. Failure after a weight transfer starts is outside this recovery boundary.
 
-The SGLang exemplar documents the defaults below. Fault-tolerance and client
-defaults are centralized in `SGLangFaultToleranceConfig` and
-`SGLangHttpClientConfig`, respectively:
+The SGLang exemplar documents the defaults below. Fault-tolerance and client defaults are centralized in `SGLangFaultToleranceConfig` and `SGLangHttpClientConfig`, respectively:
 
 ```yaml
 policy:
@@ -95,24 +88,11 @@ policy:
         max_retries: 3
 ```
 
-Health intervals and timeouts are positive, finite seconds; the first-wait grace
-can be zero. The restart limit is a nonnegative integer per logical engine over
-the run's lifetime. Exhaustion aborts refit; zero disables restarts. The
-`sglang_fault_tolerance_config` block is required and inherited from the SGLang
-exemplar. An empty block uses the defaults above, including disabled recovery.
+Health intervals and timeouts are positive, finite seconds; the first-wait grace can be zero. The restart limit is a nonnegative integer per logical engine over the run's lifetime. Exhaustion aborts refit; zero disables restarts. The `sglang_fault_tolerance_config` block is required and inherited from the SGLang exemplar. An empty block uses the defaults above, including disabled recovery.
 
-The two router knobs require positive integers and configure only a router
-launched by NeMo-RL. Omitting them retains the pinned router's defaults. An
-external router owns its own retry/circuit configuration. The independent
-client budget still applies with `use_external_router: true`.
+The two router knobs require positive integers and configure only a router launched by NeMo-RL. Omitting them retains the pinned router's defaults. An external router owns its own retry/circuit configuration. The independent client budget still applies with `use_external_router: true`.
 
-Despite their names, `retry_max_retries` and client `max_retries` count **total
-attempts including the first**, not additional retries. A client attempt can
-therefore contain several router attempts. Distributed HTTP dispatch uses the
-client budget, and its existing local fallback gets that budget again if the
-actor call fails. These settings permit tuning bounded nonstreaming recovery;
-they do not guarantee survival after fleet loss or retry exhaustion. A streaming
-response that has already started cannot be replayed.
+Despite their names, `retry_max_retries` and client `max_retries` count **total attempts including the first**, not additional retries. A client attempt can therefore contain several router attempts. Distributed HTTP dispatch uses the client budget, and its existing local fallback gets that budget again if the actor call fails. These settings permit tuning bounded nonstreaming recovery; they do not guarantee survival after fleet loss or retry exhaustion. A streaming response that has already started cannot be replayed.
 
 ## VLLM Backend
 
@@ -253,10 +233,7 @@ Keep the video preprocessing values identical in `data.default` and `mcore_gener
 
 #### Multimodal prompt contracts
 
-`multimodal_prompt_config` controls how structured image and video content is
-lowered into model prompt tokens. It contains optional `image_spec` and
-`video_spec` mappings. Each mapping may override the Megatron inference wrapper's
-defaults:
+`multimodal_prompt_config` controls how structured image and video content is lowered into model prompt tokens. It contains optional `image_spec` and `video_spec` mappings. Each mapping may override the Megatron inference wrapper's defaults:
 
 ```yaml
 policy:
@@ -278,55 +255,30 @@ policy:
           include_frame_timestamps_for_nemotron_vl: true
 ```
 
-The mappings are partial overrides: omitted values come from the selected
-wrapper's `multimodal_prompt_config`. Consequently,
-`multimodal_prompt_config` requires a `megatron_inference_wrapper`, and that
-wrapper must define a default prompt contract.
+The mappings are partial overrides: omitted values come from the selected wrapper's `multimodal_prompt_config`. Consequently, `multimodal_prompt_config` requires a `megatron_inference_wrapper`, and that wrapper must define a default prompt contract.
 
-- `model_token` is the model-specific placeholder that is later replaced by
-  multimodal embeddings.
-  - Example: `model_token: "<image>"` lowers one structured image block to
-    `<image>` before tokenization.
+- `model_token` is the model-specific placeholder that is later replaced by multimodal embeddings.
+  - Example: `model_token: "<image>"` lowers one structured image block to `<image>` before tokenization.
 - `prefix` and `suffix` wrap each model placeholder.
-  - Example: `prefix: "<img>"`, `model_token: "<image>"`, and
-    `suffix: "</img>"` produce `<img><image></img>`.
-- `content_part_separator` joins adjacent structured content parts before the
-  chat template is applied.
-  - Example: Given a text part `Describe this` followed by an image block,
-    `content_part_separator: "\n"` produces
-    `Describe this\n<img><image></img>` instead of
-    `Describe this<img><image></img>`.
-- `input_marker` removes a marker already present in incoming text when the
-  same message also contains structured media. Current built-in wrappers leave
-  this setting unset.
-  - Example: For a custom contract with `input_marker: "<video>"`, incoming
-    text `Describe this: <video>` plus a structured video block becomes
-    `Describe this: ` plus the configured video prompt, rather than retaining
-    two video markers.
+  - Example: `prefix: "<img>"`, `model_token: "<image>"`, and `suffix: "</img>"` produce `<img><image></img>`.
+- `content_part_separator` joins adjacent structured content parts before the chat template is applied.
+  - Example: Given a text part `Describe this` followed by an image block, `content_part_separator: "\n"` produces `Describe this\n<img><image></img>` instead of `Describe this<img><image></img>`.
+- `input_marker` removes a marker already present in incoming text when the same message also contains structured media. Current built-in wrappers leave this setting unset.
+  - Example: For a custom contract with `input_marker: "<video>"`, incoming text `Describe this: <video>` plus a structured video block becomes `Describe this: ` plus the configured video prompt, rather than retaining two video markers.
 - `expansion_mode` controls how compact media placeholders are expanded.
   - `single` emits one compact model placeholder per structured media item.
-    - Example: A video block initially becomes one `<img><image></img>` span;
-      the `<image>` token is expanded internally to the number of projected
-      video features.
-  - `temporal_patch` rewrites one compact video placeholder into one
-    placeholder per temporal tubelet before feature expansion.
-    - Example: Four frames with temporal patch size `2` form two tubelets, so
-      the compact video span is rewritten as
-      `<img><image></img> <img><image></img>`: one span for frames 1–2 and one
-      for frames 3–4.
-- `include_frame_timestamps_for_nemotron_vl: true` adds the sampled-frame times
-  to each temporal-patch span. This option is valid only with
-  `expansion_mode: temporal_patch`.
-  - Example: For frame indices `[0, 1, 2, 3]`, FPS `1`, and temporal patch size
-    `2`, the prompt fragment becomes:
+    - Example: A video block initially becomes one `<img><image></img>` span; the `<image>` token is expanded internally to the number of projected video features.
+  - `temporal_patch` rewrites one compact video placeholder into one placeholder per temporal tubelet before feature expansion.
+    - Example: Four frames with temporal patch size `2` form two tubelets, so the compact video span is rewritten as `<img><image></img> <img><image></img>`: one span for frames 1–2 and one for frames 3–4.
+- `include_frame_timestamps_for_nemotron_vl: true` adds the sampled-frame times to each temporal-patch span. This option is valid only with `expansion_mode: temporal_patch`.
+  - Example: For frame indices `[0, 1, 2, 3]`, FPS `1`, and temporal patch size `2`, the prompt fragment becomes:
 
     ```text
     Frame 1 sampled at 0.00 seconds and frame 2 sampled at 1.00 seconds: <img><image></img>
     Frame 3 sampled at 2.00 seconds and frame 4 sampled at 3.00 seconds: <img><image></img>
     ```
 
-Omitting `data.default.video_sampling_style` keeps the default/simple video
-path. To opt into Nemotron-VL sampling, set the style explicitly:
+Omitting `data.default.video_sampling_style` keeps the default/simple video path. To opt into Nemotron-VL sampling, set the style explicitly:
 
 ```yaml
 data:
@@ -334,15 +286,9 @@ data:
     video_sampling_style: nemotron_vl
 ```
 
-Nemotron-VL video preprocessing always uses timestamped `temporal_patch`
-expansion, the only video format Nemotron checkpoints are trained on, so keep
-the Megatron inference `video_spec` on that format.
+Nemotron-VL video preprocessing always uses timestamped `temporal_patch` expansion, the only video format Nemotron checkpoints are trained on, so keep the Megatron inference `video_spec` on that format.
 
-These settings control NeMo-RL's video preprocessing only. They do not change the
-Megatron inference prompt, which comes from the selected
-`megatron_inference_wrapper`. The Nemotron Omni wrapper already defaults to
-timestamped temporal-patch video prompts. For other wrappers, or to change these
-values, set them explicitly:
+These settings control NeMo-RL's video preprocessing only. They do not change the Megatron inference prompt, which comes from the selected `megatron_inference_wrapper`. The Nemotron Omni wrapper already defaults to timestamped temporal-patch video prompts. For other wrappers, or to change these values, set them explicitly:
 
 ```yaml
 policy:
@@ -355,9 +301,7 @@ policy:
           include_frame_timestamps_for_nemotron_vl: true
 ```
 
-The current engine has one prompt contract for all requests. Supporting
-different prompt styles in one engine would require a future per-request
-endpoint or engine configuration.
+The current engine has one prompt contract for all requests. Supporting different prompt styles in one engine would require a future per-request endpoint or engine configuration.
 
 ## Usage Examples
 
@@ -433,8 +377,7 @@ policy:
       http_server_num_replicas: 8
 ```
 
-For a complete example, see
-`examples/configs/recipes/llm/grpo-llama3.2-1b-instruct-1n8g-megatron_generation.yaml`.
+For a complete example, see `examples/configs/recipes/llm/grpo-llama3.2-1b-instruct-1n8g-megatron_generation.yaml`.
 
 ## Extend with New Backends
 

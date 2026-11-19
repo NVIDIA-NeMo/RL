@@ -54,7 +54,8 @@ from tensordict import TensorDict
 
 from nemo_rl.data_plane.adapters import mooncake_ssd_offload
 from nemo_rl.data_plane.adapters.tq_controller_patch import configure_controller_patch
-from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
+from nemo_rl.data_plane.adapters.transfer_queue_env import rdma_rails
+from nemo_rl.data_plane.checkpoint import CheckpointCapture
 from nemo_rl.data_plane.codec import timed_codec
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
@@ -115,7 +116,8 @@ def rdma_devices() -> str:
     fabric where each rail is its own subnet, a cross-rail draw has no route and
     dies with "transport retry counter exceeded".
 
-    IB and RoCE are never mixed; InfiniBand is preferred when present.
+    Device choice is ``transfer_queue_env.rdma_rails``: IB over RoCE, never
+    mixed, and without the management interface's RDMA function.
 
     Also the skip predicate for the mooncake tests — ``mooncake_cpu`` is
     RDMA-only, so they cannot run without a device.
@@ -129,11 +131,8 @@ def rdma_devices() -> str:
     # well after setup has begun — so treat a missing verbs node as no device.
     if not glob.glob("/dev/infiniband/uverbs*"):
         return ""
-    layers = rail_link_layers()
-    ib = [n for n, layer in layers.items() if layer == "InfiniBand"]
-    roce = [n for n, layer in layers.items() if layer == "Ethernet"]
     # No space after the comma: mooncake splits on "," only.
-    return ",".join(ib or roce)
+    return ",".join(rdma_rails())
 
 
 def _mooncake_transport_config() -> dict:
@@ -996,6 +995,13 @@ def _init_tq(
                 },
             },
         }
+        if simple_cfg.async_checkpoint:
+            # Load the SimpleStorage-only hook only when it is requested.
+            from nemo_rl.data_plane.adapters.tq_simple_checkpoint import (
+                configure_simple_checkpoint,
+            )
+
+            configure_simple_checkpoint()
         if storage_unit_node_ids is not None:
             _pin_simple_storage_units(storage_unit_node_ids)
         ssd = simple_cfg.ssd_offload
@@ -1646,6 +1652,31 @@ class TQDataPlaneClient(DataPlaneClient):
         tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
+
+    def capture_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> CheckpointCapture | None:
+        if self._backend != "simple":
+            return None
+        simple_cfg = backend_config(self._cfg)
+        if not simple_cfg.async_checkpoint:
+            return None
+        # The capture implementation depends on pinned SimpleStorage internals.
+        from nemo_rl.data_plane.adapters.tq_simple_checkpoint import (
+            capture_simple_checkpoint,
+        )
+
+        self._require_checkpointing_support()
+        _connect_existing()
+        return capture_simple_checkpoint(
+            checkpoint_dir,
+            num_storage_units=simple_cfg.num_storage_units,
+            metadata=metadata,
+            timeout_s=simple_cfg.checkpoint_io_timeout_s,
+        )
 
     def save_checkpoint(
         self,

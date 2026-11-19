@@ -21,7 +21,7 @@ comes from the backend-neutral ``policy.generation.disaggregation`` block.
 """
 
 from collections.abc import Mapping
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, PositiveFloat, PositiveInt
 
@@ -76,6 +76,10 @@ class MegatronDynamoFrontendArgs(BaseModel, extra="forbid"):
         "least-loaded",
         "device-aware-weighted",
     ] = "kv"
+    # Idle seconds a NeMo-Gym session stays on one engine; None disables it.
+    session_affinity_ttl_secs: Annotated[int, Field(gt=0, le=31_536_000)] | None = None
+    # Processes in the frontend that render chat calls; see the vLLM dynamo_cfg.
+    render_workers: PositiveInt = 8
     extra_cli_args: list[str] = Field(default_factory=list)
 
 

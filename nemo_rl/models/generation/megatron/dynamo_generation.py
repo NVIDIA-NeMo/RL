@@ -472,6 +472,10 @@ class MegatronDynamoGeneration(GenerationInterface):
                 # The engines' venv carries ai-dynamo, so the frontend runs the
                 # same release as every engine.
                 frontend_python=self.engine_python(),
+                ray_address=ray.get_runtime_context().gcs_address,
+                # NeMo-Gym reaches these engines through their own chat proxies,
+                # not the frontend's chat engine.
+                serves_chat=False,
             )
             self._dynamo_runtime = runtime
             runtime.start()

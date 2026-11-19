@@ -31,9 +31,7 @@ cd docs/
 uv run --group docs sphinx-build --builder linkcheck . _build/linkcheck
 ```
 
-It will output a JSON file at `_build/linkcheck/output.json` with links it found while building the
-docs. Records will have a status of `broken` if the link is not reachable. The `docs/conf.py` file is
-configured to ignore github links because the CI test will often experience rate limit errors.
+It will output a JSON file at `_build/linkcheck/output.json` with links it found while building the docs. Records will have a status of `broken` if the link is not reachable. The `docs/conf.py` file is configured to ignore github links because the CI test will often experience rate limit errors.
 Comment out the `linkcheck_ignore` variable there to check all the links.
 
 ## Live Building

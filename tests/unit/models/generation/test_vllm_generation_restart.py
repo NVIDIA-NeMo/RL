@@ -93,6 +93,7 @@ class TestRestartShardTokenCapture:
         "dp_cfg": {"backend": "simple"},
         "staging_partition": "rollout_staging",
         "capture_media": False,
+        "media_family": None,
         "top_logprobs": 4,
         "generation_prefix_cuts_enabled": False,
         "generation_cut_control_token": None,

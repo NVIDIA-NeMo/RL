@@ -117,6 +117,10 @@ class _FakeRay:
     def put(value):
         return value
 
+    @staticmethod
+    def get_runtime_context():
+        return SimpleNamespace(gcs_address="10.0.0.1:6379")
+
 
 class _FakePlacementGroup:
     def __init__(self, bundle_nodes):
@@ -343,8 +347,19 @@ class _FakeEngine:
 class _FakeRuntime:
     """Stand-in for ``ManagedDynamoRuntime``: etcd, NATS and the frontend."""
 
-    def __init__(self, env: "_Env", *, dynamo_cfg, model_name, frontend_python):
+    def __init__(
+        self,
+        env: "_Env",
+        *,
+        dynamo_cfg,
+        model_name,
+        frontend_python,
+        ray_address,
+        serves_chat,
+    ):
         self.dynamo_cfg = dynamo_cfg
+        self.ray_address = ray_address
+        self.serves_chat = serves_chat
         self.model_name = model_name
         self.frontend_python = frontend_python
         self.log = env.log
