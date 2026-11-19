@@ -692,7 +692,8 @@ def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
         is_async_rl=True,
     )
 
-    assert "training_worker_idle_time_ratio" in perf
+    # exposed / (training + logprobs + exposed + refit) = 2 / 9
+    assert math.isclose(perf["training_worker_idle_time_ratio"], 2.0 / 9.0)
 
     # Throughput checks
     assert math.isclose(perf["samples_per_sec_per_gpu"], 0.5, rel_tol=1e-6)
@@ -819,7 +820,30 @@ def test_async_ppo_metrics_use_async_flag_without_grpo_config():
         is_async_rl=True,
     )
 
-    assert "training_worker_idle_time_ratio" in perf
+    assert math.isclose(perf["training_worker_idle_time_ratio"], 2.0 / 9.0)
+
+
+def test_async_idle_ratio_is_zero_for_tiny_exposed_generation():
+    master_config = _base_ppo_master_config(colocated=False)
+    timing_metrics = {
+        "policy_and_reference_logprobs": 2.0,
+        "policy_training": 4.0,
+        "total_step_time": 10.0,
+        "exposed_generation": 0.05,
+        "prepare_for_generation/total": 1.0,
+    }
+
+    perf = print_performance_metrics(
+        {},
+        {"total_num_tokens": 6050.0},
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=True,
+    )
+
+    assert perf["training_worker_idle_time_ratio"] == 0
 
 
 # ============================================================================

@@ -1,0 +1,465 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import importlib.util
+import multiprocessing
+import pickle
+import sys
+import threading
+import unittest
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, call, patch
+
+# Import by path to avoid the vLLM package's GPU/Ray worker imports.
+MODULE_PATH = (
+    Path(__file__).resolve().parents[4] / "nemo_rl/models/generation/vllm/multi_api.py"
+)
+spec = importlib.util.spec_from_file_location("multi_api_test_target", MODULE_PATH)
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class MultiAPITest(unittest.IsolatedAsyncioTestCase):
+    def test_engine_listener_handoff_and_cleanup(self):
+        for queue_limit, fail_start in [(None, False), (32, False), (32, True)]:
+            with self.subTest(queue_limit=queue_limit, fail_start=fail_start):
+                owner = SimpleNamespace(
+                    cfg={},
+                    _reserved_socket=Mock(),
+                    _reserved_node_ip="localhost",
+                    routed_experts_dtype="int32",
+                )
+                pool = module.MultiAPIServerPool(owner, 2)
+                config = SimpleNamespace(
+                    parallel_config=SimpleNamespace(
+                        data_parallel_size=1, data_parallel_backend="mp"
+                    ),
+                    scheduler_config=SimpleNamespace(max_num_queued_reqs=queue_limit),
+                )
+                engine_args = SimpleNamespace(
+                    create_engine_config=Mock(return_value=config),
+                    disable_log_stats=False,
+                    enable_log_requests=False,
+                )
+                listeners = Mock(
+                    inputs=[Mock(), Mock()],
+                    outputs=[Mock(), Mock()],
+                    addresses=SimpleNamespace(
+                        inputs=["ipc://input0", "ipc://input1"],
+                        outputs=["ipc://output0", "ipc://output1"],
+                    ),
+                )
+                launch = SimpleNamespace(
+                    engine_manager=Mock(), coordinator=None, tensor_queue=object()
+                )
+
+                @contextmanager
+                def launch_engines(cfg, executor, log_stats, addresses):
+                    self.assertIs(cfg, config)
+                    self.assertIs(addresses, listeners.addresses)
+                    yield launch
+
+                context = Mock()
+                parent, child = Mock(), Mock()
+                context.Pipe.return_value = parent, child
+                parent.recv.return_value = ("ok", None)
+                if fail_start:
+                    context.Process.return_value.start.side_effect = OSError(
+                        "spawn failed"
+                    )
+                make_engine = Mock(return_value=Mock())
+                bind_listeners = Mock(return_value=listeners)
+                modules = {
+                    "ray": SimpleNamespace(
+                        get_runtime_context=lambda: SimpleNamespace(namespace="test")
+                    ),
+                    "prometheus_client": SimpleNamespace(values=Mock()),
+                    "vllm.v1.engine.admission_control": SimpleNamespace(
+                        SharedAdmissionStats=SimpleNamespace(
+                            num_counters=lambda count: count * 8
+                        )
+                    ),
+                    "vllm.v1.engine.async_llm": SimpleNamespace(AsyncLLM=make_engine),
+                    "vllm.v1.engine.utils": SimpleNamespace(
+                        bind_engine_zmq_listeners=bind_listeners,
+                        launch_core_engines=launch_engines,
+                    ),
+                    "vllm.v1.executor.abstract": SimpleNamespace(
+                        Executor=SimpleNamespace(get_class=lambda cfg: object)
+                    ),
+                    "vllm.v1.metrics": SimpleNamespace(reader=SimpleNamespace()),
+                    "vllm.v1.metrics.prometheus": SimpleNamespace(
+                        get_prometheus_registry=Mock(),
+                        setup_multiprocess_prometheus=Mock(),
+                    ),
+                }
+                with (
+                    patch.dict(sys.modules, modules),
+                    patch.dict(module.os.environ),
+                    patch.object(
+                        module.multiprocessing, "get_context", return_value=context
+                    ),
+                ):
+                    if fail_start:
+                        with self.assertRaisesRegex(OSError, "spawn failed"):
+                            pool.create_engine(engine_args, [])
+                        listeners.cleanup.assert_called_once_with()
+                        launch.engine_manager.shutdown.assert_called_once_with()
+                        make_engine.assert_not_called()
+                        pool.close_engines()
+                        listeners.cleanup.assert_called_once_with()
+                        continue
+                    self.assertIs(
+                        pool.create_engine(engine_args, []), make_engine.return_value
+                    )
+                bind_listeners.assert_called_once_with(config, 2)
+                child_addresses = context.Process.call_args.kwargs["args"][4]
+                owner_addresses = make_engine.call_args.kwargs["client_addresses"]
+                for index, addresses in enumerate([owner_addresses, child_addresses]):
+                    self.assertIs(
+                        addresses["input_listener"], listeners.inputs[index].socket
+                    )
+                    self.assertIs(
+                        addresses["output_listener"], listeners.outputs[index].socket
+                    )
+                    self.assertIs(addresses["tensor_queue"], launch.tensor_queue)
+                listeners.inputs[1].close.assert_called_once_with()
+                listeners.outputs[1].close.assert_called_once_with()
+                listeners.inputs[0].close.assert_not_called()
+                listeners.outputs[0].close.assert_not_called()
+                if queue_limit is None:
+                    context.RawArray.assert_not_called()
+                    self.assertNotIn("mp_admission_counters", owner_addresses)
+                    self.assertNotIn("mp_admission_counters", child_addresses)
+                else:
+                    context.RawArray.assert_called_once_with("q", 16)
+                    self.assertIs(
+                        owner_addresses["mp_admission_counters"],
+                        context.RawArray.return_value,
+                    )
+                    self.assertIs(
+                        child_addresses["mp_admission_counters"],
+                        context.RawArray.return_value,
+                    )
+                self.assertEqual(launch.watched_frontend_processes, pool.children)
+                listeners.cleanup.assert_not_called()
+                make_engine.return_value.shutdown()
+                pool.stop_children()
+                pool.close_engines()
+                pool.close_engines()
+                listeners.cleanup.assert_called_once_with()
+                launch.engine_manager.shutdown.assert_called_once_with()
+
+    def test_spawn_target_does_not_capture_pool(self):
+        pool = module.MultiAPIServerPool(threading.Lock(), 2)
+        with patch.dict(sys.modules, {module.__name__: module}):
+            pickle.loads(pickle.dumps(pool.run_api_process))
+
+    async def test_spawned_host_preserves_frontend_settings(self):
+        # Exercise child initialization without constructing a GPU worker.
+        for dtype, video_config in [
+            ("int16", None),
+            (
+                "int32",
+                SimpleNamespace(sampling_style="nemotron_vl", temporal_patch_size=2),
+            ),
+        ]:
+            hosts = []
+            lifecycle = Mock()
+            init_telemetry = Mock()
+            shutdown_telemetry = Mock()
+            lifecycle.attach_mock(init_telemetry, "init")
+            lifecycle.attach_mock(shutdown_telemetry, "flush")
+
+            class Host:
+                def _init_frontend_state(self):
+                    self.http_server = None
+                    self.setup_token_capture = AsyncMock()
+                    lifecycle.attach_mock(self.setup_token_capture, "capture")
+                    self.set_rollout_weight_version = AsyncMock()
+                    self.captured_call_progress = AsyncMock(
+                        return_value={"weight_version": 10, "calls": [["child", 20]]}
+                    )
+                    self.get_data_plane_snapshot = Mock(return_value={"calls": 3})
+                    hosts.append(self)
+
+            engine = Mock()
+            register_video_loader = Mock()
+
+            def make_engine(**kwargs):
+                if video_config is not None:
+                    register_video_loader.assert_called_once_with(
+                        sampling_style="nemotron_vl", temporal_patch_size=2
+                    )
+                return engine
+
+            connection = Mock()
+            lifecycle.attach_mock(connection.send, "send")
+            connection.recv.side_effect = [
+                ("capture", ({"impl": "transfer_queue"}, "stage", True, 4)),
+                ("version", (10,)),
+                ("progress", ()),
+                ("snapshot", ()),
+                ("stop", ()),
+            ]
+            listener = Mock()
+            listener.getsockname.return_value = ("localhost", 8100)
+            http_client = Mock()
+            install_yield = Mock()
+            modules = {
+                "ray": SimpleNamespace(is_initialized=lambda: False, init=Mock()),
+                "nemo_rl.models.generation.vllm.config": SimpleNamespace(
+                    resolve_vllm_video_config=Mock(return_value=video_config)
+                ),
+                "nemo_rl.models.generation.vllm.video_utils": SimpleNamespace(
+                    register_torchcodec_vllm_video_loader=register_video_loader
+                ),
+                "nemo_rl.models.generation.vllm.patches": SimpleNamespace(
+                    install_output_loop_yield=install_yield
+                ),
+                "vllm.v1.engine.async_llm": SimpleNamespace(
+                    AsyncLLM=Mock(side_effect=make_engine)
+                ),
+                "vllm.v1.executor.abstract": SimpleNamespace(
+                    Executor=SimpleNamespace(get_class=lambda cfg: object)
+                ),
+                "vllm.v1.metrics.prometheus": SimpleNamespace(
+                    shutdown_prometheus=Mock()
+                ),
+                "nemo_rl.models.generation.vllm.vllm_worker_async": SimpleNamespace(
+                    VllmAsyncGenerationWorkerImpl=Host,
+                    _AsyncLLMHTTPClient=http_client,
+                ),
+                "nemo_rl.telemetry.setup": SimpleNamespace(
+                    init_telemetry_worker=init_telemetry,
+                    shutdown_telemetry=shutdown_telemetry,
+                ),
+            }
+            with patch.dict(sys.modules, modules):
+                await asyncio.to_thread(
+                    module.MultiAPIServerPool.run_api_process,
+                    connection,
+                    {
+                        "vllm_cfg": {
+                            "flat_logprobs": True,
+                            "output_loop_yield_budget_ms": 20,
+                        }
+                    },
+                    SimpleNamespace(disable_log_stats=False, enable_log_requests=False),
+                    SimpleNamespace(parallel_config=SimpleNamespace()),
+                    {},
+                    count=8,
+                    index=1,
+                    listener=listener,
+                    node_ip="localhost",
+                    namespace="test",
+                    routed_experts_dtype=dtype,
+                )
+            self.assertEqual(hosts[0].routed_experts_dtype, dtype)
+            self.assertEqual(connection.send.call_args_list[0].args, (("ok", None),))
+            if video_config is None:
+                register_video_loader.assert_not_called()
+            self.assertTrue(http_client.call_args.kwargs["flat_logprobs"])
+            install_yield.assert_called_once_with(engine, reader_budget_s=0.02)
+            hosts[0].setup_token_capture.assert_awaited_once_with(
+                {"impl": "transfer_queue"},
+                "stage",
+                capture_media=True,
+                top_logprobs=4,
+            )
+            hosts[0].set_rollout_weight_version.assert_awaited_once_with(10)
+            hosts[0].captured_call_progress.assert_awaited_once_with()
+            hosts[0].get_data_plane_snapshot.assert_called_once_with()
+            init_telemetry.assert_called_once_with()
+            self.assertLess(
+                lifecycle.mock_calls.index(call.init()),
+                lifecycle.mock_calls.index(
+                    call.capture(
+                        {"impl": "transfer_queue"},
+                        "stage",
+                        capture_media=True,
+                        top_logprobs=4,
+                    )
+                ),
+            )
+            self.assertEqual(
+                lifecycle.mock_calls[-3:],
+                [call.flush(), call.send(("ok", None)), call.flush()],
+            )
+            self.assertEqual(
+                [call.args[0] for call in connection.send.call_args_list],
+                [
+                    ("ok", None),
+                    ("ok", None),
+                    ("ok", None),
+                    ("ok", {"weight_version": 10, "calls": [["child", 20]]}),
+                    ("ok", {"calls": 3}),
+                    ("ok", None),
+                ],
+            )
+            engine.shutdown.assert_called_once()
+            listener.close.assert_called_once()
+
+    def test_reply_error_and_timeout(self):
+        parent, child = multiprocessing.Pipe()
+        try:
+            child.send(("error", "capture failed"))
+            with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                module.MultiAPIServerPool.receive_reply(parent, 0.1)
+            with self.assertRaises(TimeoutError):
+                module.MultiAPIServerPool.receive_reply(parent, 0.01)
+        finally:
+            parent.close()
+            child.close()
+
+    async def test_fanout_capture_and_version_acknowledgements(self):
+        pool = module.MultiAPIServerPool(SimpleNamespace(), 8)
+        peers = []
+        for _ in range(7):
+            parent, child = multiprocessing.Pipe()
+            pool.connections.append(parent)
+            pool.children.append(Mock(is_alive=Mock(return_value=True)))
+            peers.append(child)
+        try:
+            for name, args in [
+                ("capture", ({"impl": "transfer_queue"}, "stage", False, 4)),
+                ("version", (10,)),
+            ]:
+                task = asyncio.create_task(pool.command(name, *args))
+                await asyncio.sleep(0.01)
+                self.assertFalse(task.done())
+                for peer in peers:
+                    self.assertEqual(peer.recv(), (name, args))
+                    peer.send(("ok", None))
+                await task
+        finally:
+            for connection in pool.connections + peers:
+                connection.close()
+
+    async def test_queries_preserve_child_reply_order(self):
+        pool = module.MultiAPIServerPool(SimpleNamespace(), 3)
+        peers = []
+        for _ in range(2):
+            parent, child = multiprocessing.Pipe()
+            pool.connections.append(parent)
+            pool.children.append(Mock(is_alive=Mock(return_value=True)))
+            peers.append(child)
+        try:
+            for name, replies in [
+                (
+                    "progress",
+                    [None, {"weight_version": 4, "calls": [["child", 30]]}],
+                ),
+                ("snapshot", [{"calls": 2}, {"calls": 3}]),
+            ]:
+                task = asyncio.create_task(pool.command(name))
+                await asyncio.sleep(0.01)
+                for peer in peers:
+                    self.assertEqual(peer.recv(), (name, ()))
+                for peer, reply in reversed(list(zip(peers, replies))):
+                    peer.send(("ok", reply))
+                self.assertEqual(await task, replies)
+        finally:
+            for connection in pool.connections + peers:
+                connection.close()
+
+    async def test_child_error_cleans_pool_and_engine(self):
+        pool = module.MultiAPIServerPool(SimpleNamespace(), 8)
+        parent, child = multiprocessing.Pipe()
+        process = Mock()
+        process.is_alive.side_effect = [True, True, False]
+        engine = Mock()
+        pool.children = [process]
+        pool.connections = [parent]
+        pool.engine_manager = engine
+        child.send(("error", "initialization failed"))
+        try:
+            with self.assertRaisesRegex(
+                RuntimeError, "initialization failed"
+            ) as failure:
+                await pool.command("capture", {}, "stage", False, 4)
+            engine.shutdown.assert_called_once()
+            process.terminate.assert_called_once()
+            self.assertEqual(pool.children, [])
+            self.assertIs(pool._failure, failure.exception)
+            for name, args in [
+                ("version", (10,)),
+                ("capture", ({}, "stage", False, 4)),
+            ]:
+                with self.assertRaisesRegex(
+                    RuntimeError, "initialization failed"
+                ) as later:
+                    await pool.command(name, *args)
+                self.assertIs(later.exception.__cause__, failure.exception)
+            self.assertEqual(await pool.command("stop"), [])
+            pool.stop_children()
+            pool.close_engines()
+            engine.shutdown.assert_called_once()
+            process.terminate.assert_called_once()
+        finally:
+            child.close()
+
+    async def test_command_send_failure_cleans_pool_and_engines(self):
+        for alive, send_error, error_type, message in [
+            (False, None, RuntimeError, "exited"),
+            (True, BrokenPipeError("closed pipe"), BrokenPipeError, "closed pipe"),
+        ]:
+            with self.subTest(alive=alive):
+                pool = module.MultiAPIServerPool(SimpleNamespace(), 2)
+                process = Mock()
+                process.is_alive.side_effect = [alive, alive, False]
+                connection = Mock()
+                connection.send.side_effect = send_error
+                engine = Mock()
+                coordinator = Mock()
+                pool.children = [process]
+                pool.connections = [connection]
+                pool.engine_manager = engine
+                pool.coordinator = coordinator
+
+                with self.assertRaisesRegex(error_type, message):
+                    await pool.command("version", 10)
+
+                engine.shutdown.assert_called_once()
+                coordinator.shutdown.assert_called_once()
+                connection.close.assert_called_once()
+                process.join.assert_called_once_with(timeout=10)
+                if alive:
+                    process.terminate.assert_called_once()
+                else:
+                    process.terminate.assert_not_called()
+                self.assertEqual(pool.children, [])
+                self.assertEqual(pool.connections, [])
+
+    async def test_cleanup_is_idempotent_and_allows_repeated_stop(self):
+        pool = module.MultiAPIServerPool(SimpleNamespace(), 2)
+        pool.engine_manager = Mock()
+        pool.coordinator = Mock()
+        engine, coordinator = pool.engine_manager, pool.coordinator
+        pool.stop_children()
+        pool.close_engines()
+        pool.stop_children()
+        pool.close_engines()
+        engine.shutdown.assert_called_once_with()
+        coordinator.shutdown.assert_called_once_with()
+        self.assertIsNone(pool._failure)
+        self.assertEqual(await pool.command("stop"), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

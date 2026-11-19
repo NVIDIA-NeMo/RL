@@ -216,6 +216,10 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "canonical_output_tokens",
         "metrics",
         "reward_observations",
+        "reward_mask_sample",
+        "reward_truncated",
+        "reward_original",
+        "loss_multiplier",
         "dropped",
         "drop_reason",
         "valid_row_count",
@@ -223,6 +227,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "token_metrics",
         # One (model call ID, weight version, tokens) tuple per trained call.
         "call_versions",
+        # Controller-set verdict: the finalized group scored all-same reward.
+        "zero_variance",
     }
 
 

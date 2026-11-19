@@ -4,20 +4,10 @@ This guide explains how to post-train the Nemotron 3 Nano Omni vision-language m
 
 ## Multimodal payload deduplication
 
-The maintained Nemotron recipes enable `grpo.deduplicate_multimodal_data` to
-share immutable model-ready media segments across logical GRPO generations and
-re-intern them after batching, replay, and sharding. The representation supports
-image, video, and audio payload keys, although the maintained recipes currently
-qualify image inputs only. Deduplication requires the vLLM generation backend.
-It works with `data_plane.enabled=true` except on NeMo-Gym runs, where the
-TransferQueue trainer does not attach the initial Gym image payloads. On the
-data plane it saves driver RAM only: `PackedTensor.to_wire` emits one row per
-*logical* row, so the wire payload is `O(G x images)` either way.
+The maintained Nemotron recipes enable `grpo.deduplicate_multimodal_data` to share immutable model-ready media segments across logical GRPO generations and re-intern them after batching, replay, and sharding. The representation supports image, video, and audio payload keys, although the maintained recipes currently qualify image inputs only. Deduplication requires the vLLM generation backend.
+It works with `data_plane.enabled=true` except on NeMo-Gym runs, where the TransferQueue trainer does not attach the initial Gym image payloads. On the data plane it saves driver RAM only: `PackedTensor.to_wire` emits one row per *logical* row, so the wire payload is `O(G x images)` either way.
 
-`grpo.debug_payload_metrics` emits logical, physical, and protocol-5 serialized
-payload sizes for the exact Ray boundaries used by generation, replay, logprobs,
-and training. It is disabled by default because measuring serialized size adds
-work and is intended for qualification and debugging rather than production.
+`grpo.debug_payload_metrics` emits logical, physical, and protocol-5 serialized payload sizes for the exact Ray boundaries used by generation, replay, logprobs, and training. It is disabled by default because measuring serialized size adds work and is intended for qualification and debugging rather than production.
 
 ## AutoModel backend
 
@@ -135,9 +125,7 @@ The Megatron backend uses a dedicated `NemotronOmniModel` supplied by Megatron B
 
 This collator-owned packing boundary differs from the historical Nemotron Omni `LLaVAModel` path, which collapsed the expanded media-token sequence before packing and expanded it again inside the model. The dedicated model removes that extra representation change and allows the integration to use Megatron Bridge and Megatron-LM from their maintained main branches.
 
-The maintained Megatron VLM recipes cover Nano image-and-text GRPO. The NeMo
-Gym integration also supports the static, one-video-per-row workflow described
-below. Audio and mixed audio-video rows are not supported by that workflow.
+The maintained Megatron VLM recipes cover Nano image-and-text GRPO. The NeMo Gym integration also supports the static, one-video-per-row workflow described below. Audio and mixed audio-video rows are not supported by that workflow.
 
 ### Checkpoint compatibility
 
@@ -161,9 +149,7 @@ The recipes keep sequence packing enabled because the model owns the packing ste
 
 ## NeMo Gym video GRPO
 
-Nemotron 3 Nano Omni video GRPO accepts one local video in the initial static
-NeMo Gym prompt. The user message uses an `input_video` part followed by
-`input_text`:
+Nemotron 3 Nano Omni video GRPO accepts one local video in the initial static NeMo Gym prompt. The user message uses an `input_video` part followed by `input_text`:
 
 ```json
 {
@@ -179,15 +165,7 @@ NeMo Gym prompt. The user message uses an `input_video` part followed by
 }
 ```
 
-Only local paths under `policy.generation.vllm_kwargs.allowed_local_media_path`
-are accepted. Environment-produced video and video introduced in a later
-trajectory turn are not supported. Each row must contain exactly one video and no audio. MCQA rows
-must provide real top-level `options` and one uppercase `expected_answer`
-present in those options. Use
-[`prepare_video_dataset.py`](../../../../examples/nemo_gym/prepare_video_dataset.py)
-to convert and validate source JSONL. Raw videos are decoded with TorchCodec;
-the runtime can also read externally prepared lossless frame manifests, but the
-converter currently emits raw-video rows only.
+Only local paths under `policy.generation.vllm_kwargs.allowed_local_media_path` are accepted. Environment-produced video and video introduced in a later trajectory turn are not supported. Each row must contain exactly one video and no audio. MCQA rows must provide real top-level `options` and one uppercase `expected_answer` present in those options. Use [`prepare_video_dataset.py`](../../../../examples/nemo_gym/prepare_video_dataset.py) to convert and validate source JSONL. Raw videos are decoded with TorchCodec; the runtime can also read externally prepared lossless frame manifests, but the converter currently emits raw-video rows only.
 
 The recipes contain explicit placeholder paths. Override them when launching:
 
@@ -199,33 +177,17 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
   data.validation.data_path=/path/to/validation.jsonl
 ```
 
-Policy and rollout preprocessing must use the same sampling contract. The
-provided recipes set one `policy.generation.vllm_cfg.video` block for
-TorchCodec-backed Nemotron sampling, 32 frames, and a temporal patch size of 2.
+Policy and rollout preprocessing must use the same sampling contract. The provided recipes set one `policy.generation.vllm_cfg.video` block for TorchCodec-backed Nemotron sampling, 32 frames, and a temporal patch size of 2.
 NeMo RL materializes those values for both policy and rollout preprocessing.
-The runtime therefore needs TorchCodec and its FFmpeg dependencies; no parallel
-sampling environment variables are required.
+The runtime therefore needs TorchCodec and its FFmpeg dependencies; no parallel sampling environment variables are required.
 
-The remaining policy-side video settings live under `data.default`:
-`video_target_num_patches`, `video_maintain_aspect_ratio`, and, for generic
-processors only, `min_generation_tokens`. Set
-`policy.generation.vllm_cfg.reset_encoder_cache_after_weight_update: true` only
-when the multimodal encoder trains; the provided frozen-vision recipes leave it
-disabled.
+The remaining policy-side video settings live under `data.default`: `video_target_num_patches`, `video_maintain_aspect_ratio`, and, for generic processors only, `min_generation_tokens`. Set `policy.generation.vllm_cfg.reset_encoder_cache_after_weight_update: true` only when the multimodal encoder trains; the provided frozen-vision recipes leave it disabled.
 
 The synchronous and asynchronous overlays are:
 
 - [2-node synchronous recipe](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-2n8g-megatron-tp4ep4-gym-video.v1.yaml)
 - [16-node asynchronous recipe](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml)
 
-They require the corresponding Nemotron Omni support in Megatron Bridge and
-video request/token propagation in NeMo Gym. Policy preprocessing numerically
-matches unmodified stock vLLM 0.29.0; a custom vLLM fork is not required.
+They require the corresponding Nemotron Omni support in Megatron Bridge and video request/token propagation in NeMo Gym. Policy preprocessing numerically matches unmodified stock vLLM 0.29.0; a custom vLLM fork is not required.
 
-Both overlays use a large positive `grpo.max_num_steps` value so it does not
-bind normal training. Training still follows the existing GRPO step-limit
-semantics. The recipes also leave
-`grpo.seq_logprob_error_threshold: null`: logged token multiplicative
-probability error (TMPE) is raw and no high-error sequence is masked. Interpret
-TMPE together with reward, loss, sequence length, and refit metrics; isolated
-maxima are less informative than a sustained shift in the distribution.
+Both overlays use a large positive `grpo.max_num_steps` value so it does not bind normal training. Training still follows the existing GRPO step-limit semantics. The recipes also leave `grpo.seq_logprob_error_threshold: null`: logged token multiplicative probability error (TMPE) is raw and no high-error sequence is masked. Interpret TMPE together with reward, loss, sequence length, and refit metrics; isolated maxima are less informative than a sustained shift in the distribution.
