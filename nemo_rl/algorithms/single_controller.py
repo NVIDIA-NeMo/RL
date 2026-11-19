@@ -66,7 +66,6 @@ from typing import (
 )
 
 import ray
-import torch
 from ray.exceptions import RayActorError
 from wandb import Table
 
@@ -459,7 +458,6 @@ class SingleControllerActor:
             else ()
         )
         self._train_fields += self._router_excluded_fields
-        self._forest_step_row_multiple = actor_args.forest_step_row_multiple
         self._dp_client = actor_args.dp_client
         self._dp_backend = master_config.data_plane["backend"]
         if self._dp_backend == "mooncake_cpu":
@@ -3110,14 +3108,6 @@ class SingleControllerActor:
                         self._rollout_manager.suspend_request_deadlines()
                         await asyncio.to_thread(self._gen.finish_generation)
 
-                    if self._master_config.token_capture.forest_padding_scope == "step":
-                        with self._timer.time("data_processing"):
-                            train_meta, pad_meta = await self._pad_forest_step_rows(
-                                train_meta
-                            )
-                        if pad_meta is not None:
-                            consumed_metas.append(pad_meta)
-
                     # ---- 2. Prepare the batch ----
                     if self._is_ppo:
                         # Doing value inference first keeps each chunk to one visit
@@ -5312,70 +5302,6 @@ class SingleControllerActor:
         await asyncio.to_thread(self._value.get_values_from_meta, meta)
         await asyncio.to_thread(self._value.finish_inference)
         return meta.with_fields([self._advantage_cfg.values_field])
-
-    async def _pad_forest_step_rows(
-        self, meta: KVBatchMeta
-    ) -> tuple[KVBatchMeta, Optional[KVBatchMeta]]:
-        """Pad a Forest training batch once to the policy and critic row multiple.
-
-        Used with ``token_capture.forest_padding_scope: step``. Pad rows copy
-        the first row under new sample IDs with ``sample_mask`` zeroed.
-        Returns the padded meta and the
-        pad rows' meta for post-step cleanup, or ``(meta, None)``.
-        """
-        num_pad = -meta.size % self._forest_step_row_multiple
-        if num_pad == 0:
-            return meta, None
-        assert meta.tags is not None
-        sources = [0] * num_pad
-        pad_ids = [
-            f"{meta.sample_ids[source]}_pad{index}"
-            for index, source in enumerate(sources)
-        ]
-        fields = await self._call_dp(
-            "get_samples",
-            sample_ids=[meta.sample_ids[source] for source in sources],
-            partition_id=meta.partition_id,
-            select_fields=list(meta.fields or []),
-        )
-        fields["sample_mask"] = torch.zeros_like(fields["sample_mask"])
-        if ROUTER_EXCLUDED_ROWS in fields.keys():
-            fields[ROUTER_EXCLUDED_ROWS] = torch.ones_like(fields[ROUTER_EXCLUDED_ROWS])
-        # Ownerless padding of the source's dispatch group, as in per-group padding.
-        tags = [
-            dict(meta.tags[source])
-            | {
-                "logical_rollout_id": None,
-                "logical_slot": None,
-                "segment_index": None,
-                "segment_count": 0,
-                "is_execution_padding": True,
-                "uses_borrowed_input": True,
-            }
-            | {key: 0 for key in VIOLATION_TAG_KEYS if key in meta.tags[source]}
-            for source in sources
-        ]
-        async with self._data_plane_checkpoint_barrier.mutation("other"):
-            await self._call_dp(
-                "put_samples",
-                sample_ids=pad_ids,
-                partition_id=meta.partition_id,
-                fields=fields,
-                tags=tags,
-            )
-        pad_meta = KVBatchMeta(
-            partition_id=meta.partition_id,
-            task_name=meta.task_name,
-            sample_ids=pad_ids,
-            fields=list(meta.fields or []),
-            sequence_lengths=(
-                [meta.sequence_lengths[source] for source in sources]
-                if meta.sequence_lengths is not None
-                else None
-            ),
-            tags=tags,
-        )
-        return meta.concat(pad_meta), pad_meta
 
     async def _value_train_epochs(
         self, metas: list[KVBatchMeta], *, num_epochs: int

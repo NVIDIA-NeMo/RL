@@ -68,7 +68,7 @@ def test_removed_forest_padding_source_fails_at_startup(source):
         {},
         {"ppo": None, "token_capture": None},
         {"ppo": {"adv_estimator": {"name": "gae", "normalize_advantages": True}}},
-        {"token_capture": {"forest_training": True, "forest_padding_scope": "step"}},
+        {"token_capture": {"forest_training": True}},
     ],
 )
 def test_forest_config_without_deferred_options_is_accepted(config):

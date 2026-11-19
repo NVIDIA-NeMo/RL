@@ -139,7 +139,6 @@ def test_forest_selection_config(policy):
     "option",
     [
         {"exclude_padding_from_router_stats": True},
-        {"forest_padding_scope": "step"},
     ],
 )
 def test_forest_options_require_forest_training(option):
@@ -1012,72 +1011,6 @@ def test_ppo_keeps_gae_advantages_for_weighted_rows() -> None:
     )
     torch.testing.assert_close(data["advantages"], expected)
     torch.testing.assert_close(data["returns"], returns)
-
-
-def _step_padded(multiple: int = 4):
-    """Five real rows in two groups, padded once for the whole batch."""
-    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)]), ("b", [(2.0, 1), (3.0, 1)])])
-    data = _with_values(data, seed=2)
-    data[ROUTER_EXCLUDED_ROWS] = torch.zeros(meta.size, dtype=torch.bool)
-    meta = KVBatchMeta(
-        "train", "train", meta.sample_ids, fields=list(data.keys()), tags=meta.tags
-    )
-    store = _RowStore(
-        {
-            sid: {name: data[name][row].clone() for name in data.keys()}
-            for row, sid in enumerate(meta.sample_ids)
-        }
-    )
-    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
-    ctrl = object.__new__(controller_cls)
-    ctrl._dp_client = store
-    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
-    ctrl._forest_step_row_multiple = multiple
-    ctrl._master_config = SimpleNamespace(
-        token_capture=TokenCaptureConfig(
-            forest_training=True, forest_padding_scope="step"
-        )
-    )
-    padded, pad_meta = asyncio.run(ctrl._pad_forest_step_rows(meta))
-    return meta, padded, pad_meta, store
-
-
-def test_forest_step_padding_copies_rows_once_per_batch() -> None:
-    meta, padded, pad_meta, store = _step_padded()
-    copied = [0, 0, 0]
-    assert padded.size == 8 and pad_meta.size == 3
-    assert padded.sample_ids == meta.sample_ids + pad_meta.sample_ids
-    for pad_id, row in zip(pad_meta.sample_ids, copied, strict=True):
-        pad, real = store.rows[pad_id], store.rows[meta.sample_ids[row]]
-        torch.testing.assert_close(pad["token_mask"], real["token_mask"])
-        torch.testing.assert_close(pad["values"], real["values"])
-        assert pad["sample_mask"] == 0 and pad[ROUTER_EXCLUDED_ROWS]
-    for tag, row in zip(pad_meta.tags, copied, strict=True):
-        assert tag["is_execution_padding"] and tag["uses_borrowed_input"]
-        assert tag["dispatch_group_id"] == meta.tags[row]["dispatch_group_id"]
-        assert tag["logical_rollout_id"] is None and tag["segment_count"] == 0
-    # A batch already at the multiple is left alone.
-    _, unpadded, none, _ = _step_padded(multiple=5)
-    assert none is None and unpadded.size == 5
-
-
-def test_forest_step_padding_whitening_excludes_padding_copies() -> None:
-    _, padded, _, store = _step_padded()
-    data = store.get_samples(sample_ids=padded.sample_ids, select_fields=padded.fields)
-    inputs = data.clone()
-    ctrl = _ppo_controller(padded, data)
-    _, valid = asyncio.run(ctrl._advantage_stage(padded))
-    assert valid
-    real = torch.tensor([1.0] * 5 + [0.0] * 3)
-    expected, _ = ctrl._advantage_estimator.compute_advantage(
-        prompt_ids=None,
-        rewards=inputs["total_reward"].float(),
-        mask=inputs["token_mask"] * real.unsqueeze(-1),
-        values=inputs["values"],
-    )
-    expected = expected * inputs["token_mask"] * real.unsqueeze(-1)
-    torch.testing.assert_close(data["advantages"], expected)
-    assert data["advantages"][5:].count_nonzero() == 0
 
 
 def test_forest_objective_accepts_ppo_gae_only() -> None:
