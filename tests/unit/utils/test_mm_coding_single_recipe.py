@@ -98,7 +98,7 @@ def test_adapter_rejects_eval_split_and_outside_root(tmp_path: Path) -> None:
 def test_single_rows_materialize_without_eval_indexes_or_cross_benchmark_collisions(
     tmp_path: Path,
 ) -> None:
-    materialize = pytest.importorskip("nemo_gym.data").materialize_task
+    materialize = pytest.importorskip("nemo_gym.data.task_materialization").materialize_task
     from nemo_gym.server_runtime import SingleAgentTurnTaskInput
 
     image = tmp_path / "reference.png"
