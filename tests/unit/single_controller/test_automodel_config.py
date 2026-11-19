@@ -41,9 +41,7 @@ def config():
 
 
 @pytest.mark.parametrize("lookahead", [1, 2, 4])
-def test_full_batch_lookahead_supported(
-    config: dict[str, Any], lookahead: int
-) -> None:
+def test_full_batch_lookahead_supported(config: dict[str, Any], lookahead: int) -> None:
     prompts = config["grpo"]["num_prompts_per_step"]
     config["async_rl"]["sampler"]["max_lookahead_versions"] = lookahead
     config["async_rl"]["max_inflight_prompts"] = (lookahead + 1) * prompts
