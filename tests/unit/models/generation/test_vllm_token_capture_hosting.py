@@ -735,7 +735,7 @@ def _engine_request(
 
 
 class _OutputProcessor:
-    """vLLM 0.33's OutputProcessor surface: live requests and the two hooks."""
+    """vLLM 0.34's OutputProcessor surface: live requests and the two hooks."""
 
     def __init__(self, *requests: SimpleNamespace) -> None:
         self.request_states = {r.request_id: r for r in requests}
@@ -762,7 +762,7 @@ def _progress_client(processor) -> _AsyncLLMHTTPClient:
 
 
 def _progress_reader(
-    monkeypatch, client: _AsyncLLMHTTPClient, *, vllm_version: str = "0.33.0"
+    monkeypatch, client: _AsyncLLMHTTPClient, *, vllm_version: str = "0.34.0"
 ) -> VllmProgressReader:
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.progress_reader.importlib.metadata.version",
@@ -826,9 +826,9 @@ def test_finished_request_is_released_once_its_consumer_has_the_output(monkeypat
 
 
 def test_progress_reads_refuse_an_unchecked_vllm(monkeypatch):
-    with pytest.raises(RuntimeError, match="checked on vLLM 0.33.x"):
+    with pytest.raises(RuntimeError, match=r"checked on vLLM 0\.33\.x and 0\.34\.x"):
         _progress_reader(
-            monkeypatch, _progress_client(_OutputProcessor()), vllm_version="0.34.1"
+            monkeypatch, _progress_client(_OutputProcessor()), vllm_version="0.35.1"
         )
 
 

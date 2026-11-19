@@ -27,13 +27,13 @@ import pytest
 from packaging.version import Version
 
 from nemo_rl.models.generation.vllm.progress_reader import (
-    _PROGRESS_READ_VLLM_RELEASE,
+    _PROGRESS_READ_VLLM_RELEASES,
 )
 
 pytestmark = pytest.mark.vllm
 
 _RECHECK = """\
-Before moving _PROGRESS_READ_VLLM_RELEASE, re-read against the new vLLM:
+Before extending _PROGRESS_READ_VLLM_RELEASES, re-read against the new vLLM:
   - VllmProgressReader.__init__ (vllm/progress_reader.py): the process_outputs
     lock wrap and the _finish_request retention hook;
   - VllmProgressReader._read_one_request: request_states, external_req_ids,
@@ -46,11 +46,11 @@ then update the checks in this file."""
 
 
 def test_progress_reads_are_pinned_to_the_checked_vllm_release():
-    installed = Version(importlib.metadata.version("vllm")).release[:2]
+    installed = tuple(Version(importlib.metadata.version("vllm")).release[:2])
 
-    assert installed == _PROGRESS_READ_VLLM_RELEASE, (
+    assert installed in _PROGRESS_READ_VLLM_RELEASES, (
         f"vLLM {installed} is installed; progress reads were checked on "
-        f"{_PROGRESS_READ_VLLM_RELEASE}.\n{_RECHECK}"
+        f"{_PROGRESS_READ_VLLM_RELEASES}.\n{_RECHECK}"
     )
 
 

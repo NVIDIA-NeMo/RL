@@ -24,10 +24,12 @@ references across layerwise reload.  (Rank-local Marlin padding is gone: 0.25's
 ``prepare_nvfp4_moe_layer_for_marlin`` pads natively.)
 """
 
+import importlib.metadata
 from types import MethodType
 from typing import Any
 
 import torch
+from packaging.version import Version
 
 NEMO_MODELOPT_W4A4 = "nemo_modelopt_nvfp4"
 NEMO_MODELOPT_W4A16 = "nemo_modelopt_w4a16_nvfp4"
@@ -103,6 +105,11 @@ def _canonicalize_nvfp4_scale_(scale: torch.Tensor) -> None:
     """Remove the E4M3 sign bit before Marlin's unsigned scale conversion."""
     with torch.no_grad():
         scale.copy_(scale.to(torch.float32).abs().to(scale.dtype))
+
+
+def _vllm_retires_unused_input_scales() -> bool:
+    """True when vLLM retires weight-only MoE input scales itself (0.34+)."""
+    return Version(importlib.metadata.version("vllm")) >= Version("0.34")
 
 
 def register_nemo_modelopt_nvfp4() -> None:
@@ -249,8 +256,16 @@ def register_nemo_modelopt_nvfp4() -> None:
                 params_dtype,
                 **extra_weight_attrs,
             )
-            del layer.w13_input_scale
-            del layer.w2_input_scale
+            if _vllm_retires_unused_input_scales():
+                # vLLM 0.34 retires these placeholders itself after loading
+                # (getattr(layer, name).retired = True), so they must stay
+                # registered. W4A16 refits never send them: tell layerwise
+                # reload they load zero elements so it does not wait for them.
+                layer.w13_input_scale.weight_loader_numel = 0
+                layer.w2_input_scale.weight_loader_numel = 0
+            else:
+                del layer.w13_input_scale
+                del layer.w2_input_scale
 
         def process_weights_after_loading(self, layer: Any) -> None:
             reload_kernel = self.moe_kernel
@@ -264,10 +279,14 @@ def register_nemo_modelopt_nvfp4() -> None:
                 _canonicalize_nvfp4_scale_(layer.w13_weight_scale)
                 _canonicalize_nvfp4_scale_(layer.w2_weight_scale)
             # W4A16 checkpoint metadata deliberately omits activation scales so
-            # layerwise reload never waits for tensors that do not exist. The
-            # native Marlin converter accepts None and removes these attributes.
-            layer.w13_input_scale = None
-            layer.w2_input_scale = None
+            # layerwise reload never waits for tensors that do not exist. On
+            # vLLM 0.33 the native Marlin converter accepts None and removes
+            # these attributes; from 0.34 the weight-only path retires the
+            # placeholder params itself (getattr(layer, name).retired = True),
+            # so they must stay registered.
+            if not _vllm_retires_unused_input_scales():
+                layer.w13_input_scale = None
+                layer.w2_input_scale = None
             super().process_weights_after_loading(layer)
             if reload_kernel is not None:
                 self.moe_kernel = reload_kernel
