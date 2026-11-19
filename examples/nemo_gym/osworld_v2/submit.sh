@@ -51,20 +51,61 @@ if [[ "$OSWORLD_DRIVER_SCRIPT" != "eval_driver.sh" ]]; then
   unset OSWORLD_EVAL_MODE
 fi
 
-if [[ -z "${OPENSANDBOX_BASE_URL:-}" && -n "${OPENSANDBOX_DOMAIN:-}" ]]; then
-  export OPENSANDBOX_BASE_URL="$OPENSANDBOX_DOMAIN"
-fi
-export OPENSANDBOX_API_KEY="${OPENSANDBOX_API_KEY:-}"
+export OSWORLD_RECIPE="${OSWORLD_RECIPE:-molt-b8k8-checkpoint}"
+export OSWORLD_SANDBOX_PROVIDER="${OSWORLD_SANDBOX_PROVIDER:-opensandbox}"
+case "$OSWORLD_RECIPE" in
+  molt-b8k8-checkpoint) ;;
+  flashreinforce-b32n4)
+    if [[ "$OSWORLD_SANDBOX_PROVIDER" != "agentenv" ]]; then
+      echo "$OSWORLD_RECIPE requires OSWORLD_SANDBOX_PROVIDER=agentenv" >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "Unsupported OSWORLD_RECIPE: $OSWORLD_RECIPE" >&2
+    exit 2
+    ;;
+esac
 
 required_vars=(
   CONTAINER
   NANO_OMNI_MODEL_NAME
   NANO_OMNI_CHAT_TEMPLATE
-  OPENSANDBOX_BASE_URL
   SLURM_ACCOUNT
   SLURM_PARTITION
   OSWORLD_RESULTS_ROOT
 )
+case "$OSWORLD_SANDBOX_PROVIDER" in
+  opensandbox)
+    if [[ -z "${OPENSANDBOX_BASE_URL:-}" && -n "${OPENSANDBOX_DOMAIN:-}" ]]; then
+      export OPENSANDBOX_BASE_URL="$OPENSANDBOX_DOMAIN"
+    fi
+    export OPENSANDBOX_API_KEY="${OPENSANDBOX_API_KEY:-}"
+    required_vars+=(OPENSANDBOX_BASE_URL)
+    ;;
+  agentenv)
+    export AGENTENV_URL="${AGENTENV_URL:-${AGENTENV_ENDPOINT:-}}"
+    required_vars+=(AGENTENV_URL AGENTENV_API_KEY AGENTENV_TEMPLATE)
+    # Gym reads the weights as a mapping; accept the name:weight,... form too.
+    if [[ -n "${AGENTENV_TEMPLATE_WEIGHTS:-}" && "$AGENTENV_TEMPLATE_WEIGHTS" != \{* ]]; then
+      AGENTENV_TEMPLATE_WEIGHTS="${AGENTENV_TEMPLATE_WEIGHTS//:/: }"
+      export AGENTENV_TEMPLATE_WEIGHTS="{${AGENTENV_TEMPLATE_WEIGHTS//,/, }}"
+    fi
+    ;;
+  *)
+    echo "OSWORLD_SANDBOX_PROVIDER must be opensandbox or agentenv" >&2
+    exit 2
+    ;;
+esac
+if [[ "$OSWORLD_RECIPE" == "flashreinforce-b32n4" ]]; then
+  required_vars+=(
+    OSWORLD_RLVR_FUNCTIONS_ROOT
+    OSWORLD_CANONICAL_HARNESS_ROOT
+    OSWORLD_CANONICAL_AGENT_SHA256
+    OSWORLD_CANONICAL_FEEDBACK_SHA256
+    OSWORLD_EVALUATOR_TOOLS_ROOT
+  )
+fi
 if [[ "$OSWORLD_DRIVER_SCRIPT" == "eval_driver.sh" ]]; then
   case "${OSWORLD_EVAL_MODE:-}" in
     sft|checkpoint) ;;
@@ -122,6 +163,33 @@ fi
 if [[ "$OSWORLD_DRIVER_SCRIPT" == "eval_driver.sh" && "${OSWORLD_EVAL_MODE:-}" == "checkpoint" ]]; then
   export OSWORLD_EVAL_CHECKPOINT_DIR
   OSWORLD_EVAL_CHECKPOINT_DIR="$(canonical_dir "$OSWORLD_EVAL_CHECKPOINT_DIR")"
+fi
+if [[ -n "${AGENTENV_TLS_CA:-}" ]]; then
+  AGENTENV_TLS_CA="$(canonical_file "$AGENTENV_TLS_CA")"
+fi
+if [[ -n "${OSWORLD_RLVR_FUNCTIONS_ROOT:-}" ]]; then
+  export OSWORLD_RLVR_FUNCTIONS_ROOT
+  OSWORLD_RLVR_FUNCTIONS_ROOT="$(canonical_dir "$OSWORLD_RLVR_FUNCTIONS_ROOT")"
+fi
+if [[ -n "${OSWORLD_CANONICAL_HARNESS_ROOT:-}" ]]; then
+  export OSWORLD_CANONICAL_HARNESS_ROOT OSWORLD_CANONICAL_AGENT_SHA256 OSWORLD_CANONICAL_FEEDBACK_SHA256
+  OSWORLD_CANONICAL_HARNESS_ROOT="$(canonical_dir "$OSWORLD_CANONICAL_HARNESS_ROOT")"
+  : "${OSWORLD_CANONICAL_AGENT_SHA256:?}"
+  : "${OSWORLD_CANONICAL_FEEDBACK_SHA256:?}"
+  printf '%s  %s\n' "$OSWORLD_CANONICAL_AGENT_SHA256" \
+    "$OSWORLD_CANONICAL_HARNESS_ROOT/mm_agents/nvidia/nemotron_agent.py" | sha256sum --check --quiet
+  printf '%s  %s\n' "$OSWORLD_CANONICAL_FEEDBACK_SHA256" \
+    "$OSWORLD_CANONICAL_HARNESS_ROOT/desktop_env/execution_feedback.py" | sha256sum --check --quiet
+fi
+if [[ -n "${OSWORLD_EVALUATOR_TOOLS_ROOT:-}" ]]; then
+  export OSWORLD_EVALUATOR_TOOLS_ROOT
+  OSWORLD_EVALUATOR_TOOLS_ROOT="$(canonical_dir "$OSWORLD_EVALUATOR_TOOLS_ROOT")"
+  for tool in ffprobe ffmpeg gimp-console pdftotext pdftoppm; do
+    test -x "$OSWORLD_EVALUATOR_TOOLS_ROOT/usr/bin/$tool"
+  done
+  test -x "$OSWORLD_EVALUATOR_TOOLS_ROOT/usr/lib/libreoffice/program/soffice"
+  test -d "$OSWORLD_EVALUATOR_TOOLS_ROOT/runtime-libs"
+  test -d "$OSWORLD_EVALUATOR_TOOLS_ROOT/etc/libreoffice"
 fi
 
 test -r "$NANO_OMNI_MODEL_NAME/config.json"
@@ -187,6 +255,33 @@ export OSWORLD_CACHE_ROOT="$(readlink -f "$cache_root")"
 export OSWORLD_RUNTIME_LIB_DIR="$(readlink -f "$runtime_lib_dir")"
 export OSWORLD_GYM_VENV_DIR="$(readlink -f "$gym_venv_dir")"
 
+# Rollouts evaluate in Ray tasks, which inherit the job environment rather than
+# runtime_env.sh, so settings they need are exported (or mounted) here.
+if [[ -n "${OSWORLD_EVALUATOR_TOOLS_ROOT:-}" ]]; then
+  export OSWORLD_EVALUATOR_PYTHON="${OSWORLD_EVALUATOR_PYTHON:-$OSWORLD_GYM_VENV_DIR/responses_api_agents/osworld_agent/.venv/bin/python}"
+fi
+# An AgentENV deployment behind an internal CA: trust it in addition to the
+# public roots, for the E2B SDK (SSL_CERT_FILE) and the guest forwarders
+# (REQUESTS_CA_BUNDLE), without breaking other HTTPS clients.
+if [[ "$OSWORLD_SANDBOX_PROVIDER" == "agentenv" && -n "${AGENTENV_TLS_CA:-}" ]]; then
+  public_roots=""
+  for candidate in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
+    if [[ -s "$candidate" ]]; then
+      public_roots="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$public_roots" ]]; then
+    echo "No public CA bundle found to combine with AGENTENV_TLS_CA" >&2
+    exit 2
+  fi
+  ca_bundle="$series_root/agentenv-ca-bundle.pem"
+  (umask 077 && cat "$public_roots" "$AGENTENV_TLS_CA" > "$ca_bundle.tmp")
+  mv -f "$ca_bundle.tmp" "$ca_bundle"
+  export SSL_CERT_FILE="$ca_bundle"
+  export REQUESTS_CA_BUNDLE="$ca_bundle"
+fi
+
 copy_runtime_lib() {
   local library="$1"
   local destination="$OSWORLD_RUNTIME_LIB_DIR/$library"
@@ -224,7 +319,7 @@ for library in libopenblas.so.0 libgfortran.so.5 libquadmath.so.0 libgcc_s.so.1;
   copy_runtime_lib "$library"
 done
 
-EXPECTED_CONTAINER_SHA256="1b4edcdeac017210e6abe25885372e025ac111c45aeb038bda334659436eb74e"
+EXPECTED_CONTAINER_SHA256="1b4edcdeac017210e6abe25885372e025ac111c45aeb038bda334659436eb74e"  # pragma: allowlist secret
 if [[ "${OSWORLD_VERIFY_CONTAINER_SHA256:-1}" == "1" ]]; then
   actual_container_sha256="$(sha256sum "$CONTAINER" | awk '{print $1}')"
   if [[ "$actual_container_sha256" != "$EXPECTED_CONTAINER_SHA256" ]]; then
@@ -284,6 +379,44 @@ add_identity_mount "$OSWORLD_CHECKPOINT_DIR"
 add_identity_mount "$OSWORLD_CACHE_ROOT"
 add_identity_mount "$OSWORLD_RUNTIME_LIB_DIR"
 add_identity_mount "$OSWORLD_GYM_VENV_DIR"
+if [[ -n "${OSWORLD_RLVR_FUNCTIONS_ROOT:-}" ]]; then
+  add_identity_mount "$OSWORLD_RLVR_FUNCTIONS_ROOT"
+fi
+if [[ -n "${OSWORLD_CANONICAL_HARNESS_ROOT:-}" ]]; then
+  add_identity_mount "$OSWORLD_CANONICAL_HARNESS_ROOT"
+fi
+if [[ -n "${OSWORLD_EVALUATOR_TOOLS_ROOT:-}" ]]; then
+  add_identity_mount "$OSWORLD_EVALUATOR_TOOLS_ROOT"
+  for path in \
+    usr/lib/libreoffice \
+    etc/libreoffice \
+    var/lib/libreoffice \
+    var/spool/libreoffice \
+    etc/fonts \
+    usr/share/fonts \
+    usr/share/fontconfig \
+    usr/share/X11 \
+    etc/X11 \
+    usr/lib/thunderbird; do
+    if [[ -d "$OSWORLD_EVALUATOR_TOOLS_ROOT/$path" ]]; then
+      mount_specs+=("$OSWORLD_EVALUATOR_TOOLS_ROOT/$path:/$path")
+    fi
+  done
+  # Ray workers keep the image's PATH, so each wrapper is mounted under its
+  # tool name in /usr/local/bin; evaluators also call /usr/bin/python3 and
+  # /usr/bin/gimp-console directly.
+  evaluator_bin="$SCRIPT_DIR/evaluator_tools/bin"
+  for wrapper in "$evaluator_bin"/*; do
+    tool="$(basename "$wrapper")"
+    if [[ "$tool" != python3 ]]; then
+      mount_specs+=("$(readlink -f "$wrapper"):/usr/local/bin/$tool")
+    fi
+  done
+  mount_specs+=(
+    "$evaluator_bin/python3:/usr/bin/python3"
+    "$evaluator_bin/evaluator-tool:/usr/bin/gimp-console"
+  )
+fi
 if [[ -n "${OSWORLD_UV_BIN_DIR:-}" ]]; then
   export OSWORLD_UV_BIN_DIR="$(readlink -f "$OSWORLD_UV_BIN_DIR")"
   add_identity_mount "$OSWORLD_UV_BIN_DIR"

@@ -21,6 +21,9 @@ NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_GROUP_ID_KEY = "_ng_group_id"
 NEMO_GYM_GROUP_ATTEMPT_KEY = "_ng_group_attempt"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
+# Rollout indices dispatched together in one group attempt. A fork-capable
+# environment initializes the task once and clones exactly these siblings.
+NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY = "_ng_active_generation_indices"
 # Names owned by Gym (MODEL_SAMPLING_KEY_NAME, MODEL_SAMPLING_HEADER, MODEL_SAMPLING_NULL), copied because their
 # readers cannot import nemo_gym: the driver and vLLM-only actors set the row key, and the vLLM chat route also
 # serves workers built without nemo_gym (the ModelOpt workers). A test checks they still match.

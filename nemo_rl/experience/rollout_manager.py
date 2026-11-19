@@ -68,6 +68,7 @@ from nemo_rl.experience.failures import (
     is_terminal_gym_episode_failure,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY,
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_MODEL_SAMPLING_KEY,
@@ -1390,6 +1391,8 @@ class AsyncNemoGymRolloutImpl:
             row[NEMO_GYM_GROUP_ID_KEY] = group_id
             row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempt
             row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
+            # Recovery may dispatch only a subset of the group.
+            row[NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY] = list(indices)
             if rollout_ids is not None:
                 # Opaque run-body carrier (Gym's _ng_rollout_id key): the agent
                 # derives the id from the run body and stamps /ng-rollout/<id>

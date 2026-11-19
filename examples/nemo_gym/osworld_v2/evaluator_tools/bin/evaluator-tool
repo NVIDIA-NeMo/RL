@@ -1,0 +1,23 @@
+#!/bin/bash
+set -euo pipefail
+
+: "${OSWORLD_EVALUATOR_TOOLS_ROOT:?}"
+tool="${0##*/}"
+binary="$OSWORLD_EVALUATOR_TOOLS_ROOT/usr/bin/$tool"
+test -x "$binary"
+test -d "$OSWORLD_EVALUATOR_TOOLS_ROOT/runtime-libs"
+
+evaluator_ld_library_path="$OSWORLD_EVALUATOR_TOOLS_ROOT/runtime-libs"
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+  evaluator_ld_library_path="$evaluator_ld_library_path:$LD_LIBRARY_PATH"
+fi
+
+export GIMP2_DATADIR="${GIMP2_DATADIR:-$OSWORLD_EVALUATOR_TOOLS_ROOT/usr/share/gimp/2.0}"
+export GIMP2_LOCALEDIR="${GIMP2_LOCALEDIR:-$OSWORLD_EVALUATOR_TOOLS_ROOT/usr/share/locale}"
+export GIMP2_PLUGINDIR="${GIMP2_PLUGINDIR:-$OSWORLD_EVALUATOR_TOOLS_ROOT/usr/lib/x86_64-linux-gnu/gimp/2.0}"
+export BABL_PATH="${BABL_PATH:-$OSWORLD_EVALUATOR_TOOLS_ROOT/usr/lib/x86_64-linux-gnu/babl-0.1}"
+export GEGL_PATH="${GEGL_PATH:-$OSWORLD_EVALUATOR_TOOLS_ROOT/usr/lib/x86_64-linux-gnu/gegl-0.4}"
+export VLC_PLUGIN_PATH="${VLC_PLUGIN_PATH:-$OSWORLD_EVALUATOR_TOOLS_ROOT/usr/lib/x86_64-linux-gnu/vlc/plugins}"
+export XDG_DATA_DIRS="$OSWORLD_EVALUATOR_TOOLS_ROOT/usr/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+
+exec env LD_LIBRARY_PATH="$evaluator_ld_library_path" "$binary" "$@"

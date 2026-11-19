@@ -53,6 +53,7 @@ from nemo_rl.experience.failures import (
     GymTerminalEpisodeFailure,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY,
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_MODEL_SAMPLING_KEY,
@@ -1668,6 +1669,12 @@ def test_nemo_gym_attempt_ids_are_fresh_and_resume_from_counter(
     assert [row[NEMO_GYM_TASK_INDEX_KEY] for row in dispatched[-1]] == [2, 2]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in dispatched[-1]] == [1, 2]
     assert [row["_ng_rollout_id"] for row in dispatched[-1]] == ["r1", "r2"]
+    assert [row[NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY] for row in dispatched[0]] == [
+        [0, 1, 2]
+    ] * 3
+    assert [row[NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY] for row in dispatched[-1]] == [
+        [1, 2]
+    ] * 2
     assert all(
         row[NEMO_GYM_GROUP_ID_KEY] == "stable-group"
         and row[NEMO_GYM_GROUP_ATTEMPT_KEY] == 2

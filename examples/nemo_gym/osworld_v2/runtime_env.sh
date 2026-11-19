@@ -7,10 +7,37 @@ set -euo pipefail
 : "${OSWORLD_CHECKPOINT_DIR:?}"
 : "${NANO_OMNI_MODEL_NAME:?}"
 : "${NANO_OMNI_CHAT_TEMPLATE:?}"
-if [[ -z "${OPENSANDBOX_BASE_URL:-}" && -n "${OPENSANDBOX_DOMAIN:-}" ]]; then
-  export OPENSANDBOX_BASE_URL="$OPENSANDBOX_DOMAIN"
-fi
-: "${OPENSANDBOX_BASE_URL:?}"
+# Each recipe is a launch_osworld_v2_cc.py flag of the same name.
+case "${OSWORLD_RECIPE:=molt-b8k8-checkpoint}" in
+  molt-b8k8-checkpoint|flashreinforce-b32n4) ;;
+  *)
+    echo "Unsupported OSWORLD_RECIPE: $OSWORLD_RECIPE" >&2
+    exit 2
+    ;;
+esac
+export OSWORLD_RECIPE
+case "${OSWORLD_SANDBOX_PROVIDER:=opensandbox}" in
+  opensandbox)
+    if [[ -z "${OPENSANDBOX_BASE_URL:-}" && -n "${OPENSANDBOX_DOMAIN:-}" ]]; then
+      export OPENSANDBOX_BASE_URL="$OPENSANDBOX_DOMAIN"
+    fi
+    : "${OPENSANDBOX_BASE_URL:?}"
+    ;;
+  agentenv)
+    # submit.sh derives these so that Ray workers inherit them.
+    : "${AGENTENV_URL:?}"
+    : "${AGENTENV_API_KEY:?}"
+    : "${AGENTENV_TEMPLATE:?}"
+    if [[ -n "${AGENTENV_TLS_CA:-}" ]]; then
+      test -r "${SSL_CERT_FILE:?}"
+    fi
+    ;;
+  *)
+    echo "OSWORLD_SANDBOX_PROVIDER must be opensandbox or agentenv" >&2
+    exit 2
+    ;;
+esac
+export OSWORLD_SANDBOX_PROVIDER
 if [[ -n "${OSWORLD_EVAL_MODE:-}" ]]; then
   : "${OSWORLD_GRPO_VAL_DATA:?}"
 else
@@ -74,6 +101,26 @@ export NEMO_GYM_EXTRA_ROOTS="$OSWORLD_GYM_ROOT:$OSWORLD_RL_ROOT"
 export NRL_FORCE_REBUILD_VENVS=false
 export NRL_IGNORE_VERSION_MISMATCH=1
 export NEMO_LENS_ENABLED=0
+
+if [[ -n "${OSWORLD_RLVR_FUNCTIONS_ROOT:-}" ]]; then
+  test -d "$OSWORLD_RLVR_FUNCTIONS_ROOT"
+  export OSWORLD_RLVR_FUNCTIONS_ROOT
+fi
+if [[ -n "${OSWORLD_CANONICAL_HARNESS_ROOT:-}" ]]; then
+  : "${OSWORLD_CANONICAL_AGENT_SHA256:?}"
+  : "${OSWORLD_CANONICAL_FEEDBACK_SHA256:?}"
+  test -r "$OSWORLD_CANONICAL_HARNESS_ROOT/mm_agents/nvidia/nemotron_agent.py"
+  test -r "$OSWORLD_CANONICAL_HARNESS_ROOT/desktop_env/execution_feedback.py"
+  export OSWORLD_CANONICAL_HARNESS_ROOT OSWORLD_CANONICAL_AGENT_SHA256 OSWORLD_CANONICAL_FEEDBACK_SHA256
+fi
+# submit.sh mounts the evaluator tool rootfs and puts its wrappers on PATH.
+if [[ -n "${OSWORLD_EVALUATOR_TOOLS_ROOT:-}" ]]; then
+  test -x "$OSWORLD_EVALUATOR_TOOLS_ROOT/usr/bin/ffprobe"
+  test -x "$OSWORLD_EVALUATOR_TOOLS_ROOT/usr/bin/pdftotext"
+  test -d "$OSWORLD_EVALUATOR_TOOLS_ROOT/runtime-libs"
+  test -x /usr/lib/libreoffice/program/soffice
+  : "${OSWORLD_EVALUATOR_PYTHON:?}"
+fi
 
 export NRL_REFIT_BUFFER_MEMORY_RATIO="${NRL_REFIT_BUFFER_MEMORY_RATIO:-0.005}"
 export NRL_REFIT_NUM_BUFFERS="${NRL_REFIT_NUM_BUFFERS:-1}"

@@ -180,6 +180,15 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # If False (default), correction is applied at the token level as in the
     # original GRPO paper.
     sequence_level_importance_ratios: bool = False
+    # Bounds on the generation-to-trainer IS weight itself. A very large upper
+    # bound (for example 1e9) keeps the weight effectively untruncated while
+    # mapping non-finite weights to the bound instead of zero.
+    actor_importance_sampling_ratio_min: float = Field(
+        default=0.0, ge=0, allow_inf_nan=False
+    )
+    actor_importance_sampling_ratio_max: Optional[float] = Field(
+        default=None, gt=0, allow_inf_nan=False
+    )
 
     # --- Clipping ---
     ratio_clip_min: float = 0.2
@@ -207,10 +216,18 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     #   "icepop"       – zero out tokens with IS weight outside [min, max]
     #   "adaptive-ppo-clip" – advantage-aware token filtering with an
     #                         entropy-adaptive upper bound
-    #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
+    #   "seq-mask-tis" – zero out sequences by the ``is_correction_gating``
+    #                    statistic, non-truncated token IS correction
     truncated_importance_sampling_type: Optional[
         Literal["tis", "icepop", "adaptive-ppo-clip", "seq-mask-tis"]
     ] = None
+    # Per-sequence statistic gated by seq-mask-tis:
+    #   "ratio"     – geometric-mean IS ratio, kept inside [min, max]
+    #   "binary_kl" – mean sampled-token Bernoulli KL(rollout || trainer)
+    #   "tv"        – mean sampled-token |p_rollout - p_trainer|
+    # The divergences are kept when <= truncated_importance_sampling_ratio and
+    # require truncated_importance_sampling_ratio_min <= 0.
+    is_correction_gating: Literal["ratio", "binary_kl", "tv"] = "ratio"
     truncated_importance_sampling_ratio: Optional[float] = None
     # Lower bound for TIS clipping, or ICE-POP / adaptive-ppo-clip /
     # seq-mask-tis filtering
@@ -420,6 +437,22 @@ class ClippedPGLossFn(LossFunction):
 
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
+        self.actor_importance_sampling_ratio_min = (
+            cfg.actor_importance_sampling_ratio_min
+        )
+        self.actor_importance_sampling_ratio_max = (
+            cfg.actor_importance_sampling_ratio_max
+        )
+        if (
+            self.actor_importance_sampling_ratio_max is not None
+            and self.actor_importance_sampling_ratio_min
+            > self.actor_importance_sampling_ratio_max
+        ):
+            raise ValueError(
+                "actor_importance_sampling_ratio_min cannot exceed "
+                "actor_importance_sampling_ratio_max"
+            )
+        self.is_correction_gating = cfg.is_correction_gating
         self.positive_example_nll_weight = cfg.positive_example_nll_weight
         self.metrics_level = cfg.metrics_level
         self.enable_torch_compile = cfg.enable_torch_compile
@@ -510,6 +543,19 @@ class ClippedPGLossFn(LossFunction):
                 assert not self.sequence_level_importance_ratios, (
                     "adaptive-ppo-clip uses token-level advantage-aware filtering "
                     "and is incompatible with sequence_level_importance_ratios=True"
+                )
+
+        if self.is_correction_gating != "ratio":
+            if self.truncated_importance_sampling_type != "seq-mask-tis":
+                raise ValueError(
+                    f"is_correction_gating={self.is_correction_gating!r} requires "
+                    "truncated_importance_sampling_type='seq-mask-tis'"
+                )
+            if self.truncated_importance_sampling_ratio_min > 0:
+                raise ValueError(
+                    f"is_correction_gating={self.is_correction_gating!r} gates on an "
+                    "upper divergence bound; set "
+                    "truncated_importance_sampling_ratio_min <= 0"
                 )
 
         # adaptive-ppo-clip controller state. The driver advances it once per
@@ -913,9 +959,6 @@ class ClippedPGLossFn(LossFunction):
             # importance weight w_i = exp(Σ_t (log π_actor − log π_behaviour))
             seq_lp_diff = ((prev_logprobs - generation_logprobs) * mask).sum(dim=-1)
             actor_importance_weights = torch.exp(seq_lp_diff).detach()
-            actor_importance_weights = torch.nan_to_num(
-                actor_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
-            )
             # Broadcast to token dimension so we can reuse existing reduction
             actor_importance_weights_expanded = actor_importance_weights.unsqueeze(-1)
         else:
@@ -923,9 +966,15 @@ class ClippedPGLossFn(LossFunction):
             actor_importance_weights_expanded = torch.exp(
                 prev_logprobs - generation_logprobs
             )
+        if actor_importance_weights_expanded is not None:
+            is_min = self.actor_importance_sampling_ratio_min
+            is_max = self.actor_importance_sampling_ratio_max
             actor_importance_weights_expanded = torch.nan_to_num(
-                actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
-            )
+                actor_importance_weights_expanded,
+                nan=is_min,
+                posinf=is_max if is_max is not None else 0.0,
+                neginf=is_min,
+            ).clamp(min=is_min, max=is_max)
         # ---- Truncated Importance Sampling ----
         # "tis"          – clamp IS weights to [min, max], where min defaults to 0
         # "icepop"       – zero out tokens whose IS weight ∉ [min, max]   (ref bounds: 0.5–5)
@@ -934,9 +983,10 @@ class ClippedPGLossFn(LossFunction):
         #                  whose IS weight > max + k (k adapts to entropy), and
         #                  every token whose IS weight exceeds the outer bound
         #   Paper: https://microsoft.ai/pdf/mai-thinking-1.pdf
-        # "seq-mask-tis" – zero out entire sequences whose geometric-mean
-        #                  IS ratio ∉ [min, max]; retained sequences keep
-        #                  raw (non-truncated) token-level IS weights      (ref bounds: 0.999–1.002)
+        # "seq-mask-tis" – zero out entire sequences whose is_correction_gating
+        #                  statistic ∉ [min, max]; retained sequences keep
+        #                  raw (non-truncated) token-level IS weights
+        #                  (ref bounds for the geometric-mean ratio: 0.999–1.002)
         #   Blog: https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
         # is_oob_ratio: fraction of tokens (tis/icepop/adaptive-ppo-clip) or sequences (seq-mask-tis)
         # whose importance weight falls outside the truncation bounds. Each microbatch
@@ -1014,16 +1064,35 @@ class ClippedPGLossFn(LossFunction):
                     posinf=30.0,
                     neginf=-30.0,
                 ).clamp(min=-30.0, max=30.0)
-                seq_log_is_ratio_mean = masked_mean(
-                    log_is_ratio, token_mask, dim=-1
-                )  # [B]
-                seq_geomean_is_ratio = torch.exp(seq_log_is_ratio_mean).detach()  # [B]
-                seq_kept_mask = (
-                    (
-                        seq_geomean_is_ratio
-                        >= self.truncated_importance_sampling_ratio_min
+                if self.is_correction_gating == "ratio":
+                    seq_gate_stat = torch.exp(
+                        masked_mean(log_is_ratio, token_mask, dim=-1)
+                    ).detach()  # [B]
+                else:
+                    rollout_prob = generation_logprobs.float().exp()
+                    train_prob = prev_logprobs.float().exp()
+                    if self.is_correction_gating == "binary_kl":
+                        rollout_prob = rollout_prob.clamp(1e-6, 1 - 1e-6)
+                        train_prob = train_prob.clamp(1e-6, 1 - 1e-6)
+                        token_gate_stat = rollout_prob * (
+                            rollout_prob.log() - train_prob.log()
+                        ) + (1 - rollout_prob) * (
+                            (1 - rollout_prob).log() - (1 - train_prob).log()
+                        )
+                    else:
+                        token_gate_stat = (rollout_prob - train_prob).abs()
+                    # A non-finite divergence on a valid token drops the row.
+                    token_gate_stat = torch.where(
+                        token_mask.bool(),
+                        torch.nan_to_num(token_gate_stat, nan=torch.inf),
+                        torch.zeros_like(token_gate_stat),
                     )
-                    & (seq_geomean_is_ratio <= self.truncated_importance_sampling_ratio)
+                    seq_gate_stat = masked_mean(
+                        token_gate_stat, token_mask, dim=-1
+                    ).detach()  # [B]
+                seq_kept_mask = (
+                    (seq_gate_stat >= self.truncated_importance_sampling_ratio_min)
+                    & (seq_gate_stat <= self.truncated_importance_sampling_ratio)
                 ).float()  # [B]
                 _is_filter_metrics = {
                     "is_oob_ratio": masked_mean(

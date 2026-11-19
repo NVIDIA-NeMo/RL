@@ -1040,18 +1040,22 @@ class MasterConfig(BaseModel, extra="allow"):
 def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
     """Keep the initial Forest objective identical at startup and before fanout.
 
-    Forest supports standard token-level GRPO, or ``reinforce_baseline`` with
-    token-level IS correction and a per-segment ``seq-mask-tis`` gate.
+    Forest supports standard token-level GRPO, ``reinforce_baseline`` with
+    token-level IS correction and a per-segment geometric-ratio
+    ``seq-mask-tis`` gate, or either estimator with a per-segment divergence
+    gate (``is_correction_gating`` binary_kl/tv). The divergence-gated
+    objective may also use the sequence-level loss.
     """
     reinforce_baseline = grpo.adv_estimator.name == "reinforce_baseline"
     seq_mask_tis = loss.truncated_importance_sampling_type == "seq-mask-tis"
+    divergence_gate = seq_mask_tis and loss.is_correction_gating != "ratio"
+    gated = reinforce_baseline or divergence_gate
     unsupported = {
         "grpo.adv_estimator.name": grpo.adv_estimator.name
         not in ("grpo", "reinforce_baseline"),
-        "loss_fn.token_level_loss": not loss.token_level_loss,
+        "loss_fn.token_level_loss": not loss.token_level_loss and not divergence_gate,
         "loss_fn.sequence_level_importance_ratios": loss.sequence_level_importance_ratios,
-        "loss_fn.truncated_importance_sampling_type": seq_mask_tis
-        != reinforce_baseline,
+        "loss_fn.truncated_importance_sampling_type": seq_mask_tis != gated,
         "loss_fn.use_kl_in_reward": loss.use_kl_in_reward,
         "loss_fn.positive_example_nll_weight": loss.positive_example_nll_weight != 0,
         # The loss filters physical rows; forest training masks whole owners.
@@ -1064,15 +1068,19 @@ def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> No
         "grpo.malformed_thinking_advantage": grpo.malformed_thinking_advantage
         is not None,
     }
-    if reinforce_baseline:
+    if gated:
         ratio_min = loss.truncated_importance_sampling_ratio_min
         ratio_max = loss.truncated_importance_sampling_ratio
+        if ratio_min is None or ratio_max is None:
+            bad_gate_bounds = True
+        elif divergence_gate:
+            bad_gate_bounds = not ratio_min <= 0 < ratio_max
+        else:
+            bad_gate_bounds = not 0 < ratio_min <= ratio_max
         unsupported |= {
             "grpo.masked_reward_policy": grpo.masked_reward_policy != "include",
             "loss_fn.use_importance_sampling_correction": not loss.use_importance_sampling_correction,
-            "loss_fn.truncated_importance_sampling_ratio_min/ratio": ratio_min is None
-            or ratio_max is None
-            or not 0 < ratio_min <= ratio_max,
+            "loss_fn.truncated_importance_sampling_ratio_min/ratio": bad_gate_bounds,
             "loss_fn.force_on_policy_ratio": not loss.force_on_policy_ratio,
             "loss_fn.disable_ppo_ratio": loss.disable_ppo_ratio,
             "loss_fn.use_cispo": loss.use_cispo,
@@ -1082,8 +1090,9 @@ def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> No
     if bad:
         raise ValueError(
             "Forest training (token_capture.forest_training) requires standard "
-            "token-level GRPO, or reinforce_baseline with token-level IS correction "
-            f"and seq-mask-tis; unsupported settings: {', '.join(bad)}"
+            "token-level GRPO, reinforce_baseline with token-level IS correction "
+            "and seq-mask-tis, or GRPO/reinforce_baseline with a divergence-gated "
+            f"seq-mask-tis; unsupported settings: {', '.join(bad)}"
         )
 
 

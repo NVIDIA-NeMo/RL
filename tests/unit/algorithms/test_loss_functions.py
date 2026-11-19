@@ -1884,6 +1884,104 @@ def test_seq_mask_tis_finite_gate_is_independent_per_physical_row():
     assert torch.isfinite(loss)
 
 
+@pytest.mark.parametrize(
+    "gating,expected_loss,expected_oob",
+    [
+        # Row 1 has Bernoulli KL 0.0201/3 <= 0.01 but TV 0.1/3 > 0.01.
+        ("binary_kl", -6.25 / 9, 1 / 3),
+        ("tv", -3.0 / 9, 2 / 3),
+    ],
+)
+def test_seq_mask_tis_divergence_gate(gating, expected_loss, expected_oob):
+    data, batch_size, seq_len, _ = _setup_clipped_pg_test_data(
+        batch_size=3, device="cpu"
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            use_importance_sampling_correction=True,
+            truncated_importance_sampling_type="seq-mask-tis",
+            is_correction_gating=gating,
+            truncated_importance_sampling_ratio_min=0.0,
+            truncated_importance_sampling_ratio=0.01,
+            force_on_policy_ratio=True,
+        )
+    )
+    log = lambda p: torch.log(torch.tensor(p)).item()  # noqa: E731
+    data["advantages"][:, 1:] = 1.0
+    data["generation_logprobs"][:, 1:] = torch.tensor(
+        [
+            [log(0.5), log(0.5), log(0.5)],
+            [log(0.4), log(0.5), log(0.5)],
+            [log(0.1), log(0.5), log(0.5)],
+        ]
+    )
+
+    loss, metrics = loss_fn(
+        next_token_logprobs=torch.full((batch_size, seq_len - 1), log(0.5)),
+        data=data,
+        global_valid_seqs=torch.tensor(float(batch_size)),
+        global_valid_toks=torch.tensor(float(batch_size * (seq_len - 1))),
+    )
+
+    # Kept rows keep raw token IS: row 0 is [1, 1, 1], row 1 is [1.25, 1, 1].
+    torch.testing.assert_close(loss, torch.tensor(expected_loss))
+    assert metrics["is_oob_ratio"] == pytest.approx(expected_oob)
+
+
+def test_seq_mask_tis_divergence_gate_requires_nonpositive_lower_bound():
+    with pytest.raises(ValueError, match="ratio_min <= 0"):
+        ClippedPGLossFn(
+            ClippedPGLossConfig(
+                use_importance_sampling_correction=True,
+                truncated_importance_sampling_type="seq-mask-tis",
+                is_correction_gating="binary_kl",
+                truncated_importance_sampling_ratio_min=0.001,
+                truncated_importance_sampling_ratio=0.01,
+            )
+        )
+    with pytest.raises(ValueError, match="requires truncated_importance_sampling"):
+        ClippedPGLossFn(
+            ClippedPGLossConfig(
+                use_importance_sampling_correction=True,
+                truncated_importance_sampling_type="icepop",
+                is_correction_gating="tv",
+                truncated_importance_sampling_ratio_min=0.5,
+                truncated_importance_sampling_ratio=5.0,
+            )
+        )
+
+
+def test_actor_importance_sampling_ratio_bounds():
+    data, batch_size, seq_len, _ = _setup_clipped_pg_test_data(
+        batch_size=2, device="cpu"
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            use_importance_sampling_correction=True,
+            actor_importance_sampling_ratio_min=0.5,
+            actor_importance_sampling_ratio_max=2.0,
+            force_on_policy_ratio=True,
+        )
+    )
+    log4 = torch.log(torch.tensor(4.0)).item()
+    data["advantages"][:, 1:] = 1.0
+    data["generation_logprobs"][:, 1:] = torch.tensor(
+        [[-log4, log4, 0.0], [float("nan"), float("inf"), float("-inf")]]
+    )
+
+    loss, _ = loss_fn(
+        next_token_logprobs=torch.zeros((batch_size, seq_len - 1)),
+        data=data,
+        global_valid_seqs=torch.tensor(float(batch_size)),
+        global_valid_toks=torch.tensor(float(batch_size * (seq_len - 1))),
+    )
+
+    # Weights clamp to [2, 0.5, 1]; NaN and 0 map to the minimum, +inf to the maximum.
+    torch.testing.assert_close(loss, torch.tensor(-(3.5 + 3.0) / 6))
+
+
 def test_masked_mean_all_zeros():
     """Test masked_mean function with all zeros mask."""
     values = torch.tensor([1.0, 2.0, 3.0, 4.0])
