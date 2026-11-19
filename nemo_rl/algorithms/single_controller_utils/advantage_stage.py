@@ -642,9 +642,6 @@ class AdvantageComputer:
             )
             if cfg.is_ppo:
                 advantages, returns = result
-                # mask carries dataset loss weights, which GAE and the loss
-                # already apply; only zero the tokens outside it.
-                advantages = torch.where(mask.bool(), advantages, 0.0)
             else:
                 advantages = result
         else:
