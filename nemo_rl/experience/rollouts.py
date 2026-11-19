@@ -77,6 +77,7 @@ from nemo_rl.environments.nemotron_utils import (
 from nemo_rl.experience.dynamic_sampling import mask_sample_flagged
 from nemo_rl.experience.failures import GymRowFailure
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY,
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_MODEL_SAMPLING_KEY,
@@ -2512,6 +2513,9 @@ def _prepare_nemo_gym_rows(
                 f"{group_ids[group_index]}-g{rollout_index}-t{group_attempts[group_index]}",
             )
         row[NEMO_GYM_ROLLOUT_INDEX_KEY] = rollout_index
+        row.setdefault(
+            NEMO_GYM_ACTIVE_GENERATION_INDICES_KEY, list(range(num_generations))
+        )
 
 
 def _bucket_nemo_gym_rows_by_instance(
