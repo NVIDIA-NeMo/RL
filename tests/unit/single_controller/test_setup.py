@@ -637,7 +637,7 @@ def test_build_clusters_sizes_megatron_dynamo_replicas_from_the_engine_layouts(
         sc_setup_mod, "RayVirtualCluster", lambda **kwargs: SimpleNamespace(**kwargs)
     )
 
-    _, inference_cluster, _ = sc_setup_mod._build_clusters(master_config)
+    _, inference_cluster, _, _ = sc_setup_mod._build_clusters(master_config)
 
     assert segment_calls == [("training", 1, 2), ("inference", segment_size, 2)]
     assert inference_cluster.segment_size == segment_size
