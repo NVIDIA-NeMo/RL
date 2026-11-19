@@ -170,7 +170,6 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
 from nemo_rl.data_plane.observability import (
-    backend_health_metrics,
     log_step_metrics,
     metrics_never_fail_the_step,
 )
@@ -1744,7 +1743,7 @@ class SingleControllerActor:
             await self._log_data_plane_metrics_impl(total_step_time)
 
     async def _log_data_plane_metrics_impl(self, total_step_time: float) -> None:
-        """Log this step's data-plane cost.
+        """Log this step's data-plane cost. No-op unless observability is enabled.
 
         This client's share depends on the configuration: it writes the rollout
         rows unless token capture moves that to the finalizer actors, and it
@@ -1754,15 +1753,18 @@ class SingleControllerActor:
         cluster view. The fan-out blocks on ``ray.get``, so it runs off the
         event loop.
 
-        nixl's unit metrics (retired memory, SSD spills) and Mooncake's master
-        counters (memory use, SSD offload) are logged even with observability
-        off: a leak only shows over a long run, in the runs that need it, and
-        the first SSD spill / offload of a run logs its warning from here.
+        nixl's unit metrics (retired memory, SSD spills) are logged even with
+        observability off: a leak only shows over a long run, in the runs that
+        need it.
         """
-        health = await asyncio.to_thread(backend_health_metrics, self._dp_backend)
-        if health:
-            prefix, metrics = health
-            self._logger.log_metrics(metrics, self._train_steps, prefix=prefix)
+        if self._dp_backend == "nixl":
+            from nemo_rl.data_plane.adapters.tq_nixl import unit_metrics
+
+            unit = unit_metrics()
+            if unit:
+                self._logger.log_metrics(
+                    unit, self._train_steps, prefix="data_plane/nixl"
+                )
         result = await asyncio.to_thread(
             self._trainer.get_data_plane_step_metrics,
             total_step_time,
