@@ -106,9 +106,14 @@ def create_local_venv(
     venv_path = os.path.join(NEMO_RL_VENV_DIR, venv_name)
 
     # Force rebuild if requested
-    if force_rebuild and os.path.exists(venv_path):
+    if force_rebuild and os.path.lexists(venv_path):
         logger.info(f"Force rebuilding venv at {venv_path}")
-        shutil.rmtree(venv_path)
+        if os.path.islink(venv_path):
+            # In the image, an actor's path links to a venv shared with other actors.
+            # Remove only the link so the rebuild cannot change their venv.
+            os.unlink(venv_path)
+        else:
+            shutil.rmtree(venv_path)
 
     logger.info(f"Creating new venv at {venv_path}")
 
@@ -163,6 +168,17 @@ def _env_builder(
 
     # Sleep to stagger node startup
     time.sleep(1 * node_idx)
+
+    # In the image this path links to a venv other actors share. Drop the link first,
+    # so the build marker and the rebuild land in this actor's own folder.
+    if force_rebuild and venv_path.is_symlink():
+        try:
+            venv_path.unlink()
+        except OSError:
+            # On a shared venv dir another node may have already replaced the link
+            # with its own folder; the marker check below then waits for that build.
+            if venv_path.is_symlink():
+                raise
 
     if started_file.exists():
         # Another node is already building, wait for completion
