@@ -1,0 +1,138 @@
+# SingleController GRPO on SWE2 (OpenHands agent in per-instance Apptainer
+# sandboxes) with Nano 3.5, Megatron training and vLLM generation, eight HTTP
+# frontends per TP4 engine. 32n8g: 8 training nodes, 24 generation nodes (48
+# engines); 256 prompts x 16 generations in flight.
+defaults: ./dapo-nanov3.5-30BA3B-4n8g-megatron-vllm-noncolocated-single-controller.yaml
+cluster:
+  num_nodes: 32
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
+  max_num_steps: 10
+  max_num_epochs: 100
+  use_dynamic_sampling: false
+  overlong_filtering: false
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+policy:
+  train_global_batch_size: 1024
+  max_total_sequence_length: 262144
+  logprob_chunk_size: 2048
+  make_sequence_length_divisible_by: 64
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    context_parallel_size: 8
+    sequence_parallel: true
+    defer_fp32_logits: true
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}
+    vllm_cfg:
+      http_api_server_count: 8
+      expose_http_server: true
+      tensor_parallel_size: 4
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.85
+      enforce_eager: false
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+    vllm_kwargs:
+      attention_backend: FLASH_ATTN
+      mamba_ssm_cache_dtype: float32
+      compilation_config:
+        cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+        pass_config:
+          fuse_allreduce_rms: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 24
+async_rl:
+  sampler:
+    name: ready_first
+    max_staleness_versions: 10
+  max_inflight_prompts: 256
+  max_buffered_rollouts: 704
+  generation_fleet_health:
+    enabled: false
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    skip_venv_if_present: true
+    num_gpu_nodes: 0
+    use_absolute_ip: true
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    swe_agents_train_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_train
+    swe_agents_val_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_val
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 8
+          chat_template_kwargs:
+            enable_thinking: true
+            force_nonempty_content: true
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 200
+          concurrency: 4096
+          swebench_agent_timeout: 7200
+          run_with_mixed_prompts: true
+          dataset_path: ${data.train.data_path}
+          container_formatter:
+          - /path/to/sif
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 200
+          concurrency: 4096
+          swebench_agent_timeout: 7200
+          dataset_path: ${data.validation.data_path}
+          container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
+data:
+  _override_: true
+  max_input_seq_length: null
+  shuffle: true
+  num_workers: 0
+  use_multiple_dataloader: false
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    system_prompt_file: null
+  train:
+    data_path: ${oc.env:HF_HOME}/superv3_data/swe2/train-split.jsonl
+  # SC has no validation (val_period=0), so this is never read.
+  validation:
+    data_path: ${oc.env:HF_HOME}/superv3_data/swe2/train-split.jsonl
+checkpointing:
+  enabled: false
+logger:
+  log_dir: logs/grpo-nanov3.5-30BA3B-32n8g-megatron-vllm-tp4-swe2-single-controller-api8
+  wandb:
+    project: nemo-rl
+    name: grpo-nanov3.5-30BA3B-32n8g-megatron-vllm-tp4-swe2-single-controller-api8

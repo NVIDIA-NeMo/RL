@@ -1,0 +1,9 @@
+defaults: ./grpo-nanov3.5-30BA3B-32n8g-megatron-vllm-tp4-swe2-single-controller-api8.yaml
+policy:
+  generation:
+    vllm_cfg:
+      http_api_server_count: 1
+logger:
+  log_dir: logs/grpo-nanov3.5-30BA3B-32n8g-megatron-vllm-tp4-swe2-single-controller-api1
+  wandb:
+    name: grpo-nanov3.5-30BA3B-32n8g-megatron-vllm-tp4-swe2-single-controller-api1
