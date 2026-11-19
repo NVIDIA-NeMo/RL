@@ -80,7 +80,7 @@ unpack() {
     local marker="${VENV_DIR}/.from-archive"
     [[ "$(cat "${marker}" 2>/dev/null)" == "${archive}" ]] && return 0
 
-    local staging
+    local staging swapped=0
     if staging="$(mktemp -d "$(dirname "${VENV_DIR}")/.gym_venvs.XXXXXX")" &&
         [[ "$(stat -c %s "${archive}" 2>/dev/null)" == "$(cat "${archive}.size" 2>/dev/null)" ]] &&
         tar -C "${staging}" -xf "${archive}" &&
@@ -95,14 +95,19 @@ unpack() {
             echo "Gym venvs: unpacked ${archive} into ${VENV_DIR}"
             return 0
         fi
-        rm -rf "${VENV_DIR}"
-        [[ -e "${staging}/.previous" ]] && mv "${staging}/.previous" "${VENV_DIR}"
+        swapped=1
     fi
+    # End the job first, so a failing cleanup below cannot skip it. ray.sub checks for ENDED once a minute.
+    [[ -z "${ended_file}" ]] || touch "${ended_file}" || true
     echo "Error: unpacking ${archive} into ${VENV_DIR} failed on $(hostname)." >&2
     echo "  Check that the archive is mounted at this path and that its .size and .servers files sit next to it." >&2
+    # Cleanup is best effort. -T keeps mv from moving the old venvs into a partly deleted ${VENV_DIR}.
+    if ((swapped)); then
+        rm -rf "${VENV_DIR}" || true
+        if [[ -e "${staging}/.previous" ]]; then mv -T "${staging}/.previous" "${VENV_DIR}" || true; fi
+    fi
     # A .previous left in staging means the old venvs could not be put back; keep them there.
-    [[ -n "${staging:-}" && ! -e "${staging}/.previous" ]] && rm -rf "${staging}"
-    [[ -n "${ended_file}" ]] && touch "${ended_file}"
+    if [[ -n "${staging:-}" && ! -e "${staging}/.previous" ]]; then rm -rf "${staging}" || true; fi
     exit 1
 }
 
