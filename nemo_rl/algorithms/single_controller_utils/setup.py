@@ -167,6 +167,7 @@ from nemo_rl.utils.checkpoint import (
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.path_utils import is_msc_path
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
+from nemo_rl.weight_sync.refit_actor import RemoteWeightSynchronizer
 
 
 @dataclass
@@ -1146,6 +1147,25 @@ def _load_opd_full_teacher_lm_heads(
             f"alias={teacher.alias!r}] from {results[0]}",
             flush=True,
         )
+
+
+def _move_synchronizer_to_refit_actor(
+    weight_synchronizer: WeightSynchronizer, generation: Any
+) -> WeightSynchronizer:
+    """Hand an initialized synchronizer to a RefitActor (async_rl.refit_actor.enabled).
+
+    Done after ``init_communicator`` and the setup-time refit, so setup itself is
+    unchanged; from here on every call goes through the returned proxy. The supported
+    transports are checked from config by ``validate_single_controller_config``.
+    """
+    remote = RemoteWeightSynchronizer(weight_synchronizer, generation)
+    generation.weight_synchronizer = remote
+    print(
+        f"  refit actor: {type(weight_synchronizer).__name__} runs in a separate "
+        "RefitActor",
+        flush=True,
+    )
+    return remote
 
 
 def setup_single_controller(
@@ -2499,6 +2519,11 @@ def setup_single_controller(
     setup_timing_metrics.total_setup_time_s = total_setup_time
     setup_timing_metrics.other_setup_time_s = total_setup_time - worker_setup_time
     print_setup_timing_summary(setup_timing_metrics)
+
+    if master_config.async_rl.refit_actor.enabled:
+        weight_synchronizer = _move_synchronizer_to_refit_actor(
+            weight_synchronizer, generation
+        )
 
     # Build actor args and return
     actor_args = SingleControllerActorArgs(
