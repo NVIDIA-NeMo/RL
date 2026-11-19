@@ -1003,7 +1003,7 @@ def test_forest_objective_accepts_ppo_gae_only() -> None:
     validate_forest_objective(PPOConfig(), ClippedPGLossConfig())
     with pytest.raises(ValueError, match="ppo.adv_estimator.name"):
         validate_forest_objective(
-            PPOConfig(adv_estimator={"name": "raw_reward"}), ClippedPGLossConfig()
+            PPOConfig(adv_estimator=GAEConfig(name="raw_reward")), ClippedPGLossConfig()
         )
     with pytest.raises(ValueError, match="ppo.use_dynamic_sampling"):
         validate_forest_objective(
