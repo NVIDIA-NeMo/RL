@@ -37,20 +37,19 @@ from nemo_rl.models.megatron.data import ProcessedInputs, process_microbatch
 from nemo_rl.models.policy.training_engine_adapter.config import TrainingEngineConfig
 from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 
+# Extrema the loss returns per microbatch. They are reported as they are; the driver
+# takes the min or max over every microbatch of every replica.
+RATIO_EXTREMA = (
+    "probs_ratio_min",
+    "probs_ratio_max",
+    "probs_ratio_clamped_min",
+    "probs_ratio_clamped_max",
+)
 # Metrics the loss returns that are not sums over tokens, so they cannot be added across
 # microbatches and ranks: its own total, a per-rank sample count, a mean with a separate
-# denominator, and extrema.
-# TODO: reduce the ratio extrema with min and max instead of dropping them.
+# denominator, and the extrema above.
 _NOT_ADDITIVE = frozenset(
-    {
-        "loss",
-        "num_valid_samples",
-        "positive_nll_loss",
-        "probs_ratio_min",
-        "probs_ratio_max",
-        "probs_ratio_clamped_min",
-        "probs_ratio_clamped_max",
-    }
+    {"loss", "num_valid_samples", "positive_nll_loss", *RATIO_EXTREMA}
 )
 
 
@@ -113,6 +112,53 @@ def check_supported_loss(loss_fn: LossFunction) -> None:
         raise NotImplementedError(
             f"The TrainingEngine policy does not support loss_fn options: {', '.join(enabled)}."
         )
+
+
+def _additive_metrics(
+    metrics: dict[str, Any], device: torch.device
+) -> dict[str, torch.Tensor]:
+    """The loss's metrics that are sums over loss tokens when the global counts are 1."""
+    return {
+        name: torch.as_tensor(value, dtype=torch.float64, device=device)
+        for name, value in metrics.items()
+        if name not in _NOT_ADDITIVE
+    }
+
+
+def _record_extrema(metrics: dict[str, Any], extrema: dict[str, list[float]]) -> None:
+    """Append one microbatch's ratio extrema, for the metrics level that reports them."""
+    for name in RATIO_EXTREMA:
+        if name in metrics:
+            extrema[name].append(float(metrics[name]))
+
+
+def clipped_pg_loss_of_scores(
+    loss_fn: ClippedPGLossFn,
+    logprobs: torch.Tensor,
+    rows: BatchedDataDict[Any],
+    extrema: dict[str, list[float]],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """The loss of samples that are already scored, without gradients (evaluation).
+
+    Args:
+        loss_fn: NeMo RL's loss.
+        logprobs: [B, S] scores as ``postprocess_forward_only`` returns them.
+        rows: The same samples as NeMo RL holds them, on the device of ``logprobs``.
+        extrema: Receives the ratio extrema of these samples.
+
+    Returns:
+        The loss and its additive metrics, as sums over the loss tokens of ``rows``.
+    """
+    one = torch.ones((), device=logprobs.device)
+    with torch.no_grad():
+        loss, metrics = loss_fn(
+            next_token_logprobs=logprobs[:, 1:],
+            data=rows,
+            global_valid_seqs=one,
+            global_valid_toks=one,
+        )
+    _record_extrema(metrics, extrema)
+    return loss, _additive_metrics(metrics, logprobs.device)
 
 
 def build_recipe(engine_config: TrainingEngineConfig) -> TrainingRecipe:
@@ -324,8 +370,13 @@ class NeMoRLTrainingEngine(TrainingEngine):
         output: ModelOutput,
         *,
         loss_fn: ClippedPGLossFn,
+        extrema: dict[str, list[float]],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Token-level clipped policy-gradient loss, summed over the microbatch.
+
+        ``extrema`` receives the microbatch's ratio extrema, which the engine's summed
+        metrics cannot carry.
+
 
         Runs as in NeMo RL's Megatron policy: its packed loss wrapper first gathers the
         logprobs into whole sequences, then calls the loss on NeMo RL's own microbatch.
@@ -347,9 +398,9 @@ class NeMoRLTrainingEngine(TrainingEngine):
         one = torch.ones((), device=device)
         loss, metrics = whole_sequence_loss(output.logprobs, rows, one, one)
         cp_size = 1 if cp_group is None else cp_group.size()
+        _record_extrema(metrics, extrema)
         sums = {
-            name: torch.as_tensor(value, dtype=torch.float64, device=device) / cp_size
-            for name, value in metrics.items()
-            if name not in _NOT_ADDITIVE
+            name: total / cp_size
+            for name, total in _additive_metrics(metrics, device).items()
         }
         return loss / cp_size, sums

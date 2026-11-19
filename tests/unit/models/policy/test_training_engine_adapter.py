@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import copy
+import math
+from collections import defaultdict
 
 import pytest
 import torch
@@ -155,14 +157,27 @@ def test_clipped_pg_loss_sums_to_the_native_loss():
         packed_seq_params=SimpleNamespace(cu_seqlens_q_padded=torch.tensor([0, 8, 12])),
     )
     engine = SimpleNamespace(process_groups=SimpleNamespace(cp=None))
+    extrema = defaultdict(list)
     loss_sum, sums = NeMoRLTrainingEngine.clipped_pg_loss(
-        engine, batch, SimpleNamespace(logprobs=logprobs.unsqueeze(0)), loss_fn=loss_fn
+        engine,
+        batch,
+        SimpleNamespace(logprobs=logprobs.unsqueeze(0)),
+        loss_fn=loss_fn,
+        extrema=extrema,
     )
 
     assert loss_sum / num_tokens == pytest.approx(float(native_loss), abs=1e-5)
     assert float(sums[KL_PENALTY_KEY]) / float(num_tokens) == pytest.approx(
         native_metrics[KL_PENALTY_KEY], abs=1e-5
     )
+    # The extrema are not sums: they are handed out separately, one entry per microbatch.
+    assert "probs_ratio_min" not in sums
+    assert extrema["probs_ratio_min"] == [
+        pytest.approx(native_metrics["probs_ratio_min"])
+    ]
+    assert extrema["probs_ratio_max"] == [
+        pytest.approx(native_metrics["probs_ratio_max"])
+    ]
 
 
 def _engine_without_model(seq_length: int = 16, pad_multiple: int = 4):
@@ -283,6 +298,7 @@ class _FakeEngine:
 
     def __init__(self, dp_rank: int = 0):
         self.device = "cuda"
+        self.trainable = True
         self.calls = []
         self.saved = None
         self.parallel_info = {"dp_rank": dp_rank, "dp_size": 1}
@@ -295,6 +311,9 @@ class _FakeEngine:
         self.calls.append(
             ("forward_backward", len(data.micro_batch_indices[0]), tokens)
         )
+        # Ratio extrema of this call, as the loss method hands them out.
+        loss_kwargs["extrema"]["probs_ratio_min"].append(1.0 / tokens)
+        loss_kwargs["extrema"]["probs_ratio_max"].append(float(tokens))
         return SimpleNamespace(
             loss_sum=2.0 * tokens,
             num_loss_tokens=tokens,
@@ -314,8 +333,12 @@ class _FakeEngine:
     def cpu(self):
         self.device = "cpu"
 
-    def save_state(self, path, user_state):
+    def save_state(self, path, user_state, async_save):
         self.saved = (path, user_state, self.device)
+        self.calls.append(("save_state", async_save))
+
+    def wait_for_save(self):
+        self.calls.append(("wait_for_save",))
 
 
 def _worker(dp_rank: int = 0):
@@ -326,8 +349,8 @@ def _worker(dp_rank: int = 0):
 
     worker = TrainingEnginePolicyWorkerImpl.__new__(TrainingEnginePolicyWorkerImpl)
     worker.engine = _FakeEngine(dp_rank)
-    # One replica: its count is the total.
-    worker._sum_over_replicas = lambda count: count
+    # One replica: its values are the totals.
+    worker._sum_over_replicas = lambda values: values
     worker.cfg = {
         "train_global_batch_size": 2,
         "megatron_cfg": {
@@ -337,18 +360,22 @@ def _worker(dp_rank: int = 0):
                 "adam_beta1": 0.9,
                 "adam_beta2": 0.999,
                 "adam_eps": 1e-8,
-                "weight_decay": 0.01,
             },
             "scheduler": {
                 "lr_warmup_iters": 2,
                 "lr_warmup_init": 0.0,
                 "lr_decay_style": "constant",
+                "start_weight_decay": 0.01,
+                "end_weight_decay": 0.01,
+                "weight_decay_incr_style": "constant",
             },
         },
     }
     worker._lr_decay_iters = None
+    worker._weight_decay_iters = 10
     worker._train_calls = 0
     worker._train_state = None
+    worker._async_save = False
     return worker
 
 
@@ -413,8 +440,17 @@ def test_train_step_rejects_an_unsupported_loss():
     sequence_level = ClippedPGLossFn(ClippedPGLossConfig(token_level_loss=False))
     with pytest.raises(NotImplementedError, match="token_level_loss=false"):
         worker.begin_train_step(loss_fn=sequence_level)
-    with pytest.raises(NotImplementedError, match="eval_mode"):
-        worker.train(_training_batch(), _loss_fn(), eval_mode=True)
+    data = _with_plan(_training_batch(), [[[0, 2]]])
+    with pytest.raises(NotImplementedError, match="token_level_loss=false"):
+        worker.train(data, sequence_level, eval_mode=True)
+
+
+@pytest.mark.mcore
+def test_a_policy_without_an_optimizer_cannot_train():
+    worker = _worker()
+    worker.engine.trainable = False
+    with pytest.raises(RuntimeError, match="without an optimizer"):
+        worker.begin_train_step(loss_fn=_loss_fn())
 
 
 @pytest.mark.mcore
@@ -445,9 +481,101 @@ def test_only_the_first_replica_reports_the_metric_lists():
 
     result = _worker(dp_rank=1).train(data, _loss_fn(), gbs=2)
 
-    assert result["all_mb_metrics"] == {}
+    # Only the ratio extrema, which are this replica's own.
+    assert result["all_mb_metrics"] == {
+        "probs_ratio_min": [pytest.approx(1 / 7)],
+        "probs_ratio_max": [7.0],
+    }
     assert float(result["global_loss"]) == pytest.approx(2.0)
     assert result["grad_norm"].tolist() == [0.25]
+
+
+@pytest.mark.mcore
+def test_ratio_extrema_are_reduced_over_the_microbatches_of_an_update():
+    worker = _worker()
+    data = _training_batch()  # 4 loss tokens in the first sample, 3 in the second
+
+    worker.begin_train_step(loss_fn=_loss_fn())
+    worker.train_microbatch(data=_with_plan(data.slice(0, 1), [[[0, 1]]]))
+    worker.train_microbatch(data=_with_plan(data.slice(1, 2), [[[0, 1]]]))
+    metrics = worker.finish_train_step()["all_mb_metrics"]
+
+    assert metrics["probs_ratio_min"] == [pytest.approx(1 / 4)]
+    assert metrics["probs_ratio_max"] == [4.0]
+
+
+@pytest.mark.mcore
+def test_weight_decay_follows_the_schedule():
+    worker = _worker()
+    scheduler = worker.cfg["megatron_cfg"]["scheduler"]
+    scheduler.update(
+        start_weight_decay=0.0, end_weight_decay=0.1, weight_decay_incr_style="linear"
+    )
+
+    decay = {}
+    for calls in (0, 5, 10, 11):
+        worker._train_calls = calls
+        decay[calls] = worker._adam_params().weight_decay
+    assert decay == {
+        0: 0.0,
+        5: pytest.approx(0.05),
+        10: pytest.approx(0.1),
+        11: 0.1,
+    }
+
+    scheduler["weight_decay_incr_style"] = "cosine"
+    worker._train_calls = 5
+    assert worker._adam_params().weight_decay == pytest.approx(0.05)
+    worker._train_calls = 2
+    assert worker._adam_params().weight_decay == pytest.approx(
+        0.05 * (math.cos(math.pi * 0.8) + 1.0)
+    )
+
+
+class _EvalEngine:
+    """Scores every sample with fixed logprobs; training calls are not expected."""
+
+    def __init__(self, logprobs: torch.Tensor):
+        self.logprobs = logprobs
+        self.parallel_info = {"dp_rank": 0, "dp_size": 1}
+
+    def forward_only(self, data, gather_output):
+        return self.logprobs[: data.size]
+
+
+@pytest.mark.mcore
+def test_eval_mode_returns_the_native_loss_and_updates_nothing():
+    from nemo_rl.algorithms.loss.loss_functions import KL_PENALTY_KEY
+
+    worker = _worker()
+    data = _with_plan(_training_batch(), [[[0, 2]]])
+    loss_fn = _loss_fn()
+    # [B, S] scores as the engine returns them: the first token's is 0.
+    logprobs = torch.cat([torch.zeros(2, 1), -torch.rand(2, 5)], dim=1)
+    worker.engine = _EvalEngine(logprobs)
+    num_tokens = (data["token_mask"] * data["sample_mask"].unsqueeze(-1)).sum()
+    native_loss, native_metrics = loss_fn(
+        next_token_logprobs=logprobs[:, 1:],
+        data=data,
+        global_valid_seqs=torch.tensor(2.0),
+        global_valid_toks=num_tokens,
+    )
+
+    result = worker.train(data, loss_fn, eval_mode=True, gbs=2)
+
+    metrics = result["all_mb_metrics"]
+    assert float(result["global_loss"]) == pytest.approx(float(native_loss), abs=1e-5)
+    assert metrics["loss"] == [pytest.approx(float(native_loss), abs=1e-5)]
+    assert metrics[KL_PENALTY_KEY] == [
+        pytest.approx(native_metrics[KL_PENALTY_KEY], abs=1e-5)
+    ]
+    assert metrics["global_valid_toks"] == [7]
+    assert metrics["global_valid_seqs"] == [2]
+    assert metrics["probs_ratio_max"] == [
+        pytest.approx(native_metrics["probs_ratio_max"])
+    ]
+    assert result["grad_norm"].tolist() == []
+    assert worker._train_calls == 0
 
 
 class _ScoringEngine:
@@ -491,6 +619,20 @@ def test_save_checkpoint_keeps_the_schedule_position_and_residency():
     assert worker.engine.device == "cpu"
     with pytest.raises(NotImplementedError, match="save_optimizer"):
         worker.save_checkpoint("/ckpt/weights", optimizer_path=None)
+
+
+@pytest.mark.mcore
+def test_async_save_is_passed_to_the_engine_and_finalized_by_waiting():
+    worker = _worker()
+    assert worker.poll_async_save()
+    worker._async_save = True
+
+    worker.save_checkpoint("/ckpt/weights", optimizer_path="/ckpt/optimizer")
+    worker.finalize_async_save()
+
+    assert worker.engine.calls == [("save_state", True), ("wait_for_save",)]
+    with pytest.raises(NotImplementedError, match="defer_async_checkpoint_finalize"):
+        worker.poll_async_save()
 
 
 @pytest.mark.mcore

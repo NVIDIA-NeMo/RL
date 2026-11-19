@@ -625,6 +625,26 @@ def test_get_resume_paths_torch_dist_megatron_optimizer(
     load_sharded_keys.assert_called_once_with(iteration_path)
 
 
+def test_get_resume_paths_follows_the_iteration_tracker(checkpoint_dir, monkeypatch):
+    """The TrainingEngine policy saves under its update count, not iter_0000000."""
+    checkpoint_path = checkpoint_dir / "step_8"
+    weights_path = checkpoint_path / "policy" / "weights"
+    iteration_path = weights_path / "iter_0000008"
+    iteration_path.mkdir(parents=True)
+    (iteration_path / "metadata.json").touch()
+    (weights_path / "latest_checkpointed_iteration.txt").write_text("8")
+    load_common_state = MagicMock(return_value={"optimizer": {}})
+    monkeypatch.setattr(
+        checkpoint_module, "_load_megatron_common_state_dict", load_common_state
+    )
+
+    assert CheckpointManager.get_resume_paths(checkpoint_path) == (
+        weights_path,
+        checkpoint_path / "policy" / "optimizer",
+    )
+    load_common_state.assert_called_once_with(iteration_path)
+
+
 def test_get_resume_paths_ignores_save_optim_without_optimizer_shards(
     checkpoint_dir, monkeypatch
 ):

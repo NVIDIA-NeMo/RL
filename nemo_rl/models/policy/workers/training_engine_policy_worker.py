@@ -38,9 +38,11 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.training_engine_adapter.engine import (
+    RATIO_EXTREMA,
     NeMoRLTrainingEngine,
     build_recipe,
     check_supported_loss,
+    clipped_pg_loss_of_scores,
 )
 from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
@@ -60,6 +62,14 @@ def _freeze_moe_routers(model: list[Any]) -> list[Any]:
     return model
 
 
+def _reduced_extrema(extrema: dict[str, list[float]]) -> dict[str, float]:
+    """The smallest of each minimum and the largest of each maximum over microbatches."""
+    return {
+        name: min(values) if name.endswith("_min") else max(values)
+        for name, values in extrema.items()
+    }
+
+
 @dataclass
 class _TrainState:
     """The loss function and running totals of one optimizer update while its chunks arrive."""
@@ -71,6 +81,8 @@ class _TrainState:
     metric_sums: dict[str, float] = field(default_factory=lambda: defaultdict(float))
     # Samples with at least one loss token on this data-parallel replica.
     num_local_loss_seqs: int = 0
+    # The ratio extrema of each microbatch of this replica.
+    extrema: dict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -119,11 +131,6 @@ class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         """Build the engines from ``policy.training_engine``."""
         # optimizer_path is not used: an engine checkpoint always holds the optimizer state.
         del tokenizer, processor, optimizer_path, worker_sharding_annotations, kwargs
-        if not init_optimizer:
-            # TODO: an inference-only policy is one frozen engine.
-            raise NotImplementedError(
-                "A TrainingEngine policy without an optimizer is not implemented yet."
-            )
         if is_refit_destination:
             # TODO: receiving weights needs an engine import path.
             raise NotImplementedError(
@@ -151,12 +158,27 @@ class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             optimizer_cfg = megatron_cfg["optimizer"]
             if not 0 <= optimizer_cfg["min_lr"] <= optimizer_cfg["lr"]:
                 raise ValueError("Learning-rate decay requires 0 <= min_lr <= lr.")
-        if scheduler_cfg["start_weight_decay"] != scheduler_cfg["end_weight_decay"]:
-            # TODO: weight decay schedules.
-            raise NotImplementedError(
-                "The TrainingEngine policy needs a constant weight decay "
-                "(scheduler.start_weight_decay == scheduler.end_weight_decay)."
+        if scheduler_cfg["weight_decay_incr_style"] not in (
+            "constant",
+            "linear",
+            "cosine",
+        ):
+            raise ValueError(
+                "Unsupported weight decay schedule: "
+                f"{scheduler_cfg['weight_decay_incr_style']!r}."
             )
+        if (
+            scheduler_cfg["weight_decay_incr_style"] == "constant"
+            and scheduler_cfg["start_weight_decay"] != scheduler_cfg["end_weight_decay"]
+        ):
+            raise ValueError(
+                "scheduler.weight_decay_incr_style=constant requires "
+                "start_weight_decay == end_weight_decay."
+            )
+        # A weight decay schedule runs over the whole training, as in Megatron.
+        self._weight_decay_iters = None
+        if scheduler_cfg["weight_decay_incr_style"] != "constant":
+            self._weight_decay_iters = megatron_cfg["train_iters"]
 
         # Must be the first CUDA-touching call in this process: configure_worker leaves
         # every device visible, so the worker selects its own.
@@ -180,12 +202,19 @@ class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         checkpoint_path = engine_config["checkpoint_path"]
         sample_pad_multiple = config["make_sequence_length_divisible_by"]
         hooks = [_freeze_moe_routers] if megatron_cfg["freeze_moe_router"] else []
+        # As for the Megatron policy: saves block unless checkpoint.async_save is set.
+        checkpoint_cfg = megatron_cfg.get("checkpoint") or {}
+        self._async_save = bool(
+            "async_save" in checkpoint_cfg and checkpoint_cfg["async_save"]
+        )
+        # Without an optimizer the policy only scores: a frozen engine.
         self.engine = NeMoRLTrainingEngine.from_recipe(
             recipe,
             sample_pad_multiple=sample_pad_multiple,
             checkpoint_path=checkpoint_path,
+            trainable=init_optimizer,
             hooks=hooks,
-            spawn_async_save_worker=False,
+            spawn_async_save_worker=self._async_save,
         )
         self.reference_engine: Optional[TrainingEngine] = None
         if init_reference_model:
@@ -194,6 +223,8 @@ class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 sample_pad_multiple=sample_pad_multiple,
                 checkpoint_path=checkpoint_path,
                 trainable=False,
+                # Never saved.
+                spawn_async_save_worker=False,
             )
         # train() and finish_train_step() calls so far; the learning-rate schedule
         # advances once per call.
@@ -308,8 +339,26 @@ class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             beta1=optimizer_cfg["adam_beta1"],
             beta2=optimizer_cfg["adam_beta2"],
             eps=optimizer_cfg["adam_eps"],
-            weight_decay=optimizer_cfg["weight_decay"],
+            weight_decay=self._weight_decay(),
         )
+
+    def _weight_decay(self) -> float:
+        """Weight decay for the current train() call, on Megatron's schedule."""
+        scheduler_cfg = self.cfg["megatron_cfg"]["scheduler"]
+        start = scheduler_cfg["start_weight_decay"]
+        end = scheduler_cfg["end_weight_decay"]
+        style = scheduler_cfg["weight_decay_incr_style"]
+        if style == "constant":
+            return end
+        assert self._weight_decay_iters is not None
+        if self._train_calls > self._weight_decay_iters:
+            return end
+        progress = self._train_calls / self._weight_decay_iters
+        if style == "linear":
+            coefficient = progress
+        else:
+            coefficient = 0.5 * (math.cos(math.pi * (1.0 - progress)) + 1.0)
+        return start + coefficient * (end - start)
 
     def train(
         self,
@@ -325,17 +374,15 @@ class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         ``data`` holds this replica's share of every global batch. ``mbs`` is not used:
         the microbatches follow the packing plan on ``data``.
 
+        With ``eval_mode`` the loss is computed per global batch and nothing is updated.
+
         Returns:
-          "global_loss" (mean loss per loss token, averaged over the updates), "grad_norm",
-          and "all_mb_metrics" with one entry per update for each metric. Token-level
-          metrics are per-token means of the update over all replicas.
+          "global_loss" (mean loss per loss token, averaged over the updates), "grad_norm"
+          (empty with ``eval_mode``), and "all_mb_metrics" with one entry per update for
+          each metric. Token-level metrics are per-token means of the update over all
+          replicas.
         """
         del mbs
-        if eval_mode:
-            # TODO: a forward with the loss and no gradient accumulation.
-            raise NotImplementedError(
-                "eval_mode is not implemented for the TrainingEngine policy yet."
-            )
         if check_dim_skip_keys is not None:
             raise ValueError(
                 "check_dim_skip_keys is only supported by the Automodel worker."
@@ -343,6 +390,14 @@ class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         local_gbs = gbs // self.engine.parallel_info["dp_size"]
+        if eval_mode:
+            check_supported_loss(loss_fn)
+            return self._train_result(
+                [
+                    self._evaluate(data.get_batch(index, local_gbs), loss_fn)
+                    for index in range(len(data.micro_batch_indices))
+                ]
+            )
         # Every update of one train() call uses the same schedule position.
         adam_params = self._adam_params()
         updates = []
@@ -352,6 +407,39 @@ class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             updates.append(self._apply_update(adam_params))
         self._train_calls += 1
         return self._train_result(updates)
+
+    def _evaluate(
+        self, data: BatchedDataDict[Any], loss_fn: LossFunction
+    ) -> dict[str, float]:
+        """The loss and metrics of one global batch, without gradients or an update.
+
+        Scores this replica's samples, runs the loss on the scores, and adds the
+        replicas' sums up.
+
+        Returns: as _apply_update, without the optimizer's entries.
+        """
+        logprobs = self.engine.forward_only(data, gather_output=True)
+        rows = data.to(logprobs.device)
+        extrema: dict[str, list[float]] = defaultdict(list)
+        loss, sums = clipped_pg_loss_of_scores(loss_fn, logprobs, rows, extrema)
+        has_loss = (rows["token_mask"] * rows["sample_mask"].unsqueeze(-1))[:, 1:] > 0
+        local = {
+            **{name: float(total) for name, total in sums.items()},
+            "loss": float(loss),
+            "global_valid_toks": int(has_loss.sum()),
+            "global_valid_seqs": int(has_loss.any(dim=-1).sum()),
+        }
+        names = sorted(local)
+        totals = dict(
+            zip(names, self._sum_over_replicas([local[name] for name in names]))
+        )
+        tokens = max(totals["global_valid_toks"], 1)
+        update = {
+            name: int(total) if name.startswith("global_valid_") else total / tokens
+            for name, total in totals.items()
+        }
+        update.update(_reduced_extrema(extrema))
+        return update
 
     # ---- streaming train step ----
     # One optimizer update fed in several chunks: begin_train_step, train_microbatch once
@@ -367,6 +455,11 @@ class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         """Open an update. ``gbs`` and ``mbs`` are not used: each chunk brings its plan."""
         del gbs, mbs
         check_supported_loss(loss_fn)
+        if not self.engine.trainable:
+            raise RuntimeError(
+                "This policy was built without an optimizer (init_optimizer=False) "
+                "and cannot train."
+            )
         if self._train_state is not None:
             raise RuntimeError(
                 "A train step is already open; call finish_train_step or "
@@ -380,7 +473,7 @@ class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         output = self.engine.forward_backward(
             data,
             loss_fn="clipped_pg_loss",
-            loss_kwargs={"loss_fn": state.loss_fn},
+            loss_kwargs={"loss_fn": state.loss_fn, "extrema": state.extrema},
         )
         state.loss_sum += output.loss_sum
         state.num_loss_tokens += output.num_loss_tokens
@@ -429,16 +522,19 @@ class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         update["lr"] = adam_params.learning_rate
         update["wd"] = adam_params.weight_decay
         update["global_valid_toks"] = state.num_loss_tokens
-        update["global_valid_seqs"] = self._sum_over_replicas(state.num_local_loss_seqs)
+        update["global_valid_seqs"] = int(
+            self._sum_over_replicas([state.num_local_loss_seqs])[0]
+        )
         update["update_successful"] = step["update_successful"]
         update["grad_norm"] = step["grad_norm"]
+        update.update(_reduced_extrema(state.extrema))
         return update
 
-    def _sum_over_replicas(self, count: int) -> int:
-        """Add up a per-replica count over the data-parallel replicas."""
-        total = torch.tensor([count], device="cuda")
-        torch.distributed.all_reduce(total, group=self.engine.process_groups.dp)
-        return int(total.item())
+    def _sum_over_replicas(self, values: list[float]) -> list[float]:
+        """Add up per-replica values over the data-parallel replicas."""
+        totals = torch.tensor(values, dtype=torch.float64, device="cuda")
+        torch.distributed.all_reduce(totals, group=self.engine.process_groups.dp)
+        return totals.tolist()
 
     def _train_result(self, updates: list[dict[str, float]]) -> dict[str, Any]:
         """The worker's training result for a list of updates."""
@@ -446,15 +542,22 @@ class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         for update in updates:
             for name, value in update.items():
                 metrics[name].append(value)
-        grad_norms = metrics.pop("grad_norm")
+        # Absent after an evaluation, which does not step the optimizer.
+        grad_norms = metrics.pop("grad_norm", [])
         losses = metrics["loss"]
         # The metrics are already totals over all ranks, and the driver adds up what the
-        # replicas report, so only the first replica reports them.
-        is_first_replica = self.engine.parallel_info["dp_rank"] == 0
+        # replicas report, so only the first replica reports them. The ratio extrema are
+        # this replica's own; the driver takes the min or max over all replicas.
+        if self.engine.parallel_info["dp_rank"] != 0:
+            metrics = {
+                name: values
+                for name, values in metrics.items()
+                if name in RATIO_EXTREMA
+            }
         return {
             "global_loss": torch.tensor(sum(losses) / len(losses)),
             "grad_norm": torch.tensor(grad_norms),
-            "all_mb_metrics": dict(metrics) if is_first_replica else {},
+            "all_mb_metrics": dict(metrics),
         }
 
     # ---- model residency ----
@@ -562,7 +665,9 @@ class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
     ) -> None:
         """Save weights, optimizer state and the schedule position under ``weights_path``.
 
-        Blocks until the checkpoint is on disk. The tokenizer is not saved.
+        Blocks until the checkpoint is on disk, unless checkpoint.async_save is set: then
+        it returns once the state is copied to host memory, and finalize_async_save
+        waits for the write. The tokenizer is not saved.
         """
         del tokenizer_path
         if optimizer_path is None:
@@ -575,10 +680,28 @@ class TrainingEnginePolicyWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         was_offloaded = self.engine.device == "cpu"
         self.engine.cuda()
         self.engine.save_state(
-            str(weights_path), user_state={"train_calls": self._train_calls}
+            str(weights_path),
+            user_state={"train_calls": self._train_calls},
+            async_save=self._async_save,
         )
         if was_offloaded:
+            # Waits for a write that is still running.
             self.engine.cpu()
+
+    def finalize_async_save(self) -> None:
+        """Block until a save that is still being written is on disk."""
+        self.engine.wait_for_save()
+
+    def poll_async_save(self) -> bool:
+        """Whether no save is still being written, without waiting."""
+        if not self._async_save:
+            return True
+        # TODO: the engine can only wait for its pending save; it needs a check that
+        # does not block.
+        raise NotImplementedError(
+            "The TrainingEngine policy cannot poll an async save; set "
+            "defer_async_checkpoint_finalize=false."
+        )
 
 
 @ray.remote(
