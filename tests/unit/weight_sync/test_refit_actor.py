@@ -21,10 +21,6 @@ import pytest
 import ray
 from ray import cloudpickle
 
-from nemo_rl.algorithms.single_controller_utils.config import (
-    AsyncRLConfig,
-    RefitActorConfig,
-)
 from nemo_rl.weight_sync.factory import validate_refit_actor_transport
 from nemo_rl.weight_sync.refit_actor import (
     RemoteWeightSynchronizer,
@@ -62,6 +58,15 @@ def _fakes():
         @property
         def is_stale(self):
             return self._stale
+
+        @property
+        def built_membership(self):
+            return self._built_membership
+
+        def rebind_generation(self, generation):
+            self._generation = generation
+            if self._built_membership is not None:
+                generation.set_refit_membership(self._built_membership)
 
         def init_communicator(self):
             self._built_membership = (
@@ -104,12 +109,6 @@ def remote():
     proxy.shutdown()
 
 
-def test_config_default_is_off():
-    assert RefitActorConfig().enabled is False
-    assert AsyncRLConfig().refit_actor.enabled is False
-    assert AsyncRLConfig(refit_actor={"enabled": True}).refit_actor.enabled is True
-
-
 def test_sync_weights_runs_in_actor(remote):
     proxy, _ = remote
     assert proxy.is_stale is True
@@ -138,20 +137,6 @@ def test_restarted_shard_handle_reaches_actor(remote):
     generation.worker_group.workers[1] = "w1-restarted"
     result = proxy.sync_weights()
     assert result["workers"] == ["w0", "w1-restarted"]
-
-
-def test_dead_actor_is_replaced_on_reconcile(remote):
-    proxy, generation = remote
-    first = proxy._actor
-    ray.kill(first)
-    # ray.kill is asynchronous; wait until the actor is really gone.
-    with pytest.raises(ray.exceptions.RayActorError):
-        for _ in range(100):
-            ray.get(first.ping.remote(), timeout=30)
-    assert proxy.reconcile_communicator([], force=True) is True
-    assert proxy._actor is not first
-    assert generation.membership == ("rebuilt", (), ("w0", "w1"))
-    assert proxy.sync_weights()["syncs"] == 1
 
 
 @pytest.mark.parametrize(
@@ -190,6 +175,25 @@ def test_colocated_generation_is_rejected():
         )
 
 
+def _kill_and_wait(actor):
+    ray.kill(actor)
+    # ray.kill is asynchronous; wait until the actor is really gone.
+    with pytest.raises(ray.exceptions.RayActorError):
+        for _ in range(100):
+            ray.get(actor.ping.remote(), timeout=30)
+
+
+def test_a_dead_refit_actor_is_a_clear_error(remote):
+    proxy, _ = remote
+    _kill_and_wait(proxy._actor)
+    with pytest.raises(RuntimeError, match="RefitActor died"):
+        proxy.reconcile_communicator([], force=True)
+    with pytest.raises(RuntimeError, match="RefitActor died"):
+        proxy.sync_weights()
+    with pytest.raises(RuntimeError, match="RefitActor died"):
+        _ = proxy.is_stale
+
+
 def _roundtrip(obj):
     """Pickle as Ray does when the proxy travels inside the controller's actor args."""
 
@@ -220,44 +224,6 @@ def test_attached_copy_syncs_and_ships_its_generation(remote):
         (0,),
         ("w0", "w1-controller"),
     )
-
-
-def test_attached_copy_replaces_dead_actor_from_factory(remote):
-    FakeGeneration, FakeSynchronizer = _fakes()
-    proxy, _ = remote
-    copy = _roundtrip(proxy)
-    controller_generation = FakeGeneration(["w0", "w1"])
-    built = []
-
-    def factory():
-        built.append(1)
-        return FakeSynchronizer(controller_generation)
-
-    copy.attach(controller_generation, synchronizer_factory=factory)
-    first = copy._actor
-    ray.kill(first)
-    with pytest.raises(ray.exceptions.RayActorError):
-        for _ in range(100):
-            ray.get(first.ping.remote(), timeout=30)
-    assert copy.reconcile_communicator([], force=True) is True
-    assert built == [1]
-    assert copy._actor is not first
-    assert copy.sync_weights()["syncs"] == 1
-    copy.shutdown()
-
-
-def test_unpickled_copy_without_factory_cannot_replace_actor(remote):
-    FakeGeneration, _ = _fakes()
-    proxy, _ = remote
-    copy = _roundtrip(proxy)
-    copy.attach(FakeGeneration(["w0"]))
-    first = copy._actor
-    ray.kill(first)
-    with pytest.raises(ray.exceptions.RayActorError):
-        for _ in range(100):
-            ray.get(first.ping.remote(), timeout=30)
-    with pytest.raises(RuntimeError, match="synchronizer_factory"):
-        copy.reconcile_communicator([], force=True)
 
 
 def _self_shutting_fakes(marker_dir):

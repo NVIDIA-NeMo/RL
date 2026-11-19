@@ -495,17 +495,7 @@ class WatchdogConfig(BaseModel, extra="allow"):
 
 
 class RefitActorConfig(BaseModel, extra="allow"):
-    """Where the weight synchronizer runs.
-
-    By default the SingleController runs the refit transport in its own process: the
-    calls to every train worker and generation leader, and the wait on their replies.
-    ``enabled`` moves the synchronizer into a separate CPU Ray actor on the same node
-    (nemo_rl/weight_sync/refit_actor.py), so a busy controller does not delay the refit
-    and a slow refit does not occupy the controller. The controller keeps the rollout
-    gate, generation pause/resume, refit membership, the refit deadline and recovery.
-    Requires non-colocated generation and an NCCL transport (collective or
-    nccl_reshard).
-    """
+    """Run the weight synchronizer in a separate CPU Ray actor (weight_sync/refit_actor.py)."""
 
     # Run the weight synchronizer in a separate RefitActor. Off by default.
     enabled: bool = False
