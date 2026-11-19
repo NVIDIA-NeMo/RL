@@ -26,6 +26,11 @@ from nemo_rl.telemetry.vocabulary import (
 #: Prefix every algorithm logs its setup timings under.
 SETUP_TIMING_PREFIX = "timing/setup"
 
+#: Prefix the v1 loops log ``print_performance_metrics`` output under. Named
+#: here because the tee has to read it too, and a rename on one side alone
+#: would leave the throughput and FLOP series reporting nothing with no error.
+PERFORMANCE_PREFIX = "performance"
+
 #: Single-Controller snapshot-attempt dict names, shared with the OTel tee; not in
 #: ``rollout_checkpoint.py``, which imports the GRPO stack.
 ROLLOUT_CHECKPOINT_OUTCOME_PREFIX = "rollout/checkpoint_outcome"
@@ -86,6 +91,44 @@ TRAINING_TEED_METRICS = (
 )
 
 register_teed_metrics(TRAINING_TEED_METRICS)
+
+
+# Keys the FLOP tracker's output reaches the Logger under. Three rather than
+# one because the loops consume the tracker differently: the v1 loops divide
+# by an elapsed time and log the rates under PERFORMANCE_PREFIX, while sft_v2
+# and the Single-Controller forward the worker's raw per-step count untouched
+# and have no rate to log. Declared together here, not beside any one producer,
+# because five modules write them.
+TRAIN_FLOPS_PER_GPU_KEY = "train_flops_per_gpu"
+TRAIN_FP_UTILIZATION_KEY = "train_fp_utilization"
+TOTAL_FLOPS_KEY = "total_flops"
+
+#: Teed rows for the keys above. Absent from a step rather than zero whenever
+#: the tracker did not report: ``megatron_policy_worker`` only fills
+#: ``total_flops`` for backends that track it, and the v1 rates are skipped
+#: under sequence packing, where the padded-length formula does not hold. A
+#: gap in the series is the honest reading, so none of these is a counter.
+FLOPS_TEED_METRICS = (
+    TeedMetric(
+        TRAIN_FLOPS_PER_GPU_KEY,
+        "rl.flops.per_gpu",
+        unit="{TFLOP}/s",
+        description="Achieved training throughput per GPU.",
+    ),
+    TeedMetric(
+        TRAIN_FP_UTILIZATION_KEY,
+        "rl.flops.utilization",
+        description="Achieved TFLOPS over the device's theoretical peak, 0-1 (MFU).",
+    ),
+    TeedMetric(
+        TOTAL_FLOPS_KEY,
+        "rl.flops.per_step",
+        unit="{FLOP}",
+        description="FLOPs in one training step, summed over ranks.",
+    ),
+)
+
+register_teed_metrics(FLOPS_TEED_METRICS)
 
 
 @dataclass

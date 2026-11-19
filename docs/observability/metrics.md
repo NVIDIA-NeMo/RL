@@ -1,6 +1,6 @@
 # Metrics
 
-NeMo-RL emits seven namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), per-host memory (`rl.host.memory.*`), and rollout checkpoint metrics (`rl.checkpoint.*`).
+NeMo-RL emits eight namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), FLOPs (`rl.flops.*`), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), per-host memory (`rl.host.memory.*`), and rollout checkpoint metrics (`rl.checkpoint.*`).
 
 Metrics are emitted **only when telemetry is exporting**. Most pass through the metrics logger of the process that logs them, via its process-local telemetry handle: the driver in the v1 loops, and the Single-Controller actor in v2, which owns the Logger there and so emits the training scalars, `rl.setup.duration` and `rl.checkpoint.*`. `rl.host.memory.*` is scraped from every node by a driver-side monitor on its own timer. Resource attributes identify the producing process.
 
@@ -8,7 +8,7 @@ Every `rl.*` series is **declared by NeMo-RL**, not by lens. lens provides a con
 
 ## The tee
 
-The tee lives outside the algorithm code: `nemo_rl/telemetry/metrics.py` hooks `nemo_rl.utils.logger.Logger.log_metrics`, so after `log_metrics` fans a step out to the file / W&B / MLflow backends it calls `tee_rl_metrics_to_otel(metrics, prefix)`. It is best-effort — the prefixes read include the per-step `train` dicts (`prefix in ("train", "")`) and the one-off `timing/setup` dict at step 0, plus completed `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries and the per-attempt `rollout/checkpoint_outcome` dictionary. Other prefixes are skipped, non-scalar values are ignored, and the whole path is a no-op unless telemetry is actively exporting. The numbers you already see in W&B are therefore the same series you get in your OTLP backend, with no double bookkeeping.
+The tee lives outside the algorithm code: `nemo_rl/telemetry/metrics.py` hooks `nemo_rl.utils.logger.Logger.log_metrics`, so after `log_metrics` fans a step out to the file / W&B / MLflow backends it calls `tee_rl_metrics_to_otel(metrics, prefix)`. It is best-effort — the prefixes read include the per-step `train` dicts (`prefix in ("train", "")`) and the one-off `timing/setup` dict at step 0, plus completed `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries and the per-attempt `rollout/checkpoint_outcome` dictionary. The per-step `performance` dict is read too, but for declared scalars alone. Other prefixes are skipped, non-scalar values are ignored, and the whole path is a no-op unless telemetry is actively exporting. The numbers you already see in W&B are therefore the same series you get in your OTLP backend, with no double bookkeeping.
 
 Each family has its own exception handler, so a bad value in one cannot silence the others.
 
@@ -17,6 +17,7 @@ Each family has its own exception handler, so a bad value in one cannot silence 
 Mirrored as gauges from the keys the algorithms already log. Each series is a `TeedMetric` row pairing a logger key with an `rl.*` name, declared in the module that logs the key:
 
 - `TRAINING_TEED_METRICS` in `nemo_rl/algorithms/metric_utils.py`: the scalars every training loop logs (reward, policy loss, gradient norm, learning rate, response length).
+- `FLOPS_TEED_METRICS` in `nemo_rl/algorithms/metric_utils.py`: the FLOP tracker's output — see below.
 - `LOSS_TEED_METRICS` in `nemo_rl/algorithms/loss/loss_functions.py`: KL divergence and entropy.
 - `CRITIC_TEED_METRICS` in `nemo_rl/algorithms/ppo.py`: the PPO value loss.
 - `SFT_V2_TEED_METRICS` in `nemo_rl/algorithms/sft_v2.py`: the SFT v2 controller's step timings and throughput. SFT v2 logs from its controller actor, which initializes telemetry before its first metric is logged.
@@ -24,6 +25,34 @@ Mirrored as gauges from the keys the algorithms already log. Each series is a `T
 `kl_penalty` is named for the penalty but holds the divergence — the coefficient is divided back out in `loss_functions.py` — which is why the metric is named `rl.kl.divergence`.
 
 Each row uses the same key constant as its logging site, so a rename cannot leave a gauge silently reporting nothing.
+
+## FLOPs (`rl.flops.*`)
+
+`nemo_rl/utils/flops_tracker.py` counts the FLOPs a training step costs and reads the device's theoretical peak. Three series carry its output, because the loops consume it in two different shapes:
+
+| Series | Unit | Logger key | Produced by |
+| --- | --- | --- | --- |
+| `rl.flops.per_gpu` | TFLOP/s | `train_flops_per_gpu` | GRPO, GRPO-sync and PPO via `print_performance_metrics`; SFT, DPO and distillation inline |
+| `rl.flops.utilization` | ratio, 0–1 | `train_fp_utilization` | the same six loops, when the device's peak is known |
+| `rl.flops.per_step` | FLOP | `total_flops` | SFT v2 and the Single-Controller, which forward the worker's raw per-step count rather than deriving a rate |
+
+The first two are rates over an elapsed time, so they need a denominator. The v1 loops prefer the CUDA-synchronized `train_elapsed_seconds` the Megatron worker records over the driver-side `policy_training` timer, which stops when the Ray future is submitted rather than when the GPU is done — plotting against the driver timer overstates throughput.
+
+`rl.flops.utilization` is the model FLOP utilization: achieved TFLOPS over `get_theoretical_tflops()` for the device and dtype. TF32 and the various reduced precisions have different peaks, so the denominator follows the run's dtype.
+
+### Gaps are expected, and are not zeros
+
+None of the three is a counter, and a step that produced no number reports nothing rather than zero. Three reasons a step is absent:
+
+- The backend does not track FLOPs, so `total_flops` never reaches the results dict.
+- Sequence packing is on, which makes the v1 loops skip the block entirely (`print_performance_metrics` gates on `not packing_enabled`): the formula bills padded sequence length, which packing is precisely designed to eliminate, so the figure would be wrong rather than merely approximate.
+- The device's theoretical peak is unknown, which drops `rl.flops.utilization` but keeps `rl.flops.per_gpu`.
+
+Treat a gap as "not measured". A dashboard that fills forward or sums across the gap is reading something the run did not claim.
+
+### The `performance` prefix
+
+`rl.flops.per_gpu` and `rl.flops.utilization` reach the tee from the v1 loops' `performance` dict, which `PERFORMANCE_PREFIX` in `nemo_rl/algorithms/metric_utils.py` names on both sides. That prefix is read for declared scalars only, never for the efficiency family: it carries no `efficiency/*` key, and scanning it for them would let an unrelated key land on a category series.
 
 ## Startup phases
 

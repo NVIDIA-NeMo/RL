@@ -27,6 +27,11 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
+from nemo_rl.algorithms.metric_utils import (
+    TOTAL_FLOPS_KEY,
+    TRAIN_FLOPS_PER_GPU_KEY,
+    TRAIN_FP_UTILIZATION_KEY,
+)
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.deepseek_v4_tokenizer import (
     get_deepseek_v4_tokenizer,
@@ -907,27 +912,27 @@ def print_performance_metrics(
     packing_enabled = master_config.policy.get("sequence_packing", {}).get(
         "enabled", False
     )
-    if "total_flops" in train_results and not packing_enabled:
+    if TOTAL_FLOPS_KEY in train_results and not packing_enabled:
         # Prefer the CUDA-synchronized elapsed time recorded inside the Megatron worker
         # over the driver-side policy_training timer, which returns as soon as the Ray
         # future is submitted and can be much shorter than actual GPU compute time.
         train_elapsed_seconds = train_results.get(
             "train_elapsed_seconds", timing_metrics["policy_training"]
         )
-        total_tflops = train_results["total_flops"] / train_elapsed_seconds / 1e12
+        total_tflops = train_results[TOTAL_FLOPS_KEY] / train_elapsed_seconds / 1e12
         num_ranks = train_results["num_ranks"]
         print(
             f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)",
             flush=True,
         )
-        performance_metrics["train_flops_per_gpu"] = total_tflops / num_ranks
+        performance_metrics[TRAIN_FLOPS_PER_GPU_KEY] = total_tflops / num_ranks
         if "theoretical_tflops" in train_results:
             theoretical_tflops = train_results["theoretical_tflops"]
             print(
                 f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%",
                 flush=True,
             )
-            performance_metrics["train_fp_utilization"] = (
+            performance_metrics[TRAIN_FP_UTILIZATION_KEY] = (
                 total_tflops / theoretical_tflops
             )
 

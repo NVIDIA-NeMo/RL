@@ -80,6 +80,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import (
     GRAD_NORM_KEY,
     LOSS_KEY,
+    PERFORMANCE_PREFIX,
     REWARD_KEY,
 )
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
@@ -1556,7 +1557,7 @@ def grpo_train_sync(
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(
-                performance_metrics, total_steps + 1, prefix="performance"
+                performance_metrics, total_steps + 1, prefix=PERFORMANCE_PREFIX
             )
             # Before the step_finished=True log below, which commits the step:
             # anything logged against a committed step is dropped by wandb, so

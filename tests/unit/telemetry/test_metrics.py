@@ -707,10 +707,39 @@ def test_tee_skips_prefixes_other_than_train():
     )
 
     reader = _start_exporting_telemetry()
-    tee_rl_metrics_to_otel({"efficiency/idle/refit_bubble_s": 12.0}, "performance")
     tee_rl_metrics_to_otel({"efficiency/idle/refit_bubble_s": 12.0}, "validation")
 
     assert _gauge_points(reader.get_metrics_data(), RL_EFFICIENCY_SECONDS_METRIC) == []
+
+
+def test_the_performance_prefix_is_read_for_scalars_but_not_for_efficiency():
+    """It carries the FLOP rates, and nothing a category series should read.
+
+    ``print_performance_metrics`` output is the only place the v1 loops log
+    the FLOP tracker's rates, so the prefix has to be teed for the rows that
+    name those keys. It holds no ``efficiency/*`` key of its own, and running
+    the efficiency handler over it anyway would let a key that happened to
+    collide land on a category series.
+    """
+    pytest.importorskip("nemo.lens")
+    _import_teed_metric_owners()
+    from nemo_rl.telemetry.metrics import (
+        RL_EFFICIENCY_SECONDS_METRIC,
+        tee_rl_metrics_to_otel,
+    )
+
+    reader = _start_exporting_telemetry()
+    tee_rl_metrics_to_otel(
+        {
+            "train_flops_per_gpu": 62.5,
+            "efficiency/idle/refit_bubble_s": 12.0,
+        },
+        "performance",
+    )
+
+    data = reader.get_metrics_data()
+    assert [p.value for p in _gauge_points(data, "rl.flops.per_gpu")] == [62.5]
+    assert _gauge_points(data, RL_EFFICIENCY_SECONDS_METRIC) == []
 
 
 def test_tee_skips_efficiency_instruments_without_efficiency_keys(monkeypatch):
@@ -786,6 +815,32 @@ def test_map_teed_scalars_reads_training_and_vllm_keys():
         "learning_rate": 1e-6,
         "vllm_prompt_tokens": 400.0,
         "vllm_generations_failed": 2.0,
+    }
+
+
+def test_map_teed_scalars_reads_the_flops_keys():
+    """The three shapes the FLOP tracker's output reaches the Logger in.
+
+    The rates come from the v1 loops' ``performance`` dict and from the
+    ``train`` dict in sft/dpo/distillation; the raw per-step count is what
+    sft_v2 and the Single-Controller forward instead of a rate. All three are
+    one mapping, so a run supplying any of them is covered.
+    """
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+
+    assert map_teed_scalars(
+        {
+            "train_flops_per_gpu": 62.5,
+            "train_fp_utilization": 0.42,
+            "total_flops": 1.0e15,
+            "num_ranks": 8,
+        }
+    ) == {
+        "flops_per_gpu": 62.5,
+        "flops_utilization": 0.42,
+        "flops_per_step": 1.0e15,
     }
 
 

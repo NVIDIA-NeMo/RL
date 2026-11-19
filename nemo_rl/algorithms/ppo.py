@@ -49,7 +49,7 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, make_objective_reduction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
-from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX
+from nemo_rl.algorithms.metric_utils import PERFORMANCE_PREFIX, SETUP_TIMING_PREFIX
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -2203,7 +2203,7 @@ def ppo_train(
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(
-                performance_metrics, total_steps + 1, prefix="performance"
+                performance_metrics, total_steps + 1, prefix=PERFORMANCE_PREFIX
             )
             logger.log_metrics(
                 timing_metrics,
@@ -3223,7 +3223,7 @@ def async_ppo_train(
                 merged_efficiency, total_wall_time, step + 1
             )
 
-            logger.log_metrics(performance_metrics, step + 1, prefix="performance")
+            logger.log_metrics(performance_metrics, step + 1, prefix=PERFORMANCE_PREFIX)
             logger.log_metrics(metrics, step + 1, prefix="train")
             logger.log_metrics(efficiency_loggable, step + 1, prefix="")
             logger.log_metrics(

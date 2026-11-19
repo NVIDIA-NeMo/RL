@@ -23,7 +23,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-from nemo_rl.algorithms.metric_utils import REWARD_KEY
+from nemo_rl.algorithms.metric_utils import REWARD_KEY, TOTAL_FLOPS_KEY
 from nemo_rl.data_plane import KVBatchMeta
 
 if TYPE_CHECKING:
@@ -80,8 +80,8 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
         metrics["draft_grad_norm"] = draft_grad_norm.detach().mean().item()
     elif draft_grad_norm is not None:
         metrics["draft_grad_norm"] = float(draft_grad_norm)
-    if "total_flops" in train_result:
-        metrics["total_flops"] = float(train_result["total_flops"])
+    if TOTAL_FLOPS_KEY in train_result:
+        metrics[TOTAL_FLOPS_KEY] = float(train_result[TOTAL_FLOPS_KEY])
     if "num_ranks" in train_result:
         metrics["num_ranks"] = int(train_result["num_ranks"])
 
