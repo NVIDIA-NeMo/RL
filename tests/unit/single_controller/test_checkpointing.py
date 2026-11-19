@@ -2418,6 +2418,71 @@ class TestPeriodicRolloutCheckpoint:
                 )
             )
 
+    def test_deferred_snapshot_logs_persist_and_release_phases(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock_now = [0.0]
+
+        def clock() -> float:
+            clock_now[0] += 1e-6
+            return clock_now[0]
+
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        events = []
+
+        @contextlib.asynccontextmanager
+        async def snapshot(_path):
+            yield _FakeEnvironmentSnapshot()
+
+        serialize = snapshots_module._serialize_recovery_state
+
+        def timed_serialize(state):
+            payload, _, binding = serialize(state)
+            clock_now[0] += 5.0
+            return payload, 5.0, binding
+
+        monkeypatch.setattr(
+            snapshots_module, "_serialize_recovery_state", timed_serialize
+        )
+
+        class Capture(CheckpointCapture):
+            def persist(self, *, extra_metadata=None) -> None:
+                events.append("persist")
+                clock_now[0] += 10.0
+
+            def release(self) -> None:
+                events.append("release")
+                clock_now[0] += 3.0
+
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        actor._dp_client.capture_checkpoint = (
+            lambda checkpoint_dir, *, metadata: Capture()
+        )
+        attach_rollout_checkpointing(actor)
+        try:
+            with patch(
+                "nemo_rl.algorithms.rollout_checkpointing.snapshots.time.monotonic",
+                new=clock,
+            ):
+                assert asyncio.run(
+                    actor._rollout_snapshots.save_snapshot(force=True)
+                ).saved
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events == ["persist", "release"]
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["recovery_state_serialize_seconds"] == 5.0
+        # persist excludes the serialization that runs just before the write
+        assert logged["tq_persist_seconds"] == pytest.approx(10.0, abs=1e-3)
+        assert logged["tq_release_seconds"] == pytest.approx(3.0, abs=1e-3)
+        assert logged["tq_save_seconds"] == pytest.approx(
+            logged["tq_capture_seconds"] + logged["tq_persist_seconds"]
+        )
+        # the deferred write happens after the barrier, so it is not part of the hold
+        assert logged["exclusive_hold_seconds"] < 1.0
+
     def test_logs_snapshot_phase_durations(self, tmp_path: Path) -> None:
         actor = self._actor(tmp_path)
         actor._logger = MagicMock()
@@ -3754,6 +3819,95 @@ class TestDataPlaneCheckpoint:
             assert torch.load(published / "train_dataloader.pt", weights_only=True) == {
                 "cursor": {"offset": 1}
             }
+
+    def test_trainer_deferred_save_binds_recovery_hash_in_persisted_metadata(
+        self, tmp_path: Path
+    ) -> None:
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=1,
+            save_period=1,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+        )
+        sample_ids = ["g0-0", "g0-1"]
+        dp_client = _FakeDPClient(sample_ids=sample_ids)
+        replay_metadata = {
+            "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+            "storage": REPLAY_BUFFER_METADATA_STORAGE,
+            "partition_id": _PARTITION_ID,
+            "saved_capacity": 4,
+            "manifest_digest": "digest-1",
+            "groups": [
+                {
+                    "meta": KVBatchMeta(
+                        partition_id=_PARTITION_ID,
+                        task_name="train",
+                        sample_ids=sample_ids,
+                        fields=["input_ids"],
+                        sequence_lengths=[16, 16],
+                        tags=[
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                        ],
+                    ),
+                    "start_weight": 0,
+                    "end_weight": 0,
+                    "target_step": None,
+                    "group_id": "g0",
+                }
+            ],
+        }
+        events: list[str] = []
+
+        class Capture(CheckpointCapture):
+            def __init__(self, checkpoint_dir, metadata):
+                self.checkpoint_dir = Path(checkpoint_dir)
+                self.metadata = metadata
+
+            def persist(self, *, extra_metadata=None) -> None:
+                events.append("persist")
+                self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                (self.checkpoint_dir / "metadata.json").write_text(
+                    json.dumps(
+                        {
+                            "storage_saved": True,
+                            "user_metadata": {
+                                **self.metadata,
+                                **(extra_metadata or {}),
+                            },
+                        }
+                    )
+                )
+
+            def release(self) -> None:
+                events.append("release")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            events.append("capture")
+            assert "rollout_recovery_payload_sha256" not in metadata
+            return Capture(checkpoint_dir, metadata)
+
+        dp_client.capture_checkpoint = capture_checkpoint
+        _run_train_pump(
+            mc,
+            _make_actor_args(
+                dp_client=dp_client,
+                tq_buffer=_FakeTQBuffer(metadata_state=replay_metadata),
+            ),
+        )
+
+        assert events == ["capture", "persist", "release"]
+        assert not dp_client.save_calls
+        step_dir = tmp_path / "checkpoints" / "step_1"
+        recovery_path = step_dir / ROLLOUT_RECOVERY_STATE_FILENAME
+        assert recovery_path.is_file()
+        user_metadata = json.loads(
+            (step_dir / "data_plane" / "metadata.json").read_text()
+        )["user_metadata"]
+        assert user_metadata["rollout_recovery_payload_sha256"] == (
+            hashlib.sha256(recovery_path.read_bytes()).hexdigest()
+        )
 
     def test_trainer_native_fallback_stays_inside_barrier(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
