@@ -29,6 +29,7 @@ project-includes = [
   "examples/**/*.py",
   "docs/*.py",
   "tools/**/*.py",
+  "docker/*.py",
 ]
 
 # Errors that existed when a file was last baselined. `pyrefly check` reports only
