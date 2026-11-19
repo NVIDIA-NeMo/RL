@@ -251,6 +251,7 @@ def _controller(
     controller._dispatched_rollouts = set()
     controller._trainer_version = 0
     controller._train_steps = 0
+    controller._rollout_stop_version = controller._algo_cfg.max_num_steps
     controller._current_epoch = 0
     controller._rollout_recovery_enabled = True
     # Dynamic sampling off: these fixtures exercise the fault-tolerance path.

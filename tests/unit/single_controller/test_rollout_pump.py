@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -120,6 +120,7 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     this file needs all of them, and a field added to only some of the builders is a
     missing attribute rather than a wrong answer.
     """
+    ctrl._rollout_stop_version = ctrl._algo_cfg.max_num_steps
     if not hasattr(ctrl, "_rollout_runtime"):
         ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._rollout_runtime.batch_shortfall = {}
@@ -366,6 +367,7 @@ def test_non_recovery_reserve_drain_rejects_an_occupied_target_step() -> None:
     ctrl._rollout_recovery_enabled = False
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
     ctrl._trainer_version = 0
+    ctrl._rollout_stop_version = 1
     launched: list[Any] = []
 
     async def launch(*args: Any) -> None:
@@ -408,6 +410,7 @@ def test_unrecorded_dispatch_takes_no_mutation_slot() -> None:
     ctrl._rollout_manager = SimpleNamespace()  # any ledger call would fail
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
     ctrl._trainer_version = 0
+    ctrl._rollout_stop_version = 1
     launched: list[Any] = []
 
     async def launch(*args: Any) -> None:
@@ -531,7 +534,7 @@ def _batch(*contents: str) -> BatchedDataDict:
 
 def _pump_controller(
     manager: Any,
-    dataloader: list[BatchedDataDict],
+    dataloader: Iterable[BatchedDataDict],
     *,
     on_dropped_prompt: str = "replace",
     max_replacement_attempts: int = 1,
@@ -584,6 +587,96 @@ def _pump_controller(
     ) * num_prompts_per_step
     ctrl._rollout_runtime.sampler_stamps_target_steps = False
     return ctrl
+
+
+@pytest.mark.parametrize("trainer_version", [0, 7])
+def test_rollout_pump_stops_at_remaining_training_budget(trainer_version: int) -> None:
+    manager = _ScriptedRolloutManager([])
+    batches = [_batch(f"prompt{i}") for i in range(6)]
+    iterator = iter(batches)
+    ctrl = _pump_controller(manager, iterator, on_dropped_prompt="shrink")
+    ctrl._trainer_version = trainer_version
+    ctrl._sampler = InOrderSampler(ctrl._buffer, max_lookahead_versions=4)
+    ctrl._sampler.set_dispatch_index(trainer_version)
+    ctrl._rollout_stop_version = trainer_version + 3
+
+    asyncio.run(asyncio.wait_for(ctrl._rollout_pump(), timeout=2))
+
+    assert manager.prompts_seen == ["prompt0", "prompt1", "prompt2"]
+    assert next(iterator) is batches[3]
+    assert ctrl._sampler.dispatch_index == trainer_version + 2
+    assert ctrl._rollout_exhausted.is_set()
+
+
+def test_completed_training_budget_leaves_dataloader_untouched() -> None:
+    manager = _ScriptedRolloutManager([])
+    batch = _batch("unused")
+    iterator = iter([batch])
+    ctrl = _pump_controller(manager, iterator)
+    ctrl._rollout_runtime.sampler_stamps_target_steps = True
+    ctrl._rollout_stop_version = 0
+
+    asyncio.run(asyncio.wait_for(ctrl._rollout_pump(), timeout=2))
+
+    assert manager.prompts_seen == []
+    assert next(iterator) is batch
+
+
+def test_final_training_step_can_replace_a_dropped_prompt() -> None:
+    manager = _ScriptedRolloutManager([RolloutOutcome.SKIPPED])
+    ctrl = _pump_controller(
+        manager, [_batch("original"), _batch("replacement"), _batch("unused")]
+    )
+    ctrl._rollout_stop_version = 1
+
+    asyncio.run(asyncio.wait_for(ctrl._rollout_pump(), timeout=2))
+
+    assert manager.prompts_seen == ["original", "replacement"]
+    assert ctrl._sampler.dispatch_index == 0
+    assert ctrl._rollout_runtime.batch_shortfall == {}
+
+
+def test_final_training_step_retains_unused_spares() -> None:
+    manager = _ScriptedRolloutManager([])
+    ctrl = _pump_controller(manager, [_batch("used"), _batch("spare")])
+    ctrl._rollout_stop_version = 1
+
+    asyncio.run(asyncio.wait_for(ctrl._rollout_pump(), timeout=2))
+
+    assert manager.prompts_seen == ["used"]
+    assert ctrl._sampler.dispatch_index == 0
+    assert len(ctrl._rollout_runtime.replacement_reserve) == 1
+
+
+def test_final_training_step_refills_filtered_replacements() -> None:
+    manager = _ScriptedRolloutManager([RolloutOutcome.FILTERED] * 3)
+    ctrl = _pump_controller(
+        manager,
+        [_batch("original"), *[_batch(f"spare{i}") for i in range(4)]],
+        on_dropped_prompt="shrink",
+        dynamic_sampling_max_replacements=5,
+    )
+    ctrl._rollout_stop_version = 1
+
+    asyncio.run(asyncio.wait_for(ctrl._rollout_pump(), timeout=2))
+
+    assert manager.prompts_seen == ["original", "spare0", "spare1", "spare2"]
+    assert ctrl._sampler.dispatch_index == 0
+    assert ctrl._rollout_runtime.batch_shortfall == {}
+
+
+@pytest.mark.parametrize("sampler_class", [ReadyFirstSampler, WindowedSampler])
+def test_unstamped_sampler_can_generate_extra_batches(sampler_class: type) -> None:
+    manager = _ScriptedRolloutManager([])
+    ctrl = _pump_controller(
+        manager, [_batch("a"), _batch("b")], on_dropped_prompt="shrink"
+    )
+    ctrl._sampler = sampler_class(ctrl._buffer, max_staleness_versions=1)
+    ctrl._rollout_stop_version = 1
+
+    asyncio.run(asyncio.wait_for(ctrl._rollout_pump(), timeout=2))
+
+    assert manager.prompts_seen == ["a", "b"]
 
 
 def test_filtered_group_can_draw_from_the_next_epoch() -> None:
