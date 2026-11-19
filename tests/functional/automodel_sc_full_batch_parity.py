@@ -22,6 +22,7 @@ network TransferQueue and live vLLM are covered by the separate SC smoke run.
 
 import argparse
 import copy
+import itertools
 import json
 import os
 from dataclasses import replace
@@ -222,12 +223,17 @@ def run(args):
     records = []
     passed = False
     try:
-        for token_level in (True, False):
+        # force_on_policy_ratio=False is the documented lookahead configuration and
+        # exercises the ordinary policy-ratio branch; True keeps the ratio at one and
+        # relies on the importance-sampling correction alone.
+        for token_level, force_on_policy_ratio in itertools.product(
+            (True, False), (True, False)
+        ):
             loss_fn = ClippedPGLossFn(
                 ClippedPGLossConfig(
                     token_level_loss=token_level,
                     reference_policy_kl_penalty=0.01,
-                    force_on_policy_ratio=True,
+                    force_on_policy_ratio=force_on_policy_ratio,
                     use_importance_sampling_correction=True,
                 )
             )
@@ -277,7 +283,7 @@ def run(args):
                 torch.set_rng_state(cpu_rng)
                 torch.cuda.set_rng_state(gpu_rng)
                 del before, optim_before
-                partition = f"parity-{token_level}-{step}"
+                partition = f"parity-{token_level}-{force_on_policy_ratio}-{step}"
                 client.register_partition(
                     partition_id=partition,
                     fields=list(batch),
@@ -352,6 +358,7 @@ def run(args):
                 errors = dict(zip(errors, maxima.cpu().tolist()))
                 record = {
                     "token_level": token_level,
+                    "force_on_policy_ratio": force_on_policy_ratio,
                     "step": step,
                     **errors,
                     "loss": float(sync_metrics["global_loss"].sum()),

@@ -39,7 +39,11 @@ error_console = Console(stderr=True)
 
 
 def merge_tb_logs_to_json(
-    log_dir, output_path, error_on_conflicts=False, required_tag_prefix=None
+    log_dir,
+    output_path,
+    error_on_conflicts=False,
+    required_tag_prefix=None,
+    allow_conflicts_prefix=None,
 ):
     """Merge multiple TensorBoard event files into a single JSON file.
 
@@ -49,6 +53,9 @@ def merge_tb_logs_to_json(
         error_on_conflicts: If True, raise an error if conflicting values are found for the same step
         required_tag_prefix: If set, require at least one TensorBoard tag in any
             plugin category to start with this prefix
+        allow_conflicts_prefix: If set, metrics whose tag starts with this prefix
+            keep the latest value on a conflict even when error_on_conflicts is
+            True; use it for counters logged on a timer under the current step
 
     Raises:
         ValueError: If conflicting values are found for the same step and
@@ -105,7 +112,11 @@ def merge_tb_logs_to_json(
 
                     # Only consider it a conflict if the values are different
                     if existing_value != value:
-                        if error_on_conflicts:
+                        tolerated = (
+                            allow_conflicts_prefix is not None
+                            and metric_name.startswith(allow_conflicts_prefix)
+                        )
+                        if error_on_conflicts and not tolerated:
                             # Immediate error if we choose to error on conflicts
                             raise ValueError(
                                 f"Conflict detected for metric '{metric_name}' at step {step}:\n"
@@ -244,6 +255,14 @@ if __name__ == "__main__":
         default=None,
         help="Require a TensorBoard tag in any plugin category with this prefix",
     )
+    parser.add_argument(
+        "--allow-conflicts-prefix",
+        default=None,
+        help=(
+            "With --error-on-conflicts, keep the latest value instead of erroring "
+            "for metrics whose tag starts with this prefix"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -253,6 +272,7 @@ if __name__ == "__main__":
             args.output_path,
             args.error_on_conflicts,
             args.require_tag_prefix,
+            args.allow_conflicts_prefix,
         )
     except Exception as e:
         error_console.print(f"[bold red]Error: {e}[/bold red]")
