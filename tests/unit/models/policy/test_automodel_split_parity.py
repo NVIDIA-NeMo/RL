@@ -71,7 +71,8 @@ def test_full_batch_split_parity(
     execute the same assertions. Two updates per loss normalization exercise
     optimizer/scheduler progression, with two microbatches per rank and a masked
     sample, with and without chunked training logprobs, and with the policy ratio
-    both forced to one and computed. Network TQ, Ray dispatch,
+    both forced to one and computed. The dense case leaves the expert-parallel
+    key unset, as the shipped dense recipes do. Network TQ, Ray dispatch,
     and live refits are covered by L1.
     """
     if torch.cuda.device_count() < 2:
@@ -83,8 +84,8 @@ def test_full_batch_split_parity(
     register_omegaconf_resolvers()
     config = load_config(str(root / "examples/configs/grpo_math_1B.yaml"))
     config.policy.logprob_chunk_size = logprob_chunk_size
-    config.policy.automodel_cfg.expert_parallel_size = expert_parallel_size
     if expert_parallel_size > 1:
+        config.policy.automodel_cfg.expert_parallel_size = expert_parallel_size
         config.policy.automodel_cfg.automodel_kwargs.backend = {
             "_target_": "nemo_automodel.components.models.common.utils.BackendConfig",
             "attn": "te",

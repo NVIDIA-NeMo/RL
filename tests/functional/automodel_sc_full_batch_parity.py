@@ -157,11 +157,13 @@ def run(args):
     cfg.policy.dynamic_batching.enabled = False
     cfg.policy.sequence_packing.enabled = False
     cfg.policy.automodel_cfg.deterministic = True
+    # Shipped recipes omit the key for dense models; setup treats that as EP=1.
+    expert_parallel_size = cfg.policy.automodel_cfg.get("expert_parallel_size")
     if args.force_hf:
         cfg.policy.automodel_cfg.automodel_kwargs.force_hf = True
         cfg.policy.automodel_cfg.automodel_kwargs.pop("backend", None)
     elif (
-        cfg.policy.automodel_cfg.expert_parallel_size in (None, 1)
+        expert_parallel_size in (None, 1)
         and "backend" in cfg.policy.automodel_cfg.automodel_kwargs
     ):
         cfg.policy.automodel_cfg.automodel_kwargs.backend.dispatcher = "torch"
@@ -186,7 +188,6 @@ def run(args):
     # numerical test; production initialization is otherwise unchanged.
     with patch.object(ray, "get_gpu_ids", return_value=[local_rank]):
         worker = AutomodelPolicyWorkerImpl(policy_cfg, init_reference_model=False)
-    expert_parallel_size = cfg.policy.automodel_cfg.expert_parallel_size
     if expert_parallel_size is not None and expert_parallel_size > 1:
         assert worker.moe_mesh is not None
         assert worker.moe_mesh["ep"].size() == expert_parallel_size
@@ -210,7 +211,7 @@ def run(args):
                 "model": args.model,
                 "force_hf": args.force_hf,
                 "dp": world,
-                "ep": cfg.policy.automodel_cfg.expert_parallel_size,
+                "ep": expert_parallel_size,
                 "gbs": world * 2,
                 "steps_per_loss_type": args.steps,
                 "rtol": args.rtol,
