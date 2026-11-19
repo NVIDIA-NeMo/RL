@@ -656,8 +656,14 @@ class GenerationInterface(ABC):
         """Return a backend-specific collective world size when required."""
         return None
 
-    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
-        """Prepare per-layer param metadata for nccl_reshard-based refit."""
+    def prepare_nccl_reshard_refit_info(self, refit_infos: list[dict]) -> None:
+        """Prepare per-layer param metadata for nccl_reshard-based refit.
+
+        ``refit_infos`` holds one plan per destination layout, in the order of
+        the ``layout_index`` the bulk communicators were built with. vLLM and
+        Megatron generation have a single layout; disaggregated TRT-LLM has one
+        per engine role.
+        """
         raise NotImplementedError
 
     def nccl_reshard_refit(
@@ -700,6 +706,7 @@ class GenerationInterface(ABC):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        media_family: str | None = None,
         top_logprobs: int = 0,
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
@@ -719,6 +726,10 @@ class GenerationInterface(ABC):
             capture_media: Whether the staging partition carries media columns and
                 the workers must stage the media the engine consumed beside each
                 call's tokens.
+            media_family: With ``capture_media``, the family the driver picked from
+                the run's processor (``captured_media.media_capture_family``); the
+                workers check that their engine built the matching processor.
+                ``None`` for text-only capture.
             generation_prefix_cuts_enabled: Allow checkpoint-time cuts of active
                 model calls for prefix recovery.
             generation_cut_control_token: Bearer token used by Gym's checkpoint

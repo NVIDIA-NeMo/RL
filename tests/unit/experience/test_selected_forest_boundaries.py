@@ -802,6 +802,57 @@ def test_selected_forest_publishes_once(
     assert_loss_once(forest, selected, records)
 
 
+def _continued_request(records: list, terminal: Any) -> ReassemblyRequest:
+    # A turn restore continued rollout "attempt" as "attempt-a1".
+    return ReassemblyRequest(
+        group_id="group",
+        rollout_ids=("attempt-a1",),
+        canonical_sample_ids=("group_g0",),
+        receipts=(
+            {**receipt(records, terminal=terminal), "capture_key": "attempt-a1"},
+        ),
+        rewards=(1.0,),
+        fallback_weight_version=7,
+        prompt_idx=99,
+        mask_sample=(False,),
+        logical_selections=(selection(records),),
+    )
+
+
+def test_continued_attempt_trains_calls_its_earlier_attempt_staged(
+    forest: ForestCapture,
+) -> None:
+    before, _ = forest.capture([None])
+    after, _ = forest.capture([None], owner="attempt-a1")
+    # The restore carried the earlier call over, stamped with its staging owner.
+    carried = [r.model_copy(update={"source_capture_key": "attempt"}) for r in before]
+    records = carried + after
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    actor._finalizer = forest.finalizer
+
+    request = _continued_request(records, after[-1])
+    # Cleanup reads capture_receipts; finalize() alone never checks it.
+    assert request.capture_receipts == request.receipts
+    result = actor.finalize(request)
+
+    assert result.valid_row_count == 2
+    assert_loss_once(forest, records, records)
+
+
+@pytest.mark.parametrize("first", ["another_rollout", "unstamped"])
+def test_continued_attempt_refuses_rows_it_cannot_own(
+    forest: ForestCapture, first: str
+) -> None:
+    owner = "other" if first == "another_rollout" else "attempt"
+    before, _ = forest.capture([None], owner=owner)
+    after, _ = forest.capture([None], owner="attempt-a1")
+    if first == "another_rollout":
+        before = [r.model_copy(update={"source_capture_key": owner}) for r in before]
+
+    with pytest.raises(ValueError, match="Foreign capture scope"):
+        _continued_request(before + after, after[-1]).capture_receipts
+
+
 def test_shared_action_masks_counts_and_prompt_are_owned_once(
     forest: ForestCapture,
 ) -> None:
@@ -1253,6 +1304,12 @@ def test_forest_shaping_and_observations_are_per_owner(
     assert observation.rollout_id == "attempt"
     assert observation.reward == pytest.approx(2.0 - (scored_index + 1) / 10)
     assert observation.log_context.agent_name == "test-agent"
+    # Raw voting flags ride beside the observation, one per observation.
+    assert result.reward_mask_sample == [False]
+    assert len(result.reward_truncated) == 1
+    # The Gym reward is the dispatcher's input, before effort shaping.
+    assert result.reward_original == [1.0]
+    assert result.loss_multiplier == 1.0
     assert result.metrics[f"finalize/effort/low/{scored_index + 1}"] == 1
     for key in result.meta.sample_ids[:3]:
         assert forest.plane.rows["canonical", key][
@@ -1285,6 +1342,59 @@ def test_forest_rows_flag_padding_for_router_statistics(forest: ForestCapture) -
         for key in result.meta.sample_ids
     ]
     assert flags == [False, False, True, True]
+
+
+def test_ordinary_finalize_carries_nondefault_voting_fields(
+    forest: ForestCapture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The finalizer ships the raw per-row voting fields the controller classifies on.
+
+    An ordinary (non-Forest) group with a masked valid row, an invalid row and a
+    truncated valid row, under a non-unit dataset loss weight, must return those exact
+    flags, the pre-shaping Gym rewards and the loss_multiplier for the valid rows only
+    -- all away from their defaults -- so the controller's zero-variance filter reads
+    real signal, not placeholders, and the invalid row never votes.
+    """
+    # Two independent single-call rollouts, each its own ordinary reward row.
+    records_a, _ = forest.capture([None], owner="attempt")
+    records_b, _ = forest.capture([None], owner="healthy")
+
+    # Keep truncation mixed across the two valid reward rows.
+    monkeypatch.setattr(
+        forest.finalizer,
+        "_truncated_flags",
+        lambda rows, logical: [False, False, True],
+    )
+
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt", "bad", "healthy"],
+        [
+            receipt(records_a, terminal=records_a[-1]),
+            # An invalid row between the two valid ones: the voting lists must skip it.
+            None,
+            # capture_key must match the rollout_id "healthy" or finalize rejects the row.
+            {**receipt(records_b, terminal=records_b[-1]), "capture_key": "healthy"},
+        ],
+        [0.25, 7.0, 0.75],
+        mask_sample=[True, False, False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        loss_multiplier=0.5,
+        canonical_sample_ids=["group_g0", "group_g1", "group_g2"],
+    )
+
+    assert result.total_row_count == 3
+    assert result.valid_row_count == 2
+    assert len(result.reward_observations) == 2
+    # The raw voting flags ride one-per-valid-row, in rollout order, not their
+    # defaults, so the controller classifies the real group.
+    assert result.reward_mask_sample == [True, False]
+    assert result.reward_truncated == [False, True]
+    # The Gym rewards, before any effort shaping or penalties.
+    assert result.reward_original == [0.25, 0.75]
+    # The dataset-level weight is carried through unchanged (non-unit).
+    assert result.loss_multiplier == 0.5
 
 
 def test_publication_identity_drift_preserves_staging(forest, monkeypatch):

@@ -12,6 +12,7 @@ NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 # sleep/wake and per-wake reshard on top of training, so keep the async-gym
 # sibling's 180 min budget until measured.
 NUM_MINUTES=180
+USES_OPENSANDBOX=1
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

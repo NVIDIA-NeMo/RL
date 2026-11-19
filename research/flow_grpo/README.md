@@ -183,23 +183,11 @@ Text accuracy improves while PickScore stays flat.
 ## Research integration
 
 This experimental project keeps generation and policy training in the same worker.
-It lives in `research/` while customer feedback and integration requirements are
-being established. The Python package is `flow_grpo`; core NeMo RL remains a
-workspace dependency. The SDE utilities live under `flow_grpo/algorithms/` and the
-model adapter under `flow_grpo/models/`. The policy facade and its workers
-follow core's layout under `flow_grpo/models/policy/` and
-`flow_grpo/models/policy/workers/`, respectively.
+It lives in `research/` while customer feedback and integration requirements are being established. The Python package is `flow_grpo`; core NeMo RL remains a workspace dependency. The SDE utilities live under `flow_grpo/algorithms/` and the model adapter under `flow_grpo/models/`. The policy facade and its workers follow core's layout under `flow_grpo/models/policy/` and `flow_grpo/models/policy/workers/`, respectively.
 
-The root `uv.lock` is shared by the workspace. After changing this project's
-`pyproject.toml`, run `uv lock` from the repository root and review the lockfile
-changes. No root `diffusion` extra is needed.
+The root `uv.lock` is shared by the workspace. After changing this project's `pyproject.toml`, run `uv lock` from the repository root and review the lockfile changes. No root `diffusion` extra is needed.
 
-The driver registers both policy and reward actor environments with
-`uv run --locked --directory <research-project>`. The existing worker environment
-builder first installs root build dependencies, then installs this project's
-dependencies into that worker environment. Reward actors receive the resolved
-runtime environment explicitly. `NEMO_RL_PY_EXECUTABLES_SYSTEM=1` instead uses the
-driver interpreter, which must already have these dependencies installed.
+The driver registers both policy and reward actor environments with `uv run --locked --directory <research-project>`. The existing worker environment builder first installs root build dependencies, then installs this project's dependencies into that worker environment. Reward actors receive the resolved runtime environment explicitly. `NEMO_RL_PY_EXECUTABLES_SYSTEM=1` instead uses the driver interpreter, which must already have these dependencies installed.
 
 From this directory, run unit tests with:
 
@@ -209,11 +197,6 @@ uv run --no-sync pytest tests/unit
 ```
 
 Unit and functional tests are discovered by the shared research CI runners.
-The OCR convergence script is listed in the root `tests/test_suites/nightly.txt`;
-its matching recipe remains in this project's `configs/recipes/`. Run suite
-scripts from the repository root, or use `tools/launch` with their
-repository-relative path.
+The OCR convergence script is listed in the root `tests/test_suites/nightly.txt`; its matching recipe remains in this project's `configs/recipes/`. Run suite scripts from the repository root, or use `tools/launch` with their repository-relative path.
 
-Both YAML configurations live in `configs/recipes/`. The full GenRM recipe has
-a matching suite script in `disabled.txt` because it requires an external judge;
-the shorter PaddleOCR recipe remains in `nightly.txt`.
+Both YAML configurations live in `configs/recipes/`. The full GenRM recipe has a matching suite script in `disabled.txt` because it requires an external judge; the shorter PaddleOCR recipe remains in `nightly.txt`.
