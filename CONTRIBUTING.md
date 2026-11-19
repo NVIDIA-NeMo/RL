@@ -251,7 +251,6 @@ Comment `/review` on a pull request for the formal review service. Use `/review 
 
 The retired `/claude review` and `/claude strict-review` commands only reply with migration instructions when posted as an exact command by an owner, member, or collaborator. Other commenters, bots, and quoted mentions do not trigger a notice. These commands never run or automatically request a review.
 
-Repository review guidance remains in AGENTS.md and [the existing team-review skill](skills/review-pr-team/SKILL.md).
-The local `/review-pr` and `/review-pr-team` workflows are unchanged.
+Repository review guidance remains in AGENTS.md and [the existing team-review skill](skills/review-pr-team/SKILL.md). The local `/review-pr-team` workflow is unchanged.
 Before relying on repository-specific formal reviews, verify the service's profile registration and a Ready snapshot of the protected-main guidance.
 This migration does not register or activate that integration.

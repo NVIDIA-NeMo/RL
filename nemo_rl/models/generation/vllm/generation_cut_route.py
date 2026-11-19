@@ -18,10 +18,9 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import Callable
+from typing import Any, Protocol
 
 from fastapi import FastAPI, Header, HTTPException
-
-from nemo_rl.models.generation.prefix_recovery import NoPrefixRecovery, PrefixRecovery
 
 # Gym owns this route (nemo_gym._checkpoint.generation_cut.GENERATION_CUT_ROUTE),
 # but nemo_gym is an optional extra. A drifted copy would 404 every cut, which Gym
@@ -29,14 +28,28 @@ from nemo_rl.models.generation.prefix_recovery import NoPrefixRecovery, PrefixRe
 GENERATION_CUT_ROUTE = "/ng-control/v1/generation-cut"
 
 
+class GenerationCutBackend(Protocol):
+    """What runs a cut: a worker's prefix recovery, or the Dynamo frontend's fan-out."""
+
+    @property
+    def control_token(self) -> str | None:
+        """The bearer token a cut must carry; None refuses every cut."""
+        ...
+
+    async def run_cut(self, inventory: Any) -> Any:
+        """Cut the calls Gym's inventory names and return Gym's receipt."""
+        ...
+
+
 def register_generation_cut_route(
-    app: FastAPI, recovery: Callable[[], PrefixRecovery | NoPrefixRecovery]
+    app: FastAPI, recovery: Callable[[], GenerationCutBackend]
 ) -> None:
-    """Serve Gym's generation-cut call from the worker's prefix recovery.
+    """Serve Gym's generation-cut call from the host's cut backend.
 
     ``recovery`` returns the worker's current ``PrefixRecovery`` or
-    ``NoPrefixRecovery``. It is a callable because the server starts before
-    ``setup_token_capture`` builds the recovery object.
+    ``NoPrefixRecovery``, or the Dynamo frontend's fan-out to its engines. It
+    is a callable because the server starts before ``setup_token_capture``
+    builds the recovery object.
     """
 
     @app.post(GENERATION_CUT_ROUTE)
