@@ -1,3 +1,9 @@
+> **HL-Gauss SingleController branch (`binhu/hlgauss_ppo_sc`):**
+> Start with the [branch recipes and launch guide](examples/hlgauss_ppo_sc/README.md).
+> These recipes use SingleController PPO, including the critic. Score centering
+> and failure classification are separate options. The legacy HL-Gauss PPO
+> implementation remains on `binhu/hlgauss_ppo`.
+
 <div align="center">
 
    # NeMo RL: A Scalable and Efficient Post-Training Library

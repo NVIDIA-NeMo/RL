@@ -1,0 +1,20 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Offline SingleController rollout banks, not legacy PPO dump files.
+# Entry: examples/run_critic_pretrain_single_controller.py
+defaults: nano_ctrunc.yaml
+data:
+  # Pretraining consumes rollout banks directly, not a fresh prompt dataloader.
+  train:
+    data_path: ""
+cluster:
+  num_nodes: 8
+checkpointing:
+  checkpoint_dir: results/hlgauss_sc_critic_pretrain
+critic_pretrain:
+  bank_dirs: ???
+  num_epochs: 1
+  train_on_env_masked: true
+  train_on_truncated: true
+  eval_period: 10
+  optimizer_state: every_checkpoint

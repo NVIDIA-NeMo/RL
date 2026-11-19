@@ -1,0 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Optional algorithm change, not required by score centering.
+defaults: nano_sc_failures.yaml
+ppo:
+  tool_failure_credit:
+    enabled: true
+    categories: [schema_error, edit_failed, read_missing]
+  malformed_think_credit:
+    enabled: true
+    max_advantage: -2.0
+reward_penalties:
+  # Replace whole-rollout malformed zeroing; do not apply both penalties.
+  penalize_malformed_think_tag: false
+  log_malformed_think_tag: true
+  token_ids:
+    turn_start: 10

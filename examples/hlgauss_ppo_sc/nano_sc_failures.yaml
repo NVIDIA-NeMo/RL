@@ -1,0 +1,39 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+defaults: nano_sc.yaml
+ppo:
+  # Otherwise the final length filter would mask context-limited rows again.
+  overlong_filtering: false
+env:
+  invalid_sample_failure_kinds:
+  - agent_run_error
+  - judge_failed
+  - infrastructure
+  - verifier_error
+  - provider_oom_killed
+  mask_sample_rules:
+  - name: agent_timeout
+    field: opencode_error_type
+    equals: timeout
+    failure_kind: agent_timeout
+  - name: agent_timeout_exception
+    field: opencode_error_type
+    equals: TimeoutError
+    failure_kind: agent_timeout
+  - name: agent_oom
+    field: opencode_exit_code
+    equals: 137
+    failure_kind: provider_oom_killed
+  - name: eval_incomplete
+    field: evaluation_completed
+    equals: false
+    failure_kind: verifier_error
+  - name: context_limited
+    field: opencode_context_limited
+    equals: true
+    failure_kind: model_context_limit
+  reward_penalty_rules:
+  - name: context_limited_trains
+    masked_by: [context_limited]
+    reward: null
+    unmask_rules: [context_limited, agent_timeout, agent_timeout_exception]

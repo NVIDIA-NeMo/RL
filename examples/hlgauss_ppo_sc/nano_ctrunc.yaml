@@ -1,0 +1,73 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# SingleController PPO. All relative defaults are shipped in this branch.
+defaults: ../swe_ppo_hsg/ppo_nano_v3_5_swe_sandbox_capture_priv.yaml
+data:
+  # No validation pass is configured; avoid an unresolved validation data path.
+  validation: null
+cluster:
+  gpus_per_node: 4
+  num_nodes: 24
+  segment_size: 8
+checkpointing:
+  checkpoint_dir: results/hlgauss_ppo_sc
+  save_period: 10
+  checkpoint_must_save_by: 00:03:50:00
+ppo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 1
+  ppo_epochs: 1
+  critic_ppo_epochs: 1
+  overlong_filtering: true
+  critic_train_on_env_masked: true
+  critic_train_on_truncated: true
+  adv_estimator:
+    length_adaptive_alpha: 0.0
+value_loss_fn:
+  cliprange: null
+policy:
+  train_global_batch_size: 128
+  max_total_sequence_length: 196608
+  logprob_chunk_size: 1024
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    context_parallel_size: 2
+    expert_model_parallel_size: 8
+    optimizer:
+      lr: 1.5e-6
+      min_lr: 1.5e-6
+  generation:
+    colocated:
+      resources:
+        num_nodes: 16
+    vllm_cfg:
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      max_model_len: ${policy.max_total_sequence_length}
+value:
+  head:
+    type: hl_gauss
+    num_bins: 101
+    v_min: -0.1
+    v_max: 1.1
+    sigma: null
+    prior_success: 0.5
+    weight_init_scale: 1.0
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    context_parallel_size: 2
+    expert_model_parallel_size: 8
+    optimizer:
+      lr: 6.0e-6
+      min_lr: 6.0e-6
+    scheduler:
+      lr_warmup_iters: 5
+reward_penalties:
+  penalize_tool_call_loops: true
+  penalize_reasoning_loops: true
+  tool_call_loop_min_calls: 3
+  tool_call_loop_max_period: 4
+  tool_call_loop_min_cycles: 3
+  reasoning_loop_min_repeats: 3
+  reasoning_loop_min_line_chars: 60
+  reasoning_loop_min_distinct_lines: 2

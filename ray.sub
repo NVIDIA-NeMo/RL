@@ -187,7 +187,8 @@ MIN_WORKER_PORT=${MIN_WORKER_PORT:-2000}
 MAX_WORKER_PORT=${MAX_WORKER_PORT:-2999}
 ########################################################
 # Number seconds to sync logs from /tmp/ray/session_*/logs to $LOG_DIR/ray/
-RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
+# Periodic Ray log copying is disabled for this branch.
+unset RAY_LOG_SYNC_FREQUENCY
 ########################################################
 
 # Unset UV_CACHE_DIR to avoid local cache directory interferring with the container cache
@@ -682,7 +683,7 @@ monitor-sidecar &
 # Background process to sync ray logs every $RAY_LOG_SYNC_FREQUENCY seconds
 log-sync-sidecar() {
   set +x
-  if [[ -z "$RAY_LOG_SYNC_FREQUENCY" ]]; then
+  if [[ -z "${RAY_LOG_SYNC_FREQUENCY:-}" ]]; then
     echo "RAY_LOG_SYNC_FREQUENCY is not set, skipping log sync sidecar"
     return
   fi
@@ -913,7 +914,7 @@ monitor-sidecar &
 # Background process to sync ray logs every $RAY_LOG_SYNC_FREQUENCY seconds
 log-sync-sidecar() {
   set +x
-  if [[ -z "$RAY_LOG_SYNC_FREQUENCY" ]]; then
+  if [[ -z "${RAY_LOG_SYNC_FREQUENCY:-}" ]]; then
     echo "RAY_LOG_SYNC_FREQUENCY is not set, skipping log sync sidecar"
     return
   fi

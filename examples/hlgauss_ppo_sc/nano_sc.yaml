@@ -1,0 +1,22 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+defaults: nano_ctrunc.yaml
+loss_fn:
+  score_centering: true
+token_capture:
+  top_logprobs: 32
+policy:
+  megatron_cfg:
+    # Actor only; critic remains CP2. No optimizer CPU offload is added.
+    context_parallel_size: 4
+    use_fused_linear_logprobs: false
+  sequence_packing:
+    enabled: true
+    fuse_loss: true
+  generation:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    vllm_kwargs:
+      max_logprobs: 32
+      logprobs_mode: processed_logprobs
