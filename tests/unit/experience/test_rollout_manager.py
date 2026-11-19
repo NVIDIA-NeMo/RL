@@ -2420,6 +2420,26 @@ def _make_capture_manager(
 
 
 class TestGenerateForFinalizationFlow:
+    def test_streamed_identity_and_routing_do_not_copy_sealed_receipts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mgr = _make_capture_manager(_FakeCaptureBuffer())
+        ledger = mgr.recovery_ledger
+        original_copy = ledger._copy_group
+
+        def copy_unsealed_group(record):
+            assert all(
+                sibling.current_attempt.receipt is None for sibling in record.siblings
+            ), "identity/routing lookup copied sealed receipts"
+            return original_copy(record)
+
+        monkeypatch.setattr(ledger, "_copy_group", copy_unsealed_group)
+        request, _ = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+
+        assert len(request.receipts) == 2
+        assert request.resolved_agent_name == "resolved-agent"
+        assert request.attribution_key == "resolved-agent"
+
     @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
     @pytest.mark.parametrize("materialized", [False, True])
     def test_resolved_route_survives_all_sealed_restore(

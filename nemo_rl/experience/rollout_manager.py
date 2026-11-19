@@ -3150,9 +3150,9 @@ class RolloutManager:
                 )
             # Read from the ledger: a row re-sent after a broken stream runs
             # under a fresh attempt, not the ID this dispatch started with.
-            expected_gate_rollout_id = self._recovery_ledger.get_group(
-                group_id
-            ).gate_rollout_id(generation_index)
+            expected_gate_rollout_id = self._recovery_ledger.current_gate_rollout_id(
+                group_id, generation_index
+            )
             if gate_rollout_id != expected_gate_rollout_id:
                 raise ValueError(
                     "streamed rollout identity mismatch: "
@@ -3262,6 +3262,9 @@ class RolloutManager:
                 reward_checks,
                 reward_log_contexts,
             ) = self._recovery_ledger.finalization_inputs(group_id)
+            resolved_agent_name, attribution_key = (
+                self._recovery_ledger.finalization_routing(group_id)
+            )
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
@@ -3285,12 +3288,8 @@ class RolloutManager:
                     else None
                 ),
                 execution_row_multiple=self._execution_row_multiple,
-                resolved_agent_name=self._recovery_ledger.get_group(
-                    group_id
-                ).resolved_agent_name,
-                attribution_key=self._recovery_ledger.get_group(
-                    group_id
-                ).attribution_key,
+                resolved_agent_name=resolved_agent_name,
+                attribution_key=attribution_key,
             )
             assert_metadata_only(request)
             return request, rollout_metrics
