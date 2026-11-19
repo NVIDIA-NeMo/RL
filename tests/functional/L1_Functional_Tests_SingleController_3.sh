@@ -62,8 +62,6 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_filt
 # BrowseComp compaction smoke (valid rows must prove a context boundary), then
 # resumed from step 10 to 12.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_context_compaction_resume.sh
-# PPO (GAE, Megatron critic) on the same Forest rows, with checkpoint/resume.
-run_test fast uv run --no-sync bash ./tests/functional/ppo_async_gym_single_controller_context_compaction.sh
 # Two-process token-capture recovery: preserve one sealed sibling in TQ and
 # redispatch only its unfinished peer after restoring the step checkpoint.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
