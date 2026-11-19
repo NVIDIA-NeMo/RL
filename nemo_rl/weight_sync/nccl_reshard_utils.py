@@ -402,7 +402,7 @@ def get_placements(param_name: str, dim_map: dict, ndim: int) -> list:
     Expert params shard dim 0 on EP; their ETP shard dims are shifted by +1.
     """
     num_mesh_dims = len(dim_map) or 1
-    placements = [Replicate() for _ in range(num_mesh_dims)]
+    placements: list[Shard | Replicate] = [Replicate() for _ in range(num_mesh_dims)]
 
     if ndim < 2:
         # For 1-D params, it assumes that it is always fully replicated.

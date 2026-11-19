@@ -23,7 +23,7 @@ import threading
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -649,8 +649,11 @@ def test_token_capture_top_logprobs_rejects_megatron_generation():
         validate_single_controller_config(mc)
 
 
-def test_prefix_recovery_rejects_sampler_top_k_capture():
-    # A restored prefix has no sampler top-k for its spliced tokens.
+@pytest.mark.parametrize(
+    "target_level", [RecoveryTargetLevel.PREFIX, RecoveryTargetLevel.TURN]
+)
+def test_rollout_recovery_accepts_sampler_top_k_capture(target_level):
+    # Each prefix cut stages its tokens' sampler top-k with them.
     mc = _make_master_config(
         env={"should_use_nemo_gym": True},
         loss_cfg=ClippedPGLossConfig(score_centering=True),
@@ -659,13 +662,7 @@ def test_prefix_recovery_rejects_sampler_top_k_capture():
     mc.policy["generation"].update(
         top_logprobs=4, temperature=1.0, top_p=1.0, top_k=None
     )
-    mc.rollout_recovery.target_level = RecoveryTargetLevel.PREFIX
-    with pytest.raises(
-        ValueError, match="does not support policy.generation.top_logprobs"
-    ):
-        validate_single_controller_config(mc)
-
-    mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+    mc.rollout_recovery.target_level = target_level
     validate_single_controller_config(mc)
 
 
@@ -831,7 +828,7 @@ def test_recovery_target_enables_required_checkpoint_capabilities(
 
 
 @contextlib.contextmanager
-def _patched_gym_token_capture(finalizer_actors):
+def _patched_gym_token_capture(finalizer_actors, *, router_replay: bool = False):
     """Patch the Gym and finalizer actors a Gym token-capture setup builds.
 
     Yields the Gym spin-up and finalizer-creation mocks.
@@ -841,8 +838,8 @@ def _patched_gym_token_capture(finalizer_actors):
         patch.object(
             sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
         ) as spinup,
-        patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
-        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(sc_setup_mod, "router_replay_enabled", return_value=router_replay),
+        patch.object(sc_setup_mod, "media_capture_family", return_value="omni"),
         patch(
             "nemo_rl.experience.rollout_reassembler_actor."
             "create_rollout_reassembler_actors",
@@ -1246,6 +1243,7 @@ class TestSetup:
                 ["http://generation"],
                 MagicMock(name="tokenizer"),
                 policy_api_key=None,
+                generation_cut_control_urls=None,
             )
 
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is False
@@ -1272,11 +1270,13 @@ class TestSetup:
                 ["http://generation"],
                 MagicMock(name="tokenizer"),
                 policy_api_key=None,
+                generation_cut_control_urls=["http://generation-cuts"],
             )
 
         kwargs = mock_spinup.call_args.kwargs
         assert kwargs["turn_checkpointing_enabled"] is True
         assert kwargs["generation_prefix_cuts_enabled"] is generation_prefix_cuts
+        assert kwargs["generation_cut_control_urls"] == ["http://generation-cuts"]
         # The flag is a typed keyword, not an undeclared key in the capture config.
         assert "generation_prefix_cuts_enabled" not in kwargs["token_capture"]
 
@@ -1310,7 +1310,6 @@ class TestSetup:
     @pytest.mark.parametrize(
         ("feature", "match"),
         [
-            ("router_replay", "does not yet support router replay"),
             (
                 "megatron",
                 "target_level='prefix' currently supports only the vllm generation",
@@ -1331,8 +1330,6 @@ class TestSetup:
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
-        if feature == "router_replay":
-            mc.policy["router_replay"] = {"enabled": True}
 
         with pytest.raises(NotImplementedError, match=match):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -1519,12 +1516,15 @@ class TestSetup:
 
         assert gym_log_dirs_at_build == [str(tmp_path / "exp_001" / "nemo_gym")]
 
+    @pytest.mark.parametrize("router_replay", [False, True])
     def test_prefix_recovery_accepts_multimodal_capture(
         self,
         tmp_path: Path,
         patched_factories,
+        router_replay: bool,
     ):
         mc = _make_master_config(colocated=False, backend="vllm", megatron_enabled=True)
+        mc.policy["router_replay"] = {"enabled": router_replay}
         mc.checkpointing.checkpoint_dir = str(tmp_path / "checkpoints")
         mc.checkpointing.enabled = True
         mc.checkpointing.save_data_plane = True
@@ -1546,7 +1546,9 @@ class TestSetup:
         patched_factories["setup_response_data"].return_value = (list(range(8)), None)
         tokenizer = MagicMock(pad_token_id=0)
 
-        with _patched_gym_token_capture([MagicMock(name="finalizer")]):
+        with _patched_gym_token_capture(
+            [MagicMock(name="finalizer")], router_replay=router_replay
+        ):
             setup_single_controller(
                 mc, tokenizer, processor=MagicMock(tokenizer=tokenizer)
             )
@@ -1554,6 +1556,7 @@ class TestSetup:
         generation, _ = patched_factories["_build_generation"].return_value
         _, setup_kwargs = generation.setup_token_capture.call_args
         assert setup_kwargs["capture_media"] is True
+        assert setup_kwargs["media_family"] == "omni"
         assert setup_kwargs["generation_prefix_cuts_enabled"] is True
 
     def test_disabled_periodic_checkpointing_ignores_existing_snapshots(
@@ -2412,6 +2415,33 @@ class TestSetup:
         ):
             yield
 
+    def test_gym_vllm_starts_communicator_before_gym_finishes(self, patched_factories):
+        """The refit communicator needs only the trainer and generation, so it starts
+        when both return, not after Gym: Gym's build waits here for the communicator,
+        which a start after Gym could never satisfy."""
+        mc = self._gym_vllm_config()
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        communicator_started = threading.Event()
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = communicator_started.set
+
+        def _build_gym(*args: Any, **kwargs: Any) -> Any:
+            assert communicator_started.wait(timeout=30), (
+                "the communicator did not start while Gym was still building"
+            )
+            return MagicMock(name="nemo_gym_shards")
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "build_nemo_gym_actors", side_effect=_build_gym),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        weight_sync.init_communicator.assert_called_once_with()
+        assert actor_args.weight_synchronizer is weight_sync
+
     def test_gym_vllm_loads_dataset_while_trainer_builds(self, patched_factories):
         """The dataset load waits for the trainer build to start; in the old order
         (load first, then build) it would time out."""
@@ -2668,7 +2698,7 @@ class TestSetup:
         assert data_kwargs["is_vlm"] is True
         mock_spinup.assert_called_once_with(
             mc.env,
-            base_urls=patched_factories["fake_gen"].dp_openai_server_base_urls,
+            base_urls=patched_factories["fake_gen"].client_base_urls,
             model_name="test-model",
             # Reaches the actor once, at spinup, rather than riding along with every
             # run_rollouts call.
@@ -2677,6 +2707,10 @@ class TestSetup:
             use_fastokens=False,
             turn_checkpointing_enabled=False,
             generation_prefix_cuts_enabled=False,
+            # Where the generation backend takes Gym's checkpoint cuts.
+            generation_cut_control_urls=patched_factories[
+                "fake_gen"
+            ].generation_cut_control_urls,
             # The vLLM server's bearer token, handed to the Gym model server.
             policy_api_key=patched_factories["fake_gen"].http_server_api_key,
             token_capture=None,
@@ -2779,6 +2813,281 @@ class TestSetup:
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
         fake_gym_shards.shutdown.assert_not_called()
+
+    @staticmethod
+    def _setup_tail_config(patched_factories: dict[str, Any]) -> MasterConfig:
+        """NeMo-Gym + vLLM with token capture and advantage workers: all three tail lanes run."""
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.reward_penalties = RewardPenaltyConfig(
+            penalize_duplicated_reasoning=True,
+            penalize_empty_final_answer=True,
+            penalize_unwanted_tokens=True,
+            penalize_malformed_think_tag=False,
+            token_ids={"unwanted": [99], "think_open": 12, "think_close": 13},
+        )
+        mc.token_capture.enabled = True
+        mc.env = {"should_use_nemo_gym": True, "nemo_gym": {"effort_levels": None}}
+        mc.async_rl.num_advantage_workers = 1
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        return mc
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _setup_tail_patches(
+        create_finalizers: Callable[..., Any],
+        create_advantage: Callable[..., Any],
+        start_early: bool,
+    ):
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch.object(
+                sc_setup_mod, "_start_communicator_early", return_value=start_early
+            ),
+            # The partial test config does not build a real stage config; the lane only needs one.
+            patch.object(sc_setup_mod, "AdvantageStageConfig"),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor."
+                "create_rollout_reassembler_actors",
+                side_effect=create_finalizers,
+            ),
+            patch(
+                "nemo_rl.algorithms.advantage_actor.create_advantage_actors",
+                side_effect=create_advantage,
+            ),
+        ):
+            yield
+
+    @pytest.mark.parametrize("start_early", [True, False])
+    def test_setup_tail_starts_communicator_and_actor_pools_together(
+        self, patched_factories, start_early: bool
+    ):
+        """The refit communicator and both actor pools share no state, so they run
+        together: each waits here for the other two, which a serial order or a
+        thread pool too small for all three could never satisfy. Covers the
+        communicator started with the builds and the one started in the tail."""
+        mc = self._setup_tail_config(patched_factories)
+        together = threading.Barrier(3, timeout=10)
+        arrived: list[str] = []
+        fake_finalizers = [MagicMock(name="finalizer")]
+        fake_advantage = [MagicMock(name="advantage")]
+
+        def _meet(lane: str) -> None:
+            arrived.append(lane)
+            together.wait()
+
+        def _create_finalizers(*args: Any, **kwargs: Any) -> list[Any]:
+            _meet("finalizers")
+            return fake_finalizers
+
+        def _create_advantage(*args: Any, **kwargs: Any) -> list[Any]:
+            _meet("advantage")
+            return fake_advantage
+
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = lambda: _meet("communicator")
+
+        with self._setup_tail_patches(
+            _create_finalizers, _create_advantage, start_early
+        ):
+            try:
+                actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=9))
+            except threading.BrokenBarrierError:
+                pytest.fail(f"tail lanes did not run together; arrived: {arrived}")
+
+        weight_sync.init_communicator.assert_called_once_with()
+        assert actor_args.weight_synchronizer is weight_sync
+        assert actor_args.finalizer_actors == fake_finalizers
+        assert actor_args.advantage_actors == fake_advantage
+
+    @pytest.mark.parametrize("start_early", [True, False])
+    def test_setup_tail_raises_a_communicator_failure_after_joining_the_pools(
+        self, patched_factories, start_early: bool
+    ):
+        mc = self._setup_tail_config(patched_factories)
+        pools_done: list[str] = []
+
+        def _create_finalizers(*args: Any, **kwargs: Any) -> list[Any]:
+            pools_done.append("finalizers")
+            return [MagicMock()]
+
+        def _create_advantage(*args: Any, **kwargs: Any) -> list[Any]:
+            pools_done.append("advantage")
+            return [MagicMock()]
+
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = RuntimeError("rendezvous boom")
+
+        with self._setup_tail_patches(
+            _create_finalizers, _create_advantage, start_early
+        ):
+            with pytest.raises(RuntimeError, match="rendezvous boom"):
+                setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+        assert sorted(pools_done) == ["advantage", "finalizers"]
+
+    @pytest.mark.parametrize("start_early", [True, False])
+    def test_setup_tail_raises_a_pool_failure_after_joining_the_communicator(
+        self, patched_factories, start_early: bool
+    ):
+        mc = self._setup_tail_config(patched_factories)
+        pool_failed = threading.Event()
+        communicator_done = threading.Event()
+
+        def _init_communicator() -> None:
+            # Still running when the pool fails; setup must wait for it before raising.
+            assert pool_failed.wait(timeout=10), "the pool lane never ran"
+            communicator_done.set()
+
+        def _create_finalizers(*args: Any, **kwargs: Any) -> list[Any]:
+            pool_failed.set()
+            raise RuntimeError("pool boom")
+
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = _init_communicator
+
+        with self._setup_tail_patches(
+            _create_finalizers, lambda *a, **k: [MagicMock()], start_early
+        ):
+            with pytest.raises(RuntimeError, match="pool boom"):
+                setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+        assert communicator_done.is_set()
+
+    @pytest.mark.parametrize(
+        ("backend", "colocated", "has_teachers", "expected"),
+        [
+            ("vllm", False, False, True),
+            ("vllm", True, False, False),
+            ("vllm", False, True, False),
+            ("sglang", False, False, False),
+            ("megatron", False, False, False),
+        ],
+    )
+    def test_start_communicator_early_only_for_non_colocated_vllm_without_teachers(
+        self, backend: str, colocated: bool, has_teachers: bool, expected: bool
+    ):
+        assert (
+            sc_setup_mod._start_communicator_early(
+                backend, colocated=colocated, has_teachers=has_teachers
+            )
+            is expected
+        )
+
+    @pytest.mark.parametrize("with_teachers", [False, True])
+    def test_teachers_move_the_communicator_from_the_builds_to_the_tail(
+        self, patched_factories, capsys, with_teachers: bool
+    ):
+        """The real predicate decides where the rendezvous runs: OPD teachers keep it
+        out of the builds, whose teacher LM-head collectives it must not interleave
+        with. Started early, it runs on a daemon thread and is reported apart from
+        the tail lanes it does not belong to."""
+        mc = self._setup_tail_config(patched_factories)
+        teacher_patches: list[Any] = []
+        if with_teachers:
+            mc.grpo.adv_estimator = AdvEstimatorConfig(name="opd")
+            mc.on_policy_distillation = OnPolicyDistillationConfig(
+                enabled=True,
+                teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+                default_teacher_alias="teacher",
+                non_colocated_teachers={"enabled": True},
+            )
+            teacher_patches = [
+                patch.object(
+                    sc_setup_mod.opd_module,
+                    "reserve_teacher_clusters",
+                    return_value={"teacher": MagicMock()},
+                ),
+                patch.object(
+                    sc_setup_mod.opd_module,
+                    "create_teacher_worker_groups",
+                    return_value=({"teacher": MagicMock()}, {"teacher": "teacher"}),
+                ),
+            ]
+        communicator_threads: list[threading.Thread] = []
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = lambda: communicator_threads.append(
+            threading.current_thread()
+        )
+
+        with contextlib.ExitStack() as stack:
+            for teacher_patch in teacher_patches:
+                stack.enter_context(teacher_patch)
+            stack.enter_context(
+                patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(
+                    sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+                )
+            )
+            stack.enter_context(
+                patch.object(sc_setup_mod, "validate_dataset_agent_coverage")
+            )
+            stack.enter_context(
+                patch.object(sc_setup_mod, "router_replay_enabled", return_value=False)
+            )
+            stack.enter_context(patch.object(sc_setup_mod, "AdvantageStageConfig"))
+            stack.enter_context(
+                patch(
+                    "nemo_rl.experience.rollout_reassembler_actor."
+                    "create_rollout_reassembler_actors",
+                    return_value=[MagicMock()],
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.advantage_actor.create_advantage_actors",
+                    return_value=[MagicMock()],
+                )
+            )
+            setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+        (thread,) = communicator_threads
+        tail_line = next(
+            line
+            for line in capsys.readouterr().out.splitlines()
+            if "Setup tail:" in line
+        )
+        if with_teachers:
+            assert thread.name.startswith("setup-tail")
+            assert "refit communicator" in tail_line
+        else:
+            assert thread.name == "refit-communicator"
+            assert thread.daemon
+            assert "refit communicator" not in tail_line
+
+    def test_start_on_daemon_thread_returns_the_result_or_the_error(self):
+        threads: list[threading.Thread] = []
+
+        def _record() -> int:
+            threads.append(threading.current_thread())
+            return 7
+
+        assert (
+            sc_setup_mod._start_on_daemon_thread(_record, name="lane").result(10) == 7
+        )
+        assert threads[0].daemon and threads[0].name == "lane"
+
+        def _fail() -> None:
+            raise RuntimeError("lane boom")
+
+        future = sc_setup_mod._start_on_daemon_thread(_fail, name="lane")
+        with pytest.raises(RuntimeError, match="lane boom"):
+            future.result(10)
 
     @pytest.mark.parametrize("think_tag_penalty", [False, True])
     @pytest.mark.parametrize("with_processor", [True, False])
@@ -2904,11 +3213,45 @@ class TestSetup:
         generation, _ = patched_factories["_build_generation"].return_value
         _, setup_kwargs = generation.setup_token_capture.call_args
         assert setup_kwargs["capture_media"] is with_processor
+        assert setup_kwargs["media_family"] == ("omni" if with_processor else None)
         # Workers bound a generation cut by Gym's control timeout, counted
         # from when the cut request reaches them.
         assert setup_kwargs["generation_cut_control_timeout_s"] == (
             mc.token_capture.control_timeout_s
         )
+
+    def test_dynamo_token_capture_tells_gym_to_speak_dynamo(self, patched_factories):
+        """The same vLLM workers stage the calls; Gym reaches them through the frontend."""
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "dynamo": True,
+                "vllm_cfg": {"async_engine": True, "expose_http_server": True},
+            }
+        )
+        mc.token_capture.enabled = True
+        mc.env = {"should_use_nemo_gym": True, "nemo_gym": {}}
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+                return_value=[MagicMock()],
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+        assert mc.token_capture.generation_backend == "dynamo"
 
     def test_nemo_gym_coverage_failure_shuts_down_shards(self, patched_factories):
         mc = _make_master_config(colocated=False, backend="vllm")
@@ -4491,7 +4834,7 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
 
     with (
         patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(sc_setup_mod, "media_capture_family", return_value="omni"),
         patch.object(
             sc_setup_mod.opd_module,
             "get_opd_full_config",
@@ -4511,6 +4854,33 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
         mock_gate.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    ("processor_name", "message"),
+    [
+        ("Qwen2VLProcessor", "got Qwen2VLProcessor"),
+        ("PixtralProcessor", "no learner yet"),
+    ],
+    ids=["unknown-processor", "pixtral"],
+)
+def test_token_capture_media_family_is_picked_by_the_driver(
+    patched_factories, processor_name, message
+):
+    """The driver picks the media family from the processor class. A processor
+    without one is rejected by name, and Pixtral until a learner reads its
+    captured layout; both before any data or cluster setup."""
+    mc = _make_gym_megatron_capture_config()
+    processor = type(processor_name, (MagicMock,), {})()
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        pytest.raises(ValueError, match=message),
+    ):
+        setup_single_controller(mc, MagicMock(pad_token_id=0), processor=processor)
+
+    patched_factories["setup_response_data"].assert_not_called()
+    patched_factories["_build_clusters"].assert_not_called()
+
+
 @pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])
 def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
     patched_factories, multimodal
@@ -4525,7 +4895,7 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
 
     with (
         patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(sc_setup_mod, "media_capture_family", return_value="omni"),
         patch.object(
             sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_actor
         ) as mock_spinup,
@@ -4569,6 +4939,7 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
     setup_args, setup_kwargs = actor_args.gen_handle.setup_token_capture.call_args
     assert setup_args[1] == mc.token_capture.staging_partition
     assert setup_kwargs["capture_media"] is multimodal
+    assert setup_kwargs["media_family"] == ("omni" if multimodal else None)
     assert setup_kwargs["top_logprobs"] == 0
     # What the workers pinned the media column to is what the finalizers get.
     assert (

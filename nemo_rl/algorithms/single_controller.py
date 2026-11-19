@@ -241,6 +241,7 @@ from nemo_rl.utils.path_utils import (
     is_msc_path,
 )
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.weight_sync.refit_actor import RemoteWeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -665,6 +666,9 @@ class SingleControllerActor:
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
         self._inference_cluster = actor_args.inference_cluster
+        if isinstance(self._weight_synchronizer, RemoteWeightSynchronizer):
+            # The proxy arrived pickled inside actor_args, with only its actor handle.
+            self._weight_synchronizer.attach(self._gen)
 
         restored_trainer_version = (
             actor_args.save_state.trainer_version
@@ -879,7 +883,8 @@ class SingleControllerActor:
         """Start the rollout / train / watchdog pumps and run until one finishes."""
         await self._environment_checkpoint.check_startup()
         # Synchronize weights before starting the pumps, unless setup already delivered them.
-        if self._weight_synchronizer.is_stale:
+        # The RefitActor proxy answers is_stale with blocking calls to the actor.
+        if await asyncio.to_thread(lambda: self._weight_synchronizer.is_stale):
             await self._sync_weights()
         self._rollout_manager.set_weight_version(self._trainer_version)
         self._rollout_manager.set_tally_step_provider(
@@ -5013,6 +5018,9 @@ class SingleControllerActor:
         is bounded-failure-first rather than resume-and-forget.
         """
         budget_s = self._refit_await_budget_s()
+        if isinstance(self._weight_synchronizer, RemoteWeightSynchronizer):
+            await self._sync_weights_in_refit_actor(kv_scales, what, budget_s)
+            return
         if budget_s is None:
             await asyncio.to_thread(
                 self._weight_synchronizer.sync_weights, kv_scales=kv_scales
@@ -5046,6 +5054,30 @@ class SingleControllerActor:
                 "bound has passed, so a generation rank is most likely alive but not "
                 "answering -- a Ray actor call has no timeout of its own, so waiting here "
                 "is unbounded. Giving up so the fleet can be reconciled and retried."
+            ) from None
+
+    async def _sync_weights_in_refit_actor(
+        self,
+        kv_scales: Optional[dict[str, float]],
+        what: str,
+        budget_s: Optional[float],
+    ) -> None:
+        """``_sync_weights_within`` for a RefitActor: await its ObjectRef, no thread."""
+        synchronizer = cast(RemoteWeightSynchronizer, self._weight_synchronizer)
+        try:
+            refit_ref = await asyncio.to_thread(
+                synchronizer.submit_sync_weights, kv_scales
+            )
+            await asyncio.wait_for(asyncio.wrap_future(refit_ref.future()), budget_s)
+        except RayActorError as error:
+            await asyncio.to_thread(synchronizer.raise_if_actor_died, error)
+            raise
+        except asyncio.TimeoutError:
+            raise RefitAborted(
+                f"the {what} refit did not return from the RefitActor within "
+                f"{budget_s}s. Every worker-side bound has passed, so a generation rank "
+                "is most likely alive but not answering. Giving up so the fleet can be "
+                "reconciled and retried."
             ) from None
 
     async def _sync_weights(

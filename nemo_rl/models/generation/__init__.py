@@ -223,6 +223,14 @@ def configure_generation_config(
                     "frontend serves the same engines on 0.0.0.0 and checks no "
                     "bearer token."
                 )
+            if config["vllm_cfg"].get("http_api_server_count", 1) > 1:
+                raise ValueError(
+                    "policy.generation.vllm_cfg.http_api_server_count > 1 is not "
+                    "supported with policy.generation.dynamo=true: NeMo-Gym's calls "
+                    "go through the Dynamo frontend, so the extra vLLM HTTP "
+                    "frontends would serve none of them. Size "
+                    "dynamo_cfg.frontend_args.render_workers instead."
+                )
             colocated = config.get("colocated")
             if colocated is not None and colocated["enabled"]:
                 raise ValueError(

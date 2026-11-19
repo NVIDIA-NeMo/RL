@@ -2687,7 +2687,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
           - dense MLP down       -> ``down_proj`` (direct 1:1).
         """
         vllm_params = dict(self.model_runner.model.named_parameters())
-        mapping = {}
+        mapping: dict[str, tuple[torch.nn.Parameter, tuple[slice, ...] | None]] = {}
 
         # Collect FFN param names + global shapes from refit_info, plus the
         # grouped-expert tag (gate_proj/up_proj/down_proj) for MoE params.
