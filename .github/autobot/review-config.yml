@@ -1,9 +1,10 @@
 # .github/autobot/review-config.yml
+review:
+  model: claude
+
 auto-review:
   enabled: true
   mode: comment
-  on: status_change
-  when: ready_for_review
 
 approval:
   enabled: true
