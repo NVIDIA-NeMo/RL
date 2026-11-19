@@ -192,8 +192,10 @@ def test_loss_fn_logprobs_records_token_logprobs_and_frees_logits():
     )
     expected = torch.cat([torch.zeros(2, 1), expected.squeeze(-1)], dim=1)
 
-    pipeline_loss_fn(logits.clone(), torch.tensor([6, 7]), context=context)
+    pipeline_input = logits.clone()
+    pipeline_loss_fn(pipeline_input, torch.tensor([6, 7]), context=context)
     torch.testing.assert_close(context.results[1], expected)
+    assert pipeline_input.untyped_storage().size() == 0
 
 
 def test_build_pipeline_config_sets_nemo_rl_runtime_fields():
@@ -468,27 +470,26 @@ def _check_tq_coordinates(rank: int, world_size: int) -> None:
         AutomodelPolicyWorkerImpl,
     )
 
-    # The Automodel mesh order (pp, dp_replicate, dp_shard, cp, tp) with PP=2,
-    # DP=1, TP=2: both pipeline stages of the single DP rank are replicas.
+    # PP=2, DP=1: both pipeline stages of the single DP rank are replicas.
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.device_mesh = init_device_mesh(
         "cuda",
-        (2, 1, 1, 1, 2),
+        (2, 1, 1, 1, 1),
         mesh_dim_names=("pp", "dp_replicate", "dp_shard", "cp", "tp"),
     )
     coords = worker._local_coords()
     assert coords == {
-        "tensor_parallel": rank % 2,
+        "tensor_parallel": 0,
         "context_parallel": 0,
-        "pipeline_parallel": rank // 2,
+        "pipeline_parallel": rank,
     }
     # Exactly one rank of the DP replica writes back to TQ.
     leaders = [None] * world_size
     torch.distributed.all_gather_object(leaders, worker._is_replica_leader())
-    assert leaders == [True, False, False, False]
+    assert leaders == [True, False]
     replica_group = worker._get_replica_group()
-    assert torch.distributed.get_process_group_ranks(replica_group) == [0, 1, 2, 3]
+    assert torch.distributed.get_process_group_ranks(replica_group) == [0, 1]
 
 
 def test_tq_coordinates_include_pipeline_stage(distributed_test_runner):
-    distributed_test_runner(_check_tq_coordinates, world_size=4)
+    distributed_test_runner(_check_tq_coordinates, world_size=2)

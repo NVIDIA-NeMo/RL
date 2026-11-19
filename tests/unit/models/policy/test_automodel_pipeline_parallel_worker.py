@@ -403,6 +403,18 @@ def test_pipeline_padding_and_data_parallel(tiny_untied_llama_path, reference_ru
 
 
 @pytest.mark.timeout(900)
+def test_pipeline_padding_matches_non_pipelined(tiny_untied_llama_path, reference_runs):
+    """PP=2 on 2 GPUs where the last schedule call holds one padding microbatch."""
+    actual = _run_steps(
+        _policy_config(tiny_untied_llama_path, pp_size=2, microbatches_per_step=3),
+        2,
+        "pp_padding",
+        NLLLossFn(),
+    )
+    _assert_runs_close(reference_runs["nll"], actual)
+
+
+@pytest.mark.timeout(900)
 def test_pipeline_with_tensor_parallel(tiny_untied_llama_path, reference_runs):
     """PP=2 x TP=2 reproduces the non-pipelined run."""
     if torch.cuda.device_count() < 4:

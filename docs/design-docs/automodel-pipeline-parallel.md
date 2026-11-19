@@ -56,7 +56,8 @@ EP8 with PP2 on 16 GPUs).
 SFT also requires `sft.val_micro_batch_size == policy.train_micro_batch_size`. DPO
 rejects PP at setup because it runs microbatches of `2 * train_micro_batch_size`. The
 Automodel value worker rejects PP. Top-k logits and full logits raise
-`NotImplementedError` in the worker.
+`NotImplementedError` in the worker, so distillation and xtoken distillation reject a
+PP teacher at setup.
 
 ## Design
 
