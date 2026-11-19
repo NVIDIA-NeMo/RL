@@ -1845,7 +1845,7 @@ class TestPauseTrainStepWithOffloading:
             for buffer in buffers:
                 buffer.grad_data.zero_()
 
-        def scale_gradients(scale: float) -> None:
+        def scale_gradients(scale: torch.Tensor) -> None:
             for buffer in buffers:
                 buffer.grad_data.mul_(scale)
 
