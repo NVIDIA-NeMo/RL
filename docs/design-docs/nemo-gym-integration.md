@@ -52,7 +52,7 @@ For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/n
 
 ### SGLang with async GRPO
 
-The legacy async-GRPO entrypoint also supports SGLang-backed Gym rollouts. Start from a SGLang Megatron-refit configuration and apply the following overrides together with the Gym environment configuration above:
+The legacy async-GRPO entrypoint also supports SGLang-backed Gym rollouts. Use the [SGLang Gym recipe](../../examples/configs/recipes/llm/grpo-qwen3-0.6b-1n4g-megatron-sglang-noncolocated-async-gym.yaml) for the complete adapter and environment configuration. Its execution requirements include:
 
 ```yaml
 grpo:
@@ -75,6 +75,8 @@ policy:
 ```
 
 SGLang requires dedicated generation resources for this async entrypoint; size the training cluster and generation allocation separately for the model. Importance-sampling correction is required because rollout weights can lag training weights. Gym uses the stable SGLang router endpoint through the shared Gym actor factory, including sharded Gym deployments.
+
+Select Gym's `responses_api_models/sglang_model/configs/sglang_model_for_training.yaml`, introduced in [Gym #1787](https://github.com/NVIDIA-NeMo/Gym/pull/1787), and set its `context_length` to the SGLang engine's limit. This adapter calls `/generate` to preserve exact sampled token IDs and logprobs. The vLLM model server expects vLLM-specific integer-token metadata and cannot substitute for this adapter with the pinned SGLang version.
 
 Before every refit the collector drains outstanding trajectories. Async SGLang rejects `in_flight_weight_updates: true`; keep this setting disabled. Generation overlaps training between refits, but this does not provide request-preserving in-flight refits. See [async GRPO usage tips](../guides/async-grpo.md#usage-tips) for cache invalidation semantics. Validation leaves the dedicated generation engines resident so collection can resume without a separate wake.
 

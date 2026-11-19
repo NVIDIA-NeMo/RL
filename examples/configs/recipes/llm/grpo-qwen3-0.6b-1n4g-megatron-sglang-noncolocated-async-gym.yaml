@@ -1,0 +1,109 @@
+defaults:
+  - ../../grpo_math_1B_sglang.yaml
+  - ../../grpo_math_1B_megatron.yaml
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 2
+  max_num_steps: 10
+  val_period: 5
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: null
+  val_batch_size: null
+  overlong_filtering: false
+  skip_reference_policy_logprobs_calculation: true
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0
+  use_importance_sampling_correction: true
+
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  max_total_sequence_length: 768
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+  generation:
+    backend: sglang
+    use_async_rollouts: true
+    max_new_tokens: 768
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 1
+        gpus_per_node: 2
+    sglang_cfg:
+      context_length: 768
+      tool_call_parser: qwen25
+      mem_fraction_static: 0.3
+      max_running_requests: 16
+      disable_cuda_graph: true
+      sglang_server_config:
+        num_gpus: 2
+        num_gpus_per_engine: 1
+        needs_offload: true
+        cpu_weight_backup: false
+        sglang_server_concurrency: 16
+
+data:
+  max_input_seq_length: null
+  shuffle: true
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl
+  validation:
+    data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    config_paths:
+      - responses_api_models/sglang_model/configs/sglang_model_for_training.yaml
+      - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    workplace_assistant_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: workplace_assistant_simple_agent
+    policy_model:
+      responses_api_models:
+        sglang_model:
+          context_length: ${policy.generation.sglang_cfg.context_length}
+          uses_reasoning_parser: false
+          chat_template_kwargs:
+            enable_thinking: false
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen3-0.6b-1n4g-megatron-sglang-noncolocated-async-gym
+
+logger:
+  log_dir: logs/grpo-qwen3-0.6b-1n4g-megatron-sglang-noncolocated-async-gym
+  wandb:
+    name: grpo-qwen3-0.6b-1n4g-megatron-sglang-noncolocated-async-gym
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 4
