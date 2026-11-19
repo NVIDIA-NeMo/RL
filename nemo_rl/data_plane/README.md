@@ -815,57 +815,16 @@ failure cleanup and restore into fresh actors, runs in
 bash tests/functional/data_plane_simple_checkpoint_cpu.sh
 ```
 
-### Single-controller checkpoint integration
+### Using `async_checkpoint` with Single-Controller checkpoints
 
-With `data_plane.simple.async_checkpoint: true`, `RolloutSnapshotter` captures
-the TQ view and matching controller metadata under its mutation barrier, then
-resumes the environment and dispatch before persisting the retained shards.
-Recovery validation and the rollout-recovery state build remain inside capture.
-That state shares no containers with the live ledger, so `SnapshotCapture.persist`
-serializes and hashes it after resume and adds the hash to the TQ metadata. The
-snapshot is published only after persistence and all recovery sidecars finish.
+Set `data_plane.simple.async_checkpoint: true` (needs `ssd_offload.enabled: false`) to shorten the data-plane pause during SC checkpoints:
 
-Full trainer checkpoints use the same retained-view path when
-`checkpointing.save_data_plane: true`. Capture and validation run under the
-controller mutation barrier; persistence and release run after that barrier
-opens, before saving models or publishing the checkpoint. Canonical TQ writes
-can resume during persistence, but the trainer save itself still awaits it.
-Unsupported backends and configurations keep their synchronous save path.
+- **Rollout snapshots:** TQ is captured under the barrier, then rollouts and Gym resume while the shards are written. The snapshot is published only after the write finishes.
+- **Trainer checkpoints** (with `checkpointing.save_data_plane: true`): same capture, but the trainer save still waits for the write before saving model weights.
+- Other backends and configurations keep the synchronous save.
+- If a captured view cannot be released, checkpointing stops and keeps the unpublished directory; do not delete it while the run is alive.
 
-Trainer checkpoints do not pause Gym or capture in-progress Gym sessions. Their
-barrier protects recovery-owned rows and controller ownership, not every live
-staging write. Unreferenced staging rows do not become recoverable work and are
-cleaned during restore; environment recovery still requires a rollout snapshot.
-
-Temporary capture ownership lives in `SnapshotCapture`, separate from the
-serializable `CapturedRolloutState`. Failures release the retained views after
-outstanding writes settle and do not publish a partial snapshot. If release
-cannot be confirmed within its RPC budget, checkpointing stops with an invariant
-error and retains the unpublished directory: a remote write may still be using
-it. The save lock is acquired before the next mutation barrier, so a new capture
-cannot race the previous snapshot's persistence/release.
-
-The snapshot-save lock remains held until publication, so optimizer commits may
-still wait. This setting makes persistence asynchronous relative to rollout
-dispatch and live TQ traffic, not relative to every training operation.
-
-The `timing/rollout_checkpoint` metrics split `tq_capture_seconds`,
-`tq_persist_seconds`, and `tq_release_seconds`; `tq_save_seconds` includes capture
-and persistence. Compare these with `environment_paused_seconds` and
-`exclusive_hold_seconds` to measure time removed from the pause.
-
-The rest of the save is split into the checks and recovery state around the
-barrier:
-
-| Metric | Phase |
-|---|---|
-| `replay_inventory_seconds` | Compare TQ replay keys with the replay index |
-| `recovery_state_build_seconds` | Copy and validate the rollout-recovery ledger |
-| `recovery_state_serialize_seconds` | `torch.save` and sha256 of that state; after the barrier with a retained view, inside it otherwise |
-| `staging_inventory_seconds` | Compare TQ staging keys with recovery ownership |
-
-A phase that does not run for the configuration logs 0. `tq_persist_seconds`
-excludes the recovery serialization that precedes the write.
+To measure the gain, compare `exclusive_hold_seconds` and `gym_parked_seconds` with the setting on and off. The phase names are mapped in `_CHECKPOINT_DURATION_PHASES` in `nemo_rl/telemetry/metrics.py`; see `docs/observability/metrics.md`.
 
 ## Async path (proposed)
 
