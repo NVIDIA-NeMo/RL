@@ -29,7 +29,11 @@ Modeled after `tests/unit/models/policy/test_megatron_worker.py`.
 """
 
 import os
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Callable
+from unittest.mock import MagicMock, patch
 
 import pytest
 import ray
@@ -47,6 +51,258 @@ from nemo_rl.models.value.lm_value import Value
 from nemo_rl.utils.checkpoint import CheckpointManager
 
 pytestmark = pytest.mark.mcore
+
+
+def test_value_media_mask_only_for_explicit_model_forward() -> None:
+    """Qwen2.5-style forwards must not receive the rollout media mask."""
+    from nemo_rl.models.megatron.common import model_media_placeholder_token_id
+
+    class _WithMask(torch.nn.Module):
+        image_token_index = 42
+
+        def forward(self, input_ids, media_token_validity_mask=None):
+            del media_token_validity_mask
+            return input_ids
+
+    class _WithoutMask(torch.nn.Module):
+        image_token_index = 42
+
+        def forward(self, input_ids):
+            return input_ids
+
+    assert model_media_placeholder_token_id(_WithMask()) == 42
+    assert model_media_placeholder_token_id(_WithoutMask()) is None
+
+
+def test_value_head_hook_replaces_nested_vlm_language_head() -> None:
+    """VLM critics must replace the head used by the nested language model."""
+    from megatron.bridge.training.utils.train_utils import LinearForLastLayer
+
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        make_value_head_hook,
+    )
+
+    class _VLMChunk:
+        post_process = True
+        pg_collection = None
+
+        def __init__(self) -> None:
+            self.language_model = SimpleNamespace(
+                output_layer=torch.nn.Linear(4, 16, bias=False)
+            )
+
+        def sharded_state_dict(
+            self, prefix: str = "", sharded_offsets=(), metadata=None
+        ):
+            del sharded_offsets, metadata
+            return {
+                f"{prefix}language_model.output_layer.weight": (
+                    self.language_model.output_layer.weight
+                ),
+                f"{prefix}language_model.decoder.weight": torch.ones(1),
+            }
+
+    non_post_process_chunk = SimpleNamespace(post_process=False)
+    chunk = _VLMChunk()
+    result = make_value_head_hook(hidden_size=4, sequence_parallel=False)(
+        [non_post_process_chunk, chunk]
+    )
+
+    assert result == [non_post_process_chunk, chunk]
+    assert isinstance(chunk.language_model.output_layer, LinearForLastLayer)
+    assert chunk.language_model.output_layer.out_features == 1
+    assert not hasattr(chunk, "output_layer")
+
+    assert "language_model.output_layer.weight" in chunk.sharded_state_dict()
+    with chunk.hide_loss_modules():
+        state = chunk.sharded_state_dict()
+    assert "language_model.output_layer.weight" not in state
+    assert "language_model.decoder.weight" in state
+
+
+def test_value_head_parent_supports_gpt_and_rejects_unknown_layouts() -> None:
+    """The scalar head helper must handle GPT chunks and fail closed otherwise."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _value_head_parent,
+    )
+
+    output_layer = torch.nn.Linear(4, 8, bias=False)
+    gpt_chunk = SimpleNamespace(output_layer=output_layer)
+
+    parent, path = _value_head_parent(gpt_chunk)
+
+    assert parent is gpt_chunk
+    assert path == "output_layer"
+    with pytest.raises(AttributeError, match="no supported output layer"):
+        _value_head_parent(SimpleNamespace())
+
+
+def test_get_values_suspends_activation_offload() -> None:
+    """Value inference must preserve the activation-offload training warmup."""
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        PipelineOffloadManager,
+    )
+
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    class OffloadManager:
+        def __init__(self) -> None:
+            self.do_offload = True
+
+        def disable_offload(self) -> None:
+            self.do_offload = False
+
+        def enable_offload(self) -> None:
+            self.do_offload = True
+
+    manager = OffloadManager()
+    model_config = SimpleNamespace(fine_grained_activation_offloading=True)
+    model = SimpleNamespace(config=model_config, eval=lambda: None)
+    worker = SimpleNamespace(
+        _train_step_state=None,
+        cfg={"train_micro_batch_size": 1},
+        model=model,
+        _policy_like_cfg={},
+        mcore_state=SimpleNamespace(straggler_timer=None),
+        defer_fp32_logits=False,
+        media_placeholder_token_id=None,
+        model_slices_context_parallel_inputs=False,
+    )
+    observed_states: list[tuple[bool, bool]] = []
+
+    def run_forward_only(**kwargs: Any) -> list[dict[str, torch.Tensor]]:
+        assert kwargs["forward_only"] is True
+        observed_states.append(
+            (model_config.fine_grained_activation_offloading, manager.do_offload)
+        )
+        return [{"values": torch.tensor([[1.0]])}]
+
+    with (
+        patch.object(PipelineOffloadManager, "OFFLOAD_MGR", manager),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_microbatch_iterator",
+            return_value=(iter([]), 1, 1, 1, 1),
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_forward_backward_func",
+            return_value=run_forward_only,
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_pipeline_model_parallel_group",
+            return_value=None,
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.is_pipeline_last_stage",
+            return_value=True,
+        ),
+        patch("nemo_rl.models.value.workers.megatron_value_worker.broadcast_tensor"),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.cuda.nvtx.range_push"),
+        patch("torch.cuda.nvtx.range_pop"),
+    ):
+        result = MegatronValueWorkerImpl.get_values(worker, BatchedDataDict({}))
+
+    torch.testing.assert_close(result["values"], torch.tensor([[1.0]]))
+    assert observed_states == [(False, False)]
+    assert model_config.fine_grained_activation_offloading is True
+    assert manager.do_offload is True
+
+
+def test_get_values_passes_multimodal_batch_to_model_forward(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Value inference must not silently become image-blind."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "pixel_values": torch.ones(1, 4),
+            "image_grid_thw": torch.tensor([[1, 1, 1]]),
+            "media_token_validity_mask": torch.tensor([[True, False]]),
+        }
+    )
+    processed = SimpleNamespace(
+        data_dict=batch,
+        input_ids_cp_sharded=torch.tensor([[1, 2]]),
+        attention_mask=None,
+        position_ids=None,
+        packed_seq_params=None,
+        cu_seqlens_padded=None,
+        media_token_validity_mask=batch["media_token_validity_mask"],
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(fine_grained_activation_offloading=False),
+        eval=lambda: None,
+    )
+    worker = SimpleNamespace(
+        _train_step_state=None,
+        cfg={"train_micro_batch_size": 1},
+        model=model,
+        _policy_like_cfg={},
+        mcore_state=SimpleNamespace(straggler_timer=None),
+        defer_fp32_logits=False,
+        # Exercise the explicit-mask critic path. The None case intentionally
+        # removes it, as covered by the multimodal-utils mask tests.
+        media_placeholder_token_id=1,
+        model_slices_context_parallel_inputs=True,
+    )
+
+    def run_forward_only(**kwargs: Any) -> list[dict[str, torch.Tensor]]:
+        output, collect = kwargs["forward_step_func"](iter([processed]), model)
+        _, collected = collect(output)
+        return [collected]
+
+    with (
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_microbatch_iterator",
+            return_value=(iter([]), 1, 1, 2, 2),
+        ) as get_microbatch_iterator,
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_forward_backward_func",
+            return_value=run_forward_only,
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.model_forward",
+            return_value=torch.ones(1, 2, 1),
+        ) as model_forward,
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_pipeline_model_parallel_group",
+            return_value=None,
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.is_pipeline_last_stage",
+            return_value=True,
+        ),
+        patch("nemo_rl.models.value.workers.megatron_value_worker.broadcast_tensor"),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.cuda.nvtx.range_push"),
+        patch("torch.cuda.nvtx.range_pop"),
+    ):
+        result = MegatronValueWorkerImpl.get_values(worker, batch)
+
+    assert model_forward.call_args.kwargs["data_dict"] is batch
+    assert "pixel_values" in model_forward.call_args.kwargs["data_dict"]
+    assert (
+        model_forward.call_args.kwargs["media_token_validity_mask"]
+        is batch["media_token_validity_mask"]
+    )
+    assert (
+        model_forward.call_args.kwargs["model_slices_context_parallel_inputs"] is True
+    )
+    assert (
+        get_microbatch_iterator.call_args.kwargs["model_slices_context_parallel_inputs"]
+        is True
+    )
+    torch.testing.assert_close(result["values"], torch.tensor([[0.0, 1.0]]))
+    assert (
+        "MegatronValueWorker multimodal input fields: image_grid_thw,pixel_values"
+        in capsys.readouterr().out
+    )
 
 
 def _create_value_test_config(
@@ -69,7 +325,7 @@ def _create_value_test_config(
             "enabled": False,
             "reward_model_type": "regression",
         },
-        "dtensor_cfg": {"enabled": False},
+        "automodel_cfg": {"enabled": False},
         "dynamic_batching": {"enabled": False},
         "sequence_packing": {"enabled": False},
         "megatron_cfg": {
@@ -117,6 +373,7 @@ def _create_value_test_config(
                 "clip_grad": 1.0,
                 "optimizer_cpu_offload": False,
                 "optimizer_offload_fraction": 0.0,
+                "overlap_cpu_optimizer_d2h_h2d": False,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
@@ -188,6 +445,262 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
             raise ValueError(f"Unknown config_updates key: {k!r}")
 
 
+def test_prepare_for_training_leaves_native_cpu_optimizer_placement():
+    """HybridDeviceOptimizer owns state placement for value-model training."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    class _TrainableModel:
+        def __init__(self) -> None:
+            self.train_called = False
+
+        def train(self) -> None:
+            self.train_called = True
+
+    worker = object.__new__(MegatronValueWorkerImpl)
+    worker._keep_resident = False
+    model = _TrainableModel()
+    worker.model = model
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = True
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+    worker.move_model = lambda model, device, move_grads, move_params: model
+    worker.move_optimizer = lambda device: pytest.fail(
+        "native optimizer CPU offload must not use the generic optimizer mover"
+    )
+
+    MegatronValueWorkerImpl.prepare_for_training(worker)
+
+    assert model.train_called
+
+
+@pytest.mark.parametrize("optimizer_cpu_offload", [False, True])
+def test_finish_training_updates_eval_cache_before_parameter_offload(
+    optimizer_cpu_offload: bool,
+) -> None:
+    """Mamba's eval cache needs live parameters before CPU offload frees storage."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    events: list[str] = []
+
+    class _ModelWithEvalCache:
+        def __init__(self) -> None:
+            self.a_log: torch.Tensor | None = torch.tensor([0.0, 1.0])
+            self.decay: torch.Tensor | None = None
+
+        def eval(self) -> None:
+            assert self.a_log is not None, "eval read freed parameter storage"
+            self.decay = -torch.exp(self.a_log.float())
+            events.append("eval")
+
+    model = _ModelWithEvalCache()
+
+    def move_model(
+        moved_model: _ModelWithEvalCache,
+        device: str,
+        move_params: bool,
+        move_grads: bool,
+    ) -> _ModelWithEvalCache:
+        assert moved_model is model
+        assert (device, move_params, move_grads) == ("cpu", True, True)
+        # Model offload invalidates the original parameter storage. Accessing it
+        # during a later eval() reproduces the Mamba lifecycle failure.
+        moved_model.a_log = None
+        events.append("model_cpu")
+        return moved_model
+
+    def move_optimizer(device: str) -> None:
+        assert device == "cpu"
+        events.append("optimizer_cpu")
+
+    worker = SimpleNamespace(
+        _train_step_state=None,
+        _keep_resident=False,
+        model=model,
+        optimizer=object(),
+        optimizer_cpu_offload=optimizer_cpu_offload,
+        move_model=move_model,
+        move_optimizer=move_optimizer,
+        cfg={"megatron_cfg": {}},
+    )
+    with (
+        patch("nemo_rl.models.value.workers.megatron_value_worker.gc.collect"),
+        patch("torch.cuda.empty_cache"),
+    ):
+        MegatronValueWorkerImpl.finish_training(worker)
+
+    assert worker.model is model
+    torch.testing.assert_close(model.decay, -torch.exp(torch.tensor([0.0, 1.0])))
+    assert events == ["eval", "model_cpu"] + (
+        [] if optimizer_cpu_offload else ["optimizer_cpu"]
+    )
+
+
+def test_resident_value_lifecycle_never_moves_model_or_optimizer():
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    model = MagicMock()
+    worker = SimpleNamespace(
+        _train_step_state=None,
+        _keep_resident=True,
+        model=model,
+        optimizer=object(),
+        optimizer_cpu_offload=False,
+        cfg={"megatron_cfg": {"empty_unused_memory_level": 0}},
+        move_model=MagicMock(side_effect=AssertionError("model moved")),
+        move_optimizer=MagicMock(side_effect=AssertionError("optimizer moved")),
+    )
+
+    MegatronValueWorkerImpl.prepare_for_training(worker)
+    MegatronValueWorkerImpl.prepare_for_inference(worker)
+    MegatronValueWorkerImpl.finish_inference(worker)
+    MegatronValueWorkerImpl.finish_training(worker)
+
+    assert model.train.call_count == 1
+    assert model.eval.call_count == 2
+    worker.move_model.assert_not_called()
+    worker.move_optimizer.assert_not_called()
+
+
+def test_split_value_accepts_uneven_packed_dp_shard_and_sanitizes_media_mask():
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    state = SimpleNamespace(
+        loss_fn=object(),
+        mbs=1,
+        gbs=128,
+        counts=torch.zeros(3, device="cuda"),
+        metrics=[],
+        num_microbatches=0,
+        num_chunks=0,
+        failed=False,
+    )
+    worker = SimpleNamespace(
+        _assert_train_step_open=lambda: state,
+        _restore_train_hooks=lambda current_state: None,
+        _policy_like_cfg={"sequence_packing": {"enabled": True}},
+        mcore_state=SimpleNamespace(straggler_timer=None),
+        model=SimpleNamespace(no_sync=nullcontext),
+        defer_fp32_logits=False,
+        cfg={"megatron_cfg": {"empty_unused_memory_level": 0}},
+        # Qwen2.5-VL-style forwards do not accept the transported mask.
+        media_placeholder_token_id=None,
+    )
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.ones((65, 2), dtype=torch.long, device="cuda"),
+            "sample_mask": torch.ones(65, device="cuda"),
+            "token_mask": torch.ones((65, 2), device="cuda"),
+            "media_token_validity_mask": torch.ones(
+                (65, 2), dtype=torch.bool, device="cuda"
+            ),
+        }
+    )
+    rerun = SimpleNamespace(
+        should_run_forward_backward=MagicMock(side_effect=[True, False])
+    )
+    with (
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_microbatch_iterator",
+            return_value=(iter(()), 1, 1, None, 2),
+        ) as get_microbatch_iterator,
+        patch("nemo_rl.models.value.workers.megatron_value_worker.LossPostProcessor"),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_rerun_state_machine",
+            return_value=rerun,
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.megatron_forward_backward",
+            return_value=[],
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.is_pipeline_last_stage",
+            return_value=False,
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.broadcast_loss_metrics_from_last_stage",
+            return_value=[],
+        ),
+        patch("torch.cuda.nvtx.range_push"),
+        patch("torch.cuda.nvtx.range_pop"),
+    ):
+        MegatronValueWorkerImpl.train_microbatch(worker, data)
+
+    assert state.counts[2].item() == 65
+    assert state.num_chunks == 1
+    assert not state.failed
+    assert get_microbatch_iterator.call_args.args[0] is data
+    assert "media_token_validity_mask" not in data
+
+
+def test_finish_training_preserves_model_move_contract(monkeypatch):
+    """Check that offloading preserves the model move-parameter contract."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    class _EvalModel:
+        def eval(self) -> None:
+            events.append("eval")
+
+    events = []
+    move_kwargs = []
+    worker = object.__new__(MegatronValueWorkerImpl)
+    worker._keep_resident = False
+    worker._train_step_state = None
+    worker.model = _EvalModel()
+    worker.optimizer = None
+    worker.cfg = {"megatron_cfg": {}}
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append("move_model") or move_kwargs.append(kwargs) or model
+    )
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    MegatronValueWorkerImpl.finish_training(worker)
+
+    assert events == ["eval", "move_model"]
+    assert move_kwargs == [{"move_params": True, "move_grads": True}]
+
+
+@pytest.mark.parametrize("clear_caches", [True, False])
+def test_finish_training_clears_transient_caches_when_configured(
+    monkeypatch, clear_caches: bool
+) -> None:
+    """clear_memory_caches_before_refit releases the critic's RoPE/MoE caches too."""
+    from nemo_rl.models.value.workers import megatron_value_worker
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    events: list[str] = []
+    model = SimpleNamespace(eval=lambda: events.append("eval"))
+    worker = object.__new__(MegatronValueWorkerImpl)
+    worker._keep_resident = False
+    worker.model = model
+    worker.optimizer = None
+    worker._train_step_state = None
+    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": clear_caches}}
+    worker.move_model = lambda m, device, **kwargs: events.append("move_model") or m
+    monkeypatch.setattr(
+        megatron_value_worker,
+        "clear_transient_megatron_caches",
+        lambda m: events.append("clear") if m is model else None,
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    MegatronValueWorkerImpl.finish_training(worker)
+
+    assert events == ["eval", "move_model"] + (["clear"] if clear_caches else [])
+
+
 @pytest.fixture
 def value_setup(request, tiny_qwen2_model_path):
     """Spin up a `Value` wrapper around a tiny Qwen2 backbone for testing.
@@ -227,7 +740,7 @@ def value_setup(request, tiny_qwen2_model_path):
         _apply_config_updates(config, config_updates)
         tokenizer = get_tokenizer(config["tokenizer"])
 
-        value = Value(cluster=cluster, config=config, tokenizer=tokenizer)
+        value = Value(cluster=cluster, config=config, tokenizer=tokenizer, seed=42)
 
         # Build a tiny test batch.
         torch.manual_seed(42)
@@ -441,13 +954,13 @@ def test_value_worker_parallelism_equivalence(
         # Reference worker: feature OFF.
         ref_config = _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
         tokenizer = get_tokenizer(ref_config["tokenizer"])
-        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer)
+        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer, seed=42)
         values_ref = ref.get_values(data)["values"].detach().cpu()
 
         # Save weights, then reload into a feature-ON worker (same weights).
         weights_path = os.path.join(str(tmp_path), "value", "weights")
         ref.prepare_for_inference()
-        ref.save_checkpoint(weights_path=weights_path)
+        ref.save_checkpoint(weights_path=weights_path, is_final_checkpoint=False)
         ref.shutdown()
         ref = None
 
@@ -457,6 +970,7 @@ def test_value_worker_parallelism_equivalence(
             cluster=cluster,
             config=feat_config,
             tokenizer=tokenizer,
+            seed=42,
             weights_path=Path(weights_path),
             name_prefix="lm_value_feat",
         )
@@ -517,13 +1031,13 @@ def test_value_worker_context_parallel_equivalence(tiny_qwen2_model_path, tmp_pa
         )
         _apply_config_updates(ref_config, {"sequence_packing": True})
         tokenizer = get_tokenizer(ref_config["tokenizer"])
-        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer)
+        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer, seed=42)
         values_ref = ref.get_values(data)["values"].detach().cpu()
 
         # Save weights, then reload into the CP=2 worker (same weights).
         weights_path = os.path.join(str(tmp_path), "value", "weights")
         ref.prepare_for_inference()
-        ref.save_checkpoint(weights_path=weights_path)
+        ref.save_checkpoint(weights_path=weights_path, is_final_checkpoint=False)
         ref.shutdown()
         ref = None
 
@@ -538,6 +1052,7 @@ def test_value_worker_context_parallel_equivalence(tiny_qwen2_model_path, tmp_pa
             cluster=cluster,
             config=feat_config,
             tokenizer=tokenizer,
+            seed=42,
             weights_path=Path(weights_path),
             name_prefix="lm_value_feat",
         )
@@ -555,7 +1070,10 @@ def test_value_worker_context_parallel_equivalence(tiny_qwen2_model_path, tmp_pa
 
 
 @pytest.mark.mcore
-def test_unpack_value_sequences_variable_lengths():
+@pytest.mark.parametrize("boundary_type", [torch.tensor, tuple])
+def test_unpack_value_sequences_variable_lengths(
+    boundary_type: Callable[[list[int]], torch.Tensor | tuple[int, ...]],
+) -> None:
     """`_unpack_value_sequences` unpacks packed [1, T] values to [B, S] with a
     per-sequence right-shift. Runs CPU-only (cp_group=None) and uses variable
     lengths to cover what the uniform-length GPU equivalence test does not.
@@ -570,12 +1088,15 @@ def test_unpack_value_sequences_variable_lengths():
         torch.tensor([7.0, 8.0]),
     ]
     packed = torch.cat(seqs).unsqueeze(0)  # [1, 10]
-    cu_seqlens_padded = torch.tensor([0, 3, 8, 10], dtype=torch.int32)
+    cu_seqlens_padded = boundary_type([0, 3, 8, 10])
     unpacked_seqlen = 5
 
-    out = _unpack_value_sequences(
-        packed, cu_seqlens_padded, unpacked_seqlen, cp_group=None
-    )
+    with patch.object(
+        torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
+    ):
+        out = _unpack_value_sequences(
+            packed, cu_seqlens_padded, unpacked_seqlen, cp_group=None
+        )
 
     assert out.shape == (3, unpacked_seqlen)
     expected = torch.zeros(3, unpacked_seqlen)
@@ -583,6 +1104,50 @@ def test_unpack_value_sequences_variable_lengths():
         # values[t] = V(state before token t): prepend 0, drop last.
         expected[i, : v.shape[0]] = torch.cat([torch.zeros(1), v[:-1]])
     torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.parametrize("boundary_type", [torch.tensor, tuple])
+def test_unpack_value_sequences_context_parallel(
+    boundary_type: Callable[[list[int]], torch.Tensor | tuple[int, ...]],
+) -> None:
+    """Gather each packed sequence before shifting and truncating its values."""
+    # Megatron is an optional dependency loaded only for mcore tests.
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _unpack_value_sequences,
+    )
+
+    # CP rank 0 owns the first and last quarter of each sequence.
+    packed = torch.tensor([[1.0, 4.0, 10.0, 20.0, 70.0, 80.0]])
+    sequences = [
+        torch.tensor([1.0, 2.0, 3.0, 4.0]),
+        torch.arange(10.0, 90.0, 10.0),
+    ]
+    cp_group = object()
+    with (
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.allgather_cp_sharded_tensor",
+            side_effect=sequences,
+        ) as gather,
+        patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
+        ),
+    ):
+        out = _unpack_value_sequences(
+            packed, boundary_type([0, 4, 12]), 5, cp_group=cp_group
+        )
+
+    assert gather.call_count == 2
+    for call, expected_shard in zip(
+        gather.call_args_list, [packed[0, :2], packed[0, 2:]]
+    ):
+        torch.testing.assert_close(call.args[0], expected_shard)
+        assert call.args[1] is cp_group
+        assert call.kwargs == {"seq_dim": 0}
+    torch.testing.assert_close(
+        out,
+        torch.tensor([[0.0, 1.0, 2.0, 3.0, 0.0], [0.0, 10.0, 20.0, 30.0, 40.0]]),
+    )
 
 
 def test_value_loss_prepare_fn_shift_and_truncate():
@@ -720,6 +1285,7 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
     value.save_checkpoint(
         weights_path=weights_path,
         optimizer_path=optimizer_path,
+        is_final_checkpoint=False,
     )
 
     # Verify on-disk artifacts.
@@ -749,6 +1315,7 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
         cluster=cluster,
         config=config,
         tokenizer=tokenizer,
+        seed=42,
         weights_path=resume_weights_path,
         optimizer_path=resume_optimizer_path,
         name_prefix="lm_value_resumed",
@@ -788,6 +1355,7 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
         resumed.save_checkpoint(
             weights_path=resaved_weights_path,
             optimizer_path=resaved_optimizer_path,
+            is_final_checkpoint=False,
         )
         assert not Path(resaved_optimizer_path).exists()
 

@@ -8,7 +8,7 @@ GPUS_PER_NODE=8
 STEPS_PER_RUN=10
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=240
+NUM_MINUTES=120
 SNAPSHOT_MEGATRON_BRIDGE=1
 # ===== END CONFIG =====
 
@@ -34,7 +34,7 @@ uv run examples/run_grpo.py \
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 if ! grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"; then echo "ERROR: VllmQuantInternalWorkerExtension not found in real-quant run" >&2; exit 1; fi
-if ! grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"; then echo "ERROR: 'Detected ModelOpt NVFP4 checkpoint' not found in real-quant run" >&2; exit 1; fi
+if ! grep -q "quantization=nemo_modelopt_" "$RUN_LOG"; then echo "ERROR: 'quantization=nemo_modelopt_' not found in real-quant run" >&2; exit 1; fi
 if grep -q "FakeQuantWorker" "$RUN_LOG"; then echo "ERROR: FakeQuantWorker unexpectedly present in real-quant run" >&2; exit 1; fi
 if grep -q "VLLM_QUANT_CFG" "$RUN_LOG"; then echo "ERROR: VLLM_QUANT_CFG unexpectedly present in real-quant run" >&2; exit 1; fi
 

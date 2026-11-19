@@ -34,7 +34,7 @@ def find_python_executables():
     """
     # Pattern to match:
     # - python (exact match, as representative of driver script's python)
-    # - python-* wrapper scripts (like python-AsyncTrajectoryCollector, python-DTensorPolicyWorker, etc.)
+    # - python-* wrapper scripts (like python-AsyncTrajectoryCollector, python-AutomodelPolicyWorker, etc.)
     # Excludes python3, python3.12, etc. and argcomplete-related scripts
     python_pattern = re.compile(r"^python$|^python-(?!.*argcomplete).*$")
 

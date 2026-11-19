@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from functools import partial
+from typing import cast
 
 from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.datasets.response_datasets.aime import AIMEDataset
@@ -32,12 +33,15 @@ from nemo_rl.data.datasets.response_datasets.general_conversations_dataset impor
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.gsm8k import GSM8KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
-from nemo_rl.data.datasets.response_datasets.livecodebench import (
-    LiveCodeBenchDataset,
-)
 from nemo_rl.data.datasets.response_datasets.intent import (
     IntentBenchDataset,
     IntentTrainDataset,
+)
+from nemo_rl.data.datasets.response_datasets.livecodebench import (
+    LiveCodeBenchDataset,
+)
+from nemo_rl.data.datasets.response_datasets.megatron_sft_packed import (
+    MegatronSFTPackedDataset,
 )
 from nemo_rl.data.datasets.response_datasets.mmpr_tiny import MMPRTinyDataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
@@ -83,6 +87,7 @@ DATASET_REGISTRY = {
     "livecodebench_v6": LiveCodeBenchDataset,
     "intent-train": IntentTrainDataset,
     "intent-bench": IntentBenchDataset,
+    "megatron_sft_packed": MegatronSFTPackedDataset,
     "open_assistant": OasstDataset,
     "OpenMathInstruct-2": OpenMathInstruct2Dataset,
     "NuminaMath-1.5": NuminaMath15Dataset,
@@ -99,7 +104,9 @@ DATASET_REGISTRY = {
 }
 
 
-def load_response_dataset(data_config: ResponseDatasetConfig):
+def load_response_dataset(
+    data_config: ResponseDatasetConfig, *, context_parallel_size: int | None = None
+):
     """Loads response dataset.
 
     Resolution order for ``data_config["dataset_name"]``:
@@ -133,9 +140,16 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
     # that never calls `split_train_validation`).
     warn_on_unsupported_dataset_config_keys(dataset_class, data_config)
 
-    dataset = dataset_class(
-        **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
-    )
+    if dataset_name == "megatron_sft_packed":
+        packed_dataset_class = cast(type[MegatronSFTPackedDataset], dataset_class)
+        dataset = packed_dataset_class(
+            **data_config,  # pyrefly: ignore[missing-argument]  `data_path` and `chat_key` are required
+            context_parallel_size=context_parallel_size,
+        )
+    else:
+        dataset = dataset_class(
+            **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
+        )
 
     # bind prompt, system prompt and data processor
     dataset.set_task_spec(data_config)
@@ -162,6 +176,7 @@ __all__ = [
     "LiveCodeBenchDataset",
     "IntentBenchDataset",
     "IntentTrainDataset",
+    "MegatronSFTPackedDataset",
     "MMPRTinyDataset",
     "NemoGymDataset",
     "NemotronCascade2SFTMathDataset",

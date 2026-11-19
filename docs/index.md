@@ -20,7 +20,7 @@ Learn about NeMo RL's architecture, design philosophy, and key features that mak
 :link: about/quick-start
 :link-type: doc
 
-Get up and running quickly with examples for both DTensor and Megatron Core training backends.
+Get up and running quickly with examples for both Automodel and Megatron Core training backends.
 :::
 
 :::{grid-item-card} {octicon}`download` Installation
@@ -55,7 +55,7 @@ Troubleshooting common issues including missing submodules and memory fragmentat
 :link: about/backends
 :link-type: doc
 
-Learn about DTensor and Megatron Core training backends, their capabilities, and how to choose the right one for your use case.
+Learn about Automodel and Megatron Core training backends, their capabilities, and how to choose the right one for your use case.
 :::
 
 :::{grid-item-card} {octicon}`workflow` Algorithms
@@ -69,7 +69,7 @@ Discover supported algorithms including GRPO, PPO, SFT, DPO, RM, on-policy disti
 :link: about/evaluation
 :link-type: doc
 
-Learn how to evaluate your models using built-in evaluation datasets and custom evaluation pipelines.
+Measure model and agent capabilities with repeatable benchmarks and custom evaluations.
 :::
 
 :::{grid-item-card} {octicon}`server` Cluster Setup
@@ -77,6 +77,13 @@ Learn how to evaluate your models using built-in evaluation datasets and custom 
 :link-type: doc
 
 Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
+:::
+
+:::{grid-item-card} {octicon}`workflow` Dynamo Serving
+:link: guides/dynamo-generation
+:link-type: doc
+
+Serve the SingleController's non-colocated vLLM generation through Dynamo's frontend and KV-aware router with `dynamo: true`.
 :::
 
 ::::
@@ -101,7 +108,7 @@ Step-by-step guide for supervised fine-tuning on the OpenMathInstruct2 dataset.
 :::
 
 :::{grid-item-card} {octicon}`rocket` Nemotron 3 Ultra
-:link: guides/nemotron-3-ultra
+:link: guides/models/nemotron/nemotron-3-ultra
 :link-type: doc
 
 Post-train Nemotron 3 Ultra with RLVR, teacher training, and MOPD stages on GB200 NVL72 hardware.
@@ -119,6 +126,13 @@ Create custom reward environments and integrate them with NeMo RL training pipel
 :link-type: doc
 
 Configure offline and online Eagle3 draft-model workflows to accelerate rollout generation with vLLM.
+:::
+
+:::{grid-item-card} {octicon}`rocket` Automodel Speculative Decoding
+:link: guides/automodel-speculative-decoding
+:link-type: doc
+
+Co-train DSpark, DFlash, and EAGLE3 drafters alongside the policy on the Automodel backend.
 :::
 
 :::{grid-item-card} {octicon}`unmute` Audio GRPO on AVQA
@@ -153,7 +167,7 @@ Learn how to add support for new model architectures in NeMo RL.
 :link: guides/lora
 :link-type: doc
 
-Parameter-efficient fine-tuning with LoRA: backend support, DTensor vs Megatron schema comparison, config examples, and recipes.
+Parameter-efficient fine-tuning with LoRA: backend support, Automodel vs Megatron schema comparison, config examples, and recipes.
 :::
 
 :::{grid-item-card} {octicon}`arrow-both` YaRN Long-Context Training
@@ -184,6 +198,13 @@ Choose among colocated IPC, NCCL, sparse delta, and NIXL refit transports.
 Use NIXL checkpoint-engine refit to update non-colocated vLLM generation workers from policy workers.
 :::
 
+:::{grid-item-card} {octicon}`workflow` Single-Controller (Async GRPO and PPO)
+:link: guides/single-controller
+:link-type: doc
+
+Run async GRPO or PPO via the SingleController path: TransferQueue data plane, pluggable staleness samplers, and streaming trainer.
+:::
+
 ::::
 
 ## Advanced Topics
@@ -205,6 +226,13 @@ Deep dive into NeMo RL's architecture, APIs, and design decisions for scalable R
 Tools and techniques for debugging distributed Ray applications and RL training runs.
 :::
 
+:::{grid-item-card} {octicon}`graph` Observability
+:link: observability/index
+:link-type: doc
+
+OpenTelemetry traces and `rl.*` metrics via nemo-lens: span groups, configuration, vLLM tracing, and an OTLP export stack.
+:::
+
 :::{grid-item-card} {octicon}`zap` FP8 Quantization
 :link: fp8
 :link-type: doc
@@ -216,8 +244,14 @@ Optimize large language models with FP8 quantization for faster training and inf
 :link: guides/quantization-aware-rl
 :link-type: doc
 
-Run quantization-aware GRPO and distillation using NVIDIA ModelOpt.
-Includes NVFP4 W4A4 and W4A16 real rollout.
+Run quantized GRPO and distillation with NVIDIA ModelOpt.
+:::
+
+:::{grid-item-card} {octicon}`meter` End-to-End NVFP4 Training
+:link: design-docs/te-nvfp4-per-token-rollout
+:link-type: doc
+
+Run W4A4 policy training and per-token vLLM rollout on NVIDIA Blackwell GPUs.
 :::
 
 :::{grid-item-card} {octicon}`container` Docker Containers
@@ -282,19 +316,18 @@ guides/sft-openmathinstruct2.md
 ```{toctree}
 :caption: Guides
 
-guides/nemotron-3-nano.md
-guides/nemotron-3-nano-omni.md
-guides/nemotron-3-super.md
-guides/nemotron-3-ultra.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
+guides/nemotron-omni-mpo.md
 guides/dapo.md
 guides/lora.md
 guides/cispo.md
 guides/prorlv2.md
 guides/swe-rl-qwen3.md
 guides/grpo.md
+guides/score-centering.md
+guides/length-penalty.md
 guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
@@ -302,22 +335,25 @@ guides/grpo-audio.md
 guides/grpo-audio-visual.md
 guides/rm.md
 guides/environments.md
-guides/eval.md
 guides/deepseek.md
 guides/models/index.md
-guides/models/qwen/index.md
-guides/models/qwen/qwen3-5.md
 model-quirks.md
 guides/async-grpo.md
+guides/single-controller.md
+guides/context-compaction.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
+guides/automodel-speculative-decoding.md
 guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
 guides/refit.md
 guides/checkpoint-engine-refit.md
+guides/persistent-jit-caches.md
+guides/dynamo-generation.md
 guides/router-replay.md
+guides/sampler-replay.md
 guides/muon-optimizer.md
-guides/dtensor-tp-accuracy.md
+guides/automodel-tp-accuracy.md
 guides/ft-launcher-guide.md
 ```
 
@@ -340,6 +376,12 @@ guides/use-custom-vllm.md
 ```
 
 ```{toctree}
+:caption: Observability
+
+observability/index.md
+```
+
+```{toctree}
 :caption: Design Docs
 
 design-docs/design-and-philosophy.md
@@ -349,17 +391,29 @@ design-docs/uv.md
 design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
+design-docs/ppo-colocated-streaming.md
+design-docs/pd-disaggregation-rollout.md
+design-docs/dynamo-integration.md
 design-docs/sparse-delta-refit.md
 design-docs/checkpoint-engines.md
 design-docs/checkpointing.md
 design-docs/loss-functions.md
-design-docs/fsdp2-parallel-plan.md
+design-docs/automodel-parallel-plan.md
 design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md
+design-docs/te-nvfp4-per-token-rollout.md
 design-docs/nccl-reshard-refit.md
+design-docs/nixl-data-plane.md
+design-docs/dspark-auxiliary-heads.md
+design-docs/media-token-validity-mask.md
+design-docs/automodel-context-parallel.md
+design-docs/token-capture-ledger.md
+design-docs/dflash-draft-body.md
+design-docs/dspark-objectives.md
+design-docs/single-controller-rollout-checkpointing.md
 ```
 
 ```{toctree}

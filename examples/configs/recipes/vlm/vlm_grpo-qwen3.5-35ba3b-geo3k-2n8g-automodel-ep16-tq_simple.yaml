@@ -1,0 +1,3 @@
+defaults: vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.yaml
+data_plane:
+  enabled: true

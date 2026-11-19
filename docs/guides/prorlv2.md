@@ -23,7 +23,7 @@ uv run examples/run_grpo.py --config examples/configs/prorlv2.v2.yaml {overrides
 
 `prorlv2.v2.yaml` inherits from [`examples/configs/grpo_math_1B.yaml`](../../examples/configs/grpo_math_1B.yaml) and only overrides a small set of fields under `grpo` and `loss_fn`, plus output directories.
 
-**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for gated models.
+**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `hf auth login` as well for gated models.
 
 ## DAPO: Dynamic Sampling
 
@@ -32,7 +32,7 @@ Standard GRPO will train on all generated responses, even when a prompt's `num_g
 - **Config**: enable with `grpo.use_dynamic_sampling: true` and tune:
   - `grpo.batch_multiplier`: how many extra prompts to generate to compensate filtering
   - `grpo.dynamic_sampling_max_gen_batches`: upper bound before raising an error
-- **Implementation**: see `dynamic_sampling()` in [`nemo_rl/algorithms/grpo.py`](../../nemo_rl/algorithms/grpo.py).
+- **Implementation**: see `dynamic_sampling()` in [`nemo_rl/algorithms/grpo.py`](../../nemo_rl/algorithms/grpo.py). On the single-controller path, `dynamic_sampling_max_gen_batches` bounds one training step rather than a batch accumulation loop, and `batch_multiplier` is rejected; see [Dynamic sampling](single-controller.md#dynamic-sampling).
 
 ## Decoupled local/global advantage normalization
 
@@ -122,7 +122,7 @@ This computes the policy gradient loss per token (under masking) instead of aggr
 
 ## Importance Sampling Correction and MoE Stability
 
-When training and generation backends differ (e.g., FSDP vs vLLM, BF16 vs FP8), the logprobs they produce can disagree. NeMo RL captures this disagreement as an IS correction weight:
+When training and generation backends differ (e.g., Automodel vs vLLM, BF16 vs FP8), the logprobs they produce can disagree. NeMo RL captures this disagreement as an IS correction weight:
 
 $$\rho_t = \exp(\texttt{prev\_logprobs}_t - \texttt{generation\_logprobs}_t)$$
 
@@ -131,7 +131,7 @@ For dense models $\rho_t$ stays close to 1.0. For **MoE models**, even tiny floa
 | Source | Cause | Solution |
 |--------|-------|----------|
 | **Router Shift** (algorithmic) | Multi mini-batch updates change the router too fast. | **Pure Online Training** — set `max_num_epochs: 1` (default in `grpo_math_1B.yaml`). |
-| **Backend Mismatch** (engineering) | FSDP and vLLM compute different logits; small differences flip expert selection. | **IS Correction + Filtering** — ICE-POP or seq-mask-tis (see below). |
+| **Backend Mismatch** (engineering) | Automodel and vLLM compute different logits; small differences flip expert selection. | **IS Correction + Filtering** — ICE-POP or seq-mask-tis (see below). |
 
 Pure Online training eliminates router shift by ensuring the policy is updated only once per rollout. This leaves backend mismatch as the remaining source of instability, which is handled by filtering.
 

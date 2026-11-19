@@ -30,7 +30,7 @@ policy:
   quant_batch_size: 1
   quant_sequence_length: 2048
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true

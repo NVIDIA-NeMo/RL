@@ -176,18 +176,24 @@ def test_sdpo_loss_detects_disagreement_outside_sampled_token():
         }
     )
     gvt = torch.tensor(1.0)  # one valid response position
-    loss, _ = loss_fn(student_topk_logp, teacher_topk_logp, None, data, torch.tensor(1.0), gvt)
+    loss, _ = loss_fn(
+        student_topk_logp, teacher_topk_logp, None, data, torch.tensor(1.0), gvt
+    )
 
     # Expected reverse KL: sum_v p_s(v) [log p_s(v) - log p_t(v)]
     expected = (student_p * (student_p.log() - teacher_p.log())).sum().item()
-    assert math.isclose(loss.item(), expected, rel_tol=1e-4, abs_tol=1e-5), f"got {loss.item()}, expected {expected}"
+    assert math.isclose(loss.item(), expected, rel_tol=1e-4, abs_tol=1e-5), (
+        f"got {loss.item()}, expected {expected}"
+    )
     assert loss.item() > 0
 
 
 def test_sdpo_loss_token_mask_excludes_prompt_positions():
     """token_mask=0 at a position should remove it from the loss average."""
     batch_size, seq_len, topk, vocab = 2, 6, 4, 16
-    s, t, H, data, _ = _build_inputs(batch_size=batch_size, seq_len=seq_len, topk=topk, vocab_size=vocab)
+    s, t, H, data, _ = _build_inputs(
+        batch_size=batch_size, seq_len=seq_len, topk=topk, vocab_size=vocab
+    )
     # First half of each sequence is "prompt" (mask=0)
     tm = torch.ones(batch_size, seq_len)
     tm[:, : seq_len // 2] = 0.0
@@ -265,7 +271,9 @@ def test_sdpo_loss_js_is_symmetric():
         "sdpo_mask": torch.ones(2),
     }
     gvt = (data["token_mask"][:, 1:] * data["sdpo_mask"].unsqueeze(-1)).sum()
-    loss_ab, _ = loss_fn(student_topk_logp_ab, teacher_topk_logp_ab, H_ab, data, torch.tensor(2.0), gvt)
+    loss_ab, _ = loss_fn(
+        student_topk_logp_ab, teacher_topk_logp_ab, H_ab, data, torch.tensor(2.0), gvt
+    )
 
     # Swap which side is the "teacher".
     student_logp_full2 = F.log_softmax(logits_b, dim=-1)
@@ -274,7 +282,9 @@ def test_sdpo_loss_js_is_symmetric():
     teacher_topk_logp_ba = teacher_logp_full2.gather(-1, teacher_topk_idx2)
     student_topk_logp_ba = student_logp_full2.gather(-1, teacher_topk_idx2)
     H_ba = (student_logp_full2.exp() * student_logp_full2).sum(-1)
-    loss_ba, _ = loss_fn(student_topk_logp_ba, teacher_topk_logp_ba, H_ba, data, torch.tensor(2.0), gvt)
+    loss_ba, _ = loss_fn(
+        student_topk_logp_ba, teacher_topk_logp_ba, H_ba, data, torch.tensor(2.0), gvt
+    )
 
     assert torch.allclose(loss_ab, loss_ba, atol=1e-5), (loss_ab.item(), loss_ba.item())
 
@@ -326,9 +336,9 @@ def test_sdpo_ref_kl_positive_when_drifted(kl_estimator):
         "reference_policy_kl_type": kl_estimator,
     }
 
-    loss_low, _ = SDPOLossFn(
-        {**cfg_base, "reference_policy_kl_penalty": 0.0}
-    )(s, t, H, data, torch.tensor(4.0), gvt)
+    loss_low, _ = SDPOLossFn({**cfg_base, "reference_policy_kl_penalty": 0.0})(
+        s, t, H, data, torch.tensor(4.0), gvt
+    )
     loss_high, metrics_high = SDPOLossFn(
         {**cfg_base, "reference_policy_kl_penalty": 1.0}
     )(s, t, H, data, torch.tensor(4.0), gvt, next_token_logprobs=curr_lp)
@@ -443,7 +453,9 @@ def test_sdpo_loss_js_bounded_by_log2():
         }
     )
     gvt = torch.tensor(1.0)
-    loss, metrics = loss_fn(student_logp, teacher_logp, H_all, data, torch.tensor(1.0), gvt)
+    loss, metrics = loss_fn(
+        student_logp, teacher_logp, H_all, data, torch.tensor(1.0), gvt
+    )
     assert loss.item() <= math.log(2) + 1e-3
     assert metrics["sdpo/per_pos_kl"] <= math.log(2) + 1e-3
     assert loss.item() > 0  # disjoint supports → strictly positive
@@ -518,7 +530,9 @@ def test_sdpo_rollout_is_clips_large_ratios():
     )
     assert torch.allclose(loss, clip * base_loss, atol=1e-5)
     assert metrics["sdpo/rollout_is_clip_frac"] == pytest.approx(1.0)
-    assert metrics["sdpo/rollout_is_ratio_mean"] == pytest.approx(math.exp(10.0), rel=1e-4)
+    assert metrics["sdpo/rollout_is_ratio_mean"] == pytest.approx(
+        math.exp(10.0), rel=1e-4
+    )
 
 
 def test_sdpo_rollout_is_requires_inputs():
@@ -575,7 +589,10 @@ def test_sdpo_k_plus_one_zero_when_teacher_equals_student():
         loss_fn = _bucket_loss_fn(kl_type)
         # H_all is not needed in bucket mode
         loss, _ = loss_fn(s, t, None, data, torch.tensor(2.0), gvt)
-        assert torch.allclose(loss, torch.zeros_like(loss), atol=1e-5), (kl_type, loss.item())
+        assert torch.allclose(loss, torch.zeros_like(loss), atol=1e-5), (
+            kl_type,
+            loss.item(),
+        )
 
 
 def test_sdpo_k_plus_one_matches_manual_categorical_kl():
@@ -628,17 +645,16 @@ def test_full_vocab_logsumexp_matches_torch():
     torch.manual_seed(0)
     proc = TopkLogitsPostProcessor(
         cfg={},
-        device_mesh=None,
-        cp_mesh=None,
         tp_mesh=None,
-        cp_size=1,
         k=3,
         enable_seq_packing=False,
         return_logsumexp=True,
     )
     logits = torch.randn(2, 2500, 64)  # > one 1024 seq chunk
     lse = proc._full_vocab_logsumexp(logits)
-    assert torch.allclose(lse, torch.logsumexp(logits.to(torch.float32), dim=-1), atol=1e-5)
+    assert torch.allclose(
+        lse, torch.logsumexp(logits.to(torch.float32), dim=-1), atol=1e-5
+    )
 
 
 def test_sdpo_k_plus_one_finite_on_deterministic_tokens():

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,12 +13,20 @@
 # limitations under the License.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, NotRequired, Optional, TypedDict, Union
+from functools import cache
+from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data.captured_media import MediaColumnSpec
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 # Routed-expert index tensors ([seq, layers, topk]) are carried in the narrowest
 # signed dtype that fits ids 0..num_experts-1 plus the -1 missing-route sentinel:
@@ -39,6 +47,15 @@ _ROUTED_EXPERTS_DTYPE_NAMES = {
     torch.int16: "int16",
     torch.int32: "int32",
 }
+
+
+@cache
+def _warn_unsupported_in_flight_refit_pause_once(backend_name: str) -> None:
+    """Warn once per backend type when native refit pause is unavailable."""
+    print(
+        f"⚠️ {backend_name} has no native generation pause/resume support; "
+        "continuing with the backend's existing in-flight refit behavior"
+    )
 
 
 def get_num_routed_experts(hf_config: Any) -> Optional[int]:
@@ -178,6 +195,33 @@ class OptionalResourcesConfig(TypedDict):
     num_nodes: int | None
 
 
+class DisaggConfig(BaseModel, extra="allow"):
+    """Prefill/decode disaggregation, in the terms every backend shares."""
+
+    enabled: bool = False
+
+    # Engines per replica; independent, so the P:D ratio is free.
+    num_prefill_engines: int = 1
+    num_decode_engines: int = 1
+
+    # Frontend servers per replica, each its own actor with a distinct URL. The
+    # rollout client shards conversations across them by session, so one
+    # frontend's CPU stops being the replica's throughput ceiling.
+    num_frontend_workers: int = 1
+
+    # Render and tokenize on the frontends instead of the prefill adapter,
+    # which is one thread per engine and scales only by adding GPUs.
+    # Frontends are CPU-only -- this is what num_frontend_workers buys.
+    frontend_tokenize: bool = False
+
+    # base + replica_idx * num_frontend_workers + frontend_idx. Deterministic
+    # so a restarted frontend re-binds the same port and its URL stays valid.
+    # Like every service port it must stay below 9000, the ephemeral floor on
+    # some DGX/GB200 nodes; the default band is virtual_cluster's
+    # DEFAULT_DISAGG_FRONTEND_PORT_RANGE_*.
+    frontend_base_port: int = DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
+
+
 class ColocationConfig(TypedDict):
     enabled: bool
     resources: OptionalResourcesConfig
@@ -194,6 +238,16 @@ class CheckpointEngineConfig(TypedDict):
     engine_kwargs: dict[str, dict[str, Any]]
 
 
+class SamplerReplayConfig(BaseModel, extra="allow"):
+    """Sampler replay, with or without loss_fn.score_centering."""
+
+    # Renormalize the trainer's top-k/top-p log-probs over the support the sampler
+    # actually drew from (its captured top-K head) instead of recomputing the
+    # filters. Requires top_logprobs >= top_k and token capture. False: the
+    # trainer recomputes top_k/top_p on its own logits.
+    enabled: bool = False
+
+
 class GenerationConfig(TypedDict):
     """Configuration for generation."""
 
@@ -202,10 +256,17 @@ class GenerationConfig(TypedDict):
     temperature: float
     top_p: float
     top_k: int | None
+    # Sampler replay (see SamplerReplayConfig); absent means disabled.
+    sampler_replay: NotRequired[SamplerReplayConfig]
+    top_logprobs: NotRequired[
+        int
+    ]  # Sampler candidates per token; 0 disables collection.
     # Validation-only sampling. The exemplar YAMLs default these to the train
     # values above via interpolation (${.temperature}, ...), so validation
     # samples exactly like training unless overridden. Only honored on the
-    # NeMo-Gym vLLM rollout path (guarded in grpo.setup()).
+    # NeMo-Gym vLLM and TRT-LLM rollout paths (guarded in grpo.setup()); a
+    # val_top_k override also needs val_temperature or val_top_p to differ, since
+    # the server tells validation requests apart by those two.
     val_temperature: float
     val_top_p: float
     val_top_k: int | None
@@ -213,14 +274,69 @@ class GenerationConfig(TypedDict):
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None
     bad_words: NotRequired[list[str] | None]
+    ignore_eos: NotRequired[bool]
     colocated: NotRequired[ColocationConfig]
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
     use_async_rollouts: NotRequired[bool]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
+    # Eagle draft weights arrive via refit when policy.draft.enabled=true.
+    _draft_weights_from_refit: NotRequired[bool]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
     _mtp_weights_from_refit: NotRequired[bool]
+    # The trainer streams the drafter's full weight set (incl. embed/lm_head)
+    # on refit (Automodel draft co-training); drafter module sharing must be
+    # disabled and the draft manifest is validated exactly.
+    _draft_full_refit: NotRequired[bool]
+    # Internal debug-only measurement of exact Ray generation arguments.
+    # Populated from grpo.debug_payload_metrics; not meant to be set by the user.
+    _debug_payload_metrics: NotRequired[bool]
+
+    # The layout, in the terms every backend shares. How a backend *implements*
+    # disaggregation goes in that backend's own block.
+    disaggregation: NotRequired[DisaggConfig]
+
+
+def sampler_replay_enabled(config: GenerationConfig) -> bool:
+    """Whether ``policy.generation.sampler_replay.enabled`` is set; absent means off.
+
+    The block is a dict until MasterConfig validates it into a SamplerReplayConfig.
+    """
+    replay = config.get("sampler_replay")
+    return replay is not None and SamplerReplayConfig.model_validate(replay).enabled
+
+
+def should_use_async_rollouts(
+    generation_config: GenerationConfig | None,
+) -> bool:
+    """Determine whether a generation backend uses asynchronous rollouts."""
+    if generation_config is None:
+        return False
+    backend = generation_config.get("backend", "")
+
+    if backend == "sglang":
+        return bool(generation_config.get("use_async_rollouts", False))
+
+    if backend == "vllm":
+        return bool(generation_config.get("vllm_cfg", {}).get("async_engine", False))
+
+    if backend == "trtllm":
+        assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
+            "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
+            "synchronous engine path (async_engine=false) is no longer supported."
+        )
+        return True
+
+    if backend == "megatron":
+        mcore_cfg = generation_config.get("mcore_generation_config", {})
+        assert mcore_cfg.get("async_engine") is None, (
+            "Megatron Inference always uses the async engine. The parameter "
+            "policy.generation.mcore_generation_config.async_engine was removed."
+        )
+        return True
+
+    return False
 
 
 @dataclass
@@ -342,8 +458,69 @@ class GenerationOutputSpec(TypedDict):
     __extra__: Any
 
 
+@dataclass(frozen=True)
+class CollectiveSenderSpec:
+    """Policy-side protocol and packing geometry for NCCL weight transfer."""
+
+    nccl_peer: str = "nemo"
+    buffer_size_bytes: int | None = None
+    num_buffers: int | None = None
+    use_legacy_packing: bool = False
+
+
+def agreed_media_columns(
+    reported: list["Optional[MediaColumnSpec]"],
+) -> "Optional[MediaColumnSpec]":
+    """The one media column spec the capture workers pinned, or ``None``.
+
+    Each ``setup_token_capture`` fan-out target reports the spec it pinned its
+    staging media column to (``None`` from text-only workers and ranks that
+    host no capture). The reassembler mints empty media rows from this spec,
+    so two workers disagreeing would publish two pixel dtypes or widths into
+    one column; that is refused here, at setup, rather than found by
+    TransferQueue mid-run.
+    """
+    specs = {spec for spec in reported if spec is not None}
+    if len(specs) > 1:
+        raise RuntimeError(
+            "capture workers pinned different media column specs: "
+            f"{sorted(map(str, specs))}"
+        )
+    return next(iter(specs), None)
+
+
+def reject_unenforceable_refit_deadline(
+    backend: str, refit_timeout_s: Optional[float]
+) -> None:
+    """Refuse a refit deadline the backend cannot actually apply.
+
+    Accepting it and doing nothing would be worse than refusing. The deadline exists so
+    that a generation rank dying mid-refit cannot hang the weight-sync collective
+    forever; a user who sets it on a backend that ignores it gets exactly that hang,
+    while believing they are protected. Only transports whose workers own an
+    abortable collective can enforce it.
+
+    ``None`` disables the deadline and passes through untouched.
+    """
+    if refit_timeout_s is not None:
+        raise NotImplementedError(
+            f"{backend} refit cannot enforce a refit deadline "
+            f"(refit_timeout_s={refit_timeout_s}). Unset "
+            "async_rl.generation_fleet_health.refit_timeout_s, or select a refit "
+            "transport with worker-side watchdog support."
+        )
+
+
 class GenerationInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
+
+    @classmethod
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Backend-specific pure-config validation, run before any build.
+
+        Args:
+            master_config: The single-controller MasterConfig.
+        """
 
     @abstractmethod
     def init_collective(
@@ -360,40 +537,349 @@ class GenerationInterface(ABC):
 
     @abstractmethod
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
+        """Ready the engine for a generation phase (start or wake it).
+
+        Idempotent wake: calling this on an already-running engine must be safe and cheap.
+        """
         pass
 
     @abstractmethod
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
+        """Wind down after a generation phase.
+
+        Callers may pass `release_gpu` (keyword-only, default True):
+        True means the caller needs the GPUs for itself (a training step or a checkpoint save),
+        so even a colocated engine must fully stand down;
+        False means the phase is merely over, and a colocated engine must keep serving
+        usable with no intervening prepare_for_generation.
+        Only the colocated Megatron backend honors the flag today; other backends
+        ignore it, as do engines on dedicated GPUs.
+        """
         pass
+
+    @abstractmethod
+    def shutdown(self) -> bool:
+        """Shut down generation resources; repeated calls must be safe."""
+        pass
+
+    def pause_generation(self, mode: str) -> None:
+        """Pause in-flight generation on the backend."""
+        raise NotImplementedError
+
+    def continue_generation(self) -> None:
+        """Resume previously paused generation on the backend."""
+        raise NotImplementedError
+
+    def restart_shard(self, shard_idx: int) -> Optional[str]:
+        """Rebuild one data-parallel shard's workers and bring its engine back up.
+
+        Declared here because ``EngineSupervisor`` calls it by name on whatever backend it
+        was handed. Undeclared, a backend that does not implement it -- or one that loses
+        the method to a merge, which has happened once already -- degrades to an
+        ``AttributeError`` swallowed by the supervisor's ``except``, and the shard is
+        recorded as a failed restart rather than as an unsupported one. Raising here says
+        which it is.
+
+        Blocking and slow -- it reloads the model -- so callers run it off the control
+        loop.
+
+        Returns:
+            The replacement's OpenAI base URL, or None for an engine that exposes no HTTP
+            server. The URL is expected to differ from the old one: the new engine binds
+            its own port, so callers must publish it rather than assume the fleet's URL
+            list is still accurate.
+        """
+        raise NotImplementedError
+
+    def shard_liveness_ref(self, shard_idx: int) -> ray.ObjectRef:
+        """Liveness of the worker leading one data-parallel shard.
+
+        Which Ray worker leads shard N depends on how shards are laid out across workers,
+        which is the backend's business. Asking for it by shard index keeps that here
+        rather than in the control loop, where the same arithmetic had a second copy that
+        also assumed every backend has a ``worker_group``.
+        """
+        raise NotImplementedError
+
+    def log_shard_gpu_state(
+        self, shard_idx: int, *, label: str, timeout_s: float = 30.0
+    ) -> None:
+        """Print the state of the GPU one shard holds, from that shard's own node.
+
+        A no-op by default rather than ``NotImplementedError``, unlike ``restart_shard``
+        above: this is a diagnostic taken on the restart path, and a backend that cannot
+        provide it should cost the caller nothing. Failing a restart over a missing log
+        line would be worse than the missing log line.
+        """
 
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Whether the generation backend requires KV cache scales synchronization."""
         return False
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
+        """Prepare the info for refit.
+
+        Returns:
+            Optionally, the parameter names the backend wants pre-quantized on
+            the trainer before streaming (e.g. vllm_cfg.refit_prequantize);
+            None when no trainer-side pre-quantization is requested. The vLLM
+            implementation also installs its FP8 configuration on the workers.
+        """
         raise NotImplementedError
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         """Update the model weights from the given IPC handles."""
         raise NotImplementedError
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
-        """Update the model weights from collective communication."""
+    def update_weights_from_collective(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
+        """Update the model weights from collective communication.
+
+        ``refit_timeout_s`` bounds the receive side of the refit. It is part of the
+        signature for every backend, not just the ones that can act on it, because the
+        synchronizer calls this polymorphically -- a backend that omits the parameter
+        does not fail at import or type-check time, it fails at the Ray boundary during
+        the first refit. Backends that cannot enforce it should say so via
+        ``reject_unenforceable_refit_deadline`` rather than accept it silently.
+        """
         raise NotImplementedError
 
-    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
-        """Prepare per-layer param metadata for nccl_reshard-based refit."""
+    def get_collective_sender_spec(self) -> CollectiveSenderSpec:
+        """Return policy-side NCCL protocol and packed-buffer requirements."""
+        return CollectiveSenderSpec()
+
+    def get_inference_world_size(self) -> int | None:
+        """Return a backend-specific collective world size when required."""
+        return None
+
+    def prepare_nccl_reshard_refit_info(self, refit_infos: list[dict]) -> None:
+        """Prepare per-layer param metadata for nccl_reshard-based refit.
+
+        ``refit_infos`` holds one plan per destination layout, in the order of
+        the ``layout_index`` the bulk communicators were built with. vLLM and
+        Megatron generation have a single layout; disaggregated TRT-LLM has one
+        per engine role.
+        """
         raise NotImplementedError
 
-    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
-        """Receive weights from training workers via nccl_reshard."""
+    def nccl_reshard_refit(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
+        """Receive weights from training workers via nccl_reshard.
+
+        Takes the deadline for the same reason its sibling above does, and the reason is
+        worth repeating because this is the hook that was missed: the synchronizer calls
+        both polymorphically, so a backend whose signature omits the parameter does not
+        fail at import or type-check time -- it fails at the Ray boundary during the first
+        refit, a long way from the signature that caused it.
+
+        Args:
+            refit_timeout_s: Deadline for this collective, after which the worker aborts
+                its own communicator. None leaves the refit path unchanged.
+        """
         raise NotImplementedError
 
-    # Optional hook; backends may override to invalidate any reusable caches
-    # (e.g., vLLM prefix/KV caches) after weight updates.
+    def attach_fleet_health(self, monitor: Any, selector: Any) -> None:
+        """Route this backend's shard selection through fleet health.
+
+        Declared here rather than discovered with ``hasattr`` at the call site, so an
+        unsupported backend says so itself and the capability is greppable from the
+        interface. Same shape as the refit hooks above.
+
+        Args:
+            monitor: ``GenerationFleetHealth`` owning shard eligibility, which the
+                backend also reports observed failures and successes to.
+            selector: ``HealthyShardSelector`` picking among the serving shards.
+        """
+        raise NotImplementedError(
+            "async_rl.generation_fleet_health.enabled=true is not supported for the "
+            f"{type(self).__name__} generation backend"
+        )
+
+    def setup_token_capture(
+        self,
+        dp_cfg: "DataPlaneConfig",
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
+        media_family: str | None = None,
+        top_logprobs: int = 0,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
+        generation_cut_control_timeout_s: float | None = None,
+    ) -> "Optional[MediaColumnSpec]":
+        """Install token capture in the serving workers (``token_capture.enabled``).
+
+        Declared here for the same reason as :meth:`attach_fleet_health`: the
+        single-controller setup calls this on whichever backend is configured, so an
+        unsupported backend says so itself instead of failing with AttributeError.
+
+        Args:
+            dp_cfg: Data-plane config the workers use to build their in-worker client.
+            staging_partition: Data-plane partition that captured rows are staged in.
+            top_logprobs: Number of sampler candidates to stage per generated token;
+                zero disables collection. Unsupported backends reject a positive count.
+            capture_media: Whether the staging partition carries media columns and
+                the workers must stage the media the engine consumed beside each
+                call's tokens.
+            media_family: With ``capture_media``, the family the driver picked from
+                the run's processor (``captured_media.media_capture_family``); the
+                workers check that their engine built the matching processor.
+                ``None`` for text-only capture.
+            generation_prefix_cuts_enabled: Allow checkpoint-time cuts of active
+                model calls for prefix recovery.
+            generation_cut_control_token: Bearer token used by Gym's checkpoint
+                coordinator to authorize generation-cut requests.
+            generation_cut_control_timeout_s: Bound on one generation-cut
+                request; calls not cut by then are acknowledged as failures.
+
+        Returns:
+            With ``capture_media``, the pixel dtype and patch size the workers
+            pinned the staging media column to (every worker reports the same
+            spec); the reassembler publishes empty media rows in that geometry
+            for groups without media. ``None`` for text-only capture.
+        """
+        raise NotImplementedError(
+            f"token_capture.enabled is not supported for {type(self).__name__}"
+        )
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the weight version workers stamp on captured model calls.
+
+        Args:
+            version: Trainer weight version now being served, applied to all
+                subsequent captured requests.
+        """
+        raise NotImplementedError(
+            f"token_capture.enabled is not supported for {type(self).__name__}"
+        )
+
+    def captured_call_progress(
+        self, *, timeout_s: Optional[float] = None
+    ) -> list[dict[str, Any]]:
+        """Report how far each running captured call got, while paused for a refit.
+
+        Returns one ``{"weight_version": v, "calls": [[model_call_id,
+        generated_tokens], ...]}`` per serving engine: the tokens each call
+        generated on version ``v`` before the refit replaces it. Backends that
+        cannot report this return nothing, and their calls count every token
+        under the version they began on.
+
+        Args:
+            timeout_s: How long to wait for the engines; ``None`` waits forever.
+        """
+        return []
+
     def invalidate_kv_cache(self) -> bool:
+        """Confirm stale KV state cannot be reused after a weight update.
+
+        Backends may implement this by invalidating active-request KV state directly or
+        by performing equivalent engine-side handling atomically with refit. Clearing
+        only unreferenced prefix-cache entries is insufficient while requests are active.
+
+        Returns:
+            True only when the backend guarantees the recompute contract; False when it
+            is unsupported or could not be completed.
+        """
+        return False
+
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Arrange a safe generation pause around the upcoming weight refit.
+
+        Backends with native in-flight refit support override this hook. The default
+        implementation warns once per backend type and lets the refit continue with
+        the backend's existing in-flight behavior. Native pause implementations
+        freeze requests until :meth:`resume_generation_after_refit`. A backend
+        may instead acknowledge a lifecycle owned by its weight synchronizer,
+        which must pause and handle the requested cache clearing before transfer
+        and resume before returning. Such backends document their request handling
+        and timeout semantics; for example, SGLang may retract or abort requests.
+
+        Args:
+            clear_cache: Also clear the engine's reusable caches at pause time so
+                preserved requests recompute their KV after the weight update.
+            timeout_s: Maximum time to wait for engines to pause; None waits indefinitely.
+
+        Returns:
+            True if every engine paused or the weight synchronizer guarantees the
+            lifecycle above; False when neither is supported. Pause failures raise
+            from this hook or the synchronizer that owns the pause.
+        """
+        _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
+        return False
+
+    def resume_generation_after_refit(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Resume generation paused by :meth:`pause_generation_for_refit`.
+
+        The default implementation shares the once-per-backend warning emitted by
+        :meth:`pause_generation_for_refit` and lets the refit continue for backends
+        without native pause/resume support.
+
+        Args:
+            timeout_s: Maximum time to wait for engines to resume; None waits indefinitely.
+
+        Returns:
+            True if every surviving engine resumed, including when the weight
+            synchronizer already performed the resume; False when neither path is
+            supported. With fleet health, confirmed dead engines may be excluded
+            if enough survivors remain. Other resume failures raise.
+        """
+        _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
+        return False
+
+    def flush_obsolete_generation_cut_rows(
+        self, epoch: int, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Delete chunk rows of calls that ended before snapshot ``epoch``.
+
+        Returns once every worker's delete is done, so none overlaps the
+        snapshot's TQ save. A worker ignores an epoch no newer than one it
+        already flushed.
+        """
+        raise NotImplementedError(
+            "generation-prefix checkpointing is not supported for "
+            f"{type(self).__name__}"
+        )
+
+    def get_generation_prefix_counts(self) -> dict[str, int]:
+        """Sum over workers of generation-prefix restore and cut counts.
+
+        Returns:
+            Counts since the workers started: ``restored_calls`` and their
+            ``restored_prefix_tokens``, and the progress-read counts named by
+            ``PrefixRecovery.counts``.
+        """
+        raise NotImplementedError(
+            "generation-prefix checkpointing is not supported for "
+            f"{type(self).__name__}"
+        )
+
+    def blocks_training(self) -> bool:
+        """Whether this engine must stand down before a training step.
+
+        True when generation shares GPUs with training (colocated): the
+        training loop then pauses collection and winds the engine down
+        before training. Engines on dedicated GPUs never block training.
+        """
+        return False
+
+    def wake_carries_weight_updates(self) -> bool:
+        """Whether prepare_for_generation alone serves the latest weights.
+
+        True when waking the engine suffices for it to serve weights updated while it slept
+        (colocated Megatron: the wake reshards, or the engine shares the training tensors outright).
+        The async loop may then defer a wake past a checkpoint save and advance
+        the collector's weight version with no explicit transfer.
+        Backends whose wake does not reload weights must return False so the loop refits instead.
+        """
         return False
 
     def clear_logger_metrics(self) -> None:
@@ -414,3 +900,33 @@ class GenerationInterface(ABC):
             Dictionary of metrics. Format may vary by backend.
         """
         return {}
+
+    def snapshot_step_metrics(self) -> None:
+        """Begin a per-training-step generation metric window.
+
+        Backends without per-step generation metrics may use this default no-op.
+        """
+
+    def get_step_metrics(self, *, keep_snapshot: bool = False) -> dict[str, float]:
+        """Finish the current metric window and return generation metrics.
+
+        Args:
+            keep_snapshot: Use this window's end as the next window's baseline.
+
+        Returns:
+            Metrics accumulated since the current baseline. Backends without
+            per-step generation metrics return an empty dictionary.
+        """
+        return {}
+
+    def drain_latest_logger_metrics(self) -> dict[str, Any]:
+        """Consume a bounded latest-value snapshot for frequent telemetry polls.
+
+        Implementations may clear or compact their accumulated metric histories.
+        Callers must not assume that a later ``get_logger_metrics`` includes values
+        observed before this drain. Backends supporting raw rollout throughput
+        should return cumulative sampled-token counters under ``generation_tokens``
+        as ``data_parallel_worker_id -> list[counter]``. The controller computes
+        per-worker deltas before summing them, so counter resets are detectable.
+        """
+        return self.get_logger_metrics()

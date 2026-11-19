@@ -1,0 +1,29 @@
+defaults: ./mopd-qwen3-1.7b-3n8g-megatron-pack.yaml
+
+# SingleController consumes async_rl and requires the legacy async block to be absent.
+grpo:
+  async_grpo: null
+  val_period: 0
+  # OPD needs the student pass, but not a separate frozen reference-policy pass.
+  skip_reference_policy_logprobs_calculation: true
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: 64
+
+data_plane:
+  enabled: true
+
+checkpointing:
+  checkpoint_dir: results/mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller
+  metric_name: null
+
+logger:
+  wandb:
+    name: mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller
+  mlflow:
+    run_name: mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller

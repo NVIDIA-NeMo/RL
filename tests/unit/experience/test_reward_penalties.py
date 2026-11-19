@@ -19,7 +19,7 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollouts import (
-    _extract_mask_sample_flags,
+    _mask_sample_flags,
     _postprocess_single_nemo_gym_group,
     apply_reward_penalties,
     resolve_reward_penalty_config,
@@ -91,7 +91,7 @@ class _FakeTokenizer:
         return self.token_map[text]
 
 
-class TestExtractMaskSampleFlags:
+class TestMaskSampleFlags:
     def test_reads_mask_sample_from_instance_config(self):
         results = [
             {"full_result": {"instance_config": {"mask_sample": True}}},
@@ -101,7 +101,7 @@ class TestExtractMaskSampleFlags:
             {"full_result": {"instance_config": None}},
         ]
 
-        mask_sample = _extract_mask_sample_flags(results)
+        mask_sample = _mask_sample_flags(r["full_result"] for r in results)
 
         assert mask_sample.dtype == torch.bool
         assert torch.equal(
@@ -658,6 +658,21 @@ class TestPenalizeMultiEndThink:
         )
         counts = apply_reward_penalties([result], cfg)
         assert result["full_result"]["reward"] == 1.0
+
+    def test_half_resolved_think_tag_ids_rejected_at_setup(self):
+        with pytest.raises(ValueError, match="must both be set"):
+            resolve_reward_penalty_config(
+                {"penalize_malformed_think_tag": True, "token_ids": {"think_open": 12}},
+                _FakeTokenizer(token_map={"<think>": [12], "</think>": [13, 14]}),
+            )
+
+    def test_single_thinking_tag_rejected_at_setup(self):
+        with pytest.raises(ValueError, match="open and close thinking tags"):
+            resolve_reward_penalty_config(
+                {"penalize_malformed_think_tag": True},
+                _FakeTokenizer(),
+                thinking_tags=["<think>"],
+            )
 
     def test_custom_thinking_tags_used_for_inference_and_string_check(self):
         cfg = resolve_reward_penalty_config(

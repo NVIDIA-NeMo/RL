@@ -19,13 +19,21 @@ at node startup. The file path is communicated via the NRL_GPU_CPU_AFFINITY_FILE
 environment variable. See ray.sub for the writer side.
 
 Disable all binding with NRL_DISABLE_NUMA_BINDING=1.
-Disable only memory policy with NRL_DISABLE_NUMA_MEMBIND=1.
+Disable only memory policy with NRL_DISABLE_NUMA_PREFERRED=1
+(NRL_DISABLE_NUMA_MEMBIND=1 is a deprecated alias).
+
+Socket helpers (``cpu_nodes`` ... ``first_touch``) serve CPU-only processes
+such as the NIXL data plane's storage units, which have no GPU to key on. A
+*socket* is a NUMA node that has CPUs, read from sysfs; the CPU-less nodes
+Grace systems expose for GPU memory are ignored, so a GB200/GB300 tray or a
+2-socket x86 node has 2 sockets and a GH200 node has 1.
 """
 
 import ctypes
 import ctypes.util
 import logging
 import os
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +49,7 @@ def bind_to_gpu_numa(gpu_id: int) -> bool:
 
     Reads the GPU→cpulist mapping written by topology_probe.sh at node
     startup, then calls os.sched_setaffinity() for CPU pinning and
-    numa_set_membind() for memory policy. Best-effort: failures are
+    numa_set_preferred() for memory policy. Best-effort: failures are
     logged, never raised.
 
     Args:
@@ -53,7 +61,7 @@ def bind_to_gpu_numa(gpu_id: int) -> bool:
             ``int(ray.get_gpu_ids()[0])``.
 
     Returns True if CPU binding succeeded, False if skipped or failed.
-    Memory binding is attempted independently and logged separately.
+    The memory policy is set independently and logged separately.
     """
     if os.environ.get("NRL_DISABLE_NUMA_BINDING") == "1":
         return False
@@ -70,7 +78,7 @@ def bind_to_gpu_numa(gpu_id: int) -> bool:
                     cpus = _parse_cpulist(cpulist)
                     os.sched_setaffinity(0, cpus)
                     logger.info("NUMA CPU binding: GPU %s → CPUs %s", gpu, cpulist)
-                    _set_numa_membind(cpus)
+                    _set_numa_preferred(cpus)
                     return True
         logger.debug("NUMA binding: GPU %s not found in %s", gpu, GPU_CPU_AFFINITY_PATH)
     except FileNotFoundError:
@@ -122,49 +130,51 @@ def _get_numa_node(libnuma: ctypes.CDLL, cpus: set[int]) -> int:
     return libnuma.numa_node_of_cpu(min(cpus))
 
 
-def _set_numa_membind(cpus: set[int]) -> bool:
-    """Hard-bind memory allocations to the NUMA node of the given CPUs."""
+def _set_numa_preferred(cpus: set[int]) -> bool:
+    """Prefer memory allocations on the NUMA node of the given CPUs.
+
+    Uses ``numa_set_preferred`` (MPOL_PREFERRED), not a hard bind: pages come
+    from the local node while it has room and spill to other nodes once it is
+    full. A hard bind (MPOL_BIND) caps each worker at one node's memory, which
+    on GB200 is half of the host RAM per Grace socket, so a host-memory peak
+    such as a large Megatron checkpoint save gets the worker OOM-killed while
+    the rest of the node is free.
+    """
+    if os.environ.get("NRL_DISABLE_NUMA_PREFERRED") == "1":
+        return False
     if os.environ.get("NRL_DISABLE_NUMA_MEMBIND") == "1":
+        logger.warning(
+            "NRL_DISABLE_NUMA_MEMBIND is deprecated; set NRL_DISABLE_NUMA_PREFERRED=1 instead"
+        )
         return False
 
     libnuma = _load_libnuma()
     if libnuma is None:
-        logger.debug("NUMA membind skipped: libnuma.so.1 not available")
+        logger.debug("NUMA memory policy skipped: libnuma.so.1 not available")
         return False
 
     try:
         numa_node = _get_numa_node(libnuma, cpus)
         if numa_node < 0:
             logger.debug(
-                "NUMA membind skipped: numa_node_of_cpu(%d) returned %d",
+                "NUMA memory policy skipped: numa_node_of_cpu(%d) returned %d",
                 min(cpus),
                 numa_node,
             )
             return False
 
-        libnuma.numa_allocate_nodemask.restype = ctypes.c_void_p
-        libnuma.numa_bitmask_setbit.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-        libnuma.numa_bitmask_setbit.restype = ctypes.c_void_p
-        libnuma.numa_set_membind.argtypes = [ctypes.c_void_p]
-        libnuma.numa_bitmask_free.argtypes = [ctypes.c_void_p]
-
-        nodemask = libnuma.numa_allocate_nodemask()
-        if not nodemask:
-            logger.debug("NUMA membind skipped: numa_allocate_nodemask returned NULL")
-            return False
-
-        try:
-            libnuma.numa_bitmask_setbit(nodemask, numa_node)
-            libnuma.numa_set_membind(nodemask)
-        finally:
-            libnuma.numa_bitmask_free(nodemask)
+        libnuma.numa_set_preferred.argtypes = [ctypes.c_int]
+        libnuma.numa_set_preferred.restype = None
+        libnuma.numa_set_preferred(numa_node)
 
         logger.info(
-            "NUMA membind: hard-bound to node %d (from CPU %d)", numa_node, min(cpus)
+            "NUMA memory policy: preferring node %d (from CPU %d)",
+            numa_node,
+            min(cpus),
         )
         return True
     except Exception as exc:
-        logger.debug("NUMA membind skipped: %s", exc)
+        logger.debug("NUMA memory policy skipped: %s", exc)
         return False
 
 
@@ -179,3 +189,38 @@ def _parse_cpulist(cpulist: str) -> set[int]:
         else:
             cpus.add(int(part))
     return cpus
+
+
+# ----------------------------------------------------------------------------- sockets
+NODE_ROOT = "/sys/devices/system/node"
+
+
+def cpu_nodes(root: str = NODE_ROOT) -> dict[int, set[int]]:
+    """NUMA node id -> CPUs, for nodes that have CPUs (i.e. sockets)."""
+    out: dict[int, set[int]] = {}
+    for d in Path(root).glob("node[0-9]*"):
+        f = d / "cpulist"
+        text = f.read_text().strip() if f.exists() else ""
+        if text:
+            out[int(d.name[4:])] = _parse_cpulist(text)
+    return out
+
+
+def bind_process(cpus: set[int]) -> None:
+    """Pin every thread of this process (and threads it creates later) to ``cpus``."""
+    for tid in os.listdir("/proc/self/task"):
+        try:
+            os.sched_setaffinity(int(tid), cpus)
+        except OSError:
+            pass
+
+
+def first_touch(arr) -> None:
+    """Fault every page of ``arr`` from the current (pinned) thread.
+
+    The kernel's default first-touch policy then places the pages on this socket.
+    """
+    step = os.sysconf("SC_PAGE_SIZE")
+    flat = arr.reshape(-1).view("uint8")
+    flat[::step] = 0
+    flat[-1:] = 0

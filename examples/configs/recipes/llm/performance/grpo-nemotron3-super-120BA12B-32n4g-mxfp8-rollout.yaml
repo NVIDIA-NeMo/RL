@@ -1,0 +1,27 @@
+defaults: ./grpo-nemotron3-super-120BA12B-32n4g.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-nemotron3-super-120BA12B-32n4g-mxfp8-rollout
+policy:
+  generation:
+    vllm_cfg:
+      precision: "fp8"
+      is_mx: true
+      quantization_ignore_patterns:
+        - model.layers.*.mixer.in_proj
+        - model.layers.*.mixer.out_proj
+        - model.layers.*.mixer.qkv_proj
+        - model.layers.*.mixer.o_proj
+        - model.layers.*.mixer.up_proj
+        - model.layers.*.mixer.down_proj
+        - model.layers.*.mixer.gate
+        - model.layers.*.mixer.shared_experts.*
+        - model.layers.*.mixer.fc1_latent_proj
+        - model.layers.*.mixer.fc2_latent_proj
+        - mtp.*
+        - language_model.mtp.*
+    vllm_kwargs:
+      moe_backend: flashinfer_trtllm
+logger:
+  log_dir: logs/grpo-nemotron3-super-120BA12B-32n4g-mxfp8-rollout
+  wandb:
+    name: grpo-nemotron3-super-120BA12B-32n4g-mxfp8-rollout

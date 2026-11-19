@@ -18,7 +18,33 @@ from typing import Any, Optional
 from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 
 NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
+NEMO_GYM_GROUP_ID_KEY = "_ng_group_id"
+NEMO_GYM_GROUP_ATTEMPT_KEY = "_ng_group_attempt"
+NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
+# Names owned by Gym (MODEL_SAMPLING_KEY_NAME, MODEL_SAMPLING_HEADER, MODEL_SAMPLING_NULL), copied because their
+# readers cannot import nemo_gym: the driver and vLLM-only actors set the row key, and the vLLM chat route also
+# serves workers built without nemo_gym (the ModelOpt workers). A test checks they still match.
+NEMO_GYM_MODEL_SAMPLING_KEY = "_ng_model_sampling"
+NEMO_GYM_MODEL_SAMPLING_HEADER = "x-ng-sampling"
+NEMO_GYM_MODEL_SAMPLING_NULL = "null"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
+# Unconsumed suffix of a gap-fill dataloader batch, carried in the async
+# collector's rollouts state so a checkpoint cannot strand yielded prompts.
+PENDING_PROMPTS_KEY = "pending_prompt_batch"
+# Frontier-aligned async checkpoint metadata (rollouts.pt). The frontier key
+# holds the checkpoint cut — the resume filter threshold — and the base is
+# the ordinal the saved dataloader snapshot resumes yielding from. Together
+# they let a resume regenerate every unaccounted prompt instead of skipping
+# it.
+FRONTIER_ORDINAL_KEY = "frontier_ordinal"
+RESUME_BASE_ORDINAL_KEY = "resume_base_ordinal"
+# Post-restore replay-buffer metadata: ordinals of the retained prompt groups,
+# reported after age/step filtering so the collector can regenerate the rest.
+RETAINED_TASK_INDICES_KEY = "retained_task_indices"
+# Ordinals already trained but at or above the checkpoint cut (rollouts.pt).
+# The resume folds them into the covered set so the re-yielded window drops
+# them instead of training them a second time.
+TRAINED_TASK_INDICES_KEY = "trained_task_indices"
 
 
 @dataclass
@@ -29,6 +55,9 @@ class Completion:
     env_extras: Optional[dict[str, Any]]
     truncated: bool
     reward: float
+    # The environment's reward before effort shaping and reward penalties, which
+    # dynamic sampling filters on. ``None`` means nothing rewrote ``reward``.
+    reward_original: Optional[float] = None
 
 
 @dataclass
@@ -41,3 +70,4 @@ class PromptGroupRecord:
     metadata: dict[str, Any]
     completions: list["Completion"]
     rollout_metrics: dict[str, Any]
+    loss_multiplier: float = 1.0

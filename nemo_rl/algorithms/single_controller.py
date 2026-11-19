@@ -14,20 +14,26 @@
 
 """SingleController: asyncio orchestrator for the RL training loop.
 
-CPU-only Ray actor that runs two concurrent pumps and coordinates the
-other actors via lightweight RPCs. SC sends control signals and reads
-metadata only — model tensors still move through DataPlane or NCCL.
+CPU-only Ray actor that runs two concurrent pumps plus a watchdog, and
+coordinates the other actors via lightweight RPCs. SC sends control signals
+and reads metadata only — model tensors still move through DataPlane or NCCL.
 
 Data flow:
   _rollout_pump  → gen.generate_and_push(prompt, dp_client) ← RPC to GenWorker
                      GenWorker → dp_client.put_samples(...)
   _train_pump    → sampler.evict/select against TQReplayBuffer
+                 → _value_stage(meta) (PPO only) → value.get_values_from_meta(...)
+                     Value → dp_client.get/put_samples(...) (via its own client)
                  → _advantage_stage(meta) → dp_client.get_samples(...)
                                         → adv_estimator.compute_advantage(...)
                                         → dp_client.put_samples(...)
                  → trainer.begin/train_microbatches/finish_train_step (split API,
                      driver-side TQPolicy via asyncio.to_thread)
                      Trainer → dp_client.get_samples(...)   (via its own client)
+                 → early policy refit (PPO, separate generation GPUs)
+                 → _value_train_epochs(full_batch_meta) (PPO only)
+                     → value.train_from_meta(...)
+                     Value → dp_client.get_samples(...)     (via its own client)
                  → dp_client.clear_samples(...)             ← SC clears after train
   _sync_weights  → WeightSynchronizer.sync_weights()
 """
@@ -35,54 +41,340 @@ Data flow:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
+import math
+import os
+import statistics
+import threading
 import time
-from functools import partial
-from typing import Any, Optional, Union
+import uuid
+import warnings
+from collections import deque
+from collections.abc import AsyncIterator, Iterator
+from dataclasses import replace
+from functools import cached_property, partial
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Optional,
+    Union,
+    cast,
+)
 
 import ray
-import torch
+from ray.exceptions import RayActorError
+from wandb import Table
 
-from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
-from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    CHECKPOINT_MUTATION_KINDS,
+    CheckpointMutationKind,
+    DataPlaneCheckpointBarrier,
+    DataPlaneMutationCut,
+)
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    BaseSampler,
+    ReadyFirstSamplerConfig,
+    TransactionalAdmissionSampler,
+    create_sampler,
+)
+from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
+    GRPOSaveState,
+    _save_adaptive_loss_state,
+    _update_adaptive_loss_state,
+    _write_latest_checkpoint_status,
+    aggregate_rollout_metrics,
+)
+from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.metric_utils import (
+    SETUP_TIMING_PREFIX,
+    SetupTimingMetrics,
+)
+from nemo_rl.algorithms.ppo import _compute_critic_metrics
+from nemo_rl.algorithms.rollout_checkpointing.manifest import (
+    BootstrapCompatibilityIdentity,
+)
+from nemo_rl.algorithms.rollout_checkpointing.restore import RolloutRestorer
+from nemo_rl.algorithms.rollout_checkpointing.snapshots import (
+    RolloutSnapshotter,
+    write_controller_sidecars,
+)
+from nemo_rl.algorithms.rollout_checkpointing.state import (
+    ResumeSource,
+    RolloutParts,
+    RolloutRuntimeState,
+    TrainingProgress,
+)
+from nemo_rl.algorithms.rollout_checkpointing.trace import (
+    ROLLOUT_TRACE_FILENAME,
+    RefitCuts,
+    RolloutTrace,
+    batch_age_group_metrics,
+    pop_batch_age,
+)
+from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
+    AdvantageComputer,
+    AdvantageOutcome,
+    AdvantageRequest,
+    AdvantageStageConfig,
+    row_group_ids,
+    split_meta_by_prompt_group,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
-    validate_sampler_buffer_capacity,
-    validate_single_controller_config,
+    algo_config,
+    dedicated_value_enabled,
+    is_ppo_run,
+    rollout_snapshots_enabled,
+    validate_forest_objective,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    ChunkReceipt,
+    make_debug_writer,
+)
+from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
+    has_logical_owners,
+)
+from nemo_rl.algorithms.single_controller_utils.setup import (
+    SingleControllerActorArgs,
+    _maybe_restore_native_data_plane_checkpoint,
+    _register_single_controller_partitions,
+)
+from nemo_rl.algorithms.single_controller_utils.step_assembly import (
+    ShortfallCredit,
+    StepAssembler,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
+    BelowValidFractionGroup,
+    FinalizeOutcome,
+    RejectedGroup,
+    ZeroVarianceGroup,
     aggregate_step_metrics,
-    fields_for_put,
     reduce_advantage_pump_metrics,
-    squeeze_trailing_unit_dim,
-    tensor_field,
 )
 from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
+from nemo_rl.data.multimodal_utils import present_multimodal_fields
+from nemo_rl.data_plane import (
+    KVBatchMeta,
+)
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
+    configure_checkpoint_workers,
+)
+from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
+from nemo_rl.data_plane.observability import (
+    log_step_metrics,
+    metrics_never_fail_the_step,
+)
+from nemo_rl.data_plane.schema import (
+    DP_CALIB_INPUT_FIELDS,
+    DP_TRAIN_FIELDS,
+    ROLLOUT_METRICS,
+    ROUTE_PLAN_TAG,
+    SAMPLER_TOPK_FIELDS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
+from nemo_rl.environments.checkpointing import build_environment_checkpoint
+from nemo_rl.environments.checkpointing.interfaces import (
+    EnvironmentCheckpoint,
+)
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
+from nemo_rl.experience.reward_penalties import (
+    FinalizedReward,
+    aggregate_capture_reward_metrics,
+    capture_reward_result_tables,
+)
+from nemo_rl.experience.rollout_manager import (
+    RolloutOutcome,
+)
+from nemo_rl.experience.route_plan import decode_route_plan
+from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
+from nemo_rl.models.generation.fleet_health import ShardState
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
+from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
-from nemo_rl.utils.logger import Logger
-from nemo_rl.utils.timer import Timer
+from nemo_rl.models.value.tq_value import TQValue
+from nemo_rl.telemetry.instrumentation import (
+    NO_SPAN,
+    RL_ALGORITHM,
+    RL_IDLE_POLLS_ATTR,
+    efficiency_span,
+    is_span_group_enabled,
+    iteration_scope,
+    managed_span,
+    per_prompt_scope,
+    safe_set_span_attributes,
+    start_efficiency_span,
+    umbrella_span,
+)
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    shutdown_telemetry,
+)
+from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.telemetry.vocabulary import (
+    TELEMETRY_TRAIN_STEP_KEY,
+    TELEMETRY_WALL_TIME_METRIC,
+)
+from nemo_rl.utils.checkpoint import (
+    CheckpointManager,
+    PathLike,
+)
+from nemo_rl.utils.logger import (
+    Logger,
+    should_log_nemo_gym_full_result_tables,
+)
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.path_utils import (
+    is_msc_path,
+)
+from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.weight_sync.refit_actor import RemoteWeightSynchronizer
 
-Generation = Union[VllmGeneration, SGLangGeneration]
+if TYPE_CHECKING:
+    from nemo_rl.experience.rollout_reassembler import FinalizedGroup
+    from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
+
+Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
+
+# Named `log` rather than `logger` to keep it distinct from the experiment
+# Logger this module also uses as `self._logger`.
+log = logging.getLogger(__name__)
+
+# How long teardown waits for an in-flight engine restart. Short, and not the restart's own
+# budget: at this point the run is over, so the only thing a completed restart buys is a
+# cleaner exit. Not configurable for the same reason.
+_SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
+
+
+def _latest_generation_values(
+    metrics: dict[str, Any], metric_name: str
+) -> dict[int, float]:
+    """Return the latest value keyed by generation data-parallel worker."""
+    per_worker = metrics.get(metric_name)
+    if not isinstance(per_worker, dict):
+        return {}
+    return {
+        worker_id: float(values[-1])
+        for worker_id, values in per_worker.items()
+        if isinstance(worker_id, int)
+        and isinstance(values, list)
+        and values
+        and isinstance(values[-1], (int, float))
+    }
+
+
+def _percentile(values: list[float], quantile: float) -> float:
+    """Return a deterministic nearest-rank percentile for telemetry."""
+    if not values:
+        raise ValueError("percentile requires at least one value")
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, math.ceil(quantile * len(ordered)) - 1))
+    return ordered[index]
+
+
+def _pooled_opd_metrics(
+    stat_sum: float, stat_sumsq: float, count: int, gap_sum: float
+) -> dict[str, float]:
+    """Compute whole-step OPD metrics from exact pooled sufficient statistics.
+
+    ``stat_*`` pool the advantage and ``gap_sum`` the raw teacher-student gap
+    over the same tokens. They differ once TROPD (proximal_teacher_alpha < 1)
+    or subtract_global_baseline reshapes the advantage.
+    """
+    if count <= 0:
+        return {}
+    mean = stat_sum / count
+    # OPDAdvantageEstimator uses torch.std's default unbiased estimator.
+    variance = (stat_sumsq - count * mean * mean) / (count - 1) if count > 1 else 0.0
+    return {
+        "on_policy_distillation/teacher_student_logprob_gap_mean": gap_sum / count,
+        "on_policy_distillation/adv_mean": mean,
+        "on_policy_distillation/adv_std": math.sqrt(max(variance, 0.0)),
+    }
+
+
+def _train_fields_for_step(
+    *,
+    policy_logprobs_required: bool,
+    reference_logprobs_required: bool,
+    sampler_head_required: bool,
+) -> tuple[str, ...]:
+    """Return only the data-plane columns produced for this train step."""
+    fields = tuple(
+        field
+        for field in DP_TRAIN_FIELDS
+        if (policy_logprobs_required or field != "prev_logprobs")
+        and (reference_logprobs_required or field != "reference_policy_logprobs")
+    )
+    if sampler_head_required:
+        fields += SAMPLER_TOPK_FIELDS
+    return fields
+
+
+def _worker_group_snapshots(worker_group: Any) -> Callable[[], list[dict[str, Any]]]:
+    """Snapshot source reading every rank's data-plane counters in one fan-out."""
+
+    def fan_out() -> list[dict[str, Any]]:
+        futures = worker_group.run_all_workers_single_data("get_data_plane_snapshot")
+        return [s for s in ray.get(futures) if s]
+
+    return fan_out
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
 class SingleControllerActor:
     """CPU-only Ray actor that orchestrates the RL training loop.
 
-    Owns two concurrent asyncio tasks:
-      - _rollout_pump: dispatches prompts to GenerationWorkerActor
-      - _train_pump:   claims DataPlane meta, trains, clears consumed rows,
-                       then runs _sync_weights (drain gate + weight
-                       synchronization) inline after each optimizer step
+    Owns three concurrent asyncio tasks:
+      - _rollout_pump:  dispatches prompts to GenerationWorkerActor
+      - _train_pump:    claims DataPlane meta, trains, clears consumed rows,
+                        then runs _sync_weights (drain gate + weight
+                        synchronization) inline after each optimizer step
+      - _stall_watchdog_pump: publishes rollout counters and reports stalls or
+                        unhealthy environments, which are the failures that
+                        otherwise produce no signal at all
+
+    Plus _gen_fleet_probe_pump when fleet health is enabled, which probes generation
+    shard liveness on its own, much shorter clock.
 
     All other actors are passive — they expose methods and wait to be called.
     """
+
+    # async_rl.defer_async_checkpoint_finalize, and the (tmp_step_N path, step) of a
+    # policy save whose async write has not been finalized and published yet.
+    _defer_checkpoint_finalize: bool = False
+    _pending_checkpoint: Optional[tuple[PathLike, int]] = None
+    # rollout_checkpointing.trace's event log. Disabled by default; a disabled
+    # trace holds no state, so one instance serves every controller.
+    _rollout_trace: RolloutTrace = RolloutTrace(None)
+
+    # True from the moment a failed refit pulls every shard out of service until the
+    # retry puts them back; the exhaustion check stands down for that window. See
+    # _recovery_window.
+    #
+    # Declared on the class, not assigned in __init__, for the same reason
+    # AbstractPolicyWorker.model_update_group is: the stall watchdog reads it on every
+    # tick, and it must exist on any instance the watchdog can reach.
+    _recovering_from_refit: bool = False
+
+    # Declared on the class for the same reason, and because every pump reaches
+    # for it: ``None`` makes ``managed_span`` fall back to the process-global
+    # handle, so an instance built without running __init__ emits no spans
+    # rather than raising out of the training loop.
+    _tracer: Any = None
 
     def __init__(
         self,
@@ -97,59 +389,353 @@ class SingleControllerActor:
             actor_args: Pre-built actor args from setup_single_controller.
             setup_timing_metrics: Driver-side setup timings; logged here (Logger isn't cloudpickleable).
         """
-        validate_single_controller_config(master_config)
+        # The run lives in this actor, so it opens the job span. Named
+        # explicitly: nothing sets NRL_WORKER_GROUP outside RayWorkerGroup.
+        _telemetry = init_telemetry_worker(
+            rank=0,
+            world_size=1,
+            worker_group="single_controller",
+        )
+        self._tracer = _telemetry.tracer if _telemetry is not None else None
 
         self._advantage_cfg = AdvantageConfig()
         self._partition_id: str = actor_args.partition_id
 
         self._master_config = master_config
-        self._async_cfg = master_config.async_rl
-        self._policy_logprobs_required = not (
-            master_config.loss_fn.force_on_policy_ratio
-            and master_config.grpo.seq_logprob_error_threshold is None
+        self._log_full_result_tables = (
+            master_config.logger.wandb_enabled
+            and should_log_nemo_gym_full_result_tables(
+                wandb_enabled=master_config.logger.wandb_enabled,
+                wandb_config=master_config.logger.wandb,
+            )
         )
-        self._reference_logprobs_required = not bool(
-            master_config.grpo.skip_reference_policy_logprobs_calculation
+        self._algo_cfg = algo_config(master_config)
+        self._async_cfg = master_config.async_rl
+        self._is_ppo: bool = is_ppo_run(master_config)
+        self._streaming_ppo: bool = (
+            self._is_ppo
+            and self._async_cfg.min_groups_for_streaming_train
+            < self._algo_cfg.num_prompts_per_step
+        )
+        self._ppo_group_multiple = actor_args.ppo_group_multiple
+        self._ppo_min_remaining_groups = actor_args.ppo_min_remaining_groups
+        self._value_dedicated: bool = dedicated_value_enabled(master_config)
+        # GRPO has no epoch knob: it makes one optimizer step per RL step.
+        self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
+        self._critic_ppo_epochs: int = (
+            self._algo_cfg.critic_ppo_epochs if self._is_ppo else 1
+        )
+        # The advantage pool is built driver-side from the same derivation, so
+        # read the gates off it rather than recomputing them here.
+        self._advantage_stage_config = AdvantageStageConfig.from_master_config(
+            master_config
+        )
+        stage_cfg = self._advantage_stage_config
+        self._message_level_advantage_penalties_enabled = (
+            stage_cfg.message_level_advantage_penalties_enabled
+        )
+        self._policy_logprobs_required = stage_cfg.policy_logprobs_required
+        # In-loss filtering decides rejections in the policy loss, which does not
+        # run during critic warmup; those steps take the separate pass instead.
+        self._warmup_policy_logprobs_required = (
+            self._is_ppo and master_config.loss_fn.seq_logprob_error_in_loss
+        )
+        self._reference_logprobs_required = stage_cfg.reference_logprobs_required
+        self._teacher_logprobs_required = stage_cfg.teacher_logprobs_required
+        self._train_fields = _train_fields_for_step(
+            policy_logprobs_required=self._policy_logprobs_required,
+            reference_logprobs_required=self._reference_logprobs_required,
+            # Score centering and sampler replay both read the captured head.
+            sampler_head_required=master_config.loss_fn.score_centering
+            or sampler_replay_enabled(master_config.policy["generation"]),
         )
         self._dp_client = actor_args.dp_client
+        self._dp_backend = master_config.data_plane["backend"]
+        if self._dp_backend == "mooncake_cpu":
+            if actor_args.last_checkpoint_path is not None or (
+                master_config.checkpointing.enabled
+                and master_config.checkpointing.save_data_plane
+            ):
+                checkpoint_workers = list(
+                    actor_args.trainer_handle.worker_group.workers
+                )
+                if actor_args.value_handle is not None:
+                    checkpoint_workers.extend(
+                        actor_args.value_handle.worker_group.workers
+                    )
+                for teacher in (actor_args.teacher_worker_groups or {}).values():
+                    checkpoint_workers.extend(teacher.worker_group.workers)
+                if master_config.token_capture.enabled:
+                    generation_workers = actor_args.gen_handle.worker_group
+                    checkpoint_workers.extend(
+                        generation_workers.workers[index]
+                        for index in generation_workers.dp_leader_worker_indices
+                    )
+                checkpoint_workers.extend(actor_args.finalizer_actors)
+                checkpoint_workers.extend(actor_args.storage_units)
+                # Advantage actors write the advantages column through their own
+                # connect-only clients, so their local stores hold rows a
+                # snapshot must see.
+                checkpoint_workers.extend(actor_args.advantage_actors)
+                # Reuse existing actor RPCs. This actor's local store is handled
+                # directly: __init__ cannot service an RPC back to itself.
+                configure_checkpoint_workers(checkpoint_workers)
+            # actor_args is fully deserialized before __init__, so this process's
+            # Mooncake client and memory segment are attached. Teachers were
+            # attached during driver setup; restore now sees the full topology.
+            data_plane_load_started = time.monotonic()
+            data_plane_checkpoint_metadata = (
+                _maybe_restore_native_data_plane_checkpoint(
+                    load_checkpoint=self._dp_client.load_checkpoint,
+                    last_checkpoint_path=actor_args.last_checkpoint_path,
+                    save_state=actor_args.save_state,
+                    partition_id=self._partition_id,
+                    sampler_name=master_config.async_rl.sampler.name,
+                    opd_full_teacher_checkpoints=(
+                        opd_module.opd_full_teacher_checkpoints_by_index(master_config)
+                    ),
+                )
+            )
+            if actor_args.rollout_checkpoint_load_metrics is not None:
+                actor_args.rollout_checkpoint_load_metrics["tq_load_seconds"] = (
+                    time.monotonic() - data_plane_load_started
+                )
+            # A restored controller already contains the partition schema.
+            # Re-warming it with float32 placeholders conflicts with restored
+            # fields such as int64 input_ids. Fresh Mooncake runs still need
+            # the warm-up before concurrent producers start.
+            if data_plane_checkpoint_metadata is None:
+                _register_single_controller_partitions(
+                    self._dp_client,
+                    master_config=master_config,
+                    partition_id=self._partition_id,
+                    include_multimodal_fields=(
+                        actor_args.partition_includes_multimodal_fields
+                    ),
+                )
+        else:
+            data_plane_checkpoint_metadata = actor_args.data_plane_checkpoint_metadata
         self._gen: Generation = actor_args.gen_handle
         self._trainer: TQPolicy = actor_args.trainer_handle
+        self._value: Optional[TQValue] = getattr(actor_args, "value_handle", None)
         self._dataloader = actor_args.dataloader
         self._weight_synchronizer = actor_args.weight_synchronizer
         self._advantage_estimator = actor_args.advantage_estimator
+        # Built driver-side so the actors attach their TQ clients before this
+        # process configures checkpoint participants. Empty means the stage runs
+        # in-process through the same computer the actors wrap, so a run without
+        # a pool and a run with one cannot drift.
+        self._advantage_actors: list[Any] = list(actor_args.advantage_actors)
+        self._available_advantage_actors: asyncio.Queue = asyncio.Queue()
+        for actor in self._advantage_actors:
+            self._available_advantage_actors.put_nowait(actor)
+        self._advantage_computer = AdvantageComputer(
+            self._dp_client,
+            config=self._advantage_stage_config,
+            advantage_estimator=self._advantage_estimator,
+        )
         self._loss_fn = actor_args.loss_fn
+        self._value_loss_fn: LossFunction | None = getattr(
+            actor_args, "value_loss_fn", None
+        )
         self._buffer = actor_args.tq_buffer
         self._rollout_manager = actor_args.rollout_manager
+        self._rollout_manager.set_next_nemo_gym_task_index(
+            actor_args.save_state.next_nemo_gym_task_index
+        )
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
+        self._rollout_recovery_ledger = self._rollout_manager.recovery_ledger
+
+        # Direct access, deliberately. A getattr default here reads as defensive but
+        # buys a silent failure mode: rename or drop the field and
+        # watchdog.gym_subprocess_check: true degrades to a health check that iterates
+        # nothing and reports nothing -- the exact class of silent failure this work
+        # exists to remove. A missing field should break loudly at construction, where
+        # it costs five minutes, not quietly at hour three of a run.
+        self._env_handles = actor_args.env_handles
+        # Rollout state the environment backend holds between turns. Only
+        # turn- and prefix-level recovery keep any; otherwise this is a no-op.
+        self._environment_checkpoint: EnvironmentCheckpoint = (
+            build_environment_checkpoint(
+                master_config,
+                env_handles=self._env_handles,
+                rollout_manager=self._rollout_manager,
+                dp_client=self._dp_client,
+                generation=self._gen,
+            )
+        )
+        # These two keep the getattr for a genuinely different reason: None is a
+        # meaningful value meaning "feature off", and it is also their default. Absence
+        # therefore degrades to the documented off state rather than to a broken one.
+        self._gen_fleet = getattr(actor_args, "fleet_monitor", None)
+        self._generation_router = getattr(actor_args, "generation_router", None)
+        self._finalizer_actors = list(actor_args.finalizer_actors)
+        for actor in (*self._finalizer_actors, *self._advantage_actors):
+            self._trainer.add_data_plane_snapshot_source(actor)
+        gen_snapshots = getattr(self._gen, "get_data_plane_snapshots", None)
+        if gen_snapshots is not None:
+            self._trainer.add_data_plane_snapshot_fn(gen_snapshots)
+        self._storage_units = tuple(actor_args.storage_units)
+        self._available_finalizers: asyncio.Queue[Any] = asyncio.Queue()
+        for actor in self._finalizer_actors:
+            self._available_finalizers.put_nowait(actor)
+        self._active_finalizers = 0
+        self._finalizer_waiters = 0
+        self._finalizer_unknown_outcomes = 0
+        # Rollout state the pumps and checkpoints share; restore fills it before
+        # the pumps start.
+        self._rollout_runtime = RolloutRuntimeState()
+        teacher_worker_groups = getattr(actor_args, "teacher_worker_groups", None) or {}
+        if teacher_worker_groups:
+            self._teacher_coordinator: Optional[
+                opd_module.TQTeacherLogprobCoordinator
+            ] = opd_module.TQTeacherLogprobCoordinator(
+                dp_client=self._dp_client,
+                teacher_worker_groups=teacher_worker_groups,
+                alias_to_group_alias=(
+                    getattr(actor_args, "alias_to_group_alias", None) or {}
+                ),
+                on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
+            )
+            self._buffer.set_post_write_enricher(self._teacher_coordinator.enrich)
+        else:
+            self._teacher_coordinator = None
+        if self._value is not None:
+            self._trainer.add_data_plane_snapshot_fn(
+                _worker_group_snapshots(self._value.worker_group)
+            )
+        for teacher in teacher_worker_groups.values():
+            self._trainer.add_data_plane_snapshot_fn(
+                _worker_group_snapshots(teacher.worker_group)
+            )
+        # Only with fleet health: without a ledger nothing ever reaches DEAD, so there
+        # is nothing for a supervisor to restart.
+        _fleet_health_cfg = master_config.async_rl.generation_fleet_health
+        self._engine_supervisor = (
+            EngineSupervisor(
+                generation=self._gen,
+                monitor=self._gen_fleet,
+                restart_timeout_s=_fleet_health_cfg.restart_timeout_s,
+                restart_backoff_s=_fleet_health_cfg.restart_backoff_s,
+            )
+            if self._gen_fleet is not None and _fleet_health_cfg.restart_dead_shards
+            else None
+        )
 
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
         self._logger = Logger(master_config.logger)  # type: ignore
-        self._logger.log_hyperparams(master_config.model_dump())
+        hparams = master_config.model_dump()
+        if hparams.get("token_capture"):
+            # The control-plane bearer token must never reach W&B/TB telemetry.
+            hparams["token_capture"]["control_auth_token"] = "<redacted>"
+        self._logger.log_hyperparams(hparams)
         self._logger.log_metrics(
-            setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
+            setup_timing_metrics.to_metrics_dict(), step=0, prefix=SETUP_TIMING_PREFIX
         )
         self._timer = Timer()
+        self._throughput_sample_time: Optional[float] = None
+        self._throughput_generation_tokens_by_worker: Optional[dict[int, int]] = None
+        self._throughput_rollout_counters: Optional[dict[str, int]] = None
+        self._rollout_telemetry_lock = asyncio.Lock()
+        self._rollout_completion_durations_s: deque[float] = deque(maxlen=10_000)
+        self._rollout_queue_wait_durations_s: deque[float] = deque(maxlen=10_000)
+
+        # Also built here, not on the driver: TimeoutChecker must capture
+        # wall-clock start times inside the actor, not at driver setup time.
+        # actor_args only carries the driver-side restore products
+        # (save_state, last_checkpoint_path).
+        self._checkpointer = CheckpointManager(master_config.checkpointing)
+        self._defer_checkpoint_finalize = (
+            master_config.async_rl.defer_async_checkpoint_finalize
+        )
+        self._timeout = TimeoutChecker(
+            timeout=master_config.checkpointing.checkpoint_must_save_by,
+            fit_last_save_time=True,
+        )
+        self._timeout.start_iterations()
+
+        # Loaded (or initial) GRPOSaveState from setup; _get_grpo_save_state
+        # already defaulted any fields missing from older checkpoints.
+        self._save_state: GRPOSaveState = actor_args.save_state
+        self._consumed_samples: int = actor_args.save_state.consumed_samples
+        self._total_valid_tokens: int = actor_args.save_state.total_valid_tokens
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
         self._inference_cluster = actor_args.inference_cluster
+        if isinstance(self._weight_synchronizer, RemoteWeightSynchronizer):
+            # The proxy arrived pickled inside actor_args, with only its actor handle.
+            self._weight_synchronizer.attach(self._gen)
 
-        num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
+        restored_trainer_version = (
+            actor_args.save_state.trainer_version
+            if actor_args.save_state.trainer_version is not None
+            else actor_args.save_state.current_step
+        )
         self._sampler = create_sampler(
             self._buffer,
             self._async_cfg.sampler,
+            min_groups_for_streaming_train=self._async_cfg.min_groups_for_streaming_train,
         )
-        required_capacity = self._sampler.required_buffer_capacity(num_prompts_per_step)
-        validate_sampler_buffer_capacity(
-            self._async_cfg,
-            required_capacity=required_capacity,
-            sampler_name=type(self._sampler).__name__,
+        restored_dispatch_index = actor_args.save_state.sampler_dispatch_index
+        # The saved dispatch index counts groups dispatched ahead of training, which
+        # only a data-plane snapshot can give back. Without one (e.g. msc://), those
+        # groups are gone, so counting them as dispatched would stall the resume.
+        buffered_groups_not_restored = (
+            self._sampler.supports_buffer_checkpoint
+            and actor_args.last_checkpoint_path is not None
+            and data_plane_checkpoint_metadata is None
+        )
+        if restored_dispatch_index is None or buffered_groups_not_restored:
+            # Checkpoints predating exact sampler state reconstruct the original
+            # fresh-step invariant from the restored trainer version.
+            self._sampler.set_dispatch_index(restored_trainer_version)
+        else:
+            self._sampler.restore_dispatch_index(restored_dispatch_index)
+        if (
+            self._master_config.checkpointing.enabled
+            and self._sampler.supports_buffer_checkpoint
+            and not self._master_config.checkpointing.save_data_plane
+            # msc:// cannot hold data-plane snapshots; setup warns that buffered
+            # rollouts are then discarded on resume.
+            and not is_msc_path(self._master_config.checkpointing.checkpoint_dir)
+        ):
+            raise ValueError(
+                "SingleController checkpointing with a replay-checkpoint-capable "
+                "sampler requires checkpointing.save_data_plane=true so "
+                "completed, unconsumed rollouts are recoverable."
+            )
+        restoring_rollout_recovery = bool(
+            data_plane_checkpoint_metadata is not None
+            and data_plane_checkpoint_metadata.get("rollout_recovery_payload_sha256")
+            is not None
+        )
+        self._rollout_recovery_enabled = bool(
+            restoring_rollout_recovery
+            or (
+                self._master_config.checkpointing.enabled
+                and self._master_config.checkpointing.save_data_plane
+                and self._sampler.supports_buffer_checkpoint
+            )
+        )
+        # ── asyncio state ──────────────────────────────────────────────────
+        # Commits and destructive clears use this lock with TQ snapshots. This
+        # makes the native snapshot match the controller's metadata-only replay
+        # index exactly. Generation may continue, but completed rollouts wait at
+        # commit; _buffer_capacity bounds reservations and eventually stalls
+        # dispatch instead of allowing unbounded TQ growth. Finalizer commits,
+        # cleanup, and streamed recovery-ledger transitions use the mutation side.
+        self._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        self._buffer.set_data_plane_checkpoint_barrier(
+            self._data_plane_checkpoint_barrier
+        )
+        self._rollout_manager.set_data_plane_checkpoint_barrier(
+            self._data_plane_checkpoint_barrier
         )
 
-        # ── asyncio state ──────────────────────────────────────────────────
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
         self._rollout_permitted.set()
@@ -161,9 +747,42 @@ class SingleControllerActor:
 
         # Count of in-flight generate_and_push calls
         self._inflight_rollouts: int = 0
+        self._rollout_slot_waiters: int = 0
+        self._rollout_permitted_waiters: int = 0
+        self._buffer_capacity_waiters: int = 0
 
         # Cancellation handles for in-flight rollout dispatches.
         self._dispatched_rollouts: set[asyncio.Task[None]] = set()
+
+        self._inflight_by_group_id: dict[str, tuple[asyncio.Task[None], int]] = {}
+
+        # Per-step counts of how each step got made whole with spare prompts (logged
+        # so a step's batch size stays explainable after the fact).
+        #
+        # The two counters read from opposite ends of a borrow: a step that filled a
+        # hole with a later step's finished group counts a promotion, and the step it
+        # borrowed from counts the replacement that repaid it.
+        self._batch_replacements: dict[int, int] = {}
+        self._batch_promotions: dict[int, int] = {}
+        # Dynamic sampling budgets its replacements apart from rollout fault tolerance.
+        self._dynamic_sampling_enabled: bool = self._algo_cfg.use_dynamic_sampling
+        grpo_cfg = (
+            cast(GRPOConfig, self._algo_cfg) if self._dynamic_sampling_enabled else None
+        )
+        # v1's per-step generation-batch allowance, in prompts: the batch a step was
+        # admitted with plus every resample it draws.
+        self._filtered_prompt_budget: int = (
+            grpo_cfg.dynamic_sampling_max_gen_batches
+            * self._algo_cfg.num_prompts_per_step
+            if grpo_cfg is not None
+            else 0
+        )
+        # Prompts a step has drawn beyond the batch it was admitted with.
+        self._filtered_prompts_by_step: dict[int, int] = {}
+        # Filtered spares promised to groups that are still finalizing.
+        self._filtered_spares_claimed: int = 0
+        # Set once the dataloader has nothing left, so waiters stop waiting.
+        self._dataloader_exhausted: bool = False
 
         # Backpressure valve: max unconsumed rollout groups allowed in DataPlane.
         # Acquired before each rollout dispatch; released when the buffer
@@ -172,14 +791,60 @@ class SingleControllerActor:
             self._async_cfg.max_buffered_rollouts
         )
 
-        self._trainer_version: int = 0
-        self._train_steps: int = 0
-        self._current_epoch: int = 0
+        # Where running captured calls switched weights, for batch age.
+        self._refit_cuts = RefitCuts()
+        self._rollout_trace = RolloutTrace(
+            Path(self._logger.base_log_dir) / ROLLOUT_TRACE_FILENAME
+            if master_config.rollout_checkpointing.trace
+            else None
+        )
+        if self._rollout_trace.enabled:
+            self._rollout_manager.recovery_ledger.set_event_sink(
+                self._rollout_trace.emit
+            )
+        # Built after every part they are given.
+        self._rollout_snapshots, self._rollout_restorer = (
+            self._build_rollout_checkpointing(
+                bootstrap_identity=actor_args.bootstrap_identity,
+                resume=ResumeSource(
+                    path=actor_args.last_checkpoint_path,
+                    from_rollout_snapshot=actor_args.restored_from_rollout_snapshot,
+                    data_plane_metadata=data_plane_checkpoint_metadata,
+                    rollout_checkpoint_load_metrics=(
+                        actor_args.rollout_checkpoint_load_metrics
+                    ),
+                ),
+            )
+        )
+
+        self._trainer_version: int = restored_trainer_version
+        self._train_steps: int = actor_args.save_state.current_step
+        self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
-            "rewards": [],
-            "masked_advantages": [],
+            "reward_partials": [],
+            "advantage_partials": [],
+            "num_mask_sample_filtered": [],
             "sequence_lengths": [],
+            "seq_logprob_error_metrics": [],
+            "sample_mask_metrics": [],
+            **{key: [] for key in VIOLATION_TAG_KEYS},
         }
+        self._opd_gap_sum = 0.0
+        self._opd_stat_sum = 0.0
+        self._opd_stat_sumsq = 0.0
+        self._opd_stat_count = 0
+        self._train_data_dump = (
+            make_debug_writer(self._async_cfg.debug_writer, self._logger.base_log_dir)
+            if self._async_cfg.log_full_train_data
+            else None
+        )
+        # Receipts of the chunks the stage stored this step, across every shard.
+        self._train_data_dump_receipts: list[ChunkReceipt] = []
+
+        # Seeded here rather than in run(): on resume _trainer_version is the
+        # checkpoint's step, so a run resuming mid-warmup needs the widened
+        # window before the first dispatch.
+        self._retune_lookahead_versions()
 
         print(
             f"SingleControllerActor: "
@@ -191,29 +856,165 @@ class SingleControllerActor:
         )
 
     # ── public API ─────────────────────────────────────────────────────────
-
     async def run(self) -> dict[str, Any]:
         """Main entry point. Runs until max_train_steps is reached."""
-        # Synchronize weights before starting the pumps
-        await self._sync_weights()
+        try:
+            with umbrella_span(
+                RLSpanGroup.U_JOB,
+                "rl.sc.job",
+                tracer=self._tracer,
+                **{RL_ALGORITHM: "ppo" if self._is_ppo else "grpo"},
+            ):
+                result = await self._run_pumps()
+        finally:
+            # Outside the span so the job span is flushed too, and off the
+            # event loop because the exporter's flush blocks. Shielded, and a
+            # cancel swallowed, because teardown is exactly when cancellation
+            # lands and it would mask what _run_pumps actually raised.
+            try:
+                await asyncio.shield(asyncio.to_thread(shutdown_telemetry))
+            except asyncio.CancelledError:
+                pass
+        # After the try, not inside it: pyrefly 0.24.2 reads a return nested in a
+        # try/finally as a path that can fall off the end of the function.
+        return result
 
-        # Start the rollout and train pumps
+    async def _run_pumps(self) -> dict[str, Any]:
+        """Start the rollout / train / watchdog pumps and run until one finishes."""
+        await self._environment_checkpoint.check_startup()
+        # Synchronize weights before starting the pumps, unless setup already delivered them.
+        # The RefitActor proxy answers is_stale with blocking calls to the actor.
+        if await asyncio.to_thread(lambda: self._weight_synchronizer.is_stale):
+            await self._sync_weights()
+        self._rollout_manager.set_weight_version(self._trainer_version)
+        self._rollout_manager.set_tally_step_provider(
+            lambda: self._step_assembler.assembling_version
+        )
+
+        if await self._rollout_restorer.restore():
+            self._rollout_recovery_enabled = True
+
+        # Capture the baseline before either pump can dispatch generation.
+        try:
+            await asyncio.to_thread(self._gen.snapshot_step_metrics)
+        except RayActorError as error:
+            log.warning("Skipping generation snapshot metrics: %s", error)
+
+        # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
+        watchdog_task = asyncio.create_task(self._stall_watchdog_pump())
+        tasks = [rollout_task, train_task, watchdog_task]
+        telemetry_interval_s = (
+            self._master_config.rollout_checkpointing.telemetry_interval_s
+        )
+        if telemetry_interval_s is not None:
+            await self._log_rollout_throughput_metrics(emit=False)
+        rollout_checkpoint_task = (
+            asyncio.create_task(self._rollout_snapshots.run())
+            if rollout_snapshots_enabled(self._master_config)
+            else None
+        )
+        if rollout_checkpoint_task is not None:
+            tasks.append(rollout_checkpoint_task)
+        rollout_telemetry_task = (
+            asyncio.create_task(self._rollout_telemetry_pump())
+            if telemetry_interval_s is not None
+            else None
+        )
+        if rollout_telemetry_task is not None:
+            tasks.append(rollout_telemetry_task)
+        # Only with fleet health on. Created unconditionally it would be a timer firing
+        # every probe_interval_s for every run that does not use the feature, which is
+        # the default.
+        probe_task = (
+            asyncio.create_task(self._gen_fleet_probe_pump())
+            if self._gen_fleet is not None
+            else None
+        )
+        if probe_task is not None:
+            tasks.append(probe_task)
         try:
             done, _ = await asyncio.wait(
-                {rollout_task, train_task}, return_when=asyncio.FIRST_COMPLETED
+                set(tasks), return_when=asyncio.FIRST_COMPLETED
             )
-            if rollout_task in done:
+            stop_after_rollout_checkpoint = False
+            if rollout_checkpoint_task is not None and rollout_checkpoint_task in done:
+                await rollout_checkpoint_task
+                if not self._rollout_snapshots.stop_requested:
+                    raise RuntimeError(
+                        "rollout checkpoint pump exited without requesting stop"
+                    )
+                stop_after_rollout_checkpoint = True
+            if stop_after_rollout_checkpoint:
+                # FIRST_COMPLETED may return several tasks. Do not let the
+                # orderly pre-step checkpoint stop hide a rollout/train failure
+                # that completed in the same event-loop turn.
+                for task in done:
+                    if task is not rollout_checkpoint_task:
+                        await task
+            if (
+                not stop_after_rollout_checkpoint
+                and probe_task is not None
+                and probe_task in done
+            ):
+                # Loops forever like the watchdog, so finishing at all means it raised.
+                await probe_task
+            if rollout_telemetry_task is not None and rollout_telemetry_task in done:
+                # This pump has no normal return path. Awaiting it propagates the
+                # exception, including one concurrent with an orderly checkpoint stop.
+                await rollout_telemetry_task
+            if not stop_after_rollout_checkpoint and watchdog_task in done:
+                # The watchdog loops forever, so finishing at all means it raised --
+                # a stall or an unhealthy environment. Surface that ahead of the
+                # pumps, whose own symptom would just be "waiting".
+                await watchdog_task
+            if not stop_after_rollout_checkpoint and rollout_task in done:
                 # Propagate rollout failures immediately. A normally exhausted
                 # rollout pump leaves the train pump to drain committed groups.
                 await rollout_task
-            await train_task
+            if not stop_after_rollout_checkpoint:
+                await train_task
         finally:
-            rollout_task.cancel()
-            train_task.cancel()
-            await asyncio.gather(rollout_task, train_task, return_exceptions=True)
-            self._logger.finish()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                # With the train pump stopped, publish a save that
+                # defer_async_checkpoint_finalize left pending: a failure ends the
+                # pump before its own blocking finalize. Before checkpoint close,
+                # which joins the rename.
+                await self._finish_pending_save(blocking=True)
+            except Exception as e:  # teardown must not mask the original failure
+                print(f"Error publishing the pending checkpoint: {e}", flush=True)
+            if self._engine_supervisor is not None:
+                # Not in `tasks`: the supervisor creates a task per restart, on demand, so
+                # there is nothing to cancel in that list. Without this an in-flight
+                # restart at shutdown is simply abandoned mid-way. Bounded, because the
+                # thread underneath cannot be cancelled -- giving up is what lets the
+                # process exit, and the thread being a daemon is what makes that safe.
+                await self._engine_supervisor.drain(
+                    timeout_s=_SUPERVISOR_DRAIN_TIMEOUT_S
+                )
+            for actor in self._finalizer_actors:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception as error:
+                    print(f"finalizer actor termination failed: {error}", flush=True)
+            await stop_storage_units(self._storage_units)
+            self._rollout_trace.close()
+            if self._train_data_dump is not None:
+                try:
+                    await asyncio.to_thread(self._train_data_dump.close)
+                except Exception as e:  # teardown must not mask the original failure
+                    print(f"Error during debug-writer close: {e}", flush=True)
+            try:
+                self._weight_synchronizer.shutdown()
+            except Exception as e:  # teardown must not mask the original failure
+                print(f"Error during weight-synchronizer shutdown: {e}", flush=True)
+            finally:
+                self._logger.finish()
+                await asyncio.to_thread(self._checkpointer.shutdown)
 
         return {
             "train_steps": self._train_steps,
@@ -229,9 +1030,247 @@ class SingleControllerActor:
             "inflight_rollouts": self._inflight_rollouts,
             "rollout_permitted": self._rollout_permitted.is_set(),
             "epoch": self._current_epoch,
+            "active_finalizers": self._active_finalizers,
+            "finalizer_waiters": self._finalizer_waiters,
+            "finalizer_queue_depth": self._available_finalizers.qsize(),
+            "finalizer_unknown_outcomes": self._finalizer_unknown_outcomes,
         }
 
-    # ── internal helpers ───────────────────────────────────────────────────
+    @cached_property
+    def _step_assembler(self) -> StepAssembler:
+        """Track the step the train pump is assembling and charge lost groups to it.
+
+        Built on first use so the cursor seeds from the current ``_trainer_version``
+        (the restored step on resume) and so controller instances that unit tests
+        construct via ``object.__new__`` get it without a hand-written assignment.
+        """
+        return StepAssembler(
+            sampler=self._sampler,
+            num_prompts_per_step=self._algo_cfg.num_prompts_per_step,
+            runtime=self._rollout_runtime,
+            initial_version=getattr(self, "_trainer_version", 0),
+        )
+
+    def _training_progress(self) -> TrainingProgress:
+        """Return the training counters a checkpoint reads."""
+        return TrainingProgress(
+            train_steps=self._train_steps,
+            trainer_version=self._trainer_version,
+            current_epoch=self._current_epoch,
+        )
+
+    def _build_rollout_checkpointing(
+        self,
+        *,
+        bootstrap_identity: Optional[BootstrapCompatibilityIdentity],
+        resume: ResumeSource,
+    ) -> tuple[RolloutSnapshotter, RolloutRestorer]:
+        """Build the rollout snapshotter and restorer, which share the controller's parts."""
+        rollout_parts = RolloutParts(
+            master_config=self._master_config,
+            dp_client=self._dp_client,
+            partition_id=self._partition_id,
+            buffer=self._buffer,
+            dataloader=self._dataloader,
+            sampler=self._sampler,
+            rollout_manager=self._rollout_manager,
+            data_plane_barrier=self._data_plane_checkpoint_barrier,
+            environment_checkpoint=self._environment_checkpoint,
+            runtime_state=self._rollout_runtime,
+            read_progress=self._training_progress,
+            log_metrics=self._log_telemetry_metrics,
+            trace=self._rollout_trace,
+        )
+        # Rollout snapshots, the TQ part of trainer checkpoints, the lock between
+        # them and the optimizer-commit window.
+        snapshots = RolloutSnapshotter(
+            rollout_parts,
+            checkpointer=self._checkpointer,
+            timeout=self._timeout,
+            bootstrap_identity=bootstrap_identity,
+            teacher_coordinator=self._teacher_coordinator,
+            records_prompt_groups=lambda: self._rollout_recovery_enabled,
+        )
+        # Restore fills the shared runtime state and takes one replay-capacity
+        # permit per restored group.
+        restorer = RolloutRestorer(
+            rollout_parts,
+            algo_cfg=self._algo_cfg,
+            buffer_capacity=self._buffer_capacity,
+            resume=resume,
+        )
+        return snapshots, restorer
+
+    def _log_telemetry_metrics(
+        self, metrics: dict[str, float], *, step: int, prefix: str
+    ) -> None:
+        """Log benchmark telemetry on an axis independent of trainer steps."""
+        try:
+            wall_time_ns = time.time_ns()
+            event_metrics = dict(metrics)
+            event_metrics[TELEMETRY_TRAIN_STEP_KEY] = float(step)
+            event_metrics[TELEMETRY_WALL_TIME_METRIC] = wall_time_ns / 1_000_000_000
+            self._logger.log_metrics(
+                event_metrics,
+                # W&B uses the custom wall-time axis and ignores this value.
+                # Other backends still need a restart-stable integer event step.
+                step=wall_time_ns,
+                prefix=prefix,
+                step_metric=TELEMETRY_WALL_TIME_METRIC,
+            )
+        except Exception as error:
+            warnings.warn(
+                f"Failed to log {prefix} telemetry: {type(error).__name__}: {error}",
+                stacklevel=2,
+            )
+
+    def _record_rollout_timing(
+        self, *, work_started: float, dispatch_started: float
+    ) -> None:
+        """Record one committed group's queue and execution durations."""
+        self._rollout_queue_wait_durations_s.append(dispatch_started - work_started)
+        self._rollout_completion_durations_s.append(time.monotonic() - dispatch_started)
+
+    def _require_unoccupied_target_step(self, target_step: Optional[int]) -> None:
+        """Reject a sampler admission that collides with existing buffer ownership."""
+        if target_step is None:
+            return
+        buffered = self._buffer.count_for_target_step(target_step)
+        if buffered:
+            raise RuntimeError(
+                f"sampler admitted target_step={target_step}, but the replay buffer "
+                f"already contains {buffered} group(s) for that step. The sampler "
+                "cursor and rollout ownership are inconsistent; refusing to discard "
+                "reserved prompts."
+            )
+
+    @contextlib.asynccontextmanager
+    async def _dispatch_reservation(
+        self, kind: CheckpointMutationKind
+    ) -> AsyncIterator[Optional[DataPlaneMutationCut]]:
+        """Hold a data-plane mutation cut for one dispatch change, when recorded.
+
+        With ledger dispatch, the change and its ledger records are one
+        checkpoint-atomic step counted as ``kind``. Without it nothing is
+        recorded, so the change takes no mutation slot and yields ``None``.
+        """
+        if not self._rollout_recovery_enabled:
+            yield None
+            return
+        async with self._data_plane_checkpoint_barrier.mutation(kind) as cut:
+            yield cut
+
+    def _reserve_prompt_group(
+        self,
+        cut: Optional[DataPlaneMutationCut],
+        prompt: DatumSpec,
+        *,
+        target_step: Optional[int],
+        admitted: bool = True,
+        admission_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Record a prompt group in the ledger, or return ``None`` when unrecorded.
+
+        Without a group ID the rollout manager mints one when it runs the group.
+        """
+        if cut is None:
+            return None
+        return self._rollout_manager.reserve_prompt_group(
+            cut,
+            prompt,
+            target_step=target_step,
+            admitted=admitted,
+            admission_id=admission_id,
+        )
+
+    def _discard_prompt_group(
+        self, cut: Optional[DataPlaneMutationCut], group_id: Optional[str]
+    ) -> None:
+        """Drop a recorded group's ledger ownership; unrecorded groups have none."""
+        if cut is not None:
+            assert group_id is not None, "a recorded prompt group has an ID"
+            self._rollout_manager.discard_prompt_group(cut, group_id)
+
+    async def _admit_step(
+        self,
+        group_ids: list[Optional[str]],
+        *,
+        wait_until_admissible: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> Optional[int]:
+        """Admit one step's prompts through the sampler and return its target step."""
+        if self._rollout_recovery_enabled:
+            return await self._admit_reserved_prompt_groups(
+                cast(list[str], group_ids), wait_until_admissible=wait_until_admissible
+            )
+        if wait_until_admissible is not None:
+            await wait_until_admissible()
+        target_step = await self._sampler.admit(
+            trainer_version_fn=lambda: self._trainer_version
+        )
+        self._rollout_runtime.sampler_stamps_target_steps = True
+        self._require_unoccupied_target_step(target_step)
+        return target_step
+
+    async def _admit_reserved_prompt_groups(
+        self,
+        group_ids: list[str],
+        *,
+        wait_until_admissible: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> Optional[int]:
+        """Commit one admission and mark every reserved group as admitted.
+
+        Args:
+            group_ids: The reserved groups this admission stamps.
+            wait_until_admissible: Pump-owned admission wait that can refill prompts.
+                Omitted when draining reserves after final data exhaustion.
+
+        Returns:
+            The target-step stamp assigned to every group.
+        """
+        if not group_ids:
+            raise ValueError("sampler admission requires at least one prompt group")
+
+        def _commit(
+            cut: DataPlaneMutationCut,
+            target_step: Optional[int],
+        ) -> Optional[int]:
+            self._rollout_runtime.sampler_stamps_target_steps = True
+            self._require_unoccupied_target_step(target_step)
+            for group_id in group_ids:
+                self._rollout_manager.mark_prompt_group_admitted(
+                    cut,
+                    group_id,
+                    target_step=target_step,
+                )
+
+            return target_step
+
+        if isinstance(self._sampler, TransactionalAdmissionSampler):
+            if wait_until_admissible is not None:
+                await wait_until_admissible()
+            else:
+                await self._sampler.wait_until_admissible(
+                    trainer_version_fn=lambda: self._trainer_version
+                )
+            async with self._data_plane_checkpoint_barrier.mutation(
+                "prompt_reservations"
+            ) as cut:
+                target_step = self._sampler.commit_admission(cut)
+                return _commit(cut, target_step)
+
+        # Custom samplers retain their existing monolithic admission API. Hold
+        # the mutation cut across it for correctness. Contract: a custom admit()
+        # must not wait on anything beyond a single trainer_version increment --
+        # a checkpoint drains mutation slots while blocking the train pump, so a
+        # longer wait deadlocks the run. Implement TransactionalAdmissionSampler
+        # to keep the gate wait outside the mutation cut entirely.
+        async with self._data_plane_checkpoint_barrier.mutation(
+            "prompt_reservations"
+        ) as cut:
+            target_step = await self._sampler.admit(
+                trainer_version_fn=lambda: self._trainer_version
+            )
+            return _commit(cut, target_step)
 
     async def _ray_get(self, obj_ref: Any) -> Any:
         """Await a Ray ObjectRef without blocking the asyncio event loop."""
@@ -239,23 +1278,533 @@ class SingleControllerActor:
 
     async def _call_dp(self, method_name: str, **kwargs) -> Any:
         """Call a DataPlaneClient method or a Ray actor exposing that method."""
-        method = getattr(self._dp_client, method_name)
-        remote = getattr(method, "remote", None)
-        if remote is not None:
-            return await self._ray_get(remote(**kwargs))
-        result = method(**kwargs)
-        if asyncio.iscoroutine(result):
-            return await result
-        return result
+        return await call_data_plane(
+            self._dp_client,
+            method_name,
+            offload_sync=True,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _request_staging_keys(request: "ReassemblyRequest") -> list[str]:
+        """Return the full receipt-manifest staging ownership for a request."""
+        keys: list[str] = []
+        for receipt in request.capture_receipts:
+            if receipt is None:
+                continue
+            manifest = receipt.get("manifest")
+            if not isinstance(manifest, list):
+                continue
+            for record in manifest:
+                if isinstance(record, dict) and isinstance(
+                    record.get("staging_key"), str
+                ):
+                    keys.append(record["staging_key"])
+        return list(dict.fromkeys(keys))
+
+    async def _cleanup_known_finalization_request_unlocked(
+        self,
+        cut: DataPlaneMutationCut,
+        request: "ReassemblyRequest",
+    ) -> None:
+        """Clear known request ownership while holding a barrier mutation slot."""
+        cut.require_live()
+        errors: list[BaseException] = []
+        try:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=list(request.cleanup_sample_ids),
+                partition_id=self._partition_id,
+            )
+        except Exception as error:
+            errors.append(
+                RuntimeError(
+                    "pre-publication canonical cleanup failed for "
+                    f"group={request.group_id!r}, "
+                    f"ids={request.cleanup_sample_ids!r}"
+                )
+            )
+            errors[-1].__cause__ = error
+        staging_keys = self._request_staging_keys(request)
+        if staging_keys:
+            try:
+                await self._call_dp(
+                    "clear_samples",
+                    sample_ids=staging_keys,
+                    partition_id=self._master_config.token_capture.staging_partition,
+                )
+            except Exception as error:
+                errors.append(
+                    RuntimeError(
+                        "pre-publication staging cleanup failed for "
+                        f"group={request.group_id!r}, keys={staging_keys!r}"
+                    )
+                )
+                errors[-1].__cause__ = error
+        if errors:
+            raise BaseExceptionGroup(
+                f"known-outcome cleanup failed for group {request.group_id}",
+                errors,
+            )
+        self._buffer.abort(request.group_id)
+        if request.group_id in self._rollout_recovery_ledger:
+            self._rollout_recovery_ledger.discard_group(cut, request.group_id)
+
+    async def _cleanup_known_finalization_request(
+        self, request: "ReassemblyRequest"
+    ) -> None:
+        """Clear a known request outcome without racing a native TQ snapshot."""
+        async with self._data_plane_checkpoint_barrier.mutation(
+            "group_removals"
+        ) as cut:
+            await self._cleanup_known_finalization_request_unlocked(cut, request)
+
+    def _valid_fraction_counts(
+        self, finalized: "FinalizedGroup"
+    ) -> Optional[tuple[int, int]]:
+        """Return (valid, total) when the group falls below the valid-fraction bar."""
+        min_valid_fraction = (
+            self._master_config.token_capture.min_valid_fraction_per_group
+        )
+        if min_valid_fraction is None:
+            return None
+        if self._master_config.token_capture.forest_training:
+            # Compaction expands owners into unequal row counts; use the
+            # finalizer's owner totals.
+            valid_count = int(finalized.metrics["finalize/valid_logical_owner_count"])
+            total_count = int(finalized.metrics["finalize/logical_owner_count"])
+        else:
+            valid_count = finalized.valid_row_count
+            total_count = finalized.total_row_count
+        if total_count > 0 and valid_count / total_count < min_valid_fraction:
+            return valid_count, total_count
+        return None
+
+    @contextlib.asynccontextmanager
+    async def _claim_filtered_spare(self) -> AsyncIterator[None]:
+        """Promise a finalizing group a filtered spare, in case it is rejected.
+
+        A rejected group's spare is taken inside the finalize cut, which cannot wait
+        for the pump to refill an empty pool. Claiming first waits until the pool
+        holds a spare no other finalizing group has claimed. A claim only counts
+        against the pool; the spare is popped inside the cut, and only on rejection.
+
+        Once the dataloader is exhausted, no group waits for another spare:
+        rejection takes whatever remains or closes its step short.
+        """
+        if (
+            not self._dynamic_sampling_enabled
+            or not self._sampler.uses_pooled_replacements
+        ):
+            # A sampler without a spare pool (windowed) never has a filtered spare to
+            # claim -- its pool is never refilled -- and refills filtered slots from
+            # later ordinary dispatches instead. Waiting here would block every
+            # token-capture finalization on a pool that never fills.
+            yield
+            return
+        claimed = False
+        while True:
+            # No await between the check and the claim, so two groups cannot claim one spare.
+            if len(self._rollout_runtime.filtered_reserve) > (
+                self._filtered_spares_claimed
+            ):
+                self._filtered_spares_claimed += 1
+                claimed = True
+                break
+            if self._dataloader_exhausted:
+                break
+            await asyncio.sleep(0.1)
+        try:
+            yield
+        finally:
+            if claimed:
+                self._filtered_spares_claimed -= 1
+
+    async def _finalize_with_actor(
+        self,
+        request: "ReassemblyRequest",
+        rollout_metrics: dict[str, Any],
+        *,
+        target_step: Optional[int],
+        replacements_used: int,
+    ) -> FinalizeOutcome:
+        """Finalize and index one group atomically with respect to TQ saves.
+
+        Returns the committed FinalizedGroup once the group is committed to
+        the replay buffer, or None when the finalizer itself dropped it as a
+        structural outcome (ownership already cleaned up; the caller credits
+        the step short).
+
+        A group below ``token_capture.min_valid_fraction_per_group``, or with
+        dynamic sampling on one whose voting rewards carry no signal, is
+        rejected before ``commit_finalized`` marks its slot ready, so the
+        sampler can never select it. Its cleanup, the spare prompt that
+        replaces it (or the step's shortfall credit), and that spare's ledger
+        reservation share the commit's mutation cut, so no snapshot sees the
+        group gone without its replacement. Returns a ``BelowValidFractionGroup``
+        or ``ZeroVarianceGroup`` in that case. A zero-variance group takes its
+        spare from the filtered pool, which cannot be waited on inside the cut:
+        the caller holds ``_claim_filtered_spare`` across this call so the pool
+        is not empty when the group is rejected.
+        """
+        self._finalizer_waiters += 1
+        queue_depth = max(
+            0,
+            self._finalizer_waiters - self._available_finalizers.qsize(),
+        )
+        queue_start = time.perf_counter()
+        try:
+            actor = await self._available_finalizers.get()
+        except asyncio.CancelledError:
+            await self._cleanup_known_finalization_request(request)
+            raise
+        finally:
+            self._finalizer_waiters -= 1
+        queue_wait_ms = (time.perf_counter() - queue_start) * 1000.0
+        self._active_finalizers += 1
+        active_actor_count = self._active_finalizers
+        finalize_start = time.perf_counter()
+        rpc_submitted = False
+        actor_reusable = False
+        rejected: Optional[RejectedGroup] = None
+        try:
+            # The actor publishes canonical rows before returning metadata. Keep
+            # the remote write, local replay-index update, and lineage hand-off in
+            # one mutation cut so a TQ snapshot sees all of them or none of them.
+            # This deliberately makes checkpoint acquisition wait for the tail of
+            # every in-flight finalizer RPC. Releasing the cut across the await
+            # would let a snapshot preserve canonical rows without the matching
+            # replay index and lineage transition, which is not recoverable.
+            async with self._data_plane_checkpoint_barrier.mutation(
+                "group_commits"
+            ) as cut:
+                ledger = self._rollout_recovery_ledger
+                ledger.mark_finalization_started(cut, request.group_id)
+                try:
+                    rpc_submitted = True
+                    finalized = await actor.finalize.remote(request)
+                except BaseException:
+                    self._finalizer_unknown_outcomes += 1
+                    ledger.mark_finalization_unknown(cut, request.group_id)
+                    print(
+                        "FATAL: finalizer actor RPC failed after submission; canonical "
+                        f"publication outcome is unknown for group {request.group_id}. "
+                        "Stopping validation without actor replacement or retry.",
+                        flush=True,
+                    )
+                    raise
+                else:
+                    actor_reusable = True
+
+                zero_variance = (
+                    not finalized.dropped
+                    and self._rollout_manager._is_zero_variance_finalized(finalized)
+                )
+                # The committed FinalizedGroup carries the verdict back to the
+                # dispatch loop so it is classified once, not recomputed there.
+                finalized.zero_variance = zero_variance
+                if finalized.dropped:
+                    try:
+                        await self._cleanup_known_finalization_request_unlocked(
+                            cut, request
+                        )
+                    except BaseException as cleanup_error:
+                        raise RuntimeError(
+                            "finalizer dropped the group and known-key cleanup failed "
+                            f"for group {request.group_id}"
+                        ) from cleanup_error
+                    print(
+                        f"  finalize: group {request.group_id} dropped "
+                        f"({finalized.drop_reason or 'unspecified reason'})",
+                        flush=True,
+                    )
+                    committed = False
+                elif finalized.meta is None:
+                    try:
+                        await self._cleanup_known_finalization_request_unlocked(
+                            cut, request
+                        )
+                    except BaseException as cleanup_error:
+                        raise RuntimeError(
+                            "finalizer returned no metadata and known-key cleanup "
+                            f"failed for group {request.group_id}"
+                        ) from cleanup_error
+                    raise RuntimeError(
+                        "finalizer returned no metadata for non-dropped group "
+                        f"{request.group_id}"
+                    )
+                elif (counts := self._valid_fraction_counts(finalized)) is not None:
+                    try:
+                        await self._cleanup_known_finalization_request_unlocked(
+                            cut, request
+                        )
+                    except BaseException as cleanup_error:
+                        raise RuntimeError(
+                            "finalizer group fell below "
+                            "min_valid_fraction_per_group and known-key cleanup "
+                            f"failed for group {request.group_id}"
+                        ) from cleanup_error
+                    replacement = self._take_replacement(replacements_used)
+                    lineage_group_id, replacement_step = self._substitute_dropped_group(
+                        cut, replacement, target_step
+                    )
+                    rejected = BelowValidFractionGroup(
+                        replacement=replacement,
+                        lineage_group_id=lineage_group_id,
+                        target_step=replacement_step,
+                        reward_observations=list(finalized.reward_observations),
+                        zero_variance=zero_variance,
+                        valid_count=counts[0],
+                        total_count=counts[1],
+                    )
+                    committed = False
+                elif self._dynamic_sampling_enabled and zero_variance:
+                    try:
+                        await self._cleanup_known_finalization_request_unlocked(
+                            cut, request
+                        )
+                    except BaseException as cleanup_error:
+                        raise RuntimeError(
+                            "finalizer group carried no reward signal and known-key "
+                            f"cleanup failed for group {request.group_id}"
+                        ) from cleanup_error
+                    if self._sampler.uses_pooled_replacements:
+                        replacement = self._pop_filtered_replacement(target_step)
+                        # filtered=True: a zero-variance EOF short close is allowed
+                        # below the floor, like the non-capture filtered path.
+                        lineage_group_id, replacement_step = (
+                            self._substitute_dropped_group(
+                                cut, replacement, target_step, filtered=True
+                            )
+                        )
+                    else:
+                        # No spare pool (windowed): record the filtered prompt against
+                        # the dynamic-sampling budget and leave the slot for a later
+                        # ordinary dispatch to refill, mirroring the non-capture path.
+                        # Popping would raise on the never-refilled pool, and crediting
+                        # the step short would fail an allowance it never spent.
+                        self._record_filtered_prompt(target_step)
+                        replacement = None
+                        lineage_group_id = None
+                        replacement_step = target_step
+                    rejected = ZeroVarianceGroup(
+                        replacement=replacement,
+                        lineage_group_id=lineage_group_id,
+                        target_step=replacement_step,
+                        reward_observations=list(finalized.reward_observations),
+                        zero_variance=True,
+                    )
+                    committed = False
+                else:
+                    extra_env_info: dict[str, Any] = {}
+                    if request.attribution_key is not None:
+                        extra_env_info["attribution_key"] = request.attribution_key
+                    if request.resolved_agent_name is not None:
+                        extra_env_info["agent_ref"] = {
+                            "name": request.resolved_agent_name
+                        }
+                    try:
+                        meta = finalized.meta
+                        # Gym rollout metrics and the finalizer's verified token
+                        # metrics are disjoint; one sidecar carries both.
+                        overlap = (
+                            rollout_metrics.keys() & finalized.token_metrics.keys()
+                        )
+                        if overlap:
+                            raise RuntimeError(
+                                f"group {request.group_id}: rollout and finalizer "
+                                f"metrics both report {sorted(overlap)!r}"
+                            )
+                        # Exact per-version token counts, split at the refits
+                        # that paused the group's calls.
+                        tokens_by_version = (
+                            self._refit_cuts.tokens_by_version(finalized.call_versions)
+                            if finalized.call_versions
+                            else {}
+                        )
+                        group_metrics = {
+                            **rollout_metrics,
+                            **finalized.token_metrics,
+                            **batch_age_group_metrics(tokens_by_version),
+                        }
+                        if group_metrics:
+                            # Same ROLLOUT_METRICS sidecar the echo path's commit writes.
+                            meta = replace(
+                                meta,
+                                extra_info={
+                                    **meta.extra_info,
+                                    ROLLOUT_METRICS: [group_metrics],
+                                },
+                            )
+                        await self._buffer.commit_finalized(
+                            cut,
+                            request.group_id,
+                            meta,
+                            finalized.group_min_wv,
+                            finalized.group_max_wv,
+                            staging_keys=finalized.staging_keys,
+                            extra_env_info=extra_env_info or None,
+                        )
+                    except BaseException as commit_error:
+                        try:
+                            await self._cleanup_known_finalization_request_unlocked(
+                                cut, request
+                            )
+                        except BaseException as cleanup_error:
+                            raise BaseExceptionGroup(
+                                "finalizer commit and known-key cleanup failed for "
+                                f"group {request.group_id}",
+                                [commit_error, cleanup_error],
+                            )
+                        raise
+                    # Canonical TQ rows plus replay metadata now own the completed
+                    # group; keep only unfinished work in the lineage sidecar.
+                    ledger.discard_group(cut, request.group_id)
+                    self._rollout_trace.emit(
+                        "group_published",
+                        group_id=request.group_id,
+                        tokens_by_version=tokens_by_version,
+                    )
+                    self._rollout_manager.record_canonical_publication(
+                        finalized.canonical_output_tokens
+                    )
+                    self._rollout_runtime.finalizer_metrics_by_group[
+                        request.group_id
+                    ] = dict(finalized.metrics)
+                    self._rollout_runtime.finalizer_rewards_by_group[
+                        request.group_id
+                    ] = list(finalized.reward_observations)
+                    committed = True
+        finally:
+            self._active_finalizers -= 1
+            if actor_reusable or not rpc_submitted:
+                self._available_finalizers.put_nowait(actor)
+        finalize_total_ms = (time.perf_counter() - finalize_start) * 1000.0
+        if not committed:
+            return rejected
+        finalized.metrics.update(
+            {
+                "finalize/queue_wait_ms": queue_wait_ms,
+                "finalize/total_ms": finalize_total_ms,
+                "finalize/queue_depth": float(queue_depth),
+                "finalize/active_actor_count": float(active_actor_count),
+            }
+        )
+        self._rollout_runtime.finalizer_metrics_by_group[request.group_id] = dict(
+            finalized.metrics
+        )
+        return finalized
+
+    async def _cleanup_consumed_metas_unlocked(
+        self, cut: DataPlaneMutationCut, metas: list[KVBatchMeta]
+    ) -> None:
+        """Clear consumed ownership while holding a barrier mutation slot."""
+        cut.require_live()
+        canonical_by_partition: dict[str, list[str]] = {}
+        staging_by_partition: dict[str, list[str]] = {}
+        for meta in metas:
+            canonical_by_partition.setdefault(meta.partition_id, []).extend(
+                meta.sample_ids
+            )
+            for tag in meta.tags or []:
+                encoded_plan = tag.get(ROUTE_PLAN_TAG)
+                if encoded_plan is None:
+                    continue
+                plan = decode_route_plan(encoded_plan)
+                staging_by_partition.setdefault(plan.staging_partition, []).extend(
+                    plan.cleanup_staging_keys
+                )
+
+        errors: list[BaseException] = []
+        for label, by_partition in (
+            ("canonical", canonical_by_partition),
+            ("staging", staging_by_partition),
+        ):
+            for partition_id, ids in by_partition.items():
+                unique_ids = list(dict.fromkeys(ids))
+                try:
+                    await self._call_dp(
+                        "clear_samples",
+                        sample_ids=unique_ids,
+                        partition_id=partition_id,
+                    )
+                except Exception as error:
+                    cleanup_error = RuntimeError(
+                        f"post-train {label} cleanup failed: "
+                        f"partition={partition_id!r}, ids={unique_ids!r}"
+                    )
+                    cleanup_error.__cause__ = error
+                    errors.append(cleanup_error)
+        if errors:
+            raise BaseExceptionGroup("post-train DataPlane cleanup failed", errors)
+
+    async def _log_data_plane_metrics(self, total_step_time: float) -> None:
+        """Log this step's data-plane cost. Never raises.
+
+        On by default, so this runs every step of every recipe. Mirrors
+        ``grpo_sync._log_data_plane_metrics``.
+        """
+        with metrics_never_fail_the_step(self._train_steps):
+            await self._log_data_plane_metrics_impl(total_step_time)
+
+    async def _log_data_plane_metrics_impl(self, total_step_time: float) -> None:
+        """Log this step's data-plane cost. No-op unless observability is enabled.
+
+        This client's share depends on the configuration: it writes the rollout
+        rows unless token capture moves that to the finalizer actors, and it
+        issues the advantage get and put unless advantage workers take them.
+        The trainer merges this client's counters with its worker ranks', the
+        finalizer, advantage, generation, critic and teacher sources into one
+        cluster view. The fan-out blocks on ``ray.get``, so it runs off the
+        event loop.
+
+        nixl's unit metrics (retired memory, SSD spills) are logged even with
+        observability off: a leak only shows over a long run, in the runs that
+        need it.
+        """
+        if self._dp_backend == "nixl":
+            from nemo_rl.data_plane.adapters.tq_nixl import unit_metrics
+
+            unit = unit_metrics()
+            if unit:
+                self._logger.log_metrics(
+                    unit, self._train_steps, prefix="data_plane/nixl"
+                )
+        result = await asyncio.to_thread(
+            self._trainer.get_data_plane_step_metrics,
+            total_step_time,
+            self._dp_client,
+        )
+        if result is None:
+            return  # observability disabled -> plain adapter
+        metrics, scope = result
+        log_step_metrics(self._logger, metrics, self._train_steps, scope)
+
+    @staticmethod
+    def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
+        """Return stable prompt-group IDs in canonical sample order.
+
+        Reads the same tag the advantage stage keys its baseline on rather than
+        parsing the ``_g{i}`` suffix back off the sample ids, so the two do not
+        disagree about what a group is. The stage would raise on a batch whose
+        tag is missing anyway; doing it here fails one stage earlier in the
+        same iteration.
+        """
+        if has_logical_owners(meta):
+            assert meta.tags is not None
+            return list(dict.fromkeys(tag["dispatch_group_id"] for tag in meta.tags))
+        return list(dict.fromkeys(row_group_ids(meta)))
 
     # ── the three pumps + the inline advantage stage ───────────────────────
-
     async def _rollout_pump(self) -> None:
         """Continuously dispatch rollout tasks until cancellation.
 
         Per batch:
-          0. await sampler.admit(...) to wait until the batch may dispatch and
-             obtain its target_step stamp.
+          0. Under on_dropped_prompt="replace" or dynamic sampling, divert the batch
+             into the spare pool if the pool is below its low-water mark, and skip
+             admission entirely.
+             Otherwise await sampler.admit(...) to wait until the batch may dispatch
+             and obtain its target_step stamp.
 
         Per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
@@ -263,8 +1812,18 @@ class SingleControllerActor:
           3. Wait for _rollout_permitted (paused during weight sync)
           4. Call rollout_manager.generate_and_push(prompt) — local async
              RolloutManager reserves a slot, runs the rollout, then commits the
-             group via TQReplayBuffer (→ dp_client.put_samples + mark ready)
-          5. Decrement _inflight_rollouts
+             group via TQReplayBuffer (→ dp_client.put_samples + mark ready).
+             In token-capture mode (finalizer actors present) the rollout is run
+             via generate_for_finalization instead and its metadata-only request
+             is submitted to the finalizer actor pool.
+          5. If the prompt was dropped, substitute a spare and repeat step 4 -- for this
+             step, or for whichever step lends this one a finished group in its place
+             (see _take_replacement, _pop_filtered_replacement, _promote_into_step) --
+             or credit the step short so the train pump can close it
+          6. Decrement _inflight_rollouts
+
+        Once every epoch is done, whatever is left in the spare pool is dispatched as
+        ordinary steps rather than discarded (see _drain_reserve_into_steps).
         """
         sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
         self._rollout_exhausted.clear()
@@ -273,22 +1832,301 @@ class SingleControllerActor:
         async def _dispatch_one_prompt(
             prompt: DatumSpec,
             target_step: Optional[int],
+            lineage_group_id: Optional[str],
             task_started_event: asyncio.Event,
+            *,
+            work_started: float,
+            dispatch_started: float,
         ) -> None:
             task_started_event.set()
             self._inflight_rollouts += 1
+            # This task owns one slot of a step, which can outlive both the prompt it
+            # started with and the step it started on: a dropped prompt is substituted in
+            # place and the loop runs again, and the slot is re-aimed at whichever step
+            # lends this one a finished group. Both permits are held across
+            # substitutions because the slot stays occupied either way -- they are
+            # released once something commits, or once a step is credited short.
+            replacements = 0
+            # Zero-variance substitutions for this slot, counted apart from the
+            # fault-tolerance `replacements` above so the two budgets stay independent.
+            filtered_replacements = 0
+            generation_permit_released = False
+            inflight_count_released = False
             try:
-                await self._rollout_manager.generate_and_push(
-                    prompt, target_step=target_step
-                )
-            except BaseException:
-                # On success ownership transfers to the train pump, which
-                # releases this permit after consuming the committed group.
-                self._buffer_capacity.release()
-                raise
+                if self._finalizer_actors:
+                    # Token-capture path: run capture generation, release the
+                    # generation permits as soon as the tokens are staged, then
+                    # hand the metadata-only request to the finalizer actor pool.
+                    ownership_transferred = False
+                    try:
+                        while True:
+                            # Scope only, no span: dispatched per prompt like
+                            # the branch below, so the gym and data-plane
+                            # spans under it must be gated on PER_PROMPT.
+                            with per_prompt_scope():
+                                if lineage_group_id is None:
+                                    captured = await self._rollout_manager.generate_for_finalization(
+                                        prompt,
+                                        target_step=target_step,
+                                        inflight_registry=self._inflight_by_group_id,
+                                    )
+                                else:
+                                    captured = await self._rollout_manager.generate_for_finalization(
+                                        prompt,
+                                        target_step=target_step,
+                                        inflight_registry=self._inflight_by_group_id,
+                                        lineage_group_id=lineage_group_id,
+                                    )
+                            if not inflight_count_released:
+                                self._inflight_rollouts -= 1
+                                inflight_count_released = True
+                            if not generation_permit_released:
+                                sem.release()
+                                generation_permit_released = True
+                            if captured is None:
+                                # Dropped within the infra budget: nothing was
+                                # committed, so the train pump will never release
+                                # this permit, and the step it was stamped for
+                                # must be allowed to close short.
+                                if lineage_group_id is not None:
+                                    async with (
+                                        self._data_plane_checkpoint_barrier.mutation(
+                                            "group_removals"
+                                        )
+                                    ) as cut:
+                                        await self._rollout_manager.discard_recovery_group(
+                                            cut, lineage_group_id
+                                        )
+                                self._buffer_capacity.release()
+                                self._step_assembler.credit_shortfall(target_step)
+                                return
+                            request, rollout_metrics = captured
+                            async with self._claim_filtered_spare():
+                                finalized = await self._finalize_with_actor(
+                                    request,
+                                    rollout_metrics,
+                                    target_step=target_step,
+                                    replacements_used=replacements,
+                                )
+                            if finalized is None:
+                                # Finalizer dropped the group as a structural
+                                # outcome (e.g. router replay with no routed
+                                # data yet); ownership was already cleaned up,
+                                # so like the dropped-prompt path above the
+                                # train pump will never release this permit
+                                # and the step must be allowed to close short.
+                                self._buffer_capacity.release()
+                                self._step_assembler.credit_shortfall(target_step)
+                                return
+                            self._rollout_manager.record_group_rewards(
+                                target_step,
+                                [row.reward for row in finalized.reward_observations],
+                                replacement_index=replacements + filtered_replacements,
+                                zero_variance=finalized.zero_variance,
+                            )
+                            if not isinstance(finalized, RejectedGroup):
+                                self._rollout_manager.stats.committed += 1
+                                ownership_transferred = True
+                                break
+                            # The finalize cut already cleaned the group up and
+                            # took its replacement (or credited the step short).
+                            if isinstance(finalized, ZeroVarianceGroup):
+                                self._rollout_manager.stats.zero_variance_groups += 1
+                                print(
+                                    f"  dynamic sampling: dropped group "
+                                    f"{request.group_id} (target_step={target_step}), "
+                                    "its voting rewards carry no signal; "
+                                    + (
+                                        "substituting a spare prompt"
+                                        if finalized.replacement is not None
+                                        else "no replacement; closing the step short"
+                                    ),
+                                    flush=True,
+                                )
+                                if finalized.replacement is None:
+                                    self._buffer_capacity.release()
+                                    return
+                                filtered_replacements += 1
+                            else:
+                                # Too few rollouts verified to be worth training on.
+                                print(
+                                    f"  finalize: group {request.group_id} below "
+                                    "min_valid_fraction_per_group "
+                                    f"({finalized.valid_count}/{finalized.total_count} < "
+                                    f"{self._master_config.token_capture.min_valid_fraction_per_group}); "
+                                    + (
+                                        "substituting a spare prompt"
+                                        if finalized.replacement is not None
+                                        else "no replacement; dropping the group"
+                                    ),
+                                    flush=True,
+                                )
+                                if finalized.replacement is None:
+                                    self._rollout_manager.record_finalizer_dropped_prompt()
+                                    self._buffer_capacity.release()
+                                    return
+                                replacements += 1
+                            prompt = finalized.replacement
+                            lineage_group_id = finalized.lineage_group_id
+                            target_step = finalized.target_step
+                            # A substitution is a fresh rollout, not a
+                            # continuation of the one that fell short, so it
+                            # observes the same pause a first dispatch does
+                            # instead of pushing new generation into a
+                            # weight-sync window.
+                            await self._rollout_permitted.wait()
+                            # The next generate_for_finalization call is a
+                            # brand-new generation and must be re-counted
+                            # against the same concurrency limiter a first
+                            # dispatch would hold; both permits were released
+                            # early above, right after the attempt that fell
+                            # short finished generating.
+                            await sem.acquire()
+                            self._inflight_rollouts += 1
+                            inflight_count_released = False
+                            generation_permit_released = False
+                    except BaseException:
+                        # On success ownership transfers to the train pump, which
+                        # releases this permit after consuming the committed group.
+                        if not ownership_transferred:
+                            self._buffer_capacity.release()
+                        raise
+                else:
+                    while True:
+                        try:
+                            # One span per dispatch attempt, gated before
+                            # the attribute dict since this runs per prompt.
+                            # per_prompt_scope() is entered either way: the
+                            # data-plane put inside reads it.
+                            if is_span_group_enabled(RLSpanGroup.U_PER_PROMPT):
+                                rollout_span: Any = umbrella_span(
+                                    RLSpanGroup.U_PER_PROMPT,
+                                    "rl.sc.generate_and_push",
+                                    tracer=self._tracer,
+                                    **{
+                                        "rl.rollout.attempt": replacements
+                                        + filtered_replacements,
+                                        **(
+                                            {}
+                                            if target_step is None
+                                            else {"rl.target_step": target_step}
+                                        ),
+                                    },
+                                )
+                            else:
+                                rollout_span = NO_SPAN
+                            with per_prompt_scope(), rollout_span:
+                                if lineage_group_id is None:
+                                    outcome = await self._rollout_manager.generate_and_push(
+                                        prompt,
+                                        target_step=target_step,
+                                        inflight_registry=self._inflight_by_group_id,
+                                        replacement_index=replacements
+                                        + filtered_replacements,
+                                    )
+                                else:
+                                    outcome = await self._rollout_manager.generate_and_push(
+                                        prompt,
+                                        target_step=target_step,
+                                        inflight_registry=self._inflight_by_group_id,
+                                        lineage_group_id=lineage_group_id,
+                                        replacement_index=replacements
+                                        + filtered_replacements,
+                                    )
+                        except BaseException:
+                            # On success ownership transfers to the train pump, which
+                            # releases this permit after consuming the committed group.
+                            self._buffer_capacity.release()
+                            raise
+
+                        # Only dropped groups need replacement.
+                        if outcome not in (
+                            RolloutOutcome.SKIPPED,
+                            RolloutOutcome.FILTERED,
+                        ):
+                            break
+
+                        # Filtered groups spend only the dynamic-sampling budget.
+                        filtered = outcome is RolloutOutcome.FILTERED
+                        if filtered and not self._sampler.uses_pooled_replacements:
+                            async with self._dispatch_reservation(
+                                "prompt_reservations"
+                            ) as cut:
+                                self._discard_prompt_group(cut, lineage_group_id)
+                                # Record only: windowed draws no replacement here, so a
+                                # filtered group at EOF must close the step short rather
+                                # than fail an allowance it never spent. The train pump
+                                # enforces the budget after selection instead.
+                                self._record_filtered_prompt(target_step)
+                            self._buffer_capacity.release()
+                            return
+                        async with self._replacement_mutation(filtered=filtered) as cut:
+                            replacement = (
+                                self._pop_filtered_replacement(target_step)
+                                if filtered
+                                else self._take_replacement(replacements)
+                            )
+                            # A skipped tracked prompt remains ledger-owned until this
+                            # controller transition. Dropping the old owner, reserving
+                            # a replacement, or crediting the target step short must be
+                            # one checkpoint-atomic decision.
+                            self._discard_prompt_group(cut, lineage_group_id)
+                            lineage_group_id, target_step = (
+                                self._substitute_dropped_group(
+                                    cut, replacement, target_step, filtered=filtered
+                                )
+                            )
+                        if replacement is None:
+                            # Nothing was committed, so the train pump will never see this
+                            # group and never release its permit on our behalf.
+                            self._buffer_capacity.release()
+                            return
+
+                        if filtered:
+                            filtered_replacements += 1
+                            drawn = self._filtered_prompts_by_step.get(
+                                self._step_assembler.accounting_step(target_step), 0
+                            )
+                            spent = (
+                                f"{drawn}/"
+                                f"{self._filtered_prompt_budget - self._algo_cfg.num_prompts_per_step}"
+                                " for this step"
+                            )
+                        else:
+                            replacements += 1
+                            spent = (
+                                f"{replacements}/"
+                                f"{self._async_cfg.rollout_failure.max_replacement_attempts}"
+                            )
+                        prompt = replacement
+                        print(
+                            f"  target_step={target_step}: substituting a spare prompt "
+                            f"for the {'filtered' if filtered else 'dropped'} group "
+                            f"(replacement {spent}, "
+                            f"{len(self._rollout_runtime.replacement_reserve)} spare(s) left)",
+                            flush=True,
+                        )
+                        # A substitution is a fresh rollout, not a continuation of the one
+                        # that failed, so it observes the same pause a first dispatch does
+                        # instead of pushing new generation into a weight-sync window.
+                        await self._rollout_permitted.wait()
             finally:
-                self._inflight_rollouts -= 1
-                sem.release()
+                if not inflight_count_released:
+                    self._inflight_rollouts -= 1
+                if not generation_permit_released:
+                    sem.release()
+
+            if replacements or filtered_replacements:
+                # Count each recovered slot once, against its stamp or assembling step.
+                replaced_step = self._step_assembler.accounting_step(target_step)
+                self._batch_replacements[replaced_step] = (
+                    self._batch_replacements.get(replaced_step, 0) + 1
+                )
+
+            self._record_rollout_timing(
+                work_started=work_started,
+                dispatch_started=dispatch_started,
+            )
 
             if self._async_cfg.diagnostics:
                 content = ""
@@ -307,43 +2145,161 @@ class SingleControllerActor:
                 self._buffer_capacity.release()
                 sem.release()
 
-        max_epochs = self._master_config.grpo.max_num_epochs
-        async with asyncio.TaskGroup() as rollout_tasks:
-            while max_epochs is None or self._current_epoch < max_epochs:
-                for prompt_batch in self._dataloader:
-                    target_step = await self._sampler.admit(
-                        trainer_version_fn=lambda: self._trainer_version
-                    )
+        dataloader_iterator = self._iter_prompt_batches()
 
+        async def maybe_refill() -> None:
+            if (
+                not self._dynamic_sampling_enabled
+                or not self._sampler.uses_pooled_replacements
+                or self._dataloader_exhausted
+                or len(self._rollout_runtime.filtered_reserve)
+                >= self._algo_cfg.num_prompts_per_step
+            ):
+                return
+            async with (
+                self._data_plane_checkpoint_barrier.mutation("prompt_reservations")
+                if self._rollout_recovery_enabled
+                else contextlib.nullcontext()
+            ):
+                batch = next(dataloader_iterator, None)
+                if batch is None:
+                    self._dataloader_exhausted = True
+                    return
+                for i in range(batch.size):
+                    prompt = cast(
+                        DatumSpec, {key: value[i] for key, value in batch.items()}
+                    )
+                    self._rollout_runtime.filtered_reserve.append(prompt)
+
+        async def wait_with_maybe_refill(lock: asyncio.Semaphore) -> None:
+            if self._dynamic_sampling_enabled:
+                while lock.locked():
+                    await maybe_refill()
+                    await asyncio.sleep(0.1)
+            await lock.acquire()
+
+        async def wait_for_admission() -> None:
+            # Setup rejects dynamic sampling unless the sampler is transactional.
+            sampler = cast(TransactionalAdmissionSampler, self._sampler)
+            admission = rollout_tasks.create_task(
+                sampler.wait_until_admissible(
+                    trainer_version_fn=lambda: self._trainer_version
+                )
+            )
+            await asyncio.sleep(0)
+            while not admission.done():
+                await maybe_refill()
+                await asyncio.sleep(0.1)
+            await admission
+
+        async def _launch(
+            prompt: DatumSpec,
+            target_step: Optional[int],
+            lineage_group_id: Optional[str],
+        ) -> None:
+            if self._rollout_recovery_enabled and lineage_group_id is None:
+                raise RuntimeError(
+                    "recovery-enabled rollout dispatch requires a pre-reserved "
+                    "prompt-group ID"
+                )
+            work_started = time.monotonic()
+            # check if buffer is full
+            self._buffer_capacity_waiters += 1
+            try:
+                await wait_with_maybe_refill(self._buffer_capacity)
+            finally:
+                self._buffer_capacity_waiters -= 1
+            # check if inflight rollouts is full
+            self._rollout_slot_waiters += 1
+            try:
+                await wait_with_maybe_refill(sem)
+            finally:
+                self._rollout_slot_waiters -= 1
+            # wait for rollout to be permitted
+            self._rollout_permitted_waiters += 1
+            try:
+                await self._rollout_permitted.wait()
+            finally:
+                self._rollout_permitted_waiters -= 1
+            dispatch_started = time.monotonic()
+
+            task_started_event = asyncio.Event()
+            # dispatch rollout
+            task = rollout_tasks.create_task(
+                _dispatch_one_prompt(
+                    prompt,
+                    target_step,
+                    lineage_group_id,
+                    task_started_event,
+                    work_started=work_started,
+                    dispatch_started=dispatch_started,
+                )
+            )
+            self._dispatched_rollouts.add(task)
+            task.add_done_callback(self._dispatched_rollouts.discard)
+            task.add_done_callback(
+                partial(
+                    _release_permits_if_task_not_started,
+                    task_started_event=task_started_event,
+                )
+            )
+
+        async with asyncio.TaskGroup() as rollout_tasks:
+            if self._rollout_recovery_enabled:
+                await self._rollout_restorer.redispatch_restored(
+                    _launch,
+                    partial(
+                        self._admit_reserved_prompt_groups,
+                        wait_until_admissible=wait_for_admission
+                        if self._dynamic_sampling_enabled
+                        else None,
+                    ),
+                )
+            while True:
+                prompt_dispatches: list[tuple[DatumSpec, Optional[str]]] = []
+                async with self._dispatch_reservation("prompt_reservations") as cut:
+                    try:
+                        prompt_batch = next(dataloader_iterator)
+                    except StopIteration:
+                        self._dataloader_exhausted = True
+                        break
+                    if await self._divert_batch_to_reserve(prompt_batch):
+                        continue
+                    admission_id = str(uuid.uuid4())
                     for prompt_idx in range(prompt_batch.size):
                         prompt: DatumSpec = {  # type: ignore
                             k: v[prompt_idx] for k, v in prompt_batch.items()
                         }
-
-                        # check if buffer is full
-                        await self._buffer_capacity.acquire()
-                        # check if inflight rollouts is full
-                        await sem.acquire()
-                        # wait for rollout to be permitted
-                        await self._rollout_permitted.wait()
-
-                        task_started_event = asyncio.Event()
-                        # dispatch rollout
-                        task = rollout_tasks.create_task(
-                            _dispatch_one_prompt(
-                                prompt, target_step, task_started_event
-                            )
+                        group_id = self._reserve_prompt_group(
+                            cut,
+                            prompt,
+                            target_step=None,
+                            admitted=False,
+                            admission_id=admission_id,
                         )
-                        self._dispatched_rollouts.add(task)
-                        task.add_done_callback(self._dispatched_rollouts.discard)
-                        task.add_done_callback(
-                            partial(
-                                _release_permits_if_task_not_started,
-                                task_started_event=task_started_event,
-                            )
-                        )
+                        prompt_dispatches.append((prompt, group_id))
 
-                self._current_epoch += 1
+                target_step = await self._admit_step(
+                    [group_id for _, group_id in prompt_dispatches],
+                    wait_until_admissible=wait_for_admission
+                    if self._dynamic_sampling_enabled
+                    else None,
+                )
+
+                for prompt, group_id in prompt_dispatches:
+                    await _launch(
+                        prompt,
+                        target_step,
+                        group_id,
+                    )
+
+        # Only now that every dispatched rollout has settled is the pool genuinely
+        # spare. Draining it inside the group above would race them for it, and a
+        # rollout that was about to be dropped has the better claim: it needs a spare to
+        # keep its step whole, whereas an extra step is only worth having if one is
+        # left over. A second group because the first is closed to new tasks.
+        async with asyncio.TaskGroup() as rollout_tasks:
+            await self._drain_reserve_into_steps(_launch)
 
         # Drain in-flight so return implies "all rollouts in TQ".
         inflight = list(self._dispatched_rollouts)
@@ -353,38 +2309,580 @@ class SingleControllerActor:
         self._rollout_exhausted.set()
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
 
+    def _iter_prompt_batches(self) -> Iterator[BatchedDataDict[DatumSpec]]:
+        """Traverse epochs for both ordinary dispatch and on-demand refills."""
+        max_epochs = self._algo_cfg.max_num_epochs
+        while max_epochs is None or self._current_epoch < max_epochs:
+            yield from self._dataloader
+            self._current_epoch += 1
+
+    async def _divert_batch_to_reserve(
+        self, prompt_batch: BatchedDataDict[DatumSpec]
+    ) -> bool:
+        """Consume a whole batch as spare prompts instead of admitting it as a step.
+
+        Returns whether the batch was taken, in which case the caller must not admit it.
+        Diverting before ``admit`` is what keeps the stamp sequence honest: admitting a
+        batch and then dispatching nothing for it would leave a target step that no
+        group is ever generated for, which is exactly the hang the shortfall accounting
+        exists to prevent.
+
+        A whole batch at a time because the dataloader only yields batches. The spares
+        that go unused are not wasted work -- nothing has been generated for them -- and
+        they stay in the pool for later steps.
+
+        Nothing is diverted for a sampler that does not use the pool, or before the first
+        batch has been admitted. The cost of the latter is that the first batch is always
+        admitted rather than diverted; in practice the pool is filled while that first
+        batch's rollouts are still running, so it is available by the time any of them
+        can be given up on.
+        """
+        failure_cfg = self._async_cfg.rollout_failure
+        # Cheapest gate first, and the one a run that pools nothing never looks past.
+        if (
+            failure_cfg.on_dropped_prompt != "replace"
+            and not self._dynamic_sampling_enabled
+        ):
+            return False
+        if not self._sampler.uses_pooled_replacements:
+            return False
+        if not self._rollout_runtime.sampler_stamps_target_steps:
+            return False
+        # The filter pool first: filtering is routine, so the mark pre-warms it and the
+        # on-demand path only backstops a step that outruns the mark.
+        if (
+            self._dynamic_sampling_enabled
+            and len(self._rollout_runtime.filtered_reserve)
+            < self._algo_cfg.num_prompts_per_step
+        ):
+            pool, mark, name = (
+                self._rollout_runtime.filtered_reserve,
+                self._algo_cfg.num_prompts_per_step,
+                "filter",
+            )
+        elif (
+            failure_cfg.on_dropped_prompt == "replace"
+            and len(self._rollout_runtime.replacement_reserve)
+            < failure_cfg.replacement_reserve_prompts
+        ):
+            pool, mark, name = (
+                self._rollout_runtime.replacement_reserve,
+                failure_cfg.replacement_reserve_prompts,
+                "spare",
+            )
+        else:
+            return False
+
+        for prompt_idx in range(prompt_batch.size):
+            spare: DatumSpec = {  # type: ignore
+                k: v[prompt_idx] for k, v in prompt_batch.items()
+            }
+            pool.append(spare)
+        print(
+            f"  {name} pool refilled with {prompt_batch.size} prompt(s) "
+            f"(low-water mark {mark}); this batch is "
+            "not admitted as a training step",
+            flush=True,
+        )
+        return True
+
+    async def _drain_reserve_into_steps(
+        self,
+        launch: Callable[[DatumSpec, Optional[int], Optional[str]], Awaitable[None]],
+    ) -> None:
+        """Train on the leftover spares once the dataloader has nothing more to give.
+
+        Spares were consumed from the dataset like any other prompt, so leaving them in
+        the pool at the end of the last epoch throws away data the run already paid for.
+
+        It also restores the step count. ``_clamp_max_num_steps`` derives
+        ``max_num_steps`` from ``len(dataloader)``, and every diverted batch is one
+        fewer batch the loop can admit -- so without this a replace-mode run quietly
+        finishes one step short of the budget it was configured with, per divert.
+
+        Whole steps only. A partial pool dispatched as a step is short by construction,
+        and ``min_step_batch_fraction`` would then reject it and fail a run that had
+        otherwise completed cleanly. In the ordinary case the pool holds exactly one
+        batch (the dataloader uses ``batch_size=num_prompts_per_step``), so the common
+        outcome is that the whole thing is recovered.
+
+        Not gated on ``on_dropped_prompt``: an empty pool makes this a no-op anyway, and
+        only a run that replaces something ever fills one, so the gate would buy nothing
+        while stranding a pool restored from a checkpoint into a run that has since
+        switched to "shrink".
+        """
+        num_prompts_per_step = self._algo_cfg.num_prompts_per_step
+        self._rollout_runtime.replacement_reserve.extend(
+            self._rollout_runtime.filtered_reserve
+        )
+        self._rollout_runtime.filtered_reserve.clear()
+        while len(self._rollout_runtime.replacement_reserve) >= num_prompts_per_step:
+            prompt_dispatches: list[tuple[DatumSpec, Optional[str]]] = []
+            async with self._dispatch_reservation("prompt_reservations") as cut:
+                # Take the step's prompts out before the first await. A drop
+                # resolving concurrently draws from this same pool, and could
+                # otherwise claim one of them and leave the step it is filling one
+                # group short.
+                step_prompts = [
+                    self._rollout_runtime.replacement_reserve.popleft()
+                    for _ in range(num_prompts_per_step)
+                ]
+                admission_id = str(uuid.uuid4())
+                for prompt in step_prompts:
+                    group_id = self._reserve_prompt_group(
+                        cut,
+                        prompt,
+                        target_step=None,
+                        admitted=False,
+                        admission_id=admission_id,
+                    )
+                    prompt_dispatches.append((prompt, group_id))
+            target_step = await self._admit_step(
+                [group_id for _, group_id in prompt_dispatches]
+            )
+            self._allow_short_drained_step(target_step)
+            print(
+                f"  dataloader exhausted; training on {len(prompt_dispatches)} "
+                f"pooled spare(s) as target_step={target_step}",
+                flush=True,
+            )
+            for prompt, group_id in prompt_dispatches:
+                await launch(prompt, target_step, group_id)
+
+        if self._rollout_runtime.replacement_reserve:
+            print(
+                f"  {len(self._rollout_runtime.replacement_reserve)} pooled spare(s) left over, fewer "
+                f"than the {num_prompts_per_step} a step needs; they are not trained on",
+                flush=True,
+            )
+
+    def _take_replacement(self, replacements_used: int) -> Optional[DatumSpec]:
+        """A spare prompt to stand in for a dropped group, or None to shrink instead.
+
+        For rollout failures only. A group dropped by dynamic sampling goes through
+        ``_pop_filtered_replacement``, which spends a different budget.
+
+        None covers the four ways a replacement can be unavailable: it was not asked
+        for, the sampler does not use a spare pool, the per-slot budget is spent, or the
+        pool is empty because the dataloader is exhausted. Every one of them falls back
+        to ``on_dropped_prompt="shrink"`` rather than waiting, because a step whose
+        replacements keep failing still has to close.
+
+        The sampler's uses_pooled_replacements flag decides whether it uses a pool.
+        """
+        failure_cfg = self._async_cfg.rollout_failure
+        if failure_cfg.on_dropped_prompt != "replace":
+            return None
+        if not self._sampler.uses_pooled_replacements:
+            return None
+        if replacements_used >= failure_cfg.max_replacement_attempts:
+            return None
+        if not self._rollout_runtime.replacement_reserve:
+            return None
+        return self._rollout_runtime.replacement_reserve.popleft()
+
+    def _record_filtered_prompt(self, target_step: Optional[int]) -> None:
+        """Count one resampled prompt against its step, without enforcing the budget.
+
+        Unstamped prompts are charged to the step currently being assembled. A pooled
+        sampler draws a replacement synchronously, so it checks the budget in the same
+        step; windowed draws none and relies on later dispatches, so the train pump
+        checks after selection instead (see ``_check_filtered_budget``).
+        """
+        step = self._step_assembler.accounting_step(target_step)
+        self._filtered_prompts_by_step[step] = (
+            self._filtered_prompts_by_step.get(step, 0) + 1
+        )
+
+    def _check_filtered_budget(self, step: int) -> None:
+        """Fail the run once a step has drawn past its generation-batch allowance.
+
+        v1 bounds a step by ``dynamic_sampling_max_gen_batches`` generation batches.
+        SC resamples per slot rather than per batch, so the same allowance is counted
+        in prompts: a step may draw this many batches' worth in total, the batch it was
+        admitted with included. A step that cannot be filled within it means the filter
+        is rejecting faster than the data can refill it, which v1 also ends the run on.
+
+        Raises:
+            RuntimeError: The step has spent its whole generation-batch allowance.
+        """
+        drawn = self._filtered_prompts_by_step.get(step, 0)
+        allowance = self._filtered_prompt_budget - self._algo_cfg.num_prompts_per_step
+        if drawn <= allowance:
+            return
+        raise RuntimeError(
+            f"dynamic sampling drew {drawn} replacement prompt(s) for target_step="
+            f"{step}, past the "
+            f"grpo.dynamic_sampling_max_gen_batches="
+            f"{cast(GRPOConfig, self._algo_cfg).dynamic_sampling_max_gen_batches} "
+            f"generation batches that step is allowed "
+            f"({allowance} prompt(s) beyond the "
+            f"{self._algo_cfg.num_prompts_per_step} it was admitted with). The filter "
+            "is rejecting faster than the data can refill the step; check "
+            "zero_variance_fraction, then raise the allowance or revisit the "
+            "reward/prompt mix."
+        )
+
+    def _charge_filtered_prompt(self, target_step: Optional[int]) -> None:
+        """Record a pooled resample and fail the run past the allowance.
+
+        A pooled sampler has the replacement in hand, so it enforces the budget in the
+        same step the prompt is drawn.
+        """
+        self._record_filtered_prompt(target_step)
+        self._check_filtered_budget(self._step_assembler.accounting_step(target_step))
+
+    def _enforce_windowed_filtered_budget(
+        self, step: int, selected_groups: int
+    ) -> None:
+        """Fail a non-pooled step once its total draw exceeds the allowance.
+
+        Windowed draws no spare per filter, so unlike the pooled path it cannot enforce
+        the budget as each filter arrives; the train pump calls this after every
+        selection instead. The check is against the groups actually selected, not a full
+        ``num_prompts_per_step``, so an EOF tail that legitimately selected fewer groups
+        keeps its full resample allowance rather than being overcounted. A still-starved
+        step (nothing selected yet) keeps accumulating draws across polls, so an
+        all-filtered wrapping loader still trips the budget.
+
+        Raises:
+            RuntimeError: Selected plus filtered draws spent the whole allowance.
+        """
+        if self._sampler.uses_pooled_replacements:
+            return
+        drawn = self._filtered_prompts_by_step.get(step, 0)
+        if selected_groups + drawn <= self._filtered_prompt_budget:
+            return
+        raise RuntimeError(
+            f"dynamic sampling drew {drawn} replacement prompt(s) for target_step="
+            f"{step} on top of {selected_groups} selected group(s), past the "
+            f"grpo.dynamic_sampling_max_gen_batches="
+            f"{cast(GRPOConfig, self._algo_cfg).dynamic_sampling_max_gen_batches} "
+            f"generation batches that step is allowed "
+            f"({self._filtered_prompt_budget} prompt(s) total). The filter is "
+            "rejecting faster than the data can refill the step; check "
+            "zero_variance_fraction, then raise the allowance or revisit the "
+            "reward/prompt mix."
+        )
+
+    async def _wait_for_filtered_reserve(self) -> None:
+        """Wait for pump refill without holding a checkpoint mutation cut."""
+        while (
+            not self._rollout_runtime.filtered_reserve
+            and not self._dataloader_exhausted
+        ):
+            await asyncio.sleep(0.1)
+
+    def _pop_filtered_replacement(
+        self, target_step: Optional[int]
+    ) -> Optional[DatumSpec]:
+        """Consume an available spare, or finish a step after data exhaustion."""
+        if self._rollout_runtime.filtered_reserve:
+            self._charge_filtered_prompt(target_step)
+            return self._rollout_runtime.filtered_reserve.popleft()
+        if not self._dataloader_exhausted:
+            raise RuntimeError("filtered replacement pool emptied before consumption")
+        self._rollout_runtime.steps_allowed_short.add(
+            self._step_assembler.accounting_step(target_step)
+        )
+        return None
+
+    @contextlib.asynccontextmanager
+    async def _replacement_mutation(
+        self, *, filtered: bool
+    ) -> AsyncIterator[Optional[DataPlaneMutationCut]]:
+        """Keep spare consumption and ledger transfer atomic without blocking saves."""
+        while True:
+            if filtered:
+                await self._wait_for_filtered_reserve()
+            async with self._dispatch_reservation("prompt_reservations") as cut:
+                # Another consumer may have taken the spare while this cut waited.
+                if (
+                    filtered
+                    and not self._rollout_runtime.filtered_reserve
+                    and not self._dataloader_exhausted
+                ):
+                    continue
+                yield cut
+                return
+
+    def _allow_short_drained_step(self, target_step: Optional[int]) -> None:
+        """Mark a drained-pool step for the final train-or-skip floor check."""
+        if target_step is None or not self._dynamic_sampling_enabled:
+            return
+        self._rollout_runtime.steps_allowed_short.add(target_step)
+
+    def _promote_into_step(self, target_step: Optional[int]) -> Optional[int]:
+        """Fill a dropped step from a later step's finished work, and name the lender.
+
+        Where a replacement goes, rather than whether one happens. The lost step closes
+        on generation that already exists instead of waiting out a rollout with the
+        trainer idle, and the caller redirects its spare prompt to the lender, which is
+        due a training step later and has the slack to absorb the wait. The same prompt
+        is generated either way.
+
+        Only ever reached with a spare already in hand, which is what makes the borrow
+        safe to take: an unrepaid loan is the same hole one step later.
+
+        Returns None -- leaving the caller filling the dropped step directly -- when
+        nothing is stamped so no step is stranded, when the trainer has already moved
+        past this step (a second drop can land after the first one closed it short, and
+        a group stamped for a finished step would only be evicted), or when no later
+        step has a finished group to lend. The last is always the case at
+        ``in_order.max_lookahead_versions=0``, where the next batch is not dispatched
+        until this step trains.
+
+        Returns:
+            The step that lent the group, which the caller now owes a rollout, or None.
+        """
+        if target_step is None:
+            return None
+        if target_step < self._trainer_version:
+            return None
+        lender_step = self._buffer.promote_ready_group(to_target_step=target_step)
+        if lender_step is None:
+            return None
+        self._batch_promotions[target_step] = (
+            self._batch_promotions.get(target_step, 0) + 1
+        )
+        print(
+            f"  target_step={target_step}: filled the dropped group by promoting a "
+            f"finished group from target_step={lender_step}; the spare prompt is "
+            "dispatched to repay that step instead",
+            flush=True,
+        )
+        return lender_step
+
+    def _substitute_dropped_group(
+        self,
+        cut: Optional[DataPlaneMutationCut],
+        replacement: Optional[DatumSpec],
+        target_step: Optional[int],
+        *,
+        filtered: bool = False,
+    ) -> tuple[Optional[str], Optional[int]]:
+        """Stand a spare prompt in for a dropped group, or close its step short.
+
+        Call inside the cut that removed the dropped group, so no snapshot sees the
+        group gone without its replacement. A finished group from a later step fills
+        the dropped step when one exists, and the spare is then generated for that
+        lender.
+
+        Args:
+            cut: The cut the group was removed in; ``None`` when nothing is recorded.
+            replacement: The spare already taken from its pool, or ``None`` if there
+                was none, which credits ``target_step`` short.
+            target_step: The step the dropped group was stamped for.
+            filtered: Whether the group was dropped by dynamic-sampling filtering
+                rather than a rollout failure. A filtered group that closes its step
+                short is allowed below the floor; a failed one is not.
+
+        Returns:
+            The ledger ID reserved for the spare (``None`` without rollout recovery
+            or without a spare) and the step the spare is generated for.
+        """
+        if replacement is None:
+            self._step_assembler.credit_shortfall(target_step, allow_short=filtered)
+            return None, target_step
+        # Attempted only now that a spare is in hand, because the borrow is a debt
+        # and the spare is what repays it. Borrowing without one would leave the
+        # lender short instead: the same hole, one step later.
+        lender_step = self._promote_into_step(target_step)
+        if lender_step is not None:
+            target_step = lender_step
+        lineage_group_id = None
+        if self._rollout_recovery_enabled:
+            assert cut is not None
+            lineage_group_id = self._rollout_manager.reserve_prompt_group(
+                cut, replacement, target_step=target_step
+            )
+        return lineage_group_id, target_step
+
+    def _target_groups_for_step(self, step: int) -> int:
+        """How many prompt groups this step should train on, after dropped prompts.
+
+        ``num_prompts_per_step`` is the target; groups charged to this step that were
+        given up on are subtracted, because they are never arriving. Which step a lost
+        group is charged to is the sampler's call (``charge_step_for_lost_group``): the
+        step it was stamped for, the step being assembled, or none. Without this the
+        pump waits on a group no one is generating.
+
+        Steps explicitly allowed to close short return their remaining target even
+        below the floor, letting the train pump drain their groups and abort
+        accumulated gradients. The final floor check decides whether to train or
+        skip. Data exhaustion alone does not grant this permission.
+
+        How much smaller is bounded by ``min_step_batch_fraction``, and that bound has
+        to live here because neither drop budget provides it. Both budgets are
+        run-scoped -- the consecutive counter is cleared by any commit, including
+        commits for other steps -- so drops landing on one step while other steps
+        succeed can shrink it without ever tripping them.
+
+        Raises:
+            RuntimeError: A step not permitted to close below the floor fell below
+                ``min_step_batch_fraction`` of ``num_prompts_per_step``.
+        """
+        num_prompts_per_step = self._algo_cfg.num_prompts_per_step
+        dropped = self._rollout_runtime.batch_shortfall.get(step, 0)
+        target = num_prompts_per_step - dropped
+        fraction = self._async_cfg.rollout_failure.min_step_batch_fraction
+        # ceil, so the floor is never rounded down into allowing one more drop than the
+        # fraction states. With fraction > 0 this is always >= 1, which also rules out
+        # the empty step.
+        floor = math.ceil(num_prompts_per_step * fraction)
+        if step in self._rollout_runtime.steps_allowed_short:
+            # Collect the remaining groups before deciding whether to skip. Streaming
+            # gradients must be aborted if the final count falls below the floor.
+            return target
+        if target < floor:
+            raise RuntimeError(
+                f"training step {step} lost {dropped} of {num_prompts_per_step} prompt "
+                f"group(s), leaving {target}, below the floor of {floor} set by "
+                f"async_rl.rollout_failure.min_step_batch_fraction={fraction}. "
+                "Either the generation fleet is failing a whole step's worth of "
+                "prompts, or the drop budgets are set too high to catch it: they are "
+                "run-scoped and cannot bound how short a single step gets."
+            )
+        return target
+
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
 
-        Per step:
-          1. sampler.evict drops stale groups from the buffer and clears their TQ rows.
-          2. sampler.select returns K prompt groups (or None) and drops them from the
-             buffer; DP rows survive so the trainer can read them. Already trainable —
-             buffer wrote training-shaped rows at rollout time.
-          3. _advantage_stage(train_meta).
-          4. trainer.train_microbatches_from_meta + finish_train_step.
-          5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
-             per dropped group, then sync.
-        """
-        grpo_cfg = self._master_config.grpo
+        Per step, with 1-4 running per streaming chunk and 5-6 once the chunk
+        loop closes:
+            1. Select the rollouts to train on.
+                a. sampler.evict drops stale groups from the buffer and clears their
+                    TQ rows.
+                b. sampler.select returns K prompt groups, or None, and claims them
+                    for training. The DP rows survive, already training-shaped
+                    because the buffer wrote them that way at rollout time.
+                c. Claimed groups retain their _buffer_capacity permits until
+                    step cleanup; evicted groups release theirs immediately.
+            2. Prepare the batch.
+                a. Value model forward (PPO only), parking policy parameters and
+                    optimizer on CPU where supported. Pending policy gradients
+                    stay on GPU.
+                b. Policy and reference logprobs.
+                c. _advantage_stage.
+            3. Train on the chunk.
+                a. Policy model: train_microbatches_from_meta accumulates gradients.
+                b. Full-batch PPO closes each actor epoch here (kept for ppo_epochs > 1);
+                    streaming PPO and GRPO accumulate across chunks and close the policy
+                    step in 5. Streaming PPO requires ppo.ppo_epochs=1.
+            4. Close the chunk. Refresh min_sample_version and the dispatch tally. The
+                consumed rows stay in TQ: staged capture deltas are read by the policy
+                workers during 3, so nothing is cleared until the step closes.
+                Streaming PPO prepares the critic before waiting for the next chunk.
+            5. Finish training the step.
+                a. finish_train_step all_reduces the accumulated policy gradients,
+                    rescales, and runs optimizer.step, unless full-batch PPO already
+                    closed its actor epochs in 3.
+                b. PPO refits separate generation GPUs early, then runs all
+                    ppo.critic_ppo_epochs on the concatenated full batch.
+                c. _cleanup_consumed_metas clears every consumed canonical row and
+                    its staged capture deltas, releasing training claims and capacity.
+            6. Refit the model. Sync the new policy weights to generation unless PPO
+                already refit in 5. Generation sharing the training GPUs stays asleep
+                until critic training finishes.
 
-        while self._train_steps < grpo_cfg.max_num_steps:
+        PPO critic warmup (ppo.policy_training_start_step > 0) changes which of those
+        run. For the first N steps 5b still trains the critic every step, but policy
+        training and refit are skipped. The trainer version still advances, and the
+        sampler's lookahead is widened while the policy is frozen.
+        """
+        policy_training_start_step = (
+            self._algo_cfg.policy_training_start_step if self._is_ppo else 0
+        )
+        forest_training = self._master_config.token_capture.forest_training
+        selection_kwargs = (
+            {
+                "group_multiple": self._ppo_group_multiple,
+                "min_remaining_groups": self._ppo_min_remaining_groups,
+            }
+            if self._streaming_ppo
+            else {}
+        )
+
+        while self._train_steps < self._algo_cfg.max_num_steps:
+            maybe_gpu_profile_step(self._trainer, self._train_steps + 1)
+            if self._gen is not self._trainer and isinstance(
+                self._gen, (VllmGeneration, MegatronGeneration)
+            ):
+                maybe_gpu_profile_step(self._gen, self._train_steps + 1)
             version_during_step = self._trainer_version
+            self._step_assembler.begin_step(version_during_step)
             groups_dispatched = 0
+            evicted_stale_prompt_groups = 0
             min_sample_version = None
             step_open = False
+            value_inference_prepared = False
+            chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
+            selected_rollout_metrics: list[dict[str, Any]] = []
+            # Only the final epoch's metrics are retained for each model.
+            policy_result: Optional[dict[str, Any]] = None
+            value_result: Optional[dict[str, Any]] = None
+            value_train_metas: list[KVBatchMeta] = []
+            # PPO requires at least one chunk with valid training tokens per step.
+            step_has_valid_training_tokens = False
+            early_refit_done = False
+            aborted_stale_inflight_groups = 0
+            # Always True off the PPO path: the start step is pinned to 0 there.
+            is_policy_training_step = self._train_steps >= policy_training_start_step
+            policy_logprobs_required = self._policy_logprobs_required or (
+                self._warmup_policy_logprobs_required and not is_policy_training_step
+            )
+            consumed_metas: list[KVBatchMeta] = []
+            consumed_training_claim_ids: list[str] = []
+            consumed_group_count = 0
+            step_finalizer_metrics: dict[str, list[float]] = {}
+            logical_owners: set[str] = set()
+            step_finalizer_rewards: list[FinalizedReward] = []
+            step_finalizer_group_ids: set[str] = set()
 
-            with self._timer.time("total_step_time"):
-                while groups_dispatched < grpo_cfg.num_prompts_per_step:
-                    # Wait for a selectable batch
+            with (
+                # Pinned here rather than read per span: _train_steps is
+                # incremented part-way through the step, so a later read would
+                # tag the checkpoint spans with a different value than the
+                # step they belong to.
+                iteration_scope(self._train_steps + 1),
+                self._timer.time("total_step_time"),
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
+                    "rl.sc.step",
+                    tracer=self._tracer,
+                    # No rl.epoch: the rollout pump advances the epoch on its own
+                    # clock, so its value here would describe whichever epoch that
+                    # pump had reached, not the one this step's data came from.
+                    **{"rl.weight_version": version_during_step},
+                ),
+            ):
+                if self._pending_checkpoint is not None:
+                    # Before this step's first policy-worker call, so the finalize
+                    # collectives run at the same point on every rank.
+                    with self._timer.time("checkpoint_finalize"):
+                        await self._finish_pending_save(blocking=False)
+                # One span per starvation episode, not per 5ms poll.
+                starvation_span: Optional[Any] = None
+                starvation_polls = 0
+                # Re-read on every iteration rather than once: a prompt stamped for this
+                # step can be dropped while the pump is already waiting for it, which is
+                # precisely the case that would otherwise wait forever.
+                while groups_dispatched < self._target_groups_for_step(
+                    version_during_step
+                ):
+                    # ---- 1. Select the rollouts to train on ----
                     with self._timer.time("exposed_generation"):
                         await asyncio.sleep(0)
 
                         # Evict stale groups
+                        # TQReplayBuffer.remove() owns the group-removal mutation
+                        # cut. Acquiring another cut here would nest the same
+                        # non-reentrant barrier section in this task.
                         evicted = await self._sampler.evict(
                             current_train_weight=self._trainer_version,
                         )
+                        evicted_stale_prompt_groups += evicted
                         if evicted:
                             print(
                                 f"  evicted {evicted} stale prompt group(s)",
@@ -392,20 +2890,100 @@ class SingleControllerActor:
                             )
                             for _ in range(evicted):
                                 self._buffer_capacity.release()
+                            self._prune_finalizer_state(step_finalizer_group_ids)
 
-                        # Select a batch
-                        max_prompt_groups = (
-                            grpo_cfg.num_prompts_per_step - groups_dispatched
+                        # Select a batch. Read the target again rather than reusing
+                        # the loop condition's value: the awaits above are a window in
+                        # which a prompt stamped for this step can be dropped, and the
+                        # target would then be stale by the time it is subtracted. It
+                        # can also have fallen to what is already dispatched, which is
+                        # not a batch the sampler can be asked for -- select() rejects
+                        # a min below 1 -- so close the step instead.
+                        target_groups = self._target_groups_for_step(
+                            version_during_step
                         )
+                        max_prompt_groups = target_groups - groups_dispatched
+                        if max_prompt_groups <= 0:
+                            break
+                        # Bound what one dispatch materializes; the floor below
+                        # still clamps to this maximum.
+                        chunk_cap = self._async_cfg.max_groups_for_streaming_train
+                        if chunk_cap is not None:
+                            max_prompt_groups = min(max_prompt_groups, chunk_cap)
+                        # For a colocated engine this is max_prompt_groups, pinned inside setup.
                         min_prompt_groups = min(
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
+                        if (
+                            self._rollout_exhausted.is_set()
+                            and self._sampler.closes_short_at_exhaustion
+                        ):
+                            # Nothing more will arrive, so take what is left instead of
+                            # waiting for a full chunk.
+                            min_prompt_groups = 1
+                        selected_group_ids: list[str] = []
+                        selected_training_claim_ids: list[str] = []
+                        training_claim_ids_before = (
+                            self._buffer.training_owned_group_ids()
+                        )
+                        assembly = self._step_assembler.step_assembly
+                        assert assembly is not None
+                        cursor_before_selection = (
+                            self._step_assembler.assembling_version
+                        )
+                        selection_credits: list[ShortfallCredit] = []
+                        assembly.selection_credits = selection_credits
                         train_meta, num_groups = await self._sampler.select(
                             current_train_weight=self._trainer_version,
                             min_prompt_groups=min_prompt_groups,
                             max_prompt_groups=max_prompt_groups,
+                            **selection_kwargs,
                         )
+                        assembly.selection_credits = None
+                        assembly.selected_groups = groups_dispatched + num_groups
+                        # Credits remain checkpoint-visible while the claim waits.
+                        self._step_assembler.reconcile_selection_credits(
+                            cursor_before_selection, selection_credits
+                        )
+                        if self._dynamic_sampling_enabled:
+                            # Enforce the windowed budget against what was actually
+                            # selected, every poll -- not only when a poll starves.
+                            self._enforce_windowed_filtered_budget(
+                                version_during_step, assembly.selected_groups
+                            )
+                        training_claim_ids_after = (
+                            self._buffer.training_owned_group_ids()
+                        )
+                        removed_training_claim_ids = (
+                            training_claim_ids_before - training_claim_ids_after
+                        )
+                        if removed_training_claim_ids:
+                            raise RuntimeError(
+                                "sampler selection removed existing training claims: "
+                                f"{sorted(removed_training_claim_ids)!r}"
+                            )
+                        new_training_claim_ids = (
+                            training_claim_ids_after - training_claim_ids_before
+                        )
+                        if train_meta is not None:
+                            selected_group_ids = self._group_ids_from_meta(train_meta)
+                            if new_training_claim_ids:
+                                if set(selected_group_ids) != new_training_claim_ids:
+                                    raise RuntimeError(
+                                        "sampler selection does not match its new "
+                                        "training claims: "
+                                        f"selected={selected_group_ids!r}, "
+                                        "claimed="
+                                        f"{sorted(new_training_claim_ids)!r}"
+                                    )
+                                selected_training_claim_ids = selected_group_ids
+                        elif new_training_claim_ids:
+                            raise RuntimeError(
+                                "sampler selection created training claims without "
+                                "returning batch metadata: "
+                                f"{sorted(new_training_claim_ids)!r}"
+                            )
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:
@@ -418,32 +2996,188 @@ class SingleControllerActor:
                                         flush=True,
                                     )
                                     return
+                                if self._sampler.closes_short_at_exhaustion:
+                                    # At EOF, later groups cannot fill these slots.
+                                    missing = target_groups - groups_dispatched
+                                    if self._dynamic_sampling_enabled:
+                                        self._rollout_runtime.steps_allowed_short.add(
+                                            version_during_step
+                                        )
+                                    self._rollout_runtime.batch_shortfall[
+                                        version_during_step
+                                    ] = (
+                                        self._rollout_runtime.batch_shortfall.get(
+                                            version_during_step, 0
+                                        )
+                                        + missing
+                                    )
+                                    print(
+                                        f"  rollout exhausted: step "
+                                        f"{version_during_step} closes {missing} "
+                                        "group(s) short",
+                                        flush=True,
+                                    )
+                                    continue
+                                # Against the step's own target, not the configured
+                                # batch size: a step that legitimately shrank would
+                                # otherwise be reported as missing groups it was
+                                # already excused from.
                                 raise RuntimeError(
                                     "rollout exhausted before a complete training "
                                     f"step was assembled: dispatched "
-                                    f"{groups_dispatched}/"
-                                    f"{grpo_cfg.num_prompts_per_step} prompt "
+                                    f"{groups_dispatched}/{target_groups} prompt "
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
+                            # Safe to span the select: a starved poll never
+                            # reaches the data plane, so nothing below is
+                            # counted twice.
+                            if starvation_span is None:
+                                starvation_span = start_efficiency_span(
+                                    "idle/buffer_starvation", tracer=self._tracer
+                                )
+                                starvation_polls = 0
+                            starvation_polls += 1
                             await asyncio.sleep(0.005)
                             continue
 
-                        # Release buffer capacity
-                        for _ in range(num_groups):
-                            self._buffer_capacity.release()
+                        # A batch is selectable, so the wait is over. Closing it
+                        # here rather than after the loop keeps the span on the
+                        # stall itself; the loop can go around again for the next
+                        # chunk, which opens a fresh episode.
+                        if starvation_span is not None:
+                            safe_set_span_attributes(
+                                starvation_span,
+                                {RL_IDLE_POLLS_ATTR: starvation_polls},
+                            )
+                            starvation_span.end()
+                            starvation_span = None
+
+                        consumed_metas.append(train_meta)
+                        consumed_training_claim_ids.extend(selected_training_claim_ids)
+                        consumed_group_count += num_groups
+                        if forest_training:
+                            if (
+                                not has_logical_owners(train_meta)
+                                or len(train_meta.tags or []) != train_meta.size
+                                or any(
+                                    type(tag.get("weight_version")) is not int
+                                    or type(tag.get("is_execution_padding")) is not bool
+                                    or type(tag.get("uses_borrowed_input")) is not bool
+                                    for tag in train_meta.tags or []
+                                )
+                            ):
+                                raise ValueError(
+                                    "Forest optimizer batch requires logical rows with padding flags, borrowed-input flags, and integer generation versions"
+                                )
+
+                        for group_id in selected_group_ids:
+                            if group_id in step_finalizer_group_ids:
+                                continue
+                            step_finalizer_group_ids.add(group_id)
+                            step_finalizer_rewards.extend(
+                                self._rollout_runtime.finalizer_rewards_by_group.get(
+                                    group_id, []
+                                )
+                            )
+                            for (
+                                name,
+                                value,
+                            ) in self._rollout_runtime.finalizer_metrics_by_group.get(
+                                group_id, {}
+                            ).items():
+                                step_finalizer_metrics.setdefault(name, []).append(
+                                    float(value)
+                                )
+
+                        selected_rollout_metrics.extend(
+                            train_meta.extra_info.pop(ROLLOUT_METRICS, [])
+                        )
+
+                    # Safe mid-loop: colocated steps are assembled whole, so the loop closes after this.
+                    # The gate reopens at the post-step _sync_weights wake, or after the save on save-bound steps.
+                    if self._gen.blocks_training():
+                        self._rollout_permitted.clear()
+                        # Deadline clocks measure inference service time, not wall clock:
+                        # the switch to training must not tick them down.
+                        self._rollout_manager.suspend_request_deadlines()
+                        await asyncio.to_thread(self._gen.finish_generation)
+
+                    # ---- 2. Prepare the batch ----
+                    if self._is_ppo:
+                        # Doing value inference first keeps each chunk to one visit
+                        # per model, which is saving the offload/onloading cost.
+                        # Keep accumulated policy gradients resident while
+                        # offloading policy parameters/optimizer for the critic.
+                        if not value_inference_prepared and not self._value_dedicated:
+                            with (
+                                self._timer.time("value_inference_prep"),
+                                managed_span(
+                                    RLSpanGroup.DATA_PROCESSING,
+                                    "rl.sc.value_inference_prep",
+                                    tracer=self._tracer,
+                                ),
+                            ):
+                                if step_open:
+                                    await asyncio.to_thread(
+                                        self._trainer.pause_train_step_with_offloading
+                                    )
+                                else:
+                                    await asyncio.to_thread(
+                                        self._trainer.offload_to_cpu
+                                    )
+                                    if self._gen.blocks_training():
+                                        await asyncio.to_thread(
+                                            self._trainer.finish_inference
+                                        )
+                        with (
+                            self._timer.time("value_inference"),
+                            managed_span(
+                                RLSpanGroup.ADVANTAGE,
+                                "rl.sc.value_inference",
+                                tracer=self._tracer,
+                            ),
+                        ):
+                            train_meta = await self._value_stage(
+                                train_meta,
+                                already_prepared=value_inference_prepared,
+                            )
+                        value_inference_prepared = False
+                        if step_open:
+                            with self._timer.time("training_prep"):
+                                await asyncio.to_thread(
+                                    self._trainer.prepare_for_training
+                                )
 
                     # Compute prev_logprobs / ref_logprobs
-                    if (
-                        self._policy_logprobs_required
-                        or self._reference_logprobs_required
-                    ):
-                        with self._timer.time("logprob_inference_prep"):
+                    if policy_logprobs_required or self._reference_logprobs_required:
+                        with (
+                            self._timer.time("logprob_inference_prep"),
+                            managed_span(
+                                RLSpanGroup.DATA_PROCESSING,
+                                "rl.sc.logprob_inference_prep",
+                                tracer=self._tracer,
+                            ),
+                        ):
+                            # Once the step is open, gradients are accumulating
+                            # in the trainer's grad buffers across chunks. The
+                            # Megatron buffer offload frees that storage outright
+                            # and its reload zeroes it, so offloading here would
+                            # discard every chunk but the last while the 1/N
+                            # normalizer still counts all of them.
                             await asyncio.to_thread(
-                                self._trainer.prepare_for_lp_inference
+                                self._trainer.prepare_for_lp_inference,
+                                keep_train_buffers=step_open or self._value_dedicated,
                             )
-                        with self._timer.time("policy_and_reference_logprobs"):
-                            if self._policy_logprobs_required:
+                        with (
+                            self._timer.time("policy_and_reference_logprobs"),
+                            managed_span(
+                                RLSpanGroup.LOGPROB,
+                                "rl.sc.policy_and_reference_logprobs",
+                                tracer=self._tracer,
+                            ),
+                        ):
+                            if policy_logprobs_required:
                                 await asyncio.to_thread(
                                     self._trainer.get_logprobs_from_meta, train_meta
                                 )
@@ -452,25 +3186,130 @@ class SingleControllerActor:
                                     self._trainer.get_reference_policy_logprobs_from_meta,
                                     train_meta,
                                 )
-
                     # Compute advantages
-                    with self._timer.time("advantage_calculation"):
-                        train_meta = await self._advantage_stage(train_meta)
-
-                    # Train
-                    with self._timer.time("training_prep"):
-                        await asyncio.to_thread(self._trainer.prepare_for_training)
-                    with self._timer.time("policy_training"):
-                        if not step_open:
-                            await asyncio.to_thread(
-                                self._trainer.begin_train_step,
-                                self._loss_fn,
-                            )
-                            step_open = True
-                        await asyncio.to_thread(
-                            self._trainer.train_microbatches_from_meta,
+                    with (
+                        self._timer.time("advantage_calculation"),
+                        managed_span(
+                            RLSpanGroup.ADVANTAGE,
+                            "rl.sc.advantage_calculation",
+                            tracer=self._tracer,
+                        ),
+                    ):
+                        (
                             train_meta,
+                            has_valid_training_tokens,
+                        ) = await self._advantage_stage(
+                            train_meta,
+                            policy_logprobs_required=policy_logprobs_required,
                         )
+                    if forest_training:
+                        # The advantage stage has verified every owner/segment.
+                        # Count those owners, not the physical rows or sampler tally.
+                        assert train_meta.tags is not None
+                        chunk_owners = {
+                            tag["logical_rollout_id"]
+                            for tag in train_meta.tags
+                            if not tag["is_execution_padding"]
+                        }
+                        if (
+                            len(selected_group_ids) != num_groups
+                            or len(chunk_owners)
+                            != num_groups * self._algo_cfg.num_generations_per_prompt
+                            or logical_owners.intersection(chunk_owners)
+                        ):
+                            raise ValueError(
+                                "Forest sampler chunk must contain new, complete logical groups"
+                            )
+                        logical_owners.update(chunk_owners)
+
+                    step_has_valid_training_tokens |= has_valid_training_tokens
+                    if self._is_ppo:
+                        value_train_metas.append(train_meta)
+
+                    # A full-batch PPO chunk is the whole step. Streaming may
+                    # still receive valid tokens in a later chunk.
+                    if (
+                        self._is_ppo
+                        and not self._streaming_ppo
+                        and not has_valid_training_tokens
+                    ):
+                        raise RuntimeError(
+                            "SingleController has no valid response tokens after "
+                            "filtering. Check seq_logprob_error_threshold, "
+                            "overlong_filtering, and environment mask_sample flags "
+                            "to avoid an optimizer step with an empty batch."
+                        )
+
+                    # ---- 3. Train the model -- train_microbatches_from_meta ----
+                    # Filtering can leave a GRPO streaming chunk with no training
+                    # tokens. Consume that chunk without F/B, then continue the same
+                    # optimizer step with the next chunk.
+
+                    # GRPO and streaming PPO accumulate policy gradients here.
+                    # Full-batch PPO closes each actor epoch here, keeping the
+                    # policy resident until every actor epoch has completed.
+                    # TODO(#2625): value_result, policy_result only record the last epoch's metrics.
+                    # That matches ppo.py for the losses; total_flops is additive and undercounted.
+                    if is_policy_training_step:
+                        if (
+                            self._is_ppo
+                            and groups_dispatched == 0
+                            and self._train_steps == policy_training_start_step
+                            and policy_training_start_step > 0
+                        ):
+                            print(
+                                f"  ✓ Critic warmup complete ({policy_training_start_step} "
+                                "steps). Starting policy training.",
+                                flush=True,
+                            )
+                        # Always restore training mode because log-prob inference may have
+                        # switched the model to inference mode. Keep it resident
+                        # across every PPO actor epoch.
+                        with (
+                            self._timer.time("training_prep"),
+                            managed_span(
+                                RLSpanGroup.DATA_PROCESSING,
+                                "rl.sc.training_prep",
+                                tracer=self._tracer,
+                            ),
+                        ):
+                            await asyncio.to_thread(self._trainer.prepare_for_training)
+
+                        if has_valid_training_tokens:
+                            for epoch in range(self._ppo_epochs):
+                                with (
+                                    self._timer.time("policy_training"),
+                                    managed_span(
+                                        RLSpanGroup.POLICY_UPDATE,
+                                        "rl.sc.policy_training",
+                                        tracer=self._tracer,
+                                        **{"rl.ppo_epoch": epoch + 1},
+                                    ),
+                                ):
+                                    if not step_open:
+                                        await asyncio.to_thread(
+                                            self._trainer.begin_train_step,
+                                            self._loss_fn,
+                                        )
+                                        step_open = True
+                                    await asyncio.to_thread(
+                                        self._trainer.train_microbatches_from_meta,
+                                        train_meta,
+                                        train_fields=self._train_fields,
+                                    )
+                                    # Full-batch PPO closes each policy epoch;
+                                    # streaming keeps accumulating across chunks.
+                                    if self._is_ppo and not self._streaming_ppo:
+                                        # Drain a snapshot of the old trainer
+                                        # identity before the first irreversible
+                                        # optimizer update, as on the streaming path.
+                                        await self._rollout_snapshots.begin_optimizer_commit(
+                                            drain_snapshot=True
+                                        )
+                                        policy_result = await asyncio.to_thread(
+                                            self._trainer.finish_train_step
+                                        )
+                                        step_open = False
 
                     if train_meta.sequence_lengths:
                         self._step_log_dict["sequence_lengths"].extend(
@@ -478,11 +3317,16 @@ class SingleControllerActor:
                         )
 
                     if getattr(self._gen, "requires_kv_scale_sync", False):
+                        # Mirrors grpo_sync's calibration filter. The static
+                        # list cannot name the VLM extras -- which of
+                        # pixel_values / image_grid_thw / ... exist is
+                        # per-processor -- so without the union this path
+                        # calibrates image-blind on a VLM run.
                         calibration_fields = [
                             field
                             for field in (train_meta.fields or [])
                             if field in DP_CALIB_INPUT_FIELDS
-                        ]
+                        ] + present_multimodal_fields(train_meta)
                         calibration_batches.append(
                             await asyncio.to_thread(
                                 self._trainer.read_from_dataplane,
@@ -491,6 +3335,7 @@ class SingleControllerActor:
                             )
                         )
 
+                    # ---- 4. Clear the batch ----
                     # Refresh min_sample_version
                     curr_min_sample_version = min(
                         t["weight_version"]
@@ -503,33 +3348,520 @@ class SingleControllerActor:
                     else:
                         min_sample_version = curr_min_sample_version
 
-                    # Remove consumed sample_ids from the buffer
-                    await self._call_dp(
-                        "clear_samples",
-                        sample_ids=list(train_meta.sample_ids),
-                        partition_id=self._partition_id,
+                    groups_dispatched += num_groups
+                    chunks_dispatched += 1
+                    # How many chunks a step is split into decides how many times
+                    # gradients accumulate before the single reduce, so record it
+                    # rather than leaving it to be inferred from phase timings.
+                    #
+                    # These reach a run's output only because nemo_rl/__init__.py
+                    # sets the `nemo_rl` logger to NRL_LOG_LEVEL (INFO by
+                    # default); the bare basicConfig() there pins the root logger
+                    # at WARNING and no later basicConfig can raise it. Note that
+                    # the handler writes to stderr while the progress prints
+                    # around this write to stdout, so the two are not guaranteed
+                    # to interleave in order in a Ray driver log.
+                    log.info(
+                        "train_pump: step %d chunk %d: %d group(s), %d/%d dispatched",
+                        version_during_step,
+                        chunks_dispatched,
+                        num_groups,
+                        groups_dispatched,
+                        self._algo_cfg.num_prompts_per_step,
                     )
 
-                    groups_dispatched += num_groups
+                    if (
+                        self._is_ppo
+                        and self._streaming_ppo
+                        and groups_dispatched
+                        < self._target_groups_for_step(version_during_step)
+                    ):
+                        # Prepare the critic before waiting for the next chunk.
+                        # Account for this worker work separately from waiting;
+                        # generation may already have completed. Empty selections
+                        # reuse this residency without further model switches.
+                        with (
+                            self._timer.time("value_inference_prep"),
+                            managed_span(
+                                RLSpanGroup.DATA_PROCESSING,
+                                "rl.sc.value_inference_prep",
+                                tracer=self._tracer,
+                            ),
+                        ):
+                            if not self._value_dedicated:
+                                if step_open:
+                                    await asyncio.to_thread(
+                                        self._trainer.pause_train_step_with_offloading
+                                    )
+                                else:
+                                    await asyncio.to_thread(
+                                        self._trainer.offload_to_cpu
+                                    )
+                            await asyncio.to_thread(self._value.prepare_for_inference)
+                        value_inference_prepared = True
 
-                with self._timer.time("policy_training"):
-                    result = await asyncio.to_thread(self._trainer.finish_train_step)
+                # No await separates the final target check from this advance.
+                self._step_assembler.finish_step(version_during_step)
 
-                step_metrics = aggregate_step_metrics(result)
+                # The loop can leave a wait open on two exits that continue
+                # the run, where an unended span would stay open over the
+                # training that follows and never be exported. The other
+                # exits all end the run, so they are not covered.
+                if starvation_span is not None:
+                    safe_set_span_attributes(
+                        starvation_span, {RL_IDLE_POLLS_ATTR: starvation_polls}
+                    )
+                    starvation_span.end()
+
+                if value_inference_prepared:
+                    # A dropped rollout can shrink the target while selection is
+                    # waiting, closing the step without another critic forward.
+                    # Release its speculative residency and restore policy
+                    # residency before the optimizer update and early refit.
+                    with self._timer.time("value_inference_prep"):
+                        await asyncio.to_thread(self._value.finish_inference)
+                    value_inference_prepared = False
+                    if step_open:
+                        with self._timer.time("training_prep"):
+                            await asyncio.to_thread(self._trainer.prepare_for_training)
+
+                # ---- 5. Train the policy model -- finish_train_step ----
+                log.info(
+                    "train_pump: step %d closing on %d chunk(s), %d group(s)",
+                    version_during_step,
+                    chunks_dispatched,
+                    groups_dispatched,
+                )
+
+                skipped_step = (
+                    version_during_step in self._rollout_runtime.steps_allowed_short
+                    and groups_dispatched
+                    < math.ceil(
+                        self._algo_cfg.num_prompts_per_step
+                        * self._async_cfg.rollout_failure.min_step_batch_fraction
+                    )
+                )
+                if skipped_step:
+                    if step_open:
+                        await asyncio.to_thread(self._trainer.abort_train_step)
+                        step_open = False
+                    await self._rollout_snapshots.begin_optimizer_commit(
+                        drain_snapshot=False
+                    )
+                    log.info(
+                        "train_pump: skipping data-exhausted step %d: %d/%d groups, "
+                        "min_step_batch_fraction=%s; no optimizer update",
+                        version_during_step,
+                        groups_dispatched,
+                        self._algo_cfg.num_prompts_per_step,
+                        self._async_cfg.rollout_failure.min_step_batch_fraction,
+                    )
+                elif self._is_ppo:
+                    if not step_has_valid_training_tokens:
+                        raise RuntimeError(
+                            "SingleController has no valid response tokens after "
+                            "filtering. Check seq_logprob_error_threshold, "
+                            "overlong_filtering, and environment mask_sample flags "
+                            "to avoid an optimizer step with an empty batch."
+                        )
+                    # Drain any snapshot already preparing/capturing its old
+                    # trainer identity before early refit advances the version.
+                    # Future snapshots see the flag under this same lock and
+                    # skip until the critic and batch consumption finish.
+                    await self._rollout_snapshots.begin_optimizer_commit(
+                        drain_snapshot=True
+                    )
+                    if is_policy_training_step and self._streaming_ppo:
+                        assert step_open
+                        with (
+                            self._timer.time("policy_training"),
+                            managed_span(
+                                RLSpanGroup.POLICY_UPDATE,
+                                "rl.sc.policy_optimizer_step",
+                                tracer=self._tracer,
+                            ),
+                        ):
+                            policy_result = await asyncio.to_thread(
+                                self._trainer.finish_train_step
+                            )
+                        step_open = False
+                    if is_policy_training_step and not self._gen.blocks_training():
+                        # Publish exactly one policy version before full-batch
+                        # critic training, allowing new rollouts during its epochs.
+                        # A generation engine sharing the training GPUs must
+                        # instead remain asleep until the critic has finished.
+                        self._trainer_version += 1
+                        with (
+                            self._timer.time("weight_sync"),
+                            efficiency_span("idle/refit_bubble", tracer=self._tracer),
+                        ):
+                            calibration_data = (
+                                BatchedDataDict.from_batches(calibration_batches)
+                                if calibration_batches
+                                else None
+                            )
+                            aborted_stale_inflight_groups = await self._sync_weights(
+                                calibration_data=calibration_data,
+                            )
+                        self._retune_lookahead_versions()
+                        self._rollout_manager.set_weight_version(self._trainer_version)
+                        early_refit_done = True
+                        log.info(
+                            "PPO: step %d policy update/refit complete at version %d",
+                            version_during_step,
+                            self._trainer_version,
+                        )
+
+                    with self._timer.time("value_training_prep"):
+                        if self._gen.blocks_training() and is_policy_training_step:
+                            # Gather updated parameters before offload's eval()
+                            # refreshes inference caches. Generation stays asleep
+                            # until critic training finishes.
+                            await asyncio.to_thread(
+                                self._trainer.sync_params_before_refit
+                            )
+                        if not self._value_dedicated:
+                            await asyncio.to_thread(self._trainer.offload_to_cpu)
+                        if self._gen.blocks_training():
+                            await asyncio.to_thread(self._trainer.finish_inference)
+                    # GAE has produced the frozen predictions and targets for
+                    # every row. Critic epochs replay every selected chunk.
+                    log.info(
+                        "PPO: step %d critic train: %d samples, %d epochs",
+                        version_during_step,
+                        sum(meta.size for meta in value_train_metas),
+                        self._critic_ppo_epochs,
+                    )
+                    with (
+                        self._timer.time("value_training"),
+                        managed_span(
+                            RLSpanGroup.POLICY_UPDATE,
+                            "rl.sc.value_training",
+                            tracer=self._tracer,
+                            **{"rl.critic_epochs": self._critic_ppo_epochs},
+                        ),
+                    ):
+                        value_result = await self._value_train_epochs(
+                            value_train_metas,
+                            num_epochs=self._critic_ppo_epochs,
+                        )
+                else:
+                    if forest_training and (
+                        groups_dispatched
+                        != self._target_groups_for_step(version_during_step)
+                        or len(logical_owners)
+                        != groups_dispatched * self._algo_cfg.num_generations_per_prompt
+                    ):
+                        raise ValueError(
+                            "Forest optimizer step requires complete retained logical groups"
+                        )
+                    if not step_open:
+                        raise RuntimeError(
+                            "SingleController has no valid response tokens after "
+                            "filtering. Check seq_logprob_error_threshold, "
+                            "overlong_filtering, and environment mask_sample flags "
+                            "to avoid an optimizer step with an empty batch."
+                        )
+
+                    with (
+                        self._timer.time("policy_training"),
+                        managed_span(
+                            RLSpanGroup.POLICY_UPDATE,
+                            "rl.sc.policy_optimizer_step",
+                            tracer=self._tracer,
+                        ),
+                    ):
+                        policy_result = await asyncio.to_thread(
+                            self._trainer.finish_train_step
+                        )
+                    await self._rollout_snapshots.begin_optimizer_commit(
+                        drain_snapshot=False
+                    )
+
+                # Aggregate step metrics
+                step_metrics: dict[str, Any] = {"skipped_step": int(skipped_step)}
+                if policy_result is not None:
+                    step_metrics.update(aggregate_step_metrics(policy_result))
+                    _update_adaptive_loss_state(self._loss_fn, step_metrics)
+                if value_result is not None:
+                    step_metrics.update(_compute_critic_metrics(value_result))
+                async with self._data_plane_checkpoint_barrier.mutation(
+                    "sample_clears"
+                ) as cut:
+                    await self._cleanup_consumed_metas_unlocked(cut, consumed_metas)
+                    self._buffer.release_training_claims(consumed_training_claim_ids)
+                    for group_id in step_finalizer_group_ids:
+                        self._rollout_runtime.finalizer_metrics_by_group.pop(
+                            group_id, None
+                        )
+                        self._rollout_runtime.finalizer_rewards_by_group.pop(
+                            group_id, None
+                        )
+                for _ in range(consumed_group_count):
+                    self._buffer_capacity.release()
+                step_metrics.update(
+                    {
+                        name: statistics.fmean(values)
+                        for name, values in step_finalizer_metrics.items()
+                        if values
+                        and not name.startswith(
+                            (
+                                "finalize/penalty_count/",
+                                "finalize/effort/",
+                                "finalize/length_penalty/",
+                                "finalize/truncated_count",
+                            )
+                        )
+                    }
+                )
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
-                self._step_log_dict = {k: [] for k in self._step_log_dict}
-
-                self._trainer_version += 1
-                self._train_steps += 1
-                with self._timer.time("weight_sync"):
-                    calibration_data = (
-                        BatchedDataDict.from_batches(calibration_batches)
-                        if calibration_batches
-                        else None
+                per_group_rollout_metrics: dict[str, list[Any]] = {}
+                for group_metrics in selected_rollout_metrics:
+                    for metric_name, value in group_metrics.items():
+                        per_group_rollout_metrics.setdefault(metric_name, []).append(
+                            value
+                        )
+                batch_age = pop_batch_age(
+                    per_group_rollout_metrics, version_during_step
+                )
+                if batch_age is not None:
+                    # Token-weighted policy updates between generating a token
+                    # and training on it.
+                    step_metrics["batch_age"] = batch_age
+                step_metrics.update(
+                    aggregate_rollout_metrics(per_group_rollout_metrics)
+                )
+                step_metrics.update(
+                    aggregate_capture_reward_metrics(
+                        step_finalizer_metrics, step_finalizer_rewards
                     )
-                    await self._sync_weights(calibration_data=calibration_data)
+                )
+                if self._log_full_result_tables:
+                    for name, data in capture_reward_result_tables(
+                        step_finalizer_rewards
+                    ).items():
+                        step_metrics[name] = Table(data=data, columns=["Full result"])
+                try:
+                    step_metrics.update(
+                        await asyncio.to_thread(
+                            self._gen.get_step_metrics, keep_snapshot=True
+                        )
+                    )
+                except RayActorError as error:
+                    log.warning("Skipping generation step metrics: %s", error)
+                if self._master_config.rollout_recovery.generation_prefix_cuts_enabled:
+                    try:
+                        prefix_counts = await asyncio.to_thread(
+                            self._gen.get_generation_prefix_counts
+                        )
+                    except RayActorError as error:
+                        log.warning("Skipping generation-prefix metrics: %s", error)
+                    else:
+                        # Totals since the generation workers started, so a
+                        # restore or a failed cut shows up as a step in the curve.
+                        step_metrics.update(
+                            {
+                                f"generation_prefix/{name}": float(count)
+                                for name, count in prefix_counts.items()
+                            }
+                        )
+                self._step_log_dict = {k: [] for k in self._step_log_dict}
+                step_metrics.update(
+                    _pooled_opd_metrics(
+                        self._opd_stat_sum,
+                        self._opd_stat_sumsq,
+                        self._opd_stat_count,
+                        gap_sum=self._opd_gap_sum,
+                    )
+                )
+                self._opd_gap_sum = 0.0
+                self._opd_stat_sum = 0.0
+                self._opd_stat_sumsq = 0.0
+                self._opd_stat_count = 0
+                if self._teacher_coordinator is not None:
+                    step_metrics.update(self._teacher_coordinator.drain_metrics())
+
+                if self._train_data_dump is not None:
+                    with self._timer.time("train_data_dump"):
+                        # The stage writes its chunks in the background: every
+                        # writer finishes this step's parts before the merge.
+                        await self._flush_advantage_dumps()
+                        await asyncio.to_thread(
+                            self._train_data_dump.finish_step,
+                            self._train_steps,
+                            self._train_data_dump_receipts,
+                        )
+                    self._train_data_dump_receipts = []
+
+                if not early_refit_done:
+                    self._trainer_version += 1
+                self._train_steps += 1
+                self._rollout_trace.emit(
+                    "step_trained",
+                    step=self._train_steps,
+                    trainer_version=self._trainer_version,
+                    # The policy version the optimizer step updated.
+                    trained_version=version_during_step,
+                    group_ids=sorted(step_finalizer_group_ids),
+                )
+                self._rollout_snapshots.end_optimizer_commit()
+                dropped_prompt_groups = self._rollout_runtime.batch_shortfall.get(
+                    version_during_step, 0
+                )
+                replaced_prompt_groups = self._batch_replacements.get(
+                    version_during_step, 0
+                )
+                promoted_prompt_groups = self._batch_promotions.get(
+                    version_during_step, 0
+                )
+                # Prune every stamp this step or older. Popping only this step's entry
+                # would leak the ones belonging to a step that was already closed when
+                # a straggler stamped for it was finally given up on.
+                self._rollout_runtime.batch_shortfall = {
+                    step: dropped
+                    for step, dropped in self._rollout_runtime.batch_shortfall.items()
+                    if step > version_during_step
+                }
+                self._batch_replacements = {
+                    step: replaced
+                    for step, replaced in self._batch_replacements.items()
+                    if step > version_during_step
+                }
+                self._batch_promotions = {
+                    step: promoted
+                    for step, promoted in self._batch_promotions.items()
+                    if step > version_during_step
+                }
+                # Skipped chunks consumed storage but did not contribute training samples.
+                if not skipped_step:
+                    self._consumed_samples += groups_dispatched
+                    self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
+                self._timeout.mark_iteration()
+
+                is_last_step = self._train_steps >= self._algo_cfg.max_num_steps or (
+                    self._rollout_exhausted.is_set() and len(self._buffer) == 0
+                )
+                ft_save_period = self._master_config.checkpointing.ft_save_period
+                # _train_steps was already incremented above, so it equals
+                # the legacy loop's 1-indexed `step + 1`.
+                should_save_by_step = (
+                    is_last_step
+                    or self._train_steps % self._master_config.checkpointing.save_period
+                    == 0
+                    or (
+                        ft_save_period is not None
+                        and self._train_steps % ft_save_period == 0
+                    )
+                )
+                # Call once per step and reuse the bool.
+                should_save_by_timeout = self._timeout.check_save()
+                will_save_checkpoint = self._master_config.checkpointing.enabled and (
+                    should_save_by_step or should_save_by_timeout
+                )
+                # A colocated Megatron wake is itself the refit (prepare_for_generation reshards or
+                # shares the trainer's tensors), so a save-bound step skips _sync_weights and
+                # splits it: offload before the save, wake after it.
+                defer_refit_for_save = (
+                    will_save_checkpoint
+                    and self._gen.blocks_training()
+                    and self._gen.wake_carries_weight_updates()
+                )
+
+                # ---- 6. Refit the model ----
+                # Critic warmup doesn't need a refit and the version still advances.
+                # But a colocated engine that was stood down still needs to be woken up via reshard.
+                if not early_refit_done and (
+                    (is_policy_training_step and not skipped_step)
+                    or self._gen.blocks_training()
+                ):
+                    if defer_refit_for_save:
+                        # Refit-deferral (colocated): the engine is about to be saved; let it sleep.
+                        # Record `weight_sync` for consistency in reports.
+                        # No refit_bubble: this branch syncs nothing.
+                        with self._timer.time("weight_sync"):
+                            pass
+                        with self._timer.time("offload_before_refit"):
+                            await asyncio.to_thread(self._trainer.offload_before_refit)
+                    else:
+                        # Named to match async GRPO's refit phase: training cannot
+                        # proceed and generation is serving stale weights, so the
+                        # same seconds are idle on both fleets.
+                        with (
+                            self._timer.time("weight_sync"),
+                            efficiency_span("idle/refit_bubble", tracer=self._tracer),
+                        ):
+                            calibration_data = (
+                                BatchedDataDict.from_batches(calibration_batches)
+                                if calibration_batches
+                                else None
+                            )
+                            aborted_stale_inflight_groups = await self._sync_weights(
+                                calibration_data=calibration_data,
+                            )
+                if not early_refit_done:
+                    self._retune_lookahead_versions()
+                    self._rollout_manager.set_weight_version(self._trainer_version)
+                step_metrics.update(
+                    {
+                        "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
+                        "aborted_stale_inflight_groups": aborted_stale_inflight_groups,
+                        # Non-zero means this step trained on a smaller batch than
+                        # num_prompts_per_step, which any comparison of step metrics
+                        # across steps has to account for.
+                        "dropped_prompt_groups": dropped_prompt_groups,
+                        # Groups filled by a spare prompt this step waited on --
+                        # either one it lost itself, or one it lent to an earlier
+                        # step and was repaid for. Non-zero here with zero above is
+                        # the healthy shape of on_dropped_prompt="replace": the
+                        # batch stayed whole, and the cost was the wall-clock spent
+                        # waiting on the spare.
+                        "replaced_prompt_groups": replaced_prompt_groups,
+                        # Groups this step lost and filled by borrowing finished work
+                        # from a later step. The better shape of the same thing: the
+                        # batch stayed whole and nothing waited for it, with the
+                        # repayment showing up as a replacement on the lender.
+                        "promoted_prompt_groups": promoted_prompt_groups,
+                    }
+                )
+                # Include pre-filter rewards so uniform-group filtering cannot hide policy progress.
+                reward_metrics = self._rollout_manager.drain_step_reward_metrics(
+                    version_during_step
+                )
+                step_metrics.update(reward_metrics)
+
+                # Checkpointing (mirrors async_grpo_train's save block).
+                if will_save_checkpoint:
+                    with (
+                        self._timer.time("checkpointing"),
+                        managed_span(
+                            RLSpanGroup.CHECKPOINT,
+                            "rl.sc.checkpointing",
+                            tracer=self._tracer,
+                        ),
+                    ):
+                        await self._save_checkpoint(
+                            step_metrics,
+                            is_policy_training_step=is_policy_training_step,
+                            is_final_checkpoint=is_last_step,
+                            publish_now=should_save_by_timeout,
+                        )
+                    if defer_refit_for_save:
+                        # The save is done; wake the engine unless the loop is about to exit.
+                        # Deliberately a bare wake, not `_sync_weights`.
+                        loop_will_exit = is_last_step or should_save_by_timeout
+                        if not loop_will_exit:
+                            with self._timer.time("weight_sync"):
+                                # The save onloaded model+optimizer; generation needs offload.
+                                await asyncio.to_thread(
+                                    self._trainer.offload_after_refit
+                                )
+                                await asyncio.to_thread(
+                                    self._gen.prepare_for_generation
+                                )
+                                self._rollout_permitted.set()
+                                self._rollout_manager.resume_request_deadlines()
 
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"
@@ -556,50 +3888,1249 @@ class SingleControllerActor:
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-            # TODO: checkpointing (save_period/top-k metric_name,
-            #   policy.save_checkpoint, dataloader state, TQReplayBuffer state).
-            # TODO: per-step train_data jsonl dump, vllm metrics logger,
-            #   histogram log, rollout_metrics, seq_logprob_error_metrics,
-            #   pretty-print "Training Results" block, print_performance_metrics.
-            print(f"step_metrics={step_metrics}", flush=True)
+            # min sample version refers to the version each consumed sample was
+            # generated with; lag = training version - oldest sample version.
+            lag = (
+                version_during_step - min_sample_version
+                if min_sample_version is not None
+                else 0
+            )
+            step_metrics["weight_version_lag"] = lag
+            # TODO: vllm metrics logger,
+            #   histogram log, pretty-print "Training Results" block,
+            #   print_performance_metrics.
+            printable_step_metrics = {
+                name: value
+                for name, value in step_metrics.items()
+                if not isinstance(value, list)
+            }
+            print(f"step_metrics={printable_step_metrics}", flush=True)
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
             )
+            # Must precede the step_finished=True log below. That log commits
+            # the wandb step, and wandb silently discards anything logged
+            # against a step it has already committed -- no exception, no
+            # failed return, just an empty chart. grpo_sync had the same bug.
+            await self._log_data_plane_metrics(total_time)
+            # step_finished=True here since this is the final log of our current step.
             self._logger.log_metrics(
-                timing_metrics, step=self._train_steps, prefix="timing/train"
+                timing_metrics,
+                step=self._train_steps,
+                prefix="timing/train",
+                step_finished=True,
             )
             self._timer.reset()
 
-            # min sample version refers to the version each consumed sample was
-            # generated with; lag = training version - oldest sample version.
-            lag = version_during_step - min_sample_version  # type: ignore
             print(
-                f"train step {self._train_steps}/{grpo_cfg.max_num_steps}  "
+                f"train step {self._train_steps}/{self._algo_cfg.max_num_steps}  "
                 f"trainer_v={self._trainer_version}  "
                 f"lag={lag}  ",
                 flush=True,
             )
 
+            if should_save_by_timeout:
+                if self._master_config.checkpointing.enabled:
+                    # The trainer checkpoint holds no environment state, and no
+                    # later step will wake the pump to snapshot it. step_N is
+                    # already being published in the background, so the snapshot
+                    # runs while its policy write lands and moves in after.
+                    await self._rollout_snapshots.save_at_deadline()
+                print("Timeout has been reached, stopping training early", flush=True)
+                break
+        await self._finish_pending_save(blocking=True)
+
+    async def _stall_watchdog_pump(self) -> None:
+        """Report rollout health, and detect stalls nothing else catches.
+
+        Progress is the pair (committed groups, completed train steps) rather than a
+        timestamp: both counters already exist, and "neither has moved" is the property
+        that actually matters.
+
+        Deliberately *not* conditioned on rollouts being in flight. An earlier version
+        required that, on the reasoning that an idle controller has legitimately no
+        work -- and a fault-injection run walked straight through the gap. Killing a
+        generation worker wedged the loop with zero rollouts in flight and zero
+        failures recorded: the rollout pump was blocked on backpressure behind a train
+        pump that could no longer finish a step, so nothing was in flight to count.
+        The watchdog observed six minutes of idleness and said nothing.
+
+        What separates a real stall from an idle gap is whether work remains, so that
+        is what is checked instead.
+        """
+        watchdog_cfg = self._async_cfg.stall_watchdog
+        max_num_steps = self._algo_cfg.max_num_steps
+        last_progress = (-1, -1)
+        last_progress_at = time.monotonic()
+
+        while True:
+            await asyncio.sleep(watchdog_cfg.interval_s)
+            now = time.monotonic()
+
+            stats = self._rollout_manager.stats
+            progress = (stats.committed, self._train_steps)
+            if progress != last_progress:
+                last_progress = progress
+                last_progress_at = now
+            idle_s = now - last_progress_at
+
+            metrics = dict(stats.as_metrics())
+            metrics["rollout/inflight"] = float(self._inflight_rollouts)
+            metrics["rollout/idle_s"] = idle_s
+            metrics["rollout/train_steps"] = float(self._train_steps)
+            if self._gen_fleet is not None:
+                metrics.update(self._gen_fleet.as_metrics())
+            if self._engine_supervisor is not None:
+                metrics.update(self._engine_supervisor.as_metrics())
+            if self._generation_router is not None:
+                # router/* counters are exactly what you want when a backend starts
+                # failing. Best-effort like the membership push: a router being
+                # recreated must not cost a metrics tick.
+                try:
+                    metrics.update(
+                        await self._ray_get(self._generation_router.metrics.remote())
+                    )
+                except Exception as error:  # noqa: BLE001 - metrics are advisory
+                    print(
+                        f"watchdog: router metrics unavailable this tick: "
+                        f"{type(error).__name__}: {error}",
+                        flush=True,
+                    )
+            self._logger.log_metrics(
+                metrics, step=self._train_steps, step_metric="rollout/train_steps"
+            )
+
+            if watchdog_cfg.gym_subprocess_check:
+                # Bounded by one tick so a wedged environment cannot stop the pump, and
+                # routed through stall_action so "warn" means warn -- see
+                # _check_env_health.
+                problems = await self._check_env_health(watchdog_cfg.interval_s)
+                if problems:
+                    detail = "; ".join(problems)
+                    if watchdog_cfg.stall_action == "abort":
+                        raise RuntimeError(
+                            f"environment health check failed -- {detail}"
+                        )
+                    print(f"WARNING: environment health -- {detail}", flush=True)
+
+            if self._gen_fleet is not None and not self._recovering_from_refit:
+                # Raises once too few shards remain for the run to be worth continuing.
+                # Checked after publishing so the final state is on record.
+                #
+                # Skipped mid-recovery: the serving set is empty by construction there,
+                # not because the fleet is gone. See _recovery_window.
+                self._gen_fleet.raise_if_exhausted()
+
+            work_remains = self._train_steps < max_num_steps
+            if work_remains and idle_s > watchdog_cfg.stall_timeout_s:
+                message = (
+                    f"no rollout committed and no train step completed in "
+                    f"{idle_s:.0f}s ({self._inflight_rollouts} rollouts in flight, "
+                    f"{stats.committed} groups committed, step "
+                    f"{self._train_steps}/{max_num_steps}, "
+                    f"stall_timeout_s={watchdog_cfg.stall_timeout_s})"
+                )
+                if watchdog_cfg.stall_action == "abort":
+                    raise RolloutStall(message)
+                print(f"WARNING: rollout stall -- {message}", flush=True)
+
+    async def _gen_fleet_probe_pump(self) -> None:
+        """Probe the generation fleet on its own clock.
+
+        Separate from the watchdog because the two cadences answer different questions.
+        The watchdog publishes counters and notices a stalled run, which is a
+        minutes-scale concern; liveness detection is the input to every recovery
+        decision and has to be seconds-scale.
+
+        Sharing the watchdog's loop made ``probe_interval_s`` decorative -- probes ran at
+        ``watchdog.interval_s`` and nothing read the configured value. With the shipped
+        defaults that put detection at ``30s * unhealthy_threshold``, i.e. 60-90s, which
+        is *longer* than the refit deadline: by the time a hung refit aborted, the monitor
+        still had the dead shard as SUSPECT, so the rebuild that abort exists to trigger
+        saw an empty absent set and did nothing. Arithmetic, not a race -- it could never
+        have worked. Job 5925668.
+        """
+        interval_s = self._async_cfg.generation_fleet_health.probe_interval_s
+        while True:
+            await asyncio.sleep(interval_s)
+            await self._probe_generation_fleet()
+            # Between probing and publishing: a shard condemned by the probe above starts
+            # restarting on this tick rather than the next, and moving to RESTARTING
+            # before the router push keeps a shard that is coming back out of the
+            # serving set.
+            if self._engine_supervisor is not None:
+                self._engine_supervisor.tick()
+            # Both of these are best-effort: they talk to a max_restarts=-1 actor that
+            # may be mid-recreation, and run() awaits this task and re-raises, so an
+            # unguarded RayActorError here would end the training job over a push that
+            # the next tick would have retried anyway. GenerationFleetExhausted from the
+            # watchdog stays the only fatal path -- the same bounded-failure contract
+            # _check_env_health follows.
+            try:
+                await self._drain_router_failures()
+                # Pushed here rather than on the watchdog's clock so a membership change
+                # reaches the router at detection speed.
+                await self._push_router_membership()
+            except Exception as error:  # noqa: BLE001 - best-effort, retried next tick
+                print(
+                    f"fleet probe: router update failed, retrying next tick: "
+                    f"{type(error).__name__}: {error}",
+                    flush=True,
+                )
+
+    async def _probe_generation_fleet(self) -> None:
+        """Ask every serving generation shard whether it is still alive.
+
+        Ray actor liveness is the cheap authoritative signal for "the process is gone",
+        and it is what the probe uses. It does not catch every failure -- a vLLM engine
+        core can die while the worker process and its HTTP thread survive -- which is
+        why the routing adapters also report the failures they observe. The two signals
+        feed the same counters.
+
+        Only serving shards are probed: a quarantined shard answering again says nothing
+        about whether its weights are current, and the monitor ignores such probes
+        anyway.
+
+        Shards are probed concurrently. Sequentially, a tick costs up to
+        ``probe_timeout_s`` per shard, so a fleet of four would take 8s to complete a
+        round the config promises every 5s -- and config validation only checks
+        ``probe_timeout_s < probe_interval_s``, which silently assumes one probe per
+        tick. Concurrent, a round is bounded by ``probe_timeout_s`` at any fleet size.
+        """
+        if self._gen_fleet is None:
+            return
+
+        fleet_cfg = self._async_cfg.generation_fleet_health
+
+        async def probe(shard_idx: int) -> None:
+            # By shard index, not by reaching through to the worker group: which worker
+            # leads a shard depends on the backend's layout, and doing that arithmetic
+            # here put a second copy of it in the control loop -- one that also assumed
+            # every backend has a `worker_group`, the assumption that broke the Dynamo
+            # lane. restart_shard already asks this way.
+            try:
+                await asyncio.wait_for(
+                    self._ray_get(self._gen.shard_liveness_ref(shard_idx)),
+                    timeout=fleet_cfg.probe_timeout_s,
+                )
+            except NotImplementedError as error:
+                # A backend that cannot be probed is a misconfiguration, not an unhealthy
+                # shard, and the two must not look alike. Recorded as a probe failure it
+                # condemns every shard within unhealthy_threshold ticks and ends the run
+                # as GenerationFleetExhausted -- a healthy fleet reported as a dead one.
+                raise RuntimeError(
+                    f"generation backend {type(self._gen).__name__} does not implement "
+                    "shard_liveness_ref, so async_rl.generation_fleet_health cannot probe "
+                    "it. Turn fleet health off for this backend, or implement the method "
+                    "over the backend's own worker group."
+                ) from error
+            except RayActorError as error:
+                # Conclusive, unlike a timeout: Ray only reports this once the actor
+                # process is actually gone. Counting it as one more ambiguous failure
+                # would delay the verdict by unhealthy_threshold intervals for no gain,
+                # and the refit deadline can expire inside that delay.
+                self._gen_fleet.record_actor_death(
+                    shard_idx, error=f"{type(error).__name__}: {error}"
+                )
+                # A DEATH, not a silence -- so stand the trainers' refit deadline down.
+                # A dead peer closes its sockets and NCCL unblocks the survivors by
+                # itself; the deadline would abort first and orphan kernels on the
+                # trainers' streams, leaving a CUDA context no rebuild can use. See
+                # stand_down_armed_watchdogs.
+                self._stand_down_refit_deadline(shard_idx)
+            except (Exception, asyncio.TimeoutError) as error:
+                self._gen_fleet.record_probe(
+                    shard_idx, ok=False, error=f"{type(error).__name__}: {error}"
+                )
+            else:
+                self._gen_fleet.record_probe(shard_idx, ok=True)
+
+        await asyncio.gather(*(probe(idx) for idx in self._gen_fleet.serving_shards()))
+
+    async def _push_router_membership(self) -> None:
+        """Tell the NeMo-Gym router which backends are currently serving.
+
+        Pushed as the full set rather than a delta, so a dropped or reordered update --
+        or a restarted router, which comes up believing every backend serves -- converges
+        on the next tick without sequence numbers or replay.
+
+        Pushed unconditionally, not gated on the membership epoch moving. The gate looked
+        free -- an unchanged serving set costs nothing to skip -- but it made the router's
+        own restart unrecoverable: a recreated actor rebuilds ``_serving`` as *every*
+        backend, while the epoch it was last pushed at has not moved, so the gate blocked
+        every corrective push and Gym routed to a quarantined shard for the rest of the
+        run. The payload is a short list of strings on a probe-interval timer; the gate
+        bought nothing and cost the guarantee both docstrings advertised.
+
+        It is also what makes the router's reflex drop safe: dropping a failing backend
+        locally is only correct because a later push puts it back.
+        """
+        if self._generation_router is None or self._gen_fleet is None:
+            return
+        await self._ray_get(
+            self._generation_router.set_serving_backends.remote(
+                self._gen_fleet.serving_base_urls()
+            )
+        )
+
+    async def _drain_router_failures(self) -> None:
+        """Fold the router's observed backend outcomes into the fleet ledger.
+
+        The router is the only component that sees a *wedged* engine: it answers
+        ``is_alive`` from a healthy worker process, so no probe can condemn it. The
+        router holds no monitor reference by design -- membership flows one way -- so it
+        counts per backend URL and this drains them here, on the tick that already talks
+        to it.
+
+        BOTH halves, and the successes first. ``consecutive_reported_failures`` is the only
+        counter that can condemn a wedged engine, and it is a *streak* -- but on the router
+        path nothing ever cleared it. ``report_success`` has exactly one caller, on the
+        native adapter, so a router run made the streak monotonic and every shard reached
+        ``unhealthy_threshold`` eventually, however healthy. Three unrelated blips days
+        apart, with thousands of successes between them, condemned a shard.
+
+        Successes first because they describe the same window: replaying failures onto a
+        streak that a success in that window should already have cleared is what made the
+        count monotonic in the first place. A genuinely wedged shard produces no successes,
+        so its condemnation timing is unchanged.
+
+        Deliberately not a reset on a clean *probe*: the reported streak is kept separate
+        from the probe streak precisely because a wedged engine still answers ``is_alive``.
+        """
+        if self._generation_router is None or self._gen_fleet is None:
+            return
+        outcomes: dict[str, tuple[int, int]] = await self._ray_get(
+            self._generation_router.drain_backend_outcomes.remote()
+        )
+        for url, (successes, failures) in outcomes.items():
+            shard_idx = self._gen_fleet.shard_for_base_url(url)
+            if shard_idx is None:
+                continue
+            if successes:
+                self._gen_fleet.report_success(shard_idx)
+            if failures:
+                # ONE failure event per backend per window, not one per request.
+                #
+                # The two halves of the same drain used to be counted differently:
+                # successes aggregated, failures replayed one by one. Requests to a
+                # backend are concurrent, so a single brief outage fails everything in
+                # flight at once -- and unhealthy_threshold=3 then condemned a shard on
+                # one tick, from evidence that is one observation, not three. On a
+                # single-shard fleet that ends the run, because min_healthy_shards=1 and
+                # the router has nothing left to route to.
+                #
+                # The threshold is calibrated against the probe path, where a tick really
+                # is an independent observation. Draining on the same clock makes this
+                # streak mean the same thing: three consecutive *windows* with failures
+                # and no success, which at the default probe_interval_s is the same ~15s
+                # a wedged engine already takes to be condemned by probes. A genuinely
+                # wedged shard produces no successes, so nothing clears its streak and it
+                # still dies on schedule; a shard that drops one burst and recovers is
+                # SUSPECT, keeps serving, and clears the streak on its next success.
+                self._gen_fleet.report_failure(
+                    shard_idx,
+                    RuntimeError(f"router: {failures} failed request(s) to {url}"),
+                )
+
+    def _stand_down_refit_deadline(self, shard_idx: int) -> None:
+        """Tell every policy worker to cancel an in-flight refit deadline.
+
+        Fire-and-forget, and deliberately not awaited: this runs inside a probe whose job
+        is to keep the ledger current, and a worker that cannot answer is already the
+        larger problem. Reaching the worker at all depends on the refit running off its
+        event loop -- see await_off_loop.
+
+        Only ever called for a CONFIRMED actor death. A frozen rank never produces one, so
+        its deadline still fires and still ends the run attributably.
+        """
+        try:
+            for worker in self._trainer.worker_group.workers:
+                worker.stand_down_refit_watchdog.remote()
+        except Exception as error:  # noqa: BLE001 - the probe must not die of this
+            print(
+                f"  refit: could not stand the deadline down after shard {shard_idx} "
+                f"died: {type(error).__name__}: {error}",
+                flush=True,
+            )
+        else:
+            print(
+                f"  refit: shard {shard_idx} is confirmed gone; standing the trainers' "
+                "refit deadline down so NCCL's own dead-peer path can unblock them",
+                flush=True,
+            )
+
+    async def _reconcile_refit_membership(self, force: bool = False) -> Optional[bool]:
+        """Ask the weight transport to match the live fleet before the refit runs.
+
+        A no-op without fleet health: with no monitor there is no notion of a shard being
+        gone, so the transport keeps the membership it was built with -- which is the
+        pre-existing behaviour, and why this is inert by default.
+
+        Returns whether the communicator was actually rebuilt, or None when the
+        transport owns no membership at all. The recovery path needs all three: after an
+        abort the old communicator is gone, so "nothing to reconcile" means there is
+        nothing to retry with either -- but "this transport has no membership" is a
+        different refusal and deserves a different message.
+
+        ``force`` says the communicator is gone rather than merely unchanged. The
+        synchronizers skip a rebuild when the absent set matches what they last built with,
+        which is what stops a lost shard costing two full rebuilds on every subsequent step
+        -- but after an abort the membership is identical and the communicator is dead, so
+        the recovery path has to override that or it retries over nothing.
+        """
+        if self._gen_fleet is None:
+            return False
+        absent = self._gen_fleet.absent_shards()
+        # to_thread like every other call that reaches the workers: this can rebuild
+        # communicators via blocking Ray calls, and running it on the loop would freeze
+        # the watchdog, which is an asyncio task on that same loop.
+        rebuilt = await asyncio.to_thread(
+            self._weight_synchronizer.reconcile_communicator, absent, force
+        )
+        # Log unconditionally, not just on a rebuild.
+        #
+        # Job 5898311 wedged with both policy workers stuck in the refit broadcast and no
+        # rebuild logged, and "no rebuild logged" could not distinguish two causes needing
+        # opposite fixes: reconcile ran BEFORE the death was recorded (absent empty, so
+        # correctly did nothing, and the race is the problem), or it ran after and
+        # reconcile_communicator wrongly returned False. The absent set is the whole
+        # difference and it was not being printed.
+        print(
+            f"  _sync_weights: refit membership absent={sorted(absent)} "
+            f"rebuilt={rebuilt}{' (forced)' if force else ''}",
+            flush=True,
+        )
+        return rebuilt
+
+    @contextlib.contextmanager
+    def _recovery_window(self) -> Iterator[None]:
+        """Mark the span where the serving set is deliberately empty.
+
+        _recover_from_failed_refit marks every serving shard partial, so they all go
+        STALE and serving_shards() is empty until _record_refit_landed runs -- after a
+        rebuild and a full retry refit, both of which await and yield the event loop.
+
+        _stall_watchdog_pump is a task on that same loop and calls raise_if_exhausted()
+        on every tick, defaulting to one every 30s. With min_healthy_shards=1 and zero
+        serving, any tick landing in this window ends the run over an exhausted fleet
+        while the retry that would have refilled it is still in flight -- killing the
+        recovery that was about to succeed, and blaming the wrong thing in the log.
+
+        A flag rather than deferring mark_weights_partial until after the rebuild: that
+        would also close the window, but it would leave shards holding a mix of old and
+        new weights in the serving set while it did.
+        """
+        self._recovering_from_refit = True
+        try:
+            yield
+        finally:
+            # finally, not a trailing assignment: the retry refit inside this window is
+            # expected to raise sometimes, and a leaked flag would disable the
+            # exhaustion check for the rest of the run.
+            self._recovering_from_refit = False
+
+    async def _recover_from_failed_refit(
+        self, failure: BaseException, *, refit_started: bool
+    ) -> None:
+        """Drop whatever stopped participating, rebuild the communicator, allow a retry.
+
+        Two failures arrive here and they are not the same event:
+
+        ``RefitAborted`` -- pausing timed out, or a rank went silent inside the
+        collective and a watchdog broke it. Only the latter leaves receiving engines
+        holding partial weights; those cannot serve until a refit completes.
+
+        ``RayActorError`` -- a shard died before transfer, or in the epilogue after
+        the collective finished. Nothing is partial; survivors have complete weights.
+
+        Both need the same repair, because both leave a communicator that no longer
+        matches the fleet, and in the abort case no communicator at all.
+
+        The probe here is the point. Waiting for the health monitor to reach its own
+        conclusion is what failed before: its verdict is paced by probe rounds while this
+        is an event, so the abort arrived first and the rebuild saw an empty absent set
+        and did nothing. Asking now, on this thread, turns a race into a lookup.
+        """
+        print(f"  _sync_weights: {failure}; rebuilding and retrying once", flush=True)
+        if self._gen_fleet is None:
+            # Without fleet health there is no notion of a shard being gone and nothing
+            # to rebuild against. Failing here is the pre-existing behaviour.
+            raise failure
+
+        # 1. Establish who is actually gone, now, rather than on the probe's clock.
+        await self._probe_generation_fleet()
+
+        # 2. Only an interrupted transfer leaves partial weights. A pause failure
+        #    before the transfer, like a death after it completed, does not.
+        if refit_started and isinstance(failure, RefitAborted):
+            for shard_idx in self._gen_fleet.serving_shards():
+                self._gen_fleet.mark_weights_partial(shard_idx)
+
+        # 3. Rebuild without the dead.
+        rebuilt = await self._reconcile_refit_membership(force=True)
+        if rebuilt is None:
+            # This transport owns no NCCL world -- IPC, HTTP, checkpoint-engine. There is
+            # nothing to rebuild, and saying "no shard was absent" here would be a wrong
+            # diagnosis of a right refusal.
+            raise RuntimeError(
+                "refit failed on a transport that owns no communicator membership, so "
+                "there is nothing to rebuild over and the run cannot continue. Only the "
+                "NCCL transports (collective, nccl_reshard) can recover this way."
+            ) from failure
+        if not rebuilt:
+            # Nothing is absent, but that is not the same as nothing being known.
+            #
+            # The engine this is really about is wedged rather than dead: is_alive() is
+            # answered by the Ray actor and never touches the engine, so the probe can only
+            # ever see a dead PROCESS. A wedged one stays serving, is never absent, and
+            # takes the run down here -- while its own generations have been timing out and
+            # driving it to SUSPECT the whole time. The abort is independent evidence that
+            # something in the collective stopped participating; SUSPECT says which.
+            #
+            # Exactly one, or not at all. With several suspects there is no way to tell
+            # which broke the collective, and condemning the wrong one costs a healthy shard
+            # and leaves the real culprit in the rebuilt communicator -- the same hang, one
+            # shard smaller. With none there is nothing to go on. Both keep the raise.
+            suspects = self._gen_fleet.suspected_shards()
+            if len(suspects) == 1:
+                culprit = suspects[0]
+                print(
+                    f"  _sync_weights: no shard is absent, but shard {culprit} was already "
+                    "suspect; condemning it as the silent participant and retrying",
+                    flush=True,
+                )
+                self._gen_fleet.condemn_silent_participant(
+                    culprit,
+                    reason=(
+                        "did not participate in a refit that had to be aborted, while "
+                        "already suspect from failing generations"
+                    ),
+                )
+                rebuilt = await self._reconcile_refit_membership(force=True)
+
+            if not rebuilt:
+                # Either nothing was suspect, or too many were. Retrying would die on the
+                # aborted communicator or -- worse -- rebuild over the full fleet and hang
+                # on the same silent rank, which is the wedge this path exists to remove.
+                raise RuntimeError(
+                    "refit failed and no generation shard could be identified as absent, "
+                    "so the communicator cannot be safely rebuilt; the run cannot "
+                    "continue. A rank that is alive but not participating would produce "
+                    f"this. Shards already suspect: {suspects or 'none'} (exactly one is "
+                    "needed to attribute the failure)."
+                ) from failure
+
+    def _refit_participants(self) -> set[int]:
+        """Shards eligible to receive this refit's weights, as of right now.
+
+        Captured at the moment membership settles rather than read at promotion time,
+        because a restart finishing mid-transfer turns its shard STALE -- which is not
+        absent -- and the communicator was already built without it.
+
+        Derived from the fleet rather than from the transport's membership so it holds for
+        backends that own no membership at all: a shard that is absent when the transfer
+        starts receives nothing either way.
+        """
+        if self._gen_fleet is None:
+            return set()
+        absent = set(self._gen_fleet.absent_shards())
+        return {
+            health.dp_shard_idx
+            for health in self._gen_fleet.snapshot()
+            if health.dp_shard_idx not in absent
+        }
+
+    def _record_refit_landed(self, participants: set[int]) -> None:
+        """Write down what each shard now holds, and return the STALE ones to service.
+
+        Two things, because they are the same fact seen from two sides: this refit reached
+        these shards. The version is what they hold; promotion is what that entitles them
+        to.
+
+        Promotion is the exit from STALE, and the reason marking partial weights is safe
+        rather than terminal. An aborted refit leaves every engine that was receiving with
+        a mix of old and new weights, so they are pulled out of service -- but nothing else
+        moves a shard out of STALE, so without this the recovery would succeed and then
+        leave the fleet empty, which ``raise_if_exhausted`` would end the run over. A worse
+        failure than the one being recovered from, and reached only on the recovery path.
+
+        Only STALE shards are promoted. A SUSPECT shard also took part in the refit, but it
+        is failing probes for its own reasons and promoting it here would reset the failure
+        count that is supposed to condemn it. It is still stamped: what weights an engine
+        holds is not a verdict on how well it is serving them.
+
+        And only STALE shards that were IN the refit. Asking "is this shard STALE?" alone
+        was correct until restart existed, because nothing could turn a shard STALE while a
+        refit was in flight. A restart can: it takes minutes, nothing blocks it, and
+        mark_loaded moves the shard DEAD -> STALE at whatever moment the reload lands. A
+        shard absent when membership settled received no weights from this transfer, so
+        promoting it would return it to service holding the checkpoint it read off disk --
+        the outcome this module's docstring exists to prevent. It stays STALE, is not
+        absent, and the next refit picks it up.
+
+        The stamp used to live inside ``report_refit`` alone, which meant it was only ever
+        written by a promotion. Nothing turns a shard STALE on a refit that succeeds, so a
+        fleet that has never lost a shard reports version 0 for the life of the run however
+        many refits it received -- and a metric that reads 0 on every healthy shard is one
+        nobody watches, which is the part that matters: this is the reading that would catch
+        the next bug of this shape.
+
+        Args:
+            participants: shards eligible for this refit, from :meth:`_refit_participants`
+                at the point membership settled.
+        """
+        if self._gen_fleet is None:
+            return
+        for health in self._gen_fleet.snapshot():
+            if health.dp_shard_idx not in participants:
+                continue
+            if health.state is ShardState.STALE:
+                self._gen_fleet.report_refit(
+                    health.dp_shard_idx, weight_version=self._trainer_version
+                )
+            else:
+                self._gen_fleet.record_weight_version(
+                    health.dp_shard_idx, weight_version=self._trainer_version
+                )
+
+    async def _check_env_health(self, timeout_s: float) -> list[str]:
+        """Ask each environment actor that exposes a health check whether it is whole.
+
+        Returns the problems found, empty when everything is well. It *reports* rather
+        than raises so the caller can route the verdict through ``stall_action``, the
+        same way the stall path does. Raising here bypassed ``stall_action`` entirely:
+        under the documented default (``"warn"``, which promises to "only report"), and
+        with ``gym_subprocess_check`` defaulting to true, an unhealthy environment killed
+        the run -- a run-ending path switched on by default, in a feature whose whole
+        posture is inert-by-default.
+
+        Each probe is bounded. ``NemoGym`` is an asyncio actor, so a *wedged* environment
+        -- precisely the case this check exists to catch -- left the await hanging
+        forever, the pump never ticked again, and stall detection was dead exactly when
+        it was needed. A probe that does not answer within one tick IS the unhealthy
+        signal; it is not a reason to stop watching.
+
+        Environments without the method are skipped rather than treated as unhealthy;
+        only NeMo-Gym has subprocess servers to lose.
+        """
+        problems: list[str] = []
+        for env_name, handle in self._env_handles.items():
+            health_check = getattr(handle, "health_check", None)
+            if health_check is None:
+                continue
+            try:
+                await asyncio.wait_for(
+                    self._ray_get(health_check.remote()), timeout=timeout_s
+                )
+            except asyncio.TimeoutError:
+                problems.append(
+                    f"environment {env_name!r} did not answer its health check within "
+                    f"{timeout_s}s"
+                )
+            except Exception as error:
+                problems.append(f"environment {env_name!r} reported unhealthy: {error}")
+        return problems
+
+    async def _abort_stale_inflight(self) -> int:
+        """Abort in-flight rollouts that the sampler can no longer select."""
+
+        def _stale_groups() -> list[tuple[str, asyncio.Task[None]]]:
+            stale_groups: list[tuple[str, asyncio.Task[None]]] = []
+            for group_id, inflight in self._inflight_by_group_id.items():
+                task, start_version = inflight
+                if self._sampler.should_abort_inflight(
+                    start_weight_version=start_version,
+                    current_train_weight=self._trainer_version,
+                ):
+                    stale_groups.append((group_id, task))
+            return stale_groups
+
+        async with self._dispatch_reservation("group_removals") as cut:
+            # Re-evaluate after acquiring the cut: a rollout may have completed
+            # while a checkpoint holder delayed this mutation.
+            stale_groups = _stale_groups()
+            for group_id, _ in stale_groups:
+                # This is an intentional live abort, not a process failure. Remove
+                # durable ownership before cancellation cleanup removes the unready
+                # TQ slot, so a concurrent checkpoint cannot resurrect the prompt.
+                self._discard_prompt_group(cut, group_id)
+            for _, task in stale_groups:
+                task.cancel()
+
+        if not stale_groups:
+            return 0
+
+        stale_tasks = [task for _, task in stale_groups]
+        results = await asyncio.gather(*stale_tasks, return_exceptions=True)
+        failures = [
+            result
+            for result in results
+            if isinstance(result, BaseException)
+            and not isinstance(result, asyncio.CancelledError)
+        ]
+        if failures:
+            raise BaseExceptionGroup(
+                "stale in-flight rollout cleanup failed",
+                failures,
+            )
+
+        print(
+            f"  aborted {len(stale_tasks)} stale in-flight rollout(s)",
+            flush=True,
+        )
+        return len(stale_tasks)
+
+    def _prune_finalizer_state(self, selected_group_ids: set[str]) -> None:
+        """Release pending finalizer state for groups evicted before training.
+
+        Eviction reports only a count, so reconcile against the groups that can
+        still be consumed: those in the buffer plus those already selected by
+        the step in progress.
+        """
+        live = set(self._buffer.group_ids) | selected_group_ids
+        for group_id in (
+            self._rollout_runtime.finalizer_metrics_by_group.keys()
+            | self._rollout_runtime.finalizer_rewards_by_group.keys()
+        ) - live:
+            self._rollout_runtime.finalizer_metrics_by_group.pop(group_id, None)
+            self._rollout_runtime.finalizer_rewards_by_group.pop(group_id, None)
+
+    async def _rollout_telemetry_pump(self) -> None:
+        """Sample generation and publication throughput at a fixed cadence."""
+        interval_s = self._master_config.rollout_checkpointing.telemetry_interval_s
+        if interval_s is None:
+            raise RuntimeError("rollout telemetry pump started while disabled")
+        while True:
+            await asyncio.sleep(interval_s)
+            await self._log_rollout_throughput_metrics()
+
+    async def _log_rollout_throughput_metrics(self, *, emit: bool = True) -> None:
+        """Serialize backend sampling so cumulative counters have one baseline."""
+        async with self._rollout_telemetry_lock:
+            await self._collect_and_log_rollout_throughput_metrics(emit=emit)
+
+    async def _collect_and_log_rollout_throughput_metrics(
+        self, *, emit: bool = True
+    ) -> None:
+        """Compare generation-engine output with canonical TQ publication."""
+        now = time.monotonic()
+        counters = self._rollout_manager.telemetry_snapshot()
+        barrier = await self._data_plane_checkpoint_barrier.drain_telemetry()
+        generation_metrics: dict[str, Any] = {}
+        try:
+            generation_metrics = await asyncio.to_thread(
+                self._gen.drain_latest_logger_metrics
+            )
+        except Exception as error:
+            warnings.warn(
+                "Failed to collect generation throughput telemetry: "
+                f"{type(error).__name__}: {error}",
+                stacklevel=2,
+            )
+
+        generated_values = _latest_generation_values(
+            generation_metrics, "generation_tokens"
+        )
+        generated_by_worker = (
+            {worker_id: int(value) for worker_id, value in generated_values.items()}
+            if generated_values
+            else None
+        )
+        generated_tokens = (
+            sum(generated_by_worker.values())
+            if generated_by_worker is not None
+            else None
+        )
+        metrics: dict[str, float] = {
+            key: float(value) for key, value in counters.items()
+        }
+        metrics.update(
+            {
+                "controller_dispatched_tasks": float(len(self._dispatched_rollouts)),
+                "controller_inflight_rollouts": float(self._inflight_rollouts),
+                "controller_rollout_capacity": float(
+                    self._async_cfg.max_inflight_prompts
+                ),
+                "controller_rollout_slot_waiters": float(self._rollout_slot_waiters),
+                "controller_rollout_permitted_waiters": float(
+                    self._rollout_permitted_waiters
+                ),
+                "controller_buffer_capacity_waiters": float(
+                    self._buffer_capacity_waiters
+                ),
+                "checkpoint_barrier_active": float(barrier.checkpoint_active),
+                "checkpoint_active_mutations": float(barrier.active_mutations),
+                "checkpoint_waiting_mutations": float(barrier.waiting_mutations),
+                "checkpoint_max_simultaneous_waiters": float(
+                    barrier.max_waiting_mutations
+                ),
+                "checkpoint_blocked_mutations": float(
+                    sum(barrier.blocked_by_kind.values())
+                ),
+                "buffer_occupancy_groups": float(len(self._buffer)),
+            }
+        )
+        for kind in CHECKPOINT_MUTATION_KINDS:
+            metrics[f"checkpoint_blocked_{kind}"] = float(barrier.blocked_by_kind[kind])
+        mutation_waits = list(barrier.wait_durations_s)
+        if mutation_waits:
+            metrics["checkpoint_mutation_wait_seconds_total"] = sum(mutation_waits)
+            metrics["checkpoint_mutation_wait_seconds_mean"] = sum(
+                mutation_waits
+            ) / len(mutation_waits)
+            metrics["checkpoint_mutation_wait_seconds_p95"] = _percentile(
+                mutation_waits, 0.95
+            )
+            metrics["checkpoint_mutation_wait_seconds_max"] = max(mutation_waits)
+
+        running = _latest_generation_values(generation_metrics, "inflight_batch_sizes")
+        waiting = _latest_generation_values(generation_metrics, "num_pending_samples")
+        kv_usage = _latest_generation_values(generation_metrics, "kv_cache_usage_perc")
+        if running:
+            metrics["vllm_requests_running"] = sum(running.values())
+        if waiting:
+            metrics["vllm_requests_waiting"] = sum(waiting.values())
+        if kv_usage:
+            metrics["vllm_kv_cache_usage_mean"] = sum(kv_usage.values()) / len(kv_usage)
+        if generated_tokens is not None:
+            metrics["generation_output_tokens"] = float(generated_tokens)
+
+        completion_durations = list(self._rollout_completion_durations_s)
+        queue_wait_durations = list(self._rollout_queue_wait_durations_s)
+        self._rollout_completion_durations_s.clear()
+        self._rollout_queue_wait_durations_s.clear()
+        if completion_durations:
+            metrics["group_completion_samples"] = float(len(completion_durations))
+            metrics["group_completion_seconds_mean"] = sum(completion_durations) / len(
+                completion_durations
+            )
+            metrics["group_completion_seconds_p50"] = _percentile(
+                completion_durations, 0.50
+            )
+            metrics["group_completion_seconds_p95"] = _percentile(
+                completion_durations, 0.95
+            )
+        if queue_wait_durations:
+            metrics["group_queue_wait_seconds_mean"] = sum(queue_wait_durations) / len(
+                queue_wait_durations
+            )
+            metrics["group_queue_wait_seconds_p95"] = _percentile(
+                queue_wait_durations, 0.95
+            )
+
+        previous_time = self._throughput_sample_time
+        previous_counters = self._throughput_rollout_counters
+        previous_generated = self._throughput_generation_tokens_by_worker
+        if previous_time is not None and previous_counters is not None:
+            elapsed = now - previous_time
+            if elapsed > 0:
+                metrics["sample_elapsed_seconds"] = elapsed
+                metrics["committed_groups_per_second"] = (
+                    counters["committed_groups"] - previous_counters["committed_groups"]
+                ) / elapsed
+                metrics["committed_output_tokens_per_second"] = (
+                    counters["committed_output_tokens"]
+                    - previous_counters["committed_output_tokens"]
+                ) / elapsed
+                if generated_by_worker is not None and previous_generated is not None:
+                    current_workers = set(generated_by_worker)
+                    previous_workers = set(previous_generated)
+                    monotonic = all(
+                        generated_by_worker[worker_id] >= previous_generated[worker_id]
+                        for worker_id in current_workers & previous_workers
+                    )
+                    if current_workers == previous_workers and monotonic:
+                        generated_delta = sum(
+                            generated_by_worker[worker_id]
+                            - previous_generated[worker_id]
+                            for worker_id in current_workers
+                        )
+                        metrics["generation_output_tokens_per_second"] = (
+                            generated_delta / elapsed
+                        )
+                    else:
+                        metrics["generation_counter_discontinuity"] = 1.0
+
+        self._throughput_sample_time = now
+        self._throughput_generation_tokens_by_worker = generated_by_worker
+        self._throughput_rollout_counters = counters
+        if emit:
+            self._log_telemetry_metrics(
+                metrics,
+                step=self._train_steps,
+                prefix="rollout/throughput",
+            )
+            if self._async_cfg.diagnostics:
+                print(f"rollout_throughput_metrics={metrics}", flush=True)
+
+    async def _save_checkpoint(
+        self,
+        step_metrics: dict[str, Any],
+        *,
+        is_policy_training_step: bool,
+        is_final_checkpoint: bool,
+        publish_now: bool = False,
+    ) -> None:
+        """Serialize full and rollout-only checkpoint publication.
+
+        ``publish_now`` starts publishing step_N in the background even with
+        ``defer_async_checkpoint_finalize``, as the checkpoint deadline needs.
+        """
+        # The workers would wait for a still-pending save anyway; publish it first.
+        await self._finish_pending_save(blocking=True)
+        async with self._rollout_snapshots.trainer_checkpoint():
+            await self._save_checkpoint_impl(
+                step_metrics,
+                is_policy_training_step=is_policy_training_step,
+                is_final_checkpoint=is_final_checkpoint,
+                publish_now=publish_now,
+            )
+
+    async def _save_checkpoint_impl(
+        self,
+        step_metrics: dict[str, Any],
+        *,
+        is_policy_training_step: bool,
+        is_final_checkpoint: bool,
+        publish_now: bool = False,
+    ) -> None:
+        """Write a full checkpoint for the just-finished train step.
+
+        Everything except the (possibly async) policy weight write must be on disk
+        before `_publish_when_policy_write_done`, which is why it runs last.
+        Non-colocated engines keep serving rollouts throughout.
+        Colocated engines are stood down for the save.
+        The policy optimizer is skipped during critic warmup: it has never stepped.
+        """
+        save_state = self._save_state
+        # SC has no validation loop yet; drop the default sentinel instead of
+        # persisting a bogus val_reward.
+        if hasattr(save_state, "val_reward"):
+            delattr(save_state, "val_reward")
+
+        # validate_single_controller_config already rejected anything but a
+        # "train:" prefix, so step_metrics is the only source to consult.
+        full_metric_name = self._master_config.checkpointing.metric_name
+        if full_metric_name is not None:
+            metric_name = full_metric_name.split(":", 1)[1]
+            if not is_policy_training_step or step_metrics.get("skipped_step", 0):
+                reason = (
+                    "a skipped data-exhausted step"
+                    if step_metrics.get("skipped_step", 0)
+                    else "PPO critic warmup"
+                )
+                warnings.warn(
+                    f"checkpointing.metric_name={full_metric_name!r} is not "
+                    f"available during {reason}; this checkpoint will "
+                    "not be saved as top-k.",
+                    stacklevel=2,
+                )
+                if hasattr(save_state, full_metric_name):
+                    delattr(save_state, full_metric_name)
+            elif metric_name not in step_metrics:
+                raise ValueError(f"Metric {metric_name} not found in train metrics")
+            else:
+                setattr(save_state, full_metric_name, step_metrics[metric_name])
+
+        # Flush the previous checkpoint's background finalization first;
+        # re-raises a failure from it.
+        await asyncio.to_thread(self._checkpointer.finalize_pending)
+
+        print(f"Saving checkpoint for step {self._train_steps}...")
+
+        # Admission, dataloader movement, replay mutations, and canonical TQ writes
+        # all take the mutation side of this barrier. Capture every restart-facing
+        # controller artifact under the exclusive side so the checkpoint cannot
+        # contain a cursor without its prompt owner, or two durable owners for one
+        # canonical group. The environment keeps running: its state lives only
+        # in rollout snapshots taken after this checkpoint.
+        async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
+            save_state.current_step = self._train_steps
+            save_state.total_steps = self._train_steps
+            save_state.trainer_version = self._trainer_version
+            save_state.current_epoch = self._current_epoch
+            save_state.consumed_samples = self._consumed_samples
+            save_state.total_valid_tokens = self._total_valid_tokens
+            _save_adaptive_loss_state(save_state, self._loss_fn)
+            save_state.sampler_name = self._async_cfg.sampler.name
+            save_state.sampler_dispatch_index = self._sampler.dispatch_index
+            save_state.next_nemo_gym_task_index = (
+                self._rollout_manager.get_next_nemo_gym_task_index()
+            )
+
+            checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
+                self._checkpointer.init_tmp_checkpoint,
+                self._train_steps,
+                vars(save_state),
+                self._master_config,
+            )
+            captured = await self._rollout_snapshots.capture(
+                cut, checkpoint_path, "trainer_checkpoint"
+            )
+
+        # Save value model
+        if self._is_ppo:
+            # The critic shares the training GPUs, so the two weight saves are
+            # serialized. The critic goes first because offloading the policy runs
+            # finalize_async_save, which would block on the policy's own write if
+            # that had already been staged.
+            if not self._value_dedicated:
+                await asyncio.to_thread(self._trainer.offload_to_cpu)
+            # The value model writes synchronously, so unlike the policy below it is
+            # fully on disk when this returns and needs no finalize wait.
+            await asyncio.to_thread(self._value.prepare_for_training)
+            await asyncio.to_thread(
+                self._value.save_checkpoint,
+                weights_path=os.path.join(checkpoint_path, "value", "weights"),
+                optimizer_path=os.path.join(checkpoint_path, "value", "optimizer")
+                if self._checkpointer.save_optimizer
+                else None,
+                tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
+                is_final_checkpoint=is_final_checkpoint,
+            )
+            await asyncio.to_thread(self._value.finish_training)
+            # Also covers a warmup step, which never ran prepare_for_training in
+            # the pump and would otherwise save from CPU-resident params.
+            if not self._value_dedicated:
+                await asyncio.to_thread(self._trainer.prepare_for_training)
+
+        # Save policy model
+        # With async_save this returns after D2H staging; disk writes finish
+        # in the background.
+        await asyncio.to_thread(
+            self._trainer.save_checkpoint,
+            weights_path=os.path.join(checkpoint_path, "policy", "weights"),
+            # GRPO may skip its first steps; only consumed samples prove an update.
+            # Uninitialized optimizer and scheduler state cannot be checkpointed.
+            optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer")
+            if (
+                self._checkpointer.save_optimizer
+                and is_policy_training_step
+                and (self._is_ppo or self._consumed_samples > 0)
+            )
+            else None,
+            tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
+            is_final_checkpoint=is_final_checkpoint,
+        )
+
+        await write_controller_sidecars(checkpoint_path, captured)
+        # Keep this last: the rename it leads to waits only for the policy's async
+        # weight write, so anything written into checkpoint_path after it races
+        # the rename.
+        await self._publish_when_policy_write_done(
+            checkpoint_path, publish_now=publish_now
+        )
+
+    async def _publish_when_policy_write_done(
+        self, checkpoint_path: PathLike, *, publish_now: bool = False
+    ) -> None:
+        """Arrange for tmp_step_N to become step_N once the policy write lands.
+
+        The only way a full checkpoint gets published. Call it only after every
+        other part of the checkpoint is on disk.
+        """
+        if self._defer_checkpoint_finalize and not publish_now:
+            # Published by _finish_pending_save at a later step boundary.
+            self._pending_checkpoint = (checkpoint_path, self._train_steps)
+            return
+        # Rename happens in the background once the async weight writes
+        # finish; flushed at the next save or on exit.
+        self._checkpointer.begin_finalization(
+            checkpoint_path,
+            wait_fn=self._trainer.finalize_async_save,
+        )
+        await asyncio.to_thread(
+            _write_latest_checkpoint_status,
+            self._checkpointer,
+            last_checkpoint_step=self._train_steps,
+        )
+        self._rollout_snapshots.trainer_checkpoint_published(self._train_steps)
+
+    async def _finish_pending_save(self, *, blocking: bool) -> None:
+        """Finalize and publish a save deferred by defer_async_checkpoint_finalize.
+
+        Called from the train pump between policy-worker calls, and once at teardown
+        after the pumps stop: the finalize runs collectives on the training
+        communicator, so every rank must reach it at the same point. A non-blocking
+        poll finalizes the save on every worker only once all ranks' background writes
+        are done; until then the write overlaps training. tmp_step_N becomes step_N
+        after the finalize, under the same lock as every other checkpoint publication.
+        The save stays pending until the rename has started, so a cancellation while
+        waiting for the lock leaves it for the teardown publish.
+        """
+        if self._pending_checkpoint is None:
+            return
+        if blocking:
+            await asyncio.to_thread(self._trainer.finalize_async_save)
+        elif not await asyncio.to_thread(self._trainer.poll_async_save):
+            return
+        checkpoint_path, step = self._pending_checkpoint
+        async with self._rollout_snapshots.trainer_checkpoint():
+            self._checkpointer.begin_finalization(checkpoint_path)
+            # No await between the rename starting and the clear.
+            self._pending_checkpoint = None
+            await asyncio.to_thread(
+                _write_latest_checkpoint_status,
+                self._checkpointer,
+                last_checkpoint_step=step,
+            )
+        self._rollout_snapshots.trainer_checkpoint_published(step)
+
+    # Grace on top of the workers' own refit deadline, so their attributable error wins
+    # the race against this bound. They need to hit the deadline, abort, unwind, raise,
+    # and have Ray deliver it -- seconds, not minutes. If this fires first we lose their
+    # diagnosis and report only "the refit never came back", which is true but less useful.
+    _REFIT_UNWIND_GRACE_S = 60.0
+    # Pause/resume remain bounded even when the collective watchdog is disabled.
+    _GENERATION_CONTROL_TIMEOUT_S = 360.0
+
+    def _refit_await_budget_s(self) -> Optional[float]:
+        """How long to wait for the refit before giving up, or None to wait forever."""
+        deadline = self._async_cfg.generation_fleet_health.refit_timeout_s
+        return None if deadline is None else deadline + self._REFIT_UNWIND_GRACE_S
+
+    async def _sync_weights_within(self, kv_scales, what: str) -> None:
+        """Run the refit off-loop, and stop waiting if it outlives the deadline.
+
+        WHY THIS IS NEEDED ON TOP OF EVERY WORKER-SIDE BOUND. A frozen-but-alive rank is a
+        Ray actor that never answers, and Ray puts no timeout on an actor call. So the
+        controller's await never resolves however well the workers behave. Job 6508251
+        measured that end state: the deadline fired, the workers aborted, the trainers
+        returned, every actor was idle -- and the run still sat for 1800s because this
+        await had no bound. It is the last unbounded wait on the refit path, and unlike the
+        others it is not in NCCL or CUDA.
+
+        Timing out raises RefitAborted so this joins the existing recovery path rather than
+        inventing a second one: the caller reconciles membership and retries once. By then
+        the fleet probe has usually condemned the silent shard, so the rebuild can exclude
+        it and the retry may genuinely succeed.
+
+        A DEDICATED DAEMON THREAD, not asyncio.to_thread. to_thread runs on the default
+        ThreadPoolExecutor, whose workers are non-daemon and are joined at interpreter
+        exit -- so a thread still blocked on the frozen actor would hang shutdown, trading
+        a wedge in the refit for a wedge on the way out. asyncio.wait_for cannot cancel a
+        running thread either way; this only controls whether the orphan can block exit.
+
+        The orphan is a real consequence, not a free win. If the retry succeeds the run
+        continues with a thread still parked inside the old sync_weights, and if that rank
+        were ever resumed it would wake up holding a communicator that has since been
+        replaced. Acceptable against a guaranteed 30-minute stall, and it is why this path
+        is bounded-failure-first rather than resume-and-forget.
+        """
+        budget_s = self._refit_await_budget_s()
+        if isinstance(self._weight_synchronizer, RemoteWeightSynchronizer):
+            await self._sync_weights_in_refit_actor(kv_scales, what, budget_s)
+            return
+        if budget_s is None:
+            await asyncio.to_thread(
+                self._weight_synchronizer.sync_weights, kv_scales=kv_scales
+            )
+            return
+
+        loop = asyncio.get_running_loop()
+        settled: asyncio.Future = loop.create_future()
+
+        def _settle(setter, value) -> None:
+            # wait_for cancels `settled` on timeout, and setting a result on a cancelled
+            # future raises InvalidStateError inside the loop callback.
+            if not settled.done():
+                setter(value)
+
+        def _run() -> None:
+            try:
+                self._weight_synchronizer.sync_weights(kv_scales=kv_scales)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the loop below
+                loop.call_soon_threadsafe(_settle, settled.set_exception, exc)
+            else:
+                loop.call_soon_threadsafe(_settle, settled.set_result, None)
+
+        threading.Thread(target=_run, name=f"sc-refit-{what}", daemon=True).start()
+
+        try:
+            await asyncio.wait_for(settled, budget_s)
+        except asyncio.TimeoutError:
+            raise RefitAborted(
+                f"the {what} refit did not return within {budget_s}s. Every worker-side "
+                "bound has passed, so a generation rank is most likely alive but not "
+                "answering -- a Ray actor call has no timeout of its own, so waiting here "
+                "is unbounded. Giving up so the fleet can be reconciled and retried."
+            ) from None
+
+    async def _sync_weights_in_refit_actor(
+        self,
+        kv_scales: Optional[dict[str, float]],
+        what: str,
+        budget_s: Optional[float],
+    ) -> None:
+        """``_sync_weights_within`` for a RefitActor: await its ObjectRef, no thread."""
+        synchronizer = cast(RemoteWeightSynchronizer, self._weight_synchronizer)
+        try:
+            refit_ref = await asyncio.to_thread(
+                synchronizer.submit_sync_weights, kv_scales
+            )
+            await asyncio.wait_for(asyncio.wrap_future(refit_ref.future()), budget_s)
+        except RayActorError as error:
+            await asyncio.to_thread(synchronizer.raise_if_actor_died, error)
+            raise
+        except asyncio.TimeoutError:
+            raise RefitAborted(
+                f"the {what} refit did not return from the RefitActor within "
+                f"{budget_s}s. Every worker-side bound has passed, so a generation rank "
+                "is most likely alive but not answering. Giving up so the fleet can be "
+                "reconciled and retried."
+            ) from None
+
     async def _sync_weights(
         self,
         *,
         calibration_data: Optional[BatchedDataDict[Any]] = None,
-    ) -> None:
-        """Pause new rollout dispatches, synchronize weights, resume.
+    ) -> int:
+        """Pause rollout dispatch and generation, synchronize weights, resume.
 
-        SC owns the pause gate; in-flight generations continue through the
-        refit — vLLM V1 async engine supports weight updates during pending
-        requests.
+        SC owns the rollout-dispatch gate and asks every generation backend to
+        pause in-flight work through the common refit lifecycle hooks. Backends
+        without native pause support warn and retain their existing in-flight
+        update behavior. Continuous-serving vLLM preserves request state while
+        paused. A colocated engine is already stood down before training; the
+        synchronizer's sync remains its weight-carrying wake.
 
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
-          2. Optionally calibrate FP8 KV-cache scales.
-          3. weight_synchronizer.sync_weights(kv_scales=...)
-          4. _rollout_permitted.set()   — resume
+          2. Reconcile refit membership and optionally calibrate FP8 KV-cache scales.
+          3. Materialize deferred policy parameter all-gathers.
+          4. generation.pause_generation_for_refit(clear_cache=...)
+          5. weight_synchronizer.sync_weights(kv_scales=...)
+          6. generation.resume_generation_after_refit()
+          7. _rollout_permitted.set()   — resume dispatch
+
+        Args:
+            calibration_data: Optional data used to calibrate FP8 KV-cache
+                scales before synchronizing weights.
+
+        Returns:
+            The number of stale in-flight rollout groups aborted before the
+            weight synchronization.
         """
         self._rollout_permitted.clear()
 
+        # TODO(#2625): Abort unconditionally once Gym-path abort is validated;
+        # for now only the native path aborts stale in-flight requests.
+        aborted_stale_inflight_groups = (
+            0
+            if should_use_nemo_gym(self._master_config)
+            else await self._abort_stale_inflight()
+        )
+
         # TODO(#2625): Add drain-gate support during refit.
+
+        # Reconcile before the refit, not on a death event. The refit group is provably
+        # idle here and every rank is synchronized, which is required because the
+        # operations that change membership are themselves collectives. Doing it every
+        # time is also idempotent, so a missed or reordered health update converges on
+        # the next step instead of needing replay. Cheap rather than free: the
+        # synchronizer skips the rebuild when the absent set matches what it last built
+        # with, so the steady state after a loss is a set comparison, not a rebuild.
+        await self._reconcile_refit_membership()
 
         t0 = time.monotonic()
         kv_scales = None
@@ -615,19 +5146,216 @@ class SingleControllerActor:
             )
             kv_scales = calibration_result["layers"]
 
-        await asyncio.to_thread(
-            self._weight_synchronizer.sync_weights,
-            kv_scales=kv_scales,
+        # Reconcile once more, immediately before the collective.
+        #
+        # The reconcile above runs before calibration and two to_thread hops; a death
+        # recorded in that gap would otherwise be ignored until the NEXT step, by which
+        # time this broadcast is already hanging on the missing rank. Idempotent, and a
+        # set comparison in the common case -- it used to be a full rebuild on every call
+        # once a shard was gone, because absent_shards() never empties again.
+        await self._reconcile_refit_membership()
+        # Read once, here, because the answer changes underneath a refit. A restart takes
+        # minutes and nothing blocks it, so mark_loaded can turn a shard STALE mid-transfer
+        # -- and STALE is not absent, so asking again at promotion time would include a
+        # shard the communicator was deliberately built without.
+        participants = self._refit_participants()
+
+        # Recovery may repeat the transport, but an optimizer update only needs
+        # one parameter all-gather, so keep this outside the retry block.
+        with self._timer.time("prepare_for_generation/sync_policy_params"):
+            await asyncio.to_thread(self._trainer.sync_params_before_refit)
+
+        clear_cache = self._async_cfg.recompute_kv_cache_after_weight_updates
+        timeout_s = self._refit_await_budget_s()
+        if timeout_s is None:
+            timeout_s = self._GENERATION_CONTROL_TIMEOUT_S
+        generation_paused_for_refit = False
+        refit_started = False
+        print("⏸️ Requesting generation pause before refit", flush=True)
+        try:
+            generation_paused_for_refit = await asyncio.to_thread(
+                self._gen.pause_generation_for_refit,
+                clear_cache=clear_cache,
+                timeout_s=timeout_s,
+            )
+            if generation_paused_for_refit:
+                print(
+                    f"   {len(self._inflight_by_group_id)} in-flight rollout group(s) paused",
+                    flush=True,
+                )
+            refit_started = True
+            await self._sync_weights_within(kv_scales, "first")
+        except (RefitAborted, RayActorError) as failure:
+            # DETECT AND FAIL FAST, because this one cannot be recovered from.
+            #
+            # sync_stream_within gives up on kernels already enqueued on THIS trainer's
+            # stream, and aborting a communicator does not retire them. Its CUDA context is
+            # unusable afterwards: ncclCommAbort never returns and no rebuild on that device
+            # can bootstrap, so entering the recovery here does not fail -- it wedges, for
+            # the full harness deadline, with no attribution. Jobs 6521181, 6523731, 6582457
+            # and 6584636 each eliminated one candidate explanation and left this one.
+            #
+            # Narrow by construction: the token is applied only by sync_stream_within, which
+            # is reachable only from _nccl_reshard_refit. The packed-broadcast transport
+            # takes the same fault, fires the same deadline, aborts and recovers, and so
+            # does reshard when the fault lands at a step boundary. Recovering this last
+            # case is deliberately left to a future change; see the design doc, 8.5.7.
+            if is_refit_context_lost(failure):
+                print(
+                    "  _sync_weights: the refit aborted mid-transfer on the nccl_reshard "
+                    "bulk path, which orphans GPU work on the trainers and leaves their "
+                    "CUDA contexts unusable. Recovery is not possible from here, so the "
+                    "run ends now rather than wedging in a rebuild that cannot complete.",
+                    flush=True,
+                )
+                raise
+            with self._recovery_window():
+                await self._recover_from_failed_refit(
+                    failure, refit_started=refit_started
+                )
+                participants = self._refit_participants()
+                # A restarted engine may have joined the rebuilt membership without
+                # receiving the initial pause, even if it reuses the same shard index.
+                generation_paused_for_refit = await asyncio.to_thread(
+                    self._gen.pause_generation_for_refit,
+                    clear_cache=clear_cache,
+                    timeout_s=timeout_s,
+                )
+                # Once only: a second failure is a real fault, not a membership problem,
+                # and retrying forever would recreate the wedge this exists to remove.
+                await self._sync_weights_within(kv_scales, "retry")
+                # Inside the window: this is what refills the serving set, so releasing
+                # the flag before it runs would reopen the gap it exists to close.
+                self._record_refit_landed(participants)
+        else:
+            # A completed refit is what makes an engine's weights current, so this is
+            # where a shard pulled out of service for holding partial ones earns its way
+            # back. else, not a trailing statement: the recovery path above already
+            # promoted inside its window, and everything below this must still run on
+            # both paths.
+            self._record_refit_landed(participants)
+
+        paused_calls: list[dict[str, Any]] = []
+        if generation_paused_for_refit and self._master_config.token_capture.enabled:
+            # How far each running captured call got on the old weights. Read after
+            # the transfer, still paused, so calls that arrived during it report 0
+            # tokens and count all theirs on the new weights.
+            try:
+                paused_calls = await asyncio.to_thread(
+                    self._gen.captured_call_progress, timeout_s=timeout_s
+                )
+            except Exception as error:
+                # Batch age is not worth a failed refit: these calls count every
+                # token under the version they began on.
+                warnings.warn(
+                    "could not read running calls' token counts at a refit "
+                    f"({type(error).__name__}); batch age counts them under the "
+                    "version they began on",
+                    stacklevel=1,
+                )
+        print("▶️ Requesting generation resume after refit", flush=True)
+        generation_resumed_after_refit = await asyncio.to_thread(
+            self._gen.resume_generation_after_refit, timeout_s=timeout_s
         )
-        if self._async_cfg.recompute_kv_cache_after_weight_updates:
-            self._gen.invalidate_kv_cache()
+        if generation_paused_for_refit and not generation_resumed_after_refit:
+            raise RuntimeError(
+                "Failed to resume generation after a successful refit pause"
+            )
+
+        if clear_cache and not generation_paused_for_refit:
+            # A backend that paused natively already received clear_cache=True at pause
+            # time. Other backends must explicitly confirm equivalent engine-side cache
+            # handling; merely clearing reusable prefix entries does not invalidate KV
+            # blocks still owned by running requests.
+            invalidated = await asyncio.to_thread(self._gen.invalidate_kv_cache)
+            if not invalidated:
+                raise NotImplementedError(
+                    "recompute_kv_cache_after_weight_updates=True requires the "
+                    "generation backend to clear active-request KV state during a "
+                    "native refit pause or confirm equivalent engine-side handling"
+                )
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
-        self._rollout_manager.set_weight_version(self._trainer_version)
+        if self._master_config.token_capture.enabled:
+            # Rotate the version vLLM workers stamp on captured model calls
+            # (per-call tagging; group staleness = min over the group's calls).
+            await asyncio.to_thread(
+                self._gen.set_rollout_weight_version, self._trainer_version
+            )
+            for progress in paused_calls:
+                self._refit_cuts.record(
+                    progress["weight_version"], self._trainer_version, progress["calls"]
+                )
+            if isinstance(self._sampler, BaseSampler):
+                self._refit_cuts.forget_before(
+                    self._trainer_version - self._sampler.eviction_window
+                )
+        self._rollout_trace.emit("weights_synced", weight_version=self._trainer_version)
         self._rollout_permitted.set()
+        self._rollout_manager.resume_request_deadlines()
+        return aborted_stale_inflight_groups
 
-    async def _advantage_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
+    async def _value_stage(
+        self, meta: KVBatchMeta, *, already_prepared: bool = False
+    ) -> KVBatchMeta:
+        """Run the PPO value model's forward pass over the selected chunk.
+
+        Tensors never touch SC: workers fetch the sequence columns from
+        DataPlane and commit the per-token prediction back under ``values``,
+        which the advantage stage then reads alongside the rewards. Shared
+        workers offload after the forward; dedicated workers keep it resident.
+        Streaming may prepare it before the chunk's rollout data is ready.
+
+        Args:
+            meta: Selected chunk's metadata.
+            already_prepared: Reuse the critic residency prepared before waiting
+                for this chunk instead of loading the model again.
+
+        Returns:
+            The batch metadata with the ``values`` column recorded on it.
+        """
+        if not already_prepared:
+            await asyncio.to_thread(self._value.prepare_for_inference)
+        await asyncio.to_thread(self._value.get_values_from_meta, meta)
+        await asyncio.to_thread(self._value.finish_inference)
+        return meta.with_fields([self._advantage_cfg.values_field])
+
+    async def _value_train_epochs(
+        self, metas: list[KVBatchMeta], *, num_epochs: int
+    ) -> dict[str, Any]:
+        """Replay all step chunks per critic epoch under one residency cycle."""
+        value_loss_fn = self._value_loss_fn
+        if value_loss_fn is None:
+            raise RuntimeError("PPO value training requires a value loss function")
+        await asyncio.to_thread(self._value.prepare_for_training)
+        result: dict[str, Any] | None = None
+        if self._algo_cfg.value_training_mode == "whole_batch":
+            full_meta = metas[0].concat(*metas[1:])
+            for _ in range(num_epochs):
+                result = await asyncio.to_thread(
+                    self._value.train_from_meta, full_meta, value_loss_fn
+                )
+        else:
+            # Split exposes the per-chunk API, but this controller still collects
+            # all step chunks before training the critic.
+            for _ in range(num_epochs):
+                await asyncio.to_thread(self._value.begin_train_step, value_loss_fn)
+                for meta in metas:
+                    await asyncio.to_thread(
+                        self._value.train_microbatches_from_meta, meta
+                    )
+                result = await asyncio.to_thread(self._value.finish_train_step)
+        await asyncio.to_thread(self._value.finish_training)
+        assert result is not None
+        return result
+
+    async def _advantage_stage(
+        self,
+        meta: KVBatchMeta,
+        *,
+        policy_logprobs_required: Optional[bool] = None,
+    ) -> tuple[KVBatchMeta, bool]:
         """Fetch advantage inputs, compute advantages, and write them back.
 
         SC owns the prompt-group-scoped advantage stage because the selected
@@ -635,85 +5363,169 @@ class SingleControllerActor:
         DP sharding. Tensor payloads still move through DataPlane: SC fetches
         only the configured advantage input columns and writes the computed
         ``advantages`` column back under the same ``sample_ids``.
+
+        Returns:
+            The updated batch metadata and whether the batch contains at least
+            one valid training token.
         """
+        for tag in meta.tags or []:
+            for key in VIOLATION_TAG_KEYS:
+                self._step_log_dict.setdefault(key, []).append(int(tag.get(key, 0)))
+
+        logical = has_logical_owners(meta)
+        if logical:
+            if (
+                self._is_ppo
+                or not isinstance(self._algo_cfg, GRPOConfig)
+                or self._algo_cfg.adv_estimator.name != "grpo"
+                or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
+            ):
+                raise ValueError(
+                    "Forest logical owners require the standard GRPO estimator"
+                )
+            validate_forest_objective(self._algo_cfg, self._master_config.loss_fn)
         if self._advantage_estimator is None:
-            return meta
-        adv_cfg = self._advantage_cfg
+            return meta, True
 
-        data = await self._call_dp(
-            "get_samples",
-            sample_ids=meta.sample_ids,
-            partition_id=meta.partition_id,
-            select_fields=self._advantage_input_fields(),
+        # Split on prompt-group boundaries so the pool works a chunk in
+        # parallel when the estimator does not require the global batch.
+        stage_cfg = self._advantage_stage_config
+        num_actors = len(self._advantage_actors)
+        shards = (
+            split_meta_by_prompt_group(meta, num_actors)
+            if stage_cfg.shardable
+            else None
         )
-
-        prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
-        rewards = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.reward_field)
-        ).float()
-        token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
-        sample_mask = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.sample_mask_field)
-        ).float()
-        mask = token_mask * sample_mask.unsqueeze(-1)
-
-        repeated_batch: dict[str, torch.Tensor] = {
-            "total_reward": rewards,
-        }
-        for field_name in adv_cfg.repeated_batch_fields:
-            repeated_batch[field_name] = squeeze_trailing_unit_dim(
-                tensor_field(data, field_name)
+        # Every decline is silent by construction, so an unlogged one is
+        # indistinguishable from a shard that bought nothing -- which is how one
+        # 256-node run was spent measuring a no-op. Name the reason too: the
+        # default pool of 0 would otherwise report a layout it never examined.
+        if shards is not None:
+            decline = ""
+        elif not stage_cfg.shardable:
+            decline = (
+                f" (estimator {stage_cfg.algo.adv_estimator.name!r} is not "
+                "shard-invariant)"
             )
-
-        kwargs: dict[str, torch.Tensor] = {}
-        if self._policy_logprobs_required:
-            kwargs["logprobs_policy"] = tensor_field(
-                data,
-                adv_cfg.policy_logprobs_field,
+        elif num_actors <= 1:
+            decline = " (pool has fewer than 2 actors)"
+        elif len(set(row_group_ids(meta))) < 2:
+            decline = " (chunk has fewer than 2 prompt groups)"
+        else:
+            decline = " (prompt-group layout not recoverable)"
+        log.info(
+            "advantage stage: %d row(s) over %d shard(s), pool=%d%s",
+            len(meta.sample_ids),
+            len(shards) if shards is not None else 1,
+            len(self._advantage_actors),
+            decline,
+        )
+        requests = [
+            AdvantageRequest(
+                meta=shard,
+                # Only the stage still holds the untruncated tensors, so it
+                # writes the dump and needs the step to name the file by.
+                train_step=(
+                    self._train_steps if self._train_data_dump is not None else None
+                ),
+                policy_logprobs_required=policy_logprobs_required,
             )
-        if self._reference_logprobs_required:
-            kwargs["logprobs_reference"] = tensor_field(
-                data,
-                adv_cfg.reference_logprobs_field,
+            for shard in (shards if shards is not None else [meta])
+        ]
+        # Each actor writes advantages inside its RPC, so the cut must cover
+        # the whole call or a snapshot could land mid-write.
+        async with self._data_plane_checkpoint_barrier.mutation("advantage_writeback"):
+            outcomes = await asyncio.gather(
+                *(self._run_advantage_stage(request) for request in requests)
             )
+        # Every reduction downstream of here is already per-call: the partials
+        # and OPD moments are contributions rather than totals, and the
+        # sequence-error metrics reduce count-weighted across records.
+        new_fields: list[str] = []
+        has_valid_training_tokens = False
+        for outcome in outcomes:
+            self._absorb_advantage_outcome(outcome)
+            new_fields.extend(outcome.meta.fields or [])
+            has_valid_training_tokens |= outcome.has_valid_training_tokens
+        # Shards only ever add field names, never touch per-sample rows, so the
+        # full-batch meta carrying the union of those names is the whole result.
+        return meta.with_fields(new_fields), has_valid_training_tokens
 
-        advantages = self._advantage_estimator.compute_advantage(
-            prompt_ids=prompt_ids,
-            rewards=rewards,
-            mask=mask,
-            repeated_batch=repeated_batch,
-            **kwargs,
-        )
-        response_advantages = torch.masked_select(advantages, mask.bool())
-        self._step_log_dict["rewards"].append(rewards.detach().cpu())
-        self._step_log_dict["masked_advantages"].append(
-            response_advantages.detach().cpu()
+    async def _flush_advantage_dumps(self) -> None:
+        """Wait until every advantage writer has stored this step's dump chunks."""
+        if not self._advantage_actors:
+            await asyncio.to_thread(self._advantage_computer.flush_train_data_dump)
+            return
+        await asyncio.gather(
+            *(actor.flush_train_data_dump.remote() for actor in self._advantage_actors)
         )
 
-        await self._call_dp(
-            "put_samples",
-            sample_ids=meta.sample_ids,
-            partition_id=meta.partition_id,
-            fields=fields_for_put(
-                meta,
-                {adv_cfg.output_field: advantages},
-            ),
+    async def _run_advantage_stage(self, request: AdvantageRequest) -> AdvantageOutcome:
+        """Run one advantage stage on the pool, or in-process without one."""
+        if not self._advantage_actors:
+            return await self._advantage_computer.run(request)
+        actor = await self._available_advantage_actors.get()
+        try:
+            outcome = await actor.run.remote(request)
+        except BaseException:
+            # The writeback is half-done and unreadable from here, so this
+            # propagates rather than retrying, and the actor is not handed back.
+            print(
+                "FATAL: advantage actor RPC failed after submission; the "
+                f"writeback outcome is unknown for {len(request.meta.sample_ids)} "
+                "samples.",
+                flush=True,
+            )
+            raise
+        else:
+            self._available_advantage_actors.put_nowait(actor)
+            return outcome
+
+    def _absorb_advantage_outcome(self, outcome: AdvantageOutcome) -> None:
+        """Fold one call's reduced results into this step's accumulators."""
+        self._step_log_dict["num_mask_sample_filtered"].append(
+            outcome.num_mask_sample_filtered
         )
-        return meta.with_fields([adv_cfg.output_field])
+        self._step_log_dict["reward_partials"].append(outcome.reward_partial)
+        self._step_log_dict["advantage_partials"].append(outcome.advantage_partial)
+        if outcome.seq_logprob_error_metrics is not None:
+            self._step_log_dict["seq_logprob_error_metrics"].append(
+                outcome.seq_logprob_error_metrics
+            )
+        if outcome.sample_mask_metrics is not None:
+            self._step_log_dict.setdefault("sample_mask_metrics", []).append(
+                outcome.sample_mask_metrics
+            )
+        self._opd_stat_sum += outcome.opd_stat_sum
+        self._opd_stat_sumsq += outcome.opd_stat_sumsq
+        self._opd_stat_count += outcome.opd_stat_count
+        self._opd_gap_sum += outcome.opd_gap_sum
+        if outcome.train_data_dump_s:
+            # Recorded rather than timed here: the serialization ran wherever
+            # the stage ran, which with a pool is not this process.
+            self._timer.record(
+                "train_data_dump", outcome.train_data_dump_s, should_log=False
+            )
+        if outcome.train_data_dump_receipt is not None:
+            self._train_data_dump_receipts.append(outcome.train_data_dump_receipt)
 
     # ── utility helpers ────────────────────────────────────────────────────
+    def _retune_lookahead_versions(self) -> None:
+        """Widen the sampler's lookahead while the policy is frozen, then shrink it back.
 
-    def _advantage_input_fields(self) -> list[str]:
-        adv_cfg = self._advantage_cfg
-        fields = [
-            adv_cfg.prompt_ids_field,
-            adv_cfg.reward_field,
-            adv_cfg.token_mask_field,
-            adv_cfg.sample_mask_field,
-            *adv_cfg.repeated_batch_fields,
-        ]
-        if self._policy_logprobs_required:
-            fields.append(adv_cfg.policy_logprobs_field)
-        if self._reference_logprobs_required:
-            fields.append(adv_cfg.reference_logprobs_field)
-        return list(dict.fromkeys(fields))
+        Port of ppo.py's _async_ppo_generation_lead_steps.
+        """
+        if not self._is_ppo or isinstance(
+            self._async_cfg.sampler, ReadyFirstSamplerConfig
+        ):
+            # Ready-first retains all admitted rollouts and uses a fixed gate window.
+            return
+        steady = self._async_cfg.sampler.max_lookahead_versions
+        warmup = self._async_cfg.sampler.warmup_lookahead_versions
+        start = self._algo_cfg.policy_training_start_step
+        if warmup is None or self._trainer_version >= start:
+            window = steady
+        else:
+            remaining_to_frontier = start + steady - self._trainer_version
+            window = max(steady, min(warmup, remaining_to_frontier))
+        self._sampler.set_gate_window(window)

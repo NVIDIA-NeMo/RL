@@ -24,7 +24,7 @@ import torch
 import yaml
 
 import nemo_rl.utils.checkpoint as checkpoint_module
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 
 
 @pytest.fixture
@@ -34,15 +34,15 @@ def checkpoint_dir(tmp_path):
 
 @pytest.fixture
 def checkpoint_config(checkpoint_dir):
-    return {
-        "enabled": True,
-        "checkpoint_dir": checkpoint_dir,
-        "metric_name": "loss",
-        "higher_is_better": False,
-        "save_period": 1,
-        "keep_top_k": 3,
-        "save_optimizer": True,
-    }
+    return CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=checkpoint_dir,
+        metric_name="loss",
+        higher_is_better=False,
+        save_period=1,
+        keep_top_k=3,
+        save_optimizer=True,
+    )
 
 
 @pytest.fixture
@@ -50,12 +50,35 @@ def checkpoint_manager(checkpoint_config):
     return CheckpointManager(checkpoint_config)
 
 
+def test_checkpoint_manager_rejects_top_level_automodel_fields(checkpoint_config):
+    legacy_fields = {
+        "model_save_format": "torch_save",
+        "save_consolidated": True,
+        "single_rank_consolidation": False,
+        "consolidation_timeout_minutes": 30,
+        "model_cache_dir": "/tmp/model-cache",
+        "model_repo_id": "org/model",
+        "is_peft": False,
+        "peft_config": None,
+        "is_async": True,
+    }
+    with pytest.raises(ValueError) as error:
+        # Legacy keys arrive through extra="allow" on the validated model.
+        CheckpointManager(
+            CheckpointingConfig(**checkpoint_config.model_dump(), **legacy_fields)
+        )
+
+    for field in legacy_fields:
+        assert field in str(error.value)
+
+
 def test_init_tmp_checkpoint(checkpoint_manager, checkpoint_dir):
     # Test creating a new checkpoint
     step = 1
     training_info = {"loss": 0.5, "tensor": torch.tensor(0.5), "numpy": np.array(0.5)}
     run_config = MagicMock()
-    run_config.model_dump.return_value = {"model": "test"}
+    expected_config = {"model": "test"}
+    run_config.model_dump.return_value = expected_config
 
     save_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info, run_config)
 
@@ -73,7 +96,8 @@ def test_init_tmp_checkpoint(checkpoint_manager, checkpoint_dir):
     # Check if config was saved
     with open(save_dir / "config.yaml", "r") as f:
         saved_config = yaml.safe_load(f)
-        assert saved_config == run_config.model_dump()
+        assert saved_config == expected_config
+    run_config.model_dump.assert_called_once_with(mode="json")
 
 
 def test_finalize_checkpoint(checkpoint_manager, checkpoint_dir):
@@ -264,11 +288,11 @@ def test_get_best_checkpoint_path_bias_recent_if_equal(
     # Force the checkpoint history into the adversarial (older-first) order so the
     # test fails deterministically without the recency tie-break, regardless of the
     # underlying filesystem's glob ordering.
-    import nemo_rl.utils.checkpoint as checkpoint_mod
+    import glob
 
-    orig_glob = checkpoint_mod.glob.glob
+    orig_glob = glob.glob
     monkeypatch.setattr(
-        checkpoint_mod.glob,
+        glob,
         "glob",
         lambda pattern: sorted(
             orig_glob(pattern), key=lambda p: int(Path(p).name.split("_")[1])
@@ -330,15 +354,15 @@ def test_load_training_metadata(checkpoint_manager, checkpoint_dir):
 
 def test_checkpoint_without_keep_top_k(tmp_path):
     # Test checkpoint manager without keep_top_k
-    config = {
-        "enabled": True,
-        "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
-        "metric_name": "loss",
-        "higher_is_better": False,
-        "save_period": 1,
-        "keep_top_k": None,
-        "save_optimizer": True,
-    }
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str((tmp_path.resolve() / "checkpoints")),
+        metric_name="loss",
+        higher_is_better=False,
+        save_period=1,
+        keep_top_k=None,
+        save_optimizer=True,
+    )
     manager = CheckpointManager(config)
 
     # Create multiple checkpoints
@@ -398,7 +422,7 @@ def test_save_optimizer_flag_initialization(checkpoint_config):
     assert manager.save_optimizer is True
 
     # Test that save_optimizer respects explicit False
-    checkpoint_config["save_optimizer"] = False
+    checkpoint_config.save_optimizer = False
     manager = CheckpointManager(checkpoint_config)
     assert manager.save_optimizer is False
 
@@ -456,7 +480,7 @@ def test_get_resume_paths_missing_optimizer(
 
 @pytest.mark.parametrize("model_component", ["policy", "value"])
 def test_get_resume_paths_separate_optimizer(checkpoint_dir, model_component):
-    """DTensor checkpoints use a physical optimizer directory."""
+    """Automodel checkpoints use a physical optimizer directory."""
     checkpoint_path = checkpoint_dir / "step_1"
     expected_weights_path = checkpoint_path / model_component / "weights"
     expected_optimizer_path = checkpoint_path / model_component / "optimizer"
@@ -498,6 +522,11 @@ def test_get_resume_paths_warns_when_megatron_optimizer_missing(
         "_load_megatron_common_state_dict",
         MagicMock(return_value={"args": {}}),
     )
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_megatron_sharded_metadata_keys",
+        MagicMock(return_value=set()),
+    )
 
     with pytest.warns(UserWarning, match="Optimizer state not found"):
         weights_path, optimizer_path = CheckpointManager.get_resume_paths(
@@ -508,7 +537,7 @@ def test_get_resume_paths_warns_when_megatron_optimizer_missing(
     assert optimizer_path is None
 
 
-def test_get_resume_paths_prefers_dtensor_optimizer(checkpoint_dir, monkeypatch):
+def test_get_resume_paths_prefers_automodel_optimizer(checkpoint_dir, monkeypatch):
     checkpoint_path = checkpoint_dir / "step_1"
     optimizer_path = checkpoint_path / "policy" / "optimizer"
     optimizer_path.mkdir(parents=True)
@@ -553,6 +582,80 @@ def test_get_resume_paths_propagates_megatron_load_failure(
         CheckpointManager.get_resume_paths(checkpoint_path)
 
 
+@pytest.mark.parametrize("model_component", ["policy", "value"])
+def test_get_resume_paths_torch_dist_megatron_optimizer(
+    checkpoint_dir, monkeypatch, model_component
+):
+    """Modern MCore manifests optimizer shards through torch_dist metadata."""
+    checkpoint_path = checkpoint_dir / "step_1"
+    expected_weights_path = checkpoint_path / model_component / "weights"
+    iteration_path = expected_weights_path / "iter_0000000"
+    iteration_path.mkdir(parents=True)
+    (iteration_path / "metadata.json").touch()
+    with open(iteration_path / "run_config.yaml", "w") as f:
+        yaml.safe_dump({"checkpoint": {"save_optim": True}}, f)
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_megatron_common_state_dict",
+        MagicMock(return_value={"args": {}}),
+    )
+    load_sharded_keys = MagicMock(
+        return_value={
+            "chained_1.optimizer.distributed.dp_group_idx_5.gbuf_idx_0."
+            "dtype_(torch.bfloat16, torch.bfloat16)"
+        }
+    )
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_megatron_sharded_metadata_keys",
+        load_sharded_keys,
+    )
+
+    expected_optimizer_path = checkpoint_path / model_component / "optimizer"
+    assert not expected_optimizer_path.exists()
+    assert not (iteration_path / "common.pt").exists()
+
+    weights_path, optimizer_path = CheckpointManager.get_resume_paths(
+        checkpoint_path,
+        model_component=model_component,
+    )
+
+    assert weights_path == expected_weights_path
+    assert optimizer_path == expected_optimizer_path
+    load_sharded_keys.assert_called_once_with(iteration_path)
+
+
+def test_get_resume_paths_ignores_save_optim_without_optimizer_shards(
+    checkpoint_dir, monkeypatch
+):
+    """run_config records intent and must not masquerade as saved optimizer state."""
+    checkpoint_path = checkpoint_dir / "step_1"
+    weights_path = checkpoint_path / "policy" / "weights"
+    iteration_path = weights_path / "iter_0000000"
+    iteration_path.mkdir(parents=True)
+    (iteration_path / "metadata.json").touch()
+    with open(iteration_path / "run_config.yaml", "w") as f:
+        yaml.safe_dump({"checkpoint": {"save_optim": True}}, f)
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_megatron_common_state_dict",
+        MagicMock(return_value={"args": {}}),
+    )
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_megatron_sharded_metadata_keys",
+        MagicMock(return_value={"model.decoder.layers.weight"}),
+    )
+
+    with pytest.warns(UserWarning, match="Optimizer state not found"):
+        returned_weights_path, optimizer_path = CheckpointManager.get_resume_paths(
+            checkpoint_path
+        )
+
+    assert returned_weights_path == weights_path
+    assert optimizer_path is None
+
+
 def test_get_best_checkpoint_path_no_checkpoints(checkpoint_manager, checkpoint_dir):
     """Test that get_best_checkpoint_path returns None when no checkpoints exist."""
     result = checkpoint_manager.get_best_checkpoint_path()
@@ -562,15 +665,15 @@ def test_get_best_checkpoint_path_no_checkpoints(checkpoint_manager, checkpoint_
 def test_get_best_checkpoint_path_some_missing_metric(tmp_path):
     """Test that get_best_checkpoint_path filters out checkpoints missing the metric and warns."""
     # Use keep_top_k=None to keep all checkpoints for this test
-    config = {
-        "enabled": True,
-        "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
-        "metric_name": "loss",
-        "higher_is_better": False,
-        "save_period": 1,
-        "keep_top_k": None,  # Keep all checkpoints
-        "save_optimizer": True,
-    }
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str((tmp_path.resolve() / "checkpoints")),
+        metric_name="loss",
+        higher_is_better=False,
+        save_period=1,
+        keep_top_k=None,
+        save_optimizer=True,
+    )
     manager = CheckpointManager(config)
 
     # Create checkpoints where some have the metric and others don't
@@ -607,15 +710,15 @@ def test_get_best_checkpoint_path_some_missing_metric(tmp_path):
 def test_get_best_checkpoint_path_all_missing_metric(tmp_path):
     """Test that get_best_checkpoint_path returns latest checkpoint when all are missing the metric."""
     # Use keep_top_k=None to keep all checkpoints for this test
-    config = {
-        "enabled": True,
-        "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
-        "metric_name": "loss",
-        "higher_is_better": False,
-        "save_period": 1,
-        "keep_top_k": None,  # Keep all checkpoints
-        "save_optimizer": True,
-    }
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str((tmp_path.resolve() / "checkpoints")),
+        metric_name="loss",
+        higher_is_better=False,
+        save_period=1,
+        keep_top_k=None,
+        save_optimizer=True,
+    )
     manager = CheckpointManager(config)
 
     # Create checkpoints where none have the required metric
@@ -650,15 +753,15 @@ def test_get_best_checkpoint_path_all_missing_metric(tmp_path):
 
 def test_get_best_checkpoint_path_higher_is_better(tmp_path):
     """Test get_best_checkpoint_path with higher_is_better=True."""
-    config = {
-        "enabled": True,
-        "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
-        "metric_name": "accuracy",
-        "higher_is_better": True,
-        "save_period": 1,
-        "keep_top_k": None,  # Keep all
-        "save_optimizer": True,
-    }
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str((tmp_path.resolve() / "checkpoints")),
+        metric_name="accuracy",
+        higher_is_better=True,
+        save_period=1,
+        keep_top_k=None,
+        save_optimizer=True,
+    )
     manager = CheckpointManager(config)
 
     # Create checkpoints with different accuracy values
@@ -681,15 +784,15 @@ def test_get_best_checkpoint_path_higher_is_better(tmp_path):
 
 @pytest.fixture
 def async_checkpoint_config(checkpoint_dir):
-    return {
-        "enabled": True,
-        "checkpoint_dir": checkpoint_dir,
-        "metric_name": None,
-        "higher_is_better": False,
-        "save_period": 1,
-        "keep_top_k": None,
-        "save_optimizer": True,
-    }
+    return CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=checkpoint_dir,
+        metric_name=None,
+        higher_is_better=False,
+        save_period=1,
+        keep_top_k=None,
+        save_optimizer=True,
+    )
 
 
 @pytest.fixture
@@ -806,15 +909,15 @@ class TestShutdown:
 
     def test_waits_for_rename_and_deletion(self, checkpoint_dir):
         """shutdown() blocks until both rename and deletion complete."""
-        config = {
-            "enabled": True,
-            "checkpoint_dir": checkpoint_dir,
-            "metric_name": None,
-            "higher_is_better": False,
-            "save_period": 1,
-            "keep_top_k": 1,
-            "save_optimizer": True,
-        }
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_dir,
+            metric_name=None,
+            higher_is_better=False,
+            save_period=1,
+            keep_top_k=1,
+            save_optimizer=True,
+        )
         manager = CheckpointManager(config)
 
         for step in [1, 2, 3]:
@@ -898,15 +1001,15 @@ class TestDeletionSerialization:
 
     def test_keep_top_k_with_async_finalization(self, checkpoint_dir):
         """Old checkpoints are deleted without blocking the main thread."""
-        config = {
-            "enabled": True,
-            "checkpoint_dir": checkpoint_dir,
-            "metric_name": None,
-            "higher_is_better": False,
-            "save_period": 1,
-            "keep_top_k": 2,
-            "save_optimizer": True,
-        }
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_dir,
+            metric_name=None,
+            higher_is_better=False,
+            save_period=1,
+            keep_top_k=2,
+            save_optimizer=True,
+        )
         manager = CheckpointManager(config)
 
         for step in range(1, 6):
@@ -924,15 +1027,15 @@ class TestDeletionSerialization:
 
     def test_deletion_does_not_block_next_save(self, checkpoint_dir):
         """Deletion runs asynchronously, so the next begin_finalization returns quickly."""
-        config = {
-            "enabled": True,
-            "checkpoint_dir": checkpoint_dir,
-            "metric_name": None,
-            "higher_is_better": False,
-            "save_period": 1,
-            "keep_top_k": 1,
-            "save_optimizer": True,
-        }
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_dir,
+            metric_name=None,
+            higher_is_better=False,
+            save_period=1,
+            keep_top_k=1,
+            save_optimizer=True,
+        )
         manager = CheckpointManager(config)
 
         tmp1 = manager.init_tmp_checkpoint(1, {"loss": 0.1})
@@ -1073,7 +1176,7 @@ class TestContextManager:
 
 
 class TestRenameCheckpointSwap:
-    """Tests for _rename_checkpoint when the target step dir already exists."""
+    """Tests for publishing a checkpoint when the target step dir already exists."""
 
     def test_swaps_when_target_exists(self, checkpoint_manager, checkpoint_dir):
         """A pre-existing step_N is atomically replaced by the new tmp_step_N."""
@@ -1123,16 +1226,16 @@ class TestFTKeepLatestK:
         higher_is_better=False,
         save_period=1,
     ):
-        config = {
-            "enabled": True,
-            "checkpoint_dir": checkpoint_dir,
-            "metric_name": metric_name,
-            "higher_is_better": higher_is_better,
-            "save_period": save_period,
-            "keep_top_k": keep_top_k,
-            "ft_keep_latest_k": ft_keep_latest_k,
-            "save_optimizer": True,
-        }
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_dir,
+            metric_name=metric_name,
+            higher_is_better=higher_is_better,
+            save_period=save_period,
+            keep_top_k=keep_top_k,
+            ft_keep_latest_k=ft_keep_latest_k,
+            save_optimizer=True,
+        )
         return CheckpointManager(config)
 
     @staticmethod
@@ -1325,3 +1428,23 @@ class TestFTKeepLatestK:
 
         # top-2 by metric -> {1, 2}; ft latest-2 -> {5, 6}; union -> {1, 2, 5, 6}.
         assert self._remaining_steps(checkpoint_dir) == [1, 2, 5, 6]
+
+
+def test_a_non_numeric_staging_name_costs_only_the_span_label(
+    checkpoint_manager, checkpoint_dir
+):
+    """The span's step is read from the directory name, so it must never raise.
+
+    ``_rename_checkpoint`` publishes whatever sits between the second and third
+    underscore, so ``tmp_step_final`` becomes ``step_final``. The span wants an
+    int and cannot have one here; it drops the label rather than failing the
+    finalization that carries it.
+    """
+    staged = checkpoint_dir / "tmp_step_final"
+    staged.mkdir(parents=True)
+
+    checkpoint_manager.begin_finalization(staged, wait_fn=None)
+    checkpoint_manager.finalize_pending()
+
+    assert (checkpoint_dir / "step_final").exists()
+    assert not staged.exists()

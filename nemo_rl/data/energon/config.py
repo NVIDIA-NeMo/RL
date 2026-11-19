@@ -1,0 +1,152 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import Annotated, Any, ClassVar, Literal, Self
+
+from pydantic import BaseModel, Field, model_validator
+
+from nemo_rl.data.energon.multimodal.model_families import ModelFamily
+
+
+class EnergonSourceConfig(BaseModel, extra="allow"):
+    """One prepared Energon dataset split."""
+
+    path: str
+    split: str
+    virtual_epoch_length: Annotated[int, Field(ge=0)] = 0
+    limit: Annotated[int, Field(ge=1)] | None = None
+
+
+class EnergonPackingOptions(BaseModel, extra="forbid"):
+    """Options for task-encoder-owned sequence packing."""
+
+    max_sequences_per_bin: Annotated[int, Field(ge=1)] | None = None
+    balanced_knapsack_delta: Annotated[int, Field(ge=0)] | None = None
+
+
+class EnergonPackingConfig(BaseModel, extra="forbid"):
+    """One task-encoder-owned packing implementation."""
+
+    name: str
+    buffer_size: Annotated[int, Field(ge=1)]
+    options: EnergonPackingOptions
+
+
+class _EnergonComponentConfig(BaseModel, extra="allow"):
+    """Shared selection fields for built-in and file-backed Energon plugins."""
+
+    _label: ClassVar[str]
+    name: str | None
+    python_file: str | None = None
+    object_name: str | None = None
+    options: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_registry_key(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return {"name": value}
+        if isinstance(value, dict) and "object" in value:
+            raise ValueError("object is not supported; use object_name.")
+        if isinstance(value, dict) and value.get("python_file") and "name" not in value:
+            return {**value, "name": None}
+        return value
+
+    @model_validator(mode="after")
+    def _validate_component_reference(self) -> Self:
+        if self.name is not None:
+            if self.python_file is not None or self.object_name is not None:
+                raise ValueError(
+                    f"{self._label} must use either name or python_file and object_name."
+                )
+            return self
+        if not self.python_file or not self.object_name:
+            raise ValueError(
+                f"File-backed {self._label.lower()}s require python_file and object_name."
+            )
+        return self
+
+
+class EnergonTaskEncoderConfig(_EnergonComponentConfig):
+    """One built-in or file-backed task encoder and optional packing."""
+
+    _label: ClassVar[str] = "Task encoder"
+    name: str | None = "generic_sft"
+    packing: EnergonPackingConfig | None = None
+
+
+class EnergonCookerConfig(_EnergonComponentConfig):
+    """One built-in or file-backed source cooker."""
+
+    _label: ClassVar[str] = "Cooker"
+    name: str | None = "generic_conversation"
+    has_subflavors: dict[str, str | int | float | bool | None] | None = None
+
+
+class EnergonLoaderConfig(BaseModel, extra="allow"):
+    """Shared Energon settings for driver- and worker-owned SFT loaders."""
+
+    model_family: ModelFamily = Field(
+        description="Model family used to validate cooker and task-encoder support."
+    )
+    num_workers: Annotated[int, Field(ge=0)] = 8
+    shuffle_buffer_size: Annotated[int, Field(ge=0)] = 1000
+    max_samples_per_sequence: (
+        Annotated[
+            int,
+            Field(
+                ge=1,
+                description="Maximum sequential sample run used when sharding a dataset.",
+            ),
+        ]
+        | None
+    ) = None
+    # Packing is configured by task_encoder.packing. Keep the old field in the
+    # resolved config so older recipes that set it to null remain loadable.
+    packing_buffer_size: None = None
+    batch_grouping: Literal["auto"] = "auto"
+    processor_adapter: Literal["hf_multimodal"] = "hf_multimodal"
+    topology_mapper: Literal["default"] = "default"
+    task_encoder: EnergonTaskEncoderConfig = Field(
+        default_factory=EnergonTaskEncoderConfig
+    )
+    cookers: list[EnergonCookerConfig] = Field(
+        default_factory=lambda: [EnergonCookerConfig()]
+    )
+    seed_offset: int = 0
+    prefetch_factor: Annotated[int, Field(ge=1)] = 2
+    checkpoint_every_sec: Annotated[float, Field(gt=0)] = 60.0
+    watchdog_timeout_seconds: Annotated[float, Field(gt=0)] | None = 60.0
+    nvdataset_cache_dir: str | None = Field(
+        default=None,
+        description=(
+            "Root used to resolve dss:// dataset paths. When set, this is "
+            "exported as NVDATASET_CACHE_DIR for Energon loader workers."
+        ),
+    )
+    cache_pool_max_gbytes: Annotated[float, Field(gt=0)] | None = Field(
+        default=None,
+        description="Maximum file-store cache size in GiB; None uses Energon's limit.",
+    )
+    cache_pool_num_workers: Annotated[int, Field(ge=1)] | None = Field(
+        default=None,
+        description="FileStoreCachePool copy threads; None uses Energon's default.",
+    )
+    gc_collect_every_n_steps: Annotated[int, Field(ge=0)] | None = Field(
+        default=None,
+        description=(
+            "Loader steps between forced garbage collections; 0 disables, "
+            "None uses Energon's default."
+        ),
+    )

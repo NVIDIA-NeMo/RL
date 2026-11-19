@@ -20,9 +20,134 @@ verified by the architecture invariants in test_architecture_invariants.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from nemo_rl.data_plane import build_data_plane_client
+
+
+@pytest.mark.parametrize("backend", ["simple", "mooncake_cpu"])
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_factory_passes_checkpoint_runtime_mode_to_bootstrap(
+    monkeypatch, backend, checkpointing
+) -> None:
+    from nemo_rl.data_plane.adapters import tq_mooncake_checkpoint
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    bootstrap = MagicMock()
+    connect = MagicMock()
+    monkeypatch.setattr(adapter, "_init_tq", bootstrap)
+    monkeypatch.setattr(adapter, "_connect_existing", connect)
+    monkeypatch.setattr(adapter, "_get_local_node_ip", lambda: "")
+    monkeypatch.setattr(adapter, "_patch_mooncake_register_check", lambda: None)
+    monkeypatch.setattr(
+        tq_mooncake_checkpoint, "install_tq_mooncake_checkpoint_plugin", lambda: None
+    )
+    cfg = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": backend,
+        "claim_meta_poll_interval_s": 0.5,
+        "mooncake_cpu": {"reuse_registered_buffers": False},
+    }
+
+    plan = ["a" * 56, "b" * 56]
+    client = build_data_plane_client(
+        cfg, checkpointing=checkpointing, storage_unit_node_ids=plan
+    )
+
+    # The storage-unit plan reaches bootstrap as an argument, not via the config.
+    bootstrap.assert_called_once_with(
+        cfg, checkpointing=checkpointing, storage_unit_node_ids=plan
+    )
+    connect.assert_not_called()
+    assert client._supports_checkpointing is True
+
+
+def test_worker_attach_carries_its_segment_size(monkeypatch) -> None:
+    """A worker states the Mooncake memory it owns in the build call itself."""
+    from nemo_rl.data_plane.adapters import tq_mooncake_checkpoint
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    connect = MagicMock()
+    monkeypatch.setattr(adapter, "_connect_existing_with_segment_size", connect)
+    monkeypatch.setattr(adapter, "_get_local_node_ip", lambda: "")
+    monkeypatch.setattr(adapter, "_patch_mooncake_register_check", lambda: None)
+    monkeypatch.setattr(
+        tq_mooncake_checkpoint, "install_tq_mooncake_checkpoint_plugin", lambda: None
+    )
+    cfg = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "mooncake_cpu",
+        "claim_meta_poll_interval_s": 0.5,
+        "mooncake_cpu": {"reuse_registered_buffers": False},
+    }
+
+    build_data_plane_client(cfg, bootstrap=False, segment_size=0)
+
+    connect.assert_called_once_with(0)
+
+
+@pytest.mark.parametrize(("bootstrap", "segment_size"), [(True, None), (False, 0)])
+def test_every_mooncake_client_offers_its_segment_to_ssd_offload(
+    monkeypatch, bootstrap, segment_size
+) -> None:
+    """Each client decides from its own segment whether it runs offload."""
+    from nemo_rl.data_plane.adapters import mooncake_ssd_offload, tq_mooncake_checkpoint
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    install = MagicMock()
+    monkeypatch.setattr(mooncake_ssd_offload, "install", install)
+    monkeypatch.setattr(adapter, "_init_tq", MagicMock())
+    monkeypatch.setattr(adapter, "_connect_existing_with_segment_size", MagicMock())
+    monkeypatch.setattr(adapter, "_get_local_node_ip", lambda: "")
+    monkeypatch.setattr(adapter, "_patch_mooncake_register_check", lambda: None)
+    monkeypatch.setattr(
+        tq_mooncake_checkpoint, "install_tq_mooncake_checkpoint_plugin", lambda: None
+    )
+    cfg = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "mooncake_cpu",
+        "claim_meta_poll_interval_s": 0.5,
+        "mooncake_cpu": {"reuse_registered_buffers": False},
+    }
+
+    build_data_plane_client(cfg, bootstrap=bootstrap, segment_size=segment_size)
+
+    (mooncake_cfg, owned), _ = install.call_args
+    assert owned == segment_size
+    assert mooncake_cfg.reuse_registered_buffers is False
+
+
+def test_segment_size_attach_overrides_only_this_process(monkeypatch) -> None:
+    """The override reaches this client's storage config; the controller's is untouched."""
+    import ray
+    from omegaconf import OmegaConf
+    from transfer_queue import interface as tq_interface
+
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    published = OmegaConf.create(
+        {
+            "backend": {
+                "storage_backend": "MooncakeStore",
+                "MooncakeStore": {"global_segment_size": 64, "local_buffer_size": 8},
+            }
+        }
+    )
+    attached = []
+    monkeypatch.setattr(ray, "get_actor", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(ray, "get", lambda _ref: published)
+    monkeypatch.setattr(tq_interface, "_maybe_create_tq_client", attached.append)
+
+    adapter._connect_existing_with_segment_size(16)
+
+    assert attached[0].backend.MooncakeStore.global_segment_size == 16
+    assert attached[0].backend.MooncakeStore.local_buffer_size == 8
+    assert published.backend.MooncakeStore.global_segment_size == 64
 
 
 def test_factory_none_cfg_rejected():
@@ -63,3 +188,157 @@ def test_factory_disabled_error_message_helpful():
     assert "grpo" in msg.lower() or "legacy" in msg.lower(), (
         f"factory rejection should reference the legacy trainer; got: {msg}"
     )
+
+
+@pytest.fixture
+def stub_tq_adapter(monkeypatch):
+    """Stand in for the TQ adapter, which needs mooncake and a live cluster."""
+    import sys
+    from types import ModuleType
+
+    from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+
+    module = ModuleType("nemo_rl.data_plane.adapters.transfer_queue")
+
+    class _StubClient(NoOpDataPlaneClient):
+        # Takes whatever the factory passes; which keywords actually reach
+        # the adapter is checked in
+        # test_factory_passes_checkpoint_runtime_mode_to_bootstrap.
+        def __init__(self, cfg, **kwargs):
+            super().__init__()
+
+    module.TQDataPlaneClient = _StubClient
+    monkeypatch.setitem(
+        sys.modules, "nemo_rl.data_plane.adapters.transfer_queue", module
+    )
+    return _StubClient
+
+
+def _is_wrapped(client) -> bool:
+    from nemo_rl.data_plane.observability import MetricsDataPlaneClient
+
+    return isinstance(client, MetricsDataPlaneClient)
+
+
+def _has_event_sink(client) -> bool:
+    """Whether the wrapper got a per-op sink at all, rather than spans only."""
+    return client._on_event is not None
+
+
+def test_telemetry_alone_installs_the_metrics_wrapper(monkeypatch, stub_tq_adapter):
+    """Transfer-queue spans must not depend on data-plane event logging.
+
+    The wrapper carries both, and requiring users to enable an unrelated
+    logging feature to get spans is how the queue stayed absent from traces.
+    """
+    import nemo_rl.data_plane.factory as factory_mod
+
+    monkeypatch.setattr(factory_mod, "telemetry_enabled_in_env", lambda: True)
+
+    client = build_data_plane_client(
+        {"enabled": True, "impl": "transfer_queue"}, bootstrap=False
+    )
+    assert _is_wrapped(client)
+    # Event logging stays off: only spans were asked for, and attaching a sink
+    # would add a per-op callback nobody enabled.
+    assert not _has_event_sink(client)
+    client.close()
+
+
+def test_observability_alone_installs_the_wrapper_without_a_default_sink(
+    monkeypatch, stub_tq_adapter
+):
+    """Observability alone gets the wrapper, but no per-op sink by default.
+
+    The metrics surface is ``get_step_metrics``, which the trainer logs once a
+    step; a sink here fires on every single transfer, so ``log_event`` is opt-in
+    via ``observability.callback``.
+    """
+    import nemo_rl.data_plane.factory as factory_mod
+
+    monkeypatch.setattr(factory_mod, "telemetry_enabled_in_env", lambda: False)
+
+    client = build_data_plane_client(
+        {
+            "enabled": True,
+            "impl": "transfer_queue",
+            "observability": {"enabled": True},
+        },
+        bootstrap=False,
+    )
+    assert _is_wrapped(client)
+    assert not _has_event_sink(client)
+    client.close()
+
+
+def test_observability_callback_is_the_opt_in_path_to_per_op_events(
+    monkeypatch, stub_tq_adapter
+):
+    """An explicitly configured callback is wired straight through."""
+    import nemo_rl.data_plane.factory as factory_mod
+
+    monkeypatch.setattr(factory_mod, "telemetry_enabled_in_env", lambda: False)
+
+    def sink(event):
+        pass
+
+    client = build_data_plane_client(
+        {
+            "enabled": True,
+            "impl": "transfer_queue",
+            "observability": {"enabled": True, "callback": sink},
+        },
+        bootstrap=False,
+    )
+    assert _is_wrapped(client)
+    assert client._on_event is sink
+    client.close()
+
+
+def test_disabled_observability_block_is_not_armed_by_telemetry(
+    monkeypatch, stub_tq_adapter
+):
+    """A telemetry-only run must not honour a disabled observability block.
+
+    Telemetry installs the wrapper for its spans, which puts the ``callback``
+    and ``verify_tensor_hash`` fields of an ``enabled: false`` block back in
+    reach. Acting on them would start a per-op sink and re-read every tensor
+    element on both put and get for a feature the user switched off.
+    """
+    import nemo_rl.data_plane.factory as factory_mod
+
+    monkeypatch.setattr(factory_mod, "telemetry_enabled_in_env", lambda: True)
+
+    def sink(event):
+        pass
+
+    client = build_data_plane_client(
+        {
+            "enabled": True,
+            "impl": "transfer_queue",
+            "observability": {
+                "enabled": False,
+                "callback": sink,
+                "verify_tensor_hash": True,
+            },
+        },
+        bootstrap=False,
+    )
+    assert _is_wrapped(client)
+    assert not _has_event_sink(client)
+    assert not client._verify_tensor_hash
+    client.close()
+
+
+def test_no_wrapper_when_neither_telemetry_nor_observability_is_on(
+    monkeypatch, stub_tq_adapter
+):
+    import nemo_rl.data_plane.factory as factory_mod
+
+    monkeypatch.setattr(factory_mod, "telemetry_enabled_in_env", lambda: False)
+
+    client = build_data_plane_client(
+        {"enabled": True, "impl": "transfer_queue"}, bootstrap=False
+    )
+    assert not _is_wrapped(client)
+    client.close()

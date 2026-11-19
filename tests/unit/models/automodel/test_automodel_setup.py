@@ -15,7 +15,9 @@
 """Unit tests for automodel setup utilities."""
 
 import os
-from unittest.mock import MagicMock, Mock, patch
+import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, create_autospec, patch
 
 import pytest
 
@@ -26,7 +28,9 @@ except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
 import torch
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
+from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.config import DistributedContext
 from nemo_rl.models.automodel.setup import (
     ModelAndOptimizerState,
@@ -40,11 +44,6 @@ from nemo_rl.models.automodel.setup import (
 )
 
 
-def test_token_classification_backport_still_required():
-    with pytest.raises(ImportError):
-        from nemo_automodel import NeMoAutoModelForTokenClassification  # noqa: F401
-
-
 @pytest.fixture
 def mock_config():
     """Create a mock policy configuration for testing."""
@@ -54,7 +53,7 @@ def mock_config():
         "max_grad_norm": 1.0,
         "offload_optimizer_for_logprob": False,
         "sequence_packing": {"enabled": False},
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "cpu_offload": False,
             "tensor_parallel_size": 1,
             "context_parallel_size": 1,
@@ -115,6 +114,10 @@ class TestValidateAndPrepareConfig:
         # Verify result is a RuntimeConfig named tuple
         assert isinstance(result, RuntimeConfig)
         assert result.dtype == torch.bfloat16
+        assert (
+            mock_autoconfig_class.from_pretrained.call_args.kwargs["torch_dtype"]
+            == torch.bfloat16
+        )
         assert result.cpu_offload is False
         assert result.offload_optimizer_for_logprob is False
         assert result.max_grad_norm == 1.0
@@ -137,6 +140,26 @@ class TestValidateAndPrepareConfig:
         mock_config["precision"] = "invalid_precision"
 
         with pytest.raises(ValueError, match="Unknown precision"):
+            validate_and_prepare_config(
+                config=mock_config,
+                processor=None,
+                rank=0,
+            )
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_fsdp_output_dtype_validation_invalid(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+    ):
+        """Test that an invalid fsdp_output_dtype raises ValueError."""
+        mock_config["automodel_cfg"]["fsdp_output_dtype"] = "invalid_dtype"
+
+        with pytest.raises(ValueError, match="Unknown FSDP output dtype"):
             validate_and_prepare_config(
                 config=mock_config,
                 processor=None,
@@ -199,6 +222,42 @@ class TestValidateAndPrepareConfig:
         assert isinstance(result, RuntimeConfig)
         assert result.is_reward_model is True
 
+    @pytest.mark.parametrize("cp_size", [2, 4])
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_context_parallel_bradley_terry_raises_error(
+        self, mock_dynamo, mock_autoconfig_class, mock_config, mock_autoconfig, cp_size
+    ):
+        """Sequence-level reward heads cannot use token-level CP restoration."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_config["automodel_cfg"]["context_parallel_size"] = cp_size
+        mock_config["reward_model_cfg"] = {
+            "enabled": True,
+            "reward_model_type": "bradley_terry",
+        }
+
+        with pytest.raises(NotImplementedError, match="Bradley-Terry reward models"):
+            validate_and_prepare_config(mock_config, None, 0)
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_context_parallel_regression_reward_model_is_supported(
+        self, mock_dynamo, mock_autoconfig_class, mock_config, mock_autoconfig
+    ):
+        """The sequence-level guard must not reject token-level PPO values."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_config["automodel_cfg"]["context_parallel_size"] = 2
+        mock_config["reward_model_cfg"] = {
+            "enabled": True,
+            "reward_model_type": "regression",
+        }
+
+        result = validate_and_prepare_config(mock_config, None, 0)
+
+        assert result.is_reward_model
+        assert result.attn_impl == "sdpa"
+        assert mock_autoconfig.num_labels == 1
+
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
@@ -211,7 +270,8 @@ class TestValidateAndPrepareConfig:
     ):
         """Test that CP with sequence packing raises ValueError."""
         mock_config["sequence_packing"]["enabled"] = True
-        mock_config["dtensor_cfg"]["context_parallel_size"] = 2
+        mock_config["automodel_cfg"]["context_parallel_size"] = 2
+        mock_config["precision"] = "bfloat16"
 
         with pytest.raises(
             ValueError, match="Context parallel is not supported for sequence packing"
@@ -221,6 +281,34 @@ class TestValidateAndPrepareConfig:
                 processor=None,
                 rank=0,
             )
+
+    @pytest.mark.parametrize("is_reward_model", [False, True])
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_context_parallel_float32_is_supported(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+        is_reward_model,
+    ):
+        """Policy and value heads share the same CP precision constraints."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config["precision"] = "float32"
+        mock_config["automodel_cfg"]["context_parallel_size"] = 2
+        mock_config["reward_model_cfg"] = {
+            "enabled": is_reward_model,
+            "reward_model_type": "regression",
+        }
+
+        result = validate_and_prepare_config(mock_config, None, 0)
+
+        assert result.dtype == torch.float32
+        assert result.is_reward_model is is_reward_model
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -238,8 +326,8 @@ class TestValidateAndPrepareConfig:
         mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
         mock_resolve_class.return_value = Mock
 
-        mock_config["dtensor_cfg"]["sequence_parallel"] = True
-        mock_config["dtensor_cfg"]["tensor_parallel_size"] = 1
+        mock_config["automodel_cfg"]["sequence_parallel"] = True
+        mock_config["automodel_cfg"]["tensor_parallel_size"] = 1
 
         # Should not raise an error, just print a warning
         result = validate_and_prepare_config(
@@ -274,18 +362,19 @@ class TestValidateAndPrepareConfig:
 
         # Test FA2 for sequence packing with cp=1
         mock_config["sequence_packing"]["enabled"] = True
-        mock_config["dtensor_cfg"]["context_parallel_size"] = 1
+        mock_config["automodel_cfg"]["context_parallel_size"] = 1
+        mock_config["precision"] = "bfloat16"
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.attn_impl == "flash_attention_2"
 
         # Test SDPA for cp > 1
         mock_config["sequence_packing"]["enabled"] = False
-        mock_config["dtensor_cfg"]["context_parallel_size"] = 2
+        mock_config["automodel_cfg"]["context_parallel_size"] = 2
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.attn_impl == "sdpa"
 
         # Test None for cp=1 without sequence packing
-        mock_config["dtensor_cfg"]["context_parallel_size"] = 1
+        mock_config["automodel_cfg"]["context_parallel_size"] = 1
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.attn_impl is None
 
@@ -358,12 +447,55 @@ class TestValidateAndPrepareConfig:
         mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
         mock_resolve_class.return_value = Mock
 
-        # Test with generation colocated disabled
+        mock_config["generation"]["backend"] = "vllm"
         mock_config["generation"]["colocated"]["enabled"] = False
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.is_generation_colocated is False
         # NCCL_CUMEM_ENABLE should be set when not colocated
         assert os.environ.get("NCCL_CUMEM_ENABLE") == "1"
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    @patch.dict(os.environ, {}, clear=True)
+    def test_generation_sglang_not_colocated(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config["generation"]["backend"] = "sglang"
+        mock_config["generation"]["colocated"]["enabled"] = False
+
+        result = validate_and_prepare_config(mock_config, None, 0)
+
+        assert result.is_generation_colocated is False
+        assert os.environ.get("NCCL_CUMEM_ENABLE") == "0"
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    @patch.dict(os.environ, {}, clear=True)
+    def test_no_generation_leaves_nccl_cumem_unset(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        del mock_config["generation"]
+
+        result = validate_and_prepare_config(mock_config, None, 0)
+
+        assert result.is_generation_colocated is None
+        assert "NCCL_CUMEM_ENABLE" not in os.environ
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -400,6 +532,7 @@ class TestValidateAndPrepareConfig:
         """Test that sequence packing with reward model raises NotImplementedError."""
         mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
         mock_config["sequence_packing"]["enabled"] = True
+        mock_config["precision"] = "bfloat16"
         mock_config["reward_model_cfg"] = {
             "enabled": True,
             "reward_model_type": "bradley_terry",
@@ -407,13 +540,42 @@ class TestValidateAndPrepareConfig:
 
         with pytest.raises(
             NotImplementedError,
-            match="Sequence packing is not supported for reward models",
+            match="Sequence packing is only supported for token-level regression reward models",
         ):
             validate_and_prepare_config(
                 config=mock_config,
                 processor=None,
                 rank=0,
             )
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_sequence_packing_with_regression_reward_model(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """Token-level regression models support sequence packing."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_config["sequence_packing"]["enabled"] = True
+        mock_config["precision"] = "bfloat16"
+        mock_config["reward_model_cfg"] = {
+            "enabled": True,
+            "reward_model_type": "regression",
+        }
+
+        result = validate_and_prepare_config(
+            config=mock_config,
+            processor=None,
+            rank=0,
+        )
+
+        assert result.enable_seq_packing is True
+        assert result.allow_flash_attn_args is True
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -494,7 +656,8 @@ class TestValidateAndPrepareConfig:
         mock_resolve_class.return_value = Mock
 
         mock_config["sequence_packing"]["enabled"] = True
-        mock_config["dtensor_cfg"]["context_parallel_size"] = 1
+        mock_config["automodel_cfg"]["context_parallel_size"] = 1
+        mock_config["precision"] = "bfloat16"
 
         result = validate_and_prepare_config(
             config=mock_config,
@@ -640,14 +803,14 @@ class TestSetupDistributed:
         return mock_mesh
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
-    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
     @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_basic(
         self,
         mock_torch_dist,
         mock_fsdp2_config,
-        mock_create_mesh,
+        mock_mesh_context,
         mock_moe_config,
         mock_config,
         mock_runtime_config,
@@ -660,7 +823,9 @@ class TestSetupDistributed:
         mock_moe_config_instance = MagicMock()
         mock_moe_config.return_value = mock_moe_config_instance
         mock_moe_mesh = MagicMock()
-        mock_create_mesh.return_value = (mock_device_mesh, mock_moe_mesh)
+        mock_mesh_context.build.return_value = SimpleNamespace(
+            device_mesh=mock_device_mesh, moe_mesh=mock_moe_mesh
+        )
 
         result = setup_distributed(mock_config, mock_runtime_config)
 
@@ -671,15 +836,54 @@ class TestSetupDistributed:
         assert result.fsdp2_config == mock_fsdp2_config_instance
         assert result.moe_config == mock_moe_config_instance
 
+    @pytest.mark.parametrize(
+        "configured_dtype,expected_output_dtype",
+        [
+            (None, torch.float32),
+            ("float32", torch.float32),
+            ("bfloat16", torch.bfloat16),
+            ("float16", torch.float16),
+        ],
+    )
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
-    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_fsdp_output_dtype(
+        self,
+        mock_torch_dist,
+        mock_mesh_context,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+        mock_device_mesh,
+        configured_dtype,
+        expected_output_dtype,
+    ):
+        """fsdp_output_dtype only changes output_dtype; params/reductions are untouched."""
+        mock_torch_dist.get_world_size.return_value = 8
+        mock_moe_config.return_value = MagicMock()
+        mock_mesh_context.build.return_value = SimpleNamespace(
+            device_mesh=mock_device_mesh, moe_mesh=None
+        )
+        if configured_dtype is not None:
+            mock_config["automodel_cfg"]["fsdp_output_dtype"] = configured_dtype
+
+        result = setup_distributed(mock_config, mock_runtime_config)
+
+        mp_policy = result.fsdp2_config.mp_policy
+        assert mp_policy.param_dtype == torch.bfloat16
+        assert mp_policy.reduce_dtype == torch.float32
+        assert mp_policy.output_dtype == expected_output_dtype
+
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
     @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_with_cpu_offload(
         self,
         mock_torch_dist,
         mock_fsdp2_config,
-        mock_create_mesh,
+        mock_mesh_context,
         mock_moe_config,
         mock_config,
         mock_device_mesh,
@@ -688,7 +892,9 @@ class TestSetupDistributed:
         mock_torch_dist.get_world_size.return_value = 4
         mock_fsdp2_config.return_value = MagicMock()
         mock_moe_config.return_value = MagicMock()
-        mock_create_mesh.return_value = (mock_device_mesh, None)
+        mock_mesh_context.build.return_value = SimpleNamespace(
+            device_mesh=mock_device_mesh, moe_mesh=None
+        )
 
         runtime_config = RuntimeConfig(
             model_class=Mock,
@@ -714,14 +920,14 @@ class TestSetupDistributed:
         assert isinstance(result, DistributedContext)
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
-    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
     @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_world_size_one_cpu_offload_raises(
         self,
         mock_torch_dist,
         mock_fsdp2_config,
-        mock_create_mesh,
+        mock_mesh_context,
         mock_moe_config,
         mock_config,
     ):
@@ -752,25 +958,27 @@ class TestSetupDistributed:
             setup_distributed(mock_config, runtime_config)
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
-    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
     @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_passes_correct_params(
         self,
         mock_torch_dist,
         mock_fsdp2_config,
-        mock_create_mesh,
+        mock_mesh_context,
         mock_moe_config,
         mock_config,
         mock_runtime_config,
         mock_device_mesh,
     ):
-        """Test that FSDP2Config and create_device_mesh are called with correct parameters."""
+        """Test that FSDP2Config and MeshContext.build are called with correct parameters."""
         mock_torch_dist.get_world_size.return_value = 4
         mock_fsdp2_config.return_value = MagicMock()
         mock_moe_config.return_value = MagicMock()
-        mock_create_mesh.return_value = (mock_device_mesh, None)
-        mock_config["dtensor_cfg"]["dp_replicate_size"] = 2
+        mock_mesh_context.build.return_value = SimpleNamespace(
+            device_mesh=mock_device_mesh, moe_mesh=None
+        )
+        mock_config["automodel_cfg"]["dp_replicate_size"] = 2
 
         setup_distributed(mock_config, mock_runtime_config)
 
@@ -778,26 +986,28 @@ class TestSetupDistributed:
         fsdp2_call_kwargs = mock_fsdp2_config.call_args[1]
         assert fsdp2_call_kwargs["sequence_parallel"] is False
         assert fsdp2_call_kwargs["activation_checkpointing"] is False
-        assert fsdp2_call_kwargs["backend"] == "nccl"
+        # Automodel r0.6.0 dropped FSDP2Config.backend; the mesh helpers default to nccl.
+        assert "backend" not in fsdp2_call_kwargs
 
-        # Verify create_device_mesh was called with correct size params
-        mesh_call_kwargs = mock_create_mesh.call_args[1]
-        assert mesh_call_kwargs["tp_size"] == 1
-        assert mesh_call_kwargs["pp_size"] == 1
-        assert mesh_call_kwargs["cp_size"] == 1
-        assert mesh_call_kwargs["ep_size"] == 1
-        assert mesh_call_kwargs["dp_replicate_size"] == 2
+        # Verify MeshContext.build was called with correct size params
+        mesh_call_args, mesh_call_kwargs = mock_mesh_context.build.call_args
+        parallelism = mesh_call_args[1]
+        assert parallelism.tp_size == 1
+        assert parallelism.pp_size == 1
+        assert parallelism.cp_size == 1
+        assert parallelism.ep_size == 1
+        assert parallelism.dp_replicate_size == 2
         assert mesh_call_kwargs["world_size"] == 4
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
-    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
     @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_dp_replicate_size_requires_divisible_dp(
         self,
         mock_torch_dist,
         mock_fsdp2_config,
-        mock_create_mesh,
+        mock_mesh_context,
         mock_moe_config,
         mock_config,
         mock_runtime_config,
@@ -806,7 +1016,7 @@ class TestSetupDistributed:
         mock_torch_dist.get_world_size.return_value = 6
         mock_fsdp2_config.return_value = MagicMock()
         mock_moe_config.return_value = MagicMock()
-        mock_config["dtensor_cfg"]["dp_replicate_size"] = 4
+        mock_config["automodel_cfg"]["dp_replicate_size"] = 4
 
         with pytest.raises(ValueError, match="dp_replicate_size"):
             setup_distributed(mock_config, mock_runtime_config)
@@ -862,6 +1072,31 @@ class TestSetupModelAndOptimizer:
         tokenizer.pad_token_id = 0
         return tokenizer
 
+    @pytest.mark.parametrize(
+        "use_te, optimizer_kwargs, expected_dtype",
+        [
+            (False, {}, torch.float32),
+            (True, {"master_weights": False}, torch.float32),
+            (True, {"master_weights": True}, torch.bfloat16),
+            (
+                True,
+                {"master_weights": True, "master_weight_dtype": "torch.float32"},
+                torch.bfloat16,
+            ),
+            (
+                True,
+                {"master_weights": True, "master_weight_dtype": "torch.float16"},
+                torch.float32,
+            ),
+        ],
+        ids=[
+            "adamw",
+            "te-no-master",
+            "te-default-master",
+            "te-fp32-master",
+            "te-fp16-master",
+        ],
+    )
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")
@@ -875,8 +1110,12 @@ class TestSetupModelAndOptimizer:
         mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
+        monkeypatch,
+        use_te,
+        optimizer_kwargs,
+        expected_dtype,
     ):
-        """Test basic model and optimizer setup."""
+        """Test model setup and the load dtype selected for optimizer precision."""
         mock_get_rank.return_value = 0
         mock_lambda_lr.return_value = MagicMock()
 
@@ -892,6 +1131,17 @@ class TestSetupModelAndOptimizer:
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
 
+        mock_config["optimizer"]["kwargs"] = optimizer_kwargs
+        if use_te:
+            mock_config["optimizer"]["name"] = (
+                "transformer_engine.pytorch.optimizers.FusedAdam"
+            )
+        monkeypatch.setitem(
+            sys.modules,
+            "transformer_engine.pytorch.optimizers",
+            SimpleNamespace(FusedAdam=mock_get_class.return_value) if use_te else None,
+        )
+
         result = setup_model_and_optimizer(
             config=mock_config,
             tokenizer=mock_tokenizer,
@@ -903,15 +1153,62 @@ class TestSetupModelAndOptimizer:
         )
 
         assert isinstance(result, ModelAndOptimizerState)
-        # Verify from_pretrained was called with distributed kwargs
+        # Automodel r0.6.0 requires the distributed topology + policies to arrive as a
+        # single DistributedSetup; the separate kwargs are rejected with a TypeError.
         mock_runtime_config.model_class.from_pretrained.assert_called_once()
         call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
-        assert call_kwargs["device_mesh"] == mock_distributed_context.device_mesh
+        assert call_kwargs["torch_dtype"] == expected_dtype
+        for legacy_kwarg in (
+            "device_mesh",
+            "moe_mesh",
+            "distributed_config",
+            "moe_config",
+            "activation_checkpointing",
+        ):
+            assert legacy_kwarg not in call_kwargs
+        distributed_setup = call_kwargs["distributed_setup"]
         assert (
-            call_kwargs["distributed_config"] == mock_distributed_context.fsdp2_config
+            distributed_setup.mesh_context.device_mesh
+            == mock_distributed_context.device_mesh
         )
+        assert (
+            distributed_setup.mesh_context.moe_mesh == mock_distributed_context.moe_mesh
+        )
+        assert (
+            distributed_setup.strategy_config == mock_distributed_context.fsdp2_config
+        )
+        assert distributed_setup.pipeline_config is None
+        # ep_size defaults to 1 in mock_config, so the MoE parallelizer config is unused.
+        assert distributed_setup.moe_parallel_config is None
+        assert distributed_setup.activation_checkpointing is False
         # Verify config= is NOT passed (avoids duplicate arg for custom models)
         assert "config" not in call_kwargs
+
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    def test_restore_from_without_lora_enabled_raises(
+        self,
+        mock_get_rank,
+        mock_config,
+        mock_runtime_config,
+        mock_distributed_context,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+    ):
+        """restore_from with LoRA disabled must fail loudly, not silently no-op."""
+        mock_get_rank.return_value = 0
+        mock_config["automodel_cfg"]["lora_cfg"] = {
+            "enabled": False,
+            "restore_from": "/donor/step_5/policy/weights",
+        }
+
+        with pytest.raises(ValueError, match="lora_cfg.restore_from is set"):
+            setup_model_and_optimizer(
+                config=mock_config,
+                tokenizer=mock_tokenizer,
+                runtime_config=mock_runtime_config,
+                distributed_context=mock_distributed_context,
+                checkpoint_manager=mock_checkpoint_manager,
+            )
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
@@ -1134,6 +1431,8 @@ class TestSetupModelAndOptimizer:
         assert call_kwargs["max_position_embeddings"] == 4096
         assert "config" not in call_kwargs
 
+    @pytest.mark.parametrize("cp_size", [1, 2])
+    @pytest.mark.parametrize("is_reward_model", [False, True])
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_and_optimizer_no_optimizer(
@@ -1145,9 +1444,21 @@ class TestSetupModelAndOptimizer:
         mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
+        cp_size,
+        is_reward_model,
     ):
-        """Test model setup without optimizer initialization."""
+        """Policy and value setup share the CP SDPA allowlist."""
+        from torch.nn.attention import SDPBackend
+
         mock_get_rank.return_value = 0
+        mock_distributed_context = mock_distributed_context._replace(cp_size=cp_size)
+        mock_runtime_config = mock_runtime_config._replace(
+            is_reward_model=is_reward_model
+        )
+        mock_config["reward_model_cfg"] = {
+            "enabled": is_reward_model,
+            "reward_model_type": "regression",
+        }
 
         mock_model = MagicMock()
         mock_model.state_dict.return_value = {}
@@ -1167,6 +1478,13 @@ class TestSetupModelAndOptimizer:
 
         assert result.optimizer is None
         assert result.scheduler is None
+        call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
+        assert call_kwargs["torch_dtype"] == mock_runtime_config.dtype
+        assert call_kwargs["sdpa_method"] == (
+            [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+            if cp_size > 1
+            else None
+        )
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
@@ -1564,6 +1882,48 @@ class TestSetupModelAndOptimizer:
                 checkpoint_manager=mock_checkpoint_manager,
             )
 
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    @patch("nemo_rl.models.automodel.setup.get_class")
+    def test_setup_model_with_cp_raises_for_gemma4_unified(
+        self,
+        mock_get_class,
+        mock_get_rank,
+        mock_config,
+        mock_runtime_config,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+    ):
+        """Test that Gemma 4 unified checkpoints reject context parallel."""
+        mock_get_rank.return_value = 0
+        mock_fsdp2_config = MagicMock()
+        mock_fsdp2_config.sequence_parallel = False
+        distributed_context = DistributedContext(
+            device_mesh=MagicMock(),
+            moe_mesh=MagicMock(),
+            fsdp2_config=mock_fsdp2_config,
+            moe_config=MagicMock(),
+            dp_size=1,
+            tp_size=1,
+            cp_size=2,
+        )
+
+        mock_runtime_config.model_config.model_type = "gemma4_unified"
+        mock_runtime_config.model_config.architectures = [
+            "Gemma4UnifiedForConditionalGeneration"
+        ]
+
+        with pytest.raises(
+            AssertionError,
+            match="Context parallel is not supported for the Gemma 4 unified checkpoint",
+        ):
+            setup_model_and_optimizer(
+                config=mock_config,
+                tokenizer=mock_tokenizer,
+                runtime_config=mock_runtime_config,
+                distributed_context=distributed_context,
+                checkpoint_manager=mock_checkpoint_manager,
+            )
+
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")
@@ -1597,7 +1957,7 @@ class TestSetupModelAndOptimizer:
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
 
-        mock_config["dtensor_cfg"]["automodel_kwargs"] = {
+        mock_config["automodel_cfg"]["automodel_kwargs"] = {
             "backend": {
                 "_target_": "some.backend.Class",
                 "param1": "value1",
@@ -1619,8 +1979,14 @@ class TestSetupModelAndOptimizer:
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")
     @patch("nemo_rl.models.automodel.setup.PeftConfig")
+    @pytest.mark.parametrize(
+        "weights_path,restore_from",
+        [(None, None), (None, "/donor"), ("/resume", "/donor")],
+    )
+    @patch("nemo_rl.models.automodel.setup._load_initial_lora_adapter")
     def test_setup_model_with_lora(
         self,
+        mock_warm_start,
         mock_peft_config,
         mock_get_class,
         mock_get_rank,
@@ -1630,6 +1996,8 @@ class TestSetupModelAndOptimizer:
         mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
+        weights_path,
+        restore_from,
     ):
         """Test model setup with LoRA enabled."""
         mock_get_rank.return_value = 0
@@ -1649,10 +2017,11 @@ class TestSetupModelAndOptimizer:
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
 
-        mock_config["dtensor_cfg"]["lora_cfg"] = {
+        mock_config["automodel_cfg"]["lora_cfg"] = {
             "enabled": True,
             "use_triton": False,
             "rank": 8,
+            "restore_from": restore_from,
         }
 
         result = setup_model_and_optimizer(
@@ -1661,6 +2030,7 @@ class TestSetupModelAndOptimizer:
             runtime_config=mock_runtime_config,
             distributed_context=mock_distributed_context,
             checkpoint_manager=mock_checkpoint_manager,
+            weights_path=weights_path,
         )
 
         mock_peft_config.from_dict.assert_called_once()
@@ -1668,6 +2038,15 @@ class TestSetupModelAndOptimizer:
         call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
         assert call_kwargs["peft_config"] == mock_peft_config_instance
         assert result.peft_config == mock_peft_config_instance
+
+        if weights_path:
+            mock_checkpoint_manager.load_checkpoint.assert_called_once()
+            mock_warm_start.assert_not_called()
+        elif restore_from:
+            mock_checkpoint_manager.load_checkpoint.assert_not_called()
+            mock_warm_start.assert_called_once()
+        else:
+            mock_warm_start.assert_not_called()
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
@@ -1699,7 +2078,7 @@ class TestSetupModelAndOptimizer:
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
 
-        mock_config["dtensor_cfg"]["activation_checkpointing"] = True
+        mock_config["automodel_cfg"]["activation_checkpointing"] = True
 
         with patch(
             "nemo_rl.models.automodel.setup.torch.backends.cuda"
@@ -1836,6 +2215,19 @@ class TestGetTokenizer:
         assert result is mock_tokenizer
 
     @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    def test_forwards_tokenizer_kwargs(self, mock_nemo_auto_tokenizer):
+        """Test tokenizer_kwargs are forwarded to NeMoAutoTokenizer."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token = "<pad>"
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
+
+        get_tokenizer({"name": "gpt2", "tokenizer_kwargs": {"model_max_length": 123}})
+
+        mock_nemo_auto_tokenizer.from_pretrained.assert_called_once_with(
+            "gpt2", trust_remote_code=True, model_max_length=123
+        )
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
     def test_sets_pad_token_from_eos(self, mock_nemo_auto_tokenizer):
         """Test that pad_token is set to eos_token when None."""
         mock_tokenizer = MagicMock()
@@ -1846,6 +2238,36 @@ class TestGetTokenizer:
         get_tokenizer({"name": "gpt2"})
 
         assert mock_tokenizer.pad_token == "<eos>"
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    @patch("nemo_rl.models.automodel.setup.get_deepseek_v4_tokenizer")
+    def test_uses_vllm_deepseek_v4_renderer(
+        self, mock_get_deepseek_v4_tokenizer, mock_nemo_auto_tokenizer, capsys
+    ):
+        base_tokenizer = MagicMock()
+        base_tokenizer.pad_token = "<pad>"
+        tokenizer = MagicMock()
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = base_tokenizer
+        mock_get_deepseek_v4_tokenizer.return_value = tokenizer
+
+        result = get_tokenizer(
+            {
+                "name": "deepseek-ai/DeepSeek-V4-Flash-Base",
+                "chat_template": "deepseek_v4",
+                "chat_template_kwargs": {"enable_thinking": True},
+            }
+        )
+
+        assert result is tokenizer
+        mock_nemo_auto_tokenizer.from_pretrained.assert_called_once_with(
+            "deepseek-ai/DeepSeek-V4-Flash-Base", trust_remote_code=True
+        )
+        mock_get_deepseek_v4_tokenizer.assert_called_once_with(
+            base_tokenizer, {"enable_thinking": True}
+        )
+        assert (
+            "Using vLLM 0.25.1's DeepSeek V4 chat renderer" in capsys.readouterr().out
+        )
 
     @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
     def test_does_not_override_existing_pad_token(self, mock_nemo_auto_tokenizer):
@@ -2016,6 +2438,30 @@ class TestGetTokenizer:
         assert mock_processor.name_or_path == "test-model"
 
     @patch("nemo_rl.models.automodel.setup.AutoProcessor")
+    def test_get_processor_forwards_tokenizer_kwargs(self, mock_auto_processor):
+        """Test tokenizer_kwargs are forwarded through AutoProcessor."""
+        mock_processor = MagicMock()
+        mock_processor.tokenizer.pad_token = "<pad>"
+        mock_auto_processor.from_pretrained.return_value = mock_processor
+        config = {
+            "name": "test-vlm",
+            "tokenizer_kwargs": {"model_max_length": 123, "use_fast": False},
+        }
+
+        get_tokenizer(config, get_processor=True)
+
+        mock_auto_processor.from_pretrained.assert_called_once_with(
+            "test-vlm",
+            trust_remote_code=True,
+            use_fast=False,
+            model_max_length=123,
+        )
+        assert config["tokenizer_kwargs"] == {
+            "model_max_length": 123,
+            "use_fast": False,
+        }
+
+    @patch("nemo_rl.models.automodel.setup.AutoProcessor")
     def test_get_processor_sets_pad_from_eos(self, mock_auto_processor):
         """Test that processor path also sets pad_token from eos when None."""
         mock_processor = MagicMock()
@@ -2049,6 +2495,7 @@ class TestGetTokenizer:
         mock_nemo_auto_tokenizer.from_pretrained.assert_called_once()
 
 
+@pytest.mark.automodel
 class TestMaybeSetForceHf:
     """Tests for _maybe_set_force_hf adapter compatibility check."""
 
@@ -2143,70 +2590,643 @@ class TestMaybeSetForceHf:
         assert "force_hf" not in kwargs
 
 
-@pytest.mark.automodel
-def test_automodel_dtype_restore_workaround_still_needed(monkeypatch):
-    """Tripwire for the temporary fp32 master-weight workaround in setup.py.
+class _TinyLoraModel(torch.nn.Module):
+    """Tiny module with one LoRA-adapted linear for warm-start tests."""
 
-    ``_disable_automodel_checkpoint_dtype_restore`` no-ops Automodel's
-    ``_restore_loaded_model_dtype`` because (pre PR #2419) it downgrades an explicitly-fp32
-    load back to the bf16 checkpoint dtype, breaking optimizer master weights. This test
-    reproduces that downgrade against the *live* pinned function (no model/checkpoint load).
+    def __init__(self):
+        from nemo_automodel.components._peft.lora import LinearLoRA
 
-    It PASSES while the bug is present. It FAILS — telling us to delete the workaround in
-    ``nemo_rl/models/automodel/setup.py`` (and this test) — once Automodel either removes the
-    function or ships PR #2419 (honors the explicit fp32 via ``promote_types`` so the weight
-    stays fp32).
-    """
-    import inspect
-    import types
+        super().__init__()
+        self.layer = LinearLoRA(torch.nn.Linear(4, 8), dim=2, alpha=4)
 
-    import nemo_automodel.components.checkpoint.utils as ckpt_utils
-    from nemo_automodel._transformers import model_init
 
-    restore = getattr(model_init, "_restore_loaded_model_dtype", None)
-    # An earlier test in this process may have triggered the setup.py workaround
-    # (_disable_automodel_checkpoint_dtype_restore), which globally and irreversibly
-    # replaces this symbol with a no-op. Recover the genuine upstream function it
-    # stashed so this tripwire exercises Automodel's real behavior, not our no-op.
-    restore = getattr(restore, "_nrl_original", restore)
-    if restore is None:
-        pytest.fail(
-            "Automodel removed _restore_loaded_model_dtype - remove the fp32 master-weight "
-            "workaround _disable_automodel_checkpoint_dtype_restore() in "
-            "nemo_rl/models/automodel/setup.py."
+class _IdentityStateDictAdapter:
+    """Minimal custom adapter that preserves state-dict keys."""
+
+    @staticmethod
+    def to_hf(state_dict, **kwargs):
+        return state_dict
+
+
+class _TinyQwen3MoeLoraModel(torch.nn.Module):
+    """Minimal native Qwen3-MoE LoRA key layout for adapter-key tests."""
+
+    def __init__(self, *, ep_size=1):
+        from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import (
+            Qwen3MoeStateDictAdapter,
         )
 
-    model = torch.nn.Linear(4, 4).float()
-    assert model.weight.dtype == torch.float32
+        super().__init__()
+        experts = torch.nn.Module()
+        experts.ep_size = ep_size
+        experts.register_parameter(
+            "lora_gate_and_up_A", torch.nn.Parameter(torch.empty(2, 4, 2))
+        )
+        experts.register_parameter(
+            "lora_gate_and_up_B", torch.nn.Parameter(torch.empty(2, 2, 6))
+        )
+        experts.register_parameter(
+            "lora_down_A", torch.nn.Parameter(torch.empty(2, 3, 2))
+        )
+        experts.register_parameter(
+            "lora_down_B", torch.nn.Parameter(torch.empty(2, 2, 4))
+        )
+        mlp = torch.nn.Module()
+        mlp.add_module("experts", experts)
+        layer = torch.nn.Module()
+        layer.add_module("mlp", mlp)
+        inner_model = torch.nn.Module()
+        inner_model.add_module("layers", torch.nn.ModuleList([layer]))
+        self.add_module("model", inner_model)
+        self.state_dict_adapter = Qwen3MoeStateDictAdapter(
+            config=SimpleNamespace(),
+            moe_config=SimpleNamespace(n_routed_experts=2),
+            backend=SimpleNamespace(),
+        )
 
-    # Pretend the checkpoint stored the weight in bf16.
-    monkeypatch.setattr(
-        ckpt_utils,
-        "_get_checkpoint_tensor_dtypes",
-        lambda *args, **kwargs: {"weight": torch.bfloat16},
-    )
-    # Reproduce NeMo-RL's explicit-fp32 load. PR #2419 honors the request ONLY via the
-    # new `requested_dtype` parameter (it ignores hf_config.torch_dtype / load_kwargs in
-    # this function): with requested_dtype=fp32 it promotes the bf16 checkpoint tensor up
-    # to fp32 and leaves the weight unchanged. The current pin predates #2419 and its
-    # signature has no such parameter, so pass it only when the signature accepts it:
-    #   pre-#2419  -> requested_dtype absent -> weight downgraded to bf16 (assert holds, workaround needed)
-    #   post-#2419 -> requested_dtype=fp32   -> weight stays fp32      (assert fails, fires the removal tripwire)
-    hf_config = types.SimpleNamespace(torch_dtype=torch.float32)
-    restore_kwargs = {}
-    if "requested_dtype" in inspect.signature(restore).parameters:
-        restore_kwargs["requested_dtype"] = torch.float32
-    restore(
-        model,
-        "dummy",
-        hf_config,
-        None,
-        {"torch_dtype": "torch.float32"},
-        **restore_kwargs,
-    )
 
-    assert model.weight.dtype == torch.bfloat16, (
-        "Automodel no longer downgrades an explicit-fp32 load (likely PR #2419 landed); the "
-        "_disable_automodel_checkpoint_dtype_restore() workaround in setup.py is obsolete - "
-        "remove it and this test."
-    )
+_QWEN3_MOE_HF_LORA_KEYS = (
+    "base_model.model.model.layers.0.mlp.experts.base_layer.lora_B.weight",
+    "base_model.model.model.layers.0.mlp.experts.base_layer.lora_A.weight",
+    "base_model.model.model.layers.0.mlp.experts.lora_B.weight",
+    "base_model.model.model.layers.0.mlp.experts.lora_A.weight",
+)
+
+
+def _write_adapter_checkpoint(
+    adapter_dir,
+    *,
+    dim=2,
+    alpha=4,
+    base_model_name_or_path="tiny-model",
+    keys=("layer.lora_A.weight", "layer.lora_B.weight"),
+    peft_type="LORA",
+    fill=1.0,
+):
+    """Write a minimal HF-PEFT-style adapter checkpoint (config + safetensors).
+
+    Tensors are filled with a non-zero value so a test cannot confuse
+    "loaded the donor" with "left the zero-init adapters alone".
+    """
+    import json as _json
+
+    from safetensors.torch import save_file
+
+    os.makedirs(adapter_dir, exist_ok=True)
+    tensors = {}
+    for key in keys:
+        shape = (2, 4) if "lora_A" in key else (8, 2)
+        tensors[key] = torch.full(shape, fill)
+    save_file(tensors, os.path.join(adapter_dir, "adapter_model.safetensors"))
+    with open(os.path.join(adapter_dir, "adapter_config.json"), "w") as f:
+        _json.dump(
+            {
+                "peft_type": peft_type,
+                "r": dim,
+                "lora_alpha": alpha,
+                "base_model_name_or_path": base_model_name_or_path,
+                "target_modules": ["layer"],
+            },
+            f,
+        )
+
+
+def _lora_cfg(dim=2, alpha=4):
+    return {
+        "enabled": True,
+        "target_modules": [],
+        "exclude_modules": [],
+        "match_all_linear": True,
+        "dim": dim,
+        "alpha": alpha,
+        "dropout": 0.0,
+        "dropout_position": "post",
+        "lora_A_init": "xavier",
+    }
+
+
+@pytest.mark.automodel
+class TestResolveLoraAdapterDir:
+    def test_direct_adapter_dir(self, tmp_path):
+        from nemo_rl.models.automodel.checkpoint import _resolve_lora_adapter_dir
+
+        _write_adapter_checkpoint(tmp_path / "adapter")
+        assert _resolve_lora_adapter_dir(str(tmp_path / "adapter")) == str(
+            tmp_path / "adapter"
+        )
+
+    def test_weights_dir_with_model_subdir(self, tmp_path):
+        from nemo_rl.models.automodel.checkpoint import _resolve_lora_adapter_dir
+
+        weights_dir = tmp_path / "step_5" / "policy" / "weights"
+        _write_adapter_checkpoint(weights_dir / "model")
+        assert _resolve_lora_adapter_dir(str(weights_dir)) == str(weights_dir / "model")
+
+    def test_missing_adapter_file_raises(self, tmp_path):
+        from nemo_rl.models.automodel.checkpoint import _resolve_lora_adapter_dir
+
+        with pytest.raises(FileNotFoundError, match="adapter_model.safetensors"):
+            _resolve_lora_adapter_dir(str(tmp_path))
+
+
+@pytest.mark.automodel
+class TestValidateLoraAdapterConfig:
+    def test_matching_config_passes(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_config
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir)
+        _validate_lora_adapter_config(
+            str(adapter_dir), _lora_cfg(), "tiny-model"
+        )  # should not raise
+
+    def test_peft_type_mismatch_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_config
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, peft_type="IA3")
+        with pytest.raises(ValueError, match="peft_type"):
+            _validate_lora_adapter_config(str(adapter_dir), _lora_cfg(), "tiny-model")
+
+    def test_rank_mismatch_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_config
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, dim=8)
+        with pytest.raises(ValueError, match="r=8"):
+            _validate_lora_adapter_config(str(adapter_dir), _lora_cfg(), "tiny-model")
+
+    def test_alpha_mismatch_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_config
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, alpha=16)
+        with pytest.raises(ValueError, match="lora_alpha"):
+            _validate_lora_adapter_config(str(adapter_dir), _lora_cfg(), "tiny-model")
+
+    def test_base_model_mismatch_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_config
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, base_model_name_or_path="other-model")
+        with pytest.raises(ValueError, match="other-model"):
+            _validate_lora_adapter_config(str(adapter_dir), _lora_cfg(), "tiny-model")
+
+    def test_unknown_base_model_does_not_raise(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_config
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, base_model_name_or_path="N/A")
+        _validate_lora_adapter_config(str(adapter_dir), _lora_cfg(), "tiny-model")
+
+    def test_missing_config_file_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_config
+
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        with pytest.raises(FileNotFoundError, match="adapter_config.json"):
+            _validate_lora_adapter_config(str(adapter_dir), _lora_cfg(), "tiny-model")
+
+
+@pytest.mark.automodel
+class TestValidateLoraAdapterKeys:
+    def test_prefixed_keys_match(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(
+            adapter_dir,
+            keys=(
+                "base_model.model.layer.lora_A.weight",
+                "base_model.model.layer.lora_B.weight",
+            ),
+        )
+        _validate_lora_adapter_keys(str(adapter_dir), _TinyLoraModel())
+
+    def test_missing_key_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(
+            adapter_dir, keys=("base_model.model.layer.lora_A.weight",)
+        )
+        with pytest.raises(ValueError, match="Missing from donor"):
+            _validate_lora_adapter_keys(str(adapter_dir), _TinyLoraModel())
+
+    def test_unexpected_key_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(
+            adapter_dir,
+            keys=(
+                "layer.lora_A.weight",
+                "layer.lora_B.weight",
+                "layer2.lora_A.weight",
+            ),
+        )
+        with pytest.raises(ValueError, match="unexpected in donor"):
+            _validate_lora_adapter_keys(str(adapter_dir), _TinyLoraModel())
+
+    def test_state_dict_adapter_model_still_validated(self, tmp_path):
+        """A custom state_dict_adapter must not disable the coverage check.
+
+        Regression test: the escape hatch used to be gated on
+        ``state_dict_adapter``, which 26/33 Automodel architectures set
+        (including plain LlamaForCausalLM) -- so the check silently passed
+        while the non-strict PEFT load left donor-uncovered adapters at fresh
+        init. The validator must instead compare keys after the adapter's HF
+        conversion.
+        """
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(
+            adapter_dir, keys=("base_model.model.layer.lora_A.weight",)
+        )
+        model = _TinyLoraModel()
+        model.state_dict_adapter = _IdentityStateDictAdapter()
+        with pytest.raises(ValueError, match="Missing from donor"):
+            _validate_lora_adapter_keys(str(adapter_dir), model)
+
+    def test_qwen3_moe_hf_keys_match_at_ep1(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, keys=_QWEN3_MOE_HF_LORA_KEYS)
+        _validate_lora_adapter_keys(str(adapter_dir), _TinyQwen3MoeLoraModel(ep_size=1))
+
+    def test_expert_parallel_model_with_incomplete_donor_raises(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _validate_lora_adapter_keys
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir, keys=_QWEN3_MOE_HF_LORA_KEYS[:-1])
+        with pytest.raises(ValueError, match="Missing from donor"):
+            _validate_lora_adapter_keys(
+                str(adapter_dir), _TinyQwen3MoeLoraModel(ep_size=2)
+            )
+
+
+@pytest.mark.automodel
+class TestLoadInitialLoraAdapter:
+    def test_requires_peft_checkpointer(self, tmp_path):
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir)
+        manager = AutomodelCheckpointManager(dp_mesh=MagicMock(), tp_mesh=MagicMock())
+        manager.checkpointer = MagicMock()
+        manager.checkpointer.config.is_peft = False
+
+        with pytest.raises(RuntimeError, match="is_peft=True"):
+            manager.load_lora_adapter(_TinyLoraModel(), str(adapter_dir))
+
+        manager.checkpointer.load_model.assert_not_called()
+
+    @pytest.mark.parametrize("fail_load", [False, True])
+    def test_preserves_config_and_removes_staging(self, tmp_path, fail_load):
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir)
+        manager = AutomodelCheckpointManager(dp_mesh=MagicMock(), tp_mesh=MagicMock())
+        manager.checkpointer = MagicMock()
+        cfg = manager.checkpointer.config
+        cfg.model_save_format = "original-format"
+        cfg.is_peft = True
+        cfg.dequantize_base_checkpoint = True
+        cfg.checkpoint_dir = "/original"
+        previous_config = (
+            cfg.model_save_format,
+            cfg.is_peft,
+            cfg.dequantize_base_checkpoint,
+            cfg.checkpoint_dir,
+        )
+        seen = []
+
+        def load_model(*, model, model_path):
+            seen.append(model_path)
+            assert os.path.isfile(os.path.join(model_path, "adapter_model.safetensors"))
+            assert cfg.is_peft is True
+            assert cfg.dequantize_base_checkpoint is True
+            assert cfg.checkpoint_dir == "/original"
+            if fail_load:
+                raise RuntimeError("load failed")
+
+        manager.checkpointer.load_model.side_effect = load_model
+        if fail_load:
+            with pytest.raises(RuntimeError, match="load failed"):
+                manager.load_lora_adapter(_TinyLoraModel(), str(adapter_dir))
+        else:
+            manager.load_lora_adapter(_TinyLoraModel(), str(adapter_dir))
+        assert (
+            cfg.model_save_format,
+            cfg.is_peft,
+            cfg.dequantize_base_checkpoint,
+            cfg.checkpoint_dir,
+        ) == previous_config
+        assert len(seen) == 1
+        assert not os.path.exists(os.path.dirname(seen[0]))
+
+    def test_loads_through_checkpointer(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
+
+        weights_dir = tmp_path / "step_5" / "policy" / "weights"
+        adapter_dir = weights_dir / "model"
+        _write_adapter_checkpoint(
+            adapter_dir,
+            keys=(
+                "base_model.model.layer.lora_A.weight",
+                "base_model.model.layer.lora_B.weight",
+            ),
+        )
+        model = _TinyLoraModel()
+        # autospec binds the mocks to the real signatures, so a wrong kwarg
+        # name in setup.py fails the test instead of silently recording a call.
+        manager = create_autospec(AutomodelCheckpointManager, instance=True)
+        manager.checkpointer = create_autospec(Checkpointer, instance=True)
+        manager.checkpointer.config = MagicMock()
+        manager.checkpointer.config.is_peft = True
+        manager.load_lora_adapter.side_effect = lambda model, adapter_dir: (
+            AutomodelCheckpointManager.load_lora_adapter(manager, model, adapter_dir)
+        )
+        _load_initial_lora_adapter(
+            model=model,
+            checkpoint_manager=manager,
+            restore_from=str(weights_dir),
+            lora_cfg=_lora_cfg(),
+            model_name="tiny-model",
+        )
+        manager.checkpointer.load_model.assert_called_once_with(
+            model=model, model_path=str(adapter_dir)
+        )
+
+    def test_invalid_donor_fails_before_load(self, tmp_path):
+        from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
+
+        adapter_dir = tmp_path / "adapter"
+        # dim=8 donor vs dim=2 run -> validation must fail before any load.
+        _write_adapter_checkpoint(adapter_dir, dim=8)
+        manager = MagicMock()
+        with pytest.raises(ValueError, match="r=8"):
+            _load_initial_lora_adapter(
+                model=_TinyLoraModel(),
+                checkpoint_manager=manager,
+                restore_from=str(adapter_dir),
+                lora_cfg=_lora_cfg(),
+                model_name="tiny-model",
+            )
+        manager.checkpointer.load_model.assert_not_called()
+
+    def test_bare_adapter_dir_loaded_via_model_path(self, tmp_path):
+        """A bare adapter dir must still take the checkpointer's PEFT branch.
+
+        Automodel selects its PEFT safetensors read by a basename test on the
+        path (Path(path).name == "model"), so the bare layout is staged under a
+        temporary "model" path component before loading.
+        """
+        from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
+
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(
+            adapter_dir,
+            keys=(
+                "base_model.model.layer.lora_A.weight",
+                "base_model.model.layer.lora_B.weight",
+            ),
+        )
+        model = _TinyLoraModel()
+        manager = create_autospec(AutomodelCheckpointManager, instance=True)
+        manager.checkpointer = create_autospec(Checkpointer, instance=True)
+        manager.checkpointer.config = MagicMock()
+        manager.checkpointer.config.is_peft = True
+        manager.load_lora_adapter.side_effect = lambda model, adapter_dir: (
+            AutomodelCheckpointManager.load_lora_adapter(manager, model, adapter_dir)
+        )
+
+        seen = {}
+
+        def fake_load_model(*, model, model_path, **kwargs):
+            # Inspected mid-call: the staging symlink is cleaned up after load.
+            seen["model_path"] = model_path
+            seen["resolves"] = os.path.isfile(
+                os.path.join(model_path, "adapter_model.safetensors")
+            )
+
+        manager.checkpointer.load_model.side_effect = fake_load_model
+        _load_initial_lora_adapter(
+            model=model,
+            checkpoint_manager=manager,
+            restore_from=str(adapter_dir),
+            lora_cfg=_lora_cfg(),
+            model_name="tiny-model",
+        )
+        assert os.path.basename(seen["model_path"]) == "model"
+        # The staged path still resolved to the donor's adapter file.
+        assert seen["resolves"]
+        # The staging directory was cleaned up after the load.
+        assert not os.path.exists(os.path.dirname(seen["model_path"]))
+
+    @pytest.mark.parametrize("relative_path", ["adapter", "model"])
+    def test_relative_adapter_path_is_canonicalized(
+        self, tmp_path, monkeypatch, relative_path
+    ):
+        from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
+
+        adapter_dir = tmp_path / relative_path
+        _write_adapter_checkpoint(
+            adapter_dir,
+            keys=(
+                "base_model.model.layer.lora_A.weight",
+                "base_model.model.layer.lora_B.weight",
+            ),
+        )
+        monkeypatch.chdir(tmp_path)
+        manager = create_autospec(AutomodelCheckpointManager, instance=True)
+        manager.checkpointer = create_autospec(Checkpointer, instance=True)
+        manager.checkpointer.config = MagicMock()
+        manager.checkpointer.config.is_peft = True
+        manager.load_lora_adapter.side_effect = lambda model, adapter_dir: (
+            AutomodelCheckpointManager.load_lora_adapter(manager, model, adapter_dir)
+        )
+        seen = {}
+
+        def fake_load_model(*, model, model_path, **kwargs):
+            seen["model_path"] = model_path
+            seen["resolves"] = os.path.isfile(
+                os.path.join(model_path, "adapter_model.safetensors")
+            )
+
+        manager.checkpointer.load_model.side_effect = fake_load_model
+        _load_initial_lora_adapter(
+            model=_TinyLoraModel(),
+            checkpoint_manager=manager,
+            restore_from=relative_path,
+            lora_cfg=_lora_cfg(),
+            model_name="tiny-model",
+        )
+
+        assert os.path.isabs(seen["model_path"])
+        assert seen["resolves"]
+
+
+@pytest.fixture
+def _init_gloo_pg():
+    """Single-process gloo PG so the real Automodel Checkpointer can run on CPU."""
+    if not torch.distributed.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29517")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
+    yield
+
+
+class _TwoLinearModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            [torch.nn.Linear(4, 4), torch.nn.Linear(4, 1)]
+        )
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+@pytest.mark.automodel
+class TestLoadInitialLoraAdapterEndToEnd:
+    """Warm start must actually put the donor's weights into the model."""
+
+    def test_donor_adapter_weights_land_in_model(self, _init_gloo_pg, tmp_path):
+        from nemo_automodel.components._peft.lora import (
+            PeftConfig,
+            apply_lora_to_linear_modules,
+        )
+
+        from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
+
+        peft_config = PeftConfig(
+            target_modules=[],
+            match_all_linear=True,
+            dim=2,
+            alpha=4,
+            dropout=0.0,
+            dropout_position="post",
+            lora_A_init="xavier",
+            use_triton=False,
+        )
+
+        # Donor: distinctive non-zero adapter weights, so "loaded the donor"
+        # cannot be confused with "left the zero-init adapters alone".
+        donor = _TwoLinearModel()
+        apply_lora_to_linear_modules(donor, peft_config)
+        for name, param in donor.named_parameters():
+            if "lora_" in name:
+                torch.nn.init.normal_(param, mean=3.0, std=1.0)
+        donor_lora = {
+            k: v.clone() for k, v in donor.state_dict().items() if "lora_" in k
+        }
+        assert donor_lora
+
+        mesh = torch.distributed.device_mesh.init_device_mesh(
+            "cpu", (1,), mesh_dim_names=("dp",)
+        )
+        manager = AutomodelCheckpointManager(dp_mesh=mesh, tp_mesh=mesh)
+        manager.init_checkpointer(
+            config_updates={"model_save_format": "safetensors", "is_peft": True}
+        )
+        weights_path = str(tmp_path / "step_5" / "policy" / "weights")
+        manager.save_checkpoint(
+            model=donor,
+            weights_path=weights_path,
+            is_final_checkpoint=False,
+            peft_config=peft_config,
+        )
+
+        # Fresh run: adapters start at zero, like a cold LoRA init.
+        model = _TwoLinearModel()
+        apply_lora_to_linear_modules(model, peft_config)
+        for name, param in model.named_parameters():
+            if "lora_" in name:
+                param.data.zero_()
+
+        _load_initial_lora_adapter(
+            model=model,
+            checkpoint_manager=manager,
+            restore_from=weights_path,
+            lora_cfg=_lora_cfg(),
+            model_name="tiny-model",
+        )
+
+        loaded = {k: v for k, v in model.state_dict().items() if "lora_" in k}
+        assert set(loaded) == set(donor_lora)
+        for key, expected in donor_lora.items():
+            assert torch.allclose(loaded[key], expected), f"{key} was not warm-started"
+            assert not torch.allclose(loaded[key], torch.zeros_like(loaded[key]))
+
+    def test_donor_covering_fewer_modules_raises(self, _init_gloo_pg, tmp_path):
+        """A donor targeting fewer modules than the run must fail closed.
+
+        Regression test for the state_dict_adapter escape hatch: the PEFT load
+        is unconditionally non-strict, so without key validation this donor
+        would load partially (one layer warm-started, the other silently left
+        at fresh init) and still print a success message.
+        """
+        from nemo_automodel.components._peft.lora import (
+            PeftConfig,
+            apply_lora_to_linear_modules,
+        )
+
+        from nemo_rl.models.automodel.setup import _load_initial_lora_adapter
+
+        donor_peft_config = PeftConfig(
+            target_modules=["*layers.0*"],
+            match_all_linear=False,
+            dim=2,
+            alpha=4,
+            dropout=0.0,
+            dropout_position="post",
+            lora_A_init="xavier",
+            use_triton=False,
+        )
+        donor = _TwoLinearModel()
+        apply_lora_to_linear_modules(donor, donor_peft_config)
+        donor_lora_names = [n for n, _ in donor.named_parameters() if "lora_" in n]
+        # Sanity: the donor adapter covers layers.0 only, not layers.1.
+        assert donor_lora_names
+        assert all("layers.0" in n for n in donor_lora_names)
+
+        mesh = torch.distributed.device_mesh.init_device_mesh(
+            "cpu", (1,), mesh_dim_names=("dp",)
+        )
+        manager = AutomodelCheckpointManager(dp_mesh=mesh, tp_mesh=mesh)
+        manager.init_checkpointer(
+            config_updates={"model_save_format": "safetensors", "is_peft": True}
+        )
+        weights_path = str(tmp_path / "step_5" / "policy" / "weights")
+        manager.save_checkpoint(
+            model=donor,
+            weights_path=weights_path,
+            is_final_checkpoint=False,
+            peft_config=donor_peft_config,
+        )
+
+        run_peft_config = PeftConfig(
+            target_modules=[],
+            match_all_linear=True,
+            dim=2,
+            alpha=4,
+            dropout=0.0,
+            dropout_position="post",
+            lora_A_init="xavier",
+            use_triton=False,
+        )
+        model = _TwoLinearModel()
+        apply_lora_to_linear_modules(model, run_peft_config)
+
+        with pytest.raises(ValueError, match="Missing from donor"):
+            _load_initial_lora_adapter(
+                model=model,
+                checkpoint_manager=manager,
+                restore_from=weights_path,
+                lora_cfg=_lora_cfg(),
+                model_name="tiny-model",
+            )

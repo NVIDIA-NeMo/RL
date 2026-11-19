@@ -151,6 +151,27 @@ def _compute_shard_slices(global_shape, mesh_shape, coordinates, placements):
     return result
 
 
+def local_shard_slices(param_info, rank) -> tuple[slice, ...]:
+    """Return this destination rank's slices of an HF-global tensor.
+
+    ``param_info`` is one bulk param of a reshard plan; its ``dst_mesh_info``
+    and ``dst_placements`` say how the destination shards the
+    ``global_shape`` tensor.
+    """
+    mesh_tensor = _mesh_rank_tensor(param_info["dst_mesh_info"])
+    coordinates = (mesh_tensor == rank).nonzero(as_tuple=False)
+    if coordinates.numel() == 0:
+        raise ValueError(f"Rank {rank} is absent from the destination mesh")
+    return tuple(
+        _compute_shard_slices(
+            param_info["global_shape"],
+            list(mesh_tensor.shape),
+            coordinates[0].tolist(),
+            param_info["dst_placements"],
+        )
+    )
+
+
 def _rank_regions(mesh, placements, global_shape):
     ranks = _mesh_rank_tensor(mesh)
     mesh_shape = tuple(int(size) for size in ranks.shape)
@@ -334,6 +355,60 @@ def _destroy_subcommunicator(communicator):
         if callable(finalize):
             finalize()
         destroy()
+
+
+def _abort_subcommunicator(communicator):
+    if communicator is None:
+        return
+    abort = getattr(communicator, "abort", None)
+    if not callable(abort):
+        return
+    try:
+        abort()
+    except Exception:  # noqa: BLE001
+        # Per child, not around the loop. The caller is already blocked on one of these,
+        # and it is not necessarily the one that raised -- giving up on the rest would
+        # leave it hung on a child that would have aborted cleanly. Swallowing is no
+        # worse than not having tried.
+        pass
+
+
+def abort_xferdtensor_python_subcommunicators(process_group):
+    """Abort this group's split children and drop them, without collective teardown.
+
+    Called from ``StatelessProcessGroup.abort()``, which exists precisely for the case
+    where a peer is gone. That rules out ``clear_xferdtensor_python_caches``: it destroys
+    children via ``finalize()``/``destroy()``, and its own docstring describes that as a
+    protocol where "every rank in that group must call cleanup in the same order" -- a
+    collective, which a dead rank cannot join. Using it here would move the hang rather
+    than remove it.
+
+    Why the children need their own abort at all: NCCL gives a split child its own abort
+    flag unless ``splitShare`` is set, and it defaults to 0 (nothing in this repo sets
+    ``NCCL_COMM_SPLIT_SHARE_RESOURCES``). The parent's ``childAbortFlag`` is unlinked once
+    child init completes, so ``ncclCommAbort`` on the parent sets only the parent's flag.
+    A rank blocked in a collective on a child is therefore never released by aborting the
+    parent -- and because it never returns, the guarded block never exits and
+    ``guard.fired`` is never read. No exception-translation fix can reach a hang.
+
+    Dropping the cache entries also stops a rebuild stranding the previous children for
+    the life of the worker: ``_SUBCOMM_CACHE`` is keyed on ``id(nccl_communicator)``, so a
+    new parent mints new keys and the old children would otherwise never be reclaimed.
+    """
+    process_group_id = id(process_group)
+    communicator_ids = _PROCESS_GROUP_COMM_IDS.pop(process_group_id, set())
+    communicator = getattr(process_group, "nccl_communicator", None)
+    if communicator is not None:
+        communicator_ids.add(id(communicator))
+    for cache in (_SUBCOMM_CACHE, _INACTIVE_SUBCOMM_CACHE):
+        for key in list(cache):
+            if key[0] in communicator_ids:
+                _abort_subcommunicator(cache.pop(key))
+    # Detached so the weakref finalizer cannot later run the collective destroy over
+    # children that are already aborted, reintroducing the hang from the GC.
+    finalizer = _PROCESS_GROUP_FINALIZERS.pop(process_group_id, None)
+    if finalizer is not None:
+        finalizer.detach()
 
 
 def _evict_communicators(comm_ids):

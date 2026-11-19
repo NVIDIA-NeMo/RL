@@ -29,6 +29,7 @@ from omegaconf import OmegaConf
 
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
@@ -86,6 +87,8 @@ def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
                 ray_namespace=None,
                 initial_global_config_dict=nemo_gym_dict,
                 invalid_tool_call_patterns=None,
+                checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
+                turn_checkpointing_enabled=False,
             )
 
             nemo_gym_opts = {
@@ -98,6 +101,21 @@ def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
                         **os.environ,
                         "VIRTUAL_ENV": nemo_gym_py_exec,
                         "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
+                        # Gym server setup scripts shell out to `uv pip install --no-cache`
+                        # (e.g. swe_agents' r2e_gym.sh), and uv rejects --no-cache combined
+                        # with symlink installs: "Symlink-based installation is not supported
+                        # with `--no-cache`". docker/Dockerfile exports UV_LINK_MODE=symlink
+                        # for this prefetch (as does the nemotron-3-super guide), and
+                        # os.environ above propagates it into every server's setup
+                        # subprocess. Pin hardlink for the Gym actor only, so
+                        # the outer prefetch keeps symlink semantics. hardlink survives uv
+                        # cache pruning where symlink does not. Note it is as space-efficient
+                        # as copy, but not as symlink: across Docker layers, linking out of
+                        # the lower-layer uv cache makes overlayfs copy the bytes up.
+                        # The override is required rather than redundant next to os.environ --
+                        # Ray merges runtime_env env_vars per key over the inherited
+                        # environment, so deleting this key leaves the raylet's symlink.
+                        "UV_LINK_MODE": "hardlink",
                     },
                 },
             }

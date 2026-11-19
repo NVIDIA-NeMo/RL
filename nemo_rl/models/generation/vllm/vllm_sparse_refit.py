@@ -136,6 +136,9 @@ class VllmSparseRefitReceiver:
     def set_worker_hostnames(self, hostnames: list[str]) -> None:
         self._refit_workers_share_node = len(set(hostnames)) == 1
 
+    def set_async_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._refit_async_loop = loop
+
     def start_sync_server(self) -> None:
         llm = self._worker.llm
         if llm is None:
@@ -287,7 +290,7 @@ class VllmSparseRefitReceiver:
                 )
             except Exception:
                 # Drain peers before removing shared batch files.
-                self._refit_collective_rpc("synchronize_device", ())
+                self._refit_collective_rpc("synchronize_sparse_refit_device", ())
                 raise
         finally:
             for payload in staged:
@@ -428,8 +431,6 @@ class VllmSparseRefitReceiver:
             raw_request: Request,
             action: Literal["prepare", "s3", "flush", "zmq_flush"],
         ) -> JSONResponse:
-            if cfg["vllm_cfg"]["async_engine"]:
-                self._refit_async_loop = asyncio.get_running_loop()
             supplied_token = raw_request.headers.get(G_VLLM_REFIT_API_KEY_HEADER)
             if token is not None and (
                 supplied_token is None or not hmac.compare_digest(token, supplied_token)

@@ -13,14 +13,43 @@
 # limitations under the License.
 
 import os
-from contextlib import contextmanager
+import pickle
+import shutil
+import threading
+import uuid
+from collections.abc import Iterator
 from typing import Any, Callable, Optional
 
 import torch
 from megatron.bridge import AutoBridge
 from megatron.core.transformer import ModuleSpec
 
-from nemo_rl.models.policy import MegatronConfig
+from nemo_rl.models.policy import MegatronConfig, provider_override_allowed
+
+
+def iter_vlm_config_overrides(
+    megatron_config: MegatronConfig,
+) -> Iterator[tuple[str, Any]]:
+    """Yield explicitly configured Nemotron Omni provider overrides.
+
+    Only keys present in the recipe are yielded, so omitting one keeps the
+    provider's own default rather than silently forcing False.
+    """
+    keys = (
+        "radio_force_eval_mode",
+        "radio_force_cpe_eval_mode",
+        "freeze_vision_model",
+        "freeze_vision_projection",
+        "freeze_sound_encoder",
+        "freeze_sound_projection",
+        "recompute_vision",
+        "vision_recompute_granularity",
+        "vision_recompute_method",
+        "vision_recompute_num_layers",
+    )
+    for key in keys:
+        if key in megatron_config:
+            yield key, megatron_config[key]
 
 
 def to_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
@@ -41,41 +70,89 @@ def to_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
     raise ValueError(f"Unknown dtype: {dtype}")
 
 
-@contextmanager
-def _prefer_nvrx_for_dist_ckpt_save():
-    """Prefer NVRx async strategy for torch_dist save in HF->Megatron import.
+def megatron_conversion_is_complete(pretrained_path: str) -> bool:
+    """Whether a completed HF->Megatron conversion exists at `pretrained_path`."""
+    iteration_path = os.path.join(pretrained_path, "iter_0000000")
+    if not os.path.isfile(os.path.join(iteration_path, "run_config.yaml")):
+        return False
+    try:
+        with open(os.path.join(iteration_path, ".metadata"), "rb") as metadata_file:
+            metadata = pickle.load(metadata_file)
+    except (OSError, EOFError, pickle.UnpicklingError):
+        return False
 
-    Megatron-LM's torch_dist sync save currently routes through the MCore async
-    finalize path, which can fail when write results contain non-picklable
-    objects (e.g., code objects) during gather_object.
+    storage_data = getattr(metadata, "storage_data", None)
+    if not storage_data:
+        return False
+    relative_paths = {item.relative_path for item in storage_data.values()}
+    return all(
+        os.path.isfile(path := os.path.join(iteration_path, relative_path))
+        and os.path.getsize(path) > 0
+        for relative_path in relative_paths
+    )
+
+
+def publish_megatron_conversion(
+    staging_path: str, pretrained_path: str, *, overwrite: bool = False
+) -> None:
+    """Atomically publish a staged HF->Megatron conversion.
+
+    Args:
+        staging_path: Directory the conversion was saved into.
+        pretrained_path: Final conversion-cache path.
+        overwrite: Replace any existing complete conversion.
     """
-    try:
-        from megatron.core.dist_checkpointing.strategies.torch import (
-            TorchDistSaveShardedStrategy,
-        )
-    except ImportError:
-        # If dist-checkpoint strategy cannot be imported, leave behavior unchanged.
-        yield
-        return
-
-    original_save = TorchDistSaveShardedStrategy.save
-
-    def _save_with_nvrx_fallback(self, sharded_state_dict, checkpoint_dir):
-        try:
-            async_request = self.async_save(
-                sharded_state_dict, checkpoint_dir, async_strategy="nvrx"
+    displaced: Optional[str] = None
+    for attempt in range(2):
+        if not overwrite and megatron_conversion_is_complete(pretrained_path):
+            # A concurrent producer sharing the cache won; use its artifact.
+            print(
+                f"Completed conversion already published at {pretrained_path}; "
+                "discarding the staged copy.",
+                flush=True,
             )
-            async_request.execute_sync()
-            del async_request
-        except (ImportError, ModuleNotFoundError):
-            # Keep backward compatibility on environments without nvrx.
-            original_save(self, sharded_state_dict, checkpoint_dir)
-
-    TorchDistSaveShardedStrategy.save = _save_with_nvrx_fallback
-    try:
-        yield
-    finally:
-        TorchDistSaveShardedStrategy.save = original_save
+            threading.Thread(
+                target=shutil.rmtree,
+                args=(staging_path,),
+                kwargs={"ignore_errors": True},
+                daemon=True,
+            ).start()
+            break
+        try:
+            os.rename(staging_path, pretrained_path)
+            break
+        except OSError:
+            if attempt == 1:
+                if not overwrite and megatron_conversion_is_complete(pretrained_path):
+                    # A peer published into the slot we freed; use its artifact.
+                    threading.Thread(
+                        target=shutil.rmtree,
+                        args=(staging_path,),
+                        kwargs={"ignore_errors": True},
+                        daemon=True,
+                    ).start()
+                    break
+                raise
+        if not overwrite and megatron_conversion_is_complete(pretrained_path):
+            # A complete artifact raced in between the probe and the rename;
+            # concede to it on the next pass.
+            continue
+        # The final path is occupied (stale partial conversion, or a complete one under overwrite);
+        # displace it, retry the rename, then delete the displaced copy.
+        displaced = f"{pretrained_path}.displaced-{uuid.uuid4().hex[:8]}"
+        try:
+            os.rename(pretrained_path, displaced)
+        except FileNotFoundError:
+            # A concurrent publisher displaced it first; retry from the top.
+            displaced = None
+    if displaced is not None:
+        # Doomed uniquely-named copy nothing reads; delete without blocking startup.
+        threading.Thread(
+            target=shutil.rmtree,
+            args=(displaced,),
+            kwargs={"ignore_errors": True},
+            daemon=True,
+        ).start()
 
 
 def import_model_from_hf_name(
@@ -85,6 +162,8 @@ def import_model_from_hf_name(
     model_post_wrap_hook: Optional[Callable] = None,
     transformer_layer_spec: Optional[ModuleSpec | Callable] = None,
     mamba_stack_spec: Optional[ModuleSpec | Callable] = None,
+    *,
+    overwrite: bool = False,
     **config_overrides: Any,
 ):
     """Import a Hugging Face model into Megatron checkpoint format and save the Megatron checkpoint to the output path.
@@ -102,6 +181,7 @@ def import_model_from_hf_name(
         mamba_stack_spec: Optional Megatron ``ModuleSpec`` (or callable
             returning one) overriding the default Mamba stack spec selected by
             Mamba model providers.
+        overwrite: Publish over an existing complete conversion.
         **config_overrides: Extra keyword arguments forwarded to
             ``AutoBridge.from_hf_pretrained``.
     """
@@ -110,6 +190,21 @@ def import_model_from_hf_name(
     )
 
     model_provider = bridge.to_megatron_provider(load_weights=True)
+
+    if megatron_config is not None:
+        for key, value in iter_vlm_config_overrides(megatron_config):
+            if not provider_override_allowed(megatron_config, key):
+                continue
+            # Match the import-time behaviour in megatron/setup.py: a key the
+            # recipe set explicitly must not be dropped just because this
+            # provider lacks the field, or a frozen tower silently trains.
+            if not hasattr(model_provider, key):
+                raise ValueError(
+                    f"megatron_cfg set '{key}' but "
+                    f"{type(model_provider).__name__} has no such field; this "
+                    "provider does not support that tower control."
+                )
+            setattr(model_provider, key, value)
 
     # Keep track of defaults so can restore them to the config after loading the model
     orig_tensor_model_parallel_size = model_provider.tensor_model_parallel_size
@@ -191,8 +286,34 @@ def import_model_from_hf_name(
     config.num_layers_in_last_pipeline_stage = orig_num_layers_in_last_pipeline_stage
     config.pipeline_dtype = orig_pipeline_dtype
 
-    with _prefer_nvrx_for_dist_ckpt_save():
-        bridge.save_megatron_model(megatron_model, output_path)
+    # Stage the save next to the final path, then atomically rename into place
+    # so concurrent readers of the shared cache never see a partial checkpoint.
+    output_path = os.path.normpath(output_path)
+    output_parent = os.path.dirname(output_path)
+    if output_parent:
+        os.makedirs(output_parent, exist_ok=True)
+    dist_active = (
+        torch.distributed.is_available() and torch.distributed.is_initialized()
+    )
+    staging_token = uuid.uuid4().hex[:8]
+    if dist_active:
+        token_box = [staging_token]
+        torch.distributed.broadcast_object_list(token_box, src=0)
+        staging_token = token_box[0]
+    staging_path = os.path.join(
+        output_parent, f".{os.path.basename(output_path)}.staging-{staging_token}"
+    )
+
+    bridge.save_megatron_model(megatron_model, staging_path)
+
+    # Every rank must finish writing before rank 0 publishes the staging dir,
+    # and no rank may read output_path before the rename lands.
+    if dist_active:
+        torch.distributed.barrier()
+    if not dist_active or torch.distributed.get_rank() == 0:
+        publish_megatron_conversion(staging_path, output_path, overwrite=overwrite)
+    if dist_active:
+        torch.distributed.barrier()
 
     # resetting mcore state
     import megatron.core.rerun_state_machine

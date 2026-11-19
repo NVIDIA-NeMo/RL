@@ -32,6 +32,7 @@ import torch
 import torch.nn.functional as F
 
 from nemo_rl.algorithms.loss import (
+    ClippedPGLossConfig,
     ClippedPGLossFn,
     SDPOHybridLossFn,
     SDPOLossFn,
@@ -114,7 +115,9 @@ def _build_inputs(
 
 
 def _call_hybrid(grpo_weight: float, inp: dict):
-    hybrid = SDPOHybridLossFn({"grpo_weight": grpo_weight, "sdpo": _sdpo_cfg(), "grpo": _grpo_cfg()})
+    hybrid = SDPOHybridLossFn(
+        {"grpo_weight": grpo_weight, "sdpo": _sdpo_cfg(), "grpo": _grpo_cfg()}
+    )
     return hybrid(
         inp["student_topk_logprobs"],
         inp["teacher_topk_logprobs"],
@@ -138,7 +141,7 @@ def _call_sdpo(inp: dict):
 
 
 def _call_grpo(inp: dict):
-    return ClippedPGLossFn(_grpo_cfg())(
+    return ClippedPGLossFn(ClippedPGLossConfig(**_grpo_cfg()))(
         inp["next_token_logprobs"],
         inp["data"],
         inp["global_valid_seqs"],
@@ -197,7 +200,9 @@ def test_hybrid_metrics_structure():
 @pytest.mark.parametrize("bad_weight", [-0.1, 1.5])
 def test_hybrid_rejects_out_of_range_weight(bad_weight):
     with pytest.raises(ValueError, match="grpo_weight"):
-        SDPOHybridLossFn({"grpo_weight": bad_weight, "sdpo": _sdpo_cfg(), "grpo": _grpo_cfg()})
+        SDPOHybridLossFn(
+            {"grpo_weight": bad_weight, "sdpo": _sdpo_cfg(), "grpo": _grpo_cfg()}
+        )
 
 
 def test_prepare_loss_input_routes_combined_type(monkeypatch):
@@ -206,7 +211,7 @@ def test_prepare_loss_input_routes_combined_type(monkeypatch):
     We monkeypatch the two logprob kernels with sentinels so the test verifies
     routing/wiring of the new branch independent of kernel internals.
     """
-    import nemo_rl.algorithms.loss.utils as utils
+    import nemo_rl.algorithms.loss.loss_input as utils
 
     student_sentinel = torch.tensor([1.0])
     teacher_sentinel = torch.tensor([2.0])
@@ -224,7 +229,9 @@ def test_prepare_loss_input_routes_combined_type(monkeypatch):
         lambda **kw: logprob_sentinel,
     )
 
-    loss_fn = SDPOHybridLossFn({"grpo_weight": 0.5, "sdpo": _sdpo_cfg(), "grpo": _grpo_cfg()})
+    loss_fn = SDPOHybridLossFn(
+        {"grpo_weight": 0.5, "sdpo": _sdpo_cfg(), "grpo": _grpo_cfg()}
+    )
     assert loss_fn.input_type == LossInputType.DISTILLATION_AND_LOGPROB
 
     logits = torch.randn(2, 4, 8)
@@ -258,23 +265,32 @@ def test_hybrid_advantage_prompt_ids_grouping():
     Verifies the prompt-major repeat_interleave layout yields correct
     leave-one-out group baselines and the expected [B, S] advantage shape.
     """
-    from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+    from nemo_rl.algorithms.advantage_estimator import (
+        AdvEstimatorConfig,
+        GRPOAdvantageEstimator,
+    )
 
     num_prompts, num_generations, seq_len = 2, 2, 5
     batch_size = num_prompts * num_generations  # 4
 
     # Same construction as sdpo_train (the line that was buggy).
-    prompt_ids = torch.arange(num_prompts).repeat_interleave(num_generations).unsqueeze(-1)
+    prompt_ids = (
+        torch.arange(num_prompts).repeat_interleave(num_generations).unsqueeze(-1)
+    )
     assert prompt_ids.shape == (batch_size, 1)
 
     rewards = torch.tensor([1.0, 0.0, 1.0, 1.0])  # group0: [1,0], group1: [1,1]
     mask = torch.ones(batch_size, seq_len)
 
     est = GRPOAdvantageEstimator(
-        {"name": "grpo", "use_leave_one_out_baseline": True, "normalize_rewards": False},
-        {},
+        AdvEstimatorConfig(
+            name="grpo", use_leave_one_out_baseline=True, normalize_rewards=False
+        ),
+        None,
     )
-    advantages = est.compute_advantage(prompt_ids=prompt_ids, rewards=rewards, mask=mask)
+    advantages = est.compute_advantage(
+        prompt_ids=prompt_ids, rewards=rewards, mask=mask
+    )
 
     assert advantages.shape == (batch_size, seq_len)
     # Advantages are constant across the sequence dimension (expanded from [B, 1]).
@@ -294,7 +310,11 @@ def test_hybrid_adv_estimator_accepts_wrapped_dict_config():
         GRPOAdvantageEstimator,
     )
 
-    adv_cfg = {"name": "grpo", "use_leave_one_out_baseline": True, "normalize_rewards": True}
+    adv_cfg = {
+        "name": "grpo",
+        "use_leave_one_out_baseline": True,
+        "normalize_rewards": True,
+    }
     est = GRPOAdvantageEstimator(AdvEstimatorConfig(**adv_cfg), None)
     assert est.use_leave_one_out_baseline is True
     assert est.normalize_rewards is True

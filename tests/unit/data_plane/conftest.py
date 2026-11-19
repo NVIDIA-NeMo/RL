@@ -29,11 +29,14 @@ smoke / smoke-backend / smoke-1d / obj-backend / mix-e2e today).
 
 from __future__ import annotations
 
+import functools
+import os
+
 import pytest
 
 from nemo_rl.data_plane import build_data_plane_client
 
-from ._rollout_shapes import mooncake_available
+from ._rollout_shapes import mooncake_available, rdma_available
 
 
 def _make_tq_cfg(backend: str) -> dict:
@@ -41,11 +44,15 @@ def _make_tq_cfg(backend: str) -> dict:
         "enabled": True,
         "impl": "transfer_queue",
         "backend": backend,
-        "storage_capacity": 1024,
-        "num_storage_units": 1,
         "claim_meta_poll_interval_s": 0.5,
-        "global_segment_size": 8589934592,  # 8 GiB — sized for CI host RAM
-        "local_buffer_size": 1073741824,  # 1 GiB
+        "simple": {"storage_capacity": 1024, "num_storage_units": 1},
+        "mooncake_cpu": {
+            "global_segment_size": 8589934592,  # 8 GiB — sized for CI host RAM
+            "local_buffer_size": 1073741824,  # 1 GiB
+            # reuse_registered_buffers omitted on purpose: absent must mean on,
+            # so the fixture exercises the default the same way a user config
+            # that never mentions the flag does.
+        },
     }
 
 
@@ -66,6 +73,15 @@ def _session_tq_client_mooncake_cpu():
         pytest.skip(
             "mooncake not installed — skipping mooncake_cpu "
             "(set NEMO_RL_REQUIRE_MOONCAKE=1 to fail loud)"
+        )
+    # mooncake_cpu is RDMA-only, so it cannot run without an RDMA device. CI
+    # sets NEMO_RL_REQUIRE_MOONCAKE=1 on runners that have one, which turns
+    # this skip into a failure — otherwise losing the device passthrough would
+    # silently drop mooncake coverage and still go green.
+    if not rdma_available():
+        pytest.skip(
+            "no usable mlx5 RDMA device — mooncake_cpu requires RDMA "
+            "(set MC_MOONCAKE_DEVICE=<dev> to override)"
         )
     client = build_data_plane_client(_make_tq_cfg("mooncake_cpu"))
     yield client
@@ -90,3 +106,119 @@ def tq_client_backends(request):
     (see module docstring).
     """
     return request.getfixturevalue(f"_session_tq_client_{request.param}")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_codec_timer():
+    """Drain the module-level codec timer around every test in this package.
+
+    ``pack_jagged_fields`` records into a process-global timer, so a test that
+    packs (the codec and column_io suites) leaves residue that the next
+    ``get_step_metrics`` would report as its own ``step/codec/pack_s``.
+    """
+    from nemo_rl.data_plane.codec import drain_codec_ms
+
+    drain_codec_ms()
+    yield
+    drain_codec_ms()
+
+
+# ----------------------------------------------------------------------------- nixl backend
+# Tests marked ``nixl`` need NIXL importable and UCX restricted to RDMA (the
+# NIXL data plane refuses TCP) and an RDMA device; tests marked ``gpu`` need a
+# CUDA device. Both are skipped otherwise, so CPU-only runners execute only the
+# pure tests. ``_nixl_ready`` sets the RDMA-only UCX env itself, through
+# ``configure_engine_env``. CI sets NEMO_RL_REQUIRE_NIXL=1 on runners with an
+# RDMA device, which turns a nixl skip into a failure there, as
+# NEMO_RL_REQUIRE_MOONCAKE does.
+
+
+@functools.cache
+def _nixl_ready() -> str | None:
+    try:
+        from nixl._api import nixl_agent  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        return f"nixl not importable: {e}"
+    from nemo_rl.data_plane.adapters.transfer_queue import rdma_devices
+    from nemo_rl.data_plane.adapters.transfer_queue_env import configure_engine_env
+    from nemo_rl.data_plane.nixl.errors import TransportPolicyError
+
+    # configure_engine_env fills in UCX_TLS, so the UCX env no longer tells a
+    # host with RDMA from one without: look for the device itself.
+    if not rdma_devices():
+        return "no RDMA device"
+    try:
+        configure_engine_env({"backend": "nixl"})  # ends with check_rdma_only
+    except TransportPolicyError as e:
+        return f"UCX not restricted to RDMA: {e}"
+    return None
+
+
+def _require_nixl() -> bool:
+    return os.environ.get("NEMO_RL_REQUIRE_NIXL") == "1"
+
+
+def pytest_runtest_setup(item):
+    if item.get_closest_marker("nixl") and _require_nixl():
+        why = _nixl_ready()
+        if why:
+            pytest.fail(f"NEMO_RL_REQUIRE_NIXL=1 but {why}")
+
+
+def _has_cuda() -> bool:
+    try:
+        import torch
+
+        return torch.cuda.is_available() and torch.cuda.device_count() > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def pytest_collection_modifyitems(config, items):
+    marked = [
+        it
+        for it in items
+        if it.get_closest_marker("nixl") or it.get_closest_marker("gpu")
+    ]
+    if not marked:
+        return
+    # TransferQueue keeps one process-global client, and tq.init() reuses it.
+    # Run the nixl tests before anything builds the session simple/mooncake
+    # clients below, or their tq.init(NixlStore) would attach to that client.
+    nixl = [it for it in items if it.get_closest_marker("nixl")]
+    if nixl:
+        ids = {id(it) for it in nixl}
+        items[:] = nixl + [it for it in items if id(it) not in ids]
+    why = None if _require_nixl() else _nixl_ready()  # required: fails in setup
+    cuda = _has_cuda()
+    for item in marked:
+        if item.get_closest_marker("nixl") and why:
+            item.add_marker(pytest.mark.skip(reason=why))
+        if item.get_closest_marker("gpu") and not cuda:
+            item.add_marker(pytest.mark.skip(reason="no CUDA device"))
+
+
+@pytest.fixture(scope="session")
+def ray_cluster(init_ray_cluster):
+    """Ray is already up (tests/unit/conftest.py); the NIXL tests only need it."""
+    yield
+
+
+@pytest.fixture(scope="module")
+def tq_system(ray_cluster):
+    """A live TransferQueue with the NixlStore backend (2 small units)."""
+    import transfer_queue as tq
+
+    import nemo_rl.data_plane.adapters.tq_nixl as tq_nixl  # registers the backend
+
+    from ._nixl_helpers import make_tq_conf
+
+    conf = make_tq_conf()
+    tq.init(conf)
+    manager = tq.get_client().storage_manager
+    assert isinstance(manager, tq_nixl.NixlStorageManager), (
+        f"tq.init attached to an existing {type(manager).__name__}, not NixlStore"
+    )
+    yield conf
+    tq.close()
+    tq_nixl.shutdown(conf)

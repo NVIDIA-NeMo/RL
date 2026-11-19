@@ -21,6 +21,7 @@ mesh construction, placement rules, expert grouping, and the top-level
 torch.distributed, no model object — so this module runs on CPU with no extras.
 """
 
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -28,7 +29,9 @@ import torch
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_rl.weight_sync.nccl_reshard_utils import (
+    LocalParamSpec,
     MeshInfo,
+    RefitCtx,
     _extract_layer_name,
     build_mesh_info,
     build_nccl_reshard_refit_info,
@@ -38,7 +41,60 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     group_expert_params_in_metadata,
     is_expert_param,
     is_nccl_reshard_param,
+    make_nccl_reshard_refit_info_wire_safe,
+    restore_refit_info_placements,
 )
+
+
+def test_local_param_spec_defaults_to_bf16():
+    base = torch.ones(2, dtype=torch.bfloat16)
+    spec = LocalParamSpec(base=base)
+
+    assert spec.wire_dtype == torch.bfloat16
+    assert spec.materialize().buf is base
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_local_param_spec_preserves_explicit_wire_dtype(dtype):
+    base = torch.ones(2, dtype=dtype)
+    spec = LocalParamSpec(base=base, wire_dtype=dtype)
+
+    assert spec.materialize().buf is base
+
+
+@pytest.mark.parametrize("with_hook", [False, True])
+def test_local_param_spec_rejects_buffer_dtype_mismatch(with_hook):
+    base = torch.ones(2, dtype=torch.float32)
+    spec = LocalParamSpec(
+        base=base,
+        pre=(lambda tensor: RefitCtx(buf=tensor)) if with_hook else None,
+    )
+
+    with pytest.raises(ValueError, match="torch.float32.*wire_dtype torch.bfloat16"):
+        spec.materialize()
+    assert base.dtype == torch.float32
+
+
+def test_local_param_spec_runs_pre_fresh_and_leaves_commit_to_caller():
+    base = torch.ones(2, dtype=torch.float32)
+    commits = []
+
+    def pre(tensor):
+        return RefitCtx(buf=tensor.to(torch.bfloat16), extra={"base": tensor})
+
+    # Keep existing positional base/pre/post construction compatible.
+    spec = LocalParamSpec(base, pre, commits.append)
+    first = spec.materialize()
+    base.fill_(3)
+    second = spec.materialize()
+
+    assert not commits
+    assert second.extra["base"] is base
+    torch.testing.assert_close(first.buf, torch.ones(2, dtype=torch.bfloat16))
+    torch.testing.assert_close(second.buf, torch.full((2,), 3, dtype=torch.bfloat16))
+    assert spec.post is not None
+    spec.post(second)
+    assert commits == [second]
 
 
 # --------------------------------------------------------------------------
@@ -47,19 +103,189 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 def _valid_nccl_reshard_config() -> SimpleNamespace:
     return SimpleNamespace(
         policy={
+            "precision": "bfloat16",
             "generation": {
                 "backend": "vllm",
                 "colocated": {"enabled": False},
                 "vllm_cfg": {},
             },
             "megatron_cfg": {"enabled": True},
-            "dtensor_cfg": {"enabled": False},
+            "automodel_cfg": {"enabled": False},
         }
     )
 
 
 def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
     check_nccl_reshard_refit_support(_valid_nccl_reshard_config())
+
+
+@pytest.mark.parametrize("tensor_parallel_size,expert_parallel_size", [(1, 4), (2, 16)])
+def test_check_nccl_reshard_refit_support_accepts_vllm_native_dp(
+    tensor_parallel_size: int, expert_parallel_size: int
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update(
+        {
+            "tensor_parallel_size": tensor_parallel_size,
+            "expert_parallel_size": expert_parallel_size,
+        }
+    )
+
+    check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("tensor_parallel_size,expert_parallel_size", [(2, 3), (4, 2)])
+def test_check_nccl_reshard_refit_support_rejects_invalid_vllm_native_dp(
+    tensor_parallel_size: int, expert_parallel_size: int
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update(
+        {
+            "tensor_parallel_size": tensor_parallel_size,
+            "expert_parallel_size": expert_parallel_size,
+        }
+    )
+
+    with pytest.raises(ValueError, match="expert_parallel_size must be a multiple"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_megatron_etp_with_vllm() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["megatron_cfg"]["expert_tensor_parallel_size"] = 2
+
+    with pytest.raises(ValueError, match="expert_tensor_parallel_size must be 1"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_reload_api() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["refit_with_reload_api"] = True
+
+    with pytest.raises(ValueError, match="explicitly unsupported"):
+        check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize(
+    "speculative_config",
+    [
+        {"method": "eagle3"},
+        {"method": "dflash"},
+        {"method": "dspark"},
+        {"method": "dflash", "num_speculative_tokens": 4},
+        {"model": "draft-checkpoint", "num_speculative_tokens": 3},
+    ],
+    ids=["eagle3", "dflash", "dspark", "dflash-k4", "model-without-method"],
+)
+def test_check_nccl_reshard_refit_support_rejects_draft_speculators(
+    speculative_config: dict,
+) -> None:
+    """Co-trained drafters never reach process_weights_after_loading here."""
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_kwargs"] = {
+        "speculative_config": speculative_config
+    }
+
+    with pytest.raises(ValueError, match="speculative_config.method"):
+        check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize(
+    "speculative_config",
+    [
+        {"method": "mtp"},
+        {"method": "eagle3", "num_speculative_tokens": 0},
+        {"num_speculative_tokens": 3},
+    ],
+    ids=["mtp", "disabled-eagle3", "no-method-no-model"],
+)
+def test_check_nccl_reshard_refit_support_accepts_non_draft_speculators(
+    speculative_config: dict,
+) -> None:
+    """MTP finalizes outside the draft manifest; K=0 disables speculation."""
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_kwargs"] = {
+        "speculative_config": speculative_config
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_collects_without_vllm_cfg() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["backend"] = "sglang"
+    config.policy["generation"].pop("vllm_cfg")
+
+    with pytest.raises(ValueError) as exc_info:
+        check_nccl_reshard_refit_support(config)
+
+    assert "policy.generation.backend must be 'vllm'" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("trainer_precision", ["float16", "float32", "bfloat16"])
+@pytest.mark.parametrize("gen_precision", ["float16", "float32", "bfloat16", "fp8"])
+@pytest.mark.parametrize("source_recipe", [None, "mxfp8"])
+@pytest.mark.parametrize("is_mx", [False, True])
+def test_check_nccl_reshard_checks_independent_storage_precisions(
+    trainer_precision, gen_precision, source_recipe, is_mx
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = trainer_precision
+    config.policy["generation"]["vllm_cfg"].update(
+        {"precision": gen_precision, "is_mx": is_mx}
+    )
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": source_recipe is not None,
+        "fp8_param": source_recipe is not None,
+        "fp8_recipe": source_recipe,
+    }
+    if (
+        trainer_precision == "float32"
+        and gen_precision == "fp8"
+        and is_mx
+        and source_recipe is None
+    ):
+        with pytest.raises(ValueError, match="rejects FP32 wire buffers"):
+            check_nccl_reshard_refit_support(config)
+        return
+    check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize(
+    "gen_precision",
+    [None, "auto", "bf16", "bfloat16", "half", "float16", "float", "float32", "fp8"],
+)
+@pytest.mark.parametrize("is_mx", [False, True])
+def test_blockwise_physical_misc_requires_matching_vllm_storage(gen_precision, is_mx):
+    config = _valid_nccl_reshard_config()
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_param": True,
+        "fp8_recipe": "blockwise",
+    }
+    config.policy["generation"]["vllm_cfg"].update(
+        {"precision": gen_precision, "is_mx": is_mx}
+    )
+    if gen_precision == "fp8" and not is_mx:
+        check_nccl_reshard_refit_support(config)
+    else:
+        with pytest.raises(ValueError, match="unchanged misc refit stream"):
+            check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("gen_precision", ["bfloat16", "float16", "float32", "fp8"])
+@pytest.mark.parametrize("is_mx", [False, True])
+def test_blockwise_compute_without_fp8_storage_keeps_logical_misc(gen_precision, is_mx):
+    config = _valid_nccl_reshard_config()
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_param": False,
+        "fp8_recipe": "blockwise",
+    }
+    config.policy["generation"]["vllm_cfg"].update(
+        {"precision": gen_precision, "is_mx": is_mx}
+    )
+    check_nccl_reshard_refit_support(config)
 
 
 @pytest.mark.parametrize(
@@ -71,7 +297,7 @@ def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
         ),
         (
             {"backend": "sglang"},
-            "policy.generation.backend must be 'vllm' (got 'sglang')",
+            "policy.generation.backend must be 'vllm', 'megatron' or 'trtllm' (got 'sglang')",
         ),
     ],
 )
@@ -85,6 +311,222 @@ def test_check_nccl_reshard_refit_support_rejects_invalid_config(
         check_nccl_reshard_refit_support(config)
 
     assert expected_violation in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("train_fp8_cfg", "generation_fp8_cfg"),
+    [
+        ({"enabled": False}, {"enabled": False}),
+        (
+            {"enabled": True, "fp8_recipe": "mxfp8", "fp8_param": True},
+            {"enabled": True, "fp8_recipe": "mxfp8"},
+        ),
+    ],
+)
+def test_check_nccl_reshard_refit_support_accepts_megatron_bf16_and_mxfp8(
+    train_fp8_cfg: dict[str, object], generation_fp8_cfg: dict[str, object]
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["megatron_cfg"]["expert_tensor_parallel_size"] = 2
+    config.policy["megatron_cfg"]["fp8_cfg"] = train_fp8_cfg
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "refit_transport": "nccl_reshard",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "expert_model_parallel_size": 2,
+            "expert_tensor_parallel_size": 2,
+            "pipeline_model_parallel_size": 1,
+            # Any grouped-GEMM backend stores MXFP8 destinations the same way;
+            # torch is the MCore fused-MoE fallback the functional test uses.
+            "inference_grouped_gemm_backend": "torch",
+            # _prepare_mxfp8_refit only installs MXFP8 destinations for
+            # inference_optimized cores; this mirrors the functional test.
+            "transformer_impl": "inference_optimized",
+            "fp8_cfg": generation_fp8_cfg,
+        },
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_accepts_blockwise_megatron_source() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_recipe": "blockwise",
+        "fp8_param": True,
+    }
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "refit_transport": "nccl_reshard",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "expert_tensor_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "fp8_cfg": {"enabled": False},
+        },
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_accepts_megatron_transport() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "refit_transport": "nccl_reshard",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "refit_backend": "nvshmem",
+            "pipeline_model_parallel_size": 1,
+        },
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("gemm_backend", ["torch", "flashinfer", "vllm", None])
+def test_check_nccl_reshard_accepts_every_grouped_gemm_backend_for_mxfp8(
+    gemm_backend: str | None,
+) -> None:
+    """MCore stores MXFP8 experts identically for all three backends.
+
+    Only flashinfer reaches the TRT-LLM MXFP8 kernels; torch and vllm run MXFP8
+    layers through the MCore fused-MoE path. An omitted key resolves to MCore's
+    default (vllm) and is therefore valid too.
+    """
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    mcore_generation_config = {
+        "pipeline_model_parallel_size": 1,
+        "transformer_impl": "inference_optimized",
+        "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+    }
+    if gemm_backend is not None:
+        mcore_generation_config["inference_grouped_gemm_backend"] = gemm_backend
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "refit_transport": "nccl_reshard",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": mcore_generation_config,
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+def _megatron_gen_config(*, policy_updates=None, **mcore_generation_config):
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy.update(policy_updates or {})
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "refit_transport": "nccl_reshard",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "pipeline_model_parallel_size": 1,
+            **mcore_generation_config,
+        },
+    }
+    return config
+
+
+@pytest.mark.parametrize(
+    ("policy_updates", "mcore_generation_config", "expected_violation"),
+    [
+        # Gen-side PP has no stage-aware destination routing yet.
+        (
+            None,
+            {"pipeline_model_parallel_size": 2},
+            "pipeline_model_parallel_size must be 1",
+        ),
+        # fp8_param without fp8_cfg.enabled is a half-configured trainer.
+        (
+            {"megatron_cfg": {"enabled": True, "fp8_cfg": {"fp8_param": True}}},
+            {},
+            "fp8_cfg.enabled=True",
+        ),
+        # Other destination quantization recipes are not covered by this path.
+        (
+            None,
+            {"fp8_cfg": {"enabled": True, "fp8_recipe": "delayed"}},
+            "fp8_recipe must be 'mxfp8' or 'blockwise'",
+        ),
+        (
+            None,
+            {
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"},
+                "transformer_impl": "inference_optimized",
+            },
+            "Blockwise FP8 Megatron destinations require Transformer Engine",
+        ),
+    ],
+)
+def test_check_nccl_reshard_rejects_unsupported_megatron_generation(
+    policy_updates, mcore_generation_config, expected_violation
+) -> None:
+    config = _megatron_gen_config(
+        policy_updates=policy_updates, **mcore_generation_config
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        check_nccl_reshard_refit_support(config)
+
+    assert expected_violation in str(exc_info.value)
+
+
+@pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
+@pytest.mark.parametrize("inherited", [False, True])
+@pytest.mark.parametrize("disable_parameter_transpose_cache", [False, True])
+def test_check_nccl_reshard_rejects_cached_te_fp8_compute(
+    recipe: str, inherited: bool, disable_parameter_transpose_cache: bool
+) -> None:
+    megatron_cfg = {
+        "fp8_cfg": {"enabled": True, "fp8_recipe": recipe, "fp8_param": False},
+        # This top-level key is not applied to the inference provider.
+        "disable_parameter_transpose_cache": disable_parameter_transpose_cache,
+    }
+    config = _megatron_gen_config(
+        policy_updates={"megatron_cfg": {"enabled": True, **megatron_cfg}}
+        if inherited
+        else None,
+        **({} if inherited else megatron_cfg),
+    )
+
+    with pytest.raises(ValueError, match="reuse stale cached FP8 weights"):
+        check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
+def test_check_nccl_reshard_accepts_te_quantized_megatron_destination(recipe):
+    config = _megatron_gen_config(
+        transformer_impl="transformer_engine",
+        fp8_cfg={"enabled": True, "fp8_recipe": recipe, "fp8_param": True},
+    )
+
+    check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
+@pytest.mark.parametrize("inherited", [False, True])
+def test_check_nccl_reshard_accepts_te_fp8_with_cache_disabled(
+    recipe: str, inherited: bool
+) -> None:
+    model_overrides = {"disable_parameter_transpose_cache": True}
+    config = _megatron_gen_config(
+        fp8_cfg={"enabled": True, "fp8_recipe": recipe, "fp8_param": False},
+        policy_updates={
+            "megatron_cfg": {"enabled": True, "model_overrides": model_overrides}
+        }
+        if inherited
+        else None,
+        **({} if inherited else {"model_overrides": model_overrides}),
+    )
+
+    check_nccl_reshard_refit_support(config)
 
 
 # --------------------------------------------------------------------------
@@ -198,6 +640,7 @@ def test_get_tp_shard_dim(name, expected):
         ("model.layers.0.mlp.down_proj.weight", True),
         ("model.layers.0.mlp.experts.3.gate_proj.weight", True),
         ("model.language_model.layers.7.mlp.experts.3.up_proj.weight", True),
+        ("model.layers.0.mlp.experts.3.up_proj.weight_scale_inv", False),
         # shared experts are FFN-named but fuse differently -> misc
         ("model.layers.0.mlp.shared_expert.gate_proj.weight", False),
         ("model.language_model.layers.1.mlp.shared_expert.down_proj.weight", False),
@@ -288,6 +731,24 @@ def test_get_placements_expert_tp_shifts_by_one():
     )
 
 
+def test_get_placements_expert_ep_and_etp_shard_distinct_axes():
+    # Megatron generation activates EP and expert-TP in the SAME mesh (the layout
+    # build_mesh_info emits for etp>1, ep>1). EP must own the expert dim and ETP
+    # the shifted projection dim; asserting per-axis rather than on the set of
+    # shard dims is what catches the two being swapped.
+    dm = {"ep": 0, "tp": 1}
+    gate = get_placements("a.mlp.experts.gate_proj.weight", dm, 3)
+    down = get_placements("a.mlp.experts.down_proj.weight", dm, 3)
+    assert _shard_dim_at(gate, dm, "ep") == 0
+    assert _shard_dim_at(gate, dm, "tp") == 1
+    assert _shard_dim_at(down, dm, "ep") == 0
+    assert _shard_dim_at(down, dm, "tp") == 2
+    # The router gate is not an expert param: it stays replicated on both axes.
+    assert all(
+        isinstance(p, Replicate) for p in get_placements("a.mlp.gate.weight", dm, 2)
+    )
+
+
 # --------------------------------------------------------------------------
 # group_expert_params_in_metadata
 # --------------------------------------------------------------------------
@@ -331,6 +792,45 @@ def test_group_expert_params_collapses_to_grouped_hf_entries():
     assert (
         "grouped_expert_proj" not in grouped["model.layers.0.self_attn.q_proj.weight"]
     )
+
+
+def test_group_expert_params_canonicalizes_qwen35_grouped_slabs():
+    base = "model.language_model.layers.0.mlp.experts"
+    metadata = {
+        f"{base}.gate_up_proj": {
+            "shape": [256, 1024, 2048],
+            "dtype": "torch.bfloat16",
+        },
+        f"{base}.down_proj": {
+            "shape": [256, 2048, 512],
+            "dtype": "torch.bfloat16",
+        },
+        "model.visual.proj.weight": {
+            "shape": [2048, 2048],
+            "dtype": "torch.bfloat16",
+        },
+    }
+
+    grouped = group_expert_params_in_metadata(metadata)
+
+    assert grouped[f"{base}.gate_proj.weight"] == {
+        "shape": [256, 512, 2048],
+        "dtype": "torch.bfloat16",
+        "grouped_expert_proj": "gate_proj",
+    }
+    assert grouped[f"{base}.up_proj.weight"] == {
+        "shape": [256, 512, 2048],
+        "dtype": "torch.bfloat16",
+        "grouped_expert_proj": "up_proj",
+    }
+    assert grouped[f"{base}.down_proj.weight"] == {
+        "shape": [256, 2048, 512],
+        "dtype": "torch.bfloat16",
+        "grouped_expert_proj": "down_proj",
+    }
+    assert f"{base}.gate_up_proj" not in grouped
+    assert f"{base}.down_proj" not in grouped
+    assert grouped["model.visual.proj.weight"] == metadata["model.visual.proj.weight"]
 
 
 def test_group_expert_params_no_experts_is_identity():
@@ -476,3 +976,211 @@ def test_build_refit_info_groups_experts_and_tags_them():
         for layer in info["layer_names"]
         for p in info["per_layer_params"][layer]
     )
+
+
+@pytest.mark.parametrize(
+    "gen_world_size,gen_tp_size,gen_ep_size,train_world_size",
+    [(8, 1, 4, 8), (32, 2, 16, 16)],
+)
+def test_build_refit_info_places_native_dp_experts_across_instances(
+    gen_world_size: int,
+    gen_tp_size: int,
+    gen_ep_size: int,
+    train_world_size: int,
+) -> None:
+    info = build_nccl_reshard_refit_info(
+        _moe_metadata(num_experts=16),
+        train_parallelism={"tp_size": 1, "ep_size": 4, "pp_size": 1},
+        gen_parallelism={
+            "tp_size": gen_tp_size,
+            "ep_size": gen_ep_size,
+            "etp_size": 1,
+            "pp_size": 1,
+        },
+        train_world_size=train_world_size,
+        gen_world_size=gen_world_size,
+    )
+    expert = _find(info, "model.layers.0.mlp.experts.gate_proj.weight")
+
+    assert tuple(expert["dst_mesh_info"].mesh.shape) == (
+        gen_world_size // gen_ep_size,
+        gen_ep_size,
+    )
+    assert expert["dst_mesh_info"].mesh.flatten().tolist() == list(
+        range(train_world_size, train_world_size + gen_world_size)
+    )
+    assert isinstance(expert["dst_placements"][1], Shard)
+    assert expert["dst_placements"][1].dim == 0
+
+
+def test_build_refit_info_replicates_megatron_experts_when_etp_is_one():
+    info = build_nccl_reshard_refit_info(
+        _moe_metadata(num_experts=2),
+        train_parallelism={"tp_size": 1, "ep_size": 2, "pp_size": 1},
+        gen_parallelism={
+            "tp_size": 2,
+            "ep_size": 1,
+            "etp_size": 1,
+            "pp_size": 1,
+        },
+        train_world_size=2,
+        gen_world_size=2,
+    )
+
+    gate = _find(info, "model.layers.0.mlp.experts.gate_proj.weight")
+    assert all(isinstance(placement, Replicate) for placement in gate["dst_placements"])
+
+
+def test_build_refit_info_shards_megatron_experts_across_ep_and_etp():
+    info = build_nccl_reshard_refit_info(
+        _moe_metadata(num_experts=2),
+        train_parallelism={
+            "tp_size": 1,
+            "ep_size": 2,
+            "etp_size": 2,
+            "pp_size": 1,
+        },
+        gen_parallelism={
+            "tp_size": 2,
+            "ep_size": 2,
+            "etp_size": 2,
+            "pp_size": 1,
+        },
+        train_world_size=4,
+        gen_world_size=4,
+    )
+
+    gate = _find(info, "model.layers.0.mlp.experts.gate_proj.weight")
+    down = _find(info, "model.layers.0.mlp.experts.down_proj.weight")
+    assert {
+        placement.dim
+        for placement in gate["src_placements"]
+        if isinstance(placement, Shard)
+    } == {0, 1}
+    assert {
+        placement.dim
+        for placement in down["src_placements"]
+        if isinstance(placement, Shard)
+    } == {0, 2}
+    assert any(
+        isinstance(placement, Shard) and placement.dim == 0
+        for placement in gate["dst_placements"]
+    )
+    assert any(
+        isinstance(placement, Shard) and placement.dim == 1
+        for placement in gate["dst_placements"]
+    )
+    assert any(
+        isinstance(placement, Shard) and placement.dim == 0
+        for placement in down["dst_placements"]
+    )
+    assert any(
+        isinstance(placement, Shard) and placement.dim == 2
+        for placement in down["dst_placements"]
+    )
+
+
+# --------------------------------------------------------------------------
+# make_nccl_reshard_refit_info_wire_safe / restore_refit_info_placements
+# --------------------------------------------------------------------------
+def _contains_tensor(obj) -> bool:
+    if isinstance(obj, torch.Tensor):
+        return True
+    if isinstance(obj, dict):
+        return any(_contains_tensor(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_contains_tensor(v) for v in obj)
+    if hasattr(obj, "__dict__"):  # e.g. MeshInfo wrapping its rank tensor
+        return any(_contains_tensor(v) for v in vars(obj).values())
+    return False
+
+
+def _refit_info_for_wire() -> dict:
+    return build_nccl_reshard_refit_info(
+        _dense_metadata(),
+        train_parallelism={"tp_size": 2, "ep_size": 1, "pp_size": 1},
+        gen_parallelism={"tp_size": 4, "ep_size": 1, "pp_size": 1},
+        train_world_size=2,
+        gen_world_size=4,
+    )
+
+
+def test_wire_safe_refit_info_carries_no_tensors_and_pickles_plainly():
+    # MeshInfo holds a rank tensor; a tensor pickled in a megatron-importing
+    # process needs `import megatron` at unpickle time, so the wire form must
+    # be tensor-free end to end (the invariant this function exists for).
+    info = _refit_info_for_wire()
+    assert _contains_tensor(info)
+
+    wire = make_nccl_reshard_refit_info_wire_safe(info)
+
+    assert not _contains_tensor(wire)
+    # Placements are encoded exactly as restore expects: Shard -> {"dim": d},
+    # Replicate -> {}.
+    for params in wire["per_layer_params"].values():
+        for p in params:
+            assert isinstance(p["src_mesh_info"], dict)
+            assert isinstance(p["dst_mesh_info"], dict)
+            for placement in p["src_placements"] + p["dst_placements"]:
+                assert isinstance(placement, dict)
+    pickle.loads(pickle.dumps(wire))
+
+
+def test_wire_safe_does_not_mutate_the_train_side_refit_info():
+    info = _refit_info_for_wire()
+
+    make_nccl_reshard_refit_info_wire_safe(info)
+
+    for layer in info["layer_names"]:
+        for p in info["per_layer_params"][layer]:
+            assert isinstance(p["src_mesh_info"], MeshInfo)
+            assert isinstance(p["dst_mesh_info"], MeshInfo)
+            for placement in p["src_placements"] + p["dst_placements"]:
+                assert isinstance(placement, (Shard, Replicate))
+
+
+def test_wire_safe_then_restore_reproduces_placements_and_meshes():
+    info = _refit_info_for_wire()
+
+    wire = pickle.loads(pickle.dumps(make_nccl_reshard_refit_info_wire_safe(info)))
+    restored = restore_refit_info_placements(wire)
+
+    assert restored["layer_names"] == info["layer_names"]
+    for layer in info["layer_names"]:
+        original = {p["name"]: p for p in info["per_layer_params"][layer]}
+        assert len(restored["per_layer_params"][layer]) == len(original)
+        for p in restored["per_layer_params"][layer]:
+            o = original[p["name"]]
+            for key in ("src_mesh_info", "dst_mesh_info"):
+                assert isinstance(p[key], MeshInfo)
+                assert torch.equal(p[key].mesh, o[key].mesh)
+            for key in ("src_placements", "dst_placements"):
+                assert p[key] == o[key]
+
+
+def test_wire_safe_pickle_is_independent_of_a_patched_storage_loader(monkeypatch):
+    # megatron.core replaces torch.storage._load_from_bytes at import time; a
+    # tensor pickled under the patch records the patcher's module path and
+    # cannot be unpickled without it. Mimic the patch with a dummy module and
+    # assert only the raw form references it — the invariant the wire-safe
+    # conversion exists to guarantee.
+    import io
+    import sys
+    import types
+
+    dummy = types.ModuleType("dummy_unpickler_module")
+
+    def _dummy_load_from_bytes(b):
+        return torch.load(io.BytesIO(b), weights_only=True)
+
+    _dummy_load_from_bytes.__module__ = "dummy_unpickler_module"
+    _dummy_load_from_bytes.__qualname__ = "_dummy_load_from_bytes"
+    dummy._dummy_load_from_bytes = _dummy_load_from_bytes
+    monkeypatch.setitem(sys.modules, "dummy_unpickler_module", dummy)
+    monkeypatch.setattr(torch.storage, "_load_from_bytes", _dummy_load_from_bytes)
+
+    info = _refit_info_for_wire()
+    wire = make_nccl_reshard_refit_info_wire_safe(info)
+
+    assert b"dummy_unpickler_module" in pickle.dumps(info)
+    assert b"dummy_unpickler_module" not in pickle.dumps(wire)

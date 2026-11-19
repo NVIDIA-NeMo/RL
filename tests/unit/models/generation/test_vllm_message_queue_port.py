@@ -14,7 +14,8 @@
 
 """Regression tests for the MessageQueue remote-socket bind patch (RL-1111).
 
-``MessageQueue.__init__`` picks the port for its remote (TCP) socket with
+vLLM 0.28 binds port zero directly and ignores the engine's reserved band.
+The patch restores band selection with retries. Older versions picked a port with
 ``get_open_port()``, which binds a probe socket, *releases it*, and returns the
 number; ZMQ only binds the port for real several statements later. Every
 ``RayWorkerProc`` on a non-driver node takes ``n_local_reader=0`` and so needs
@@ -48,8 +49,7 @@ pytestmark = pytest.mark.vllm
 
 _VLLM_MQ_SOURCE = "distributed/device_communicators/shm_broadcast.py"
 _MARKER = "_nrl_bind_attempts"
-# Enough concurrent binders that a lost race is essentially certain: unpatched,
-# this leaves 6 of 8 workers dead.
+# Exercise concurrent binders sharing the same reserved port band.
 _RACERS = 8
 _LOOPBACK = "127.0.0.1"
 
@@ -204,13 +204,18 @@ def test_probe_releases_the_port_it_returns(reserved_band):
     assert get_open_port() == get_open_port() == reserved_band
 
 
-def test_unpatched_message_queue_loses_the_port_race(pristine_source, reserved_band):
-    """Documents the bug: concurrent workers collide on one port."""
+def test_unpatched_message_queue_ignores_reserved_band(pristine_source, reserved_band):
+    """vLLM 0.28 avoids bind races by asking the OS for ephemeral ports."""
+    from nemo_rl.distributed.virtual_cluster import DEFAULT_VLLM_PORTS_PER_ENGINE
+
     outcomes = _race(_load_message_queue(pristine_source))
-    failures = [outcome for outcome in outcomes if outcome.startswith("ERROR")]
-    if not failures:
-        pytest.skip("the port race did not materialize on this machine")
-    assert any("Address already in use" in failure for failure in failures)
+    assert not [outcome for outcome in outcomes if outcome.startswith("ERROR")]
+    ports = [int(outcome.rsplit(":", 1)[1]) for outcome in outcomes]
+    assert len(set(ports)) == _RACERS
+    assert any(
+        not reserved_band <= port < reserved_band + DEFAULT_VLLM_PORTS_PER_ENGINE
+        for port in ports
+    ), f"all ephemeral ports unexpectedly landed in the reserved band: {ports}"
 
 
 def test_patched_message_queue_survives_the_port_race(patched_source, reserved_band):

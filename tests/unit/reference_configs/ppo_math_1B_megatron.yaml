@@ -8,8 +8,12 @@ ppo:
   max_rollout_turns: 1
   max_num_epochs: 100000
   max_num_steps: 100000
-  ppo_epochs: 4
+  ppo_epochs: 4  # actor passes over each rollout batch
+  # Critic passes over each rollout batch; follows ppo_epochs unless overridden.
+  critic_ppo_epochs: ${ppo.ppo_epochs}
+  value_training_mode: whole_batch
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
+  warm_start_value_checkpoint: null  # step_<n> dir of a critic-pretrain run whose value/ seeds the critic
   val_period: 20
   val_at_start: true
   val_at_end: false
@@ -21,6 +25,14 @@ ppo:
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
   skip_reference_policy_logprobs_calculation: true  # No KL, so skip ref logprobs
+
+  async_ppo:
+    enabled: false
+    max_trajectory_age_steps: 1
+    warmup_generation_lead_steps: null
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: true
+    drop_incomplete_targets_on_restore: false
 
   reward_shaping:
     enabled: true
@@ -47,6 +59,10 @@ ppo:
     source_max: 1.0
     target_min: -1.0  # DAPO: scale rewards to [-1, 1]
     target_max: 1.0
+  # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
+  invalid_tool_call_advantage: null
+  # Advantage value assigned to tokens with malformed <think>/</think> tags (e.g. -5.0). null disables.
+  malformed_thinking_advantage: null
   seq_logprob_error_threshold: null
 
 loss_fn:
@@ -63,13 +79,23 @@ loss_fn:
   truncated_importance_sampling_type: null
   truncated_importance_sampling_ratio: null
   truncated_importance_sampling_ratio_min: null
+  # Only used by adaptive-ppo-clip.
+  truncated_importance_sampling_adaptive_target_entropy: 0.3
+  truncated_importance_sampling_adaptive_k_step: 0.25
+  truncated_importance_sampling_adaptive_k_max: 1.0
+  truncated_importance_sampling_adaptive_outer_bound: 50.0
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false
+  seq_logprob_error_in_loss: false  # Supported by Megatron GRPO trainers and SingleController PPO (ppo_epochs=1).
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
   use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
+  metrics_level: "full"
+  enable_torch_compile: false
+  # Score centering (https://arxiv.org/abs/2609.20807); needs policy.generation.top_logprobs > 0.
+  score_centering: false
 
 value_loss_fn:
   scale: 0.4
@@ -83,9 +109,12 @@ checkpointing:
   keep_top_k: 5
   save_period: 10
   checkpoint_must_save_by: null
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
+  ft_keep_latest_k: null
+  ft_save_period: null
+  pretrained_checkpoint: null
+  save_data_plane: false
+  load_replay_buffer: true
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
@@ -101,10 +130,16 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
@@ -122,14 +157,24 @@ policy:
       dropout_position: "post"
       lora_A_init: "xavier"
       use_triton: true
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
 
   megatron_cfg:
     enabled: true
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: false
+      parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
+    fine_grained_activation_offloading: false
+    offload_modules: null
     converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
@@ -149,11 +194,18 @@ policy:
     moe_token_dispatcher_type: "allgather"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    # Set this in both policy.megatron_cfg and value.megatron_cfg for PPO.
+    distributed_timeout_minutes: null
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
+    reuse_logits_storage: false
+    fp32_lm_head: false
     moe_per_layer_logging: False
 
     optimizer:
@@ -173,6 +225,7 @@ policy:
       clip_grad: ${policy.max_grad_norm}
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -223,25 +276,46 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    top_logprobs: 0  # Sampler candidates per token for score centering or replay; 0 disables collection.
+    # Sampler replay: with top-k/top-p, score the trainer's log-probs over the support
+    # the sampler drew from (the finite entries of its captured head) instead of
+    # recomputing the filters. Required by loss_fn.score_centering under top-k/top-p,
+    # and usable without it; needs top_logprobs >= top_k. See docs/guides/sampler-replay.md.
+    sampler_replay:
+      enabled: false
     val_temperature: ${.temperature}
     val_top_p: ${.top_p}
     val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
+    lora_refit_mode: native
     mcore_generation_config:
       buffer_size_gb: 20
-      buffer_guaranteed_fraction: 0.1
-      num_cuda_graphs: 16
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      num_cuda_graphs: -1  # Number of CUDA graphs to build; -1 autotunes
       block_size_tokens: 256
       use_cuda_graphs_for_non_decode_steps: true
       enable_chunked_prefill: true
-      unified_memory_level: 0
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
       max_tokens: 16384
+      refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
+      refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
+      logprobs_mode: processed_logprobs
+      http_server_num_replicas: 8
     vllm_cfg:
+      http_api_server_count: 1 # Positive process count; values >1 require async_engine: true and expose_http_server: true.
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
+      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head}
+      # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
+      refit_with_reload_api: false
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
@@ -253,6 +327,8 @@ policy:
       num_first_layers_in_bf16: 0
       enable_vllm_metrics_logger: true
       vllm_metrics_logger_interval: 0.5
+      flat_logprobs: false # Requires async_engine: true and expose_http_server: true. Store logprobs in vLLM's FlatLogprobs (not for requests asking for prompt logprobs); avoids long GC pauses on the generation actor under large backlogs
+      output_loop_yield_budget_ms: null # Requires async_engine: true. e.g. 20: make vLLM's output loops yield so refit/control calls are not starved under a backlog
     vllm_kwargs: {}
     colocated:
       enabled: true
@@ -262,6 +338,9 @@ policy:
 
 # Value Model with Megatron-Core Backend (for GAE in PPO)
 value:
+  dedicated: false
+  resources:
+    num_nodes: null
   model_name: ${policy.model_name}
   tokenizer:
     name: ${value.model_name}
@@ -278,9 +357,13 @@ value:
     enabled: false
     reward_model_type: "regression"
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: false
@@ -298,14 +381,24 @@ value:
       dropout_position: "post"
       lora_A_init: "xavier"
       use_triton: true
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
 
   megatron_cfg:
     enabled: true
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: false
+      parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
+    fine_grained_activation_offloading: false
+    offload_modules: null
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
@@ -324,11 +417,17 @@ value:
     moe_token_dispatcher_type: "allgather"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    # Set this in both policy.megatron_cfg and value.megatron_cfg for PPO.
+    distributed_timeout_minutes: null
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
+    fp32_lm_head: false
     moe_per_layer_logging: False
 
     optimizer:
@@ -348,6 +447,7 @@ value:
       clip_grad: 1.0
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: 0.1
@@ -393,6 +493,7 @@ data:
   max_input_seq_length: 2048
   shuffle: true
   num_workers: 1
+  use_multiple_dataloader: false
   train:
     dataset_name: DAPOMath17K
   validation:
@@ -411,6 +512,7 @@ env:
 logger:
   log_dir: "logs"
   num_val_samples_to_print: 0
+  extra_backends: []
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false
@@ -420,13 +522,20 @@ logger:
     project: "ppo-dapo-megatron-dev"
     name: "ppo_dapo_megatron_1B"
     log_nemo_gym_full_result_tables: false
+    entity: null
+    id: null
+    resume: null
   swanlab:
     project: "ppo-dapo-megatron-dev"
     name: "ppo_dapo_megatron_1B"
-  tensorboard: {}
+  tensorboard:
+    log_dir: null
   mlflow:
     experiment_name: "ppo-dapo-megatron-dev"
     run_name: "ppo_dapo_megatron_1B"
+    run_id: null
+    tracking_uri: null
+    artifact_location: null
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
@@ -437,3 +546,7 @@ cluster:
   master_port_range_low: 1400
   master_port_range_high: 1999
   segment_size: null
+
+# OpenTelemetry instrumentation; null = disabled (default). Mirrors the optional
+# field on the MasterConfig, which stays None unless a run opts in.
+telemetry: null

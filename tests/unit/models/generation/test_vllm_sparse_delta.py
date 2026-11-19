@@ -155,6 +155,7 @@ def test_backend_applies_decoded_sparse_payload_sources() -> None:
     )
 
     ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.model_runner = SimpleNamespace(model=torch.nn.Module())
     applier = MagicMock()
     applier.discover_native_skips.return_value = {"weight"}
     applier.update_weights_from_decoded_sparse_payload.return_value = {"ok": True}

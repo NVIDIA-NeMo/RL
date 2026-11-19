@@ -20,9 +20,7 @@ Set the `NRL_NSYS_WORKER_PATTERNS` environment variable with a comma-separated l
 export NRL_NSYS_WORKER_PATTERNS="*policy*,*vllm*"
 ```
 
-Set the `NRL_NSYS_PROFILE_STEP_RANGE` environment variable to control which training steps the profiler captures. Its
-format is colon separated integers representing `start:stop`, where `start` is inclusive and `stop` is exclusive
-(same as slice syntax `arr[start:stop]`). Note that the `start` is 1-indexed, so `NRL_NSYS_PROFILE_STEP_RANGE=0:10` would error.
+Set the `NRL_NSYS_PROFILE_STEP_RANGE` environment variable to control which training steps the profiler captures. Its format is colon separated integers representing `start:stop`, where `start` is inclusive and `stop` is exclusive (same as slice syntax `arr[start:stop]`). Note that the `start` is 1-indexed, so `NRL_NSYS_PROFILE_STEP_RANGE=0:10` would error.
 
 ```bash
 export NRL_NSYS_PROFILE_STEP_RANGE=3:5
@@ -30,11 +28,7 @@ export NRL_NSYS_PROFILE_STEP_RANGE=3:5
 
 ### Extra Nsys Options (Optional)
 
-Set `NRL_NSYS_EXTRA_OPTIONS` to a JSON object to add or override nsys CLI flags on top of
-the built-in defaults. Keys are the nsys flag names (without leading `--`); values are the
-flag values (string, or anything Ray's nsight runtime_env accepts). User-supplied keys win
-on conflict with the built-in defaults (`t`, `o`, `stop-on-exit`, `capture-range`,
-`capture-range-end`, `cuda-graph-trace`).
+Set `NRL_NSYS_EXTRA_OPTIONS` to a JSON object to add or override nsys CLI flags on top of the built-in defaults. Keys are the nsys flag names (without leading `--`); values are the flag values (string, or anything Ray's nsight runtime_env accepts). User-supplied keys win on conflict with the built-in defaults (`t`, `o`, `stop-on-exit`, `capture-range`, `capture-range-end`, `cuda-graph-trace`).
 
 ```bash
 export NRL_NSYS_EXTRA_OPTIONS='{"gpu-metrics-device": "all", "cuda-memory-usage": "true", "cpuctxsw": "none"}'
@@ -45,8 +39,7 @@ Common additions:
 - `cuda-memory-usage`: track host/device memory allocations (`"true"`).
 - `cpuctxsw`: control CPU context-switch sampling (`"none"`, `"process-tree"`).
 
-Empty or unset means no extras — defaults apply unchanged. Invalid JSON or a non-object
-payload raises at startup so misconfiguration surfaces immediately.
+Empty or unset means no extras — defaults apply unchanged. Invalid JSON or a non-object payload raises at startup so misconfiguration surfaces immediately.
 
 ### Pattern Format
 
@@ -59,9 +52,13 @@ payload raises at startup so misconfiguration surfaces immediately.
 ### Supported Workers
 
 The supported worker types are:
-- **DTensorPolicyWorker**: Pattern matched against `"dtensor_policy_worker"`
+- **AutomodelPolicyWorker**: Pattern matched against `"automodel_policy_worker"`
 - **VllmGenerationWorker**: Pattern matched against `"vllm_generation_worker"`
+- **VllmAsyncGenerationWorker**: Pattern matched against `"vllm_async_generation_worker"` (used when `async_engine` is `true`)
 - **TrtllmAsyncGenerationWorker**: Pattern matched against `"trtllm_async_generation_worker"`
+
+> [!IMPORTANT]
+> For the async vLLM engine, match `vllm_async_generation_worker` exactly. Do not use `*vllm*` or `*generation_worker`: they also match `vllm_generation_worker`, which sets `ray_workers_use_nsight=True` for the inner TP workers. Those workers then use vLLM's own always-on nsight config instead of the deferred-capture one, so the capture range is lost. With the async engine the inner TP workers inherit their nsight config from the outer `VllmAsyncGenerationWorker`, which is why its name must match.
 
 ## Example Usage
 
@@ -79,7 +76,7 @@ NRL_NSYS_PROFILE_STEP_RANGE=1:2 NRL_NSYS_WORKER_PATTERNS="*policy*,*vllm*" uv ru
 ### Profile Workers with Exact Names
 
 ```bash
-NRL_NSYS_PROFILE_STEP_RANGE=3:10 NRL_NSYS_WORKER_PATTERNS="dtensor_policy_worker,vllm_generation_worker" uv run examples/run_grpo.py grpo.max_num_steps=5
+NRL_NSYS_PROFILE_STEP_RANGE=3:10 NRL_NSYS_WORKER_PATTERNS="automodel_policy_worker,vllm_generation_worker" uv run examples/run_grpo.py grpo.max_num_steps=5
 ```
 
 ### Profile Megatron Workers
@@ -106,13 +103,14 @@ When profiling is enabled, it generates the following logs and files:
 
 1. **Logging**: You'll see log messages indicating which workers have profiling enabled:
    ```
-   Nsight profiling enabled for worker 'dtensor_policy_worker' (matched pattern '*policy*')
+   Nsight profiling enabled for worker 'automodel_policy_worker' (matched pattern '*policy*')
    ```
 
 2. **Profile Files**: Each profiled worker generates a `.nsys-rep` file with naming pattern:
    ```
-   dtensor_policy_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
+   automodel_policy_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
+   vllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    trtllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    worker_process_<PID>.nsys-rep
    ```

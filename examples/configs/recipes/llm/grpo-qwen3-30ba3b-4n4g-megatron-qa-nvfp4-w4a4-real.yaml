@@ -1,6 +1,4 @@
 defaults: ../../../../examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml
-cluster:
-  segment_size: null
 grpo:
   max_num_steps: 300
   val_at_end: true

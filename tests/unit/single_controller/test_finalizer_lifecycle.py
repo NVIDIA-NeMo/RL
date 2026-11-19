@@ -1,0 +1,1014 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Lifecycle tests for actor-pool finalization and deferred-route ownership."""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from collections import deque
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import ANY, AsyncMock, MagicMock
+
+import pytest
+
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+    PostWriteEnrichmentError,
+    TQReplayBuffer,
+)
+from nemo_rl.algorithms.opd import TQTeacherLogprobCoordinator
+from nemo_rl.algorithms.single_controller import (
+    RolloutRuntimeState,
+    SingleControllerActor,
+)
+from nemo_rl.algorithms.single_controller_utils.utils import (
+    BelowValidFractionGroup,
+    ZeroVarianceGroup,
+)
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
+from nemo_rl.experience.dynamic_sampling import (
+    rewards_carry_no_signal,
+    voting_rewards_from_finalized,
+)
+from nemo_rl.experience.reward_penalties import FinalizedReward
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup
+from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
+from nemo_rl.experience.route_plan import (
+    ROUTE_PLAN_SCHEMA_VERSION,
+    RouteAssemblyPlan,
+    RouteSpan,
+    encode_route_plan,
+)
+
+
+class _RemoteFinalize:
+    def __init__(
+        self,
+        *,
+        result: FinalizedGroup | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        self._result = result
+        self._error = error
+        self.calls: list[ReassemblyRequest] = []
+
+    def remote(self, request: ReassemblyRequest) -> Any:
+        self.calls.append(request)
+
+        async def _result():
+            if self._error is not None:
+                raise self._error
+            assert self._result is not None
+            return self._result
+
+        return _result()
+
+
+class _DataPlaneClient:
+    def __init__(self) -> None:
+        self.clear_calls: list[dict[str, Any]] = []
+
+    async def clear_samples(self, *, sample_ids: list[str], partition_id: str) -> None:
+        self.clear_calls.append(
+            {"sample_ids": list(sample_ids), "partition_id": partition_id}
+        )
+
+
+def _request(
+    resolved_agent_name: str | None = None, *, attribution_key: str | None = None
+) -> ReassemblyRequest:
+    return ReassemblyRequest(
+        group_id="group",
+        prompt_idx=17,
+        rollout_ids=("group_g0",),
+        canonical_sample_ids=("group_g0",),
+        receipts=(
+            {
+                "manifest": [
+                    {"staging_key": "group_g0/call"},
+                    {"staging_key": "group_g0/call"},
+                ]
+            },
+        ),
+        rewards=(1.0,),
+        mask_sample=(False,),
+        fallback_weight_version=3,
+        resolved_agent_name=resolved_agent_name,
+        attribution_key=attribution_key,
+    )
+
+
+def _controller(actor: object) -> Any:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._rollout_runtime = RolloutRuntimeState()
+    ctrl._available_finalizers = asyncio.Queue()
+    ctrl._available_finalizers.put_nowait(actor)
+    ctrl._active_finalizers = 0
+    ctrl._finalizer_waiters = 0
+    ctrl._finalizer_unknown_outcomes = 0
+    ctrl._rollout_recovery_ledger = MagicMock()
+    ctrl._rollout_recovery_ledger.__contains__.return_value = False
+    ctrl._rollout_manager = MagicMock()
+    # Classify with real reward helpers instead of a truthy MagicMock.
+    ctrl._rollout_manager._is_zero_variance_finalized.side_effect = (
+        lambda finalized: rewards_carry_no_signal(
+            voting_rewards_from_finalized(
+                finalized,
+                masked_reward_policy=(
+                    None if ctrl._is_ppo else ctrl._algo_cfg.masked_reward_policy
+                ),
+                overlong_filtering=ctrl._algo_cfg.overlong_filtering,
+            )
+        )
+    )
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._buffer = MagicMock()
+    ctrl._buffer.commit_finalized = AsyncMock()
+    ctrl._dp_client = _DataPlaneClient()
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._partition_id = "canonical"
+    ctrl._master_config = SimpleNamespace(
+        token_capture=SimpleNamespace(
+            staging_partition="staging",
+            min_valid_fraction_per_group=None,
+            forest_training=False,
+        ),
+        grpo=SimpleNamespace(
+            num_prompts_per_step=1,
+            masked_reward_policy="include",
+            overlong_filtering=False,
+        ),
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._is_ppo = False
+    ctrl._dynamic_sampling_enabled = False
+    # Replacement, filtered-spare and shortfall-crediting paths read the live sampler.
+    # Default to a stamped, pooled sampler: filtered drops draw a spare, and a lost
+    # group is charged to its own stamped step (matching these tests' expectations).
+    ctrl._sampler = SimpleNamespace(
+        uses_pooled_replacements=True,
+        requires_shortfall_reconciliation=False,
+        charge_step_for_lost_group=(
+            lambda *, target_step, assembling_version: target_step
+        ),
+    )
+    ctrl._trainer_version = 3
+    ctrl._train_steps = 3
+    return ctrl
+
+
+@pytest.mark.parametrize(
+    ("resolved_agent_name", "attribution_key", "expected_extra_env_info"),
+    [
+        (None, None, None),
+        ("flat-agent", None, {"agent_ref": {"name": "flat-agent"}}),
+        (
+            "flat-agent",
+            "flat-agent",
+            {"agent_ref": {"name": "flat-agent"}, "attribution_key": "flat-agent"},
+        ),
+        (None, "usersim:train", {"attribution_key": "usersim:train"}),
+    ],
+)
+def test_successful_actor_finalization_returns_actor_and_transfers_ownership(
+    resolved_agent_name: str | None,
+    attribution_key: str | None,
+    expected_extra_env_info: dict[str, Any] | None,
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={"finalize/group_ms": 1.0},
+    )
+    finalize = _RemoteFinalize(result=result)
+    actor = SimpleNamespace(finalize=finalize)
+    ctrl = _controller(actor)
+    request = _request(resolved_agent_name, attribution_key=attribution_key)
+
+    committed = asyncio.run(
+        ctrl._finalize_with_actor(request, {}, target_step=None, replacements_used=0)
+    )
+
+    assert committed is result
+    assert finalize.calls == [request]
+    assert ctrl._available_finalizers.get_nowait() is actor
+    assert ctrl._active_finalizers == 0
+    assert ctrl._finalizer_unknown_outcomes == 0
+    ctrl._buffer.commit_finalized.assert_awaited_once_with(
+        ANY,
+        "group",
+        meta,
+        3,
+        3,
+        staging_keys=["group_g0/call"],
+        extra_env_info=expected_extra_env_info,
+    )
+    assert (
+        ctrl._rollout_runtime.finalizer_metrics_by_group["group"]["finalize/group_ms"]
+        == 1.0
+    )
+
+
+def test_capture_rollout_metrics_ride_on_the_committed_meta() -> None:
+    """A capture group's rollout metrics reach the replay sidecar the train pump reads."""
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+        extra_info={"existing": 1},
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+    )
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    metrics = {"agent/rollout_time_taken/mean": 12.5}
+
+    asyncio.run(
+        ctrl._finalize_with_actor(
+            _request(), metrics, target_step=None, replacements_used=0
+        )
+    )
+
+    committed_meta = ctrl._buffer.commit_finalized.await_args.args[2]
+    assert committed_meta.extra_info == {"existing": 1, ROLLOUT_METRICS: [metrics]}
+    # The finalizer's own meta is not mutated.
+    assert meta.extra_info == {"existing": 1}
+
+
+def _token_metrics_result(token_metrics: dict[str, Any]) -> FinalizedGroup:
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    return FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        token_metrics=token_metrics,
+    )
+
+
+@pytest.mark.parametrize("rollout_metrics", [{"turns_per_sample/mean": 2.0}, {}])
+def test_finalizer_token_metrics_and_rollout_metrics_share_one_sidecar(
+    rollout_metrics: dict[str, float],
+) -> None:
+    """Neither source overwrites the other, including on partial-retry groups."""
+    token_metrics = {"gen_tokens_per_sample/mean": 7.0}
+    result = _token_metrics_result(token_metrics)
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+
+    asyncio.run(
+        ctrl._finalize_with_actor(
+            _request(), rollout_metrics, target_step=None, replacements_used=0
+        )
+    )
+
+    committed_meta = ctrl._buffer.commit_finalized.await_args.args[2]
+    assert committed_meta.extra_info[ROLLOUT_METRICS] == [
+        {**rollout_metrics, **token_metrics}
+    ]
+
+
+def test_overlapping_finalizer_and_rollout_metrics_fail_the_commit() -> None:
+    result = _token_metrics_result({"gen_tokens_per_sample/mean": 7.0})
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+
+    with pytest.raises(RuntimeError, match="both report"):
+        asyncio.run(
+            ctrl._finalize_with_actor(
+                _request(),
+                {"gen_tokens_per_sample/mean": 1.0},
+                target_step=None,
+                replacements_used=0,
+            )
+        )
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel", "missing_route"])
+def test_captured_group_waits_for_teacher_before_readiness_or_cleanup(
+    outcome: str,
+) -> None:
+    """Exercise the real controller -> buffer -> teacher coordinator boundary."""
+
+    async def exercise() -> None:
+        meta = KVBatchMeta(
+            partition_id="canonical",
+            task_name="train",
+            sample_ids=["group_g0"],
+            fields=["input_ids", "input_lengths"],
+            sequence_lengths=[3],
+            tags=[{"weight_version": 3}],
+        )
+        result = FinalizedGroup(
+            meta=meta,
+            group_min_wv=2,
+            group_max_wv=3,
+            staging_keys=["group_g0/call"],
+        )
+        actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+        ctrl = _controller(actor)
+        ctrl._buffer = TQReplayBuffer(
+            ctrl._dp_client,
+            partition_id="canonical",
+            staging_partition_id="staging",
+            pad_value_dict={"token_ids": 0},
+            include_message_violation_fields=False,
+        )
+        ctrl._buffer.set_data_plane_checkpoint_barrier(
+            ctrl._data_plane_checkpoint_barrier
+        )
+        ctrl._buffer.reserve(weight_version=3, group_id="group")
+        teacher_started = asyncio.Event()
+        release_teacher = threading.Event()
+        teacher_writes: list[str] = []
+        loop = asyncio.get_running_loop()
+
+        def score(received_meta: KVBatchMeta) -> None:
+            assert received_meta is meta
+            loop.call_soon_threadsafe(teacher_started.set)
+            if not release_teacher.wait(timeout=5):
+                raise TimeoutError("test did not release teacher inference")
+            # Includes a partial write in the failure case. Cleanup must happen
+            # only after this background writer has stopped, even on cancellation.
+            assert ctrl._dp_client.clear_calls == []
+            teacher_writes.extend(received_meta.sample_ids)
+            if outcome == "failure":
+                raise RuntimeError("teacher unavailable")
+
+        teacher = SimpleNamespace(
+            sharding_annotations=SimpleNamespace(get_axis_size=lambda _: 1),
+            get_logprobs_from_meta=score,
+        )
+        coordinator = TQTeacherLogprobCoordinator(
+            dp_client=ctrl._dp_client,
+            teacher_worker_groups={"vision": teacher},
+            alias_to_group_alias={"image_agent": "vision"},
+            on_policy_distillation_cfg={
+                "teacher_model_by_agent_name": {"image_agent": "/ckpt/student"},
+                "strict_agent_name_match": True,
+            },
+        )
+        ctrl._buffer.set_post_write_enricher(coordinator.enrich)
+        task = asyncio.create_task(
+            ctrl._finalize_with_actor(
+                _request(None if outcome == "missing_route" else "image_agent"),
+                {},
+                target_step=None,
+                replacements_used=0,
+            )
+        )
+        try:
+            if outcome != "missing_route":
+                await asyncio.wait_for(teacher_started.wait(), timeout=2)
+                assert ctrl._buffer.ready_list == [False]
+                assert ctrl._buffer.meta_list == [None]
+                ctrl._rollout_recovery_ledger.discard_group.assert_not_called()
+                if outcome == "cancel":
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    assert not task.done()
+                    assert ctrl._dp_client.clear_calls == []
+                release_teacher.set()
+
+            if outcome == "success":
+                assert await asyncio.wait_for(task, timeout=2) is result
+                assert ctrl._buffer.ready_list == [True]
+                assert ctrl._buffer.start_weight_list == [2]
+                assert ctrl._buffer.end_weight_list == [3]
+                assert ctrl._buffer._staging_keys_list == [["group_g0/call"]]
+                committed_meta = ctrl._buffer.meta_list[0]
+                assert committed_meta is not None
+                assert committed_meta.fields == [
+                    *meta.fields,
+                    "teacher_reference_logprobs",
+                ]
+                assert teacher_writes == ["group_g0"]
+                assert ctrl._dp_client.clear_calls == []
+                ctrl._rollout_recovery_ledger.discard_group.assert_called_once()
+                assert (
+                    coordinator.drain_metrics()[
+                        "on_policy_distillation/teacher_samples"
+                    ]
+                    == 1
+                )
+            else:
+                expected_error = (
+                    asyncio.CancelledError
+                    if outcome == "cancel"
+                    else PostWriteEnrichmentError
+                )
+                with pytest.raises(expected_error):
+                    await asyncio.wait_for(task, timeout=2)
+                assert ctrl._buffer.group_ids == ()
+                assert ctrl._dp_client.clear_calls == [
+                    {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+                    {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+                ]
+                assert teacher_writes == (
+                    [] if outcome == "missing_route" else ["group_g0"]
+                )
+                ctrl._rollout_manager.record_canonical_publication.assert_not_called()
+            assert ctrl._available_finalizers.get_nowait() is actor
+            assert ctrl._active_finalizers == 0
+            assert ctrl._finalizer_unknown_outcomes == 0
+        finally:
+            release_teacher.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+def _below_threshold_result() -> FinalizedGroup:
+    # One of two rollouts verified: 0.5 < the 0.75 bar set by _below_threshold.
+    return FinalizedGroup(
+        meta=KVBatchMeta(
+            partition_id="canonical",
+            task_name="train",
+            sample_ids=["group_g0", "group_g1"],
+            fields=["input_ids"],
+            sequence_lengths=[3, 3],
+            tags=[{"weight_version": 3}, {"weight_version": 3}],
+        ),
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={"finalize/invalid_row_rate": 0.5},
+        reward_observations=[FinalizedReward("group_g0", "group_g0", 1.0, None)],
+        valid_row_count=1,
+        total_row_count=2,
+    )
+
+
+def _below_threshold(ctrl: Any, *, spares: list[dict[str, Any]]) -> None:
+    ctrl._master_config.token_capture.min_valid_fraction_per_group = 0.75
+    ctrl._async_cfg = SimpleNamespace(
+        rollout_failure=SimpleNamespace(
+            on_dropped_prompt="replace", max_replacement_attempts=1
+        )
+    )
+    ctrl._rollout_runtime.replacement_reserve = deque(spares)
+    ctrl._rollout_runtime.batch_shortfall = {}
+    ctrl._rollout_runtime.sampler_stamps_target_steps = True
+    ctrl._rollout_recovery_enabled = True
+
+
+class _ReadyWatchingClient(_DataPlaneClient):
+    """Records whether any replay slot was ready while rows were being cleared."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.buffer: TQReplayBuffer | None = None
+        self.ready_during_clear: list[bool] = []
+
+    async def clear_samples(self, *, sample_ids: list[str], partition_id: str) -> None:
+        assert self.buffer is not None
+        self.ready_during_clear.append(any(self.buffer.ready_list))
+        await asyncio.sleep(0)  # let any other task run mid-cleanup
+        await super().clear_samples(sample_ids=sample_ids, partition_id=partition_id)
+
+
+def test_below_threshold_group_never_becomes_selectable() -> None:
+    """A rejected group leaves the buffer without ever being marked ready."""
+    enricher_calls: list[str] = []
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_below_threshold_result()))
+    )
+    _below_threshold(ctrl, spares=[])
+    client = _ReadyWatchingClient()
+    ctrl._dp_client = client
+    ctrl._buffer = TQReplayBuffer(
+        client,
+        partition_id="canonical",
+        pad_value_dict={"token_ids": 0},
+        include_message_violation_fields=False,
+        require_routed_experts=False,
+    )
+    client.buffer = ctrl._buffer
+    ctrl._buffer.set_data_plane_checkpoint_barrier(ctrl._data_plane_checkpoint_barrier)
+
+    async def _enrich(meta: KVBatchMeta, extra_env_info: Any) -> None:
+        enricher_calls.append(meta.sample_ids[0])
+
+    ctrl._buffer.set_post_write_enricher(_enrich)
+    ctrl._buffer.reserve(weight_version=3, target_step=3, group_id="group")
+
+    outcome = asyncio.run(
+        ctrl._finalize_with_actor(_request(), {}, target_step=3, replacements_used=0)
+    )
+
+    assert outcome == BelowValidFractionGroup(
+        replacement=None,
+        lineage_group_id=None,
+        target_step=3,
+        reward_observations=[FinalizedReward("group_g0", "group_g0", 1.0, None)],
+        zero_variance=True,
+        valid_count=1,
+        total_count=2,
+    )
+    assert ctrl._buffer.group_ids == ()
+    assert client.ready_during_clear == [False, False]
+    assert client.clear_calls == [
+        {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+        {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+    ]
+    # Never committed: no enrichment, no pending metrics, and the step was
+    # credited short because no spare was left.
+    assert enricher_calls == []
+    assert "group" not in ctrl._rollout_runtime.finalizer_metrics_by_group
+    assert "group" not in ctrl._rollout_runtime.finalizer_rewards_by_group
+    assert ctrl._rollout_runtime.batch_shortfall == {3: 1}
+    assert ctrl._available_finalizers.qsize() == 1
+
+
+@pytest.mark.parametrize("recovery", [True, False])
+def test_below_threshold_replacement_is_reserved_in_the_cleanup_cut(
+    recovery: bool,
+) -> None:
+    """The rejected group's ledger discard and its spare's reservation share a cut.
+
+    Without rollout recovery the spare is not reserved here: the pump never
+    discards a lineage it did not get, so generate_for_finalization must own it.
+    """
+    spare = {"idx": 99}
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_below_threshold_result()))
+    )
+    _below_threshold(ctrl, spares=[spare])
+    ctrl._rollout_recovery_enabled = recovery
+    ctrl._rollout_recovery_ledger.__contains__.return_value = True
+    ctrl._rollout_manager.reserve_prompt_group.return_value = "spare-group"
+    ctrl._buffer.promote_ready_group = MagicMock(return_value=None)
+    ctrl._batch_promotions = {}
+
+    outcome = asyncio.run(
+        ctrl._finalize_with_actor(_request(), {}, target_step=3, replacements_used=0)
+    )
+
+    assert outcome == BelowValidFractionGroup(
+        replacement=spare,
+        lineage_group_id="spare-group" if recovery else None,
+        target_step=3,
+        reward_observations=[FinalizedReward("group_g0", "group_g0", 1.0, None)],
+        zero_variance=True,
+        valid_count=1,
+        total_count=2,
+    )
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+    ctrl._buffer.abort.assert_called_once_with("group")
+    ctrl._rollout_recovery_ledger.discard_group.assert_called_once()
+    (discard_cut, discarded), _ = ctrl._rollout_recovery_ledger.discard_group.call_args
+    assert discarded == "group"
+    if recovery:
+        ctrl._rollout_manager.reserve_prompt_group.assert_called_once()
+        (reserve_cut, reserved), kwargs = (
+            ctrl._rollout_manager.reserve_prompt_group.call_args
+        )
+        assert reserved is spare
+        assert kwargs == {"target_step": 3}
+        assert reserve_cut is discard_cut
+    else:
+        ctrl._rollout_manager.reserve_prompt_group.assert_not_called()
+    assert not ctrl._rollout_runtime.replacement_reserve
+    assert ctrl._rollout_runtime.batch_shortfall == {}
+
+
+def test_below_threshold_replacement_borrows_a_finished_group_and_repays_the_lender() -> (
+    None
+):
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_below_threshold_result()))
+    )
+    _below_threshold(ctrl, spares=[{"idx": 99}])
+    ctrl._rollout_recovery_ledger.__contains__.return_value = True
+    ctrl._rollout_manager.reserve_prompt_group.return_value = "spare-group"
+    ctrl._batch_promotions = {}
+    ctrl._buffer.promote_ready_group = MagicMock(return_value=5)
+
+    outcome = asyncio.run(
+        ctrl._finalize_with_actor(_request(), {}, target_step=3, replacements_used=0)
+    )
+
+    ctrl._buffer.promote_ready_group.assert_called_once_with(to_target_step=3)
+    assert ctrl._batch_promotions == {3: 1}
+    # The spare is owed to the lender, so it is reserved for the lender's step.
+    assert outcome.target_step == 5
+    assert outcome.lineage_group_id == "spare-group"
+    (_, reserved), kwargs = ctrl._rollout_manager.reserve_prompt_group.call_args
+    assert reserved == {"idx": 99}
+    assert kwargs == {"target_step": 5}
+    assert ctrl._rollout_runtime.batch_shortfall == {}
+
+
+def _signal_result(
+    rewards: list[float],
+    *,
+    truncated: list[bool] | None = None,
+    mask_sample: list[bool] | None = None,
+    reward_original: list[float] | None = None,
+) -> FinalizedGroup:
+    count = len(rewards)
+    return FinalizedGroup(
+        meta=KVBatchMeta(
+            partition_id="canonical",
+            task_name="train",
+            sample_ids=[f"group_g{i}" for i in range(count)],
+            fields=["input_ids"],
+            sequence_lengths=[3] * count,
+            tags=[{"weight_version": 3}] * count,
+        ),
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        reward_observations=[
+            FinalizedReward(f"group_g{i}", f"group_g{i}", reward, None)
+            for i, reward in enumerate(rewards)
+        ],
+        reward_mask_sample=mask_sample or [False] * count,
+        reward_truncated=truncated or [False] * count,
+        reward_original=list(rewards if reward_original is None else reward_original),
+        valid_row_count=count,
+        total_row_count=count,
+    )
+
+
+def _dynamic_sampling(
+    ctrl: Any,
+    *,
+    spares: list[dict[str, Any]],
+    exhausted: bool = False,
+    policy: str = "include",
+    overlong_filtering: bool = False,
+    lender_step: int | None = None,
+) -> None:
+    ctrl._dynamic_sampling_enabled = True
+    ctrl._algo_cfg.masked_reward_policy = policy
+    ctrl._algo_cfg.overlong_filtering = overlong_filtering
+    ctrl._algo_cfg.dynamic_sampling_max_gen_batches = 10
+    ctrl._filtered_prompt_budget = 10 * ctrl._algo_cfg.num_prompts_per_step
+    ctrl._filtered_prompts_by_step = {}
+    ctrl._batch_promotions = {}
+    ctrl._dataloader_exhausted = exhausted
+    ctrl._rollout_runtime.filtered_reserve = deque(spares)
+    ctrl._rollout_runtime.sampler_stamps_target_steps = True
+    ctrl._rollout_runtime.batch_shortfall = {}
+    ctrl._rollout_runtime.steps_allowed_short = set()
+    ctrl._rollout_recovery_enabled = False
+    ctrl._buffer.promote_ready_group = MagicMock(return_value=lender_step)
+
+
+def _finalize_for_step_3(ctrl: Any) -> Any:
+    return asyncio.run(
+        ctrl._finalize_with_actor(_request(), {}, target_step=3, replacements_used=0)
+    )
+
+
+def test_zero_variance_group_is_rejected_before_commit_and_replaced() -> None:
+    """The spare comes from the filtered pool and is charged to the step's budget."""
+    spare = {"idx": 7}
+    result = _signal_result([1.0, 1.0])
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    _dynamic_sampling(ctrl, spares=[spare])
+
+    outcome = _finalize_for_step_3(ctrl)
+
+    assert outcome == ZeroVarianceGroup(
+        replacement=spare,
+        lineage_group_id=None,
+        target_step=3,
+        reward_observations=result.reward_observations,
+        zero_variance=True,
+    )
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+    ctrl._buffer.abort.assert_called_once_with("group")
+    assert not ctrl._rollout_runtime.filtered_reserve
+    assert ctrl._filtered_prompts_by_step == {3: 1}
+    assert ctrl._rollout_runtime.batch_shortfall == {}
+    # Not a fault-tolerance replacement, so that pool is untouched.
+    assert not ctrl._rollout_runtime.replacement_reserve
+    assert ctrl._available_finalizers.qsize() == 1
+
+
+def test_zero_variance_group_borrows_a_finished_group_and_repays_the_lender() -> None:
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_signal_result([0.0, 0.0])))
+    )
+    _dynamic_sampling(ctrl, spares=[{"idx": 7}], lender_step=5)
+    ctrl._rollout_recovery_enabled = True
+    ctrl._rollout_recovery_ledger.__contains__.return_value = True
+    ctrl._rollout_manager.reserve_prompt_group.return_value = "spare-group"
+
+    outcome = _finalize_for_step_3(ctrl)
+
+    ctrl._buffer.promote_ready_group.assert_called_once_with(to_target_step=3)
+    assert ctrl._batch_promotions == {3: 1}
+    # The spare is owed to the lender, so it is reserved for the lender's step,
+    # in the same cut that discarded the rejected group's ledger entry.
+    assert outcome.target_step == 5
+    assert outcome.lineage_group_id == "spare-group"
+    (discard_cut, discarded), _ = ctrl._rollout_recovery_ledger.discard_group.call_args
+    (reserve_cut, reserved), kwargs = (
+        ctrl._rollout_manager.reserve_prompt_group.call_args
+    )
+    assert discarded == "group"
+    assert reserved == {"idx": 7}
+    assert kwargs == {"target_step": 5}
+    assert reserve_cut is discard_cut
+
+
+def test_zero_variance_group_closes_its_step_short_when_no_spare_is_left() -> None:
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_signal_result([1.0, 1.0])))
+    )
+    _dynamic_sampling(ctrl, spares=[], exhausted=True)
+
+    outcome = _finalize_for_step_3(ctrl)
+
+    assert isinstance(outcome, ZeroVarianceGroup)
+    assert outcome.replacement is None
+    assert ctrl._rollout_runtime.batch_shortfall == {3: 1}
+    assert 3 in ctrl._rollout_runtime.steps_allowed_short
+    ctrl._buffer.promote_ready_group.assert_not_called()
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+
+
+def test_group_with_reward_spread_commits_and_leaves_the_pool_alone() -> None:
+    result = _signal_result([1.0, 0.0])
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    _dynamic_sampling(ctrl, spares=[{"idx": 7}])
+
+    assert _finalize_for_step_3(ctrl) is result
+
+    ctrl._buffer.commit_finalized.assert_awaited_once()
+    assert len(ctrl._rollout_runtime.filtered_reserve) == 1
+    assert ctrl._filtered_prompts_by_step == {}
+
+
+def test_zero_variance_group_commits_when_dynamic_sampling_is_off() -> None:
+    result = _signal_result([1.0, 1.0])
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+
+    assert _finalize_for_step_3(ctrl) is result
+
+    ctrl._buffer.commit_finalized.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("policy", "rejected"),
+    [("exclude", True), ("include", False)],
+)
+def test_only_the_voting_rows_decide_the_filter(policy: str, rejected: bool) -> None:
+    """The truncated 0.0 is the only spread; under exclude it does not vote."""
+    result = _signal_result([0.0, 1.0, 1.0, 1.0], truncated=[True, False, False, False])
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    _dynamic_sampling(ctrl, spares=[{"idx": 7}], policy=policy, overlong_filtering=True)
+
+    outcome = _finalize_for_step_3(ctrl)
+
+    assert isinstance(outcome, ZeroVarianceGroup) is rejected
+    if not rejected:
+        assert outcome is result
+
+
+@pytest.mark.parametrize(
+    ("trained", "gym", "rejected"),
+    [
+        # Effort shaping or a penalty made the trained rewards differ; the Gym
+        # reward did not, so the group carries no task signal.
+        ([1.9, 1.0], [1.0, 1.0], True),
+        ([0.0, 1.0], [1.0, 1.0], True),
+        # Only the trained rewards are uniform; the Gym rewards still differ.
+        ([0.0, 0.0], [0.0, 1.0], False),
+    ],
+)
+def test_the_filter_reads_the_original_reward_not_the_trained_reward(
+    trained: list[float], gym: list[float], rejected: bool
+) -> None:
+    result = _signal_result(trained, reward_original=gym)
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    _dynamic_sampling(ctrl, spares=[{"idx": 7}])
+
+    outcome = _finalize_for_step_3(ctrl)
+
+    assert isinstance(outcome, ZeroVarianceGroup) is rejected
+
+
+def test_below_valid_fraction_is_decided_before_zero_variance() -> None:
+    """A group that fails both takes a fault-tolerance spare, not a filtered one."""
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_below_threshold_result()))
+    )
+    _below_threshold(ctrl, spares=[{"idx": 1}])
+    _dynamic_sampling(ctrl, spares=[{"idx": 2}])
+    ctrl._rollout_runtime.replacement_reserve = deque([{"idx": 1}])
+    ctrl._rollout_runtime.sampler_stamps_target_steps = True
+
+    outcome = _finalize_for_step_3(ctrl)
+
+    assert isinstance(outcome, BelowValidFractionGroup)
+    assert outcome.replacement == {"idx": 1}
+    assert len(ctrl._rollout_runtime.filtered_reserve) == 1
+    assert ctrl._filtered_prompts_by_step == {}
+
+
+def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:
+    finalize = _RemoteFinalize(error=RuntimeError("actor died after submission"))
+    actor = SimpleNamespace(finalize=finalize)
+    ctrl = _controller(actor)
+    request = _request()
+
+    with pytest.raises(RuntimeError, match="actor died after submission"):
+        asyncio.run(
+            ctrl._finalize_with_actor(
+                request, {}, target_step=None, replacements_used=0
+            )
+        )
+
+    assert finalize.calls == [request]
+    assert ctrl._available_finalizers.empty()
+    assert ctrl._active_finalizers == 0
+    assert ctrl._finalizer_unknown_outcomes == 1
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+    ctrl._buffer.abort.assert_not_called()
+    assert ctrl._dp_client.clear_calls == []
+
+
+def test_missing_actor_metadata_cleans_known_canonical_and_staging_ownership() -> None:
+    result = FinalizedGroup(
+        meta=None,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+    )
+    actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+    ctrl = _controller(actor)
+
+    with pytest.raises(RuntimeError, match="no metadata for non-dropped group"):
+        asyncio.run(
+            ctrl._finalize_with_actor(
+                _request(), {}, target_step=None, replacements_used=0
+            )
+        )
+
+    assert ctrl._dp_client.clear_calls == [
+        {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+        {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+    ]
+    ctrl._buffer.abort.assert_called_once_with("group")
+    assert ctrl._available_finalizers.get_nowait() is actor
+
+
+def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
+    # A finalizer-side structural drop (e.g. router replay with no routed
+    # data yet) -- not a low valid-row fraction, which the controller now
+    # decides, not the finalizer (see min_valid_fraction_per_group's removal
+    # from RolloutReassembler).
+    result = FinalizedGroup(
+        meta=None,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+        dropped=True,
+        drop_reason=(
+            "router replay on, no rollout carried routed_experts, "
+            "and (L, K) is unknown yet"
+        ),
+    )
+    actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+    ctrl = _controller(actor)
+
+    committed = asyncio.run(
+        ctrl._finalize_with_actor(_request(), {}, target_step=None, replacements_used=0)
+    )
+
+    assert committed is None
+    assert ctrl._dp_client.clear_calls == [
+        {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+        {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+    ]
+    ctrl._buffer.abort.assert_called_once_with("group")
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+    assert "group" not in ctrl._rollout_runtime.finalizer_metrics_by_group
+    assert ctrl._available_finalizers.get_nowait() is actor
+
+
+def test_post_train_cleanup_clears_canonical_rows_and_route_plan_staging_keys() -> None:
+    plan = RouteAssemblyPlan(
+        schema_version=ROUTE_PLAN_SCHEMA_VERSION,
+        staging_partition="staging",
+        spans=(
+            RouteSpan(
+                staging_key="group_g0/call",
+                carry_len=2,
+                generation_len=1,
+                staged_route_len=3,
+                extras_digest_version=1,
+                extras_digest="0" * 64,
+            ),
+        ),
+        cleanup_staging_keys=("group_g0/call", "group_g0/fork"),
+        expected_token_length=3,
+    )
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0", "group_g1"],
+        fields=["input_ids"],
+        tags=[
+            {ROUTE_PLAN_TAG: encode_route_plan(plan)},
+            {ROUTE_PLAN_TAG: encode_route_plan(plan)},
+        ],
+    )
+    ctrl = _controller(SimpleNamespace())
+
+    async def _cleanup() -> None:
+        async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
+            await ctrl._cleanup_consumed_metas_unlocked(cut, [meta])
+
+    asyncio.run(_cleanup())
+
+    assert ctrl._dp_client.clear_calls == [
+        {
+            "sample_ids": ["group_g0", "group_g1"],
+            "partition_id": "canonical",
+        },
+        {
+            "sample_ids": ["group_g0/call", "group_g0/fork"],
+            "partition_id": "staging",
+        },
+    ]
+
+
+class _SyncDataPlaneClient:
+    """Synchronous client like the production TQ adapter; records caller threads."""
+
+    def __init__(self) -> None:
+        self.clear_calls: list[dict[str, Any]] = []
+        self.clear_thread_ids: list[int] = []
+
+    def clear_samples(self, *, sample_ids: list[str], partition_id: str) -> None:
+        self.clear_thread_ids.append(threading.get_ident())
+        self.clear_calls.append(
+            {"sample_ids": list(sample_ids), "partition_id": partition_id}
+        )
+
+
+def test_known_outcome_cleanup_runs_sync_clears_off_the_event_loop() -> None:
+    ctrl = _controller(SimpleNamespace())
+    ctrl._dp_client = _SyncDataPlaneClient()
+
+    async def _main() -> int:
+        await ctrl._cleanup_known_finalization_request(_request())
+        return threading.get_ident()
+
+    loop_thread_id = asyncio.run(_main())
+
+    assert ctrl._dp_client.clear_calls == [
+        {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+        {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+    ]
+    assert ctrl._dp_client.clear_thread_ids
+    assert all(tid != loop_thread_id for tid in ctrl._dp_client.clear_thread_ids)
+    ctrl._buffer.abort.assert_called_once_with("group")

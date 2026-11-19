@@ -1,4 +1,10 @@
+---
+orphan: true
+---
+
 # Nemotron 3 Nano
+
+> **Note:** This document has moved and will be deprecated here. See the new location: https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/models/nemotron/nemotron-3-nano.md
 
 This guide explains how to post-train the [Nemotron 3 Nano model](https://research.nvidia.com/labs/nemotron/files/NVIDIA-Nemotron-3-Nano-Technical-Report.pdf) using NeMo RL.
 
@@ -31,7 +37,7 @@ git submodule update --init --recursive
 
 ## Create a launch script
 
-Create a file named `launch.sh` with the following contents. Be sure to fill in the `DATA_DIR`, `MODEL_CHECKPOINT`, `WANDB_API_KEY`, `SLURM_ACCOUNT`, `SLURM_PARTITION`, `MOUNTS`. Note that the default recipe (`examples/nemo_gym/grpo_nanov3.yaml`) uses 32 nodes.
+Create a file named `launch.sh` with the following contents. Be sure to fill in the `DATA_DIR`, `MODEL_CHECKPOINT`, `WANDB_API_KEY`, `SLURM_ACCOUNT`, `SLURM_PARTITION`, `MOUNTS`, and the three OpenSandbox variables that the recipe's `code_gen` environment needs (see [NeMo Gym Code Generation Sandbox](environments.md#nemo-gym-code-generation-sandbox), which also covers running without OpenSandbox). Note that the default recipe (`examples/nemo_gym/grpo_nanov3.yaml`) uses 32 nodes.
 
 ```bash
 CODE_DIR=$PWD
@@ -44,6 +50,9 @@ WANDB_API_KEY=...
 SLURM_ACCOUNT=...
 SLURM_PARTITION=...
 MOUNTS=... # SRC:DST[,SRC:DST...] e.g., MOUNTS="/lustre:/lustre,/data:/data"
+CODE_GEN_SANDBOX_IMAGE=... # the code_gen verifier image that OpenSandbox runs
+OPENSANDBOX_DOMAIN=... # the OpenSandbox endpoint, e.g. https://opensandbox.example.com
+OPENSANDBOX_API_KEY=... # your OpenSandbox access key
 
 CONTAINER="nvcr.io/nvidia/nemo-rl:v0.4.0.nemotron_3_nano"
 COMMAND="uv run examples/nemo_gym/run_grpo_nemo_gym.py --config examples/nemo_gym/grpo_nanov3.yaml data.train_jsonl_fpath=$DATA_DIR/train-split.jsonl data.validation_jsonl_fpath=$DATA_DIR/val-split.jsonl policy.model_name=$MODEL_CHECKPOINT logger.wandb_enabled=True"
@@ -52,6 +61,9 @@ COMMAND="${COMMAND}" \
 CONTAINER="${CONTAINER}" \
 MOUNTS="${MOUNTS}" \
 WANDB_API_KEY=${WANDB_API_KEY} \
+CODE_GEN_SANDBOX_IMAGE=${CODE_GEN_SANDBOX_IMAGE} \
+OPENSANDBOX_DOMAIN=${OPENSANDBOX_DOMAIN} \
+OPENSANDBOX_API_KEY=${OPENSANDBOX_API_KEY} \
 sbatch \
     --nodes=32 \
     --account="${SLURM_ACCOUNT}" \

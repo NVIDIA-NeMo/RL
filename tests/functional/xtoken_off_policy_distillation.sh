@@ -57,7 +57,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     teachers.0.max_total_sequence_length=256 \
     distillation.num_prompts_per_step=8 \
     distillation.max_num_steps=3 \
-    teachers.0.projection_matrix_path=$PROJ_PATH \
+    teachers.0.aligner.projection_matrix_path=$PROJ_PATH \
     data.train.characters_per_sample=256 \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \

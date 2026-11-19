@@ -40,7 +40,7 @@ This section outlines how workers define their required executables, details the
 
 ### Worker Configuration
 
-In our codebase, workers (classes decorated with `@ray.remote`, e.g., `PolicyWorker`) are associated with a `PY_EXECUTABLE` which specifies what dependencies the worker needs. These are set in a global registry in [`ACTOR_ENVIRONMENT_REGISTRY`](../../nemo_rl/distributed/ray_actor_environment_registry.py). This allows different parts of our application to have their own tailored environments.
+In our codebase, workers (classes decorated with `@ray.remote`, e.g., `PolicyWorker`) are associated with a `PY_EXECUTABLE` which specifies what dependencies the worker needs. These are declared in `ACTOR_ENVIRONMENTS` in [`nemo_rl/distributed/actor_environments.py`](../../nemo_rl/distributed/actor_environments.py), from which the global registry [`ACTOR_ENVIRONMENT_REGISTRY`](../../nemo_rl/distributed/ray_actor_environment_registry.py) is built. Workers defined outside this repo register themselves by assigning into `ACTOR_ENVIRONMENT_REGISTRY` at runtime -- see `research/template_project`. This allows different parts of our application to have their own tailored environments.
 
 ### Supported Python Executables
 
@@ -59,6 +59,8 @@ class PY_EXECUTABLES:
 
 To ensure consistent dependencies between actors, we run with `--locked` to make sure the dependencies are consistent with the contents of `uv.lock`.
 
+Setting the `NEMO_RL_PY_EXECUTABLES_SYSTEM=1` environment variable rewrites every `uv run` command in `PY_EXECUTABLES` — not only the ones shown here — to `SYSTEM`, so all actors launch on the driver's interpreter and no per-actor venv is created. Use it only in an environment where every actor's dependencies are already installed, such as a single-environment container image.
+
 ### Customization
 
 If you need a different Python executable configuration, you can override the default one by passing your own in {py:class}`RayWorkerBuilder.__call__ <nemo_rl.distributed.worker_groups.RayWorkerBuilder.__call__>`. This provides flexibility for special use cases without modifying the core configurations.
@@ -70,7 +72,7 @@ When a NeMo RL job is started:
 1. The driver script creates several {py:class}`RayWorkerGroup <nemo_rl.distributed.worker_groups.RayWorkerGroup>`s.
 2. Each worker group will create their workers which are wrapped in a {py:class}`RayWorkerBuilder <nemo_rl.distributed.worker_groups.RayWorkerBuilder>` where the fully qualified name (FQN) of the worker class is passed as a string.
 3. {py:class}`RayWorkerBuilder <nemo_rl.distributed.worker_groups.RayWorkerBuilder>` launches the worker under {py:class}`RayWorkerBuilder <nemo_rl.distributed.worker_groups.RayWorkerBuilder. IsolatedWorkerInitializer>` which allows us to initialize the class without importing packages not available in the base environment.
-4. Before the worker class is instantiated by the `RayWorkerBuilder`, the FQN is used to lookup -- in a [global registry](../../nemo_rl/distributed/ray_actor_environment_registry.py))) -- to determine which member of `PY_EXECUTABLES` should be used to launch that set of workers. If the chosen `PY_EXECUTABLES.*` starts with `uv`; a `venv` is created with all the dependencies it needs and the `runtime_env["py_executable"]` is replaced with the `venv`'s python interpreter.
+4. Before the worker class is instantiated by the `RayWorkerBuilder`, the FQN is used to lookup -- in a [global registry](../../nemo_rl/distributed/ray_actor_environment_registry.py) built from [`ACTOR_ENVIRONMENTS`](../../nemo_rl/distributed/actor_environments.py) -- to determine which member of `PY_EXECUTABLES` should be used to launch that set of workers. If the chosen `PY_EXECUTABLES.*` starts with `uv`; a `venv` is created with all the dependencies it needs and the `runtime_env["py_executable"]` is replaced with the `venv`'s python interpreter.
 
 This approach allows a fast start-up and maintains dependency isolation. It also has the added benefit of having all the virtual environments local under `./venvs`.
 

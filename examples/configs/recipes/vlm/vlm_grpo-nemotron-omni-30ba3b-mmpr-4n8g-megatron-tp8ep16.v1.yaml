@@ -1,9 +1,8 @@
-defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml
+defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-2n8g-megatron-tp8ep8.v1.yaml
 grpo:
   num_prompts_per_step: 512
   overlong_filtering: true
   zero_variance_prompt_filtering: false
-  deduplicate_multimodal_data: false
 loss_fn:
   ratio_clip_max: 0.28
   use_on_policy_kl_approximation: true
@@ -17,6 +16,7 @@ policy:
   train_global_batch_size: 2048
   logprob_chunk_size: 1024
   megatron_cfg:
+    defer_fp32_logits: true
     empty_unused_memory_level: 2
     expert_model_parallel_size: 16
     optimizer:
@@ -33,10 +33,12 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 2
       load_format: auto
-      enforce_eager: false
       max_model_len: ${policy.max_total_sequence_length}
-      gpu_memory_utilization: 0.75
+      gpu_memory_utilization: 0.6
     vllm_kwargs:
+      compilation_config:
+        pass_config:
+          fuse_allreduce_rms: true
       max_num_batched_tokens: 32768
       max_num_seqs: 512
 data:

@@ -18,7 +18,9 @@ import pytest
 
 # Check if nemo_automodel is available for tests that need it
 try:
-    from nemo_automodel.components.moe.utils import BackendConfig  # noqa: F401
+    from nemo_automodel.components.models.common.utils import (
+        BackendConfig,  # noqa: F401
+    )
 
     NEMO_AUTOMODEL_AVAILABLE = True
 except ImportError:
@@ -51,7 +53,8 @@ class TestAutoModelBackendConfig:
             "attn": "te",
             "linear": "te",
             "rms_norm": "te",
-            "enable_deepep": True,
+            "dispatcher": "hybridep",
+            "experts": "torch_mm",
             "fake_balanced_gate": False,
             "enable_hf_state_dict_adapter": True,
             "enable_fsdp_optimizations": False,

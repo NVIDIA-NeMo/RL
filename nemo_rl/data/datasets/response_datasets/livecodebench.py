@@ -36,7 +36,6 @@ from huggingface_hub import hf_hub_download
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 
-
 _LCBV6_START = date(2025, 2, 1)
 _LCBV6_END = date(2025, 5, 31)
 
@@ -136,8 +135,7 @@ def _build_user_prompt(question: str, starter_code: str | None) -> str:
     # Solution().<method>, so LeetCode-style problems need the signature.
     if starter_code and starter_code.strip():
         parts.append(
-            "Use the following starter code:\n\n"
-            f"```python\n{starter_code.strip()}\n```"
+            f"Use the following starter code:\n\n```python\n{starter_code.strip()}\n```"
         )
     return "\n\n".join(parts)
 

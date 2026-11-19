@@ -15,7 +15,7 @@ policy: &POLICY_BASE
     precision: "bfloat16"
     logprob_chunk_size: null
 
-    dtensor_cfg:
+    automodel_cfg:
         enabled: false
 
     dynamic_batching:
@@ -40,6 +40,22 @@ policy: &POLICY_BASE
         enabled: true
         empty_unused_memory_level: 0
         activation_checkpointing: false
+        # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
+        cuda_graph_impl: "none"
+        cuda_graph_modules: []
+        cuda_graph_warmup_steps: 3
+        # Offload specific module activations to CPU. Works for both dense and MoE
+        # models and requires transformer_engine. Different from optimizer_cpu_offload,
+        # which offloads optimizer states. On TE >= 2.10,
+        # also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+        fine_grained_activation_offloading: false
+        # Modules to offload when fine_grained_activation_offloading is true.
+        # Common examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"].
+        # Supported names depend on the pinned Megatron-LM version and are
+        # validated by MCore. "attn_proj" requires "core_attn". See the latest
+        # upstream module reference:
+        # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+        offload_modules: null
         # recompute_granularity controls activation checkpointing depth.
         # "full": recompute all activations (default, max memory savings).
         # "selective": recompute only specific modules (see recompute_modules).
@@ -70,10 +86,14 @@ policy: &POLICY_BASE
         bias_activation_fusion: True
         moe_per_layer_logging: False
         defer_fp32_logits: False
+        reuse_logits_storage: false
         moe_enable_deepep: false
         moe_token_dispatcher_type: "alltoall"
         moe_shared_expert_overlap: false
         use_gloo_process_groups: false
+        # Collective timeout (minutes) for default, Megatron model-parallel, and
+        # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+        distributed_timeout_minutes: null
         peft:
             enabled: false
             target_modules: []
@@ -86,6 +106,7 @@ policy: &POLICY_BASE
             lora_B_init_method: "zero"
             a2a_experimental: false
             lora_dtype: null
+            restore_from: null  # Warm start: path to a native Megatron PEFT checkpoint (iter_XXXXXXX dir or its root) to initialize this run's LoRA weights from, e.g. a previous SFT run
 
         optimizer:
             optimizer: "adam"
@@ -111,6 +132,7 @@ policy: &POLICY_BASE
             # optimizer cpu offload
             optimizer_cpu_offload: false
             optimizer_offload_fraction: 0.0
+            overlap_cpu_optimizer_d2h_h2d: false
 
             clip_grad: ${policy.max_grad_norm}
 
@@ -144,6 +166,8 @@ policy: &POLICY_BASE
         top_k: null
         stop_token_ids: null
         stop_strings: null
+        # LoRA defaults to native refit; Megatron LoRA recipes override this to merged.
+        lora_refit_mode: native
         vllm_cfg:
             async_engine: false
             precision: ${...precision}

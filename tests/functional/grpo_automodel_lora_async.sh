@@ -27,13 +27,14 @@ NRL_FORCE_REBUILD_VENVS=true uv run coverage run -a --data-file=$PROJECT_ROOT/te
     grpo.num_prompts_per_step=8 \
     grpo.num_generations_per_prompt=4 \
     data.shuffle=false \
-    policy.dtensor_cfg.lora_cfg.enabled=True \
-    policy.dtensor_cfg.lora_cfg.dim=32 \
+    policy.automodel_cfg.lora_cfg.enabled=True \
+    policy.automodel_cfg.lora_cfg.dim=32 \
     policy.train_global_batch_size=32 \
     policy.train_micro_batch_size=1 \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.gpus_per_node=1 \
     policy.generation.colocated.resources.num_nodes=1 \
+    policy.generation.lora_refit_mode=merged \
     policy.generation.vllm_cfg.async_engine=true \
     grpo.async_grpo.enabled=true \
     loss_fn.use_importance_sampling_correction=true \

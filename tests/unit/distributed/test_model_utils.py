@@ -12,26 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import math
 import os
+from datetime import timedelta
 
 import pytest
 import ray
 import torch
 
-from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    apply_top_k_top_p,
+)
 from nemo_rl.distributed.model_utils import (
+    ChunkedDistributedCrossEntropyToFixedLogits,
+    ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
     ChunkedDistributedLogprob,
     ChunkedDistributedLogprobWithSampling,
+    ChunkedDistributedReverseKLToFixedLogits,
     DistributedLogprob,
     DistributedLogprobWithSampling,
+    SamplerSupportLogprob,
     _compute_distributed_log_softmax,
+    _compute_distributed_selected_logprobs,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
+    check_sampler_support,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
     gather_logits_at_global_indices,
+    get_policy_logprobs_at_sampler_topk,
+    sampler_support_ids,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -40,6 +53,105 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
+
+
+def test_compute_distributed_selected_logprobs(monkeypatch):
+    """Selected-token path matches gathering a complete log-softmax tensor."""
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+
+    torch.manual_seed(42)
+    logits = torch.randn(2, 5, 11, dtype=torch.float32)
+    target = torch.randint(0, logits.shape[-1], (2, 5))
+    target_mask = torch.zeros_like(target, dtype=torch.bool)
+    target_mask[0, 3] = True
+
+    actual = _compute_distributed_selected_logprobs(
+        logits,
+        masked_target=target,
+        target_mask=target_mask,
+        group=None,
+    )
+    expected = (
+        torch.log_softmax(logits, dim=-1).gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    )
+    expected[target_mask] = 0.0
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_compute_distributed_selected_logprobs_without_output_reduce(monkeypatch):
+    """The caller can own the final selected-logprob reduction."""
+    reduce_ops = []
+
+    def fake_all_reduce(tensor, *, op, group):
+        reduce_ops.append(op)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    torch.manual_seed(42)
+    logits = torch.randn(2, 5, 11, dtype=torch.float32)
+    target = torch.randint(0, logits.shape[-1], (2, 5))
+    target_mask = torch.zeros_like(target, dtype=torch.bool)
+
+    actual = _compute_distributed_selected_logprobs(
+        logits,
+        masked_target=target,
+        target_mask=target_mask,
+        group=None,
+        reduce_output=False,
+    )
+    expected = (
+        torch.log_softmax(logits, dim=-1).gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert reduce_ops == [
+        torch.distributed.ReduceOp.MAX,
+        torch.distributed.ReduceOp.SUM,
+    ]
+
+
+def test_compute_distributed_selected_logprobs_tp_shards(monkeypatch):
+    """TP-local selected values reduce to full-vocabulary token logprobs."""
+    torch.manual_seed(123)
+    full_logits = torch.randn(2, 5, 12, dtype=torch.float32)
+    target = torch.randint(0, full_logits.shape[-1], (2, 5))
+    global_max = full_logits.amax(dim=-1, keepdim=True)
+    shifted_full_logits = full_logits - global_max
+    global_sum_exp = shifted_full_logits.exp().sum(dim=-1, keepdim=True)
+    expected = (
+        torch.log_softmax(full_logits, dim=-1)
+        .gather(-1, target.unsqueeze(-1))
+        .squeeze(-1)
+    )
+
+    shard_size = full_logits.shape[-1] // 2
+    for rank in range(2):
+        vocab_start = rank * shard_size
+        vocab_end = vocab_start + shard_size
+        target_mask = (target < vocab_start) | (target >= vocab_end)
+        masked_target = target - vocab_start
+        masked_target[target_mask] = 0
+        remote_selected_logprobs = expected.masked_fill(~target_mask, 0.0)
+
+        def fake_all_reduce(tensor, *, op, group):
+            if op == torch.distributed.ReduceOp.MAX:
+                tensor.copy_(global_max)
+            elif tensor.shape == global_sum_exp.shape:
+                tensor.copy_(global_sum_exp)
+            else:
+                tensor.add_(remote_selected_logprobs)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        actual = _compute_distributed_selected_logprobs(
+            full_logits[..., vocab_start:vocab_end].contiguous(),
+            masked_target=masked_target,
+            target_mask=target_mask,
+            group=None,
+        )
+        torch.testing.assert_close(actual, expected)
 
 
 @ray.remote(num_gpus=1)
@@ -137,7 +249,7 @@ class ModelUtilsTestActor:
         actual_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
             packed_logits,
             packed_target_ids,
-            cu_seqlens,
+            to_cpu_int_tuple(cu_seqlens),
             seq_len,  # unpacked_seqlen
             vocab_start_index,
             vocab_end_index,
@@ -148,6 +260,74 @@ class ModelUtilsTestActor:
         # 4. Compare results
         torch.testing.assert_close(
             actual_logprobs, expected_logprobs, rtol=1e-5, atol=1e-5
+        )
+        return {"success": True, "error": None}
+
+    def test_topk_logprobs_equivalence(self):
+        """TP+CP top-k log-probs and their gradient match a full-vocab log-softmax."""
+        torch.distributed.init_process_group(backend="nccl")
+
+        # Rank layout: rank = cp_rank * tp_size + tp_rank. Every rank creates
+        # every group, in the same order, as new_group requires.
+        rank = int(os.environ["RANK"])
+        tp_rank = rank % self.tp_size
+        cp_rank = rank // self.tp_size
+        tp_group = cp_group = None
+        for cp_r in range(self.cp_size):
+            ranks = [cp_r * self.tp_size + tp_r for tp_r in range(self.tp_size)]
+            group = torch.distributed.new_group(ranks=ranks)
+            if rank in ranks:
+                tp_group = group
+        for tp_r in range(self.tp_size):
+            ranks = [cp_r * self.tp_size + tp_r for cp_r in range(self.cp_size)]
+            group = torch.distributed.new_group(ranks=ranks)
+            if rank in ranks:
+                cp_group = group
+
+        batch_size, seq_len, vocab_size, top_k = 2, 16, 64, 5
+        vocab_part_size = vocab_size // self.tp_size
+        torch.manual_seed(7)  # identical full tensors on every rank
+        full_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
+        sampler_topk_token_ids = torch.randint(
+            0,
+            vocab_size,
+            (batch_size, seq_len, top_k),
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        reference_logits = full_logits.clone().requires_grad_(True)
+        expected = torch.log_softmax(reference_logits, dim=-1)[:, :-1].gather(
+            dim=-1, index=sampler_topk_token_ids.long()[:, 1:]
+        )
+        expected.sum().backward()
+
+        shard = full_logits[
+            ..., tp_rank * vocab_part_size : (tp_rank + 1) * vocab_part_size
+        ]
+        shard = _get_tokens_on_this_cp_rank(shard, cp_rank, self.cp_size, seq_dim=1)
+        shard = shard.clone().requires_grad_(True)
+        actual = get_policy_logprobs_at_sampler_topk(
+            sampler_topk_token_ids=sampler_topk_token_ids,
+            next_token_logits=shard,
+            vocab_parallel_rank=tp_rank,
+            vocab_parallel_group=tp_group,
+            context_parallel_group=cp_group if self.cp_size > 1 else None,
+            chunk_size=4,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+        actual.sum().backward()
+        expected_grad = reference_logits.grad[
+            ..., tp_rank * vocab_part_size : (tp_rank + 1) * vocab_part_size
+        ]
+        expected_grad = _get_tokens_on_this_cp_rank(
+            expected_grad, cp_rank, self.cp_size, seq_dim=1
+        )
+        # The CP all-gather's backward sums the identical per-rank losses, which
+        # LossPostProcessor undoes by dividing by cp_size.
+        torch.testing.assert_close(
+            shard.grad / self.cp_size, expected_grad, rtol=1e-5, atol=1e-5
         )
         return {"success": True, "error": None}
 
@@ -246,6 +426,67 @@ def test_from_parallel_logits_to_logprobs_packed_sequences(
         cluster.shutdown()
 
 
+def test_get_policy_logprobs_at_sampler_topk_single_device():
+    """The unsharded path is a rolled gather of the full log-softmax, with gradient."""
+    torch.manual_seed(0)
+    logits = torch.randn(2, 6, 11, requires_grad=True)
+    sampler_topk_token_ids = torch.randint(0, 11, (2, 6, 3), dtype=torch.int32)
+
+    actual = get_policy_logprobs_at_sampler_topk(
+        sampler_topk_token_ids=sampler_topk_token_ids, next_token_logits=logits
+    )
+    expected = torch.log_softmax(logits, dim=-1)[:, :-1].gather(
+        dim=-1, index=sampler_topk_token_ids.long()[:, 1:]
+    )
+
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
+@pytest.mark.parametrize(
+    "tp_cp_config",
+    [
+        (2, 1),  # TP=2, CP=1
+        (1, 2),  # TP=1, CP=2
+        (2, 2),  # TP=2, CP=2
+    ],
+)
+def test_get_policy_logprobs_at_sampler_topk_tp_cp(
+    register_model_utils_test_actor, tp_cp_config
+):
+    """Score centering's head log-probs under TP and CP against a full-vocab reference."""
+    tp_size, cp_size = tp_cp_config
+    world_size = tp_size * cp_size
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {world_size}, got {torch.cuda.device_count()}"
+        )
+
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[world_size], use_gpus=True)
+    try:
+        sharding = NamedSharding(
+            layout=np.arange(world_size).reshape(tp_size, cp_size), names=["tp", "cp"]
+        )
+        builder = RayWorkerBuilder(
+            register_model_utils_test_actor, tp_size, cp_size, sharding
+        )
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+        results = ray.get(
+            worker_group.run_all_workers_single_data("test_topk_logprobs_equivalence")
+        )
+        for i, result in enumerate(results):
+            assert result["success"], f"Worker {i} failed: {result['error']}"
+        worker_group.shutdown(force=True)
+    finally:
+        cluster.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # distributed_test_runner-based packed-sequences tests (coverage-friendly)
 # ---------------------------------------------------------------------------
@@ -304,6 +545,8 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
         cu_seqlens_padded[i + 1] = cu_seqlens_padded[i] + padded_seq_lengths[i]
 
     total_padded = int(cu_seqlens_padded[-1].item())
+    cu_seqlens_cpu = to_cpu_int_tuple(cu_seqlens)
+    cu_seqlens_padded_cpu = to_cpu_int_tuple(cu_seqlens_padded)
 
     torch.manual_seed(42)
     unpacked_logits_full = torch.randn(
@@ -334,12 +577,14 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
 
     # --- Path 1: target_is_pre_rolled=False ---
     # Pack raw (unrolled) input_ids to [1, T_padded] using _pack_input_ids.
-    packed_target_raw = _pack_input_ids(input_ids, cu_seqlens, cu_seqlens_padded)
+    packed_target_raw = _pack_input_ids(
+        input_ids, cu_seqlens_cpu, cu_seqlens_padded_cpu
+    )
 
     logprobs_not_pre_rolled = from_parallel_logits_to_logprobs_packed_sequences(
         packed_logits,
         packed_target_raw,
-        cu_seqlens_padded,
+        cu_seqlens_padded_cpu,
         max_seq_len,
         vocab_start_index,
         vocab_end_index,
@@ -352,8 +597,8 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
     # --- Path 2: target_is_pre_rolled=True ---
     packed_target_pre_rolled = _pack_input_ids(
         input_ids,
-        cu_seqlens,
-        cu_seqlens_padded,
+        cu_seqlens_cpu,
+        cu_seqlens_padded_cpu,
         cp_rank=my_cp_rank_val,
         cp_size=cp_size,
         roll_shift=-1,
@@ -362,7 +607,7 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
     logprobs_pre_rolled = from_parallel_logits_to_logprobs_packed_sequences(
         packed_logits,
         packed_target_pre_rolled,
-        cu_seqlens_padded,
+        cu_seqlens_padded_cpu,
         max_seq_len,
         vocab_start_index,
         vocab_end_index,
@@ -1583,3 +1828,817 @@ def test_distributed_vocab_topk_ops(
         worker_group.shutdown(force=True)
     finally:
         cluster.shutdown()
+
+
+# ── Full-vocabulary MOPD divergence kernels ─────────────────────────────────
+# At TP=1 the distributed log-softmax degenerates to a plain one, so both
+# opd_full kernels can be pinned against a closed-form reference with no GPU and
+# no process group -- same monkeypatch style as _compute_distributed_selected_logprobs.
+
+
+@pytest.fixture
+def single_rank_collectives(monkeypatch):
+    """Neutralize the collectives so the kernels compute their TP=1 limit.
+
+    ``_compute_distributed_log_softmax`` reduces through two different entry
+    points -- ``torch.distributed.all_reduce`` for the running max and the
+    *differentiable* ``torch.distributed.nn.functional.all_reduce`` for the
+    normalizer -- and the per-token reduction uses the first one again. Patching
+    only one of them would silently leave a real collective in the path.
+    """
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, *a, **kw: None)
+    monkeypatch.setattr(
+        torch.distributed.nn.functional,
+        "all_reduce",
+        lambda tensor, *a, **kw: tensor,
+    )
+
+
+def _student_teacher_reference(
+    student: torch.Tensor, teacher: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Closed-form [B, S] reverse KL, cross entropy, and sum_v p_s log p_s."""
+    student_log_probs = torch.log_softmax(student.float(), dim=-1)
+    teacher_log_probs = torch.log_softmax(teacher.float(), dim=-1)
+    student_probs = student_log_probs.exp()
+    return (
+        (student_probs * (student_log_probs - teacher_log_probs)).sum(-1),
+        (-student_probs * teacher_log_probs).sum(-1),
+        (student_probs * student_log_probs).sum(-1),
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 7, 32])
+def test_student_teacher_kernels_match_closed_form(single_rank_collectives, chunk_size):
+    """Forward values and chunk invariance for both opd_full kernels.
+
+    chunk_size 3 and 7 straddle S=7 so both the ragged-tail and the
+    single-chunk ``out_chunks[0]`` shortcut are exercised; 32 > S covers the
+    "whole sequence at once" default that ``chunk_size: null`` resolves to.
+    """
+    torch.manual_seed(0)
+    student = torch.randn(2, 7, 11)
+    teacher = torch.randn(2, 7, 11)
+    expected_kl, expected_ce, expected_neg_entropy = _student_teacher_reference(
+        student, teacher
+    )
+
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(
+        student, teacher, chunk_size, None, True
+    )
+    cross_entropy = ChunkedDistributedCrossEntropyToFixedLogits.apply(
+        student, teacher, chunk_size, None, True
+    )
+
+    torch.testing.assert_close(reverse_kl, expected_kl, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(cross_entropy, expected_ce, rtol=1e-5, atol=1e-6)
+    # Both kernels normalize in fp32 regardless of the input dtype.
+    assert reverse_kl.dtype == torch.float32
+    assert cross_entropy.dtype == torch.float32
+
+
+def test_student_teacher_decomposition_identity(single_rank_collectives):
+    """entropy + cross entropy == reverse KL, the residual the recipe gates on.
+
+    ``opd_full_decomposition_error`` in the nightly recipe asserts this holds;
+    pin the true noise floor here so a regression cannot hide under that
+    recipe's much looser threshold.
+    """
+    torch.manual_seed(1)
+    student = torch.randn(3, 5, 13)
+    teacher = torch.randn(3, 5, 13)
+
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(
+        student, teacher, 2, None, True
+    )
+    cross_entropy = ChunkedDistributedCrossEntropyToFixedLogits.apply(
+        student, teacher, 2, None, True
+    )
+    neg_entropy = ChunkedDistributedEntropy.apply(student, 2, None, True)
+
+    torch.testing.assert_close(
+        neg_entropy + cross_entropy, reverse_kl, rtol=0, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [
+        ChunkedDistributedReverseKLToFixedLogits,
+        ChunkedDistributedCrossEntropyToFixedLogits,
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [2, 5])
+def test_student_teacher_backward_matches_autograd(
+    single_rank_collectives, kernel, chunk_size
+):
+    """The hand-written backward equals autograd through the reference.
+
+    Both kernels share ``dL/dz = p_s * (w - L)``, which drops the
+    ``dw/dlog p_s`` term because it is constant and cancels against
+    ``sum_v p_s = 1``. That cancellation is the whole reason the two weights can
+    share one backward, and nothing else checks it.
+    """
+    torch.manual_seed(2)
+    teacher = torch.randn(2, 5, 9)
+    grad_output = torch.randn(2, 5)
+
+    student = torch.randn(2, 5, 9, requires_grad=True)
+    kernel.apply(student, teacher, chunk_size, None, False).mul(
+        grad_output
+    ).sum().backward()
+
+    reference_student = student.detach().clone().requires_grad_(True)
+    reference_kl, reference_ce, _ = _student_teacher_reference(
+        reference_student, teacher
+    )
+    reference = (
+        reference_kl
+        if kernel is ChunkedDistributedReverseKLToFixedLogits
+        else reference_ce
+    )
+    reference.mul(grad_output).sum().backward()
+
+    torch.testing.assert_close(
+        student.grad, reference_student.grad, rtol=1e-4, atol=1e-5
+    )
+
+
+def test_student_teacher_backward_leaves_teacher_gradient_free(
+    single_rank_collectives,
+):
+    """The teacher is a frozen constant: no gradient may flow back into it."""
+    torch.manual_seed(3)
+    student = torch.randn(1, 4, 6, requires_grad=True)
+    teacher = torch.randn(1, 4, 6, requires_grad=True)
+
+    ChunkedDistributedReverseKLToFixedLogits.apply(
+        student, teacher, 2, None, False
+    ).sum().backward()
+
+    assert student.grad is not None
+    assert teacher.grad is None
+
+
+def test_reverse_kl_vanishes_for_identical_logits(single_rank_collectives):
+    """The self-distillation invariant the nightly recipe gates on, unit-sized."""
+    torch.manual_seed(4)
+    logits = torch.randn(1, 4, 13)
+
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(
+        logits, logits.clone(), 4, None, True
+    )
+
+    torch.testing.assert_close(
+        reverse_kl, torch.zeros_like(reverse_kl), rtol=0, atol=1e-6
+    )
+
+
+def test_student_teacher_kernels_accept_bf16_logits(single_rank_collectives):
+    """bf16 logits in, fp32 value and bf16 grad out -- the mainline dtype path."""
+    torch.manual_seed(5)
+    student = torch.randn(1, 4, 8, dtype=torch.bfloat16, requires_grad=True)
+    teacher = torch.randn(1, 4, 8, dtype=torch.bfloat16)
+
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(
+        student, teacher, 2, None, False
+    )
+    reverse_kl.sum().backward()
+
+    assert reverse_kl.dtype == torch.float32
+    assert student.grad is not None
+    # The grad buffer is allocated in the logits' dtype; every multiply still
+    # happens in fp32, before the copy_ narrows it.
+    assert student.grad.dtype == student.dtype
+
+
+@pytest.mark.parametrize(
+    ("student_shape", "teacher_shape", "match"),
+    [
+        ((2, 5, 9), (2, 5, 8), r"same \[B, S, V_local\] shape"),
+        ((5, 9), (5, 9), "must be rank 3"),
+    ],
+)
+def test_student_teacher_kernels_reject_misaligned_shards(
+    single_rank_collectives, student_shape, teacher_shape, match
+):
+    """A teacher shard that is not this rank's vocabulary window must not run."""
+    with pytest.raises(ValueError, match=match):
+        ChunkedDistributedReverseKLToFixedLogits.apply(
+            torch.randn(*student_shape), torch.randn(*teacher_shape), 2, None, True
+        )
+
+
+def test_student_teacher_reduction_normalizes_both_sides_across_tp(monkeypatch):
+    """Both distributions are TP-normalized, not just the student's.
+
+    This is the one part of the kernels that TP=1 cannot observe: skipping the
+    teacher's log-softmax collectives is exactly correct at TP=1 and silently
+    wrong at TP>1, because the teacher's softmax denominator would then only
+    span this rank's vocabulary shard. Assert the collective trace instead.
+    """
+    plain_ops: list[object] = []
+    autograd_ops: list[object] = []
+
+    def fake_all_reduce(tensor, *args, **kwargs):
+        plain_ops.append(kwargs["op"])
+
+    def fake_autograd_all_reduce(tensor, *args, **kwargs):
+        autograd_ops.append(kwargs["op"])
+        return tensor
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(
+        torch.distributed.nn.functional, "all_reduce", fake_autograd_all_reduce
+    )
+
+    torch.manual_seed(6)
+    # S=4 over chunks of 2 -> two chunks, so the counts below are per-chunk x2.
+    ChunkedDistributedReverseKLToFixedLogits.apply(
+        torch.randn(1, 4, 6), torch.randn(1, 4, 6), 2, None, True
+    )
+
+    # Per chunk: a MAX for the student log-softmax, a MAX for the teacher's, and
+    # a SUM for the per-token reduction across vocabulary shards.
+    assert (
+        plain_ops
+        == [
+            torch.distributed.ReduceOp.MAX,
+            torch.distributed.ReduceOp.MAX,
+            torch.distributed.ReduceOp.SUM,
+        ]
+        * 2
+    )
+    # Per chunk: one normalizer SUM for each of the two distributions.
+    assert autograd_ops == [torch.distributed.ReduceOp.SUM] * 4
+
+
+def test_student_teacher_backward_reduces_the_normalizer_across_tp(monkeypatch):
+    """``dL/dz = p_s * (w - L)`` needs the GLOBAL ``L`` in backward as well.
+
+    The forward trace above stops at ``inference_only=True``. Backward
+    recomputes both log-softmaxes and ``L`` from the saved shards, so a backward
+    that forgot the SUM all-reduce on ``L`` would be exact at TP=1 and silently
+    wrong at TP>1 -- the same blind spot, one call later.
+    """
+    plain_ops: list[object] = []
+    autograd_ops: list[object] = []
+
+    def fake_all_reduce(tensor, *args, **kwargs):
+        plain_ops.append(kwargs["op"])
+
+    def fake_autograd_all_reduce(tensor, *args, **kwargs):
+        autograd_ops.append(kwargs["op"])
+        return tensor
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(
+        torch.distributed.nn.functional, "all_reduce", fake_autograd_all_reduce
+    )
+
+    torch.manual_seed(7)
+    student = torch.randn(1, 4, 6, requires_grad=True)
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(
+        student, torch.randn(1, 4, 6), 2, None, False
+    )
+    # Keep only the backward's collectives.
+    plain_ops.clear()
+    autograd_ops.clear()
+
+    reverse_kl.sum().backward()
+
+    # Per chunk: MAX for the student log-softmax, MAX for the teacher's, and the
+    # SUM that turns the shard-local ``L`` into the global one.
+    assert (
+        plain_ops
+        == [
+            torch.distributed.ReduceOp.MAX,
+            torch.distributed.ReduceOp.MAX,
+            torch.distributed.ReduceOp.SUM,
+        ]
+        * 2
+    )
+    assert autograd_ops == [torch.distributed.ReduceOp.SUM] * 4
+
+
+def test_student_teacher_kernels_normalize_bf16_logits_in_fp32(
+    single_rank_collectives,
+):
+    """A log-softmax taken in bf16 is off by ~1e-2; the fp32 path is within 1e-5."""
+    torch.manual_seed(5)
+    student = torch.randn(1, 4, 8, dtype=torch.bfloat16)
+    teacher = torch.randn(1, 4, 8, dtype=torch.bfloat16)
+
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(
+        student, teacher, 2, None, True
+    )
+
+    expected_kl, _, _ = _student_teacher_reference(student, teacher)
+    torch.testing.assert_close(reverse_kl, expected_kl, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=str)
+@pytest.mark.parametrize("leaf", [False, True])
+def test_chunked_logprob_backward_grad_reuses_logits_storage(
+    single_rank_collectives, leaf, dtype
+):
+    """Activation logits take their grad in place; leaves are never overwritten."""
+    torch.manual_seed(0)
+    batch, seq, vocab = 2, 7, 11
+    base = torch.randn(batch, seq, vocab, dtype=dtype, requires_grad=True)
+    target = torch.randint(0, vocab, (batch, seq))
+
+    ref = base.detach().float().requires_grad_(True)
+    expected = torch.log_softmax(ref, dim=-1).gather(-1, target.unsqueeze(-1))
+    (expected_grad,) = torch.autograd.grad(expected.sum(), ref)
+    # The grad is computed in fp32 and rounded to the logits' dtype.
+    expected_grad = expected_grad.to(dtype)
+
+    logits = base if leaf else base * 1.0  # non-leaf activation
+    before = logits.detach().clone()
+    logprobs = ChunkedDistributedLogprob.apply(
+        logits, target, 0, vocab, 3, None, False, True
+    )
+    logprobs.sum().backward()
+
+    torch.testing.assert_close(base.grad, expected_grad)
+    if leaf:
+        torch.testing.assert_close(logits.detach(), before)
+    else:
+        # The grad was written into the logits' own storage.
+        torch.testing.assert_close(logits.detach(), expected_grad)
+
+
+def test_chunked_logprob_fp32_default_grad_with_shared_logits(single_rank_collectives):
+    """Reverse KL and logprob on the same fp32 logits: the default must not reuse them."""
+    torch.manual_seed(1)
+    base = torch.randn(1, 4, 6, requires_grad=True)
+    teacher = torch.randn(1, 4, 6)
+    target = torch.randint(0, 6, (1, 4))
+    ref = base.detach().double().requires_grad_(True)
+    log_p = torch.log_softmax(ref, -1)
+    expected_loss = (
+        log_p.exp() * (log_p - torch.log_softmax(teacher.double(), -1))
+    ).sum()
+    expected_loss = expected_loss + log_p.gather(-1, target.unsqueeze(-1)).sum()
+    (expected,) = torch.autograd.grad(expected_loss, ref)
+
+    logits = base * 1.0
+    kl = ChunkedDistributedReverseKLToFixedLogits.apply(logits, teacher, 2, None, False)
+    lp = ChunkedDistributedLogprob.apply(logits, target, 0, 6, 2, None, False)
+    (kl.sum() + lp.sum()).backward()
+    torch.testing.assert_close(base.grad, expected.float(), rtol=1e-5, atol=1e-5)
+
+
+def test_chunked_logprob_fp32_default_grad_with_narrow_views(single_rank_collectives):
+    """Two sequences as narrow views of one packed logits (non-fused packing)."""
+    torch.manual_seed(2)
+    base = torch.randn(1, 6, 5, requires_grad=True)
+    target = torch.randint(0, 5, (1, 6))
+    expected_loss = torch.log_softmax(base.double(), -1).gather(
+        -1, target.unsqueeze(-1)
+    )
+    (expected,) = torch.autograd.grad(expected_loss.sum(), base)
+
+    logits = base * 1.0
+    total = sum(
+        ChunkedDistributedLogprob.apply(
+            logits.narrow(1, start, 3),
+            target[:, start : start + 3],
+            0,
+            5,
+            2,
+            None,
+            False,
+        ).sum()
+        for start in (0, 3)
+    )
+    total.backward()
+    torch.testing.assert_close(base.grad, expected.float(), rtol=1e-5, atol=1e-5)
+
+
+# Filtered score centering replays the sampler's support captured in the head.
+_SCORE_CENTERING_FILTERS = TrainingSamplingParams(
+    top_k=8, top_p=0.9, sampler_replay=True
+)
+
+
+def _run_score_centering_packed_equivalence(
+    rank, world_size, tp_size, cp_size, device, sampling_params=None
+):
+    """Compare packed TP/CP values and gradients with a full-vocabulary reference."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.loss.interfaces import LossInputType
+    from nemo_rl.algorithms.loss.loss_input import prepare_packed_loss_input
+    from nemo_rl.algorithms.loss.utils import _pack_input_ids
+
+    tp_groups = [
+        torch.distributed.new_group([c * tp_size + t for t in range(tp_size)])
+        for c in range(cp_size)
+    ]
+    cp_groups = [
+        torch.distributed.new_group([c * tp_size + t for c in range(cp_size)])
+        for t in range(tp_size)
+    ]
+    tp_rank, cp_rank = rank % tp_size, rank // tp_size
+    tp_group = tp_groups[cp_rank]
+    cp_group = cp_groups[tp_rank] if cp_size > 1 else None
+    torch.manual_seed(12)
+    full = torch.randn(2, 8, 12, device=device, requires_grad=True)
+    ids = torch.stack([torch.randperm(12)[:3] for _ in range(16)]).view(2, 8, 3)
+    ids = ids.to(device)
+    sampler_logprobs = torch.zeros(2, 8, 3, device=device)
+    if sampling_params is not None:
+        # The sampler kept slots 0 and 1 (all of its mass) and filtered slot 2.
+        sampler_logprobs[..., :2] = -math.log(2)
+        sampler_logprobs[..., 2] = -float("inf")
+    # Under replay the caller marks filtered head slots with -1.
+    head_ids = sampler_support_ids(ids, sampler_logprobs) if sampling_params else ids
+    lengths, padded = (0, 5, 12), (0, 8, 20)
+
+    def pack_rows(tensor):
+        rows = []
+        for i, (actual_len, padded_len) in enumerate([(5, 8), (7, 12)]):
+            row = torch.cat(
+                [
+                    tensor[i : i + 1, :actual_len],
+                    tensor.new_zeros(1, padded_len - actual_len, 12),
+                ],
+                dim=1,
+            )
+            rows.append(_get_tokens_on_this_cp_rank(row, cp_rank, cp_size, seq_dim=1))
+        return torch.cat(rows, dim=1)
+
+    local = (
+        pack_rows(full)[..., tp_rank * 6 : (tp_rank + 1) * 6]
+        if tp_size == 2
+        else pack_rows(full)
+    )
+    local = local.detach().requires_grad_()
+    actual = get_policy_logprobs_at_sampler_topk(
+        sampler_topk_token_ids=head_ids,
+        next_token_logits=local,
+        vocab_parallel_rank=tp_rank,
+        vocab_parallel_group=tp_group,
+        context_parallel_group=cp_group,
+        chunk_size=2,
+        cu_seqlens_q=lengths,
+        cu_seqlens_q_padded=padded,
+        packed_sampler_topk_token_ids=_pack_input_ids(
+            head_ids, lengths, padded, cp_rank=cp_rank, cp_size=cp_size, roll_shift=-1
+        ),
+        sampling_params=sampling_params,
+    )
+    data = {
+        "input_ids": ids[..., 0],
+        "token_mask": torch.ones(2, 8, device=device),
+        "sample_mask": torch.ones(2, device=device),
+        "sampler_topk_token_ids": ids,
+        "sampler_topk_logprobs": sampler_logprobs,
+    }
+    loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=True)
+    prepared, _ = prepare_packed_loss_input(
+        local,
+        data,
+        loss_fn,
+        lengths,
+        padded,
+        vocab_parallel_rank=tp_rank,
+        vocab_parallel_group=tp_group,
+        context_parallel_group=cp_group,
+        sampling_params=sampling_params,
+        chunk_size=2,
+    )
+    torch.testing.assert_close(prepared["policy_logprobs_at_sampler_topk"], actual)
+    with pytest.raises(ValueError, match="externally prepacked"):
+        prepare_packed_loss_input(
+            local,
+            {**data, "cu_seqlens": lengths},
+            loss_fn,
+            lengths,
+            padded,
+            vocab_parallel_rank=tp_rank,
+            vocab_parallel_group=tp_group,
+            context_parallel_group=cp_group,
+            chunk_size=2,
+        )
+    actual = prepared["policy_logprobs_at_sampler_topk"]
+    if sampling_params is None:
+        expected = full[:, :-1].log_softmax(-1).gather(-1, ids[:, 1:])
+    else:
+        expected = _sampler_support_reference(full[:, :-1], head_ids[:, 1:])
+    mask = torch.zeros_like(expected, dtype=torch.bool)
+    mask[0, :4] = True
+    mask[1, :6] = True
+    assert torch.isneginf(expected[mask]).any() == (sampling_params is not None)
+    torch.testing.assert_close(
+        prepared["next_token_logprobs"].where(mask[..., 0], 0.0),
+        expected[..., 0].where(mask[..., 0], 0.0),
+    )
+    torch.testing.assert_close(
+        actual.where(mask, 0.0), expected.where(mask, 0.0), atol=1e-6, rtol=1e-5
+    )
+    mask &= torch.isfinite(expected)
+    (actual.where(mask, 0.0).sum() / cp_size).backward()
+    expected.where(mask, 0.0).sum().backward()
+    reference_grad = pack_rows(full.grad)
+    if tp_size == 2:
+        reference_grad = reference_grad[..., tp_rank * 6 : (tp_rank + 1) * 6]
+    torch.testing.assert_close(local.grad, reference_grad, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+@pytest.mark.parametrize("tp_size,cp_size", [(2, 1), (1, 2), (2, 2)])
+def test_score_centering_packed_tp_cp(
+    distributed_test_runner, tp_size, cp_size, filtered
+):
+    if torch.cuda.device_count() < tp_size * cp_size:
+        pytest.skip(f"Packed TP/CP gradient test requires {tp_size * cp_size} GPUs")
+    distributed_test_runner(
+        functools.partial(
+            _run_score_centering_packed_equivalence,
+            tp_size=tp_size,
+            cp_size=cp_size,
+            device="cuda",
+            sampling_params=_SCORE_CENTERING_FILTERS if filtered else None,
+        ),
+        world_size=tp_size * cp_size,
+    )
+
+
+def _run_score_centering_packed_gloo(rank, tp_size, cp_size, init_file, filtered):
+    """Exercise combined TP/CP collectives without requiring four GPU devices."""
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=tp_size * cp_size,
+        timeout=timedelta(seconds=120),
+    )
+    try:
+        _run_score_centering_packed_equivalence(
+            rank,
+            tp_size * cp_size,
+            tp_size,
+            cp_size,
+            device="cpu",
+            sampling_params=_SCORE_CENTERING_FILTERS if filtered else None,
+        )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+@pytest.mark.parametrize("tp_size,cp_size", [(2, 1), (1, 2), (2, 2)])
+def test_score_centering_packed_tp_cp_gloo(tmp_path, tp_size, cp_size, filtered):
+    """Retain combined TP=2/CP=2 value/gradient coverage on two-GPU CI runners."""
+    torch.multiprocessing.spawn(
+        _run_score_centering_packed_gloo,
+        args=(tp_size, cp_size, str(tmp_path / "gloo-init"), filtered),
+        nprocs=tp_size * cp_size,
+        join=True,
+    )
+
+
+def _sampler_support(batch_size, seq_len, vocab_size, k, generator=None):
+    """Distinct per-position support ids ``[B, S, k]``, ``-1`` where the sampler filtered."""
+    ids = torch.stack(
+        [
+            torch.randperm(vocab_size, generator=generator)[:k]
+            for _ in range(batch_size * seq_len)
+        ]
+    ).view(batch_size, seq_len, k)
+    filtered = torch.rand(batch_size, seq_len, k, generator=generator) < 0.3
+    filtered[..., 0] = False  # the likeliest id is always kept
+    return ids.masked_fill(filtered, -1)
+
+
+def _sampler_support_reference(logits, support):
+    """Log-softmax over each position's support ids, ``-inf`` at filtered slots."""
+    valid = support >= 0
+    z = (
+        logits.float()
+        .gather(-1, support.clamp(min=0))
+        .masked_fill(~valid, -float("inf"))
+    )
+    log_norm = z.logsumexp(-1, keepdim=True)
+    return z - torch.where(torch.isneginf(log_norm), 0.0, log_norm)
+
+
+@pytest.mark.parametrize("chunk_size", [None, 2])
+def test_sampler_support_logprob_matches_the_renormalized_support(chunk_size):
+    """Exact sampler replay: renormalize over the captured S_q, no vocab top-k."""
+    torch.manual_seed(0)
+    logits = torch.randn(2, 5, 11, dtype=torch.float64).float().requires_grad_(True)
+    support = _sampler_support(2, 5, 11, 4)
+    support[1, 4] = -1  # a position without support (e.g. padding) stays finite-free
+    actual = SamplerSupportLogprob.apply(logits, support, 0, None, chunk_size, False)
+    expected = _sampler_support_reference(logits, support)
+    torch.testing.assert_close(actual, expected)
+    assert torch.isneginf(actual[1, 4]).all() and not actual.isnan().any()
+
+    finite = torch.isfinite(expected)
+    weights = torch.randn(expected.shape)
+    grad = torch.autograd.grad(actual.where(finite, 0.0).mul(weights).sum(), logits)[0]
+    reference = torch.autograd.grad(
+        expected.where(finite, 0.0).mul(weights).sum(), logits
+    )[0]
+    torch.testing.assert_close(grad, reference)
+
+
+@pytest.mark.parametrize(
+    ("head", "sampled_in_head", "expected"),
+    [
+        # vLLM's small-batch top-k path keeps a tie the full head left out, and
+        # the sampler drew it: drop the position, don't raise.
+        ("full", False, False),
+        ("full", True, True),
+        # A head with a -inf slot holds every kept token: a miss is corruption.
+        ("filtered", False, None),
+        ("filtered", True, True),
+    ],
+)
+def test_check_sampler_support_drops_a_tie_left_out_of_a_full_head(
+    head, sampled_in_head, expected
+):
+    ids = torch.tensor([[[0, 1, 2, 3], [4, 5, 6, 7]]])
+    # Position 1's head misses 5e-5 of the sampler's mass, under the 1e-4
+    # tolerance; the full head's last slot is a finite near-zero entry.
+    last = 5e-5 if head == "full" else 0.0
+    probs = torch.tensor([[[0.4, 0.3, 0.2, 0.1], [0.5, 0.3, 0.19995 - last, last]]])
+    input_ids = torch.tensor([[0, 5 if sampled_in_head else 8]])
+    args = (input_ids, ids, probs.log(), torch.ones(1, 2))
+    if expected is None:
+        with pytest.raises(ValueError, match="not in its captured sampler support"):
+            check_sampler_support(*args)
+        return
+    complete = check_sampler_support(*args)
+    assert complete.tolist() == [[True, expected]]
+
+
+def _run_sampler_support_tp_gloo(rank, world_size, init_file):
+    """TP=2: one all-reduce of the K gathered logits per chunk, nothing vocabulary-sized."""
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=120),
+    )
+    dist = torch.distributed
+    originals = {
+        name: getattr(dist, name)
+        for name in ("all_reduce", "all_gather", "all_to_all", "all_to_all_single")
+    }
+    calls = []
+
+    def spy(name):
+        def wrapped(*args, **kwargs):
+            calls.append((name, args[0].numel()))
+            return originals[name](*args, **kwargs)
+
+        return wrapped
+
+    for name in originals:
+        setattr(dist, name, spy(name))
+    try:
+        batch_size, seq_len, vocab_size, k = 2, 6, 16, 4
+        local_vocab = vocab_size // world_size
+        generator = torch.Generator().manual_seed(3)
+        full = torch.randn(batch_size, seq_len, vocab_size, generator=generator)
+        full = full.to(torch.bfloat16).requires_grad_(True)
+        support = _sampler_support(batch_size, seq_len, vocab_size, k, generator)
+        local = full.detach()[..., rank * local_vocab : (rank + 1) * local_vocab]
+        local = local.clone().requires_grad_(True)
+        actual = SamplerSupportLogprob.apply(
+            local, support, rank * local_vocab, dist.group.WORLD, 4, False
+        )
+        assert [name for name, _ in calls] == ["all_reduce"] * 2, calls
+        assert all(numel <= batch_size * 4 * k for _, numel in calls), calls
+
+        expected = _sampler_support_reference(full, support)
+        torch.testing.assert_close(actual, expected.detach())
+        finite = torch.isfinite(expected)
+        actual.where(finite, 0.0).sum().backward()
+        expected.where(finite, 0.0).sum().backward()
+        torch.testing.assert_close(
+            local.grad,
+            full.grad[..., rank * local_vocab : (rank + 1) * local_vocab],
+        )
+        assert [name for name, _ in calls] == ["all_reduce"] * 2, calls
+    finally:
+        for name, fn in originals.items():
+            setattr(dist, name, fn)
+        torch.distributed.destroy_process_group()
+
+
+def test_sampler_support_logprob_tp_gloo(tmp_path):
+    torch.multiprocessing.spawn(
+        _run_sampler_support_tp_gloo,
+        args=(2, str(tmp_path / "gloo-init")),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _score_centering_packed_inputs():
+    torch.manual_seed(13)
+    full = torch.randn(2, 8, 12, requires_grad=True)
+    ids = torch.randint(0, 12, (2, 8, 3))
+    packed = torch.cat(
+        [
+            torch.cat([full[i : i + 1, :n], full.new_zeros(1, p - n, 12)], dim=1)
+            for i, (n, p) in enumerate([(5, 8), (7, 12)])
+        ],
+        dim=1,
+    )
+    data = {
+        "input_ids": ids[..., 0],
+        "sampler_topk_token_ids": ids,
+        "sampler_topk_logprobs": torch.zeros_like(ids, dtype=torch.float32),
+    }
+    return full, ids, packed * 1.0, data  # non-leaf logits, as in training
+
+
+@pytest.fixture
+def single_rank_gloo_group(tmp_path):
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'init'}", rank=0, world_size=1
+    )
+    yield torch.distributed.group.WORLD
+    torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "reuse,chunk_size", [(False, 2), (True, 2), (True, None)], ids=str
+)
+def test_packed_logits_reuse_follows_the_flag_and_chunking(
+    single_rank_gloo_group, monkeypatch, reuse, chunk_size
+):
+    """The chunked logprob reuses the logits' storage only when asked and chunked."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.loss import loss_input as loss_input_module
+    from nemo_rl.algorithms.loss.interfaces import LossInputType
+
+    seen = []
+    original = loss_input_module.from_parallel_logits_to_logprobs_packed_sequences
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["reuse_logits_storage"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        loss_input_module, "from_parallel_logits_to_logprobs_packed_sequences", spy
+    )
+    _, _, logits, data = _score_centering_packed_inputs()
+    loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=False)
+    loss_input_module.prepare_packed_loss_input(
+        logits,
+        data,
+        loss_fn,
+        (0, 5, 12),
+        (0, 8, 20),
+        vocab_parallel_rank=0,
+        vocab_parallel_group=single_rank_gloo_group,
+        chunk_size=chunk_size,
+        reuse_logits_storage=reuse,
+    )
+    assert seen == [reuse and chunk_size is not None]
+
+
+def test_score_centering_chunked_grad_with_activation_logits(single_rank_gloo_group):
+    """Both consumers of the packed logits get their grad from the original values."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.loss.interfaces import LossInputType
+    from nemo_rl.algorithms.loss.loss_input import prepare_packed_loss_input
+
+    full, ids, logits, data = _score_centering_packed_inputs()
+    loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=True)
+    prepared, _ = prepare_packed_loss_input(
+        logits,
+        data,
+        loss_fn,
+        (0, 5, 12),
+        (0, 8, 20),
+        vocab_parallel_rank=0,
+        vocab_parallel_group=single_rank_gloo_group,
+        chunk_size=2,
+    )
+    mask = torch.zeros(2, 7, 1)
+    mask[0, :4] = 1
+    mask[1, :6] = 1
+    actual = (prepared["policy_logprobs_at_sampler_topk"] * mask).sum()
+    actual = actual + (prepared["next_token_logprobs"] * mask[..., 0]).sum()
+    actual.backward()
+
+    ref = full.detach().double().requires_grad_(True)
+    log_p = ref[:, :-1].log_softmax(-1)
+    expected = (log_p.gather(-1, ids[:, 1:]) * mask).sum()
+    expected = expected + (log_p.gather(-1, ids[:, 1:, :1]) * mask).sum()
+    expected.backward()
+    torch.testing.assert_close(full.grad, ref.grad.float(), atol=1e-6, rtol=1e-5)

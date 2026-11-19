@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,12 +13,13 @@
 # limitations under the License.
 
 
+from pathlib import Path
 from typing import Any, Callable
 
 import pytest
 import torch
 from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
@@ -31,7 +32,9 @@ from nemo_rl.data.llm_message_utils import (
     get_formatted_message_log,
     get_keys_from_message_log,
     message_log_to_flat_messages,
+    validate_precomputed_loss_masks,
 )
+from nemo_rl.data.multimodal_utils import PackedTensor
 
 
 @pytest.fixture
@@ -639,6 +642,175 @@ def test_formatted_message_log_empty_message():
             )
 
 
+def test_formatted_message_log_preapplied_template_for_text_parts() -> None:
+    class RawTokenizer:
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            assert not add_special_tokens
+            return [ord(character) for character in text]
+
+    result = get_formatted_message_log(
+        [
+            {"role": "user", "content": "ab"},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "cd"}],
+            },
+        ],
+        RawTokenizer(),  # type: ignore[arg-type]
+        TaskDataSpec(task_name="test"),
+        chat_template_preapplied=True,
+    )
+
+    assert [message["content"] for message in result] == ["ab", "cd"]
+    assert torch.equal(result[0]["token_ids"], torch.tensor([97, 98]))
+    assert torch.equal(result[1]["token_ids"], torch.tensor([99, 100]))
+
+
+@pytest.fixture(scope="module")
+def preapplied_tokenizer() -> PreTrainedTokenizerBase:
+    return AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+
+
+@pytest.mark.parametrize(
+    "turns",
+    [
+        ["A: ", "Paris"],
+        ["Q: France?\nA: ", "Paris\n", "Q: Spain?\nA: ", "Madrid\n"],
+        ["\n  ", "  \n", "xx \n", "a"],
+    ],
+)
+def test_preapplied_template_preserves_turn_tokens_and_loss(
+    preapplied_tokenizer: PreTrainedTokenizerBase, turns: list[str]
+) -> None:
+    messages = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": turn}
+        for i, turn in enumerate(turns)
+    ]
+    result = get_formatted_message_log(
+        messages,
+        preapplied_tokenizer,
+        TaskDataSpec(),
+        chat_template_preapplied=True,
+    )
+    assert [message["content"] for message in result] == turns
+    assert all("token_ids" not in message for message in messages)
+    for message, turn in zip(result, turns, strict=True):
+        assert message["token_ids"].tolist() == preapplied_tokenizer.encode(
+            turn, add_special_tokens=False
+        )
+        assert preapplied_tokenizer.decode(message["token_ids"]) == turn
+    add_loss_mask_to_message_log([result], roles_to_train_on=["assistant"])
+    for message in result:
+        mask = message["token_loss_mask"]
+        assert mask.numel() > 0
+        assert torch.all(mask == (1 if message["role"] == "assistant" else 0))
+
+
+@pytest.mark.parametrize("content", ["", []])
+def test_preapplied_template_empty_turn_uses_integer_tokens(
+    preapplied_tokenizer: PreTrainedTokenizerBase, content: Any
+) -> None:
+    result = get_formatted_message_log(
+        [{"role": "assistant", "content": content}],
+        preapplied_tokenizer,
+        TaskDataSpec(),
+        chat_template_preapplied=True,
+    )
+    assert result[0]["content"] == ""
+    assert result[0]["token_ids"].numel() == 0
+    assert result[0]["token_ids"].dtype == torch.long
+    assert (
+        get_formatted_message_log(
+            [], preapplied_tokenizer, TaskDataSpec(), chat_template_preapplied=True
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        None,
+        42,
+        [{"type": "image", "image": None}],
+        [{"type": "audio"}],
+        [{"type": "video"}],
+        ["text"],
+        {"type": "text", "text": "answer"},
+    ],
+)
+def test_preapplied_template_rejects_non_text(
+    preapplied_tokenizer: PreTrainedTokenizerBase, content: Any
+) -> None:
+    with pytest.raises(ValueError, match="text-only"):
+        get_formatted_message_log(
+            [{"role": "user", "content": content}],
+            preapplied_tokenizer,
+            TaskDataSpec(),
+            chat_template_preapplied=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"add_generation_prompt": True}, "add_generation_prompt"),
+        ({"tools": []}, "tools"),
+    ],
+)
+def test_preapplied_template_rejects_template_options(
+    preapplied_tokenizer: PreTrainedTokenizerBase, kwargs: dict[str, Any], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        get_formatted_message_log(
+            [{"role": "user", "content": "A: "}],
+            preapplied_tokenizer,
+            TaskDataSpec(),
+            chat_template_preapplied=True,
+            **kwargs,
+        )
+
+
+def test_preapplied_template_rejects_task_prompt(
+    preapplied_tokenizer: PreTrainedTokenizerBase, tmp_path: Path
+) -> None:
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Question: {}")
+    with pytest.raises(ValueError, match="task_data_spec prompt"):
+        get_formatted_message_log(
+            [{"role": "user", "content": "A: "}],
+            preapplied_tokenizer,
+            TaskDataSpec(prompt_file=prompt),
+            chat_template_preapplied=True,
+        )
+
+
+def test_preapplied_template_preserves_special_tokens(
+    preapplied_tokenizer: PreTrainedTokenizerBase,
+) -> None:
+    turns = [
+        "<|im_start|>user\nA: <|im_end|>\n",
+        "<|im_start|>assistant\nParis<|im_end|>\n",
+    ]
+    messages = [
+        {"role": role, "content": turn}
+        for role, turn in zip(["user", "assistant"], turns, strict=True)
+    ]
+    for add_bos_eos in [False, True]:
+        result = get_formatted_message_log(
+            messages,
+            preapplied_tokenizer,
+            TaskDataSpec(),
+            add_bos_token=add_bos_eos,
+            add_eos_token=add_bos_eos,
+            chat_template_preapplied=True,
+        )
+        assert [m["token_ids"].tolist() for m in result] == [
+            preapplied_tokenizer.encode(turn, add_special_tokens=False)
+            for turn in turns
+        ]
+
+
 def test_add_loss_mask_to_chat_message_log(
     tokenized_chat_message_log: list[LLMMessageLogType],
 ):
@@ -689,6 +861,51 @@ def test_add_loss_mask_to_chat_message_log(
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.bool, torch.int64, torch.float32])
+def test_validate_precomputed_loss_masks_preserves_messages(dtype: torch.dtype) -> None:
+    message_logs = [
+        [
+            {
+                "token_ids": torch.tensor([1, 2]),
+                "token_loss_mask": torch.tensor([1, 0], dtype=dtype),
+            },
+            {
+                "token_ids": torch.empty(0, dtype=torch.long),
+                "token_loss_mask": torch.empty(0, dtype=dtype),
+            },
+        ],
+        [
+            {
+                "token_ids": torch.tensor([3]),
+                "token_loss_mask": torch.tensor([0], dtype=dtype),
+            }
+        ],
+    ]
+    originals = [
+        {key: value.clone() for key, value in message.items()}
+        for log in message_logs
+        for message in log
+    ]
+
+    validate_precomputed_loss_masks(message_logs)
+
+    for message, original in zip(
+        (message for log in message_logs for message in log), originals
+    ):
+        for key, value in original.items():
+            assert torch.equal(message[key], value)
+
+
+def test_validate_precomputed_loss_masks_checks_later_conversations() -> None:
+    message_logs = [
+        [{"token_ids": torch.tensor([1]), "token_loss_mask": torch.tensor([1])}],
+        [{"token_ids": torch.tensor([2]), "token_loss_mask": torch.tensor([0.5])}],
+    ]
+
+    with pytest.raises(ValueError, match="binary vectors"):
+        validate_precomputed_loss_masks(message_logs)
+
+
 def test_get_first_index_that_differs():
     assert get_first_index_that_differs("hello", "hello") == 5
     assert get_first_index_that_differs("hello", "hello world") == 5
@@ -721,6 +938,34 @@ def test_message_log_to_flat_messages_with_packed_images() -> None:
     assert isinstance(flat["images"], PackedTensor)
     assert tuple(flat["images"].as_tensor().shape) == (5, 3, 8, 8)
     assert torch.equal(flat["token_ids"], torch.tensor([1, 2, 3]))
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_flatten_rejects_mixed_packed_and_raw_media_values(batched: bool) -> None:
+    packed_log = [
+        {
+            "role": "user",
+            "content": "packed",
+            "token_ids": torch.tensor([1]),
+            "pixel_values": PackedTensor(torch.ones(1, 2), dim_to_pack=0),
+        }
+    ]
+    raw_log = [
+        {
+            "role": "user",
+            "content": "raw",
+            "token_ids": torch.tensor([2]),
+            "pixel_values": torch.ones(1, 2),
+        }
+    ]
+
+    with pytest.raises(TypeError, match="also contains non-packed values"):
+        if batched:
+            batched_message_log_to_flat_message(
+                [packed_log, raw_log], pad_value_dict={"token_ids": 0}
+            )
+        else:
+            message_log_to_flat_messages(packed_log + raw_log)
 
 
 def test_batched_message_log_to_flat_message_with_packed_images() -> None:
@@ -770,6 +1015,39 @@ def test_batched_message_log_to_flat_message_with_packed_images() -> None:
     # total packed along dim 0 = 1 + (2 + 1) = 4
     assert tuple(batched["images"].as_tensor().shape) == (4, 3, 4, 4)
     assert torch.equal(input_lengths, torch.tensor([4, 5], dtype=torch.int32))
+
+
+def test_batched_message_log_rejects_mixed_multiturn_media() -> None:
+    compact_image = PackedTensor(
+        torch.randn(1, 3, 4, 4), dim_to_pack=0
+    ).enable_deduplication()
+    batch_logs: list[LLMMessageLogType] = [
+        [
+            {
+                "role": "user",
+                "token_ids": torch.tensor([1]),
+                "images": compact_image,
+            }
+        ],
+        [
+            {
+                "role": "user",
+                "token_ids": torch.tensor([2]),
+                "images": PackedTensor(torch.randn(1, 3, 4, 4), dim_to_pack=0),
+            },
+            {
+                "role": "user",
+                "token_ids": torch.tensor([3]),
+                "images": PackedTensor(torch.randn(1, 3, 4, 4), dim_to_pack=0),
+            },
+        ],
+    ]
+
+    with pytest.raises(
+        AssertionError,
+        match="flattened_concat requires one logical row per input",
+    ):
+        batched_message_log_to_flat_message(batch_logs, pad_value_dict={"token_ids": 0})
 
 
 @pytest.mark.parametrize("image_first", [True, False])
@@ -920,6 +1198,53 @@ def test_get_formatted_message_log_debug_off_by_default(
 
     captured = capsys.readouterr()
     assert "DEBUG: Individual message turns" not in captured.out
+
+
+@pytest.mark.parametrize("visual_first", [False, True])
+def test_batched_flatten_aligns_nested_sparse_multimodal_rows(visual_first):
+    media = PackedTensor(torch.ones(1, 3, 2, 2), dim_to_pack=0).enable_deduplication()
+    visual_log = [
+        {
+            "role": "user",
+            "content": "look",
+            "token_ids": torch.tensor([1]),
+            "pixel_values": media,
+        },
+        {
+            "role": "assistant",
+            "content": "seen",
+            "token_ids": torch.tensor([2]),
+        },
+    ]
+    text_log = [
+        {
+            "role": "user",
+            "content": "text only",
+            "token_ids": torch.tensor([3]),
+        },
+        {
+            "role": "assistant",
+            "content": "answer",
+            "token_ids": torch.tensor([4]),
+        },
+    ]
+    message_logs = [visual_log, text_log] if visual_first else [text_log, visual_log]
+
+    flat, _ = batched_message_log_to_flat_message(
+        message_logs, pad_value_dict={"token_ids": 0}
+    )
+    packed = flat["pixel_values"]
+
+    assert isinstance(packed, PackedTensor)
+    assert len(packed) == 2
+    assert packed.logical_segment_counts_by_row() == (
+        [1, 0] if visual_first else [0, 1]
+    )
+    assert len(packed.tensors) == 1
+    torch.testing.assert_close(
+        flat.get_multimodal_dict(as_tensors=True)["pixel_values"],
+        torch.ones(1, 3, 2, 2),
+    )
 
 
 def test_get_formatted_message_log_debug_enabled(

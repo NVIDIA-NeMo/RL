@@ -16,6 +16,7 @@ grpo:
   async_grpo:
     enabled: false
     max_trajectory_age_steps: 1
+    max_generation_failures: 0
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -53,7 +54,7 @@ policy:
   max_total_sequence_length: 512
   precision: "bfloat16"
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
@@ -80,13 +81,33 @@ policy:
   # this is useful for sequence parallel training
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
 
-  optimizer: null # remove default FSDP optimizer
+  optimizer: null # remove default Automodel optimizer
 
   megatron_cfg:
     enabled: true
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
+    # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
+    cuda_graph_impl: "none"
+    cuda_graph_modules: []
+    cuda_graph_warmup_steps: 3
+    # Offload specific module activations to CPU. Works for both dense and MoE
+    # models and requires transformer_engine. Different from optimizer_cpu_offload,
+    # which offloads optimizer states. On TE >= 2.10,
+    # also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+    fine_grained_activation_offloading: false
+    # Modules to offload when fine_grained_activation_offloading is true.
+    # Common examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"].
+    # Supported names depend on the pinned Megatron-LM version and are
+    # validated by MCore. "attn_proj" requires "core_attn". See the latest
+    # upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: null
     # recompute_granularity controls activation checkpointing depth.
     # "full": recompute all activations (default, max memory savings).
     # "selective": recompute only specific modules (see recompute_modules).
@@ -116,6 +137,9 @@ policy:
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
 
@@ -131,6 +155,7 @@ policy:
       lora_B_init_method: "zero"
       a2a_experimental: false
       lora_dtype: null
+      restore_from: null  # Warm start: path to a native Megatron PEFT checkpoint (iter_XXXXXXX dir or its root) to initialize this run's LoRA weights from, e.g. a previous SFT run
     
     optimizer:
       optimizer: "adam"

@@ -26,14 +26,19 @@ loop in one object, injected into both pumps:
   - ``is_on_policy`` / ``required_buffer_capacity`` (derived facts): what the
     weight-sync and capacity-validation paths need *without* re-reading raw
     knobs, so those consumers can't drift out of sync with the sampler.
+  - drop accounting (``charge_step_for_lost_group`` plus the
+    ``uses_pooled_replacements`` / ``closes_short_at_exhaustion`` /
+    ``requires_shortfall_reconciliation`` flags): what losing a prompt group for
+    good costs under this policy, i.e. which step it is charged to and whether a
+    spare pool replaces it.
 
 ``PromptGroupSampler`` is the interface; ``WindowedSampler`` /
-``WeightFifoSampler`` / ``InOrderSampler`` are the built-in policies, one per
-behavior, each owning only the args that apply to it.  ``create_sampler`` builds
-one from a discriminated-union config (or a ``module:ClassName`` FQN for a
-policy defined outside this repo) — the config's ``name`` is the single source
-of truth for which behavior runs, so there are no cross-field knob combinations
-to validate.
+``ReadyFirstSampler`` / ``WeightFifoSampler`` / ``InOrderSampler`` are the
+built-in policies, one per behavior, each owning only the args that apply to it.
+``create_sampler`` builds one from a discriminated-union config (or a
+``module:ClassName`` FQN for a policy defined outside this repo) — the config's
+``name`` is the single source of truth for which behavior runs, so there are no
+cross-field knob combinations to validate.
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ import importlib
 from typing import (
     Annotated,
     Callable,
+    ClassVar,
     Literal,
     Optional,
     Protocol,
@@ -51,10 +57,14 @@ from typing import (
     runtime_checkable,
 )
 
-from pydantic import BaseModel, Field, NonNegativeInt
+from pydantic import BaseModel, Field, NonNegativeInt, model_validator
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneMutationCut,
+    TQReplayBuffer,
+)
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 
 # Poll interval for the rollout-pump admission gate.
 _GATE_POLL_SECONDS = 0.005
@@ -66,6 +76,11 @@ class PromptGroupSampler(Protocol):
 
     Implement this (or subclass ``BaseSampler``) to add a custom sampling
     algorithm; point ``async_rl.sampler`` at ``module:ClassName`` to load it.
+    A custom sampler that supports replay recovery must explicitly declare
+    ``supports_buffer_checkpoint = True``. It must additionally declare
+    ``supports_training_claims = True`` before periodic rollout snapshots may
+    be enabled; omitting that optional capability preserves the legacy
+    remove-on-selection behavior.
     """
 
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
@@ -87,12 +102,49 @@ class PromptGroupSampler(Protocol):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        group_multiple: int = 1,
+        min_remaining_groups: int = 0,
     ) -> tuple[Optional[KVBatchMeta], int]:
-        """Pick up to ``max_prompt_groups`` eligible groups; drop them locally."""
+        """Pick up to ``max_prompt_groups`` eligible groups for training.
+
+        Claim-aware samplers transfer the groups from ordinary replay-buffer
+        selection into training ownership until the controller releases them.
+        Legacy custom samplers may still remove selected groups immediately.
+
+        Args:
+            current_train_weight: Trainer version used by the staleness policy.
+            min_prompt_groups: Minimum groups needed to return a selection.
+            max_prompt_groups: Maximum selection size. For chunked training,
+                this is the groups remaining in the current batch, or
+                ``async_rl.max_groups_for_streaming_train`` when that is lower.
+            group_multiple: Align the capped selection to this many complete
+                groups, leaving any unaligned ready groups unclaimed.
+            min_remaining_groups: Defer a nonfinal selection if it would leave
+                fewer than this many groups in ``max_prompt_groups``. Under a
+                chunk cap that window is the capped chunk rather than the step,
+                so a floor close to the cap defers until the chunk can fill. A
+                complete
+                aligned remainder may be selected even when below this floor,
+                provided it meets ``min_prompt_groups``. Zero preserves greedy
+                selection. Custom streaming PPO samplers must honor this bound.
+
+        Returns:
+            Selected metadata and group count, or ``(None, 0)`` when the
+            eligible groups do not satisfy the selection bounds.
+        """
         ...
 
     async def evict(self, *, current_train_weight: int) -> int:
         """Drop groups that can no longer be selected; clear their DP rows."""
+        ...
+
+    def should_abort_inflight(
+        self,
+        *,
+        start_weight_version: int,
+        current_train_weight: int,
+    ) -> bool:
+        """Return whether an unfinished rollout can no longer be selected."""
         ...
 
     @property
@@ -100,8 +152,61 @@ class PromptGroupSampler(Protocol):
         """True when the policy admits zero staleness (sync mode)."""
         ...
 
+    supports_buffer_checkpoint: ClassVar[bool]
+    """Whether completed buffered groups can be restored safely."""
+
+    supports_training_claims: ClassVar[bool]
+    """Whether selected groups remain owned until the train step commits."""
+
+    uses_pooled_replacements: ClassVar[bool]
+    """Whether dropped groups are replaced from a dedicated spare pool."""
+
+    closes_short_at_exhaustion: ClassVar[bool]
+    """Whether the last step may close on the groups left once the data runs out."""
+
+    requires_shortfall_reconciliation: ClassVar[bool]
+    """Whether a loss charged during an awaited selection must be reconciled.
+
+    True for policies that charge against the assembling cursor (it can move while
+    selection awaits its claim); False for policies that stamp a fixed target step.
+    """
+
+    def charge_step_for_lost_group(
+        self, *, target_step: Optional[int], assembling_version: int
+    ) -> Optional[int]:
+        """Return the step a permanently lost group is charged to, or None."""
+        ...
+
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         """Buffer-capacity the policy needs, or ``None`` if unconstrained."""
+        ...
+
+    @property
+    def dispatch_index(self) -> int:
+        """Last admitted dispatch batch index."""
+        ...
+
+    def set_dispatch_index(self, resume_from_trainer_version: int) -> None:
+        """Seed the cursor for checkpoints that predate exact sampler state."""
+        ...
+
+    def restore_dispatch_index(self, dispatch_index: int) -> None:
+        """Restore the exact dispatch cursor from controller state."""
+        ...
+
+
+@runtime_checkable
+class TransactionalAdmissionSampler(Protocol):
+    """Sampler whose blocking wait is separate from its cursor mutation."""
+
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None:
+        """Wait until one admission can commit without mutating sampler state."""
+        ...
+
+    def commit_admission(self, cut: DataPlaneMutationCut) -> Optional[int]:
+        """Advance the cursor under a live data-plane mutation cut."""
         ...
 
 
@@ -113,11 +218,70 @@ class BaseSampler(abc.ABC):
     select-finalize / weight-window-evict helpers.
     """
 
+    supports_buffer_checkpoint: ClassVar[bool] = False
+    supports_training_claims: ClassVar[bool] = True
+
+    # Drop-accounting defaults, right for a gated sampler that does not stamp.
+    uses_pooled_replacements: ClassVar[bool] = True
+    closes_short_at_exhaustion: ClassVar[bool] = False
+
+    # Streaming/gated policies charge against the moving assembling cursor, so a loss
+    # that raced an awaited selection is reconciled once the result is known.
+    requires_shortfall_reconciliation: ClassVar[bool] = True
+
     def __init__(self, buffer: TQReplayBuffer) -> None:
         self._buffer = buffer
         # Pre-incremented before each admitted batch, so -1 lets the first
         # batch through a zero-staleness gate.
         self._dispatch_index: int = -1
+
+    def charge_step_for_lost_group(
+        self, *, target_step: Optional[int], assembling_version: int
+    ) -> Optional[int]:
+        """Charge the group's own step, or the one being assembled if it has none."""
+        return assembling_version if target_step is None else target_step
+
+    @property
+    def dispatch_index(self) -> int:
+        """Return the last admitted dispatch batch index."""
+        return self._dispatch_index
+
+    def set_dispatch_index(self, resume_from_trainer_version: int) -> None:
+        """Seed the cursor for checkpoints that predate exact sampler state.
+
+        Args:
+            resume_from_trainer_version: Trainer version from which the run
+                resumes. The next admitted batch receives that version.
+        """
+        if resume_from_trainer_version < 0:
+            raise ValueError(
+                "resume_from_trainer_version must be non-negative, got "
+                f"{resume_from_trainer_version}"
+            )
+        self._dispatch_index = resume_from_trainer_version - 1
+
+    def restore_dispatch_index(self, dispatch_index: int) -> None:
+        """Restore the exact dispatch cursor.
+
+        Args:
+            dispatch_index: Last admitted batch index, or ``-1`` when no batch
+                has been admitted. Call before the first ``admit``.
+        """
+        if dispatch_index < -1:
+            raise ValueError(
+                f"dispatch_index must be at least -1, got {dispatch_index}"
+            )
+        self._dispatch_index = dispatch_index
+
+    @property
+    @abc.abstractmethod
+    def requires_single_weight_batch(self) -> bool:
+        """Whether selection needs a complete batch from one weight version.
+
+        Concrete policies declare a boolean class attribute so setup can reject
+        incompatible drop policies before constructing the sampler.
+        """
+        ...
 
     # ── rollout-pump side ────────────────────────────────────────────────
     @abc.abstractmethod
@@ -133,6 +297,8 @@ class BaseSampler(abc.ABC):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        group_multiple: int = 1,
+        min_remaining_groups: int = 0,
     ) -> tuple[Optional[KVBatchMeta], int]: ...
 
     async def evict(self, *, current_train_weight: int) -> int:
@@ -154,9 +320,22 @@ class BaseSampler(abc.ABC):
         return await self._buffer.remove(stale_idxs, remove_in_dp=True)
 
     # ── derived facts ────────────────────────────────────────────────────
+    def should_abort_inflight(
+        self,
+        *,
+        start_weight_version: int,
+        current_train_weight: int,
+    ) -> bool:
+        return False
+
     @property
     def is_on_policy(self) -> bool:
         return self._eviction_window() == 0
+
+    @property
+    def eviction_window(self) -> int:
+        """Weight versions a group stays trainable for; older groups are evicted."""
+        return self._eviction_window()
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
@@ -167,7 +346,16 @@ class BaseSampler(abc.ABC):
         return 0
 
     @staticmethod
-    def _validate_group_bounds(min_prompt_groups: int, max_prompt_groups: int) -> None:
+    def _validate_group_bounds(
+        min_prompt_groups: int,
+        max_prompt_groups: int,
+        *,
+        min_remaining_groups: int = 0,
+    ) -> None:
+        if min_remaining_groups < 0:
+            raise ValueError(
+                f"min_remaining_groups must be >= 0, got {min_remaining_groups}"
+            )
         if min_prompt_groups < 1:
             raise ValueError(f"min_prompt_groups must be >= 1, got {min_prompt_groups}")
         if max_prompt_groups < min_prompt_groups:
@@ -181,23 +369,50 @@ class BaseSampler(abc.ABC):
         valid_idxs: list[int],
         min_prompt_groups: int,
         max_prompt_groups: int,
+        *,
+        group_multiple: int = 1,
+        min_remaining_groups: int = 0,
     ) -> tuple[Optional[KVBatchMeta], int]:
-        """Cap, drop from the buffer, and concat the chosen groups.
+        """Cap, align, and claim the selected groups for training.
 
-        Greedy without waiting: returns all currently-eligible groups up to
-        ``max_prompt_groups`` (never fewer on purpose, never waits to fill it),
-        or ``(None, 0)`` below ``min_prompt_groups``.
+        Returns the largest aligned selection up to ``max_prompt_groups``,
+        or ``(None, 0)`` below ``min_prompt_groups``. Unaligned tail groups
+        stay unclaimed, preserving their rows and readiness for a later chunk.
+        A selection leaving a nonzero tail below ``min_remaining_groups`` is
+        also deferred before any groups are claimed.
         """
-        if len(valid_idxs) < min_prompt_groups:
-            return None, 0
+        if group_multiple < 1:
+            raise ValueError(f"group_multiple must be >= 1, got {group_multiple}")
+        if min_remaining_groups and max_prompt_groups % group_multiple:
+            # A dropped rollout can shrink the current target after setup.
+            # Waiting cannot produce an aligned flush of this remainder.
+            raise ValueError(
+                "Tail-aware selection requires max_prompt_groups "
+                f"({max_prompt_groups}) to be a multiple of {group_multiple}"
+            )
+        if max_prompt_groups // group_multiple * group_multiple < min_prompt_groups:
+            raise ValueError(
+                f"No multiple of {group_multiple} fits selection bounds "
+                f"[{min_prompt_groups}, {max_prompt_groups}]"
+            )
         requested_groups = min(len(valid_idxs), max_prompt_groups)
+        requested_groups -= requested_groups % group_multiple
+        if requested_groups < min_prompt_groups:
+            return None, 0
+        remaining_groups = max_prompt_groups - requested_groups
+        if 0 < remaining_groups < min_remaining_groups:
+            return None, 0
         selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
-        await self._buffer.remove(selected_idxs, remove_in_dp=False)
-        return (
-            selected_metas[0].concat(*selected_metas[1:]),  # type: ignore
-            len(selected_idxs),
-        )
+        selected_rollout_metrics = [
+            metrics
+            for meta in selected_metas
+            for metrics in meta.extra_info.get(ROLLOUT_METRICS, [])  # type: ignore[union-attr]
+        ]
+        selected_meta = selected_metas[0].concat(*selected_metas[1:])  # type: ignore[union-attr]
+        selected_meta.extra_info[ROLLOUT_METRICS] = selected_rollout_metrics
+        await self._buffer.claim_for_training(selected_idxs)
+        return selected_meta, len(selected_idxs)
 
 
 class WindowedSampler(BaseSampler):
@@ -209,12 +424,22 @@ class WindowedSampler(BaseSampler):
     freshest-first.
     """
 
+    # Ungated restored groups are ordinary in-window candidates.
+    supports_buffer_checkpoint: ClassVar[bool] = True
+    requires_single_weight_batch: ClassVar[bool] = False
+
+    # Rollout never stops producing, so a lost group is made up by later ones: no spare
+    # pool is needed, and only the tail of the data can leave a step short.
+    uses_pooled_replacements: ClassVar[bool] = False
+    closes_short_at_exhaustion: ClassVar[bool] = True
+
     def __init__(
         self,
         buffer: TQReplayBuffer,
         *,
         max_staleness_versions: int,
         sample_freshest_first: bool = False,
+        min_groups_for_streaming_train: Optional[int] = None,
     ) -> None:
         super().__init__(buffer)
         if max_staleness_versions < 0:
@@ -224,12 +449,46 @@ class WindowedSampler(BaseSampler):
             )
         self.max_staleness_versions = max_staleness_versions
         self.sample_freshest_first = sample_freshest_first
+        # Unordered: any full buffer is selectable, so the minimum capacity is the streaming floor.
+        self.min_groups_for_streaming_train = min_groups_for_streaming_train
 
     def _eviction_window(self) -> int:
         return self.max_staleness_versions
 
+    def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
+        return self.min_groups_for_streaming_train
+
+    def charge_step_for_lost_group(
+        self, *, target_step: Optional[int], assembling_version: int
+    ) -> Optional[int]:
+        """Charge nothing: a step takes any ready groups, so none of them is missing."""
+        return None
+
+    def should_abort_inflight(
+        self,
+        *,
+        start_weight_version: int,
+        current_train_weight: int,
+    ) -> bool:
+        min_valid_version = max(
+            0,
+            current_train_weight - self.max_staleness_versions,
+        )
+        return start_weight_version < min_valid_version
+
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None:
+        """Return immediately because buffer capacity is this policy's gate."""
+        del trainer_version_fn
+
+    def commit_admission(self, cut: DataPlaneMutationCut) -> Optional[int]:
+        """Return the unstamped admission result without changing a cursor."""
+        cut.require_live()
+        return None
+
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
-        # Over-sampled: dispatch is bounded by buffer capacity, not by version.
+        await self.wait_until_admissible(trainer_version_fn=trainer_version_fn)
         return None
 
     async def select(
@@ -238,8 +497,14 @@ class WindowedSampler(BaseSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        group_multiple: int = 1,
+        min_remaining_groups: int = 0,
     ) -> tuple[Optional[KVBatchMeta], int]:
-        self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
+        self._validate_group_bounds(
+            min_prompt_groups,
+            max_prompt_groups,
+            min_remaining_groups=min_remaining_groups,
+        )
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
         valid_idxs = [
             i
@@ -255,7 +520,11 @@ class WindowedSampler(BaseSampler):
                 )
             )
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            group_multiple=group_multiple,
+            min_remaining_groups=min_remaining_groups,
         )
 
 
@@ -277,6 +546,10 @@ class _GatedSampler(BaseSampler):
 
     def __init__(self, buffer: TQReplayBuffer, *, gate_window: int) -> None:
         super().__init__(buffer)
+        self._gate_window = 0
+        self.set_gate_window(gate_window)
+
+    def set_gate_window(self, gate_window: int) -> None:
         if gate_window < 0:
             raise ValueError(f"gate_window must be non-negative, got {gate_window}")
         self._gate_window = gate_window
@@ -291,14 +564,89 @@ class _GatedSampler(BaseSampler):
             gate_window=self._gate_window,
         )
 
-    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
-        while self._dispatch_index >= trainer_version_fn() + self._gate_window:
+    def can_admit(self, *, trainer_version: int) -> bool:
+        """Whether the gate permits admission without advancing the cursor."""
+        return self._dispatch_index < trainer_version + self._gate_window
+
+    async def wait_until_admissible(
+        self, *, trainer_version_fn: Callable[[], int]
+    ) -> None:
+        """Wait for the gate without advancing the durable dispatch cursor."""
+        while not self.can_admit(trainer_version=trainer_version_fn()):
             await asyncio.sleep(_GATE_POLL_SECONDS)
+
+    def commit_admission(self, cut: DataPlaneMutationCut) -> Optional[int]:
+        """Advance the cursor after the controller enters its mutation cut."""
+        cut.require_live()
+        return self._commit_admission()
+
+    def _commit_admission(self) -> Optional[int]:
+        """Advance admission for the legacy monolithic API."""
         self._dispatch_index += 1
         return self._stamp()
 
+    async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
+        await self.wait_until_admissible(trainer_version_fn=trainer_version_fn)
+        return self._commit_admission()
+
     def _stamp(self) -> Optional[int]:
         return None
+
+
+class ReadyFirstSampler(_GatedSampler):
+    """Gated admission with ready-first, mixed-version selection.
+
+    Admission limits generation to ``max_staleness_versions`` dispatch batches
+    ahead of the current trainer version. Selection remains ready-first across
+    weight versions instead of draining one version at a time: every ready
+    group generated by a policy version no newer than the trainer stays
+    selectable, including late stragglers outside the admission window, so no
+    rollout is ever discarded.
+    """
+
+    # Committed groups retain start_weight, which is sufficient for selection.
+    supports_buffer_checkpoint: ClassVar[bool] = True
+    requires_single_weight_batch: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        buffer: TQReplayBuffer,
+        *,
+        max_staleness_versions: int,
+    ) -> None:
+        super().__init__(buffer, gate_window=max_staleness_versions)
+        self.max_staleness_versions = max_staleness_versions
+
+    async def select(
+        self,
+        *,
+        current_train_weight: int,
+        min_prompt_groups: int,
+        max_prompt_groups: int,
+        group_multiple: int = 1,
+        min_remaining_groups: int = 0,
+    ) -> tuple[Optional[KVBatchMeta], int]:
+        self._validate_group_bounds(
+            min_prompt_groups,
+            max_prompt_groups,
+            min_remaining_groups=min_remaining_groups,
+        )
+        valid_idxs = [
+            i
+            for i, weight in enumerate(self._buffer.start_weight_list)
+            if weight <= current_train_weight and self._buffer.ready_list[i]
+        ]
+        return await self._finalize_selection(
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            group_multiple=group_multiple,
+            min_remaining_groups=min_remaining_groups,
+        )
+
+    async def evict(self, *, current_train_weight: int) -> int:
+        # Every already-admitted group remains selectable; nothing is stale.
+        return 0
 
 
 class WeightFifoSampler(_GatedSampler):
@@ -307,6 +655,16 @@ class WeightFifoSampler(_GatedSampler):
     ``select`` drains the oldest in-window ``start_weight`` first and waits for
     that weight's batch to fill. Evict uses the weight window (default).
     """
+
+    # Committed groups retain start_weight, which is sufficient for selection.
+    supports_buffer_checkpoint: ClassVar[bool] = True
+    requires_single_weight_batch: ClassVar[bool] = True
+    # A replacement is dispatched at whatever the weight version is once the original
+    # was given up on. Unless the trainer has not moved since, that is a newer version
+    # than the bucket the replacement is meant to fill, and select -- which waits on the
+    # oldest in-window bucket alone -- then waits on a bucket nothing can top up. A pool
+    # that only works when the timing happens to line up is not one worth having.
+    uses_pooled_replacements: ClassVar[bool] = False
 
     def __init__(self, buffer: TQReplayBuffer, *, max_staleness_versions: int) -> None:
         super().__init__(buffer, gate_window=max_staleness_versions)
@@ -318,8 +676,14 @@ class WeightFifoSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        group_multiple: int = 1,
+        min_remaining_groups: int = 0,
     ) -> tuple[Optional[KVBatchMeta], int]:
-        self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
+        self._validate_group_bounds(
+            min_prompt_groups,
+            max_prompt_groups,
+            min_remaining_groups=min_remaining_groups,
+        )
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
         in_window = [
             weight
@@ -335,7 +699,11 @@ class WeightFifoSampler(_GatedSampler):
             if weight == target_version and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            group_multiple=group_multiple,
+            min_remaining_groups=min_remaining_groups,
         )
 
 
@@ -347,11 +715,50 @@ class InOrderSampler(_GatedSampler):
     (the staleness window is not used for selection). ``evict`` is keyed on
     ``target_step`` — not the start weight — so a slot whose target step is still
     upcoming is never dropped early, and evict/select can't disagree.
+
+    warmup_lookahead_versions widens the gate while the PPO policy is frozen, so more
+    batches stay in flight during critic warmup. The driver retunes the window every
+    step and shrinks it back to max_lookahead_versions once the policy starts training,
+    so the widened lookahead does not turn into permanent extra staleness. Buffer
+    capacity is sized for the peak of the two.
     """
 
-    def __init__(self, buffer: TQReplayBuffer, *, max_lookahead_versions: int) -> None:
+    # Committed groups retain target_step, which is sufficient for selection.
+    # The controller checkpoints the exact dispatch cursor separately.
+    supports_buffer_checkpoint: ClassVar[bool] = True
+    requires_single_weight_batch: ClassVar[bool] = False
+
+    uses_pooled_replacements: ClassVar[bool] = True
+    closes_short_at_exhaustion: ClassVar[bool] = False
+
+    # in_order stamps each group's fixed target step, so a loss needs no reconciliation.
+    requires_shortfall_reconciliation: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        buffer: TQReplayBuffer,
+        *,
+        max_lookahead_versions: int,
+        warmup_lookahead_versions: Optional[int] = None,
+    ) -> None:
         super().__init__(buffer, gate_window=max_lookahead_versions)
         self.max_lookahead_versions = max_lookahead_versions
+        self.warmup_lookahead_versions = warmup_lookahead_versions
+
+    def charge_step_for_lost_group(
+        self, *, target_step: Optional[int], assembling_version: int
+    ) -> Optional[int]:
+        """Charge the group's own step: each batch is trained as exactly one step."""
+        return target_step
+
+    def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
+        # Sized for the peak window: otherwise the buffer, not the gate, bounds
+        # the lookahead and widening it during warmup does nothing.
+        if self.warmup_lookahead_versions is None:
+            peak = self.max_lookahead_versions
+        else:
+            peak = self.warmup_lookahead_versions
+        return _gated_required_buffer_capacity(groups_per_step, gate_window=peak)
 
     def _stamp(self) -> Optional[int]:
         return self._dispatch_index
@@ -362,15 +769,25 @@ class InOrderSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        group_multiple: int = 1,
+        min_remaining_groups: int = 0,
     ) -> tuple[Optional[KVBatchMeta], int]:
-        self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
+        self._validate_group_bounds(
+            min_prompt_groups,
+            max_prompt_groups,
+            min_remaining_groups=min_remaining_groups,
+        )
         valid_idxs = [
             i
             for i, target in enumerate(self._buffer.target_step_list)
             if target == current_train_weight and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            group_multiple=group_multiple,
+            min_remaining_groups=min_remaining_groups,
         )
 
     async def evict(self, *, current_train_weight: int) -> int:
@@ -400,6 +817,12 @@ class WindowedSamplerConfig(BaseModel, extra="allow"):
     sample_freshest_first: bool = False
 
 
+class ReadyFirstSamplerConfig(BaseModel, extra="allow"):
+    name: Literal["ready_first"] = "ready_first"
+    # How far generation may run ahead of the trainer, in dispatch batches.
+    max_staleness_versions: NonNegativeInt = 1
+
+
 class WeightFifoSamplerConfig(BaseModel, extra="allow"):
     name: Literal["weight_fifo"] = "weight_fifo"
     # Lookahead + selectable weight window, in trainer versions.
@@ -410,12 +833,39 @@ class InOrderSamplerConfig(BaseModel, extra="allow"):
     name: Literal["in_order"] = "in_order"
     # How far generation may run ahead of the trainer, in dispatch batches.
     max_lookahead_versions: NonNegativeInt = 1
+    # Widened lookahead while the PPO policy is frozen; None keeps the steady value.
+    warmup_lookahead_versions: Optional[NonNegativeInt] = None
+
+    @model_validator(mode="after")
+    def validate_warmup_lookahead(self) -> "InOrderSamplerConfig":
+        if (
+            self.warmup_lookahead_versions is not None
+            and self.warmup_lookahead_versions < self.max_lookahead_versions
+        ):
+            raise ValueError(
+                "warmup_lookahead_versions must be greater than or equal "
+                "to max_lookahead_versions"
+            )
+        return self
+
+    @property
+    def peak_lookahead_versions(self) -> int:
+        """Widest window the run can reach; what buffer capacity must cover."""
+        if self.warmup_lookahead_versions is None:
+            return self.max_lookahead_versions
+        return self.warmup_lookahead_versions
 
 
 class CustomSamplerConfig(BaseModel, extra="allow"):
     name: Literal["custom"] = "custom"
     # "module:ClassName" of a PromptGroupSampler defined outside this repo.
-    # Extra keys are forwarded to the constructor (after ``buffer``).
+    # Extra keys are forwarded to the constructor (after ``buffer``). The
+    # target class must declare a boolean ``supports_buffer_checkpoint`` class
+    # attribute so setup can validate recovery requirements before allocating
+    # cluster resources. Periodic rollout snapshots additionally require an
+    # explicit boolean ``supports_training_claims = True`` declaration.
+    # Dynamic sampling and nonzero drop budgets require a boolean
+    # ``requires_single_weight_batch = False`` class declaration.
     target: str
 
 
@@ -425,6 +875,7 @@ class CustomSamplerConfig(BaseModel, extra="allow"):
 SamplerConfig = Annotated[
     Union[
         WindowedSamplerConfig,
+        ReadyFirstSamplerConfig,
         WeightFifoSamplerConfig,
         InOrderSamplerConfig,
         CustomSamplerConfig,
@@ -436,8 +887,15 @@ SamplerConfig = Annotated[
 def required_buffer_capacity_for_config(
     cfg: SamplerConfig,
     groups_per_step: int,
+    *,
+    min_groups_for_streaming_train: int,
 ) -> Optional[int]:
-    """Return a built-in sampler's required capacity without constructing it."""
+    """Return a sampler config's required capacity without constructing it."""
+    if isinstance(cfg, ReadyFirstSamplerConfig):
+        return _gated_required_buffer_capacity(
+            groups_per_step,
+            gate_window=cfg.max_staleness_versions,
+        )
     if isinstance(cfg, WeightFifoSamplerConfig):
         return _gated_required_buffer_capacity(
             groups_per_step,
@@ -446,40 +904,201 @@ def required_buffer_capacity_for_config(
     if isinstance(cfg, InOrderSamplerConfig):
         return _gated_required_buffer_capacity(
             groups_per_step,
-            gate_window=cfg.max_lookahead_versions,
+            gate_window=cfg.peak_lookahead_versions,
         )
+    if isinstance(cfg, WindowedSamplerConfig):
+        return min_groups_for_streaming_train
     return None
+
+
+def _custom_sampler_class(cfg: CustomSamplerConfig) -> type:
+    """Import and return a custom sampler class without constructing it."""
+    module_name, sep, class_name = cfg.target.partition(":")
+    if not sep:
+        raise ValueError(
+            f"custom sampler target must be 'module:ClassName', got {cfg.target!r}"
+        )
+    sampler_cls = getattr(importlib.import_module(module_name), class_name)
+    if not isinstance(sampler_cls, type):
+        raise TypeError(f"custom sampler target is not a class: {cfg.target!r}")
+    return sampler_cls
+
+
+def _sampler_class_for_config(cfg: SamplerConfig) -> type:
+    """Return the sampler class selected by a built-in or custom config."""
+    if isinstance(cfg, CustomSamplerConfig):
+        return _custom_sampler_class(cfg)
+    try:
+        return {
+            WindowedSamplerConfig: WindowedSampler,
+            ReadyFirstSamplerConfig: ReadyFirstSampler,
+            WeightFifoSamplerConfig: WeightFifoSampler,
+            InOrderSamplerConfig: InOrderSampler,
+        }[type(cfg)]
+    except KeyError:
+        raise ValueError(f"unknown sampler config {type(cfg).__name__}") from None
+
+
+def sampler_supports_transactional_admission(cfg: SamplerConfig) -> bool:
+    """Whether admission can wait outside mutations while the pump refills prompts."""
+    return issubclass(_sampler_class_for_config(cfg), TransactionalAdmissionSampler)
+
+
+def sampler_requires_single_weight_batch(cfg: SamplerConfig) -> bool:
+    """Read the resolved policy's selection requirement without constructing it.
+
+    Custom subclasses inherit their selection policy's declaration. Missing or
+    instance-only declarations fail before a run can enable filtering or drops.
+    """
+    sampler_cls = _sampler_class_for_config(cfg)
+    capability = getattr(sampler_cls, "requires_single_weight_batch", None)
+    if not isinstance(capability, bool):
+        raise TypeError(
+            f"{sampler_cls.__name__}.requires_single_weight_batch must be a "
+            f"boolean class attribute, got {capability!r}"
+        )
+    return capability
+
+
+def sampler_uses_pooled_replacements(cfg: SamplerConfig) -> bool:
+    """Whether the configured sampler replaces lost groups from a spare pool.
+
+    Reads the resolved class without constructing it. Every sampler declares the
+    member: built-ins as a ClassVar, custom samplers enforced by
+    ``require_drop_accounting_members`` during config validation, which runs
+    before this reader, so the attribute is always present.
+    """
+    sampler_cls = _sampler_class_for_config(cfg)
+    return sampler_cls.uses_pooled_replacements
+
+
+def sampler_supports_buffer_checkpoint(cfg: SamplerConfig) -> bool:
+    """Return a sampler class's static replay-checkpoint capability.
+
+    Custom classes are imported but not instantiated, allowing setup to fail
+    before allocating cluster resources or triggering constructor side effects.
+    """
+    sampler_cls = _sampler_class_for_config(cfg)
+
+    if isinstance(cfg, CustomSamplerConfig):
+        # A custom subclass must opt in explicitly instead of inheriting a
+        # built-in sampler's capability declaration accidentally.
+        capability = sampler_cls.__dict__.get("supports_buffer_checkpoint", False)
+    else:
+        capability = getattr(sampler_cls, "supports_buffer_checkpoint", None)
+    if not isinstance(capability, bool):
+        raise TypeError(
+            f"{sampler_cls.__name__}.supports_buffer_checkpoint must be a "
+            f"boolean class attribute, got {capability!r}"
+        )
+    return capability
+
+
+def sampler_supports_training_claims(cfg: SamplerConfig) -> bool:
+    """Return whether selection transfers rows into training ownership.
+
+    Built-in samplers use :meth:`TQReplayBuffer.claim_for_training`. Custom
+    samplers retain the legacy local-removal contract unless they explicitly
+    opt in, so enabling periodic snapshots cannot silently assume ownership
+    metadata that the sampler never created.
+    """
+    sampler_cls = _sampler_class_for_config(cfg)
+    if isinstance(cfg, CustomSamplerConfig):
+        capability = sampler_cls.__dict__.get("supports_training_claims", False)
+    else:
+        capability = getattr(sampler_cls, "supports_training_claims", None)
+    if not isinstance(capability, bool):
+        raise TypeError(
+            f"{sampler_cls.__name__}.supports_training_claims must be a "
+            f"boolean class attribute, got {capability!r}"
+        )
+    return capability
+
+
+def require_drop_accounting_members(cfg: SamplerConfig) -> None:
+    """Reject a custom sampler that omits a drop-accounting class attribute.
+
+    Dynamic sampling (and nonzero drop budgets) read these members directly off the
+    sampler. A custom class that leaves any out — or sets them only in ``__init__``,
+    which is invisible to this pre-construction check — fails here rather than silently
+    getting gated defaults. Built-in samplers are skipped.
+    """
+    if not isinstance(cfg, CustomSamplerConfig):
+        return
+    sampler_cls = _custom_sampler_class(cfg)
+    missing = [m for m in _DROP_ACCOUNTING_MEMBERS if not hasattr(sampler_cls, m)]
+    if not missing:
+        return
+    raise ValueError(
+        f"{sampler_cls.__name__} is used with dynamic sampling but is missing the "
+        f"required drop-accounting class attribute(s) {missing}. Declare them as class "
+        "attributes (not in __init__, which runs after this check): "
+        "uses_pooled_replacements and closes_short_at_exhaustion (bool), "
+        "requires_shortfall_reconciliation (bool), and charge_step_for_lost_group "
+        "(method). A gated sampler that stamps no step typically uses "
+        "uses_pooled_replacements=True, closes_short_at_exhaustion=False; a "
+        "windowed-style producer uses False/True."
+    )
+
+
+_DROP_ACCOUNTING_MEMBERS = (
+    "uses_pooled_replacements",
+    "closes_short_at_exhaustion",
+    "requires_shortfall_reconciliation",
+    "charge_step_for_lost_group",
+)
 
 
 def create_sampler(
     buffer: TQReplayBuffer,
     cfg: SamplerConfig,
+    *,
+    min_groups_for_streaming_train: Optional[int] = None,
 ) -> PromptGroupSampler:
-    """Build a sampler from its config (or import one by FQN)."""
+    """Build a sampler from its config (or import one by FQN).
+
+    Args:
+        buffer: Shared TQReplayBuffer holding the candidate slots.
+        cfg: Discriminated sampler config selecting the policy.
+        min_groups_for_streaming_train: Streaming floor used by the windowed sampler.
+    """
+    sampler_cls = _sampler_class_for_config(cfg)
+    sampler: PromptGroupSampler
     if isinstance(cfg, WindowedSamplerConfig):
-        return WindowedSampler(
+        sampler = sampler_cls(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
             sample_freshest_first=cfg.sample_freshest_first,
+            min_groups_for_streaming_train=min_groups_for_streaming_train,
         )
-    if isinstance(cfg, WeightFifoSamplerConfig):
-        return WeightFifoSampler(
-            buffer, max_staleness_versions=cfg.max_staleness_versions
+    elif isinstance(cfg, ReadyFirstSamplerConfig):
+        sampler = sampler_cls(
+            buffer,
+            max_staleness_versions=cfg.max_staleness_versions,
         )
-    if isinstance(cfg, InOrderSamplerConfig):
-        return InOrderSampler(buffer, max_lookahead_versions=cfg.max_lookahead_versions)
-    if isinstance(cfg, CustomSamplerConfig):
-        module_name, sep, class_name = cfg.target.partition(":")
-        if not sep:
-            raise ValueError(
-                f"custom sampler target must be 'module:ClassName', got {cfg.target!r}"
-            )
-        sampler_cls = getattr(importlib.import_module(module_name), class_name)
+    elif isinstance(cfg, WeightFifoSamplerConfig):
+        sampler = sampler_cls(
+            buffer,
+            max_staleness_versions=cfg.max_staleness_versions,
+        )
+    elif isinstance(cfg, InOrderSamplerConfig):
+        sampler = sampler_cls(
+            buffer,
+            max_lookahead_versions=cfg.max_lookahead_versions,
+            warmup_lookahead_versions=cfg.warmup_lookahead_versions,
+        )
+    elif isinstance(cfg, CustomSamplerConfig):
+        sampler_supports_buffer_checkpoint(cfg)
         sampler = sampler_cls(buffer, **(cfg.model_extra or {}))
         if not isinstance(sampler, PromptGroupSampler):
             raise TypeError(
                 f"{cfg.target} does not implement the PromptGroupSampler "
-                f"interface (needs admit/select/evict)"
+                f"interface (needs admit/select/evict/should_abort_inflight, "
+                f"dispatch_index, set_dispatch_index, restore_dispatch_index, "
+                f"is_on_policy, supports_buffer_checkpoint, "
+                f"required_buffer_capacity; periodic rollout snapshots also "
+                f"require supports_training_claims=True)"
             )
-        return sampler
-    raise ValueError(f"unknown sampler config {type(cfg).__name__}")
+    else:
+        raise ValueError(f"unknown sampler config {type(cfg).__name__}")
+    return sampler

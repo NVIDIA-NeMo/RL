@@ -1,0 +1,20 @@
+# Three steps ensure at least one batch was generated after a weight refit.
+defaults: mopd-nemotron-super-omni-120ba12b-10n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+checkpointing:
+  enabled: false
+cluster:
+  num_nodes: 4
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+  max_num_epochs: 1
+  max_num_steps: 3
+policy:
+  train_global_batch_size: 4
+  max_total_sequence_length: 4096
+  generation:
+    max_new_tokens: 256
+logger:
+  log_dir: logs/mopd-nemotron-super-omni-circle-count-smoke
+  wandb:
+    name: mopd-nemotron-super-omni-circle-count-smoke

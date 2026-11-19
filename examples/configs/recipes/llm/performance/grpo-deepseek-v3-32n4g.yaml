@@ -3,6 +3,10 @@ checkpointing:
   checkpoint_dir: results/grpo-deepseek-v3-32n4g
 policy:
   megatron_cfg:
+    # Avoid the additional host-memory lifetime of asynchronous checkpoint
+    # staging for this 671B model on four-GPU nodes.
+    checkpoint:
+      async_save: false
     pipeline_model_parallel_size: 8
     num_layers_in_first_pipeline_stage: 7
     num_layers_in_last_pipeline_stage: 6
@@ -10,6 +14,11 @@ policy:
     moe_token_dispatcher_type: flex
     moe_flex_dispatcher_backend: hybridep
     moe_hybridep_num_sms: 32
+    env_vars:
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "16"
+      NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
+      NVLINK_DOMAIN_SIZE: "72"
+      USE_MNNVL: "1"
   generation:
     vllm_cfg:
       gpu_memory_utilization: 0.3

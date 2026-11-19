@@ -25,7 +25,48 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     PY_EXECUTABLES,
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.distributed.worker_groups import (
+    RayWorkerBuilder,
+    RayWorkerGroup,
+    _check_dp_leader_worker_indices,
+    _get_initializer_env_vars,
+)
+
+
+def test_dp_leaders_may_be_an_ascending_subset_of_the_group_leaders():
+    # A disaggregated replica routes through its first engine only.
+    _check_dp_leader_worker_indices([0, 6], tied_group_leaders=[0, 2, 4, 6, 8])
+
+
+@pytest.mark.parametrize(
+    "requested",
+    [[0, 3], [6, 0]],
+    ids=["not-a-group-leader", "out-of-order"],
+)
+def test_dp_leaders_outside_the_group_leaders_are_rejected(requested):
+    with pytest.raises(ValueError, match="ascending subset"):
+        _check_dp_leader_worker_indices(requested, tied_group_leaders=[0, 2, 4, 6])
+
+
+def test_initializer_env_adds_hf_modules_cache_to_pythonpath(monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", "/driver/pythonpath")
+
+    result = _get_initializer_env_vars({"HF_MODULES_CACHE": "/hf/modules"})
+
+    assert result["HF_MODULES_CACHE"] == "/hf/modules"
+    assert result["PYTHONPATH"].split(os.pathsep) == [
+        "/hf/modules",
+        "/driver/pythonpath",
+    ]
+
+
+def test_initializer_env_does_not_duplicate_hf_modules_cache(monkeypatch):
+    monkeypatch.setenv("HF_MODULES_CACHE", "/hf/modules")
+    monkeypatch.setenv("PYTHONPATH", f"/project{os.pathsep}/hf/modules")
+
+    result = _get_initializer_env_vars({})
+
+    assert result["PYTHONPATH"] == f"/project{os.pathsep}/hf/modules"
 
 
 @ray.remote
@@ -1035,7 +1076,7 @@ def test_get_nsight_config_if_pattern_matches():
             "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:5"
         ),
     ):
-        result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
+        result = get_nsight_config_if_pattern_matches("automodel_policy_worker")
         assert result == {}
 
     # Test 3: Pattern matches with wildcard
@@ -1048,11 +1089,11 @@ def test_get_nsight_config_if_pattern_matches():
             "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:5"
         ),
     ):
-        result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
+        result = get_nsight_config_if_pattern_matches("automodel_policy_worker")
         assert "nsight" in result
         assert result["nsight"]["t"] == "cuda,nvtx"
         assert result["nsight"]["s"] == "none"
-        assert result["nsight"]["o"] == "'dtensor_policy_worker_1:5_%p'"
+        assert result["nsight"]["o"] == "'automodel_policy_worker_1:5_%p'"
         assert result["nsight"]["stop-on-exit"] == "true"
 
     # Test 4: Exact name match
@@ -1172,7 +1213,7 @@ def test_get_nsight_config_extra_options():
             {"capture-range": "none", "cuda-graph-trace": "graph"},
         ),
     ):
-        result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
+        result = get_nsight_config_if_pattern_matches("automodel_policy_worker")
         assert "nsight" in result
         nsight = result["nsight"]
         assert nsight["capture-range"] == "none"
@@ -1333,3 +1374,28 @@ def test_environment_variable_precedence_full(
                 os.environ[key] = original_env[key]
             else:
                 os.environ.pop(key, None)
+
+
+def test_large_init_args_reach_every_worker_through_the_object_store(
+    register_test_actor, virtual_cluster_4_bundles
+):
+    """Constructor arguments are shared through the object store and still arrive as values."""
+    big_arg = b"a" * (2 << 20)
+    big_kwarg = "k" * (2 << 20)
+    builder = RayWorkerBuilder(register_test_actor, big_arg, small=1, big=big_kwarg)
+    sharding = NamedSharding(layout=[[0, 1], [2, 3]], names=["dp", "tp"])
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster_4_bundles,
+        remote_worker_builder=builder,
+        workers_per_node=None,
+        sharding_annotations=sharding,
+    )
+    try:
+        assert len(worker_group._initializer_pool) == 2
+        for worker in worker_group.workers:
+            args, kwargs = ray.get(worker.get_init_args_kwargs.remote())
+            assert args == (big_arg,)
+            assert kwargs["big"] == big_kwarg
+            assert kwargs["small"] == 1
+    finally:
+        worker_group.shutdown(force=True)

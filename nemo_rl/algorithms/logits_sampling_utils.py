@@ -37,11 +37,16 @@ class TrainingSamplingParams:
         top_k: Top-k filtering parameter (None or -1 to disable)
         top_p: Top-p filtering parameter (1.0 to disable)
         temperature: Temperature for scaling logits (default: 1.0)
+        sampler_replay: Score the sampled token (and, with score
+            centering, the head) over the sampler's realized support (its captured top-K head)
+            instead of recomputing top_k/top_p on the trainer's logits. Top-p
+            then requires top_k, which bounds the support.
     """
 
     top_k: int | None = None
     top_p: float = 1.0
     temperature: float = 1.0
+    sampler_replay: bool = False
 
 
 def _need_top_k_filtering(top_k: int | None) -> bool:
@@ -64,6 +69,30 @@ def need_top_k_or_top_p_filtering(
     top_k = sampling_params.top_k
     top_p = sampling_params.top_p
     return _need_top_k_filtering(top_k) or _need_top_p_filtering(top_p)
+
+
+def replays_sampler_support(sampling_params: Optional[TrainingSamplingParams]) -> bool:
+    """Whether filtered log-probs renormalize over the sampler's captured support."""
+    return (
+        sampling_params is not None
+        and sampling_params.sampler_replay
+        and need_top_k_or_top_p_filtering(sampling_params)
+    )
+
+
+def check_top_p_has_top_k(top_k: int | None, top_p: float | None) -> None:
+    """Reject top-p without top-k: top-p alone does not bound the kept set.
+
+    Replaying the sampler's support needs the bound, since the captured head must
+    hold the whole kept set.
+    """
+    if _need_top_p_filtering(top_p) and not _need_top_k_filtering(top_k):
+        raise ValueError(
+            "top-p replay requires top_k: top_p < 1 requires a positive top_k "
+            f"(got top_p={top_p}, top_k={top_k}), since top-p alone does not bound "
+            "the set of tokens the trainer replays. See "
+            "docs/guides/sampler-replay.md#head-size-and-top-p"
+        )
 
 
 @torch.no_grad()
@@ -150,7 +179,9 @@ def _apply_top_k_top_p_fn(
     # Save original shape and flatten to 2D for consistent chunking
     original_shape = logits.shape
     vocab_size = logits.shape[-1]
-    logits = logits.view(-1, vocab_size)  # [*, vocab_size] -> [num_tokens, vocab_size]
+    logits = logits.reshape(
+        -1, vocab_size
+    )  # [*, vocab_size] -> [num_tokens, vocab_size]
     num_tokens = logits.shape[0]
 
     chunk_size = chunk_size if chunk_size is not None else num_tokens

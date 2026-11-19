@@ -31,38 +31,35 @@ Used by both :mod:`token_aligner` and
   :func:`get_sparse_projection_matrix` / :func:`get_topk_projection`
   process-local caches, :func:`slice_sparse_projection_rows`, and
   :func:`build_exact_token_map` (cached common/uncommon partition).
-- :func:`alignment_from_flat_batch` rehydrates the flat ``alignment_*``
-  data-dict keys into an :class:`AlignmentBatch`.
+- Same-tokenizer KD: :func:`same_tokenizer_topk_kl` /
+  :func:`same_tokenizer_full_vocab_kl` — per-position KL between student and
+  teacher on a shared tokenizer vocab, averaged over the positions that receive
+  KD.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, fields
-from typing import Any, Dict, Mapping, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
 from torch.distributed.tensor import DTensor
 
-from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 from nemo_rl.distributed.model_utils import (
-    cp_load_balanced_to_contiguous,
     cp_shift_next,
     get_logprobs_from_vocab_parallel_logits,
     group_all_reduce_sum_with_grad,
+    to_local_if_dtensor,
     vocab_parallel_argmax,
+    vocab_parallel_full_log_softmax,
+    vocab_parallel_gather_columns,
 )
-from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
+from nemo_rl.utils.tensor_ops import masked_mean
 
-
-def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
-    """Rebuild :class:`AlignmentBatch` from the flat ``alignment_*`` keys.
-
-    The field set is driven off :class:`AlignmentBatch` so the helper
-    can't drift from the schema.
-    """
-    return AlignmentBatch(
-        **{f.name: data[f"alignment_{f.name}"] for f in fields(AlignmentBatch)}
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.context_parallel import (
+        ContextParallelSharder,
     )
 
 
@@ -186,6 +183,38 @@ def slice_sparse_projection_rows(
     ).coalesce()
 
 
+def slice_sparse_projection_cols(
+    sparse_matrix: torch.Tensor,
+    col_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Column-slice a sparse-COO projection ``[V_s, V_t]`` to ``[V_s, len(col_indices)]``.
+
+    ``col_indices`` must be sorted and unique -- ``select_teacher_topk_indices``
+    returns exactly that. Keeps COO entries whose column appears in
+    ``col_indices`` and remaps that column to its position in the list, so the
+    result equals what a dense ``matrix[:, col_indices]`` would give.
+
+    The row slicer above shifts by a constant because ranks own contiguous
+    slabs; columns here are an arbitrary sorted subset, hence the searchsorted.
+    """
+    indices = sparse_matrix.indices()
+    values = sparse_matrix.values()
+    cols = indices[1]
+    # Position each entry's column would take in ``col_indices``; entries whose
+    # column is absent land on a neighbour and are dropped by the equality test.
+    pos = torch.searchsorted(col_indices, cols).clamp(max=col_indices.numel() - 1)
+    mask = col_indices[pos] == cols
+    kept_indices = indices[:, mask].clone()
+    kept_indices[1] = pos[mask]
+    return torch.sparse_coo_tensor(
+        kept_indices,
+        values[mask],
+        (sparse_matrix.size(0), col_indices.numel()),
+        device=sparse_matrix.device,
+        dtype=sparse_matrix.dtype,
+    ).coalesce()
+
+
 # ---------------------------------------------------------------------------
 # TP/CP-aware loss primitives
 #
@@ -259,6 +288,201 @@ def select_teacher_topk_indices(
         return top_indices.sort().values
 
 
+def _same_tokenizer_kd_weights(
+    *,
+    kd_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Float ``[B, T]`` weights of the predictor positions that receive KD.
+
+    The predictor at position ``t`` receives KD when its target token
+    ``kd_mask[:, t + 1]`` is set (CP-aware next-token shift, so the global-last
+    position never does) and its sample is not masked out.
+    """
+    next_mask = cp_shift_next(to_local_if_dtensor(kd_mask), cp_group, fill=0)
+    sample_mask = to_local_if_dtensor(sample_mask)
+    return next_mask.float() * sample_mask.unsqueeze(-1).float()
+
+
+def _per_position_kl(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    *,
+    reverse_kl: bool,
+) -> torch.Tensor:
+    """Per-position KL summed over the vocab axis.
+
+    Forward is ``KL(teacher || student)``; reverse is ``KL(student || teacher)``.
+    """
+    if reverse_kl:
+        return torch.nn.functional.kl_div(
+            teacher_log_probs, student_log_probs, reduction="none", log_target=True
+        ).sum(dim=-1)
+    return torch.nn.functional.kl_div(
+        student_log_probs, teacher_log_probs, reduction="none", log_target=True
+    ).sum(dim=-1)
+
+
+def _masked_kd_mean(
+    per_position_kl: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    num_kd_tokens: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """``T**2``-scaled mean of a per-position KL over the global KD-token count."""
+    return (
+        masked_mean(per_position_kl, weights, global_normalization_factor=num_kd_tokens)
+        * temperature
+        * temperature
+    )
+
+
+def same_tokenizer_topk_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    *,
+    kd_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    num_kd_tokens: torch.Tensor,
+    vocab_size: int,
+    vocab_topk: int,
+    temperature: float,
+    reverse_kl: bool,
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Top-K per-position KL between student and teacher on a shared tokenizer vocab.
+
+    Student and teacher share a tokenizer, so positions align 1:1. One sorted
+    top-K vocab list is chosen for the whole microbatch by the per-vocab max over
+    every teacher row (:func:`select_teacher_topk_indices`), MAX-reduced across CP
+    so every CP rank uses the same columns. The student's K columns are gathered
+    TP-aware and both sides are
+    softmaxed within the K subset: the full-vocab partition function cancels,
+    so the all-gathered ``[B, T, V]`` student log-probs are never built. The
+    result is the KD-position mean (global denominator ``num_kd_tokens``)
+    scaled by ``temperature**2``.
+
+    Args:
+        student_logits: ``[B, T, V]`` student logits on this CP rank's
+            contiguous window (``[B, T, V/TP]`` when vocab-sharded across TP).
+        teacher_logits: ``[B, T, V_t]`` full-vocab teacher logits on the same
+            positions; columns past ``vocab_size`` (lm_head padding) are dropped.
+        kd_mask: ``[B, T]`` mask of target tokens that receive KD; the
+            predictor at ``t`` is supervised when ``kd_mask[:, t + 1]`` is set.
+        sample_mask: ``[B]`` per-sample mask.
+        num_kd_tokens: Global (DP/CP) count of KD positions, the mean's
+            denominator.
+        vocab_size: Shared tokenizer vocab size.
+        vocab_topk: Number of vocab columns K the KL is computed over (capped
+            at the teacher vocab width).
+        temperature: Softmax temperature.
+        reverse_kl: If True, ``KL(student || teacher)``; otherwise
+            ``KL(teacher || student)``.
+        tp_group: Tensor-parallel group the student vocab is sharded over.
+        cp_group: Context-parallel group the sequence is sharded over.
+
+    Returns:
+        Scalar KD loss.
+    """
+    teacher = teacher_logits
+    if teacher.shape[-1] > vocab_size:
+        teacher = teacher[..., :vocab_size]
+    k = min(vocab_topk, teacher.shape[-1])
+    topk_idx = select_teacher_topk_indices(teacher, k, cp_group=cp_group)
+
+    student_topk_logits = vocab_parallel_gather_columns(
+        student_logits, topk_idx, tp_group=tp_group
+    )
+    student_log_probs_k = torch.log_softmax(student_topk_logits / temperature, dim=-1)
+    teacher_log_probs_k = torch.log_softmax(
+        teacher[..., topk_idx].float() / temperature, dim=-1
+    )
+    per_position_kl = _per_position_kl(
+        student_log_probs_k, teacher_log_probs_k, reverse_kl=reverse_kl
+    )
+    weights = _same_tokenizer_kd_weights(
+        kd_mask=kd_mask, sample_mask=sample_mask, cp_group=cp_group
+    )
+    return _masked_kd_mean(
+        per_position_kl,
+        weights,
+        num_kd_tokens=num_kd_tokens,
+        temperature=temperature,
+    )
+
+
+def same_tokenizer_full_vocab_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    *,
+    kd_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    num_kd_tokens: torch.Tensor,
+    vocab_size: int,
+    temperature: float,
+    reverse_kl: bool,
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Full-vocab per-position KL between student and teacher on a shared tokenizer vocab.
+
+    Student and teacher share a tokenizer, so positions align 1:1. The student
+    log-probs are gathered to the full vocab across TP. Both sides are cut to the
+    shared tokenizer vocab ``vocab_size``, dropping lm_head padding columns, and
+    the student is renormalized over it. The result is the KD-position mean
+    (global denominator ``num_kd_tokens``) scaled by ``temperature**2``.
+
+    Args:
+        student_logits: ``[B, T, V_s]`` student logits on this CP rank's
+            contiguous window (``[B, T, V_s/TP]`` when vocab-sharded across
+            TP), ``V_s >= vocab_size``.
+        teacher_logits: ``[B, T, V_t]`` full-vocab teacher logits on the same
+            positions, ``V_t >= vocab_size``.
+        kd_mask: ``[B, T]`` mask of target tokens that receive KD; the
+            predictor at ``t`` is supervised when ``kd_mask[:, t + 1]`` is set.
+        sample_mask: ``[B]`` per-sample mask.
+        num_kd_tokens: Global (DP/CP) count of KD positions, the mean's
+            denominator.
+        vocab_size: Shared tokenizer vocab size; student and teacher columns
+            past it (lm_head padding) are dropped.
+        temperature: Softmax temperature.
+        reverse_kl: If True, ``KL(student || teacher)``; otherwise
+            ``KL(teacher || student)``.
+        tp_group: Tensor-parallel group the student vocab is sharded over.
+        cp_group: Context-parallel group the sequence is sharded over.
+
+    Returns:
+        Scalar KD loss.
+    """
+    student_log_probs = vocab_parallel_full_log_softmax(
+        student_logits, temperature, tp_group=tp_group
+    )
+    if student_log_probs.shape[-1] > vocab_size:
+        # Renormalize over the shared vocab without the lm_head padding columns.
+        student_log_probs = torch.log_softmax(
+            student_log_probs[..., :vocab_size], dim=-1
+        )
+    teacher = teacher_logits.float()
+    if teacher.shape[-1] > vocab_size:
+        teacher = teacher[..., :vocab_size]
+    teacher_log_probs = torch.log_softmax(teacher / temperature, dim=-1)
+    per_position_kl = _per_position_kl(
+        student_log_probs, teacher_log_probs, reverse_kl=reverse_kl
+    )
+    weights = _same_tokenizer_kd_weights(
+        kd_mask=kd_mask, sample_mask=sample_mask, cp_group=cp_group
+    )
+    return _masked_kd_mean(
+        per_position_kl,
+        weights,
+        num_kd_tokens=num_kd_tokens,
+        temperature=temperature,
+    )
+
+
 @dataclass
 class LocalizedAlignment:
     """CP-localized alignment tensors consumed by the loss reductions.
@@ -287,19 +511,11 @@ def localize_alignment(
     *,
     teacher_seq_len: int,
     alignment_prefix: str = "alignment_",
-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> LocalizedAlignment:
-    """Localize the chunk-alignment data-dict fields for the local CP shard.
+    """Unwrap the chunk-alignment data-dict fields from DTensor to local tensors.
 
-    Unwraps the ``{alignment_prefix}*`` / ``sample_mask`` entries from DTensor to
-    their local tensors. Student-seq fields (``student_chunk_id``) come from
-    ``cp_buffers`` in PyTorch's *load-balanced* (``2*cp`` interleaved) CP layout,
-    not contiguous — the caller
-    (:func:`prepare_xtoken_cross_tokenizer_loss_input`) must relayout them to this
-    rank's contiguous window via :func:`cp_load_balanced_to_contiguous` before use.
-    The teacher-seq ``teacher_chunk_id`` is full, so it is sliced contiguously to
-    this CP rank's ``teacher_seq_len`` window to match the IPC consumer's
-    contiguous teacher-logit slice.
+    The teacher-seq ``teacher_chunk_id`` is full, so it is trimmed to
+    ``teacher_seq_len`` to match the IPC consumer's teacher-logit slice.
 
     Args:
         alignment_prefix: Data-dict key prefix for this teacher's alignment
@@ -307,17 +523,8 @@ def localize_alignment(
             teacher in the multi-teacher trainer / collator). ``sample_mask`` is
             student-level and stays unprefixed.
     """
-    teacher_chunk_id_full = to_local_if_dtensor(
-        data[f"{alignment_prefix}teacher_chunk_id"]
-    )
-    cp_rank = (
-        torch.distributed.get_rank(cp_group)
-        if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1
-        else 0
-    )
-    teacher_seq_start = cp_rank * teacher_seq_len
-    teacher_chunk_id = teacher_chunk_id_full[
-        :, teacher_seq_start : teacher_seq_start + teacher_seq_len
+    teacher_chunk_id = to_local_if_dtensor(data[f"{alignment_prefix}teacher_chunk_id"])[
+        :, :teacher_seq_len
     ]
     return LocalizedAlignment(
         sample_mask=to_local_if_dtensor(data["sample_mask"]),
@@ -334,19 +541,15 @@ def student_next_token_ce(
     logits: torch.Tensor,
     *,
     input_ids: torch.Tensor,
-    seq_index: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Per-token next-token cross-entropy ``[B, T-1]`` on the student.
 
-    DTensor (TP/CP) logits route through the vocab-parallel log-prob helper
-    (which also handles the CP roll); plain logits use a local shifted
-    ``cross_entropy``. The next-token shift (drop the last predictor) matches the
-    convention the KL terms use.
+    DTensor (TP) logits route through the vocab-parallel log-prob helper; plain
+    logits use a local shifted ``cross_entropy``. The next-token shift (drop the
+    last predictor) matches the convention the KL terms use.
     """
     if isinstance(logits, DTensor):
-        next_token_logprobs = get_logprobs_from_vocab_parallel_logits(
-            logits, input_ids, seq_index=seq_index
-        )
+        next_token_logprobs = get_logprobs_from_vocab_parallel_logits(logits, input_ids)
         return -next_token_logprobs
     shift_logits = logits[:, :-1].contiguous()
     shift_labels = input_ids[:, 1:].contiguous()
@@ -976,6 +1179,7 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     projection_matrix_paths: list[Optional[str]],
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
 ) -> tuple[
     torch.Tensor,
     Dict[int, torch.Tensor],
@@ -993,13 +1197,17 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     localized, next-token-shifted chunk alignment from its ``alignment_{i}_*``
     keys; a same-tokenizer teacher (``None`` path) gets a thin alignment carrying
     only the shared student fields (identity 1:1 token alignment, no chunks).
-    TP/CP groups come from the student ``logits``' device mesh, falling back to
-    the passed groups for non-DTensor logits.
+    The TP group comes from the student ``logits``' device mesh, falling back to
+    ``vocab_parallel_group`` for non-DTensor logits; the CP group is always the
+    passed ``context_parallel_group``.
 
     Args:
         projection_matrix_paths: Per-teacher projection paths. Its length is the
             teacher count and drives the ``teacher_{i}_*`` / ``alignment_{i}_*``
             keys read here; a ``None`` entry marks a same-tokenizer teacher.
+        cp_sharder: Automodel's model-owned sequence layout, set only when
+            context_parallel_size > 1. It relays the student tensors to this
+            rank's contiguous window.
 
     Returns:
         ``(student_logits_contig, teacher_full_logits_by_idx, aligns_by_idx, tp_group, cp_group)``.
@@ -1007,25 +1215,52 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     if isinstance(logits, DTensor):
         mesh = logits.device_mesh
         mesh_names = mesh.mesh_dim_names or ()
-        cp_group = mesh.get_group("cp") if "cp" in mesh_names else None
         tp_group = mesh.get_group("tp") if "tp" in mesh_names else None
     else:
-        cp_group = context_parallel_group
         tp_group = vocab_parallel_group
+    cp_group = context_parallel_group
 
     device = torch.cuda.current_device()
 
-    # Student CP-relay computed once and shared by every teacher's KD term and
-    # the next-token-accuracy metric. Relaid from CP load-balanced to this rank's
-    # contiguous window; input_ids / token_mask stay unshifted (the accuracy
-    # metric and the same-vocab KD apply their own CP-aware next-token shift).
-    student_logits_contig = cp_load_balanced_to_contiguous(logits, cp_group=cp_group)
-    student_input_ids = cp_load_balanced_to_contiguous(
-        data["input_ids"], cp_group=cp_group
-    )
-    student_token_mask = cp_load_balanced_to_contiguous(
-        data["token_mask"], cp_group=cp_group
-    )
+    # Student CP relay is computed once and shared by every teacher's KD term.
+    # Automodel restores its own model layout before NeMo RL selects the
+    # contiguous IPC-consumer window.
+    if cp_sharder is not None:
+        # Keep the student-logit autograd graph intact: to_local_if_dtensor()
+        # runs DTensor.to_local() under torch.no_grad(), which would detach the
+        # X-token KD loss from the student model for TP > 1.
+        local_logits = logits.to_local() if isinstance(logits, DTensor) else logits
+        full_student_logits = cp_sharder.gather_token_tensor(
+            local_logits, seq_dim=1, trim=True
+        )
+        cp_size = (
+            torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+        )
+        full_student_seq_len = full_student_logits.shape[1]
+        if full_student_seq_len % cp_size != 0:
+            raise ValueError(
+                "X-token student sequence length must be divisible by the student "
+                "context parallel size, but got "
+                f"sequence_length={full_student_seq_len}, cp_size={cp_size}. "
+                "Set policy.make_sequence_length_divisible_by to a multiple of "
+                "policy.automodel_cfg.context_parallel_size."
+            )
+        cp_rank = torch.distributed.get_rank(cp_group) if cp_group is not None else 0
+        student_seq_len = full_student_seq_len // cp_size
+        student_seq_start = cp_rank * student_seq_len
+        student_logits_contig = full_student_logits.narrow(
+            1, student_seq_start, student_seq_len
+        ).contiguous()
+        student_input_ids = to_local_if_dtensor(data["input_ids"])[
+            :, student_seq_start : student_seq_start + student_seq_len
+        ].contiguous()
+        student_token_mask = to_local_if_dtensor(data["token_mask"])[
+            :, student_seq_start : student_seq_start + student_seq_len
+        ].contiguous()
+    else:
+        student_logits_contig = logits
+        student_input_ids = data["input_ids"]
+        student_token_mask = data["token_mask"]
     sample_mask = to_local_if_dtensor(data["sample_mask"])
 
     teacher_full_logits_by_idx: Dict[int, torch.Tensor] = {}
@@ -1046,20 +1281,46 @@ def prepare_xtoken_cross_tokenizer_loss_input(
                 student_token_mask=student_token_mask,
             )
             continue
-        align = localize_alignment(
-            data,
-            teacher_seq_len=teacher_full_logits.shape[1],
-            alignment_prefix=f"alignment_{i}_",
-            cp_group=cp_group,
-        )
-        align.student_chunk_id = cp_shift_next(
-            cp_load_balanced_to_contiguous(align.student_chunk_id, cp_group=cp_group),
-            cp_group,
-            fill=-1,
-        )
-        align.teacher_chunk_id = cp_shift_next(
-            align.teacher_chunk_id, cp_group, fill=-1
-        )
+        alignment_prefix = f"alignment_{i}_"
+        if cp_sharder is not None:
+            student_chunk_id = to_local_if_dtensor(
+                data[f"{alignment_prefix}student_chunk_id"]
+            ).roll(shifts=-1, dims=1)
+            student_chunk_id[:, -1] = -1
+            student_chunk_id = student_chunk_id[
+                :, student_seq_start : student_seq_start + student_seq_len
+            ].contiguous()
+
+            teacher_chunk_id = to_local_if_dtensor(
+                data[f"{alignment_prefix}teacher_chunk_id"]
+            ).roll(shifts=-1, dims=1)
+            teacher_chunk_id[:, -1] = -1
+            teacher_seq_len = teacher_full_logits.shape[1]
+            teacher_seq_start = cp_rank * teacher_seq_len
+            teacher_chunk_id = teacher_chunk_id[
+                :, teacher_seq_start : teacher_seq_start + teacher_seq_len
+            ].contiguous()
+            align = LocalizedAlignment(
+                sample_mask=sample_mask,
+                student_chunk_id=student_chunk_id,
+                teacher_chunk_id=teacher_chunk_id,
+                pair_valid=to_local_if_dtensor(data[f"{alignment_prefix}pair_valid"]),
+                pair_is_correct=to_local_if_dtensor(
+                    data[f"{alignment_prefix}pair_is_correct"]
+                ),
+            )
+        else:
+            align = localize_alignment(
+                data,
+                teacher_seq_len=teacher_full_logits.shape[1],
+                alignment_prefix=alignment_prefix,
+            )
+            align.student_chunk_id = cp_shift_next(
+                align.student_chunk_id, cp_group, fill=-1
+            )
+            align.teacher_chunk_id = cp_shift_next(
+                align.teacher_chunk_id, cp_group, fill=-1
+            )
         align.student_input_ids = student_input_ids
         align.student_token_mask = student_token_mask
         aligns_by_idx[i] = align

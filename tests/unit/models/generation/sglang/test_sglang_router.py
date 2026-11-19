@@ -12,17 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for RouterActor lifecycle — start, port allocation, stop.
+"""Tests for RouterActor configuration and lifecycle.
 
-All tests use a real Ray cluster and a real sglang_router subprocess.
-Each test creates its own RouterActor to avoid cross-test interference.
+Lifecycle tests use a real Ray cluster and a real sglang_router subprocess.
+Configuration tests validate plumbing without starting a router.
 """
+
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import ray
 import requests
 
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local
+from nemo_rl.models.generation.sglang import sglang_router
 from nemo_rl.models.generation.sglang.sglang_router import RouterActor, _start_router
 
 from . import (
@@ -30,6 +35,72 @@ from . import (
 )
 
 pytestmark = pytest.mark.sglang
+
+
+@pytest.mark.parametrize(
+    "retry_options, expected",
+    [
+        ({}, (5, 10)),
+        ({"retry_max_retries": 7}, (7, 10)),
+        ({"cb_failure_threshold": 2}, (5, 2)),
+        ({"retry_max_retries": 1, "cb_failure_threshold": 1}, (1, 1)),
+    ],
+)
+def test_router_retry_options_preserve_defaults_and_forward_overrides(
+    monkeypatch, retry_options, expected
+):
+    args = SimpleNamespace(retry_max_retries=5, cb_failure_threshold=10)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang_router.launch_router",
+        SimpleNamespace(RouterArgs=lambda: args),
+    )
+    monkeypatch.setattr(sglang_router, "get_host_info", lambda: ("host", "127.0.0.1"))
+    monkeypatch.setattr(sglang_router, "_get_free_port_local", lambda *_: 19001)
+    router = RouterActor.__ray_metadata__.modified_class()
+    start = Mock()
+    monkeypatch.setattr(router, "start", start)
+
+    assert router.init({"sglang_router_port": 19000, **retry_options}) == (
+        "127.0.0.1",
+        19000,
+    )
+    start.assert_called_once_with(args)
+    assert (args.retry_max_retries, args.cb_failure_threshold) == expected
+
+
+@pytest.mark.parametrize("key", ["retry_max_retries", "cb_failure_threshold"])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "3", None])
+def test_router_retry_options_reject_invalid_values_before_launch(
+    monkeypatch, key, value
+):
+    options = Mock()
+    monkeypatch.setattr(RouterActor, "options", options)
+    with pytest.raises(ValueError, match=f"{key} must be a positive integer"):
+        _start_router({key: value})
+    options.assert_not_called()
+
+    router = RouterActor.__ray_metadata__.modified_class()
+    start = Mock()
+    monkeypatch.setattr(router, "start", start)
+    with pytest.raises(ValueError, match=f"{key} must be a positive integer"):
+        router.init({key: value})
+    start.assert_not_called()
+
+
+def test_external_router_does_not_apply_managed_retry_options(monkeypatch):
+    options = Mock()
+    monkeypatch.setattr(RouterActor, "options", options)
+    assert _start_router(
+        {
+            "use_external_router": True,
+            "sglang_router_ip": "127.0.0.1",
+            "sglang_router_port": 19000,
+            "retry_max_retries": 0,
+            "cb_failure_threshold": 0,
+        }
+    ) == ("127.0.0.1", 19000, None)
+    options.assert_not_called()
 
 
 @pytest.fixture(scope="module")

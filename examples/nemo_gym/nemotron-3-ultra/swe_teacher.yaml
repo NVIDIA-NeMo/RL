@@ -57,8 +57,6 @@ checkpointing:
   ft_keep_latest_k: 1
   ft_save_period: 1
   checkpoint_must_save_by: "00:03:30:00"
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 # =============================================================================
@@ -113,6 +111,7 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
+    max_generation_failures: 3
     in_flight_weight_updates: true
     recompute_kv_cache_after_weight_updates: false
 
@@ -168,9 +167,10 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: 1024
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
     cpu_offload: false
     sequence_parallel: false
@@ -253,6 +253,7 @@ policy:
 
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -318,8 +319,8 @@ policy:
   # Generation (vLLM) — Non-colocated, async
   # ---------------------------------------------------------------------------
   generation:
-    port_range_low: 11001
-    port_range_high: 15000
+    port_range_low: 3000
+    port_range_high: 4999
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -333,6 +334,7 @@ policy:
     vllm_cfg:
       async_engine: true
       precision: ${policy.precision}
+      refit_with_reload_api: false
       kv_cache_dtype: "auto"
       tensor_parallel_size: 8
       pipeline_parallel_size: 1
@@ -354,6 +356,7 @@ policy:
         reasoning_parser: nano_v3
 
     vllm_kwargs:
+      moe_backend: flashinfer_cutlass
       attention_backend: FLASH_ATTN
       mamba_ssm_cache_dtype: "float32"
       # Hybrid Mamba: one state slot per running seq; the vLLM default (1024) can
@@ -398,7 +401,21 @@ env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: true
   nemo_gym:
-    nemo_gym_log_dir: "logs/nemo_gym"
+    swe_agents_train_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_train
+    swe_agents_val_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_val
+
     skip_venv_if_present: false
     # NeMo-RL-side effort shaping; stripped before forwarding to Gym.
     effort_levels:
@@ -407,8 +424,8 @@ env:
       low_penalty: 1
       low_ub: 15000
     num_gpu_nodes: 0
-    port_range_low: 15001
-    port_range_high: 20000
+    port_range_low: 5000
+    port_range_high: 5999
     invalid_tool_call_patterns:
       - "<tool_call>"
       - "</tool_call>"

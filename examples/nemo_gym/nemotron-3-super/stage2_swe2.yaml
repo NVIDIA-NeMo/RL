@@ -6,8 +6,6 @@ checkpointing:
   keep_top_k: 100
   save_period: 2
   checkpoint_must_save_by: null
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 grpo:
@@ -59,6 +57,7 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
+    max_generation_failures: 3
     in_flight_weight_updates: true
     recompute_kv_cache_after_weight_updates: false
 
@@ -97,9 +96,10 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
     cpu_offload: False
     sequence_parallel: false
@@ -165,6 +165,7 @@ policy:
 
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -228,6 +229,7 @@ policy:
       enable_prefix_caching: true
       async_engine: true
       precision: ${policy.precision}
+      refit_with_reload_api: false
       kv_cache_dtype: "auto"
       tensor_parallel_size: 8
       pipeline_parallel_size: 1
@@ -304,6 +306,20 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    swe_agents_train_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_train
+    swe_agents_val_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_val
     policy_model:
       responses_api_models:
         vllm_model:

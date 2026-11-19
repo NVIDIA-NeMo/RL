@@ -1,0 +1,117 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Extends nemo_automodel.components.speculative.dspark.markov_head (3rdparty
+# Automodel r0.6.0). The head classes are re-exported unchanged; the local
+# delta is reduced-draft-vocab support for speculators-format checkpoints
+# (draft_vocab_size < target vocab): previous tokens are target-space ids, so
+# the prev-token embedding spans the FULL target vocab while the bias
+# projection outputs draft-vocab logits. Upstream heads assume one vocab for
+# both sides.
+from typing import Any
+
+from nemo_automodel.components.speculative.dspark.markov_head import (  # noqa: F401
+    GatedMarkovHead,
+    RNNHead,
+)
+from nemo_automodel.components.speculative.dspark.markov_head import (
+    VanillaMarkov as _UpstreamVanillaMarkov,
+)
+from torch import nn
+
+
+class VanillaMarkov(_UpstreamVanillaMarkov):
+    """Upstream VanillaMarkov with a split embedding/output vocabulary."""
+
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        embed_vocab_size: int | None = None,
+    ) -> None:
+        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+        # Reduced-draft-vocab checkpoints (draft_vocab_size < target vocab)
+        # embed previous tokens over the FULL target vocab (token ids are
+        # target-space) while the bias projection outputs draft-vocab logits.
+        self.embed_vocab_size = int(embed_vocab_size or vocab_size)
+        if self.embed_vocab_size != self.vocab_size:
+            self.markov_w1 = nn.Embedding(self.embed_vocab_size, self.markov_rank)
+
+
+def build_markov_head(config: Any) -> nn.Module | None:
+    """Build the draft model's markov head from its architecture config.
+
+    Args:
+        config: the draft checkpoint's config object (e.g. a HF
+            ``PretrainedConfig``); reads ``markov_rank``, ``markov_head_type``,
+            ``vocab_size``, and (optionally) ``draft_vocab_size``.
+
+    Returns:
+        The constructed head, or None when ``markov_rank == 0`` (no markov
+        head).
+
+    Raises:
+        ValueError: if ``markov_head_type`` doesn't support the checkpoint's
+            reduced draft vocabulary (only ``"vanilla"`` does).
+    """
+    markov_rank = int(config.markov_rank)
+    assert markov_rank >= 0, f"markov_rank must be >= 0, got {markov_rank}"
+    if markov_rank == 0:
+        return None
+
+    markov_head_type = str(config.markov_head_type).lower()
+    # Reduced-draft-vocab checkpoints: bias output over draft_vocab_size,
+    # prev-token embedding over the full target vocab.
+    output_vocab = int(getattr(config, "draft_vocab_size", None) or config.vocab_size)
+    if output_vocab != config.vocab_size and markov_head_type != "vanilla":
+        # The upstream gated/rnn heads embed and project over one vocabulary:
+        # a reduced-vocab checkpoint would add a full-vocab bias to
+        # draft-vocab base logits and index target-space token ids into the
+        # smaller embedding — a guaranteed shape/indexing crash at the first
+        # draft forward. Only the vanilla head has a validated split-vocab
+        # implementation.
+        raise ValueError(
+            f"markov_head_type={markov_head_type!r} does not support a reduced "
+            f"draft vocabulary (draft_vocab_size={output_vocab} < "
+            f"vocab_size={config.vocab_size}); use a vanilla markov head or a "
+            "full-vocab checkpoint."
+        )
+    if markov_head_type == "vanilla":
+        return VanillaMarkov(
+            vocab_size=output_vocab,
+            markov_rank=markov_rank,
+            embed_vocab_size=config.vocab_size,
+        )
+    if markov_head_type == "gated":
+        return GatedMarkovHead(
+            vocab_size=config.vocab_size,
+            markov_rank=markov_rank,
+            hidden_size=config.hidden_size,
+        )
+    if markov_head_type == "rnn":
+        return RNNHead(
+            vocab_size=config.vocab_size,
+            markov_rank=markov_rank,
+            hidden_size=config.hidden_size,
+        )
+    assert False, f"Unsupported markov_head_type: {markov_head_type!r}"
+
+
+__all__ = [
+    "VanillaMarkov",
+    "GatedMarkovHead",
+    "RNNHead",
+    "build_markov_head",
+]

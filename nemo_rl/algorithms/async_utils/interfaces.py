@@ -47,7 +47,8 @@ class ReplayBufferProtocol(Protocol):  # pragma: no cover
         loses its last chance to be used for its intended training step.
 
         Returns:
-            Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
+            Dictionary with ``trajectories`` and ``avg_trajectory_age``, or
+            None if insufficient data.
         """
         ...
 
@@ -73,13 +74,30 @@ class ReplayBufferProtocol(Protocol):  # pragma: no cover
         """Restore state produced by ``state_dict``."""
         ...
 
+    def save_to_path(self, path: str) -> int:
+        """Serialize state directly from the replay actor."""
+        ...
+
+    def load_from_path(
+        self,
+        path: str,
+        num_prompts_per_step: int | None = None,
+        current_training_step: int | None = None,
+        max_age_steps: int | None = None,
+    ) -> dict[str, int]:
+        """Restore state directly in the replay actor."""
+        ...
+
     def get_trajectories_needed(
         self,
         target_step: int,
         num_prompts_per_step: int,
         max_age_steps: int | None = None,
     ) -> int:
-        """Return additional trajectories needed for ``target_step``."""
+        """Return additional trajectories needed for ``target_step``.
+
+        Return zero when the target has a complete batch or is already consumed.
+        """
         ...
 
     def has_complete_batch(

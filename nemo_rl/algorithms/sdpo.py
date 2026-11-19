@@ -38,17 +38,15 @@ from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.grpo import (
-    GRPOConfig,
-    GRPOLoggerConfig,
-    RewardPenaltyConfig,
-    _should_use_async_rollouts,
-    refit_policy_generation,
-    validate,
-)
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
     GRPOAdvantageEstimator,
+)
+from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
+    RewardPenaltyConfig,
+    refit_policy_generation,
+    validate,
 )
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
@@ -64,6 +62,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
 )
+from nemo_rl.data.utils import save_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -71,12 +70,16 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
 )
-from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.interfaces import (
+    GenerationInterface,
+    should_use_async_rollouts,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
     Logger,
+    LoggerConfig,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -88,7 +91,10 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 _DEFAULT_REPROMPT_TEMPLATE = (
-    "{prompt}\n\n" "Here is a correct solution for reference:\n\n" "{solution}\n\n" "Now solve the original problem."
+    "{prompt}\n\n"
+    "Here is a correct solution for reference:\n\n"
+    "{solution}\n\n"
+    "Now solve the original problem."
 )
 
 # Env-feedback teacher template. The teacher conditions on the model's
@@ -116,7 +122,9 @@ _DEFAULT_COMBINED_TEMPLATE = (
 # Combined teacher template for *successful* rollouts: peer demo only, no env
 # feedback line (the attempt didn't fail). Placeholders: {prompt}, {solution}.
 _DEFAULT_COMBINED_SUCCESS_TEMPLATE = (
-    "{prompt}\n\n" "Correct solution:\n\n{solution}\n\n" "Correctly solve the original question."
+    "{prompt}\n\n"
+    "Correct solution:\n\n{solution}\n\n"
+    "Correctly solve the original question."
 )
 
 
@@ -164,7 +172,7 @@ class SDPOConfig(TypedDict):
     # "student" (paper §2.2): the current policy's top-k on the STUDENT input;
     #   the teacher (and trust-region reference) logits are gathered at those
     #   indices via the gather-at-indices mode. Costs one extra no-grad
-    #   student forward per rollout step; requires the DTensor v2 backend.
+    #   student forward per rollout step; requires the Automodel backend.
     topk_source: NotRequired[str]
     reprompt_template: NotRequired[str]  # uses {prompt} and {solution} placeholders
     remove_thinking_from_demo: NotRequired[bool]  # strip <think>…</think> from demos
@@ -173,14 +181,20 @@ class SDPOConfig(TypedDict):
     # "combined": peer rollout + env feedback together
     #   (failed rollouts) and peer rollout alone (successful rollouts).
     feedback_source: NotRequired[str]
-    env_feedback_template: NotRequired[str]  # placeholders: {prompt}, {environment_output}
-    combined_template: NotRequired[str]  # placeholders: {prompt}, {solution}, {environment_output}
+    env_feedback_template: NotRequired[
+        str
+    ]  # placeholders: {prompt}, {environment_output}
+    combined_template: NotRequired[
+        str
+    ]  # placeholders: {prompt}, {solution}, {environment_output}
     combined_success_template: NotRequired[str]  # placeholders: {prompt}, {solution}
     # Trust-region anchor to the frozen-init policy: adds
     # beta * KL(student || ref) to the loss summed over response positions.
     # 0 disables (no ref-policy forward pass; ref model is not initialized).
     reference_policy_kl_penalty: NotRequired[float]  # beta; default 0.0
-    reference_policy_kl_type: NotRequired[str]  # "k1" | "k2" | "k3" (Schulman); default "k3"
+    reference_policy_kl_type: NotRequired[
+        str
+    ]  # "k1" | "k2" | "k3" (Schulman); default "k3"
     # Per-step env-feedback sample logging.
     # 0 = never log samples; 1 = every step; N = every N steps.
     log_sample_every_n_steps: NotRequired[int]
@@ -221,7 +235,7 @@ class MasterConfig(BaseModel, extra="allow"):
     env: dict[str, Any]
     data: DataConfig
     sdpo: SDPOConfig
-    logger: GRPOLoggerConfig
+    logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
 
@@ -387,7 +401,14 @@ def _log_env_feedback_sample(
             import wandb
 
             metrics["sdpo/samples"] = wandb.Table(
-                columns=["step", "kind", "reward", "response", "env_feedback", "teacher_prompt"],
+                columns=[
+                    "step",
+                    "kind",
+                    "reward",
+                    "response",
+                    "env_feedback",
+                    "teacher_prompt",
+                ],
                 data=rows,
             )
         except ImportError:
@@ -473,7 +494,11 @@ def build_sdpo_teacher_data(
         group_logs = message_logs[start:end]
 
         # Identify successful samples within this group
-        success_indices = [i for i in range(num_generations) if group_rewards[i].item() >= success_reward_threshold]
+        success_indices = [
+            i
+            for i in range(num_generations)
+            if group_rewards[i].item() >= success_reward_threshold
+        ]
 
         # Per-sample: default = use original (no self-distillation signal)
         for i in range(num_generations):
@@ -589,12 +614,20 @@ def build_sdpo_teacher_data(
                     user_turn_count += 1
                     if user_turn_count == total_user_turns:
                         original_content = m.get("content", "")
-                        reprompted_content = tpl.format(prompt=original_content, **tpl_kwargs)
-                        teacher_messages.append({"role": "user", "content": reprompted_content})
+                        reprompted_content = tpl.format(
+                            prompt=original_content, **tpl_kwargs
+                        )
+                        teacher_messages.append(
+                            {"role": "user", "content": reprompted_content}
+                        )
                     else:
-                        teacher_messages.append({"role": "user", "content": m.get("content", "")})
+                        teacher_messages.append(
+                            {"role": "user", "content": m.get("content", "")}
+                        )
                 else:
-                    teacher_messages.append({"role": m["role"], "content": m.get("content", "")})
+                    teacher_messages.append(
+                        {"role": m["role"], "content": m.get("content", "")}
+                    )
 
             # Tokenize reprompted prompt
             try:
@@ -640,15 +673,27 @@ def build_sdpo_teacher_data(
     # Pad all sequences to the same length
     max_len = max(t.shape[0] for t in teacher_input_ids_list)
     if make_seq_len_divisible_by > 1:
-        max_len = (max_len + make_seq_len_divisible_by - 1) // make_seq_len_divisible_by * make_seq_len_divisible_by
+        max_len = (
+            (max_len + make_seq_len_divisible_by - 1)
+            // make_seq_len_divisible_by
+            * make_seq_len_divisible_by
+        )
 
     teacher_input_ids = torch.stack(
-        [torch.nn.functional.pad(t, (0, max_len - t.shape[0]), value=pad_token_id) for t in teacher_input_ids_list]
+        [
+            torch.nn.functional.pad(t, (0, max_len - t.shape[0]), value=pad_token_id)
+            for t in teacher_input_ids_list
+        ]
     )
     teacher_token_mask = torch.stack(
-        [torch.nn.functional.pad(m.long(), (0, max_len - m.shape[0]), value=0) for m in teacher_token_mask_list]
+        [
+            torch.nn.functional.pad(m.long(), (0, max_len - m.shape[0]), value=0)
+            for m in teacher_token_mask_list
+        ]
     )
-    teacher_input_lengths = torch.tensor([t.shape[0] for t in teacher_input_ids_list], dtype=torch.long)
+    teacher_input_lengths = torch.tensor(
+        [t.shape[0] for t in teacher_input_ids_list], dtype=torch.long
+    )
 
     teacher_data: BatchedDataDict = BatchedDataDict(
         {
@@ -792,6 +837,82 @@ def project_student_topk_to_teacher(
 
 
 # ============================================================================
+# Validation
+# ============================================================================
+
+
+def _val_sampling_profiles(
+    generation_config: dict[str, Any],
+) -> Optional[tuple[dict[str, Any], dict[str, Any]]]:
+    """Return (val, train) sampling profiles, or None when they are equal."""
+    train = {k: generation_config.get(k) for k in ("temperature", "top_p", "top_k")}
+    val = {
+        k: generation_config.get(f"val_{k}", train[k])
+        for k in ("temperature", "top_p", "top_k")
+    }
+    return None if val == train else (val, train)
+
+
+def _run_validation(
+    policy_generation: GenerationInterface,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer: TokenizerType,
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    step: int,
+    master_config: MasterConfig,
+) -> dict[str, Any]:
+    """Run grpo.validate() for SDPO and return its bare-key metrics.
+
+    grpo.validate() reads ``master_config.grpo``; SDPO has no such block, so a
+    shim carrying the validation keys is injected.
+
+    SDPO rollouts go through the standard (non-NeMo-Gym) rollout path, which
+    builds SamplingParams from the generation worker cfg. grpo honors a
+    validation-only sampling profile (generation.val_temperature / val_top_p /
+    val_top_k) only on the NeMo-Gym path, so the profile is applied here by
+    swapping the workers' sampling params around the validation rollouts. No
+    try/finally: an exception here aborts the training run anyway.
+    """
+    sdpo_cfg = master_config.sdpo
+    # Must be a GRPOConfig model, not a dict: validate() reads .grpo by
+    # attribute (val_period, max_val_samples, val_batch_size,
+    # val_num_generations_per_prompt, max_rollout_turns) — defaults cover the
+    # keys not set here.
+    validate_cfg = master_config.model_copy(
+        update={
+            "grpo": GRPOConfig(
+                max_val_samples=sdpo_cfg["max_val_samples"],
+                val_batch_size=sdpo_cfg["val_batch_size"],
+                max_rollout_turns=sdpo_cfg["max_rollout_turns"],
+                val_num_generations_per_prompt=sdpo_cfg.get(
+                    "val_num_generations_per_prompt", 1
+                ),
+            ),
+        }
+    )
+    profiles = _val_sampling_profiles(master_config.policy["generation"])
+    if profiles is not None:
+        assert hasattr(policy_generation, "update_sampling_params"), (
+            "generation.val_temperature/val_top_p/val_top_k differ from the "
+            "train sampling params, but the generation backend does not "
+            "support update_sampling_params (vLLM only)."
+        )
+        policy_generation.update_sampling_params(**profiles[0])
+    val_metrics, _ = validate(
+        policy_generation,
+        val_dataloader,
+        tokenizer,
+        val_task_to_env,
+        step,
+        validate_cfg,
+    )
+    if profiles is not None:
+        # Restore the train sampling profile for subsequent rollouts.
+        policy_generation.update_sampling_params(**profiles[1])
+    return val_metrics
+
+
+# ============================================================================
 # Setup
 # ============================================================================
 
@@ -834,7 +955,9 @@ def setup(
         "val_at_start": sdpo_config["val_at_start"],
         "val_at_end": sdpo_config["val_at_end"],
         "max_val_samples": sdpo_config["max_val_samples"],
-        "val_num_generations_per_prompt": sdpo_config.get("val_num_generations_per_prompt", 1),
+        "val_num_generations_per_prompt": sdpo_config.get(
+            "val_num_generations_per_prompt", 1
+        ),
         "seed": sdpo_config["seed"],
         # GRPO-specific flags that SDPO doesn't use — set safe defaults
         "normalize_rewards": False,
@@ -883,7 +1006,10 @@ def setup(
     # reference model iff this stub's penalty > 0, so nudge it with an
     # epsilon nothing else reads: sdpo_train derives need_ref_logprobs from
     # the ACTUAL loss config, not this stub.
-    if sdpo_config.get("teacher_regularization", "none") == "trust_region" and _ref_kl_penalty == 0.0:
+    if (
+        sdpo_config.get("teacher_regularization", "none") == "trust_region"
+        and _ref_kl_penalty == 0.0
+    ):
         _ref_kl_penalty = 1e-12
     # grpo.setup asserts that skip_reference_policy_logprobs_calculation=True
     # is only combined with penalty == 0, so keep the stub flag consistent.
@@ -925,17 +1051,32 @@ def setup(
     # loss_config.force_on_policy_ratio / ClippedPGLossFn(cfg).
     # grpo.setup's complete attribute surface on master_config (grep-verified:
     # `master_config\.[a-z_]+` over grpo.py) is: policy, loss_fn, env, data,
-    # grpo, logger, cluster, checkpointing, reward_penalties, data_plane. The
+    # grpo, logger, cluster, checkpointing, reward_penalties, data_plane,
+    # on_policy_distillation, telemetry. The
     # SDPO MasterConfig carries the first eight; the last two are grpo-only
     # fields with defaults, injected here so attribute access doesn't die on
     # the duck-typed copy. If a future main merge adds another
     # `master_config.<field>` read to grpo.setup, extend this update dict.
+    # grpo.setup rejects a validation-only sampling profile outside the
+    # NeMo-Gym rollout path. SDPO applies the profile itself around validation
+    # (see _run_validation), so hand grpo.setup a generation config whose
+    # val_* params equal the train ones; master_config keeps the real values.
+    grpo_policy_config = dict(master_config.policy)
+    grpo_generation_config = dict(grpo_policy_config["generation"])
+    for _key in ("temperature", "top_p", "top_k"):
+        if f"val_{_key}" in grpo_generation_config:
+            grpo_generation_config[f"val_{_key}"] = grpo_generation_config.get(_key)
+    grpo_policy_config["generation"] = grpo_generation_config
+
     grpo_master_config = master_config.model_copy(
         update={
+            "policy": grpo_policy_config,
             "grpo": GRPOConfig(**grpo_config_stub),
             "loss_fn": ClippedPGLossConfig(**grpo_loss_fn_stub),
             "reward_penalties": RewardPenaltyConfig(),
             "data_plane": None,
+            "on_policy_distillation": None,
+            "telemetry": None,
         }
     )
 
@@ -1011,7 +1152,7 @@ def sdpo_train(
     """Run SDPO training algorithm."""
     timer = Timer()
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -1045,13 +1186,19 @@ def sdpo_train(
     reprompt_template = sdpo_cfg.get("reprompt_template", _DEFAULT_REPROMPT_TEMPLATE)
     remove_thinking = sdpo_cfg.get("remove_thinking_from_demo", False)
     feedback_source = sdpo_cfg.get("feedback_source", "peer_rollout")
-    env_feedback_template = sdpo_cfg.get("env_feedback_template", _DEFAULT_ENV_FEEDBACK_TEMPLATE)
+    env_feedback_template = sdpo_cfg.get(
+        "env_feedback_template", _DEFAULT_ENV_FEEDBACK_TEMPLATE
+    )
     combined_template = sdpo_cfg.get("combined_template", _DEFAULT_COMBINED_TEMPLATE)
-    combined_success_template = sdpo_cfg.get("combined_success_template", _DEFAULT_COMBINED_SUCCESS_TEMPLATE)
+    combined_success_template = sdpo_cfg.get(
+        "combined_success_template", _DEFAULT_COMBINED_SUCCESS_TEMPLATE
+    )
     make_div_by = policy_cfg.get("make_sequence_length_divisible_by", 1)
 
     teacher_regularization = sdpo_cfg.get("teacher_regularization", "none")
-    teacher_mix_coef = float(sdpo_cfg.get("teacher_mix_coef", 0.01))  # paper Table 4: alpha = 0.01
+    teacher_mix_coef = float(
+        sdpo_cfg.get("teacher_mix_coef", 0.01)
+    )  # paper Table 4: alpha = 0.01
     if teacher_regularization not in ("none", "trust_region"):
         raise ValueError(
             f"sdpo.teacher_regularization must be 'none' or 'trust_region', got {teacher_regularization!r}"
@@ -1101,7 +1248,10 @@ def sdpo_train(
         adv_cfg.setdefault("use_leave_one_out_baseline", True)
         adv_cfg.setdefault("normalize_rewards", True)
         if adv_cfg["name"] != "grpo":
-            raise ValueError(f"SDPO+GRPO hybrid only supports adv_estimator name 'grpo', " f"got {adv_cfg['name']!r}.")
+            raise ValueError(
+                f"SDPO+GRPO hybrid only supports adv_estimator name 'grpo', "
+                f"got {adv_cfg['name']!r}."
+            )
         # GRPOAdvantageEstimator reads the config by attribute since the main
         # merge — wrap the raw sdpo.adv_estimator dict in the pydantic model.
         adv_estimator = GRPOAdvantageEstimator(
@@ -1122,33 +1272,20 @@ def sdpo_train(
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
-        # grpo.validate() reads master_config.grpo for these keys; provide a shim.
-        _validate_cfg = master_config.model_copy(
-            update={
-                # Must be a GRPOConfig model, not a dict: validate() reads
-                # .grpo by attribute (val_period, max_val_samples,
-                # val_batch_size, val_num_generations_per_prompt,
-                # max_rollout_turns) — defaults cover the keys not set here.
-                "grpo": GRPOConfig(
-                    max_val_samples=sdpo_cfg["max_val_samples"],
-                    val_batch_size=sdpo_cfg["val_batch_size"],
-                    max_rollout_turns=sdpo_cfg["max_rollout_turns"],
-                    val_num_generations_per_prompt=sdpo_cfg.get("val_num_generations_per_prompt", 1),
-                ),
-            }
-        )
-        val_metrics, _ = validate(
+        val_metrics = _run_validation(
             policy_generation,
             val_dataloader,
             tokenizer,
             val_task_to_env,
             total_steps,
-            _validate_cfg,
+            master_config,
         )
         # validate() returns bare keys ("accuracy", "pass_k", ...) since the
         # main merge; log them under the val: prefix that dashboards and
         # checkpointing.metric_name ("val:accuracy") reference.
-        logger.log_metrics({f"val:{k}": v for k, v in val_metrics.items()}, step=total_steps)
+        logger.log_metrics(
+            {f"val:{k}": v for k, v in val_metrics.items()}, step=total_steps
+        )
 
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
@@ -1168,7 +1305,9 @@ def sdpo_train(
                 # ── Prepare batch ────────────────────────────────────────────
                 print("Preparing batch...", flush=True)
                 with timer.time("data_processing"):
-                    repeated_batch: BatchedDataDict[DatumSpec] = batch.repeat_interleave(num_generations)
+                    repeated_batch: BatchedDataDict[DatumSpec] = (
+                        batch.repeat_interleave(num_generations)
+                    )
                     batched_flat, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
@@ -1182,7 +1321,9 @@ def sdpo_train(
                 )
                 with timer.time("prepare_for_generation/total"):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(policy, policy_generation, colocated_inference)
+                        refit_policy_generation(
+                            policy, policy_generation, colocated_inference
+                        )
                         POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
@@ -1190,7 +1331,7 @@ def sdpo_train(
                         policy_generation.prepare_for_generation()
 
                 with timer.time("generation"):
-                    if _should_use_async_rollouts(master_config):
+                    if should_use_async_rollouts(master_config.policy["generation"]):
                         repeated_batch, rollout_metrics = run_async_multi_turn_rollout(
                             policy_generation=policy_generation,
                             input_batch=repeated_batch,
@@ -1221,9 +1362,13 @@ def sdpo_train(
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
                             if message["role"] == "assistant":
-                                message["token_loss_mask"] = torch.ones_like(message["token_ids"])
+                                message["token_loss_mask"] = torch.ones_like(
+                                    message["token_ids"]
+                                )
                             else:
-                                message["token_loss_mask"] = torch.zeros_like(message["token_ids"])
+                                message["token_loss_mask"] = torch.zeros_like(
+                                    message["token_ids"]
+                                )
                             if "generation_logprobs" not in message:
                                 message["generation_logprobs"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
@@ -1241,7 +1386,9 @@ def sdpo_train(
                             "input_lengths": input_lengths,
                             "generation_logprobs": flat_messages["generation_logprobs"],
                             "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": torch.ones(repeated_batch.size, dtype=torch.float32),
+                            "sample_mask": torch.ones(
+                                repeated_batch.size, dtype=torch.float32
+                            ),
                         }
                     )
                     train_data.to("cpu")
@@ -1344,10 +1491,9 @@ def sdpo_train(
                     if tail_buckets:
                         # K+1 buckets need TRUE log-probs so the remainder
                         # bucket 1 - sum(p) is meaningful downstream.
-                        teacher_topk_logits_raw = (
-                            teacher_topk_logits_raw.to(torch.float32)
-                            - teacher_topk["logsumexp"].unsqueeze(-1)
-                        )
+                        teacher_topk_logits_raw = teacher_topk_logits_raw.to(
+                            torch.float32
+                        ) - teacher_topk["logsumexp"].unsqueeze(-1)
 
                 # ── Trust-region teacher (paper §2.3; reference repo's
                 # TrustRegionTeacher). Blend the frozen init policy into the
@@ -1363,13 +1509,17 @@ def sdpo_train(
                 # its missing normalizer Z <= 1 lands in the teacher's
                 # remainder bucket, keeping a valid categorical.
                 if teacher_regularization == "trust_region":
-                    print("Computing trust-region reference teacher logits...", flush=True)
+                    print(
+                        "Computing trust-region reference teacher logits...", flush=True
+                    )
                     with timer.time("teacher_trust_region_ref_logits"):
                         ref_gather_data = BatchedDataDict(
                             {
                                 "input_ids": teacher_data["input_ids"],
                                 "input_lengths": teacher_data["input_lengths"],
-                                "topk_gather_indices": teacher_topk_indices_raw.to(torch.long),
+                                "topk_gather_indices": teacher_topk_indices_raw.to(
+                                    torch.long
+                                ),
                             }
                         )
                         ref_topk = policy.get_reference_policy_topk_logits(
@@ -1399,12 +1549,14 @@ def sdpo_train(
                 # Align teacher top-k tensors to student sequence positions
                 with timer.time("teacher_topk_alignment"):
                     student_seq_len = train_data["input_ids"].shape[1]
-                    teacher_topk_logits_aligned, teacher_topk_indices_aligned = align_teacher_topk(
-                        teacher_topk_logits=teacher_topk_logits_raw.cpu(),
-                        teacher_topk_indices=teacher_topk_indices_raw.cpu(),
-                        teacher_token_mask=teacher_data["token_mask"].cpu(),
-                        student_seq_len=student_seq_len,
-                        student_token_mask=train_data["token_mask"].cpu(),
+                    teacher_topk_logits_aligned, teacher_topk_indices_aligned = (
+                        align_teacher_topk(
+                            teacher_topk_logits=teacher_topk_logits_raw.cpu(),
+                            teacher_topk_indices=teacher_topk_indices_raw.cpu(),
+                            teacher_token_mask=teacher_data["token_mask"].cpu(),
+                            student_seq_len=student_seq_len,
+                            student_token_mask=train_data["token_mask"].cpu(),
+                        )
                     )
 
                 train_data["teacher_topk_logits"] = teacher_topk_logits_aligned
@@ -1434,7 +1586,9 @@ def sdpo_train(
                     sdpo_ref_penalty = loss_fn.sdpo_loss.reference_policy_kl_penalty
                     grpo_ref_penalty = loss_fn.grpo_loss.reference_policy_kl_penalty
                 else:
-                    sdpo_ref_penalty = getattr(loss_fn, "reference_policy_kl_penalty", 0.0)
+                    sdpo_ref_penalty = getattr(
+                        loss_fn, "reference_policy_kl_penalty", 0.0
+                    )
                     grpo_ref_penalty = 0.0
 
                 need_prev_logprobs = is_hybrid
@@ -1452,12 +1606,16 @@ def sdpo_train(
                     )
                     if need_prev_logprobs:
                         with timer.time("prev_logprobs"):
-                            train_data["prev_logprobs"] = policy.get_logprobs(logprob_data, timer=timer)["logprobs"]
+                            train_data["prev_logprobs"] = policy.get_logprobs(
+                                logprob_data, timer=timer
+                            )["logprobs"]
                     if need_ref_logprobs:
                         with timer.time("reference_policy_logprobs"):
-                            train_data["reference_policy_logprobs"] = policy.get_reference_policy_logprobs(
-                                logprob_data, timer=timer
-                            )["reference_logprobs"]
+                            train_data["reference_policy_logprobs"] = (
+                                policy.get_reference_policy_logprobs(
+                                    logprob_data, timer=timer
+                                )["reference_logprobs"]
+                            )
                     del logprob_data
 
                 # ── GRPO advantages (hybrid) ──────────────────────
@@ -1471,8 +1629,14 @@ def sdpo_train(
                     with timer.time("advantage_calculation"):
                         batch_size = train_data["input_ids"].shape[0]
                         num_prompts = batch_size // num_generations
-                        prompt_ids = torch.arange(num_prompts).repeat_interleave(num_generations).unsqueeze(-1)
-                        adv_mask = train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1)
+                        prompt_ids = (
+                            torch.arange(num_prompts)
+                            .repeat_interleave(num_generations)
+                            .unsqueeze(-1)
+                        )
+                        adv_mask = train_data["token_mask"] * train_data[
+                            "sample_mask"
+                        ].unsqueeze(-1)
                         train_data["advantages"] = adv_estimator.compute_advantage(
                             prompt_ids=prompt_ids,
                             rewards=rewards,
@@ -1480,7 +1644,9 @@ def sdpo_train(
                         )
                     metrics["hybrid/grpo_weight"] = loss_fn.grpo_weight
                     if adv_mask.bool().any():
-                        metrics["train/advantages_mean"] = train_data["advantages"][adv_mask.bool()].mean().item()
+                        metrics["train/advantages_mean"] = (
+                            train_data["advantages"][adv_mask.bool()].mean().item()
+                        )
 
                 # ── Train ────────────────────────────────────────────────────
                 print("Preparing for training...", flush=True)
@@ -1510,7 +1676,9 @@ def sdpo_train(
                 metrics["train/loss"] = _to_scalar(train_results.get("loss"))
                 metrics["train/grad_norm"] = _to_scalar(train_results.get("grad_norm"))
                 metrics["train/mean_reward"] = rewards.mean().item()
-                metrics["train/success_fraction"] = (rewards >= success_threshold).float().mean().item()
+                metrics["train/success_fraction"] = (
+                    (rewards >= success_threshold).float().mean().item()
+                )
 
                 # Aggregate SDPO-specific (and, for the hybrid, GRPO/hybrid)
                 # metrics from the loss function. The worker pre-divides every
@@ -1520,7 +1688,9 @@ def sdpo_train(
                 # result num_global_batches× too small — multiply it back.
                 # (With the old full-batch config num_global_batches was 1 and
                 # this was invisible; with gbs=8 it shrank everything 32×.)
-                num_global_batches = max(1, repeated_batch.size // policy_cfg["train_global_batch_size"])
+                num_global_batches = max(
+                    1, repeated_batch.size // policy_cfg["train_global_batch_size"]
+                )
                 for k, v in train_results.get("all_mb_metrics", {}).items():
                     if "sdpo" in k or "hybrid" in k or k.startswith("grpo/"):
                         val = sum(v) / len(v) if isinstance(v, list) else v
@@ -1530,7 +1700,9 @@ def sdpo_train(
                         metrics[k] = val
 
                 num_valid_tokens = int(
-                    (train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1)).sum().item()
+                    (train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1))
+                    .sum()
+                    .item()
                 )
                 total_valid_tokens += num_valid_tokens
                 metrics["train/num_valid_tokens"] = num_valid_tokens
@@ -1540,34 +1712,25 @@ def sdpo_train(
 
                 # ── Validation ───────────────────────────────────────────────
                 is_last_step = (total_steps + 1 >= max_num_steps) or (
-                    (current_epoch + 1 == max_num_epochs) and (current_step + 1 == len(dataloader))
+                    (current_epoch + 1 == max_num_epochs)
+                    and (current_step + 1 == len(dataloader))
                 )
 
-                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (val_at_end and is_last_step):
+                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
+                    val_at_end and is_last_step
+                ):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(policy, policy_generation, colocated_inference)
+                        refit_policy_generation(
+                            policy, policy_generation, colocated_inference
+                        )
                         POLICY_GENERATION_STALE = False
-                    # grpo.validate() reads master_config.grpo for these keys; provide a shim.
-                    _validate_cfg = master_config.model_copy(
-                        update={
-                            # Must be a GRPOConfig model, not a dict: validate()
-                            # reads .grpo by attribute — defaults cover the
-                            # keys not set here.
-                            "grpo": GRPOConfig(
-                                max_val_samples=sdpo_cfg["max_val_samples"],
-                                val_batch_size=sdpo_cfg["val_batch_size"],
-                                max_rollout_turns=sdpo_cfg["max_rollout_turns"],
-                                val_num_generations_per_prompt=sdpo_cfg.get("val_num_generations_per_prompt", 1),
-                            ),
-                        }
-                    )
-                    val_metrics, _ = validate(
+                    val_metrics = _run_validation(
                         policy_generation,
                         val_dataloader,
                         tokenizer,
                         val_task_to_env,
                         total_steps,
-                        _validate_cfg,
+                        master_config,
                     )
                     # validate() returns bare keys ("accuracy", "pass_k", ...)
                     # since the main merge; keep val_metrics bare for the
@@ -1600,22 +1763,31 @@ def sdpo_train(
                 )
 
                 timeout.mark_iteration()
-                should_save_by_step = is_last_step or total_steps % master_config.checkpointing["save_period"] == 0
+                should_save_by_step = (
+                    is_last_step
+                    or total_steps % master_config.checkpointing.save_period == 0
+                )
                 should_save_by_timeout = timeout.check_save()
 
-                if master_config.checkpointing["enabled"] and (should_save_by_step or should_save_by_timeout):
+                if master_config.checkpointing.enabled and (
+                    should_save_by_step or should_save_by_timeout
+                ):
                     policy.prepare_for_training()
 
                     # Track metric for top-k checkpointing
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if ":" in full_metric_name:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if metrics_source and metric_name in metrics_source:
-                            sdpo_save_state[full_metric_name] = metrics_source[metric_name]
+                            sdpo_save_state[full_metric_name] = metrics_source[
+                                metric_name
+                            ]
 
                     print(f"Saving checkpoint for step {total_steps}...", flush=True)
-                    checkpoint_path = checkpointer.init_tmp_checkpoint(total_steps, sdpo_save_state, master_config)
+                    checkpoint_path = checkpointer.init_tmp_checkpoint(
+                        total_steps, sdpo_save_state, master_config
+                    )
                     policy.save_checkpoint(
                         weights_path=os.path.join(checkpoint_path, "policy", "weights"),
                         optimizer_path=(
@@ -1623,13 +1795,15 @@ def sdpo_train(
                             if checkpointer.save_optimizer
                             else None
                         ),
-                        tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
-                        checkpointing_cfg=master_config.checkpointing,
+                        tokenizer_path=os.path.join(
+                            checkpoint_path, "policy", "tokenizer"
+                        ),
+                        is_final_checkpoint=is_last_step or should_save_by_timeout,
                     )
-                    torch.save(
-                        dataloader.state_dict(),
-                        os.path.join(checkpoint_path, "train_dataloader.pt"),
-                    )
+                    save_dataloader_state(dataloader.state_dict(), checkpoint_path)
+                    # Synchronous finalize: wait for any async weight write
+                    # (Megatron async_save) before the directory rename.
+                    policy.finalize_async_save()
                     checkpointer.finalize_checkpoint(checkpoint_path)
 
                 if should_save_by_timeout:

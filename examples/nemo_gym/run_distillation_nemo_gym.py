@@ -28,11 +28,13 @@ from nemo_rl.algorithms.distillation import (
     distillation_train,
     setup,
 )
-from nemo_rl.algorithms.grpo import _should_use_nemo_gym
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
+from nemo_rl.environments.nemo_gym import (
+    setup_nemo_gym_config,
+    should_use_nemo_gym,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
     load_config,
@@ -40,6 +42,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -78,16 +81,15 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
+    check_outdated_config(config)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
-    print(f"📊 Using log directory: {config.logger['log_dir']}")
-    if config.checkpointing["enabled"]:
-        print(
-            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
-        )
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
+    print(f"📊 Using log directory: {config.logger.log_dir}")
+    if config.checkpointing.enabled:
+        print(f"📊 Using checkpoint directory: {config.checkpointing.checkpoint_dir}")
 
     # setup tokenizer
     tokenizer = get_tokenizer(config.policy["tokenizer"])
@@ -105,9 +107,9 @@ def main() -> None:
     setup_nemo_gym_config(config, tokenizer)
 
     # We assert here since this is right after the final config has been materialized.
-    assert _should_use_nemo_gym(config)
+    assert should_use_nemo_gym(config)
 
-    # NeMo-Gym environment needs to get dp_openai_server_base_urls from
+    # NeMo-Gym environment needs to get client_base_urls from
     # student_generation, so we don't setup env here.
     print("\n▶ Setting up data...")
     train_dataset, val_dataset = setup_response_data(

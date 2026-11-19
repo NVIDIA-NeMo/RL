@@ -108,9 +108,7 @@ def _make_msg_log(prompt: str, response: str, env_feedback: str | None = None):
     response_tokens = torch.tensor(
         [ord(c) % 50000 + 1 for c in response], dtype=torch.long
     )
-    user_tokens = torch.tensor(
-        [ord(c) % 50000 + 1 for c in prompt], dtype=torch.long
-    )
+    user_tokens = torch.tensor([ord(c) % 50000 + 1 for c in prompt], dtype=torch.long)
     log = [
         {"role": "user", "content": prompt, "token_ids": user_tokens},
         {"role": "assistant", "content": response, "token_ids": response_tokens},
@@ -248,15 +246,16 @@ def test_align_teacher_topk_writes_at_predicting_logit_positions():
     student_seq_len = 7
     teacher_seq_len = 9
 
-    teacher_topk_logits = torch.arange(
-        teacher_seq_len * K, dtype=torch.float32
-    ).reshape(1, teacher_seq_len, K) + 1.0  # non-zero, distinguishable per position
+    teacher_topk_logits = (
+        torch.arange(teacher_seq_len * K, dtype=torch.float32).reshape(
+            1, teacher_seq_len, K
+        )
+        + 1.0
+    )  # non-zero, distinguishable per position
     teacher_topk_indices = teacher_topk_logits.long()
 
     student_token_mask = torch.tensor([[0, 0, 0, 1, 1, 1, 0]], dtype=torch.long)
-    teacher_token_mask = torch.tensor(
-        [[0, 0, 0, 0, 0, 1, 1, 1, 0]], dtype=torch.long
-    )
+    teacher_token_mask = torch.tensor([[0, 0, 0, 0, 0, 1, 1, 1, 0]], dtype=torch.long)
 
     aligned_logits, aligned_indices = align_teacher_topk(
         teacher_topk_logits=teacher_topk_logits,
@@ -342,14 +341,15 @@ def test_project_student_topk_writes_at_teacher_prediction_positions():
     K = 4
     student_seq_len = 7
 
-    student_topk_indices = torch.arange(
-        student_seq_len * K, dtype=torch.long
-    ).reshape(1, student_seq_len, K) + 1  # non-zero, distinguishable per position
+    student_topk_indices = (
+        torch.arange(student_seq_len * K, dtype=torch.long).reshape(
+            1, student_seq_len, K
+        )
+        + 1
+    )  # non-zero, distinguishable per position
 
     student_token_mask = torch.tensor([[0, 0, 0, 1, 1, 1, 0]], dtype=torch.long)
-    teacher_token_mask = torch.tensor(
-        [[0, 0, 0, 0, 0, 1, 1, 1, 0]], dtype=torch.long
-    )
+    teacher_token_mask = torch.tensor([[0, 0, 0, 0, 0, 1, 1, 1, 0]], dtype=torch.long)
 
     gather = project_student_topk_to_teacher(
         student_topk_indices=student_topk_indices,
@@ -362,7 +362,9 @@ def test_project_student_topk_writes_at_teacher_prediction_positions():
     assert torch.equal(gather[0, 5], student_topk_indices[0, 3])
     assert torch.equal(gather[0, 6], student_topk_indices[0, 4])
     filled = torch.tensor([4, 5, 6])
-    unfilled = torch.tensor([p for p in range(gather.shape[1]) if p not in filled.tolist()])
+    unfilled = torch.tensor(
+        [p for p in range(gather.shape[1]) if p not in filled.tolist()]
+    )
     assert torch.all(gather[0, unfilled] == 0), (
         "Non-response-prediction teacher positions must stay index 0"
     )
@@ -379,9 +381,7 @@ def test_project_student_topk_roundtrips_through_align():
 
     student_topk_indices = torch.randint(1, 5000, (1, student_seq_len, K))
     student_token_mask = torch.tensor([[0, 0, 0, 1, 1, 1, 0]], dtype=torch.long)
-    teacher_token_mask = torch.tensor(
-        [[0, 0, 0, 0, 0, 1, 1, 1, 0]], dtype=torch.long
-    )
+    teacher_token_mask = torch.tensor([[0, 0, 0, 0, 0, 1, 1, 1, 0]], dtype=torch.long)
 
     gather = project_student_topk_to_teacher(
         student_topk_indices=student_topk_indices,

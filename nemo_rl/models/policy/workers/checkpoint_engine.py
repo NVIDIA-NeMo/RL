@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 def maybe_preinit_nixl_checkpoint_engine(config: dict[str, Any]) -> Any:
     """Preinitialize NIXL when checkpoint-engine refit is configured."""
     generation_config = config.get("generation")
-    if generation_config is None:
+    if generation_config is None or generation_config.get("backend") != "vllm":
         return None
     checkpoint_config = checkpoint_engine_refit_config(generation_config)
     if checkpoint_config is None or checkpoint_config["backend"] != "nixl":
@@ -52,8 +52,8 @@ def maybe_preinit_nixl_checkpoint_engine(config: dict[str, Any]) -> Any:
     )
 
 
-class DTensorCheckpointEngineSendMixin:
-    """Onload DTensor/FSDP2 policy weights for checkpoint-engine transfer."""
+class AutomodelCheckpointEngineSendMixin:
+    """Onload Automodel policy weights for checkpoint-engine transfer."""
 
     model: torch.nn.Module
 
@@ -75,7 +75,7 @@ class DTensorCheckpointEngineSendMixin:
     ) -> Iterator[tuple[str, torch.Tensor]]:
         if kv_scales is not None:
             raise NotImplementedError(
-                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+                "FP8 kvcache is not currently supported for the Automodel path, we will support it in the future."
             )
         return self._checkpoint_engine_params()
 

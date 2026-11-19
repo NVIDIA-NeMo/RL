@@ -27,6 +27,7 @@ from transformers import AutoTokenizer
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer, set_seed
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
+from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleConfig,
@@ -41,6 +42,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 from nemo_rl.utils.timer import Timer
 
 
@@ -216,6 +218,7 @@ def main():
             config = parse_hydra_overrides(config, overrides)
 
         config = OmegaConf.to_container(config, resolve=True)
+        check_outdated_config(config)
         config = MasterConfig(**config)
         print("Applied CLI overrides")
 
@@ -224,14 +227,14 @@ def main():
     pprint.pprint(config)
 
     # Get the next experiment directory with incremented ID
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
-    print(f"📊 Using log directory: {config.logger['log_dir']}")
-    if config.checkpointing["enabled"]:
-        print(
-            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
-        )
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
+    print(f"📊 Using log directory: {config.logger.log_dir}")
+    if config.checkpointing.enabled:
+        print(f"📊 Using checkpoint directory: {config.checkpointing.checkpoint_dir}")
 
     with rl_init_timer.time("ray_connect"):
+        # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
+        maybe_configure_data_plane_env(config.data_plane)
         init_ray()
 
     set_seed(config.grpo.seed)

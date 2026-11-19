@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,10 +18,12 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossType
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.data import (
     ProcessedInputs,
     ProcessedMicrobatch,
+    check_sequence_dim,
     get_microbatch_iterator,
     make_processed_microbatch_iterator,
     process_global_batch,
@@ -66,7 +68,7 @@ class TestGetMicrobatchIterator:
         cfg = {
             "dynamic_batching": {"enabled": False},
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
         mbs = 4
         mock_dp_mesh = MagicMock()
@@ -77,7 +79,6 @@ class TestGetMicrobatchIterator:
             mbs=mbs,
             dp_mesh=mock_dp_mesh,
             tokenizer=mock_tokenizer,
-            cp_size=1,
         )
 
         # Verify iterator length
@@ -130,7 +131,7 @@ class TestGetMicrobatchIterator:
         cfg = {
             "dynamic_batching": {"enabled": True},
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
         mbs = 4
         mock_dp_mesh = MagicMock()
@@ -141,7 +142,6 @@ class TestGetMicrobatchIterator:
             mbs=mbs,
             dp_mesh=mock_dp_mesh,
             tokenizer=mock_tokenizer,
-            cp_size=1,
         )
 
         # Verify dynamic batching was used
@@ -192,7 +192,7 @@ class TestGetMicrobatchIterator:
 
         cfg = {
             "dynamic_batching": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
             "sequence_packing": {"enabled": True, "train_mb_tokens": 512},
         }
         mbs = 4
@@ -210,7 +210,6 @@ class TestGetMicrobatchIterator:
             mbs=mbs,
             dp_mesh=mock_dp_mesh,
             tokenizer=mock_tokenizer,
-            cp_size=1,
         )
 
         # Verify sequence packing was used
@@ -257,7 +256,7 @@ class TestGetMicrobatchIterator:
 
         cfg = {
             "dynamic_batching": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
             "sequence_packing": {"enabled": True, "train_mb_tokens": 512},
         }
         mbs = 4
@@ -276,7 +275,6 @@ class TestGetMicrobatchIterator:
             mbs=mbs,
             dp_mesh=mock_dp_mesh,
             tokenizer=mock_tokenizer,
-            cp_size=1,
         )
 
         # Verify local iterator_len is still 1 (not modified)
@@ -299,17 +297,14 @@ class TestProcessMicrobatch:
         )
 
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
         enable_seq_packing = False
-        cp_size = 1
-
         result = process_microbatch(
             mb=mb,
             tokenizer=mock_tokenizer,
             enable_seq_packing=enable_seq_packing,
             cfg=cfg,
-            cp_size=cp_size,
         )
 
         # Verify outputs
@@ -321,8 +316,6 @@ class TestProcessMicrobatch:
         assert result.position_ids.shape == (4, 64)
         assert result.flash_attn_kwargs == {}
         assert result.vlm_kwargs == {}
-        assert result.cp_buffers == []
-        assert result.seq_index is None
         assert result.seq_len == 64
 
     @patch("nemo_rl.models.automodel.data.pack_sequences")
@@ -342,12 +335,10 @@ class TestProcessMicrobatch:
         )
 
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
             "sequence_packing": {"train_mb_tokens": 256},
         }
         enable_seq_packing = True
-        cp_size = 1
-
         # Mock pack_sequences to return packed inputs
         packed_input_ids = torch.randint(0, 1000, (1, 204))  # Sum of lengths
         packed_position_ids = torch.arange(204).unsqueeze(0)
@@ -363,7 +354,6 @@ class TestProcessMicrobatch:
             tokenizer=mock_tokenizer,
             enable_seq_packing=enable_seq_packing,
             cfg=cfg,
-            cp_size=cp_size,
         )
 
         # Verify pack_sequences was called
@@ -382,100 +372,62 @@ class TestProcessMicrobatch:
         assert result.vlm_kwargs == {}
 
     def test_with_multimodal_inputs(self, mock_tokenizer):
-        # Create test microbatch with multimodal data
+        image = torch.randn(1, 3, 224, 224)
+        pixel_row = PackedTensor(image, dim_to_pack=0).enable_deduplication()
+        pixel_values = PackedTensor.concat([pixel_row] * 2)
         mb = BatchedDataDict(
             {
                 "input_ids": torch.randint(0, 1000, (2, 64)),
                 "sample_mask": torch.ones(2, dtype=torch.bool),
-                "pixel_values": torch.randn(2, 3, 224, 224),  # Simulated image data
+                "pixel_values": pixel_values,
             }
         )
-
-        # Mock get_multimodal_dict
-        mock_multimodal_dict = {"pixel_values": torch.randn(2, 3, 224, 224)}
-        mb.get_multimodal_dict = MagicMock(return_value=mock_multimodal_dict)
+        assert len(pixel_values.tensors) == 1
+        assert len(pixel_values) == 2
 
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
         enable_seq_packing = False
-        cp_size = 1
-
         result = process_microbatch(
             mb=mb,
             tokenizer=mock_tokenizer,
             enable_seq_packing=enable_seq_packing,
             cfg=cfg,
-            cp_size=cp_size,
         )
 
         # Verify multimodal kwargs were extracted
         assert isinstance(result, ProcessedInputs)
         assert "pixel_values" in result.vlm_kwargs
+        assert result.vlm_kwargs["pixel_values"].shape == (2, 3, 224, 224)
+        torch.testing.assert_close(
+            result.vlm_kwargs["pixel_values"][0],
+            result.vlm_kwargs["pixel_values"][1],
+            rtol=0,
+            atol=0,
+        )
         # When multimodal inputs are present, position_ids should be None
         assert result.position_ids is None
 
-    def test_with_context_parallel(self, mock_tokenizer):
-        # Create test microbatch
-        mb = BatchedDataDict(
-            {
-                "input_ids": torch.randint(0, 1000, (2, 128)),
-                "sample_mask": torch.ones(2, dtype=torch.bool),
-            }
-        )
-
-        cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
-        }
-        enable_seq_packing = False
-        cp_size = 2  # Context parallel enabled
-
+    def test_media_token_validity_mask_kept_in_vlm_kwargs(self, mock_tokenizer):
         result = process_microbatch(
-            mb=mb,
+            mb=BatchedDataDict(
+                {
+                    "input_ids": torch.randint(0, 1000, (2, 64)),
+                    "sample_mask": torch.ones(2, dtype=torch.bool),
+                    "pixel_values": PackedTensor(
+                        torch.randn(2, 3, 224, 224), dim_to_pack=0
+                    ),
+                    "media_token_validity_mask": torch.zeros(2, 64, dtype=torch.bool),
+                }
+            ),
             tokenizer=mock_tokenizer,
-            enable_seq_packing=enable_seq_packing,
-            cfg=cfg,
-            cp_size=cp_size,
+            enable_seq_packing=False,
+            cfg={"automodel_cfg": {"sequence_parallel": False}},
         )
 
-        # Verify context parallel buffers were created
-        assert isinstance(result, ProcessedInputs)
-        assert len(result.cp_buffers) == 3  # input_ids, position_ids, seq_index
-        assert result.seq_index is not None
-        assert result.seq_index.shape == (1, 128)
-        # Verify no multimodal inputs with CP
-        assert result.vlm_kwargs == {}
-
-    def test_context_parallel_with_multimodal_raises_error(self, mock_tokenizer):
-        # Create test microbatch with multimodal data
-        mb = BatchedDataDict(
-            {
-                "input_ids": torch.randint(0, 1000, (2, 64)),
-                "sample_mask": torch.ones(2, dtype=torch.bool),
-                "pixel_values": torch.randn(2, 3, 224, 224),
-            }
-        )
-
-        # Mock get_multimodal_dict to return non-empty dict
-        mock_multimodal_dict = {"pixel_values": torch.randn(2, 3, 224, 224)}
-        mb.get_multimodal_dict = MagicMock(return_value=mock_multimodal_dict)
-
-        cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
-        }
-        enable_seq_packing = False
-        cp_size = 2  # Context parallel enabled
-
-        with pytest.raises(
-            AssertionError, match="are not supported for context parallel"
-        ):
-            process_microbatch(
-                mb=mb,
-                tokenizer=mock_tokenizer,
-                enable_seq_packing=enable_seq_packing,
-                cfg=cfg,
-                cp_size=cp_size,
-            )
+        assert "pixel_values" in result.vlm_kwargs
+        assert "media_token_validity_mask" in result.vlm_kwargs
 
     def test_sequence_packing_with_multimodal_raises_error(self, mock_tokenizer):
         # Create test microbatch with multimodal data
@@ -493,12 +445,10 @@ class TestProcessMicrobatch:
         mb.get_multimodal_dict = MagicMock(return_value=mock_multimodal_dict)
 
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
             "sequence_packing": {"train_mb_tokens": 128},
         }
         enable_seq_packing = True
-        cp_size = 1
-
         with pytest.raises(
             AssertionError,
             match="multimodal kwargs are not supported for sequence packing",
@@ -508,7 +458,6 @@ class TestProcessMicrobatch:
                 tokenizer=mock_tokenizer,
                 enable_seq_packing=enable_seq_packing,
                 cfg=cfg,
-                cp_size=cp_size,
             )
 
     def test_sequence_parallel_with_multimodal_raises_error(self, mock_tokenizer):
@@ -526,11 +475,9 @@ class TestProcessMicrobatch:
         mb.get_multimodal_dict = MagicMock(return_value=mock_multimodal_dict)
 
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": True},
+            "automodel_cfg": {"sequence_parallel": True},
         }
         enable_seq_packing = False
-        cp_size = 1
-
         with pytest.raises(
             AssertionError, match="Sequence parallel is not supported with multimodal"
         ):
@@ -539,39 +486,12 @@ class TestProcessMicrobatch:
                 tokenizer=mock_tokenizer,
                 enable_seq_packing=enable_seq_packing,
                 cfg=cfg,
-                cp_size=cp_size,
             )
 
 
 @pytest.mark.automodel
 class TestProcessedInputsProperties:
     """Test ProcessedInputs dataclass properties."""
-
-    def test_has_context_parallel_true(self):
-        """Test has_context_parallel returns True when cp_buffers is non-empty."""
-        processed_inputs = ProcessedInputs(
-            input_ids=torch.randint(0, 1000, (2, 64)),
-            seq_len=64,
-            cp_buffers=[torch.randn(2, 64), torch.randn(2, 64)],
-        )
-        assert processed_inputs.has_context_parallel is True
-
-    def test_has_context_parallel_false(self):
-        """Test has_context_parallel returns False when cp_buffers is empty."""
-        processed_inputs = ProcessedInputs(
-            input_ids=torch.randint(0, 1000, (2, 64)),
-            seq_len=64,
-            cp_buffers=[],
-        )
-        assert processed_inputs.has_context_parallel is False
-
-    def test_has_context_parallel_default(self):
-        """Test has_context_parallel returns False by default."""
-        processed_inputs = ProcessedInputs(
-            input_ids=torch.randint(0, 1000, (2, 64)),
-            seq_len=64,
-        )
-        assert processed_inputs.has_context_parallel is False
 
     def test_has_flash_attention_true_with_dict(self):
         """Test has_flash_attention returns True when flash_attn_kwargs has data."""
@@ -634,10 +554,7 @@ class TestProcessedInputsProperties:
             position_ids=torch.arange(64).unsqueeze(0).expand(2, -1),
             flash_attn_kwargs={"cu_seqlens": torch.tensor([0, 32, 64])},
             vlm_kwargs={"pixel_values": torch.randn(2, 3, 224, 224)},
-            cp_buffers=[torch.randn(2, 64)],
-            seq_index=torch.arange(64).unsqueeze(0),
         )
-        assert processed_inputs.has_context_parallel is True
         assert processed_inputs.has_flash_attention is True
         assert processed_inputs.is_multimodal is True
 
@@ -713,6 +630,33 @@ class TestProcessedMicrobatch:
 
 @pytest.mark.automodel
 class TestMakeProcessedMicrobatchIterator:
+    def test_pads_jagged_routed_experts_per_microbatch(self, mock_tokenizer):
+        """Jagged routes from the data plane are padded with -1 to input_ids' width."""
+        rows = [torch.randint(0, 8, (n, 2, 4)) for n in (5, 3)]
+        batch = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (2, 6)),
+                "input_lengths": torch.tensor([5, 3]),
+                "sample_mask": torch.ones(2, dtype=torch.bool),
+                "routed_experts": torch.nested.nested_tensor(rows, layout=torch.jagged),
+            }
+        )
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "automodel_cfg": {"sequence_parallel": False},
+        }
+
+        (processed_mb,) = make_processed_microbatch_iterator(
+            raw_iterator=iter([batch]), tokenizer=mock_tokenizer, cfg=cfg
+        )
+
+        routes = processed_mb.data_dict["routed_experts"]
+        assert not routes.is_nested
+        assert routes.shape == (2, 6, 2, 4)
+        assert torch.equal(routes[0, :5], rows[0])
+        assert torch.equal(routes[1, :3], rows[1])
+        assert (routes[0, 5:] == -1).all() and (routes[1, 3:] == -1).all()
+
     def test_basic_iteration(self, mock_tokenizer):
         """Test basic iteration over microbatches."""
         # Create test data
@@ -732,14 +676,13 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([batch1, batch2])
         cfg = {
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
             cfg=cfg,
-            cp_size=1,
         )
 
         # Collect all processed microbatches
@@ -769,14 +712,13 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([batch])
         cfg = {
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
             cfg=cfg,
-            cp_size=1,
         )
 
         processed_mb = next(processed_iterator)
@@ -799,14 +741,13 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([batch])
         cfg = {
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
             cfg=cfg,
-            cp_size=1,
         )
 
         processed_mb = next(processed_iterator)
@@ -819,50 +760,20 @@ class TestMakeProcessedMicrobatchIterator:
         assert processed_inputs.position_ids is not None
         assert processed_inputs.position_ids.shape == (3, 48)
         assert processed_inputs.seq_len == 48
-        assert processed_inputs.cp_buffers == []
         assert processed_inputs.vlm_kwargs == {}
-
-    def test_with_context_parallel(self, mock_tokenizer):
-        """Test iteration with context parallel enabled."""
-        batch = BatchedDataDict(
-            {
-                "input_ids": torch.randint(0, 1000, (2, 64)),
-                "sample_mask": torch.ones(2, dtype=torch.bool),
-            }
-        )
-
-        raw_iterator = iter([batch])
-        cfg = {
-            "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
-        }
-
-        processed_iterator = make_processed_microbatch_iterator(
-            raw_iterator=raw_iterator,
-            tokenizer=mock_tokenizer,
-            cfg=cfg,
-            cp_size=2,  # Context parallel enabled
-        )
-
-        processed_mb = next(processed_iterator)
-
-        # Verify context parallel buffers are created
-        assert len(processed_mb.processed_inputs.cp_buffers) == 3
-        assert processed_mb.processed_inputs.seq_index is not None
 
     def test_empty_iterator(self, mock_tokenizer):
         """Test that empty iterator yields nothing."""
         raw_iterator = iter([])
         cfg = {
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
             cfg=cfg,
-            cp_size=1,
         )
 
         processed_mbs = list(processed_iterator)
@@ -892,14 +803,13 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([batch1, batch2, batch3])
         cfg = {
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
             cfg=cfg,
-            cp_size=1,
         )
 
         processed_mbs = list(processed_iterator)
@@ -932,7 +842,7 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([batch])
         cfg = {
             "sequence_packing": {"enabled": True, "train_mb_tokens": 256},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
 
         # Mock pack_sequences to return packed inputs
@@ -949,7 +859,6 @@ class TestMakeProcessedMicrobatchIterator:
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
             cfg=cfg,
-            cp_size=1,
         )
 
         processed_mbs = list(processed_iterator)
@@ -977,14 +886,13 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([batch])
         cfg = {
             # No "sequence_packing" key
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,
             tokenizer=mock_tokenizer,
             cfg=cfg,
-            cp_size=1,
         )
 
         processed_mbs = list(processed_iterator)
@@ -1334,10 +1242,9 @@ class TestIntegrationScenarios:
         cfg = {
             "dynamic_batching": {"enabled": False},
             "sequence_packing": {"enabled": False},
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
         }
         mbs = 4
-        cp_size = 1
 
         # Mock get_batch
         def get_batch_side_effect(batch_idx, batch_size):
@@ -1377,7 +1284,6 @@ class TestIntegrationScenarios:
             mbs=2,
             dp_mesh=mock_dp_mesh,
             tokenizer=mock_tokenizer,
-            cp_size=cp_size,
         )
 
         # Step 3: Iterate through processed microbatches
@@ -1389,3 +1295,16 @@ class TestIntegrationScenarios:
         assert all(mb.processed_inputs.input_ids.shape[0] == 2 for mb in processed_mbs)
         assert global_batch_result["global_valid_seqs"] == 8
         assert global_batch_result["global_valid_toks"] == 512
+
+
+@pytest.mark.automodel
+def test_check_sequence_dim_skips_jagged_routed_experts():
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.randint(0, 1000, (2, 6)),
+            "routed_experts": torch.nested.nested_tensor(
+                [torch.zeros(5, 2, 4), torch.zeros(3, 2, 4)], layout=torch.jagged
+            ),
+        }
+    )
+    assert check_sequence_dim(data) == (1, 6)

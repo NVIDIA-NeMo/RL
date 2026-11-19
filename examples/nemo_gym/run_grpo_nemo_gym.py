@@ -33,23 +33,33 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     StatefulDataLoader,
     TokenizerType,
-    _should_use_nemo_gym,
     grpo_train,
     refit_policy_generation,
     setup,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
+from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
+from nemo_rl.environments.nemo_gym import (
+    setup_nemo_gym_config,
+    should_use_nemo_gym,
+)
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
-from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation import (
+    configure_generation_config,
+    draft_full_refit_enabled,
+)
+from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
+from nemo_rl.models.policy.draft_config import draft_refit_enabled
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 from nemo_rl.utils.timer import Timer
 
 
@@ -95,6 +105,7 @@ def collect_trajectories(
             generation_config=generation_config,
             # This utility consumes the Tables below to write its trajectory JSONL.
             log_full_result_tables=True,
+            num_generations_per_prompt=1,
             max_rollout_turns=None,
             greedy=False,
         )
@@ -140,16 +151,16 @@ def main() -> None:
             config = parse_hydra_overrides(config, overrides)
 
         config = OmegaConf.to_container(config, resolve=True)
+        check_outdated_config(config)
         config = MasterConfig(**config)
+        materialize_vllm_video_config(config.policy, config.data)
         print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
-    print(f"📊 Using log directory: {config.logger['log_dir']}")
-    if config.checkpointing["enabled"]:
-        print(
-            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
-        )
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
+    print(f"📊 Using log directory: {config.logger.log_dir}")
+    if config.checkpointing.enabled:
+        print(f"📊 Using checkpoint directory: {config.checkpointing.checkpoint_dir}")
 
     with rl_init_timer.time("tokenizer"):
         is_vlm = bool(config.policy.get("is_vlm"))
@@ -163,9 +174,7 @@ def main() -> None:
         assert config.policy["generation"] is not None, (
             "A generation config is required for GRPO"
         )
-        has_refit_draft_weights = (
-            "draft" in config.policy and config.policy["draft"]["enabled"]
-        )
+        has_refit_draft_weights = draft_refit_enabled(config.policy.get("draft"))
         trains_mtp = (
             "megatron_cfg" in config.policy
             and config.policy["megatron_cfg"]["enabled"]
@@ -176,6 +185,7 @@ def main() -> None:
             tokenizer,
             has_refit_draft_weights=has_refit_draft_weights,
             trains_mtp=trains_mtp,
+            draft_full_refit=draft_full_refit_enabled(config.policy),
         )
         if is_vlm and "vllm_cfg" in config.policy["generation"]:
             assert not config.policy["generation"]["vllm_cfg"]["skip_tokenizer_init"], (
@@ -187,14 +197,29 @@ def main() -> None:
         setup_nemo_gym_config(config, tokenizer)
 
     # We assert here since this is right after the final config has been materialized.
-    assert _should_use_nemo_gym(config)
+    assert should_use_nemo_gym(config)
 
-    # NeMo-Gym environment needs to get dp_openai_server_base_urls from policy_generation, so we don't setup env here.
+    # `is_trajectory_collection` is a NeMo-RL-side control-flow knob; pop it
+    # before setup() so it is not forwarded into NeMo-Gym's global config. It
+    # also determines whether the validation dataset is the collection input.
+    is_trajectory_collection = bool(
+        config.env["nemo_gym"].pop("is_trajectory_collection", False)
+    )
+    should_load_validation = is_trajectory_collection or (
+        config.grpo.val_period > 0 or config.grpo.val_at_start or config.grpo.val_at_end
+    )
+
+    # NeMo-Gym environment needs to get client_base_urls from policy_generation, so we don't setup env here.
     with rl_init_timer.time("data"):
         print("\n▶ Setting up data...")
         data_tokenizer = processor if processor is not None else tokenizer
+        if not should_load_validation and config.data.get("validation") is not None:
+            print("  - Skipping validation dataset because validation is disabled.")
         train_dataset, val_dataset = setup_response_data(
-            data_tokenizer, config.data, env_configs=None
+            data_tokenizer,
+            config.data,
+            env_configs=None,
+            load_validation=should_load_validation,
         )
 
     # Validation dataset config setup.
@@ -219,14 +244,9 @@ The validation set you pass in will directly be used for validation with no addi
     pprint.pprint(config)
 
     with rl_init_timer.time("ray_connect"):
+        # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
+        maybe_configure_data_plane_env(config.data_plane)
         init_ray()
-
-    # `is_trajectory_collection` is a NeMo-RL-side control-flow knob; pop it
-    # before setup() so it is not forwarded into NeMo-Gym's global config (the
-    # gym actor is now created inside setup()).
-    is_trajectory_collection = (
-        config.env["nemo_gym"].pop("is_trajectory_collection", False) or False
-    )
 
     with rl_init_timer.time("setup"):
         (
@@ -266,74 +286,90 @@ The validation set you pass in will directly be used for validation with no addi
     task_to_env = {"nemo_gym": nemo_gym}
     val_task_to_env = task_to_env
 
-    if is_trajectory_collection:
-        collect_trajectories(
-            policy=policy,
-            policy_generation=policy_generation,
-            val_dataloader=val_dataloader,
-            tokenizer=tokenizer,
-            val_task_to_env=val_task_to_env,
-            logger=logger,
-            master_config=master_config,
-        )
-    # Check if async mode is enabled
-    elif config.grpo.async_grpo.enabled:
-        # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
-        if config.grpo.use_dynamic_sampling:
-            raise NotImplementedError(
-                "use_dynamic_sampling is not supported with async GRPO"
+    trainer_owns_environment_shutdown = False
+    try:
+        if is_trajectory_collection:
+            collect_trajectories(
+                policy=policy,
+                policy_generation=policy_generation,
+                val_dataloader=val_dataloader,
+                tokenizer=tokenizer,
+                val_task_to_env=val_task_to_env,
+                logger=logger,
+                master_config=master_config,
             )
-        if config.grpo.reward_scaling.enabled:
-            raise NotImplementedError("reward_scaling is not supported with async GRPO")
-        if config.grpo.reward_shaping.enabled:
-            raise NotImplementedError("reward_shaping is not supported with async GRPO")
+        # Check if async mode is enabled
+        elif config.grpo.async_grpo.enabled:
+            # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
+            if config.grpo.use_dynamic_sampling:
+                raise NotImplementedError(
+                    "use_dynamic_sampling is not supported with async GRPO"
+                )
+            if config.grpo.reward_scaling.enabled:
+                raise NotImplementedError(
+                    "reward_scaling is not supported with async GRPO"
+                )
+            if config.grpo.reward_shaping.enabled:
+                raise NotImplementedError(
+                    "reward_shaping is not supported with async GRPO"
+                )
 
-        # Async GRPO does not support multiple dataloaders
-        if config.data["use_multiple_dataloader"]:
-            raise NotImplementedError(
-                "use_multiple_dataloader is not supported with async GRPO"
+            # Async GRPO does not support multiple dataloaders
+            if config.data["use_multiple_dataloader"]:
+                raise NotImplementedError(
+                    "use_multiple_dataloader is not supported with async GRPO"
+                )
+
+            from nemo_rl.algorithms.grpo import async_grpo_train
+
+            print("🚀 Running async GRPO training")
+
+            # Run async GRPO training
+            async_grpo_train(
+                policy=policy,
+                policy_generation=policy_generation,
+                dataloader=dataloader,
+                val_dataloader=val_dataloader,
+                tokenizer=tokenizer,
+                loss_fn=loss_fn,
+                task_to_env=task_to_env,
+                val_task_to_env=val_task_to_env,
+                logger=logger,
+                checkpointer=checkpointer,
+                grpo_save_state=grpo_state,
+                master_config=master_config,
+                max_trajectory_age_steps=config.grpo.async_grpo.max_trajectory_age_steps,
+                teacher_worker_groups=teacher_worker_groups,
+                alias_to_group_alias=alias_to_group_alias,
+                processor=processor,
             )
+        else:
+            print("🚀 Running synchronous GRPO training")
 
-        from nemo_rl.algorithms.grpo import async_grpo_train
-
-        print("🚀 Running async GRPO training")
-
-        # Run async GRPO training
-        async_grpo_train(
-            policy=policy,
-            policy_generation=policy_generation,
-            dataloader=dataloader,
-            val_dataloader=val_dataloader,
-            tokenizer=tokenizer,
-            loss_fn=loss_fn,
-            task_to_env=task_to_env,
-            val_task_to_env=val_task_to_env,
-            logger=logger,
-            checkpointer=checkpointer,
-            grpo_save_state=grpo_state,
-            master_config=master_config,
-            max_trajectory_age_steps=config.grpo.async_grpo.max_trajectory_age_steps,
-            teacher_worker_groups=teacher_worker_groups,
-            alias_to_group_alias=alias_to_group_alias,
-        )
-    else:
-        print("🚀 Running synchronous GRPO training")
-
-        # Run standard GRPO training
-        grpo_train(
-            policy,
-            policy_generation,
-            dataloader,
-            val_dataloader,
-            tokenizer,
-            loss_fn,
-            task_to_env,
-            val_task_to_env,
-            logger,
-            checkpointer,
-            grpo_state,
-            master_config,
-        )
+            # Run standard GRPO training
+            trainer_owns_environment_shutdown = True
+            grpo_train(
+                policy,
+                policy_generation,
+                dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                grpo_state,
+                master_config,
+                processor=processor,
+            )
+    finally:
+        if not trainer_owns_environment_shutdown:
+            shutdown_environments(task_to_env, val_task_to_env)
+        try:
+            policy_generation.shutdown()
+        except Exception as error:
+            print(f"Error shutting down generation: {error}", flush=True)
 
 
 if __name__ == "__main__":

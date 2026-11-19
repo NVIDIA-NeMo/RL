@@ -1,0 +1,420 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Device selection for the mooncake transport: all IB rails, never RoCE
+alongside them. A regression here still trains, just slower, so nothing
+else would catch it.
+"""
+
+import os
+import sys
+
+import pytest
+
+from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+from nemo_rl.data_plane.adapters import transfer_queue_env as tq_env
+
+
+@pytest.fixture
+def fake_fabric(monkeypatch):
+    """Install a synthetic device inventory.
+
+    The sysfs scan lives in ``tq_env.rail_link_layers`` and the uverbs gate in
+    the adapter, but both reach it through the same stdlib ``glob`` module
+    object, so one patch covers both: the uverbs glob gates on device
+    availability and the link_layer glob enumerates.
+    """
+
+    def _install(
+        layers: dict[str, str],
+        *,
+        uverbs: bool = True,
+        inactive: frozenset[str] = frozenset(),
+        mgmt: str = "",
+        netdevs: dict[str, set[str]] | None = None,
+    ):
+        netdevs = netdevs or {}
+
+        def fake_glob(pattern: str):
+            if pattern.startswith("/dev/infiniband/uverbs"):
+                return ["/dev/infiniband/uverbs0"] if uverbs else []
+            # The scan enumerates ports/1/state and reads link_layer beside it.
+            return [f"/sys/class/infiniband/{d}/ports/1/state" for d in layers]
+
+        def fake_read_text(path, *args, **kwargs):
+            device = path.parents[2].name
+            if path.name == "state":
+                return "4: DOWN" if device in inactive else "4: ACTIVE"
+            return layers[device]
+
+        monkeypatch.setattr(tq_env.glob, "glob", fake_glob)
+        monkeypatch.setattr(tq_env.Path, "read_text", fake_read_text)
+        # The default route sits on `mgmt`; a device owns no netdev unless the
+        # test says so (no management RDMA port by default).
+        monkeypatch.setattr(tq_env, "_default_route_netdev", lambda: mgmt)
+        monkeypatch.setattr(tq_env, "_netdevs_of", lambda dev: netdevs.get(dev, set()))
+        monkeypatch.setattr(os, "environ", dict(os.environ))
+        monkeypatch.delenv("MC_MOONCAKE_DEVICE", raising=False)
+
+    return _install
+
+
+# The real pool0 layout: eight 400 Gb/s IB rails plus one 100 Gb/s RoCE port.
+_MIXED = {
+    "mlx5_0": "InfiniBand",
+    "mlx5_1": "InfiniBand",
+    "mlx5_2": "InfiniBand",
+    "mlx5_3": "Ethernet",
+    "mlx5_4": "InfiniBand",
+    "mlx5_5": "InfiniBand",
+    "mlx5_6": "InfiniBand",
+    "mlx5_7": "InfiniBand",
+    "mlx5_8": "InfiniBand",
+}
+
+
+def test_prefers_infiniband_and_excludes_roce(fake_fabric):
+    """The regression this guards: mlx5_3 was chosen over eight IB rails.
+
+    Exact equality also pins the three things the format depends on: all
+    eight rails (not one), no space after the comma (mooncake splits on ","
+    only), and no RoCE device mixed in.
+    """
+    fake_fabric(_MIXED)
+    assert (
+        tq_adapter.rdma_devices()
+        == "mlx5_0,mlx5_1,mlx5_2,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8"
+    )
+
+
+def test_falls_back_to_roce_only_when_no_ib(fake_fabric):
+    fake_fabric({"mlx5_0": "Ethernet", "mlx5_1": "Ethernet"})
+    assert tq_adapter.rdma_devices() == "mlx5_0,mlx5_1"
+
+
+def test_any_device_name_with_an_active_port_one_is_offered(fake_fabric):
+    """Selection is by port-1 state, not by an ``mlx5_*`` name.
+
+    The rails with an inactive port 1 are left out (mooncake only checks port
+    1), and non-mlx5 names such as ``rdma_vf_rail*`` are kept.
+    """
+    fake_fabric(
+        {
+            "rdma_rail0": "Ethernet",
+            "rdma_vf_rail0": "Ethernet",
+            "rdma_vf_rail1": "Ethernet",
+        },
+        inactive=frozenset({"rdma_rail0"}),
+    )
+    assert tq_adapter.rdma_devices() == "rdma_vf_rail0,rdma_vf_rail1"
+
+
+def test_every_roce_rail_is_offered(fake_fabric):
+    """The gb200 CI layout — 4 RoCE rails, two per NUMA domain — yields all 4.
+
+    Correctness does not come from thinning this list; it comes from
+    MC_ENABLE_DEST_DEVICE_AFFINITY pinning each transfer's peer rail to the
+    local one. Keeping one rail per domain does NOT make this safe: the pair
+    that survives such a filter (mlx5_0, mlx5_2) is itself cross-rail and was
+    measured failing on that fleet.
+    """
+    fake_fabric(
+        {
+            "mlx5_0": "Ethernet",
+            "mlx5_1": "Ethernet",
+            "mlx5_2": "Ethernet",
+            "mlx5_3": "Ethernet",
+        }
+    )
+    assert tq_adapter.rdma_devices() == "mlx5_0,mlx5_1,mlx5_2,mlx5_3"
+
+
+# The real GB300 inventory: mlx5_8 is the RoCE function of eth0, the
+# management interface with the default route; the fabric is rdma_vf_rail*.
+_GB300 = {
+    "mlx5_8": "Ethernet",
+    "rdma_vf_rail0": "Ethernet",
+    "rdma_vf_rail1": "Ethernet",
+    "rdma_vf_rail2": "Ethernet",
+    "rdma_vf_rail3": "Ethernet",
+}
+_GB300_NET = {"mlx5_8": {"eth0"}}
+
+
+def test_management_port_is_left_out_on_gb300(fake_fabric):
+    fake_fabric(_GB300, mgmt="eth0", netdevs=_GB300_NET)
+    assert (
+        tq_adapter.rdma_devices()
+        == "rdma_vf_rail0,rdma_vf_rail1,rdma_vf_rail2,rdma_vf_rail3"
+    )
+
+
+def test_management_port_is_kept_when_it_is_the_only_rdma_device(fake_fabric):
+    fake_fabric({"mlx5_8": "Ethernet"}, mgmt="eth0", netdevs=_GB300_NET)
+    assert tq_adapter.rdma_devices() == "mlx5_8"
+
+
+# A real /proc/net/route: header, then a non-default route before the default.
+# The non-default row has Gateway 00000000, so reading the wrong column fails.
+_ROUTE = (
+    "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+    "rdma_vf_rail0\t0000A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n"
+    "eth0\t00000000\t0100000A\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+)
+
+
+@pytest.mark.parametrize(
+    "route, expected",
+    [(_ROUTE, "eth0"), (_ROUTE.splitlines()[0] + "\n", ""), (None, "")],
+    ids=["default-route", "no-default-route", "no-procfs"],
+)
+def test_default_route_netdev_reads_proc_net_route(
+    tmp_path, monkeypatch, route, expected
+):
+    """Every other test stubs this out, so pin the /proc/net/route parsing here."""
+    route_file = tmp_path / "route"
+    if route is not None:
+        route_file.write_text(route)
+    real_path = tq_env.Path
+    monkeypatch.setattr(
+        tq_env,
+        "Path",
+        lambda p: real_path(route_file) if p == "/proc/net/route" else real_path(p),
+    )
+    assert tq_env._default_route_netdev() == expected
+
+
+def test_empty_without_verbs_node(fake_fabric):
+    """Containers see /sys without /dev/infiniband; mooncake fails late there."""
+    fake_fabric(_MIXED, uverbs=False)
+    assert tq_adapter.rdma_devices() == ""
+
+
+def test_env_override_wins_verbatim(fake_fabric, monkeypatch):
+    fake_fabric(_MIXED)
+    monkeypatch.setenv("MC_MOONCAKE_DEVICE", "mlx5_9,mlx5_10")
+    assert tq_adapter.rdma_devices() == "mlx5_9,mlx5_10"
+
+
+def test_transport_config_is_rdma_and_carries_all_rails(fake_fabric):
+    """The device list must reach mooncake, and the transport stays RDMA."""
+    fake_fabric(_MIXED)
+    cfg = tq_adapter._mooncake_transport_config()
+    assert cfg["protocol"] == "rdma"
+    assert cfg["device_name"] == tq_adapter.rdma_devices()
+
+
+def test_raises_when_no_device_since_mooncake_is_rdma_only(fake_fabric):
+    fake_fabric(_MIXED, uverbs=False)
+    with pytest.raises(RuntimeError, match="requires RDMA"):
+        tq_adapter._mooncake_transport_config()
+
+
+# ── Peer-rail pairing ────────────────────────────────────────────────────────
+#
+# Mooncake picks the peer rail at random unless told otherwise. Where each rail
+# is its own subnet (the RoCE-only gb200 CI runners) a cross-rail pair has no
+# route, which was 100% of the failures observed there.
+
+
+def _mooncake_cfg() -> dict:
+    return {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "mooncake_cpu",
+        "claim_meta_poll_interval_s": 0.5,
+    }
+
+
+@pytest.fixture
+def clean_env(monkeypatch):
+    """Isolate os.environ and pretend the engine has not been imported yet.
+
+    The real ``sys.modules`` always has ``transfer_queue`` in it here — this
+    test module imports the adapter — so the "not yet imported" case has to be
+    injected rather than arranged.
+    """
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.delenv("MC_ENABLE_DEST_DEVICE_AFFINITY", raising=False)
+    monkeypatch.delenv("MC_STORE_MEMCPY", raising=False)
+    monkeypatch.delenv("UCX_MODULES", raising=False)
+    monkeypatch.setattr(tq_env, "_engine_already_imported", lambda: None)
+
+
+@pytest.fixture
+def engine_imported(clean_env, monkeypatch):
+    """Flip ``clean_env``'s verdict: pretend the engine is already loaded."""
+    monkeypatch.setattr(tq_env, "_engine_already_imported", lambda: "transfer_queue")
+
+
+def test_affinity_pinned_on_a_roce_only_fabric(clean_env, fake_fabric):
+    """Same-rail pairing is what makes offering every rail safe."""
+    fake_fabric({"mlx5_0": "Ethernet", "mlx5_1": "Ethernet"})
+    tq_env.configure_engine_env(_mooncake_cfg())
+    assert os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
+
+
+def test_affinity_left_alone_on_infiniband(clean_env, fake_fabric):
+    """IB routes cross-rail, so the hint is not our call to make there.
+
+    Scoped deliberately: the cross-rail failure was only ever measured on RoCE,
+    and this cluster cannot test IB.
+    """
+    fake_fabric({"mlx5_0": "InfiniBand", "mlx5_1": "InfiniBand"})
+    tq_env.configure_engine_env(_mooncake_cfg())
+    assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
+
+
+def test_roce_gate_does_not_fail_open_when_sysfs_is_empty(clean_env, fake_fabric):
+    """No rails at all must not read as "InfiniBand, skip the hint"."""
+    fake_fabric({})
+    assert tq_env.fabric_is_roce_only() is False
+
+
+def test_existing_value_is_not_clobbered(clean_env, fake_fabric):
+    """A launcher-supplied value wins; we only fill the gap."""
+    fake_fabric({"mlx5_0": "Ethernet"})
+    os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] = "0"
+    tq_env.configure_engine_env(_mooncake_cfg())
+    assert os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "0"
+
+
+def test_not_applied_to_simple_backend(clean_env, fake_fabric):
+    """The knob is mooncake-only; `simple` never touches RDMA."""
+    fake_fabric({"mlx5_0": "Ethernet"})
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "simple"})
+    assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
+
+
+@pytest.mark.parametrize("preset", [None, "rc_x,self"])
+def test_nixl_defaults_ucx_to_rdma_only(clean_env, monkeypatch, preset):
+    """nixl refuses an unset UCX_TLS; fill an RDMA-only default, keep a launcher's."""
+    monkeypatch.delenv("UCX_TLS", raising=False)
+    monkeypatch.delenv("UCX_NET_DEVICES", raising=False)
+    if preset:
+        monkeypatch.setenv("UCX_TLS", preset)
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_TLS"] == (preset or "rc,cuda_copy,cuda_ipc,self,sm")
+    assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
+
+
+@pytest.mark.parametrize("preset", [None, "^fuse,cma"])
+def test_nixl_keeps_ucx_fuse_out(clean_env, monkeypatch, preset):
+    """HPC-X's RTLD_GLOBAL libucs_fuse hijacks NIXL's UCX; a launcher's value wins."""
+    monkeypatch.delenv("UCX_NET_DEVICES", raising=False)
+    if preset:
+        monkeypatch.setenv("UCX_MODULES", preset)
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_MODULES"] == (preset or "^fuse")
+
+
+@pytest.mark.parametrize("injected", ["rc,tcp,self", "all"])
+def test_nixl_replaces_a_tcp_ucx_tls_on_the_driver(clean_env, monkeypatch, injected):
+    """A tcp-capable UCX_TLS is replaced, so no launcher setup is needed."""
+    monkeypatch.setenv("UCX_TLS", injected)
+    monkeypatch.delenv("UCX_NET_DEVICES", raising=False)
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_TLS"] == "rc,cuda_copy,cuda_ipc,self,sm"
+
+
+def test_nixl_drops_eth0_from_a_cluster_ucx_net_devices(clean_env, monkeypatch):
+    """The GB200 job env is UCX_TLS=tcp + the rails + eth0; only the rails survive."""
+    monkeypatch.setenv("UCX_TLS", "tcp")
+    monkeypatch.setenv("UCX_NET_DEVICES", "mlx5_0:1,mlx5_1:1,eth0")
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_TLS"] == "rc,cuda_copy,cuda_ipc,self,sm"
+    assert os.environ["UCX_NET_DEVICES"] == "mlx5_0:1,mlx5_1:1"
+
+
+@pytest.mark.parametrize("value", ["eth0", "all,eth0"])
+def test_nixl_names_the_rails_when_ucx_net_devices_is_only_netdevs(
+    clean_env, fake_fabric, monkeypatch, value
+):
+    """The GB300 job env is UCX_TLS=tcp + UCX_NET_DEVICES=eth0, with no rail named.
+
+    The value must be set to the host's RDMA rails, not deleted: init_ray()
+    copies os.environ into the Ray runtime_env, and a deleted key never reaches
+    the workers, which then keep eth0 and refuse to start. ``all,eth0`` names
+    no RDMA device either and must get the rails too, never ``all``.
+    """
+    fake_fabric(_GB300, mgmt="eth0", netdevs=_GB300_NET)
+    monkeypatch.setenv("UCX_TLS", "tcp")
+    monkeypatch.setenv("UCX_NET_DEVICES", value)
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_TLS"] == "rc,cuda_copy,cuda_ipc,self,sm"
+    assert (
+        os.environ["UCX_NET_DEVICES"]
+        == "rdma_vf_rail0:1,rdma_vf_rail1:1,rdma_vf_rail2:1,rdma_vf_rail3:1"
+    )
+
+
+def test_nixl_refuses_netdevs_only_on_a_host_without_rails(
+    clean_env, fake_fabric, monkeypatch
+):
+    """No rail to name: fail at launch instead of leaving eth0 or 'all'."""
+    from nemo_rl.data_plane.nixl.errors import TransportPolicyError
+
+    fake_fabric({})
+    monkeypatch.setenv("UCX_TLS", "tcp")
+    monkeypatch.setenv("UCX_NET_DEVICES", "eth0")
+    with pytest.raises(TransportPolicyError, match="no active RDMA rail"):
+        tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [_mooncake_cfg(), {**_mooncake_cfg(), "backend": "nixl", "enabled": False}],
+    ids=["mooncake_cpu", "nixl-disabled"],
+)
+def test_ucx_swap_is_nixl_only(clean_env, fake_fabric, monkeypatch, cfg):
+    """Only an enabled nixl data plane rewrites UCX; nothing else touches it."""
+    from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
+
+    fake_fabric({"mlx5_0": "InfiniBand"})
+    monkeypatch.setenv("UCX_TLS", "tcp")
+    monkeypatch.setenv("UCX_NET_DEVICES", "mlx5_0:1,eth0")
+    maybe_configure_data_plane_env(cfg)
+    assert os.environ["UCX_TLS"] == "tcp"
+    assert os.environ["UCX_NET_DEVICES"] == "mlx5_0:1,eth0"
+    assert "UCX_MODULES" not in os.environ
+
+
+def test_raises_when_the_engine_was_already_imported(engine_imported, fake_fabric):
+    """The whole point of the split: too-late must be loud, not silent.
+
+    Mooncake snapshots MC_* as its extension loads, so a value set after that
+    reads back fine from os.environ while the engine ignores it — which is how
+    this cost several CI runs before being caught.
+    """
+    fake_fabric({"mlx5_0": "Ethernet"})
+    with pytest.raises(RuntimeError, match="already imported"):
+        tq_env.configure_engine_env(_mooncake_cfg())
+
+
+def test_no_raise_when_already_set_even_if_engine_imported(
+    engine_imported, fake_fabric
+):
+    """The normal worker path: Ray handed down the driver's environment."""
+    fake_fabric({"mlx5_0": "Ethernet"})
+    os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] = "1"
+    os.environ["MC_STORE_MEMCPY"] = "0"
+    tq_env.configure_engine_env(_mooncake_cfg())  # must not raise
+
+
+def test_engine_already_imported_detects_a_loaded_module(monkeypatch):
+    """Pin the detector itself, since every other test stubs it out."""
+    monkeypatch.setitem(sys.modules, "transfer_queue", object())
+    assert tq_env._engine_already_imported() == "transfer_queue"
+    for name in tq_env._ENGINE_MODULES:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    assert tq_env._engine_already_imported() is None

@@ -1,0 +1,880 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Builds the loss-function input dict from model logits."""
+
+from typing import TYPE_CHECKING, Any, Optional
+
+import torch
+
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+    replays_sampler_support,
+)
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
+from nemo_rl.algorithms.loss.utils import (
+    _pack_input_ids,
+    map_teacher_logits_to_draft_vocab,
+    reconstruct_opd_full_teacher_logits,
+)
+from nemo_rl.algorithms.x_token.loss_utils import (
+    prepare_xtoken_cross_tokenizer_loss_input,
+)
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import (
+    ChunkedDistributedCrossEntropyToFixedLogits,
+    ChunkedDistributedEntropy,
+    ChunkedDistributedReverseKLToFixedLogits,
+    allgather_cp_sharded_tensor,
+    check_sampler_support,
+    from_parallel_logits_to_logprobs_packed_sequences,
+    get_cp_sharded_next_token_logprobs,
+    get_distillation_topk_logprobs_from_logits,
+    get_next_token_logprobs_from_logits,
+    get_policy_logprobs_at_sampler_topk,
+    sampled_logprobs_from_support,
+    sampler_support_ids,
+)
+from nemo_rl.utils.sequence_lengths import CpuIntTuple
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.context_parallel import (
+        ContextParallelSharder,
+    )
+
+
+def _validate_score_centering_data(data: BatchedDataDict[Any]) -> None:
+    """Reject missing sampler inputs before computing trainer logprobs."""
+    missing = [
+        key
+        for key in ("sampler_topk_token_ids", "sampler_topk_logprobs")
+        if key not in data
+    ]
+    if missing:
+        raise ValueError(
+            f"Score centering and sampler replay require {', '.join(missing)}: "
+            "use SingleController with NeMo Gym + vLLM, token_capture.enabled=true "
+            "and policy.generation.top_logprobs > 0."
+        )
+
+
+def _replayed_sampler_support(
+    data: BatchedDataDict[Any], sampling_params: Optional[TrainingSamplingParams]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Checked :func:`sampler_support_ids` for training under sampling filters.
+
+    The trainer renormalizes over the support the sampler drew from, which its
+    captured head holds, for the actor loss and the score-centering head.
+
+    Returns:
+        The support ids ``[B, S, K]`` and where the head holds the whole support
+        ``[B, S]`` (see :func:`check_sampler_support`).
+    """
+    assert sampling_params is not None
+    _validate_score_centering_data(data)
+    if not sampling_params.sampler_replay:
+        raise ValueError(
+            "scoring over the sampler's support requires "
+            "policy.generation.sampler_replay.enabled=true"
+        )
+    token_mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+    complete = check_sampler_support(
+        data["input_ids"],
+        data["sampler_topk_token_ids"],
+        data["sampler_topk_logprobs"],
+        token_mask,
+    )
+    support = sampler_support_ids(
+        data["sampler_topk_token_ids"], data["sampler_topk_logprobs"]
+    )
+    return support, complete
+
+
+def sampler_support_logprobs(
+    logits: torch.Tensor,
+    data: BatchedDataDict[Any],
+    sampling_params: Optional[TrainingSamplingParams],
+    *,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    chunk_size: Optional[int] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
+    cu_seqlens_q: Optional[CpuIntTuple] = None,
+    cu_seqlens_q_padded: Optional[CpuIntTuple] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sampled-token and head log-probs renormalized over the sampler's support.
+
+    Shared by the actor loss and the prev-logprob pass, so both see the same
+    distribution: the head is scored once and the sampled token read from its slot.
+
+    Args:
+        logits: Next-token logits, the local TP/CP shard, packed with ``cu_seqlens_q``.
+        data: Canonical microbatch with ``input_ids``, ``token_mask``,
+            ``sample_mask`` and the captured sampler head.
+        sampling_params: Sampling filters with ``sampler_replay``.
+        vocab_parallel_rank: Vocab-parallel rank (with the group).
+        vocab_parallel_group: Vocab-parallel group, or None for the full vocabulary.
+        context_parallel_group: Context-parallel group.
+        chunk_size: Sequence chunk size (policy.logprob_chunk_size).
+        cp_sharder: Automodel context-parallel sharder (not supported).
+        cu_seqlens_q: Unpadded packed-sequence boundaries, when packed.
+        cu_seqlens_q_padded: Padded packed-sequence boundaries, when packed.
+
+    Returns:
+        The sampled token's log-probs ``[B, S - 1]`` and the head's ``[B, S - 1, K]``.
+        Tokens whose captured head misses part of the support get ``-inf``, so the
+        loss drops them and counts them in ``policy_support_excluded_tokens``.
+    """
+    support, complete = _replayed_sampler_support(data, sampling_params)
+    packed_support = None
+    if cu_seqlens_q is not None:
+        assert cu_seqlens_q_padded is not None
+        cp_size, cp_rank = 1, 0
+        if context_parallel_group is not None:
+            cp_size = torch.distributed.get_world_size(context_parallel_group)
+            cp_rank = torch.distributed.get_rank(context_parallel_group)
+        packed_support = _pack_input_ids(
+            support,
+            cu_seqlens_q,
+            cu_seqlens_q_padded,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            roll_shift=-1,
+        )
+    head = get_policy_logprobs_at_sampler_topk(
+        sampler_topk_token_ids=support,
+        next_token_logits=logits,
+        vocab_parallel_rank=vocab_parallel_rank,
+        vocab_parallel_group=vocab_parallel_group,
+        context_parallel_group=context_parallel_group,
+        chunk_size=chunk_size,
+        cp_sharder=cp_sharder,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_q_padded=cu_seqlens_q_padded,
+        packed_sampler_topk_token_ids=packed_support,
+        sampling_params=sampling_params,
+    )
+    sampled = sampled_logprobs_from_support(head, support, data["input_ids"])
+    sampled = sampled.masked_fill(~complete[:, 1:].to(sampled.device), -float("inf"))
+    return sampled, head
+
+
+def _prepare_opd_full_loss_input(
+    logits: torch.Tensor,
+    data: BatchedDataDict[Any],
+    loss_fn: LossFunction,
+    *,
+    vocab_parallel_rank: Optional[int],
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup],
+    context_parallel_group: Optional[torch.distributed.ProcessGroup],
+    sampling_params: Optional[TrainingSamplingParams],
+    chunk_size: Optional[int],
+    teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
+) -> dict[str, Any]:
+    """Build the full-vocabulary MOPD loss input from student logits + teacher payload.
+
+    Runs the distributed reverse-KL kernel here rather than inside the loss so the
+    loss stays free of process-group plumbing, mirroring the DISTILLATION branch.
+
+    Args:
+        logits: Student vocabulary-parallel logits ``[B, S_local, V_local]``.
+        data: Microbatch carrying the teacher payload column.
+        loss_fn: The ``opd_full``-configured loss function.
+        vocab_parallel_rank: Vocabulary-parallel rank.
+        vocab_parallel_group: Vocabulary-parallel process group.
+        context_parallel_group: Context-parallel process group.
+        sampling_params: Training sampling params for the sampled-token logprobs.
+        chunk_size: Sequence-dim chunk size for the sampled-token logprobs.
+        teacher_output_layer_weight_by_index: Per-teacher LM-head shards keyed
+            by index, for the hidden-state path.
+
+    Returns:
+        Loss input dict with the per-token divergence and, when requested, the
+        entropy/cross-entropy decomposition.
+
+    Raises:
+        ValueError: If the teacher payload column is missing.
+        NotImplementedError: If no vocabulary-parallel group is available.
+    """
+    # Deferred: nemo_rl.algorithms.opd imports the data plane (tensordict), which
+    # should not be pulled into every loss-function consumer.
+    from nemo_rl.algorithms.opd import (
+        opd_full_payload_field,
+        opd_full_teacher_index_field,
+    )
+
+    full_cfg = loss_fn.opd_full  # type: ignore[attr-defined]
+    if vocab_parallel_group is None:
+        raise NotImplementedError(
+            "opd_full currently requires the Megatron vocabulary-parallel path; "
+            "the Automodel-only logit path is not supported."
+        )
+
+    payload_field = opd_full_payload_field(full_cfg)
+    if payload_field not in data:
+        raise ValueError(
+            f"opd_full requires the teacher payload column {payload_field!r} in "
+            "the training microbatch."
+        )
+
+    teacher_index_field = opd_full_teacher_index_field(full_cfg)
+    teacher_index = (
+        data[teacher_index_field]
+        if teacher_index_field is not None and teacher_index_field in data
+        else None
+    )
+
+    teacher_logits = reconstruct_opd_full_teacher_logits(
+        data[payload_field],
+        teacher_payload=full_cfg.teacher_payload,
+        student_logits=logits,
+        vocab_parallel_rank=vocab_parallel_rank,
+        context_parallel_group=context_parallel_group,
+        teacher_output_layer_weight_by_index=teacher_output_layer_weight_by_index,
+        teacher_index=teacher_index,
+    ).detach()
+
+    divergence_chunk_size = full_cfg.chunk_size or int(logits.shape[1])
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(  # type: ignore[misc]
+        logits,
+        teacher_logits,
+        divergence_chunk_size,
+        vocab_parallel_group,
+        False,
+    )
+    entropy = None
+    cross_entropy = None
+    if full_cfg.validate_decomposition:
+        # inference_only: both are read detached for metrics only, so there is no
+        # reason to save their inputs for a backward that never runs.
+        entropy = ChunkedDistributedEntropy.apply(  # type: ignore[misc]
+            logits,
+            divergence_chunk_size,
+            vocab_parallel_group,
+            True,
+        )
+        cross_entropy = ChunkedDistributedCrossEntropyToFixedLogits.apply(  # type: ignore[misc]
+            logits,
+            teacher_logits,
+            divergence_chunk_size,
+            vocab_parallel_group,
+            True,
+        )
+
+    if context_parallel_group is not None and (
+        torch.distributed.get_world_size(context_parallel_group) > 1
+    ):
+        reverse_kl = allgather_cp_sharded_tensor(
+            reverse_kl, context_parallel_group, seq_dim=1
+        )
+        if entropy is not None:
+            entropy = allgather_cp_sharded_tensor(
+                entropy, context_parallel_group, seq_dim=1
+            )
+        if cross_entropy is not None:
+            cross_entropy = allgather_cp_sharded_tensor(
+                cross_entropy, context_parallel_group, seq_dim=1
+            )
+
+    # Position t predicts token t+1 on both sides, so dropping the last position
+    # matches the LOGPROB convention that pairs with token_mask[:, 1:].
+    next_token_width = int(data["input_ids"].shape[1]) - 1
+    loss_input: dict[str, Any] = {
+        "opd_full_divergence": reverse_kl[:, :next_token_width],
+        "opd_full_entropy": None if entropy is None else entropy[:, :next_token_width],
+        "opd_full_cross_entropy": (
+            None if cross_entropy is None else cross_entropy[:, :next_token_width]
+        ),
+    }
+    if getattr(loss_fn, "reference_policy_kl_penalty", 0) != 0:
+        # Unfiltered: this is consumed only by the reference-KL term, and
+        # calculate_kl cannot take -inf. Under top-k/top-p a sampled token
+        # outside the kept set would give logprob -inf, hence logr +inf, hence
+        # a NaN k3 estimate that masked_mean then spreads over the whole step.
+        # The LOGPROB branch keeps a separate unfiltered copy for the same
+        # reason; opd_full has no filtered consumer, so it just asks for one.
+        loss_input["next_token_logprobs"] = get_next_token_logprobs_from_logits(
+            input_ids=data["input_ids"],
+            next_token_logits=logits,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            sampling_params=None,
+            chunk_size=chunk_size,
+        )
+    return loss_input
+
+
+def prepare_loss_input(
+    logits: torch.Tensor,
+    data: BatchedDataDict[Any],
+    loss_fn: LossFunction,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
+    d2t: Optional[torch.Tensor] = None,
+    chunk_size: Optional[int] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
+    teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
+) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
+    """Prepare loss input for a loss function.
+
+    Args:
+        logits: Logits from the model.
+        data: Microbatch data. Will be updated if sampling_params is not None.
+        loss_fn: Loss function.
+        vocab_parallel_rank: Vocab parallel rank.
+        vocab_parallel_group: Vocab parallel group.
+        context_parallel_group: Context parallel group.
+        sampling_params: Sampling parameters.
+        d2t: Draft to target token mapping.
+        chunk_size: Sequence-dim chunk size for the vocab-parallel logprob
+            computation (policy.logprob_chunk_size); avoids materializing
+            full-size float32 logits during training.
+        cp_sharder: Automodel ``ContextParallelSharder`` owning this forward's
+            sequence layout; set only when cp_size > 1. ``logits`` are then this
+            rank's CP-local shard while ``data`` stays canonical.
+        teacher_output_layer_weight_by_index: This TP rank's
+            ``[V_local, H_teacher]`` teacher LM-head shards, keyed by the stable
+            index rows are tagged with. The ``opd_full`` hidden-state path
+            projects each row's teacher payload into teacher logits with them.
+
+    Notes:
+        Parallel groups are supplied by Megatron and Automodel workers.
+        Automodel uses a singleton vocabulary group for chunked local logprobs.
+        sampling_params is only used for LossInputType.LOGPROB, and currently only supported for ClippedPGLossFn.
+        d2t is only used for LossInputType.DRAFT.
+        teacher_output_layer_weight_by_index is only used for LossInputType.OPD_FULL.
+
+    Returns:
+        tuple(loss_input, maybe_updated_data)
+    """
+    if getattr(loss_fn, "score_centering", False):
+        _validate_score_centering_data(data)
+    if loss_fn.input_type == LossInputType.LOGIT:
+        loss_input = {"logits": logits}
+
+    elif loss_fn.input_type == LossInputType.LOGPROB:
+        score_centering = getattr(loss_fn, "score_centering", False)
+        support_head = None
+        # Linear CE fusion patch returns precomputed next-token logprobs (2D tensor).
+        # Keep normal path unchanged for standard logits (3D tensor).
+        if (
+            hasattr(loss_fn, "use_fused_linear_logprobs")
+            and loss_fn.use_fused_linear_logprobs
+        ):
+            logprobs = logits
+            logprobs = logprobs.to(torch.float32)
+            logprobs = logprobs[:, : data["input_ids"].shape[1] - 1]
+        elif replays_sampler_support(sampling_params):
+            logprobs, support_head = sampler_support_logprobs(
+                logits,
+                data,
+                sampling_params,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                chunk_size=chunk_size,
+                cp_sharder=cp_sharder,
+            )
+        else:
+            logprobs = get_next_token_logprobs_from_logits(
+                input_ids=data["input_ids"],
+                next_token_logits=logits,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                sampling_params=sampling_params,
+                chunk_size=chunk_size,
+                cp_sharder=cp_sharder,
+            )
+
+        # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
+        if need_top_k_or_top_p_filtering(sampling_params):
+            # Preserve support information until the actor loss builds its mask.
+            # compute unfiltered logprobs for reference policy KL penalty
+            if (
+                hasattr(loss_fn, "reference_policy_kl_penalty")
+                and loss_fn.reference_policy_kl_penalty != 0
+            ):
+                data["curr_logprobs_unfiltered"] = get_next_token_logprobs_from_logits(
+                    input_ids=data["input_ids"],
+                    next_token_logits=logits,
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                    sampling_params=None,  # no filtering
+                    # Only reachable with top-k/top-p sampling active that has its own kernel path so don't chunk here
+                    chunk_size=None,
+                    cp_sharder=cp_sharder,
+                )
+
+        loss_input = {"next_token_logprobs": logprobs}
+        if need_top_k_or_top_p_filtering(sampling_params):
+            loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
+        if score_centering and support_head is not None:
+            loss_input["policy_logprobs_at_sampler_topk"] = support_head
+        elif score_centering:
+            # Log-probs at the sampler's captured top-k ids, for score centering.
+            # Under filters without replay this raises: the head is only defined
+            # over the sampler's support.
+            loss_input["policy_logprobs_at_sampler_topk"] = (
+                get_policy_logprobs_at_sampler_topk(
+                    sampler_topk_token_ids=data["sampler_topk_token_ids"],
+                    next_token_logits=logits,
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                    chunk_size=chunk_size,
+                    cp_sharder=cp_sharder,
+                    sampling_params=sampling_params,
+                )
+            )
+
+    elif loss_fn.input_type == LossInputType.OPD_FULL:
+        loss_input = _prepare_opd_full_loss_input(
+            logits,
+            data,
+            loss_fn,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            sampling_params=sampling_params,
+            chunk_size=chunk_size,
+            teacher_output_layer_weight_by_index=teacher_output_layer_weight_by_index,
+        )
+
+    elif loss_fn.input_type == LossInputType.DISTILLATION:
+        # K+1 tail buckets (SDPO, paper A.3): the student side must be TRUE
+        # log-probs at the indices (the zero_outside_topk gather path), no
+        # entropy is needed (the bucket replaces the tail correction), and the
+        # teacher tensor already carries true log-probs from sdpo_train.
+        # DistillationLossFn shares this input type but has no tail_mode.
+        tail_buckets = getattr(loss_fn, "tail_mode", "legacy") == "k_plus_one"
+        zero_outside_topk = True if tail_buckets else loss_fn.zero_outside_topk
+        calculate_entropy = (
+            False
+            if tail_buckets
+            else (loss_fn.zero_outside_topk and loss_fn.kl_type != "forward")
+        )
+        student_topk_logprobs, teacher_topk_logprobs, H_all = (
+            get_distillation_topk_logprobs_from_logits(
+                student_logits=logits,
+                teacher_topk_logits=data["teacher_topk_logits"],
+                teacher_topk_indices=data["teacher_topk_indices"],
+                zero_outside_topk=zero_outside_topk,
+                calculate_entropy=calculate_entropy,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                cp_sharder=cp_sharder,
+                teacher_is_logprobs=tail_buckets,
+            )
+        )
+
+        loss_input = {
+            "student_topk_logprobs": student_topk_logprobs,
+            "teacher_topk_logprobs": teacher_topk_logprobs,
+            "H_all": H_all,
+        }
+        # SDPO's trust-region ref-KL needs grad-carrying current logprobs at
+        # the sampled tokens as its student side; detached tensors from the
+        # data dict would contribute no gradient. The rollout IS clip also
+        # needs current logprobs (detached inside the loss) to form the
+        # pi_theta/pi_rollout ratio. DistillationLossFn has neither knob,
+        # hence the getattrs.
+        if (
+            getattr(loss_fn, "reference_policy_kl_penalty", 0.0) > 0.0
+            or getattr(loss_fn, "rollout_importance_sampling_clip", None) is not None
+        ):
+            loss_input["next_token_logprobs"] = get_next_token_logprobs_from_logits(
+                input_ids=data["input_ids"],
+                next_token_logits=logits,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                sampling_params=None,  # unfiltered, consistent with ref logprobs
+                chunk_size=chunk_size,
+                cp_sharder=cp_sharder,
+            )
+
+    elif loss_fn.input_type == LossInputType.DISTILLATION_AND_LOGPROB:
+        # SDPO+GRPO hybrid: the distillation top-k inputs for the SDPO term
+        # plus next-token logprobs for the clipped-PG term.
+        sdpo_loss = loss_fn.sdpo_loss
+        # See the DISTILLATION branch for the K+1 tail-bucket handling.
+        tail_buckets = getattr(sdpo_loss, "tail_mode", "legacy") == "k_plus_one"
+        zero_outside_topk = True if tail_buckets else sdpo_loss.zero_outside_topk
+        calculate_entropy = (
+            False
+            if tail_buckets
+            else (sdpo_loss.zero_outside_topk and sdpo_loss.kl_type != "forward")
+        )
+        student_topk_logprobs, teacher_topk_logprobs, H_all = (
+            get_distillation_topk_logprobs_from_logits(
+                student_logits=logits,
+                teacher_topk_logits=data["teacher_topk_logits"],
+                teacher_topk_indices=data["teacher_topk_indices"],
+                zero_outside_topk=zero_outside_topk,
+                calculate_entropy=calculate_entropy,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                cp_sharder=cp_sharder,
+                teacher_is_logprobs=tail_buckets,
+            )
+        )
+
+        logprobs = get_next_token_logprobs_from_logits(
+            input_ids=data["input_ids"],
+            next_token_logits=logits,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            sampling_params=sampling_params,
+            chunk_size=chunk_size,
+            cp_sharder=cp_sharder,
+        )
+        loss_input = {
+            "student_topk_logprobs": student_topk_logprobs,
+            "teacher_topk_logprobs": teacher_topk_logprobs,
+            "H_all": H_all,
+            "next_token_logprobs": logprobs,
+        }
+        if need_top_k_or_top_p_filtering(sampling_params):
+            # Same contract as the LOGPROB branch: the clipped-PG term gets the
+            # current sampler support as a mask.
+            loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
+            # The GRPO and SDPO reference-policy KLs and the SDPO rollout IS
+            # ratio need unfiltered current logprobs (consistent with the
+            # unfiltered reference / rollout logprobs).
+            if (
+                loss_fn.grpo_loss.reference_policy_kl_penalty != 0
+                or sdpo_loss.reference_policy_kl_penalty > 0
+                or sdpo_loss.rollout_importance_sampling_clip is not None
+            ):
+                data["curr_logprobs_unfiltered"] = get_next_token_logprobs_from_logits(
+                    input_ids=data["input_ids"],
+                    next_token_logits=logits,
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                    sampling_params=None,  # no filtering
+                    chunk_size=None,
+                    cp_sharder=cp_sharder,
+                )
+
+    elif loss_fn.input_type == LossInputType.DISTILLATION_CROSS_TOKENIZER:
+        # Rebuild each teacher's full-vocab logits from its per-rank CUDA IPC
+        # handles and do the shared CP-resolution the loss needs; the loss fn
+        # does the per-teacher projection / chunk-average / KL reductions and
+        # aggregates them by ``kd_loss_mode``. ``projection_matrix_paths`` drives
+        # the teacher count and which teachers are same-tokenizer (``None``). The
+        # TP group is derived from the student logits' own device mesh.
+        (
+            student_logits_contig,
+            teacher_full_logits_by_idx,
+            aligns_by_idx,
+            tp_group,
+            cp_group,
+        ) = prepare_xtoken_cross_tokenizer_loss_input(
+            logits,
+            data,
+            projection_matrix_paths=loss_fn.projection_matrix_paths,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            cp_sharder=cp_sharder,
+        )
+        loss_input = {
+            "logits": logits,
+            "student_logits_contig": student_logits_contig,
+            "teacher_full_logits_by_idx": teacher_full_logits_by_idx,
+            "aligns_by_idx": aligns_by_idx,
+            "tp_group": tp_group,
+            "cp_group": cp_group,
+        }
+        if cp_sharder is not None:
+            next_token_logprobs = get_cp_sharded_next_token_logprobs(
+                logits,
+                data["input_ids"],
+                cp_sharder,
+                chunk_size=chunk_size,
+            )
+            # The sharder gathers canonical log-probabilities on every CP rank.
+            # Give each rank one disjoint canonical window for CE backward so
+            # every token contributes exactly once across the CP group. Append
+            # the unused final-token slot first so partitioning uses the original
+            # sequence length rather than the next-token length.
+            full_logprobs = torch.cat(
+                [next_token_logprobs, torch.zeros_like(next_token_logprobs[:, :1])],
+                dim=1,
+            )
+            cp_size = (
+                torch.distributed.get_world_size(context_parallel_group)
+                if context_parallel_group is not None
+                else 1
+            )
+            full_seq_len = full_logprobs.shape[1]
+            if full_seq_len % cp_size != 0:
+                raise ValueError(
+                    "Student sequence length must be divisible by the student "
+                    "context parallel size, but got "
+                    f"sequence_length={full_seq_len}, cp_size={cp_size}. "
+                    "Set policy.make_sequence_length_divisible_by to a multiple of "
+                    "policy.automodel_cfg.context_parallel_size."
+                )
+            cp_rank = (
+                torch.distributed.get_rank(context_parallel_group)
+                if context_parallel_group is not None
+                else 0
+            )
+            local_seq_len = full_seq_len // cp_size
+            seq_start = cp_rank * local_seq_len
+            next_token_mask = (
+                data["token_mask"].to(full_logprobs.device).roll(shifts=-1, dims=1)
+            )
+            next_token_mask[:, -1] = 0
+            loss_input.update(
+                student_next_token_logprobs=full_logprobs.narrow(
+                    1, seq_start, local_seq_len
+                ).contiguous(),
+                student_next_token_mask=next_token_mask.narrow(
+                    1, seq_start, local_seq_len
+                ).contiguous(),
+            )
+
+    elif loss_fn.input_type == LossInputType.DRAFT:
+        from megatron.core.transformer.multi_token_prediction import roll_tensor
+
+        teacher_logits = roll_tensor(
+            logits.detach(),
+            shifts=-1,
+            dims=1,
+            cp_group=context_parallel_group,
+        )[0]
+        token_mask = roll_tensor(
+            data["token_mask"], shifts=-1, dims=1, cp_group=context_parallel_group
+        )[0]
+        teacher_logits = map_teacher_logits_to_draft_vocab(
+            teacher_logits,
+            d2t,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+        )
+        loss_input = {
+            "teacher_logits": teacher_logits,
+            "student_logits": data["student_logits"],
+            "token_mask": token_mask,
+        }
+
+    else:
+        raise ValueError(f"Unknown loss function input type: {loss_fn.input_type}")
+
+    return loss_input, data
+
+
+def prepare_packed_loss_input(
+    logits: torch.Tensor,
+    data: BatchedDataDict[Any],
+    loss_fn: LossFunction,
+    cu_seqlens_q: CpuIntTuple,
+    cu_seqlens_q_padded: CpuIntTuple,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
+    chunk_size: Optional[int] = None,
+    reuse_logits_storage: bool = False,
+) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
+    """Prepare loss input from packed logits in a single fused pass.
+
+    Unlike prepare_loss_input which operates on a single (unpacked) sequence,
+    this function computes log probabilities from packed logits across all
+    sequences at once using from_parallel_logits_to_logprobs_packed_sequences.
+
+    Currently only supports LossInputType.LOGPROB.
+
+    Args:
+        logits: Packed logits from the model [1, T_packed // CP, V // TP].
+        data: Microbatch data (unpacked, [B, S]).
+        loss_fn: Loss function (must have input_type == LossInputType.LOGPROB).
+        cu_seqlens_q: Unpadded cumulative sequence lengths [B+1]. CPU-resident
+            integer tuples are required at this host-side loss boundary.
+        cu_seqlens_q_padded: Padded cumulative sequence lengths [B+1]. CPU-resident
+            integer tuples are required at this host-side loss boundary.
+        vocab_parallel_rank: Vocab parallel rank.
+        vocab_parallel_group: Vocab parallel group.
+        context_parallel_group: Context parallel group.
+        sampling_params: Sampling parameters.
+        chunk_size: Sequence-dim chunk size for the logprob computation
+            (policy.logprob_chunk_size); avoids materializing full-size
+            float32 logits during training.
+        reuse_logits_storage: Let the chunked logprob write its grad into the
+            logits' storage (policy.megatron_cfg.reuse_logits_storage). Takes
+            effect only with chunking; the logits must have no other consumer.
+
+    Returns:
+        tuple(loss_input, maybe_updated_data)
+    """
+    if loss_fn.input_type != LossInputType.LOGPROB:
+        raise ValueError(
+            f"prepare_packed_loss_input only supports LossInputType.LOGPROB, "
+            f"got {loss_fn.input_type}. Use SequencePackingLossWrapper with "
+            f"prepare_loss_input for other types."
+        )
+    assert vocab_parallel_group is not None, (
+        "prepare_packed_loss_input requires vocab_parallel_group (Megatron TP)."
+    )
+    assert vocab_parallel_rank is not None, (
+        "vocab_parallel_rank must be provided with vocab_parallel_group."
+    )
+
+    score_centering = getattr(loss_fn, "score_centering", False)
+    if score_centering:
+        _validate_score_centering_data(data)
+    input_ids = data["input_ids"]
+    unpacked_seqlen = input_ids.shape[1]
+    input_is_prepacked = "cu_seqlens" in data
+    replay = replays_sampler_support(sampling_params)
+    if (score_centering or replay) and input_is_prepacked:
+        raise ValueError(
+            "Score centering and sampler replay do not support externally "
+            "prepacked inputs"
+        )
+    cp_size = (
+        1
+        if context_parallel_group is None
+        else torch.distributed.get_world_size(context_parallel_group)
+    )
+    cp_rank = (
+        0
+        if context_parallel_group is None
+        else torch.distributed.get_rank(context_parallel_group)
+    )
+
+    if input_is_prepacked:
+        # Energon already produced one physical row. The distributed helper
+        # shifts each source independently before CP slicing, so source N never
+        # predicts the first token of source N+1.
+        packed_targets = input_ids
+    else:
+        packed_targets = _pack_input_ids(
+            input_ids,
+            cu_seqlens_q,
+            cu_seqlens_q_padded,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            roll_shift=-1,
+        )
+
+    # With chunking, keep logits in their original dtype: the chunked logprob
+    # kernel casts each chunk to float32 internally.
+    use_chunking = chunk_size is not None and not need_top_k_or_top_p_filtering(
+        sampling_params
+    )
+    logits_for_logprobs = logits if use_chunking else logits.to(torch.float32)
+
+    def sampler_topk_logprobs(ids: torch.Tensor) -> torch.Tensor:
+        return get_policy_logprobs_at_sampler_topk(
+            sampler_topk_token_ids=ids,
+            next_token_logits=logits,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            chunk_size=chunk_size,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_q_padded=cu_seqlens_q_padded,
+            packed_sampler_topk_token_ids=_pack_input_ids(
+                ids,
+                cu_seqlens_q,
+                cu_seqlens_q_padded,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                roll_shift=-1,
+            ),
+            sampling_params=sampling_params,
+        )
+
+    support_head = None
+    if replay:
+        logprobs, support_head = sampler_support_logprobs(
+            logits,
+            data,
+            sampling_params,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            chunk_size=chunk_size,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_q_padded=cu_seqlens_q_padded,
+        )
+    else:
+        logprobs = from_parallel_logits_to_logprobs_packed_sequences(
+            logits_for_logprobs,
+            packed_targets,
+            cu_seqlens_q_padded,
+            unpacked_seqlen,
+            vocab_start_index=vocab_parallel_rank * logits.shape[-1],
+            vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+            group=vocab_parallel_group,
+            inference_only=False,
+            cp_group=context_parallel_group,
+            sampling_params=sampling_params,
+            chunk_size=chunk_size if use_chunking else None,
+            target_is_pre_rolled=not input_is_prepacked,
+            return_packed_layout=input_is_prepacked,
+            # The grad may overwrite these logits only on the chunked path. The
+            # unfiltered KL call below reads them again, but only with chunking off.
+            reuse_logits_storage=reuse_logits_storage and use_chunking,
+        )
+
+    # Match prepare_loss_input behavior for top-k/top-p filtered training:
+    # use filtered curr_logprobs for actor loss, but keep unfiltered values for KL.
+    if need_top_k_or_top_p_filtering(sampling_params):
+        # Preserve support information until the actor loss builds its mask.
+        if (
+            hasattr(loss_fn, "reference_policy_kl_penalty")
+            and loss_fn.reference_policy_kl_penalty != 0
+        ):
+            data["curr_logprobs_unfiltered"] = (
+                from_parallel_logits_to_logprobs_packed_sequences(
+                    logits_for_logprobs,
+                    packed_targets,
+                    cu_seqlens_q_padded,
+                    unpacked_seqlen,
+                    vocab_start_index=vocab_parallel_rank * logits.shape[-1],
+                    vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+                    group=vocab_parallel_group,
+                    inference_only=False,
+                    cp_group=context_parallel_group,
+                    sampling_params=None,
+                    chunk_size=chunk_size if use_chunking else None,
+                    target_is_pre_rolled=not input_is_prepacked,
+                    return_packed_layout=input_is_prepacked,
+                )
+            )
+
+    loss_input = {"next_token_logprobs": logprobs}
+    if need_top_k_or_top_p_filtering(sampling_params):
+        loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
+    if score_centering and support_head is not None:
+        loss_input["policy_logprobs_at_sampler_topk"] = support_head
+    elif score_centering:
+        loss_input["policy_logprobs_at_sampler_topk"] = sampler_topk_logprobs(
+            data["sampler_topk_token_ids"]
+        )
+    return loss_input, data

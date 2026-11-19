@@ -34,19 +34,19 @@ The `expand` and `minimize` commands support printing to stdout or in-place edit
 
 Example:
   # Expand a config with a root level "defaults" key to see the full config; print to stdout
-  tools/config_cli.py expand examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml
+  tools/config_cli.py expand examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-automodel-tp4.yaml
 
   # Expand a config with a root level "defaults" key to see the full config; edit the config in place
-  tools/config_cli.py expand examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --in-place
+  tools/config_cli.py expand examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-automodel-tp4.yaml --in-place
 
   # Minimize a config (base inferred from its defaults key); print to stdout
-  tools/config_cli.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml
+  tools/config_cli.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-automodel-tp4.yaml
 
   # Minimize a config in place
-  tools/config_cli.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --in-place
+  tools/config_cli.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-automodel-tp4.yaml --in-place
 
   # Minimize with explicit base (rebase to a different parent)
-  tools/config_cli.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --base examples/configs/dpo.yaml --in-place
+  tools/config_cli.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-automodel-tp4.yaml --base examples/configs/dpo.yaml --in-place
 
   # Minimize all configs:
   for recipe in examples/configs/recipes/{llm,vlm}/*.yaml; do
@@ -241,6 +241,12 @@ def _prune_equal(a: Any, b: Any) -> Any:
     - Else: if equal, return a sentinel indicating removal; otherwise return `a`.
     """
     if _dict_like(a) and _dict_like(b):
+        # `_override_` makes the merge drop the base subtree wholesale (see
+        # merge_with_override), so a key matching the base is not redundant --
+        # pruning it would resolve to absent instead of the base value.
+        if a.get("_override_", False):
+            return a
+
         out: dict[str, Any] = {}
         a_dict: dict[str, Any] = a  # type: ignore[assignment]
         b_dict: dict[str, Any] = b  # type: ignore[assignment]

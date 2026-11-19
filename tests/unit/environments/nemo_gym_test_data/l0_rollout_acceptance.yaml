@@ -1,0 +1,158 @@
+cases:
+  - name: math_with_judge
+    config_path: resources_servers/math_with_judge/configs/math_with_judge.yaml
+    data_path: resources_servers/math_with_judge/data/example.jsonl
+    example_index: 0
+    example_sha256: 5e8d77674814a6b1fdcd0f2dbef0c8597cc109814763056070ff2eeb0c9d70ef  # pragma: allowlist secret
+    agent_ref:
+      type: responses_api_agents
+      name: math_with_judge_simple_agent
+    expected_generations:
+      - '\boxed{32}'
+    expected_prompt_fragment: 1000 digit numbers
+    rejected_generations:
+      - '\boxed{999999}'
+    expected_reward: 1.0
+    expected_result:
+      extracted_answer: "32"
+      library_reward: 1.0
+
+  - name: code_gen
+    config_path: resources_servers/code_gen/configs/code_gen.yaml
+    data_path: resources_servers/code_gen/data/example.jsonl
+    example_index: 4
+    example_sha256: ceea8ed47c6615783bc9df8140110b2aa86729438448ee04e74c5d4850ebff24  # pragma: allowlist secret
+    agent_ref:
+      type: responses_api_agents
+      name: code_gen_simple_agent
+    expected_generations:
+      - |-
+        ```python
+        import sys
+
+        values = iter(map(int, sys.stdin.buffer.read().split()))
+        test_count = next(values)
+        answers = []
+        for _ in range(test_count):
+            n = next(values)
+            positions = [0] * (n + 1)
+            for index in range(n):
+                positions[next(values)] = index
+            left = right = positions[1]
+            bits = []
+            for value in range(1, n + 1):
+                left = min(left, positions[value])
+                right = max(right, positions[value])
+                bits.append("1" if right - left + 1 == value else "0")
+            answers.append("".join(bits))
+        sys.stdout.write("\n".join(answers))
+        ```
+    expected_prompt_fragment: beautiful number
+    rejected_generations:
+      - |-
+        ```python
+        print(0)
+        ```
+    expected_reward: 1.0
+    expected_result:
+      result:
+        - true
+        - true
+        - true
+
+  - name: single_step_tool_use_with_argument_comparison
+    config_path: resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
+    data_path: resources_servers/single_step_tool_use_with_argument_comparison/data/example.jsonl
+    example_index: 4
+    example_sha256: 2e24731dfeda02e16351dd5abd5c1e3fd8307554f4824cf4fb3630672c63f5ca  # pragma: allowlist secret
+    agent_ref:
+      type: responses_api_agents
+      name: single_step_tool_use_with_argument_comparison_agent
+    expected_generations:
+      - '{"name":"check_seat_availability","arguments":{"event_id":"SHOW24","section":"Medical Zone"}}'
+    expected_prompt_fragment: SHOW24
+    rejected_generations:
+      - I cannot call the requested tool.
+    expected_reward: 1.0
+    expected_result:
+      category: A tool call that matches the expected tool call was found
+      expected_action:
+        type: function_call
+        name: check_seat_availability
+        arguments: '{"event_id": "SHOW24", "section": "Medical Zone"}'
+
+  - name: mcqa
+    config_path: resources_servers/mcqa/configs/mcqa.yaml
+    data_path: resources_servers/mcqa/data/example.jsonl
+    example_index: 0
+    example_sha256: 3e3bd43ed3707cc35f84edf0a57357d0cc0f8dfd7692991d0daf05ad421d0846  # pragma: allowlist secret
+    agent_ref:
+      type: responses_api_agents
+      name: mcqa_simple_agent
+    expected_generations:
+      - '\boxed{B}'
+    expected_prompt_fragment: cystic fibrosis
+    rejected_generations:
+      - '\boxed{A}'
+    expected_reward: 1.0
+    expected_result:
+      expected_answer: B
+      extracted_answer: B
+
+  - name: equivalence_llm_judge
+    config_path: resources_servers/equivalence_llm_judge/configs/equivalence_llm_judge.yaml
+    data_path: resources_servers/equivalence_llm_judge/data/example.jsonl
+    example_index: 0
+    example_sha256: efabdc976b384f6f48ee5e42cf855a66e6fba84feedd1b15fd30f256f56ecd9b  # pragma: allowlist secret
+    agent_ref:
+      type: responses_api_agents
+      name: equivalence_llm_judge_simple_agent
+    expected_generations:
+      - '\boxed{Charles Darwin}'
+    expected_prompt_fragment: theory of evolution by natural selection
+    rejected_generations:
+      - '\boxed{Ada Lovelace}'
+    rejected_judge_verdicts:
+      - "[[A!=B]]"
+    expected_reward: 1.0
+    expected_result:
+      expected_answer: darwin
+    expected_judge_verdicts:
+      - '[[A=B]]'
+
+  - name: structured_outputs_v4
+    config_path: resources_servers/structured_outputs/configs/structured_outputs_v4.yaml
+    data_path: resources_servers/structured_outputs/data/structured_outputs_v4_example.jsonl
+    example_index: 0
+    example_sha256: 138b2f4383ec722989fdefd60ea0f1724712037e46e9d62ca2df0cc14308e1a4  # pragma: allowlist secret
+    agent_ref:
+      type: responses_api_agents
+      name: structured_outputs_v4_simple_agent
+    expected_generations:
+      - '{"name":"response_tool_8","arguments":{"extraction":{"name":"Dizer Kola","native_name":"ديزركلا","romanized_name":"Dizer Kola","settlement_type":"village","country":"Iran","province":"Mazandaran","county":"Nowshahr","bakhsh":"Central","rural_district":"Baladeh Kojur","coordinates":{"latitude":36.55694,"longitude":51.79389},"population_total":250,"population_year":2006,"number_of_families":64,"timezone_standard":"UTC+3:30 (IRST)","timezone_dst":"UTC+4:30 (IRDT)"}}}'
+    expected_prompt_fragment: Dizer Kola
+    rejected_generations:
+      - I cannot extract that.
+    expected_reward: 1.0
+    expected_result:
+      schema_type: json
+      error_type: null
+
+  - name: workplace_assistant
+    config_path: resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    data_path: resources_servers/workplace_assistant/data/example.jsonl
+    example_index: 0
+    example_sha256: c7a80ae027d7bf89dea4700acc00a20d37400a91a19dbe9908d4b945367b657a  # pragma: allowlist secret
+    agent_ref:
+      type: responses_api_agents
+      name: workplace_assistant_simple_agent
+    expected_generations:
+      - '{"name":"email_reply_email","arguments":{"email_id":"00000057","body":"Thanks for the update - I will get back to you tomorrow."}}'
+      - Done
+    expected_prompt_fragment: Task Update on Develop prototype
+    rejected_generations:
+      - Done
+    expected_reward: 1.0
+    expected_result: {}
+    expected_tool_outputs:
+      - '{"output":"Email replied successfully."}'

@@ -68,7 +68,9 @@ def test_run_one_test_stdin_wrong_answer_paper_format():
     """Wrong-answer feedback follows paper F.3 Listing 4 (`Test Case N: Wrong Answer / Input / Output / Expected`)."""
     code = "n = int(input())\nprint(n + 1)"  # off by one
     test = {"input": "21\n", "output": "42\n", "testtype": "stdin"}
-    passed, _kind, feedback = _run_one_test(code, test, function_name=None, timeout=4.0, test_index=3)
+    passed, _kind, feedback = _run_one_test(
+        code, test, function_name=None, timeout=4.0, test_index=3
+    )
     assert passed is False
     assert "Test Case 3: Wrong Answer" in feedback
     assert "\nInput\n" in feedback
@@ -92,13 +94,11 @@ def test_run_one_test_stdin_runtime_error_paper_format():
 
 
 def test_run_one_test_functional_passes():
-    code = (
-        "class Solution:\n"
-        "    def add(self, a, b):\n"
-        "        return a + b\n"
-    )
+    code = "class Solution:\n    def add(self, a, b):\n        return a + b\n"
     test = {"input": "[2, 3]", "output": "5", "testtype": "functional"}
-    passed, _kind, feedback = _run_one_test(code, test, function_name="add", timeout=4.0)
+    passed, _kind, feedback = _run_one_test(
+        code, test, function_name="add", timeout=4.0
+    )
     assert passed is True
     assert feedback == ""
 
@@ -110,7 +110,9 @@ def test_run_one_test_functional_wrong_answer_paper_format():
         "        return a - b\n"  # bug
     )
     test = {"input": "[2, 3]", "output": "5", "testtype": "functional"}
-    passed, _kind, feedback = _run_one_test(code, test, function_name="add", timeout=4.0, test_index=2)
+    passed, _kind, feedback = _run_one_test(
+        code, test, function_name="add", timeout=4.0, test_index=2
+    )
     assert passed is False
     assert "Test Case 2: Wrong Answer" in feedback
     assert "Expected" in feedback
@@ -119,7 +121,9 @@ def test_run_one_test_functional_wrong_answer_paper_format():
 def test_run_one_test_timeout_paper_format():
     code = "while True:\n    pass\n"
     test = {"input": "", "output": "", "testtype": "stdin"}
-    passed, _kind, feedback = _run_one_test(code, test, function_name=None, timeout=1.0, test_index=5)
+    passed, _kind, feedback = _run_one_test(
+        code, test, function_name=None, timeout=1.0, test_index=5
+    )
     assert passed is False
     assert "Test Case 5: Time Limit Exceeded" in feedback
     assert "Timeout: 1.0s" in feedback
@@ -130,7 +134,9 @@ def test_extract_function_name_optional(function_name):
     """Smoke: stdin tests still work even when function_name is provided."""
     code = "x = int(input())\nprint(x)"
     test = {"input": "7\n", "output": "7\n", "testtype": "stdin"}
-    passed, _kind, _ = _run_one_test(code, test, function_name=function_name, timeout=4.0)
+    passed, _kind, _ = _run_one_test(
+        code, test, function_name=function_name, timeout=4.0
+    )
     assert passed is True
 
 
@@ -173,17 +179,15 @@ def test_run_one_test_functional_multiline_json_input():
         "        return sum(points) + m\n"
     )
     test = {"input": "[6,8]\n5", "output": "19", "testtype": "functional"}
-    passed, _kind, feedback = _run_one_test(code, test, function_name="maxScore", timeout=4.0)
+    passed, _kind, feedback = _run_one_test(
+        code, test, function_name="maxScore", timeout=4.0
+    )
     assert passed is True, feedback
 
 
 def test_run_one_test_functional_three_args_json_per_line():
     """Three function arguments, each its own JSON line."""
-    code = (
-        "class Solution:\n"
-        "    def f(self, a, b, c):\n"
-        "        return a + b + c\n"
-    )
+    code = "class Solution:\n    def f(self, a, b, c):\n        return a + b + c\n"
     test = {"input": "1\n2\n3", "output": "6", "testtype": "functional"}
     passed, _kind, feedback = _run_one_test(code, test, function_name="f", timeout=4.0)
     assert passed is True, feedback
@@ -219,8 +223,13 @@ def test_run_one_test_huge_input_keeps_output_and_expected_visible():
     big_input = "[" + ",".join(str(i) for i in range(1000)) + "]\n"
     test = {"input": big_input, "output": "42", "testtype": "stdin"}
     passed, _kind, fb = _run_one_test(
-        code, test, function_name=None, timeout=4.0, test_index=2,
-        max_input_lines=40, max_input_chars=800,
+        code,
+        test,
+        function_name=None,
+        timeout=4.0,
+        test_index=2,
+        max_input_lines=40,
+        max_input_chars=800,
     )
     assert passed is False
     assert "Test Case 2: Wrong Answer" in fb
@@ -249,9 +258,13 @@ _ADD_TESTS = [
 def _grade_one(response, tests, split="train", dense=False, max_failed=2):
     meta = {"tests": tests, "split": split}
     return grade_batch(
-        [response], [meta], timeout=4.0,
-        max_feedback_chars=2000, max_failed_in_feedback=max_failed,
-        max_input_lines=8, max_input_chars=250,
+        [response],
+        [meta],
+        timeout=4.0,
+        max_feedback_chars=2000,
+        max_failed_in_feedback=max_failed,
+        max_input_lines=8,
+        max_input_chars=250,
         dense_train_rewards=dense,
     )[0]
 

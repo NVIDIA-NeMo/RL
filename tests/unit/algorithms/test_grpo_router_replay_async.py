@@ -19,11 +19,14 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.grpo import (
+    AsyncGRPOConfig,
+    GRPOConfig,
     MasterConfig,
     _build_async_grpo_train_data,
     _initial_grpo_save_state,
     async_grpo_train,
 )
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -53,6 +56,7 @@ def _make_async_master_config(data_plane=None) -> MasterConfig:
     return MasterConfig.model_construct(
         **{
             "policy": {
+                "precision": "bfloat16",
                 "router_replay": {"enabled": True},
                 "generation": {
                     "backend": "vllm",
@@ -60,6 +64,11 @@ def _make_async_master_config(data_plane=None) -> MasterConfig:
                 },
             },
             "loss_fn": SimpleNamespace(use_importance_sampling_correction=True),
+            "grpo": GRPOConfig.model_construct(
+                async_grpo=AsyncGRPOConfig.model_construct(
+                    max_generation_failures=0,
+                )
+            ),
             "data_plane": data_plane,
         }
     )
@@ -69,8 +78,8 @@ def _make_async_master_config(data_plane=None) -> MasterConfig:
 @pytest.mark.parametrize(
     ("policy_config", "expect_routed_experts"),
     [
-        ({"router_replay": {"enabled": True}}, True),
-        ({"router_replay": {"enabled": False}}, False),
+        ({"precision": "bfloat16", "router_replay": {"enabled": True}}, True),
+        ({"precision": "bfloat16", "router_replay": {"enabled": False}}, False),
     ],
 )
 def test_build_async_grpo_train_data_preserves_routed_experts_for_r3(
@@ -107,6 +116,68 @@ def test_build_async_grpo_train_data_preserves_routed_experts_for_r3(
         assert torch.equal(train_data["routed_experts"], routes)
     else:
         assert "routed_experts" not in train_data
+
+
+def test_build_async_grpo_train_data_accepts_all_text_vlm_replay_batch():
+    flat_messages = BatchedDataDict(
+        {
+            "token_ids": torch.tensor([[1, 2, 3]]),
+            "generation_logprobs": torch.zeros(1, 3),
+            "token_loss_mask": torch.tensor([[0, 1, 1]]),
+        }
+    )
+    input_lengths = torch.tensor([3])
+    repeated_batch = BatchedDataDict({"loss_multiplier": torch.tensor([1.0])})
+
+    train_data = _build_async_grpo_train_data(
+        flat_messages,
+        input_lengths,
+        repeated_batch,
+        {**_make_async_master_config().policy, "is_vlm": True},
+    )
+
+    assert train_data["input_ids"].tolist() == [[1, 2, 3]]
+    assert train_data.get_multimodal_dict(as_tensors=False) == {}
+
+
+@pytest.mark.parametrize(
+    ("precision", "expected_dtype"),
+    [
+        ("float32", torch.float32),
+        ("bfloat16", torch.bfloat16),
+        ("float16", torch.float16),
+    ],
+)
+def test_build_async_grpo_train_data_uses_policy_dtype_without_expanding_dedup(
+    precision, expected_dtype
+):
+    pixels = PackedTensor(
+        [torch.randn(2, 3, 8, 8, dtype=torch.float32)], dim_to_pack=0
+    ).enable_deduplication()
+    pixels = PackedTensor.concat([pixels] * 4)
+    flat_messages = BatchedDataDict(
+        {
+            "token_ids": torch.tensor([[1, 2, 3]] * 4),
+            "generation_logprobs": torch.zeros(4, 3),
+            "token_loss_mask": torch.tensor([[0, 1, 1]] * 4),
+            "pixel_values": pixels,
+        }
+    )
+
+    train_data = _build_async_grpo_train_data(
+        flat_messages,
+        torch.tensor([3] * 4),
+        BatchedDataDict({"loss_multiplier": torch.ones(4)}),
+        {"precision": precision, "router_replay": {"enabled": False}},
+    )
+
+    cast_pixels = train_data["pixel_values"]
+    assert isinstance(cast_pixels, PackedTensor)
+    assert len(cast_pixels) == 4
+    assert len(cast_pixels.tensors) == 1
+    assert sum(cast_pixels.logical_segment_counts_by_row()) == 4
+    assert cast_pixels.tensors[0].dtype == expected_dtype
+    assert pixels.tensors[0].dtype == torch.float32
 
 
 def test_async_grpo_r3_data_plane_directs_to_single_controller():

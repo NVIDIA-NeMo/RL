@@ -12,7 +12,7 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 2048
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true
@@ -28,6 +28,7 @@ policy:
   sequence_packing:
     enabled: false
   generation:
+    lora_refit_mode: merged
     vllm_cfg:
       tensor_parallel_size: 4
       gpu_memory_utilization: 0.7

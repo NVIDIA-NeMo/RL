@@ -16,18 +16,22 @@ import os
 import types
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import vllm  # noqa: F401
 import zmq
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
+from nemo_rl.modelopt.models.generation.vllm_quant_moe_amax import (
+    route_moe_input_quantizer_amax,
+)
 from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
     matches_quant_ignore_pattern,
 )
 from nemo_rl.models.generation.vllm.checkpoint_engine import VllmCheckpointEngineMixin
+from nemo_rl.models.generation.vllm.patches import modelopt_moe_amax_aliases
 from nemo_rl.models.generation.vllm.vllm_backend import (
     IPCWeightManifestError,
     VllmInternalWorkerExtension,
@@ -149,10 +153,10 @@ def _batch_fused_modelopt_moe_weights(
     loader still requires an expert id, so only the tiny per-expert global
     scales are exposed as scalar views.
 
-    Gated ``w13`` payloads are the exception on vLLM >= 0.25: they are emitted
-    as per-expert 2-D shards instead, because ``RoutedExperts.load_weights``'
-    fused-3D branch mis-transposes packed NVFP4. See the comment at the
-    emission site below.
+    ``w13`` payloads are the exception on vLLM >= 0.25: both the gated and the
+    non-gated layouts are emitted as per-expert 2-D shards instead, because
+    ``RoutedExperts.load_weights``' fused-3D branch mis-transposes packed
+    NVFP4. See the comments at the emission sites below.
     """
     batched: list[tuple[str, torch.Tensor]] = []
     for name, tensor in weights:
@@ -171,11 +175,27 @@ def _batch_fused_modelopt_moe_weights(
         if target in {"w13_weight", "w13_weight_scale"}:
             target_suffix = "weight" if target == "w13_weight" else "weight_scale"
             if w13_num_shards_by_prefix.get(prefix) == 1:
-                batched.append(
-                    (
-                        f"{prefix}.experts.0.up_proj.{target_suffix}",
-                        tensor,
+                # Non-gated experts (e.g. Nemotron-H) have a single w13
+                # projection, but the payload is still batched [E, N, K/2].
+                # vLLM 0.26 routes it into RoutedExperts.load_weights' fused
+                # branch -- which keys off `loaded_weight.dim() == 3` alone --
+                # so it transposes and `chunk(2, dim=1)`s a dimension that was
+                # never a fused gate/up pair, and the copy shapes disagree.
+                # vLLM <= 0.25.1 escaped this only because Nemotron-H shipped
+                # its own load_weights; 0.26 deleted it in favour of
+                # AutoWeightsLoader. Emit per-expert 2-D shards for the same
+                # reason the gated branch below does.
+                if tensor.ndim != 3:
+                    raise ValueError(
+                        f"Expected a batched [E, N, K] non-gated W13 tensor for "
+                        f"{name}, got {tuple(tensor.shape)}"
                     )
+                batched.extend(
+                    (
+                        f"{prefix}.experts.{expert_id}.up_proj.{target_suffix}",
+                        expert_weight,
+                    )
+                    for expert_id, expert_weight in enumerate(tensor.unbind(0))
                 )
                 continue
             if tensor.ndim < 2 or tensor.shape[1] % 2 != 0:
@@ -334,15 +354,23 @@ def _iter_modelopt_quant_modules(
 ) -> list[tuple[str, torch.nn.Module]]:
     """Return modules whose runtime layout is owned by vLLM ModelOpt methods."""
     from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptLinearMethod,
         ModelOptNvFp4FusedMoE,
-        ModelOptNvFp4LinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kNvfp4Static,
     )
 
-    method_types = (ModelOptNvFp4FusedMoE, ModelOptNvFp4LinearMethod)
+    def is_nvfp4_method(quant_method: Any) -> bool:
+        return isinstance(quant_method, ModelOptNvFp4FusedMoE) or (
+            isinstance(quant_method, ModelOptLinearMethod)
+            and quant_method.spec.weight == kNvfp4Static
+        )
+
     return [
         (module_name, module)
         for module_name, module in model.named_modules()
-        if isinstance(getattr(module, "quant_method", None), method_types)
+        if is_nvfp4_method(getattr(module, "quant_method", None))
     ]
 
 
@@ -434,8 +462,16 @@ if os.environ.get("VLLM_MODELOPT_REAL_QUANT", "0") == "1":
 
 
 class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
+    _QUANT_AMAX_SUFFIXES = (
+        "input_quantizer._amax",
+        "k_bmm_quantizer._amax",
+        "v_bmm_quantizer._amax",
+    )
     _nrl_w13_num_shards_by_prefix: dict[str, int]
     _nrl_modelopt_reload_roots: tuple[torch.nn.Module, ...] | None = None
+
+    def _supports_unquantized_flashinfer_trtllm_refit(self) -> bool:
+        return False
 
     def maybe_init_zmq(self) -> None:
         """Use a longer timeout only for ModelOpt real-quant refits."""
@@ -523,10 +559,25 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             return
         super()._synchronize_before_ipc_data_ack()
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        super().prepare_refit_info(state_dict_info)
+    def prepare_refit_info(
+        self,
+        state_dict_info: dict[str, Any],
+        serialized_fp8_config: Optional[dict[str, Any]] = None,
+    ) -> Optional[list[str]]:
+        # Reject before any weight moves: real-quant refits go through vLLM's
+        # layerwise reload, which has no drafter equivalent.
+        if self._is_real_quant_model() and any(
+            name.startswith("draft.") for name in state_dict_info
+        ):
+            raise RuntimeError(
+                "ModelOpt real-quant refit does not support draft finalization"
+            )
         if not self._is_real_quant_model():
-            return
+            return super().prepare_refit_info(state_dict_info, serialized_fp8_config)
+
+        # Real quantization owns a separate refit handshake and must not import
+        # the legacy FP8 quantization path.
+        self.state_dict_info = state_dict_info
         self._get_modelopt_reload_roots()
         quant_config = (
             self.model_runner.vllm_config.model_config.hf_config.quantization_config
@@ -545,29 +596,31 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 "Fused ModelOpt MoE refits require all experts local; "
                 "vLLM expert parallelism is unsupported"
             )
+        return None
 
     @contextmanager
     def _patch_named_parameters_to_include_buffers(self, model):
-        """Temporarily patches model.named_parameters() to also yield input_quantizer buffers.
+        """Temporarily expose activation-quantizer amax buffers as parameters.
 
-        Weights arrive pre-folded from the Megatron side, so only input_quantizer
-        amax buffers need to be loaded. Weight quantizer buffers are skipped.
+        Weights arrive pre-folded from the Megatron side, so weight-quantizer
+        buffers are skipped. Input and KV-cache amax values use the same vLLM
+        weight-loading path.
         """
         original_named_parameters = model.named_parameters
-        # input_quantizer buffers we attached a weight_loader to and must
-        # clean up on exit; pre-existing loaders (if any) are left untouched.
+        quant_amax_suffixes = self._QUANT_AMAX_SUFFIXES
         patched_quantizer_buffers = []
 
-        def input_amax_loader(param, loaded_weight, *args, **kwargs):
+        def amax_loader(param, loaded_weight, *args, **kwargs):
+            # Input amax may fan in; K/V amax is fixed after calibration.
             param.copy_(torch.max(param, loaded_weight))
 
         def new_named_parameters(self, *args, **kwargs):
             yield from original_named_parameters(*args, **kwargs)
             for name, buf in self.named_buffers(*args, **kwargs):
-                if "input_quantizer" not in name:
+                if not name.endswith(quant_amax_suffixes):
                     continue
                 if not hasattr(buf, "weight_loader"):
-                    buf.weight_loader = input_amax_loader
+                    buf.weight_loader = amax_loader
                     patched_quantizer_buffers.append(buf)
                 yield name, buf
 
@@ -583,14 +636,17 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     def _attach_input_quantizer_amax_loaders(self, model):
         """Eagerly attach weight_loaders to input_quantizer amax buffers.
 
-        vLLM >= 0.25 loads refit weights through per-module
-        ``load_weights`` (e.g. ``LinearBase.load_weights``), which resolves
-        targets via ``getattr`` and calls ``param.weight_loader(param,
-        loaded_weight, shard_id)`` directly — it never iterates
+        vLLM's per-module refit loaders (e.g.
+        ``MergedColumnParallelLinear.load_weights``) resolve
+        targets via ``getattr`` and call ``param.weight_loader(param,
+        loaded_weight, shard_id)`` directly — they never iterate
         ``model.named_parameters()``, so the lazy attach in
         ``_patch_named_parameters_to_include_buffers`` no longer fires and
         quantizer amax buffers arrive without a loader (AttributeError:
         'Tensor' object has no attribute 'weight_loader').
+
+        The scoped MoE alias workaround is owned by ``patches.py``;
+        ``modelopt_moe_amax_aliases`` applies it around this refit.
         """
 
         def input_amax_loader(param, loaded_weight, *args, **kwargs):
@@ -604,17 +660,25 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 buf.weight_loader = input_amax_loader
                 attached.append(buf)
         try:
-            yield
+            with modelopt_moe_amax_aliases(model):
+                yield
         finally:
             for buf in attached:
                 del buf.weight_loader
 
-    def _load_weights(self, weights):
-        """Load pre-folded weights and input_quantizer amax buffers.
+    def _load_weights(self, weights, *, coverage=None):
+        """Load pre-folded weights and activation-quantizer amax buffers.
 
         Weights arrive already folded from the Megatron side (weight_quantizer
         applied during export), so no fold_weight step is needed here.
+
+        ``coverage`` follows the base signature; the full delivered name set is
+        recorded here (real-quant deliberately filters some scale entries out
+        of the actual load, but they are still handled).
         """
+        if coverage is not None:
+            weights = list(weights)
+            coverage.record_loaded(tuple(name for name, _ in weights))
         if self._is_real_quant_model():
             weights = list(weights)
             source_storage_ptrs = {
@@ -658,6 +722,36 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                         source_storage_ptrs,
                     )
 
+        # vLLM 0.28 routes every ``experts.*`` name through
+        # ``RoutedExperts.load_weights``, which resolves the rewritten name with a
+        # single ``getattr`` and therefore cannot reach the dotted quantizer
+        # buffers (``w13_input_quantizer._amax``). Fan the per-expert amax values
+        # into the fused quantizers here and keep them away from vLLM's loader.
+        # Checkpoint names (e.g. Nemotron-H's ``backbone.*``) only turn into the
+        # module's vLLM ``layer_name`` through the model's hf_to_vllm_mapper.
+        weights = route_moe_input_quantizer_amax(
+            self.model_runner.model,
+            weights,
+            mapper=getattr(self.model_runner.model, "hf_to_vllm_mapper", None),
+        )
+
+        # MBridge exports K/V amax with the HF-semantic attention path, such as
+        # ``self_attn.k_bmm_quantizer._amax``. ModelOpt installs these quantizers
+        # on vLLM's inner Attention module, whose runtime path contains ``.attn``.
+        # Insert only that ModelOpt-owned path segment here; the normal vLLM
+        # loader still owns model-specific HF mapping and PP-local filtering.
+        remapped_weights = []
+        for name, weight in weights:
+            for suffix in self._QUANT_AMAX_SUFFIXES:
+                if (
+                    "_bmm_quantizer" in suffix
+                    and name.endswith(suffix)
+                    and not name.endswith(f".attn.{suffix}")
+                ):
+                    name = f"{name[: -len(suffix)]}attn.{suffix}"
+                    break
+            remapped_weights.append((name, weight))
+
         with ExitStack() as contexts:
             for _, child in self.model_runner.model.named_children():
                 contexts.enter_context(
@@ -666,7 +760,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             contexts.enter_context(
                 self._attach_input_quantizer_amax_loaders(self.model_runner.model)
             )
-            return super()._load_weights(weights)
+            return super()._load_weights(remapped_weights)
 
     def get_weight_snapshot(self, name: str) -> torch.Tensor:
         """Return a CPU copy of a named parameter for before/after comparison."""
@@ -685,8 +779,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         enabled = 0
         with_amax = 0
         positive_amax = 0
+        kv_amax = {}
         model = self.model_runner.model
-        for _, module in model.named_modules():
+        for name, module in model.named_modules():
             if isinstance(module, TensorQuantizer):
                 total += 1
                 if module.is_enabled:
@@ -695,11 +790,14 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                         with_amax += 1
                         if (module.amax > 0).all():
                             positive_amax += 1
+                        if name.endswith(("k_bmm_quantizer", "v_bmm_quantizer")):
+                            kv_amax[name] = module.amax.detach().cpu().clone()
         return {
             "total": total,
             "enabled": enabled,
             "with_amax": with_amax,
             "positive_amax": positive_amax,
+            "kv_amax": kv_amax,
         }
 
 

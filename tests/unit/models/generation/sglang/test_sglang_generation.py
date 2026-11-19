@@ -46,6 +46,12 @@ MODEL_PATH = "Qwen/Qwen3-4B"
 pytestmark = pytest.mark.sglang
 
 
+def test_prepare_refit_info_accepts_missing_metadata():
+    generation = SGLangGeneration.__new__(SGLangGeneration)
+
+    assert generation.prepare_refit_info(None) is None
+
+
 @pytest.fixture(scope="module")
 def ray_cluster():
     """Initialise Ray once for this module's tests."""
@@ -80,6 +86,7 @@ def _make_sglang_generation_cfg(pad_token_id=PAD_TOKEN_ID, tp_size=1):
         "stop_strings": None,
         "_pad_token_id": pad_token_id,
         "sglang_cfg": {
+            "sglang_fault_tolerance_config": {"use_fault_tolerance": False},
             "model_path": MODEL_PATH,
             "dtype": "bfloat16",
             "random_seed": 42,
@@ -90,7 +97,7 @@ def _make_sglang_generation_cfg(pad_token_id=PAD_TOKEN_ID, tp_size=1):
             "dp_size": 1,
             "pp_size": 1,
             "ep_size": 1,
-            "disable_piecewise_cuda_graph": True,
+            "cuda_graph_backend_prefill": "disabled",
             "disable_cuda_graph": False,
             "mem_fraction_static": 0.3,
             "sglang_server_config": {
@@ -216,6 +223,7 @@ def _make_minimal_sglang_gen_for_clamp_test(
 ):
     sglang_gen = SGLangGeneration.__new__(SGLangGeneration)
     sglang_gen.all_engines = []
+    sglang_gen._health_monitor = None
     sglang_gen._router_actor = None
     sglang_gen._http_client = None
     sglang_gen.sglang_cfg = _make_sglang_generation_cfg()

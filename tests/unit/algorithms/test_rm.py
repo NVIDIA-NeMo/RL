@@ -27,6 +27,9 @@ from nemo_rl.algorithms.rm import (
     rm_train,
     setup,
 )
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 def test_get_rm_save_state_handles_legacy_checkpoint_and_filters_metrics():
@@ -131,15 +134,10 @@ def mock_components():
                 },
                 "train_micro_batch_size": 1,
             },
-            "checkpointing": {
-                "enabled": False,
-                "checkpoint_must_save_by": None,
-                "save_period": 10,
-            },
-            "cluster": {
-                "num_nodes": 1,
-                "gpus_per_node": 2,
-            },
+            "checkpointing": CheckpointingConfig.model_construct(
+                enabled=False, checkpoint_must_save_by=None, save_period=10
+            ),
+            "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
         }
     )
 
@@ -155,15 +153,15 @@ def mock_components():
     }
 
 
-def test_context_parallel_rejected_for_dtensor_rm():
-    """Test that context_parallel_size > 1 raises ValueError for DTensor RM training.
+def test_context_parallel_rejected_for_automodel_rm():
+    """Test that context_parallel_size > 1 raises ValueError for Automodel RM training.
 
     TODO(https://github.com/NVIDIA-NeMo/RL/issues/2482): remove when CP is supported for RM.
     """
     config = MasterConfig.model_construct(
         **{
             "policy": {
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": True,
                     "context_parallel_size": 2,
                     "tensor_parallel_size": 1,
@@ -174,9 +172,9 @@ def test_context_parallel_rejected_for_dtensor_rm():
             },
             "rm": RMConfig.model_construct(seed=42),
             "data": {},
-            "logger": {},
+            "logger": LoggerConfig.model_construct(),
             "cluster": {},
-            "checkpointing": {},
+            "checkpointing": CheckpointingConfig.model_construct(),
         }
     )
     with pytest.raises(
@@ -187,7 +185,7 @@ def test_context_parallel_rejected_for_dtensor_rm():
 
 
 def test_context_parallel_allowed_when_one():
-    """Test that context_parallel_size=1 does not raise for DTensor RM training.
+    """Test that context_parallel_size=1 does not raise for Automodel RM training.
 
     We verify the CP check passes by confirming the error comes from a later
     setup stage, not from our validation.
@@ -197,7 +195,7 @@ def test_context_parallel_allowed_when_one():
     config = MasterConfig.model_construct(
         **{
             "policy": {
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": True,
                     "context_parallel_size": 1,
                     "tensor_parallel_size": 1,
@@ -208,9 +206,9 @@ def test_context_parallel_allowed_when_one():
             },
             "rm": RMConfig.model_construct(seed=42),
             "data": {},
-            "logger": {},
+            "logger": LoggerConfig.model_construct(),
             "cluster": {},
-            "checkpointing": {},
+            "checkpointing": CheckpointingConfig.model_construct(),
         }
     )
     with pytest.raises(Exception) as excinfo:
@@ -240,6 +238,12 @@ def test_exit_on_max_steps(mock_components):
 
     # Verify we only trained for 12 steps.
     assert mock_components["policy"].train.call_count == 12
+    final_timing_call = [
+        call
+        for call in mock_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "timing/train"
+    ][-1]
+    assert final_timing_call.kwargs["step_finished"] is True
 
 
 def test_exit_on_max_epochs(mock_components):
@@ -267,16 +271,24 @@ def test_exit_on_max_epochs(mock_components):
     assert mock_components["policy"].train.call_count == 20
 
 
-def test_exit_on_timeout(mock_components, capsys):
+def test_exit_on_timeout(mock_components, capsys, tmp_path):
     """Test that training loop exits when timeout is reached"""
     # Set max steps and epochs to large numbers
     mock_components["master_config"].rm.max_num_steps = 100
     mock_components["master_config"].rm.max_num_epochs = 10
+    mock_components["master_config"].checkpointing.enabled = True
+    mock_components["master_config"].checkpointing.metric_name = None
+    mock_components["checkpointer"].init_tmp_checkpoint.return_value = str(
+        tmp_path / "tmp_step"
+    )
 
     rm_save_state = _initial_rm_save_state()
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
-    with patch("nemo_rl.algorithms.rm.TimeoutChecker") as mock_timeout_class:
+    with (
+        patch("nemo_rl.algorithms.rm.save_dataloader_state"),
+        patch("nemo_rl.algorithms.rm.TimeoutChecker") as mock_timeout_class,
+    ):
         mock_timeout_instance = MagicMock()
         # Create a side_effect that returns False 7 times, then True
         check_results = [False] * 7 + [True]
@@ -298,6 +310,12 @@ def test_exit_on_timeout(mock_components, capsys):
 
         # Verify training stopped at 8 steps (when check_save returned True)
         assert mock_components["policy"].train.call_count == 8
+        assert (
+            mock_components["policy"].save_checkpoint.call_args.kwargs[
+                "is_final_checkpoint"
+            ]
+            is False
+        )
 
         # Verify the timeout message was printed and is near the end (not followed by more training)
         captured = capsys.readouterr()
@@ -326,17 +344,17 @@ def test_ft_save_period_triggers_periodic_saves(mock_components):
     cfg.rm.val_period = 0
     cfg.rm.max_num_steps = 5
     cfg.rm.max_num_epochs = 1
-    cfg.checkpointing["enabled"] = True
-    cfg.checkpointing["save_period"] = 100  # only the final step would save
-    cfg.checkpointing["ft_save_period"] = 2
-    cfg.checkpointing["metric_name"] = None
+    cfg.checkpointing.enabled = True
+    cfg.checkpointing.save_period = 100  # only the final step would save
+    cfg.checkpointing.ft_save_period = 2
+    cfg.checkpointing.metric_name = None
 
     checkpointer = mock_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
 
     rm_save_state = _initial_rm_save_state()
 
-    with patch("nemo_rl.algorithms.rm.torch.save"):
+    with patch("nemo_rl.algorithms.rm.save_dataloader_state"):
         rm_train(
             mock_components["policy"],
             mock_components["train_dataloader"],

@@ -72,7 +72,9 @@ class LiveCodeBenchEnvMetadata(TypedDict):
     environment_output: NotRequired[str]
 
 
-_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+\-]*[ \t]*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
+_FENCE_RE = re.compile(
+    r"```[a-zA-Z0-9_+\-]*[ \t]*\n?(.*?)```", re.DOTALL | re.IGNORECASE
+)
 
 
 INCORRECT_FORMAT_FEEDBACK = (
@@ -179,8 +181,10 @@ def _parse_traceback(stderr: str) -> tuple[str, list[str]]:
             frames.append(f"Line {m.group(1)} in {m.group(2)} (Solution.py)")
     exc_line = ""
     for line in reversed(lines):
-        if line and not line.startswith(" ") and not line.lstrip().startswith(
-            ("File ", "Traceback ", '"')
+        if (
+            line
+            and not line.startswith(" ")
+            and not line.lstrip().startswith(("File ", "Traceback ", '"'))
         ):
             exc_line = line.strip()
             break
@@ -244,6 +248,7 @@ def _outputs_match(expected: str, actual: str) -> bool:
     rstrip() of each line handles trailing spaces that don't matter for
     most LCB grading; blank trailing lines are dropped.
     """
+
     def norm(s: str) -> list[str]:
         return [ln.rstrip() for ln in (s or "").splitlines()]
 
@@ -273,8 +278,10 @@ def _run_one_test(
       - runtime error -> "Runtime Error\n<ExcType>: <msg>\nLine N in <fn> (Solution.py)\nLast Executed Input\n..."
       - timeout       -> "Test Case N: Time Limit Exceeded\n..."
     """
-    testtype = test.get("testtype") or test.get("type") or (
-        "functional" if function_name else "stdin"
+    testtype = (
+        test.get("testtype")
+        or test.get("type")
+        or ("functional" if function_name else "stdin")
     )
     test_input = test.get("input", "")
     test_output = test.get("output", "")
@@ -303,8 +310,12 @@ def _run_one_test(
                 cwd=tmp,
             )
         except subprocess.TimeoutExpired:
-            return False, "timeout", _format_timeout(
-                test_index, test_input, timeout, max_input_lines, max_input_chars
+            return (
+                False,
+                "timeout",
+                _format_timeout(
+                    test_index, test_input, timeout, max_input_lines, max_input_chars
+                ),
             )
 
     stdout = proc.stdout or ""
@@ -315,8 +326,12 @@ def _run_one_test(
             return True, "", ""
         if "__LCB_ERROR__" in stdout:
             tb = stdout.split("__LCB_ERROR__", 1)[-1].strip()
-            return False, "error", _format_runtime_error(
-                tb or stderr, test_input, max_input_lines, max_input_chars
+            return (
+                False,
+                "error",
+                _format_runtime_error(
+                    tb or stderr, test_input, max_input_lines, max_input_chars
+                ),
             )
         if "__LCB_FAIL__" in stdout:
             details = stdout.split("__LCB_FAIL__", 1)[-1].strip()
@@ -324,25 +339,49 @@ def _run_one_test(
             actual_match = re.search(r"ACTUAL:\s*(.+)", details)
             expected_match = re.search(r"EXPECTED:\s*(.+)", details)
             actual_v = actual_match.group(1).strip() if actual_match else "<unknown>"
-            expected_v = expected_match.group(1).strip() if expected_match else "<unknown>"
-            return False, "wrong", _format_wrong_answer(
-                test_index, test_input, actual_v, expected_v,
-                max_input_lines, max_input_chars,
+            expected_v = (
+                expected_match.group(1).strip() if expected_match else "<unknown>"
             )
-        return False, "error", _format_runtime_error(
-            stderr or stdout, test_input, max_input_lines, max_input_chars
+            return (
+                False,
+                "wrong",
+                _format_wrong_answer(
+                    test_index,
+                    test_input,
+                    actual_v,
+                    expected_v,
+                    max_input_lines,
+                    max_input_chars,
+                ),
+            )
+        return (
+            False,
+            "error",
+            _format_runtime_error(
+                stderr or stdout, test_input, max_input_lines, max_input_chars
+            ),
         )
 
     if proc.returncode != 0:
-        return False, "error", _format_runtime_error(
-            stderr, test_input, max_input_lines, max_input_chars
+        return (
+            False,
+            "error",
+            _format_runtime_error(stderr, test_input, max_input_lines, max_input_chars),
         )
 
     if _outputs_match(test_output, stdout):
         return True, "", ""
-    return False, "wrong", _format_wrong_answer(
-        test_index, test_input, stdout, test_output,
-        max_input_lines, max_input_chars,
+    return (
+        False,
+        "wrong",
+        _format_wrong_answer(
+            test_index,
+            test_input,
+            stdout,
+            test_output,
+            max_input_lines,
+            max_input_chars,
+        ),
     )
 
 
@@ -374,7 +413,11 @@ def grade_batch(
         failures: list[tuple[str, str]] = []  # (kind, block)
         for i, test in enumerate(tests):
             passed, kind, fb = _run_one_test(
-                code, test, function_name, timeout, test_index=i + 1,
+                code,
+                test,
+                function_name,
+                timeout,
+                test_index=i + 1,
                 max_input_lines=max_input_lines,
                 max_input_chars=max_input_chars,
             )
@@ -399,9 +442,9 @@ def grade_batch(
             elif timeout_block is not None:
                 blocks = [timeout_block]
             else:
-                blocks = sorted(
-                    (fb for _, fb in failures), key=len
-                )[:max_failed_in_feedback]
+                blocks = sorted((fb for _, fb in failures), key=len)[
+                    :max_failed_in_feedback
+                ]
             feedback = "\n\n".join(blocks)
 
             # Dense train reward (reference compute_score: reward =
@@ -514,9 +557,7 @@ class LiveCodeBenchEnvironment(EnvironmentInterface[LiveCodeBenchEnvMetadata]):
         rewards = torch.tensor(rewards_list, dtype=torch.float32)
         terminateds = torch.ones_like(rewards, dtype=torch.bool)
 
-        observations = [
-            {"role": "environment", "content": fb} for fb in feedbacks
-        ]
+        observations = [{"role": "environment", "content": fb} for fb in feedbacks]
 
         new_metadata: list[LiveCodeBenchEnvMetadata] = []
         for meta, fb in zip(metadata, feedbacks):

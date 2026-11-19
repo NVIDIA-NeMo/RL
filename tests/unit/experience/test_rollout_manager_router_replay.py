@@ -38,6 +38,8 @@ def _fallback_routes(count: int) -> torch.Tensor:
 
 
 class _FakeTokenizer:
+    pad_token_id = 0
+
     def decode(self, token_ids: torch.Tensor, skip_special_tokens: bool) -> str:
         del token_ids, skip_special_tokens
         return "generated"
@@ -120,6 +122,13 @@ def test_generate_response_attaches_prefix_and_generated_routes() -> None:
         assistant_message["routed_experts"],
         torch.cat((_routes(1, start=13), _fallback_routes(1))),
     )
+    # Each message owns exactly its span, so pickling cannot carry the full buffer.
+    for message in (*message_log, assistant_message):
+        routes = message["routed_experts"]
+        assert routes.storage_offset() == 0
+        assert (
+            routes.untyped_storage().nbytes() == routes.numel() * routes.element_size()
+        )
 
 
 def test_single_rollout_adds_fallback_routes_to_environment_tokens() -> None:

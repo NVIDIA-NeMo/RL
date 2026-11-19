@@ -36,7 +36,7 @@ sdpo:
   topk_logits_k: 20                  # paper Table 12 (Section 4 / LCBv6): K=20
   teacher_regularization: "trust_region"  # paper §2.3/A.2 Eq.10: unregularized teacher diverges (Table 4; reproduced in run nttalvt9)
   teacher_mix_coef: 0.01             # paper Table 4: alpha = 0.01 (weight of CURRENT policy in the lerp)
-  topk_source: "student"             # paper §2.2: top-K indices from the STUDENT forward, teacher gathered at those indices ("teacher" = legacy teacher-selected top-k; needs DTensor v2). Pair with tail_mode k_plus_one — at K=20 student-topk + legacy tail underperformed in the A/B
+  topk_source: "student"             # paper §2.2: top-K indices from the STUDENT forward, teacher gathered at those indices ("teacher" = legacy teacher-selected top-k; Automodel backend only). Pair with tail_mode k_plus_one — at K=20 student-topk + legacy tail underperformed in the A/B
   remove_thinking_from_demo: true    # strip <think>...</think> from peer demos so {solution} slot stays content-only
   feedback_source: "combined"        # paper Table 2: peer-rollout demo + env feedback
   log_sample_every_n_steps: 1        # dump one fail + one pass per step (stdout + W&B Table)
@@ -93,8 +93,6 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 policy:
@@ -111,10 +109,19 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
+  # Run the policy offload lifecycle before non-colocated refit.
+  offload_policy_before_refit: false
+  # Move optimizer state to CPU when the refit offload lifecycle runs.
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      # Canonical Automodel modes: "false", "final", or "every".
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: true
@@ -155,6 +162,7 @@ policy:
     moe_router_bias_update_rate: 0.0
     moe_permute_fusion: false
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     defer_fp32_logits: False
     moe_per_layer_logging: False
@@ -240,7 +248,7 @@ policy:
     algorithm: "modified_first_fit_decreasing"
     sequence_length_round: 64
 
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.automodel_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
 
   optimizer:
@@ -278,7 +286,6 @@ policy:
       block_size_tokens: 256
       use_cuda_graphs_for_non_decode_steps: true
       enable_chunked_prefill: true
-      unified_memory_level: 0
       max_tokens: 32768
     vllm_cfg:
       async_engine: false

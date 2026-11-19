@@ -12,11 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for community_import checkpoint-save strategy shim."""
+"""Unit tests for community_import."""
 
 import importlib
+import os
+import pickle
 import sys
+import time
 from types import ModuleType, SimpleNamespace
+
+import pytest
+
+from nemo_rl.models.policy import provider_override_allowed
 
 
 def _ensure_package(monkeypatch, name: str) -> ModuleType:
@@ -43,6 +50,9 @@ def _load_community_import_module(monkeypatch):
     fake_torch.float32 = object()
     fake_torch.bfloat16 = object()
     fake_torch.float16 = object()
+    # import_model_from_hf_name guards its collectives on this; single-process
+    # tests take the non-distributed path.
+    fake_torch.distributed = SimpleNamespace(is_available=lambda: False)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
     # Stub megatron imports required by the module.
@@ -55,29 +65,15 @@ def _load_community_import_module(monkeypatch):
     megatron_transformer.ModuleSpec = type("ModuleSpec", (), {})
     monkeypatch.setitem(sys.modules, "megatron.core.transformer", megatron_transformer)
 
-    # Stub MegatronConfig type import.
+    # Stub the config type while retaining the real override policy.
     nemo_policy = ModuleType("nemo_rl.models.policy")
     nemo_policy.MegatronConfig = dict
+    nemo_policy.provider_override_allowed = provider_override_allowed
     monkeypatch.setitem(sys.modules, "nemo_rl.models.policy", nemo_policy)
 
     module_name = "nemo_rl.models.megatron.community_import"
     sys.modules.pop(module_name, None)
     return importlib.import_module(module_name)
-
-
-def _install_torch_strategy_module(monkeypatch, strategy_cls):
-    """Install a fake dist-checkpoint strategy module for local import."""
-    _ensure_package(monkeypatch, "megatron")
-    _ensure_package(monkeypatch, "megatron.core")
-    _ensure_package(monkeypatch, "megatron.core.dist_checkpointing")
-    _ensure_package(monkeypatch, "megatron.core.dist_checkpointing.strategies")
-    strategy_module = ModuleType("megatron.core.dist_checkpointing.strategies.torch")
-    strategy_module.TorchDistSaveShardedStrategy = strategy_cls
-    monkeypatch.setitem(
-        sys.modules,
-        "megatron.core.dist_checkpointing.strategies.torch",
-        strategy_module,
-    )
 
 
 def _install_runtime_stubs_for_hf_import(monkeypatch):
@@ -109,86 +105,46 @@ def _install_runtime_stubs_for_hf_import(monkeypatch):
     core_module.tensor_parallel = tensor_parallel
 
 
-def test_prefer_nvrx_is_noop_when_strategy_import_fails(monkeypatch):
+def test_iter_vlm_config_overrides_yields_super35_runtime_values(monkeypatch):
     module = _load_community_import_module(monkeypatch)
-    # Force this import to fail even if real megatron modules were preloaded by
-    # earlier tests in the same process.
-    monkeypatch.setitem(
-        sys.modules, "megatron.core.dist_checkpointing.strategies.torch", None
+
+    overrides = dict(
+        module.iter_vlm_config_overrides(
+            {
+                "radio_force_eval_mode": False,
+                "recompute_vision": True,
+                "vision_recompute_granularity": "full",
+                "vision_recompute_method": "block",
+                "vision_recompute_num_layers": 30,
+            }
+        )
     )
 
-    # Should not raise when dist-checkpoint strategy is unavailable.
-    with module._prefer_nvrx_for_dist_ckpt_save():
-        pass
+    assert overrides == {
+        "radio_force_eval_mode": False,
+        "recompute_vision": True,
+        "vision_recompute_granularity": "full",
+        "vision_recompute_method": "block",
+        "vision_recompute_num_layers": 30,
+    }
 
 
-def test_prefer_nvrx_uses_async_save_and_restores_original_save(monkeypatch):
-    module = _load_community_import_module(monkeypatch)
-
-    class FakeAsyncRequest:
-        def __init__(self, owner):
-            self.owner = owner
-
-        def execute_sync(self):
-            self.owner.execute_sync_calls += 1
-
-    class FakeStrategy:
-        def __init__(self):
-            self.original_save_calls = []
-            self.async_save_calls = []
-            self.execute_sync_calls = 0
-
-        def save(self, sharded_state_dict, checkpoint_dir):
-            self.original_save_calls.append((sharded_state_dict, checkpoint_dir))
-
-        def async_save(self, sharded_state_dict, checkpoint_dir, async_strategy):
-            self.async_save_calls.append(
-                (sharded_state_dict, checkpoint_dir, async_strategy)
-            )
-            return FakeAsyncRequest(self)
-
-    _install_torch_strategy_module(monkeypatch, FakeStrategy)
-    strategy = FakeStrategy()
-    original_save = FakeStrategy.save
-
-    with module._prefer_nvrx_for_dist_ckpt_save():
-        strategy.save({"x": 1}, "/tmp/ckpt")
-        assert FakeStrategy.save is not original_save
-
-    assert strategy.async_save_calls == [({"x": 1}, "/tmp/ckpt", "nvrx")]
-    assert strategy.execute_sync_calls == 1
-    assert strategy.original_save_calls == []
-    assert FakeStrategy.save is original_save
+def _stage_conversion(path) -> None:
+    """Materialize conversion config, metadata, and a nonempty tensor shard."""
+    os.makedirs(os.path.join(str(path), "iter_0000000"), exist_ok=True)
+    with open(os.path.join(str(path), "iter_0000000", "run_config.yaml"), "w") as f:
+        f.write("{}\n")
+    iteration = os.path.join(str(path), "iter_0000000")
+    with open(os.path.join(iteration, "__0_0.distcp"), "wb") as f:
+        f.write(b"checkpoint tensors")
+    metadata = SimpleNamespace(
+        storage_data={"weight": SimpleNamespace(relative_path="__0_0.distcp")}
+    )
+    with open(os.path.join(iteration, ".metadata"), "wb") as f:
+        pickle.dump(metadata, f)
 
 
-def test_prefer_nvrx_falls_back_to_original_save_when_nvrx_missing(monkeypatch):
-    module = _load_community_import_module(monkeypatch)
-
-    class FakeStrategy:
-        def __init__(self):
-            self.original_save_calls = []
-            self.async_save_calls = []
-
-        def save(self, sharded_state_dict, checkpoint_dir):
-            self.original_save_calls.append((sharded_state_dict, checkpoint_dir))
-
-        def async_save(self, sharded_state_dict, checkpoint_dir, async_strategy):
-            self.async_save_calls.append(
-                (sharded_state_dict, checkpoint_dir, async_strategy)
-            )
-            raise ModuleNotFoundError("nvrx is unavailable")
-
-    _install_torch_strategy_module(monkeypatch, FakeStrategy)
-    strategy = FakeStrategy()
-
-    with module._prefer_nvrx_for_dist_ckpt_save():
-        strategy.save({"y": 2}, "/tmp/ckpt")
-
-    assert strategy.async_save_calls == [({"y": 2}, "/tmp/ckpt", "nvrx")]
-    assert strategy.original_save_calls == [({"y": 2}, "/tmp/ckpt")]
-
-
-def test_import_model_from_hf_name_calls_bridge_save(monkeypatch):
+def test_import_model_from_hf_name_calls_bridge_save(monkeypatch, tmp_path):
     module = _load_community_import_module(monkeypatch)
     _install_runtime_stubs_for_hf_import(monkeypatch)
     # Force this import path to stay unavailable even if real megatron modules
@@ -231,6 +187,9 @@ def test_import_model_from_hf_name_calls_bridge_save(monkeypatch):
         def save_megatron_model(self, megatron_model, output_path):
             self.saved_model = megatron_model
             self.saved_path = output_path
+            # The real save materializes the checkpoint; publish needs the
+            # staged directory (and its completion marker) to exist.
+            _stage_conversion(output_path)
 
     fake_bridge = FakeBridge()
 
@@ -243,7 +202,96 @@ def test_import_model_from_hf_name_calls_bridge_save(monkeypatch):
 
     monkeypatch.setattr(module, "AutoBridge", FakeAutoBridge)
 
-    module.import_model_from_hf_name("fake/hf-model", "/tmp/out")
+    output_path = tmp_path / "out"
+    module.import_model_from_hf_name("fake/hf-model", str(output_path))
 
     assert fake_bridge.saved_model is not None
-    assert fake_bridge.saved_path == "/tmp/out"
+    # The save lands in a hidden staging sibling, then is renamed into place.
+    assert os.path.basename(fake_bridge.saved_path).startswith(".out.staging-")
+    assert module.megatron_conversion_is_complete(str(output_path))
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out"]
+
+
+@pytest.mark.parametrize(
+    ("occupant", "overwrite", "staged_wins"),
+    [
+        # The empty-target happy path is covered end to end by
+        # test_import_model_from_hf_name_calls_bridge_save.
+        # A concurrent producer's complete artifact wins; the staged copy is discarded.
+        ("complete", False, False),
+        # A stale partial occupant (bare iter_0000000/, interrupted run) is displaced.
+        ("partial", False, True),
+        # force_reconvert_from_hf replaces even a complete artifact.
+        ("complete", True, True),
+    ],
+)
+def test_publish_conversion(monkeypatch, tmp_path, occupant, overwrite, staged_wins):
+    """Publish atomically renames the staging dir, resolving occupants of the final path."""
+    module = _load_community_import_module(monkeypatch)
+    staging, final = tmp_path / ".ckpt.staging-abc", tmp_path / "ckpt"
+    _stage_conversion(staging)
+    (staging / "staged_marker").touch()
+    if occupant == "complete":
+        _stage_conversion(final)
+    elif occupant == "partial":
+        (final / "iter_0000000").mkdir(parents=True)
+
+    module.publish_megatron_conversion(str(staging), str(final), overwrite=overwrite)
+
+    assert module.megatron_conversion_is_complete(str(final))
+    assert (final / "staged_marker").exists() is staged_wins
+    # Doomed copies are deleted on a background thread; wait for it.
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline and sorted(
+        p.name for p in tmp_path.iterdir()
+    ) != ["ckpt"]:
+        time.sleep(0.01)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["ckpt"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing_metadata",
+        "invalid_metadata",
+        "empty_metadata",
+        "missing_shard",
+        "empty_shard",
+    ],
+)
+def test_conversion_requires_all_metadata_referenced_shards(
+    monkeypatch, tmp_path, failure
+):
+    module = _load_community_import_module(monkeypatch)
+    _stage_conversion(tmp_path)
+    iteration = tmp_path / "iter_0000000"
+    if failure == "missing_metadata":
+        (iteration / ".metadata").unlink()
+    elif failure == "invalid_metadata":
+        (iteration / ".metadata").write_bytes(b"invalid pickle")
+    elif failure == "empty_metadata":
+        (iteration / ".metadata").write_bytes(
+            pickle.dumps(SimpleNamespace(storage_data={}))
+        )
+    elif failure == "missing_shard":
+        (iteration / "__0_0.distcp").unlink()
+    else:
+        (iteration / "__0_0.distcp").write_bytes(b"")
+    assert not module.megatron_conversion_is_complete(str(tmp_path))
+
+
+def test_conversion_requires_every_referenced_shard(monkeypatch, tmp_path):
+    module = _load_community_import_module(monkeypatch)
+    _stage_conversion(tmp_path)
+    iteration = tmp_path / "iter_0000000"
+    (iteration / ".metadata").write_bytes(
+        pickle.dumps(
+            SimpleNamespace(
+                storage_data={
+                    "weight": SimpleNamespace(relative_path="__0_0.distcp"),
+                    "bias": SimpleNamespace(relative_path="__1_0.distcp"),
+                }
+            )
+        )
+    )
+    assert not module.megatron_conversion_is_complete(str(tmp_path))

@@ -21,6 +21,7 @@ from transformers import AutoProcessor, PreTrainedTokenizerBase
 from nemo_rl.data.datasets.utils import assert_no_double_bos
 from nemo_rl.data.interfaces import (
     DatumSpec,
+    NemoGymSourceIdentity,
     TaskDataPreProcessFnCallable,
     TaskDataProcessFnCallable,
     TaskDataSpec,
@@ -42,6 +43,8 @@ class AllTaskProcessedDataset:
         task_data_processors: Either a single TaskDataProcessFnCallable for single-task,
             or a dict mapping task names to (TaskDataSpec, TaskDataProcessFnCallable) for multi-task
         max_seq_length: Maximum sequence length for tokenized outputs
+        agent_name_sources: Stable NeMo Gym source identities the setup-time agent
+            coverage check reads instead of scanning rows.
     """
 
     def __init__(
@@ -57,8 +60,10 @@ class AllTaskProcessedDataset:
             Union[dict[str, TaskDataPreProcessFnCallable], TaskDataPreProcessFnCallable]
         ] = None,
         max_seq_length: Optional[int] = None,
+        agent_name_sources: frozenset[NemoGymSourceIdentity] | None = None,
     ):
         self.dataset = dataset
+        self.agent_name_sources = agent_name_sources
         self.tokenizer = tokenizer
         # TODO @yukih: will be removed once eval datasets are adapted
         self.default_task_data_spec = default_task_data_spec

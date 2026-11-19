@@ -1,0 +1,235 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Mooncake engine environment, configured *before* the engine is imported.
+
+Mooncake snapshots its whole ``MC_*`` configuration as its extension loads, so
+these variables only take effect if they are in ``os.environ`` beforehand. That
+makes import order load-bearing, and the failure is silent: a late write lands
+in ``os.environ`` — where it still reads back correctly — while the engine keeps
+the value it captured. On a rail-isolated RoCE fabric that silence costs a run,
+with every transfer dying as "transport retry counter exceeded".
+
+This module therefore deliberately imports **nothing** from ``transfer_queue``
+or ``mooncake``, so importing it can never be the thing that loads the engine.
+Keep it that way — a convenience import here, or one added to this package's
+``__init__``, would defeat the whole point. :func:`configure_engine_env` turns
+the ordering violation into an error rather than a silent misconfiguration.
+"""
+
+from __future__ import annotations
+
+import glob
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
+
+log = logging.getLogger(__name__)
+
+# Importing either loads mooncake's extension (transfer_queue's storage.clients
+# package eagerly imports mooncake_client, which does `from mooncake.store
+# import ...` at module scope), which is the point after which MC_* can no
+# longer be configured. Submodules need no entry of their own: importing
+# mooncake.store registers the mooncake package first.
+_ENGINE_MODULES = ("transfer_queue", "mooncake")
+
+
+def _engine_already_imported() -> str | None:
+    """Return the first engine module already in ``sys.modules``, else None."""
+    return next((m for m in _ENGINE_MODULES if m in sys.modules), None)
+
+
+def rail_link_layers() -> dict[str, str]:
+    """Map each usable RDMA device to its port-1 link layer, read from sysfs.
+
+    Any device name, not just ``mlx5_*``: vendors name rails differently. Port 1
+    must be ACTIVE: it is the port mooncake's RDMA transport uses by default
+    (``MC_IB_PORT`` overrides it). Mooncake's own discovery also accepts a
+    device active only on a higher port, which this skips.
+    """
+    layers: dict[str, str] = {}
+    for state_path in sorted(glob.glob("/sys/class/infiniband/*/ports/1/state")):
+        state = Path(state_path)
+        port_dir = state.parent
+        try:
+            if "ACTIVE" not in state.read_text():
+                continue
+            layers[port_dir.parents[1].name] = (
+                (port_dir / "link_layer").read_text().strip()
+            )
+        except OSError:
+            continue
+    return layers
+
+
+def _netdevs_of(device: str) -> set[str]:
+    """Network interfaces that share an RDMA device (sysfs ``device/net``)."""
+    try:
+        return set(os.listdir(f"/sys/class/infiniband/{device}/device/net"))
+    except OSError:
+        return set()
+
+
+def _default_route_netdev() -> str:
+    """The interface that carries the IPv4 default route, or ``""``."""
+    try:
+        for line in Path("/proc/net/route").read_text().splitlines()[1:]:
+            fields = line.split()
+            if len(fields) > 1 and fields[1] == "00000000":
+                return fields[0]
+    except OSError:
+        pass
+    return ""
+
+
+def rdma_rails() -> list[str]:
+    """This host's RDMA rails for the data plane, in sysfs order.
+
+    The one device finder for every backend. InfiniBand is preferred and never
+    mixed with RoCE. The RDMA function of the management interface (the one
+    with the default route; ``eth0`` on GB300, where it is ``mlx5_8``) is left
+    out: it is the cluster's TCP network, not a fabric rail. If it is the only
+    RDMA device it is kept, since RDMA over it still beats no RDMA.
+    """
+    layers = rail_link_layers()
+    ib = [n for n, layer in layers.items() if layer == "InfiniBand"]
+    roce = [n for n, layer in layers.items() if layer == "Ethernet"]
+    rails = ib or roce
+    mgmt = _default_route_netdev()
+    fabric = [n for n in rails if mgmt not in _netdevs_of(n)]
+    return fabric or rails
+
+
+def fabric_is_roce_only() -> bool:
+    """True when the host has RoCE rails and no InfiniBand.
+
+    Deliberately requires *seeing* InfiniBand to answer False, so an empty or
+    unreadable sysfs cannot silently opt a RoCE host out of the pairing hint.
+    """
+    layers = set(rail_link_layers().values())
+    return "Ethernet" in layers and "InfiniBand" not in layers
+
+
+def _wanted_engine_env() -> dict[str, str]:
+    """The ``MC_*`` values this backend needs, for this host's fabric."""
+    # LOCAL_MEMCPY reinterpret_casts cross-process pointers and segfaults
+    # MemcpyWorkerPool; upstream PR #1995 fixes it but is not in a published
+    # wheel. Drop once the pinned wheel includes it.
+    wanted = {"MC_STORE_MEMCPY": "0"}
+    if fabric_is_roce_only():
+        # Pin each transfer's peer rail to the local one by name. Mooncake
+        # otherwise picks the peer independently (Topology::selectDevice), and
+        # on RoCE each rail is its own subnet, so a cross-rail pair has no
+        # route. Measured on the gb200 CI runners: every cross-rail pair failed,
+        # no same-rail pair ever did. InfiniBand routes cross-rail, so it is
+        # left alone. Mooncake reads this presence-only (config.cpp:318), so
+        # `=0` enables it too — unsetting it is the only way to disable it.
+        wanted["MC_ENABLE_DEST_DEVICE_AFFINITY"] = "1"
+    return wanted
+
+
+def configure_engine_env(cfg: DataPlaneConfig) -> None:
+    """Set the engine knobs that must be identical in every process.
+
+    ``nixl``: default ``UCX_TLS`` to an RDMA-only list, which the NIXL data
+    plane requires (it never runs over tcp). The list is the one the NIXL
+    checkpoint-engine refit uses (docs/guides/checkpoint-engine-refit.md):
+    ``UCX_TLS`` reaches every Ray worker, and the refit needs ``cuda_copy`` /
+    ``cuda_ipc`` to move GPU memory. Neither carries the data plane's CPU
+    bytes off the node, so its cross-node traffic stays on ``rc``. RDMA is
+    required, with no opt-out: an unset or non-RDMA ``UCX_TLS`` becomes that
+    list and netdevs such as ``eth0`` are dropped from ``UCX_NET_DEVICES``
+    (when only netdevs were named, it becomes this host's ``rdma_rails()``),
+    so a launcher never has to set them (some clusters inject ``UCX_TLS=tcp``
+    and an ``eth0`` into every job). Replacing a set value logs a warning.
+    An unset ``UCX_MODULES`` becomes ``^fuse``, which keeps HPC-X's UCX (loaded
+    by NCCL's net plugin) from hijacking NIXL's; see "Images with HPC-X" in
+    docs/design-docs/nixl-data-plane.md.
+    ``mooncake_cpu``: the MC_* knobs
+    below. ``simple`` has no engine.
+    MC_* values already present in the environment are left alone, so a launcher can
+    override any of them — except ``MC_ENABLE_DEST_DEVICE_AFFINITY``, which
+    mooncake reads presence-only, so a launcher trying to override it to
+    ``"0"`` enables it instead; unsetting it is the only way to disable it.
+
+    Call this before anything imports ``transfer_queue`` or ``mooncake``.
+    :func:`nemo_rl.data_plane.factory.maybe_configure_data_plane_env` does, on
+    the driver before ``init_ray``, and Ray hands the result to every worker.
+
+    Raises:
+        TransportPolicyError: nixl, when ``UCX_NET_DEVICES`` names only
+            netdevs and this host has no active RDMA rail (a launcher or host
+            problem: the data plane has no RDMA device to run on), or if the
+            UCX swap failed to make the env RDMA-only (an internal invariant).
+        RuntimeError: if a variable still needs setting but the engine is
+            already imported, i.e. the value can no longer reach it. Fatal on
+            purpose — the alternative is a run that looks configured and is not.
+    """
+    if cfg["backend"] == "nixl":
+        from nemo_rl.data_plane.nixl.errors import TransportPolicyError
+        from nemo_rl.data_plane.nixl.nixl_io import check_rdma_only
+
+        # Before any UCX loads: HPC-X's libucs_fuse is dlopen'ed RTLD_GLOBAL
+        # and would capture NIXL's bundled UCX (design doc, "Images with HPC-X").
+        os.environ.setdefault("UCX_MODULES", "^fuse")
+        tls = os.environ.get("UCX_TLS", "")
+        try:
+            check_rdma_only({"UCX_TLS": tls})
+        except TransportPolicyError:
+            if tls:
+                log.warning("Replacing UCX_TLS=%s: NIXL data plane is RDMA-only", tls)
+            os.environ["UCX_TLS"] = "rc,cuda_copy,cuda_ipc,self,sm"
+        devs = os.environ.get("UCX_NET_DEVICES", "all").split(",")
+        if devs != ["all"] and any(d and ":" not in d for d in devs):
+            log.warning(
+                "Dropping network interfaces from UCX_NET_DEVICES=%s", ",".join(devs)
+            )
+            # Not ``all``: UCX could then pick the management port rdma_rails() skips.
+            rdma_devs = [d for d in devs if ":" in d] or [
+                f"{dev}:1" for dev in rdma_rails()
+            ]
+            if not rdma_devs:
+                raise TransportPolicyError(
+                    f"UCX_NET_DEVICES={','.join(devs)} names no RDMA device and "
+                    "this host has no active RDMA rail; the NIXL data plane is "
+                    "RDMA-only."
+                )
+            # Set, never delete: init_ray() ships os.environ, so a deleted key
+            # never reaches the workers.
+            os.environ["UCX_NET_DEVICES"] = ",".join(rdma_devs)
+        check_rdma_only()  # asserts the swap above left UCX RDMA-only
+        return
+    if cfg["backend"] != "mooncake_cpu":
+        return
+
+    missing = {k: v for k, v in _wanted_engine_env().items() if k not in os.environ}
+    if not missing:
+        # Already set by the launcher, or by an earlier call in this process.
+        return
+
+    imported = _engine_already_imported()
+    if imported is not None:
+        raise RuntimeError(
+            f"mooncake's engine was already imported (via {imported!r}) before "
+            f"{sorted(missing)} could be set, so the engine would never see "
+            "them: it reads its MC_* configuration once, as the extension "
+            "loads. Configure before anything imports transfer_queue or "
+            "mooncake, or export the variables in the launcher environment."
+        )
+
+    os.environ.update(missing)

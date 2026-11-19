@@ -64,6 +64,10 @@ REQUIRES: list[str] = _META["project"].get("dependencies", [])
 # by base image and architecture so it can span ref and uv-version changes.
 # There is no env-var override — to build a different fork/ref, edit
 # [tool.trtllm].
+#
+# A private fork is cloned over ssh, the same way build-custom-vllm.sh and
+# build-custom-flashinfer.sh do it: set an ssh url in [tool.trtllm] and the
+# TRT-LLM RUN's --mount=type=ssh in docker/Dockerfile carries the agent through.
 _TRTLLM: dict[str, str] = _META["tool"]["trtllm"]
 TRTLLM_URL: str = _TRTLLM["url"]
 TRTLLM_REF: str = _TRTLLM["ref"]
@@ -97,17 +101,21 @@ _DEFAULT_ARCH = "90-real;100-real"
 def _build_input_tag(arch: str) -> str:
     """Build-affecting inputs (beyond url/ref/version/platform) for the cache key.
 
-    The compiled wheel depends on the SM arch list and the torch/CUDA toolchain
-    it links against, so a change to any of these — without a git_ref bump —
-    would otherwise silently reuse a stale cached wheel. torch is imported
-    lazily so prepare_metadata_for_build_wheel (called under ``uv lock`` without
-    torch) never triggers it.
+    The compiled wheel depends on the SM arch list, the torch/CUDA toolchain it
+    links against, and the NIXL it bundles, so a change to any of these —
+    without a git_ref bump — would otherwise silently reuse a stale cached
+    wheel. torch is imported lazily so prepare_metadata_for_build_wheel (called
+    under ``uv lock`` without torch) never triggers it.
     """
     # Import lazily because metadata-only hooks do not need this heavy dependency.
     import torch  # noqa: PLC0415
 
     toolchain = f"torch{torch.__version__},cuda{torch.version.cuda}"
-    return f"arch={arch}|{toolchain}"
+    # build_wheel.py copies /opt/nvidia/nvda_nixl into the wheel, so the image's
+    # NIXL is a build input. docker/Dockerfile re-exports NIXL_VERSION as ENV
+    # for exactly this (the NGC base image otherwise reports its own 1.0.1).
+    nixl = os.environ.get("NIXL_VERSION", "")
+    return f"arch={arch}|{toolchain}|nixl={nixl}"
 
 
 def _wheel_cache_dir(base: str, git_url: str, git_ref: str, build_inputs: str) -> Path:
@@ -242,9 +250,14 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         )
         mirror_dir.mkdir(parents=True, exist_ok=True)
         mirror = mirror_dir / wheel.name
-        if wheel.resolve() != mirror.resolve():
+        # The directory is content-addressed, so an existing mirror is this
+        # wheel already; skipping the copy keeps a stage that inherits the
+        # mirror from an earlier layer from duplicating it into its own.
+        if mirror.exists():
+            print(f"[trtllm-backend] Mirror already present: {mirror}", flush=True)
+        else:
             shutil.copy2(wheel, mirror)
-        print(f"[trtllm-backend] Mirrored cached wheel to: {mirror}", flush=True)
+            print(f"[trtllm-backend] Mirrored cached wheel to: {mirror}", flush=True)
 
     destination = Path(wheel_directory) / wheel.name
     shutil.copy2(wheel, destination)

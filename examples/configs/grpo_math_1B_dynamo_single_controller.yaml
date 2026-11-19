@@ -1,0 +1,39 @@
+# grpo_math_1B_megatron_single_controller.yaml served through Dynamo.
+# `policy.generation.dynamo: true` is the whole switch: the same vLLM workers
+# register with a managed dynamo.frontend, and rollouts go through its KV-aware
+# router. Every other vLLM setting keeps its meaning; Dynamo implies
+# vllm_cfg.async_engine and needs non-colocated generation.
+#
+# dynamo_cfg is optional. The values below are its defaults
+# (nemo_rl/models/generation/dynamo/config.py).
+defaults: grpo_math_1B_megatron_single_controller.yaml
+
+policy:
+  generation:
+    dynamo: true
+    dynamo_cfg:
+      # Bounds etcd/NATS/frontend start-up and every engine's registration.
+      startup_timeout_s: 600
+      # Deadline for one rollout through the frontend. null waits as long as
+      # generation takes, as native generate_async does; on the SingleController,
+      # async_rl.rollout_failure.native.generation_timeout_s bounds both paths.
+      # NeMo-Gym's own calls keep Gym's timeouts.
+      request_timeout_s: null
+      frontend_args:
+        # kv: route each request to the engine holding most of its prefix.
+        router_mode: kv
+        # Keep a NeMo-Gym token-capture rollout on one engine while it idles up
+        # to this many seconds (null disables it).
+        session_affinity_ttl_secs: 300
+        # Processes that render NeMo-Gym's chat calls and build their replies.
+        render_workers: 8
+        extra_cli_args: []
+
+logger:
+  log_dir: results/grpo-math-1b-dynamo-single-controller
+  wandb:
+    name: grpo-dynamo-single-controller-dev
+  swanlab:
+    name: grpo-dynamo-single-controller-dev
+  mlflow:
+    run_name: grpo-dynamo-single-controller-dev

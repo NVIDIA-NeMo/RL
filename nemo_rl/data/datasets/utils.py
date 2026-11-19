@@ -98,6 +98,8 @@ def load_dataset_from_path(
     data_path: str,
     data_subset: Optional[str] = None,
     data_split: Optional[str] = "train",
+    *,
+    preserve_jsonl_rows: bool = False,
 ):
     """Load a dataset from a local file, huggingface dataset, or Arrow dataset (saved with save_to_disk).
 
@@ -105,6 +107,10 @@ def load_dataset_from_path(
         data_path: The path to the dataset.
         data_subset: The subset to load from the dataset. Only supported for huggingface datasets.
         data_split: The split to load from the dataset.
+        preserve_jsonl_rows: Load each JSONL row as an unparsed string in a
+            ``text`` column. Hugging Face materializes the text builder's
+            Arrow cache under ``HF_DATASETS_CACHE``, so subsequent jobs can
+            memory-map and reuse it instead of rebuilding Python strings.
     """
     FILEEXT2TYPE = {
         ".arrow": "arrow",
@@ -114,9 +120,20 @@ def load_dataset_from_path(
         ".parquet": "parquet",
         ".txt": "text",
     }
-    suffix = os.path.splitext(data_path)[-1]
+    suffix = (
+        ".jsonl"
+        if data_path.lower().endswith(".jsonl.packed")
+        else os.path.splitext(data_path)[-1].lower()
+    )
+    dataset_type = FILEEXT2TYPE.get(suffix)
+    # Keep each JSONL line as an unparsed string, whatever the file suffix.
+    keep_raw_lines = suffix == ".jsonl" or (
+        os.path.isfile(data_path) and dataset_type not in ("arrow", "csv", "parquet")
+    )
+    if preserve_jsonl_rows and keep_raw_lines:
+        dataset_type = "text"
     # load from local file (not save_to_disk format)
-    if dataset_type := FILEEXT2TYPE.get(suffix):
+    if dataset_type:
         assert data_subset is None, (
             "data_subset is only supported for huggingface datasets"
         )
@@ -187,6 +204,7 @@ def resolve_external_dataset_class(dataset_name: str) -> type:
 # they configured. Keys consumed by the dispatchers themselves (dataset_name,
 # env_name, processor, prompt_file, system_prompt_file) are deliberately absent.
 _BEHAVIORAL_DATASET_CONFIG_KEYS = (
+    "chat_key",
     "chosen_key",
     "data_path",
     "download_dir",
