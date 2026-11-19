@@ -56,7 +56,8 @@ _NO_PROXY_EXEMPTIONS = (
 
 
 def maybe_enable_proxy(config: dict) -> None:
-    """Export HTTP_PROXY/HTTPS_PROXY from the configured env var, if `config["proxy"]["enabled"]`.
+    """Export HTTP_PROXY/HTTPS_PROXY (+lowercase) from the configured env var, if
+    `config["proxy"]["enabled"]`.
 
     No-op if the `proxy` block is absent or `enabled` is false. Call this once, early
     in the main training script, before anything that needs outbound internet access.
@@ -74,8 +75,8 @@ def maybe_enable_proxy(config: dict) -> None:
             "repo; this only needs its address."
         )
 
-    os.environ["HTTP_PROXY"] = proxy_url
-    os.environ["HTTPS_PROXY"] = proxy_url
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        os.environ[var] = proxy_url
 
     for var in ("NO_PROXY", "no_proxy"):
         existing = os.environ.get(var, "")
@@ -84,7 +85,7 @@ def maybe_enable_proxy(config: dict) -> None:
         os.environ[var] = ",".join(dict.fromkeys(entries))
 
     logger.info(
-        "Forward-proxy enabled: HTTP_PROXY/HTTPS_PROXY exported from %s, "
+        "Forward-proxy enabled: HTTP_PROXY/HTTPS_PROXY (+lowercase) exported from %s, "
         "NO_PROXY/no_proxy exempts %s (plus any pre-existing entries).",
         url_env_var,
         _NO_PROXY_EXEMPTIONS,
