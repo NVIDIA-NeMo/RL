@@ -105,6 +105,8 @@ from nemo_rl.data_plane import (
     data_plane_supports_checkpointing,
 )
 from nemo_rl.data_plane.schema import (
+    DP_TRAIN_FIELDS,
+    SAMPLER_TOPK_FIELDS,
     SC_ROLLOUT_SCHEMA_FIELDS,
     fields_with_optional_routed_experts,
 )
@@ -355,8 +357,6 @@ def _register_single_controller_partitions(
             enabled=r3_enabled,
         )
     else:
-        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, SAMPLER_TOPK_FIELDS
-
         partition_fields = fields_with_optional_routed_experts(
             SC_ROLLOUT_SCHEMA_FIELDS
             if token_capture_cfg.forest_training
@@ -1389,12 +1389,6 @@ def setup_single_controller(
     generation_prefix_cuts_enabled = (
         master_config.rollout_recovery.generation_prefix_cuts_enabled
     )
-    if generation_prefix_cuts_enabled:
-        # The vLLM-only check ran above with the other turn/prefix checks.
-        if router_replay_enabled(master_config.policy):
-            raise NotImplementedError(
-                "generation-prefix recovery does not yet support router replay"
-            )
     if capture_media:
         if media_family is None:
             raise ValueError(
