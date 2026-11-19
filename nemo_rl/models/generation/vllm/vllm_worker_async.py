@@ -879,8 +879,9 @@ class VllmAsyncGenerationWorkerImpl(
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
-        generation_prefix_batch_size: int,
-        generation_prefix_batch_max_tokens: int,
+        prefix_write_max_rows: int,
+        prefix_write_max_tokens: int,
+        prefix_read_max_rows: int,
     ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
@@ -1027,15 +1028,21 @@ class VllmAsyncGenerationWorkerImpl(
                     router_replay=self._cut_routes_dtype is not None,
                     sampler_top_k=self._capture_top_logprobs,
                     prefix_row_extras=self._generation_cut_record_payload,
-                    generation_prefix_batch_size=generation_prefix_batch_size,
-                    generation_prefix_batch_max_tokens=(
-                        generation_prefix_batch_max_tokens
-                    ),
+                    prefix_write_max_rows=prefix_write_max_rows,
+                    prefix_write_max_tokens=prefix_write_max_tokens,
+                    prefix_read_max_rows=prefix_read_max_rows,
                 )
             )
         if self._api_server_pool is not None:
             await self._api_server_pool.command(
-                "capture", dp_cfg, staging_partition, capture_media, top_logprobs
+                "capture",
+                dp_cfg,
+                staging_partition,
+                capture_media,
+                top_logprobs,
+                prefix_write_max_rows,
+                prefix_write_max_tokens,
+                prefix_read_max_rows,
             )
         if not capture_media:
             return None

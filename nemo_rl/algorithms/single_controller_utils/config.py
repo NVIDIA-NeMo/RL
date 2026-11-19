@@ -815,11 +815,13 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     # every in-flight rollout over after a crash. False fails setup and names such
     # servers; true accepts them with a warning.
     allow_restart_only_gym_servers: bool = False
-    # Per-generation-owner bounds for prefix TQ I/O: rows per cut-time put and
-    # keys per restore-time get, and token rows per cut-time put. Rows are
-    # never split; one row larger than the token limit is processed alone.
-    generation_prefix_batch_size: Annotated[int, Field(gt=0)] = 256
-    generation_prefix_batch_max_tokens: Annotated[int, Field(gt=0)] = 4_194_304
+    # Per-generation-owner TQ I/O limits for saved partial responses
+    # (target_level: prefix). Rows per TQ write at a checkpoint cut.
+    prefix_write_max_rows: Annotated[int, Field(gt=0)] = 256
+    # Tokens per TQ write at a checkpoint cut; a larger row is written alone.
+    prefix_write_max_tokens: Annotated[int, Field(gt=0)] = 4_194_304
+    # Rows per TQ read at restore. 1 = each restore reads on its own.
+    prefix_read_max_rows: Annotated[int, Field(gt=0)] = 256
 
     @model_validator(mode="after")
     def _validate_restart_only_opt_in(self) -> "RolloutRecoveryConfig":

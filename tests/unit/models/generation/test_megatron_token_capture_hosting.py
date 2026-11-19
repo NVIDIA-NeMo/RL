@@ -27,8 +27,9 @@ pytestmark = pytest.mark.nemo_gym
 
 # ``setup_token_capture`` takes these from ``rollout_recovery`` with no defaults.
 _PREFIX_BATCH_LIMITS = {
-    "generation_prefix_batch_size": 256,
-    "generation_prefix_batch_max_tokens": 4_194_304,
+    "prefix_write_max_rows": 256,
+    "prefix_write_max_tokens": 4_194_304,
+    "prefix_read_max_rows": 256,
 }
 
 
@@ -134,6 +135,7 @@ def test_generation_setup_token_capture_captures_omni_media_only(media_family):
             "rollout_staging",
             capture_media=True,
             media_family=media_family,
+            **_PREFIX_BATCH_LIMITS,
         )
     assert worker_group.calls == []
 

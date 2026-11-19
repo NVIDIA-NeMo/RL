@@ -3138,8 +3138,9 @@ class TestSetup:
                 default_teacher_alias="teacher",
                 non_colocated_teachers={"enabled": True},
             )
-        mc.rollout_recovery.generation_prefix_batch_size = 17
-        mc.rollout_recovery.generation_prefix_batch_max_tokens = 4096
+        mc.rollout_recovery.prefix_write_max_rows = 17
+        mc.rollout_recovery.prefix_write_max_tokens = 4096
+        mc.rollout_recovery.prefix_read_max_rows = 5
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,
@@ -3214,8 +3215,9 @@ class TestSetup:
         assert setup_kwargs["generation_cut_control_timeout_s"] == (
             mc.token_capture.control_timeout_s
         )
-        assert setup_kwargs["generation_prefix_batch_size"] == 17
-        assert setup_kwargs["generation_prefix_batch_max_tokens"] == 4096
+        assert setup_kwargs["prefix_write_max_rows"] == 17
+        assert setup_kwargs["prefix_write_max_tokens"] == 4096
+        assert setup_kwargs["prefix_read_max_rows"] == 5
 
     def test_dynamo_token_capture_tells_gym_to_speak_dynamo(self, patched_factories):
         """The same vLLM workers stage the calls; Gym reaches them through the frontend."""

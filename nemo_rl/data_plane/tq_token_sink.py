@@ -522,43 +522,21 @@ class TQTokenSink:
         *,
         attachments: Mapping[str, Any] | None = None,
     ) -> StageResult:
-        """Write a call's token row and its media under its staging key."""
-        return self._stage_at_key(
-            record,
-            record.staging_key,
-            attachments=attachments,
-        )
-
-    def _stage_at_key(
-        self,
-        record: StagedCallRecord,
-        key: str,
-        *,
-        attachments: Mapping[str, Any] | None = None,
-        generation_cut_chunk: bool = False,
-    ) -> StageResult:
         """Write tokens, routes, media and sampler attachments in one ``put``.
 
         Success is returned only after the combined write was acknowledged,
         so ``staged`` coordinates vouch for tokens and pixels together. TQ has
         no transactional rollback: if the write raises, the attempted key is
         discarded best-effort before the failure is reported (see
-        ``_discard_failed_write``).
-
-        A generation-cut chunk carries exactly one route row per token and no
-        boundary row: only the resume path reads it back, and the resumed
-        call's canonical row supplies the boundary route the reassembler uses.
+        ``_discard_failed_writes``).
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
 
+        key = record.staging_key
         write_started = False
         try:
-            field_dict, tags = self._encode_record(
-                record,
-                attachments=attachments,
-                generation_cut_chunk=generation_cut_chunk,
-            )
+            field_dict, tags = self._encode_record(record, attachments=attachments)
             write_started = True
             self._store.put(key, field_dict, tags=tags)
         except Exception as error:  # noqa: BLE001 — any failure must poison, not crash serving
@@ -572,7 +550,7 @@ class TQTokenSink:
                 error,
             )
             if write_started:
-                self._discard_failed_write(key)
+                self._discard_failed_writes([key])
             return StageResult(
                 ok=False, staging_key=key, error=f"{type(error).__name__}: {error}"
             )
@@ -585,7 +563,12 @@ class TQTokenSink:
         attachments: Mapping[str, Any] | None = None,
         generation_cut_chunk: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-        """Encode one capture row and its tags without publishing it."""
+        """Encode one capture row and its tags without publishing it.
+
+        A generation-cut chunk carries exactly one route row per token and no
+        boundary row: only the resume path reads it back, and the resumed
+        call's canonical row supplies the boundary route the reassembler uses.
+        """
         remaining = dict(attachments) if attachments is not None else None
         if remaining is not None and ROUTED_EXPERTS_FIELD in remaining:
             remaining.pop(ROUTED_EXPERTS_FIELD)
@@ -777,68 +760,60 @@ class TQTokenSink:
         chunk_sequences: Sequence[int],
         attachments: Sequence[Mapping[str, Any] | None] | None = None,
     ) -> list[str]:
-        """Publish compatible generation-cut chunks using as few TQ calls as possible.
+        """Publish generation-cut chunks in one TQ put; return their keys in order.
 
-        Returns the written staging keys in input order. Rows with different
-        optional columns or fixed trailing tensor dimensions are written in
-        separate TQ batches; jagged token, identity, route-length, and
-        media-length dimensions are still coalesced by ``stack_or_nest``.
-        Raises on the first encoding or TQ error; a TQ error first discards
-        every key of the batch, since earlier groups may already be written.
+        Rows must share column names, dtypes and trailing dims (one worker's
+        cut does); otherwise this raises before writing and the caller writes
+        each row alone. A failed put discards every key of the batch, then
+        raises.
         """
-        if len(records) != len(chunk_sequences):
-            raise ValueError("records and chunk_sequences must have equal lengths")
+        if not records:
+            return []
         if attachments is None:
             attachments = [None] * len(records)
-        if len(records) != len(attachments):
-            raise ValueError("records and attachments must have equal lengths")
-        keys = [
-            generation_cut_staging_key(
-                checkpoint_id,
-                record.capture_key,
-                record.model_call_id,
-                chunk_sequence=sequence,
-            )
-            for record, sequence in zip(records, chunk_sequences, strict=True)
-        ]
-        if len(set(keys)) != len(keys):
-            raise ValueError("generation-prefix batch contains duplicate staging keys")
-        groups: dict[
-            tuple[Any, ...],
-            list[tuple[int, dict[str, torch.Tensor], dict[str, Any]]],
-        ] = {}
-        for index, (record, row_attachments) in enumerate(
-            zip(records, attachments, strict=True)
+        keys, encoded = [], []
+        for record, sequence, row_attachments in zip(
+            records, chunk_sequences, attachments, strict=True
         ):
-            fields, tags = self._encode_record(
-                record, attachments=row_attachments, generation_cut_chunk=True
+            keys.append(
+                generation_cut_staging_key(
+                    checkpoint_id,
+                    record.capture_key,
+                    record.model_call_id,
+                    chunk_sequence=sequence,
+                )
             )
-            signature = tuple(
+            encoded.append(
+                self._encode_record(
+                    record, attachments=row_attachments, generation_cut_chunk=True
+                )
+            )
+        # The TensorDict takes row 0's column names, and stack_or_nest promotes
+        # mismatched dtypes and nests mismatched trailing dims without raising.
+        layouts = {
+            tuple(
                 (name, fields[name].dtype, tuple(fields[name].shape[2:]))
                 for name in sorted(fields)
             )
-            groups.setdefault(signature, []).append((index, fields, tags))
-
+            for fields, _ in encoded
+        }
+        if len(layouts) > 1:
+            raise ValueError("generation-prefix batch rows have different layouts")
+        fields = TensorDict(
+            {
+                name: stack_or_nest([row[name][0] for row, _ in encoded])
+                for name in encoded[0][0]
+            },
+            batch_size=[len(encoded)],
+        )
         try:
-            for group in groups.values():
-                fields = TensorDict(
-                    {
-                        name: stack_or_nest([item[1][name][0] for item in group])
-                        for name in group[0][1]
-                    },
-                    batch_size=[len(group)],
-                )
-                self._store.put_many(
-                    [keys[item[0]] for item in group],
-                    fields,
-                    tags=[item[2] for item in group],
-                )
+            self._store.put_many(keys, fields, tags=[tags for _, tags in encoded])
         except Exception:
             self._discard_failed_writes(keys)
             raise
         return keys
 
-    def _discard_failed_write(self, key: str) -> None:
+    def _discard_failed_writes(self, keys: Sequence[str]) -> None:
         """Reclaim whatever a failed combined write may have left behind.
 
         TQ writes a row field by field and only then publishes readiness, so
@@ -849,10 +824,6 @@ class TQTokenSink:
         is a no-op). If it fails too the storage state is uncertain and is
         logged at ERROR for the operator; the call is still reported failed.
         """
-        self._discard_failed_writes([key])
-
-    def _discard_failed_writes(self, keys: Sequence[str]) -> None:
-        """Best-effort cleanup for one uncertain single-row or batch write."""
         try:
             self._store.clear(list(keys))
         except Exception as error:  # noqa: BLE001 — cleanup must not mask the stage failure

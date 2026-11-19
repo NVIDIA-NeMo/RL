@@ -25,8 +25,9 @@ from nemo_rl.models.generation.interfaces import (
 
 # ``setup_token_capture`` takes these from ``rollout_recovery`` with no defaults.
 _PREFIX_BATCH_LIMITS = {
-    "generation_prefix_batch_size": 256,
-    "generation_prefix_batch_max_tokens": 4_194_304,
+    "prefix_write_max_rows": 256,
+    "prefix_write_max_tokens": 4_194_304,
+    "prefix_read_max_rows": 256,
 }
 
 
