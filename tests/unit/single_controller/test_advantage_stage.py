@@ -102,7 +102,7 @@ def test_from_master_config_uses_typed_logger(
         logger=LoggerConfig(log_dir=str(tmp_path)),
         async_rl=SimpleNamespace(
             log_full_train_data=log_full_train_data,
-            debug_writer=DebugWriterConfig(),
+            debug_writer=DebugWriterConfig(target="json"),
         ),
     )
 
@@ -639,6 +639,8 @@ def _controller(
         message_level_advantage_penalties_enabled=False,
         shardable=not estimator.requires_global_batch,
         train_data_dump_dir=dump_dir,
+        # The controller below merges JSONL parts, so the computers write JSONL.
+        debug_writer=DebugWriterConfig(target="json"),
     )
     if stage_config is not None:
         config = stage_config

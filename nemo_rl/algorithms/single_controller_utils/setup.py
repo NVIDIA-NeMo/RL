@@ -91,11 +91,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.data.captured_media import media_capture_family
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.multimodal_utils import (
     WIRE_MULTIMODAL_FIELDS,
     per_token_multimodal_schema,
-    uses_image_placeholder,
 )
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
@@ -135,6 +135,7 @@ from nemo_rl.experience.rollouts import (
     should_mask_flagged_samples,
 )
 from nemo_rl.models.generation import resolve_generation_class
+from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetHealth,
@@ -835,6 +836,7 @@ def _spinup_gym(
     base_urls: list[str],
     tokenizer: PreTrainedTokenizerBase,
     policy_api_key: Optional[str],
+    generation_cut_control_urls: Optional[list[str]],
 ) -> tuple[NemoGymShardSet, float]:
     """Spin up the NeMo-Gym shard set against the reserved vLLM URLs.
 
@@ -845,6 +847,9 @@ def _spinup_gym(
             call. See NemoGym.set_tokenizer.
         policy_api_key: The bearer token the vLLM server requires on its OpenAI
             routes (VllmGeneration.http_server_api_key), or None when it checks none.
+        generation_cut_control_urls: Where Gym sends checkpoint generation cuts,
+            one per base URL (VllmGeneration.generation_cut_control_urls), or
+            None when each base URL takes its own.
 
     Returns:
         A tuple of (NeMo-Gym shard set, wall time spent in this call).
@@ -867,6 +872,7 @@ def _spinup_gym(
         generation_prefix_cuts_enabled=(
             master_config.rollout_recovery.generation_prefix_cuts_enabled
         ),
+        generation_cut_control_urls=generation_cut_control_urls,
         # Capture transport config includes the generation request's candidate count.
         token_capture=(
             {
@@ -1382,20 +1388,22 @@ def setup_single_controller(
             "MInf routing indices can be joined with Gym lineage"
         )
     capture_media = token_capture_cfg.enabled and processor is not None
+    # The driver picks the media family from the processor; the serving workers
+    # only confirm that their engine built the matching processor.
+    media_family = media_capture_family(processor) if capture_media else None
     generation_prefix_cuts_enabled = (
         master_config.rollout_recovery.generation_prefix_cuts_enabled
     )
-    if generation_prefix_cuts_enabled:
-        # The vLLM-only check ran above with the other turn/prefix checks.
-        if router_replay_enabled(master_config.policy):
-            raise NotImplementedError(
-                "generation-prefix recovery does not yet support router replay"
-            )
     if capture_media:
-        if not uses_image_placeholder(processor):
+        if media_family is None:
             raise ValueError(
-                "VLM token capture currently supports Omni dynamic images and native video"
+                "VLM token capture supports the Nemotron Omni and Pixtral (Mistral3) "
+                f"processors; got {type(processor).__name__}"
             )
+        if media_family == "pixtral":
+            # The vLLM worker captures Pixtral images, but no learner reads that
+            # captured layout yet.
+            raise ValueError("Pixtral (Mistral3) media capture has no learner yet")
         if not policy_config["megatron_cfg"]["enabled"]:
             raise ValueError(
                 "Omni media token capture currently requires the Megatron learner"
@@ -1489,7 +1497,11 @@ def setup_single_controller(
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
         # per-run control-plane bearer token, the process-shared capture
         # directory used by every Gym worker, and the capture-host backend.
-        token_capture_cfg.generation_backend = generation_config["backend"]
+        token_capture_cfg.generation_backend = (
+            "dynamo"
+            if dynamo_enabled(generation_config)
+            else generation_config["backend"]
+        )
         if token_capture_cfg.control_auth_token is None:
             # Deferred import: only needed on the capture path.
             import secrets
@@ -2003,7 +2015,7 @@ def setup_single_controller(
                 defer_model_load=True,
             )
             defer_generation_model_load = True
-            gym_base_urls = generation.dp_openai_server_base_urls
+            gym_base_urls = generation.client_base_urls
         # Before the Gym task is built, so Gym can be handed the router's single URL.
         # These two statements are the only failable ones related to the port holder's creation.
         try:
@@ -2029,6 +2041,11 @@ def setup_single_controller(
             # key; a Megatron generation server is built later and checks none.
             policy_api_key=(
                 generation.http_server_api_key if generation is not None else None
+            ),
+            generation_cut_control_urls=(
+                generation.generation_cut_control_urls
+                if generation is not None
+                else None
             ),
         )
 
@@ -2301,6 +2318,7 @@ def setup_single_controller(
             dp_config,
             token_capture_cfg.staging_partition,
             capture_media=capture_media,
+            media_family=media_family,
             top_logprobs=master_config.policy["generation"]["top_logprobs"],
             generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
             generation_cut_control_token=token_capture_cfg.control_auth_token,
