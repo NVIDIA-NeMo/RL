@@ -3709,8 +3709,7 @@ def test_forest_router_is_validated_before_rollout_manager(
             ]
     if forest_training:
         trainer.worker_group.run_all_workers_single_data.assert_called_once_with(
-            "validate_forest_execution_padding",
-            exclude_padding_from_router_stats=False,
+            "validate_forest_execution_padding"
         )
     else:
         trainer.worker_group.run_all_workers_single_data.assert_not_called()
@@ -3752,16 +3751,11 @@ def test_forest_groups_pad_to_the_row_multiple(patched_factories) -> None:
     assert rollout_manager.call_args.kwargs["execution_row_multiple"] == 4
 
 
-@pytest.mark.parametrize("exclude_router_stats", [False, True])
 def test_forest_ppo_validates_policy_and_critic_before_rollout_manager(
-    patched_factories, exclude_router_stats: bool
+    patched_factories,
 ) -> None:
     mc = _forest_ppo_config(_make_forest_master_config())
-    mc.token_capture = TokenCaptureConfig(
-        enabled=True,
-        forest_training=True,
-        exclude_padding_from_router_stats=exclude_router_stats,
-    )
+    mc.token_capture = TokenCaptureConfig(enabled=True, forest_training=True)
     trainer = patched_factories["fake_policy"]
     trainer.cfg = mc.policy
     trainer.sharding_annotations.get_axis_size.return_value = 1
@@ -3790,12 +3784,9 @@ def test_forest_ppo_validates_policy_and_critic_before_rollout_manager(
     ):
         setup_single_controller(mc, MagicMock(pad_token_id=0))
     assert events == [trainer_check, value_check, ("rollout_manager", 3)]
-    for consumer, method in (
-        (trainer, "validate_forest_execution_padding"),
-        (value, "configure_forest_router_padding"),
-    ):
+    for consumer in (trainer, value):
         consumer.worker_group.run_all_workers_single_data.assert_called_once_with(
-            method, exclude_padding_from_router_stats=exclude_router_stats
+            "validate_forest_execution_padding"
         )
 
 

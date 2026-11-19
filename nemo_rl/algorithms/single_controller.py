@@ -176,10 +176,8 @@ from nemo_rl.data_plane.observability import (
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
-    DP_VALUE_TRAIN_FIELDS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
-    ROUTER_EXCLUDED_ROWS,
     SAMPLER_TOPK_FIELDS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -450,14 +448,6 @@ class SingleControllerActor:
             sampler_head_required=master_config.loss_fn.score_centering
             or sampler_replay_enabled(master_config.policy["generation"]),
         )
-        # Workers mask these rows out of expert-bias statistics only when fetched.
-        self._router_excluded_fields: tuple[str, ...] = (
-            (ROUTER_EXCLUDED_ROWS,)
-            if master_config.token_capture.forest_training
-            and master_config.token_capture.exclude_padding_from_router_stats
-            else ()
-        )
-        self._train_fields += self._router_excluded_fields
         self._dp_client = actor_args.dp_client
         self._dp_backend = master_config.data_plane["backend"]
         if self._dp_backend == "mooncake_cpu":
@@ -5323,15 +5313,10 @@ class SingleControllerActor:
                     full_meta,
                     value_loss_fn,
                     gbs=gbs,
-                    train_fields=(
-                        *DP_VALUE_TRAIN_FIELDS,
-                        *self._router_excluded_fields,
-                    ),
                 )
         else:
             # Split exposes the per-chunk API, but this controller still collects
-            # all step chunks before training the critic. Forest, the only
-            # source of router-excluded rows, requires whole_batch.
+            # all step chunks before training the critic.
             for _ in range(num_epochs):
                 await asyncio.to_thread(
                     self._value.begin_train_step, value_loss_fn, gbs=gbs
