@@ -473,9 +473,6 @@ class GroupTokenMeanReduction(ObjectiveReduction):
         denominator: torch.Tensor,
         per_response_weights: torch.Tensor | None,
     ) -> torch.Tensor:
-        # Keep the interface importable without the optional tokenizer dependencies.
-        from nemo_rl.algorithms.utils import masked_mean
-
         assert per_response_weights is not None
         return masked_mean(
             values * per_response_weights.unsqueeze(-1),
