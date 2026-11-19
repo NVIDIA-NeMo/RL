@@ -85,6 +85,29 @@ The Rust toolchain is only installed when `sglang` is built.
 --build-arg NRL_EXTRAS="vllm mcore automodel modelopt nemo_gym"
 ```
 
+## Compiling for Fewer GPU Types
+
+Several dependencies compile CUDA code once per GPU architecture, and that is most of a cold build. By default most of them compile for Hopper (`9.0`) and Blackwell (`10.0`); flash-attn compiles for four types (`80;90;100;120`). To compile for one GPU type only, narrow the lists:
+
+```sh
+docker buildx build -f docker/Dockerfile \
+    --build-arg TORCH_CUDA_ARCH_LIST=10.0 \
+    --build-arg NVTE_CUDA_ARCHS=100 \
+    --build-arg FLASH_ATTN_CUDA_ARCHS=100 \
+    --tag <registry>/nemo-rl:latest \
+    .
+```
+
+| Build argument | Default | Read by |
+|---|---|---|
+| `TORCH_CUDA_ARCH_LIST` | `9.0 10.0` | PyTorch C++/CUDA extension builds such as DeepEP. Also kept in the image: the Megatron backend refuses to start without it, and Megatron-Core compiles a small extension at run time. |
+| `NVTE_CUDA_ARCHS` | `90;100` | Transformer Engine. |
+| `FLASH_ATTN_CUDA_ARCHS` | flash-attn's own default | flash-attn. |
+| `FLASH_MLA_DISABLE_SM90` | unset | FlashMLA. Set to `1` to skip its Hopper kernels. |
+| `NVCC_THREADS` | each package's own default (flash-attn `4`, FlashMLA `32`) | flash-attn and FlashMLA (threads per `nvcc` call). |
+
+Each combination of the first four settings gets its own uv cache, so a wheel compiled for one list is never reused for another. `NVCC_THREADS` does not change the wheel and is not part of that cache key.
+
 ## Stripping the uv Cache
 
 By default, the release image keeps `uv`'s download cache (`/opt/nemo_rl_cache/uv`) on disk. This lets the image's unprivileged runtime user re-run `uv run --extra <backend>` fully offline, since every wheel it could need is already cached in the image. The tradeoff is a larger image.
@@ -99,7 +122,7 @@ docker buildx build -f docker/Dockerfile \
 ```
 
 > [!NOTE]
-> On a long-lived local builder, BuildKit's cache mount (keyed by base image, uv version, and the HybridEP setting) persists across builds regardless of `STRIP_UV_CACHE` -- it just controls whether a copy also ships in the image layers. To reset that mount, run `docker buildx prune --filter type=exec.cachemount`.
+> On a long-lived local builder, BuildKit's cache mount (keyed by base image, uv version, the HybridEP setting, and the GPU-type build args) persists across builds regardless of `STRIP_UV_CACHE` -- it just controls whether a copy also ships in the image layers. To reset that mount, run `docker buildx prune --filter type=exec.cachemount`.
 
 ## Custom Setup Commands
 

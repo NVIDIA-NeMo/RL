@@ -58,7 +58,7 @@ on:
       uv-cache-tag:
         required: false
         default: ""
-        description: Prefix for the uv download-cache image tag (e.g. "uv-cache"); the target architecture and a hash of BASE_IMAGE, UV_VERSION and HYBRID_EP_MULTINODE are appended automatically. Empty disables the cache.
+        description: Prefix for the uv download-cache image tag (e.g. "uv-cache"); the target architecture and a hash of BASE_IMAGE, UV_VERSION, HYBRID_EP_MULTINODE and the GPU-type build args (TORCH_CUDA_ARCH_LIST, NVTE_CUDA_ARCHS, FLASH_ATTN_CUDA_ARCHS, FLASH_MLA_DISABLE_SM90) are appended automatically. Empty disables the cache.
         type: string
       trtllm-cache-scope:
         required: false
@@ -231,7 +231,9 @@ jobs:
           # A stale seed is only safe to import if it was built from the same
           # BASE_IMAGE/UV_VERSION/HYBRID_EP_MULTINODE combination -- otherwise the
           # registry-pulled native wheels can be ABI-incompatible with this build's
-          # CUDA/compiler environment. Key the seed tag by all three, mirroring how
+          # CUDA/compiler environment. The GPU-type build args are in the key too:
+          # a seed built for another GPU list would hand back wheels compiled for
+          # the wrong GPUs. This mirrors the Dockerfile's uv cache mount id, and how
           # the TRT-LLM ccache/wheel-cache tags are keyed by BASE_IMAGE above.
           resolve_arg() {
             local name="$1"
@@ -240,12 +242,20 @@ jobs:
             if [[ -z "$value" ]]; then
               value=$(sed -nE "s/^[[:space:]]*ARG[[:space:]]+${name}[[:space:]]*=[[:space:]]*(.+)[[:space:]]*\$/\1/p" "$DOCKERFILE" | tail -1)
             fi
+            # A Dockerfile default may be quoted (ARG X="a b"); Docker drops the quotes.
+            value="${value#\"}"
+            value="${value%\"}"
             printf '%s' "$value"
           }
 
           BASE_IMAGE=$(resolve_arg BASE_IMAGE)
           UV_VERSION=$(resolve_arg UV_VERSION)
           HYBRID_EP_MULTINODE=$(resolve_arg HYBRID_EP_MULTINODE)
+          # Empty is valid for the two with no default: the package's own default applies.
+          TORCH_CUDA_ARCH_LIST=$(resolve_arg TORCH_CUDA_ARCH_LIST)
+          NVTE_CUDA_ARCHS=$(resolve_arg NVTE_CUDA_ARCHS)
+          FLASH_ATTN_CUDA_ARCHS=$(resolve_arg FLASH_ATTN_CUDA_ARCHS)
+          FLASH_MLA_DISABLE_SM90=$(resolve_arg FLASH_MLA_DISABLE_SM90)
           for name_value in "BASE_IMAGE=$BASE_IMAGE" "UV_VERSION=$UV_VERSION" "HYBRID_EP_MULTINODE=$HYBRID_EP_MULTINODE"; do
             if [[ -z "${name_value#*=}" ]]; then
               echo "Could not resolve ${name_value%%=*} from build args or $DOCKERFILE" >&2
@@ -260,9 +270,9 @@ jobs:
             exit 1
           fi
 
-          CACHE_KEY=$(printf '%s' "${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}" | sha256sum | cut -c1-12)
+          CACHE_KEY=$(printf '%s' "${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}-${TORCH_CUDA_ARCH_LIST}-${NVTE_CUDA_ARCHS}-${FLASH_ATTN_CUDA_ARCHS}-${FLASH_MLA_DISABLE_SM90}" | sha256sum | cut -c1-12)
           echo "tag=${TAG_PREFIX}-${ARCH}-${CACHE_KEY}" >> "$GITHUB_OUTPUT"
-          echo "uv cache uses $BASE_IMAGE / uv $UV_VERSION / HYBRID_EP_MULTINODE=$HYBRID_EP_MULTINODE on $ARCH (key $CACHE_KEY)"
+          echo "uv cache uses $BASE_IMAGE / uv $UV_VERSION / HYBRID_EP_MULTINODE=$HYBRID_EP_MULTINODE / TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST / NVTE_CUDA_ARCHS=$NVTE_CUDA_ARCHS / FLASH_ATTN_CUDA_ARCHS=$FLASH_ATTN_CUDA_ARCHS / FLASH_MLA_DISABLE_SM90=$FLASH_MLA_DISABLE_SM90 on $ARCH (key $CACHE_KEY)"
 
       - name: Resolve uv cache seed
         id: uv_cache_seed
