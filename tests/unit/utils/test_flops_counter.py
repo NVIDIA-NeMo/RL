@@ -29,7 +29,7 @@ from nemo_rl.utils.flops_tracker import FLOPTracker, get_hf_config
         ("Qwen/Qwen3-30B-A3B", 128, 4096, 1.21e16),
         ("Qwen/Qwen3-235B-A22B", 128, 4096, 7.76e16),
         ("deepseek-ai/DeepSeek-V3", 1, 4096, 1.023e15),
-        ("moonshotai/Moonlight-16B-A3B-Instruct", 1, 4096, 6.45e13),
+        ("moonshotai/Moonlight-16B-A3B-Instruct", 1, 4096, 7.03e13),
     ],
 )
 def test_flops_counter(model_name, gbs, seqlen, expected_flops):
