@@ -1395,6 +1395,14 @@ def setup_single_controller(
                 "VLM token capture supports the Nemotron Omni and Pixtral (Mistral3) "
                 f"processors; got {type(processor).__name__}"
             )
+        if media_family == "pixtral" and policy_config["megatron_cfg"]["enabled"]:
+            raise ValueError(
+                "Pixtral (Mistral3) media capture has no learner yet for Megatron"
+            )
+        if media_family == "omni" and not policy_config["megatron_cfg"]["enabled"]:
+            raise ValueError(
+                "Omni media token capture currently requires the Megatron learner"
+            )
         if token_capture_cfg.defer_routed_experts_to_policy:
             raise ValueError("VLM token capture requires direct router replay assembly")
     if snapshots_enabled:

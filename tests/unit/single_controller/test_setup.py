@@ -4500,6 +4500,47 @@ def test_ordinary_rollout_schema_uses_processor_token_fields(
     )
 
 
+@pytest.mark.parametrize(
+    ("family", "megatron", "error"),
+    [
+        ("pixtral", False, None),
+        ("omni", True, None),
+        ("pixtral", True, "no learner yet"),
+        ("omni", False, "requires the Megatron learner"),
+    ],
+)
+def test_media_capture_selects_a_supported_learner(
+    patched_factories, family, megatron, error
+):
+    class PassedMediaValidation(Exception):
+        pass
+
+    mc = _make_gym_megatron_capture_config()
+    mc.policy["megatron_cfg"]["enabled"] = megatron
+    mc.policy["generation"]["backend"] = "vllm"
+    mc.policy["generation"]["vllm_cfg"] = {"async_engine": True}
+    expected = (
+        pytest.raises(ValueError, match=error)
+        if error
+        else pytest.raises(PassedMediaValidation)
+    )
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "media_capture_family", return_value=family),
+        patch.object(
+            sc_setup_mod.opd_module,
+            "get_opd_full_config",
+            side_effect=PassedMediaValidation,
+        ),
+        expected,
+    ):
+        setup_single_controller(
+            mc, MagicMock(pad_token_id=0), processor=MagicMock(name="processor")
+        )
+    patched_factories["setup_response_data"].assert_not_called()
+    patched_factories["_build_clusters"].assert_not_called()
+
+
 def _make_gym_megatron_capture_config() -> MasterConfig:
     mc = _make_master_config(backend="megatron", megatron_enabled=True)
     mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = True
