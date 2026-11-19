@@ -1091,8 +1091,11 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(
 ):
     """Mixed refits reload BF16 experts and rebuild each MXFP8 layout once."""
     from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptLinearMethod,
         ModelOptMxFp8FusedMoE,
-        ModelOptMxFp8LinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kMxfp8Static,
     )
 
     from nemo_rl.models.generation.vllm import vllm_backend
@@ -1104,9 +1107,8 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(
     mxfp8_moe = torch.nn.Module()
     mxfp8_moe.quant_method = ModelOptMxFp8FusedMoE.__new__(ModelOptMxFp8FusedMoE)
     mxfp8_qkv = torch.nn.Module()
-    mxfp8_qkv.quant_method = ModelOptMxFp8LinearMethod.__new__(
-        ModelOptMxFp8LinearMethod
-    )
+    mxfp8_qkv.quant_method = ModelOptLinearMethod.__new__(ModelOptLinearMethod)
+    mxfp8_qkv.quant_method.spec = SimpleNamespace(weight=kMxfp8Static)
     last_bf16_moe = torch.nn.Module()
     last_bf16_moe.expert_map_manager = SimpleNamespace(placement_strategy="linear")
     model.add_module("first_bf16_moe", first_bf16_moe)
@@ -1140,7 +1142,7 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(
         ModelOptMxFp8FusedMoE, "process_weights_after_loading", process_mxfp8
     )
     monkeypatch.setattr(
-        ModelOptMxFp8LinearMethod, "process_weights_after_loading", process_mxfp8
+        ModelOptLinearMethod, "process_weights_after_loading", process_mxfp8
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
 
@@ -1166,7 +1168,7 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(
             for module in target.modules():
                 quant_method = getattr(module, "quant_method", None)
                 if isinstance(
-                    quant_method, (ModelOptMxFp8FusedMoE, ModelOptMxFp8LinearMethod)
+                    quant_method, (ModelOptMxFp8FusedMoE, ModelOptLinearMethod)
                 ):
                     quant_method.process_weights_after_loading(module)
 

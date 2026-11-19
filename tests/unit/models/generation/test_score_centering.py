@@ -24,6 +24,7 @@ from nemo_rl.models.generation.score_centering import (
     build_score_centering_request_overrides,
     extract_flat_score_centering_samples,
     extract_score_centering_samples,
+    extract_score_centering_slice,
     validate_score_centering_request,
 )
 
@@ -257,3 +258,46 @@ def test_flat_score_centering_matches_per_position_extraction():
 def test_flat_score_centering_rejects_malformed_rows(rows, error_match):
     with pytest.raises(RuntimeError, match=error_match):
         extract_flat_score_centering_samples(_flat_output([9], rows), num_candidates=2)
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("flat_logprobs", [False, True])
+def test_score_centering_slice_reads_only_its_positions(flat_logprobs):
+    from vllm.logprobs import (
+        append_logprobs_for_next_position,
+        create_sample_logprobs,
+    )
+
+    # vLLM's container for a call still decoding: three positions so far.
+    rows = [
+        (9, 7, [(9, -3.0), (1, -0.3), (2, -1.8)]),
+        (3, 1, [(3, -0.1), (3, -0.1), (4, -5.0)]),
+        (5, 1, [(5, 0.0), (5, 0.0), (6, -float("inf"))]),
+    ]
+    live = create_sample_logprobs(flat_logprobs)
+    for _, rank, row in rows:
+        append_logprobs_for_next_position(
+            live,
+            [token_id for token_id, _ in row],
+            [logprob for _, logprob in row],
+            [None] * len(row),
+            rank,
+            num_logprobs=2,
+        )
+
+    # A cut that already staged the first position reads only the next two.
+    ids, logprobs = extract_score_centering_slice(
+        [3, 5], live, start=1, num_candidates=2
+    )
+
+    assert ids.tolist() == [[3, 4], [5, 6]]
+    torch.testing.assert_close(
+        logprobs, torch.tensor([[-0.1, -5.0], [0.0, -float("inf")]])
+    )
+    assert len(live) == 3
+
+
+@pytest.mark.parametrize("logprobs", [None, [{}]])
+def test_score_centering_slice_refuses_unpublished_positions(logprobs):
+    with pytest.raises(RuntimeError, match="need 2, have"):
+        extract_score_centering_slice([3], logprobs, start=1, num_candidates=2)

@@ -14,6 +14,8 @@
 
 from typing import Any, NotRequired, TypedDict
 
+from pydantic import BaseModel, Field
+
 from nemo_rl.models.policy import (
     AutomodelConfig,
     AutomodelConfigDisabled,
@@ -30,6 +32,13 @@ from nemo_rl.models.policy import (
     SinglePytorchSchedulerConfig,
     TokenizerConfig,
 )
+
+
+class ValueResourcesConfig(BaseModel, extra="forbid"):
+    num_nodes: int | None = Field(
+        default=None,
+        description="Number of full nodes reserved for a dedicated value model.",
+    )
 
 
 class ValueConfig(TypedDict):
@@ -56,6 +65,8 @@ class ValueConfig(TypedDict):
     # Backend configuration - Automodel or Megatron
     automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
+    dedicated: NotRequired[bool]
+    resources: NotRequired[ValueResourcesConfig]
 
     # HuggingFace config overrides
     hf_config_overrides: NotRequired[dict[str, Any]]

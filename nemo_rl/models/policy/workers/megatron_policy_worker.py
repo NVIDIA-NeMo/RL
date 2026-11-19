@@ -66,8 +66,6 @@ from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
-    chunks_accept_media_token_validity_mask,
-    media_placeholder_token_id_from_chunks,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -92,9 +90,12 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     NvFp4PerTokenRolloutConfig,
 )
 from nemo_rl.models.megatron.common import (
+    _unwrapped_chunks,
     clear_transient_megatron_caches,
     get_aux_loss_track_names,
     get_moe_metrics,
+    model_media_placeholder_token_id,
+    model_slices_context_parallel_inputs,
 )
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -247,26 +248,6 @@ def _model_self_packs_mtp_loss_mask(model: Any) -> bool:
     )
 
 
-def _model_slices_context_parallel_inputs(model: Any) -> bool:
-    """Whether the model consumes full THD input and slices CP after embedding."""
-    from megatron.core.utils import unwrap_model
-
-    unwrapped = unwrap_model(model)
-    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
-    return any(
-        bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
-        for chunk in chunks
-    )
-
-
-def _unwrapped_chunks(model: Any) -> list[Any]:
-    """Model chunks as a flat list, whatever wrapping the caller handed us."""
-    from megatron.core.utils import unwrap_model
-
-    unwrapped = unwrap_model(model)
-    return list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
-
-
 def _model_has_chunkwise_cp(model: Any) -> bool:
     return any(
         getattr(
@@ -326,16 +307,6 @@ def _model_needs_router_padding_mask(
             "HybridBlock chunkwise context parallelism."
         )
     return True
-
-
-def _model_media_placeholder_token_id(model: Any) -> Optional[int]:
-    """The vocabulary id this model treats as a media placeholder, if any."""
-    return media_placeholder_token_id_from_chunks(_unwrapped_chunks(model))
-
-
-def _model_accepts_media_token_validity_mask(model: Any) -> bool:
-    """Whether the model's forward takes an explicit media-token validity mask."""
-    return chunks_accept_media_token_validity_mask(_unwrapped_chunks(model))
 
 
 def _estimate_refit_tensor_size_in_bytes(
@@ -1169,18 +1140,14 @@ class MegatronPolicyWorkerImpl(
             not self.delegate_mtp_loss_mask_to_model or self.delegate_pack_to_model
         ), "A model cannot own MTP-mask packing without owning sequence packing"
         self.model_slices_context_parallel_inputs = (
-            _model_slices_context_parallel_inputs(self.model)
+            model_slices_context_parallel_inputs(self.model)
         )
         mtp_num_layers = self._get_model_config().mtp_num_layers
         self.mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
         # A media placeholder is an ordinary vocabulary entry, so text that
         # legitimately contains it must not be read as an anchor demanding a
         # projected feature. Only models that accept the mask are sent one.
-        self.media_placeholder_token_id = (
-            _model_media_placeholder_token_id(self.model)
-            if _model_accepts_media_token_validity_mask(self.model)
-            else None
-        )
+        self.media_placeholder_token_id = model_media_placeholder_token_id(self.model)
         if self.model_slices_context_parallel_inputs:
             if self.delegate_pack_to_model:
                 raise RuntimeError(
@@ -1403,13 +1370,14 @@ class MegatronPolicyWorkerImpl(
         # Multiplying by G/K, with K the global surviving token count, restores
         # S/K: the same normalization as filtering before training. Apply this
         # correction before optimizer.step() so gradient clipping sees S/K.
-        token_factor = float((global_valid_toks / token_denominator).item())
+        token_scale = global_valid_toks / token_denominator
+        token_factor = float(token_scale.item())
         sequence_factor = float((global_valid_seqs / sequence_denominator).item())
         if not eval_mode:
             # Finish any overlap on the comm stream before touching the reduced
             # gradient buffers (including distributed-optimizer gradient shards).
             torch.cuda.synchronize()
-            self.model.scale_gradients(token_factor)
+            self.model.scale_gradients(token_scale)
         metrics = [
             rescale_loss_metrics(
                 m,
@@ -2402,14 +2370,15 @@ class MegatronPolicyWorkerImpl(
             n_true = global_valid_toks
         else:
             n_true = global_valid_seqs
-        n_safe = n_true if n_true.item() > 0 else torch.tensor(1.0, device="cuda")
-        inv_n = float((1.0 / n_safe).item())
+        n_safe = n_true if n_true.item() > 0 else torch.ones_like(n_true)
+        gradient_scale = n_safe.reciprocal()
+        inv_n = float(gradient_scale.item())
 
         # Rescale all locally-accumulated gradients by 1/N. The reduce
         # below sees the rescaled grads; for all_reduce the result is the
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
-        self.model.scale_gradients(inv_n)
+        self.model.scale_gradients(gradient_scale)
         if draft_step_state.active:
             draft_step_state.correct_main_grads(
                 self.model.parameters(),
@@ -3622,7 +3591,9 @@ class MegatronPolicyWorkerImpl(
         """Return True if the train side stores weights as TE blockwise FP8."""
         return is_blockwise_fp8_param_storage(self.fp8_cfg)
 
-    def _build_refit_conversion_tasks(self) -> list:
+    def _build_refit_conversion_tasks(
+        self, *, exclude_param_patterns: tuple[str, ...] = ()
+    ) -> list:
         """Keep the general/misc export format expected by each backend."""
         # Deferred import to avoid circular import issues.
         from nemo_rl.models.megatron.draft import draft_model_detached
@@ -3630,11 +3601,13 @@ class MegatronPolicyWorkerImpl(
         with draft_model_detached([self.model]):
             if self._is_fp8_export() and not self._generation_needs_logical_weights():
                 return self.megatron_bridge.get_export_fp8_tasks(self.model)
-            return [
-                task
-                for task in self.megatron_bridge.get_conversion_tasks([self.model])
-                if task is not None
-            ]
+            if exclude_param_patterns:
+                tasks = self.megatron_bridge.get_conversion_tasks(
+                    [self.model], exclude_param_patterns=exclude_param_patterns
+                )
+            else:
+                tasks = self.megatron_bridge.get_conversion_tasks([self.model])
+            return [task for task in tasks if task is not None]
 
     def _generation_needs_logical_weights(self) -> bool:
         """Megatron's existing non-bulk export consumes logical model weights."""
@@ -4306,6 +4279,9 @@ class MegatronPolicyWorkerImpl(
         # Keep the misc_meta in the nccl_reshard_refit_info
         # misc_meta[hf_name] -> [shape, dtype]
         refit_info["misc_meta"] = misc_meta
+        from nemo_rl.weight_sync.xferdtensor import uses_real_reshard_op
+
+        refit_info["source_uses_real_reshard_op"] = uses_real_reshard_op()
         # Filter conversion_tasks to the misc subset.
         _misc_names = set(misc_meta.keys())
 
@@ -5599,8 +5575,12 @@ class MegatronPolicyWorkerImpl(
         return final_result
 
 
+# Every rollout sample is one generate_async call on rank 0, and the engine queues
+# requests past its own capacity. Ray's async-actor default of 1000 calls would
+# otherwise cap in-flight rows and queue control calls (finish_generation) behind them.
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
+    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker"),
+    max_concurrency=2**16,
 )  # pragma: no cover
 class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
     pass

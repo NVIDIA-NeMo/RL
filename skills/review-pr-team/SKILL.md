@@ -1,6 +1,6 @@
 ---
 name: review-pr-team
-description: Agent-team-based parallel code review for NVIDIA-NeMo/RL pull requests. Spawns specialized agents (RL expert, submodule experts, bug finder, design reviewer, test agent, devil's advocate, comment reviewer) that coordinate via shared task list and direct messaging. Leader orchestrates, collates ALL findings, and presents to user for approval before posting.
+description: Deep parallel review of NVIDIA-NeMo/RL pull requests using Claude Code agent teams or Codex collaboration agents. Coordinates specialist, adversarial, and comment-editing passes, then presents all surviving findings for approval before staging a pending GitHub review. Use for /review-pr-team, $review-pr-team, or a requested team review with a PR number.
 when_to_use: Deep multi-agent review of a PR; '/review-pr-team <number>'; 'team review PR', 'thorough parallel review'. Requires CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1.
 argument-hint: "<pr-number>"
 allowed-tools:
@@ -23,9 +23,11 @@ Review a pull request using a coordinated team of specialized agents.
 
 **Repo**: `NVIDIA-NeMo/RL`
 
-**Requires**: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` must be set — agent teams (teammate spawning, shared task list, `SendMessage`) are an experimental Claude Code feature.
+**Requires (Claude Code)**: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` must be set — agent teams (teammate spawning, shared task list, `SendMessage`) are an experimental Claude Code feature.
 
-**Sandbox**: Always pass `dangerouslyDisableSandbox: true` on every Bash tool call in this skill. The sandbox's bubblewrap (bwrap) container fails to initialize in worktree/container environments with `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`, breaking ALL commands — not just network-dependent ones like `gh`. Do NOT attempt any Bash call in sandbox mode first; it will fail and waste a round-trip.
+**Sandbox (Claude Code)**: Always pass `dangerouslyDisableSandbox: true` on every Bash tool call in this skill. The sandbox's bubblewrap (bwrap) container fails to initialize in worktree/container environments with `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`, breaking ALL commands — not just network-dependent ones like `gh`. Do NOT attempt any Bash call in sandbox mode first; it will fail and waste a round-trip.
+
+**Codex**: invoke as `$review-pr-team <pr-number>`. Read [Codex runtime](runtime/codex.md) before Phase 0; it maps the tool names used below (`Agent`, `TaskCreate`, `TaskList`, `TaskUpdate`, `SendMessage`, `AskUserQuestion`) to Codex operations and covers GitHub access without `gh`. The Claude Code requirement and sandbox setting above do not apply in Codex. Claude Code follows the remaining workflow as written. Codex applies the runtime adapter to its execution and dispatched prompts; review criteria remain shared.
 
 ---
 
@@ -116,7 +118,7 @@ This ensures review comments can point authors to the established pattern rather
 ### 1.4 Read root context
 
 - Read `CLAUDE.md` from repo root
-- Read all `.claude/skills/*/SKILL.md` files (except `review-pr` and `review-pr-team`)
+- Read all `.claude/skills/*/SKILL.md` files (except `review-pr-team`)
 - Read every `references/*.md` file in this skill's own directory. These are the shared review lessons for this repo, grouped by theme. A rule marked ★ has come up three or more times; list those first when you pass the lessons on. A rule that ends with `Details: [name](details/name.md)` has a full lesson behind it, with the steps, commands and repo maps the one-line rule leaves out. Keep those links when you pass the lessons on, and tell every agent to read the detail file whenever its rule applies to what it is checking.
 - Read every `skills/contributing/references/*.md` and treat each rule as a finding checklist, the same as this skill's own references. A rule that ends with `Review Details: [name](...)` has a review lesson behind it, and one that ends with `Contributing Details:` has an author how-to under `skills/contributing/references/details/`; tell every agent to read the linked file whenever the rule applies.
 - Then glob `~/.claude/review-memory/RL/*.md` and read EVERY match. This is the optional, machine-local store of lessons that are not in `references/` yet. It may be empty or absent; an empty glob is fine. New lessons are written here in Phase 6. A memory's `count` is how many times its pattern has shown up in reviewed PRs; list the ones with count 2 or more first.
@@ -163,10 +165,8 @@ The delivery failure is real, mechanical, and fixable. Do not let it push you of
 
 So a nudge saying "report back" produces an idle notification with no content — the agent answered into the void. Phrase it as a tool instruction, verbatim:
 
-> Your report never reached me. When you are resumed by a message, your final assistant
-> text is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
-> `SendMessage(to="team-lead", summary="...", message="<your full findings>")`. Do NOT
-> just write the text as your answer — call the tool.
+> Your report never reached me. When you are resumed by a message, your final assistant text is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
+> `SendMessage(to="team-lead", summary="...", message="<your full findings>")`. Do NOT just write the text as your answer — call the tool.
 
 On PR #3292 all six teammates were silent through two rounds of ordinary nudging; after one message phrased that way, all six delivered within minutes.
 
@@ -1091,8 +1091,7 @@ This is the single most common way this skill produces churn. The failure mode i
 
 If devil-advocate has gone idle without reporting, do NOT interpret that as "no objections." Send the explicit-tool-call nudge — a resumed agent's final assistant text is not delivered to the leader, so a silent agent is usually one that never called the tool, not one with nothing to say:
 
-> Your verdicts never reached me. When you are resumed by a message, your final assistant text
-> is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
+> Your verdicts never reached me. When you are resumed by a message, your final assistant text is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
 > `SendMessage(to="team-lead", summary="devil-advocate verdicts", message="<full verdict list>")`.
 
 Only after that nudge has ALSO failed may you proceed, and then you MUST say so in the preview ("devil-advocate did not report; findings below carry only the leader's verification").
@@ -1138,10 +1137,7 @@ After all Wave 2 agents complete:
 
 ## Phase 4: Preview & Confirm
 
-> **Precondition check before you write a single line of this preview:** has `devil-advocate`
-> delivered its verdicts via SendMessage? If not, go back to the Phase 3 hard gate. Do not
-> present findings and do not offer staging. A preview built on un-challenged findings is how
-> a review gets staged, deleted, and re-staged.
+> **Precondition check before you write a single line of this preview:** has `devil-advocate` delivered its verdicts via SendMessage? If not, go back to the Phase 3 hard gate. Do not present findings and do not offer staging. A preview built on un-challenged findings is how a review gets staged, deleted, and re-staged.
 
 #### Comment IDs: C1, C2, C3 … — never reused
 
