@@ -1217,6 +1217,7 @@ class MegatronPolicyWorkerImpl(
             label="init_complete", worker_type="MegatronPolicyWorker"
         )
         self._maybe_enable_manual_gc()
+        self._freeze_gc_after_init()
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)

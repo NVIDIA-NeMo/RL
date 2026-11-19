@@ -569,6 +569,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
         self._maybe_enable_manual_gc()
+        self._freeze_gc_after_init()
 
     def enable_forward_pre_hook(self):
         if isinstance(self.model, DistributedDataParallel):
