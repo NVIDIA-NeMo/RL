@@ -1,0 +1,23 @@
+#!/bin/bash
+set -euo pipefail
+
+: "${OSWORLD_EVALUATOR_TOOLS_ROOT:?}"
+test -x /usr/lib/libreoffice/program/soffice
+test -d "$OSWORLD_EVALUATOR_TOOLS_ROOT/runtime-libs"
+
+profile="$(mktemp -d "${TMPDIR:-/tmp}/osworld-lo-profile.XXXXXX")"
+cleanup() {
+  rm -rf -- "$profile"
+}
+trap cleanup EXIT
+
+evaluator_ld_library_path="/usr/lib/libreoffice/program:$OSWORLD_EVALUATOR_TOOLS_ROOT/runtime-libs"
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+  evaluator_ld_library_path="$evaluator_ld_library_path:$LD_LIBRARY_PATH"
+fi
+
+env \
+  LD_LIBRARY_PATH="$evaluator_ld_library_path" \
+  /usr/lib/libreoffice/program/soffice \
+  "-env:UserInstallation=file://$profile" \
+  "$@"

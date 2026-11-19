@@ -23,6 +23,7 @@ Examples:
   uv run --no-sync examples/nemo_gym/launch_osworld_v2_cc.py --validate-only
   uv run --no-sync examples/nemo_gym/launch_osworld_v2_cc.py --molt-b8k8 --validate-only
   uv run --no-sync examples/nemo_gym/launch_osworld_v2_cc.py --molt-b8k8-checkpoint --validate-only
+  uv run --no-sync examples/nemo_gym/launch_osworld_v2_cc.py --flashreinforce-b32n4 --validate-only
   uv run --no-sync examples/nemo_gym/launch_osworld_v2_cc.py logger.log_dir=/logs/run
 """
 
@@ -52,6 +53,9 @@ MOLT_CONFIG_PATH = Path(__file__).with_name(
 )
 MOLT_CHECKPOINT_CONFIG_PATH = Path(__file__).with_name(
     "grpo_nemotron_omni_30ba3b_osworld_v2_cc_molt_b8k8_checkpoint.yaml"
+)
+FLASHREINFORCE_CONFIG_PATH = Path(__file__).with_name(
+    "grpo_nemotron_omni_30ba3b_osworld_v2_flashreinforce_b32n4.yaml"
 )
 
 
@@ -90,17 +94,25 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         action="store_true",
         help="Use the Molt B8/K8 recipe with full step-boundary checkpointing.",
     )
+    parser.add_argument(
+        "--flashreinforce-b32n4",
+        action="store_true",
+        help="Use the FlashREINFORCE B32/N4 AgentENV recipe.",
+    )
     return parser.parse_known_args()
 
 
 def main() -> None:
     """Validate the dedicated recipe, then optionally run its SC entrypoint."""
     args, overrides = parse_args()
-    if args.molt_b8k8 and args.molt_b8k8_checkpoint:
+    if args.molt_b8k8 + args.molt_b8k8_checkpoint + args.flashreinforce_b32n4 > 1:
         raise ValueError(
-            "--molt-b8k8 and --molt-b8k8-checkpoint are mutually exclusive"
+            "--molt-b8k8, --molt-b8k8-checkpoint and --flashreinforce-b32n4 "
+            "are mutually exclusive"
         )
-    if args.molt_b8k8_checkpoint:
+    if args.flashreinforce_b32n4:
+        config_path = FLASHREINFORCE_CONFIG_PATH
+    elif args.molt_b8k8_checkpoint:
         config_path = MOLT_CHECKPOINT_CONFIG_PATH
     elif args.molt_b8k8:
         config_path = MOLT_CONFIG_PATH

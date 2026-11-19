@@ -100,7 +100,7 @@ PY
 else
   "$OSWORLD_DRIVER_PYTHON" \
     examples/nemo_gym/launch_osworld_v2_cc.py \
-    --molt-b8k8-checkpoint \
+    "--$OSWORLD_RECIPE" \
     --validate-only \
     "grpo.max_num_steps=${OSWORLD_GRPO_MAX_STEPS:-300}"
 fi
