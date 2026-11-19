@@ -20,7 +20,7 @@
 #   ... launch_slurm.sh full        # SGLang, 16 nodes (does not fit; see the 16n recipe)
 #   ... launch_slurm.sh full32      # SGLang, 32 nodes, EP64 + HybridEP in 16-node rack segments
 #   ... launch_slurm.sh vllm-tiny   # vLLM MXFP8, 1 node, tiny checkpoint smoke test
-#   ... launch_slurm.sh vllm-full   # vLLM MXFP8, 16 nodes, colocated
+#   ... launch_slurm.sh vllm-full   # vLLM MXFP8, 16 nodes, colocated (untested: has not completed a run)
 #   ... launch_slurm.sh vllm-async  # vLLM MXFP8, 24 nodes: 16 training + 8 generation
 #
 # The vllm-* modes need a CONTAINER whose vLLM serves Inkling2 (vllm-project/vllm#67325)

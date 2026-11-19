@@ -1,6 +1,8 @@
 # Inkling2 (released 48-layer, 384-expert MoE, ~594B params) GRPO on 16 GB200
 # nodes x 4 GPUs (185 GB/GPU): Automodel (DTensor) policy + colocated
 # vLLM rollouts with MXFP8 routed experts.
+# Status: this colocated 16-node layout has not completed a run. It is the base
+# config for grpo-inkling2-24n4g-automodel-vllm-mxfp8-async.yaml (the tested layout).
 # Follows grpo-qwen3.8-flash-next-dapo-8n8g-automodel (branch
 # qwen3-8-flash-next-support) and grpo-inkling2-tiny-1n4g-automodel-vllm-mxfp8.
 #

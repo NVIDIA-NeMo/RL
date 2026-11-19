@@ -91,7 +91,7 @@ symlinks resolve. The recipes use `/path/to/...` placeholders for the views.
 | [16-node GB200](../../../../examples/configs/recipes/llm/grpo-inkling2-16n4g-gb200-automodel-sglang.yaml) | Does not fit: SGLang runs out of memory resuming its weights next to the policy shard. |
 | [32-node GB200](../../../../examples/configs/recipes/llm/grpo-inkling2-32n4g-gb200-automodel-sglang.yaml) | The SGLang BF16 sync reference experiment below. |
 | [vLLM tiny 1-node](../../../../examples/configs/recipes/llm/grpo-inkling2-tiny-1n4g-automodel-vllm-mxfp8.yaml) | vLLM MXFP8 pipeline smoke test on a tiny random-weight checkpoint ([`make_tiny_mxfp8_view.py`](../../../../tools/inkling2/make_tiny_mxfp8_view.py)). |
-| [vLLM 16-node GB200](../../../../examples/configs/recipes/llm/grpo-inkling2-16n4g-automodel-vllm-mxfp8.yaml) | vLLM MXFP8, colocated; base for the async recipe. |
+| [vLLM 16-node GB200](../../../../examples/configs/recipes/llm/grpo-inkling2-16n4g-automodel-vllm-mxfp8.yaml) | Base config holding the shared vLLM MXFP8 settings that the async recipe inherits. Running it colocated on 16 nodes has not completed a run; use the 24-node async recipe. |
 | [vLLM 24-node GB200 async](../../../../examples/configs/recipes/llm/grpo-inkling2-24n4g-automodel-vllm-mxfp8-async.yaml) | The vLLM MXFP8 async reference experiment below (16 training + 8 generation nodes). |
 
 ### Reference recipe settings
@@ -227,6 +227,9 @@ uv run docs/guides/models/inkling/results/plot.py
 
 ## Known Issues and Scope
 
+- **The 16-node colocated vLLM MXFP8 configuration has not completed a run.**
+  It is kept as the base config for the 24-node async recipe, which is the
+  tested vLLM layout.
 - **16 nodes does not fit** the SGLang BF16 colocated layout: SGLang resumes
   about 140 GB/GPU of BF16 weights next to the policy shard and dispatch
   buffers. Use the 32-node recipe.
@@ -243,7 +246,7 @@ uv run docs/guides/models/inkling/results/plot.py
   serving relies on a container built with vllm-project/vllm#67325.
 - **The reference experiments mount this branch over prebuilt containers.**
   Both ran this branch's NeMo RL code and AutoModel main. The SGLang BF16 run
-  served with an earlier Inkling2 SGLang build already in its container, not
+  served with a pre-release Inkling2 SGLang source drop already in its container, not
   the sgl-project/sglang#50186 pin in this branch; the exact dependency set
   pinned here has not yet completed a reference run.
 - Convergence across seeds, longer runs, and other hardware remain unverified.
