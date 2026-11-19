@@ -73,6 +73,15 @@ import torch
 from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.single_controller_utils.tool_failure_credit import (
+    FailedToolTurnDetector, ToolFailureCreditStats, tool_failure_credit_config,
+    zero_positive_credit_on_failed_turns,
+)
+from nemo_rl.algorithms.single_controller_utils.malformed_think_credit import (
+    MalformedThinkTurnDetector, MalformedThinkCreditStats, malformed_think_credit_config,
+    cap_advantage_on_malformed_turns,
+)
+from nemo_rl.algorithms.critic_training_mask import CRITIC_SAMPLE_MASK, build_critic_sample_mask
 from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CHECKPOINT_MUTATION_KINDS,
@@ -109,6 +118,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     is_ppo_run,
     multi_trace_enabled,
+    rollout_collection_enabled,
 )
 from nemo_rl.algorithms.single_controller_utils.legacy_diagnostics import (
     NULL_EFFICIENCY_CLOCK,
@@ -116,10 +126,17 @@ from nemo_rl.algorithms.single_controller_utils.legacy_diagnostics import (
     LegacyPPODiagnostics,
     add_legacy_timing_aliases,
     fetch_generation_logger_metrics,
+    group_key,
     is_pad_row,
     legacy_performance_metrics,
     legacy_setup_timing_metrics,
     timer_kwargs,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_bank import (
+    BANK_FIELDS,
+    RolloutBankWriter,
+    bank_identity,
+    row_tensors,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
@@ -190,6 +207,7 @@ from nemo_rl.data_plane.observability import (
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
+    GENERATION_TOPK_FIELDS,
     INPUT_LENGTHS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
@@ -263,8 +281,9 @@ log = logging.getLogger(__name__)
 # cleaner exit. Not configurable for the same reason.
 _SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
 
-# Prompts drawn from the dataloader but not yet trained (in flight or buffered)
-# at a checkpoint whose replay buffer is dropped (checkpoint_replay_buffer=false).
+# Prompts drawn from the dataloader but not yet trained (waiting for admission, in
+# flight, or buffered) at a checkpoint whose replay buffer is dropped
+# (checkpoint_replay_buffer=false).
 # The restored dataloader resumes past them, so they are re-dispatched on resume.
 PENDING_PROMPTS_FILENAME = "pending_prompts.pt"
 # SWE privileged critic prefix cache, saved with a checkpointed replay buffer so the
@@ -365,14 +384,18 @@ def _train_fields_for_step(
     *,
     policy_logprobs_required: bool,
     reference_logprobs_required: bool,
+    score_centering: bool,
 ) -> tuple[str, ...]:
     """Return only the data-plane columns produced for this train step."""
-    return tuple(
+    fields = tuple(
         field
         for field in DP_TRAIN_FIELDS
         if (policy_logprobs_required or field != "prev_logprobs")
         and (reference_logprobs_required or field != "reference_policy_logprobs")
     )
+    if score_centering:
+        fields += GENERATION_TOPK_FIELDS
+    return fields
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -409,6 +432,11 @@ class SingleControllerActor:
     # rather than raising out of the training loop.
     _tracer: Any = None
 
+    # rollout_collection (RolloutCollectionConfig). Declared on the class so an
+    # instance built without running __init__ trains as usual.
+    _collect: bool = False
+    _bank: Optional[RolloutBankWriter] = None
+
     # Legacy async-PPO diagnostics (single_controller_utils/legacy_diagnostics.py),
     # declared on the class for the same reason: an instance built without
     # __init__ runs with them off (the null clock's hooks are no-ops).
@@ -420,6 +448,8 @@ class SingleControllerActor:
     _privilege_store: Optional[SwePrivilegePrefixStore] = None
     _pending_prompt_idx: Optional[set[int]] = None
     _resume_pending_prompts: Sequence[DatumSpec] = ()
+    _tool_failure_detector: Optional[FailedToolTurnDetector] = None
+    _malformed_think_detector: Optional[MalformedThinkTurnDetector] = None
 
     def __init__(
         self,
@@ -450,6 +480,9 @@ class SingleControllerActor:
         self._algo_cfg = algo_config(master_config)
         self._async_cfg = master_config.async_rl
         self._is_ppo: bool = is_ppo_run(master_config)
+        # rollout_collection (RolloutCollectionConfig): generation only. There is no
+        # trainer, so no logprobs, padding, training, refit or weight saves.
+        self._collect: bool = rollout_collection_enabled(master_config)
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -460,20 +493,37 @@ class SingleControllerActor:
             or self._algo_cfg.malformed_thinking_advantage is not None
         )
 
-        self._policy_logprobs_required = not (
+        self._tool_failure_credit = tool_failure_credit_config(self._algo_cfg)
+        self._malformed_think_credit = malformed_think_credit_config(self._algo_cfg)
+        self._tool_failure_credit_stats = ToolFailureCreditStats()
+        self._malformed_think_credit_stats = MalformedThinkCreditStats()
+        if not self._collect and self._tool_failure_credit is not None:
+            self._tool_failure_detector = FailedToolTurnDetector(
+                dict(master_config.policy["tokenizer"]), self._tool_failure_credit.categories
+            )
+            self._tool_failure_detector.load()
+        if not self._collect and self._malformed_think_credit is not None:
+            self._malformed_think_detector = MalformedThinkTurnDetector(
+                dict(master_config.policy["tokenizer"])
+            )
+            self._malformed_think_detector.load()
+
+        self._policy_logprobs_required = not self._collect and not (
             master_config.loss_fn.force_on_policy_ratio
             and self._algo_cfg.seq_logprob_error_threshold is None
         )
         # _build_trainer initializes the reference model only for a positive KL
         # penalty, so the controller must use the same gate before requesting it.
         self._reference_logprobs_required = bool(
-            master_config.loss_fn.reference_policy_kl_penalty > 0
+            not self._collect
+            and master_config.loss_fn.reference_policy_kl_penalty > 0
             and not self._algo_cfg.skip_reference_policy_logprobs_calculation
         )
         self._teacher_logprobs_required = opd_module.is_opd_enabled(master_config)
         self._train_fields = _train_fields_for_step(
             policy_logprobs_required=self._policy_logprobs_required,
             reference_logprobs_required=self._reference_logprobs_required,
+            score_centering=master_config.loss_fn.score_centering,
         )
         self._dp_client = actor_args.dp_client
         if master_config.data_plane["backend"] == "mooncake_cpu":
@@ -797,8 +847,8 @@ class SingleControllerActor:
         # hole with a later step's finished group counts a promotion, and the step it
         # borrowed from counts the replacement that repaid it.
         self._replacement_reserve: deque[DatumSpec] = deque()
-        # Dataset idx of every dispatched prompt not yet consumed by a train step,
-        # and the restored ones to re-dispatch (see PENDING_PROMPTS_FILENAME).
+        # Dataset idx of every drawn prompt not yet consumed by a train step, and
+        # the restored ones to re-dispatch (see PENDING_PROMPTS_FILENAME).
         self._pending_prompt_idx = set()
         self._resume_pending_prompts = []
         self._batch_replacements: dict[int, int] = {}
@@ -820,6 +870,17 @@ class SingleControllerActor:
         self._trainer_version: int = restored_trainer_version
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
+        # Each collected step's rows go to the bank. Opened after the step counter
+        # is restored: the bank sets aside every step the checkpoint does not cover.
+        self._bank: Optional[RolloutBankWriter] = (
+            RolloutBankWriter(
+                master_config.rollout_collection.bank_dir,  # type: ignore[arg-type]
+                bank_identity(master_config),
+                restored_step=self._train_steps,
+            )
+            if self._collect
+            else None
+        )
         self._step_log_dict: dict[str, list] = {
             "rewards": [],
             "sample_masks": [],
@@ -886,8 +947,9 @@ class SingleControllerActor:
 
     async def _run_pumps(self) -> dict[str, Any]:
         """Start the rollout / train / watchdog pumps and run until one finishes."""
-        # Synchronize weights before starting the pumps, unless setup already delivered them.
-        if self._weight_synchronizer.is_stale:
+        # Synchronize weights before starting the pumps, unless setup already delivered
+        # them (a collection run's engines loaded them from disk: no synchronizer).
+        if self._weight_synchronizer is not None and self._weight_synchronizer.is_stale:
             await self._sync_weights()
         self._rollout_manager.set_weight_version(self._trainer_version)
 
@@ -1006,7 +1068,8 @@ class SingleControllerActor:
                 except Exception as error:
                     print(f"finalizer actor termination failed: {error}", flush=True)
             try:
-                self._weight_synchronizer.shutdown()
+                if self._weight_synchronizer is not None:
+                    self._weight_synchronizer.shutdown()
             except Exception as e:  # teardown must not mask the original failure
                 print(f"Error during weight-synchronizer shutdown: {e}", flush=True)
             finally:
@@ -1752,6 +1815,15 @@ class SingleControllerActor:
             f"{len(metas)} restored replay group(s)",
             flush=True,
         )
+
+    def _mark_prompt_pending(self, prompt_dataset_idx: Any) -> None:
+        """Track a drawn prompt until a train step consumes it."""
+        if (
+            self._pending_prompt_idx is not None
+            and isinstance(prompt_dataset_idx, int)
+            and not isinstance(prompt_dataset_idx, bool)
+        ):
+            self._pending_prompt_idx.add(prompt_dataset_idx)
 
     async def _maybe_restore_pending_prompts(self) -> None:
         """Load prompts the previous run drew but never trained (buffer dropped).
@@ -2618,13 +2690,7 @@ class SingleControllerActor:
                     "recovery-enabled rollout dispatch requires a pre-reserved "
                     "prompt-group ID"
                 )
-            prompt_dataset_idx = prompt.get("idx")
-            if (
-                self._pending_prompt_idx is not None
-                and isinstance(prompt_dataset_idx, int)
-                and not isinstance(prompt_dataset_idx, bool)
-            ):
-                self._pending_prompt_idx.add(prompt_dataset_idx)
+            self._mark_prompt_pending(prompt.get("idx"))
             work_started = time.monotonic()
             # check if buffer is full
             self._buffer_capacity_waiters += 1
@@ -2677,6 +2743,12 @@ class SingleControllerActor:
                     for prompt_batch in self._dataloader:
                         if self._divert_batch_to_reserve(prompt_batch):
                             continue
+                        # Pending from the draw, not from _launch: a checkpoint taken
+                        # while admit() waits has the dataloader past this batch
+                        # already, so a resume would skip it. (Diverted spares are
+                        # saved with the reserve instead.)
+                        for prompt_dataset_idx in prompt_batch.get("idx", ()):
+                            self._mark_prompt_pending(prompt_dataset_idx)
                         target_step = await self._sampler.admit(
                             trainer_version_fn=lambda: self._trainer_version
                         )
@@ -3045,7 +3117,10 @@ class SingleControllerActor:
             policy_result: Optional[dict[str, Any]] = None
             value_result: Optional[dict[str, Any]] = None
             # Always True off the PPO path: the start step is pinned to 0 there.
-            is_policy_training_step = self._train_steps >= policy_training_start_step
+            # A collection run never trains (or refits) the policy.
+            is_policy_training_step = (
+                self._train_steps >= policy_training_start_step and not self._collect
+            )
             consumed_metas: list[KVBatchMeta] = []
             consumed_training_claim_ids: list[str] = []
             consumed_group_count = 0
@@ -3309,7 +3384,7 @@ class SingleControllerActor:
                                     self._trainer.get_reference_policy_logprobs_from_meta,
                                     train_meta,
                                 )
-                    elif self._is_ppo:
+                    elif self._is_ppo and not self._collect:
                         # prepare_for_lp_inference is skipped here, and it is the only
                         # other call that parks the policy optimizer before the critic.
                         with (
@@ -3322,8 +3397,13 @@ class SingleControllerActor:
                         ):
                             await asyncio.to_thread(self._trainer.offload_to_cpu)
 
+                    # Bank the rows before any mask is folded into sample_mask.
+                    if self._bank is not None:
+                        with self._timer.time("rollout_bank_write"):
+                            await self._bank_stage(train_meta)
+
                     # Value model forward
-                    if self._is_ppo:
+                    if self._is_ppo and not self._collect:
                         with (
                             self._timer.time("value_inference"),
                             managed_span(
@@ -3351,7 +3431,12 @@ class SingleControllerActor:
 
                     # A PPO step is this one chunk, so a chunk with nothing left
                     # after filtering is a step that trains neither model.
-                    if self._is_ppo and not has_valid_training_tokens:
+                    if (
+                        self._is_ppo
+                        and not self._collect
+                        and not has_valid_training_tokens
+                        and not train_meta.extra_info.get("critic_has_valid_training_tokens", False)
+                    ):
                         raise RuntimeError(
                             "SingleController has no valid response tokens after "
                             "filtering. Check seq_logprob_error_threshold, "
@@ -3370,7 +3455,7 @@ class SingleControllerActor:
                     # the colocated models do not move between CPU and GPU per epoch.
                     # TODO(#2625): value_result, policy_result only record the last epoch's metrics.
                     # That matches ppo.py for the losses; total_flops is additive and undercounted.
-                    if self._is_ppo:
+                    if self._is_ppo and not self._collect:
                         # A critic optimizer update is already irreversible. Keep
                         # periodic snapshots out until this whole training step is
                         # published as consumed below.
@@ -3453,7 +3538,9 @@ class SingleControllerActor:
                             int(s) for s in train_meta.sequence_lengths
                         )
 
-                    if getattr(self._gen, "requires_kv_scale_sync", False):
+                    if not self._collect and getattr(
+                        self._gen, "requires_kv_scale_sync", False
+                    ):
                         # Mirrors grpo_sync's calibration filter. The static
                         # list cannot name the VLM extras -- which of
                         # pixel_values / image_grid_thw / ... exist is
@@ -3552,6 +3639,16 @@ class SingleControllerActor:
 
                 # Aggregate step metrics
                 step_metrics = {}
+                if self._bank is not None:
+                    # Committed before the checkpoint below, so a checkpoint
+                    # never covers a step the bank lacks.
+                    step_metrics["rollout_bank/groups"] = float(
+                        await asyncio.to_thread(
+                            self._bank.commit_step,
+                            self._train_steps + 1,
+                            trainer_version=self._trainer_version,
+                        )
+                    )
                 if policy_result is not None:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                 if value_result is not None:
@@ -3659,6 +3756,10 @@ class SingleControllerActor:
                             fetch_generation_logger_metrics, self._gen
                         )
                     )
+                step_metrics.update(self._tool_failure_credit_stats.to_metrics())
+                step_metrics.update(self._malformed_think_credit_stats.to_metrics())
+                self._tool_failure_credit_stats = ToolFailureCreditStats()
+                self._malformed_think_credit_stats = MalformedThinkCreditStats()
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 self._rollout_stats_acc = new_rollout_stats_accumulator()
                 self._masking_stats_acc = new_masking_stats_accumulator()
@@ -4230,6 +4331,8 @@ class SingleControllerActor:
         Only ever called for a CONFIRMED actor death. A frozen rank never produces one, so
         its deadline still fires and still ends the run attributably.
         """
+        if self._trainer is None:  # a collection run never refits
+            return
         try:
             for worker in self._trainer.worker_group.workers:
                 worker.stand_down_refit_watchdog.remote()
@@ -5235,8 +5338,8 @@ class SingleControllerActor:
             # The spare pool and dataloader advance together under the same mutation
             # cut in recovery-enabled dispatch, so preserve them in this cut too.
             reserve_state = list(self._replacement_reserve)
-            # Dataset idx of the in-flight plus buffered prompts a dropped replay
-            # buffer loses; a kept one carries the privileged-critic prefixes.
+            # Dataset idx of the waiting, in-flight and buffered prompts a dropped
+            # replay buffer loses; a kept one carries the privileged-critic prefixes.
             checkpoint_replay_buffer = self._async_cfg.checkpoint_replay_buffer
             pending_prompt_indices = (
                 []
@@ -5320,8 +5423,8 @@ class SingleControllerActor:
                     self._data_plane_checkpoint_barrier.mutation_version
                 )
 
-        # Save value model
-        if self._is_ppo:
+        # Save value model (a collection run builds none)
+        if self._value is not None:
             # The critic shares the training GPUs, so the two weight saves are
             # serialized. The critic goes first because offloading the policy runs
             # finalize_async_save, which would block on the policy's own write if
@@ -5346,20 +5449,22 @@ class SingleControllerActor:
 
         # Save policy model
         # With async_save this returns after D2H staging; disk writes finish
-        # in the background.
-        await asyncio.to_thread(
-            self._trainer.save_checkpoint,
-            weights_path=os.path.join(checkpoint_path, "policy", "weights"),
-            # Always save policy weights so every PPO checkpoint has
-            # the same component layout. Before the first real policy
-            # update, omit optimizer and scheduler state because their
-            # lazily initialized state is not yet safe to checkpoint.
-            optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer")
-            if self._checkpointer.save_optimizer and is_policy_training_step
-            else None,
-            tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
-            is_final_checkpoint=is_final_checkpoint,
-        )
+        # in the background. A collection run's policy is frozen at its initial
+        # weights, which a resume reloads, so it saves none.
+        if not self._collect:
+            await asyncio.to_thread(
+                self._trainer.save_checkpoint,
+                weights_path=os.path.join(checkpoint_path, "policy", "weights"),
+                # Always save policy weights so every PPO checkpoint has
+                # the same component layout. Before the first real policy
+                # update, omit optimizer and scheduler state because their
+                # lazily initialized state is not yet safe to checkpoint.
+                optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer")
+                if self._checkpointer.save_optimizer and is_policy_training_step
+                else None,
+                tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
+                is_final_checkpoint=is_final_checkpoint,
+            )
 
         await asyncio.to_thread(
             torch.save,
@@ -5402,7 +5507,9 @@ class SingleControllerActor:
         # finish; flushed at the next save or on exit.
         self._checkpointer.begin_finalization(
             checkpoint_path,
-            wait_fn=self._trainer.finalize_async_save,
+            wait_fn=(
+                self._trainer.finalize_async_save if self._trainer is not None else None
+            ),
         )
         await asyncio.to_thread(
             _write_latest_checkpoint_status,
@@ -5616,7 +5723,14 @@ class SingleControllerActor:
             # the loop this is a blocking Ray call, and a wedged generation worker would
             # freeze the event loop itself -- taking the watchdog, which is an asyncio
             # task on that same loop, down with it.
-            await asyncio.to_thread(self._gen.invalidate_kv_cache)
+            reset_ok = await asyncio.to_thread(self._gen.invalidate_kv_cache)
+            # The flag's whole point is that generation after this refit runs on the new
+            # weights everywhere; a refused reset is worth a loud line in the run log.
+            print(
+                "  _sync_weights: generation prefix/KV caches "
+                + ("reset after refit" if reset_ok else "NOT reset after refit (see worker logs)"),
+                flush=True,
+            )
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
@@ -5668,6 +5782,85 @@ class SingleControllerActor:
             )
         except Exception as error:  # noqa: BLE001 - diagnostics only
             log.warning("Skipping legacy performance/efficiency metrics: %r", error)
+
+    async def _bank_stage(self, meta: KVBatchMeta) -> None:
+        """Write the chunk's real rows to the rollout bank, one file per prompt group.
+
+        Runs before the advantage stage folds the env / overlong masks into
+        ``sample_mask``: the bank keeps the raw flags and the pretraining driver
+        applies its own masks, so they can change without re-collecting.
+        """
+        assert self._bank is not None
+        real = [i for i, sid in enumerate(meta.sample_ids) if not is_pad_row(str(sid))]
+        sample_ids = [str(meta.sample_ids[i]) for i in real]
+        select_fields = list(BANK_FIELDS)
+        data = await call_data_plane(
+            self._dp_client,
+            "get_samples",
+            sample_ids=sample_ids,
+            partition_id=meta.partition_id,
+            select_fields=select_fields,
+        )
+        input_lengths = squeeze_trailing_unit_dim(
+            tensor_field(data, INPUT_LENGTHS)
+        ).long()
+        columns = {
+            name: row_tensors(data, name, input_lengths) for name in select_fields
+        }
+        tags = [dict(meta.tags[i]) if meta.tags else {} for i in real]
+        sequence_lengths = (
+            [int(meta.sequence_lengths[i]) for i in real]
+            if meta.sequence_lengths is not None
+            else input_lengths.tolist()
+        )
+        rows_by_group: dict[str, list[int]] = {}
+        for position, sample_id in enumerate(sample_ids):
+            rows_by_group.setdefault(group_key(sample_id), []).append(position)
+        step = self._train_steps + 1
+        for group_id, positions in rows_by_group.items():
+            raw_prompt_idx = tags[positions[0]].get("prompt_idx")
+            prompt_idx = int(raw_prompt_idx) if raw_prompt_idx is not None else None
+            instance_id, extra_env_info = await self._bank_prompt_info(prompt_idx)
+            await asyncio.to_thread(
+                self._bank.write_group,
+                step=step,
+                group_id=group_id,
+                prompt_idx=prompt_idx,
+                instance_id=instance_id,
+                extra_env_info=extra_env_info,
+                sample_ids=[sample_ids[p] for p in positions],
+                tags=[tags[p] for p in positions],
+                sequence_lengths=[sequence_lengths[p] for p in positions],
+                fields={
+                    name: [column[p] for p in positions]
+                    for name, column in columns.items()
+                },
+            )
+
+    async def _bank_prompt_info(
+        self, prompt_idx: Optional[int]
+    ) -> tuple[Optional[str], dict[str, Any]]:
+        """A dataset prompt's SWE instance id (or None) and its ``extra_env_info``.
+
+        The bank keeps the env info (the privileged critic's reference block is
+        built from it) so pretraining needs no dataset; the instance id keys the
+        held-out split.
+        """
+        if prompt_idx is None:
+            return None, {}
+        # Deferred: SWE-specific, and only a collection run needs it.
+        from nemo_rl.algorithms.swe_privileged_critic import resolve_privilege_fields
+
+        prompt = await self._dataset_prompt(prompt_idx)
+        extra_env_info = dict(prompt.get("extra_env_info") or {})
+        try:
+            instance_id = resolve_privilege_fields(extra_env_info)["instance_id"]
+        except Exception as error:  # the bank row is still usable without it
+            log.warning(
+                "rollout bank: no instance id for prompt %d: %s", prompt_idx, error
+            )
+            return None, extra_env_info
+        return instance_id or None, extra_env_info
 
     async def _value_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
         """Run the PPO value model's forward pass over the selected chunk.
@@ -5975,6 +6168,33 @@ class SingleControllerActor:
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
 
+        critic_sample_mask = None
+        critic_has_valid_training_tokens = False
+        if self._is_ppo and (
+            self._algo_cfg.critic_train_on_env_masked
+            or self._algo_cfg.critic_train_on_truncated
+        ):
+            seq_keep = None
+            if seq_logprob_error_threshold is not None and seq_error_tensors:
+                seq_keep = seq_error_tensors["seq_mult_prob_error"] <= seq_logprob_error_threshold
+            critic_sample_mask = build_critic_sample_mask(
+                sample_mask, final_sample_mask, mask_sample, truncated,
+                overlong_filtering=self._algo_cfg.overlong_filtering,
+                train_on_env_masked=self._algo_cfg.critic_train_on_env_masked,
+                train_on_truncated=self._algo_cfg.critic_train_on_truncated,
+                seq_error_keep=seq_keep,
+            )
+            critic_has_valid_training_tokens = bool(
+                (token_mask[:, 1:] * critic_sample_mask[:, None]).bool().any()
+            )
+            # Control metadata is consumed only by TQValue; the data-plane mask
+            # remains the actor mask throughout policy training.
+            meta = replace(meta, extra_info={
+                **meta.extra_info,
+                CRITIC_SAMPLE_MASK: dict(zip(meta.sample_ids, critic_sample_mask.tolist())),
+                "critic_has_valid_training_tokens": critic_has_valid_training_tokens,
+            })
+
         mask = token_mask * final_sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {
@@ -6003,7 +6223,13 @@ class SingleControllerActor:
                 adv_cfg.teacher_logprobs_field,
             )
         if self._is_ppo:
-            kwargs["values"] = tensor_field(data, adv_cfg.values_field)
+            # A collection run builds no critic. GAE on zero values still yields
+            # this stage's reward and mask metrics; nothing trains on the result.
+            kwargs["values"] = (
+                torch.zeros_like(token_mask)
+                if self._collect
+                else tensor_field(data, adv_cfg.values_field)
+            )
 
         # Rows whose reward enters the baseline/std; identical to final_sample_mask
         # unless grpo.masked_sample_rewards_in_baseline reinstates incomplete rows.
@@ -6077,7 +6303,7 @@ class SingleControllerActor:
             advantages = broadcast_rollout_advantages(
                 canonical_advantages, identity.row_to_canonical
             )
-        elif has_valid_training_tokens:
+        elif has_valid_training_tokens or critic_has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
@@ -6120,6 +6346,13 @@ class SingleControllerActor:
                     self._algo_cfg.malformed_thinking_advantage
                 ),
             )
+
+        # GAE has already computed returns and whitened advantages. Do not
+        # renormalize after these actor-only, valid-token credit caps.
+        if has_valid_training_tokens and (
+            self._tool_failure_detector is not None or self._malformed_think_detector is not None
+        ):
+            advantages = await self._apply_token_credit(data, token_mask, mask, advantages)
 
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
@@ -6232,6 +6465,7 @@ class SingleControllerActor:
                 token_mask=token_mask,
                 mask_sample=mask_sample,
                 final_sample_mask=final_sample_mask,
+                critic_sample_mask=critic_sample_mask,
                 seq_error_tensors=seq_error_tensors,
                 generation_logprobs=(
                     tensor_field(data, adv_cfg.generation_logprobs_field)
@@ -6243,9 +6477,9 @@ class SingleControllerActor:
                     if self._policy_logprobs_required
                     else None
                 ),
-                values=kwargs.get("values"),
+                values=None if self._collect else kwargs.get("values"),
                 advantages=advantages,
-                returns=returns,
+                returns=None if self._collect else returns,
                 estimator_mask=estimator_mask,
                 advantage_estimator=self._advantage_estimator,
                 input_ids=dump_input_ids,
@@ -6283,7 +6517,41 @@ class SingleControllerActor:
         shards by the global batch size, so they pad to the DP multiple too.
         GRPO segment rows rely on sequence packing instead.
         """
+        if self._collect:  # nothing trains, so nothing shards by DP
+            return False
         return self._multi_trace or (self._is_ppo and self._segment_rows_enabled())
+
+    async def _apply_token_credit(
+        self,
+        data: dict[str, Any],
+        token_mask: torch.Tensor,
+        mask: torch.Tensor,
+        advantages: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pinned NT4 credit rules; returns and loss/normalization masks are untouched."""
+        scan_rows = mask.bool().any(dim=-1)
+        if self._tool_failure_detector is not None:
+            failed, stats = await asyncio.to_thread(
+                self._tool_failure_detector.mask,
+                tensor_field(data, "input_ids"), token_mask, scan_rows=scan_rows,
+            )
+            advantages, credit_stats = zero_positive_credit_on_failed_turns(
+                advantages, failed_turn_mask=failed, train_mask=mask,
+            )
+            stats.merge(credit_stats)
+            self._tool_failure_credit_stats.merge(stats)
+        if self._malformed_think_detector is not None:
+            malformed, stats = await asyncio.to_thread(
+                self._malformed_think_detector.mask,
+                tensor_field(data, "input_ids"), token_mask, scan_rows=scan_rows,
+            )
+            advantages, credit_stats = cap_advantage_on_malformed_turns(
+                advantages, malformed_turn_mask=malformed, train_mask=mask,
+                max_advantage=self._malformed_think_credit.max_advantage,
+            )
+            stats.merge(credit_stats)
+            self._malformed_think_credit_stats.merge(stats)
+        return advantages
 
     def _segment_rows_enabled(self) -> bool:
         """``token_capture.segment_rows.enabled``; False on configs without the block."""
@@ -6302,6 +6570,8 @@ class SingleControllerActor:
             adv_cfg.mask_sample_field,
             adv_cfg.truncated_field,
         ]
+        if self._tool_failure_detector is not None or self._malformed_think_detector is not None:
+            fields.append("input_ids")
         if self._message_level_advantage_penalties_enabled:
             fields.extend(
                 [
@@ -6317,7 +6587,7 @@ class SingleControllerActor:
             fields.append(adv_cfg.reference_logprobs_field)
         if self._teacher_logprobs_required:
             fields.append(adv_cfg.teacher_logprobs_field)
-        if self._is_ppo:
+        if self._is_ppo and not self._collect:
             fields.append(adv_cfg.values_field)
         return list(dict.fromkeys(fields))
 

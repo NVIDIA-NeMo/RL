@@ -72,6 +72,11 @@ from nemo_rl.experience.legacy_rollout_metrics import (
     legacy_rollout_timing_aliases,
     rollout_debug_info,
 )
+from nemo_rl.experience.agent_step_metrics import AgentStepStats
+from nemo_rl.experience.reward_penalty_rules import (
+    RAW_REWARD_KEY, RewardPenaltyRule, apply_reward_penalty_rules, is_env_masked,
+)
+from nemo_rl.experience.invalid_samples import invalid_sample_kind, poisoned_receipt
 from nemo_rl.experience.mask_sample_rules import (
     MaskSampleRule,
     apply_mask_sample_rules,
@@ -137,6 +142,8 @@ def _with_forced_mask(env_extras: dict[str, Any], forced: bool) -> dict[str, Any
 _ROLLOUT_SCOPED_PENALTIES = (
     "penalize_duplicated_reasoning",
     "penalize_empty_final_answer",
+    "penalize_tool_call_loops",
+    "penalize_reasoning_loops",
 )
 _TRACE_SCOPED_PENALTIES = ("penalize_unwanted_tokens", "penalize_malformed_think_tag")
 
@@ -1021,6 +1028,9 @@ class AsyncNemoGymRolloutImpl:
 
     # Instances built without __init__ (tests) run with no operator mask rules.
     _mask_sample_rules: tuple[MaskSampleRule, ...] = ()
+    _invalid_sample_failure_kinds: frozenset[str] = frozenset()
+    _invalid_sample_step_count: int = 0
+    _reward_penalty_rules: tuple[RewardPenaltyRule, ...] = ()
 
     def __init__(
         self,
@@ -1046,6 +1056,8 @@ class AsyncNemoGymRolloutImpl:
         # Length-based reward shaping for low-effort prompts; None disables it.
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        invalid_sample_failure_kinds: frozenset[str] = frozenset(),
+        reward_penalty_rules: Sequence[RewardPenaltyRule] = (),
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -1056,6 +1068,10 @@ class AsyncNemoGymRolloutImpl:
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._mask_sample_rules = tuple(mask_sample_rules)
+        self._invalid_sample_failure_kinds = invalid_sample_failure_kinds
+        self._invalid_sample_step_count = 0
+        self._reward_penalty_rules = tuple(reward_penalty_rules)
+        self._agent_step_stats = AgentStepStats(self._reward_penalty_rules)
         # Step-level rule hits, drained by pop_mask_rule_metrics() once per
         # training step (the per-group rollout_metrics do not reach the
         # controller's logger on the token-capture path).
@@ -1305,7 +1321,9 @@ class AsyncNemoGymRolloutImpl:
                 # recovery records inherit the current mask and reward semantics.
                 # Completion callbacks are token-capture receipt-only, making this
                 # conversion lightweight and safe to repeat during group metrics.
-                row_completions, _, _ = self._results_to_completions([result])
+                row_completions, _, _ = self._results_to_completions(
+                    [result], agent_name=resolved_agent_ref["name"]
+                )
                 await on_completion(rowidx, row_completions[0])
             if timing_metrics is not None:
                 env_timing_metrics = timing_metrics
@@ -1468,7 +1486,7 @@ class AsyncNemoGymRolloutImpl:
             # Apply penalties before Completion captures each result's reward, while
             # preserving the batch-level counts used by legacy Gym metrics.
             completions, penalty_counts, mask_rule_stats = self._results_to_completions(
-                completed_results, record_rule_hits=True
+                completed_results, agent_name=inputs[0]["agent_ref"]["name"], record_rule_hits=True
             )
 
         # Compute rollout metrics.
@@ -1554,7 +1572,7 @@ class AsyncNemoGymRolloutImpl:
         return completions, prompt_message_log, rollout_metrics
 
     def _results_to_completions(
-        self, results: list[dict], *, record_rule_hits: bool = False
+        self, results: list[dict], *, agent_name: str = "unknown", record_rule_hits: bool = False
     ) -> tuple[
         list[Completion], dict[str, int], tuple[dict[str, int], dict[str, float], int]
     ]:
@@ -1591,14 +1609,17 @@ class AsyncNemoGymRolloutImpl:
         mask_rule_counts: dict[str, int] = {}
         mask_rule_reward_sums: dict[str, float] = {}
         mask_rule_any_count = 0
+        mask_origins: list[tuple[bool, list[str]]] = []
         for result in results:
+            env_masked = is_env_masked(result["full_result"])
             matched = apply_mask_sample_rules(
                 result["full_result"], self._mask_sample_rules
             )
+            mask_origins.append((env_masked, matched))
             if not matched:
                 continue
             mask_rule_any_count += 1
-            reward = float(result["full_result"].get("reward") or 0.0)
+            reward = float(result["full_result"].get(RAW_REWARD_KEY, result["full_result"].get("reward")) or 0.0)
             for rule_name in matched:
                 mask_rule_counts[rule_name] = mask_rule_counts.get(rule_name, 0) + 1
                 mask_rule_reward_sums[rule_name] = (
@@ -1652,11 +1673,30 @@ class AsyncNemoGymRolloutImpl:
                 ),
             ).items():
                 penalty_counts[flag] = penalty_counts.get(flag, 0) + count
+        # Match the source recipe: after other rollout reward penalties, selectively
+        # unmask context-limited results while retaining their current task reward.
+        # Env-owned masks and any additional non-whitelisted mask remain intact.
+        for result, (env_masked, matched) in zip(results, mask_origins):
+            outcome = apply_reward_penalty_rules(
+                result["full_result"], self._reward_penalty_rules,
+                agent_name=agent_name, env_masked=env_masked,
+                matched_mask_rules=matched,
+            )
+            if record_rule_hits:
+                self._agent_step_stats.record(agent_name, result["full_result"], outcome)
         completions = []
         for result in results:
             if "receipt" in result:
                 env_extras = dict(result["full_result"])
-                env_extras["ng_receipt"] = result["receipt"]
+                receipt = result["receipt"]
+                invalid_kind = invalid_sample_kind(
+                    result["full_result"], self._invalid_sample_failure_kinds
+                )
+                if invalid_kind is not None:
+                    receipt = poisoned_receipt(receipt, invalid_kind)
+                    if record_rule_hits:
+                        self._invalid_sample_step_count += 1
+                env_extras["ng_receipt"] = receipt
                 env_extras["ng_rollout_id"] = result["rollout_id"]
                 completions.append(
                     Completion(
@@ -1723,6 +1763,10 @@ class AsyncNemoGymRolloutImpl:
         self._mask_rule_step_reward_sums = {}
         self._mask_rule_step_any = 0
         self._mask_rule_step_seen = 0
+        if self._invalid_sample_failure_kinds:
+            out["mask_rules/invalid_sample_count"] = float(self._invalid_sample_step_count)
+        self._invalid_sample_step_count = 0
+        out.update(self._agent_step_stats.pop_metrics())
         return out
 
     def _compute_reward_penalty_metrics(
@@ -1825,10 +1869,13 @@ class AsyncNemoGymRolloutImpl:
                 max_gen_tokens_per_turn, n, "max_gen_tokens_per_turn"
             ),
             "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn, 95),
-            # truncated metrics
-            "natural_termination_rate": sum(not t for t in truncated) / n,
-            "truncation_rate": sum(truncated) / n,
         }
+        if not receipt_mode:
+            # Receipt completions carry truncated=False as a placeholder (no tokens at
+            # dispatch); their truncation is measured per row after reassembly and
+            # logged as truncation_rate by masking_stats, which this would overwrite.
+            rollout_metrics["natural_termination_rate"] = sum(not t for t in truncated) / n
+            rollout_metrics["truncation_rate"] = sum(truncated) / n
 
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
@@ -1881,6 +1928,8 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        invalid_sample_failure_kinds: frozenset[str] = frozenset(),
+        reward_penalty_rules: Sequence[RewardPenaltyRule] = (),
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1920,6 +1969,8 @@ class RolloutManager:
             # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores these.
             mask_env_flagged_samples=mask_env_flagged_samples,
             mask_sample_rules=mask_sample_rules,
+            invalid_sample_failure_kinds=invalid_sample_failure_kinds,
+            reward_penalty_rules=reward_penalty_rules,
             log_full_result_tables=log_full_result_tables,
             reward_penalty_config=reward_penalty_config,
             # None means "no deadlines", which is what async_rl's own defaults resolve

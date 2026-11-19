@@ -24,6 +24,7 @@ import ray
 import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.critic_training_mask import CRITIC_SAMPLE_MASK
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
@@ -246,6 +247,8 @@ class TQValue(TQDriverMixin, Value):
                     "eval_mode": eval_mode,
                     "gbs": batch_size,
                     "mbs": micro_batch_size,
+                    **({"sample_mask_override": meta.extra_info[CRITIC_SAMPLE_MASK]}
+                       if CRITIC_SAMPLE_MASK in meta.extra_info else {}),
                     **privilege_kwargs,
                     **trace_context_kwargs(),
                 },

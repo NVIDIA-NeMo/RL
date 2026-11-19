@@ -33,6 +33,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     RewardScalingConfig,
+    _raise_if_turn_credit,
     aggregate_rollout_metrics,
     compute_and_apply_seq_logprob_error_masking,
     extract_initial_prompt_messages,
@@ -45,7 +46,10 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    MseValueLossConfig,
+    build_value_loss_fn,
+)
 from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -56,6 +60,7 @@ from nemo_rl.algorithms.utils import (
     print_performance_metrics,
     set_seed,
 )
+from nemo_rl.algorithms.value_head import check_warm_start_value_head
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.dataloader import CyclingDataLoader
@@ -184,6 +189,10 @@ class PPOConfig(BaseModel, extra="allow"):
     skip_reference_policy_logprobs_calculation: bool = True
     seed: int = 42
     overlong_filtering: bool = False
+    # SingleController PPO only: critic may retain rows the actor filters.
+    # Original finalizer/padding and sequence-logprob gates remain in force.
+    critic_train_on_env_masked: bool = False
+    critic_train_on_truncated: bool = False
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool = False
@@ -251,6 +260,11 @@ class PPOConfig(BaseModel, extra="allow"):
             raise ValueError("ppo.ppo_epochs must be at least 1")
         if self.critic_ppo_epochs < 1:
             raise ValueError("ppo.critic_ppo_epochs must be at least 1")
+        if (self.critic_train_on_env_masked or self.critic_train_on_truncated) and (
+            self.adv_estimator.name != "gae"
+            or self.adv_estimator.normalize_over != "all_rows"
+        ):
+            raise ValueError("Independent critic masks require GAE normalize_over=all_rows")
         return self
 
     @model_validator(mode="after")
@@ -350,7 +364,7 @@ def setup(
     StatefulDataLoader,
     Optional[StatefulDataLoader],
     ClippedPGLossFn,
-    MseValueLossFn,
+    LossFunction,
     Logger,
     CheckpointManager,
     PPOSaveState,
@@ -363,6 +377,9 @@ def setup(
         dataloader, val_dataloader, loss_fn, value_loss_fn, logger,
         checkpointer, ppo_save_state, master_config).
     """
+    _raise_if_turn_credit(master_config.ppo)
+    if master_config.ppo.critic_train_on_env_masked or master_config.ppo.critic_train_on_truncated:
+        raise NotImplementedError("Independent critic masks require SingleController PPO")
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
 
@@ -521,7 +538,7 @@ def setup(
     #        Loss Function
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
-    value_loss_fn = MseValueLossFn(master_config.value_loss_fn)
+    value_loss_fn = build_value_loss_fn(master_config.value_loss_fn, value_config)
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
@@ -781,6 +798,7 @@ def setup(
     )
     if warm_start is not None:
         validate_warm_start_checkpoint(warm_start)
+        check_warm_start_value_head(warm_start, value_config)
         print(f"🔥 Warm-starting the value model from {warm_start} (weights only)")
     value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
         last_checkpoint_path or warm_start,

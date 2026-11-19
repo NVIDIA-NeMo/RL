@@ -60,6 +60,7 @@ from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    attach_topk_logprobs_to_chat_response_choices,
     format_prompt_for_vllm_generation,
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
@@ -251,6 +252,10 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache
 
         self._chain_prefix = ChainPrefixCache()
+        self._staging_sink: Any | None = None
+        # token_capture.top_logprobs: sampler top-k log-probs staged next to each
+        # captured call's delta; 0 leaves captured calls as they are.
+        self._capture_top_logprobs = 0
 
         super().__init__(
             config,
@@ -529,6 +534,7 @@ class VllmAsyncGenerationWorkerImpl(
         staging_partition: str,
         *,
         capture_media: bool = False,
+        top_logprobs: int = 0,
     ) -> bool:
         """Host ledger-authoritative token capture in this worker.
 
@@ -537,6 +543,8 @@ class VllmAsyncGenerationWorkerImpl(
         ``install_capture`` call wiring Gym's engine-blind capture core +
         vLLM adapter into this worker. Returns whether capture was installed
         (False on non-model-owner ranks, which serve no HTTP).
+        ``top_logprobs`` > 0 also stages the sampler's top-k log-probs of every
+        generated token next to the call's delta.
         """
         if not self.is_model_owner:
             return False
@@ -558,6 +566,16 @@ class VllmAsyncGenerationWorkerImpl(
             capture_media=capture_media,
             media_pixel_dtype=pixel_dtype,
         )
+        self._staging_sink = sink
+        self._capture_top_logprobs = int(top_logprobs)
+        if self._capture_top_logprobs:
+            # K + 1 log-prob candidates per generated token: skip vLLM's
+            # per-candidate detokenization, which only builds unused strings.
+            from nemo_rl.models.generation.vllm.patches import (
+                skip_logprob_detokenization,
+            )
+
+            skip_logprob_detokenization()
         if capture_media:
             # Omni-only: a new processor family must also change setup.py (driver
             # checks), captured_media.py (_processed_omni_tensors, pack_images,
@@ -834,8 +852,18 @@ class VllmAsyncGenerationWorkerImpl(
         media ride as opaque attachments beside the record), so ``staged``
         coords vouch for both and any failure is ``capture_failed`` at call
         time. Token ids, logprobs, and routes are stripped after staging, so
-        the worker->gate hop carries the completion and coords only.
+        the worker->gate hop carries the completion and coords only. The sampler's top-k, when attached,
+        is popped first (it never reaches JSON) and written onto the staged
+        row once the call's coords exist.
         """
+        topk = None
+        for choice in content.get("choices") or []:
+            message = choice.get("message")
+            if isinstance(message, dict) and "generation_topk_ids" in message:
+                topk = (
+                    message.pop("generation_topk_ids"),
+                    message.pop("generation_topk_logprobs"),
+                )
         state = self._capture_calls.pop(id(request), None)
         if state is None:
             return content
@@ -869,6 +897,13 @@ class VllmAsyncGenerationWorkerImpl(
             payload,
             attachments=state.media.tensors if state.media is not None else None,
         )
+        if topk is not None and coords.disposition == "staged":
+            try:
+                self._staging_sink.stage_topk(coords.staging_key, *topk)
+            except Exception:  # noqa: BLE001 — the finalizer rejects a row without its top-k
+                LOGGER.exception(
+                    "staging the sampler top-k failed for %s", coords.staging_key
+                )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # Token arrays and delta-aligned routes were staged to TQ above;
@@ -1201,6 +1236,16 @@ class VllmAsyncGenerationWorkerImpl(
             # attaches (rollout_id, call_id, parent_call_id, prev_len, mode).
             ng_capture: Optional[dict[str, Any]] = None
 
+            def to_sampling_params(self, *args, **kwargs):
+                params = super().to_sampling_params(*args, **kwargs)
+                # Captured calls also carry the sampler's top-k
+                # (token_capture.top_logprobs). Only the engine's count changes:
+                # the response is still cut at request.top_logprobs (0), so
+                # nothing extra reaches the JSON.
+                if self.ng_capture and worker_self._capture_top_logprobs:
+                    params.logprobs = worker_self._capture_top_logprobs
+                return params
+
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
         # OnlineRenderer.preprocess_chat, so the prefix-token override
         # belongs on the renderer subclass.
@@ -1255,6 +1300,12 @@ class VllmAsyncGenerationWorkerImpl(
                         response,
                         final_res,
                     )
+                    if request.ng_capture and worker_self._capture_top_logprobs:
+                        response = attach_topk_logprobs_to_chat_response_choices(
+                            response,
+                            final_res,
+                            top_k=worker_self._capture_top_logprobs,
+                        )
 
                 if worker_self._return_routed_experts_enabled():
                     response = attach_routed_experts_to_chat_response_choices(
@@ -2262,8 +2313,17 @@ class VllmAsyncGenerationWorkerImpl(
             traceback.print_exc()
             return False
 
-    async def reset_prefix_cache_async(self):
-        """Async version of reset_prefix_cache."""
+    async def reset_prefix_cache_async(self, reset_running_requests: bool = True) -> bool:
+        """Async version of reset_prefix_cache.
+
+        After a weight update the prefix cache (KV blocks and, for hybrid models, the
+        Mamba states) still holds activations of the previous weights, and vLLM only
+        resets it when no block is in use -- never the case under continuous rollouts,
+        so the plain call was refused on every refit and the refusal dropped. With
+        ``reset_running_requests`` vLLM first preempts every running request to the
+        waiting queue (they re-prefill with the new weights when rescheduled), so the
+        reset cannot be refused. Returns vLLM's success flag.
+        """
         assert self.llm is not None, (
             "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
         )
@@ -2273,9 +2333,12 @@ class VllmAsyncGenerationWorkerImpl(
                 "reset_prefix_cache_async can only be used with async_engine=True. Use reset_prefix_cache instead."
             )
 
-        await self.llm.reset_prefix_cache()
+        reset_ok = await self.llm.reset_prefix_cache(
+            reset_running_requests=reset_running_requests
+        )
         gc.collect()
         torch.cuda.empty_cache()
+        return reset_ok is not False
 
     async def pause_generation_async(self, *, clear_cache: bool) -> bool:
         """Pause vLLM generation for an in-flight weight update."""

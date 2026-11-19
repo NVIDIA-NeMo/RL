@@ -41,7 +41,11 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
-from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    HLGaussValueLossFn,
+    MseValueLossConfig,
+    MseValueLossFn,
+)
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
@@ -357,6 +361,25 @@ class TestPPOValidation:
         mc = self._privileged_config(value_seq_len=351)
 
         with pytest.raises(ValueError, match="value.max_total_sequence_length"):
+            validate_single_controller_config(mc)
+
+    def test_accepts_an_hl_gauss_critic(self):
+        mc = _ppo_master_config()
+        mc.value["head"] = {"type": "hl_gauss"}
+        validate_single_controller_config(mc)
+
+    def test_rejects_value_clipping_on_an_hl_gauss_critic(self):
+        mc = _ppo_master_config(value_loss_fn=MseValueLossConfig(cliprange=0.5))
+        mc.value["head"] = {"type": "hl_gauss"}
+
+        with pytest.raises(ValueError, match="cliprange"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_malformed_value_head(self):
+        mc = _ppo_master_config()
+        mc.value["head"] = {"type": "hl_gauss", "v_min": 1.0, "v_max": 0.0}
+
+        with pytest.raises(ValidationError, match="v_min < v_max"):
             validate_single_controller_config(mc)
 
     def test_accepts_a_privileged_critic_that_restores_buffered_groups(self):
@@ -682,6 +705,15 @@ class TestSetupBuildsTheCritic:
         assert actor_args.value_handle is patched_ppo_factories["value"]
         assert isinstance(actor_args.value_loss_fn, MseValueLossFn)
         assert timing.value_init_time_s == 2.0
+
+    def test_an_hl_gauss_head_gets_the_cross_entropy_loss(self, patched_ppo_factories):
+        mc = _ppo_master_config()
+        mc.value["head"] = {"type": "hl_gauss", "num_bins": 51}
+
+        actor_args, _ = setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        assert isinstance(actor_args.value_loss_fn, HLGaussValueLossFn)
+        assert actor_args.value_loss_fn.head.num_bins == 51
 
     def test_policy_steps_off_the_gpu_while_the_critic_loads(
         self, patched_ppo_factories

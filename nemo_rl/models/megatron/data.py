@@ -23,6 +23,7 @@ from megatron.bridge.training.utils.packed_seq_utils import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
+    get_context_parallel_group,
     get_context_parallel_rank,
     get_context_parallel_world_size,
 )
@@ -30,7 +31,8 @@ from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
-from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
+from nemo_rl.data_plane.schema import GENERATION_TOPK_CP_BLOCK_FIELDS, OPD_FULL_FIELDS
+from nemo_rl.data_plane.worker_mixin import gather_topk_cp_blocks
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.alignment import (
@@ -152,6 +154,9 @@ def make_processed_microbatch_iterator(
     for data_dict in raw_iterator:
         # Move to GPU
         data_dict = data_dict.to("cuda")
+        gather_topk_cp_blocks(
+            data_dict, get_context_parallel_group(check_initialized=False)
+        )
 
         # Process the microbatch
         processed_inputs = process_microbatch(
@@ -1793,11 +1798,17 @@ def get_and_validate_seqlen(data: BatchedDataDict[Any]):
     # target (they never feed the model forward, only the loss, which reads
     # each sequence's own real length regardless of how far the column is
     # padded) -- see codec.py's OPD_FULL_FIELDS exclusion. Their dim 1 can
-    # therefore legitimately be shorter than every other column's.
+    # therefore legitimately be shorter than every other column's. So can the
+    # context-parallel blocks of the captured top-k, which each microbatch
+    # gathers back to full rows (gather_topk_cp_blocks).
     sequence_dim = 1
     seq_dim_size = data["input_ids"].shape[sequence_dim]
     for k, v in data.items():
-        if k in PACKED_MULTIMODAL_FIELDS or k in OPD_FULL_FIELDS:
+        if (
+            k in PACKED_MULTIMODAL_FIELDS
+            or k in OPD_FULL_FIELDS
+            or k in GENERATION_TOPK_CP_BLOCK_FIELDS.values()
+        ):
             continue
         if torch.is_tensor(v) and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (

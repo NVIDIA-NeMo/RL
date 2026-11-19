@@ -29,10 +29,17 @@ from nemo_rl.algorithms.loss.interfaces import (
     LossType,
     MetricNormalizer,
 )
+from nemo_rl.algorithms.loss.score_centering import score_centering_term
 from nemo_rl.algorithms.utils import (
     calculate_kl,
     compute_seq_logprob_errors,
     masked_mean,
+)
+from nemo_rl.algorithms.value_head import (
+    ValueHeadConfig,
+    bin_centers,
+    hl_gauss_targets,
+    resolve_value_head,
 )
 from nemo_rl.algorithms.x_token.loss_utils import (
     LocalizedAlignment,
@@ -214,6 +221,11 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # L = L_PPO + μ·L_NLL(correct)   (arXiv:2504.05118, Eq. 10)
     # Set to 0 to disable.
     positive_example_nll_weight: float = 0.0
+    # Score centering (arXiv:2609.20807): per token, add A * sum_v sg(c_v) log p_v
+    # over the sampler's top-k ids so the update subtracts the sampler-expected
+    # (TIS-weighted) score. Needs token_capture.top_logprobs > 0; composes only
+    # with importance sampling off or token-level "tis".
+    score_centering: bool = False
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -417,6 +429,29 @@ class ClippedPGLossFn(LossFunction):
                     "and is incompatible with sequence_level_importance_ratios=True"
                 )
 
+        self.score_centering = cfg.score_centering
+        if self.score_centering:
+            assert self.opd_full is None and not use_fused_linear_logprobs, (
+                "score_centering needs the policy-gradient loss on full logits"
+            )
+            assert not self.sequence_level_importance_ratios and (
+                not self.use_importance_sampling_correction
+                or self.truncated_importance_sampling_type == "tis"
+            ), (
+                "score_centering composes only with importance sampling off or "
+                "token-level 'tis' (the sampler-expected weighted score has a closed "
+                "form there)"
+            )
+        # Bounds of the token-level TIS clamp; they set the effective centering mass.
+        self._score_centering_is_bounds = (
+            (
+                self.truncated_importance_sampling_ratio_min or 0.0,
+                self.truncated_importance_sampling_ratio,
+            )
+            if self.score_centering and self.use_importance_sampling_correction
+            else None
+        )
+
         # Advertise, per returned metric, the global denominator it was
         # normalized by (see MetricNormalizer). Built here — next to the flags
         # that pick the denominators — so split-API trainers can undo the
@@ -467,6 +502,10 @@ class ClippedPGLossFn(LossFunction):
                 if self.truncated_importance_sampling_type == "seq-mask-tis"
                 else MetricNormalizer.TOKENS
             )
+        if self.score_centering:
+            self.metric_normalizations["score_centering_head_mass"] = (
+                MetricNormalizer.TOKENS
+            )
         if self.opd_full is not None:
             # opd_full returns its own metric set from _opd_full_call; the
             # policy-gradient diagnostics above are never produced there.
@@ -504,6 +543,7 @@ class ClippedPGLossFn(LossFunction):
         opd_full_divergence: Optional[Tensor] = None,
         opd_full_entropy: Optional[Tensor] = None,
         opd_full_cross_entropy: Optional[Tensor] = None,
+        next_token_topk_logprobs: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
 
@@ -513,6 +553,8 @@ class ClippedPGLossFn(LossFunction):
             next_token_logprobs: Sampled-token log-probabilities ``[B, S - 1]``.
                 Required on the policy-gradient branch; on the ``opd_full``
                 branch only when ``reference_policy_kl_penalty`` is non-zero.
+            next_token_topk_logprobs: Log-probabilities at the sampler's top-k
+                ids ``[B, S - 1, k]``, required when ``score_centering`` is on.
             data: Microbatch with masks, advantages, and prior log-probabilities.
             global_valid_seqs: Global valid-sequence count for normalization.
             global_valid_toks: Global valid-token count for normalization.
@@ -872,16 +914,33 @@ class ClippedPGLossFn(LossFunction):
         else:
             importance_weights_to_use = torch.ones_like(prev_logprobs)
 
+        per_token_loss = importance_weights_to_use * clip_loss
+        score_centering_metrics: dict = {}
+        if self.score_centering:
+            assert next_token_topk_logprobs is not None, (
+                "score_centering requires next_token_topk_logprobs from prepare_loss_input"
+            )
+            centering, head_mass = score_centering_term(
+                next_token_topk_logprobs,
+                data["generation_topk_logprobs"][:, 1:],
+                self._score_centering_is_bounds,
+                token_mask=mask,
+            )
+            per_token_loss = per_token_loss + advantages * centering
+            score_centering_metrics["score_centering_head_mass"] = masked_mean(
+                head_mass, mask, global_normalization_factor=global_valid_toks
+            ).item()
+
         if self.loss_type == LossType.TOKEN_LEVEL:
             actor_loss = masked_mean(
-                importance_weights_to_use * clip_loss,
+                per_token_loss,
                 mask,
                 global_normalization_factor=global_valid_toks,
             )
         else:
             actor_loss = masked_mean(
                 masked_mean(
-                    importance_weights_to_use * clip_loss,
+                    per_token_loss,
                     token_mask,
                     dim=-1,
                 ),
@@ -983,6 +1042,7 @@ class ClippedPGLossFn(LossFunction):
                 APPROX_ENTROPY_KEY: seq_entropy_approx.item(),
                 **_is_filter_metrics,
                 **seq_error_metrics,
+                **score_centering_metrics,
                 "positive_nll_loss": nll_loss.item(),
             },
         )
@@ -2005,58 +2065,158 @@ class MseValueLossFn(LossFunction):
             )
             vf_clipfrac = 0.0
 
-        with torch.no_grad():
-            # Use global_valid_toks so each MB contributes local_sum/global_total.
-            # Summing across MBs in ppo.py then gives the correct global mean.
-            returns_mean = masked_mean(
-                returns,
-                mask,
-                global_normalization_factor=global_valid_toks,
-            ).item()
-            values_mean = masked_mean(
-                values,
-                mask,
-                global_normalization_factor=global_valid_toks,
-            ).item()
-
-            # Min/max are per-MB; ppo.py takes min/max across MBs.
-            masked_values = values[mask.bool()]
-            values_min = (
-                masked_values.min().item() if masked_values.numel() > 0 else 0.0
-            )
-            values_max = (
-                masked_values.max().item() if masked_values.numel() > 0 else 0.0
-            )
-
-            # Explained variance sufficient statistics.
-            # EV = 1 - Var(residual) / Var(returns)
-            # We export E[r²] and E[(r-v)²] (both / global_valid_toks so they
-            # sum correctly across MBs).  ppo.py combines them with returns_mean
-            # and values_mean to compute exact global EV.
-            returns_sq_mean = masked_mean(
-                returns**2,
-                mask,
-                global_normalization_factor=global_valid_toks,
-            ).item()
-            residual_sq_mean = masked_mean(
-                (returns - values) ** 2,
-                mask,
-                global_normalization_factor=global_valid_toks,
-            ).item()
-
         metrics = {
             "loss": float(loss.item()),
             "vf_clipfrac": vf_clipfrac,
-            "returns_mean": returns_mean,
-            "values_mean": values_mean,
-            "values_min": values_min,
-            "values_max": values_max,
-            "returns_sq_mean": returns_sq_mean,
-            "residual_sq_mean": residual_sq_mean,
+            **_value_fit_metrics(values, returns, mask, global_valid_toks),
             "num_valid_samples": int(values.shape[0]),
         }
 
         return loss, metrics
+
+
+def _value_fit_metrics(
+    values: torch.Tensor,
+    returns: torch.Tensor,
+    mask: torch.Tensor,
+    global_valid_toks: torch.Tensor,
+) -> dict[str, float]:
+    """How well per-token values fit the returns; shared by the value losses."""
+    with torch.no_grad():
+        # Use global_valid_toks so each MB contributes local_sum/global_total.
+        # Summing across MBs in ppo.py then gives the correct global mean.
+        returns_mean = masked_mean(
+            returns,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        ).item()
+        values_mean = masked_mean(
+            values,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        ).item()
+
+        # Min/max are per-MB; ppo.py takes min/max across MBs.
+        masked_values = values[mask.bool()]
+        values_min = masked_values.min().item() if masked_values.numel() > 0 else 0.0
+        values_max = masked_values.max().item() if masked_values.numel() > 0 else 0.0
+
+        # Explained variance sufficient statistics.
+        # EV = 1 - Var(residual) / Var(returns)
+        # We export E[r²] and E[(r-v)²] (both / global_valid_toks so they
+        # sum correctly across MBs).  ppo.py combines them with returns_mean
+        # and values_mean to compute exact global EV.
+        returns_sq_mean = masked_mean(
+            returns**2,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        ).item()
+        residual_sq_mean = masked_mean(
+            (returns - values) ** 2,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        ).item()
+
+    return {
+        "returns_mean": returns_mean,
+        "values_mean": values_mean,
+        "values_min": values_min,
+        "values_max": values_max,
+        "returns_sq_mean": returns_sq_mean,
+        "residual_sq_mean": residual_sq_mean,
+    }
+
+
+class HLGaussValueLossFn(LossFunction):
+    """HL-Gauss value loss: cross-entropy of the critic's bins against smoothed returns.
+
+    The critic head outputs ``value.head.num_bins`` logits per token
+    (nemo_rl/algorithms/value_head.py). Each return is clamped to the support and spread
+    over the bins as a Gaussian of width ``value.head.sigma``; the loss is
+    ``scale * token-mean CE``. There is no value clipping: the target does not depend on
+    the previous prediction. The metrics carry MseValueLossFn's keys, computed on the
+    decoded value (the expectation over bin centers), so explained variance and the
+    critic dashboards read the same for both heads.
+    """
+
+    input_type = LossInputType.LOGIT
+
+    def __init__(self, cfg: MseValueLossConfig, head: ValueHeadConfig):
+        if not head.categorical:
+            raise ValueError(
+                f"HLGaussValueLossFn needs an hl_gauss head, got {head.type}"
+            )
+        if cfg.cliprange:
+            raise ValueError(
+                "value_loss_fn.cliprange clips a scalar value prediction, but "
+                "value.head.type=hl_gauss trains the critic by cross-entropy: set "
+                "value_loss_fn.cliprange=null."
+            )
+        self.scale = cfg.scale
+        # Read by critic pretraining, which turns clipping off where it cannot bind.
+        self.cliprange = None
+        self.head = head
+        self.loss_type = LossType.TOKEN_LEVEL
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Cross-entropy of ``logits`` ``[B, S, num_bins]`` against ``data["returns"]``."""
+        if logits.shape[-1] != self.head.num_bins:
+            raise ValueError(
+                f"HL-Gauss expects {self.head.num_bins} logits per token, got shape "
+                f"{tuple(logits.shape)}"
+            )
+        token_mask = data["token_mask"]
+        sample_mask = data["sample_mask"]
+        returns = data["returns"]
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        targets = hl_gauss_targets(returns, self.head)
+        token_ce = -(targets * log_probs).sum(dim=-1)
+        loss = self.scale * masked_mean(
+            token_ce, mask, global_normalization_factor=global_valid_toks
+        )
+
+        with torch.no_grad():
+            probs = log_probs.exp()
+            values = (probs * bin_centers(self.head, device=probs.device)).sum(dim=-1)
+            # Spread of the predicted distribution (0 = one bin, log(num_bins) = uniform).
+            entropy = -(probs * log_probs).sum(dim=-1)
+            # Returns the support cannot represent (clamped before smoothing).
+            outside = (returns < self.head.v_min) | (returns > self.head.v_max)
+            hl_gauss_metrics = {
+                "hl_gauss_entropy": masked_mean(
+                    entropy, mask, global_normalization_factor=global_valid_toks
+                ).item(),
+                "hl_gauss_clip_frac": masked_mean(
+                    outside.float(), mask, global_normalization_factor=global_valid_toks
+                ).item(),
+            }
+
+        metrics = {
+            "loss": float(loss.item()),
+            "vf_clipfrac": 0.0,
+            **_value_fit_metrics(values, returns, mask, global_valid_toks),
+            **hl_gauss_metrics,
+            "num_valid_samples": int(values.shape[0]),
+        }
+        return loss, metrics
+
+
+def build_value_loss_fn(
+    cfg: MseValueLossConfig, value_config: Optional[dict[str, Any]]
+) -> LossFunction:
+    """The critic loss ``value.head`` calls for: MSE (scalar head) or HL-Gauss CE."""
+    head = resolve_value_head(value_config)
+    if head.categorical:
+        return HLGaussValueLossFn(cfg, head)
+    return MseValueLossFn(cfg)
 
 
 # =====================================================================

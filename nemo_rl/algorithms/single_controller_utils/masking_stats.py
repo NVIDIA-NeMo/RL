@@ -23,10 +23,15 @@ placeholder rows are reported but do not dilute the fractions.
   ``sample_mask`` 0); never trained, never in the baseline.
 * ``masking/env_flag_rows`` / ``_frac``: rows flagged ``mask_sample`` by the
   environment or by ``env.mask_sample_rules``.
-* ``masking/truncated_rows`` / ``_frac``: rows whose sequence hit the length
-  limit, whether or not ``grpo.overlong_filtering`` masks them;
-  ``masking/truncated_masked_rows``: those actually masked for it (and not
-  already env-flagged).
+* ``truncation_rate`` (no ``masking/`` prefix, logged as ``train/truncation_rate``):
+  rows whose sequence hit the length limit, whether or not anything masks them.
+  On the token-capture path this is the only correct source: the dispatch-time
+  completions carry a placeholder ``truncated=False``, and the flag is measured
+  per row only after reassembly.
+* ``masking/truncated_rows`` / ``_frac``: truncated rows masked by
+  ``grpo.overlong_filtering`` (0 when it is off; some may also be env-flagged);
+  ``masking/truncated_masked_rows``: of those, the rows not already env-flagged
+  (masked only for truncation).
 * ``masking/seq_logprob_error_rows``: rows the sequence-logprob-error check
   dropped after the other masks.
 * ``masking/masked_rows`` / ``masked_frac``: rows with tokens that ended up
@@ -36,8 +41,9 @@ placeholder rows are reported but do not dilute the fractions.
   ``masking/reinstated_rows``: incomplete rows kept in the baseline by
   ``grpo.masked_sample_rewards_in_baseline``.
 * ``masking/reward_mean_{trained,env_flag,truncated,masked}``: mean reward of
-  each population (canonical rows, i.e. rollouts), omitted when the population
-  is empty, so the effect of masking on the reward signal is visible.
+  each population (canonical rows, i.e. rollouts; ``truncated`` = rows masked by
+  the overlong filter), omitted when the population is empty, so the effect of
+  masking on the reward signal is visible.
 * ``masking/groups``, ``masking/groups_lt2_trained_frac``: GRPO groups in the
   step and the fraction left with fewer than two trained rollouts (canonical
   rows; no gradient from the group baseline).
@@ -64,6 +70,7 @@ MASKING_STATS_KEYS: tuple[str, ...] = (
     "sample_mask",
     "env_flag",
     "truncated",
+    "overlong_masked",
     "truncated_masked",
     "final_mask",
     "baseline_mask",
@@ -123,6 +130,9 @@ def accumulate_masking_stats(
     acc["sample_mask"].append(sample_mask.detach().float().reshape(batch).cpu())
     acc["env_flag"].append(env_flag.cpu())
     acc["truncated"].append(trunc.cpu())
+    acc["overlong_masked"].append(
+        trunc.cpu() if overlong_filtering else torch.zeros(batch, dtype=torch.bool)
+    )
     acc["truncated_masked"].append(
         (trunc & ~env_flag).cpu()
         if overlong_filtering
@@ -144,6 +154,7 @@ def reduce_masking_stats(acc: dict[str, list[torch.Tensor]]) -> dict[str, float]
     has_tokens = torch.cat(acc["sample_mask"]) > 0
     env_flag = torch.cat(acc["env_flag"]) & has_tokens
     truncated = torch.cat(acc["truncated"]) & has_tokens
+    overlong_masked = torch.cat(acc["overlong_masked"]) & has_tokens
     truncated_masked = torch.cat(acc["truncated_masked"]) & has_tokens
     trained = torch.cat(acc["final_mask"]) > 0
     in_baseline = torch.cat(acc["baseline_mask"]) > 0
@@ -161,8 +172,9 @@ def reduce_masking_stats(acc: dict[str, list[torch.Tensor]]) -> dict[str, float]
         "masking/placeholder_rows": float(rows - with_tokens),
         "masking/env_flag_rows": float(env_flag.sum()),
         "masking/env_flag_frac": frac(int(env_flag.sum())),
-        "masking/truncated_rows": float(truncated.sum()),
-        "masking/truncated_frac": frac(int(truncated.sum())),
+        "truncation_rate": frac(int(truncated.sum())),
+        "masking/truncated_rows": float(overlong_masked.sum()),
+        "masking/truncated_frac": frac(int(overlong_masked.sum())),
         "masking/truncated_masked_rows": float(truncated_masked.sum()),
         "masking/seq_logprob_error_rows": float(seq_logprob_dropped.sum()),
         "masking/masked_rows": float(masked.sum()),
@@ -177,7 +189,7 @@ def reduce_masking_stats(acc: dict[str, list[torch.Tensor]]) -> dict[str, float]
     canonical = torch.cat(acc["canonical"])
     _set_mean(out, "masking/reward_mean_trained", rewards[trained & canonical])
     _set_mean(out, "masking/reward_mean_env_flag", rewards[env_flag & canonical])
-    _set_mean(out, "masking/reward_mean_truncated", rewards[truncated & canonical])
+    _set_mean(out, "masking/reward_mean_truncated", rewards[overlong_masked & canonical])
     _set_mean(out, "masking/reward_mean_masked", rewards[masked & canonical])
 
     rollout_ids = torch.cat(acc["rollout_ids"])

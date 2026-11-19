@@ -4262,3 +4262,36 @@ def test_async_vllm_http_client_forwards_admission_checks() -> None:
         client.check_admission(3, request_id="req-3")
 
     assert calls == [(1, None), (2, "req-2"), (3, "req-3")]
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_worker_reset_prefix_cache_preempts_running_requests() -> None:
+    """The post-refit reset must preempt running requests (vLLM refuses it otherwise
+    under continuous rollouts) and report vLLM's result instead of dropping it."""
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = MagicMock(reset_prefix_cache=AsyncMock(return_value=True))
+
+    assert await worker.reset_prefix_cache_async() is True
+    worker.llm.reset_prefix_cache.assert_awaited_once_with(reset_running_requests=True)
+
+    worker.llm.reset_prefix_cache = AsyncMock(return_value=False)
+    assert await worker.reset_prefix_cache_async() is False
+
+
+def test_vllm_generation_invalidate_kv_cache_reports_refused_resets(monkeypatch) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": True}}
+    generation.worker_group = MagicMock()
+    generation.worker_group.run_all_workers_single_data.return_value = ["f0", "f1"]
+
+    monkeypatch.setattr(ray, "get", lambda futures: [True, False])
+    assert generation.invalidate_kv_cache() is False
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "reset_prefix_cache_async",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+
+    # Non-owner workers return None and must not count as refusals.
+    monkeypatch.setattr(ray, "get", lambda futures: [True, None])
+    assert generation.invalidate_kv_cache() is True

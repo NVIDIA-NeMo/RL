@@ -29,6 +29,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_rl.experience.loop_penalties import LoopPenaltyConfig
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
@@ -291,15 +292,18 @@ class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
     unwanted: list[int] | None = None
     think_open: int | None = None
     think_close: int | None = None
+    turn_start: int | None = None
 
 
-class RewardPenaltyConfig(BaseModel, extra="allow"):
+class RewardPenaltyConfig(LoopPenaltyConfig, extra="allow"):
     """Reward-zeroing penalties applied to NeMo-Gym rollout results."""
 
     penalize_duplicated_reasoning: bool = False
     penalize_empty_final_answer: bool = False
     penalize_unwanted_tokens: bool = False
     penalize_malformed_think_tag: bool = False
+    # Token-capture diagnostics without zeroing the rollout reward.
+    log_malformed_think_tag: bool = False
     # Multi-trace rollouts only. False (legacy async PPO): the rollout-scoped
     # penalties (duplicated reasoning, empty final answer) are checked once, on the
     # rollout's aggregate response. True: they are checked on every session
@@ -327,6 +331,8 @@ _REWARD_PENALTY_FLAGS = (
     "penalize_empty_final_answer",
     "penalize_unwanted_tokens",
     "penalize_malformed_think_tag",
+    "penalize_tool_call_loops",
+    "penalize_reasoning_loops",
 )
 
 
@@ -572,6 +578,23 @@ def _shutdown_completed_nemo_gym_startup(
     shard_set.shutdown()
 
 
+def _raise_if_turn_credit(algo_config: object) -> None:
+    """Reject SingleController-only token credit in legacy trainers."""
+    # The SingleController package imports GRPO setup helpers: defer these
+    # imports to avoid a module-initialization cycle.
+    from nemo_rl.algorithms.single_controller_utils.malformed_think_credit import (
+        malformed_think_credit_config,
+    )
+    from nemo_rl.algorithms.single_controller_utils.tool_failure_credit import (
+        tool_failure_credit_config,
+    )
+
+    if tool_failure_credit_config(algo_config) is not None:
+        raise NotImplementedError("tool_failure_credit requires SingleController")
+    if malformed_think_credit_config(algo_config) is not None:
+        raise NotImplementedError("malformed_think_credit requires SingleController")
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -603,6 +626,7 @@ def setup(
             logger, checkpointer, grpo_save_state, master_config,
             teacher_worker_groups, alias_to_group_alias.
     """
+    _raise_if_turn_credit(master_config.grpo)
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
 

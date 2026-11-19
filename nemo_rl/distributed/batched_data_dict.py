@@ -39,7 +39,7 @@ from nemo_rl.data.multimodal_utils import (
     PackedTensor,
 )
 from nemo_rl.data.packing import get_packer
-from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
+from nemo_rl.data_plane.schema import GENERATION_TOPK_CP_BLOCK_FIELDS, OPD_FULL_FIELDS
 from nemo_rl.distributed.collectives import (
     gather_jagged_object_lists,
     rebalance_nd_tensor,
@@ -1049,6 +1049,10 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             # below, but the data-plane wire form is a nested tensor, so
             # name it here.
             if k in PACKED_MULTIMODAL_FIELDS:
+                continue
+            # A context-parallel block of the captured top-k is not as long as the
+            # sequence; the microbatch iterator narrows the rows it gathers back.
+            if k in GENERATION_TOPK_CP_BLOCK_FIELDS.values():
                 continue
             if torch.is_tensor(v) and len(v.shape) >= dim + 1:
                 length = truncated_len

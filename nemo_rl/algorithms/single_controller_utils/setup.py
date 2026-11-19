@@ -56,7 +56,7 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import MseValueLossFn
+from nemo_rl.algorithms.loss.loss_functions import build_value_loss_fn
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
     print_setup_timing_summary,
@@ -67,6 +67,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     is_ppo_run,
     replay_checkpoint_enabled,
+    rollout_collection_enabled,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -81,6 +82,7 @@ from nemo_rl.algorithms.swe_privileged_critic import (
     resolve_config as resolve_swe_privileged_critic_config,
 )
 from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.value_head import check_warm_start_value_head
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
@@ -107,6 +109,8 @@ from nemo_rl.environments.nemo_gym import (
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
 )
+from nemo_rl.experience.reward_penalty_rules import parse_reward_penalty_rules
+from nemo_rl.experience.invalid_samples import parse_invalid_sample_failure_kinds
 from nemo_rl.experience.mask_sample_rules import parse_mask_sample_rules
 from nemo_rl.experience.rollout_manager import (
     RolloutManager,
@@ -339,12 +343,14 @@ def _register_single_controller_partitions(
             enabled=r3_enabled,
         )
     else:
-        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, GENERATION_TOPK_FIELDS
 
         partition_fields = fields_with_optional_routed_experts(
             DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
+        if token_capture_cfg.top_logprobs > 0:
+            partition_fields.extend(GENERATION_TOPK_FIELDS)
     if include_multimodal_fields:
         partition_fields.extend(
             field
@@ -372,7 +378,12 @@ def _register_single_controller_partitions(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
             + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
-            + (list(MEDIA_STAGING_FIELDS) if capture_media else []),
+            + (list(MEDIA_STAGING_FIELDS) if capture_media else [])
+            + (
+                list(GENERATION_TOPK_FIELDS)
+                if token_capture_cfg.top_logprobs > 0
+                else []
+            ),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
@@ -432,6 +443,19 @@ def _build_clusters(
             f"reserving {teacher_nodes} non-colocated teacher node(s); got "
             f"cluster.num_nodes={num_nodes}."
         )
+
+    if rollout_collection_enabled(master_config):
+        # Generation only: every node serves rollouts; there is no trainer.
+        inference_cluster = RayVirtualCluster(
+            name="sc_inference_cluster",
+            bundle_ct_per_node_list=[gpus_per_node] * policy_nodes,
+            use_gpus=True,
+            num_gpus_per_node=gpus_per_node,
+            max_colocated_worker_groups=1,
+            port_range_low=port_range_low,
+            port_range_high=port_range_high,
+        )
+        return None, inference_cluster, None
 
     # Worker groups sharing the training GPUs: the policy, plus the critic on
     # the PPO path.
@@ -1354,7 +1378,9 @@ def setup_single_controller(
     weights_path, optimizer_path = checkpointer.get_resume_paths(
         trainer_checkpoint_path
     )
-    if is_ppo_run(master_config):
+    # A collection run builds no trainer or critic: no weights to resolve.
+    collecting = rollout_collection_enabled(master_config)
+    if is_ppo_run(master_config) and not collecting:
         # Only a fresh run reads this; a resume ignores it and restores the critic
         # from its own checkpoint, so the key can stay in the config.
         warm_start = (
@@ -1364,6 +1390,7 @@ def setup_single_controller(
         )
         if warm_start is not None:
             validate_warm_start_checkpoint(warm_start)
+            check_warm_start_value_head(warm_start, master_config.value)
             print(f"🔥 Warm-starting the value model from {warm_start} (weights only)")
         value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
             trainer_checkpoint_path or warm_start,
@@ -1536,7 +1563,7 @@ def setup_single_controller(
     # Claim constrained training nodes before unconstrained inference or Gym
     # tasks can consume them. This matters when inference topology alignment
     # falls back while the training cluster remains topology-constrained.
-    if not colocated and segment_size is not None:
+    if not colocated and segment_size is not None and train_cluster is not None:
         train_cluster.get_placement_groups()
 
     # Claim teacher placement groups before deferred generation starts NeMo-Gym,
@@ -1778,7 +1805,8 @@ def setup_single_controller(
                 tokenizer=tokenizer,
                 processor=processor,
             )
-        build_tasks["trainer"] = _build_trainer_and_value
+        if not collecting:
+            build_tasks["trainer"] = _build_trainer_and_value
 
     # Submit build tasks and get results
     submitted: dict[str, Any] = {}
@@ -1793,7 +1821,10 @@ def setup_single_controller(
                 gen_load_time = time_metrics["gen_time"]
             else:
                 generation, gen_load_time = submitted["generation"].result()
-                trainer, value, time_metrics = submitted["trainer"].result()
+                if collecting:
+                    trainer, value, time_metrics = None, None, {"trainer_time": 0.0}
+                else:
+                    trainer, value, time_metrics = submitted["trainer"].result()
             if megatron_reserved_urls:
                 # Gym initialization needs a live URL that will respond to health checks.
                 # Megatron generation can only respond to health checks once initialized.
@@ -1853,7 +1884,8 @@ def setup_single_controller(
     # final process-local client.
     restore_data_plane_in_actor = dp_config["backend"] == "mooncake_cpu"
     data_plane_checkpoint_metadata = None
-    if not restore_data_plane_in_actor:
+    # A collection run saves no data plane (see _validate_rollout_collection).
+    if not restore_data_plane_in_actor and not collecting:
         data_plane_load_started = time.monotonic()
         data_plane_checkpoint_metadata = _maybe_restore_native_data_plane_checkpoint(
             load_checkpoint=trainer.load_data_plane_checkpoint,
@@ -1919,8 +1951,9 @@ def setup_single_controller(
     # ==========================
     # Setup Data Plane Client & Weight Sync
     # ==========================
-    # Connect-only DP client; TQPolicy already bootstrapped the controller.
-    dp_client = build_data_plane_client(dp_config, bootstrap=False)
+    # Connect-only DP client; TQPolicy already bootstrapped the controller. A
+    # collection run has no TQPolicy, so this client bootstraps it.
+    dp_client = build_data_plane_client(dp_config, bootstrap=collecting)
 
     # Token-capture mode: pre-register both rollout partitions from this
     # single driver thread before any producer is live. TQ's controller
@@ -1947,15 +1980,22 @@ def setup_single_controller(
         )
     if token_capture_cfg.enabled:
         # Both active backends stage canonical Gym rows in serving workers;
-        # only vLLM workers stage captured media beside them (capture_media).
+        # only vLLM workers stage captured media beside them (capture_media)
+        # and the sampler's top-k (token_capture.top_logprobs).
         generation.setup_token_capture(
             dp_config,
             token_capture_cfg.staging_partition,
             capture_media=capture_media,
+            **(
+                {"top_logprobs": token_capture_cfg.top_logprobs}
+                if token_capture_cfg.top_logprobs > 0
+                else {}
+            ),
         )
         generation.set_rollout_weight_version(0)
 
-    if weight_synchronizer is None:
+    # A collection run's engines loaded the policy from disk and are never refit.
+    if weight_synchronizer is None and not collecting:
         t0 = time.perf_counter()
         weight_synchronizer = create_weight_synchronizer(
             policy=trainer,
@@ -1980,8 +2020,8 @@ def setup_single_controller(
         opd_full=opd_module.get_opd_full_config(master_config),
     )
     value_loss_fn: Optional[LossFunction] = (
-        MseValueLossFn(master_config.value_loss_fn)  # type: ignore
-        if is_ppo_run(master_config)
+        build_value_loss_fn(master_config.value_loss_fn, master_config.value)  # type: ignore
+        if is_ppo_run(master_config) and not collecting
         else None
     )
 
@@ -2032,6 +2072,7 @@ def setup_single_controller(
                 ),
                 reward_penalty_config=resolved_reward_penalty_config,
                 tokenizer_config=dict(master_config.policy["tokenizer"]),
+                top_logprobs=token_capture_cfg.top_logprobs,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
@@ -2052,6 +2093,11 @@ def setup_single_controller(
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
         mask_sample_rules=parse_mask_sample_rules(master_config.env),
+        reward_penalty_rules=parse_reward_penalty_rules(
+            master_config.env,
+            mask_rule_names=[r.name for r in parse_mask_sample_rules(master_config.env)],
+        ),
+        invalid_sample_failure_kinds=parse_invalid_sample_failure_kinds(master_config.env),
         log_full_result_tables=should_log_nemo_gym_full_result_tables(
             wandb_enabled=master_config.logger["wandb_enabled"],
             wandb_config=master_config.logger["wandb"],
@@ -2079,7 +2125,7 @@ def setup_single_controller(
     privilege_cfg = resolve_swe_privileged_critic_config(master_config.value)
     privilege_store = (
         SwePrivilegePrefixStore(tokenizer, privilege_cfg)
-        if privilege_cfg is not None
+        if privilege_cfg is not None and not collecting
         else None
     )
 

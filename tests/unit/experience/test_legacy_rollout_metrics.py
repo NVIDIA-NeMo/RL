@@ -26,11 +26,14 @@ import math
 import pytest
 import torch
 
+
 from nemo_rl.algorithms.multi_trace_metrics import finalize_sum_count_metrics
 from nemo_rl.experience.interfaces import TRACE_METADATA_KEY, Completion
 from nemo_rl.experience.legacy_rollout_metrics import (
+    BEHAVIOR_FLAGS,
     ROLLOUT_DEBUG_TAG,
     aggregate_rollout_metrics_with_sum_counts,
+    behavior_rollout_metrics,
     capture_generation_size_metrics,
     capture_rollout_debug_tag,
     compaction_rollout_metrics,
@@ -992,6 +995,76 @@ class TestSandboxedAgentDebugInfo:
         assert info["openhands_run_time"] == 300.0
         assert info["final_eval_time"] == 40.0
 
+    def test_behavior_flags_are_the_known_set_as_bools(self):
+        assert rollout_debug_info(self._result())["behavior"] is None
+        info = rollout_debug_info(
+            self._result(
+                opencode_behavior={"upstream_fetch_ok": True, "not_a_flag": True}
+            )
+        )
+        assert set(info["behavior"]) == set(BEHAVIOR_FLAGS)
+        assert info["behavior"]["upstream_fetch_ok"] is True
+        assert not any(
+            v for k, v in info["behavior"].items() if k != "upstream_fetch_ok"
+        )
+
+
+class TestBehaviorRolloutMetrics:
+    @staticmethod
+    def _info(**flags):
+        return {"behavior": {flag: flags.get(flag, False) for flag in BEHAVIOR_FLAGS}}
+
+    def test_counts_flagged_rollouts(self):
+        infos = [
+            self._info(upstream_fetch_ok=True, gold_copied_external=True),
+            self._info(upstream_fetch_ok=True),
+            self._info(net_blocked_legit=True),
+            {"behavior": None},  # agent reported nothing
+        ]
+        metrics = behavior_rollout_metrics(infos)
+        assert set(metrics) == {
+            f"behavior_flagged/{flag}/count" for flag in BEHAVIOR_FLAGS
+        }
+        assert metrics["behavior_flagged/upstream_fetch_ok/count"] == 2
+        assert metrics["behavior_flagged/gold_copied_external/count"] == 1
+        assert metrics["behavior_flagged/net_blocked_legit/count"] == 1
+        assert metrics["behavior_flagged/test_deleted/count"] == 0
+
+    def test_groups_without_flags_emit_nothing(self):
+        assert behavior_rollout_metrics([{"behavior": None}]) == {}
+
+    def test_cross_group_totals_and_pct_of_batch(self):
+        group_a = {
+            "rollouts/count": 1,
+            **behavior_rollout_metrics([self._info(upstream_fetch_attempt=True)]),
+        }
+        group_b = {
+            "rollouts/count": 4,
+            **behavior_rollout_metrics(
+                [
+                    self._info(),
+                    self._info(),
+                    self._info(upstream_fetch_attempt=True),
+                    {"behavior": None},
+                ]
+            ),
+        }
+        per_group = {}
+        for group in (group_a, group_b):
+            for key, value in group.items():
+                per_group.setdefault(key, []).append(value)
+        out = aggregate_rollout_metrics_with_sum_counts(per_group, lambda rest: {})
+        assert out["behavior_flagged/upstream_fetch_attempt/count"] == 2
+        # Share of the whole batch (5 rollouts), including the one that reported no flags.
+        assert out[
+            "behavior_flagged/upstream_fetch_attempt/pct_of_batch"
+        ] == pytest.approx(40.0)
+        assert out["behavior_flagged/test_deleted/pct_of_batch"] == 0
+        assert not any(
+            k.startswith("behavior/") or "rewarded_trained" in k for k in out
+        )
+        assert "behavior_flagged/upstream_fetch_attempt/mean" not in out
+
 
 class TestCaptureRolloutDebugTag:
     def _decoded(self, finalizer_kind, *, compacted=False, empty=False):
@@ -1047,3 +1120,32 @@ class TestCaptureGenerationSizeMetrics:
 
     def test_no_sizes_leaves_metrics_alone(self):
         assert capture_generation_size_metrics([], []) == {}
+
+
+@pytest.mark.parametrize("sandboxed", [False, True])
+def test_reward_audit_distinguishes_original_score_from_post_penalty_reward(sandboxed):
+    from nemo_rl.experience.legacy_rollout_metrics import rollout_debug_info
+
+    result = {
+        "reward": 0.0,
+        "reward_before_penalties": 1.0,
+        "reward_before_loop_penalties": 1.0,
+        "loop_reward_zeroed": True,
+        "loop_penalties": {"tool_call_loop": False, "reasoning_loop": True},
+    }
+    if sandboxed:
+        result["opencode_finished"] = True
+    info = rollout_debug_info(result)
+    assert info["reward"] == 0.0
+    assert info["reward_before_penalties"] == 1.0
+    assert info["reward_before_loop_penalties"] == 1.0
+    assert info["loop_reward_zeroed"] is True
+    assert info["loop_penalties"]["reasoning_loop"] is True
+
+
+def test_missing_original_reward_audit_is_unknown_not_zero():
+    from nemo_rl.experience.legacy_rollout_metrics import rollout_debug_info
+
+    info = rollout_debug_info({"reward": 0.0})
+    assert info["reward_before_penalties"] is None
+    assert info["reward_before_loop_penalties"] is None

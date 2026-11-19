@@ -40,7 +40,7 @@ Legacy sources (nemo_rl/algorithms/ppo.py unless noted):
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Optional
+from typing import Any, Hashable, Optional
 
 import torch
 
@@ -440,3 +440,84 @@ def multi_trace_composition_metrics(
         "multi_trace/mean_trace_length": float(lengths.mean().item()),
         "multi_trace/max_trace_length": int(lengths.max().item()),
     }
+
+
+def _rank_auc(scores: torch.Tensor, positive: torch.Tensor) -> float:
+    """Tie-corrected pairwise AUC; undefined when only one class is present."""
+    n_pos = int(positive.sum())
+    n_neg = positive.numel() - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    ordered_scores, order = torch.sort(scores.double())
+    _, inverse, counts = torch.unique_consecutive(
+        ordered_scores, return_inverse=True, return_counts=True
+    )
+    ends = counts.cumsum(0).double()
+    midranks = (ends - counts.double() + 1 + ends) / 2
+    ranks = torch.empty_like(ordered_scores)
+    ranks[order] = midranks[inverse]
+    return float(
+        ((ranks[positive].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)).item()
+    )
+
+
+def critic_reward_auc_metrics(
+    values: torch.Tensor,
+    rewards: torch.Tensor,
+    mask: torch.Tensor,
+    group_ids: Sequence[Hashable] | None = None,
+    positive_threshold: float = 0.5,
+) -> dict[str, float]:
+    """Reward ranking from each response's terminal value and quarter means.
+
+    ``auc_q1..q4`` pool canonical rollouts across the batch and work with GPP=1.
+    ``within_group_auc_q1..q4`` compare siblings of the same prompt only; those
+    are undefined without a group containing both positive and negative rewards.
+    The caller masks subagents, padding and samples excluded from training.
+    """
+    valid = mask.bool()
+    has_response = valid.any(1)
+    labels = rewards.detach().float() >= positive_threshold
+    last = valid.shape[1] - 1 - valid.flip(1).float().argmax(1)
+    rows = torch.arange(valid.shape[0], device=valid.device)
+    metrics = {
+        "critic/terminal_auc": _rank_auc(
+            values[rows[has_response], last[has_response]].float(),
+            labels[has_response],
+        )
+    }
+    if group_ids is not None and len(group_ids) != values.shape[0]:
+        raise ValueError("group_ids must have one entry per trajectory")
+    groups: dict[Hashable, list[int]] = {}
+    for row, group_id in enumerate(group_ids if group_ids is not None else []):
+        if bool(has_response[row]):
+            groups.setdefault(group_id, []).append(row)
+    mixed_groups = [
+        rows_in_group
+        for rows_in_group in groups.values()
+        if len(rows_in_group) >= 2
+        and bool(labels[rows_in_group].any())
+        and bool((~labels[rows_in_group]).any())
+    ]
+    metrics["critic/n_mixed_groups"] = float(len(mixed_groups))
+    positions = (valid.long().cumsum(1) - 1).float()
+    lengths = valid.sum(1, keepdim=True).clamp_min(1)
+    bins = (positions * 4 / lengths).long().clamp(max=3)
+    for i in range(4):
+        selected = valid & (bins == i)
+        counts = selected.sum(1)
+        scores = (values.float() * selected).sum(1) / counts.clamp_min(1)
+        present = counts > 0
+        metrics[f"critic/auc_q{i + 1}"] = _rank_auc(scores[present], labels[present])
+        metrics[f"critic/auc_q{i + 1}_num_rollouts"] = float(present.sum())
+        aucs = []
+        for group in mixed_groups:
+            members = [row for row in group if bool(counts[row])]
+            if len(members) >= 2:
+                auc = _rank_auc(scores[members], labels[members])
+                if auc == auc:
+                    aucs.append(auc)
+        metrics[f"critic/within_group_auc_q{i + 1}"] = (
+            sum(aucs) / len(aucs) if aucs else float("nan")
+        )
+    return metrics

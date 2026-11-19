@@ -230,6 +230,76 @@ def test_rollout_pump_stamps_target_steps(
     assert ctrl._rollout_exhausted.is_set()
 
 
+class _HoldSecondAdmission:
+    """Gate that admits the first batch and holds the second until released."""
+
+    def __init__(self) -> None:
+        self.admissions = 0
+        self.waiting = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def admit(self, *, trainer_version_fn) -> None:
+        del trainer_version_fn
+        self.admissions += 1
+        if self.admissions == 2:
+            self.waiting.set()
+            await self.release.wait()
+        return None
+
+
+def test_rollout_pump_marks_a_drawn_batch_pending_before_admission() -> None:
+    # A checkpoint taken while admit() waits has the dataloader past the second
+    # batch already. With a dropped replay buffer only PENDING_PROMPTS_FILENAME
+    # brings it back on resume, so it must be pending from the draw on, not from
+    # its launch.
+    buffer = _RecordingBuffer()
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._buffer = buffer
+    ctrl._async_cfg = SimpleNamespace(
+        max_inflight_prompts=2,
+        diagnostics=False,
+        rollout_failure=_failure_cfg(),
+    )
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._rollout_manager = _RecordingRolloutManager(buffer)
+    sampler = _HoldSecondAdmission()
+    ctrl._sampler = sampler
+    ctrl._dataloader = [
+        BatchedDataDict(
+            {"message_log": [[{"role": "user", "content": "prompt"}]], "idx": [idx]}
+        )
+        for idx in (3, 8)
+    ]
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._buffer_capacity = asyncio.Semaphore(2)
+    ctrl._inflight_rollouts = 0
+    ctrl._inflight_by_group_id = {}
+    ctrl._dispatched_rollouts = set()
+    ctrl._trainer_version = 0
+    ctrl._current_epoch = 0
+    ctrl._pending_prompt_idx = set()
+    _init_pump_ledgers(ctrl)
+
+    async def _run() -> list[int]:
+        pump = asyncio.create_task(ctrl._rollout_pump())
+        await asyncio.wait_for(sampler.waiting.wait(), timeout=10)
+        pending_while_admission_waits = sorted(ctrl._pending_prompt_idx)
+        sampler.release.set()
+        await asyncio.wait_for(pump, timeout=10)
+        return pending_while_admission_waits
+
+    assert asyncio.run(_run()) == [3, 8]
+    # Nothing trained, so both stay pending and both were dispatched once.
+    assert sorted(ctrl._pending_prompt_idx) == [3, 8]
+    assert len(buffer.target_step_list) == 2
+
+
 @pytest.mark.parametrize(
     ("outcome", "expect_permit_released"),
     [

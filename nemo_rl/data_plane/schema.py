@@ -146,6 +146,19 @@ ROUTE_ENCODING_LIST = 2
 ROUTE_PLAN_TAG = "route_assembly_plan"
 ROUTE_PASSTHROUGH_FLAG = "route_passthrough"
 
+# Sampler top-k per generated token (token_capture.top_logprobs > 0), consumed
+# by loss_fn.score_centering: int32 ids and float32 log-probs, both ``[..., k]``.
+# Staging rows hold one call's generated positions; canonical rows are
+# token-aligned with zeros on prompt and tool tokens.
+GENERATION_TOPK_IDS_FIELD = "generation_topk_ids"
+GENERATION_TOPK_LOGPROBS_FIELD = "generation_topk_logprobs"
+GENERATION_TOPK_FIELDS = (GENERATION_TOPK_IDS_FIELD, GENERATION_TOPK_LOGPROBS_FIELD)
+# A context-parallel rank's block of every padded top-k row, under which the trainer's fetch
+# leaves it (``TQWorkerMixin._fetch``); the Megatron microbatch iterator gathers the rows back.
+GENERATION_TOPK_CP_BLOCK_FIELDS = {
+    field: f"{field}_cp_block" for field in GENERATION_TOPK_FIELDS
+}
+
 
 def fields_with_optional_routed_experts(
     fields: Sequence[str],

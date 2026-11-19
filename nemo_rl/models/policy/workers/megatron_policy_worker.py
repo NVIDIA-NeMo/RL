@@ -486,6 +486,17 @@ class MegatronPolicyWorkerImpl(
             "pipeline_parallel": parallel_state.get_pipeline_model_parallel_rank(),
         }
 
+    def _topk_split(self) -> Optional[tuple[int, int]]:
+        """Keep one CP block per rank; reconstruct just the active microbatch.
+
+        c05d08389's model-independent path. This Nano worker has no NT4 MIMO
+        encoder branches; all ranks use the existing Megatron CP group.
+        """
+        return (
+            parallel_state.get_context_parallel_rank(),
+            parallel_state.get_context_parallel_world_size(),
+        )
+
     def _routed_experts_dimensions(self) -> tuple[int, int]:
         """Return route dimensions from the initialized Megatron model config."""
         return router_replay_dimensions(self._get_model_config())

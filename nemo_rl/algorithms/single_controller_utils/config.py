@@ -30,6 +30,8 @@ from pydantic import (
 )
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.single_controller_utils.tool_failure_credit import tool_failure_credit_config
+from nemo_rl.algorithms.single_controller_utils.malformed_think_credit import malformed_think_credit_config
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
@@ -59,6 +61,7 @@ from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.experience.invalid_samples import parse_invalid_sample_failure_kinds
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
@@ -699,6 +702,10 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     defer_routed_experts_to_policy: bool = False
     # Fixed CPU finalizer pool size; actors are never automatically replaced.
     num_reassembler_workers: PositiveInt = 2
+    # Also stage the sampler's top-k log-probs for every generated token
+    # (0 = off); loss_fn.score_centering consumes them. Needs
+    # policy.generation.vllm_kwargs.max_logprobs >= top_logprobs.
+    top_logprobs: int = 0
 
 
 @dataclass(frozen=True)
@@ -857,6 +864,41 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
         return self
 
 
+class RolloutCollectionConfig(BaseModel, extra="forbid"):
+    """Generation-only rollout collection for offline critic pretraining (PPO only).
+
+    ``enabled=True`` turns a PPO config into a collection job (stage A of the
+    legacy decoupled pipeline): every node serves vLLM, which loads the policy
+    from ``policy.model_name``; there is no trainer, critic, logprob forward or
+    refit. Rollouts are generated and finalized exactly as in training (token
+    capture, segment rows), and each step's groups are written to ``bank_dir``
+    (see ``rollout_bank.py``) for
+    ``examples/run_critic_pretrain_single_controller.py``. Run one small job per
+    data shard; checkpoints carry only the dataloader position.
+    """
+
+    enabled: bool = False
+    # Directory the per-step bank shards are written to. Required when enabled.
+    bank_dir: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_bank_dir(self) -> "RolloutCollectionConfig":
+        """Require a bank directory when collection is on."""
+        if self.enabled and not self.bank_dir:
+            raise ValueError("rollout_collection.enabled requires bank_dir")
+        return self
+
+
+def rollout_collection_enabled(master_config: MasterConfig) -> bool:
+    """Whether this run collects rollouts into a bank instead of training.
+
+    ``model_construct`` skips defaults, so the block can be missing on a
+    hand-built config.
+    """
+    collection = getattr(master_config, "rollout_collection", None)
+    return bool(collection is not None and collection.enabled)
+
+
 class MasterConfig(BaseModel, extra="allow"):
     # algo configs
     grpo: Optional[GRPOConfig] = None
@@ -883,6 +925,9 @@ class MasterConfig(BaseModel, extra="allow"):
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
     telemetry: Optional[TelemetryConfig] = None
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
+    rollout_collection: RolloutCollectionConfig = Field(
+        default_factory=RolloutCollectionConfig
+    )
 
     @model_validator(mode="after")
     def validate_algorithm_block(self) -> "MasterConfig":
@@ -1205,6 +1250,62 @@ def _validate_swe_privileged_critic(master_config: MasterConfig) -> None:
         )
 
 
+def _validate_value_head(master_config: MasterConfig) -> None:
+    """Check value.head parses and fits value_loss_fn before any worker starts."""
+    from nemo_rl.algorithms.loss.loss_functions import build_value_loss_fn
+
+    build_value_loss_fn(master_config.value_loss_fn, master_config.value)  # type: ignore
+
+
+def _validate_rollout_collection(master_config: MasterConfig) -> None:
+    """Check a collection run's settings (see RolloutCollectionConfig)."""
+    if not rollout_collection_enabled(master_config):
+        return
+    if not is_ppo_run(master_config):
+        raise ValueError(
+            "rollout_collection banks rollouts for PPO critic pretraining and "
+            "needs the `ppo` block: its row padding, masks and advantage stage "
+            "are what the bank and the pretraining driver reproduce."
+        )
+    generation = master_config.policy["generation"]
+    if generation["backend"] != "vllm" or generation["colocated"]["enabled"]:
+        raise ValueError(
+            "rollout_collection needs a non-colocated vLLM engine: with no "
+            "trainer, the engine must load the policy from disk."
+        )
+    if master_config.checkpointing.get("save_data_plane") or (
+        master_config.async_rl.checkpoint_replay_buffer
+    ):
+        raise ValueError(
+            "rollout_collection checkpoints only the dataloader position: set "
+            "checkpointing.save_data_plane=false and "
+            "async_rl.checkpoint_replay_buffer=false."
+        )
+    if master_config.data_plane["backend"] == "mooncake_cpu":
+        raise ValueError(
+            "rollout_collection supports data_plane.backend='simple' only: Mooncake "
+            "checkpointing runs through the trainer, which a collection job lacks."
+        )
+    if master_config.async_rl.generation_fleet_health.restart_dead_shards:
+        raise ValueError(
+            "rollout_collection cannot restart dead engines: a restart is followed "
+            "by a refit from the trainer. Set "
+            "async_rl.generation_fleet_health.restart_dead_shards=false."
+        )
+    if master_config.ppo.policy_training_start_step > 0:  # type: ignore[union-attr]
+        raise ValueError(
+            "rollout_collection never trains the policy, so "
+            "ppo.policy_training_start_step must stay 0."
+        )
+    if master_config.ppo.warm_start_value_checkpoint is not None:  # type: ignore[union-attr]
+        warnings.warn(
+            "ppo.warm_start_value_checkpoint is ignored by rollout_collection: "
+            "the critic is not built.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+
 def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
@@ -1373,6 +1474,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
     _validate_swe_privileged_critic(master_config)
+    _validate_value_head(master_config)
 
     sampler_name = async_config.sampler.name
     if sampler_name == "ready_first":
@@ -1445,7 +1547,9 @@ def _validate_segment_rows_config(master_config: MasterConfig) -> None:
         )
     policy_config = master_config.policy
     sequence_packing_config = (
-        policy_config.get("sequence_packing", {}) if isinstance(policy_config, Mapping) else {}
+        policy_config.get("sequence_packing", {})
+        if isinstance(policy_config, Mapping)
+        else {}
     ) or {}
     if not sequence_packing_config.get("enabled", False):
         raise ValueError(
@@ -1462,14 +1566,21 @@ def _validate_segment_rows_config(master_config: MasterConfig) -> None:
         double_counting = [
             name
             for name, enabled in (
-                ("grpo.use_dynamic_sampling", getattr(algo_cfg, "use_dynamic_sampling", False)),
+                (
+                    "grpo.use_dynamic_sampling",
+                    getattr(algo_cfg, "use_dynamic_sampling", False),
+                ),
                 (
                     "grpo.reward_shaping.enabled",
-                    getattr(getattr(algo_cfg, "reward_shaping", None), "enabled", False),
+                    getattr(
+                        getattr(algo_cfg, "reward_shaping", None), "enabled", False
+                    ),
                 ),
                 (
                     "grpo.reward_scaling.enabled",
-                    getattr(getattr(algo_cfg, "reward_scaling", None), "enabled", False),
+                    getattr(
+                        getattr(algo_cfg, "reward_scaling", None), "enabled", False
+                    ),
                 ),
             )
             if enabled
@@ -1504,6 +1615,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "Use the non-streaming GRPO trainer."
         )
     _validate_algo_settings(master_config)
+    _validate_rollout_collection(master_config)
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
@@ -1516,6 +1628,56 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "reward_penalties require the NeMo-Gym rollout path "
             "(env.should_use_nemo_gym=true) on SingleController"
         )
+
+    if (
+        parse_invalid_sample_failure_kinds(master_config.env)
+        and not master_config.token_capture.enabled
+    ):
+        raise NotImplementedError(
+            "env.invalid_sample_failure_kinds publishes an invalid sample as a token-capture "
+            "placeholder, so it needs the token-capture path (token_capture.enabled=true)."
+        )
+
+    top_logprobs = master_config.token_capture.top_logprobs
+    if top_logprobs > 0:
+        if not master_config.token_capture.enabled:
+            raise ValueError(
+                "token_capture.top_logprobs requires token_capture.enabled=true"
+            )
+        if master_config.policy["generation"]["backend"] != "vllm":
+            raise ValueError(
+                "token_capture.top_logprobs requires the vLLM generation backend"
+            )
+        vllm_kwargs = master_config.policy["generation"].get("vllm_kwargs") or {}
+        max_logprobs = vllm_kwargs.get("max_logprobs")
+        if max_logprobs is None or max_logprobs < top_logprobs:
+            raise ValueError(
+                "token_capture.top_logprobs requires "
+                f"policy.generation.vllm_kwargs.max_logprobs >= {top_logprobs} "
+                "(vLLM's default is 20)"
+            )
+    if master_config.loss_fn.score_centering:
+        if top_logprobs == 0:
+            raise ValueError(
+                "loss_fn.score_centering requires token_capture.top_logprobs > 0"
+            )
+        generation_cfg = master_config.policy["generation"]
+        if (
+            generation_cfg.get("top_p") != 1.0
+            or generation_cfg.get("top_k") is not None
+        ):
+            raise ValueError(
+                "loss_fn.score_centering needs unfiltered sampling "
+                "(policy.generation.top_p=1, top_k=null) so the captured top-k is "
+                "the sampling distribution"
+            )
+        # vLLM returns pre-temperature log-probs unless logprobs_mode is
+        # processed_logprobs, so only temperature 1 makes them the sampling
+        # distribution in every mode.
+        if generation_cfg.get("temperature", 1.0) != 1.0:
+            raise ValueError(
+                "loss_fn.score_centering needs policy.generation.temperature=1"
+            )
 
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
         raise ValueError(
@@ -1703,6 +1865,43 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "active algorithm block require the NeMo-Gym rollout path "
             "(env.should_use_nemo_gym=true) on SingleController."
         )
+
+    # tool_failure_credit: the advantage stage finds failed tool calls in the captured token rows,
+    # so it needs NeMo-Gym rollouts with token capture.
+    if tool_failure_credit_config(algo_cfg) is not None:
+        if not should_use_nemo_gym(master_config):
+            raise ValueError(
+                "tool_failure_credit.enabled requires the NeMo-Gym rollout path "
+                "(env.should_use_nemo_gym=true) on SingleController."
+            )
+        if not master_config.token_capture.enabled:
+            raise NotImplementedError(
+                "tool_failure_credit.enabled finds failed tool calls in the captured token rows, "
+                "so it needs the token-capture path (token_capture.enabled=true)."
+            )
+        if opd_module.is_opd_enabled(master_config):
+            raise ValueError(
+                "tool_failure_credit clips reward advantages; with on_policy_distillation the "
+                "advantage is the teacher-student log-prob gap, so the clip does not apply."
+            )
+
+    # malformed_think_credit: the advantage stage finds malformed turns in the captured token rows.
+    if malformed_think_credit_config(algo_cfg) is not None:
+        if not should_use_nemo_gym(master_config):
+            raise ValueError(
+                "malformed_think_credit.enabled requires the NeMo-Gym rollout path "
+                "(env.should_use_nemo_gym=true) on SingleController."
+            )
+        if not master_config.token_capture.enabled:
+            raise NotImplementedError(
+                "malformed_think_credit.enabled finds malformed turns in the captured token rows, "
+                "so it needs the token-capture path (token_capture.enabled=true)."
+            )
+        if opd_module.is_opd_enabled(master_config):
+            raise ValueError(
+                "malformed_think_credit sets reward advantages; with on_policy_distillation the "
+                "advantage is the teacher-student log-prob gap, so a fixed value does not apply."
+            )
 
     opd_enabled = opd_module.is_opd_enabled(master_config)
     if opd_enabled and is_ppo_run(master_config):

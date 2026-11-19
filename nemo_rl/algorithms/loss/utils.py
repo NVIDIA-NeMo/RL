@@ -357,7 +357,7 @@ def _pack_input_ids(
     cp_size: int = 1,
     roll_shift: int = 0,
 ) -> torch.Tensor:
-    """Pack input_ids from [B, S] to [1, T_packed // CP] using sequence boundaries.
+    """Pack input_ids from [B, S, ...] to [1, T_packed // CP, ...] using sequence boundaries.
 
     Each sequence is individually padded to its padded length (from
     cu_seqlens_q_padded), optionally rolled, and CP-sharded at that padded
@@ -377,13 +377,13 @@ def _pack_input_ids(
     batch_size = input_ids.shape[0]
     total_packed_len = int(cu_seqlens_q_padded[-1].item()) // cp_size
     packed = torch.zeros(
-        total_packed_len, dtype=input_ids.dtype, device=input_ids.device
+        (total_packed_len, *input_ids.shape[2:]), dtype=input_ids.dtype, device=input_ids.device
     )
     for i in range(batch_size):
         actual_len = int((cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item())
         padded_len = int((cu_seqlens_q_padded[i + 1] - cu_seqlens_q_padded[i]).item())
         packed_start = int(cu_seqlens_q_padded[i].item())
-        seq = torch.zeros(padded_len, dtype=input_ids.dtype, device=input_ids.device)
+        seq = torch.zeros((padded_len, *input_ids.shape[2:]), dtype=input_ids.dtype, device=input_ids.device)
         # The packer absorbs bin-level alignment padding into the last
         # sequence's effective length (see _get_pack_sequence_parameters_for_megatron),
         # so cu_seqlens can exceed the unpacked row width. Copy only real

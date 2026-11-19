@@ -26,6 +26,7 @@ from transformers import (
 )
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.value_head import resolve_value_head
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.checkpoint import (
     AutomodelCheckpointManager,
@@ -147,6 +148,11 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
             config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
 
+        if resolve_value_head(config).categorical:
+            raise NotImplementedError(
+                "value.head.type=hl_gauss is implemented for the Megatron critic "
+                "(value.megatron_cfg.enabled=true), not the DTensor one."
+            )
         assert (
             config["reward_model_cfg"]["enabled"]
             and config["reward_model_cfg"]["reward_model_type"] == "regression"

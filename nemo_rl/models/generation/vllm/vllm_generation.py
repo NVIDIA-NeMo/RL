@@ -640,12 +640,14 @@ class VllmGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        top_logprobs: int = 0,
     ) -> None:
         """Install ledger-authoritative token capture in every DP-leader worker.
 
         Called once at setup when ``token_capture.enabled``; each async worker
         builds its in-worker data-plane client + TQTokenSink and makes the
-        single Gym ``install_capture`` call.
+        single Gym ``install_capture`` call. ``top_logprobs`` > 0 also stages
+        the sampler's top-k log-probs per generated token.
         """
         assert self.cfg["vllm_cfg"]["async_engine"], (
             "token capture requires the async vLLM engine (the capture host "
@@ -656,6 +658,7 @@ class VllmGeneration(GenerationInterface):
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
             capture_media=capture_media,
+            top_logprobs=top_logprobs,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         ray.get(futures)
@@ -1677,7 +1680,16 @@ class VllmGeneration(GenerationInterface):
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
             results = ray.get(futures)
-            return all(result for result in results if result is not None)
+            refused = [i for i, result in enumerate(results) if result is False]
+            if refused:
+                print(
+                    f"⚠️ vLLM prefix-cache reset refused on {len(refused)}/{len(results)} "
+                    f"engine(s) (indices {refused}); their cached prefixes still hold the "
+                    "previous weights",
+                    flush=True,
+                )
+                return False
+            return True
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")
             return False

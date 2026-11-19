@@ -29,6 +29,7 @@ TP=CP=PP=1) and inherit ``train`` / ``get_logprobs`` /
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import Counter
 from typing import TYPE_CHECKING, Any, Literal, Optional
@@ -43,6 +44,8 @@ from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
 from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
+    GENERATION_TOPK_CP_BLOCK_FIELDS,
+    GENERATION_TOPK_FIELDS,
     GLOBAL_FORWARD_PAD_SEQLEN,
     MICRO_BATCH_INDICES,
     MICRO_BATCH_LENGTHS,
@@ -68,6 +71,9 @@ if TYPE_CHECKING:
     )
 
 FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
+
+# The most bytes of captured top-k rows one broadcast stages on a rank's device.
+_TOPK_CHUNK_BYTES = 1 << 30
 
 
 def _broadcast_batched_data_dict(
@@ -227,6 +233,124 @@ def _broadcast_batched_data_dict(
     return out
 
 
+def _topk_blocks(
+    values: dict[str, torch.Tensor],
+    *,
+    split: tuple[int, int],
+    pad_value_dict: dict[str, Any],
+    pad_to_seqlen: int,
+    is_leader: bool = True,
+    src: int = 0,
+    group: Any = None,
+) -> dict[str, torch.Tensor]:
+    """This rank's block of every row of the captured top-k fields (``GENERATION_TOPK_FIELDS``).
+
+    A field's rows (``[L_r, K]``, nested or dense) are right-padded with its pad value to
+    ``width = max(L_r over rows, pad_to_seqlen)``, as :func:`materialize` pads them, and cut into
+    ``count`` blocks of ``ceil(width / count)`` positions. ``split = (index, count)`` keeps block
+    ``index`` of every row on the host, ``[B, ceil(width / count), K]``: under the field's name
+    for ``count == 1`` (the padded field itself), else under
+    ``GENERATION_TOPK_CP_BLOCK_FIELDS[field]``.
+
+    With a ``group``, only the source reads ``values``. It broadcasts the rows unpadded through
+    the group's device, at most ``_TOPK_CHUNK_BYTES`` of them at a time, and every rank copies
+    its block of each row to the host, so no rank stages a padded field or keeps a device copy
+    of the rows.
+    """
+    index, count = split
+    rows = {field: value.unbind() for field, value in values.items()}
+    descriptor = {
+        field: (
+            [row.shape[0] for row in rows[field]],
+            value.dtype,
+            tuple(rows[field][0].shape[1:]),
+        )
+        for field, value in values.items()
+    }
+    if group is not None:
+        payload = [descriptor if is_leader else None]
+        torch.distributed.broadcast_object_list(payload, src=src, group=group)
+        descriptor = payload[0]
+
+    out: dict[str, torch.Tensor] = {}
+    for field, (lengths, dtype, trailing) in descriptor.items():
+        size = -(-max(*lengths, pad_to_seqlen) // count)
+        start = index * size
+        blocks = torch.full(
+            (len(lengths), size, *trailing),
+            pad_value_dict.get(field, 0),
+            dtype=dtype,
+        )
+        out[field if count == 1 else GENERATION_TOPK_CP_BLOCK_FIELDS[field]] = blocks
+        if group is None:
+            for row, block in zip(rows[field], blocks):
+                piece = row[start : start + size]
+                block[: piece.shape[0]] = piece
+            continue
+
+        device = (
+            torch.cuda.current_device()
+            if torch.distributed.get_backend(group) == "nccl"
+            else "cpu"
+        )
+        token_bytes = math.prod(trailing) * dtype.itemsize
+        first = 0
+        while first < len(lengths):
+            last, tokens = first + 1, lengths[first]
+            while (
+                last < len(lengths)
+                and (tokens + lengths[last]) * token_bytes <= _TOPK_CHUNK_BYTES
+            ):
+                tokens += lengths[last]
+                last += 1
+            chunk = torch.empty((tokens, *trailing), dtype=dtype, device=device)
+            if is_leader:
+                offset = 0
+                for row in rows[field][first:last]:
+                    chunk[offset : offset + row.shape[0]].copy_(row)
+                    offset += row.shape[0]
+            torch.distributed.broadcast(chunk, src=src, group=group)
+            offset = 0
+            for block, length in zip(blocks[first:last], lengths[first:last]):
+                kept = max(0, min(size, length - start))
+                block[:kept].copy_(chunk[offset + start : offset + start + kept])
+                offset += length
+            del chunk
+            first = last
+    return out
+
+
+def gather_topk_cp_blocks(data: BatchedDataDict[Any], cp_group: Any) -> None:
+    """Rebuild a microbatch's captured top-k rows from its context-parallel ranks' blocks.
+
+    The trainer's fetch leaves context-parallel rank ``r`` block ``r`` of every padded top-k
+    row, under ``GENERATION_TOPK_CP_BLOCK_FIELDS`` (``TQWorkerMixin._topk_split``). The loss
+    and the logprob pass read whole rows, as wide as ``input_ids``, so every rank of
+    ``cp_group`` gathers them back for the same microbatch. A batch without blocks is left
+    alone.
+    """
+    for field, key in GENERATION_TOPK_CP_BLOCK_FIELDS.items():
+        if key not in data:
+            continue
+        blocks = data.pop(key)
+        rows = blocks.new_empty(
+            (
+                blocks.shape[0],
+                torch.distributed.get_world_size(cp_group) * blocks.shape[1],
+                *blocks.shape[2:],
+            )
+        )
+        for row, block in zip(rows, blocks):
+            torch.distributed.all_gather_single(row, block, group=cp_group)
+        width = data["input_ids"].shape[1]
+        if rows.shape[1] < width:
+            raise ValueError(
+                f"The context-parallel blocks of {field!r} rebuild {rows.shape[1]} "
+                f"positions per row, but the microbatch is {width} wide."
+            )
+        data[field] = rows[:, :width]
+
+
 def _materialize_fetched(
     td: Any,
     *,
@@ -353,6 +477,18 @@ class TQWorkerMixin:
         """
         return None
 
+    def _topk_split(self) -> Optional[tuple[int, int]]:
+        """How this rank holds the captured top-k fields (``GENERATION_TOPK_FIELDS``) it fetches.
+
+        ``(index, count)``: block ``index`` of every padded row cut into ``count`` blocks
+        (:func:`_topk_blocks`); for ``count > 1``, ``index`` and ``count`` are the rank's
+        context-parallel rank and size, and its consumers rebuild the rows with
+        :func:`gather_topk_cp_blocks`. None: the rank never reads the fields and does not
+        fetch them. Every rank of a replica group must agree on None. The default keeps whole
+        rows.
+        """
+        return 0, 1
+
     def _routed_experts_dimensions(self) -> tuple[int, int]:
         """Return model-owned ``(num_moe_layers, top_k)`` route dimensions."""
         raise NotImplementedError(
@@ -406,7 +542,8 @@ class TQWorkerMixin:
                 Forward-pass pad target is read from
                 ``meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN]`` minted by
                 :meth:`TQPolicy._stamp_pad_seqlen`.
-            layout: Materialization layout (``"padded"`` or ``"jagged"``).
+            layout: Materialization layout (``"padded"`` or ``"jagged"``) of every field
+                but the captured top-k, which arrives padded as :meth:`_topk_split` says.
             fetch_policy: ``"auto"`` uses leader-fetch + NCCL broadcast when
                 :meth:`_get_replica_group` returns a group, else independent
                 fetch (cheapest for TP=CP=PP=1). ``"independent"`` forces
@@ -440,25 +577,42 @@ class TQWorkerMixin:
 
         pad_to_seqlen = self._forward_pad_seqlen(meta) if dp_aligned_seq_len else 0
         local_batch = is_local_batch_meta(meta)
+        # The captured top-k skips ``materialize``: it is kept as each rank's block of the
+        # padded rows (_topk_blocks), or left out where the rank never reads it.
+        topk_fields = [
+            field for field in meta.fields if field in GENERATION_TOPK_FIELDS
+        ]
+        topk_split = self._topk_split() if topk_fields else None
+        if topk_split is None:
+            topk_fields = []
+        select_fields = [
+            field
+            for field in meta.fields
+            if field not in GENERATION_TOPK_FIELDS or field in topk_fields
+        ]
 
         if replica_group is not None and replica_group.size() > 1:
             is_leader = self._is_replica_leader()
             leader = torch.distributed.get_global_rank(replica_group, 0)
+            topk: dict[str, torch.Tensor] = {}
             if is_leader:
                 dp_client = self._require_dp_client()
                 if local_batch:
                     td = dp_client.get_data(
                         meta,
-                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+                        select_fields=select_fields,  # type: ignore[no-matching-overload]
                     )
                 else:
                     td = dp_client.get_samples(
                         sample_ids=meta.sample_ids,
                         partition_id=meta.partition_id,
-                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+                        select_fields=select_fields,  # type: ignore[no-matching-overload]
                     )
+                topk = {
+                    field: td.get(field) for field in topk_fields if field in td.keys()
+                }
                 data = _materialize_fetched(
-                    td,
+                    td.exclude(*topk),
                     local_batch=local_batch,
                     layout=layout,
                     pad_value_dict=pad_value_dict,
@@ -474,6 +628,18 @@ class TQWorkerMixin:
                 src=leader,
                 group=replica_group,
             )
+            if topk_split is not None:
+                data.update(
+                    _topk_blocks(
+                        topk,
+                        split=topk_split,
+                        pad_value_dict=pad_value_dict,
+                        pad_to_seqlen=pad_to_seqlen,
+                        is_leader=is_leader,
+                        src=leader,
+                        group=replica_group,
+                    )
+                )
             # Reconstruct message_log after broadcast so the views alias
             # the per-rank local ``input_ids`` rather than the leader's.
             attach_message_log_view(data)
@@ -490,16 +656,17 @@ class TQWorkerMixin:
         if local_batch:
             td = dp_client.get_data(
                 meta,
-                select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+                select_fields=select_fields,  # type: ignore[no-matching-overload]
             )
         else:
             td = dp_client.get_samples(
                 sample_ids=meta.sample_ids,
                 partition_id=meta.partition_id,
-                select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+                select_fields=select_fields,  # type: ignore[no-matching-overload]
             )
+        topk = {field: td.get(field) for field in topk_fields if field in td.keys()}
         data = _materialize_fetched(
-            td,
+            td.exclude(*topk),
             local_batch=local_batch,
             layout=layout,
             pad_value_dict=pad_value_dict,
@@ -507,6 +674,15 @@ class TQWorkerMixin:
             tags=meta.tags,
         )
         data = self._maybe_assemble_routed_experts(meta, data)
+        if topk_split is not None:
+            data.update(
+                _topk_blocks(
+                    topk,
+                    split=topk_split,
+                    pad_value_dict=pad_value_dict,
+                    pad_to_seqlen=pad_to_seqlen,
+                )
+            )
         attach_message_log_view(data)
         trace_tq_fetch_payload(
             stage=meta.task_name or "unknown",
@@ -902,6 +1078,7 @@ class TQWorkerMixin:
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         privilege_prefixes: Optional[dict[str, torch.Tensor]] = None,
+        sample_mask_override: Optional[dict[str, float]] = None,
     ) -> dict[str, Any]:
         """Per-rank training entrypoint. Fetch → packing prep → delegate.
 
@@ -910,6 +1087,14 @@ class TQWorkerMixin:
         per-token targets are shifted past each row's reference-block prefix.
         """
         data = self._fetch(meta)
+        if sample_mask_override is not None:
+            # Override locally before train() computes DP/CP-global token counts.
+            # No shared data-plane field is changed, so the actor keeps its mask.
+            original = data["sample_mask"]
+            data["sample_mask"] = torch.as_tensor(
+                [sample_mask_override[sid] for sid in meta.sample_ids],
+                dtype=original.dtype, device=original.device,
+            ).reshape_as(original)
         if privilege_prefixes is not None:
             from nemo_rl.algorithms.swe_privileged_critic import (
                 prepend_privilege_prefix,

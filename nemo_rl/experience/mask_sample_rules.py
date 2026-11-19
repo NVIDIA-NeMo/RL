@@ -61,6 +61,20 @@ comparator rule only when you want the opposite policy; the numeric fields
 (``opencode_num_compactions``, ``opencode_num_compaction_attempts``,
 ``opencode_num_model_calls``, ...) are reported by the agent either way.
 
+A rule may also name a ``failure_kind`` (Gym's ``nemo_gym.core.failure_kinds`` vocabulary, e.g.
+``agent_timeout``, ``model_context_limit``, ``verifier_error``). When the rule matches and the
+response carries no ``failure_kind`` of its own, the first matching rule's kind is written into the
+response, so downstream policy (``env.invalid_sample_failure_kinds``,
+experience/invalid_samples.py) keys on one field whether the environment or a rule classified the
+failure::
+
+    env:
+      mask_sample_rules:
+        - name: eval_incomplete
+          field: evaluation_completed
+          equals: false
+          failure_kind: verifier_error
+
 The rules run after the ``env.should_mask_flagged_samples`` gate: that gate
 drops the environment's own (possibly too coarse) flags, while these rules
 are explicit operator choices and are honored regardless. An empty list, the
@@ -77,6 +91,8 @@ from typing import Any
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 
 ENV_MASK_SAMPLE_RULES_KEY = "mask_sample_rules"
+# The Gym response's failure classification (BaseVerifyResponse.failure_kind).
+FAILURE_KIND_KEY = "failure_kind"
 _SCALAR_TYPES = (bool, int, float, str, type(None))
 
 EQUALS = "equals"
@@ -89,7 +105,7 @@ _COMPARATORS: dict[str, Callable[[Any, Any], bool]] = {
     "le": _op.le,
 }
 OPERATORS: tuple[str, ...] = (EQUALS, *_COMPARATORS)
-_RULE_KEYS = frozenset({"name", "field", *OPERATORS})
+_RULE_KEYS = frozenset({"name", "field", FAILURE_KIND_KEY, *OPERATORS})
 
 
 def _is_number(value: Any) -> bool:
@@ -112,6 +128,8 @@ class MaskSampleRule:
     field: str
     equals: Any
     operator: str = EQUALS
+    # Written into a matched response that has no failure_kind of its own.
+    failure_kind: str | None = None
 
     def __post_init__(self) -> None:
         if self.operator not in OPERATORS:
@@ -150,9 +168,7 @@ def parse_mask_sample_rules(
     for index, entry in enumerate(raw):
         prefix = f"env.{ENV_MASK_SAMPLE_RULES_KEY}[{index}]"
         if not isinstance(entry, Mapping):
-            raise ValueError(
-                f"{prefix} must be a mapping, got {type(entry).__name__}"
-            )
+            raise ValueError(f"{prefix} must be a mapping, got {type(entry).__name__}")
         field = entry.get("field")
         if not isinstance(field, str) or not field.strip() or field != field.strip():
             raise ValueError(f"{prefix}.field must be a non-empty dotted path")
@@ -179,7 +195,20 @@ def parse_mask_sample_rules(
         name = entry.get("name") or field.replace(".", "_")
         if not isinstance(name, str) or not name.strip():
             raise ValueError(f"{prefix}.name must be a non-empty string")
-        rules.append(MaskSampleRule(name=name, field=field, equals=operand, operator=op))
+        failure_kind = entry.get(FAILURE_KIND_KEY)
+        if failure_kind is not None and (
+            not isinstance(failure_kind, str) or not failure_kind.strip()
+        ):
+            raise ValueError(f"{prefix}.failure_kind must be a non-empty string")
+        rules.append(
+            MaskSampleRule(
+                name=name,
+                field=field,
+                equals=operand,
+                operator=op,
+                failure_kind=failure_kind,
+            )
+        )
     names = [rule.name for rule in rules]
     if len(set(names)) != len(names):
         raise ValueError(
@@ -232,8 +261,9 @@ def apply_mask_sample_rules(
 ) -> list[str]:
     """Set ``instance_config.mask_sample`` on ``full_result`` when a rule matches.
 
-    Returns the names of the matching rules (empty when none match or ``rules``
-    is empty, in which case ``full_result`` is not touched).
+    A response without a ``failure_kind`` also gets the first matching rule's
+    ``failure_kind``, if any. Returns the names of the matching rules (empty when
+    none match or ``rules`` is empty, in which case ``full_result`` is not touched).
     """
     matched = matching_rules(full_result, rules)
     if matched:
@@ -242,6 +272,14 @@ def apply_mask_sample_rules(
             instance_config = {}
             full_result["instance_config"] = instance_config
         instance_config[MASK_SAMPLE] = True
+        if full_result.get(FAILURE_KIND_KEY) is None:
+            kinds = [
+                rule.failure_kind
+                for rule in rules
+                if rule.name in matched and rule.failure_kind is not None
+            ]
+            if kinds:
+                full_result[FAILURE_KIND_KEY] = kinds[0]
     return matched
 
 

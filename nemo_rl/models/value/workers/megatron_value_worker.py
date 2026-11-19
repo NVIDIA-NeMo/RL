@@ -52,6 +52,12 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.value_head import (
+    ValueHeadConfig,
+    decode_values,
+    prior_bias,
+    resolve_value_head,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
@@ -135,16 +141,51 @@ def _install_value_head_load_skip(chunk: GPTModel) -> None:
     chunk.hide_loss_modules = hide_loss_modules
 
 
-def make_value_head_hook(hidden_size: int, sequence_parallel: bool):
-    """Build the pre-wrap hook that installs the value head and lets it skip base loads."""
+def _init_categorical_head(layer: LinearForLastLayer, head: ValueHeadConfig) -> None:
+    """Apply ``head.weight_init_scale`` and add the ``head.prior_success`` bias.
+
+    Bridge builds the value head without a bias; LinearForLastLayer.forward is
+    nn.Linear's, so a bias registered here is used, and like the weight it is marked
+    sequence-parallel so its gradient is all-reduced across TP.
+    """
+    if not head.categorical:
+        return
+    with torch.no_grad():
+        if head.weight_init_scale != 1.0:
+            layer.weight.mul_(head.weight_init_scale)
+        if head.prior_success is not None:
+            bias = torch.nn.Parameter(prior_bias(head).to(layer.weight))
+            if layer.sequence_parallel:
+                setattr(bias, "sequence_parallel", True)
+            layer.bias = bias
+
+
+def make_value_head_hook(
+    hidden_size: int,
+    sequence_parallel: bool,
+    head: Optional[ValueHeadConfig] = None,
+):
+    """Build the pre-wrap hook that installs the value head and lets it skip base loads.
+
+    The head is hidden -> ``head.output_size``: one value, or HL-Gauss bin logits.
+    """
+    head = head if head is not None else ValueHeadConfig()
     base_hook = create_value_head_hook(
-        hidden_size=hidden_size, sequence_parallel=sequence_parallel
+        hidden_size=hidden_size,
+        sequence_parallel=sequence_parallel,
+        output_size=head.output_size,
     )
 
     def hook(model):
         model = base_hook(model)
         for chunk in model if isinstance(model, list) else [model]:
-            if isinstance(getattr(chunk, "output_layer", None), LinearForLastLayer):
+            output_layer = getattr(chunk, "output_layer", None)
+            if isinstance(output_layer, LinearForLastLayer):
+                # The categorical head keeps the default random init, like the scalar
+                # head. A zero-init head passes the backbone no gradient (dL/dh = W^T
+                # dL/dlogits), and with Adam at a small constant lr W grows by ~lr per
+                # step: a 60-step stage-B run learned only the marginal (EV ~0).
+                _init_categorical_head(output_layer, head)
                 _install_value_head_load_skip(chunk)
         return model
 
@@ -204,10 +245,13 @@ def _value_loss_prepare_fn(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> tuple[dict[str, torch.Tensor], BatchedDataDict[Any]]:
-    """Prepare the value-head output for ``MseValueLossFn`` (LossPostProcessor prepare_fn).
+    """Prepare the value-head output for the value loss (LossPostProcessor prepare_fn).
 
     All-gather across CP (packed only — CP requires packing), shift right by one
     so ``values[t] = V(state before token t)``, then truncate to ``data["returns"]``.
+    The scalar head's output becomes ``[B, S]``; HL-Gauss bin logits stay
+    ``[B, S, num_bins]`` for the cross-entropy (the shifted-in first row is all zeros,
+    a uniform distribution at a masked position).
     """
     values = logits
     # Drop the value head's trailing singleton ([..., 1]).
@@ -223,6 +267,40 @@ def _value_loss_prepare_fn(
     values = torch.cat([torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1)
     values = values[:, : data["returns"].shape[1]]
     return {"logits": values}, data
+
+
+def _cpu_shm_async_save_strategy(ckpt_cfg: Any, model: list) -> Any:
+    """Bridge's torch_dist save strategy, staging async writes through CPU shared memory.
+
+    By default NVRx's persistent writer opens the trainer's CUDA tensors through
+    IPC handles; on NVL72 (MNNVL) nodes that import fails ("CUDA driver error:
+    out of memory" in rebuild_cuda_tensor) once the training ranks hold the
+    NVLink fabric resources, and the trainer then waits on the dead writer.
+    Megatron-Core's ``cpu_shm_mode`` makes the trainer copy the tensors to CPU
+    shared memory itself, so the writer never touches the GPU. Bridge builds this
+    same strategy without exposing the flag, and uses
+    ``checkpointing_context["save_strategy"]`` instead when it is set.
+    """
+    from megatron.core.dist_checkpointing.strategies.fully_parallel import (
+        FullyParallelSaveStrategyWrapper,
+    )
+    from megatron.core.dist_checkpointing.strategies.torch import (
+        TorchDistSaveShardedStrategy,
+    )
+
+    strategy = TorchDistSaveShardedStrategy(
+        "torch_dist",
+        1,
+        thread_count=ckpt_cfg.storage_writers_per_rank,
+        cpu_shm_mode=True,
+    )
+    if ckpt_cfg.fully_parallel_save:
+        strategy = FullyParallelSaveStrategyWrapper(
+            strategy,
+            get_pg_collection(model).dp_cp,
+            ckpt_cfg.ckpt_assume_constant_structure,
+        )
+    return strategy
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -369,6 +447,8 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         init_telemetry_worker()
 
         self.cfg = config
+        # value.head: scalar (MSE) or HL-Gauss bins; sizes the head and decodes it.
+        self.value_head = resolve_value_head(config)
         self.rank = get_rank_safe()
 
         # Step 1: Setup distributed
@@ -429,15 +509,17 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         )
 
         # Step 4: Setup Megatron model and components
-        # The value head is an independent hidden->1 head, not tied to the input
-        # embedding. Untie before building so PP>1 does not set up an embedding/
-        # output-weight grad all-reduce that mismatches the [1, hidden] head and hangs.
+        # The value head is an independent hidden->output_size head (1, or the HL-Gauss
+        # bins), not tied to the input embedding. Untie before building so PP>1 does
+        # not set up an embedding/output-weight grad all-reduce that mismatches the
+        # [output_size, hidden] head and hangs.
         self.megatron_cfg.model.share_embeddings_and_output_weights = False
-        # Replace output_layer with a hidden->1 value head before DDP wrapping, so grad
+        # Replace output_layer with the value head before DDP wrapping, so grad
         # sync, the optimizer, dist-checkpoint save/load, PP, and SP are all inherited.
         value_head_hook = make_value_head_hook(
             hidden_size=self.megatron_cfg.model.hidden_size,
             sequence_parallel=self.megatron_cfg.model.sequence_parallel,
+            head=self.value_head,
         )
 
         model_and_optimizer_state = setup_model_and_optimizer(
@@ -787,21 +869,24 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                     values = torch.zeros(1, device=output_tensor.device)
                     return torch.tensor(0.0, device=values.device), {"values": values}
 
+                # One value per token: the scalar head's output, or the expectation
+                # of the HL-Gauss bins ([..., output_size] -> [...]).
+                token_values = decode_values(output_tensor, self.value_head)
                 if processed_mb.cu_seqlens_padded is not None:
-                    # Packed (and possibly CP-sharded) [1, T // CP, 1] -> [B, S],
+                    # Packed (and possibly CP-sharded) [1, T // CP] -> [B, S],
                     # per-sequence shift + CP all-gather.
                     cp_size = get_context_parallel_world_size()
                     values = _unpack_value_sequences(
-                        output_tensor.squeeze(-1),
+                        token_values,
                         processed_mb.cu_seqlens_padded,
                         seq_length,
                         cp_group=get_context_parallel_group() if cp_size > 1 else None,
                     )
                 else:
                     # [B, S]: shift right by 1 so values[t] = V(state before token t).
-                    values = output_tensor.squeeze(-1)
                     values = torch.cat(
-                        [torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1
+                        [torch.zeros_like(token_values[:, :1]), token_values[:, :-1]],
+                        dim=1,
                     )
                 return torch.tensor(0.0, device=values.device), {"values": values}
 
@@ -941,12 +1026,25 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        defer_finalize: bool = False,
         **kwargs,
     ):
         """Save a checkpoint of the value model.
 
         The value head is the model's ``output_layer`` and is saved as part of
         the normal Megatron dist-checkpoint — no separate value-head sidecar.
+
+        By default the save is complete on return, also with
+        ``megatron_cfg.checkpoint.async_save``. With ``defer_finalize`` and
+        async_save it returns once the persistent writer has staged the tensors
+        to host memory (NVRx joins on that D2H copy before scheduling returns),
+        so the caller may offload and keep training while the disk write runs in
+        the background; the caller must call ``finalize_async_save()`` before
+        renaming or promoting the checkpoint directory.
+
+        Async saves stage through CPU shared memory unless
+        ``megatron_cfg.checkpoint.async_ckpt_use_cpu_shm`` is false (see
+        ``_cpu_shm_async_save_strategy``).
         """
         if not torch.distributed.is_initialized():
             raise RuntimeError(
@@ -954,6 +1052,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             )
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
+        ckpt_cfg = self.mcore_state.cfg.checkpoint
 
         try:
             maybe_finalize_async_save(
@@ -961,6 +1060,17 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 ckpt_cfg=self.mcore_state.cfg.checkpoint,
                 blocking=False,
             )
+            if (
+                ckpt_cfg.async_save
+                and ckpt_cfg.ckpt_format == "torch_dist"
+                and "save_strategy" not in self.checkpointing_context
+                and (self.cfg["megatron_cfg"].get("checkpoint") or {}).get(
+                    "async_ckpt_use_cpu_shm", True
+                )
+            ):
+                self.checkpointing_context["save_strategy"] = (
+                    _cpu_shm_async_save_strategy(ckpt_cfg, [self.model])
+                )
             self.mcore_state.cfg.checkpoint.save = weights_path
 
             optimizer_to_save = None
@@ -984,24 +1094,46 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 checkpointing_context=self.checkpointing_context,
             )
 
-            maybe_finalize_async_save(
-                self.mcore_state,
-                ckpt_cfg=self.mcore_state.cfg.checkpoint,
-                blocking=True,
-                terminate=True,
+            deferred = bool(
+                defer_finalize and self.mcore_state.cfg.checkpoint.async_save
             )
+            if not deferred:
+                maybe_finalize_async_save(
+                    self.mcore_state,
+                    ckpt_cfg=self.mcore_state.cfg.checkpoint,
+                    blocking=True,
+                    terminate=True,
+                )
 
             if self.should_disable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
             torch.distributed.barrier()
-            print(f"Saved value model checkpoint to {weights_path}")
+            print(
+                f"Scheduled value model checkpoint to {weights_path} (async write)"
+                if deferred
+                else f"Saved value model checkpoint to {weights_path}"
+            )
 
         except Exception as e:
             print(f"Failed to save value checkpoint to {weights_path}: {e}")
             raise
         finally:
             self.mcore_state.cfg.checkpoint.save = original_save_path
+
+    def finalize_async_save(self, terminate: bool = False) -> None:
+        """Block until every scheduled async checkpoint write is on disk.
+
+        Runs the writes' finalize steps (metadata, tracker files) on all ranks.
+        No-op without async_save or with nothing pending. ``terminate`` also
+        closes the persistent writer process (at the end of a run).
+        """
+        maybe_finalize_async_save(
+            self.mcore_state,
+            ckpt_cfg=self.mcore_state.cfg.checkpoint,
+            blocking=True,
+            terminate=terminate,
+        )
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a checkpoint for the value model."""

@@ -1143,6 +1143,43 @@ def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     assert ("agent/full_result" in metrics) is log_full_result_tables
 
 
+
+def test_receipt_completions_leave_truncation_rate_to_masking_stats():
+    """Token-capture receipts carry a placeholder truncated=False (no tokens at
+    dispatch); truncation_rate comes from masking_stats after reassembly, so the
+    rollout metrics must not report the placeholder."""
+    impl = _nemo_gym_impl(True)
+    receipt = Completion(
+        message_log=[],
+        env_extras={
+            "reward": 1.0,
+            "ng_receipt": {
+                "rollout_id": "r0",
+                "manifest": [{"cum_len": 10, "delta_len": 4}],
+            },
+            "ng_rollout_id": "r0",
+        },
+        truncated=False,
+        reward=1.0,
+    )
+    metrics = impl._compute_rollout_metrics([receipt], "agent")
+    assert "truncation_rate" not in metrics
+    assert "natural_termination_rate" not in metrics
+
+    # Message-log completions measure truncation themselves and keep both.
+    message_log = Completion(
+        message_log=[
+            {"role": "user", "token_ids": [1]},
+            {"role": "assistant", "token_ids": [2, 3]},
+        ],
+        env_extras={"reward": 1.0},
+        truncated=True,
+        reward=1.0,
+    )
+    metrics = impl._compute_rollout_metrics([message_log], "agent")
+    assert metrics["truncation_rate"] == 1.0
+    assert metrics["natural_termination_rate"] == 0.0
+
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):
     assistant_message = {
         "role": "assistant",

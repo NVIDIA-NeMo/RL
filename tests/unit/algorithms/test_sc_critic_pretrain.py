@@ -1,0 +1,939 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Offline critic pretraining on rollout banks (nemo_rl/algorithms/sc_critic_pretrain.py)."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from tensordict import TensorDict
+
+from nemo_rl.algorithms import sc_critic_pretrain as cp
+from nemo_rl.algorithms import swe_privileged_critic as spc
+from nemo_rl.algorithms.advantage_estimator import (
+    GAEConfig,
+    GeneralizedAdvantageEstimator,
+)
+from nemo_rl.algorithms.loss import (
+    ClippedPGLossConfig,
+    MseValueLossConfig,
+    MseValueLossFn,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_bank import (
+    TOKEN_FIELDS,
+    BankGroup,
+    BankGroupRef,
+)
+
+
+def _ref(group_id, *, instance_id=None, prompt_idx=0):
+    return BankGroupRef(
+        path=Path(f"/bank/{group_id}.pt"),
+        step=1,
+        group_id=group_id,
+        prompt_idx=prompt_idx,
+        instance_id=instance_id,
+        rows=1,
+        rollouts=1,
+        reward_mean=0.0,
+    )
+
+
+def _env_info(instance_id):
+    md = {"instance_id": instance_id, "patch": f"diff --git a/{instance_id}"}
+    return {"responses_create_params": {"metadata": md}}
+
+
+def _group(
+    group_id,
+    rollouts,
+    *,
+    rewards=None,
+    subagent=(),
+    env_masked=(),
+    truncated=(),
+    instance_id=None,
+    length=5,
+):
+    """A banked group: one canonical row per rollout, then subagent rows."""
+    rewards = rewards or [1.0] * rollouts
+    rows = [(r, 0) for r in range(rollouts)] + [(r, 1) for r in subagent]
+    lengths = [length + t for _, t in rows]
+    return BankGroup(
+        group_id=group_id,
+        prompt_idx=0,
+        instance_id=instance_id,
+        extra_env_info=_env_info(instance_id) if instance_id else {},
+        sample_ids=[
+            f"{group_id}_g{r}" if t == 0 else f"{group_id}_g{r}_t{t}" for r, t in rows
+        ],
+        tags=[{"rollout_local_idx": r, "trace_in_rollout_idx": t} for r, t in rows],
+        sequence_lengths=lengths,
+        fields={
+            "input_ids": [torch.arange(L) + 10 for L in lengths],
+            "token_mask": [torch.tensor([0.0, 0.0] + [1.0] * (L - 2)) for L in lengths],
+            "generation_logprobs": [torch.zeros(L) for L in lengths],
+            "input_lengths": [torch.tensor(L) for L in lengths],
+            "sample_mask": [torch.tensor(1.0) for _ in rows],
+            "mask_sample": [torch.tensor(r in env_masked) for r, _ in rows],
+            "truncated": [torch.tensor(r in truncated) for r, _ in rows],
+            "total_reward": [torch.tensor(rewards[r]) for r, _ in rows],
+        },
+    )
+
+
+# ── split / order ──────────────────────────────────────────────────────────
+
+
+def test_heldout_split_keys_on_the_task_so_repeats_stay_together():
+    refs = [
+        _ref(f"g{i}", instance_id=f"repo__{i % 40}", prompt_idx=i) for i in range(400)
+    ]
+    train, heldout = cp.split_heldout(refs, heldout_mod=8)
+    assert heldout and train
+    assert not {r.task_key for r in heldout} & {r.task_key for r in train}
+    assert cp.split_heldout(refs, heldout_mod=8) == (train, heldout)
+    assert cp.split_heldout(refs, heldout_mod=0) == (refs, [])
+
+
+def test_heldout_task_keys_hold_out_whole_tasks_without_a_hash():
+    refs = [_ref(f"g{i}", instance_id=f"repo__{i % 4}", prompt_idx=i) for i in range(8)]
+    keys = frozenset({refs[1].task_key})
+    train, heldout = cp.split_heldout(refs, heldout_mod=0, heldout_task_keys=keys)
+    assert {r.task_key for r in heldout} == keys
+    assert len(heldout) == 2 and len(train) == 6
+
+
+def test_step_layout_matches_the_legacy_tiling():
+    # Legacy stage B: gpp 32, GBS 1024, K 8, 4 donors -> 29 full groups.
+    assert cp.step_layout(1024, 32, 8, 4) == (4, 29)
+    assert cp.step_layout(1024, 32, 0, 0) == (0, 32)
+    with pytest.raises(ValueError):
+        cp.step_layout(1000, 32, 0, 0)
+    with pytest.raises(ValueError):
+        cp.step_layout(1024, 32, 8, 3)
+
+
+def test_response_split_is_frozen_beside_the_banks(tmp_path):
+    base = [str(tmp_path / f"g{i}.pt") for i in range(66)]
+    kwargs = dict(
+        withheld=8,
+        donors_per_step=4,
+        full_per_step=29,
+        heldout_mod=32,
+        seed=1,
+        redraw=False,
+    )
+    donors = cp.load_or_create_response_split(tmp_path, base, **kwargs)
+    assert len(donors) == round(66 * 4 / 33)
+    saved = json.loads((tmp_path / cp.RESPONSE_SPLIT_NAME).read_text())
+    assert saved["donors"] == sorted(Path(d).name for d in donors)
+    assert cp.load_or_create_response_split(tmp_path, base, **kwargs) == donors
+    with pytest.raises(ValueError, match="different settings"):
+        cp.load_or_create_response_split(tmp_path, base, **{**kwargs, "seed": 2})
+    with pytest.raises(ValueError, match="different settings"):
+        cp.load_or_create_response_split(tmp_path, base[:-1], **kwargs)
+
+
+def test_streams_reshuffle_each_epoch_and_pack_donors_first():
+    base = [f"g{i}" for i in range(10)]
+    stream = cp.build_epoch_stream(base, 2, seed=3)
+    assert sorted(stream[:10]) == sorted(base) and stream[:10] != stream[10:]
+    assert stream == cp.build_epoch_stream(base, 2, seed=3)
+    # Raising the epoch count extends the stream; the prefix replays.
+    assert cp.build_epoch_stream(base, 3, seed=3)[:20] == stream
+    packed = cp.build_packed_epoch_stream(
+        ["d0", "d1", "d2", "d3"], base, 2, 5, num_epochs=1, seed=0
+    )
+    assert len(packed) == 14
+    assert all(p.startswith("d") for p in packed[0:2] + packed[7:9])
+
+
+def test_slice_rollouts_keeps_a_rollouts_subagent_rows():
+    group = _group("A", 4, subagent=(1, 3))
+    tail = cp.slice_rollouts(group, 2, 4)
+    assert tail.sample_ids == ["A_g2", "A_g3", "A_g3_t1"]
+    assert [int(n) for n in tail.fields["input_lengths"]] == [5, 5, 6]
+    head = cp.slice_rollouts(group, 0, 2)
+    assert head.sample_ids == ["A_g0", "A_g1", "A_g1_t1"]
+
+
+def test_config_validation():
+    with pytest.raises(ValueError):
+        cp.CriticPretrainConfig(bank_dirs=[])
+    with pytest.raises(ValueError, match="both"):
+        cp.CriticPretrainConfig(bank_dirs=["/b"], heldout_responses_per_group=8)
+    with pytest.raises(ValueError):
+        cp.CriticPretrainConfig(bank_dirs=["/b"], typo=1)
+
+
+# ── masks / targets / metrics ──────────────────────────────────────────────
+
+
+def test_loss_mask_trains_on_everything_only_when_asked():
+    sample_mask = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    env = torch.tensor([False, True, False, False])
+    trunc = torch.tensor([False, False, True, False])
+    legacy_eval = cp.loss_sample_mask(
+        sample_mask, env, trunc, apply_env_mask=True, apply_overlong_mask=True
+    )
+    assert legacy_eval.tolist() == [1.0, 0.0, 0.0, 0.0]
+    everything = cp.loss_sample_mask(
+        sample_mask, env, trunc, apply_env_mask=False, apply_overlong_mask=False
+    )
+    # The finalizer's placeholder row never trains.
+    assert everything.tolist() == [1.0, 1.0, 1.0, 0.0]
+
+
+def _gae():
+    return GeneralizedAdvantageEstimator(
+        GAEConfig(gae_lambda=1.0, gae_gamma=1.0), ClippedPGLossConfig()
+    )
+
+
+def test_returns_are_the_reward_on_every_response_token():
+    token_mask = torch.tensor([[0, 1, 1], [0, 1, 1]], dtype=torch.float32)
+    returns = cp.gae_returns(
+        _gae(),
+        token_mask=token_mask,
+        sample_mask=torch.tensor([1.0, 0.0]),
+        rewards=torch.tensor([1.0, 0.0]),
+        values=torch.rand(2, 3),
+    )
+    torch.testing.assert_close(returns[0, 1:], torch.tensor([1.0, 1.0]))
+
+
+@pytest.mark.parametrize("normalize_over", ["all_rows", "kept_rows"])
+def test_returns_ignore_the_predictions_wherever_the_loss_looks(normalize_over):
+    estimator = GeneralizedAdvantageEstimator(
+        GAEConfig(gae_lambda=1.0, gae_gamma=1.0, normalize_over=normalize_over),
+        ClippedPGLossConfig(),
+    )
+    # Multi-turn rows (gaps in the response mask) and one row the loss drops.
+    token_mask = torch.tensor(
+        [[0, 1, 0, 1, 1], [0, 1, 1, 0, 0], [1, 1, 0, 1, 0]], dtype=torch.float32
+    )
+    sample_mask = torch.tensor([1.0, 1.0, 0.0])
+    kwargs = dict(
+        token_mask=token_mask,
+        sample_mask=sample_mask,
+        rewards=torch.tensor([1.0, 0.0, 1.0]),
+    )
+    scored = cp.gae_returns(estimator, values=torch.rand(3, 5), **kwargs)
+    unscored = cp.gae_returns(estimator, values=torch.zeros(3, 5), **kwargs)
+    seen = (token_mask * sample_mask.unsqueeze(-1)).bool()
+    torch.testing.assert_close(unscored[seen], scored[seen])
+
+
+def test_train_scoring_is_redundant_only_for_undiscounted_monte_carlo_returns():
+    def redundant(**gae):
+        return cp.train_scoring_is_redundant(
+            GeneralizedAdvantageEstimator(GAEConfig(**gae), ClippedPGLossConfig())
+        )
+
+    assert redundant(gae_lambda=1.0, gae_gamma=1.0)
+    # The value returns' lambda decides; the policy's may differ.
+    assert redundant(gae_lambda=0.95, gae_lambda_value=1.0, gae_gamma=1.0)
+    assert not redundant(gae_lambda=0.95, gae_gamma=1.0)
+    assert not redundant(gae_lambda=1.0, gae_lambda_value=0.9, gae_gamma=1.0)
+    assert not redundant(gae_lambda=1.0, gae_gamma=0.99)
+
+
+def test_an_inert_value_clip_leaves_the_loss_and_gradient_unchanged():
+    gen = torch.Generator().manual_seed(0)
+    old = torch.rand(3, 6, generator=gen)
+    data = {
+        "token_mask": torch.tensor(
+            [[0, 1, 1, 1, 0, 0], [0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]],
+            dtype=torch.float32,
+        ),
+        "sample_mask": torch.tensor([1.0, 1.0, 0.0]),
+        "returns": torch.rand(3, 6, generator=gen),
+        "values": old,
+    }
+    # The training forward on the scoring weights: v_old up to numerics.
+    prediction = old + 1e-3 * torch.randn(3, 6, generator=gen)
+    out = {}
+    for cliprange in (0.5, None):
+        values = prediction.clone().requires_grad_()
+        loss, metrics = MseValueLossFn(MseValueLossConfig(cliprange=cliprange))(
+            values,
+            data,
+            global_valid_seqs=torch.tensor(2.0),
+            global_valid_toks=torch.tensor(7.0),
+        )
+        loss.backward()
+        out[cliprange] = (loss.detach(), values.grad, metrics)
+    torch.testing.assert_close(out[None][0], out[0.5][0], rtol=0, atol=0)
+    torch.testing.assert_close(out[None][1], out[0.5][1], rtol=0, atol=0)
+    assert out[0.5][2]["vf_clipfrac"] == 0.0
+    assert out[None][2] == out[0.5][2]
+
+
+def test_heldout_stats_legacy_metrics():
+    stats = cp.HeldoutStats()
+    # One group: two winners (values high late), two losers.
+    token_mask = torch.tensor([[0, 1, 1, 1, 1]] * 4, dtype=torch.float32)
+    values = torch.tensor(
+        [
+            [0, 0.6, 0.7, 0.8, 0.9],
+            [0, 0.5, 0.6, 0.7, 0.8],
+            [0, 0.4, 0.3, 0.2, 0.1],
+            [0, 0.5, 0.4, 0.3, 0.2],
+        ]
+    )
+    rewards = torch.tensor([1.0, 1.0, 0.0, 0.0])
+    returns = rewards.unsqueeze(-1).expand(4, 5).clone()
+    stats.add(
+        values=values,
+        returns=returns,
+        token_mask=token_mask,
+        sample_mask=torch.tensor([1.0, 1.0, 1.0, 0.0]),
+        rewards=rewards,
+        canonical=torch.tensor([True, True, True, True]),
+        group_of_row=[0, 0, 0, 0],
+    )
+    # A second chunk: a homogeneous group, which within-group AUC ignores.
+    stats.add(
+        values=values[:2],
+        returns=returns[:2],
+        token_mask=token_mask[:2],
+        sample_mask=torch.ones(2),
+        rewards=rewards[:2],
+        canonical=torch.tensor([True, True]),
+        group_of_row=[0, 0],
+    )
+    m = stats.metrics()
+    assert m["critic/terminal_auc"] == pytest.approx(1.0)
+    # Last values 0.9/0.8 for winners, 0.1/0.2 for losers: errors 0.1 and 0.2.
+    assert m["critic/terminal_brier"] == pytest.approx(0.025)
+    assert 0.0 < m["critic/terminal_ece"] < 0.2
+    assert m["critic/within_group_auc_q4"] == pytest.approx(1.0)
+    assert m["critic/n_mixed_groups"] == 1.0
+    assert m["num_heldout_samples"] == 6.0
+    assert "critic/explained_var" in m and "critic/explained_var_masked" in m
+    assert m["critic/explained_var_masked"] != m["critic/explained_var"]
+
+
+def test_rank_auc_handles_ties_and_one_class():
+    assert cp._rank_auc(torch.tensor([0.5, 0.5]), torch.tensor([True, False])) == 0.5
+    assert torch.isnan(torch.tensor(cp._rank_auc(torch.ones(3), torch.ones(3))))
+
+
+# ── one driver step against an in-memory data plane ────────────────────────
+
+
+class _Plane:
+    """Stores rows per field; jagged per-token columns come back jagged."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, dict[str, torch.Tensor]] = {}
+        self.cleared: list[str] = []
+
+    def put_samples(self, *, sample_ids, partition_id, fields, tags=None):
+        del partition_id, tags
+        for name in fields.keys():
+            value = fields[name]
+            rows = value.unbind() if value.is_nested else value.unbind(0)
+            for sid, row in zip(sample_ids, rows):
+                self.rows.setdefault(sid, {})[name] = row
+
+    def get_samples(self, *, sample_ids, partition_id, select_fields):
+        del partition_id
+        out = {}
+        for name in select_fields:
+            rows = [self.rows[sid][name] for sid in sample_ids]
+            if name in TOKEN_FIELDS or name in ("values", "returns"):
+                out[name] = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+            else:
+                out[name] = torch.stack(rows)
+        return TensorDict(out, batch_size=[len(sample_ids)])
+
+    def clear_samples(self, *, sample_ids, partition_id):
+        del partition_id
+        self.cleared.extend(sample_ids)
+        for sid in sample_ids:
+            self.rows.pop(sid, None)
+
+
+class _Value:
+    """Writes a constant prediction, records the train call's view of the batch."""
+
+    def __init__(
+        self, plane: _Plane, prediction: float = 0.25, grad_norm_groups=None
+    ) -> None:
+        self.plane = plane
+        self.prediction = prediction
+        self.grad_norm_groups = grad_norm_groups
+        self.sharding_annotations = SimpleNamespace(get_axis_size=lambda axis: 2)
+        self.trained: dict | None = None
+        self.calls: list[str] = []
+
+    def prepare_for_inference(self):
+        self.calls.append("prepare_for_inference")
+
+    def finish_inference(self):
+        self.calls.append("finish_inference")
+
+    def prepare_for_training(self):
+        self.calls.append("prepare_for_training")
+
+    def finish_training(self):
+        self.calls.append("finish_training")
+
+    def get_values_from_meta(self, meta, privilege_prefixes=None):
+        self.calls.append("get_values")
+        for sid, n in zip(meta.sample_ids, meta.sequence_lengths):
+            self.plane.rows[sid]["values"] = torch.full((n,), self.prediction)
+
+    def train_from_meta(self, meta, loss_fn, gbs=None, privilege_prefixes=None):
+        self.calls.append("train")
+        self.trained = {
+            "gbs": gbs,
+            "sample_ids": list(meta.sample_ids),
+            "returns": {
+                sid: self.plane.rows[sid]["returns"] for sid in meta.sample_ids
+            },
+            "values": {sid: self.plane.rows[sid]["values"] for sid in meta.sample_ids},
+            "token_mask": {
+                sid: self.plane.rows[sid]["token_mask"] for sid in meta.sample_ids
+            },
+            "sample_mask": {
+                sid: float(self.plane.rows[sid]["sample_mask"])
+                for sid in meta.sample_ids
+            },
+            "prefix_keys": sorted(privilege_prefixes) if privilege_prefixes else None,
+        }
+        return {
+            "loss": torch.tensor(0.1),
+            "grad_norm": torch.tensor(1.0),
+            "grad_norm_groups": self.grad_norm_groups or {},
+            "all_mb_metrics": {
+                "returns_mean": [0.5],
+                "values_mean": [0.25],
+                "returns_sq_mean": [0.5],
+                "residual_sq_mean": [0.3],
+            },
+        }
+
+
+class _CharTokenizer:
+    def encode(self, text, add_special_tokens=False):
+        return [ord(c) for c in text]
+
+    def decode(self, ids):
+        return "".join(chr(i) for i in ids)
+
+    def apply_chat_template(self, messages, **kwargs):
+        return "".join(f"<{m['role']}>{m['content']}</{m['role']}>" for m in messages)
+
+    def __call__(self, text, return_tensors=None, add_special_tokens=False):
+        return {"input_ids": torch.tensor([self.encode(text)])}
+
+
+def _trainer(plane, value, *, privileged=False, estimator=None, loss_fn=None, **cfg):
+    master_config = SimpleNamespace(
+        ppo=SimpleNamespace(overlong_filtering=True),
+        value={"train_micro_batch_size": 1},
+    )
+    store = (
+        spc.SwePrivilegePrefixStore(
+            _CharTokenizer(),
+            spc.SwePrivilegedCriticConfig(enabled=True, max_total_tokens=64),
+        )
+        if privileged
+        else None
+    )
+    return cp._CriticPretrainer(
+        master_config,
+        cp.CriticPretrainConfig(bank_dirs=["/b"], **cfg),
+        value=value,
+        dp_client=plane,
+        estimator=estimator or _gae(),
+        loss_fn=loss_fn or object(),
+        privilege_store=store,
+        groups_per_step=2,
+    )
+
+
+def test_train_step_trains_on_everything_when_asked_and_cleans_up():
+    plane = _Plane()
+    value = _Value(plane)
+    trainer = _trainer(plane, value, train_on_env_masked=True, train_on_truncated=True)
+    groups = [
+        _group("A", 2, subagent=(1,), env_masked=(0,)),
+        _group("B", 1, rewards=[0.0], truncated=(0,)),
+    ]
+    metrics = trainer.train_step(groups)
+    trainer.close()
+
+    trained = value.trained
+    # 4 real rows, already a multiple of the DP size (2 x micro batch 1).
+    assert trained["gbs"] == 4
+    assert set(trained["sample_mask"].values()) == {1.0}
+    torch.testing.assert_close(
+        trained["returns"]["s0-A_g0"][2:], torch.tensor([1.0, 1.0, 1.0])
+    )
+    # gamma = lambda = 1: no scoring pass before the update.
+    assert value.calls == ["prepare_for_training", "train", "finish_training"]
+    assert plane.rows == {} and len(plane.cleared) == 4
+    assert metrics["num_samples"] == 4.0 and metrics["num_rollouts"] == 3.0
+    assert metrics["env_masked_rows"] == 1.0 and metrics["truncated_rows"] == 1.0
+    assert metrics["trained_rows"] == 4.0
+
+
+def test_train_step_logs_the_grad_norm_split_by_network_part():
+    plane = _Plane()
+    value = _Value(plane, grad_norm_groups={"attention": 3.0, "moe": 4.0})
+    trainer = _trainer(plane, value)
+    metrics = trainer.train_step([_group("A", 2)])
+    trainer.close()
+
+    assert metrics["critic/gnorm/attention"] == 3.0
+    assert metrics["critic/gnorm/moe"] == 4.0
+    # Shares of the total norm^2, which is what the global clip sees.
+    assert metrics["critic/gnorm_frac/attention"] == pytest.approx(9 / 25)
+    assert metrics["critic/gnorm_frac/moe"] == pytest.approx(16 / 25)
+
+
+def test_train_step_masks_like_legacy_by_default():
+    plane = _Plane()
+    value = _Value(plane)
+    trainer = _trainer(plane, value)
+    groups = [
+        _group("A", 2, env_masked=(0,)),
+        _group("B", 1, rewards=[0.0], truncated=(0,)),
+    ]
+    metrics = trainer.train_step(groups)
+    # Padded with one copy of row 0, which never trains.
+    assert value.trained["sample_mask"] == {
+        "s0-A_g0": 0.0,
+        "s0-A_g1": 1.0,
+        "s1-B_g0": 0.0,
+        "s0-A_g0_pad0": 0.0,
+    }
+    assert metrics["trained_rows"] == 1.0 and metrics["pad_rows"] == 1.0
+
+
+def _one_step(**trainer_kwargs):
+    plane = _Plane()
+    value = _Value(plane, prediction=0.4)
+    trainer = _trainer(
+        plane,
+        value,
+        train_on_env_masked=True,
+        train_on_truncated=True,
+        **trainer_kwargs,
+    )
+    metrics = trainer.train_step(
+        [
+            _group("A", 2, rewards=[1.0, 0.0], subagent=(1,), env_masked=(0,)),
+            _group("B", 1, rewards=[0.0], truncated=(0,)),
+        ]
+    )
+    trainer.close()
+    return trainer, value, metrics
+
+
+def test_train_step_skips_the_redundant_scoring_pass_without_changing_the_update():
+    clipped = MseValueLossFn(MseValueLossConfig(cliprange=0.5))
+    skip, skipped, skip_metrics = _one_step(loss_fn=clipped)
+    keep, kept, keep_metrics = _one_step(loss_fn=clipped, train_scoring="always")
+
+    assert skip.skip_train_scoring and not keep.skip_train_scoring
+    assert skipped.calls == ["prepare_for_training", "train", "finish_training"]
+    assert kept.calls[:3] == ["prepare_for_inference", "get_values", "finish_inference"]
+    # Every row trains here; the targets agree on every token the loss sees.
+    assert skipped.trained["sample_mask"] == kept.trained["sample_mask"]
+    assert set(kept.trained["sample_mask"].values()) == {1.0}
+    for sid, returns in kept.trained["returns"].items():
+        seen = kept.trained["token_mask"][sid].bool()
+        torch.testing.assert_close(skipped.trained["returns"][sid][seen], returns[seen])
+    auc_keys = {k for k in keep_metrics if "auc" in k or k == "critic/n_mixed_groups"}
+    assert keep_metrics["critic/terminal_auc"] == pytest.approx(0.5)
+    assert keep_metrics["critic/n_mixed_groups"] == 1
+    assert all(k not in skip_metrics for k in auc_keys)  # no AUC from zero placeholders
+    assert skip_metrics == {k: v for k, v in keep_metrics.items() if k not in auc_keys}
+    # No v_old: zero placeholder values, an unclipped training loss, and the
+    # configured loss left alone.
+    assert not any(v.any() for v in skipped.trained["values"].values())
+    assert skip.loss_fn.cliprange is None and keep.loss_fn.cliprange == 0.5
+    assert clipped.cliprange == 0.5
+
+
+def test_train_step_scores_when_the_returns_bootstrap():
+    plane = _Plane()
+    value = _Value(plane)
+    estimator = GeneralizedAdvantageEstimator(
+        GAEConfig(gae_lambda=0.95, gae_gamma=1.0), ClippedPGLossConfig()
+    )
+    trainer = _trainer(plane, value, estimator=estimator)
+    assert not trainer.skip_train_scoring
+    trainer.train_step([_group("A", 2)])
+    trainer.close()
+    assert value.calls[:3] == [
+        "prepare_for_inference",
+        "get_values",
+        "finish_inference",
+    ]
+
+
+def test_privileged_prefixes_come_from_the_banked_env_info():
+    plane = _Plane()
+    value = _Value(plane)
+    trainer = _trainer(plane, value, privileged=True)
+    groups = [
+        _group("A", 1, instance_id="repo__a"),
+        _group("B", 1, instance_id="repo__b"),
+    ]
+    metrics = trainer.train_step(groups)
+    assert value.trained["prefix_keys"] == ["repo__a", "repo__b"]
+    assert metrics["privilege/n_instances"] == 2.0
+    assert len(trainer.privilege_store) == 0
+
+
+def test_banked_instance_must_match_its_env_info():
+    plane = _Plane()
+    trainer = _trainer(plane, _Value(plane), privileged=True)
+    group = _group("A", 1, instance_id="repo__a")
+    group.instance_id = "repo__other"
+    with pytest.raises(ValueError, match="resolves to"):
+        trainer.train_step([group, _group("B", 1, instance_id="repo__b")])
+
+
+def test_evaluate_applies_the_legacy_masks_and_scores_groups():
+    plane = _Plane()
+    value = _Value(plane)
+    trainer = _trainer(plane, value, train_on_env_masked=True)
+    groups = [
+        _group("A", 2, rewards=[1.0, 0.0], env_masked=(1,)),
+        _group("B", 2, rewards=[0.0, 0.0]),
+        _group("C", 1),
+    ]
+    m = trainer.evaluate(groups)
+    # Held-out batches score even when training steps skip it.
+    assert trainer.skip_train_scoring and "get_values" in value.calls
+    assert m["num_heldout_samples"] == 5.0
+    # Constant predictions: no ranking information.
+    assert m["critic/within_group_auc_q1"] == pytest.approx(0.5)
+    assert m["critic/n_mixed_groups"] == 1.0
+    assert plane.rows == {}
+
+
+class _Checkpointer:
+    """CheckpointManager's checkpoint_dir + get_resume_paths, without the IO."""
+
+    def __init__(self, checkpoint_dir: Path) -> None:
+        self.checkpoint_dir = Path(checkpoint_dir)
+
+    @staticmethod
+    def get_resume_paths(path, *, model_component):
+        component = Path(path) / model_component
+        return component / "weights", component / "optimizer"
+
+
+def test_rolling_resume_checkpoint_rotates_and_records_its_step(tmp_path):
+    current, tmp = cp.resume_state_dirs(tmp_path)
+    assert cp.rolling_resume_step(tmp_path) is None
+    tmp.mkdir(parents=True)
+    (tmp / "shard").write_text("step 20")
+    cp.promote_rolling_resume(tmp_path, 20)
+    assert cp.rolling_resume_step(tmp_path) == 20
+    assert (current / "shard").read_text() == "step 20" and not tmp.exists()
+
+    tmp.mkdir()
+    (tmp / "shard").write_text("step 30")
+    cp.promote_rolling_resume(tmp_path, 30)
+    # Only one full checkpoint is ever kept.
+    assert cp.rolling_resume_step(tmp_path) == 30
+    assert (current / "shard").read_text() == "step 30"
+    assert not tmp.exists() and not current.with_name("old").exists()
+
+
+def test_resume_uses_the_rolling_full_checkpoint_only_for_the_latest_step(tmp_path):
+    ckpt = _Checkpointer(tmp_path)
+    current, tmp = cp.resume_state_dirs(tmp_path)
+    tmp.mkdir(parents=True)
+    cp.promote_rolling_resume(tmp_path, 30)
+
+    weights, optimizer, source = cp.critic_resume_paths(
+        ckpt, tmp_path / "step_30", 30, "latest_only"
+    )
+    assert source == str(current)
+    assert weights == current / "value" / "weights"
+    assert optimizer == current / "value" / "optimizer"
+
+    # No rolling checkpoint for step_40 (e.g. deleted): the weights-only
+    # milestone step_40 resumes (get_resume_paths finds no optimizer there).
+    (tmp_path / "step_40" / "value" / "weights").mkdir(parents=True)
+    weights, _, source = cp.critic_resume_paths(
+        ckpt, tmp_path / "step_40", 40, "latest_only"
+    )
+    assert source == str(tmp_path / "step_40")
+    assert weights == tmp_path / "step_40" / "value" / "weights"
+
+    # A fault-tolerance-only step_41 has no weights: the older rolling
+    # checkpoint (step 30) resumes, with its optimizer.
+    (tmp_path / "step_41").mkdir()
+    weights, optimizer, source = cp.critic_resume_paths(
+        ckpt, tmp_path / "step_41", 41, "latest_only"
+    )
+    assert (source, optimizer) == (str(current), current / "value" / "optimizer")
+
+    # The default keeps resuming from step_N itself.
+    _, _, source = cp.critic_resume_paths(
+        ckpt, tmp_path / "step_30", 30, "every_checkpoint"
+    )
+    assert source == str(tmp_path / "step_30")
+    assert cp.critic_resume_paths(ckpt, None, 0, "latest_only") == (None, None, None)
+
+
+def test_resume_finishes_an_interrupted_rolling_promotion(tmp_path):
+    ckpt = _Checkpointer(tmp_path)
+    current, tmp = cp.resume_state_dirs(tmp_path)
+    tmp.mkdir(parents=True)
+    cp.promote_rolling_resume(tmp_path, 30)
+    # Stopped after step_31 was finalized, before its complete (marked) rolling
+    # checkpoint was promoted: the resume promotes it.
+    (tmp / "shard").parent.mkdir(parents=True)
+    (tmp / "shard").write_text("step 31")
+    cp.mark_rolling_complete(tmp_path, 31)
+    weights, optimizer, source = cp.critic_resume_paths(
+        ckpt, tmp_path / "step_31", 31, "latest_only"
+    )
+    assert source == str(current) and optimizer == current / "value" / "optimizer"
+    assert cp.rolling_resume_step(tmp_path) == 31 and not tmp.exists()
+    assert (current / "shard").read_text() == "step 31"
+
+    # A marked tmp newer than the latest step_N (stopped before step_32 was
+    # finalized) is not promoted: the rolling step_31 matches.
+    tmp.mkdir()
+    cp.mark_rolling_complete(tmp_path, 32)
+    _, _, source = cp.critic_resume_paths(
+        ckpt, tmp_path / "step_31", 31, "latest_only"
+    )
+    assert source == str(current) and cp.rolling_resume_step(tmp_path) == 31
+
+    # No weights at step_N and no rolling checkpoint: nothing to resume from.
+    empty = tmp_path / "empty"
+    (empty / "step_5").mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="no critic weights"):
+        cp.critic_resume_paths(
+            _Checkpointer(empty), empty / "step_5", 5, "latest_only"
+        )
+
+
+def test_train_step_can_keep_the_training_state_on_the_gpus():
+    plane = _Plane()
+    value = _Value(plane)
+    trainer = _trainer(plane, value, train_on_env_masked=True, train_on_truncated=True)
+    trainer.train_step([_group("A", 2)], offload=False)
+    trainer.close()
+    # The caller saves from it, then offloads.
+    assert value.calls == ["prepare_for_training", "train"]
+
+
+def test_optimizer_state_setting():
+    assert (
+        cp.CriticPretrainConfig(bank_dirs=["b"]).optimizer_state == "every_checkpoint"
+    )
+    latest = cp.CriticPretrainConfig(bank_dirs=["b"], optimizer_state="latest_only")
+    assert latest.optimizer_state == "latest_only"
+    with pytest.raises(ValueError):
+        cp.CriticPretrainConfig(bank_dirs=["b"], optimizer_state="never")
+
+
+def test_save_due_adds_fault_tolerance_saves():
+    def due(step, ft, last=False):
+        return cp.save_due(step, is_last=last, save_period=10, ft_save_period=ft)
+
+    assert [s for s in range(1, 25) if due(s, None)] == [10, 20]
+    assert [s for s in range(1, 25) if due(s, 0)] == [10, 20]
+    assert [s for s in range(1, 8) if due(s, 1)] == list(range(1, 8))
+    assert [s for s in range(1, 13) if due(s, 3)] == [3, 6, 9, 10, 12]
+    assert due(7, None, last=True)
+
+
+class _SavingValue:
+    """The Value calls CriticCheckpointSaver makes, recorded in order."""
+
+    def __init__(self, events: list) -> None:
+        self.events = events
+        self.fail_finalize = False
+
+    def save_checkpoint(
+        self, *, weights_path, optimizer_path, defer_finalize, timeout, **_
+    ):
+        Path(weights_path).mkdir(parents=True)
+        # Async saves are bounded; synchronous ones wait as before.
+        assert timeout == (cp.ASYNC_SAVE_TIMEOUT_S if defer_finalize else None)
+        self.events.append(
+            ("save", Path(weights_path).parts[-3], optimizer_path is not None, defer_finalize)
+        )
+
+    def finalize_async_save(self, *, terminate, timeout):
+        self.events.append(("finalize_async", terminate, timeout))
+        if self.fail_finalize:
+            raise RuntimeError("worker died")
+
+
+class _SavingCheckpointer:
+    """CheckpointManager's tmp_step_N -> step_N lifecycle, recorded in order."""
+
+    save_optimizer = True
+
+    def __init__(self, checkpoint_dir: Path, events: list) -> None:
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.events = events
+
+    def init_tmp_checkpoint(self, step, save_state, master_config):
+        path = self.checkpoint_dir / f"tmp_step_{step}"
+        path.mkdir(parents=True)
+        self.events.append(("init", step))
+        return path
+
+    def finalize_checkpoint(self, path):
+        path = Path(path)
+        assert (path / cp.FILE_LIST_NAME).exists()
+        path.rename(path.with_name(path.name.removeprefix("tmp_")))
+        self.events.append(("finalize", path.name))
+
+
+def _saver(tmp_path, *, rolling, async_save):
+    events: list = []
+    value = _SavingValue(events)
+    saver = cp.CriticCheckpointSaver(
+        value,
+        _SavingCheckpointer(tmp_path, events),
+        rolling=rolling,
+        async_save=async_save,
+    )
+    return saver, value, events
+
+
+def _save(saver, step, milestone=True):
+    return saver.save(
+        step,
+        {"total_steps": step},
+        None,
+        {"files": []},
+        is_last=False,
+        milestone=milestone,
+    )
+
+
+def test_sync_critic_save_is_complete_on_return(tmp_path):
+    saver, _, events = _saver(tmp_path, rolling=True, async_save=False)
+    assert _save(saver, 1) >= 0.0
+    # Milestone: step_N weights only; the optimizer goes to the rolling
+    # checkpoint, marked complete and promoted after step_N is finalized.
+    assert events == [
+        ("init", 1),
+        ("save", "tmp_step_1", False, False),
+        ("save", "tmp", True, False),
+        ("finalize", "tmp_step_1"),
+    ]
+    assert (tmp_path / "step_1" / "value" / "weights").exists()
+    assert cp.rolling_resume_step(tmp_path) == 1
+    saver.wait(terminate=True)
+    saver.close(timeout=1.0)
+    assert len(events) == 4  # nothing pending, no async writer to stop
+
+    # Fault-tolerance-only step: the weights are only in the rolling checkpoint.
+    events.clear()
+    _save(saver, 2, milestone=False)
+    assert events == [
+        ("init", 2),
+        ("save", "tmp", True, False),
+        ("finalize", "tmp_step_2"),
+    ]
+    assert (tmp_path / "step_2").exists()
+    assert not (tmp_path / "step_2" / "value").exists()
+    assert cp.rolling_resume_step(tmp_path) == 2
+
+    # Without the rolling checkpoint every step_N is complete.
+    saver, _, events = _saver(tmp_path / "every", rolling=False, async_save=False)
+    _save(saver, 1, milestone=False)
+    assert ("save", "tmp_step_1", True, False) in events
+    assert not cp.resume_state_dirs(tmp_path / "every")[1].exists()
+
+
+def test_async_critic_save_completes_at_the_next_save_or_exit(tmp_path):
+    saver, _, events = _saver(tmp_path, rolling=True, async_save=True)
+    _save(saver, 1, milestone=False)
+    # Scheduled, not finalized: neither step_1 nor the rolling checkpoint exists.
+    assert events == [("init", 1), ("save", "tmp", True, True)]
+    assert (tmp_path / "tmp_step_1").exists() and not (tmp_path / "step_1").exists()
+    assert cp.rolling_resume_step(tmp_path) is None
+
+    events.clear()
+    _save(saver, 2)
+    # The write lands, step_1 is finalized and its rolling checkpoint promoted
+    # before step_2's tmp folder is created and its rolling tmp cleared.
+    assert events[:3] == [
+        ("finalize_async", False, cp.ASYNC_SAVE_TIMEOUT_S),
+        ("finalize", "tmp_step_1"),
+        ("init", 2),
+    ]
+    assert (tmp_path / "step_1").exists() and cp.rolling_resume_step(tmp_path) == 1
+
+    events.clear()
+    saver.wait(terminate=True)
+    assert events == [
+        ("finalize_async", True, cp.ASYNC_SAVE_TIMEOUT_S),
+        ("finalize", "tmp_step_2"),
+    ]
+    assert cp.rolling_resume_step(tmp_path) == 2
+    saver.close(timeout=1.0)  # nothing pending after a normal exit
+    assert len(events) == 2
+
+
+def test_rolling_checkpoint_is_marked_complete_before_step_n_is_finalized(
+    tmp_path, monkeypatch
+):
+    saver, _, _ = _saver(tmp_path, rolling=True, async_save=True)
+    _save(saver, 1, milestone=False)
+
+    def stop(*args):
+        raise RuntimeError("stopped")
+
+    # Stopped between finalizing step_1 and promoting its rolling checkpoint.
+    monkeypatch.setattr(cp, "promote_rolling_resume", stop)
+    with pytest.raises(RuntimeError, match="stopped"):
+        saver.wait()
+    monkeypatch.undo()
+    assert (tmp_path / "step_1").exists() and cp.rolling_resume_step(tmp_path) is None
+    _, _, source = cp.critic_resume_paths(
+        _Checkpointer(tmp_path), tmp_path / "step_1", 1, "latest_only"
+    )
+    assert source == str(cp.resume_state_dirs(tmp_path)[0])
+    assert cp.rolling_resume_step(tmp_path) == 1
+
+
+def test_async_critic_save_lands_after_an_error_without_raising(tmp_path):
+    saver, value, events = _saver(tmp_path, rolling=True, async_save=True)
+    _save(saver, 1)
+    events.clear()
+    saver.close(timeout=5.0)
+    assert events == [("finalize_async", True, 5.0), ("finalize", "tmp_step_1")]
+    assert cp.rolling_resume_step(tmp_path) == 1
+
+    _save(saver, 2)
+    value.fail_finalize = True
+    saver.close(timeout=5.0)  # logged, not raised; the previous checkpoints stay
+    assert (tmp_path / "tmp_step_2").exists() and cp.rolling_resume_step(tmp_path) == 1

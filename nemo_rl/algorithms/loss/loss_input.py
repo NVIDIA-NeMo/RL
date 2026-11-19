@@ -14,6 +14,7 @@
 
 """Builds the loss-function input dict from model logits."""
 
+import contextlib
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -42,6 +43,9 @@ from nemo_rl.distributed.model_utils import (
     get_cp_sharded_next_token_logprobs,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
+    get_next_token_topk_logprobs_from_logits,
+    get_policy_logprobs_at_sampler_topk,
+    logits_shared_for_backward,
 )
 
 if TYPE_CHECKING:
@@ -254,16 +258,23 @@ def prepare_loss_input(
             logprobs = logprobs.to(torch.float32)
             logprobs = logprobs[:, : data["input_ids"].shape[1] - 1]
         else:
-            logprobs = get_next_token_logprobs_from_logits(
-                input_ids=data["input_ids"],
-                next_token_logits=logits,
-                vocab_parallel_rank=vocab_parallel_rank,
-                vocab_parallel_group=vocab_parallel_group,
-                context_parallel_group=context_parallel_group,
-                sampling_params=sampling_params,
-                chunk_size=chunk_size,
-                cp_sharder=cp_sharder,
-            )
+            # Score centering gathers these logits again below, so the sampled-token
+            # log-prob backward must not reuse their storage for its gradient.
+            with (
+                logits_shared_for_backward()
+                if getattr(loss_fn, "score_centering", False)
+                else contextlib.nullcontext()
+            ):
+                logprobs = get_next_token_logprobs_from_logits(
+                    input_ids=data["input_ids"],
+                    next_token_logits=logits,
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                    sampling_params=sampling_params,
+                    chunk_size=chunk_size,
+                    cp_sharder=cp_sharder,
+                )
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
         if need_top_k_or_top_p_filtering(sampling_params):
@@ -290,6 +301,19 @@ def prepare_loss_input(
                 )
 
         loss_input = {"next_token_logprobs": logprobs}
+        if getattr(loss_fn, "score_centering", False):
+            # Log-probs at the sampler's captured top-k ids, for score centering.
+            loss_input["next_token_topk_logprobs"] = (
+                get_next_token_topk_logprobs_from_logits(
+                    topk_ids=data["generation_topk_ids"],
+                    next_token_logits=logits,
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                    chunk_size=chunk_size,
+                    cp_sharder=cp_sharder,
+                )
+            )
 
     elif loss_fn.input_type == LossInputType.OPD_FULL:
         loss_input = _prepare_opd_full_loss_input(
@@ -485,6 +509,9 @@ def prepare_packed_loss_input(
         "vocab_parallel_rank must be provided with vocab_parallel_group."
     )
 
+    score_centering = getattr(loss_fn, "score_centering", False)
+    if score_centering and "cu_seqlens" in data:
+        raise ValueError("SC does not support externally prepacked inputs")
     input_ids = data["input_ids"]
     unpacked_seqlen = input_ids.shape[1]
     input_is_prepacked = "cu_seqlens" in data
@@ -521,21 +548,22 @@ def prepare_packed_loss_input(
     )
     logits_for_logprobs = logits if use_chunking else logits.to(torch.float32)
 
-    logprobs = from_parallel_logits_to_logprobs_packed_sequences(
-        logits_for_logprobs,
-        packed_targets,
-        cu_seqlens_q_padded,
-        unpacked_seqlen,
-        vocab_start_index=vocab_parallel_rank * logits.shape[-1],
-        vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
-        group=vocab_parallel_group,
-        inference_only=False,
-        cp_group=context_parallel_group,
-        sampling_params=sampling_params,
-        chunk_size=chunk_size if use_chunking else None,
-        target_is_pre_rolled=not input_is_prepacked,
-        return_packed_layout=input_is_prepacked,
-    )
+    with logits_shared_for_backward() if score_centering else contextlib.nullcontext():
+        logprobs = from_parallel_logits_to_logprobs_packed_sequences(
+            logits_for_logprobs,
+            packed_targets,
+            cu_seqlens_q_padded,
+            unpacked_seqlen,
+            vocab_start_index=vocab_parallel_rank * logits.shape[-1],
+            vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+            group=vocab_parallel_group,
+            inference_only=False,
+            cp_group=context_parallel_group,
+            sampling_params=sampling_params,
+            chunk_size=chunk_size if use_chunking else None,
+            target_is_pre_rolled=not input_is_prepacked,
+            return_packed_layout=input_is_prepacked,
+        )
 
     # Match prepare_loss_input behavior for top-k/top-p filtered training:
     # use filtered curr_logprobs for actor loss, but keep unfiltered values for KL.
@@ -565,4 +593,21 @@ def prepare_packed_loss_input(
                 )
             )
 
-    return {"next_token_logprobs": logprobs}, data
+    loss_input = {"next_token_logprobs": logprobs}
+    if score_centering:
+        packed_ids = _pack_input_ids(
+            data["generation_topk_ids"], cu_seqlens_q, cu_seqlens_q_padded,
+            cp_rank=cp_rank, cp_size=cp_size, roll_shift=-1,
+        )
+        loss_input["next_token_topk_logprobs"] = get_policy_logprobs_at_sampler_topk(
+            sampler_topk_token_ids=data["generation_topk_ids"],
+            next_token_logits=logits,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            chunk_size=chunk_size,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_q_padded=cu_seqlens_q_padded,
+            packed_sampler_topk_token_ids=packed_ids,
+        )
+    return loss_input, data

@@ -32,6 +32,7 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     compute_engine_step_metrics,
+    attach_topk_logprobs_to_chat_response_choices,
     compute_spec_decode_metrics,
     encode_counter_key,
     format_prompt_for_vllm_generation,
@@ -672,6 +673,70 @@ def test_attach_token_information_to_chat_response_choices():
     ]
     assert response_dict["choices"][1]["message"]["generation_token_ids"] == []
     assert response_dict["choices"][1]["message"]["generation_log_probs"] == []
+
+
+def _ranked(*entries):
+    """One position's engine log-probs as vLLM reports them: sampled token first."""
+    return {
+        token_id: SimpleNamespace(logprob=logprob, rank=rank)
+        for token_id, logprob, rank in entries
+    }
+
+
+def test_attach_topk_logprobs_to_chat_response_choices():
+    final_res = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[7, 9, 5],
+                logprobs=[
+                    # Sampled token inside the top-2: exactly k entries; the floor applies.
+                    _ranked((7, -0.2, 1), (8, -10000.0, 2)),
+                    # Sampled token outside the top-2: k + 1 entries, ranks pick the head.
+                    _ranked((9, -3.0, 7), (1, -0.1, 1), (2, -0.9, 2)),
+                    # A tie at the boundary still yields exactly k entries.
+                    _ranked((5, -0.7, 2), (3, -0.3, 1), (4, -0.7, 2)),
+                ],
+            ),
+            SimpleNamespace(index=1, token_ids=[], logprobs=[]),
+        ]
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=0, message=SimpleNamespace()),
+            SimpleNamespace(index=1, message=SimpleNamespace()),
+        ],
+        model_dump=lambda: {"choices": [{"message": {}}, {"message": {}}]},
+    )
+
+    attach_topk_logprobs_to_chat_response_choices(response, final_res, top_k=2)
+    response_dict = model_dump_chat_response_with_dynamic_message_fields(response)
+
+    ids = response_dict["choices"][0]["message"]["generation_topk_ids"]
+    logprobs = response_dict["choices"][0]["message"]["generation_topk_logprobs"]
+    assert ids.dtype == torch.int32
+    assert logprobs.dtype == torch.float32
+    assert ids.tolist() == [[7, 8], [1, 2], [3, 5]]
+    torch.testing.assert_close(
+        logprobs, torch.tensor([[-0.2, -9999.0], [-0.1, -0.9], [-0.3, -0.7]])
+    )
+    empty = response_dict["choices"][1]["message"]
+    assert tuple(empty["generation_topk_ids"].shape) == (0, 2)
+    assert tuple(empty["generation_topk_logprobs"].shape) == (0, 2)
+
+
+def test_attach_topk_logprobs_to_chat_response_choices_requires_k_entries():
+    final_res = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(index=0, token_ids=[7], logprobs=[_ranked((7, -0.2, 1))])
+        ]
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+
+    with pytest.raises(RuntimeError, match="fewer than top_k"):
+        attach_topk_logprobs_to_chat_response_choices(response, final_res, top_k=2)
 
 
 @pytest.mark.parametrize(

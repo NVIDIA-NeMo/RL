@@ -24,6 +24,19 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/algorithms/critic_training_mask.py",
+  "nemo_rl/algorithms/value_head.py",
+  "nemo_rl/algorithms/sc_critic_pretrain.py",
+  "nemo_rl/experience/agent_step_metrics.py",
+  "nemo_rl/experience/reward_penalty_rules.py",
+  "nemo_rl/experience/invalid_samples.py",
+  "nemo_rl/experience/loop_penalties.py",
+  "nemo_rl/algorithms/single_controller_utils/rollout_bank.py",
+  "nemo_rl/algorithms/loss/score_centering.py",
+  "nemo_rl/experience/tool_failures.py",
+  "nemo_rl/experience/think_tags.py",
+  "nemo_rl/algorithms/single_controller_utils/tool_failure_credit.py",
+  "nemo_rl/algorithms/single_controller_utils/malformed_think_credit.py",
   "nemo_rl/data/captured_media.py",
   # TODO: enable these once we have 100 correctness
   #"nemo_rl/**/*.py",
