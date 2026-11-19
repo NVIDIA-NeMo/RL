@@ -279,11 +279,17 @@ class _Engine:
             return
         reply_ids = self._kit.ids(REPLY)[self.resumed :]
         logprobs = None
-        if sampling_params.logprobs is not None:
+        if sampling_params.num_logprobs is not None:
             decode = self._kit.tokenizer.decode
+            # The tokens a logprob_token_ids call asks for, at every position.
+            asked = {
+                token_id: Logprob(-3.0, 3, decode([token_id]))
+                for token_id in sampling_params.logprob_token_ids or ()
+            }
             # The sampled token, and the runner-up a top_logprobs > 0 call sees.
             logprobs = [
                 {
+                    **asked,
                     token_id: Logprob(-0.5, 1, decode([token_id])),
                     token_id + 1: Logprob(-2.0, 2, decode([token_id + 1])),
                 }
@@ -985,7 +991,11 @@ CASES = [
     # sent them: the engine samples with them as it does natively.
     _Case(
         "token_level_fields",
-        fields={"stop_token_ids": [7], "allowed_token_ids": [1, 2, 3]},
+        fields={
+            "stop_token_ids": [7],
+            "allowed_token_ids": [1, 2, 3],
+            "logprob_token_ids": [5, 9],
+        },
     ),
 ]
 
