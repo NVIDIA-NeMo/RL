@@ -97,6 +97,8 @@ Startup rejects these with `dynamo: true`:
 - `frontend_args.router_mode: direct`: it needs a worker ID on every request, and NeMo RL's rollouts name none.
 - `dynamo: true` on a backend other than vLLM, and a `dynamo_cfg` block without `dynamo: true`.
 
+Per-sample `max_output_tokens` caps ([GRPO guide](grpo.md)) are not supported either. Processors set them per sample at run time, so a rollout that carries one raises an error instead of being sent to the frontend.
+
 ## Build the image
 
 ai-dynamo is part of the `vllm` extra, so every vLLM worker venv carries it.

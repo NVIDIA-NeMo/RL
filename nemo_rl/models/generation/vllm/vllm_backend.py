@@ -787,6 +787,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 )
 
     def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
+        # Unquantized refit does not need the optional FP8 backend imports.
+        if getattr(self.model_runner.vllm_config, "quant_config", None) is None:
+            self._load_full_hf_weights(policy_weights)
+            return
+
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         if fp8.is_fp8_model(self.model_runner.vllm_config):
@@ -839,6 +844,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             weights = _drop_tied_embedding_aliases(
                 weights, aliases, getattr(model, "hf_to_vllm_mapper", None)
             )
+
+        if getattr(self.model_runner.vllm_config, "quant_config", None) is None:
+            return weights
 
         from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -1924,11 +1932,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 self._maybe_process_draft_after_loading(process_weights_after_loading)
             self._maybe_process_mtp_drafter_after_loading()
 
-        from nemo_rl.models.generation.vllm.quantization import fp8
-
         try:
-            if fp8.is_fp8_model(self.model_runner.vllm_config):
-                fp8.prepare_fp8_linear_refit(self.model_runner.model)
+            if getattr(self.model_runner.vllm_config, "quant_config", None) is not None:
+                from nemo_rl.models.generation.vllm.quantization import fp8
+
+                if fp8.is_fp8_model(self.model_runner.vllm_config):
+                    fp8.prepare_fp8_linear_refit(self.model_runner.model)
             yield finalize
             # KV-cache scales are covered by the full process_weights_after_loading
             # pass in finalize(); no second pass is needed.

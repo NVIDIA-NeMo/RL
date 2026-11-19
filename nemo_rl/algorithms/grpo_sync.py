@@ -840,6 +840,7 @@ def grpo_train_sync(
                         driver_carry["total_reward"],
                         statistics_valid_mask,
                         leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                        full_group_std=master_config.grpo.adv_estimator.full_group_std,
                         std_rewards=std_rewards,
                     )
                     driver_carry["baseline"] = baseline

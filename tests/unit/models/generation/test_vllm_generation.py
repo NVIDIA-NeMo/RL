@@ -3500,6 +3500,42 @@ def test_vllm_dynamo_rollouts_go_through_the_frontend(monkeypatch):
         asyncio.run(anext(generation.generate_async(data)))
 
 
+def test_vllm_dynamo_rejects_per_sample_output_caps(monkeypatch):
+    from nemo_rl.models.generation.dynamo import rollout_client
+    from nemo_rl.models.generation.rollout_result import (
+        RolloutResult,
+        rollout_result_to_wire,
+    )
+
+    result = RolloutResult([7], [-0.5], False, None, None)
+    frontend = AsyncMock(
+        return_value={
+            "rollout": rollout_result_to_wire(result),
+            "gen_leader_worker_idx": 0,
+        }
+    )
+    monkeypatch.setattr(rollout_client, "post_rollout", frontend)
+    generation = object.__new__(VllmGeneration)
+    generation.cfg = {
+        "model_name": "model",
+        "_pad_token_id": 0,
+        "vllm_cfg": {"max_model_len": 16},
+    }
+    generation.dynamo_frontend_url = "http://frontend/v1"
+    data = {"input_ids": torch.tensor([[5, 6, 0]]), "input_lengths": torch.tensor([2])}
+
+    # A capped row would lose its cap at the frontend, so it is rejected before sending.
+    capped = BatchedDataDict({**data, "max_output_tokens": [4]})
+    with pytest.raises(ValueError, match="not supported through the Dynamo frontend"):
+        asyncio.run(anext(generation.generate_async(capped)))
+    frontend.assert_not_called()
+
+    # An uncapped row from a partly capped batch still goes through the frontend.
+    uncapped = BatchedDataDict({**data, "max_output_tokens": [None]})
+    asyncio.run(anext(generation.generate_async(uncapped)))
+    frontend.assert_awaited_once()
+
+
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):
     """Test vLLM policy generation capabilities."""
     # Test generation

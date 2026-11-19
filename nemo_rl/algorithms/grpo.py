@@ -144,6 +144,7 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    merge_vllm_hf_overrides,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
@@ -1820,9 +1821,7 @@ def setup(
 
         configure_vllm_for_router_replay(policy_config)
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
-
-        ## make vllm hf overrides match the training policy
-        vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
+        merge_vllm_hf_overrides(vllm_kwargs, policy_config)
 
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
@@ -4002,6 +4001,7 @@ def _grpo_train_impl(
                             rewards.cuda(device_id),
                             valid_mask.cuda(device_id),
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                            full_group_std=master_config.grpo.adv_estimator.full_group_std,
                             std_rewards=(
                                 std_rewards.cuda(device_id)
                                 if std_rewards is not None
@@ -4020,6 +4020,7 @@ def _grpo_train_impl(
                             rewards,
                             valid_mask,
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                            full_group_std=master_config.grpo.adv_estimator.full_group_std,
                             std_rewards=std_rewards,
                         )
                     if "env_reward" in repeated_batch:

@@ -85,6 +85,12 @@ class VllmSpecificArgs(TypedDict):
     # fits within max_model_len. This is needed when multimodal processing makes
     # the training prompt longer than its text-only representation.
     cap_max_tokens_to_context: NotRequired[bool]
+    # Media placeholder token that the learner prompt keeps as one token while
+    # vLLM expands it into a contiguous run (for example, one audio token that
+    # becomes an encoder-length run). When set, rollout prompt validation accepts
+    # exactly that one expansion; any other prompt difference still fails.
+    # Absent: generation and learner prompts must be token-identical.
+    expanded_placeholder_token: NotRequired[str]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
     # With is_mx, quantize weights to MXFP8 on the trainer during refit and
@@ -175,6 +181,20 @@ def vllm_fp32_lm_head_enabled(
 ) -> bool:
     """Return whether vLLM should compute logits with an fp32 LM head."""
     return bool(vllm_cfg.get("fp32_lm_head"))
+
+
+def merge_vllm_hf_overrides(
+    vllm_kwargs: dict[str, Any], policy_config: Mapping[str, Any]
+) -> None:
+    """Make vLLM HF overrides match the policy while keeping generation-only keys.
+
+    Policy ``hf_config_overrides`` win on shared keys so generation and training
+    see the same model config.
+    """
+    vllm_kwargs["hf_overrides"] = {
+        **(vllm_kwargs.get("hf_overrides") or {}),
+        **(policy_config.get("hf_config_overrides") or {}),
+    }
 
 
 class VllmDeltaCompressionConfig(BaseModel, extra="allow"):
