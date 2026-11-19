@@ -131,6 +131,8 @@ policy:
 
 This option requires the Megatron policy backend. It applies to non-colocated vLLM and TensorRT-LLM collective and `nccl_reshard` transports, plus non-colocated Megatron generation. Unsupported combinations fail during synchronizer setup. It is disabled by default because CPU offload adds transfer overhead when the export already fits in trainer GPU memory.
 
+Megatron workers stage offloaded optimizer state, here and in colocated runs, in page-locked host buffers that the first offload allocates and every later offload reuses. Each rank therefore keeps a host copy of its optimizer state for the whole run. To cap that memory per rank, set `megatron_cfg.optimizer_offload_pinned_buffer_gb` (under `policy`, or `value` for PPO). State past the cap goes through pageable buffers that are freed after the reload, and those transfers are slower.
+
 For native MCore refit, select it explicitly:
 
 ```yaml

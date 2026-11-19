@@ -40,7 +40,6 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV2,
 )
 from megatron.core.models.gpt import GPTModel
-from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_context_parallel_world_size,
@@ -75,6 +74,7 @@ from nemo_rl.models.megatron.data import (
     process_global_batch,
 )
 from nemo_rl.models.megatron.manual_gc import ManualGCMixin
+from nemo_rl.models.megatron.optimizer_offload import OptimizerStateOffloader
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
 )
@@ -497,6 +497,11 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
         self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
         self.offload_optimizer_for_logprob = (
             runtime_config.offload_optimizer_for_logprob
+        )
+        self._optimizer_offloader = OptimizerStateOffloader(
+            pinned_buffer_gb=config["megatron_cfg"].get(
+                "optimizer_offload_pinned_buffer_gb"
+            )
         )
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
 
@@ -1269,17 +1274,14 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
 
     def move_optimizer(self, device: str):
         """Move optimizer state to the specified device."""
-        if isinstance(self.optimizer, ChainedOptimizer):
-            optimizer_state = self.optimizer.state
+        if device == "cpu":
+            self._optimizer_offloader.offload(self.optimizer)
+        elif device == "cuda":
+            self._optimizer_offloader.reload(self.optimizer)
         else:
-            optimizer_state = self.optimizer._get_state()
-        for _, state in optimizer_state.items():
-            for k, v in state.items():
-                if torch.is_tensor(v):
-                    if device == "cpu" and v.is_cuda:
-                        state[k] = v.to("cpu")
-                    elif device == "cuda" and not v.is_cuda:
-                        state[k] = v.to("cuda")
+            raise ValueError(
+                f"Invalid device: {device}. Only 'cpu' and 'cuda' are supported."
+            )
 
     def save_checkpoint(
         self,

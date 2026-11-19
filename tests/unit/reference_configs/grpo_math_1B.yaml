@@ -232,6 +232,9 @@ policy:
     # together every manual_gc_interval optimizer steps (a positive integer).
     manual_gc: false
     manual_gc_interval: 10
+    # Per-rank cap (GiB) on pinned host buffers kept for optimizer offload;
+    # null pins all optimizer state, 0 keeps no host memory between steps.
+    optimizer_offload_pinned_buffer_gb: null
     activation_checkpointing: false
     # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
     clear_memory_caches_before_refit: false
