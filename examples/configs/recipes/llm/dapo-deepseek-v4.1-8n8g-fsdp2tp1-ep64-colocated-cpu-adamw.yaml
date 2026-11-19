@@ -54,7 +54,6 @@ checkpointing:
   save_period: 10
   metric_name: null
   checkpoint_must_save_by: 00:03:40:00
-  model_save_format: null
   checkpoint_dir: results/dapo-deepseek-v4.1-8n8g-fsdp2tp1-ep64-colocated-cpu-adamw/checkpoints
 policy:
   model_name: ${oc.env:DS41_FULL_CHECKPOINT}
@@ -96,8 +95,9 @@ policy:
       total_iters: 10000000000
   - milestones:
     - 5
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
+    checkpoint:
+      model_save_format: torch_save
     enabled: true
     cpu_offload: true
     sequence_parallel: false
@@ -159,7 +159,8 @@ policy:
       gpu_memory_utilization: 0.7   # the policy side's resident HybridEP/NCCL buffers must fit next to vLLM across sleep/wake
       enforce_eager: false
       max_model_len: ${policy.max_total_sequence_length}
-      enable_prefix_caching: false
+      # vLLM returns routed experts (router replay) through its prefix-cache blocks.
+      enable_prefix_caching: true
       use_deep_gemm: true
       load_format: dummy
       refit_with_reload_api: false

@@ -1742,8 +1742,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         return fp8.is_fp8_model(self.model_runner.vllm_config)
 
     def _uses_deepseek_v41_fp8_refit(self) -> bool:
-        """Return whether the realized rollout model needs DSV4 FP8 reload hooks."""
-        model = self.model_runner.model
+        """Return whether the realized rollout model needs DSV4.1 FP8 reload hooks."""
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None)
+        if model is None:
+            return False
         config = getattr(model, "config", None)
         if getattr(config, "model_type", None) not in (
             "deepseek_v41",

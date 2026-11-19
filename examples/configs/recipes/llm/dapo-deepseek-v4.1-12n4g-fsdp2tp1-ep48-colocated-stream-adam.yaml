@@ -46,7 +46,6 @@ checkpointing:
   keep_top_k: 1
   save_period: 2
   checkpoint_must_save_by: 00:03:40:00
-  model_save_format: null
   checkpoint_dir: results/dapo-deepseek-v4.1-12n4g-fsdp2tp1-ep48-colocated-stream-adam/checkpoints
 policy:
   model_name: ${oc.env:DS41_FULL_CHECKPOINT}
@@ -88,7 +87,8 @@ policy:
   - milestones:
     - 5
   automodel_cfg:
-    _v2: true
+    checkpoint:
+      model_save_format: torch_save
     enabled: true
     cpu_offload: true
     sequence_parallel: false
@@ -149,7 +149,8 @@ policy:
       gpu_memory_utilization: 0.75
       enforce_eager: false
       max_model_len: ${policy.max_total_sequence_length}
-      enable_prefix_caching: false
+      # vLLM returns routed experts (router replay) through its prefix-cache blocks.
+      enable_prefix_caching: true
       use_deep_gemm: true
       load_format: dummy
       refit_with_reload_api: false

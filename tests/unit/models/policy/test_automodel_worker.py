@@ -1124,7 +1124,7 @@ class TestAutomodelLoraParamsGenerator:
         worker.maybe_init_zmq = lambda: None
         sentinel = torch.ones(1)
 
-        def refit_generator():
+        def refit_generator(*, stage_cpu_parameters=False):
             yield "sentinel", sentinel
 
         stream_impl = MagicMock()
@@ -1150,7 +1150,7 @@ class TestAutomodelLoraParamsGenerator:
         worker.model_update_group = object()
         sentinel = torch.ones(1)
 
-        def refit_generator():
+        def refit_generator(*, stage_cpu_parameters=False):
             yield "sentinel", sentinel
 
         producer = MagicMock()
