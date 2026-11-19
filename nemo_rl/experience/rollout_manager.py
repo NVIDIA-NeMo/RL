@@ -20,7 +20,14 @@ import enum
 import json
 import math
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Optional, Protocol
@@ -1555,8 +1562,13 @@ class AsyncNemoGymRolloutImpl:
                 if timing_metrics is not None:
                     env_timing_metrics = timing_metrics
 
+        consume_stream: (
+            Callable[[list[dict], int], Coroutine[Any, Any, None]] | None
+        ) = consume
+
         def submit(pending_rows: list[dict], refusal_streak: int = 0) -> None:
-            task = asyncio.create_task(consume(pending_rows, refusal_streak))
+            assert consume_stream is not None
+            task = asyncio.create_task(consume_stream(pending_rows, refusal_streak))
             streams.add(task)
             # A re-send can fail while the original stream is still blocked;
             # see its failure without waiting for that stream to end.
@@ -1571,9 +1583,14 @@ class AsyncNemoGymRolloutImpl:
         finally:
             # A failed stream or the group deadline must not leave a refused
             # row's re-send dispatching after the caller has moved on.
-            for task in streams:
-                task.cancel()
-            await asyncio.gather(*streams, return_exceptions=True)
+            try:
+                for task in streams:
+                    task.cancel()
+                await asyncio.gather(*streams, return_exceptions=True)
+            finally:
+                # The mutually recursive closures otherwise retain receipt results
+                # and the completion callback until cyclic GC runs.
+                consume_stream = None
 
         if row_failure is not None:
             raise row_failure

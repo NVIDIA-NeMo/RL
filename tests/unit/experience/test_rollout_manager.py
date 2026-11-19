@@ -25,9 +25,11 @@ Two groups:
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import tempfile
 import uuid
+import weakref
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -1296,6 +1298,48 @@ def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     metrics = impl._compute_rollout_metrics([completion], "agent")
 
     assert ("agent/full_result" in metrics) is log_full_result_tables
+
+
+def test_stream_closures_release_completed_receipts_without_cyclic_gc() -> None:
+    class WeakResult(dict):
+        pass
+
+    references: list[weakref.ReferenceType[WeakResult]] = []
+
+    class RunRollouts:
+        def options(self, **kwargs):
+            return self
+
+        def remote(self, *args, **kwargs):
+            async def result_ref():
+                result = WeakResult(_mask_gate_receipt_result())
+                references.append(weakref.ref(result))
+                return 0, {"name": "agent"}, result, None
+
+            async def stream():
+                yield result_ref()
+
+            return stream()
+
+    async def exercise() -> None:
+        await _nemo_gym_impl(True)._stream_rows(
+            SimpleNamespace(run_rollouts=RunRollouts()),
+            [{"_rowidx": 0}],
+            [None],
+            [None],
+            1,
+            "test",
+        )
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        _run(exercise())
+        assert len(references) == 1
+        assert references[0]() is None
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
