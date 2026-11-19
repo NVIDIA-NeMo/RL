@@ -48,7 +48,7 @@ if [[ "${FAST:-0}" != "1" ]]; then
         [[ -f "$test_script" ]] || continue
         project_dir=${test_script%%/tests/*}
         pushd "$project_dir"
-        uv sync --locked --inexact --group test
+        uv sync --locked --group test
         time uv run --no-sync bash "${test_script#"$project_dir/"}"
         popd
     done

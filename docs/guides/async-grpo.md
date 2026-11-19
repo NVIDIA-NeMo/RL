@@ -81,17 +81,13 @@ cluster:
 
 ### Configure the training duration
 
-Async GRPO uses the same two training bounds as synchronous GRPO and stops at
-the first one reached:
+Async GRPO uses the same two training bounds as synchronous GRPO and stops at the first one reached:
 
 ```text
 min(max_num_steps, max_num_epochs × batches_per_epoch)
 ```
 
-One epoch is one complete pass over the training dataloader. The background
-trajectory collector cycles through the stateful dataloader as needed, while
-the trainer stops at the effective step limit above. Async checkpoints retain
-the collector's dataloader position for resume.
+One epoch is one complete pass over the training dataloader. The background trajectory collector cycles through the stateful dataloader as needed, while the trainer stops at the effective step limit above. Async checkpoints retain the collector's dataloader position for resume.
 
 ## Implementation Structure
 This section covers the internal architecture of async GRPO and includes detailed explanations of how the core components interact.

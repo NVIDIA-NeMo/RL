@@ -15,22 +15,11 @@ Use the offline path when you already have a good drafter and only want faster r
 
 For the best results, start from an Eagle checkpoint that was already pretrained as a draft model, then use NeMo RL's online draft loss to keep it aligned with the policy during RL. For training or adapting an Eagle checkpoint, see the [Model Optimizer speculative decoding example](https://github.com/NVIDIA/Model-Optimizer/blob/main/examples/speculative_decoding/README.md).
 
-NeMo RL now keeps a trainer-owned draft LM head. If the draft checkpoint contains
-`lm_head.weight`, NeMo RL loads it into the draft model. If that weight is absent,
-NeMo RL initializes the draft LM head from the current policy output layer instead.
+NeMo RL now keeps a trainer-owned draft LM head. If the draft checkpoint contains `lm_head.weight`, NeMo RL loads it into the draft model. If that weight is absent, NeMo RL initializes the draft LM head from the current policy output layer instead.
 
 > [!NOTE]
-> The two backends train different parts of the drafter. On Megatron, the
-> drafter has no embedding of its own: it consumes the policy's embedding
-> output (detached), so the draft loss never trains an embedding and refit
-> streams none. On Automodel, the drafter owns its own `embed_tokens` (from
-> the checkpoint, or copied from the policy's values at init for checkpoints
-> that ship none), trained independently and streamed on every refit — see
-> `train_embed_and_head` in the
-> [Automodel speculative decoding guide](automodel-speculative-decoding.md#config-reference).
-> Whether to unify this
-> behavior across backends is an open question, not yet decided -- tracked in
-> [NVIDIA-NeMo/RL#4691](https://github.com/NVIDIA-NeMo/RL/issues/4691).
+> The two backends train different parts of the drafter. On Megatron, the drafter has no embedding of its own: it consumes the policy's embedding output (detached), so the draft loss never trains an embedding and refit streams none. On Automodel, the drafter owns its own `embed_tokens` (from the checkpoint, or copied from the policy's values at init for checkpoints that ship none), trained independently and streamed on every refit — see `train_embed_and_head` in the [Automodel speculative decoding guide](automodel-speculative-decoding.md#config-reference).
+> Whether to unify this behavior across backends is an open question, not yet decided -- tracked in [NVIDIA-NeMo/RL#4691](https://github.com/NVIDIA-NeMo/RL/issues/4691).
 
 ## Enablement
 
@@ -178,9 +167,7 @@ where `lambda` is `policy.draft.loss_weight`.
 
 ## Notes
 
-- When online draft training is enabled, `train/loss` remains the policy-training
-  objective, `train/draft_loss` reports the unweighted auxiliary draft loss, and
-  `train/total_loss` reports `loss + policy.draft.loss_weight * draft_loss`.
+- When online draft training is enabled, `train/loss` remains the policy-training objective, `train/draft_loss` reports the unweighted auxiliary draft loss, and `train/total_loss` reports `loss + policy.draft.loss_weight * draft_loss`.
   `total_loss` is only emitted when the draft loss wrapper is active.
 - Resume checkpoints include the nested draft model state when `policy.draft.enabled=true`.
 - If speculative decoding is enabled without trainer-owned draft weights, vLLM must load real draft weights at startup. When the trainer owns the draft model, the first refit pushes both policy and draft parameters.
