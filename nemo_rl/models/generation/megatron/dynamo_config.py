@@ -21,7 +21,7 @@ comes from the backend-neutral ``policy.generation.disaggregation`` block.
 """
 
 from collections.abc import Mapping
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, PositiveFloat, PositiveInt
 
@@ -30,6 +30,10 @@ from nemo_rl.models.generation.interfaces import DisaggConfig
 # What one engine serves. Megatron engines behind Dynamo always run
 # disaggregated: an aggregated Megatron engine is plain ``backend: megatron``.
 MegatronDynamoRole = Literal["prefill", "decode"]
+
+# Dynamo component each role registers under: the frontend's prefill router
+# sends the prefill leg to "prefill" and the decode leg to "backend".
+DYNAMO_COMPONENT_BY_ROLE: dict[str, str] = {"prefill": "prefill", "decode": "backend"}
 
 # How the engines take new weights. None is NeMo RL's packed collective: train
 # rank zero exports HF tensors and broadcasts them to every engine rank, which
@@ -72,6 +76,10 @@ class MegatronDynamoFrontendArgs(BaseModel, extra="forbid"):
         "least-loaded",
         "device-aware-weighted",
     ] = "kv"
+    # Idle seconds a NeMo-Gym session stays on one engine; None disables it.
+    session_affinity_ttl_secs: Annotated[int, Field(gt=0, le=31_536_000)] | None = None
+    # Processes in the frontend that render chat calls; see the vLLM dynamo_cfg.
+    render_workers: PositiveInt = 8
     extra_cli_args: list[str] = Field(default_factory=list)
 
 

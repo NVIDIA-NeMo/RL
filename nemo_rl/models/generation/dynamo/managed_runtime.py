@@ -14,8 +14,10 @@
 
 """Driver-owned Dynamo services: etcd, NATS and the OpenAI frontend.
 
-The vLLM engines are NeMo RL's own workers; each registers itself with these
-services (see ``engine_adapter``), so the runtime only waits to see them.
+The engines are NeMo RL's own workers; each registers itself with these
+services from inside its worker (vLLM: see ``engine_adapter``; Megatron:
+``MegatronDynamoGenerationMixin.start_dynamo_endpoint``), so the runtime only
+launches the services and waits to see the engines.
 """
 
 import atexit
@@ -32,7 +34,8 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Protocol
 
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
@@ -42,17 +45,43 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
-from nemo_rl.models.generation.dynamo.config import DynamoCfg
 
-# The engines register on this component and endpoint (see engine_adapter).
+# The component an aggregated or decode engine registers under; a prefill
+# engine registers under "prefill".
 DYNAMO_COMPONENT = "backend"
 DYNAMO_ENDPOINT = "generate"
 
 LOGGER = logging.getLogger(__name__)
 
 
+class FrontendArgs(Protocol):
+    """The ``dynamo_cfg.frontend_args`` fields the runtime reads."""
+
+    @property
+    def router_mode(self) -> str: ...
+
+    @property
+    def session_affinity_ttl_secs(self) -> int | None: ...
+
+    @property
+    def render_workers(self) -> int: ...
+
+    @property
+    def extra_cli_args(self) -> Sequence[str]: ...
+
+
+class ManagedDynamoCfg(Protocol):
+    """The ``dynamo_cfg`` fields the runtime reads, whichever backend owns the block."""
+
+    @property
+    def startup_timeout_s(self) -> float: ...
+
+    @property
+    def frontend_args(self) -> FrontendArgs: ...
+
+
 def frontend_argv(
-    *, host: str, port: int, namespace: str, dynamo_cfg: DynamoCfg
+    *, host: str, port: int, namespace: str, dynamo_cfg: ManagedDynamoCfg
 ) -> list[str]:
     """The ``dynamo.frontend`` arguments; ``extra_cli_args`` may not repeat one."""
     argv = [
@@ -77,13 +106,22 @@ def frontend_argv(
             str(dynamo_cfg.frontend_args.session_affinity_ttl_secs),
         ]
     extra = dynamo_cfg.frontend_args.extra_cli_args
+    seen: set[str] = set()
     for token in extra:
         flag = token.split("=", 1)[0].replace("_", "-")
-        if flag.startswith("--") and flag in argv:
+        if not flag.startswith("--"):
+            continue
+        if flag in argv:
             raise ValueError(
                 f"Dynamo frontend option {flag} is set by both the managed runtime "
                 "and dynamo_cfg.frontend_args.extra_cli_args."
             )
+        if flag in seen:
+            raise ValueError(
+                f"Dynamo frontend option {flag} is repeated in "
+                "dynamo_cfg.frontend_args.extra_cli_args."
+            )
+        seen.add(flag)
     return argv + list(extra)
 
 
@@ -119,6 +157,97 @@ def _managed_namespace() -> str:
     return re.sub(r"[^a-zA-Z0-9_-]+", "-", raw).strip("-_").lower()
 
 
+def wait_for_engine_registrations(
+    *,
+    frontend_url: str,
+    namespace: str,
+    expected_components: Mapping[str, int],
+    model_name: str,
+    timeout_s: float,
+    check_alive: Callable[[], None],
+) -> None:
+    """Block until the frontend lists every expected engine and the model.
+
+    ``/health`` lists discovery registrations; every component in
+    ``expected_components`` must show at least its count of instance ids on
+    the generate endpoint. ``/v1/models`` must then list ``model_name``: the
+    frontend installs its OpenAI routes from a model watcher that can lag
+    discovery, and exposing the URL before that races a transient 404. A
+    prefill/decode frontend answers 503 until both roles are live and never
+    falls back to aggregated serving, so every component must register.
+
+    Runs without the service processes too, which is how a copy of the owner
+    on another process (the SingleController actor's) waits.
+
+    Args:
+        frontend_url: The frontend's OpenAI base URL, ending in ``/v1``.
+        namespace: Dynamo namespace the engines register under.
+        expected_components: Component name to the number of engines in it.
+        model_name: Served model name ``/v1/models`` must list.
+        timeout_s: Total wait budget.
+        check_alive: Runs on every poll; raises when an engine or service died,
+            so a failed registration fails at once.
+
+    Raises:
+        RuntimeError: When the fleet is not fully registered within ``timeout_s``.
+    """
+    root = frontend_url.rstrip("/").removesuffix("/v1")
+    health_url = f"{root}/health"
+    models_url = f"{root}/v1/models"
+    deadline = time.monotonic() + timeout_s
+    registered: dict[str, int] = {component: 0 for component in expected_components}
+    served: set[str] = set()
+    while time.monotonic() < deadline:
+        check_alive()
+        try:
+            with urllib.request.urlopen(health_url, timeout=5) as response:
+                health = json.loads(response.read())
+            with urllib.request.urlopen(models_url, timeout=5) as response:
+                models = json.loads(response.read())
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            time.sleep(1)
+            continue
+        instances: dict[str, set[str]] = {
+            component: set() for component in expected_components
+        }
+        for instance in health.get("instances", []):
+            if not isinstance(instance, dict):
+                continue
+            component = instance.get("component")
+            if (
+                instance.get("namespace") == namespace
+                and component in instances
+                and instance.get("endpoint") == DYNAMO_ENDPOINT
+                and instance.get("instance_id") is not None
+            ):
+                instances[str(component)].add(str(instance["instance_id"]))
+        registered = {component: len(ids) for component, ids in instances.items()}
+        served = {
+            str(model["id"])
+            for model in models.get("data", [])
+            if isinstance(model, dict) and model.get("id") is not None
+        }
+        if (
+            all(
+                registered[component] >= count
+                for component, count in expected_components.items()
+            )
+            and model_name in served
+        ):
+            print(
+                f"  [Dynamo] frontend ready: {root} routes to {registered} engine(s) "
+                f"for {model_name!r}",
+                flush=True,
+            )
+            return
+        time.sleep(1)
+    raise RuntimeError(
+        "Dynamo frontend did not see every engine within "
+        f"{timeout_s}s: expected={dict(expected_components)}, "
+        f"registered={registered}, model={model_name!r}, served={sorted(served)!r}."
+    )
+
+
 # The frontend process's environment for NeMo RL's chat engine
 # (dynamo/vllm/chat_engine.py): its render workers, where setup_token_capture
 # writes the capture config, the Ray cluster its TQ reads go through, and the
@@ -152,12 +281,12 @@ def read_chat_settings() -> dict[str, Any] | None:
 
 
 class ManagedDynamoRuntime:
-    """Own etcd, NATS and the frontend that NeMo RL's vLLM engines register with."""
+    """Own etcd, NATS and the frontend that NeMo RL's engines register with."""
 
     def __init__(
         self,
         *,
-        dynamo_cfg: DynamoCfg,
+        dynamo_cfg: ManagedDynamoCfg,
         model_name: str,
         frontend_python: str,
         ray_address: str,
@@ -169,7 +298,8 @@ class ManagedDynamoRuntime:
             dynamo_cfg: The validated ``policy.generation.dynamo_cfg``.
             model_name: The served model; the frontend is ready once it lists it.
             frontend_python: An interpreter whose environment has ``ai-dynamo``:
-                the vLLM workers' own.
+                the engine workers' own, so the frontend runs the same release
+                as every engine.
             ray_address: The Ray cluster's GCS address; the frontend's chat
                 engine reads token-capture prefixes from TQ through it.
             serves_chat: Whether the engines expose chat
@@ -269,14 +399,11 @@ class ManagedDynamoRuntime:
             "DYN_HTTP_BODY_LIMIT_MB": "512",
             "DYN_TCP_MAX_MESSAGE_SIZE": str(1 << 30),
             # A canary request would stall behind a refit pause; engine liveness
-            # is the Ray actor's, as for every other vLLM worker.
+            # is the Ray actor's, as for every other NeMo RL worker.
             "DYN_HEALTH_CHECK_ENABLED": "false",
             "DYN_SDK_DISABLE_ANSI_LOGGING": "1",
         }
-        print(
-            f"  [Dynamo] managed environment={self._manager_env!r}",
-            flush=True,
-        )
+        print(f"  [Dynamo] managed environment={self._manager_env!r}", flush=True)
         try:
             self._start_etcd()
             self._start_nats()
@@ -473,63 +600,35 @@ class ManagedDynamoRuntime:
         os.replace(chat_file.name, os.path.join(self._chat_dir, name))
 
     def wait_for_engines(
-        self, expected_engines: int, check_engines: Callable[[], None]
+        self,
+        expected_engines: int | Mapping[str, int],
+        check_engines: Callable[[], None],
     ) -> None:
-        """Block until the frontend routes to ``expected_engines`` registered engines.
+        """Block until the frontend routes to every expected engine and the model.
 
-        ``/health`` lists discovery registrations before the frontend's model
-        watcher has installed its OpenAI routes, so readiness also needs the
-        served model on ``/v1/models``; otherwise an immediate request can race
-        the watcher and get a transient 404.
-
+        ``expected_engines`` is an engine count under ``DYNAMO_COMPONENT``, or a
+        count per component (prefill engines register under their own).
         ``check_engines`` runs on every poll and raises when an engine exited or
-        its endpoint stopped, so a failed registration fails at once.
+        its endpoint stopped, so a failed registration fails at once; the owned
+        service processes are checked alongside.
         """
-        health_url = f"http://127.0.0.1:{self._frontend_port}/health"
-        models_url = f"http://127.0.0.1:{self._frontend_port}/v1/models"
-        deadline = time.monotonic() + self._dynamo_cfg.startup_timeout_s
-        registered = 0
-        served: set[str] = set()
-        while time.monotonic() < deadline:
+        expected = (
+            {DYNAMO_COMPONENT: expected_engines}
+            if isinstance(expected_engines, int)
+            else dict(expected_engines)
+        )
+
+        def check_alive() -> None:
             self._assert_services_alive()
             check_engines()
-            try:
-                with urllib.request.urlopen(health_url, timeout=5) as response:
-                    health = json.loads(response.read())
-                with urllib.request.urlopen(models_url, timeout=5) as response:
-                    models = json.loads(response.read())
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-                time.sleep(1)
-                continue
-            registered = len(
-                {
-                    str(instance["instance_id"])
-                    for instance in health.get("instances", [])
-                    if isinstance(instance, dict)
-                    and instance.get("namespace") == self._namespace
-                    and instance.get("component") == DYNAMO_COMPONENT
-                    and instance.get("endpoint") == DYNAMO_ENDPOINT
-                    and instance.get("instance_id") is not None
-                }
-            )
-            served = {
-                str(model["id"])
-                for model in models.get("data", [])
-                if isinstance(model, dict) and model.get("id") is not None
-            }
-            if registered >= expected_engines and self._model_name in served:
-                print(
-                    f"  [Dynamo] frontend {self.frontend_url} routes to "
-                    f"{registered} engine(s)",
-                    flush=True,
-                )
-                return
-            time.sleep(1)
-        raise RuntimeError(
-            "Dynamo frontend did not see every vLLM engine within "
-            f"{self._dynamo_cfg.startup_timeout_s}s: expected={expected_engines}, "
-            f"registered={registered}, model={self._model_name!r}, "
-            f"served={sorted(served)!r}."
+
+        wait_for_engine_registrations(
+            frontend_url=f"http://127.0.0.1:{self._frontend_port}/v1",
+            namespace=self._namespace,
+            expected_components=expected,
+            model_name=self._model_name,
+            timeout_s=self._dynamo_cfg.startup_timeout_s,
+            check_alive=check_alive,
         )
 
     def _assert_services_alive(self) -> None:

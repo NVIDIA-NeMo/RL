@@ -248,6 +248,12 @@ mcore = [
   # dependency megatron-core[dev,mlm] and its [tool.uv.sources] path mapping, so Megatron-LM
   # pyproject changes propagate on bump without any mirror here.
   "megatron-bridge[te,ssm]",
+  # Megatron prefill/decode engines behind Dynamo (policy.generation.backend=megatron
+  # with dynamo: true): rank zero of each engine hosts Megatron-LM's Dynamo
+  # adapter through Dynamo's engine-agnostic backend SDK. Base package only: its
+  # [vllm] extra pins Dynamo's own vLLM, which these engines never run.
+  "ai-dynamo==1.5.1",
+  "ai-dynamo-runtime==1.5.1",
   # Colocated with vLLM engines (CUDA-IPC refit), so vLLM must be able to open the
   # CUDA IPC handles this torch writes. torch 2.13 and 2.14 (vLLM) write the same
   # handle version. Not moved to 2.14: its headers need C++20, which DeepEP,
