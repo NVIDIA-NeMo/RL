@@ -929,6 +929,84 @@ def test_molt_objective_rejects_unsupported_settings(grpo_update, loss_update, s
         )
 
 
+def _divergence_gate_settings():
+    return (
+        {
+            "masked_reward_policy": "include",
+            "adv_estimator": {
+                "name": "grpo",
+                "normalize_rewards": False,
+                "use_leave_one_out_baseline": False,
+            },
+        },
+        {
+            "use_importance_sampling_correction": True,
+            "truncated_importance_sampling_type": "seq-mask-tis",
+            "is_correction_gating": "binary_kl",
+            "truncated_importance_sampling_ratio_min": 0.0,
+            "truncated_importance_sampling_ratio": 0.01,
+            "actor_importance_sampling_ratio_max": 1e9,
+            "force_on_policy_ratio": True,
+        },
+    )
+
+
+@pytest.mark.parametrize("estimator", ["grpo", "reinforce_baseline"])
+@pytest.mark.parametrize("gating", ["binary_kl", "tv"])
+@pytest.mark.parametrize("token_level_loss", [True, False])
+def test_divergence_gated_objective_is_a_supported_forest_objective(
+    estimator, gating, token_level_loss
+):
+    grpo, loss = _divergence_gate_settings()
+    grpo["adv_estimator"]["name"] = estimator
+    loss |= {"is_correction_gating": gating, "token_level_loss": token_level_loss}
+    validate_forest_objective(GRPOConfig(**grpo), ClippedPGLossConfig(**loss))
+
+
+@pytest.mark.parametrize(
+    "grpo_update,loss_update,setting",
+    [
+        ({"masked_reward_policy": "exclude"}, {}, "grpo.masked_reward_policy"),
+        (
+            {},
+            {"truncated_importance_sampling_ratio_min": 0.001},
+            "loss_fn.truncated_importance_sampling_ratio_min/ratio",
+        ),
+        (
+            {},
+            {"truncated_importance_sampling_ratio_min": None},
+            "loss_fn.truncated_importance_sampling_ratio_min/ratio",
+        ),
+        ({}, {"force_on_policy_ratio": False}, "loss_fn.force_on_policy_ratio"),
+        (
+            {},
+            {"is_correction_gating": "ratio", "token_level_loss": False},
+            "loss_fn.token_level_loss",
+        ),
+    ],
+)
+def test_divergence_gated_objective_rejects_unsupported_settings(
+    grpo_update, loss_update, setting
+):
+    grpo, loss = _divergence_gate_settings()
+    with pytest.raises(ValueError, match=setting):
+        validate_forest_objective(
+            GRPOConfig(**(grpo | grpo_update)),
+            ClippedPGLossConfig(**(loss | loss_update)),
+        )
+
+
+def test_dr_grpo_forest_advantage_is_owner_reward_minus_group_mean():
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)]), ("b", [(1.0, 1), (1.0, 3)])])
+    grpo, loss = _divergence_gate_settings()
+    ctrl = _controller(meta, data, grpo=grpo, loss=loss)
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    expected = torch.tensor([-0.5, -0.5, 0.5, 0.0, 0.0, 0.0, 0.0])
+    torch.testing.assert_close(data["advantages"][:, 1], expected)
+
+
 def test_molt_whitening_uses_total_owner_tokens_across_unequal_segments():
     meta, data = _batch([("a", [(1.0, 2), (3.0, 1)])])
     data["token_mask"] = torch.tensor(
