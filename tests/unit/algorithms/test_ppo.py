@@ -2551,8 +2551,10 @@ def test_legacy_ppo_entrypoint_rejects_split_value_training(
     monkeypatch.setattr(
         run_ppo,
         "MasterConfig",
-        lambda **_: SimpleNamespace(
-            ppo=SimpleNamespace(async_ppo={}, value_training_mode="split")
+        SimpleNamespace(
+            model_validate=lambda _: SimpleNamespace(
+                ppo=SimpleNamespace(async_ppo={}, value_training_mode="split")
+            )
         ),
     )
     monkeypatch.setattr(run_ppo, "init_ray", init_ray)
