@@ -25,9 +25,13 @@ from __future__ import annotations
 import contextvars
 import inspect
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Literal, Optional
+
+import torch
+
+from nemo_rl.models.generation.prefix_recovery.routes import _final_route_placeholder
 
 
 def _remaining_generation_limits_after_prefix(
@@ -106,6 +110,8 @@ class _RestoredPrefixTerminal:
     reason: str
     finish_reason: Literal["stop", "length"]
     stop_reason: str | int | None = None
+    # Full-sequence routes for router replay; see _restored_prefix_terminal_routes.
+    routed_experts: torch.Tensor | None = field(default=None, compare=False)
 
     @property
     def original_prompt_token_count(self) -> int:
@@ -209,6 +215,26 @@ def _classify_restored_prefix_terminal(
     )
 
 
+def _restored_prefix_terminal_routes(
+    restored: torch.Tensor, *, prev_len: int
+) -> torch.Tensor:
+    """Full-sequence routes for a restored prefix that needs no more decoding.
+
+    The engine never runs, so nothing routes the positions before the restored
+    delta (the parent's last token included) or the final token: those rows
+    are missing-route placeholders.
+    """
+    layers, topk = int(restored.shape[1]), int(restored.shape[2])
+    return torch.cat(
+        (
+            _final_route_placeholder(layers, topk, restored.dtype, rows=prev_len),
+            restored[:-1],
+            _final_route_placeholder(layers, topk, restored.dtype),
+        ),
+        dim=0,
+    )
+
+
 def _build_restored_prefix_terminal_output(
     request_id: str, terminal: _RestoredPrefixTerminal
 ) -> Any:
@@ -229,6 +255,11 @@ def _build_restored_prefix_terminal_output(
                 logprobs=[],
                 finish_reason=terminal.finish_reason,
                 stop_reason=terminal.stop_reason,
+                routed_experts=(
+                    None
+                    if terminal.routed_experts is None
+                    else terminal.routed_experts.numpy()
+                ),
             )
         ],
         finished=True,

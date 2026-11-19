@@ -639,6 +639,8 @@ def _controller(
         message_level_advantage_penalties_enabled=False,
         shardable=not estimator.requires_global_batch,
         train_data_dump_dir=dump_dir,
+        # The controller below merges JSONL parts, so the computers write JSONL.
+        debug_writer=DebugWriterConfig(target="json"),
     )
     if stage_config is not None:
         config = stage_config
