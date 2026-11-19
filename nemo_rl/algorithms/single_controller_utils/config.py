@@ -2200,13 +2200,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 f"token_capture.control_timeout_s ({gym_park_s}); a turn snapshot "
                 "can hold rollout dispatch that long."
             )
-    if recovery_config.generation_prefix_cuts_enabled and top_logprobs > 0:
-        # Sampler top-k is staged from a call's final response only, so a
-        # restored generation prefix would have no candidates for its tokens.
-        raise ValueError(
-            "rollout_recovery.target_level='prefix' does not support "
-            "policy.generation.top_logprobs > 0 (loss_fn.score_centering) yet"
-        )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled
     ):
