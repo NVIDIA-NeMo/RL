@@ -801,7 +801,7 @@ def print_performance_metrics(
         exposed_generation_time = timing_metrics["exposed_generation"]
         training_worker_idle_time_ratio = (
             0
-            if exposed_generation_time > 0.1
+            if exposed_generation_time < 0.1
             else exposed_generation_time
             / (
                 policy_training_time
