@@ -17,7 +17,7 @@ import asyncio
 import json
 import math
 from collections.abc import Sequence
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -30,6 +30,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
     GAEConfig,
     GeneralizedAdvantageEstimator,
+    GRPOAdvantageEstimator,
     create_advantage_estimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
@@ -1436,3 +1437,113 @@ def test_request_override_applies_the_threshold_like_the_separate_pass(override)
     if override:
         expected[1] = 0.0
     assert masks == expected
+
+
+class TestAgentOverrides:
+    """grpo.agent_overrides: per-environment overlong filtering and normalization.
+
+    Groups 0-2 belong to a graded agent that overrides both settings; groups
+    3-5 to an agent that keeps the run-wide ones. Each half must come out
+    exactly as a run with that half's settings run-wide.
+    """
+
+    GRADED = "rubric_judge_agent"
+    OTHER = "other_agent"
+
+    def _rows(self) -> dict[str, dict[str, torch.Tensor]]:
+        rows = _rows()
+        for index, row in enumerate(rows.values()):
+            group, member = divmod(index, GROUP_SIZE)
+            # Graded rewards with a small spread in every group.
+            row["total_reward"] = torch.tensor(0.6 + 0.05 * member + 0.01 * group)
+            # One truncated row in a graded group and one in a pass/fail group.
+            row["truncated"] = torch.tensor(index in (1, 3 * GROUP_SIZE + 2))
+        return rows
+
+    def _meta(self, tagged: bool = True) -> KVBatchMeta:
+        meta = _pool_meta()
+        if tagged:
+            tags = [
+                {
+                    **tag,
+                    "agent_name": self.GRADED
+                    if index // GROUP_SIZE < NUM_GROUPS // 2
+                    else self.OTHER,
+                }
+                for index, tag in enumerate(meta.tags)
+            ]
+            meta = replace(meta, tags=tags)
+        return meta
+
+    def _run(self, algo: GRPOConfig, meta: KVBatchMeta):
+        store = _RowStore(self._rows())
+        computer = AdvantageComputer(
+            store,
+            config=_config(algo=algo),
+            advantage_estimator=GRPOAdvantageEstimator(algo.adv_estimator, None),
+        )
+        outcome = asyncio.run(computer.run(AdvantageRequest(meta=meta)))
+        ids = meta.sample_ids
+        advantages = torch.stack([store.rows[sid]["advantages"] for sid in ids])
+        sample_mask = torch.stack([store.rows[sid]["sample_mask"] for sid in ids])
+        return outcome, advantages, sample_mask
+
+    def _algo(self, *, overlong: bool, normalize: bool, overrides=None) -> GRPOConfig:
+        return GRPOConfig(
+            num_generations_per_prompt=GROUP_SIZE,
+            overlong_filtering=overlong,
+            adv_estimator=AdvEstimatorConfig(name="grpo", normalize_rewards=normalize),
+            agent_overrides=overrides,
+        )
+
+    def test_each_agent_gets_its_own_settings(self) -> None:
+        half = NUM_GROUPS // 2 * GROUP_SIZE
+        mixed_outcome, mixed_adv, mixed_mask = self._run(
+            self._algo(
+                overlong=False,
+                normalize=True,
+                overrides={
+                    self.GRADED: {
+                        "overlong_filtering": True,
+                        "normalize_rewards": False,
+                    }
+                },
+            ),
+            self._meta(),
+        )
+        _, graded_adv, graded_mask = self._run(
+            self._algo(overlong=True, normalize=False), self._meta()
+        )
+        _, other_adv, other_mask = self._run(
+            self._algo(overlong=False, normalize=True), self._meta()
+        )
+        torch.testing.assert_close(mixed_adv[:half], graded_adv[:half])
+        torch.testing.assert_close(mixed_mask[:half], graded_mask[:half])
+        torch.testing.assert_close(mixed_adv[half:], other_adv[half:])
+        torch.testing.assert_close(mixed_mask[half:], other_mask[half:])
+        # The graded agent's truncated row left the loss; the other one did not.
+        assert mixed_mask[1].item() == 0.0
+        assert mixed_mask[3 * GROUP_SIZE + 2].item() == 1.0
+        metrics = mixed_outcome.sample_mask_metrics
+        assert metrics[f"num_masked_seqs_by_overlong_filtering/{self.GRADED}"] == 1
+        assert f"num_masked_seqs_by_overlong_filtering/{self.OTHER}" not in metrics
+        assert metrics["num_masked_seqs_by_overlong_filtering"] == 1
+        assert metrics["num_rows_without_agent_tag"] == 0
+
+    def test_untagged_rows_keep_the_run_wide_settings(self) -> None:
+        algo = self._algo(
+            overlong=False,
+            normalize=True,
+            overrides={
+                self.GRADED: {"overlong_filtering": True, "normalize_rewards": False}
+            },
+        )
+        outcome, advantages, sample_mask = self._run(algo, self._meta(tagged=False))
+        _, run_wide_adv, run_wide_mask = self._run(
+            self._algo(overlong=False, normalize=True), self._meta(tagged=False)
+        )
+        torch.testing.assert_close(advantages, run_wide_adv)
+        torch.testing.assert_close(sample_mask, run_wide_mask)
+        metrics = outcome.sample_mask_metrics
+        assert metrics["num_rows_without_agent_tag"] == NUM_GROUPS * GROUP_SIZE
+        assert metrics[f"num_masked_seqs_by_overlong_filtering/{self.GRADED}"] == 0
