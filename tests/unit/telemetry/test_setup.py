@@ -17,6 +17,7 @@ from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.setup import (
     _build_resource_attributes,
     _dig,
+    _otlp_endpoint_configured,
     _process_attributes,
     _training_config_attributes,
     _worker_resource_attributes,
@@ -250,9 +251,143 @@ def test_init_driver_returns_none_when_disabled():
     assert get_telemetry_handle() is None
 
 
-def test_init_driver_returns_none_when_no_telemetry_block():
+def test_init_driver_returns_none_when_no_telemetry_block(monkeypatch):
+    # An absent block now applies the default (enabled), so this only stays off
+    # because no endpoint is configured and the guard turns it back off -- the
+    # endpoint has to be cleared for the test to pin that, not a stray collector
+    # in the developer's shell.
+    _no_otlp_endpoint(monkeypatch)
     handle = init_telemetry_driver(_FakeMasterConfig(telemetry=None), "grpo")
     assert handle is None
+
+
+def _no_otlp_endpoint(monkeypatch):
+    # Not cleared by the autouse fixture, and a developer with a collector in
+    # their shell would otherwise skip the branch under test.
+    for name in (
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_otlp_endpoint_counts_the_signal_specific_vars(monkeypatch):
+    """The SDK prefers the signal-specific vars, so either one counts as wired."""
+    _no_otlp_endpoint(monkeypatch)
+    assert _otlp_endpoint_configured() is False
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://collector:4318")
+    assert _otlp_endpoint_configured() is True
+    # Whitespace is not an endpoint.
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "   ")
+    assert _otlp_endpoint_configured() is False
+
+
+def test_init_driver_stays_off_when_nothing_configured_an_endpoint(monkeypatch, caplog):
+    """``enabled`` defaults true, so this is what a run that never asked gets.
+
+    Without the check the SDK would fall back to ``http://localhost:4317`` and
+    every such run would pay a retry per batch plus a blocked shutdown flush.
+    """
+    _no_otlp_endpoint(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="nemo_rl.telemetry.setup"):
+        handle = init_telemetry_driver(_FakeMasterConfig(TelemetryConfig()), "grpo")
+    assert handle is None
+    assert get_telemetry_handle() is None
+    assert "no OTLP endpoint configured" in caplog.text
+    # Workers rebuild from the environment and cannot repeat the check, so the
+    # verdict has to travel with them.
+    assert os.environ["NEMO_RL_OTEL_ENABLED"] == "0"
+    assert telemetry_enabled_in_env() is False
+
+
+def test_init_driver_skips_the_endpoint_check_for_the_console_exporter(
+    monkeypatch, caplog
+):
+    """``console`` needs no endpoint, so the guard never fires for it.
+
+    The guard is ``config.enabled and config.exporter == "otlp" and not
+    _otlp_endpoint_configured()``; with ``console`` the middle clause is false,
+    so the endpoint check is skipped and nothing is warned. (The explicit-opt-in
+    path itself is covered by the next test, which uses the ``otlp`` exporter.)
+    """
+    pytest.importorskip("nemo.lens")
+
+    def _fake_setup_telemetry(config, **kwargs):
+        return SimpleNamespace(is_exporting=True, tracer=None)
+
+    monkeypatch.setattr("nemo.lens.setup_telemetry", _fake_setup_telemetry)
+    _no_otlp_endpoint(monkeypatch)
+    cfg = TelemetryConfig(enabled=True, exporter="console")
+    with caplog.at_level(logging.WARNING, logger="nemo_rl.telemetry.setup"):
+        handle = init_telemetry_driver(_FakeMasterConfig(cfg), "grpo")
+    assert handle is not None
+    # console needs no endpoint, so there is nothing to warn about either.
+    assert "no OTLP endpoint" not in caplog.text
+
+
+def test_init_driver_warns_when_an_explicit_otlp_opt_in_has_no_endpoint(
+    monkeypatch, caplog
+):
+    # Fake the lens exporter so the honoured opt-in does not build a real OTLP
+    # exporter against the SDK fallback (http://localhost:4317) and then block
+    # the autouse shutdown flush -- the very failure this guard exists to avoid.
+    pytest.importorskip("nemo.lens")
+
+    def _fake_setup_telemetry(config, **kwargs):
+        return SimpleNamespace(is_exporting=True, tracer=None)
+
+    monkeypatch.setattr("nemo.lens.setup_telemetry", _fake_setup_telemetry)
+    _no_otlp_endpoint(monkeypatch)
+    cfg = TelemetryConfig(enabled=True)
+    with caplog.at_level(logging.WARNING, logger="nemo_rl.telemetry.setup"):
+        handle = init_telemetry_driver(_FakeMasterConfig(cfg), "grpo")
+    assert handle is not None, "an explicit opt-in is honoured, not overridden"
+    assert "no OTLP endpoint is set" in caplog.text
+
+
+def test_init_driver_exports_by_default_once_an_endpoint_exists(monkeypatch):
+    """The point of the default: a configured cluster needs no telemetry YAML."""
+    # Fake the lens exporter: the endpoint var is only there to clear the guard,
+    # and it points at an unresolvable host, so a real exporter would retry per
+    # batch and block the shutdown flush. What this test pins is the env the
+    # driver projects (enabled + span groups), not a live export.
+    pytest.importorskip("nemo.lens")
+
+    def _fake_setup_telemetry(config, **kwargs):
+        return SimpleNamespace(is_exporting=True, tracer=None)
+
+    monkeypatch.setattr("nemo.lens.setup_telemetry", _fake_setup_telemetry)
+    _no_otlp_endpoint(monkeypatch)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")
+    handle = init_telemetry_driver(_FakeMasterConfig(TelemetryConfig()), "grpo")
+    assert handle is not None
+    assert os.environ["NEMO_RL_OTEL_ENABLED"] == "1"
+    assert os.environ["NEMO_RL_OTEL_SPAN_GROUPS"] == "per_step"
+
+
+def test_init_driver_instruments_the_no_block_path_once_an_endpoint_exists(monkeypatch):
+    """The headline case: an absent ``telemetry:`` block is instrumented as-is.
+
+    The whole point of the default is that a run on a cluster that already
+    exports ``OTEL_EXPORTER_OTLP_*`` needs no telemetry YAML at all. That is the
+    ``telemetry=None`` path, which never builds a config object, so the default
+    has to be applied there too -- otherwise lens's own ``from_env`` default
+    (off) wins and the headline silently does not hold.
+    """
+    pytest.importorskip("nemo.lens")
+
+    def _fake_setup_telemetry(config, **kwargs):
+        return SimpleNamespace(is_exporting=True, tracer=None)
+
+    monkeypatch.setattr("nemo.lens.setup_telemetry", _fake_setup_telemetry)
+    _no_otlp_endpoint(monkeypatch)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")
+    handle = init_telemetry_driver(_FakeMasterConfig(telemetry=None), "grpo")
+    assert handle is not None
+    assert os.environ["NEMO_RL_OTEL_ENABLED"] == "1"
+    assert os.environ["NEMO_RL_OTEL_SPAN_GROUPS"] == "per_step"
 
 
 def test_init_worker_returns_none_when_disabled():
