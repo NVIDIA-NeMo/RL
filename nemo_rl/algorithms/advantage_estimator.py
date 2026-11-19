@@ -53,9 +53,8 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_kl,
     get_gdpo_reward_component_keys,
-    masked_mean,
-    masked_var,
 )
+from nemo_rl.utils.tensor_ops import masked_mean, masked_var
 
 
 class AdvEstimatorConfig(BaseModel, extra="allow"):

@@ -1428,6 +1428,7 @@ def _setup_fake_vllm_app(
     worker._capture_registry = CaptureRegistry()
     worker._prefix_recovery = NoPrefixRecovery()
     worker._capture_top_logprobs = 0
+    worker._cut_routes_dtype = None
     worker.token_capture = None
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
@@ -1809,6 +1810,8 @@ def _generation_cut_route(
                 control_timeout_s=timeout_s,
                 progress_reader=None,
                 prefix_row_extras=lambda state: None,
+                router_replay=False,
+                sampler_top_k=0,
             )
         )
         recovery.checkpoint_cut = checkpoint_cut

@@ -21,7 +21,9 @@ tensor contract regardless of how the candidates were selected.
 """
 
 import math
+from collections.abc import Sequence
 from numbers import Real
+from types import SimpleNamespace
 from typing import Any, TypedDict
 
 import torch
@@ -205,3 +207,32 @@ def extract_flat_score_centering_samples(
     if (head_logprobs.exp().sum(dim=1) > 1.0001).any():
         raise ValueError("Sampler top-k probabilities exceed unit mass")
     return head_ids.to(torch.int32), head_logprobs
+
+
+def extract_score_centering_slice(
+    token_ids: Sequence[int], logprobs: Any, *, start: int, num_candidates: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract sampler candidates for the generated positions ``start`` onward.
+
+    ``logprobs`` may be vLLM's live, append-only container for a request that
+    is still decoding: a list of per-position mappings, or ``FlatLogprobs``.
+    Only the positions of ``token_ids`` are read, which the caller must have
+    seen published. Both layouts go through the same extractor as a finished
+    output, so a staged slice matches what the final response would carry.
+
+    Returns:
+        CPU ``(sampler_ids, sampler_logprobs)`` tensors, both shaped
+        ``[len(token_ids), num_candidates]``.
+    """
+    end = start + len(token_ids)
+    if logprobs is None or len(logprobs) < end:
+        raise RuntimeError(
+            "vLLM has not published sampler top-k for every generated position: "
+            f"need {end}, have {0 if logprobs is None else len(logprobs)}"
+        )
+    view = SimpleNamespace(
+        index=0, token_ids=list(token_ids), logprobs=logprobs[start:end]
+    )
+    if isinstance(view.logprobs, list):
+        return extract_score_centering_samples(view, num_candidates=num_candidates)
+    return extract_flat_score_centering_samples(view, num_candidates=num_candidates)
