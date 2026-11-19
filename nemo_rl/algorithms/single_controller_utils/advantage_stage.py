@@ -90,21 +90,12 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.ppo import PPOConfig
 
 
-def validate_forest_estimator(
-    algo_cfg: GRPOConfig | PPOConfig, estimator: Any, *, is_ppo: bool
-) -> None:
+def validate_forest_estimator(estimator: Any, *, is_ppo: bool) -> None:
     """Forest owners support the standard GRPO estimator and PPO's GAE."""
-    name = algo_cfg.adv_estimator.name
     if is_ppo:
-        supported = name == "gae" and isinstance(
-            estimator, GeneralizedAdvantageEstimator
-        )
+        supported = isinstance(estimator, GeneralizedAdvantageEstimator)
     else:
-        supported = (
-            isinstance(algo_cfg, GRPOConfig)
-            and name == "grpo"
-            and isinstance(estimator, GRPOAdvantageEstimator)
-        )
+        supported = isinstance(estimator, GRPOAdvantageEstimator)
     if not supported:
         raise ValueError(
             "Forest logical owners require the standard GRPO estimator or PPO's GAE"
@@ -374,9 +365,7 @@ class AdvantageComputer:
         adv_cfg = cfg.advantage
         logical = has_logical_owners(meta)
         if logical:
-            validate_forest_estimator(
-                cfg.algo, self._advantage_estimator, is_ppo=cfg.is_ppo
-            )
+            validate_forest_estimator(self._advantage_estimator, is_ppo=cfg.is_ppo)
         input_fields = cfg.input_fields()
         if logical and adv_cfg.prompt_ids_field not in input_fields:
             input_fields.append(adv_cfg.prompt_ids_field)

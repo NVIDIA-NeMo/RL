@@ -5354,9 +5354,7 @@ class SingleControllerActor:
 
         logical = has_logical_owners(meta)
         if logical:
-            validate_forest_estimator(
-                self._algo_cfg, self._advantage_estimator, is_ppo=self._is_ppo
-            )
+            validate_forest_estimator(self._advantage_estimator, is_ppo=self._is_ppo)
             validate_forest_objective(self._algo_cfg, self._master_config.loss_fn)
         if self._advantage_estimator is None:
             return meta, True
