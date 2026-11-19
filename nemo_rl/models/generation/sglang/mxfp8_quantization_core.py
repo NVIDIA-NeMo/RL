@@ -115,6 +115,9 @@ def quantize_mxfp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     Uses flashinfer's swizzle-free MXFP8 kernel
     (``is_sf_swizzled_layout=False``).
     """
+    if weight.is_cuda and torch.cuda.get_device_capability(weight.device)[0] < 10:
+        raise RuntimeError("FlashInfer MXFP8 quantization requires an SM100+ GPU.")
+
     try:
         from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
     except ImportError as e:

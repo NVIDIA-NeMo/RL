@@ -16,6 +16,7 @@
 
 import json
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import safetensors.torch
@@ -139,9 +140,64 @@ def test_startup_rejects_invalid_explicit_checkpoint(tmp_path: Path, converted_p
         )
 
 
+@pytest.mark.parametrize("indexed", [False, True])
+def test_offline_conversion_serializes_backend_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, indexed: bool
+) -> None:
+    source, output = tmp_path / "source", tmp_path / "output"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"num_hidden_layers": 2}))
+    (source / "tokenizer_config.json").write_text('{"chat_template": "example"}')
+    selected = "model.layers.1.mlp.down_proj.weight"
+    preserved = "model.layers.0.mlp.down_proj.weight"
+    weights = {
+        selected: torch.ones((2, 32), dtype=torch.bfloat16),
+        preserved: torch.full((2, 32), 0.5, dtype=torch.bfloat16),
+    }
+    safetensors.torch.save_file(weights, source / "model.safetensors")
+    if indexed:
+        (source / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {name: "model.safetensors" for name in weights}})
+        )
+    quantized = torch.full((2, 32), 128.0).to(torch.float8_e4m3fn)
+    scales = torch.full((2, 1), 120, dtype=torch.uint8)
+    quantizer = Mock(return_value=(quantized, scales))
+    monkeypatch.setattr(mxfp8_setup, "quantize_mxfp8", quantizer)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    mxfp8_setup.convert_mxfp8(
+        str(source), str(output), device="cpu", num_layers_at_start_in_bf16=1
+    )
+
+    quantizer.assert_called_once()
+    torch.testing.assert_close(quantizer.call_args.args[0], weights[selected])
+    actual = safetensors.torch.load_file(output / "model.safetensors")
+    scale_key = selected.removesuffix(".weight") + ".weight_scale_inv"
+    assert actual.keys() == weights.keys() | {scale_key}
+    assert actual[selected].dtype == quantized.dtype
+    torch.testing.assert_close(
+        actual[selected].view(torch.uint8), quantized.view(torch.uint8)
+    )
+    torch.testing.assert_close(actual[scale_key], scales)
+    torch.testing.assert_close(actual[preserved], weights[preserved])
+    assert (output / "tokenizer_config.json").read_bytes() == (
+        source / "tokenizer_config.json"
+    ).read_bytes()
+    config = json.loads((output / "config.json").read_text())["quantization_config"]
+    assert config["scale_fmt"] == "ue8m0"
+    assert "layers.0." in config["modules_to_not_convert"]
+    index = json.loads((output / "model.safetensors.index.json").read_text())
+    assert index["weight_map"] == {name: "model.safetensors" for name in actual}
+    assert index["metadata"]["total_size"] == sum(
+        tensor.numel() * tensor.element_size() for tensor in actual.values()
+    )
+
+
 @pytest.mark.sglang
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires real CUDA quantization"
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="FlashInfer MXFP8 quantization requires an SM100+ GPU",
 )
 @pytest.mark.parametrize("indexed", [False, True])
 def test_offline_checkpoint_matches_online_quantization(tmp_path: Path, indexed: bool):
