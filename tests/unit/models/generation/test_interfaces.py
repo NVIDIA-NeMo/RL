@@ -14,6 +14,8 @@
 
 """Default behaviour of the optional hooks declared on GenerationInterface."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -21,7 +23,63 @@ from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     agreed_media_columns,
+    resolve_generation_max_seq_len,
 )
+
+
+@pytest.mark.parametrize(
+    "cfg,reported_limit,expected",
+    [
+        ({"backend": "vllm", "vllm_cfg": {"max_model_len": 1024}}, None, 1024),
+        (
+            {"backend": "megatron", "mcore_generation_config": {"max_model_len": 2048}},
+            None,
+            2048,
+        ),
+        ({"backend": "trtllm", "trtllm_cfg": {"max_model_len": 4096}}, None, 4096),
+        (
+            {
+                "backend": "sglang",
+                "sglang_cfg": {"context_length": 8192},
+                "vllm_cfg": {"max_model_len": 1},
+            },
+            16384,
+            8192,
+        ),
+        (
+            {
+                "backend": "sglang",
+                "sglang_cfg": {"context_length": None},
+                "vllm_cfg": {"max_model_len": 1},
+            },
+            16384,
+            16384,
+        ),
+        ({"max_total_sequence_length": 32768}, None, 32768),
+    ],
+)
+def test_resolve_generation_max_seq_len(
+    cfg: dict, reported_limit: int | None, expected: int
+) -> None:
+    generation = SimpleNamespace(cfg=cfg, context_length=reported_limit)
+
+    assert resolve_generation_max_seq_len(generation) == expected
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        {"backend": "unknown", "vllm_cfg": {"max_model_len": 1}},
+        {"backend": "sglang", "sglang_cfg": {"context_length": None}},
+    ],
+)
+def test_resolve_generation_max_seq_len_rejects_unresolved_backend(cfg: dict) -> None:
+    generation = SimpleNamespace(cfg=cfg, context_length=None)
+
+    with pytest.raises(
+        ValueError, match="Unable to resolve the generation max sequence length"
+    ):
+        resolve_generation_max_seq_len(generation)
 
 
 class _MinimalGeneration(GenerationInterface):

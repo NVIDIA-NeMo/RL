@@ -1184,7 +1184,7 @@ def patched_ppo_factories():
             "nemo_rl.algorithms.grpo._create_advantage_estimator",
             return_value=MagicMock(),
         ),
-        patch.object(sc_setup_mod, "_generation_max_seq_len", return_value=32),
+        patch.object(sc_setup_mod, "resolve_generation_max_seq_len", return_value=32),
     ):
         yield {
             "_build_trainer": mock_trainer,

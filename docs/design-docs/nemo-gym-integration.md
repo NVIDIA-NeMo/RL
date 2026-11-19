@@ -76,7 +76,7 @@ policy:
 
 SGLang requires dedicated generation resources for this async entrypoint; size the training cluster and generation allocation separately for the model. Importance-sampling correction is required because rollout weights can lag training weights. Gym uses the stable SGLang router endpoint through the shared Gym actor factory, including sharded Gym deployments.
 
-Before every refit the collector drains outstanding trajectories, even if `in_flight_weight_updates` is enabled. Generation overlaps training between refits, but this does not provide request-preserving in-flight refits. See [async GRPO usage tips](../guides/async-grpo.md#usage-tips) for cache invalidation semantics. Validation leaves the dedicated generation engines resident so collection can resume without a separate wake.
+Before every refit the collector drains outstanding trajectories. Async SGLang rejects `in_flight_weight_updates: true`; keep this setting disabled. Generation overlaps training between refits, but this does not provide request-preserving in-flight refits. See [async GRPO usage tips](../guides/async-grpo.md#usage-tips) for cache invalidation semantics. Validation leaves the dedicated generation engines resident so collection can resume without a separate wake.
 
 When `policy.generation.sglang_cfg.context_length` is null, Gym truncation checks use the effective context window reported by the running SGLang engines, not `policy.max_total_sequence_length`. An explicit context length still selects the engine limit.
 

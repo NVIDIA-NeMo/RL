@@ -491,6 +491,7 @@ def _make_generation(monitor):
     gen.weight_synchronizer = None
     gen.all_engines = []
     gen.needs_offload = True
+    gen._colocated = True
     gen.num_gpus_per_engine = 1
     gen.num_gpus_per_node = 1
     gen.gpu_offset = 0
@@ -530,6 +531,21 @@ def test_finish_generation_pauses_monitoring():
     gen.finish_generation()
 
     assert monitor.events == ["pause"]
+
+
+def test_finish_generation_keeps_dedicated_engines_resident(fake_ray: object) -> None:
+    monitor = _RecordingMonitor()
+    engine = _FakeEngine()
+    gen = _make_generation(monitor)
+    gen._colocated = False
+    gen.all_engines = [engine]
+
+    gen.finish_generation(release_gpu=True)
+    gen.prepare_for_generation()
+
+    assert monitor.events == ["resume"]
+    assert engine.memory_events == []
+    assert not gen._offloaded_memory_tags
 
 
 def test_memory_transitions_are_idempotent(fake_ray):

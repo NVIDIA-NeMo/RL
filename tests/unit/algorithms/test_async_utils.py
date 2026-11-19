@@ -2865,13 +2865,13 @@ class TestAsyncTrajectoryCollector:
         collector.policy_generation.invalidate_kv_cache.assert_not_called()
 
     def test_sglang_prepare_for_refit_drains_pending_generations(self):
-        """SGLang refit is a barrier even when async collection is enabled."""
+        """Supported SGLang refits drain asynchronous collection."""
         collector = self.create_local_collector()
         collector.master_config.policy["generation"] = {
             "backend": "sglang",
             "use_async_rollouts": True,
         }
-        collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = False
         collector.wait_for_pending_generations = mock.MagicMock()
 
         collector.prepare_for_refit()

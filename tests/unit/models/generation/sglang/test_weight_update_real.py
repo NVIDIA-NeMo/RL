@@ -72,6 +72,7 @@ EOS_TOKEN_ID = 151645
 def _make_sglang_cfg(tp_size, pad_token_id=PAD_TOKEN_ID):
     return {
         "backend": "sglang",
+        "colocated": {"enabled": True},
         "model_name": MODEL_PATH,
         "model_path": MODEL_PATH,
         "tokenizer": {"name": MODEL_PATH},

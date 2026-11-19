@@ -99,6 +99,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
     GenerationSamplingParams,
+    resolve_generation_max_seq_len,
 )
 from nemo_rl.telemetry.instrumentation import dispatch_with_trace_context
 from nemo_rl.utils.length_penalty import (
@@ -2706,43 +2707,6 @@ def _tensorize_nemo_gym_result(result: dict) -> None:
     )
 
 
-def _resolve_generation_context_limit(
-    policy_generation: GenerationInterface,
-    *,
-    policy_max_seq_len: Optional[int],
-) -> int:
-    """Resolve the active backend's context limit for NeMo-Gym rollouts."""
-    cfg = policy_generation.cfg
-    backend = cfg.get("backend")
-
-    if backend == "sglang":
-        context_length = cfg["sglang_cfg"].get("context_length")
-        if context_length is not None:
-            return context_length
-        return policy_generation.context_length
-
-    if backend == "vllm":
-        return cfg["vllm_cfg"]["max_model_len"]
-    if backend == "megatron":
-        return cfg["mcore_generation_config"]["max_model_len"]
-    if backend == "trtllm":
-        return cfg["trtllm_cfg"]["max_model_len"]
-
-    # Preserve compatibility with lightweight GenerationInterface test doubles
-    # and backends that do not yet expose an explicit backend field.
-    if "vllm_cfg" in cfg:
-        return cfg["vllm_cfg"]["max_model_len"]
-    if "mcore_generation_config" in cfg:
-        return cfg["mcore_generation_config"]["max_model_len"]
-    if "trtllm_cfg" in cfg:
-        return cfg["trtllm_cfg"]["max_model_len"]
-    if "max_total_sequence_length" in cfg:
-        return cfg["max_total_sequence_length"]
-    if policy_max_seq_len is not None:
-        return policy_max_seq_len
-    raise ValueError("Unable to resolve the generation context limit for NeMo-Gym.")
-
-
 async def run_async_nemo_gym_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
@@ -2840,10 +2804,7 @@ async def run_async_nemo_gym_rollout(
     assert max_rollout_turns is None, (
         "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
-    engine_max_model_len = _resolve_generation_context_limit(
-        policy_generation,
-        policy_max_seq_len=max_seq_len,
-    )
+    engine_max_model_len = resolve_generation_max_seq_len(policy_generation)
     if max_seq_len is not None and max_seq_len > engine_max_model_len:
         warnings.warn(
             f"policy max_total_sequence_length ({max_seq_len}) is greater than the "
@@ -3300,7 +3261,7 @@ def nemo_gym_rollout_hit_max_tokens(
             ``incomplete_details``; agents that synthesize their terminal
             response do not, and fall back to the token-count check.
         total_tokens: Token count of the rollout's full message log.
-        max_total_tokens_per_sample: The generation backend's context limit.
+        max_total_tokens_per_sample: The generation backend's max sequence length.
 
     Returns:
         True if the rollout was cut off by a token limit.

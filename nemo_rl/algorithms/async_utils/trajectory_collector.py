@@ -1067,12 +1067,7 @@ class AsyncTrajectoryCollector:
         # Check if we're using async engine
         generation_cfg = self.master_config.policy["generation"]
         backend = generation_cfg["backend"]
-        if backend == "sglang":
-            # SGLang collects asynchronously, but its refit protocol pauses the
-            # rollout engines and cannot overlap pending generation requests.
-            is_async_engine = False
-        else:
-            is_async_engine = should_use_async_rollouts(generation_cfg)
+        is_async_engine = should_use_async_rollouts(generation_cfg)
         in_flight_weight_updates = self.async_config.in_flight_weight_updates
 
         if is_async_engine and in_flight_weight_updates:

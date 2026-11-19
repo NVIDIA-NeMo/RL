@@ -2768,6 +2768,34 @@ def test_sglang_async_grpo_reaches_training_and_refit(mock_grpo_components):
     assert refit.call_count >= 1
 
 
+def test_sglang_async_rejects_in_flight_weight_updates(
+    mock_grpo_components: dict,
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"].update(backend="sglang", use_async_rollouts=True)
+    master_config.grpo.async_grpo.in_flight_weight_updates = True
+    generation = MagicMock(spec=SGLangGeneration)
+
+    with pytest.raises(NotImplementedError, match="in_flight_weight_updates=true"):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    generation.pause_generation_for_refit.assert_not_called()
+    mock_grpo_components["policy"].train.assert_not_called()
+
+
 @pytest.mark.timeout(30)
 @pytest.mark.parametrize("val_at_start", [False, True])
 @pytest.mark.parametrize("save_checkpoint", [False, True])
@@ -2800,6 +2828,7 @@ def test_sglang_async_validation_keeps_engines_resident(
     generation.blocks_training.return_value = False
     generation.wake_carries_weight_updates.return_value = False
     generation.needs_offload = True
+    generation._colocated = False
     generation._offloaded_memory_tags = set()
     generation._health_monitor = None
     generation.engines = [MagicMock()]
@@ -2843,7 +2872,8 @@ def test_sglang_async_validation_keeps_engines_resident(
     assert policy.train.call_count == 2
     assert validate.call_count == 2 + int(val_at_start)
     assert resume.remote.call_count >= validate.call_count
-    generation.finish_generation.assert_not_called()
+    assert generation.finish_generation.call_count == validate.call_count
+    assert not generation._offloaded_memory_tags
 
 
 def test_initial_refit_completes_before_async_collection_starts(
@@ -5178,7 +5208,6 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         master_config.env,
         base_urls=["http://trtllm.example/v1"],
         model_name="test-model",
-        generation_backend="trtllm",
         tokenizer=tokenizer,
         enable_router_replay=False,
         use_fastokens=False,

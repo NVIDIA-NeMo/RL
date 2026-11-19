@@ -1722,7 +1722,7 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
 
 def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
     class _FakePolicyGeneration:
-        cfg = {"vllm_cfg": {"max_model_len": 100}}
+        cfg = {"backend": "vllm", "vllm_cfg": {"max_model_len": 100}}
 
     # stop_strings is truthy so the function hits the next assert and exits
     # right after emitting the warning — keeps this test free of any rollout work.
@@ -1760,16 +1760,14 @@ def test_nemo_gym_context_limit_uses_active_sglang_backend():
     )()
 
     assert (
-        rollouts_mod._resolve_generation_context_limit(
+        rollouts_mod.resolve_generation_max_seq_len(
             policy_generation,
-            policy_max_seq_len=512,
         )
         == 256
     )
 
 
-@pytest.mark.parametrize("policy_max_seq_len", [1024, 16384, None])
-def test_nemo_gym_context_limit_uses_resolved_sglang_limit(policy_max_seq_len):
+def test_nemo_gym_context_limit_uses_resolved_sglang_limit():
     policy_generation = type(
         "_PolicyGeneration",
         (),
@@ -1784,24 +1782,23 @@ def test_nemo_gym_context_limit_uses_resolved_sglang_limit(policy_max_seq_len):
     )()
 
     assert (
-        rollouts_mod._resolve_generation_context_limit(
+        rollouts_mod.resolve_generation_max_seq_len(
             policy_generation,
-            policy_max_seq_len=policy_max_seq_len,
         )
         == 8192
     )
     assert not nemo_gym_rollout_hit_max_tokens(
         {"response": {"status": "completed", "incomplete_details": None}},
         total_tokens=2048,
-        max_total_tokens_per_sample=rollouts_mod._resolve_generation_context_limit(
-            policy_generation, policy_max_seq_len=policy_max_seq_len
+        max_total_tokens_per_sample=rollouts_mod.resolve_generation_max_seq_len(
+            policy_generation
         ),
     )
     assert nemo_gym_rollout_hit_max_tokens(
         {"response": {"status": "completed", "incomplete_details": None}},
         total_tokens=8192,
-        max_total_tokens_per_sample=rollouts_mod._resolve_generation_context_limit(
-            policy_generation, policy_max_seq_len=policy_max_seq_len
+        max_total_tokens_per_sample=rollouts_mod.resolve_generation_max_seq_len(
+            policy_generation
         ),
     )
 
@@ -2053,7 +2050,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
             return _AsyncOnlyStream(values)
 
     class _PolicyGeneration:
-        cfg = {"vllm_cfg": {"max_model_len": 128}}
+        cfg = {"backend": "vllm", "vllm_cfg": {"max_model_len": 128}}
 
     rows = []
     for task_index in (10, 10, 11, 11):

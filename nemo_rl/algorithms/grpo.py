@@ -1087,7 +1087,6 @@ def setup(
             env_configs,
             base_urls=base_urls,
             model_name=model_name,
-            generation_backend=backend,
             tokenizer=tokenizer,
             enable_router_replay=router_replay_enabled(policy_config),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
@@ -5295,14 +5294,17 @@ def async_grpo_train(
             media to NeMo Gym prompt rows.
     """
     # Ensure we are running with a compatible async generation backend.
-    # SGLang drains pending requests at each refit boundary rather than
-    # overlapping generation with an in-flight weight update.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
     assert backend in ("vllm", "megatron", "sglang", "trtllm"), (
         "Async GRPO supports the vLLM, Megatron, SGLang, and TRT-LLM generation backends; "
         f"got policy.generation.backend={backend!r}."
     )
+    if backend == "sglang" and master_config.grpo.async_grpo.in_flight_weight_updates:
+        raise NotImplementedError(
+            "grpo.async_grpo.in_flight_weight_updates=true is not supported with the "
+            "SGLang generation backend yet; set it to false."
+        )
     assert should_use_async_rollouts(generation_config), (
         "Async GRPO requires Megatron, SGLang, or an async vLLM or TRT-LLM "
         "generation engine. Set "
@@ -5632,8 +5634,7 @@ def async_grpo_train(
             initial_val_metrics = val_metrics
             # A colocated engine keeps serving between phases (preserves its
             # KV/prefix cache); the backend makes that call, not the loop.
-            if not isinstance(policy_generation, SGLangGeneration):
-                policy_generation.finish_generation(release_gpu=False)
+            policy_generation.finish_generation(release_gpu=False)
             logger.log_metrics(val_metrics, step, prefix="validation")
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
             if master_config.grpo.debug_payload_metrics:
@@ -6395,10 +6396,9 @@ def async_grpo_train(
                         # Save-bound steps need the GPUs for checkpointing,
                         # so the engine must stand down; otherwise a colocated
                         # engine keeps serving (backend's call).
-                        if not isinstance(policy_generation, SGLangGeneration):
-                            policy_generation.finish_generation(
-                                release_gpu=saving_this_step
-                            )
+                        policy_generation.finish_generation(
+                            release_gpu=saving_this_step
+                        )
                         logger.log_metrics(
                             validation_timings, step + 1, prefix="timing/validation"
                         )

@@ -2985,13 +2985,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         # an explicit mcore_generation_config.async_engine key.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
     elif generation_config["backend"] == "sglang":
-        if generation_config.get("sglang_cfg") is None:
-            raise ValueError(
-                "NeMo Gym with the SGLang backend requires "
-                "policy.generation.sglang_cfg."
-            )
-        # SGLang is always an HTTP server. This switch selects its asynchronous
-        # rollout control flow without mutating an inherited inactive vLLM block.
+        # SGLang is always an HTTP server; this selects its async rollout flow.
         generation_config["use_async_rollouts"] = True
     elif generation_config["backend"] == "trtllm":
         # Must stay in sync with should_use_nemo_gym, which reads
@@ -3022,22 +3016,6 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     if config.policy.get("is_vlm"):
         env_cfg = config.env.setdefault("nemo_gym", {})
         env_cfg.setdefault("tokenizer_config", dict(config.policy["tokenizer"]))
-
-
-def _normalize_nemo_gym_base_urls(
-    base_urls: list[str], *, generation_backend: str
-) -> list[str]:
-    """Return generation URLs in the form expected by NeMo Gym."""
-    if generation_backend != "sglang":
-        return list(base_urls)
-
-    normalized_urls: list[str] = []
-    for base_url in base_urls:
-        base_url = base_url.rstrip("/")
-        normalized_urls.append(
-            base_url if base_url.endswith("/v1") else f"{base_url}/v1"
-        )
-    return normalized_urls
 
 
 def build_nemo_gym_config(
@@ -3597,7 +3575,6 @@ def build_nemo_gym_actors(
     enable_router_replay: bool,
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
-    generation_backend: str = "vllm",
     generation_prefix_cuts_enabled: bool = False,
     generation_cut_control_urls: Optional[list[str]] = None,
     token_capture: Optional[dict[str, Any]] = None,
@@ -3614,7 +3591,6 @@ def build_nemo_gym_actors(
     the slowest shard rather than the sum.
 
     Args:
-        generation_backend: Generation backend that produced ``base_urls``.
         tokenizer: Installed on every actor once it is up, rather than passed
             per rollout call. See ``NemoGym.set_tokenizer`` for why.
         turn_checkpointing_enabled: Install and discover one Gym v2 checkpoint
@@ -3635,9 +3611,6 @@ def build_nemo_gym_actors(
             start, or the shards' entries did not pass the startup checks. Any
             actors already created are torn down first.
     """
-    base_urls = _normalize_nemo_gym_base_urls(
-        base_urls, generation_backend=generation_backend
-    )
     nemo_gym_dict = dict(env_configs["nemo_gym"])
     plan = parse_shard_plan(nemo_gym_dict)
 
@@ -4003,7 +3976,6 @@ def spinup_nemo_gym_actor(
     *,
     base_urls: list[str],
     model_name: str,
-    generation_backend: str = "vllm",
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
@@ -4018,7 +3990,6 @@ def spinup_nemo_gym_actor(
     GPU resources land where the caller expects.
 
     Args:
-        generation_backend: Generation backend that produced ``base_urls``.
         tokenizer: Installed on the actor once, here, rather than passed per
             rollout call. See ``NemoGym.set_tokenizer`` for why that
             distinction is the difference between a working run and a stalled
@@ -4052,7 +4023,6 @@ def spinup_nemo_gym_actor(
         env_configs,
         base_urls=base_urls,
         model_name=model_name,
-        generation_backend=generation_backend,
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,

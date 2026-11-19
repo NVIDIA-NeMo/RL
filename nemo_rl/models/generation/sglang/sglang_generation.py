@@ -99,6 +99,7 @@ class SGLangGeneration(GenerationInterface):
         # GenerationInterface consumers (create_weight_synchronizer, the refit
         # transports) read ``cfg``; keep the sglang-specific name as the alias.
         self.cfg = sglang_cfg
+        self._colocated = sglang_cfg["colocated"]["enabled"]
         self._owns_runtime = True
         self._async_loop = AsyncLoopThread()
 
@@ -212,7 +213,7 @@ class SGLangGeneration(GenerationInterface):
         Individual engine URLs change when fault tolerance replaces an engine;
         the router address remains stable and tracks the replacement.
         """
-        return [f"http://{self.router_ip}:{self.router_port}"]
+        return [f"http://{self.router_ip}:{self.router_port}/v1"]
 
     @property
     def nodes_per_engine(self) -> int:
@@ -1019,7 +1020,9 @@ class SGLangGeneration(GenerationInterface):
             self._health_monitor.resume()
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """Sleep workers and reset prefix cache."""
+        """Release colocated workers' memory between training and generation."""
+        if not self._colocated:
+            return
         if self._health_monitor:
             self._health_monitor.pause()
         if not self.needs_offload:

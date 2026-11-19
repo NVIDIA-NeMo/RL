@@ -318,7 +318,7 @@ def patched_factories():
         ) as mock_loss,
         patch.object(
             sc_setup_mod,
-            "_generation_max_seq_len",
+            "resolve_generation_max_seq_len",
             return_value=32,
         ),
         patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
@@ -2674,7 +2674,6 @@ class TestSetup:
             mc.env,
             base_urls=patched_factories["fake_gen"].client_base_urls,
             model_name="test-model",
-            generation_backend="vllm",
             # Reaches the actor once, at spinup, rather than riding along with every
             # run_rollouts call.
             tokenizer=tokenizer,

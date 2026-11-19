@@ -81,6 +81,7 @@ EOS_TOKEN_ID = 151645
 def _make_sglang_generation_cfg(pad_token_id=PAD_TOKEN_ID, tp_size=1):
     return {
         "backend": "sglang",
+        "colocated": {"enabled": True},
         "model_name": MODEL_PATH,
         "model_path": MODEL_PATH,
         "tokenizer": {"name": MODEL_PATH},
@@ -248,7 +249,7 @@ def test_nemo_gym_url_uses_stable_router():
     generation.router_ip = "[2001:db8::1]"
     generation.router_port = 31000
 
-    assert generation.dp_openai_server_base_urls == ["http://[2001:db8::1]:31000"]
+    assert generation.dp_openai_server_base_urls == ["http://[2001:db8::1]:31000/v1"]
 
 
 @pytest.mark.timeout(30)

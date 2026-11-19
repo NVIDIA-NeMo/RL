@@ -14,7 +14,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cache
-from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union, cast
 
 import ray
 import torch
@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
     from nemo_rl.data.captured_media import MediaColumnSpec
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
+    from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
+    from nemo_rl.models.policy.interfaces import PolicyInterface
 
 # Routed-expert index tensors ([seq, layers, topk]) are carried in the narrowest
 # signed dtype that fits ids 0..num_experts-1 plus the -1 missing-route sentinel:
@@ -305,6 +307,31 @@ def sampler_replay_enabled(config: GenerationConfig) -> bool:
     """
     replay = config.get("sampler_replay")
     return replay is not None and SamplerReplayConfig.model_validate(replay).enabled
+
+
+def resolve_generation_max_seq_len(
+    generation: "GenerationInterface | PolicyInterface",
+) -> int:
+    """Resolve the active generation backend's max sequence length."""
+    cfg = generation.cfg
+    backend = cfg.get("backend")
+    if backend == "sglang":
+        context_length = cfg["sglang_cfg"]["context_length"]
+        if context_length is None:
+            context_length = cast("SGLangGeneration", generation).context_length
+        if context_length is None:
+            raise ValueError("Unable to resolve the generation max sequence length.")
+        return context_length
+    if backend == "vllm":
+        return cfg["vllm_cfg"]["max_model_len"]
+    if backend == "megatron":
+        return cfg["mcore_generation_config"]["max_model_len"]
+    if backend == "trtllm":
+        return cfg["trtllm_cfg"]["max_model_len"]
+    # Megatron distillation can use the training policy as its generation backend.
+    if backend is None and "max_total_sequence_length" in cfg:
+        return cfg["max_total_sequence_length"]
+    raise ValueError("Unable to resolve the generation max sequence length.")
 
 
 def should_use_async_rollouts(

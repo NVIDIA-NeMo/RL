@@ -182,7 +182,10 @@ def test_failed_constructor_cleanup_is_repeatable_and_destructor_safe(
         original_destructor(instance)
 
     monkeypatch.setattr(SGLangGeneration, "__del__", record_destructor)
-    config = {"sglang_cfg": {"sglang_fault_tolerance_config": {}}}
+    config = {
+        "colocated": {"enabled": True},
+        "sglang_cfg": {"sglang_fault_tolerance_config": {}},
+    }
     if invalid_config:
         config["sglang_cfg"]["sglang_fault_tolerance_config"] = {
             "rollout_max_restart_attempts": -1
