@@ -74,10 +74,12 @@ from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
     is_nemo_gym_task,
 )
+from nemo_rl.experience.reward_penalties import effort_shaping_enabled
 from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
     RecoveryTargetLevel,
 )
+from nemo_rl.experience.rollouts import get_effort_config
 from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
@@ -1632,6 +1634,24 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "grpo.length_penalty adjusts only the scalar reward, which GDPO does "
             "not read -- the run would silently skip the penalty. Remove "
             "grpo.length_penalty to use GDPO."
+        )
+
+    if algo_cfg.adv_estimator.name == "gdpo" and any(
+        getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
+    ):
+        raise NotImplementedError(
+            "reward_penalties zero only the scalar reward, which GDPO does not "
+            "read -- the run would silently skip the penalties. Disable every "
+            "reward_penalties.penalize_* flag to use GDPO."
+        )
+
+    if algo_cfg.adv_estimator.name == "gdpo" and effort_shaping_enabled(
+        get_effort_config(master_config.env)
+    ):
+        raise NotImplementedError(
+            "env.nemo_gym.effort_levels adjusts only the scalar reward, which "
+            "GDPO does not read -- the run would silently skip the shaping. "
+            "Remove env.nemo_gym.effort_levels to use GDPO."
         )
 
     async_config = master_config.async_rl
