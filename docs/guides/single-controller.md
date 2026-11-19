@@ -41,7 +41,7 @@ bash tests/functional/automodel_sc_full_batch_smoke.sh
 
 The script uses the Qwen2.5-1.5B SC recipe with one training GPU and one rollout
 GPU. It saves after step 1 and resumes through step 4. Append normal config
-overrides for a local model path, W&B logging, or log directory.
+overrides for a local model path or W&B logging; set the `EXP_DIR` environment variable to a fresh parent directory to choose where both launches write logs and checkpoints.
 
 For numerical parity, run the fixed-data test in the AutoModel environment:
 

@@ -76,7 +76,7 @@ Training still accumulates the complete batch before one optimizer step.
 The Gemma4 E2B recipe above was also run for 50 steps at `max_lookahead_versions: 4` with both capacities at `5 × num_prompts_per_step`.
 The lag climbed one version per step and held at four from step five onward; mean `gen_kl_error` was 4.6e-4 and the median token-multiplier error 1.009, matching the lookahead-one nightly.
 This is a functional check, not a convergence study.
-Lookahead values above one, sampler warmup overrides, and partial streaming dispatch remain unsupported for AutoModel SC.
+Sampler warmup overrides and partial streaming dispatch remain unsupported for AutoModel SC.
 
 ## Interfaces and ownership
 
