@@ -1279,6 +1279,27 @@ def _mask_gate_receipt_result():
     }
 
 
+def test_receipt_completion_carries_gym_reward_components():
+    result = _mask_gate_receipt_result()
+    result["full_result"]["reward"] = 1.5
+    result["full_result"]["reward_components"] = {"correctness": 1.0, "format": 0.5}
+    completion = _nemo_gym_impl(True)._results_to_completions([result])[0][0]
+    assert completion.reward == 1.5
+    assert completion.reward_components == {
+        "reward/correctness": 1.0,
+        "reward/format": 0.5,
+    }
+
+
+@pytest.mark.parametrize("reward", [0.25, None])
+def test_receipt_completion_rejects_components_that_miss_the_scalar(reward):
+    result = _mask_gate_receipt_result()
+    result["full_result"]["reward"] = reward
+    result["full_result"]["reward_components"] = {"correctness": 1.0, "format": 0.5}
+    with pytest.raises(ValueError, match="reward_components sum"):
+        _nemo_gym_impl(True)._results_to_completions([result])
+
+
 def test_receipt_completion_keeps_mask_flag_when_gate_on():
     completion = _nemo_gym_impl(True)._results_to_completions(
         [_mask_gate_receipt_result()]
@@ -3363,6 +3384,110 @@ def test_capture_completion_preserves_checks_and_raw_reward_until_finalization()
     assert impl._compute_reward_penalty_metrics(counts, 0) == {}
     metrics = impl._compute_rollout_metrics(completions, "agent")
     assert not any(k.startswith(("total_reward/", "agent/reward/")) for k in metrics)
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_capture_manager_forwards_reward_components_to_reassembly(
+    monkeypatch, granularity
+):
+    components = {"reward/correctness": 0.5, "reward/format": 0.0}
+    original = _receipt_record
+
+    def with_components(*args, **kwargs):
+        record = original(*args, **kwargs)
+        for completion in record.completions:
+            completion.reward_components = dict(components)
+        return record
+
+    monkeypatch.setattr(f"{__name__}._receipt_record", with_components)
+    mgr = _make_capture_manager(
+        _FakeCaptureBuffer(),
+        recovery_config=RolloutRecoveryConfig(
+            target_level=RecoveryTargetLevel(granularity.value)
+        ),
+    )
+    request, _ = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+    assert request.reward_components == (components, components)
+
+
+def _components_by_generation(monkeypatch, by_generation):
+    """Give sibling ``i`` of a capture manager's group ``by_generation[i]``.
+
+    Returns the ``verify_fields`` to build that manager with.
+    """
+    original = _receipt_record
+
+    def with_components(*args, **kwargs):
+        record = original(*args, **kwargs)
+        for completion in record.completions:
+            index = completion.env_extras.pop("generation_index")
+            completion.reward_components = by_generation[index]
+        return record
+
+    monkeypatch.setattr(f"{__name__}._receipt_record", with_components)
+    return [{"generation_index": index} for index in range(len(by_generation))]
+
+
+@pytest.mark.parametrize("saved_schema", [8, 9])
+def test_restored_sibling_reward_components_join_the_regenerated_siblings(
+    monkeypatch, saved_schema
+):
+    sealed_components = {"reward/correctness": 0.0, "reward/format": 0.5}
+    new_components = {"reward/correctness": 1.0, "reward/format": 0.5}
+    verify_fields = _components_by_generation(monkeypatch, [None, new_components])
+    first = _make_capture_manager(_FakeCaptureBuffer())
+    prompt = {"prompt": "p", "idx": 9}
+    group_id = _with_cut(
+        first._tq_buffer,
+        lambda cut: first.reserve_prompt_group(cut, prompt, target_step=7),
+    )
+    ledger = first.recovery_ledger
+    _with_cut(first._tq_buffer, lambda cut: ledger.mark_group_dispatched(cut, group_id))
+    gate_id = ledger.get_group(group_id).gate_rollout_id(0)
+    _with_cut(
+        first._tq_buffer,
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            group_id,
+            generation_index=0,
+            gate_rollout_id=gate_id,
+            receipt={
+                "capture_key": gate_id,
+                "manifest": [{"staging_key": f"{gate_id}/call"}],
+            },
+            reward=0.5,
+            mask_sample=False,
+            resolved_agent_name="resolved-agent",
+            reward_components=sealed_components,
+        ),
+    )
+    state = ledger.state_dict()
+    if saved_schema == 8:
+        # Schema 8 has no reward_components field.
+        state["schema_version"] = 8
+        for sibling in state["groups"][0]["siblings"]:
+            for attempt in sibling["attempts"]:
+                del attempt["reward_components"]
+
+    restored = _make_capture_manager(_FakeCaptureBuffer(), verify_fields=verify_fields)
+    _with_cut(
+        restored._tq_buffer,
+        lambda cut: restored.recovery_ledger.load_state_dict(cut, state),
+    )
+    _with_cut(
+        restored._tq_buffer,
+        lambda cut: restored.recovery_ledger.prepare_for_restart(cut),
+    )
+    request, _ = _run(
+        restored.generate_for_finalization(
+            prompt, target_step=7, lineage_group_id=group_id
+        )
+    )
+    assert restored._impl.seen_generation_indices == [1]
+    assert request.reward_components == (
+        None if saved_schema == 8 else sealed_components,
+        new_components,
+    )
 
 
 @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
