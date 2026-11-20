@@ -135,7 +135,9 @@ policy:
 
 The option is independent of `cpu_offload`: parameters, gradients and optimizer state stay where they are. Logprob, reference and evaluation passes do not save activations and are unaffected, and the logits and loss computation stay on the GPU.
 
-Each rank needs host memory for one microbatch's block inputs, roughly `num_layers * tokens_per_microbatch * hidden_size * bytes_per_element`, rounded up by the pinned-memory allocator, so account for every rank on a node. FSDP casts each block's input to the training `precision` before the block saves it, so `bytes_per_element` is 2 for `bfloat16` whatever `fsdp_output_dtype` is. A tensor that several operations save is copied once. The copies run on the compute stream, so each microbatch pays one device-to-host and one host-to-device transfer of those tensors; benchmark the step time on the target hardware.
+Each rank needs host memory for one microbatch's block inputs, roughly `num_layers * tokens_per_microbatch * hidden_size * bytes_per_element`, so account for every rank on a node. The pinned-memory allocator rounds each copy up to a power of two, so with variable microbatch lengths (for example, sequence packing) plan for up to twice that. FSDP casts each block's input to the training `precision` before the block saves it, so `bytes_per_element` is 2 for `bfloat16` whatever `fsdp_output_dtype` is. A tensor that several operations save is copied once, and tensors that share storage with a model parameter stay on the GPU. The copies run on the compute stream, so each microbatch pays one device-to-host and one host-to-device transfer of those tensors; benchmark the step time on the target hardware.
+
+At the end of each training step the worker returns the cached pinned memory to the system, so it is not held during generation. The next step pins it again, which takes time proportional to its size.
 
 ## Configuration Examples
 

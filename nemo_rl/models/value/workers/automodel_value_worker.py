@@ -224,7 +224,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         self.peft_config = model_and_optimizer_state.peft_config
         self.autocast_enabled = model_and_optimizer_state.autocast_enabled
         self._activation_offload = (
-            ActivationCpuOffload()
+            ActivationCpuOffload(self.model)
             if config["automodel_cfg"].get("activation_offloading")
             else None
         )
@@ -410,6 +410,8 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
                 self.scheduler.step()
             # Clear cache
             torch.cuda.empty_cache()
+            if self._activation_offload is not None:
+                self._activation_offload.empty_host_cache()
 
             # Aggregate training statistics
             metrics = aggregate_training_statistics(

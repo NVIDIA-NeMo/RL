@@ -1619,7 +1619,7 @@ class TestAutomodelForwardBackward:
             cp_sharder=None,
             model_context_factory=nullcontext,
         )
-        offload = ActivationCpuOffload()
+        offload = ActivationCpuOffload(torch.nn.Module())
 
         automodel_forward_backward(
             model=mock_model,

@@ -629,7 +629,7 @@ class AutomodelPolicyWorkerImpl(
             )
 
         self._activation_offload = (
-            ActivationCpuOffload()
+            ActivationCpuOffload(self.model)
             if config["automodel_cfg"].get("activation_offloading")
             else None
         )
@@ -885,6 +885,8 @@ class AutomodelPolicyWorkerImpl(
             # dynamic batch and sequence dims causes alot of fragmentation, so clear
             # the memory allocator before moving on
             torch.cuda.empty_cache()
+            if self._activation_offload is not None:
+                self._activation_offload.empty_host_cache()
 
             # Aggregate training statistics across microbatches and ranks
             metrics = aggregate_training_statistics(

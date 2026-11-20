@@ -13,20 +13,24 @@
 # limitations under the License.
 
 import copy
+import os
 from contextlib import nullcontext
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import Shard, distribute_tensor
 
 from nemo_rl.models.automodel import activation_offload
 from nemo_rl.models.automodel.activation_offload import (
     MIN_OFFLOAD_BYTES,
     ActivationCpuOffload,
-    _pack,
+    _copy_to_host,
     _unpack,
 )
 
@@ -97,7 +101,7 @@ def test_offload_matches_gpu_training_and_frees_saved_block_inputs():
 
     ref_losses, ref_grads, ref_retained = _train(reference, inputs, None)
     off_losses, off_grads, off_retained = _train(
-        offloaded, inputs, ActivationCpuOffload()
+        offloaded, inputs, ActivationCpuOffload(offloaded)
     )
 
     # The host round trip is an exact copy, so training is bitwise identical.
@@ -114,23 +118,58 @@ def test_offload_matches_gpu_training_and_frees_saved_block_inputs():
     assert max(off_retained) < block_input_bytes
 
 
-def test_pack_keeps_parameters_their_views_and_small_tensors_on_gpu():
-    weight = nn.Parameter(torch.randn(1024, 1024, device="cuda"))
+@pytest.fixture(scope="module")
+def singleton_mesh() -> DeviceMesh:
+    """A real one-rank mesh for DTensor parameters."""
+    if not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29523")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        dist.init_process_group(backend="nccl", rank=0, world_size=1)
+    return DeviceMesh("cuda", [0], mesh_dim_names=("dp",))
+
+
+def test_parameters_their_aliases_and_small_tensors_stay_on_gpu():
+    model = nn.Linear(1024, 1024, bias=False).cuda()
+    weight = model.weight
     small = torch.randn(MIN_OFFLOAD_BYTES // 8, device="cuda")
     assert weight.numel() * weight.element_size() >= MIN_OFFLOAD_BYTES
+    offload = ActivationCpuOffload(model)
 
-    assert _pack(weight) is weight
-    transposed = weight.t()
-    assert _pack(transposed) is transposed
-    assert _pack(small) is small
+    with offload:
+        for tensor in (weight, weight.t(), weight.detach(), weight.data, small):
+            assert offload.pack_hook(tensor) is tensor
 
 
-def test_pack_moves_activations_to_pinned_host_memory_and_back():
+def test_a_parameter_registered_after_construction_stays_on_gpu():
+    model = nn.Linear(1024, 1024, bias=False).cuda()
+    offload = ActivationCpuOffload(model)
+    # FSDP registers the unsharded parameter under the same name during forward.
+    model.weight = nn.Parameter(torch.randn(1024, 1024, device="cuda"))
+    alias = model.weight.detach()
+
+    with offload:
+        assert offload.pack_hook(alias) is alias
+
+
+def test_local_tensors_of_dtensor_parameters_stay_on_gpu(singleton_mesh):
+    model = nn.Linear(1024, 1024, bias=False).cuda()
+    model.weight = nn.Parameter(
+        distribute_tensor(model.weight.detach(), singleton_mesh, [Shard(0)])
+    )
+    offload = ActivationCpuOffload(model)
+    local = model.weight.to_local().detach()
+
+    with offload:
+        assert offload.pack_hook(local) is local
+
+
+def test_copy_to_host_moves_activations_to_pinned_host_memory_and_back():
     activation = torch.randn(1024, 1024, device="cuda")[:, :512]
 
-    packed = _pack(activation)
+    packed = _copy_to_host(activation)
 
-    assert isinstance(packed, tuple)
     device, host = packed
     assert device == activation.device
     assert host.device.type == "cpu" and host.is_pinned()
@@ -139,19 +178,38 @@ def test_pack_moves_activations_to_pinned_host_memory_and_back():
     torch.testing.assert_close(restored, activation, rtol=0, atol=0)
 
 
+def test_source_from_another_stream_is_not_reused_before_its_copy_runs():
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        source = torch.randn(1024, 1024, device="cuda")
+    torch.cuda.current_stream().wait_stream(side)
+    expected = source.clone()
+    source_ptr = source.data_ptr()
+    # Hold the copy back on the current stream while the side stream reallocates.
+    torch.cuda._sleep(100_000_000)
+    packed = _copy_to_host(source)
+    del source
+    with torch.cuda.stream(side):
+        reused = torch.zeros(1024, 1024, device="cuda")
+
+    torch.cuda.synchronize()
+    assert reused.data_ptr() != source_ptr
+    torch.testing.assert_close(packed[1].cuda(), expected, rtol=0, atol=0)
+
+
 def test_a_tensor_saved_twice_is_copied_to_the_host_once(monkeypatch):
     copies = []
-    pack = activation_offload._pack
+    copy_to_host = activation_offload._copy_to_host
 
-    def counting_pack(tensor):
-        packed = pack(tensor)
+    def counting_copy_to_host(tensor):
+        packed = copy_to_host(tensor)
         copies.append(packed)
         return packed
 
-    monkeypatch.setattr(activation_offload, "_pack", counting_pack)
+    monkeypatch.setattr(activation_offload, "_copy_to_host", counting_copy_to_host)
     x = torch.randn(1024, 1024, device="cuda", requires_grad=True)
 
-    with ActivationCpuOffload():
+    with ActivationCpuOffload(nn.Module()):
         # mul saves both operands, which are the same tensor here.
         loss = (x * x).sum()
     loss.backward()
@@ -161,7 +219,7 @@ def test_a_tensor_saved_twice_is_copied_to_the_host_once(monkeypatch):
 
 
 def test_a_tensor_modified_in_place_after_a_save_gets_a_new_host_copy():
-    offload = ActivationCpuOffload()
+    offload = ActivationCpuOffload(nn.Module())
     activation = torch.randn(1024, 1024, device="cuda")
     before_write = activation.clone()
 
@@ -175,3 +233,21 @@ def test_a_tensor_modified_in_place_after_a_save_gets_a_new_host_copy():
     assert after_write is not first
     torch.testing.assert_close(_unpack(first), before_write, rtol=0, atol=0)
     torch.testing.assert_close(_unpack(after_write), activation, rtol=0, atol=0)
+
+
+def test_empty_host_cache_returns_the_pinned_copies_to_the_system():
+    model = _checkpointed_model()
+    offload = ActivationCpuOffload(model)
+    x = torch.randn(TOKENS, HIDDEN, device="cuda")
+    with offload:
+        loss = model(x).sum()
+    loss.backward()
+    del loss
+    torch.cuda.synchronize()
+    cached = torch.cuda.host_memory_stats()["allocated_bytes.current"]
+    assert cached >= NUM_BLOCKS * TOKENS * HIDDEN * 4
+
+    offload.empty_host_cache()
+
+    released = cached - torch.cuda.host_memory_stats()["allocated_bytes.current"]
+    assert released >= NUM_BLOCKS * TOKENS * HIDDEN * 4
