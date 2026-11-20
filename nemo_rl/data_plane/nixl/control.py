@@ -118,7 +118,9 @@ class UnitServer:
     """
 
     def __init__(
-        self, handlers: dict[str, Callable[..., Any]], lock: threading.Lock
+        self,
+        handlers: dict[str, Callable[..., Any]],
+        lock: threading.Lock | threading.RLock,
     ) -> None:
         self.handlers = handlers
         self.lock = lock

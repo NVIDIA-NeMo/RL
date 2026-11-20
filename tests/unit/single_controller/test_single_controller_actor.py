@@ -18,6 +18,7 @@ import asyncio
 import json
 import math
 import threading
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -44,7 +45,9 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     BaseSampler,
     InOrderSampler,
+    ReadyFirstSampler,
     ReadyFirstSamplerConfig,
+    WindowedSampler,
 )
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
@@ -63,6 +66,7 @@ from nemo_rl.algorithms.single_controller import (
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
     AdvantageStageConfig,
+    _train_fields_for_step,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -71,12 +75,15 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     TokenCaptureConfig,
     logprob_passes_required,
     resolve_ppo_chunk_alignment,
+    validate_grpo_chunk_cap_alignment,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    DebugWriterConfig,
     JsonDebugWriter,
     TrainChunk,
 )
+from nemo_rl.algorithms.single_controller_utils.step_assembly import ShortfallCredit
 from nemo_rl.algorithms.single_controller_utils.utils import tensor_field
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
@@ -95,6 +102,7 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.weight_sync.sglang_weight_synchronizer import (
@@ -107,12 +115,12 @@ from tests.unit.single_controller._rollout_checkpoints import (
 
 
 def test_train_fields_add_the_sampler_topk_for_score_centering():
-    without = single_controller._train_fields_for_step(
+    without = _train_fields_for_step(
         policy_logprobs_required=True,
         reference_logprobs_required=False,
         sampler_head_required=False,
     )
-    with_topk = single_controller._train_fields_for_step(
+    with_topk = _train_fields_for_step(
         policy_logprobs_required=True,
         reference_logprobs_required=False,
         sampler_head_required=True,
@@ -164,18 +172,18 @@ class _InitRolloutManager:
         self.checkpoint_barrier = barrier
 
 
-def _checkpointing_config(tmp_path) -> dict:
+def _checkpointing_config(tmp_path) -> CheckpointingConfig:
     """Minimal checkpointing block for actors built through __init__."""
-    return {
-        "enabled": False,
-        "checkpoint_dir": str(tmp_path / "checkpoints"),
-        "metric_name": None,
-        "higher_is_better": True,
-        "keep_top_k": None,
-        "save_period": 10,
-        "save_optimizer": True,
-        "checkpoint_must_save_by": None,
-    }
+    return CheckpointingConfig.model_construct(
+        enabled=False,
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        metric_name=None,
+        higher_is_better=True,
+        keep_top_k=None,
+        save_period=10,
+        save_optimizer=True,
+        checkpoint_must_save_by=None,
+    )
 
 
 def _grpo_master_config(tmp_path) -> MasterConfig:
@@ -245,6 +253,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         restored_from_rollout_snapshot=False,
         ppo_group_multiple=1,
         ppo_min_remaining_groups=0,
+        trainer_warmup_kwargs=None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -284,11 +293,20 @@ def test_ppo_group_multiple_requires_complete_microbatches(
 
 
 @pytest.mark.parametrize(
-    ("num_prompts_per_step", "min_groups", "error"),
-    [(32, 1, "min_groups_for_streaming_train"), (3, 2, "num_prompts_per_step")],
+    ("num_prompts_per_step", "min_groups", "chunk_cap", "error"),
+    [
+        (32, 1, None, "min_groups_for_streaming_train"),
+        (3, 2, None, "num_prompts_per_step"),
+        # The cap becomes the sampler's max_prompt_groups, and tail-aware
+        # selection refuses an unaligned max. The uncapped max is
+        # target - dispatched, which stays aligned because the target is and
+        # every chunk is, so only a cap can break the invariant -- and it would
+        # break it on the first select, with the allocation already up.
+        (32, 2, 3, "max_groups_for_streaming_train"),
+    ],
 )
 def test_ppo_chunk_validation_rejects_incomplete_chunks(
-    num_prompts_per_step: int, min_groups: int, error: str
+    num_prompts_per_step: int, min_groups: int, chunk_cap: int | None, error: str
 ) -> None:
     config = MasterConfig.model_construct(
         ppo=PPOConfig(
@@ -303,10 +321,35 @@ def test_ppo_chunk_validation_rejects_incomplete_chunks(
             "train_micro_batch_size": 1,
             "dynamic_batching": {"enabled": True},
         },
-        async_rl=AsyncRLConfig(min_groups_for_streaming_train=min_groups),
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=min_groups,
+            max_groups_for_streaming_train=chunk_cap,
+        ),
     )
     with pytest.raises(ValueError, match=error):
         resolve_ppo_chunk_alignment(config, 8, 8)
+
+
+def test_ppo_accepts_a_chunk_cap_aligned_to_the_dp_layout() -> None:
+    config = MasterConfig.model_construct(
+        ppo=PPOConfig(num_prompts_per_step=32, num_generations_per_prompt=16),
+        policy={
+            "train_micro_batch_size": 4,
+            "dynamic_batching": {"enabled": False},
+        },
+        value={
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": True},
+        },
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=2,
+            max_groups_for_streaming_train=4,
+        ),
+    )
+
+    # An aligned cap is accepted and leaves the alignment it would have had
+    # uncapped: group multiple 2, tail floor (2 + 1) // 2.
+    assert resolve_ppo_chunk_alignment(config, 8, 8) == (2, 1)
 
 
 def test_ppo_chunk_validation_accepts_complete_chunks() -> None:
@@ -323,6 +366,153 @@ def test_ppo_chunk_validation_accepts_complete_chunks() -> None:
         async_rl=AsyncRLConfig(min_groups_for_streaming_train=2),
     )
     assert resolve_ppo_chunk_alignment(config, 8, 8) == (2, 1)
+
+
+@pytest.mark.parametrize(("min_groups", "expected"), [(32, (2, 0)), (2, (2, 1))])
+def test_ppo_accepts_a_chunk_cap_that_cannot_bind(
+    min_groups: int, expected: tuple[int, int]
+) -> None:
+    """A cap at or above num_prompts_per_step never reaches the sampler.
+
+    The pump's maximum is ``target - dispatched`` and the target is
+    ``num_prompts_per_step`` less any dropped groups, so ``min(target, 33)`` is
+    always the target. Requiring alignment of a cap that cannot limit a
+    selection rejects a config that would have run.
+    """
+    config = MasterConfig.model_construct(
+        ppo=PPOConfig(num_prompts_per_step=32, num_generations_per_prompt=16),
+        policy={
+            "train_micro_batch_size": 4,
+            "dynamic_batching": {"enabled": False},
+        },
+        value={
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": True},
+        },
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=min_groups,
+            max_groups_for_streaming_train=33,
+        ),
+    )
+
+    assert resolve_ppo_chunk_alignment(config, 8, 8) == expected
+
+
+def _grpo_chunk_cap_config(
+    chunk_cap: int | None,
+    *,
+    num_generations_per_prompt: int = 2,
+    forest_training: bool = False,
+    train_micro_batch_size: int = 1,
+    dynamic_batching: bool = True,
+    sequence_packing: bool = False,
+) -> MasterConfig:
+    return MasterConfig.model_construct(
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=8,
+            num_generations_per_prompt=num_generations_per_prompt,
+        ),
+        policy={
+            "train_micro_batch_size": train_micro_batch_size,
+            "dynamic_batching": {"enabled": dynamic_batching},
+            "sequence_packing": {"enabled": sequence_packing},
+        },
+        token_capture=TokenCaptureConfig.model_construct(
+            forest_training=forest_training
+        ),
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=2,
+            max_groups_for_streaming_train=chunk_cap,
+        ),
+    )
+
+
+def test_grpo_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp() -> None:
+    """GRPO passes no group_multiple, so the cap alone decides the chunk size.
+
+    Three groups at two generations each is six samples, and the training
+    dispatch shards without allow_uneven_shards, so six cannot split four ways.
+    """
+    with pytest.raises(ValueError, match="max_groups_for_streaming_train"):
+        validate_grpo_chunk_cap_alignment(_grpo_chunk_cap_config(3), 4)
+
+
+def test_grpo_rejects_a_cap_that_leaves_each_rank_a_partial_microbatch() -> None:
+    """Static batching splits a chunk twice, so the DP split alone is not enough.
+
+    Three groups at four generations is twelve samples, six per rank on DP 2,
+    and the Megatron worker then splits those six by a microbatch size of four.
+    Checking only the DP size accepts this config and it fails mid-step.
+    """
+    config = _grpo_chunk_cap_config(
+        3,
+        num_generations_per_prompt=4,
+        train_micro_batch_size=4,
+        dynamic_batching=False,
+    )
+
+    with pytest.raises(ValueError, match="max_groups_for_streaming_train"):
+        validate_grpo_chunk_cap_alignment(config, 2)
+
+
+@pytest.mark.parametrize("chunk_cap", [None, 2, 4, 8, 9])
+def test_grpo_accepts_shardable_and_nonbinding_chunk_caps(
+    chunk_cap: int | None,
+) -> None:
+    # 2 and 4 shard evenly across DP 4; 8 and 9 are at or above
+    # num_prompts_per_step and so never bind; None is the unbounded default.
+    validate_grpo_chunk_cap_alignment(_grpo_chunk_cap_config(chunk_cap), 4)
+
+
+@pytest.mark.parametrize(
+    ("dynamic_batching", "sequence_packing"), [(True, False), (False, True)]
+)
+def test_grpo_ignores_microbatch_sizes_when_the_consumer_bins_its_own(
+    dynamic_batching: bool, sequence_packing: bool
+) -> None:
+    """Packed and dynamically batched consumers only need complete DP shards.
+
+    The same twelve samples over DP 2 that the static-batching case rejects are
+    accepted here, so the microbatch term cannot reject a config that ran before.
+    """
+    config = _grpo_chunk_cap_config(
+        3,
+        num_generations_per_prompt=4,
+        train_micro_batch_size=4,
+        dynamic_batching=dynamic_batching,
+        sequence_packing=sequence_packing,
+    )
+
+    validate_grpo_chunk_cap_alignment(config, 2)
+
+
+def test_forest_is_exempt_because_its_groups_are_padded_to_execution_rows() -> None:
+    """Forest's producer pads each group to the policy execution row multiple.
+
+    Its logical group count is therefore not its physical row count, so the
+    sample arithmetic this guard does would be measuring the wrong thing.
+    """
+    validate_grpo_chunk_cap_alignment(
+        _grpo_chunk_cap_config(3, forest_training=True), 4
+    )
+
+
+def test_the_grpo_chunk_cap_guard_leaves_ppo_to_its_own_alignment() -> None:
+    # 3 groups x 2 generations is 6 samples, which DP 4 cannot shard, so the
+    # GRPO guard would reject this config if it did not skip PPO runs.
+    config = MasterConfig.model_construct(
+        ppo=PPOConfig(num_prompts_per_step=32, num_generations_per_prompt=2),
+        policy={
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": True},
+        },
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=2,
+            max_groups_for_streaming_train=3,
+        ),
+    )
+
+    validate_grpo_chunk_cap_alignment(config, 4)
 
 
 def _one_group_tags(count: int, *, weight_version: int = 0) -> list[dict[str, object]]:
@@ -369,6 +559,8 @@ def _stamp_advantage_stage_config(
         message_level_advantage_penalties_enabled=penalties_enabled,
         shardable=shardable,
         train_data_dump_dir=str(dump.log_dir) if dump is not None else None,
+        # The dumps installed here are JsonDebugWriters, so the stage writes JSONL.
+        debug_writer=DebugWriterConfig(target="json"),
     )
     ctrl._advantage_computer = AdvantageComputer(
         ctrl._dp_client,
@@ -449,8 +641,8 @@ def test_fresh_mooncake_init_registers_partition(
     dp_client = MagicMock(name="dp_client")
     master_config = _grpo_master_config(tmp_path)
     master_config.data_plane = _data_plane_config("mooncake_cpu")
-    master_config.checkpointing["enabled"] = checkpoint_enabled
-    master_config.checkpointing["save_data_plane"] = save_data_plane
+    master_config.checkpointing.enabled = checkpoint_enabled
+    master_config.checkpointing.save_data_plane = save_data_plane
     actor_args = _actor_args_for_init(dp_client=dp_client)
     if not checkpoint_enabled:
         actor_args.trainer_handle = None
@@ -510,7 +702,8 @@ def test_mooncake_checkpoint_workers_configured_before_restore(
     master_config = _grpo_master_config(tmp_path)
     master_config.data_plane = _data_plane_config("mooncake_cpu")
     master_config.token_capture.enabled = token_capture
-    master_config.checkpointing.update(enabled=True, save_data_plane=True)
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_data_plane = True
     workers = [object() for _ in range(10)]
 
     def group(members: list[object], leaders: tuple[int, ...] = ()) -> SimpleNamespace:
@@ -1968,6 +2161,8 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
     assert len(dump_timings) == 1
     assert math.isfinite(dump_timings[0]) and dump_timings[0] > 0
 
+    # The stage writes in the background; the controller flushes before merging.
+    ctrl._advantage_computer.flush_train_data_dump()
     ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_receipts)
     dumped = [
         json.loads(line)
@@ -2111,6 +2306,13 @@ def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None
 
 
 class _EmptySampler:
+    # Matches BaseSampler's gated defaults: the controller reads these directly off
+    # the sampler, so every pump-driving stub must declare them. Specialized stubs
+    # override individual flags to stand in for a different policy.
+    uses_pooled_replacements = True
+    closes_short_at_exhaustion = False
+    requires_shortfall_reconciliation = True
+
     async def evict(self, *, current_train_weight: int) -> int:
         del current_train_weight
         return 0
@@ -2394,13 +2596,16 @@ def _train_pump_controller(*, sampler) -> object:
         ),
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
-        checkpointing={"enabled": False, "save_period": 10},
+        checkpointing=CheckpointingConfig.model_construct(
+            enabled=False, save_period=10
+        ),
         rollout_recovery=SimpleNamespace(generation_prefix_cuts_enabled=False),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._async_cfg = SimpleNamespace(
         min_groups_for_streaming_train=1,
+        max_groups_for_streaming_train=None,
         rollout_failure=SimpleNamespace(min_step_batch_fraction=0.9),
         sampler=SimpleNamespace(
             max_lookahead_versions=1,
@@ -2417,7 +2622,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
-    ctrl._train_fields = single_controller._train_fields_for_step(
+    ctrl._train_fields = _train_fields_for_step(
         policy_logprobs_required=False,
         reference_logprobs_required=False,
         sampler_head_required=False,
@@ -2431,8 +2636,10 @@ def _train_pump_controller(*, sampler) -> object:
     attach_rollout_checkpointing(ctrl)
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
+    ctrl._trainer_warmup_task = None
     ctrl._is_ppo = False
     ctrl._streaming_ppo = False
+    ctrl._value_dedicated = False
     ctrl._ppo_epochs = 1
     ctrl._critic_ppo_epochs = 1
     ctrl._value = None
@@ -2455,12 +2662,18 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
+    # _step_assembler is a cached_property: left unbuilt here so it seeds from the
+    # trainer version and prompts-per-step each test sets before first using it.
     ctrl._train_steps = 0
     attach_rollout_checkpointing(ctrl)
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
     ctrl._dynamic_sampling_enabled = False
+    # A loose generation-batch budget so dynamic-sampling pump tests do not trip it by
+    # default; tests that exercise the budget set these two fields explicitly.
+    ctrl._filtered_prompt_budget = 10 * ctrl._algo_cfg.num_prompts_per_step
+    ctrl._filtered_prompts_by_step = {}
     ctrl._rollout_runtime.steps_allowed_short = set()
     ctrl._rollout_runtime.finalizer_metrics_by_group = {}
     ctrl._rollout_runtime.finalizer_rewards_by_group = {}
@@ -2568,6 +2781,510 @@ def _dropping_controller(*, credit_in_evict: bool):
     ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
     return ctrl
+
+
+class _ClosesShortSampler(_OneThenEmptySampler):
+    """Yields one group, then nothing: a windowed-style sampler at the end of the data."""
+
+    uses_pooled_replacements = False
+    closes_short_at_exhaustion = True
+
+    def __init__(self, meta: KVBatchMeta) -> None:
+        super().__init__(meta)
+        self.min_prompt_groups_asked: list[int] = []
+
+    def charge_step_for_lost_group(
+        self, *, target_step: int | None, assembling_version: int
+    ) -> int | None:
+        del target_step, assembling_version
+        return None
+
+    async def select(self, **kwargs):
+        self.min_prompt_groups_asked.append(kwargs["min_prompt_groups"])
+        return await super().select(**kwargs)
+
+
+def _closes_short_controller(*, min_step_batch_fraction: float):
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=_one_group_tags(1),
+    )
+    sampler = _ClosesShortSampler(meta)
+    ctrl = _train_pump_controller(sampler=sampler)
+    ctrl._async_cfg.rollout_failure.min_step_batch_fraction = min_step_batch_fraction
+    # A full chunk is the whole step, so the first request would ask for 2 groups.
+    ctrl._async_cfg.min_groups_for_streaming_train = 2
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    return ctrl, sampler
+
+
+def test_train_pump_closes_the_last_step_short_when_a_windowed_sampler_runs_out(
+    monkeypatch,
+) -> None:
+    """Nothing is charged to a step mid-run, so only the tail can leave one short."""
+    # ceil(0.5 * 2) is 1, so closing on the one group it got is legal.
+    ctrl, sampler = _closes_short_controller(min_step_batch_fraction=0.5)
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._train_steps == 1
+    assert ctrl._consumed_samples == 1, "the step is what shrank, not the run"
+    assert ctrl._rollout_runtime.batch_shortfall == {}, "pruned once the step closed"
+    assert ctrl._step_assembler._assembling_version == 1, (
+        "a later loss counts toward the next step"
+    )
+    assert set(sampler.min_prompt_groups_asked) == {1}, (
+        "with no more data coming, it takes whatever is left instead of waiting for "
+        "a full chunk"
+    )
+
+
+def test_train_pump_still_fails_a_windowed_tail_below_the_floor() -> None:
+    """The shortfall at the end of the data is held to min_step_batch_fraction too."""
+    # ceil(0.9 * 2) is 2, so a step with only one group is below the floor.
+    ctrl, _ = _closes_short_controller(min_step_batch_fraction=0.9)
+
+    with pytest.raises(RuntimeError, match="below the floor"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+
+@pytest.mark.parametrize(
+    "min_step_batch_fraction, skipped",
+    [(0.5, False), (1.0, True)],
+    ids=["trainable_tail", "below_floor_tail"],
+)
+def test_windowed_tail_under_dynamic_sampling_trains_or_skips_by_the_floor(
+    monkeypatch, min_step_batch_fraction: float, skipped: bool
+) -> None:
+    """A windowed EOF tail is allowed to close short, so the floor decides, not a raise.
+
+    With dynamic sampling on, the exhausted windowed step is marked allowed-short, so
+    the final floor check trains it or skips it instead of failing. One group of two:
+    a 50% floor (ceil is 1) trains it; a 100% floor (ceil is 2) skips it without an
+    optimizer update. The dynamic-sampling-off counterparts above instead raise, since
+    a short step is an error when nothing is being filtered.
+    """
+    ctrl, _ = _closes_short_controller(min_step_batch_fraction=min_step_batch_fraction)
+    ctrl._dynamic_sampling_enabled = True
+    ctrl._trainer.abort_train_step = MagicMock()
+    ctrl._trainer.finish_train_step = MagicMock(return_value={})
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert 0 in ctrl._rollout_runtime.steps_allowed_short, (
+        "the exhausted windowed step must reach the train-or-skip check, not raise"
+    )
+    assert ctrl._trainer.abort_train_step.call_count == int(skipped)
+    assert ctrl._trainer.finish_train_step.call_count == int(not skipped)
+    assert ctrl._consumed_samples == int(not skipped)
+    metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert metrics["skipped_step"] == int(skipped)
+
+
+@pytest.mark.parametrize(
+    ("pooled", "selected", "drawn", "raises"),
+    [
+        (True, 0, 100, False),
+        (False, 2, 8, False),
+        (False, 2, 9, True),
+        (False, 1, 9, False),
+        (False, 1, 10, True),
+        (False, 0, 10, False),
+        (False, 0, 11, True),
+    ],
+)
+def test_windowed_filtered_budget_counts_selected_plus_drawn(
+    pooled: bool, selected: int, drawn: int, raises: bool
+) -> None:
+    """The after-selection budget is selected-plus-drawn against the whole allowance.
+
+    Budget 10, PPS 2. A pooled sampler is exempt (it charges as it draws). A full step
+    (selected == PPS) matches the old budget-minus-PPS behaviour; an EOF tail that
+    selected fewer than PPS keeps the larger budget-minus-selected allowance instead of
+    being overcounted against a full PPS; a step that selected nothing still accumulates
+    draws, so an all-filtered wrapping loader eventually trips the budget.
+    """
+    ctrl = _train_pump_controller(
+        sampler=SimpleNamespace(uses_pooled_replacements=pooled)
+    )
+    ctrl._filtered_prompt_budget = 10
+    ctrl._algo_cfg.dynamic_sampling_max_gen_batches = 5
+    ctrl._filtered_prompts_by_step = {3: drawn} if drawn else {}
+
+    if raises:
+        with pytest.raises(
+            RuntimeError, match="generation batches that step is allowed"
+        ):
+            ctrl._enforce_windowed_filtered_budget(3, selected)
+    else:
+        ctrl._enforce_windowed_filtered_budget(3, selected)
+
+
+def test_the_closes_short_stub_declares_what_the_windowed_sampler_does() -> None:
+    """The stub drives the pump tests above, so it must not drift from the real one."""
+    windowed = WindowedSampler(MagicMock(), max_staleness_versions=1)
+    stub = _ClosesShortSampler(MagicMock())
+
+    assert stub.uses_pooled_replacements == windowed.uses_pooled_replacements
+    assert stub.closes_short_at_exhaustion == windowed.closes_short_at_exhaustion
+    assert (
+        stub.requires_shortfall_reconciliation
+        == windowed.requires_shortfall_reconciliation
+    )
+    for target_step in (None, 3):
+        assert stub.charge_step_for_lost_group(
+            target_step=target_step, assembling_version=7
+        ) == windowed.charge_step_for_lost_group(
+            target_step=target_step, assembling_version=7
+        )
+
+
+class _ReadyFirstFilteringSampler(_OneThenEmptySampler):
+    """One group, then a filtered group reported through the real ready_first policy.
+
+    Stands in for a dynamic-sampling drop under ready_first: the group is filtered
+    after it finishes generating, so it carries no target_step and the pump is already
+    waiting on it. The credit goes through StepAssembler.credit_shortfall rather than
+    writing the dict, so the real ReadyFirstSampler.charge_step_for_lost_group decides the step.
+    """
+
+    def __init__(self, meta: KVBatchMeta) -> None:
+        super().__init__(meta)
+        self._real = ReadyFirstSampler(MagicMock(), max_staleness_versions=1)
+        self.ctrl = None
+
+    uses_pooled_replacements = True
+    closes_short_at_exhaustion = False
+
+    def charge_step_for_lost_group(self, *, target_step, assembling_version):
+        return self._real.charge_step_for_lost_group(
+            target_step=target_step, assembling_version=assembling_version
+        )
+
+    async def select(self, **kwargs):
+        BaseSampler._validate_group_bounds(
+            kwargs["min_prompt_groups"], kwargs["max_prompt_groups"]
+        )
+        meta, num_groups = await super().select(**kwargs)
+        if meta is None:
+            # The pool is empty, so the filtered group is lost for good.
+            self.ctrl._step_assembler.credit_shortfall(None)
+        return meta, num_groups
+
+
+def test_train_pump_closes_a_ready_first_step_short_on_a_filtered_group(
+    monkeypatch,
+) -> None:
+    """End to end: an unstamped loss shrinks the step being assembled, not a later one."""
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=_one_group_tags(1),
+    )
+    sampler = _ReadyFirstFilteringSampler(meta)
+    ctrl = _train_pump_controller(sampler=sampler)
+    sampler.ctrl = ctrl
+    # ceil(0.5 * 2) is 1, so closing on the one group it got is legal.
+    ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
+    # Rollouts are still running, so the pump cannot fall back to the exhausted path:
+    # it has to act on the credit or wait on a group nobody is generating.
+    ctrl._rollout_exhausted.clear()
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._train_steps == 1
+    assert ctrl._consumed_samples == 1, "the step is what shrank, not the run"
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert train_metrics["dropped_prompt_groups"] == 1
+    assert ctrl._rollout_runtime.batch_shortfall == {}, (
+        "pruned once the step it was charged to closed"
+    )
+
+
+def test_ready_first_replaces_a_filtered_group_then_shrinks_the_assembling_step() -> (
+    None
+):
+    """Dynamic sampling under ready_first: spare first, then the step being assembled."""
+    ctrl = _train_pump_controller(
+        sampler=ReadyFirstSampler(MagicMock(), max_staleness_versions=1)
+    )
+    ctrl._async_cfg.rollout_failure = SimpleNamespace(
+        min_step_batch_fraction=0.5,
+        on_dropped_prompt="replace",
+        max_replacement_attempts=1,
+    )
+    ctrl._rollout_runtime.replacement_reserve = deque(["spare0"])
+    ctrl._rollout_runtime.batch_shortfall = {}
+    ctrl._step_assembler._assembling_version = 4
+
+    assert ctrl._take_replacement(0) == "spare0"
+    assert ctrl._take_replacement(0) is None, "the pool is now empty"
+    ctrl._step_assembler.credit_shortfall(None)
+
+    assert ctrl._rollout_runtime.batch_shortfall == {4: 1}
+    assert ctrl._target_groups_for_step(4) == 1, "2 prompts per step, one lost"
+    assert ctrl._target_groups_for_step(5) == 2, "the next step is untouched"
+
+
+class _GatedUnstampedSampler(_FullStepSampler):
+    """A whole step in one chunk, from a gated sampler that stamps no step."""
+
+    uses_pooled_replacements = True
+    closes_short_at_exhaustion = False
+
+    def charge_step_for_lost_group(
+        self, *, target_step: int | None, assembling_version: int
+    ) -> int | None:
+        return assembling_version if target_step is None else target_step
+
+
+class _LosingTrainer(_NoOpTrainer):
+    """Loses a group of some later step while the chunk trains."""
+
+    def __init__(self) -> None:
+        self.ctrl = None
+
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
+        del meta, train_fields
+        self.ctrl._step_assembler.credit_shortfall(None)
+
+
+@pytest.mark.parametrize("when", ["training", "selection"])
+@pytest.mark.parametrize(
+    ("drops", "exhausted"),
+    [(1, False), (2, False), (3, False), (1, True), (2, True), (5, True)],
+)
+def test_unstamped_losses_preserve_selected_groups(
+    monkeypatch, when: str, drops: int, exhausted: bool
+) -> None:
+    """Concurrent losses fill unselected slots, including across an awaited claim."""
+
+    async def exercise() -> None:
+        loop = asyncio.get_running_loop()
+        first_optimizer_shortfalls = []
+        provisional_shortfalls = []
+
+        def lose() -> None:
+            for _ in range(drops):
+                ctrl._step_assembler.credit_shortfall(None, allow_short=exhausted)
+            provisional_shortfalls.append(dict(ctrl._rollout_runtime.batch_shortfall))
+
+        class Sampler(_EmptySampler):
+            uses_pooled_replacements = True
+            closes_short_at_exhaustion = False
+
+            def __init__(self) -> None:
+                self.policy = ReadyFirstSampler(MagicMock(), max_staleness_versions=1)
+                self.sizes = [3] + ([5 - drops] if drops < 5 else [])
+                self.index = 0
+
+            def charge_step_for_lost_group(self, *, target_step, assembling_version):
+                return self.policy.charge_step_for_lost_group(
+                    target_step=target_step, assembling_version=assembling_version
+                )
+
+            async def select(self, *, min_prompt_groups, max_prompt_groups, **kwargs):
+                if self.index == len(self.sizes):
+                    return None, 0
+                index = self.index
+                size = self.sizes[index]
+                assert min_prompt_groups <= size <= max_prompt_groups
+                self.index += 1
+                if index == 0 and when == "selection":
+                    await asyncio.sleep(0)
+                    lose()
+                    await asyncio.sleep(0)
+                return KVBatchMeta(
+                    partition_id="rollout_data",
+                    task_name="train",
+                    sample_ids=[f"{index}-{i}" for i in range(size)],
+                    fields=[],
+                    sequence_lengths=[1] * size,
+                    tags=[
+                        {GROUP_ID_TAG: f"{index}-{i}", "weight_version": 0}
+                        for i in range(size)
+                    ],
+                ), size
+
+        class Trainer(_NoOpTrainer):
+            def __init__(self) -> None:
+                self.chunks = 0
+
+            def train_microbatches_from_meta(self, meta, *, train_fields) -> None:
+                self.chunks += 1
+                if self.chunks == 1 and when == "training":
+                    credited = threading.Event()
+
+                    def apply() -> None:
+                        lose()
+                        credited.set()
+
+                    loop.call_soon_threadsafe(apply)
+                    assert credited.wait(timeout=3)
+
+            def finish_train_step(self) -> dict:
+                first_optimizer_shortfalls.append(
+                    dict(ctrl._rollout_runtime.batch_shortfall)
+                )
+                return {}
+
+        ctrl = _train_pump_controller(sampler=Sampler())
+        ctrl._trainer = Trainer()
+        ctrl._algo_cfg.num_prompts_per_step = 4
+        ctrl._algo_cfg.max_num_steps = 2
+        ctrl._async_cfg.min_groups_for_streaming_train = 3
+        ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
+        ctrl._sync_weights = AsyncMock(return_value=0)
+        ctrl._logger = MagicMock()
+
+        await asyncio.wait_for(ctrl._train_pump(), timeout=3)
+
+        expected = {0: 1}
+        if drops > 1:
+            expected[1] = drops - 1
+        assert first_optimizer_shortfalls[0] == expected
+        assert sum(provisional_shortfalls[0].values()) == drops
+        assert ctrl._train_steps == 2
+        assert ctrl._consumed_samples == 8 - drops
+        assert len(first_optimizer_shortfalls) == (1 if drops == 5 else 2)
+        assert ctrl._rollout_runtime.batch_shortfall == {}
+        assert not ctrl._rollout_runtime.shortfall_reconciliation_pending
+        if exhausted and drops > 1:
+            assert {0, 1} <= ctrl._rollout_runtime.steps_allowed_short
+
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("policy", ["stamped", "windowed", "custom"])
+def test_selection_reconciliation_preserves_sampler_charge_policy(
+    monkeypatch, policy: str
+) -> None:
+    """Only the sampler's accounting cursor changes; explicit destinations remain."""
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=_one_group_tags(1),
+    )
+
+    class Sampler(_ChunkedSampler):
+        uses_pooled_replacements = True
+        closes_short_at_exhaustion = False
+
+        def charge_step_for_lost_group(self, *, target_step, assembling_version):
+            if policy == "windowed":
+                return None
+            if policy == "stamped":
+                return target_step
+            return 7
+
+        async def select(self, **kwargs):
+            if self._remaining == 2:
+                await asyncio.sleep(0)
+                for _ in range(2):
+                    ctrl._step_assembler.credit_shortfall(
+                        7 if policy == "stamped" else None
+                    )
+            return await super().select(**kwargs)
+
+    ctrl = _train_pump_controller(sampler=Sampler(meta, chunks=2))
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+
+    assert ctrl._train_steps == 1
+    assert ctrl._consumed_samples == 2
+    assert ctrl._rollout_runtime.batch_shortfall == (
+        {} if policy == "windowed" else {7: 2}
+    )
+
+
+@pytest.mark.parametrize("reconciles", [True, False])
+@pytest.mark.parametrize("allow_short", [True, False])
+def test_a_loss_racing_selection_defers_only_under_reconciliation(
+    reconciles: bool, allow_short: bool
+) -> None:
+    """A loss that races an awaited selection charges its step immediately; only a
+    reconciling sampler also collects the credit and defers the snapshot."""
+
+    class Sampler(_EmptySampler):
+        uses_pooled_replacements = True
+        closes_short_at_exhaustion = False
+        requires_shortfall_reconciliation = reconciles
+
+        def charge_step_for_lost_group(self, *, target_step, assembling_version):
+            return assembling_version if target_step is None else target_step
+
+    ctrl = _train_pump_controller(sampler=Sampler())
+    asm = ctrl._step_assembler
+    asm.begin_step(0)
+    # The controller arms a credit sink before awaiting select(), so a racing
+    # loss is collected rather than lost (single_controller.py).
+    asm.step_assembly.selection_credits = []
+
+    asm.credit_shortfall(None, allow_short=allow_short)
+
+    # Immediate in both cases: the step is charged, and permitted short when exhausted.
+    assert ctrl._rollout_runtime.batch_shortfall == {0: 1}
+    assert (0 in ctrl._rollout_runtime.steps_allowed_short) == allow_short
+
+    # Credit collection, pending state and snapshot deferral only for a reconciler.
+    if reconciles:
+        assert asm.step_assembly.selection_credits == [
+            ShortfallCredit(None, 0, allow_short)
+        ]
+        assert ctrl._rollout_runtime.shortfall_reconciliation_pending
+    else:
+        assert asm.step_assembly.selection_credits == []
+        assert not ctrl._rollout_runtime.shortfall_reconciliation_pending
+
+
+def test_a_group_lost_while_the_last_chunk_trains_counts_toward_the_next_step(
+    monkeypatch,
+) -> None:
+    """Charged to this step it would be pruned with it, and the next would stall."""
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0", "sample-1"],
+        fields=[],
+        sequence_lengths=[1, 1],
+        tags=_one_group_tags(2),
+    )
+    ctrl = _train_pump_controller(sampler=_GatedUnstampedSampler(meta))
+    trainer = _LosingTrainer()
+    trainer.ctrl = ctrl
+    ctrl._trainer = trainer
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._train_steps == 1
+    assert ctrl._rollout_runtime.batch_shortfall == {1: 1}, (
+        "step 1 is the one now short a group"
+    )
 
 
 @pytest.mark.parametrize("credit_in_evict", [False, True])
@@ -2756,6 +3473,7 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
     if single_forward_cispo:
         cfg = _grpo_master_config(tmp_path)
         cfg.policy["generation"]["backend"] = "vllm"
+        cfg.policy["generation"]["vllm_cfg"] = {"http_api_server_count": 1}
         cfg.async_rl.sampler = ReadyFirstSamplerConfig()
         cfg.loss_fn = ClippedPGLossConfig(
             use_cispo=True,
@@ -2774,7 +3492,7 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
         reference_logprobs_required = stage_cfg.reference_logprobs_required
     ctrl._policy_logprobs_required = policy_logprobs_required
     ctrl._reference_logprobs_required = reference_logprobs_required
-    ctrl._train_fields = single_controller._train_fields_for_step(
+    ctrl._train_fields = _train_fields_for_step(
         policy_logprobs_required=policy_logprobs_required,
         reference_logprobs_required=reference_logprobs_required,
         sampler_head_required=False,
@@ -2954,9 +3672,12 @@ def test_run_pumps_snapshots_generation_before_dispatch(
     ctrl = controller_cls.__new__(controller_cls)
     ctrl._environment_checkpoint = SimpleNamespace(check_startup=AsyncMock())
     ctrl._weight_synchronizer = SimpleNamespace(is_stale=False)
-    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(
+        set_weight_version=MagicMock(), set_tally_step_provider=MagicMock()
+    )
     ctrl._trainer_version = 0
     ctrl._rollout_restorer = SimpleNamespace(restore=AsyncMock(return_value=False))
+    ctrl._trainer_warmup_kwargs = None
     events = []
 
     def snapshot() -> None:
@@ -3158,6 +3879,124 @@ def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> No
     assert "policy.offload_to_cpu" not in calls
 
 
+class _OverfilledSampler(_EmptySampler):
+    """A buffer generation has already raced far ahead of the trainer.
+
+    Grants whatever the pump asks for, up to what is ready. That is the part of
+    the sampler contract the cap depends on: the only thing standing between a
+    full buffer and a single step-sized dispatch is the bound the pump passes
+    in, so a fake that returns a fixed size cannot show the cap working.
+    """
+
+    def __init__(self, meta: KVBatchMeta, ready: int) -> None:
+        self._meta = meta
+        self.ready = ready
+        self.select_bounds: list[tuple[int, int]] = []
+        self.chunks: list[int] = []
+
+    async def select(self, **kwargs):
+        min_prompt_groups = kwargs["min_prompt_groups"]
+        max_prompt_groups = kwargs["max_prompt_groups"]
+        self.select_bounds.append((min_prompt_groups, max_prompt_groups))
+        if self.ready < min_prompt_groups:
+            return None, 0
+        granted = min(self.ready, max_prompt_groups)
+        self.ready -= granted
+        self.chunks.append(granted)
+        return self._meta, granted
+
+
+def _chunk_cap_controller(
+    monkeypatch, *, cap: int | None, num_prompts: int, floor: int, ready: int = 8
+):
+    """A pump over a buffer holding ``ready`` groups the trainer has not taken."""
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=_one_group_tags(1),
+    )
+    sampler = _OverfilledSampler(meta, ready=ready)
+    ctrl = _train_pump_controller(sampler=sampler)
+    ctrl._algo_cfg.num_prompts_per_step = num_prompts
+    ctrl._async_cfg.min_groups_for_streaming_train = floor
+    ctrl._async_cfg.max_groups_for_streaming_train = cap
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._trainer = _OrderRecordingTrainer([])
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    return ctrl, sampler
+
+
+def test_an_uncapped_pump_swallows_a_generation_lead_in_one_chunk(
+    monkeypatch,
+) -> None:
+    """The behaviour the cap exists to bound, stated as the baseline.
+
+    Training is slow, so generation has run 64 groups ahead of an 8-group step.
+    Uncapped, the first select asks for the whole outstanding step and the
+    buffer can satisfy it, so the step is one chunk and the trainers and
+    advantage stage materialize all 8 groups' rows together.
+    """
+    ctrl, sampler = _chunk_cap_controller(
+        monkeypatch, cap=None, num_prompts=8, floor=2, ready=64
+    )
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert sampler.chunks == [8]
+    assert ctrl._train_steps == 1
+
+
+def test_a_capped_pump_takes_only_the_cap_from_an_overfilled_buffer(
+    monkeypatch,
+) -> None:
+    """Same lead, capped: the chunk size is the cap, not what is available.
+
+    The buffer can hand over the whole step on the first select and is asked for
+    the cap instead, so no single dispatch carries more than the cap's rows. The
+    lead itself is untouched -- the step still consumes exactly
+    ``num_prompts_per_step`` groups, so capping changes how much is materialized
+    at once, not how much the step trains on.
+    """
+    ctrl, sampler = _chunk_cap_controller(
+        monkeypatch, cap=2, num_prompts=8, floor=2, ready=64
+    )
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert sampler.chunks == [2, 2, 2, 2]
+    assert max(upper for _, upper in sampler.select_bounds) == 2
+    assert sampler.ready == 64 - 8
+    assert ctrl._train_steps == 1
+
+
+def test_a_capped_chunk_keeps_its_floor_and_still_closes_an_uneven_step(
+    monkeypatch,
+) -> None:
+    """A cap bounds the chunk without costing the floor or stranding the tail.
+
+    The floor rides along on every full chunk, so a capped run still waits for a
+    worthwhile batch rather than streaming single groups. The last chunk of an
+    uneven step is smaller than the floor, and only there does the clamp fire,
+    so the step still closes instead of waiting for groups that will not come.
+    """
+    ctrl, sampler = _chunk_cap_controller(
+        monkeypatch, cap=2, num_prompts=3, floor=2, ready=64
+    )
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    # Full chunk carries the configured floor; the 1-group tail clamps it down.
+    assert sampler.select_bounds == [(2, 2), (1, 1)]
+    assert sampler.chunks == [2, 1]
+    assert ctrl._train_steps == 1
+
+
 # ── PPO ────────────────────────────────────────────────────────────────────
 
 
@@ -3170,12 +4009,15 @@ class _NoOpValue:
     def __init__(self, calls: list[str] | None = None, prefix: str = "") -> None:
         self.calls: list[str] = [] if calls is None else calls
         self._prefix = prefix
+        self.resident_calls: list[tuple[str, bool]] = []
+        self._keep_resident = False
         self.trained_sample_ids: list[list[str]] = []
 
     def _record(self, name: str) -> None:
         self.calls.append(f"{self._prefix}{name}")
 
     def prepare_for_inference(self) -> None:
+        self.resident_calls.append(("prepare_for_inference", self._keep_resident))
         self._record("prepare_for_inference")
 
     def get_values_from_meta(self, meta: KVBatchMeta) -> None:
@@ -3183,9 +4025,11 @@ class _NoOpValue:
         self._record("get_values_from_meta")
 
     def finish_inference(self) -> None:
+        self.resident_calls.append(("finish_inference", self._keep_resident))
         self._record("finish_inference")
 
     def prepare_for_training(self) -> None:
+        self.resident_calls.append(("prepare_for_training", self._keep_resident))
         self._record("prepare_for_training")
 
     def begin_train_step(self, loss_fn) -> None:
@@ -3215,6 +4059,7 @@ class _NoOpValue:
         }
 
     def finish_training(self) -> None:
+        self.resident_calls.append(("finish_training", self._keep_resident))
         self._record("finish_training")
 
 
@@ -3340,6 +4185,45 @@ def test_train_pump_parks_the_policy_on_cpu_across_the_critic_stages(
         "critic.train_microbatches_from_meta",
         "critic.finish_train_step",
         "critic.finish_training",
+    ]
+
+
+@pytest.mark.parametrize("policy_logprobs_required", [False, True])
+def test_dedicated_value_keeps_both_models_resident_during_ppo_step(
+    monkeypatch, policy_logprobs_required
+) -> None:
+    meta = _single_group_meta()
+    calls: list[str] = []
+    value = _NoOpValue(calls=calls, prefix="critic.")
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta), value=value
+    )
+    ctrl._value_dedicated = True
+    value._keep_resident = True
+    ctrl._policy_logprobs_required = policy_logprobs_required
+    trainer = _OrderRecordingTrainer(calls)
+    trainer.prepare_for_lp_inference = MagicMock(wraps=trainer.prepare_for_lp_inference)
+    trainer.offload_to_cpu = MagicMock(wraps=trainer.offload_to_cpu)
+    trainer.finish_inference = MagicMock(wraps=trainer.finish_inference)
+    ctrl._trainer = trainer
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    trainer.offload_to_cpu.assert_not_called()
+    trainer.finish_inference.assert_not_called()
+    if policy_logprobs_required:
+        trainer.prepare_for_lp_inference.assert_called_once_with(
+            keep_train_buffers=True
+        )
+    else:
+        trainer.prepare_for_lp_inference.assert_not_called()
+    assert value.resident_calls == [
+        ("prepare_for_inference", True),
+        ("finish_inference", True),
+        ("prepare_for_training", True),
+        ("finish_training", True),
     ]
 
 
@@ -3807,6 +4691,25 @@ def test_streaming_ppo_split_value_replays_each_chunk_per_epoch(
     assert controller._trainer_version == controller._train_steps == 1
 
 
+def test_streaming_ppo_dedicated_value_keeps_policy_resident(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, metas, calls = _streaming_ppo_controller(monkeypatch)
+    controller._value_dedicated = True
+    controller._value._keep_resident = True
+
+    asyncio.run(asyncio.wait_for(controller._train_pump(), timeout=1.0))
+
+    assert calls.count("critic.get_values_from_meta") == len(metas)
+    assert calls.count("policy.train_microbatches_from_meta") == len(metas)
+    assert "policy.pause_train_step_with_offloading" not in calls
+    assert "policy.offload_to_cpu" not in calls
+    assert controller._value.resident_calls == [
+        ("prepare_for_inference", True),
+        ("finish_inference", True),
+    ] * len(metas) + [("prepare_for_training", True), ("finish_training", True)]
+
+
 @pytest.mark.parametrize("warmup", [False, True])
 @pytest.mark.parametrize(
     "valid_chunks",
@@ -4177,7 +5080,7 @@ def test_ppo_checkpoint_saves_both_updates_without_repeating_early_refit(
         ctrl, metas, calls = _streaming_ppo_controller(monkeypatch)
     else:
         ctrl, metas, calls = _full_batch_ppo_controller(monkeypatch, policy_epochs=3)
-    ctrl._master_config.checkpointing["enabled"] = True
+    ctrl._master_config.checkpointing.enabled = True
 
     async def save_checkpoint(metrics: dict, **kwargs: bool) -> None:
         assert kwargs == {
@@ -4748,6 +5651,9 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
         # The chunk above stands in for the stage's write, so stand in for the
         # receipt it would have reported alongside it too.
         ctrl._train_data_dump_receipts = [receipt]
+        # ...and for the in-process stage the commit flushes before merging.
+        ctrl._advantage_actors = []
+        ctrl._advantage_computer = SimpleNamespace(flush_train_data_dump=lambda: None)
 
     def finish_training() -> dict:
         assert not final.exists()
@@ -4769,6 +5675,69 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
         assert logged_timings[0]["train_data_dump"] > 2.0
         assert not final.with_suffix(".jsonl.partial").exists()
     assert "train_data_dump" not in ctrl._timer.get_timing_metrics()
+
+
+@pytest.mark.parametrize("pooled", [False, True])
+@pytest.mark.parametrize("flush_fails", [False, True])
+def test_train_pump_flushes_every_writer_before_publishing(
+    monkeypatch: pytest.MonkeyPatch, pooled: bool, flush_fails: bool
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0", "sample-1"],
+        fields=[],
+        sequence_lengths=[1, 1],
+        tags=_one_group_tags(2),
+    )
+    ctrl = _train_pump_controller(sampler=_FullStepSampler(meta))
+    ctrl._logger = MagicMock()
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    events: list[str] = []
+
+    async def flush(name: str) -> None:
+        # Yield first, so a publish that did not wait would run before this ends.
+        await asyncio.sleep(0.01)
+        if flush_fails and name == "flush-last":
+            raise RuntimeError("flush failed")
+        events.append(name)
+
+    ctrl._train_data_dump = MagicMock()
+    ctrl._train_data_dump_receipts = []
+    ctrl._train_data_dump.finish_step.side_effect = lambda *_: events.append("publish")
+    if pooled:
+        ctrl._advantage_actors = [
+            SimpleNamespace(
+                flush_train_data_dump=SimpleNamespace(
+                    remote=lambda name=name: flush(name)
+                )
+            )
+            for name in ("flush-first", "flush-last")
+        ]
+    else:
+
+        def flush_inline() -> None:
+            if flush_fails:
+                raise RuntimeError("flush failed")
+            events.append("flush-last")
+
+        ctrl._advantage_actors = []
+        ctrl._advantage_computer = SimpleNamespace(flush_train_data_dump=flush_inline)
+    ctrl._trainer.finish_train_step = MagicMock(return_value={})
+
+    if flush_fails:
+        with pytest.raises(RuntimeError, match="flush failed"):
+            asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+        ctrl._train_data_dump.finish_step.assert_not_called()
+        assert "publish" not in events
+    else:
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+        assert events[-1] == "publish"
+        assert events.count("publish") == 1
+        assert {"flush-last"} <= set(events)
+        if pooled:
+            assert {"flush-first", "flush-last"} <= set(events[:-1])
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])

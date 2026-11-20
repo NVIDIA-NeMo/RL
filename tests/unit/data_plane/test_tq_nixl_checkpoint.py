@@ -211,8 +211,8 @@ def test_ssd_on_save_on_2_restore_on_1_spills_and_reads_back(
     ns = "nvdp-ckpt-ssd"
 
     def system(n):
-        # 8 MiB slab per unit: 4 MiB put area + 4 MiB IO area.
-        conf = make_tq_conf(num_units=n, slab_bytes=8 * MiB, namespace=ns)
+        # Per unit: a 4 MiB put area and a 4 MiB IO area beside it.
+        conf = make_tq_conf(num_units=n, slab_bytes=4 * MiB, namespace=ns)
         conf.backend.NixlStore.op_timeout_s = 60.0
         conf.backend.NixlStore.ssd = {
             "enabled": True,

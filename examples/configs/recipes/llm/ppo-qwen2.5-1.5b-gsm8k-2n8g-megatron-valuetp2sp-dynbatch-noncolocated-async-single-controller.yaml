@@ -72,7 +72,7 @@ async_rl:
     warmup_lookahead_versions: 4
   recompute_kv_cache_after_weight_updates: true
   # Full-batch default. A smaller value streams policy training with ppo_epochs=1
-  # and normalizes per chunk when normalize_advantages=true; critic epochs stay full batch.
+  # and normalize_advantages=false; critic epochs stay full batch.
   min_groups_for_streaming_train: ${ppo.num_prompts_per_step}
   max_inflight_prompts: 1280
   # num_prompts_per_step * (warmup_lookahead_versions + 1) -- sized for the peak window.

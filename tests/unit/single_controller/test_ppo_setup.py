@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -36,6 +37,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     GeneralizedAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    CustomSamplerConfig,
     ReadyFirstSamplerConfig,
     WeightFifoSamplerConfig,
     WindowedSamplerConfig,
@@ -57,6 +59,8 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.models.value.config import ValueResourcesConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig
 
@@ -133,18 +137,19 @@ def _make_master_config(
             "megatron_cfg": {"enabled": megatron_enabled},
             "generation": {
                 "backend": "vllm",
+                "vllm_cfg": {"http_api_server_count": 1},
                 "colocated": {"enabled": False, "resources": {}},
             },
         },
-        checkpointing={
-            "enabled": False,
-            "checkpoint_dir": "results/_sc_ppo_setup_test_ckpt",
-            "metric_name": None,
-            "higher_is_better": False,
-            "keep_top_k": None,
-            "save_period": 10,
-            "save_optimizer": False,
-        },
+        checkpointing=CheckpointingConfig(
+            enabled=False,
+            checkpoint_dir="results/_sc_ppo_setup_test_ckpt",
+            metric_name=None,
+            higher_is_better=False,
+            keep_top_k=None,
+            save_period=10,
+            save_optimizer=False,
+        ),
         logger=LoggerConfig.model_construct(),
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
@@ -245,6 +250,46 @@ class TestAlgoConfigSelection:
 
 class TestPPOValidation:
     @pytest.mark.parametrize(
+        ("invalid_setting", "message"),
+        [
+            ("policy_backend", "policy.megatron_cfg.enabled=true"),
+            ("colocated", "colocated.enabled=false"),
+            ("missing_value_nodes", "value.resources.num_nodes >= 1"),
+            ("missing_resources", "value.resources.num_nodes >= 1"),
+            ("partial_generation_node", "generation to use full nodes"),
+            ("no_policy_node", "at least one full policy node"),
+        ],
+    )
+    def test_rejects_invalid_dedicated_value_layout(
+        self, invalid_setting: str, message: str
+    ) -> None:
+        mc = _ppo_master_config()
+        mc.cluster = ClusterConfig(num_nodes=3, gpus_per_node=8)
+        mc.policy["megatron_cfg"]["enabled"] = True
+        mc.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 1,
+        }
+        mc.value["dedicated"] = True
+        mc.value["resources"] = ValueResourcesConfig(num_nodes=1)
+
+        if invalid_setting == "policy_backend":
+            mc.policy["megatron_cfg"]["enabled"] = False
+        elif invalid_setting == "colocated":
+            mc.policy["generation"]["colocated"]["enabled"] = True
+        elif invalid_setting == "missing_value_nodes":
+            mc.value["resources"].num_nodes = None
+        elif invalid_setting == "missing_resources":
+            del mc.value["resources"]
+        elif invalid_setting == "partial_generation_node":
+            mc.policy["generation"]["colocated"]["resources"]["gpus_per_node"] = 4
+        else:
+            mc.cluster = ClusterConfig(num_nodes=2, gpus_per_node=8)
+
+        with pytest.raises(ValueError, match=message):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
         "make_config",
         [
             _ppo_master_config,
@@ -282,6 +327,156 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="the `ppo` block is absent"):
             validate_single_controller_config(mc)
 
+    def test_vlm_architecture_signature_uses_media_structure(self):
+        from nemo_rl.algorithms.single_controller_utils.config import (
+            _vlm_architecture_signature,
+        )
+
+        config = SimpleNamespace(
+            model_type="qwen2_5_vl",
+            architectures=["Qwen2_5_VLForConditionalGeneration"],
+            get_text_config=lambda: SimpleNamespace(model_type="qwen2"),
+            vision_config=SimpleNamespace(model_type="qwen2_5_vl_vision"),
+            image_token_id=151655,
+            video_token_id=151656,
+            vision_start_token_id=151652,
+            vision_end_token_id=151653,
+        )
+        with patch(
+            "transformers.AutoConfig.from_pretrained", return_value=config
+        ) as load:
+            signature = _vlm_architecture_signature(
+                "/models/policy", {"revision": "validated"}
+            )
+
+        load.assert_called_once_with(
+            "/models/policy", trust_remote_code=True, revision="validated"
+        )
+        assert signature == (
+            "qwen2_5_vl",
+            ("Qwen2_5_VLForConditionalGeneration",),
+            "qwen2",
+            "qwen2_5_vl_vision",
+            (
+                ("image_token_id", 151655),
+                ("video_token_id", 151656),
+                ("vision_start_token_id", 151652),
+                ("vision_end_token_id", 151653),
+            ),
+        )
+
+    def test_vlm_tokenizer_signature_uses_vocab_and_special_tokens(self):
+        from nemo_rl.algorithms.single_controller_utils.config import (
+            _vlm_tokenizer_signature,
+        )
+
+        tokenizer = SimpleNamespace(
+            get_vocab=lambda: {"<image>": 2, "answer": 1},
+            bos_token_id=10,
+            eos_token_id=11,
+            pad_token_id=12,
+            unk_token_id=13,
+            sep_token_id=None,
+            cls_token_id=None,
+            mask_token_id=None,
+        )
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
+        ) as load:
+            signature = _vlm_tokenizer_signature(
+                {
+                    "name": "/tokenizers/policy",
+                    "tokenizer_kwargs": {"use_fast": False},
+                },
+                "/models/fallback",
+            )
+
+        load.assert_called_once_with(
+            "/tokenizers/policy", trust_remote_code=True, use_fast=False
+        )
+        assert signature[0] == 2
+        assert len(signature[1]) == 64
+        assert signature[2] == (10, 11, 12, 13, None, None, None)
+
+    def test_rejects_vlm_ppo_without_both_model_names(self):
+        mc = _ppo_master_config()
+        mc.policy["is_vlm"] = True
+        assert mc.value is not None
+        mc.value["model_name"] = ""
+
+        with pytest.raises(
+            ValueError, match="requires model_name for both the policy and critic"
+        ):
+            validate_single_controller_config(mc)
+
+    def test_rejects_vlm_policy_with_a_different_critic_model(self):
+        mc = _ppo_master_config()
+        mc.policy["is_vlm"] = True
+        mc.policy["model_name"] = "Qwen/Qwen2.5-VL-3B-Instruct"
+
+        with (
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.config._vlm_architecture_signature",
+                side_effect=[("qwen2_5_vl",), ("qwen3",)],
+            ),
+            pytest.raises(ValueError, match="compatible policy and critic VLM"),
+        ):
+            validate_single_controller_config(mc)
+
+    def test_accepts_vlm_policy_with_the_same_vlm_critic(self):
+        mc = _ppo_master_config()
+        mc.policy["is_vlm"] = True
+        mc.policy["model_name"] = "Qwen/Qwen2.5-VL-3B-Instruct"
+        mc.policy["tokenizer"]["name"] = mc.policy["model_name"]
+        assert mc.value is not None
+        mc.value["model_name"] = mc.policy["model_name"]
+        mc.value["tokenizer"]["name"] = mc.policy["model_name"]
+
+        validate_single_controller_config(mc)
+
+    def test_accepts_compatible_vlm_checkpoints_at_different_paths(self):
+        mc = _ppo_master_config()
+        mc.policy["is_vlm"] = True
+        mc.policy["model_name"] = "/checkpoints/policy-vlm"
+        mc.policy["tokenizer"]["name"] = "/tokenizers/policy"
+        assert mc.value is not None
+        mc.value["model_name"] = "/checkpoints/value-vlm"
+        mc.value["tokenizer"]["name"] = "/tokenizers/value"
+
+        with (
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.config._vlm_architecture_signature",
+                side_effect=[("qwen2_5_vl",), ("qwen2_5_vl",)],
+            ),
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.config._vlm_tokenizer_signature",
+                side_effect=[("same-vocab",), ("same-vocab",)],
+            ),
+        ):
+            validate_single_controller_config(mc)
+
+    def test_rejects_vlm_critic_with_an_incompatible_tokenizer(self):
+        mc = _ppo_master_config()
+        mc.policy["is_vlm"] = True
+        mc.policy["model_name"] = "/checkpoints/policy-vlm"
+        mc.policy["tokenizer"]["name"] = "/tokenizers/policy"
+        assert mc.value is not None
+        mc.value["model_name"] = "/checkpoints/value-vlm"
+        mc.value["tokenizer"]["name"] = "/tokenizers/value"
+
+        with (
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.config._vlm_architecture_signature",
+                side_effect=[("qwen2_5_vl",), ("qwen2_5_vl",)],
+            ),
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.config._vlm_tokenizer_signature",
+                side_effect=[("policy-vocab",), ("value-vocab",)],
+            ),
+            pytest.raises(ValueError, match="compatible policy and critic tokenizers"),
+        ):
+            validate_single_controller_config(mc)
+
     @pytest.mark.parametrize("critic_epochs", [1, 2])
     def test_accepts_streaming_with_one_policy_epoch(self, critic_epochs):
         mc = _ppo_master_config(min_groups_for_streaming_train=1, megatron_enabled=True)
@@ -306,12 +501,12 @@ class TestPPOValidation:
         validate_single_controller_config(mc)
 
     @pytest.mark.parametrize(
-        ("min_groups", "normalize_advantages", "expect_warning"),
+        ("min_groups", "normalize_advantages", "expect_error"),
         [(1, True, True), (1, False, False), (_NUM_PROMPTS_PER_STEP, True, False)],
         ids=["streaming-normalized", "streaming-unnormalized", "full-batch"],
     )
-    def test_chunk_normalization_warning(
-        self, min_groups: int, normalize_advantages: bool, expect_warning: bool
+    def test_chunk_normalization_requires_full_batch(
+        self, min_groups: int, normalize_advantages: bool, expect_error: bool
     ) -> None:
         mc = _ppo_master_config(
             min_groups_for_streaming_train=min_groups, megatron_enabled=True
@@ -319,15 +514,11 @@ class TestPPOValidation:
         mc.ppo.ppo_epochs = 1
         mc.ppo.adv_estimator.normalize_advantages = normalize_advantages
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        if expect_error:
+            with pytest.raises(ValueError, match="normalize_advantages.*min_groups"):
+                validate_single_controller_config(mc)
+        else:
             validate_single_controller_config(mc)
-
-        assert len(caught) == int(expect_warning)
-        if expect_warning:
-            assert caught[0].category is UserWarning
-            assert "normalizes GAE advantages per chunk" in str(caught[0].message)
-            assert "instead of across the full batch" in str(caught[0].message)
 
     def test_rejects_streaming_without_megatron_policy(self):
         mc = _ppo_master_config(min_groups_for_streaming_train=1)
@@ -462,8 +653,8 @@ class TestPPOValidation:
         mc.policy["megatron_cfg"]["checkpoint"] = {
             "ckpt_assume_constant_structure": constant_structure
         }
-        mc.checkpointing["enabled"] = True
-        mc.checkpointing["save_optimizer"] = True
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_optimizer = True
         return mc
 
     def test_rejects_constant_ckpt_structure_with_warmup(self):
@@ -491,16 +682,20 @@ class TestPPOValidation:
 
         validate_single_controller_config(mc)
 
-    def test_rejects_length_penalty_until_sc_applies_it(self):
-        # The SC path has no length-penalty hook yet; fail at setup rather
-        # than silently training on unadjusted rewards.
+    @pytest.mark.parametrize("use_gym", [False, True])
+    def test_length_penalty_requires_gym(self, use_gym):
         mc = _make_master_config()
-        mc.grpo.length_penalty = LengthPenaltyConfig.model_validate(
-            {"default": {"total_bonus": 0.1}}
-        )
-
-        with pytest.raises(NotImplementedError, match="length_penalty"):
+        mc.grpo.length_penalty = LengthPenaltyConfig()
+        mc.env = {"should_use_nemo_gym": use_gym}
+        if use_gym:
+            mc.policy["generation"]["vllm_cfg"] = {
+                "async_engine": True,
+                "expose_http_server": True,
+            }
             validate_single_controller_config(mc)
+        else:
+            with pytest.raises(ValueError, match="length_penalty requires"):
+                validate_single_controller_config(mc)
 
     @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
     def test_accepts_absent_length_penalty(self, algorithm: str):
@@ -511,6 +706,29 @@ class TestPPOValidation:
             mc.grpo.length_penalty = None
 
         validate_single_controller_config(mc)
+
+    def test_ppo_rejects_length_penalty_extra(self):
+        mc = _ppo_master_config()
+        mc.ppo = mc.ppo.model_copy(update={"length_penalty": LengthPenaltyConfig()})
+        with pytest.raises(NotImplementedError, match="length_penalty"):
+            validate_single_controller_config(mc)
+
+    def test_forest_rejects_length_penalty(self):
+        # Forest discards the scored response before length is measured, so
+        # grpo.length_penalty is deferred to a follow-up and rejected at setup.
+        mc = _make_master_config()
+        mc.env = {"should_use_nemo_gym": True}
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
+        mc.grpo.length_penalty = LengthPenaltyConfig()
+        mc.token_capture.enabled = True
+        mc.token_capture.forest_training = True
+        with pytest.raises(
+            ValueError, match="Forest training does not support grpo.length_penalty"
+        ):
+            validate_single_controller_config(mc)
 
     @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
     def test_accepts_overlong_filtering(self, algorithm: str):
@@ -622,10 +840,16 @@ def _dynamic_sampling_config(
     mc.policy["train_global_batch_size"] = (
         _NUM_PROMPTS_PER_STEP * num_generations_per_prompt
     )
+    if sampler == "ready_first":
+        # ready_first trains on groups from older policies, so it needs the correction.
+        mc.loss_fn = ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0, use_importance_sampling_correction=True
+        )
     sampler_cfg = {"name": sampler}
     if sampler == "custom":
-        # A custom sampler config requires a target; the validator does not import it.
-        sampler_cfg["target"] = "my_pkg.samplers:MySampler"
+        sampler_cfg["target"] = (
+            "nemo_rl.algorithms.async_utils.staleness_sampler:InOrderSampler"
+        )
     mc.async_rl = AsyncRLConfig(
         min_groups_for_streaming_train=_NUM_PROMPTS_PER_STEP,
         max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
@@ -675,14 +899,50 @@ class TestDynamicSamplingValidation:
     def test_accepts_replace_with_a_stamping_sampler(self):
         validate_single_controller_config(_dynamic_sampling_config())
 
-    def test_rejects_a_custom_sampler(self):
-        # Narrowed to in_order: a custom class cannot declare at setup that it stamps
-        # a target step or that its admission wait can be interrupted for a refill.
-        # #4784 reopens this through a capability protocol.
-        mc = _dynamic_sampling_config(sampler="custom")
+    def test_accepts_a_custom_sampler(self):
+        validate_single_controller_config(_dynamic_sampling_config(sampler="custom"))
 
-        with pytest.raises(ValueError, match="sampler.name='in_order'"):
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "nemo_rl.algorithms.async_utils.staleness_sampler:WeightFifoSampler",
+            "tests.unit.single_controller.test_sampler_interface:InheritedWeightFifoSampler",
+        ],
+    )
+    def test_rejects_custom_fixed_weight_selection(self, target):
+        mc = _dynamic_sampling_config()
+        mc.async_rl.sampler = CustomSamplerConfig(
+            target=target, max_staleness_versions=0
+        )
+
+        with pytest.raises(
+            ValueError, match="requires a complete batch from one weight"
+        ):
             validate_single_controller_config(mc)
+
+    def test_rejects_custom_without_selection_declaration(self):
+        mc = _dynamic_sampling_config()
+        mc.async_rl.sampler = CustomSamplerConfig(
+            target="tests.unit.single_controller.test_sampler_interface:NoDropAccounting"
+        )
+
+        with pytest.raises(TypeError, match="requires_single_weight_batch"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_custom_fixed_weight_policy_before_cluster_allocation(self):
+        mc = _dynamic_sampling_config()
+        mc.async_rl.sampler = CustomSamplerConfig(
+            target="nemo_rl.algorithms.async_utils.staleness_sampler:WeightFifoSampler",
+            max_staleness_versions=0,
+        )
+
+        with patch.object(sc_setup_mod, "_build_clusters") as build_clusters:
+            with pytest.raises(
+                ValueError, match="requires a complete batch from one weight"
+            ):
+                setup_single_controller(mc, MagicMock())
+
+        build_clusters.assert_not_called()
 
     def test_accepts_shrink_because_filtering_replaces_regardless(self):
         # Filtering replaces uniform groups even when rollout failures shrink.
@@ -690,14 +950,11 @@ class TestDynamicSamplingValidation:
             _dynamic_sampling_config(on_dropped_prompt="shrink")
         )
 
-    def test_rejects_token_capture(self):
-        # The capture path cannot borrow a finished group from a later step, so every
-        # drop would stall its step for a full fresh rollout.
+    def test_accepts_token_capture(self):
         mc = _dynamic_sampling_config()
         mc.token_capture.enabled = True
 
-        with pytest.raises(ValueError, match="token_capture.enabled"):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_rejects_a_zero_generation_batch_allowance(self):
         mc = _dynamic_sampling_config(max_gen_batches=0)
@@ -726,17 +983,9 @@ class TestDynamicSamplingValidation:
             warnings.simplefilter("error", UserWarning)
             validate_single_controller_config(mc)
 
-    def test_rejects_a_sampler_that_stamps_no_target_step(self):
-        mc = _dynamic_sampling_config(sampler="ready_first")
-
-        with pytest.raises(ValueError, match="sampler.name='in_order'"):
-            validate_single_controller_config(mc)
-
-    def test_rejects_a_single_generation_per_prompt(self):
-        mc = _dynamic_sampling_config(num_generations_per_prompt=1)
-
-        with pytest.raises(ValueError, match="num_generations_per_prompt >= 2"):
-            validate_single_controller_config(mc)
+    @pytest.mark.parametrize("sampler", ["windowed", "ready_first"])
+    def test_accepts_the_samplers_that_stamp_no_target_step(self, sampler):
+        validate_single_controller_config(_dynamic_sampling_config(sampler=sampler))
 
     def test_ppo_rejects_dynamic_sampling_outright(self):
         # Removed from the SC `unsupported` list, PPO dynamic sampling is now rejected
@@ -914,6 +1163,7 @@ def patched_ppo_factories():
                 MagicMock(name="train"),
                 MagicMock(name="inference"),
                 None,
+                None,
             ),
         ) as mock_clusters,
         patch.object(
@@ -946,6 +1196,54 @@ def patched_ppo_factories():
 
 
 class TestSetupBuildsTheCritic:
+    @pytest.mark.parametrize("shared_node", [False, True])
+    def test_dedicated_value_claims_distinct_nodes_and_resident_worker(
+        self, patched_ppo_factories, shared_node: bool
+    ) -> None:
+        mc = _ppo_master_config()
+        mc.cluster = ClusterConfig(num_nodes=3, gpus_per_node=8)
+        mc.policy["megatron_cfg"]["enabled"] = True
+        mc.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 1,
+        }
+        mc.value["dedicated"] = True
+        mc.value["resources"] = ValueResourcesConfig(num_nodes=1)
+        train_cluster = MagicMock(name="train_cluster")
+        inference_cluster = MagicMock(name="inference_cluster")
+        value_cluster = MagicMock(name="value_cluster")
+        train_cluster.node_count.return_value = 1
+        value_cluster.node_count.return_value = 1
+        train_cluster.get_available_addresses_and_ports_batch.return_value = [
+            ("policy-node", 1000)
+        ]
+        value_cluster.get_available_addresses_and_ports_batch.return_value = [
+            ("policy-node" if shared_node else "value-node", 1000)
+        ]
+
+        with (
+            patch.object(
+                sc_setup_mod,
+                "_build_clusters",
+                return_value=(train_cluster, inference_cluster, value_cluster, None),
+            ),
+            patch(
+                "nemo_rl.data_plane.mooncake_storage_unit.plan_storage_unit_nodes",
+                return_value=None,
+            ) as plan_storage,
+        ):
+            if shared_node:
+                with pytest.raises(RuntimeError, match="share physical nodes"):
+                    setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+                patched_ppo_factories["_build_value"].assert_not_called()
+                return
+            setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        assert patched_ppo_factories["_build_value"].call_args.args[0] is value_cluster
+        patched_ppo_factories["value"].prepare_for_training.assert_called_once_with()
+        patched_ppo_factories["policy"].offload_to_cpu.assert_not_called()
+        assert plan_storage.call_args.args[1]["value"] is value_cluster
+
     def test_actor_args_carry_the_critic_and_its_loss(self, patched_ppo_factories):
         mc = _ppo_master_config()
 
@@ -1013,7 +1311,7 @@ class TestValueWarmStart:
                 **_STEP_CONFIG,
             )
         )
-        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+        mc.checkpointing.checkpoint_dir = str(tmp_path / "run")
 
         setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
 
@@ -1026,7 +1324,7 @@ class TestValueWarmStart:
 
     def test_unset_leaves_the_critic_cold(self, patched_ppo_factories, tmp_path):
         mc = _ppo_master_config()
-        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+        mc.checkpointing.checkpoint_dir = str(tmp_path / "run")
 
         setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
 
@@ -1056,7 +1354,7 @@ class TestValueWarmStart:
                 **_STEP_CONFIG,
             )
         )
-        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+        mc.checkpointing.checkpoint_dir = str(tmp_path / "run")
 
         with pytest.raises(ValueError, match=message):
             setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
@@ -1081,7 +1379,7 @@ class TestValueWarmStart:
                 **_STEP_CONFIG,
             )
         )
-        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+        mc.checkpointing.checkpoint_dir = str(tmp_path / "run")
 
         with patch.object(sc_setup_mod, "load_dataloader_state"):
             setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
@@ -1117,6 +1415,26 @@ class TestTrainClusterSizesForTheCritic:
             cls.side_effect = lambda **kwargs: MagicMock(kwargs=kwargs)
             yield cls
 
+    def test_dedicated_value_uses_separate_cluster(self, fake_cluster):
+        master_config = _cluster_config(
+            _ppo_master_config(), colocated=False, backend="vllm"
+        )
+        master_config.cluster = ClusterConfig(num_nodes=5, gpus_per_node=8)
+        master_config.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 1,
+        }
+        master_config.value["dedicated"] = True
+        master_config.value["resources"] = ValueResourcesConfig(num_nodes=2)
+
+        train, inference, value, _ = sc_setup_mod._build_clusters(master_config)
+
+        assert train.kwargs["bundle_ct_per_node_list"] == [8, 8]
+        assert inference.kwargs["bundle_ct_per_node_list"] == [8]
+        assert value.kwargs["bundle_ct_per_node_list"] == [8, 8]
+        assert train.kwargs["max_colocated_worker_groups"] == 1
+        assert value.kwargs["max_colocated_worker_groups"] == 1
+
     @pytest.mark.parametrize(
         ("make_config", "colocated", "backend", "expected_train_groups"),
         [
@@ -1140,9 +1458,10 @@ class TestTrainClusterSizesForTheCritic:
     ):
         mc = _cluster_config(make_config(), colocated=colocated, backend=backend)
 
-        train, inference, _teacher_topology = sc_setup_mod._build_clusters(mc)
+        train, inference, value, _teacher_topology = sc_setup_mod._build_clusters(mc)
 
         assert train.kwargs["max_colocated_worker_groups"] == expected_train_groups
+        assert value is None
         if colocated:
             assert train is inference
         else:
@@ -1160,10 +1479,22 @@ def _in_loss_ppo_config(*, streaming: bool = False) -> MasterConfig:
     mc.loss_fn.seq_logprob_error_in_loss = True
     mc.loss_fn.force_on_policy_ratio = True
     mc.loss_fn.token_level_loss = True
+    mc.ppo.adv_estimator.normalize_advantages = False
     return mc
 
 
 class TestInLossSeqFilterForPPO:
+    def test_rejects_normalization_before_in_loss_filtering(self) -> None:
+        mc = _in_loss_ppo_config()
+        mc.ppo.adv_estimator.normalize_advantages = True
+
+        with pytest.raises(ValueError, match="normalize_advantages"):
+            validate_single_controller_config(mc)
+
+        mc.loss_fn.seq_logprob_error_in_loss = False
+        validate_single_controller_config(mc)
+        assert logprob_passes_required(mc, mc.ppo)[0]
+
     @pytest.mark.parametrize("streaming", [False, True])
     def test_accepts_one_policy_epoch_and_skips_policy_logprobs(
         self, streaming: bool
@@ -1187,3 +1518,10 @@ class TestInLossSeqFilterForPPO:
 
         with pytest.raises(ValueError, match="without use_kl_in_reward"):
             validate_single_controller_config(mc)
+
+
+def test_dynamic_sampling_rejects_weight_fifo():
+    with pytest.raises(ValueError, match="cannot be combined with.*weight_fifo"):
+        validate_single_controller_config(
+            _dynamic_sampling_config(sampler="weight_fifo")
+        )

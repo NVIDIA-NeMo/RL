@@ -54,6 +54,7 @@ from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     RolloutRecoveryLedger,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from tests.unit.single_controller import _checkpoint_scenarios as scenarios
 from tests.unit.single_controller._rollout_checkpoints import (
     attach_rollout_checkpointing,
@@ -237,7 +238,7 @@ def _controller(
     )
     controller._master_config = SimpleNamespace(
         grpo=controller._algo_cfg,
-        checkpointing={"load_replay_buffer": True},
+        checkpointing=CheckpointingConfig.model_construct(load_replay_buffer=True),
         token_capture=SimpleNamespace(enabled=False, forest_training=False),
     )
     controller._dataloader = loader
@@ -357,9 +358,10 @@ async def _exercise_round_trip(
     checkpoint_path = tmp_path / "step_0"
     checkpoint_path.mkdir()
     async with first._data_plane_checkpoint_barrier.checkpoint() as cut:
-        snapshot = await first._rollout_snapshots.capture(
+        captured = await first._rollout_snapshots.capture(
             cut, checkpoint_path, "rollout_snapshot"
         )
+        snapshot = captured.state
     assert snapshot.replay_metadata is not None
     assert snapshot.rollout_recovery_payload is not None
     torch.save(
