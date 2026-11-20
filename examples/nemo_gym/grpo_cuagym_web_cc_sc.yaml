@@ -1,0 +1,225 @@
+# CUA-Gym / WebArena web-agent GRPO with context compaction: SingleController +
+# TransferQueue data plane + token capture with forest training
+# (docs/guides/context-compaction.md) + router replay, with the Gym web agent
+# (resources_servers/cuagym, responses_api_agents/webarena_agent).
+#
+# Node layout: SC rejects colocated generation, so training and generation nodes
+# are separate. cluster.num_nodes counts BOTH; the generation node count is
+# policy.generation.colocated.resources.num_nodes. The launcher overrides these.
+defaults: grpo_nanov3.yaml
+
+grpo:
+  num_prompts_per_step: 32          # TASKS_PER_STEP
+  num_generations_per_prompt: 8     # GENS_PER_TASK  (SC: prompts*gens == train_global_batch_size)
+  val_num_generations_per_prompt: 1
+  max_rollout_turns: 1              # Gym owns the web agent's internal turns.
+  max_num_epochs: 100
+  max_num_steps: 100
+  val_period: 0                     # SC has no in-training validation yet (setup rejects val_period>0)
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: false
+  seq_logprob_error_threshold: null
+  async_grpo: null
+  # Masked rollouts still vote in their group's baseline/std (never trainable).
+  masked_reward_policy: include
+  calculate_advantages_on_gpu: false   # forest training requirement
+  skip_reference_policy_logprobs_calculation: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: false
+  # Each prompt group weighs equally, its tokens sharing that weight (E34's prompt_mean).
+  normalization: group_token_mean
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: 0.5
+  truncated_importance_sampling_type: icepop
+
+checkpointing:
+  enabled: false                    # launcher: SAVE_PERIOD / resume
+  checkpoint_dir: ${oc.env:CC_RUN_ROOT}/checkpoints
+  save_period: 10
+  keep_top_k: 20
+  metric_name: null
+  checkpoint_must_save_by: "00:03:45:00"
+  save_data_plane: true             # SC requirement whenever checkpointing is enabled
+
+policy:
+  model_name: ${oc.env:NANO_OMNI_MODEL_NAME}
+  is_vlm: true
+  tokenizer:
+    name: ${oc.env:NANO_OMNI_MODEL_NAME}
+    chat_template: ${oc.env:NANO_OMNI_MODEL_NAME}/chat_template.jinja
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  train_global_batch_size: 256      # = num_prompts_per_step * num_generations_per_prompt
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 32768
+  logprob_chunk_size: null
+  make_sequence_length_divisible_by: 8
+  router_replay:
+    enabled: true
+  sequence_packing:
+    enabled: false                  # CC execution padding requires fixed batches
+  dynamic_batching:
+    enabled: false
+  megatron_cfg:
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8   # launcher: POLICY_EP (16 for the 2-node TP8/EP16 learner)
+    pipeline_model_parallel_size: 1
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    radio_force_cpe_eval_mode: true
+    clear_memory_caches_before_refit: true
+    freeze_moe_router: true
+    moe_router_enable_expert_bias: true   # keep the checkpoint's aux-loss-free balancing bias loaded
+    # Forest training needs dropless routing. E34 trained with the bias frozen at its
+    # checkpoint value (v1 used 1e-3); keep that for parity.
+    moe_router_bias_update_rate: 0
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    optimizer:
+      lr: 1e-5
+      min_lr: 1e-5
+    scheduler:
+      lr_decay_style: constant
+      lr_warmup_iters: 0
+    checkpoint:
+      async_save: false
+  generation:
+    max_new_tokens: 2048
+    bad_words: ["<image>", "<img>", "</img>"]
+    mcore_generation_config:
+      refit_backend: nvshmem
+      parsers: []
+    vllm_cfg:
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 8
+      gpu_memory_utilization: 0.85
+      max_model_len: 32768
+      enforce_eager: true             # v1 + Ali's fixture ran eager; CUDA-graph capture crashed the B200 gen workers in memory profiling (job 1968968)
+      enable_prefix_caching: false
+      skip_tokenizer_init: false
+      load_format: dummy
+      logprobs_mode: raw_logprobs
+      async_engine: true
+      reasoning_parser_plugin: null
+      http_server_serving_chat_kwargs:
+        # web_agent drives the browser through structured function calls with
+        # tool_choice=auto, so the serving layer must parse tool calls (Ali's
+        # scripted fixture never needed this; vLLM 400s otherwise). qwen3_coder /
+        # qwen3 are vLLM built-ins matching the Nemotron web policy's wire format
+        # (validated in the v1 web recipe grpo_cuagym_web_cc.yaml).
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: qwen3
+        chat_template_content_format: string
+        chat_template: ${oc.env:NANO_OMNI_MODEL_NAME}/chat_template.jinja
+        default_chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+    vllm_kwargs:
+      # B200: auto picks flashinfer trtllm_bf16_moe, which breaks refit and returns
+      # zero-filled routed_experts (router replay fails). triton is the validated path.
+      moe_backend: triton
+      attention_backend: FLASH_ATTN
+      limit_mm_per_prompt: {image: 16}
+      mm_processor_cache_gb: 0
+      max_num_batched_tokens: 32768
+      mamba_ssm_cache_dtype: float32
+      enable_chunked_prefill: false
+    colocated:
+      enabled: false                # SC requires disaggregated generation
+      resources:
+        gpus_per_node: 8
+        num_nodes: 2                # launcher: GEN_NODES
+
+data:
+  max_input_seq_length: 32768
+  shuffle: true
+  train:
+    data_path: ${oc.env:CUAGYM_CC_DATA_PATH}
+  validation:
+    data_path: ${oc.env:CUAGYM_CC_VAL_DATA_PATH,${oc.env:CUAGYM_CC_DATA_PATH}}
+
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  should_mask_flagged_samples: true
+  nemo_gym:
+    is_trajectory_collection: false
+    skip_venv_if_present: true
+    # Gym server venvs (cuagym / webarena / web_agent) must live on the shared FS:
+    # browser actors are spread over all nodes. The image bakes NEMO_GYM_VENV_DIR=/opt/gym_venvs
+    # and the container env wins over the host export, so pin the dir explicitly here.
+    uv_venv_dir: ${oc.env:CC_GYM_VENV_DIR,/opt/gym_venvs}
+    # Actor-wide ceiling shared by synchronous steps and async target batches.
+    max_inflight_rollouts: 256
+    distributed_result_processing: true
+    result_workers_per_node: 1
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model.yaml
+      - resources_servers/cuagym/configs/${oc.env:CC_AUTHORITY_YAML,cuagym_cc_authority_n2k2.yaml}
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true   # serving runs the qwen3 reasoning parser (v1 setting)
+
+token_capture:
+  enabled: true
+  forest_training: true
+  selection_policy: returned_history
+  defer_routed_experts_to_policy: false
+  num_reassembler_workers: 1
+
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0
+  min_groups_for_streaming_train: 32   # = num_prompts_per_step (one full step per train)
+  max_groups_for_streaming_train: null # cap on groups per streaming train chunk (learner memory); null = uncapped
+  max_inflight_prompts: 32
+  max_buffered_rollouts: 256
+  log_group_rewards: true              # per-task GROUP_REWARDS lines in the driver log
+  rollout_failure:
+    # Web rollouts fail for prompt-specific reasons (browser/site errors, lost model
+    # calls); the agent reports them as HTTP 422 -> RolloutDataFailure. Retry the prompt
+    # once, then drop it and substitute a spare prompt so the step keeps its full batch
+    # (CC requires min_step_batch_fraction=1: a step can never shrink).
+    max_data_attempts_per_prompt: 2
+    max_skipped_prompts: 512           # run-lifetime budget of dropped prompts
+    on_dropped_prompt: replace
+    max_replacement_attempts: 2
+    replacement_reserve_prompts: 4
+    min_step_batch_fraction: 1
+
+logger:
+  log_dir: ${oc.env:CC_RUN_ROOT}
+  wandb_enabled: true
+  wandb:
+    project: ${oc.env:WANDB_PROJECT,cc-web-rl}
+    name: ${oc.env:CC_WANDB_NAME,cuagym-cc-v2}
+    log_nemo_gym_full_result_tables: false
+  tensorboard_enabled: false
+  monitor_gpus: true
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8                      # training + generation nodes (launcher override)
