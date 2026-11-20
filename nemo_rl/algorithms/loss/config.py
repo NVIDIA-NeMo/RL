@@ -117,24 +117,14 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     score_centering: bool = False
 
 
-class CISPOLossConfig(BaseModel, extra="forbid"):
-    """CISPO (https://arxiv.org/abs/2506.13585), selected with ``kind: cispo``.
+class _ClippedPGVariantConfig(BaseModel, extra="forbid"):
+    """Settings shared by the objective-specific configs of ClippedPGLossFn.
 
-    Carries only the settings CISPO supports, so a setting of another objective
-    (``disable_ppo_ratio``, ``sequence_level_importance_ratios``,
-    ``ratio_clip_c``) is rejected when the config is loaded. Field names,
-    defaults and meanings match ClippedPGLossConfig, which documents them.
+    Field names, defaults and meanings match ClippedPGLossConfig, which
+    documents them. A variant adds the settings of its objective and leaves out
+    the rest, so a setting of another objective is rejected when the config is
+    loaded.
     """
-
-    kind: Literal["cispo"] = "cispo"
-    # Fixed by the objective. Kept as fields so trainer code that reads these
-    # switches, and configs that still spell them out, keep working.
-    use_cispo: Literal[True] = True
-    token_level_loss: Literal[True] = True
-
-    # --- Clipping ---
-    ratio_clip_min: float = 0.2
-    ratio_clip_max: float = 0.2
 
     # --- KL regularization ---
     reference_policy_kl_penalty: float = Field(default=0.01, ge=0, allow_inf_nan=False)
@@ -148,6 +138,32 @@ class CISPOLossConfig(BaseModel, extra="forbid"):
     use_importance_sampling_correction: bool = False
     truncated_importance_sampling_ratio: float | None = None
     truncated_importance_sampling_ratio_min: float | None = None
+
+    positive_example_nll_weight: float = 0.0
+    metrics_level: Literal["full", "minimal"] = "full"
+    enable_torch_compile: bool = False
+
+    def as_clipped_pg_config(self) -> ClippedPGLossConfig:
+        """Express these settings as the config of the shared loss implementation."""
+        return ClippedPGLossConfig.model_validate(self.model_dump(exclude={"kind"}))
+
+
+class CISPOLossConfig(_ClippedPGVariantConfig):
+    """CISPO (https://arxiv.org/abs/2506.13585), selected with ``kind: cispo``.
+
+    Has no ``disable_ppo_ratio``, ``sequence_level_importance_ratios`` or
+    ``ratio_clip_c``: CISPO is incompatible with them.
+    """
+
+    kind: Literal["cispo"] = "cispo"
+    # Fixed by the objective. Kept as fields so trainer code that reads these
+    # switches, and configs that still spell them out, keep working.
+    use_cispo: Literal[True] = True
+    token_level_loss: Literal[True] = True
+
+    ratio_clip_min: float = 0.2
+    ratio_clip_max: float = 0.2
+
     truncated_importance_sampling_type: (
         Literal["tis", "icepop", "adaptive-ppo-clip", "seq-mask-tis"] | None
     ) = None
@@ -160,24 +176,41 @@ class CISPOLossConfig(BaseModel, extra="forbid"):
         default=50.0, gt=0.0
     )
 
-    # --- On-policy ---
     force_on_policy_ratio: bool = False
     seq_logprob_error_in_loss: bool = False
-
-    positive_example_nll_weight: float = 0.0
-    metrics_level: Literal["full", "minimal"] = "full"
-    enable_torch_compile: bool = False
     score_centering: bool = False
 
-    def as_clipped_pg_config(self) -> ClippedPGLossConfig:
-        """Express these settings as the config of the shared loss implementation."""
-        return ClippedPGLossConfig.model_validate(self.model_dump(exclude={"kind"}))
+
+class ReinforceLossConfig(_ClippedPGVariantConfig):
+    """REINFORCE / RLOO (https://arxiv.org/abs/2402.14740), selected with ``kind: reinforce``.
+
+    Has no ratio clipping, sequence-level ratios, CISPO or adaptive-ppo-clip
+    settings: without the policy ratio they have nothing to act on.
+    """
+
+    kind: Literal["reinforce"] = "reinforce"
+    # Fixed by the objective. Kept as fields so trainer code that reads these
+    # switches, and configs that still spell them out, keep working.
+    disable_ppo_ratio: Literal[True] = True
+    # The shared loss applies force_on_policy_ratio in place of
+    # disable_ppo_ratio, and in-loss sequence filtering requires it.
+    force_on_policy_ratio: Literal[False] = False
+    seq_logprob_error_in_loss: Literal[False] = False
+
+    token_level_loss: bool = True
+    score_centering: bool = False
+
+    # adaptive-ppo-clip requires force_on_policy_ratio.
+    truncated_importance_sampling_type: (
+        Literal["tis", "icepop", "seq-mask-tis"] | None
+    ) = None
 
 
 # Switches of ClippedPGLossConfig that select an objective, and the kind that
 # replaces each. They keep working, with a warning, until they are removed.
 _DEPRECATED_SWITCHES = {
     "use_cispo": "kind: cispo",
+    "disable_ppo_ratio": "kind: reinforce",
 }
 
 
@@ -202,7 +235,7 @@ def _select_legacy_config(value: Any) -> Any:
 # objective supports. An untagged block stays the all-in-one
 # ClippedPGLossConfig, so existing configs load unchanged.
 PolicyGradientLossConfig = Annotated[
-    ClippedPGLossConfig | CISPOLossConfig,
+    ClippedPGLossConfig | CISPOLossConfig | ReinforceLossConfig,
     Field(discriminator="kind"),
     BeforeValidator(_select_legacy_config),
 ]
@@ -211,7 +244,7 @@ PolicyGradientLossConfig = Annotated[
 def as_clipped_pg_config(cfg: PolicyGradientLossConfig) -> ClippedPGLossConfig:
     """Return the settings of any loss config that ClippedPGLossFn implements."""
     match cfg:
-        case CISPOLossConfig():
+        case CISPOLossConfig() | ReinforceLossConfig():
             return cfg.as_clipped_pg_config()
         case ClippedPGLossConfig():
             return cfg

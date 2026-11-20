@@ -13,12 +13,12 @@ grpo:
     name: opd
   seq_logprob_error_threshold: 2.0
 loss_fn:
+  _override_: true  # REINFORCE accepts only its own settings; replace the inherited block
+  kind: reinforce
   reference_policy_kl_penalty: 0.0
   kl_input_clamp_value: null
   kl_output_clamp_value: null
-  ratio_clip_max: 0.28
   use_on_policy_kl_approximation: true
-  disable_ppo_ratio: true
   use_importance_sampling_correction: true
   truncated_importance_sampling_ratio: 5.0
   truncated_importance_sampling_ratio_min: 0.2

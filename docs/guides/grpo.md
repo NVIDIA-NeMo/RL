@@ -493,12 +493,13 @@ Throughout, $r_{i,t} = \frac{\pi_\theta(o_{i,t})}{\pi_{\theta_{\text{old}}}(o_{i
 | **GRPO / PPO / DAPO** | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ |
 | **CISPO** (`kind: cispo`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \text{sg}\big(\text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}})\big) A_i \log \pi_\theta(o_{i,t})$ | Not available — rejected at construction time, because CISPO is defined per token. |
 | **GSPO** (`sequence_level_importance_ratios: true`) | Not available — rejected at construction time, because the sequence-level ratio is mutually exclusive with token-level reduction. | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(s_i A_i,\ \text{clip}(s_i, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$, where $s_i = \Big(\frac{\pi_\theta(o_i)}{\pi_{\theta_{\text{old}}}(o_i)}\Big)^{1/\lvert o_i\rvert}$ |
-| **REINFORCE / RLOO** (`disable_ppo_ratio: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t A_i \log \pi_\theta(o_{i,t})$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t A_i \log \pi_\theta(o_{i,t})$ |
+| **REINFORCE / RLOO** (`kind: reinforce`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t A_i \log \pi_\theta(o_{i,t})$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t A_i \log \pi_\theta(o_{i,t})$ |
 
 Two notes on the table:
 
 - The "not available" cells are enforced by assertions in `ClippedPGLossFn.__init__`, so an incompatible config fails immediately rather than training with a silently different objective.
 - In the GSPO row, $s_i$ does not depend on $t$, so the inner $\frac{1}{\lvert o_i\rvert} \sum_t$ collapses and the objective reduces to one clipped term per response.
+- CISPO and REINFORCE / RLOO also have dedicated configs, selected with `kind: cispo` and `kind: reinforce` in the `loss_fn` block. They build the same loss, but accept only the settings their objective uses, so a setting from another row fails when the config is loaded (for example `ratio_clip_max` under REINFORCE, which the loss ignores). The [CISPO guide](cispo.md#configuration) shows the pattern, including `_override_: true` for recipes that inherit a `loss_fn` block. The older switches `use_cispo: true` and `disable_ppo_ratio: true` in a block without `kind` are deprecated and will be removed in a future release; they still work and log a `FutureWarning`.
 
 #### Losses that do not expose this parameter
 

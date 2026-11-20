@@ -23,6 +23,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
     PolicyGradientLossConfig,
+    ReinforceLossConfig,
     as_clipped_pg_config,
     build_policy_gradient_loss,
 )
@@ -103,6 +104,24 @@ VARIANTS = {
         },
         {"disable_ppo_ratio", "sequence_level_importance_ratios", "ratio_clip_c"},
     ),
+    "reinforce": (
+        ReinforceLossConfig,
+        {"disable_ppo_ratio": True},
+        {
+            **IS_CORRECTION,
+            "token_level_loss": False,
+            "reference_policy_kl_penalty": 0.0,
+            "truncated_importance_sampling_type": "icepop",
+        },
+        {
+            "ratio_clip_min",
+            "ratio_clip_max",
+            "ratio_clip_c",
+            "sequence_level_importance_ratios",
+            "use_cispo",
+            *ADAPTIVE_PPO_CLIP_SETTINGS,
+        },
+    ),
 }
 UNSUPPORTED_SETTINGS = [
     (kind, setting)
@@ -149,6 +168,9 @@ def test_variant_rejects_settings_of_other_objectives(kind, setting):
     [
         ("cispo", "use_cispo", True),
         ("cispo", "token_level_loss", True),
+        ("reinforce", "disable_ppo_ratio", True),
+        ("reinforce", "force_on_policy_ratio", False),
+        ("reinforce", "seq_logprob_error_in_loss", False),
     ],
 )
 def test_variant_pins_the_switches_its_objective_fixes(kind, setting, fixed):
@@ -162,6 +184,7 @@ def test_variant_pins_the_switches_its_objective_fixes(kind, setting, fixed):
     ("kind", "truncation"),
     [
         *((kind, "unknown") for kind in VARIANTS),
+        ("reinforce", "adaptive-ppo-clip"),
     ],
 )
 def test_variant_rejects_a_truncation_type_it_does_not_support(kind, truncation):
@@ -175,6 +198,7 @@ def test_variant_rejects_a_truncation_type_it_does_not_support(kind, truncation)
     ("switch", "replacement"),
     [
         ("use_cispo", "kind: cispo"),
+        ("disable_ppo_ratio", "kind: reinforce"),
     ],
 )
 def test_deprecated_switch_still_loads_and_warns(switch, replacement):
@@ -202,6 +226,7 @@ def test_untagged_block_without_a_deprecated_switch_does_not_warn(loss_fn):
         ({"ratio_clip_max": 0.3}, ClippedPGLossConfig),
         ({"kind": "legacy_pg", "ratio_clip_max": 0.3}, ClippedPGLossConfig),
         ({"kind": "cispo"}, CISPOLossConfig),
+        ({"kind": "reinforce"}, ReinforceLossConfig),
     ],
 )
 def test_trainer_configs_select_the_loss_config_by_kind(
