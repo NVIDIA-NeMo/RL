@@ -18,9 +18,34 @@ from pathlib import Path
 import datasets
 import pytest
 from datasets import Dataset
+from omegaconf import OmegaConf
 
+from nemo_rl.data.datasets.response_datasets import load_response_dataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
-from nemo_rl.data.datasets.utils import load_dataset_from_path
+from nemo_rl.data.datasets.utils import (
+    load_dataset_from_path,
+    update_single_dataset_config,
+)
+from nemo_rl.utils.config import load_config
+
+
+def test_sglang_gym_recipe_loads_both_local_workplace_splits(tmp_path, monkeypatch):
+    recipe = (
+        Path(__file__).resolve().parents[4]
+        / "examples/configs/recipes/llm/grpo-qwen3-0.6b-1n4g-megatron-sglang-noncolocated-async-gym.yaml"
+    )
+    data = OmegaConf.to_container(load_config(recipe).data, resolve=True)
+    monkeypatch.setattr(datasets.config, "HF_DATASETS_CACHE", str(tmp_path / "cache"))
+    for split in ("train", "validation"):
+        split_config = data[split]
+        update_single_dataset_config(split_config, data["default"])
+        assert split_config["dataset_name"] == "NemoGymDataset"
+        path = tmp_path / f"{split}.jsonl"
+        row = {"agent_ref": {"name": f"workplace_{split}"}}
+        path.write_text(json.dumps(row) + "\n")
+        split_config["data_path"] = str(path)
+        dataset = load_response_dataset(split_config)
+        assert json.loads(dataset.dataset[0]["extra_env_info"]) == row
 
 
 def test_jsonl_rows_are_cached_as_raw_text(tmp_path: Path, monkeypatch) -> None:

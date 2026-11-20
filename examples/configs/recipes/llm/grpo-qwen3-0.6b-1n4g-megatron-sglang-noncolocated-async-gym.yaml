@@ -70,14 +70,18 @@ policy:
         rollout_max_restart_attempts: 3
       tool_call_parser: qwen25
 data:
+  _override_: true
   max_input_seq_length: null
+  shuffle: true
   num_workers: 0
+  use_multiple_dataloader: false
   train:
     data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl
   validation:
     data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl
   default:
     prompt_file: null
+    system_prompt_file: null
     processor: nemo_gym_data_processor
     env_name: nemo_gym
     dataset_name: NemoGymDataset
