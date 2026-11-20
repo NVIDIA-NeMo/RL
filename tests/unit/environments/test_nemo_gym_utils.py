@@ -1370,7 +1370,7 @@ def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
     with _patched_cluster(cluster):
         nemo_gym_mod.build_nemo_gym_actors(
             config.env,
-            base_urls=["http://frontend"],
+            base_urls=["http://frontend-0", "http://frontend-1"],
             model_name="test-model",
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
@@ -1395,6 +1395,9 @@ def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
         vllm_model = gym_config["policy_model"]["responses_api_models"]["vllm_model"]
         assert vllm_model["dynamo_frontend"] is True
         assert vllm_model["reasoning_field"] == "reasoning_content"
+        # Several frontends: Gym moves the sessions of one that stops answering.
+        assert vllm_model["route_around_failing_endpoints"] is True
+        assert vllm_model["endpoint_connection_retry_timeout_s"] == 60.0
         assert "dynamo_dialect" not in gym_config
 
 
@@ -1521,9 +1524,8 @@ def test_turn_recovery_rejects_typed_environment_servers(as_omegaconf):
         nemo_gym_mod._reject_typed_environment_servers(as_config(typed))
 
 
-@pytest.mark.parametrize("control_urls", [None, ["http://frontend:2400"]])
 def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
-    detected_uv_dirs, control_urls
+    detected_uv_dirs,
 ):
     config = build_nemo_gym_config(
         _env_configs(),
@@ -1533,7 +1535,6 @@ def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
         use_fastokens=False,
         turn_checkpointing_enabled=True,
         generation_prefix_cuts_enabled=True,
-        generation_cut_control_urls=control_urls,
         token_capture={
             "enabled": True,
             "capture_dir": "/capture",
@@ -1545,8 +1546,6 @@ def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
         "responses_api_models"
     ]["vllm_model"]
     assert model["checkpoint"] == {"policy": True, "generation_cuts": True}
-    # Only a backend that takes cuts elsewhere (a Dynamo frontend) names where.
-    assert model.get("generation_cut_control_url") == control_urls
 
 
 @pytest.mark.nemo_gym
@@ -1563,7 +1562,6 @@ def test_prefix_checkpointing_policy_overrides_are_gym_fields(detected_uv_dirs):
         use_fastokens=False,
         turn_checkpointing_enabled=True,
         generation_prefix_cuts_enabled=True,
-        generation_cut_control_urls=["http://frontend:2400"],
         token_capture={
             "enabled": True,
             "capture_dir": "/capture",
@@ -1574,7 +1572,6 @@ def test_prefix_checkpointing_policy_overrides_are_gym_fields(detected_uv_dirs):
     model = config["initial_global_config_dict"]["policy_model"][
         "responses_api_models"
     ]["vllm_model"]
-    assert "generation_cut_control_url" in model
     assert set(model) - set(VLLMModelConfig.model_fields) == set()
     checkpoint_config = VLLMModelConfig.model_fields["checkpoint"].annotation
     assert set(model["checkpoint"]) == {"policy", "generation_cuts"}

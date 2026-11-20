@@ -20,9 +20,15 @@ carries its default. NeMo-Gym's chat calls are rendered and parsed with the
 native server's own settings (``vllm_cfg.http_server_serving_chat_kwargs``).
 """
 
+import os
 from typing import Annotated, Any, Literal, Mapping
 
 from pydantic import BaseModel, Field, PositiveFloat, PositiveInt, model_validator
+
+from nemo_rl.telemetry.setup import (
+    telemetry_enabled_in_env,
+    vllm_native_tracing_requested,
+)
 
 
 class DynamoFrontendArgs(BaseModel, extra="forbid"):
@@ -34,27 +40,43 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
     router_mode: Literal[
         "round-robin",
         "random",
-        "power-of-two",
         "kv",
         "least-loaded",
         "device-aware-weighted",
     ] = "kv"
     # Idle seconds a NeMo-Gym token-capture session stays on one engine, as native
-    # pins each Gym session to one server; None disables it. Needs Dynamo 1.7
-    # (ai-dynamo/dynamo#15333): 1.5.1 drops a chat call's session id. Dynamo keeps
-    # at most 65,536 sessions (HTTP 529 past that).
+    # pins each Gym session to one server; None disables it.
     session_affinity_ttl_secs: Annotated[int, Field(gt=0, le=31_536_000)] | None = 300
+    # Most sessions the affinity table holds; a new one past it gets HTTP 529.
+    # Every frontend holds the whole fleet's sessions, so size it for all of them.
+    # Entries are allocated as sessions start and reaped after the TTL, so the cap
+    # only bounds memory; a large run holds more sessions than Dynamo's own 65,536.
+    session_affinity_max_entries: PositiveInt = 16_777_216
+    # Frontends, spread round-robin over the generation nodes, each with its own
+    # router. More than one adds --router-replica-sync; with router_mode kv, every
+    # router then sees the requests the others have in flight. NeMo-Gym keeps each
+    # session on one.
+    num_frontends: PositiveInt = 1
     # Processes that render NeMo-Gym's chat calls and build their replies (the
     # checkpoint's template, tokenizer, HF processor and vLLM's parsers); each
-    # uses one core. See docs/guides/dynamo-generation.md for sizing.
+    # uses one core. Every frontend runs its own. See
+    # docs/guides/dynamo-generation.md for sizing.
     render_workers: PositiveInt = 8
     extra_cli_args: list[str] = Field(default_factory=list)
+    # Extra environment for every frontend, for settings Dynamo reads only from
+    # the environment, e.g. DYN_TCP_LISTEN_BACKLOG. It may not set a variable
+    # the runtime manages.
+    extra_env: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _chat_is_nemo_rls(self) -> "DynamoFrontendArgs":
         # NeMo-Gym's chat calls are rendered and parsed by NeMo RL's chat
         # engine, never by Dynamo's own renderer or chat processor.
-        for flag in ("--dyn-chat-processor", "--custom-jinja-template"):
+        for flag in (
+            "--dyn-chat-processor",
+            "--dyn-chat-processor-config",
+            "--custom-jinja-template",
+        ):
             if any(arg.split("=", 1)[0] == flag for arg in self.extra_cli_args):
                 raise ValueError(
                     f"dynamo_cfg.frontend_args.extra_cli_args may not set {flag}: "
@@ -86,3 +108,23 @@ def dynamo_enabled(generation_config: Mapping[str, Any]) -> bool:
 def dynamo_cfg(generation_config: Mapping[str, Any]) -> DynamoCfg:
     """The validated ``dynamo_cfg`` block; an absent block means all defaults."""
     return DynamoCfg.model_validate(generation_config.get("dynamo_cfg") or {})
+
+
+def trace_export_env() -> dict[str, str]:
+    """Dynamo's trace-context switch, on when the engines trace natively.
+
+    Dynamo carries a call's trace context from the frontend to the engine only
+    while its OTLP export is on, and reads the switch when a process first loads
+    it, so the frontends and the vLLM workers need it in their environment from
+    the start. The condition is the one that turns on vLLM's own tracing
+    (``_maybe_enable_vllm_native_tracing``), so the engine has a tracer for the
+    trace headers it is handed. Dynamo reads the collector from the same
+    ``OTEL_EXPORTER_OTLP_*`` variables.
+    """
+    endpoint = (
+        os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+        or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    )
+    if telemetry_enabled_in_env() and vllm_native_tracing_requested() and endpoint:
+        return {"OTEL_EXPORT_ENABLED": "1"}
+    return {}

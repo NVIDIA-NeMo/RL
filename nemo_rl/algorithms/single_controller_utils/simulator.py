@@ -18,18 +18,16 @@ A simulator run (``examples/run_single_controller_simulator.py``) keeps the
 SingleController's own pumps, data plane, sampler and refit lifecycle, and swaps
 one side of the loop for a mock that uses no GPU. This module holds the
 ``rollout_only`` slice: the generation backend, NeMo-Gym and the TransferQueue
-data plane are real, while the trainer is :class:`CpuTrainer` and the weight
-transfer is :class:`NoOpWeightSynchronizer`. The weight version still advances
-and generation is still paused and resumed around every refit, so the rollout
-side sees the same step rhythm it sees in training, minus the GPU work.
-
-The ``train_only`` and ``train_rollout`` modes and the ``cpu`` rollout backend
-are the later slices of the same driver and are rejected here with an explicit
-error rather than silently running something else.
+data plane are real, while the trainer is :class:`NoOpTrainer` and the weight
+transfer is :class:`NoOpWeightSynchronizer`. The train pump consumes each
+selected batch without training on it, the weight version still advances and
+generation is still paused and resumed around every refit, so the rollout side
+sees the same step rhythm it sees in training, minus the GPU work.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import warnings
@@ -37,31 +35,17 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Optional, cast
 
 import ray
-from pydantic import (
-    BaseModel,
-    NonNegativeFloat,
-    PositiveInt,
-    model_validator,
-)
-from tensordict import TensorDict
+from pydantic import BaseModel, NonNegativeFloat, PositiveInt
 
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     is_ppo_run,
 )
-from nemo_rl.data_plane import (
-    cluster_step_metrics,
-    is_metrics_client,
-    merge_snapshots,
-)
-from nemo_rl.data_plane.driver_mixin import TQDriverMixin
+from nemo_rl.data_plane import is_metrics_client
 from nemo_rl.data_plane.factory import build_data_plane_client
-from nemo_rl.data_plane.interfaces import (
-    DataPlaneClient,
-    DataPlaneRuntimeConfig,
-    KVBatchMeta,
-)
+from nemo_rl.data_plane.interfaces import DataPlaneClient, DataPlaneRuntimeConfig
+from nemo_rl.data_plane.observability import reduce_step_snapshots
 from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm.config import (
@@ -75,20 +59,14 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 logger = logging.getLogger(__name__)
 
-SimulatorMode = Literal["rollout_only", "train_only", "train_rollout"]
-TrainBackend = Literal["cpu", "automodel", "mcore"]
-
-# Top-level key the simulator YAML is mounted under next to the recipe, so a
-# command-line override addresses it as simulator.<key>=<value>.
-SIMULATOR_CONFIG_KEY = "simulator"
+SimulatorMode = Literal["rollout_only"]
+TrainBackend = Literal["cpu"]
 # Generation backends validated under the SC refit lifecycle with the trainer
 # stubbed out; build_simulated_weight_synchronizer dispatches on the same set.
 SIMULATOR_GENERATION_BACKENDS: tuple[str, ...] = ("vllm", "sglang")
 
-# Columns the CpuTrainer fills in place of the policy / reference forwards.
-GENERATION_LOGPROBS_FIELD = "generation_logprobs"
-PREV_LOGPROBS_FIELD = "prev_logprobs"
-REFERENCE_LOGPROBS_FIELD = "reference_policy_logprobs"
+# Poll every 50 ms to limit idle time charged to simulated training.
+_SIMULATED_TRAIN_POLL_S: float = 0.05
 
 
 class SimulatorConfig(BaseModel, extra="forbid", frozen=True):
@@ -98,13 +76,13 @@ class SimulatorConfig(BaseModel, extra="forbid", frozen=True):
     ``examples/run_single_controller_simulator.py`` loads next to an SC recipe.
     """
 
-    # Which side of the loop is real. Only rollout_only is implemented.
+    # Which side of the loop is real.
     mode: SimulatorMode = "rollout_only"
-    # The trainer. rollout_only requires cpu, the stand-in that uses no GPU.
+    # The trainer. cpu is the no-op stand-in: it trains nothing and uses no GPU.
     train_backend: TrainBackend = "cpu"
-    # Seconds the stand-in trainer holds each step where policy.train() would
-    # run. Generation keeps serving meanwhile; the hold ends early once no
-    # rollout is in flight, and the skipped seconds are logged.
+    # Hold once after all chunks arrive; per-chunk forward/backward overlap is omitted.
+    # End early when idle: admission waits for a version advance or, with windowed
+    # sampling, buffer capacity released at step cleanup. Log the skipped time.
     train_time_s: NonNegativeFloat = 0.0
     # Seconds the stand-in weight transfer holds inside the refit pause, where
     # the real transfer would keep generation frozen.
@@ -115,26 +93,9 @@ class SimulatorConfig(BaseModel, extra="forbid", frozen=True):
     # Steps to run; overrides the recipe's max_num_steps. None keeps the recipe's.
     num_steps: Optional[PositiveInt] = None
 
-    @model_validator(mode="after")
-    def _check_implemented(self) -> "SimulatorConfig":
-        if self.mode != "rollout_only":
-            raise NotImplementedError(
-                f"simulator mode {self.mode!r} is not implemented yet; only "
-                "'rollout_only' is. 'train_only' needs the cpu rollout backend "
-                "(synthetic rollouts), 'train_rollout' is the ordinary "
-                "run_grpo_single_controller.py run."
-            )
-        if self.train_backend != "cpu":
-            raise NotImplementedError(
-                "rollout_only stubs the trainer out, so train_backend must be "
-                f"'cpu'; got {self.train_backend!r}. A real train backend is the "
-                "ordinary run_grpo_single_controller.py run."
-            )
-        return self
-
     @property
-    def uses_cpu_trainer(self) -> bool:
-        """Whether setup builds a :class:`CpuTrainer` in place of ``TQPolicy``."""
+    def uses_no_op_trainer(self) -> bool:
+        """Whether setup builds a :class:`NoOpTrainer` in place of ``TQPolicy``."""
         return self.train_backend == "cpu"
 
 
@@ -169,9 +130,7 @@ def apply_simulator_overrides(
     algo = raw_config.get(algo_key)
     if settings.num_steps is not None and algo is not None:
         algo["max_num_steps"] = settings.num_steps
-        # One epoch yields at least one step whenever the dataset holds a full
-        # batch, so num_steps epochs can never clamp num_steps steps away. The
-        # recipe may omit max_num_epochs and take the schema default.
+        # Allow num_steps even when each epoch holds only one batch.
         recipe_epochs = algo.get("max_num_epochs")
         algo["max_num_epochs"] = (
             settings.num_steps
@@ -243,7 +202,7 @@ def validate_simulator_config(
     (non-colocated vLLM, one optimizer step per RL step, no validation) are
     already enforced and only the trainer-less gaps are named here.
     """
-    if not settings.uses_cpu_trainer:
+    if not settings.uses_no_op_trainer:
         return
     if is_ppo_run(master_config):
         raise NotImplementedError(
@@ -300,6 +259,23 @@ def validate_simulator_config(
                 "the KV cache, as the SGLang weight synchronizers require. Use "
                 "'abort' or 'retract'."
             )
+    megatron = master_config.policy.get("megatron_cfg")
+    if megatron is not None and megatron["enabled"]:
+        peft = megatron.get("peft")
+        if (
+            master_config.checkpointing.pretrained_checkpoint is not None
+            or master_config.policy.get("pretrained_checkpoint") is not None
+            or (
+                peft is not None
+                and peft["enabled"]
+                and peft.get("restore_from") is not None
+            )
+        ):
+            raise ValueError(
+                "rollout_only cannot load trainer-side initial checkpoints. "
+                "Use an HF-exported initial policy via policy.model_name and "
+                "remove the trainer-only checkpoint selectors."
+            )
     if master_config.checkpointing.enabled:
         raise ValueError(
             "rollout_only requires checkpointing.enabled=false: the cpu train "
@@ -327,6 +303,16 @@ def validate_simulator_config(
             "the step's approx_entropy from the trainer, which the cpu train "
             "backend does not produce."
         )
+    if master_config.async_rl.log_full_train_data:
+        raise NotImplementedError(
+            "async_rl.log_full_train_data dumps the rows the advantage stage "
+            "prepares for training, which rollout_only does not run."
+        )
+    if master_config.async_rl.refit_actor.enabled:
+        raise NotImplementedError(
+            "async_rl.refit_actor.enabled moves a real weight transfer into its "
+            "own actor; rollout_only has no transfer to move."
+        )
     refit_timeout_s = master_config.async_rl.generation_fleet_health.refit_timeout_s
     if refit_timeout_s is not None and settings.refit_time_s >= refit_timeout_s:
         raise ValueError(
@@ -335,6 +321,40 @@ def validate_simulator_config(
             f"({refit_timeout_s}); otherwise every simulated refit is aborted as "
             "a stuck transfer. Raise the timeout or set it to null."
         )
+
+
+async def simulate_train_step(
+    train_time_s: float, rollouts_idle: Callable[[], bool]
+) -> tuple[float, float]:
+    """Hold where the optimizer step would run on a simulator run.
+
+    One hold per step, after every chunk of the step has been consumed; forward
+    and backward work that overlaps later chunks of the same step is not
+    modeled. The hold ends early once ``rollouts_idle`` reports that nothing is
+    generating: admission waits for the trainer version to advance or, with
+    windowed sampling, for buffer capacity released at step cleanup, and neither
+    happens before this returns, so the rest of the hold is idle on both sides.
+    Idleness is polled every ``_SIMULATED_TRAIN_POLL_S``, which bounds the idle
+    time charged to the held part.
+
+    Args:
+        train_time_s: Seconds to hold.
+        rollouts_idle: Whether no rollout is dispatched or in flight; evaluated
+            on every poll.
+
+    Returns:
+        ``(held_s, idle_skipped_s)``.
+    """
+    if train_time_s <= 0:
+        return 0.0, 0.0
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    deadline = started + train_time_s
+    while (remaining := deadline - loop.time()) > 0:
+        if rollouts_idle():
+            return loop.time() - started, remaining
+        await asyncio.sleep(min(remaining, _SIMULATED_TRAIN_POLL_S))
+    return loop.time() - started, 0.0
 
 
 class NoOpWeightSynchronizer(WeightSynchronizer):
@@ -354,7 +374,6 @@ class NoOpWeightSynchronizer(WeightSynchronizer):
         if refit_time_s < 0:
             raise ValueError("refit_time_s must be non-negative")
         self._refit_time_s = refit_time_s
-        self.sync_count = 0
 
     def sync_weights(
         self,
@@ -366,13 +385,7 @@ class NoOpWeightSynchronizer(WeightSynchronizer):
         del timer, kv_scales
         if self._refit_time_s > 0:
             time.sleep(self._refit_time_s)
-        self.sync_count += 1
         return None
-
-    @property
-    def refit_time_s(self) -> float:
-        """Seconds each ``sync_weights`` holds inside the refit pause."""
-        return self._refit_time_s
 
     @property
     def is_stale(self) -> bool:
@@ -450,21 +463,15 @@ def build_simulated_weight_synchronizer(
     )
 
 
-class CpuTrainer(TQDriverMixin):
+class NoOpTrainer:
     """Stand-in for ``TQPolicy`` that touches only the data plane, never a GPU.
 
     Owns the TransferQueue bootstrap ``TQPolicy`` normally performs, so the
     rest of setup (connect-only clients, partition registration, the replay
-    buffer) is unchanged. Every GPU phase transition the SingleController
-    drives is a no-op; the logprob stages copy ``generation_logprobs`` into
-    the ``prev_logprobs`` / ``reference_policy_logprobs`` columns so the
-    advantage stage reads the columns it expects and reports a zero
-    generation/training mismatch; the train step accepts its microbatches
-    and returns an empty metrics dict.
-
-    What only a real trainer can do -- FP8 KV-scale calibration and
-    checkpointing -- raises ``NotImplementedError``. Setup rejects the configs
-    that would reach those paths before any engine is built.
+    buffer) is unchanged. The train pump consumes each selected batch without
+    calling a trainer, so this class answers only what the shared step close
+    and refit path ask of one: data-plane metrics and the pre-refit parameter
+    sync, which has nothing to gather here.
     """
 
     def __init__(
@@ -472,7 +479,6 @@ class CpuTrainer(TQDriverMixin):
         *,
         dp_cfg: DataPlaneRuntimeConfig,
         policy_config: PolicyConfig,
-        checkpointing: bool = False,
         storage_unit_node_ids: Optional[list[str]] = None,
         dp_client: Optional[DataPlaneClient] = None,
     ) -> None:
@@ -483,29 +489,22 @@ class CpuTrainer(TQDriverMixin):
                 exactly as ``TQPolicy`` does.
             policy_config: ``master_config.policy``; read by the callers that
                 expect ``trainer.cfg``.
-            checkpointing: TQ bootstrap mode; always False on a simulator run.
             storage_unit_node_ids: Storage-unit plan forwarded to the bootstrap.
             dp_client: An already-built client to use instead of bootstrapping
                 one. Tests pass an in-process client here.
         """
         self.cfg = policy_config
-        self.dp_cfg = dp_cfg
         if dp_client is None:
             dp_client = build_data_plane_client(
                 dp_cfg,
                 bootstrap=True,
-                checkpointing=checkpointing,
+                checkpointing=False,
                 storage_unit_node_ids=storage_unit_node_ids,
             )
         self.dp_client = dp_client
-        self._step_open = False
-        self._step_rows = 0
-        self.steps_completed = 0
         self._prev_cluster_snapshot: dict[str, Any] = {}
         self._extra_snapshot_sources: list[Any] = []
         self._extra_snapshot_fns: list[Callable[[], list[dict[str, Any]]]] = []
-
-    # ── data-plane lifecycle (what TQPolicy owns) ───────────────────────────
 
     def load_data_plane_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
         """Restore TQ through the bootstrap client, as ``TQPolicy`` does."""
@@ -571,39 +570,14 @@ class CpuTrainer(TQDriverMixin):
             except Exception as error:  # noqa: BLE001 - metrics must never fail a step
                 logger.warning("data-plane snapshot from %s failed: %s", fn, error)
         collect_ms = (time.perf_counter() - collect_started) * 1e3
-        driver = driver_client.get_step_metrics(step_time_s, snapshots[0], collect_ms)
-        if len(snapshots) == 1:
-            return driver, "driver"
-        merged = merge_snapshots(snapshots)
-        metrics = cluster_step_metrics(
-            merged, self._prev_cluster_snapshot, step_time_s, collect_ms
+        metrics, scope, self._prev_cluster_snapshot = reduce_step_snapshots(
+            driver_client,
+            snapshots,
+            self._prev_cluster_snapshot,
+            step_time_s,
+            collect_ms,
         )
-        self._prev_cluster_snapshot = merged
-        return metrics, "cluster"
-
-    # ── GPU phase transitions: nothing to move ──────────────────────────────
-
-    def prepare_for_training(self) -> None:
-        """No-op: no parameters to bring to GPU."""
-
-    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
-        """No-op: the logprob stages below read the data plane only."""
-        del keep_train_buffers
-
-    def finish_inference(self) -> None:
-        """No-op."""
-
-    def offload_to_cpu(self) -> None:
-        """No-op: there is nothing resident on a GPU."""
-
-    def offload_before_refit(self) -> None:
-        """No-op."""
-
-    def offload_after_refit(self) -> None:
-        """No-op."""
-
-    def pause_train_step_with_offloading(self) -> None:
-        """No-op: there are no gradients to park."""
+        return metrics, scope
 
     def sync_params_before_refit(self) -> None:
         """No-op: no deferred all-gathers to materialize."""
@@ -613,120 +587,3 @@ class CpuTrainer(TQDriverMixin):
 
     def stop_gpu_profiling(self) -> None:
         """No-op."""
-
-    # ── logprob stages: copy the generation column ──────────────────────────
-
-    def get_logprobs_from_meta(
-        self,
-        meta: KVBatchMeta,
-        micro_batch_size: Optional[int] = None,
-        timer: Optional[Timer] = None,
-    ) -> None:
-        """Write ``prev_logprobs`` as a copy of ``generation_logprobs``."""
-        del micro_batch_size, timer
-        self._copy_column(meta, GENERATION_LOGPROBS_FIELD, PREV_LOGPROBS_FIELD)
-
-    def get_reference_policy_logprobs_from_meta(
-        self,
-        meta: KVBatchMeta,
-        micro_batch_size: Optional[int] = None,
-        timer: Optional[Timer] = None,
-    ) -> None:
-        """Write ``reference_policy_logprobs`` as a copy of ``generation_logprobs``."""
-        del micro_batch_size, timer
-        self._copy_column(meta, GENERATION_LOGPROBS_FIELD, REFERENCE_LOGPROBS_FIELD)
-
-    def _copy_column(self, meta: KVBatchMeta, source: str, target: str) -> None:
-        """Copy one column under the same sample ids, row layout untouched.
-
-        A direct ``get_samples`` / ``put_samples`` pair rather than the padded
-        read/write helpers: the copy then has exactly the per-row shape the
-        rollout wrote, which is what the advantage stage compares it against.
-        """
-        rows = self.dp_client.get_samples(
-            sample_ids=meta.sample_ids,
-            partition_id=meta.partition_id,
-            select_fields=[source],
-        )
-        self.dp_client.put_samples(
-            sample_ids=meta.sample_ids,
-            partition_id=meta.partition_id,
-            fields=TensorDict({target: rows.get(source)}, batch_size=rows.batch_size),
-        )
-
-    # ── train step: accept the batch, return no metrics ─────────────────────
-
-    def begin_train_step(
-        self, loss_fn: Any, gbs: Optional[int] = None, mbs: Optional[int] = None
-    ) -> None:
-        """Open a step; the loss is not evaluated and the batch sizes are unused."""
-        del loss_fn, gbs, mbs
-        if self._step_open:
-            raise RuntimeError("CpuTrainer: a train step is already open")
-        self._step_open = True
-        self._step_rows = 0
-
-    def train_microbatches_from_meta(
-        self,
-        meta: KVBatchMeta,
-        timer: Any = None,
-        train_fields: tuple[str, ...] = (),
-    ) -> None:
-        """Count the rows of a chunk; no forward or backward runs.
-
-        Same signature as ``TQPolicy.train_microbatches_from_meta``; the timer
-        and the field list are accepted and ignored.
-        """
-        del timer, train_fields
-        if not self._step_open:
-            raise RuntimeError("CpuTrainer: train_microbatches_from_meta before begin")
-        self._step_rows += meta.size
-
-    def finish_train_step(self) -> dict[str, Any]:
-        """Close the step. Returns no metrics: nothing was trained."""
-        if not self._step_open:
-            raise RuntimeError("CpuTrainer: finish_train_step without an open step")
-        self._step_open = False
-        self.steps_completed += 1
-        return {}
-
-    def abort_train_step(self) -> None:
-        """Drop the open step."""
-        self._step_open = False
-        self._step_rows = 0
-
-    @property
-    def step_rows(self) -> int:
-        """Rows accepted by the open (or most recently closed) step."""
-        return self._step_rows
-
-    # ── only a real trainer can do these; setup refuses the configs that need them
-
-    def calibrate_qkv_fp8_scales(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Raise: KV-scale calibration needs the policy's forward pass."""
-        raise NotImplementedError(
-            "CpuTrainer cannot calibrate FP8 KV scales; rollout_only rejects "
-            "refittable fp8 KV caches at setup"
-        )
-
-    def save_checkpoint(self, *args: Any, **kwargs: Any) -> None:
-        """Raise: there is no model state to save."""
-        raise NotImplementedError("CpuTrainer has no checkpoint to save")
-
-    def finalize_async_save(self, *args: Any, **kwargs: Any) -> None:
-        """Raise: see :meth:`save_checkpoint`."""
-        raise NotImplementedError("CpuTrainer has no checkpoint to finalize")
-
-    def poll_async_save(self) -> bool:
-        """Raise: see :meth:`save_checkpoint`."""
-        raise NotImplementedError("CpuTrainer has no checkpoint to poll")
-
-    @property
-    def sharding_annotations(self) -> Any:
-        """Raise: no worker group, so no sharding."""
-        raise NotImplementedError("CpuTrainer has no worker group")
-
-    @property
-    def worker_group(self) -> Any:
-        """Raise: no worker group."""
-        raise NotImplementedError("CpuTrainer has no worker group")

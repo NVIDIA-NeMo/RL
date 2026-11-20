@@ -147,7 +147,10 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
     _maybe_restore_native_data_plane_checkpoint,
     _register_single_controller_partitions,
 )
-from nemo_rl.algorithms.single_controller_utils.simulator import SimulatorConfig
+from nemo_rl.algorithms.single_controller_utils.simulator import (
+    SimulatorConfig,
+    simulate_train_step,
+)
 from nemo_rl.algorithms.single_controller_utils.step_assembly import (
     ShortfallCredit,
     StepAssembler,
@@ -169,6 +172,7 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     configure_checkpoint_workers,
 )
 from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.checkpoint import checkpoint_io
 from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
 from nemo_rl.data_plane.observability import (
     log_step_metrics,
@@ -242,6 +246,7 @@ from nemo_rl.utils.path_utils import (
     is_msc_path,
 )
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.weight_sync.refit_actor import RemoteWeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -376,7 +381,7 @@ class SingleControllerActor:
     # rather than raising out of the training loop.
     _tracer: Any = None
 
-    # Same again: the train pump asks for the simulated train step on every
+    # Same again: the train pump asks whether the run is simulated on every
     # step, and ``None`` is the training-run answer, so a controller built
     # without __init__ (the test stubs) trains rather than raises.
     _simulator: Optional[SimulatorConfig] = None
@@ -525,9 +530,7 @@ class SingleControllerActor:
         self._value: Optional[TQValue] = getattr(actor_args, "value_handle", None)
         self._dataloader = actor_args.dataloader
         self._weight_synchronizer = actor_args.weight_synchronizer
-        # None on a training run. Like the fleet monitor and router below, None is
-        # the documented "feature off" value, so absence degrades to a training
-        # run rather than to a broken one.
+        # None selects the ordinary training path.
         self._simulator: Optional[SimulatorConfig] = getattr(
             actor_args, "simulator", None
         )
@@ -677,6 +680,9 @@ class SingleControllerActor:
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
         self._inference_cluster = actor_args.inference_cluster
+        if isinstance(self._weight_synchronizer, RemoteWeightSynchronizer):
+            # The proxy arrived pickled inside actor_args, with only its actor handle.
+            self._weight_synchronizer.attach(self._gen)
 
         restored_trainer_version = (
             actor_args.save_state.trainer_version
@@ -899,7 +905,8 @@ class SingleControllerActor:
         """Start the rollout / train / watchdog pumps and run until one finishes."""
         await self._environment_checkpoint.check_startup()
         # Synchronize weights before starting the pumps, unless setup already delivered them.
-        if self._weight_synchronizer.is_stale:
+        # The RefitActor proxy answers is_stale with blocking calls to the actor.
+        if await asyncio.to_thread(lambda: self._weight_synchronizer.is_stale):
             await self._sync_weights()
         self._rollout_manager.set_weight_version(self._trainer_version)
         self._rollout_manager.set_tally_step_provider(
@@ -2760,50 +2767,6 @@ class SingleControllerActor:
             )
         return target
 
-    # Poll interval of the simulated train step's idle check. Class attribute so
-    # a test can shorten it on a bare controller.
-    _SIMULATED_TRAIN_POLL_S: float = 1.0
-
-    def _rollouts_idle(self) -> bool:
-        """Whether nothing is generating: no dispatch task exists and none is in flight.
-
-        ``_dispatched_rollouts`` holds tasks from creation, so a prompt whose task
-        has not started yet still counts as busy.
-        """
-        return self._inflight_rollouts == 0 and not self._dispatched_rollouts
-
-    async def _simulate_training(self) -> tuple[float, float]:
-        """Stand in for the GPU train step on a simulator run.
-
-        Holds ``simulator.train_time_s`` where ``policy.train()`` would run, so
-        generation is paced as it is beside a non-colocated trainer. The hold
-        ends early once no rollout is in flight: dispatch is gated on the
-        trainer version, or (``windowed``) on buffer capacity released at step
-        cleanup, and neither moves until this returns, so the rest of
-        the wait is idle on both sides and a rollout-only run continues
-        identically after it. The skipped seconds are reported so the e2e step
-        time is still recoverable as held + skipped.
-
-        Returns:
-            ``(held_s, idle_skipped_s)``; both zero unless the cpu trainer
-            stands in for the train step.
-        """
-        settings = self._simulator
-        if (
-            settings is None
-            or not settings.uses_cpu_trainer
-            or settings.train_time_s <= 0
-        ):
-            return 0.0, 0.0
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        deadline = started + settings.train_time_s
-        while (remaining := deadline - loop.time()) > 0:
-            if self._rollouts_idle():
-                return loop.time() - started, remaining
-            await asyncio.sleep(min(remaining, self._SIMULATED_TRAIN_POLL_S))
-        return loop.time() - started, 0.0
-
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
 
@@ -2848,11 +2811,18 @@ class SingleControllerActor:
         run. For the first N steps 5b still trains the critic every step, but policy
         training and refit are skipped. The trainer version still advances, and the
         sampler's lookahead is widened while the policy is frozen.
+
+        A simulator run with the no-op trainer consumes each selected chunk as it
+        is: 2b, 2c and 3 are skipped, and 5a is the simulated hold. Selection,
+        cleanup, the version advance and the refit are the same code.
         """
         policy_training_start_step = (
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
         )
         forest_training = self._master_config.token_capture.forest_training
+        no_op_trainer = (
+            self._simulator is not None and self._simulator.uses_no_op_trainer
+        )
         selection_kwargs = (
             {
                 "group_multiple": self._ppo_group_multiple,
@@ -3212,7 +3182,9 @@ class SingleControllerActor:
                                 )
 
                     # Compute prev_logprobs / ref_logprobs
-                    if policy_logprobs_required or self._reference_logprobs_required:
+                    if not no_op_trainer and (
+                        policy_logprobs_required or self._reference_logprobs_required
+                    ):
                         with (
                             self._timer.time("logprob_inference_prep"),
                             managed_span(
@@ -3249,21 +3221,25 @@ class SingleControllerActor:
                                     train_meta,
                                 )
                     # Compute advantages
-                    with (
-                        self._timer.time("advantage_calculation"),
-                        managed_span(
-                            RLSpanGroup.ADVANTAGE,
-                            "rl.sc.advantage_calculation",
-                            tracer=self._tracer,
-                        ),
-                    ):
-                        (
-                            train_meta,
-                            has_valid_training_tokens,
-                        ) = await self._advantage_stage(
-                            train_meta,
-                            policy_logprobs_required=policy_logprobs_required,
-                        )
+                    if no_op_trainer:
+                        # The stand-in consumes the selected groups without training on them.
+                        has_valid_training_tokens = False
+                    else:
+                        with (
+                            self._timer.time("advantage_calculation"),
+                            managed_span(
+                                RLSpanGroup.ADVANTAGE,
+                                "rl.sc.advantage_calculation",
+                                tracer=self._tracer,
+                            ),
+                        ):
+                            (
+                                train_meta,
+                                has_valid_training_tokens,
+                            ) = await self._advantage_stage(
+                                train_meta,
+                                policy_logprobs_required=policy_logprobs_required,
+                            )
                     if forest_training:
                         # The advantage stage has verified every owner/segment.
                         # Count those owners, not the physical rows or sampler tally.
@@ -3312,7 +3288,7 @@ class SingleControllerActor:
                     # policy resident until every actor epoch has completed.
                     # TODO(#2625): value_result, policy_result only record the last epoch's metrics.
                     # That matches ppo.py for the losses; total_flops is additive and undercounted.
-                    if is_policy_training_step:
+                    if is_policy_training_step and not no_op_trainer:
                         if (
                             self._is_ppo
                             and groups_dispatched == 0
@@ -3617,7 +3593,7 @@ class SingleControllerActor:
                         raise ValueError(
                             "Forest optimizer step requires complete retained logical groups"
                         )
-                    if not step_open:
+                    if not no_op_trainer and not step_open:
                         raise RuntimeError(
                             "SingleController has no valid response tokens after "
                             "filtering. Check seq_logprob_error_threshold, "
@@ -3633,15 +3609,22 @@ class SingleControllerActor:
                             tracer=self._tracer,
                         ),
                     ):
-                        # A no-op outside a simulator run. Inside the timer, so the
-                        # held seconds land where policy_training would.
-                        (
-                            simulated_train_s,
-                            simulated_idle_skipped_s,
-                        ) = await self._simulate_training()
-                        policy_result = await asyncio.to_thread(
-                            self._trainer.finish_train_step
-                        )
+                        if no_op_trainer:
+                            assert self._simulator is not None
+                            (
+                                simulated_train_s,
+                                simulated_idle_skipped_s,
+                            ) = await simulate_train_step(
+                                self._simulator.train_time_s,
+                                lambda: (
+                                    self._inflight_rollouts == 0
+                                    and not self._dispatched_rollouts
+                                ),
+                            )
+                        else:
+                            policy_result = await asyncio.to_thread(
+                                self._trainer.finish_train_step
+                            )
                     await self._rollout_snapshots.begin_optimizer_commit(
                         drain_snapshot=False
                     )
@@ -3893,7 +3876,7 @@ class SingleControllerActor:
                         "promoted_prompt_groups": promoted_prompt_groups,
                     }
                 )
-                if self._simulator is not None and self._simulator.uses_cpu_trainer:
+                if no_op_trainer:
                     # Where policy.train() would have run, and how much of that
                     # hold was skipped because no rollout was left to overlap with.
                     step_metrics.update(
@@ -4320,6 +4303,8 @@ class SingleControllerActor:
         Only ever called for a CONFIRMED actor death. A frozen rank never produces one, so
         its deadline still fires and still ends the run attributably.
         """
+        if self._simulator is not None and self._simulator.uses_no_op_trainer:
+            return
         try:
             for worker in self._trainer.worker_group.workers:
                 worker.stand_down_refit_watchdog.remote()
@@ -4769,6 +4754,16 @@ class SingleControllerActor:
             metrics["vllm_requests_waiting"] = sum(waiting.values())
         if kv_usage:
             metrics["vllm_kv_cache_usage_mean"] = sum(kv_usage.values()) / len(kv_usage)
+        for state in ("queued", "inflight"):
+            frontend_calls = _latest_generation_values(
+                generation_metrics, f"dynamo_frontend_{state}_requests"
+            )
+            if frontend_calls:
+                metrics[f"dynamo_frontend_requests_{state}"] = sum(
+                    frontend_calls.values()
+                )
+            for frontend, calls in frontend_calls.items():
+                metrics[f"dynamo_frontend_{frontend}_requests_{state}"] = calls
         if generated_tokens is not None:
             metrics["generation_output_tokens"] = float(generated_tokens)
 
@@ -4921,29 +4916,40 @@ class SingleControllerActor:
         # contain a cursor without its prompt owner, or two durable owners for one
         # canonical group. The environment keeps running: its state lives only
         # in rollout snapshots taken after this checkpoint.
-        async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
-            save_state.current_step = self._train_steps
-            save_state.total_steps = self._train_steps
-            save_state.trainer_version = self._trainer_version
-            save_state.current_epoch = self._current_epoch
-            save_state.consumed_samples = self._consumed_samples
-            save_state.total_valid_tokens = self._total_valid_tokens
-            _save_adaptive_loss_state(save_state, self._loss_fn)
-            save_state.sampler_name = self._async_cfg.sampler.name
-            save_state.sampler_dispatch_index = self._sampler.dispatch_index
-            save_state.next_nemo_gym_task_index = (
-                self._rollout_manager.get_next_nemo_gym_task_index()
-            )
+        async with contextlib.AsyncExitStack() as capture_resources:
+            async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
+                save_state.current_step = self._train_steps
+                save_state.total_steps = self._train_steps
+                save_state.trainer_version = self._trainer_version
+                save_state.current_epoch = self._current_epoch
+                save_state.consumed_samples = self._consumed_samples
+                save_state.total_valid_tokens = self._total_valid_tokens
+                _save_adaptive_loss_state(save_state, self._loss_fn)
+                save_state.sampler_name = self._async_cfg.sampler.name
+                save_state.sampler_dispatch_index = self._sampler.dispatch_index
+                save_state.next_nemo_gym_task_index = (
+                    self._rollout_manager.get_next_nemo_gym_task_index()
+                )
 
-            checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
-                self._checkpointer.init_tmp_checkpoint,
-                self._train_steps,
-                vars(save_state),
-                self._master_config,
-            )
-            captured = await self._rollout_snapshots.capture(
-                cut, checkpoint_path, "trainer_checkpoint"
-            )
+                checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
+                    self._checkpointer.init_tmp_checkpoint,
+                    self._train_steps,
+                    vars(save_state),
+                    self._master_config,
+                )
+                captured_snapshot = await self._rollout_snapshots.capture(
+                    cut, checkpoint_path, "trainer_checkpoint", allow_deferred=True
+                )
+                captured = captured_snapshot.state
+                if captured_snapshot.data_plane is not None:
+                    capture_resources.push_async_callback(
+                        checkpoint_io, captured_snapshot.data_plane.release
+                    )
+
+            # Canonical publication can resume while the retained TQ cut is saved.
+            # Checkpoint persistence still finishes before model save/publication.
+            if captured_snapshot.data_plane is not None:
+                captured = await captured_snapshot.persist()
 
         # Save value model
         if self._is_ppo:
@@ -5095,6 +5101,9 @@ class SingleControllerActor:
         is bounded-failure-first rather than resume-and-forget.
         """
         budget_s = self._refit_await_budget_s()
+        if isinstance(self._weight_synchronizer, RemoteWeightSynchronizer):
+            await self._sync_weights_in_refit_actor(kv_scales, what, budget_s)
+            return
         if budget_s is None:
             await asyncio.to_thread(
                 self._weight_synchronizer.sync_weights, kv_scales=kv_scales
@@ -5128,6 +5137,30 @@ class SingleControllerActor:
                 "bound has passed, so a generation rank is most likely alive but not "
                 "answering -- a Ray actor call has no timeout of its own, so waiting here "
                 "is unbounded. Giving up so the fleet can be reconciled and retried."
+            ) from None
+
+    async def _sync_weights_in_refit_actor(
+        self,
+        kv_scales: Optional[dict[str, float]],
+        what: str,
+        budget_s: Optional[float],
+    ) -> None:
+        """``_sync_weights_within`` for a RefitActor: await its ObjectRef, no thread."""
+        synchronizer = cast(RemoteWeightSynchronizer, self._weight_synchronizer)
+        try:
+            refit_ref = await asyncio.to_thread(
+                synchronizer.submit_sync_weights, kv_scales
+            )
+            await asyncio.wait_for(asyncio.wrap_future(refit_ref.future()), budget_s)
+        except RayActorError as error:
+            await asyncio.to_thread(synchronizer.raise_if_actor_died, error)
+            raise
+        except asyncio.TimeoutError:
+            raise RefitAborted(
+                f"the {what} refit did not return from the RefitActor within "
+                f"{budget_s}s. Every worker-side bound has passed, so a generation rank "
+                "is most likely alive but not answering. Giving up so the fleet can be "
+                "reconciled and retried."
             ) from None
 
     async def _sync_weights(

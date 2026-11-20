@@ -58,12 +58,12 @@ uv run --group test coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --
 if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
     uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-    # Liveness: the math env scored a rollout and all four steps ran. Fidelity: the cpu
-    # trainer publishes generation_logprobs as prev_logprobs, so the ratio is exactly 1.
+    # Liveness: the math env scored a rollout and all four steps ran. Fidelity: no
+    # trainer-side stage runs, so the training/generation ratio is absent.
     # Refit: the SGLang no-op synchronizer pauses, flushes and holds refit_time_s every step.
     uv run tests/check_metrics.py $JSON_METRICS \
-        'max(data["train/reward"]) > 0' \
-        'abs(max(data["train/max_seq_mult_prob_error"]) - 1.0) < 1e-6' \
+        'max(data["train/unfiltered_reward"]) > 0' \
+        '"train/max_seq_mult_prob_error" not in data' \
         'min(data["timing/train/weight_sync"]) >= 3' \
         'min(data["train/simulated_train_time_s"]) >= 0' \
         'max(data["train/simulated_train_idle_skipped_s"]) <= 10' \

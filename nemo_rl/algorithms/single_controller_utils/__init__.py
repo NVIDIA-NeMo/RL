@@ -28,7 +28,7 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
     setup_single_controller,
 )
 from nemo_rl.algorithms.single_controller_utils.simulator import (
-    CpuTrainer,
+    NoOpTrainer,
     NoOpWeightSynchronizer,
     SGLangNoOpWeightSynchronizer,
     SimulatorConfig,
@@ -41,8 +41,8 @@ from nemo_rl.algorithms.single_controller_utils.watchdog import WatchdogConfig
 __all__ = [
     "AdvantageConfig",
     "AsyncRLConfig",
-    "CpuTrainer",
     "MasterConfig",
+    "NoOpTrainer",
     "NoOpWeightSynchronizer",
     "RolloutCheckpointConfig",
     "RolloutFailureConfig",

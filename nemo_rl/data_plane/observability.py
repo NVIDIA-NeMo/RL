@@ -881,6 +881,44 @@ def cluster_step_metrics(
     return metrics
 
 
+def reduce_step_snapshots(
+    driver_client: Any,
+    snapshots: "list[dict[str, Any]]",
+    prev_cluster_snapshot: dict[str, Any],
+    step_time_s: float,
+    collect_ms: float,
+) -> tuple[dict[str, float], str, dict[str, Any]]:
+    """Reduce one step's snapshots to its data-plane cost and the scope it covers.
+
+    Reported as the cluster's or the driver's, never both, so there is a single
+    answer to "what did the data plane cost". The driver reading is taken every
+    step, even when the cluster view supersedes it, so that a step which falls
+    back after N cluster steps differences against last step rather than
+    reporting N steps' accumulated history as one.
+
+    Args:
+        driver_client: Metrics client that owns the driver's counters and baseline.
+        snapshots: This step's snapshots, the driver's first. Reading it closed
+            the driver's step window, so it is handed over rather than taken again.
+        prev_cluster_snapshot: The caller's cluster baseline from its last cluster step.
+        step_time_s: Step wall time, for the share of the step.
+        collect_ms: What collecting the snapshots cost, charged to the step.
+
+    Returns:
+        ``(metrics, scope, cluster_baseline)``: scope is ``"cluster"``, or
+        ``"driver"`` when only the driver's snapshot arrived; the baseline is
+        the one the caller keeps for its next call.
+    """
+    driver = driver_client.get_step_metrics(step_time_s, snapshots[0], collect_ms)
+    if len(snapshots) == 1:
+        return driver, "driver", prev_cluster_snapshot
+    merged = merge_snapshots(snapshots)
+    metrics = cluster_step_metrics(
+        merged, prev_cluster_snapshot, step_time_s, collect_ms
+    )
+    return metrics, "cluster", merged
+
+
 def _step_metrics(
     snap: dict[str, Any],
     prev: dict[str, Any],

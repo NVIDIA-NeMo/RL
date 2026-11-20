@@ -56,6 +56,8 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller
 # Token-capture (gate-authoritative) path: same SC+Gym smoke with the gate
 # custodying token lineage and the finalizer publishing training rows.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
+# Same SC+Gym smoke with the refit run in a separate RefitActor.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++async_rl.refit_actor.enabled=true
 # Score centering through capture, canonical TQ columns, trainer gather and loss.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_gym_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_filtered_gym_single_controller.sh
@@ -77,10 +79,14 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # Gym-v2 active-decode recovery: checkpoint a nonterminal vLLM prefix, restart
 # the process, restore that exact prefix, and generate only its remaining tail.
 # Three launches on 2 GPUs: an uninterrupted reference, the interrupted run and
-# the recovery (7-9 minutes locally). Full tier: it depends on three runs making
-# the same near-greedy choices, and local runs have failed for reasons outside
-# recovery, so it stays out of fast lanes until a CI-GPU pass rate is shown.
-run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh
+# the recovery (7-9 minutes locally).
+# Score centering with sampler replay: each cut also stages the sampler top-k,
+# and a resumed row trains with it. Score centering needs token-level IS on full
+# logits, so this turns off the config's GSPO and the fused linear logprobs.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh ++policy.generation.top_logprobs=4 ++loss_fn.score_centering=true ++policy.generation.sampler_replay.enabled=true ++policy.generation.top_k=4 ++loss_fn.force_on_policy_ratio=false loss_fn.sequence_level_importance_ratios=false loss_fn.token_level_loss=true loss_fn.reference_policy_kl_penalty=0 grpo.skip_reference_policy_logprobs_calculation=true policy.sequence_packing.enabled=false ++policy.megatron_cfg.use_fused_linear_logprobs=false policy.logprob_chunk_size=128
+# The same active-decode recovery with MoE router replay, on a tiny random MoE:
+# each restored call must stage the routes it restored for training.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_router_replay_prefix_recovery_single_controller_1n2g.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

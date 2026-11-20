@@ -3,16 +3,17 @@
 # SingleController recipe (--config), which is used as it is. Override a key from the
 # command line as simulator.<key>=<value>.
 
-# Which side of the RL loop is real. Only rollout_only is implemented: real generation
-# and environments, with the trainer replaced by a stand-in.
+# Which side of the RL loop is real. rollout_only: real generation and environments,
+# with the trainer replaced by a stand-in.
 mode: rollout_only
 
-# The trainer. rollout_only requires cpu, the stand-in that uses no GPU.
+# The trainer. cpu is the no-op stand-in: it trains nothing and uses no GPU.
 train_backend: cpu
 
-# Seconds the stand-in trainer holds each step where policy.train() would run.
-# Generation keeps serving meanwhile. The hold ends early once no rollout is in
-# flight, and the skipped seconds are logged as train/simulated_train_idle_skipped_s.
+# Seconds the controller holds each step, once, after all of the step's chunks arrive,
+# where the optimizer step would run. Generation keeps serving meanwhile. The hold ends
+# early once nothing is generating, and the skipped seconds are logged as
+# train/simulated_train_idle_skipped_s.
 train_time_s: 0.0
 
 # Seconds the stand-in weight transfer holds inside the refit pause, where a real

@@ -34,7 +34,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.setup import setup_single_controller
 from nemo_rl.algorithms.single_controller_utils.simulator import (
-    SIMULATOR_CONFIG_KEY,
     SimulatorConfig,
     apply_simulator_overrides,
     reject_online_quantization,
@@ -64,8 +63,11 @@ from nemo_rl.utils.config import (
 from nemo_rl.utils.logger import get_next_experiment_dir
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
+# A command-line override with this prefix addresses the simulator YAML.
+_SIMULATOR_OVERRIDE_PREFIX = "simulator."
 
-def controller_placement() -> dict[str, Any]:
+
+def _controller_placement() -> dict[str, Any]:
     """Pin the controller to ray.sub's dedicated head (the ``ray_head`` resource) when the cluster has one.
 
     Returns:
@@ -76,43 +78,65 @@ def controller_placement() -> dict[str, Any]:
     return {}
 
 
-def _load_configs(
+def _load_simulator_config(
+    simulator_config_path: str, overrides: list[str]
+) -> tuple[SimulatorConfig, list[str]]:
+    """Load the simulator YAML and apply the overrides addressed to it.
+
+    Args:
+        simulator_config_path: The simulator YAML.
+        overrides: Hydra-style overrides from the command line;
+            ``simulator.<key>=<value>`` addresses the simulator YAML.
+
+    Returns:
+        The validated simulator config, and the overrides left for the recipe.
+    """
+    config = load_config(simulator_config_path)
+    print(f"Loaded simulator configuration from: {simulator_config_path}")
+    simulator_overrides: list[str] = []
+    recipe_overrides: list[str] = []
+    for override in overrides:
+        key = override.lstrip("+~")
+        if key.startswith(_SIMULATOR_OVERRIDE_PREFIX):
+            sigil = override[: len(override) - len(key)]
+            simulator_overrides.append(sigil + key[len(_SIMULATOR_OVERRIDE_PREFIX) :])
+        else:
+            recipe_overrides.append(override)
+    if simulator_overrides:
+        print(f"Simulator overrides: {simulator_overrides}")
+        config = parse_hydra_overrides(config, simulator_overrides)
+    simulator = SimulatorConfig(
+        **cast(dict[str, Any], OmegaConf.to_container(config, resolve=True))
+    )
+    print(f"Simulator config: {simulator}")
+    return simulator, recipe_overrides
+
+
+def _load_config(
     config_path: str,
     overrides: list[str],
     *,
-    simulator_config_path: Optional[str],
-) -> tuple[MasterConfig, Optional[SimulatorConfig]]:
-    """Resolve the recipe, and the simulator YAML of a simulator run, with the overrides applied.
+    simulator: Optional[SimulatorConfig],
+) -> MasterConfig:
+    """Resolve the recipe with the overrides applied.
 
     Args:
         config_path: The SC recipe YAML.
-        overrides: Hydra-style overrides; ``simulator.<key>=<value>`` addresses
-            the simulator YAML, anything else the recipe.
-        simulator_config_path: The simulator YAML, or None on a training run.
+        overrides: Hydra-style overrides for the recipe.
+        simulator: The simulator config, whose node and step counts replace the
+            recipe's; None on a training run.
 
     Returns:
-        The validated recipe, and the simulator config (None on a training run).
+        The validated recipe.
     """
     config = load_config(config_path)
     print(f"Loaded configuration from: {config_path}")
-    if simulator_config_path is not None:
-        if SIMULATOR_CONFIG_KEY in config:
-            raise ValueError(
-                f"{config_path} has a top-level `{SIMULATOR_CONFIG_KEY}` key, which a "
-                "simulator run reserves for the simulator config; rename or drop it."
-            )
-        config[SIMULATOR_CONFIG_KEY] = load_config(simulator_config_path)
-        print(f"Loaded simulator configuration from: {simulator_config_path}")
 
     if overrides:
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
     raw_config = cast(dict[str, Any], OmegaConf.to_container(config, resolve=True))
-    simulator = None
-    if simulator_config_path is not None:
-        simulator = SimulatorConfig(**raw_config.pop(SIMULATOR_CONFIG_KEY))
-        print(f"Simulator config: {simulator}")
     check_outdated_config(raw_config)
     if simulator is not None:
         # After the CLI overrides, so the simulator's node and step counts win over the recipe.
@@ -145,7 +169,7 @@ def _load_configs(
             "The SingleController entrypoints require data_plane.enabled=true. "
             "Use examples/run_grpo.py for the legacy / sync paths."
         )
-    return master_config, simulator
+    return master_config
 
 
 def _configure_generation(
@@ -206,9 +230,10 @@ def run_single_controller(
     # only at exit. Line-buffer the driver so they show up as they are printed.
     sys.stdout.reconfigure(line_buffering=True)
     register_omegaconf_resolvers()
-    config, simulator = _load_configs(
-        config_path, overrides, simulator_config_path=simulator_config_path
-    )
+    simulator = None
+    if simulator_config_path is not None:
+        simulator, overrides = _load_simulator_config(simulator_config_path, overrides)
+    config = _load_config(config_path, overrides, simulator=simulator)
 
     print("Final config:")
     pprint.pprint(config)
@@ -266,7 +291,7 @@ def run_single_controller(
                     config, tokenizer, processor=processor, simulator=simulator
                 )
 
-        placement = controller_placement()
+        placement = _controller_placement()
         print(
             f"🚀 Launching SingleControllerActor (placement={placement or 'default'})"
         )
