@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import asdict
-from typing import Any, Callable, Optional
+from typing import Any
 
 import torch
 from packaging.version import Version as PkgVersion
@@ -25,12 +24,14 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from nemo_rl.utils.flops_formulas import (
-    FLOPSConfig,
-    deepseekv3,
-    glm_moe_dsa,
-    llama,
-    qwen2,
-    qwen3,
+    DeepSeekV3Flops,
+    FlopsModel,
+    GlmMoeDsaFlops,
+    LlamaFlops,
+    MlaAttention,
+    MoeFfn,
+    Qwen2Flops,
+    Qwen3Flops,
 )
 
 
@@ -107,24 +108,41 @@ def _get_glm_index_compute_layers(config: PretrainedConfig) -> int:
     )
 
 
-def convert_config_to_flops_config(
-    config: PretrainedConfig,
-) -> tuple[FLOPSConfig, Callable]:
-    """Convert a pretrained config to a tuple containing a FLOPSConfig and a flops formula."""
+def _mla_attention_from_hf_config(config: PretrainedConfig) -> MlaAttention:
+    """Read the MLA projection sizes that DeepSeek-style configs share."""
+    return MlaAttention(
+        attention_heads=config.num_attention_heads,
+        q_lora_rank=config.q_lora_rank,
+        kv_lora_rank=config.kv_lora_rank,
+        qk_head_dim=config.qk_nope_head_dim,
+        qk_pos_emb_head_dim=config.qk_rope_head_dim,
+        v_head_dim=config.v_head_dim,
+    )
+
+
+def flops_model_from_hf_config(config: PretrainedConfig) -> FlopsModel:
+    """Build the FLOPs model of the model family that a pretrained config describes.
+
+    Args:
+        config: Effective Hugging Face config of the model that is trained.
+
+    Returns:
+        The FLOPs model for the config's model family.
+
+    Raises:
+        ValueError: If the model family has no FLOPs formula.
+    """
     if isinstance(config, Qwen2Config):
-        return FLOPSConfig(
-            gbs=0,
+        return Qwen2Flops(
             hs=config.hidden_size,
             layers=config.num_hidden_layers,
             ffn_hs=config.intermediate_size,
             vocab_size=config.vocab_size,
-        ), qwen2
+        )
     elif isinstance(config, (Qwen3Config, Qwen3MoeConfig)):
-        return FLOPSConfig(
-            gbs=0,
+        return Qwen3Flops(
             hs=config.hidden_size,
             layers=config.num_hidden_layers,
-            ffn_hs=config.intermediate_size,
             vocab_size=config.vocab_size,
             query_groups=config.num_key_value_heads,
             attention_heads=config.num_attention_heads,
@@ -134,67 +152,55 @@ def convert_config_to_flops_config(
             # for non-MoE models, we use the intermediate size as the ffn hidden size
             moe_ffn_hidden_size=config.intermediate_size,
             moe_router_topk=1,
-        ), qwen3
+        )
     elif isinstance(config, LlamaConfig):
-        return FLOPSConfig(
-            gbs=0,
+        return LlamaFlops(
             hs=config.hidden_size,
             layers=config.num_hidden_layers,
             ffn_hs=config.intermediate_size,
             query_groups=config.num_key_value_heads,
             attention_heads=config.num_attention_heads,
             vocab_size=config.vocab_size,
-        ), llama
+        )
     elif config.__class__.model_type == "deepseek_v3":
-        return FLOPSConfig(
-            gbs=0,
+        return DeepSeekV3Flops(
             hs=config.hidden_size,
             layers=config.num_hidden_layers,
-            ffn_hs=config.intermediate_size,
-            attention_heads=config.num_attention_heads,
-            moe_router_topk=config.num_experts_per_tok,
-            query_groups=config.num_key_value_heads,
             vocab_size=config.vocab_size,
-            q_lora_rank=config.q_lora_rank,
-            kv_lora_rank=config.kv_lora_rank,
-            qk_head_dim=config.qk_nope_head_dim,
-            qk_pos_emb_head_dim=config.qk_rope_head_dim,
-            v_head_dim=config.v_head_dim,
-            moe_layer_freq=1,
-            moe_shared_expert_intermediate_size=config.moe_intermediate_size,
-            moe_ffn_hidden_size=config.moe_intermediate_size,
-            mtp_num_layers=0,
-            causal_self_attn=True,
-        ), deepseekv3
-    elif config.__class__.model_type == "glm_moe_dsa":
-        return FLOPSConfig(
-            gbs=0,
-            hs=config.hidden_size,
-            layers=config.num_hidden_layers,
-            ffn_hs=config.intermediate_size,
-            attention_heads=config.num_attention_heads,
-            moe_router_topk=config.num_experts_per_tok,
-            query_groups=config.num_key_value_heads,
-            vocab_size=config.vocab_size,
-            q_lora_rank=config.q_lora_rank,
-            kv_lora_rank=config.kv_lora_rank,
-            qk_head_dim=config.qk_nope_head_dim,
-            qk_pos_emb_head_dim=config.qk_rope_head_dim,
-            v_head_dim=config.v_head_dim,
-            moe_layer_freq=_get_glm_moe_layer_pattern(config),
-            moe_shared_expert_intermediate_size=(
-                config.moe_intermediate_size * config.n_shared_experts
+            mla=_mla_attention_from_hf_config(config),
+            ffn=MoeFfn(
+                ffn_hs=config.intermediate_size,
+                # Every layer is counted as a mixture-of-experts layer.
+                moe_layer_pattern=(1,) * config.num_hidden_layers,
+                moe_shared_expert_intermediate_size=config.moe_intermediate_size,
+                moe_ffn_hidden_size=config.moe_intermediate_size,
+                moe_router_topk=config.num_experts_per_tok,
             ),
-            moe_ffn_hidden_size=config.moe_intermediate_size,
-            # GLM-5 HF config may expose next-token-prediction heads, but the
-            # MCore Bridge path used by these runs disables MTP mappings.
-            mtp_num_layers=None,
-            causal_self_attn=True,
+            mtp_num_layers=0,
+        )
+    elif config.__class__.model_type == "glm_moe_dsa":
+        # GLM-5 HF config may expose next-token-prediction heads, but the
+        # MCore Bridge path used by these runs disables MTP mappings, so
+        # GlmMoeDsaFlops counts none.
+        return GlmMoeDsaFlops(
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            vocab_size=config.vocab_size,
+            mla=_mla_attention_from_hf_config(config),
+            ffn=MoeFfn(
+                ffn_hs=config.intermediate_size,
+                moe_layer_pattern=tuple(_get_glm_moe_layer_pattern(config)),
+                moe_shared_expert_intermediate_size=(
+                    config.moe_intermediate_size * config.n_shared_experts
+                ),
+                moe_ffn_hidden_size=config.moe_intermediate_size,
+                moe_router_topk=config.num_experts_per_tok,
+            ),
             dsa_indexer_n_heads=config.index_n_heads,
             dsa_indexer_head_dim=config.index_head_dim,
             dsa_indexer_topk=config.index_topk,
             dsa_indexer_compute_layers=_get_glm_index_compute_layers(config),
-        ), glm_moe_dsa
+        )
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")
 
@@ -236,42 +242,19 @@ def get_theoretical_tflops(device_name: str, model_dtype: torch.dtype) -> float:
 
 
 class FLOPTracker:
-    def __init__(
-        self,
-        model_name: str,
-        base_config: FLOPSConfig | None = None,
-        flops_formula: Callable[[FLOPSConfig], float] | None = None,
-    ):
+    def __init__(self, model_name: str, flops_model: FlopsModel):
         self.model_name = model_name
-        self.base_config = base_config
-        self.total_flops = 0
-        self.flops_formula: Optional[Callable[[FLOPSConfig], float]] = flops_formula
+        self.flops_model = flops_model
+        self.total_flops: float = 0
 
     @classmethod
     def from_config(cls, model_name: str, config: PretrainedConfig) -> "FLOPTracker":
-        flops_config, flops_formula = convert_config_to_flops_config(config)
         return cls(
-            model_name=model_name, base_config=flops_config, flops_formula=flops_formula
+            model_name=model_name, flops_model=flops_model_from_hf_config(config)
         )
 
     def track(self, n_samples: int, padded_seq_len: int):
-        if self.flops_formula is None:
-            raise ValueError("Flops formula is not set")
-
-        base_config_dict = (
-            asdict(self.base_config) if self.base_config is not None else {}
-        )
-
-        # Override gbs and enc_seq_len with current values
-        config_dict = {
-            **base_config_dict,
-            "gbs": n_samples,
-            "enc_seq_len": padded_seq_len,
-        }
-
-        # Compute and accumulate flops
-        flops = self.flops_formula(FLOPSConfig(**config_dict))
-        self.total_flops += flops
+        self.total_flops += self.flops_model.flops(n_samples, padded_seq_len)
 
     def track_batch(self, sequence_lengths: list[int]):
         """Track the flops for a batch of sequences."""

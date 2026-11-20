@@ -12,18 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import replace
 from typing import Any
 
 import pytest
 import torch
+from pydantic import TypeAdapter, ValidationError
 from transformers.configuration_utils import PretrainedConfig
 
 from nemo_rl.models.policy.lm_policy import _aggregate_megatron_flops_metrics
-from nemo_rl.utils.flops_formulas import FLOPSConfig, glm_moe_dsa, qwen3
+from nemo_rl.utils.flops_formulas import (
+    FlopsModel,
+    GlmMoeDsaFlops,
+    MlaAttention,
+    MoeFfn,
+    Qwen3Flops,
+)
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
-    convert_config_to_flops_config,
+    flops_model_from_hf_config,
     get_hf_config,
     get_theoretical_tflops,
     is_using_tf32,
@@ -88,11 +94,9 @@ def test_get_hf_config_forwards_overrides(
     }
 
 
-def _qwen3_flops_config(head_dim):
+def _qwen3_flops(head_dim: int | None) -> Qwen3Flops:
     # Qwen3-235B-A22B-like shape (smaller layer count for a cheap test).
-    return FLOPSConfig(
-        gbs=1,
-        enc_seq_len=4096,
+    return Qwen3Flops(
         hs=4096,
         layers=2,
         attention_heads=64,
@@ -106,7 +110,7 @@ def _qwen3_flops_config(head_dim):
 
 def test_qwen3_flops_head_dim_backward_compat():
     """head_dim=None falls back to hidden_size // num_heads, matching the old formula."""
-    assert qwen3(_qwen3_flops_config(None)) == qwen3(_qwen3_flops_config(4096 // 64))
+    assert _qwen3_flops(None).flops(1, 4096) == _qwen3_flops(4096 // 64).flops(1, 4096)
 
 
 def test_qwen3_flops_wide_attention():
@@ -116,40 +120,53 @@ def test_qwen3_flops_wide_attention():
     The QKV/output projections and the O(seq^2) scores scale with num_heads*head_dim, not hidden_size,
     so the formula must not collapse head_dim to hidden_size/num_heads.
     """
-    standard = qwen3(_qwen3_flops_config(4096 // 64))  # head_dim=64 == hidden/num_heads
-    wide = qwen3(_qwen3_flops_config(128))  # head_dim=128 (Qwen3-235B)
+    # head_dim=64 == hidden/num_heads
+    standard = _qwen3_flops(4096 // 64).flops(1, 4096)
+    wide = _qwen3_flops(128).flops(1, 4096)  # head_dim=128 (Qwen3-235B)
     assert wide > standard
 
 
-def test_flops_formula_names_the_unset_config_field():
-    config = replace(_qwen3_flops_config(None), vocab_size=None)
-    with pytest.raises(ValueError, match=r"FLOPSConfig\.vocab_size is required"):
-        qwen3(config)
+def test_flops_model_names_the_missing_field():
+    fields = _qwen3_flops(None).model_dump(exclude={"vocab_size"})
+    with pytest.raises(ValidationError, match="vocab_size"):
+        Qwen3Flops(**fields)
 
 
-def _glm_moe_dsa_flops_config(
+def test_flops_model_rejects_a_field_of_another_model_family():
+    fields = _qwen3_flops(None).model_dump()
+    with pytest.raises(ValidationError, match="dsa_indexer_topk"):
+        Qwen3Flops(**fields, dsa_indexer_topk=2048)
+
+
+def test_flops_model_round_trips_through_its_kind():
+    flops_model = _glm_moe_dsa_flops()
+    restored = TypeAdapter(FlopsModel).validate_python(flops_model.model_dump())
+    assert isinstance(restored, GlmMoeDsaFlops)
+    assert restored == flops_model
+
+
+def _glm_moe_dsa_flops(
     index_topk: int = 2048, index_compute_layers: int = 78
-) -> FLOPSConfig:
-    return FLOPSConfig(
-        gbs=1,
-        enc_seq_len=4096,
+) -> GlmMoeDsaFlops:
+    return GlmMoeDsaFlops(
         hs=6144,
         layers=78,
-        ffn_hs=12288,
-        attention_heads=64,
-        moe_router_topk=8,
-        query_groups=64,
         vocab_size=154880,
-        q_lora_rank=2048,
-        kv_lora_rank=512,
-        qk_head_dim=192,
-        qk_pos_emb_head_dim=64,
-        v_head_dim=256,
-        moe_layer_freq=[0] * 3 + [1] * 75,
-        moe_shared_expert_intermediate_size=2048,
-        moe_ffn_hidden_size=2048,
-        mtp_num_layers=None,
-        causal_self_attn=True,
+        mla=MlaAttention(
+            attention_heads=64,
+            q_lora_rank=2048,
+            kv_lora_rank=512,
+            qk_head_dim=192,
+            qk_pos_emb_head_dim=64,
+            v_head_dim=256,
+        ),
+        ffn=MoeFfn(
+            ffn_hs=12288,
+            moe_layer_pattern=(0,) * 3 + (1,) * 75,
+            moe_shared_expert_intermediate_size=2048,
+            moe_ffn_hidden_size=2048,
+            moe_router_topk=8,
+        ),
         dsa_indexer_n_heads=32,
         dsa_indexer_head_dim=128,
         dsa_indexer_topk=index_topk,
@@ -158,29 +175,31 @@ def _glm_moe_dsa_flops_config(
 
 
 def test_glm_moe_dsa_flops_scale_with_sparse_topk():
-    smaller_topk = glm_moe_dsa(_glm_moe_dsa_flops_config(index_topk=1024))
-    larger_topk = glm_moe_dsa(_glm_moe_dsa_flops_config(index_topk=4096))
+    smaller_topk = _glm_moe_dsa_flops(index_topk=1024).flops(1, 4096)
+    larger_topk = _glm_moe_dsa_flops(index_topk=4096).flops(1, 4096)
     assert larger_topk > smaller_topk
 
 
 def test_glm_moe_dsa_flops_components():
-    config = FLOPSConfig(
-        gbs=2,
-        enc_seq_len=8,
+    flops_model = GlmMoeDsaFlops(
         hs=4,
         layers=2,
-        ffn_hs=8,
-        attention_heads=2,
-        moe_router_topk=2,
         vocab_size=16,
-        q_lora_rank=3,
-        kv_lora_rank=2,
-        qk_head_dim=2,
-        qk_pos_emb_head_dim=1,
-        v_head_dim=2,
-        moe_layer_freq=[0, 1],
-        moe_shared_expert_intermediate_size=2,
-        moe_ffn_hidden_size=2,
+        mla=MlaAttention(
+            attention_heads=2,
+            q_lora_rank=3,
+            kv_lora_rank=2,
+            qk_head_dim=2,
+            qk_pos_emb_head_dim=1,
+            v_head_dim=2,
+        ),
+        ffn=MoeFfn(
+            ffn_hs=8,
+            moe_layer_pattern=(0, 1),
+            moe_shared_expert_intermediate_size=2,
+            moe_ffn_hidden_size=2,
+            moe_router_topk=2,
+        ),
         dsa_indexer_n_heads=2,
         dsa_indexer_head_dim=2,
         dsa_indexer_topk=4,
@@ -188,14 +207,17 @@ def test_glm_moe_dsa_flops_components():
     )
 
     # Per input: 15,168 linear + 2,880 sparse attention + 736 indexer
-    # + 3,072 vocabulary projection FLOPs; gbs=2.
-    assert glm_moe_dsa(config) == 43_712
+    # + 3,072 vocabulary projection FLOPs; batch size 2.
+    assert flops_model.flops(batch_size=2, seq_len=8) == 43_712
 
 
-def test_glm_moe_dsa_flops_all_dense_layers_need_no_router_topk():
-    dense_config = replace(_glm_moe_dsa_flops_config(), moe_layer_freq=[0] * 78)
-    without_router_topk = replace(dense_config, moe_router_topk=None)
-    assert glm_moe_dsa(without_router_topk) == glm_moe_dsa(dense_config)
+def test_glm_moe_dsa_flops_need_the_query_rank():
+    flops_model = _glm_moe_dsa_flops()
+    without_query_rank = flops_model.model_copy(
+        update={"mla": flops_model.mla.model_copy(update={"q_lora_rank": None})}
+    )
+    with pytest.raises(ValueError, match=r"mla\.q_lora_rank"):
+        without_query_rank.flops(1, 4096)
 
 
 def _glm_5_2_indexer_types() -> list[str]:
@@ -220,15 +242,11 @@ def _glm_5_2_indexer_types() -> list[str]:
     ids=["glm-5.1", "glm-5.2"],
 )
 def test_glm_moe_dsa_config_is_supported(model_config, expected_index_compute_layers):
-    flops_config, flops_formula = convert_config_to_flops_config(model_config)
+    flops_model = flops_model_from_hf_config(model_config)
 
-    assert flops_formula is glm_moe_dsa
-    assert flops_config.moe_layer_freq == [0] * 3 + [1] * 75
-    assert flops_config.moe_shared_expert_intermediate_size == 2048
-    assert flops_config.dsa_indexer_n_heads == 32
-    assert flops_config.dsa_indexer_head_dim == 128
-    assert flops_config.dsa_indexer_topk == 2048
-    assert flops_config.dsa_indexer_compute_layers == expected_index_compute_layers
+    assert flops_model == _glm_moe_dsa_flops(
+        index_compute_layers=expected_index_compute_layers
+    )
 
     flops_tracker = FLOPTracker.from_config("glm-moe-dsa-test", model_config)
     flops_tracker.track(n_samples=1, padded_seq_len=4096)
@@ -236,11 +254,11 @@ def test_glm_moe_dsa_config_is_supported(model_config, expected_index_compute_la
 
 
 def test_glm_5_2_reused_indices_reduce_indexer_flops():
-    glm_5_1_config = _glm_moe_dsa_flops_config(index_compute_layers=78)
-    glm_5_2_config = _glm_moe_dsa_flops_config(index_compute_layers=21)
+    seq_len = 4096
+    glm_5_1 = _glm_moe_dsa_flops(index_compute_layers=78)
+    glm_5_2 = _glm_moe_dsa_flops(index_compute_layers=21)
 
-    actual_difference = glm_moe_dsa(glm_5_1_config) - glm_moe_dsa(glm_5_2_config)
-    seq_len = glm_5_1_config.enc_seq_len
+    actual_difference = glm_5_1.flops(1, seq_len) - glm_5_2.flops(1, seq_len)
     dense_causal_pairs = seq_len * (seq_len + 1) // 2
     projection_params = 2048 * 32 * 128 + 6144 * 128 + 6144 * 32
     per_layer_indexer_flops = 2 * (
