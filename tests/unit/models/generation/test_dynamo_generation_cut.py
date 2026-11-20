@@ -15,7 +15,12 @@
 """NeMo-Gym's checkpoint generation cut through the Dynamo frontend."""
 
 import asyncio
+import os
+import subprocess
+import sys
 import time
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,11 +30,13 @@ from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
     GenerationCutInventory,
     GenerationCutPrefix,
     GenerationCutPrefixAck,
+    GenerationCutReceipt,
 )
 
 from nemo_rl.models.generation.dynamo import managed_runtime  # noqa: E402
 from nemo_rl.models.generation.dynamo.config import DynamoCfg  # noqa: E402
 from nemo_rl.models.generation.dynamo.managed_runtime import (  # noqa: E402
+    FrontendHost,
     ManagedDynamoRuntime,
 )
 from nemo_rl.models.generation.dynamo.vllm.generation_cut import (  # noqa: E402
@@ -37,7 +44,10 @@ from nemo_rl.models.generation.dynamo.vllm.generation_cut import (  # noqa: E402
     DEADLINE_KEY,
     GENERATION_CUT_ANNOTATION,
     INVENTORY_KEY,
-    EngineCutFanOut,
+    CutRouteHandler,
+)
+from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
+    GENERATION_CUT_ROUTE,
 )
 
 pytestmark = pytest.mark.nemo_gym
@@ -141,7 +151,6 @@ def test_a_cut_reaches_every_engine_and_each_call_gets_its_engines_answer(
     )
     runtime = _Runtime(client)
     monkeypatch.setenv("DYN_NAMESPACE", "nemo-rl-test")
-    monkeypatch.setenv(managed_runtime.CAPTURE_FILE_ENV, str(tmp_path / "capture.pkl"))
     driver = ManagedDynamoRuntime(
         dynamo_cfg=DynamoCfg(),
         model_name="model",
@@ -149,12 +158,32 @@ def test_a_cut_reaches_every_engine_and_each_call_gets_its_engines_answer(
         ray_address="10.0.0.1:6379",
         serves_chat=True,
     )
-    driver._chat_dir = str(tmp_path)
+    # The driver publishes through this frontend's host, in-process here.
+    host = FrontendHost()
+    host._chat_dir = str(tmp_path)
+    monkeypatch.setattr(managed_runtime, "ray", SimpleNamespace(get=lambda refs: refs))
+    driver._frontend_hosts = [
+        SimpleNamespace(
+            publish_chat_capture=SimpleNamespace(remote=host.publish_chat_capture)
+        )
+    ]
+    driver._started = True
 
     async def run():
-        fan_out = EngineCutFanOut(runtime, asyncio.get_running_loop())
-        # Before capture is set up the route refuses every cut, as natively.
-        assert fan_out.control_token is None
+        handler = CutRouteHandler(str(tmp_path / "capture.pkl"))
+
+        def post(bearer: str = "secret"):
+            # A call from Gym, as Dynamo hands it to the route's handler:
+            # lower-case header names and the raw body.
+            return handler.answer(
+                SimpleNamespace(
+                    runtime=runtime,
+                    headers={"authorization": f"Bearer {bearer}"},
+                    body=inventory.model_dump_json().encode(),
+                )
+            )
+
+        refused = await post()
         driver.publish_chat_capture(
             dp_cfg={"backend": "simple"},
             staging_partition="staging",
@@ -162,13 +191,18 @@ def test_a_cut_reaches_every_engine_and_each_call_gets_its_engines_answer(
             generation_cut_control_token="secret",
             generation_cut_control_timeout_s=0.5,
         )
-        assert fan_out.control_token == "secret"
+        wrong_bearer = await post("wrong")
         arrived = time.time()
-        return arrived, await fan_out.run_cut(inventory)
+        return refused, wrong_bearer, arrived, await post()
 
-    arrived, receipt = asyncio.run(run())
+    refused, wrong_bearer, arrived, (status, body) = asyncio.run(run())
 
+    # Before capture is set up the route refuses every cut, as natively.
+    assert refused == (404, {"detail": "generation-prefix cuts are disabled"})
+    assert wrong_bearer == (401, {"detail": "invalid control bearer"})
+    assert status == 200
     # Gym accepts it as the answer to its inventory: every call acked once.
+    receipt = GenerationCutReceipt.model_validate(body)
     receipt.validate_for(inventory)
     assert {ack.model_call_id: ack.disposition for ack in receipt.prefixes} == {
         "held": "durable_prefix",
@@ -190,3 +224,28 @@ def test_a_cut_reaches_every_engine_and_each_call_gets_its_engines_answer(
         },
     }
     assert client.requests == {1: request, 2: request, 3: request, 4: request}
+
+
+@pytest.mark.vllm
+def test_loading_the_route_imports_gym_and_keeps_an_unset_hf_home_unset(
+    tmp_path,
+) -> None:
+    # A fresh interpreter, as the frontend's is when it loads the route extension.
+    code = (
+        "import os, sys\n"
+        "from nemo_rl.models.generation.dynamo.vllm.generation_cut import routes\n"
+        # Building the route checks that Dynamo accepts its timeout and body limit.
+        "(route,) = routes()\n"
+        f"assert (route.method, route.path) == ('POST', {GENERATION_CUT_ROUTE!r})\n"
+        "assert 'nemo_gym._checkpoint.generation_cut' in sys.modules\n"
+        "assert 'HF_HOME' not in os.environ\n"
+    )
+    env = {name: value for name, value in os.environ.items() if name != "HF_HOME"}
+    env[managed_runtime.CAPTURE_FILE_ENV] = str(tmp_path / "capture.pkl")
+
+    subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[4],
+        env=env,
+        check=True,
+    )

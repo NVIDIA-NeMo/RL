@@ -3351,7 +3351,7 @@ def _dynamo_master_config(
     ("settings", "error"),
     [
         ({}, None),
-        ({"router": True}, "routes the whole fleet behind one URL"),
+        ({"router": True}, "each of which routes to the whole fleet"),
         ({"fleet_health": True}, "Disable fleet health"),
         # Gym's replies need the engine's tokenizer; NeMo RL's rollouts do not.
         ({"gym": True, "skip_tokenizer_init": True}, "skip_tokenizer_init"),
@@ -3460,7 +3460,7 @@ def test_vllm_dynamo_rollouts_go_through_the_frontend(monkeypatch):
         "_pad_token_id": 0,
         "vllm_cfg": {"max_model_len": 16},
     }
-    generation.dynamo_frontend_url = "http://frontend/v1"
+    generation.dynamo_frontend_urls = ("http://frontend-0/v1", "http://frontend-1/v1")
     data = BatchedDataDict(
         {
             "input_ids": torch.tensor([[5, 6, 0]]),
@@ -3471,13 +3471,18 @@ def test_vllm_dynamo_rollouts_go_through_the_frontend(monkeypatch):
     # The frontend request carries token IDs only, so media prompts stay native.
     media = BatchedDataDict({**data, "vllm_content": [None]})
     assert generation._dynamo_serves(data) and not generation._dynamo_serves(media)
-    # NeMo-Gym is pointed at the frontend too.
-    assert generation.client_base_urls == ["http://frontend/v1"]
+    # NeMo-Gym is pointed at every frontend.
+    assert generation.client_base_urls == [
+        "http://frontend-0/v1",
+        "http://frontend-1/v1",
+    ]
 
     _, output = asyncio.run(anext(generation.generate_async(data, greedy=True)))
 
     ((url, payload, timeout_s),) = requests
-    assert (url, timeout_s) == ("http://frontend/v1/completions", None)
+    # A rollout goes to one of them.
+    assert url in {f"{base}/completions" for base in generation.dynamo_frontend_urls}
+    assert timeout_s is None
     # The unpadded prompt; the engine samples it from the generation config, and
     # the frontend's own stop rules never end the stream before the engine does.
     assert payload["prompt"] == [5, 6]
