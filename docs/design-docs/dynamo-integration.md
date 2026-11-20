@@ -42,6 +42,12 @@ Colocated generation is rejected at startup: a sleeping engine stays registered,
 
 No HTTP control routes are involved. The Rust Worker installs a SIGTERM handler that chains to Ray's, so actor shutdown is unchanged, and discovery drops an engine when its process exits.
 
+With `async_rl.generation_fleet_health`, the SingleController calls `set_serving_shards` on every fleet probe and before generation resumes after a refit, and `VllmGeneration` makes the frontends' routing match:
+- The adapter keeps the `Endpoint` the Worker hands it (`on_endpoint_ready`). A shard leaving service calls `unregister_endpoint_instance()`, which removes only its discovery record: every frontend stops routing to it, and its requests in flight finish.
+- Only the engine's own process can remove its registration. A quarantined shard that does not confirm is killed, so the registration goes with its etcd lease.
+- `restart_shard` does not start the replacement's endpoint, because it holds init weights. The endpoint starts when a refit returns the shard to service.
+- The SingleController's copy of `VllmGeneration` has no managed runtime, so the namespace and engine environment an endpoint starts with are kept as plain fields.
+
 ## NeMo-Gym chat
 
 Dynamo's frontend hands chat calls to a custom chat processor when one is named. The managed runtime starts each frontend with `--dyn-chat-processor` naming NeMo RL's chat engine (`dynamo/vllm/chat_engine.py`) and its settings in `--dyn-chat-processor-config`, so the frontend keeps its HTTP server, router and `/v1/completions` path, and only chat goes to the chat engine.

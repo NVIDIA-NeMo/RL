@@ -25,6 +25,7 @@ import json
 import pickle
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import numpy as np
 import pytest
@@ -370,6 +371,69 @@ def test_an_endpoint_that_stops_serving_reports_why() -> None:
         None,
         "RuntimeError('etcd unreachable')",
     ]
+
+
+def test_an_engine_leaves_and_rejoins_the_frontends_routing(monkeypatch) -> None:
+    endpoint = SimpleNamespace(
+        register_endpoint_instance=AsyncMock(),
+        unregister_endpoint_instance=AsyncMock(),
+    )
+    stop = asyncio.Event()
+
+    class _Worker:
+        def __init__(self, engine, config):
+            self._engine = engine
+
+        async def run(self):
+            # As Dynamo's Worker: the engine gets its endpoint, then it serves.
+            await self._engine.on_endpoint_ready(endpoint)
+            await stop.wait()
+            raise RuntimeError("etcd lost")
+
+    monkeypatch.setattr(engine_adapter, "Worker", _Worker)
+    env = {
+        "DYN_DISCOVERY_BACKEND": "etcd",
+        "DYN_REQUEST_PLANE": "tcp",
+        "DYN_EVENT_PLANE": "nats",
+    }
+    for key, value in env.items():
+        # Registered here so the variables the engine exports are restored.
+        monkeypatch.setenv(key, value)
+    host = _host(_FakeLLM())
+    host._dynamo_endpoint_task = None
+    host._dynamo_adapter = None
+    host._dynamo_routed = False
+    endpoint_args = {"namespace": "ns", "engine_env": env, "leader_worker_idx": 0}
+
+    async def run() -> None:
+        # Not served through Dynamo: the probe stays the actor's alone.
+        host.llm.errored = True
+        assert host.is_alive()
+        host.llm.errored = False
+
+        # A restarted shard's first time in service starts its endpoint.
+        await host.set_dynamo_routed_async(True, **endpoint_args)
+        with pytest.raises(RuntimeError, match="not started serving yet"):
+            await host.set_dynamo_routed_async(False, **endpoint_args)
+        await asyncio.sleep(0)
+        await host.set_dynamo_routed_async(False, **endpoint_args)
+        await host.set_dynamo_routed_async(False, **endpoint_args)
+        await host.set_dynamo_routed_async(True, **endpoint_args)
+        endpoint.unregister_endpoint_instance.assert_awaited_once_with()
+        endpoint.register_endpoint_instance.assert_awaited_once_with()
+
+        assert host.is_alive()
+        # A call through a frontend does not name the engine that failed it.
+        host.llm.errored = True
+        with pytest.raises(RuntimeError, match="engine behind Dynamo is dead"):
+            host.is_alive()
+        host.llm.errored = False
+        stop.set()
+        await asyncio.wait([host._dynamo_endpoint_task])
+        with pytest.raises(RuntimeError, match="etcd lost"):
+            host.is_alive()
+
+    asyncio.run(run())
 
 
 def test_engines_register_the_block_size_kv_events_are_hashed_with() -> None:

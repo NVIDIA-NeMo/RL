@@ -27,6 +27,8 @@ the run.
 
 import asyncio
 from types import SimpleNamespace
+from unittest import mock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -92,6 +94,8 @@ def _controller(*, shard_count=3, router=None, unhealthy_threshold=3):
         base_urls=_urls(shard_count),
     )
     ctrl._generation_router = router
+    ctrl._gen = SimpleNamespace(set_serving_shards=MagicMock())
+    ctrl._serving_shards_push_lock = asyncio.Lock()
     # The probe pump also ticks the engine supervisor. None is its
     # "restart_dead_shards is off" value, which is what these tests want.
     ctrl._engine_supervisor = None
@@ -290,6 +294,43 @@ class TestPumpContainment:
             return still_running
 
         assert asyncio.run(_main()), "the pump must survive a failed push"
+
+    @pytest.mark.parametrize("recovering", [False, True])
+    def test_the_backend_learns_the_serving_shards_unless_a_refit_recovers(
+        self, recovering
+    ):
+        """A backend behind its own router (Dynamo) follows the fleet from here.
+
+        Mid-recovery every shard is out of service with its engine paused, so a push
+        there would take the whole fleet out of that router for nothing.
+        """
+        ctrl = _controller()
+        ctrl._recovering_from_refit = recovering
+        ctrl._gen_fleet.record_actor_death(1)
+        probes = 0
+
+        async def _probe() -> None:
+            nonlocal probes
+            probes += 1
+
+        ctrl._probe_generation_fleet = _probe
+
+        async def _main():
+            task = asyncio.ensure_future(ctrl._gen_fleet_probe_pump())
+            # The third probe starts only after two whole ticks ran.
+            while probes < 3:
+                await asyncio.sleep(0.001)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_main())
+        if recovering:
+            ctrl._gen.set_serving_shards.assert_not_called()
+        else:
+            assert ctrl._gen.set_serving_shards.call_args == mock.call(
+                {0, 2}, quarantined_shards={1}, timeout_s=1.0
+            )
 
 
 async def _noop() -> None:

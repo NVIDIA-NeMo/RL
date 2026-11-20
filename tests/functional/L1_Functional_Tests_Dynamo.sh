@@ -51,6 +51,10 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # Router replay across a prefix cut, behind Dynamo: each restored call must stage its saved routes.
 # The tiny DeepSeek model adds a second routing layout to the native run's Qwen3-MoE build.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_router_replay_prefix_recovery_single_controller_1n2g.sh ++policy.generation.dynamo=true policy.model_name=silence09/DeepSeek-R1-Small-2layers policy.tokenizer.name=silence09/DeepSeek-R1-Small-2layers
+# Fleet health: a lost shard leaves the frontends' routing, and a restarted one joins it after a refit.
+# Both need 3 GPUs and skip below that, as the native variants do.
+run_test uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh ++policy.generation.dynamo=true
+run_test env RESTART_DEAD_SHARDS=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh ++policy.generation.dynamo=true
 
 cd "${PROJECT_ROOT}/tests"
 if compgen -G ".coverage*" > /dev/null; then
