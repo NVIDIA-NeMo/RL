@@ -30,10 +30,8 @@ from nemo_rl.data_plane.interfaces import (
 from nemo_rl.data_plane.observability import (
     MetricsDataPlaneClient,
     breakdown_table,
-    cluster_step_metrics,
     is_metrics_client,
     log_event,
-    merge_snapshots,
 )
 
 __all__ = [
@@ -44,10 +42,8 @@ __all__ = [
     "MetricsDataPlaneClient",
     "build_data_plane_client",
     "breakdown_table",
-    "cluster_step_metrics",
     "data_plane_supports_checkpointing",
     "is_metrics_client",
     "log_event",
-    "merge_snapshots",
     "materialize",
 ]

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import math
 from types import SimpleNamespace
@@ -37,6 +38,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.algorithms.single_controller_utils.simulator import (
+    NoOpTrainer,
+    NoOpWeightSynchronizer,
+    SimulatorConfig,
+)
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
@@ -446,6 +452,9 @@ def test_train_pump_drives_mcore_training_step(
             assert metrics["evicted_stale_prompt_groups"] == 0
             assert metrics["aborted_stale_inflight_groups"] == 0
             assert metrics["weight_version_lag"] >= 0
+            # Only a simulator run reports the simulated hold.
+            assert "simulated_train_time_s" not in metrics
+            assert "simulated_train_idle_skipped_s" not in metrics
 
         # The final "timing/train" log of each step must carry step_finished=True
         # (the behavior this restores) so W&B commits the step; the "train" log must not.
@@ -462,5 +471,179 @@ def test_train_pump_drives_mcore_training_step(
         assert timing_finished == [True] * train_steps
         assert train_finished == [False] * train_steps
 
+    finally:
+        trainer.shutdown()
+
+
+class _ListLogger:
+    """Keep the metrics the controller logs, for the test to read."""
+
+    def __init__(self) -> None:
+        self.entries: list[tuple[str | None, dict[str, Any]]] = []
+
+    def log_metrics(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        prefix: str | None = "",
+        step_metric: str | None = None,
+        step_finished: bool = False,
+    ) -> None:
+        del step, step_metric, step_finished
+        self.entries.append((prefix, dict(metrics)))
+
+
+def test_train_pump_consumes_batches_with_the_no_op_trainer(tmp_path):
+    """Two simulator steps on the real stand-ins: consume, release, advance, hold.
+
+    No GPU: the trainer is the NoOpTrainer and the refit the NoOpWeightSynchronizer,
+    so the pump must reach the next step without any trainer-side stage.
+    """
+    train_steps = 2
+    num_generations = 2
+    num_prompts = 2
+    total_groups = train_steps * num_prompts
+    train_time_s = 0.2
+
+    trainer = NoOpTrainer(dp_cfg=_simple_tq_cfg(), policy_config={})
+    try:
+        dp_client = trainer.dp_client
+        dp_client.register_partition(
+            partition_id=_PARTITION_ID,
+            fields=_REGISTERED_FIELDS,
+            num_samples=total_groups * num_generations,
+            consumer_tasks=["prev_lp", "ref_lp", "train"],
+        )
+        tq_buffer = TQReplayBuffer(
+            dp_client,
+            partition_id=_PARTITION_ID,
+            pad_value_dict={"input_ids": 0},
+            include_message_violation_fields=False,
+        )
+        for step in range(train_steps):
+            for g in range(num_prompts):
+                meta = _populate_group(
+                    dp_client,
+                    group_uuid=f"step{step}_prompt{g}",
+                    group_size=num_generations,
+                    seq_len=16,
+                    weight_version=step,
+                )
+                _prepopulate_buffer(tq_buffer, meta, weight_version=step)
+
+        published_versions: list[int] = []
+        rollout_manager = SimpleNamespace(
+            _tq_buffer=None,
+            recovery_ledger=None,
+            get_next_nemo_gym_task_index=lambda: 0,
+            set_next_nemo_gym_task_index=lambda _value: None,
+            set_data_plane_checkpoint_barrier=lambda _barrier: None,
+            set_weight_version=published_versions.append,
+            suspend_request_deadlines=lambda: None,
+            resume_request_deadlines=lambda: None,
+            drain_step_reward_metrics=lambda _step: {},
+            filter_zero_variance_groups=False,
+        )
+        master_config = MasterConfig.model_construct(
+            data_plane={
+                "enabled": True,
+                "impl": "transfer_queue",
+                "backend": "simple",
+            },
+            policy={
+                "train_global_batch_size": num_prompts * num_generations,
+                "generation": {
+                    "top_k": None,
+                    "top_p": 1.0,
+                    "colocated": {"enabled": False},
+                },
+            },
+            env={},
+            grpo=GRPOConfig.model_construct(
+                num_prompts_per_step=num_prompts,
+                num_generations_per_prompt=num_generations,
+                max_num_steps=train_steps,
+                max_num_epochs=None,
+            ),
+            loss_fn=ClippedPGLossConfig(force_on_policy_ratio=False),
+            async_rl=AsyncRLConfig(
+                sampler=WindowedSamplerConfig(max_staleness_versions=1),
+                min_groups_for_streaming_train=num_prompts,
+                max_inflight_prompts=num_prompts,
+                max_buffered_rollouts=total_groups,
+            ),
+            logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
+            checkpointing=CheckpointingConfig(
+                enabled=False,
+                checkpoint_dir=str(tmp_path / "checkpoints"),
+                metric_name=None,
+                higher_is_better=False,
+                keep_top_k=None,
+                save_period=10_000,
+                save_optimizer=False,
+                checkpoint_must_save_by=None,
+            ),
+        )
+        actor_args = SingleControllerActorArgs(
+            gen_handle=_FakeGeneration(),
+            trainer_handle=trainer,
+            env_handles={},
+            train_cluster=None,
+            inference_cluster=None,  # type: ignore[arg-type]
+            dp_client=dp_client,
+            dataloader=None,  # type: ignore[arg-type]  # _rollout_pump not started
+            weight_synchronizer=NoOpWeightSynchronizer(),
+            advantage_estimator=_FakeAdvEstimator(),
+            loss_fn=SimpleLossFn(),
+            rollout_manager=rollout_manager,
+            tq_buffer=tq_buffer,
+            partition_id=_PARTITION_ID,
+            save_state=_initial_grpo_save_state(),
+            last_checkpoint_path=None,
+            finalizer_actors=[],
+            advantage_actors=[],
+            simulator=SimulatorConfig(train_time_s=train_time_s),
+        )
+        ctrl = SingleControllerActor.__ray_metadata__.modified_class(
+            master_config=master_config,
+            actor_args=actor_args,
+            setup_timing_metrics=SetupTimingMetrics(),
+        )
+        logger = _ListLogger()
+        ctrl._logger = logger
+
+        async def advantage_stage_must_not_run(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError("a simulator step ran the advantage stage")
+
+        ctrl._advantage_stage = advantage_stage_must_not_run
+
+        async def run() -> None:
+            # A rollout holds one capacity permit per group until its step is cleaned up.
+            for _ in range(total_groups):
+                await ctrl._buffer_capacity.acquire()
+            assert ctrl._buffer_capacity.locked()
+            await ctrl._train_pump()
+            for _ in range(total_groups):
+                await asyncio.wait_for(ctrl._buffer_capacity.acquire(), timeout=1.0)
+
+        asyncio.run(run())
+
+        assert ctrl._train_steps == train_steps
+        assert ctrl._trainer_version == train_steps
+        assert published_versions == list(range(1, train_steps + 1))
+        assert len(ctrl._buffer) == 0
+
+        train_metrics = [
+            metrics for prefix, metrics in logger.entries if prefix == "train"
+        ]
+        assert len(train_metrics) == train_steps
+        for metrics in train_metrics:
+            # Nothing is generating in this test, so the whole hold is skipped as idle.
+            held = metrics["simulated_train_time_s"]
+            skipped = metrics["simulated_train_idle_skipped_s"]
+            assert held + skipped == pytest.approx(train_time_s, abs=0.05)
+            assert skipped > 0
+            assert "reward" not in metrics
+            assert "advantages/mean" not in metrics
     finally:
         trainer.shutdown()

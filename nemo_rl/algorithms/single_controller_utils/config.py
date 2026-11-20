@@ -56,6 +56,7 @@ from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
+from nemo_rl.algorithms.single_controller_utils.watchdog import WatchdogConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.data_plane.schema import (
@@ -467,29 +468,6 @@ class GenerationRouterConfig(BaseModel, extra="allow"):
                 "Gym raises its own retry ceiling on each attempt, so returning one "
                 "would make it retry forever -- exactly the hang the router exists to "
                 "prevent. Use a 4xx outside that set, e.g. 409."
-            )
-        return self
-
-
-class WatchdogConfig(BaseModel, extra="allow"):
-    """Last-resort detection for stalls that no other layer catches."""
-
-    # How often the watchdog task runs its checks.
-    interval_s: PositiveFloat = 30.0
-    # Rollouts in flight but none committed for this long counts as a stall.
-    stall_timeout_s: PositiveFloat = 600.0
-    # Whether a detected stall only reports, or ends the run.
-    stall_action: Literal["warn", "abort"] = "warn"
-    # Poll NeMo-Gym's own RunHelper for dead subprocess servers each tick.
-    gym_subprocess_check: bool = True
-
-    @model_validator(mode="after")
-    def _check_consistent(self) -> "WatchdogConfig":
-        if self.stall_timeout_s <= self.interval_s:
-            raise ValueError(
-                f"async_rl.stall_watchdog.stall_timeout_s ({self.stall_timeout_s}) must be "
-                f"> interval_s ({self.interval_s}); otherwise the watchdog reports a "
-                "stall before it has had a chance to observe one."
             )
         return self
 

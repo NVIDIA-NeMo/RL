@@ -91,6 +91,12 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_grpo_chunk_cap_alignment,
     validate_single_controller_config,
 )
+from nemo_rl.algorithms.single_controller_utils.simulator import (
+    NoOpTrainer,
+    NoOpWeightSynchronizer,
+    SimulatorConfig,
+    validate_simulator_config,
+)
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.captured_media import media_capture_family
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -183,7 +189,8 @@ class SingleControllerActorArgs:
     gen_handle: Any
     trainer_handle: Any  # driver-side TQPolicy
     env_handles: dict[str, EnvironmentInterface]
-    train_cluster: RayVirtualCluster
+    # None on a simulator run with the no-op trainer: every node is inference.
+    train_cluster: Optional[RayVirtualCluster]
     inference_cluster: RayVirtualCluster
     dp_client: DataPlaneClient
     dataloader: StatefulDataLoader
@@ -221,6 +228,9 @@ class SingleControllerActorArgs:
     # the MSE loss it trains under.
     value_handle: Optional[TQValue] = None
     value_loss_fn: Optional[LossFunction] = None
+    # None on a training run. A simulator run (run_single_controller_simulator.py)
+    # carries the stand-in settings the controller reads for its held train step.
+    simulator: Optional[SimulatorConfig] = None
     ppo_group_multiple: int = 1
     ppo_min_remaining_groups: int = 0
 
@@ -430,6 +440,96 @@ def _non_colocated_teacher_node_count(master_config: MasterConfig) -> int:
     return sum(config.num_nodes for config in teacher_configs)
 
 
+def _inference_gpus_per_instance(master_config: MasterConfig) -> int:
+    """GPUs one generation instance spans: the unit kept inside one NVLink domain.
+
+    vLLM: TP x PP. SGLang: gpus_per_server already covers every parallelism
+    dimension. Megatron: the NVLink-domain span of the generation parallelism.
+    """
+    generation_config = cast(dict[str, Any], master_config.policy["generation"])
+    backend = generation_config["backend"]
+    if backend == "vllm":
+        vllm_cfg = generation_config["vllm_cfg"]
+        return vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
+            "pipeline_parallel_size", 1
+        )
+    if backend == "sglang":
+        return generation_config["sglang_cfg"].get("gpus_per_server", 1)
+    if backend == "megatron":
+        return MegatronGeneration.nvlink_domain_span(master_config.policy)
+    raise ValueError(
+        "single_controller_utils.setup only supports vllm, sglang, "
+        f"or megatron generation; got {backend!r}"
+    )
+
+
+def _build_inference_only_cluster(
+    master_config: MasterConfig,
+) -> RayVirtualCluster:
+    """Allocate every node to generation: a simulator run with no trainer.
+
+    Sized by ``policy.generation.colocated.resources``, as the non-colocated
+    split sizes its inference side, so the engines keep the recipe's shape (TP,
+    PP, GPUs per node); the allocation simply holds no training nodes. Each
+    multi-node instance is pinned to one NVLink domain, as ``_build_clusters``
+    does for the inference cluster of a training run.
+
+    Returns:
+        The inference cluster.
+    """
+    cluster_config = master_config.cluster
+    generation_config = master_config.policy["generation"]
+    if generation_config["colocated"]["enabled"]:
+        raise ValueError(
+            "An inference-only cluster needs policy.generation.colocated.enabled="
+            "false: colocated generation is sized by the training cluster it shares."
+        )
+    inference_resources = generation_config["colocated"]["resources"]
+    inference_gpus_per_node = inference_resources["gpus_per_node"]
+    if inference_gpus_per_node is None:
+        raise ValueError(
+            "Non-colocated generation requires "
+            "policy.generation.colocated.resources.gpus_per_node."
+        )
+    inference_nodes = inference_resources["num_nodes"] or 1
+    segment_size = cluster_config.segment_size
+
+    inference_constraints = None
+    inference_segment_size = None
+    if segment_size is not None:
+        gpus_per_instance = _inference_gpus_per_instance(master_config)
+        nodes_per_instance = (
+            gpus_per_instance + inference_gpus_per_node - 1
+        ) // inference_gpus_per_node
+        if inference_nodes % nodes_per_instance == 0:
+            inference_segment_size = nodes_per_instance
+            inference_constraints, _, _ = prepare_segment_topology(
+                inference_segment_size,
+                inference_nodes,
+                role="inference",
+            )
+        else:
+            print(
+                f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
+                f"nodes_per_instance={nodes_per_instance}; skipping inference "
+                "topology constraints",
+                flush=True,
+            )
+
+    inference_cluster = RayVirtualCluster(
+        name="sc_inference_cluster",
+        bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
+        use_gpus=True,
+        num_gpus_per_node=inference_gpus_per_node,
+        max_colocated_worker_groups=1,
+        port_range_low=cluster_config.master_port_range_low,
+        port_range_high=cluster_config.master_port_range_high,
+        segment_size=inference_segment_size,
+        node_resource_constraints=inference_constraints,
+    )
+    return inference_cluster
+
+
 def _build_clusters(
     master_config: MasterConfig,
 ) -> tuple[
@@ -557,25 +657,7 @@ def _build_clusters(
                 remaining_topology = {
                     node_id: topology[node_id] for node_id in value_remaining_ids
                 }
-            generation_config_dict = cast(dict[str, Any], generation_config)
-            if backend == "vllm":
-                vllm_cfg = generation_config_dict["vllm_cfg"]
-                gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
-                    "pipeline_parallel_size", 1
-                )
-            elif backend == "sglang":
-                gpus_per_instance = generation_config_dict["sglang_cfg"].get(
-                    "gpus_per_server", 1
-                )
-            elif backend == "megatron":
-                gpus_per_instance = MegatronGeneration.nvlink_domain_span(
-                    master_config.policy
-                )
-            else:
-                raise ValueError(
-                    "single_controller_utils.setup only supports vllm, sglang, "
-                    f"or megatron generation; got {backend!r}"
-                )
+            gpus_per_instance = _inference_gpus_per_instance(master_config)
             nodes_per_instance = (
                 gpus_per_instance + inference_gpus_per_node - 1
             ) // inference_gpus_per_node
@@ -1205,6 +1287,7 @@ def setup_single_controller(
     *,
     processor: Optional[AutoProcessor] = None,
     partition_id: str = "rollout_data",
+    simulator: Optional[SimulatorConfig] = None,
 ) -> tuple[SingleControllerActorArgs, SetupTimingMetrics]:
     """Build the full SC actor args driver-side.
 
@@ -1213,12 +1296,21 @@ def setup_single_controller(
         tokenizer: Tokenizer used by the policy.
         processor: Optional AutoProcessor for VLM paths.
         partition_id: TQ partition the rollout writer + sampler share.
+        simulator: Settings of a simulator run
+            (examples/run_single_controller_simulator.py), or None for a
+            training run. With the ``cpu`` train backend no trainer is built:
+            every node is an inference node, a ``NoOpTrainer`` bootstraps the
+            data plane, and the refit is a ``NoOpWeightSynchronizer``.
 
     Returns:
         A tuple of (pre-built SC actor args, driver-side per-phase timings
         logged by the SC actor).
     """
     validate_single_controller_config(master_config)
+    if simulator is not None:
+        validate_simulator_config(master_config, simulator)
+    no_op_trainer = simulator is not None and simulator.uses_no_op_trainer
+
     generation_config = master_config.policy["generation"]
     # Normalize the optional request count once before partitions/workers start.
     top_logprobs = generation_config.setdefault("top_logprobs", 0)
@@ -1596,7 +1688,10 @@ def setup_single_controller(
     # Checkpointing
     # ==========================
     checkpointer = CheckpointManager(master_config.checkpointing)
-    trainer_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    # No-op trainer runs start fresh even when training checkpoints already exist.
+    trainer_checkpoint_path = (
+        None if no_op_trainer else checkpointer.get_latest_checkpoint_path()
+    )
     loaded_state = cast(
         Optional[dict[str, Any]],
         checkpointer.load_training_info(trainer_checkpoint_path),
@@ -1820,9 +1915,16 @@ def setup_single_controller(
     setup_timing_metrics = SetupTimingMetrics()
 
     # Create clusters
-    train_cluster, inference_cluster, value_cluster, teacher_segment_topology = (
-        _build_clusters(master_config)
-    )
+    if no_op_trainer:
+        # Every node serves generation: there is no trainer to hand GPUs to.
+        train_cluster = None
+        value_cluster = None
+        inference_cluster = _build_inference_only_cluster(master_config)
+        teacher_segment_topology = None
+    else:
+        train_cluster, inference_cluster, value_cluster, teacher_segment_topology = (
+            _build_clusters(master_config)
+        )
     dedicated_value = value_cluster is not None
     colocated = generation_config["colocated"]["enabled"]
     segment_size = master_config.cluster.segment_size
@@ -1830,9 +1932,9 @@ def setup_single_controller(
     # Claim constrained training nodes before unconstrained inference or Gym
     # tasks can consume them. This matters when inference topology alignment
     # falls back while the training cluster remains topology-constrained.
-    if value_cluster is not None:
+    if train_cluster is not None and value_cluster is not None:
         reserve_disjoint_clusters(train_cluster, value_cluster)
-    elif not colocated and segment_size is not None:
+    elif not colocated and segment_size is not None and train_cluster is not None:
         train_cluster.get_placement_groups()
 
     # Claim teacher placement groups before deferred generation starts NeMo-Gym,
@@ -1868,12 +1970,15 @@ def setup_single_controller(
         start_storage_units,
     )
 
-    clusters_by_name: dict[str, RayVirtualCluster] = {
-        "train": train_cluster,
-        "inference": inference_cluster,
-        **({"value": value_cluster} if value_cluster is not None else {}),
-        **{f"teacher:{name}": c for name, c in teacher_clusters.items()},
-    }
+    clusters_by_name: dict[str, RayVirtualCluster] = {}
+    if train_cluster is not None:
+        clusters_by_name["train"] = train_cluster
+    clusters_by_name["inference"] = inference_cluster
+    if value_cluster is not None:
+        clusters_by_name["value"] = value_cluster
+    clusters_by_name.update(
+        {f"teacher:{name}": c for name, c in teacher_clusters.items()}
+    )
     storage_unit_node_ids = plan_storage_unit_nodes(dp_config, clusters_by_name)
 
     # Create build tasks for generation / trainer / (nemo-gym) workers
@@ -1912,6 +2017,9 @@ def setup_single_controller(
             A tuple of (TQPolicy trainer, TQValue critic or None, per-phase wall
             times keyed as "trainer_time" and "value_time").
         """
+        # Only the no-op trainer runs without a training cluster, and it
+        # never calls this builder.
+        assert train_cluster is not None, "building a trainer needs a train cluster"
         nonlocal ppo_group_multiple, ppo_min_remaining_groups
         time_metrics: dict[str, float] = {}
         trainer, time_metrics["trainer_time"] = _build_trainer(
@@ -1960,6 +2068,27 @@ def setup_single_controller(
             value.finish_training()
             trainer.prepare_for_training()
         return trainer, value, time_metrics
+
+    def _build_no_op_trainer() -> tuple[Any, Optional[TQValue], dict[str, float]]:
+        """Build the simulator's trainer stand-in.
+
+        It bootstraps the TransferQueue controller exactly where TQPolicy would,
+        so the connect-only clients built later find it.
+
+        Returns:
+            A tuple of (NoOpTrainer, None, per-phase wall time keyed "trainer_time").
+        """
+        t0 = time.perf_counter()
+        trainer = NoOpTrainer(
+            dp_cfg=dp_config,
+            policy_config=policy_config,
+            storage_unit_node_ids=storage_unit_node_ids,
+        )
+        return trainer, None, {"trainer_time": time.perf_counter() - t0}
+
+    trainer_factory = (
+        _build_no_op_trainer if no_op_trainer else _build_trainer_and_value
+    )
 
     def _build_generation_then_trainer(
         defer_generation_model_load: bool, generation=None
@@ -2126,7 +2255,7 @@ def setup_single_controller(
                 tokenizer=tokenizer,
                 processor=processor,
             )
-        build_tasks["trainer"] = _build_trainer_and_value
+        build_tasks["trainer"] = trainer_factory
 
     # The communicator needs only the trainer and generation: start it when both return, beside Gym's last stretch.
     start_communicator_early = _start_communicator_early(
@@ -2147,16 +2276,25 @@ def setup_single_controller(
         if existing_synchronizer is not None:
             return existing_synchronizer
         t0 = time.perf_counter()
-        new_synchronizer = create_weight_synchronizer(
-            policy=trainer,
-            generation=generation,
-            generation_backend=generation_config["backend"],
-            colocated=colocated,
-            train_cluster=train_cluster,
-            inference_cluster=inference_cluster,
-            refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
-            refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
-        )
+        new_synchronizer: WeightSynchronizer
+        if no_op_trainer:
+            # The engine loads the checkpoint itself, so refit only holds for
+            # the simulated transfer time.
+            assert simulator is not None
+            new_synchronizer = NoOpWeightSynchronizer(
+                refit_time_s=simulator.refit_time_s
+            )
+        else:
+            new_synchronizer = create_weight_synchronizer(
+                policy=trainer,
+                generation=generation,
+                generation_backend=generation_config["backend"],
+                colocated=colocated,
+                train_cluster=train_cluster,
+                inference_cluster=inference_cluster,
+                refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+                refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
+            )
         generation.weight_synchronizer = new_synchronizer
         new_synchronizer.init_communicator()
         elapsed = time.perf_counter() - t0
@@ -2227,7 +2365,9 @@ def setup_single_controller(
                     flush=True,
                 )
                 final_train_iters = _megatron_train_iters(master_config)
-                if final_train_iters != speculative_train_iters:
+                # The no-op trainer has no scheduler horizon, so a clamp changes
+                # nothing for it; rebuilding would only bootstrap TQ twice.
+                if final_train_iters != speculative_train_iters and not no_op_trainer:
                     # Correct but slow: the speculative trainer has the wrong
                     # scheduler horizon, so it is replaced.
                     print(
@@ -2653,6 +2793,7 @@ def setup_single_controller(
         # PPO extras
         value_handle=value,
         value_loss_fn=value_loss_fn,
+        simulator=simulator,
         ppo_group_multiple=ppo_group_multiple,
         ppo_min_remaining_groups=ppo_min_remaining_groups,
     )
