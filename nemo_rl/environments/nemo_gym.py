@@ -599,8 +599,22 @@ def _typed_gym_failure(error: Exception) -> Optional[Exception]:
     status = getattr(error, "status", None)
     if not isinstance(status, int):
         return None
+    raw_content = getattr(error, "response_content", None)
+    if isinstance(raw_content, bytes):
+        response_content = raw_content.decode(errors="replace")
+    elif isinstance(raw_content, str):
+        response_content = raw_content
+    else:
+        response_content = ""
+    # The web agent reports an inner resource-server seed failure as HTTP 422 even
+    # when the seed failed because an external site was temporarily unavailable.
+    # That is infrastructure, not a prompt defect: retrying the missing siblings
+    # after the site recovers is both safe and necessary for long production runs.
+    wrapped_seed_infra = status == 422 and "WebArena seed failed" in response_content
     detail = f"NeMo-Gym /run failed with HTTP {status}: {error}"
-    if http_status_is_infra(status):
+    if wrapped_seed_infra:
+        detail += f"; response={response_content[:1000]}"
+    if http_status_is_infra(status) or wrapped_seed_infra:
         return GymTransportError(detail)
     return RolloutDataFailure(detail)
 
