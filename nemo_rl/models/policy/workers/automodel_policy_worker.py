@@ -37,6 +37,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.automodel.activation_offload import ActivationCpuOffload
 from nemo_rl.models.automodel.checkpoint import (
     AutomodelCheckpointManager,
     build_checkpoint_config,
@@ -627,6 +628,12 @@ class AutomodelPolicyWorkerImpl(
                 "automodel_kwargs.backend.fake_balanced_gate off."
             )
 
+        self._activation_offload = (
+            ActivationCpuOffload(self.model)
+            if config["automodel_cfg"].get("activation_offloading")
+            else None
+        )
+
         # Initialize reference model if requested. With deferred loading the
         # model still holds the base (model_name) weights here, so the KL
         # reference stays anchored to the same policy across resumes.
@@ -788,6 +795,7 @@ class AutomodelPolicyWorkerImpl(
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
                     router_replay_gates=self._router_replay_gates,
+                    activation_offload=self._activation_offload,
                 )
 
                 # Extract losses and metrics from results
@@ -877,6 +885,8 @@ class AutomodelPolicyWorkerImpl(
             # dynamic batch and sequence dims causes alot of fragmentation, so clear
             # the memory allocator before moving on
             torch.cuda.empty_cache()
+            if self._activation_offload is not None:
+                self._activation_offload.empty_host_cache()
 
             # Aggregate training statistics across microbatches and ranks
             metrics = aggregate_training_statistics(

@@ -344,6 +344,16 @@ def validate_and_prepare_config(
 
     # Get other configuration values
     cpu_offload = config["automodel_cfg"]["cpu_offload"]
+    if (
+        config["automodel_cfg"].get("activation_offloading")
+        and not config["automodel_cfg"]["activation_checkpointing"]
+    ):
+        raise ValueError(
+            "automodel_cfg.activation_offloading requires "
+            "automodel_cfg.activation_checkpointing: without checkpointing, every "
+            "intermediate tensor of every layer would be copied to host memory and "
+            "back on each microbatch."
+        )
     offload_optimizer_for_logprob = config.get("offload_optimizer_for_logprob", False)
     max_grad_norm = config["max_grad_norm"]
     enable_seq_packing = config["sequence_packing"]["enabled"]

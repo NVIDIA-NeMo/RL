@@ -145,6 +145,8 @@ policy:
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
+    # Keep each checkpointed block's input in pinned host memory between forward and backward. Requires activation_checkpointing.
+    activation_offloading: false
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
@@ -390,6 +392,8 @@ value:
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: false
+    # Keep each checkpointed block's input in pinned host memory between forward and backward. Requires activation_checkpointing.
+    activation_offloading: false
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null

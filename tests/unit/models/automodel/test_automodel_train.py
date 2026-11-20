@@ -28,6 +28,7 @@ except ImportError:
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.automodel.activation_offload import ActivationCpuOffload
 from nemo_rl.models.automodel.data import (
     ProcessedInputs,
     ProcessedMicrobatch,
@@ -1153,6 +1154,54 @@ class TestForwardWithPostProcessingFn:
         # Verify result shape
         assert result.shape == (batch_size,)
 
+    def test_activation_offload_wraps_only_the_model_forward(
+        self,
+        mock_model,
+        base_cfg,
+    ):
+        batch_size, seq_len = 2, 4
+        input_ids = torch.randint(0, 100, (batch_size, seq_len))
+        processed_inputs = ProcessedInputs(input_ids=input_ids, seq_len=seq_len)
+        processed_mb = ProcessedMicrobatch(
+            data_dict=BatchedDataDict({"input_ids": input_ids}),
+            processed_inputs=processed_inputs,
+            original_batch_size=batch_size,
+            original_seq_len=seq_len,
+        )
+        events = []
+
+        class RecordingOffload:
+            active = False
+
+            def __enter__(self):
+                self.active = True
+
+            def __exit__(self, *args):
+                self.active = False
+                return False
+
+        offload = RecordingOffload()
+
+        def model_call(**kwargs):
+            events.append(("model", offload.active))
+            return MagicMock(logits=torch.randn(batch_size, 1))
+
+        def score(**kwargs):
+            events.append(("post_processing", offload.active))
+            return torch.zeros(batch_size)
+
+        mock_model.side_effect = model_call
+        with patch.object(ScorePostProcessor, "__call__", side_effect=score):
+            forward_with_post_processing_fn(
+                model=mock_model,
+                prepared=_prepare_cp1(mock_model, processed_inputs),
+                post_processing_fn=ScorePostProcessor(cfg=base_cfg),
+                processed_mb=processed_mb,
+                activation_offload=offload,
+            )
+
+        assert events == [("model", True), ("post_processing", False)]
+
     def test_forward_with_score_post_processor_gathers_cp(
         self,
         mock_model,
@@ -1530,6 +1579,70 @@ class TestAutomodelForwardBackward:
 
         mock_replay_context.assert_called_once_with(gates, processed_mb)
         assert events == ["replay_enter", "forward", "backward", "replay_exit"]
+
+    @pytest.mark.parametrize("forward_only", [True, False])
+    @patch("nemo_rl.models.automodel.train.forward_with_post_processing_fn")
+    @patch("nemo_rl.models.automodel.train.prepare_model_forward")
+    def test_forward_backward_offloads_activations_only_when_training(
+        self,
+        mock_prepare_model_forward,
+        mock_forward,
+        forward_only,
+        mock_model,
+        mock_loss_fn,
+        base_cfg,
+        mock_device_mesh,
+        mock_cp_mesh,
+    ):
+        batch_size, seq_len = 2, 8
+        input_ids = torch.randint(0, 100, (batch_size, seq_len))
+        processed_mb = ProcessedMicrobatch(
+            data_dict=BatchedDataDict(
+                {
+                    "input_ids": input_ids,
+                    "input_lengths": torch.full((batch_size,), seq_len),
+                    "sample_mask": torch.ones(batch_size, dtype=torch.bool),
+                }
+            ),
+            processed_inputs=ProcessedInputs(input_ids=input_ids, seq_len=seq_len),
+            original_batch_size=batch_size,
+            original_seq_len=seq_len,
+        )
+        mock_forward.side_effect = lambda **kwargs: (
+            torch.ones(1, requires_grad=True).sum(),
+            {},
+            None,
+        )
+        mock_prepare_model_forward.return_value = PreparedModelForward(
+            model_batch={"input_ids": input_ids},
+            cp_size=1,
+            cp_sharder=None,
+            model_context_factory=nullcontext,
+        )
+        offload = ActivationCpuOffload(torch.nn.Module())
+
+        automodel_forward_backward(
+            model=mock_model,
+            data_iterator=iter([processed_mb, processed_mb]),
+            post_processing_fn=LossPostProcessor(
+                loss_fn=mock_loss_fn,
+                cfg=base_cfg,
+                cp_mesh=mock_cp_mesh,
+                cp_size=1,
+                dp_size=1,
+            ),
+            device_mesh=mock_device_mesh,
+            padding_token_id=0,
+            autocast_context_factory=nullcontext,
+            forward_only=forward_only,
+            global_valid_seqs=torch.tensor(batch_size),
+            global_valid_toks=torch.tensor(batch_size * seq_len),
+            activation_offload=offload,
+        )
+
+        expected = None if forward_only else offload
+        offloads = [c.kwargs["activation_offload"] for c in mock_forward.call_args_list]
+        assert offloads == [expected, expected]
 
     def test_forward_backward_with_on_microbatch_start(
         self,

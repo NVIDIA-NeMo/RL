@@ -28,6 +28,7 @@ from transformers import (
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.automodel.activation_offload import ActivationCpuOffload
 from nemo_rl.models.automodel.checkpoint import (
     AutomodelCheckpointManager,
     build_checkpoint_config,
@@ -222,6 +223,11 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         self.model_config = model_and_optimizer_state.model_config
         self.peft_config = model_and_optimizer_state.peft_config
         self.autocast_enabled = model_and_optimizer_state.autocast_enabled
+        self._activation_offload = (
+            ActivationCpuOffload(self.model)
+            if config["automodel_cfg"].get("activation_offloading")
+            else None
+        )
 
         # Set instance attributes from runtime config. Value workers do not use
         # sampling parameters, but RuntimeConfig still carries the field.
@@ -354,6 +360,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
                     num_global_batches=num_global_batches,
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
+                    activation_offload=self._activation_offload,
                 )
 
                 # Extract losses and metrics from results
@@ -403,6 +410,8 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
                 self.scheduler.step()
             # Clear cache
             torch.cuda.empty_cache()
+            if self._activation_offload is not None:
+                self._activation_offload.empty_host_cache()
 
             # Aggregate training statistics
             metrics = aggregate_training_statistics(

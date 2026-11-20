@@ -211,6 +211,13 @@ class AutomodelConfig(TypedDict):
     # Distributed config options (mirrors Automodel's FSDP2Config)
     sequence_parallel: bool
     activation_checkpointing: bool
+    # Keep the activations that training saves for backward in pinned host memory
+    # between forward and backward. With activation checkpointing that is each
+    # decoder block's input, one [tokens, hidden] tensor per block. Requires
+    # activation_checkpointing. Independent of cpu_offload: parameters, gradients
+    # and optimizer state stay where they are. Costs a device-to-host and a
+    # host-to-device copy of those tensors per microbatch, on the compute stream.
+    activation_offloading: NotRequired[bool]
     cpu_offload: bool
     custom_parallel_plan: NotRequired[str | None]
     defer_fsdp_grad_sync: NotRequired[bool]

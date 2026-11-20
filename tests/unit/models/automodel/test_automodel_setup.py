@@ -169,6 +169,30 @@ class TestValidateAndPrepareConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_activation_offloading_requires_activation_checkpointing(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """Activation offload is rejected without checkpointing and accepted with it."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config["automodel_cfg"]["activation_offloading"] = True
+
+        with pytest.raises(
+            ValueError, match="requires automodel_cfg.activation_checkpointing"
+        ):
+            validate_and_prepare_config(config=mock_config, processor=None, rank=0)
+
+        mock_config["automodel_cfg"]["activation_checkpointing"] = True
+        validate_and_prepare_config(config=mock_config, processor=None, rank=0)
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
     def test_sequence_packing_with_vlm_raises_error(
         self,
         mock_dynamo,
