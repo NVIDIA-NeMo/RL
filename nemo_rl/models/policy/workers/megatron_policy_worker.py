@@ -64,9 +64,17 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
 )
-from nemo_rl.algorithms.loss.interfaces import SEQ_LOGPROB_KEEP_MASK_KEY, LossFunction
+from nemo_rl.algorithms.loss.interfaces import (
+    SEQ_LOGPROB_KEEP_MASK_KEY,
+    LossFunction,
+    get_objective_reduction,
+)
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
-from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
+from nemo_rl.algorithms.loss.utils import (
+    metric_normalizer_scales,
+    rescale_loss_metrics,
+)
+from nemo_rl.algorithms.loss.wrapper import StreamingObjectiveLoss
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
@@ -211,6 +219,55 @@ _SHAPE_PROFILE_LAYOUT = (
     "expert_model_parallel_size",
     "expert_tensor_parallel_size",
 )
+
+
+def _validate_streaming_router_auxiliaries(model_config: Any) -> None:
+    """Reject router losses that need a separate streaming normalization."""
+    # Dense models instantiate no router, even if unused MoE fields remain.
+    if getattr(model_config, "num_moe_experts", None) is None:
+        return
+
+    def nonzero(value: Any) -> bool:
+        if isinstance(value, (list, tuple)):
+            return any(nonzero(item) for item in value)
+        return value is not None and float(value) != 0
+
+    # Mirrors Megatron-LM TopKRouter.get_aux_loss_coeff / is_aux_loss_enabled
+    # (modes gated by the configured balancing type, coefficient > 0) and
+    # apply_z_loss (fires whenever moe_z_loss_coeff is not None), at the pinned
+    # commit 3e95097b. Re-check on a Megatron-LM bump.
+    routing_type = getattr(model_config, "moe_router_load_balancing_type", None)
+    aux_coeff: Any = getattr(model_config, "moe_aux_loss_coeff", 0.0)
+    if isinstance(routing_type, (list, tuple)):
+        if not isinstance(aux_coeff, (list, tuple)) or len(routing_type) != len(
+            aux_coeff
+        ):
+            raise ValueError(
+                "Streaming non-token objective normalization requires matching "
+                "routing-mode and auxiliary-coefficient lists"
+            )
+    active_modes = []
+    for name in ("aux_loss", "seq_aux_loss", "global_aux_loss"):
+        coeff = 0.0
+        if routing_type == name:
+            coeff = aux_coeff
+        elif isinstance(routing_type, (list, tuple)) and name in routing_type:
+            coeff = aux_coeff[routing_type.index(name)]
+        if coeff is not None and float(coeff) > 0:
+            active_modes.append(name)
+    if active_modes:
+        raise ValueError(
+            "Streaming non-token objective normalization requires zero active MoE auxiliary losses; "
+            f"modes={active_modes}, moe_aux_loss_coeff={aux_coeff!r}; "
+            "auxiliary gradients use a different denominator"
+        )
+    # Router z-loss is independent of the load-balancing mode. A zero
+    # coefficient may still create a tracker, but contributes no gradient.
+    if nonzero(getattr(model_config, "moe_z_loss_coeff", None)):
+        raise ValueError(
+            "Streaming non-token objective normalization requires moe_z_loss_coeff=0; "
+            "auxiliary gradients use a different denominator"
+        )
 
 
 def _should_use_router_replay(
@@ -1418,6 +1475,8 @@ class MegatronPolicyWorkerImpl(
                 loss_fn.metric_normalizations,
                 token_factor=token_factor,
                 sequence_factor=sequence_factor,
+                # The gradient was rescaled by token_factor above.
+                loss_divisor_factor=token_factor,
             )
             for m in metrics
         ]
@@ -1923,21 +1982,25 @@ class MegatronPolicyWorkerImpl(
         mtp_detach_heads = bool(getattr(model_config, "mtp_detach_heads", False))
         mtp_loss_scaling_factor = getattr(model_config, "mtp_loss_scaling_factor", 0.1)
         loss_type = getattr(loss_fn, "loss_type", LossType.TOKEN_LEVEL)
+        objective_reduction = get_objective_reduction(loss_fn)
+        non_token_normalization = not objective_reduction.token_normalized
+        if non_token_normalization:
+            _validate_streaming_router_auxiliaries(model_config)
 
         # MTP is a token-summed auxiliary loss and therefore always needs the
-        # valid-token denominator. Under a sequence-level main loss, the split
-        # path can apply that distinct denominator only when mcore has isolated
+        # valid-token denominator. When the main objective uses another
+        # denominator, the split path can apply that denominator only when mcore has isolated
         # and tagged the detached MTP parameters. Attached-head gradients are
         # already mixed into the backbone and cannot be corrected after the
         # global counts become available at finish.
         if (
             mtp_enabled
             and mtp_loss_scaling_factor != 0
-            and loss_type != LossType.TOKEN_LEVEL
+            and non_token_normalization
             and not mtp_detach_heads
         ):
             raise ValueError(
-                "MTP with a nonzero loss weight and sequence-level loss requires "
+                "MTP with a nonzero loss weight and non-token objective normalization requires "
                 "policy.megatron_cfg.mtp_detach_heads=True on the SingleController "
                 "split training path because the MTP auxiliary gradient must be "
                 "normalized by valid tokens independently of the main loss. "
@@ -1948,6 +2011,10 @@ class MegatronPolicyWorkerImpl(
         return {
             "loss_fn": loss_fn,
             "loss_type": loss_type,
+            "objective_reduction": objective_reduction,
+            "local_objective_denominator": torch.zeros(
+                (), dtype=torch.float64, device="cuda"
+            ),
             "metric_normalizations": metric_normalizations,
             "mtp_enabled": mtp_enabled,
             "mtp_detach_heads": mtp_detach_heads,
@@ -2178,18 +2245,18 @@ class MegatronPolicyWorkerImpl(
         # call process_global_batch directly because it eagerly all_reduces
         # the local sums, which is exactly what we're trying to defer.
         assert "sample_mask" in data, "sample_mask required on microbatch data"
-        sample_mask = data["sample_mask"]
-        call_local_seqs = torch.sum(sample_mask).to(torch.float64)
-        if "token_mask" in data:
-            token_mask = data["token_mask"]
-            call_local_toks = torch.sum(
-                token_mask[:, 1:] * sample_mask.unsqueeze(-1)
-            ).to(torch.float64)
-        else:
-            call_local_toks = call_local_seqs * data["input_ids"].shape[1]
+        # Reuse one row-length reduction for diagnostics and the objective,
+        # before packing/CP; only DP partitions these full response rows.
+        objective_reduction = state["objective_reduction"]
+        call_local_seqs, call_local_toks, call_objective_denominator = (
+            objective_reduction.local_counts(data)
+        )
+        if objective_reduction.requires_explicit_denominator:
+            loss_fn = StreamingObjectiveLoss(loss_fn)
 
         state["local_valid_seqs"] = state["local_valid_seqs"] + call_local_seqs
         state["local_valid_toks"] = state["local_valid_toks"] + call_local_toks
+        state["local_objective_denominator"] += call_objective_denominator
 
         # Match the synchronous Megatron path: derive the mask on the worker
         # immediately before microbatch processing so sequence packing applies
@@ -2365,8 +2432,6 @@ class MegatronPolicyWorkerImpl(
         return result
 
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
-        from nemo_rl.algorithms.loss.interfaces import LossType
-
         # Recover policy and draft counts with one existing DP collective.
         # The draft slice is length-1 while the step is active and empty
         # otherwise, so every rank in the DP group has to agree on
@@ -2380,13 +2445,16 @@ class MegatronPolicyWorkerImpl(
         if in_loss_filter:
             # Chunks backpropagated unnormalized survivor sums, so divide by the
             # survivor counts. Metrics are already on every PP stage; reduce DP only.
-            policy_counts = _local_survivor_counts(
+            seq_and_tok_counts = _local_survivor_counts(
                 state["all_mb_metrics"], state["local_valid_toks"].device
             )
         else:
-            policy_counts = torch.stack(
+            seq_and_tok_counts = torch.stack(
                 [state["local_valid_seqs"], state["local_valid_toks"]]
             ).to(torch.float64)
+        policy_counts = torch.cat(
+            [seq_and_tok_counts, state["local_objective_denominator"].reshape(1)]
+        )
         to_reduce = torch.cat(
             [
                 policy_counts,
@@ -2398,14 +2466,16 @@ class MegatronPolicyWorkerImpl(
         )
         global_valid_seqs = to_reduce[0]
         global_valid_toks = to_reduce[1]
-        draft_step_state.set_global_counts(to_reduce[2:])
+        draft_step_state.set_global_counts(to_reduce[policy_counts.numel() :])
         if in_loss_filter:
             _raise_if_no_survivors(global_valid_toks)
 
-        if state["loss_type"] == LossType.TOKEN_LEVEL:
-            n_true = global_valid_toks
-        else:
-            n_true = global_valid_seqs
+        # Under in-loss filtering the token and sequence counts are survivors.
+        n_true = state["objective_reduction"].loss_divisor(
+            global_valid_toks=global_valid_toks,
+            global_valid_seqs=global_valid_seqs,
+            global_objective_denominator=to_reduce[2],
+        )
         n_safe = n_true if n_true.item() > 0 else torch.ones_like(n_true)
         gradient_scale = n_safe.reciprocal()
         inv_n = float(gradient_scale.item())
@@ -2422,7 +2492,7 @@ class MegatronPolicyWorkerImpl(
             )
         # The uniform rescale gives MTP the main loss's denominator. Correct
         # detached, MTP-tagged parameters back to the valid-token denominator
-        # used by the synchronous path. For token-level loss the factor is 1.
+        # used by the synchronous path. For global-token loss the factor is 1.
         # This runs before gradient reduction; scaling and reduction are linear.
         if state["mtp_enabled"] and state["mtp_detach_heads"]:
             self._scale_mtp_param_grads(
@@ -2578,8 +2648,12 @@ class MegatronPolicyWorkerImpl(
             if global_valid_seqs.item() > 0
             else torch.tensor(1.0, device="cuda")
         )
-        inv_toks = float((1.0 / n_toks_safe).item())
-        inv_seqs = float((1.0 / n_seqs_safe).item())
+        scales = metric_normalizer_scales(
+            state["objective_reduction"],
+            global_valid_toks=n_toks_safe,
+            global_valid_seqs=n_seqs_safe,
+            global_objective_denominator=n_safe,
+        )
 
         from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 
@@ -2589,17 +2663,15 @@ class MegatronPolicyWorkerImpl(
             """Apply the loss-advertised per-metric denominator.
 
             Metrics the loss did not advertise fall back to the gradient
-            normalization (the ``loss_type`` denominator).
+            normalization (the objective denominator).
             """
             kind = metric_normalizations.get(name)
             if kind is MetricNormalizer.NONE:
                 return value
-            if kind is MetricNormalizer.TOKENS:
-                scale = inv_toks
-            elif kind is MetricNormalizer.SEQUENCES:
-                scale = inv_seqs
-            else:  # not advertised → same as gradient normalization
+            if kind is None:  # not advertised → same as gradient normalization
                 scale = inv_n
+            else:
+                scale = scales[kind]
             return (
                 value.detach() * scale
                 if isinstance(value, torch.Tensor)
