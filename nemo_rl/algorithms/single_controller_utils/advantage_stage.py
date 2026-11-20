@@ -85,6 +85,7 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.schema import (
+    AGENT_NAME_TAG,
     DP_TRAIN_FIELDS,
     INPUT_IDS,
     INPUT_LENGTHS,
@@ -115,11 +116,6 @@ def _train_fields_for_step(
     if sampler_head_required:
         fields += SAMPLER_TOPK_FIELDS
     return fields
-
-
-# Row tag naming the NeMo-Gym agent of the row's prompt group; the rollout
-# finalizer stamps it when grpo.agent_overrides is set.
-AGENT_NAME_TAG = "agent_name"
 
 
 def agent_override_rows(

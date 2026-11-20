@@ -378,18 +378,20 @@ _REWARD_PENALTY_FLAGS = (
 
 
 class AgentOverrideConfig(BaseModel, extra="forbid"):
-    """Per-environment GRPO settings for one NeMo-Gym agent (``grpo.agent_overrides``).
+    """Per-environment GRPO settings for one attribution key (``grpo.agent_overrides``).
 
-    An unset field (None) inherits the run-wide value. Applied by the
-    SingleController advantage stage to the rows of that agent's prompt groups,
-    so a multi-environment run can treat e.g. a judge-graded environment
-    differently from pass/fail ones.
+    The key is the rows' attribution key, as in ``grpo.length_penalty.agent_overrides``:
+    the NeMo-Gym agent name for flat rows, the ``task_id.taskset`` for materialized
+    task rows. An unset field (None) inherits the run-wide value. Applied by the
+    SingleController advantage stage to the rows of that key's prompt groups, so a
+    multi-environment run can treat e.g. a judge-graded environment differently
+    from pass/fail ones.
     """
 
-    # Overrides grpo.overlong_filtering: True leaves this agent's truncated rows
-    # out of the loss, False trains them at their reward.
+    # Overrides grpo.overlong_filtering: True leaves this environment's truncated
+    # rows out of the loss, False trains them at their reward.
     overlong_filtering: Optional[bool] = None
-    # Overrides grpo.adv_estimator.normalize_rewards: whether this agent's
+    # Overrides grpo.adv_estimator.normalize_rewards: whether this environment's
     # group advantages are divided by the group's reward standard deviation.
     normalize_rewards: Optional[bool] = None
 
@@ -441,9 +443,11 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
     async_grpo: AsyncGRPOConfig | None = Field(default_factory=AsyncGRPOConfig)
     overlong_filtering: bool = False
-    # Per-environment settings keyed by NeMo-Gym agent name (the rows'
-    # attribution key, e.g. rubric_judge_agent); see AgentOverrideConfig.
-    # SingleController path only: the legacy ``setup()`` rejects it.
+    # Per-environment settings keyed by the rows' attribution key, as in
+    # grpo.length_penalty.agent_overrides: the Gym agent name for flat rows
+    # (e.g. rubric_judge_agent), the task_id.taskset for materialized task rows
+    # (e.g. "rubric_judge:train"). See AgentOverrideConfig.
+    # SingleController with token capture only: the legacy ``setup()`` rejects it.
     agent_overrides: dict[str, AgentOverrideConfig] | None = None
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
@@ -486,11 +490,14 @@ class GRPOConfig(BaseModel, extra="allow"):
             return self
         if not overrides:
             raise ValueError(
-                "grpo.agent_overrides must name at least one agent (or be null)"
+                "grpo.agent_overrides must name at least one attribution key "
+                "(or be null)"
             )
         for agent, override in overrides.items():
             if not isinstance(agent, str) or not agent:
-                raise ValueError("grpo.agent_overrides keys must be agent names")
+                raise ValueError(
+                    "grpo.agent_overrides keys must be non-empty attribution keys"
+                )
             if (
                 override.overlong_filtering is None
                 and override.normalize_rewards is None
@@ -506,6 +513,19 @@ class GRPOConfig(BaseModel, extra="allow"):
                 raise ValueError(
                     f"grpo.agent_overrides.{agent}.normalize_rewards needs "
                     f"grpo.adv_estimator.name 'grpo', got {self.adv_estimator.name!r}"
+                )
+            if (
+                override.overlong_filtering not in (None, self.overlong_filtering)
+                and self.use_dynamic_sampling
+                and self.masked_reward_policy == "exclude"
+            ):
+                # Dynamic sampling picks its voters with the run-wide
+                # overlong_filtering, so it would keep or drop this key's
+                # groups by the wrong rows.
+                raise ValueError(
+                    f"grpo.agent_overrides.{agent}.overlong_filtering differs from "
+                    "grpo.overlong_filtering, which grpo.use_dynamic_sampling with "
+                    "masked_reward_policy 'exclude' does not support"
                 )
         return self
 
@@ -929,6 +949,13 @@ def setup(
             "silently train the sampled-token top-k objective instead of the "
             "full-vocabulary reverse KL."
         )
+    if grpo_config.agent_overrides:
+        raise NotImplementedError(
+            "grpo.agent_overrides is applied by the SingleController advantage "
+            "stage (examples/run_grpo_single_controller.py); this path does not "
+            "apply it. Use the run-wide grpo.overlong_filtering / "
+            "grpo.adv_estimator.normalize_rewards here, or the SingleController path."
+        )
 
     # Set seed for all random number generators
     set_seed(grpo_config.seed)
@@ -1141,13 +1168,6 @@ def setup(
     _raise_if_length_penalty_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
-    if master_config.grpo.agent_overrides:
-        raise NotImplementedError(
-            "grpo.agent_overrides is applied by the SingleController advantage "
-            "stage (examples/run_grpo_single_controller.py); this path does not "
-            "apply it. Use the run-wide grpo.overlong_filtering / "
-            "grpo.adv_estimator.normalize_rewards here, or the SingleController path."
-        )
     nemo_gym_actor = None
 
     def _spinup_nemo_gym(base_urls, model_name, policy_api_key=None):

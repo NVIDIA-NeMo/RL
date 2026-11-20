@@ -60,7 +60,7 @@ def test_agent_override_leaves_unset_fields_to_the_run():
 
 
 def test_agent_overrides_reject_empty_mapping():
-    with pytest.raises(ValidationError, match="at least one agent"):
+    with pytest.raises(ValidationError, match="at least one attribution key"):
         GRPOConfig(agent_overrides={})
 
 
@@ -80,6 +80,36 @@ def test_agent_overrides_normalize_needs_grpo_estimator():
             adv_estimator={"name": "gdpo"},
             agent_overrides={GRADED: {"normalize_rewards": False}},
         )
+
+
+@pytest.mark.parametrize("run_wide", [False, True])
+def test_agent_overrides_reject_a_differing_overlong_flag_under_exclude_dynamic_sampling(
+    run_wide,
+):
+    with pytest.raises(ValidationError, match="masked_reward_policy 'exclude'"):
+        GRPOConfig(
+            overlong_filtering=run_wide,
+            use_dynamic_sampling=True,
+            masked_reward_policy="exclude",
+            agent_overrides={GRADED: {"overlong_filtering": not run_wide}},
+        )
+
+
+def test_agent_overrides_allow_the_run_wide_overlong_flag_or_include_policy():
+    # Repeating the run-wide value is harmless under exclude.
+    GRPOConfig(
+        overlong_filtering=True,
+        use_dynamic_sampling=True,
+        masked_reward_policy="exclude",
+        agent_overrides={GRADED: {"overlong_filtering": True}},
+    )
+    # Under include neither side drops truncated rows from the vote.
+    GRPOConfig(
+        overlong_filtering=False,
+        use_dynamic_sampling=True,
+        masked_reward_policy="include",
+        agent_overrides={GRADED: {"overlong_filtering": True}},
+    )
 
 
 # ---- per-row switches from row tags --------------------------------------------------------------

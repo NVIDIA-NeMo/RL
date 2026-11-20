@@ -1530,6 +1530,59 @@ class TestAgentOverrides:
         assert metrics["num_masked_seqs_by_overlong_filtering"] == 1
         assert metrics["num_rows_without_agent_tag"] == 0
 
+    def test_overrides_with_the_opposite_run_wide_settings(self) -> None:
+        """The reverse direction: the run filters and does not normalize; one agent
+        turns both the other way, and the unlisted agent keeps the run's values."""
+        half = NUM_GROUPS // 2 * GROUP_SIZE
+        _, mixed_adv, mixed_mask = self._run(
+            self._algo(
+                overlong=True,
+                normalize=False,
+                overrides={
+                    self.OTHER: {"overlong_filtering": False, "normalize_rewards": True}
+                },
+            ),
+            self._meta(),
+        )
+        _, graded_adv, graded_mask = self._run(
+            self._algo(overlong=True, normalize=False), self._meta()
+        )
+        _, other_adv, other_mask = self._run(
+            self._algo(overlong=False, normalize=True), self._meta()
+        )
+        torch.testing.assert_close(mixed_adv[:half], graded_adv[:half])
+        torch.testing.assert_close(mixed_mask[:half], graded_mask[:half])
+        torch.testing.assert_close(mixed_adv[half:], other_adv[half:])
+        torch.testing.assert_close(mixed_mask[half:], other_mask[half:])
+        assert mixed_mask[1].item() == 0.0
+        assert mixed_mask[3 * GROUP_SIZE + 2].item() == 1.0
+
+    def test_per_agent_counts_cover_only_rows_overlong_filtering_masked(self) -> None:
+        """Each agent's count holds only its own rows, and a row the rollout already
+        masked stays in num_masked_seqs_by_loss_multiplier."""
+        algo = self._algo(
+            overlong=False,
+            normalize=True,
+            overrides={
+                self.GRADED: {"overlong_filtering": True},
+                self.OTHER: {"overlong_filtering": True},
+            },
+        )
+        rows = self._rows()
+        rows["s2"]["truncated"] = torch.tensor(True)
+        rows["s2"]["sample_mask"] = torch.tensor(0.0)
+        computer = AdvantageComputer(
+            _RowStore(rows),
+            config=_config(algo=algo),
+            advantage_estimator=GRPOAdvantageEstimator(algo.adv_estimator, None),
+        )
+        outcome = asyncio.run(computer.run(AdvantageRequest(meta=self._meta())))
+        metrics = outcome.sample_mask_metrics
+        assert metrics[f"num_masked_seqs_by_overlong_filtering/{self.GRADED}"] == 1
+        assert metrics[f"num_masked_seqs_by_overlong_filtering/{self.OTHER}"] == 1
+        assert metrics["num_masked_seqs_by_overlong_filtering"] == 2
+        assert metrics["num_masked_seqs_by_loss_multiplier"] == 1
+
     def test_untagged_rows_keep_the_run_wide_settings(self) -> None:
         algo = self._algo(
             overlong=False,

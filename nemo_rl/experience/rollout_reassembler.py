@@ -52,6 +52,7 @@ from nemo_rl.data.captured_media import (
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
+    AGENT_NAME_TAG,
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
@@ -1484,7 +1485,7 @@ class RolloutReassembler:
                     else None
                 ) or group_agent
                 if name is not None:
-                    tag["agent_name"] = name
+                    tag[AGENT_NAME_TAG] = name
         _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
         _put_t0 = time.perf_counter()
         self._call_dp(

@@ -740,6 +740,30 @@ grpo:
 
 Set `overlong_filtering` to true when training on tasks where truncation at the maximum sequence length is expected, such as long-form reasoning or mathematical proofs.
 
+#### Per-Environment Settings
+
+In a multi-environment NeMo-Gym run, `grpo.agent_overrides` sets `overlong_filtering` and `adv_estimator.normalize_rewards` for one environment's rows. Unset fields inherit the run-wide value, and environments without an entry keep the run-wide values.
+
+```yaml
+grpo:
+  overlong_filtering: false                 # run-wide
+  adv_estimator: {normalize_rewards: true}  # run-wide
+  agent_overrides:
+    rubric_judge_agent:
+      overlong_filtering: true   # this environment's truncated rows leave the loss
+      normalize_rewards: false   # no division by the group's reward std
+```
+
+| Field | Replaces |
+|---|---|
+| `overlong_filtering` | `grpo.overlong_filtering` |
+| `normalize_rewards` | `grpo.adv_estimator.normalize_rewards` (needs `adv_estimator.name: grpo`) |
+
+- **Key.** Each key is the rows' attribution key, the same key as `grpo.length_penalty.agent_overrides`: the NeMo-Gym agent name for flat rows, and the `task_id.taskset` for materialized task rows (see [NeMo Gym integration](../design-docs/nemo-gym-integration.md)). Use the name that appears in the `<name>/reward/*` metrics. A key that matches no row is ignored. Keys that contain `:` must be set in YAML, not as a Hydra command-line override.
+- **Where it works.** SingleController with `token_capture.enabled: true` only, because the token-capture finalizer tags each row with its key. The SingleController config validation rejects it without token capture, and the legacy `setup()` rejects it.
+- **Dynamic sampling.** With `use_dynamic_sampling: true` and `masked_reward_policy: exclude`, an `overlong_filtering` override must equal the run-wide value, because dynamic sampling votes with the run-wide flag.
+- **Metrics.** `num_masked_seqs_by_overlong_filtering/<key>` counts each configured key's rows that overlong filtering removed, and `num_rows_without_agent_tag` counts rows that fell back to the run-wide values (expected 0). Forest runs (`token_capture.forest_training`) do not log these two metrics.
+
 #### Advantage Clipping
 
 After advantage normalization, per-token advantages can become very large when the per-prompt reward standard deviation is small. The optional `advantage_clip_low` and `advantage_clip_high` parameters clamp normalized advantages to a bounded range before policy training.

@@ -2657,11 +2657,9 @@ def setup_single_controller(
                     ),
                     thinking_tags=thinking_tags,
                     top_logprobs=master_config.policy["generation"]["top_logprobs"],
-                    # getattr: PPO's config has no agent_overrides field.
-                    stamp_agent_names=bool(
-                        getattr(master_config.grpo, "agent_overrides", None)
-                        if master_config.grpo is not None
-                        else None
+                    stamp_agent_names=(
+                        master_config.grpo is not None
+                        and bool(master_config.grpo.agent_overrides)
                     ),
                 ),
                 num_workers=token_capture_cfg.num_reassembler_workers,
