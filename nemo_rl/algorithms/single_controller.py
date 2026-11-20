@@ -5483,6 +5483,11 @@ class SingleControllerActor:
                     self._train_steps if self._train_data_dump is not None else None
                 ),
                 policy_logprobs_required=policy_logprobs_required,
+                trainer_version=(
+                    self._trainer_version
+                    if self._advantage_stage_config.log_group_rewards
+                    else None
+                ),
             )
             for shard in (shards if shards is not None else [meta])
         ]

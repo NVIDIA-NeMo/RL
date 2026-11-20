@@ -570,6 +570,10 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_buffered_rollouts: int = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
+    # Print one ``GROUP_REWARDS`` line per prompt group from the advantage stage
+    # (trainer version, dataset prompt index, sorted rollout rewards), so each
+    # task's training reward can be followed over a run.
+    log_group_rewards: bool = False
     # CPU actors that run the advantage stage. 0 keeps it in the controller
     # process, which is the historical behaviour and is correct, but it both
     # holds a whole cohort's advantage inputs in the controller's heap and
@@ -1088,7 +1092,13 @@ def validate_forest_objective(
     unsupported = {
         f"{section}.adv_estimator.name": algo_cfg.adv_estimator.name
         != ("gae" if is_ppo else "grpo"),
-        "loss_fn.normalization": loss.resolved_normalization != "global_token_mean",
+        # group_token_mean weighs dispatch groups, which only GRPO has.
+        "loss_fn.normalization": loss.resolved_normalization
+        not in (
+            ("global_token_mean",)
+            if is_ppo
+            else ("global_token_mean", "group_token_mean")
+        ),
         "loss_fn.sequence_level_importance_ratios": loss.sequence_level_importance_ratios,
         "loss_fn.truncated_importance_sampling_type": loss.truncated_importance_sampling_type
         == "seq-mask-tis",
