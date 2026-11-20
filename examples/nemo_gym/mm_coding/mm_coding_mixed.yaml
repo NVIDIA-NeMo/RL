@@ -1,8 +1,8 @@
-# Mixed coding harness routes share the single recipe's Super VL learner and reward.
+# Mixed coding harness routes share the single recipe's Megatron learner and reward.
 defaults: mm_coding_multi.yaml
 
 checkpointing:
-  checkpoint_dir: results/grpo-super35-mm-coding-mixed
+  checkpoint_dir: results/grpo-mm-coding-mixed
 
 # A multi-turn history can retain the reference and several preview images.
 policy:
@@ -19,6 +19,6 @@ env:
     - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
 
 logger:
-  log_dir: logs/grpo-super35-mm-coding-mixed
+  log_dir: logs/grpo-mm-coding-mixed
   wandb:
-    name: super35-mm-coding-mixed-acceptance
+    name: mm-coding-mixed-acceptance

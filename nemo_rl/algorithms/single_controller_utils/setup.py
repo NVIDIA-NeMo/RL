@@ -1451,11 +1451,11 @@ def setup_single_controller(
                 "VLM token capture supports the Nemotron Omni and Pixtral (Mistral3) "
                 f"processors; got {type(processor).__name__}"
             )
-        if media_family == "pixtral" and policy_config["megatron_cfg"]["enabled"]:
-            raise ValueError(
-                "Pixtral (Mistral3) media capture has no learner yet for Megatron"
-            )
-        if media_family == "omni" and not policy_config["megatron_cfg"]["enabled"]:
+        if media_family == "pixtral":
+            # The vLLM worker captures Pixtral images, but no learner reads that
+            # captured layout yet.
+            raise ValueError("Pixtral (Mistral3) media capture has no learner yet")
+        if not policy_config["megatron_cfg"]["enabled"]:
             raise ValueError(
                 "Omni media token capture currently requires the Megatron learner"
             )

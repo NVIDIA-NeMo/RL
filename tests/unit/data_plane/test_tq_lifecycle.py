@@ -585,7 +585,11 @@ def test_smoke_round_trip(tq_client) -> None:
     tq_client.clear_samples(sample_ids=None, partition_id="smoke")
 
 
-def test_registering_live_partition_preserves_typed_rows_through_real_client(tq_client):
+def test_registering_live_partition_preserves_typed_rows_through_real_client(
+    tq_client, monkeypatch
+):
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
     partition = "schema-restored-live"
     keys = ["typed-row"]
     original = TensorDict(
@@ -593,6 +597,8 @@ def test_registering_live_partition_preserves_typed_rows_through_real_client(tq_
         batch_size=[1],
     )
     tq_client.put_samples(keys, partition, fields=original)
+    puts = MagicMock(wraps=tq_adapter.tq.kv_batch_put)
+    monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", puts)
     # Both clients have no warmed-field cache, as happens after native restore
     # and when the learner client is deserialized into another process.
     for client in [tq_client, pickle.loads(pickle.dumps(tq_client))]:
@@ -601,6 +607,10 @@ def test_registering_live_partition_preserves_typed_rows_through_real_client(tq_
         assert torch.equal(actual["ids"], original["ids"])
         assert torch.equal(actual["keep"], original["keep"])
         assert client.list_sample_ids(partition) == keys
+    assert all(
+        {"ids", "keep"}.isdisjoint(call.kwargs["fields"].keys())
+        for call in puts.call_args_list
+    ), "Registration must not send placeholders for existing typed columns"
     tq_client.clear_samples(None, partition)
 
 

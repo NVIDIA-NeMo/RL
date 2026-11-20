@@ -1,14 +1,14 @@
+# Compose onto the operator's validated model/runtime/parallelism configuration.
 defaults:
 - ../../configs/grpo_math_1B_megatron_single_controller.yaml
-- workplace_assistant_automodel.yaml
+- ${oc.env:MM_CODING_BASE_CONFIG}
 grpo:
   async_grpo: null
-  num_prompts_per_step: 4
-  max_num_steps: 3
+  deduplicate_multimodal_data: false
   val_at_start: false
   val_period: 0
 checkpointing:
-  checkpoint_dir: results/grpo-super35-mm-coding-single
+  checkpoint_dir: results/grpo-mm-coding-single
   metric_name: null
   save_period: 1
   save_data_plane: true
@@ -16,15 +16,17 @@ token_capture:
   enabled: true
 policy:
   is_vlm: true
-  train_global_batch_size: 64
+  megatron_cfg:
+    enabled: true
   automodel_cfg:
-    context_parallel_size: 1
+    enabled: false
   generation:
+    backend: vllm
+    max_new_tokens: ${oc.decode:${oc.env:MM_CODING_MAX_NEW_TOKENS}}
     vllm_kwargs:
       limit_mm_per_prompt:
         image: 2
 data:
-  _override_: true
   max_input_seq_length: null
   shuffle: true
   num_workers: 0
@@ -61,8 +63,8 @@ env:
             enable_thinking: true
             truncate_history_thinking: false
 logger:
-  log_dir: logs/grpo-super35-mm-coding-single
+  log_dir: logs/grpo-mm-coding-single
   wandb_enabled: false
   wandb:
     project: visual-coding
-    name: super35-mm-coding-single-acceptance
+    name: mm-coding-single-acceptance

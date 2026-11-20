@@ -17,6 +17,8 @@
 set -euo pipefail
 umask 077
 
+: "${MM_CODING_BASE_CONFIG:?Provide an absolute path to the validated Megatron/vLLM base config}"
+: "${MM_CODING_MAX_NEW_TOKENS:?Set the output budget used to prepare the rows}"
 : "${MM_CODING_TRAIN_DATA:?Provide the approved training split}"
 : "${MM_CODING_VALIDATION_DATA:?Provide the disjoint validation split}"
 : "${MM_CODING_REFERENCE_ROOT:?Provide the original image root}"
@@ -49,11 +51,11 @@ if [[ -e "${checkpoint_dir}" || -L "${checkpoint_dir}" ]]; then
 fi
 mkdir -p -- "$(dirname -- "${checkpoint_dir}")"
 mkdir -- "${checkpoint_dir}"
-uv run --no-sync python examples/nemo_gym/nemotron-3.5-super-vl/check_mm_coding_runtime.py \
-    --mode "${mode}" > "${output}/runtime-check.json"
+uv run --no-sync python examples/nemo_gym/mm_coding/check_mm_coding_runtime.py \
+    --mode "${mode}" --config "examples/nemo_gym/mm_coding/mm_coding_${mode}.yaml" > "${output}/runtime-check.json"
 common=(
     examples/run_grpo_single_controller.py
-    --config "examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_${mode}.yaml"
+    --config "examples/nemo_gym/mm_coding/mm_coding_${mode}.yaml"
     "checkpointing.checkpoint_dir=${checkpoint_dir}"
     checkpointing.enabled=true
     checkpointing.save_period=1
@@ -67,9 +69,21 @@ common=(
 # These are separate interpreter/driver processes. Both phases use the same split and checkpoint root.
 uv run --no-sync python "${common[@]}" \
     "grpo.max_num_steps=${save_steps}" "logger.log_dir=${output}/save" > "${output}/save.log" 2>&1
-test -d "${checkpoint_dir}/step_${save_steps}/policy/weights"
-test -d "${checkpoint_dir}/step_${save_steps}/policy/optimizer"
+# Use the native inspector: Megatron embeds optimizer state in its weights checkpoint.
+uv run --no-sync python - "${checkpoint_dir}/step_${save_steps}" <<'CHECKPOINT'
+import sys
+from nemo_rl.utils.checkpoint import CheckpointManager
+weights, optimizer = CheckpointManager.get_resume_paths(sys.argv[1])
+assert weights is not None and weights.is_dir(), "Missing policy weights"
+assert optimizer is not None, "Missing native optimizer state"
+CHECKPOINT
 uv run --no-sync python "${common[@]}" \
     "grpo.max_num_steps=${resume_steps}" "logger.log_dir=${output}/resume" > "${output}/resume.log" 2>&1
-test -d "${checkpoint_dir}/step_${resume_steps}/policy/optimizer"
+uv run --no-sync python - "${checkpoint_dir}/step_${resume_steps}" <<'CHECKPOINT'
+import sys
+from nemo_rl.utils.checkpoint import CheckpointManager
+weights, optimizer = CheckpointManager.get_resume_paths(sys.argv[1])
+assert weights is not None and weights.is_dir(), "Missing resumed policy weights"
+assert optimizer is not None, "Missing resumed native optimizer state"
+CHECKPOINT
 echo "${mode}: save and resume processes exited successfully; inspect native restore, update and data-cursor evidence."

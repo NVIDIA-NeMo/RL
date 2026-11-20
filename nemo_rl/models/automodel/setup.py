@@ -74,10 +74,7 @@ from nemo_rl.models.automodel.router_replay import (
     require_automodel_moe_model,
     validate_automodel_router_replay_config,
 )
-from nemo_rl.models.automodel.utils import (
-    move_model_buffers_to_device,
-    resolve_model_class,
-)
+from nemo_rl.models.automodel.utils import resolve_model_class
 from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import (
@@ -996,7 +993,8 @@ def setup_model_and_optimizer(
     # CPU offload if needed
     if cpu_offload:
         # Move buffers to CPU for FSDP modules
-        move_model_buffers_to_device(model, "cpu")
+        for v in model.buffers():
+            v.data = v.data.to("cpu")
         model = model.to("cpu")
 
     # Build the DSpark draft model before optimizer construction so its params

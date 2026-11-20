@@ -24,9 +24,9 @@ from PIL import Image
 from pydantic import ValidationError
 
 ROOT = Path(__file__).resolve().parents[3]
-EXAMPLE = ROOT / "examples/nemo_gym/nemotron-3.5-super-vl"
+EXAMPLE = ROOT / "examples/nemo_gym/mm_coding"
 spec = importlib.util.spec_from_file_location(
-    "prepare_mm_coding_single", EXAMPLE / "prepare_mm_coding_single.py"
+    "prepare_mm_coding", EXAMPLE / "prepare_mm_coding.py"
 )
 assert spec is not None and spec.loader is not None
 adapter = importlib.util.module_from_spec(spec)
@@ -98,7 +98,9 @@ def test_adapter_rejects_eval_split_and_outside_root(tmp_path: Path) -> None:
 def test_single_rows_materialize_without_eval_indexes_or_cross_benchmark_collisions(
     tmp_path: Path,
 ) -> None:
-    materialize = pytest.importorskip("nemo_gym.data.task_materialization").materialize_task
+    materialize = pytest.importorskip(
+        "nemo_gym.data.task_materialization"
+    ).materialize_task
     from nemo_gym.server_runtime import SingleAgentTurnTaskInput
 
     image = tmp_path / "reference.png"
@@ -331,7 +333,7 @@ def test_runtime_guard_detects_missing_session_api(monkeypatch):
     monkeypatch.setattr(guard.importlib.util, "find_spec", find)
     assert guard.check_runtime() == ["nemo_gym.server_runtime.sandbox_lending"]
     monkeypatch.setattr("sys.argv", ["check_mm_coding_runtime"])
-    with pytest.raises(SystemExit, match="stock RL Gym pin"):
+    with pytest.raises(SystemExit, match="Check the RL Gym pin"):
         guard.main()
 
 
@@ -425,3 +427,95 @@ def test_deferred_harness_cannot_silently_become_opencode(tmp_path, harness):
         )
     with pytest.raises(ValueError, match="unique supported harnesses"):
         adapter.select_route(task, mode="multi", harnesses=(harness,))
+
+
+@pytest.mark.parametrize("selected", ["single", "opencode"])
+def test_training_reader_and_processor_preserve_materialized_rows(tmp_path, selected):
+    # Gym is optional in the CPU lane; the joint integration runtime executes this.
+    materialize = pytest.importorskip(
+        "nemo_gym.data.task_materialization"
+    ).materialize_task
+    from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
+    from nemo_rl.data.processors import nemo_gym_data_processor
+    from nemo_rl.environments.nemo_gym import get_nemo_gym_route_name
+
+    row = adapter.gym_row(
+        adapter.ExperimentTask(
+            benchmark="mmsvg_text2svg",
+            task_id="example-1",
+            prompt="Draw a blue circle",
+            ground_truth="PRIVATE_REFERENCE",
+        ),
+        reference_root=tmp_path,
+        split="train",
+        max_output_tokens=8192,
+        selected=selected,
+    )
+    data_path = tmp_path / "train.jsonl"
+    data_path.write_text(json.dumps(row) + "\n")
+    dataset = NemoGymDataset(str(data_path))
+    datum = nemo_gym_data_processor(dataset.dataset[0], None, None, None, idx=0)
+    assert datum["extra_env_info"] == row
+    actual = (
+        materialize(datum["extra_env_info"], taskset="coding")
+        if selected == "single"
+        else datum["extra_env_info"]
+    )
+    expected = materialize(row, taskset="coding") if selected == "single" else row
+    route = get_nemo_gym_route_name(
+        datum["extra_env_info"],
+        {"mm-coding:opencode": "mm_coding_opencode_environment"},
+    )
+    assert route == (
+        "mm_coding_training_simple_agent"
+        if selected == "single"
+        else "mm_coding_opencode_environment"
+    )
+    assert actual == expected
+    params = actual["task_input"]["responses_create_params"]
+    assert "PRIVATE_REFERENCE" not in json.dumps(params)
+    if selected == "opencode":
+        assert actual["task_id"]["taskset"] == "mm-coding:opencode"
+        assert "Only the final answer file" in json.dumps(params)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"policy": {"generation": {"backend": "sglang"}}}, "vLLM generation"),
+        (
+            {"policy": {"generation": {"max_new_tokens": 24576}}},
+            "Reserve input context",
+        ),
+        ({"token_capture": {"enabled": False}}, "token_capture.enabled=true"),
+    ],
+)
+def test_acceptance_guard_rejects_unsupported_runtime_combinations(
+    tmp_path, monkeypatch, overrides, error
+):
+    from omegaconf import OmegaConf
+
+    spec = importlib.util.spec_from_file_location(
+        "check_mm_coding_runtime", EXAMPLE / "check_mm_coding_runtime.py"
+    )
+    assert spec is not None and spec.loader is not None
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    base = (
+        ROOT
+        / "examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml"
+    )
+    monkeypatch.setenv("MM_CODING_BASE_CONFIG", str(base))
+    monkeypatch.setenv("MM_CODING_TRAIN_DATA", str(tmp_path / "train.jsonl"))
+    monkeypatch.setenv("MM_CODING_VALIDATION_DATA", str(tmp_path / "validation.jsonl"))
+    monkeypatch.setenv("MM_CODING_MAX_NEW_TOKENS", "8192")
+    config_path = tmp_path / "invalid.yaml"
+    OmegaConf.save(
+        OmegaConf.create(
+            {"defaults": str(EXAMPLE / "mm_coding_mixed.yaml")} | overrides
+        ),
+        config_path,
+    )
+    guard.check_training_config(EXAMPLE / "mm_coding_mixed.yaml")
+    with pytest.raises(ValueError, match=error):
+        guard.check_training_config(config_path)

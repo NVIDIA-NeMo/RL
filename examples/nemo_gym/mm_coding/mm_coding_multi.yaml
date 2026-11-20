@@ -1,8 +1,8 @@
-# Multi coding harness routes share the single recipe's Super VL learner and reward.
+# Multi coding harness routes share the single recipe's Megatron learner and reward.
 defaults: mm_coding_single.yaml
 
 checkpointing:
-  checkpoint_dir: results/grpo-super35-mm-coding-multi
+  checkpoint_dir: results/grpo-mm-coding-multi
 
 # A multi-turn history can retain the reference and several preview images.
 policy:
@@ -25,6 +25,6 @@ env:
           max_output_tokens: ${policy.generation.max_new_tokens}
 
 logger:
-  log_dir: logs/grpo-super35-mm-coding-multi
+  log_dir: logs/grpo-mm-coding-multi
   wandb:
-    name: super35-mm-coding-multi-acceptance
+    name: mm-coding-multi-acceptance

@@ -373,11 +373,19 @@ def test_shipped_config(
 
     coding_recipe = Path(
         config_file
-    ).parent == repo_root / "examples/nemo_gym/nemotron-3.5-super-vl" and Path(
+    ).parent == repo_root / "examples/nemo_gym/mm_coding" and Path(
         config_file
     ).name.startswith("mm_coding_")
     if coding_recipe:
+        monkeypatch.setenv(
+            "MM_CODING_BASE_CONFIG",
+            str(
+                repo_root
+                / "examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml"
+            ),
+        )
         # Dummy paths resolve the recipe schema; this test never opens training data.
+        monkeypatch.setenv("MM_CODING_MAX_NEW_TOKENS", "8192")
         monkeypatch.setenv("MM_CODING_TRAIN_DATA", "/path/to/mm-coding-train.jsonl")
         monkeypatch.setenv(
             "MM_CODING_VALIDATION_DATA", "/path/to/mm-coding-validation.jsonl"
