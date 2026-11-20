@@ -14,9 +14,9 @@
 """Co-resident generation owner (nemo_rl/models/megatron/sm_partition.py): config, MPS env, worker check (CPU), and
 the same-GPU CUDA IPC refit between two processes (GPU)."""
 
-import tempfile
 import os
 import subprocess
+import tempfile
 import time
 from types import SimpleNamespace
 
