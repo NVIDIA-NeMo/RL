@@ -367,6 +367,13 @@ class MultiAPIServerPool:
                 )
 
                 install_output_loop_yield(engine, reader_budget_s=budget_ms / 1000)
+            # The owning frontend's GIL/GC settings, applied after engine startup
+            # so a GC freeze covers the engine's long-lived objects.
+            from nemo_rl.models.generation.vllm.vllm_worker_async import (
+                _tune_actor_interpreter,
+            )
+
+            _tune_actor_interpreter(host.cfg["vllm_cfg"])
             host.llm = engine
             connection.send(("ok", None))
 
