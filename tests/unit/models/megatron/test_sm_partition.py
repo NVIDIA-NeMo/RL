@@ -561,9 +561,9 @@ def local_refit_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def single_rank_workers(
-    local_refit_rpc,
-) -> tuple[SimpleNamespace, SimpleNamespace, list]:
+def single_rank_workers(local_refit_rpc):
+    from nemo_rl.models.generation.megatron import MegatronGeneration
+
     log = []
     policy = SimpleNamespace(
         cfg=_cfg(),
@@ -578,10 +578,11 @@ def single_rank_workers(
             },
         ),
     )
-    generation = SimpleNamespace(
-        refresh_dp_openai_server_base_urls=lambda **kwargs: log.append(
-            "engine.refresh_urls"
-        ),
+    generation = object.__new__(MegatronGeneration)
+    generation._owns_policy = False
+    generation.cfg = {"mcore_generation_config": {"expose_http_server": True}}
+    generation.dp_openai_server_base_urls = []
+    generation._policy = SimpleNamespace(
         worker_group=_Group(
             log,
             "engine",
@@ -589,12 +590,9 @@ def single_rank_workers(
                 "coresident_refit_placement": [smp.RefitPlacement("gpu0", 0)],
                 "open_coresident_refit_handles": [smp.RefitBinding([], {})],
                 "coresident_refit_copy": [
-                    {
-                        "seconds": 0.0,
-                        "bytes": 1.0,
-                        "bytes_shared": 0.0,
-                    }
+                    {"seconds": 0, "bytes": 1, "bytes_shared": 0}
                 ],
+                "report_dp_openai_server_base_url": ["http://node:8000/v1"],
             },
         ),
     )
@@ -614,7 +612,11 @@ def test_coresident_refit_publishes_only_in_sync_weights(single_rank_workers, we
     refit.init_communicator()
     refit.before_learner_write()  # before the engine runs: nothing to pause
     refit.sync_weights()  # first refit starts the engine
-    assert log[-2:] == ["engine.coresident_resume", "engine.refresh_urls"]
+    assert log[-2:] == [
+        "engine.coresident_resume",
+        "engine.report_dp_openai_server_base_url",
+    ]
+    assert generation.dp_openai_server_base_urls == ["http://node:8000/v1"]
     log.clear()
     refit.before_learner_write()
     assert log == (["engine.coresident_pause"] if weights == "shared" else [])
@@ -671,6 +673,23 @@ def test_coresident_failed_pause_does_not_mark_engine_paused(
         refit.sync_weights()
     assert refit._paused_at is None
     assert log == ["engine.coresident_pause"]
+
+
+@pytest.mark.parametrize(
+    "method", ["coresident_resume", "report_dp_openai_server_base_url"]
+)
+def test_first_refit_failure_does_not_publish_engine(single_rank_workers, method):
+    from nemo_rl.weight_sync.megatron_weight_synchronizer import CoresidentRefit
+
+    policy, generation, log = single_rank_workers
+    refit = CoresidentRefit(policy, generation)
+    refit.init_communicator()
+    generation.worker_group.replies[method] = [TimeoutError("engine timed out")]
+    with pytest.raises(TimeoutError, match="engine timed out"):
+        refit.sync_weights()
+    assert log[-1] == f"engine.{method}"
+    assert generation.dp_openai_server_base_urls == []
+    assert not refit._engine_running
 
 
 def test_coresident_copy_failure_keeps_engine_paused(single_rank_workers) -> None:
@@ -785,12 +804,17 @@ def test_residual_transfer_precedes_publication_and_failures_keep_engine_paused(
     log = []
 
     exports = [
-        smp.RefitExport(smp.RefitPlacement(f"gpu{rank}", rank), [], {}, f"source{rank}")
-        for rank in range(2)
+        smp.RefitExport(
+            smp.RefitPlacement(f"gpu{rank}", rank),
+            [{"rank": rank}],
+            {"w": (rank,)},
+            f"source{rank}",
+        )
+        for rank in range(4)
     ]
     residual = [
         {"owner_rank": rank, "name": "weight", "shape": (8, 4), "element_size": 4}
-        for rank in range(2)
+        for rank in (3, 2)
     ]
     learner = _Group(
         log,
@@ -804,13 +828,16 @@ def test_residual_transfer_precedes_publication_and_failures_keep_engine_paused(
         log,
         "engine",
         {
-            "coresident_refit_placement": [item.placement for item in exports],
+            "coresident_refit_placement": [
+                smp.RefitPlacement("gpu3", 1),
+                smp.RefitPlacement("gpu2", 0),
+            ],
             "open_coresident_refit_handles": [
                 smp.RefitBinding([item], {"tensors_bound": 0}) for item in residual
             ],
             "export_coresident_refit_destinations": [
                 smp.RefitDestination(f"gpu{rank}", f"receive{rank}", {})
-                for rank in range(2)
+                for rank in (3, 2)
             ],
             "coresident_refit_copy": [
                 {"seconds": 0.0, "bytes": 0.0, "bytes_shared": 16.0}
@@ -825,6 +852,21 @@ def test_residual_transfer_precedes_publication_and_failures_keep_engine_paused(
         SimpleNamespace(cfg=_cfg(), worker_group=learner), generation
     )
     refit.init_communicator()
+    opened = next(
+        kwargs
+        for method, kwargs in engine.calls
+        if method == "open_coresident_refit_handles"
+    )
+    assert opened == {
+        "local_placement": [exports[3].placement, exports[2].placement],
+        "local_handles": [exports[3].handles, exports[2].handles],
+        "common_kwargs": {
+            "source_metadata": [item for export in exports for item in export.metadata],
+            "engine_to_learner": {1: 3, 0: 2},
+            "learner_world_size": 4,
+            "share": False,
+        },
+    }
     assert "learner.init_coresident_reshard" in log
     log.clear()
     if failure is not None:
@@ -850,7 +892,7 @@ def test_residual_transfer_precedes_publication_and_failures_keep_engine_paused(
         assert stats["coresident_shared_bytes_total"] == 32
         replacements = [
             smp.RefitDestination(f"gpu{rank}", f"moved{rank}", {"weight": ("new", ())})
-            for rank in range(2)
+            for rank in (3, 2)
         ]
         engine.replies["export_coresident_refit_destinations"] = replacements
         refit.sync_weights()
@@ -1115,93 +1157,6 @@ def test_uncapped_client_retries_transient_control_failure(
         "mps_client_registered"
     ]
     assert len(calls) == 3
-
-
-def test_refit_subset_keeps_all_source_ranks_and_publishes_only_paired_destinations(
-    local_refit_rpc,
-):
-    from nemo_rl.weight_sync import megatron_weight_synchronizer as mws
-
-    exports = [
-        smp.RefitExport(
-            smp.RefitPlacement(f"gpu{rank}", rank),
-            [{"rank": rank}],
-            {"w": (rank,)},
-            f"source{rank}",
-        )
-        for rank in range(4)
-    ]
-    learner = _Group(
-        [],
-        "learner",
-        {
-            "export_coresident_refit_handles": exports,
-            "coresident_refit_source_ready": [item.fingerprint for item in exports],
-        },
-    )
-    destinations = [
-        smp.RefitDestination(f"gpu{rank}", f"receive{rank}", {}) for rank in [2, 3]
-    ]
-    engine = _Group(
-        [],
-        "engine",
-        {
-            "coresident_refit_placement": [
-                smp.RefitPlacement(f"gpu{rank + 2}", rank) for rank in [1, 0]
-            ],
-            "open_coresident_refit_handles": [
-                smp.RefitBinding(
-                    [
-                        {
-                            "owner_rank": rank,
-                            "name": "weight",
-                            "shape": (2,),
-                            "element_size": 4,
-                        }
-                    ],
-                    {},
-                )
-                for rank in [2, 3]
-            ],
-            "export_coresident_refit_destinations": destinations,
-            "coresident_refit_copy": [
-                {"seconds": 0.0, "bytes": 8.0, "bytes_shared": 0.0}
-            ]
-            * 2,
-        },
-    )
-    refit = mws.CoresidentRefit(
-        SimpleNamespace(cfg=_cfg(), worker_group=learner),
-        SimpleNamespace(
-            worker_group=engine,
-            refresh_dp_openai_server_base_urls=lambda **kwargs: None,
-        ),
-    )
-    refit.init_communicator()
-    opened = next(
-        kwargs
-        for method, kwargs in engine.calls
-        if method == "open_coresident_refit_handles"
-    )
-    assert opened == {
-        "local_placement": [exports[3].placement, exports[2].placement],
-        "local_handles": [exports[3].handles, exports[2].handles],
-        "common_kwargs": {
-            "source_metadata": [item for export in exports for item in export.metadata],
-            "engine_to_learner": {1: 3, 0: 2},
-            "learner_world_size": 4,
-            "share": False,
-        },
-    }
-    stats = refit.sync_weights()
-    assert stats["coresident_copy_bytes_total"] == 32
-    forwarded = next(
-        kwargs["destinations"]
-        for method, kwargs in learner.calls
-        if method == "coresident_reshard"
-    )
-    assert forwarded == {item.device_id: item for item in destinations}
-    assert any(method == "coresident_refit_source_ready" for method, _ in learner.calls)
 
 
 @pytest.mark.parametrize(

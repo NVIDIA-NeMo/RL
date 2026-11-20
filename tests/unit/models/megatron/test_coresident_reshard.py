@@ -56,7 +56,9 @@ def materialize(source):
     return result
 
 
-@pytest.mark.parametrize("source_tp,target_tp", [(1, 4), (2, 4), (4, 2), (4, 1)])
+@pytest.mark.parametrize(
+    "source_tp,target_tp", [(1, 2), (1, 4), (2, 4), (4, 2), (4, 1)]
+)
 @pytest.mark.parametrize("dim", [0, 1])
 def test_native_residual_plans_and_local_views_cover_exact_full_tensor(
     source_tp, target_tp, dim
@@ -152,6 +154,13 @@ def test_native_residual_plans_and_local_views_cover_exact_full_tensor(
                 full.chunk(target_tp, dim=dim)[rank % target_tp] + publication * 100
             )
             torch.testing.assert_close(targets[rank], expected, rtol=0, atol=0)
+    if source_tp == 1:
+        for rank, item in enumerate(classified):
+            view = item.local_sources["engine.weight"]
+            expected = sources[rank].chunk(target_tp, dim=dim)[rank % target_tp]
+            assert isinstance(view, torch.Tensor)
+            assert view.storage_offset() == expected.storage_offset()
+            assert view.stride() == expected.stride()
     if source_tp > target_tp:
         assert all(item.residual for item in classified)
     if source_tp == 2 and target_tp == 4:

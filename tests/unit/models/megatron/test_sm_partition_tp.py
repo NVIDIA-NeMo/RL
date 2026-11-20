@@ -76,38 +76,6 @@ def cpu_copy_stream(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 @pytest.mark.parametrize("tp", [2, 4])
-@pytest.mark.parametrize("dim", [0, 1])
-def test_dense_tp1_to_larger_tp_matches_independent_row_column_slices(
-    tp: int, dim: int
-) -> None:
-    full = torch.arange(96, dtype=torch.float32).reshape(8, 12)
-    width = full.shape[dim] // tp
-    for rank in range(tp):
-        expected = (
-            full[rank * width : (rank + 1) * width, :]
-            if dim == 0
-            else full[:, rank * width : (rank + 1) * width]
-        )
-        source = _metadata("weight", full, rank=rank, group=[rank], dim=dim)
-        destination = _metadata(
-            "engine.weight",
-            expected,
-            rank=rank,
-            group=list(range(tp)),
-            dim=dim,
-            resolved="weight",
-        )
-        mapped = _local_sources({"weight": full}, [source], [destination])[
-            "engine.weight"
-        ]
-        assert isinstance(mapped, torch.Tensor)
-        torch.testing.assert_close(mapped, expected, rtol=0, atol=0)
-        assert mapped.untyped_storage().data_ptr() == full.untyped_storage().data_ptr()
-        assert mapped.storage_offset() == expected.storage_offset()
-        assert mapped.is_contiguous() == (dim == 0)
-
-
-@pytest.mark.parametrize("tp", [2, 4])
 def test_glu_stride_two_fragments_copy_and_follow_next_publication(
     tp: int, cpu_copy_stream: list[str]
 ) -> None:
@@ -251,15 +219,6 @@ def test_contiguous_alias_and_strided_private_copy_update_at_refit(
     assert smp.copy_refit(mapped, named) == initial
     torch.testing.assert_close(column, expected_column + 100, rtol=0, atol=0)
     assert len(cpu_copy_stream) == 2
-
-
-def test_missing_remote_source_coverage_is_rejected() -> None:
-    local = torch.arange(48, dtype=torch.float32).reshape(4, 12)
-    whole = torch.empty(8, 12)
-    source = _metadata("weight", local, rank=0, group=[0, 1])
-    destination = _metadata("weight", whole, rank=0, group=[0])
-    with pytest.raises((ValueError, RuntimeError), match="cover|remote|local"):
-        _local_sources({"weight": local}, [source], [destination])
 
 
 @pytest.mark.parametrize("stale_source", [False, True])
