@@ -72,6 +72,9 @@ class ReassemblyRequest:
     execution_row_multiple: int = 1
     reward_checks: tuple[RewardChecks | None, ...] | None = None
     reward_log_contexts: tuple[RewardLogContext | None, ...] | None = None
+    # Each rollout's ``Completion.reward_components``, published as
+    # ``reward/<name>`` columns beside ``total_reward``.
+    reward_components: tuple[Optional[dict[str, float]], ...] | None = None
     # Real agent identity for flat rows, retained for existing checkpoint readers.
     resolved_agent_name: Optional[str] = None
     # Taskset or flat-agent attribution, persisted with sealed receipts.
@@ -254,6 +257,9 @@ class RolloutReassemblerActor:  # pragma: no cover
             else None,
             reward_log_contexts=list(request.reward_log_contexts)
             if request.reward_log_contexts is not None
+            else None,
+            reward_components=list(request.reward_components)
+            if request.reward_components is not None
             else None,
         )
         assert_metadata_only(result)

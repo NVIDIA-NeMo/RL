@@ -227,6 +227,86 @@ def _fetch_rows(tq_client, sample_ids):
     )
 
 
+def test_finalize_group_publishes_reward_components(tq_client, partitions):
+    group_id = "grp_components"
+    receipt, _ = _stage_fixture(
+        tq_client, "worked_example", rollout_id=f"{group_id}_g0"
+    )
+    receipt["capture_key"] = f"{group_id}_g0"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+
+    _finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],  # second rollout lost its receipt -> placeholder
+        [1.5, 0.5],
+        mask_sample=[False, False],
+        fallback_weight_version=9,
+        prompt_idx=17,
+        reward_components=[
+            {"reward/correctness": 1.0, "reward/format": 0.5},
+            {"reward/correctness": 0.5, "reward/format": 0.0},
+        ],
+    )
+
+    rows = tq_client.get_samples(
+        sample_ids=rollout_ids,
+        partition_id=CANONICAL_PARTITION,
+        select_fields=["sample_mask", "reward/correctness", "reward/format"],
+    )
+    assert torch.as_tensor(rows["sample_mask"]).flatten().tolist() == [1.0, 0.0]
+    correctness = torch.as_tensor(rows["reward/correctness"]).flatten()
+    assert correctness.tolist() == [1.0, 0.5]
+    assert correctness.dtype == torch.float32
+    assert torch.as_tensor(rows["reward/format"]).flatten().tolist() == [0.5, 0.0]
+
+
+def test_finalize_group_zero_fills_missing_reward_components(tq_client, partitions):
+    group_id = "grp_partial_components"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1", f"{group_id}_g2"]
+
+    _finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [None, None, None],
+        [1.5, 0.0, 1.0],
+        mask_sample=[False, False, False],
+        fallback_weight_version=9,
+        prompt_idx=17,
+        # A sealed rollout has no components when its verifier omitted them or
+        # when it was restored from a schema 8 ledger.
+        reward_components=[
+            {"reward/correctness": 1.0, "reward/format": 0.5},
+            None,
+            {"reward/correctness": 1.0},
+        ],
+    )
+
+    rows = tq_client.get_samples(
+        sample_ids=rollout_ids,
+        partition_id=CANONICAL_PARTITION,
+        select_fields=["reward/correctness", "reward/format"],
+    )
+    correctness = torch.as_tensor(rows["reward/correctness"]).flatten()
+    assert correctness.tolist() == [1.0, 0.0, 1.0]
+    assert torch.as_tensor(rows["reward/format"]).flatten().tolist() == [0.5, 0.0, 0.0]
+
+
+def test_finalize_group_rejects_reward_components_for_forest_rows(tq_client):
+    with pytest.raises(ValueError, match="Forest rows do not carry reward components"):
+        _finalizer(tq_client).finalize_group(
+            "grp_forest",
+            ["grp_forest_g0"],
+            [None],
+            [1.0],
+            mask_sample=[False],
+            fallback_weight_version=9,
+            prompt_idx=17,
+            logical_selections=[],
+            reward_components=[{"reward/correctness": 1.0}],
+        )
+
+
 def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions):
     group_id = "grp1"
     receipt, expected = _stage_fixture(

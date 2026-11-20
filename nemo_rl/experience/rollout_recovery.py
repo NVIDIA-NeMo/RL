@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
     from nemo_rl.experience.rollout_reassembler import RolloutSelection
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 8
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 9
 # Schemas 2 to 5 predate turn-level recovery; they load through
 # _upgrade_pre_turn_recovery_groups.
 _PRE_TURN_RECOVERY_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
@@ -53,6 +53,7 @@ SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {
     *_PRE_TURN_RECOVERY_SCHEMA_VERSIONS,
     6,
     7,
+    8,
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
 }
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
@@ -106,6 +107,7 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "mask_sample",
         "reward_checks",
         "reward_log_context",
+        "reward_components",
         "staging_keys",
         "logical_selection",
         *_ATTEMPT_STATE_KEYS.values(),
@@ -309,6 +311,7 @@ class RolloutAttemptRecord:
     mask_sample: Optional[bool] = None
     reward_checks: RewardChecks | None = None
     reward_log_context: RewardLogContext | None = None
+    reward_components: Optional[dict[str, float]] = None
     staging_keys: list[str] = field(default_factory=list)
     logical_selection: RolloutSelection | None = None
     environment_instance_id: Optional[str] = None
@@ -463,6 +466,7 @@ class SiblingSealResult:
     logical_selection: RolloutSelection | None = None
     resolved_agent_name: Optional[str] = field(default=None, kw_only=True)
     attribution_key: Optional[str] = field(default=None, kw_only=True)
+    reward_components: Optional[dict[str, float]] = field(default=None, kw_only=True)
 
 
 class UnresolvedCaptureAcknowledgement(ValueError):
@@ -940,6 +944,7 @@ class RolloutRecoveryLedger:
             attempt.mask_sample = None
             attempt.reward_checks = None
             attempt.reward_log_context = None
+            attempt.reward_components = None
             attempt.staging_keys.clear()
         record.status = PromptGroupStatus.GENERATING
 
@@ -1360,6 +1365,7 @@ class RolloutRecoveryLedger:
         reward_checks: RewardChecks | None = None,
         reward_log_context: RewardLogContext | None = None,
         logical_selection: RolloutSelection | None = None,
+        reward_components: Optional[dict[str, float]] = None,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
@@ -1396,6 +1402,7 @@ class RolloutRecoveryLedger:
                 and attempt.mask_sample is mask_sample
                 and attempt.reward_checks == reward_checks
                 and attempt.reward_log_context == reward_log_context
+                and attempt.reward_components == reward_components
                 and attempt.staging_keys == staging_keys
             ):
                 return
@@ -1418,6 +1425,7 @@ class RolloutRecoveryLedger:
         attempt.mask_sample = mask_sample
         attempt.reward_checks = reward_checks
         attempt.reward_log_context = reward_log_context
+        attempt.reward_components = copy.deepcopy(reward_components)
         attempt.staging_keys = staging_keys
         attempt.status = RolloutAttemptStatus.SEALED
         self._record_environment_forget_if_restored(record, generation_index)
@@ -1521,6 +1529,7 @@ class RolloutRecoveryLedger:
             attempt.mask_sample = result.mask_sample
             attempt.reward_checks = result.reward_checks
             attempt.reward_log_context = result.reward_log_context
+            attempt.reward_components = copy.deepcopy(result.reward_components)
             attempt.staging_keys = staging_keys
             attempt.status = RolloutAttemptStatus.SEALED
             self._record_environment_forget_if_restored(record, generation_index)
@@ -1770,6 +1779,9 @@ class RolloutRecoveryLedger:
                                     )
                                     if attempt.reward_log_context is not None
                                     else None,
+                                    "reward_components": copy.deepcopy(
+                                        attempt.reward_components
+                                    ),
                                     "staging_keys": list(attempt.staging_keys),
                                     # Old key names, kept so checkpoints
                                     # written before the rename still restore.
@@ -1948,11 +1960,9 @@ class RolloutRecoveryLedger:
                     raise ValueError("rollout-recovery attempt must be a mapping")
                 _reject_unknown_fields(
                     attempt_state,
-                    expected=(
-                        _ATTEMPT_STATE_FIELDS
-                        if schema_version >= 5
-                        else (_ATTEMPT_STATE_FIELDS - {"logical_selection"})
-                    ),
+                    expected=_ATTEMPT_STATE_FIELDS
+                    - ({"logical_selection"} if schema_version < 5 else set())
+                    - ({"reward_components"} if schema_version < 9 else set()),
                     context="rollout-recovery attempt",
                 )
                 raw_attempt_uuid = attempt_state.get("attempt_uuid")
@@ -2006,6 +2016,20 @@ class RolloutRecoveryLedger:
                     )
                 log_context = parse_reward_log_context(
                     attempt_state.get("reward_log_context")
+                )
+                if schema_version >= 9 and "reward_components" not in attempt_state:
+                    raise ValueError(
+                        f"recovery attempt is missing reward_components: gate_id={base_gate_id!r}"
+                    )
+                raw_components = attempt_state.get("reward_components")
+                if raw_components is not None and not isinstance(raw_components, dict):
+                    raise ValueError(
+                        "recovery attempt reward_components must be a mapping or None"
+                    )
+                reward_components = (
+                    {str(name): float(value) for name, value in raw_components.items()}
+                    if raw_components is not None
+                    else None
                 )
                 staging_keys = attempt_state.get("staging_keys")
                 # The writer always records both, and None/0 are valid values,
@@ -2072,6 +2096,7 @@ class RolloutRecoveryLedger:
                     or mask_sample is not None
                     or checks is not None
                     or log_context is not None
+                    or reward_components is not None
                     or staging_keys
                 ):
                     raise ValueError("only sealed attempts may retain receipt data")
@@ -2085,6 +2110,7 @@ class RolloutRecoveryLedger:
                         mask_sample=mask_sample,
                         reward_checks=checks,
                         reward_log_context=log_context,
+                        reward_components=reward_components,
                         staging_keys=list(staging_keys),
                         environment_instance_id=environment_instance_id,
                         environment_attempt=environment_attempt,

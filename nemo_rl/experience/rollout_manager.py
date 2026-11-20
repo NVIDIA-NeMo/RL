@@ -1937,21 +1937,17 @@ class AsyncNemoGymRolloutImpl:
                 {
                     **result["full_result"],
                     "reward": result.get(
-                        "reward_original", result["full_result"]["reward"]
+                        "reward_original",
+                        result["full_result"].get("reward") or 0.0,
                     ),
                 }
-                for result in token_results
+                for result in results
             ]
         )
         # A sample without components gets zeros, as on the legacy path, so a
         # verify result that omits them does not fail the group's payload.
         component_columns = build_reward_component_columns(
-            [
-                None
-                if "receipt" in result
-                else extract_reward_components(result["full_result"])
-                for result in results
-            ]
+            [extract_reward_components(result["full_result"]) for result in results]
         )
         completions = []
         for index, result in enumerate(results):
@@ -1983,6 +1979,11 @@ class AsyncNemoGymRolloutImpl:
                         # (nemo_gym._postprocess_receipt_mode): a gym result with
                         # no reward finalizes as 0.0 rather than a KeyError.
                         reward=float(result["full_result"].get("reward") or 0.0),
+                        reward_components={
+                            name: float(column[index])
+                            for name, column in component_columns.items()
+                        }
+                        or None,
                     )
                 )
                 continue
@@ -3216,6 +3217,7 @@ class RolloutManager:
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
                     logical_selection=selection,
+                    reward_components=completion.reward_components,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -3250,6 +3252,7 @@ class RolloutManager:
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
                     logical_selection=selection,
+                    reward_components=completion.reward_components,
                 )
 
         try:
@@ -3323,6 +3326,10 @@ class RolloutManager:
                     else None
                 ),
                 execution_row_multiple=self._execution_row_multiple,
+                reward_components=tuple(
+                    sibling.current_attempt.reward_components
+                    for sibling in self._recovery_ledger.get_group(group_id).siblings
+                ),
                 resolved_agent_name=self._recovery_ledger.get_group(
                     group_id
                 ).resolved_agent_name,

@@ -14,8 +14,8 @@
 
 """Producer-side payload helpers for the async-RL TQ path."""
 
-from collections.abc import Mapping
-from typing import Any, cast
+from collections.abc import Mapping, Sequence
+from typing import Any, Optional, cast
 
 import numpy as np
 import torch
@@ -37,7 +37,7 @@ from nemo_rl.data_plane.schema import (
     TRUNCATED,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.interfaces import PromptGroupRecord
 
 VIOLATION_TAG_KEYS = (
     "num_invalid_tool_calls",
@@ -95,13 +95,14 @@ def _add_message_violation_masks(
             )
 
 
-def _reward_component_columns(
-    completions: list[Completion],
+def reward_component_columns(
+    reward_components: Sequence[Optional[dict[str, float]]],
 ) -> dict[str, torch.Tensor]:
     """Return one ``[N]`` column per reward component of a multi-reward prompt group.
 
     Args:
-        completions: The prompt group's completions.
+        reward_components: ``Completion.reward_components`` of each of the
+            prompt group's completions, in row order.
 
     Returns:
         A float32 column per component name, or an empty dict for a
@@ -112,9 +113,9 @@ def _reward_component_columns(
             name lacks the ``reward/`` prefix that keeps it apart from the
             other payload fields.
     """
-    if all(c.reward_components is None for c in completions):
+    if all(c is None for c in reward_components):
         return {}
-    components = [c.reward_components or {} for c in completions]
+    components = [c or {} for c in reward_components]
     names = sorted(components[0])
     if any(sorted(c) != names for c in components):
         raise ValueError(
@@ -219,7 +220,7 @@ def record_to_train_batch(
         TRUNCATED: truncated,
         "total_reward": total_reward,
         _VIOLATION_COUNTS_KEY: violation_counts,
-        **_reward_component_columns(completions),
+        **reward_component_columns([c.reward_components for c in completions]),
     }
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]

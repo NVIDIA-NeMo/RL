@@ -70,7 +70,7 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSource,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
-from nemo_rl.experience.payload import pack_payload
+from nemo_rl.experience.payload import pack_payload, reward_component_columns
 from nemo_rl.experience.reward_penalties import (
     CAPTURE_PENALTIES,
     FinalizedReward,
@@ -870,6 +870,7 @@ class RolloutReassembler:
         execution_row_multiple: int = 1,
         reward_checks: Optional[list[RewardChecks | None]] = None,
         reward_log_contexts: Optional[list[RewardLogContext | None]] = None,
+        reward_components: Optional[list[Optional[dict[str, float]]]] = None,
     ) -> FinalizedGroup:
         """Publish one prompt group, with optional physical rows per logical owner.
 
@@ -886,6 +887,10 @@ class RolloutReassembler:
         is not carried from the dispatcher -- the receipt path has no real
         tokens to measure it from at dispatch time -- so it is computed here
         instead, from each row's rebuilt length against ``max_seq_len``.
+        ``reward_components`` is each rollout's ``Completion.reward_components``;
+        every row, placeholders included, publishes them as ``reward/<name>``
+        columns the way ``record_to_train_batch`` does. A rollout that lacks a
+        component another rollout of the group has gets 0.0 for it.
         """
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
@@ -917,6 +922,25 @@ class RolloutReassembler:
             raise ValueError("execution row padding requires logical Forest segments")
         if logical_selections is not None and loss_multiplier != 1.0:
             raise ValueError("Forest currently requires unit dataset loss_multiplier")
+        components_by_rollout = (
+            tuple(reward_components)
+            if reward_components is not None
+            else (None,) * len(rollout_ids)
+        )
+        assert len(components_by_rollout) == len(rollout_ids), (
+            "reward_components must be one per rollout"
+        )
+        # Capture rollouts are sealed one at a time, so a rollout whose verifier
+        # omitted its components, or one restored from schema 8, has none: fill 0.0.
+        names = sorted({name for c in components_by_rollout if c for name in c})
+        component_columns = reward_component_columns(
+            [
+                {name: (c or {}).get(name, 0.0) for name in names} or None
+                for c in components_by_rollout
+            ]
+        )
+        if component_columns and logical_selections is not None:
+            raise ValueError("Forest rows do not carry reward components")
         _group_t0 = time.perf_counter()
         logical = None
         if logical_selections is None:
@@ -1158,6 +1182,7 @@ class RolloutReassembler:
             execution_row_multiple=execution_row_multiple,
             canonical_sample_ids=canonical_sample_ids,
             loss_multiplier=loss_multiplier,
+            component_columns=component_columns,
         )
         # Length metrics are already pooled in finalize/length_penalty/*_sum.
         # Keep them separate from token metrics.
@@ -1234,6 +1259,7 @@ class RolloutReassembler:
         execution_row_multiple: int,
         canonical_sample_ids: list[str],
         loss_multiplier: float,
+        component_columns: dict[str, torch.Tensor],
     ) -> FinalizedGroup:
         """Shared ordinary/Forest tensorization, single publication, and cleanup."""
         valid_rows = [row for row in rows if row.valid]
@@ -1375,6 +1401,7 @@ class RolloutReassembler:
             TRUNCATED: torch.tensor(
                 self._truncated_flags(rows, logical), dtype=torch.bool
             ),
+            **component_columns,
         }
         if sampler_topk_token_ids is not None:
             train_batch[SAMPLER_TOPK_TOKEN_IDS_FIELD] = sampler_topk_token_ids

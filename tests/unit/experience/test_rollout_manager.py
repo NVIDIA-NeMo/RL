@@ -1274,6 +1274,27 @@ def _mask_gate_receipt_result():
     }
 
 
+def test_receipt_completion_carries_gym_reward_components():
+    result = _mask_gate_receipt_result()
+    result["full_result"]["reward"] = 1.5
+    result["full_result"]["reward_components"] = {"correctness": 1.0, "format": 0.5}
+    completion = _nemo_gym_impl(True)._results_to_completions([result])[0][0]
+    assert completion.reward == 1.5
+    assert completion.reward_components == {
+        "reward/correctness": 1.0,
+        "reward/format": 0.5,
+    }
+
+
+@pytest.mark.parametrize("reward", [0.25, None])
+def test_receipt_completion_rejects_components_that_miss_the_scalar(reward):
+    result = _mask_gate_receipt_result()
+    result["full_result"]["reward"] = reward
+    result["full_result"]["reward_components"] = {"correctness": 1.0, "format": 0.5}
+    with pytest.raises(ValueError, match="reward_components sum"):
+        _nemo_gym_impl(True)._results_to_completions([result])
+
+
 def test_receipt_completion_keeps_mask_flag_when_gate_on():
     completion = _nemo_gym_impl(True)._results_to_completions(
         [_mask_gate_receipt_result()]
@@ -3050,6 +3071,30 @@ def test_capture_completion_preserves_checks_and_raw_reward_until_finalization()
     assert impl._compute_reward_penalty_metrics(counts, 0) == {}
     metrics = impl._compute_rollout_metrics(completions, "agent")
     assert not any(k.startswith(("total_reward/", "agent/reward/")) for k in metrics)
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_capture_manager_forwards_reward_components_to_reassembly(
+    monkeypatch, granularity
+):
+    components = {"reward/correctness": 0.5, "reward/format": 0.0}
+    original = _receipt_record
+
+    def with_components(*args, **kwargs):
+        record = original(*args, **kwargs)
+        for completion in record.completions:
+            completion.reward_components = dict(components)
+        return record
+
+    monkeypatch.setattr(f"{__name__}._receipt_record", with_components)
+    mgr = _make_capture_manager(
+        _FakeCaptureBuffer(),
+        recovery_config=RolloutRecoveryConfig(
+            target_level=RecoveryTargetLevel(granularity.value)
+        ),
+    )
+    request, _ = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+    assert request.reward_components == (components, components)
 
 
 @pytest.mark.parametrize("granularity", list(RecoveryGranularity))

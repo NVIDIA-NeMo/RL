@@ -1545,12 +1545,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "grpo.length_penalty."
         )
 
-    if algo_cfg.adv_estimator.name == "gdpo" and master_config.token_capture.enabled:
-        raise NotImplementedError(
-            "GDPO requires per-component rewards, which token capture does not "
-            "preserve. Set token_capture.enabled=false to use GDPO."
-        )
-
     if algo_cfg.adv_estimator.name == "gdpo" and algo_cfg.reward_shaping.enabled:
         raise NotImplementedError(
             "grpo.reward_shaping adjusts only the scalar reward, which GDPO does "
