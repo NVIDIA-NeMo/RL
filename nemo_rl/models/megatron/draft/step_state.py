@@ -35,7 +35,7 @@ class DraftStepPayload:
 
 @dataclass(slots=True)
 class DraftStepState:
-    """Accumulate one-bin EAGLE loss state across split microbatches."""
+    """Accumulate method-defined loss bins across split microbatches."""
 
     _local_numerators: torch.Tensor | None = None
     _local_counts: torch.Tensor | None = None
@@ -71,13 +71,6 @@ class DraftStepState:
     def accumulate(self, payload: DraftStepPayload) -> None:
         """Add one detached microbatch payload to this optimizer step."""
         stats = payload.stats
-        if stats.numerators.shape != (1,):
-            raise ValueError(
-                "current EAGLE draft step state requires exactly one bin, "
-                f"got {stats.numerators.shape}."
-            )
-        if not torch.equal(stats.weights, torch.ones_like(stats.weights)):
-            raise ValueError("current one-bin EAGLE draft loss requires unit weight")
         if self._local_numerators is None:
             self._local_numerators = stats.numerators.detach().clone()
             self._local_counts = stats.counts.detach().clone()
@@ -102,14 +95,16 @@ class DraftStepState:
         return self._local_counts.to(device=reference.device, dtype=reference.dtype)
 
     def set_global_counts(self, counts: torch.Tensor) -> None:
-        """Record the DP-reduced one-bin denominator."""
+        """Record the DP-by-CP-reduced method-specific denominator bins."""
         if not self.active:
             if counts.numel() != 0:
                 raise ValueError("inactive draft step cannot accept global counts")
             return
-        if counts.shape != (1,):
+        assert self._local_counts is not None
+        if counts.shape != self._local_counts.shape:
             raise ValueError(
-                f"global draft counts must contain one bin, got {counts.shape}"
+                "global draft counts must match local bins, "
+                f"got {counts.shape} and {self._local_counts.shape}"
             )
         self._global_counts = counts.detach().clone()
 
@@ -131,11 +126,22 @@ class DraftStepState:
             return value.detach() * scale
         return value * scale
 
+    def weighted_numerator_for_reduction(self, reference: torch.Tensor) -> torch.Tensor:
+        """Return this CP rank's weighted numerator on a collective-safe device."""
+        if self._local_numerators is None or self._weights is None:
+            return reference.new_zeros(())
+        numerators = self._local_numerators.to(
+            device=reference.device, dtype=reference.dtype
+        )
+        weights = self._weights.to(device=reference.device, dtype=reference.dtype)
+        return (numerators * weights).sum()
+
     def correct_main_grads(
         self,
         parameters: Iterable[Any],
         *,
         policy_normalization_count: torch.Tensor,
+        context_parallel_size: int,
     ) -> None:
         """Correct draft-tagged main grads after policy normalization.
 
@@ -144,9 +150,18 @@ class DraftStepState:
         module is attached only to the post-process chunk. Ranks that hold no
         draft-tagged parameter are therefore expected and must no-op here.
         """
+        if context_parallel_size < 1:
+            raise ValueError("context_parallel_size must be positive")
         policy_count = float(policy_normalization_count.detach().item())
         draft_scale = self._normalization_scale()
-        correction = policy_count * draft_scale if policy_count > 0 else 0.0
+        # The Megatron loss wrapper divides each microbatch loss by cp_size
+        # (the cp_normalize step in nemo_rl/models/megatron/train.py), so the
+        # draft gradient reaches backward already scaled by 1 / cp_size.
+        correction = (
+            policy_count * draft_scale * context_parallel_size
+            if policy_count > 0
+            else 0.0
+        )
         for param in parameters:
             if getattr(param, "grad_norm_group", None) != DRAFT_GRAD_NORM_GROUP:
                 continue

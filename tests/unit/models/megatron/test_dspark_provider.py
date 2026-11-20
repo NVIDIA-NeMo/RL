@@ -350,6 +350,72 @@ def test_factory_rejects_body_without_sharded_state_contract() -> None:
         )
 
 
+@pytest.mark.mcore
+def test_provider_resolves_one_dp_cp_group_for_body_and_all_dspark_heads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CP-replicated body/heads must share one checkpoint replica group."""
+    pytest.importorskip("megatron.core.transformer.utils")
+    captured_body_metadata: list[dict[str, Any] | None] = []
+    captured_head_groups: list[object | None] = []
+
+    class _RecordingBody(nn.Identity):
+        def sharded_state_dict(
+            self,
+            prefix: str = "",
+            sharded_offsets: tuple[tuple[int, int, int], ...] = (),
+            metadata: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            del prefix, sharded_offsets
+            captured_body_metadata.append(metadata)
+            return {}
+
+    def _record_sharded_tensors(
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        axis_map: dict[str, int],
+        sharded_offsets: tuple[tuple[int, int, int], ...],
+        *,
+        tp_group: object | None,
+        dp_cp_group: object | None,
+    ) -> dict[str, torch.Tensor]:
+        del axis_map, sharded_offsets, tp_group
+        captured_head_groups.append(dp_cp_group)
+        return {f"{prefix}{name}": tensor for name, tensor in state_dict.items()}
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.utils.make_sharded_tensors_for_checkpoint",
+        _record_sharded_tensors,
+    )
+    dp_cp_group = object()
+    resolved_metadata = {"dp_cp_group": dp_cp_group}
+    monkeypatch.setattr(
+        _PROVIDER,
+        "_ensure_dp_cp_group",
+        lambda metadata: resolved_metadata if metadata is None else metadata,
+    )
+    provider = build_dspark_provider(
+        body=_RecordingBody(),
+        target_vocab_size=9,
+        draft_vocab_size=9,
+        hidden_size=5,
+        markov_rank=3,
+        confidence_enabled=True,
+        confidence_with_markov=True,
+        dtype=torch.float64,
+    )
+    state = provider.sharded_state_dict(prefix="draft.", metadata=None)
+
+    assert captured_body_metadata == [resolved_metadata]
+    assert captured_head_groups == [dp_cp_group, dp_cp_group]
+    assert set(state) == {
+        "draft.markov_head.markov_w1.weight",
+        "draft.markov_head.markov_w2.weight",
+        "draft.confidence_head.proj.weight",
+        "draft.confidence_head.proj.bias",
+    }
+
+
 def test_factory_rejects_markov_confidence_without_confidence() -> None:
     with pytest.raises(ValueError, match="requires confidence_enabled"):
         build_dspark_provider(

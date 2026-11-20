@@ -15,9 +15,10 @@
 from __future__ import annotations
 
 import math
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from torch.nn.attention.flex_attention import (
     BlockMask,
@@ -25,6 +26,12 @@ from torch.nn.attention.flex_attention import (
 )
 
 from nemo_rl.models.megatron.draft.block_plan import DFlashBatchPlan
+from nemo_rl.models.megatron.draft.context_parallel import gather_projected_kv
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
+
+    from nemo_rl.models.megatron.draft.sequence_layout import DraftSequenceLayout
 
 _COMPILED_FLEX_ATTENTION = torch.compile(flex_attention)
 _FLEX_QUERY_BLOCK_SIZE = 128
@@ -40,18 +47,22 @@ def _validate_block_only_attention_inputs(
     block_q: Tensor,
     block_k: Tensor,
     block_v: Tensor,
+    sequence_layout: DraftSequenceLayout | None,
 ) -> None:
     tensors = (trunk_k, trunk_v, block_q, block_k, block_v)
     if any(tensor.ndim != 4 for tensor in tensors):
         raise ValueError("DFlash attention tensors must have rank four")
 
-    batch_size = plan.batch_size
-    sequence_length = plan.sequence_length
-    num_blocks = batch_size * plan.anchors_per_sample
+    num_blocks = plan.sample_rows.numel()
     block_size = plan.block_size
-    if trunk_k.shape[:2] != (batch_size, sequence_length):
+    expected_trunk_shape = (
+        (plan.batch_size, plan.sequence_length)
+        if sequence_layout is None
+        else (1, sequence_layout.owner_cp_rank.numel())
+    )
+    if trunk_k.shape[:2] != expected_trunk_shape:
         raise ValueError("trunk_k shape does not match the DFlash plan")
-    if trunk_v.shape[:2] != (batch_size, sequence_length):
+    if trunk_v.shape[:2] != expected_trunk_shape:
         raise ValueError("trunk_v shape does not match the DFlash plan")
     if block_q.shape[:2] != (num_blocks, block_size):
         raise ValueError("block_q shape does not match the DFlash plan")
@@ -68,6 +79,8 @@ def _validate_block_only_attention_inputs(
         plan.anchor_positions,
         plan.slot_valid,
     )
+    if sequence_layout is not None:
+        plan_tensors = (*plan_tensors, sequence_layout.owner_cp_rank)
     if any(tensor.device != device for tensor in (*tensors, *plan_tensors)):
         raise ValueError("DFlash attention inputs and plan must share a device")
     if not dtype.is_floating_point:
@@ -146,18 +159,33 @@ def _grouped_masked_attention(
     )
 
 
-def _block_visibility(plan: DFlashBatchPlan) -> Tensor:
-    num_blocks = plan.batch_size * plan.anchors_per_sample
-    trunk_key_count = plan.batch_size * plan.sequence_length
+def _block_visibility(
+    plan: DFlashBatchPlan,
+    sequence_layout: DraftSequenceLayout | None,
+) -> Tensor:
+    num_blocks = plan.sample_rows.numel()
     device = plan.token_valid_mask.device
-
-    if plan.sequence_length == 0:
+    if sequence_layout is not None:
+        trunk_key_count = sequence_layout.owner_cp_rank.numel()
+        trunk_positions = torch.arange(
+            trunk_key_count,
+            dtype=torch.int64,
+            device=device,
+        )
+        visible_trunk = (
+            (trunk_positions[None, :] >= plan.packed_segment_starts[:, None])
+            & (trunk_positions[None, :] < plan.global_anchor_positions[:, None])
+            & sequence_layout.packed_valid_mask[None, :]
+        )
+    elif plan.sequence_length == 0:
+        trunk_key_count = 0
         visible_trunk = torch.zeros(
             (num_blocks, 0),
             dtype=torch.bool,
             device=device,
         )
     else:
+        trunk_key_count = plan.batch_size * plan.sequence_length
         trunk_key_indices = torch.arange(
             trunk_key_count,
             dtype=torch.int64,
@@ -197,9 +225,16 @@ def _block_visibility(plan: DFlashBatchPlan) -> Tensor:
     return plan.slot_valid[:, :, None] & visible_keys[:, None, :]
 
 
-def _create_global_block_mask(plan: DFlashBatchPlan) -> BlockMask:
-    num_blocks = plan.batch_size * plan.anchors_per_sample
-    trunk_key_count = plan.batch_size * plan.sequence_length
+def _create_global_block_mask(
+    plan: DFlashBatchPlan,
+    sequence_layout: DraftSequenceLayout | None,
+) -> BlockMask:
+    num_blocks = plan.sample_rows.numel()
+    trunk_key_count = (
+        plan.batch_size * plan.sequence_length
+        if sequence_layout is None
+        else sequence_layout.owner_cp_rank.numel()
+    )
     block_key_count = num_blocks * plan.block_size
     global_key_count = trunk_key_count + block_key_count
     num_query_blocks = (
@@ -217,8 +252,14 @@ def _create_global_block_mask(plan: DFlashBatchPlan) -> BlockMask:
         kv_block_starts + _FLEX_KV_BLOCK_SIZE,
         max=global_key_count,
     )
-    sample_starts = plan.sample_rows[:, None] * plan.sequence_length
-    sample_prefix_ends = sample_starts + plan.anchor_positions[:, None]
+    if sequence_layout is None:
+        sample_starts = plan.sample_rows[:, None] * plan.sequence_length
+        sample_prefix_ends = sample_starts + plan.anchor_positions[:, None]
+        token_valid_mask = plan.token_valid_mask.reshape(-1)
+    else:
+        sample_starts = plan.packed_segment_starts[:, None]
+        sample_prefix_ends = plan.global_anchor_positions[:, None]
+        token_valid_mask = sequence_layout.packed_valid_mask
     own_block_starts = (
         trunk_key_count
         + torch.arange(
@@ -237,8 +278,11 @@ def _create_global_block_mask(plan: DFlashBatchPlan) -> BlockMask:
         & (kv_block_ends[None, :] > own_block_starts)
     )
     base_kv_num_blocks = candidate_blocks.sum(dim=-1, dtype=torch.int32)
+    max_trunk_length = (
+        plan.sequence_length if sequence_layout is None else trunk_key_count
+    )
     max_trunk_blocks = (
-        plan.sequence_length + 2 * _FLEX_KV_BLOCK_SIZE - 2
+        max_trunk_length + 2 * _FLEX_KV_BLOCK_SIZE - 2
     ) // _FLEX_KV_BLOCK_SIZE
     max_own_blocks = (
         plan.block_size + 2 * _FLEX_KV_BLOCK_SIZE - 2
@@ -278,7 +322,7 @@ def _create_global_block_mask(plan: DFlashBatchPlan) -> BlockMask:
 
     token_valid_mask = torch.cat(
         (
-            plan.token_valid_mask.reshape(-1),
+            token_valid_mask,
             torch.zeros(
                 1,
                 dtype=torch.bool,
@@ -299,22 +343,30 @@ def _create_global_block_mask(plan: DFlashBatchPlan) -> BlockMask:
             key_index,
             max=max(trunk_key_count - 1, 0),
         )
-        safe_sequence_length = max(plan.sequence_length, 1)
-        trunk_row = torch.div(
-            safe_trunk_index,
-            safe_sequence_length,
-            rounding_mode="floor",
-        )
-        trunk_position = torch.remainder(
-            safe_trunk_index,
-            safe_sequence_length,
-        )
-        visible_trunk = (
-            (key_index < trunk_key_count)
-            & (trunk_row == plan.sample_rows[block_index])
-            & (trunk_position < plan.anchor_positions[block_index])
-            & token_valid_mask[safe_trunk_index]
-        )
+        if sequence_layout is None:
+            safe_sequence_length = max(plan.sequence_length, 1)
+            trunk_row = torch.div(
+                safe_trunk_index,
+                safe_sequence_length,
+                rounding_mode="floor",
+            )
+            trunk_position = torch.remainder(
+                safe_trunk_index,
+                safe_sequence_length,
+            )
+            visible_trunk = (
+                (key_index < trunk_key_count)
+                & (trunk_row == plan.sample_rows[block_index])
+                & (trunk_position < plan.anchor_positions[block_index])
+                & token_valid_mask[safe_trunk_index]
+            )
+        else:
+            visible_trunk = (
+                (key_index < trunk_key_count)
+                & (safe_trunk_index >= plan.packed_segment_starts[block_index])
+                & (safe_trunk_index < plan.global_anchor_positions[block_index])
+                & token_valid_mask[safe_trunk_index]
+            )
 
         safe_block_index = torch.clamp(
             key_index - trunk_key_count,
@@ -362,6 +414,7 @@ def _flex_block_only_attention_cuda(
     block_k: Tensor,
     block_v: Tensor,
     scale: float,
+    sequence_layout: DraftSequenceLayout | None,
 ) -> Tensor:
     num_kv_heads = trunk_k.shape[2]
     head_dim = trunk_k.shape[3]
@@ -386,7 +439,7 @@ def _flex_block_only_attention_cuda(
                 block_q.permute(0, 2, 1, 3),
                 global_key,
                 global_value,
-                block_mask=_create_global_block_mask(plan),
+                block_mask=_create_global_block_mask(plan, sequence_layout),
                 scale=scale,
                 enable_gqa=block_q.shape[2] != num_kv_heads,
             ),
@@ -404,9 +457,29 @@ def dflash_block_only_attention(
     block_q: Tensor,
     block_k: Tensor,
     block_v: Tensor,
+    sequence_layout: DraftSequenceLayout | None = None,
+    context_parallel_group: ProcessGroup | None = None,
     scale: float | None = None,
 ) -> Tensor:
     """Apply bidirectional anchored-block attention without trunk queries."""
+    if sequence_layout is not None:
+        trunk_k = gather_projected_kv(
+            trunk_k,
+            sequence_layout=sequence_layout,
+            cp_group=context_parallel_group,
+            sequence_dim=1,
+        )
+        trunk_v = gather_projected_kv(
+            trunk_v,
+            sequence_layout=sequence_layout,
+            cp_group=context_parallel_group,
+            sequence_dim=1,
+        )
+    elif (
+        context_parallel_group is not None
+        and dist.get_world_size(context_parallel_group) > 1
+    ):
+        raise ValueError("context_parallel_group requires a draft sequence layout")
     _validate_block_only_attention_inputs(
         plan=plan,
         trunk_k=trunk_k,
@@ -414,10 +487,22 @@ def dflash_block_only_attention(
         block_q=block_q,
         block_k=block_k,
         block_v=block_v,
+        sequence_layout=sequence_layout,
     )
     effective_scale = block_q.shape[-1] ** -0.5 if scale is None else scale
     if not math.isfinite(effective_scale):
         raise ValueError("attention scale must be finite")
+
+    if block_q.shape[0] == 0:
+        # K/V gathering above is collective across CP ranks, and its autograd
+        # backward is collective as well. Keep an explicit zero-valued edge to
+        # both gathered tensors so this empty-query rank still enters backward
+        # while other CP ranks differentiate their owned draft blocks.
+        gathered_dependency = trunk_k.sum() + trunk_v.sum()
+        local_dependency = block_k.sum() + block_v.sum()
+        return block_q * 0 + torch.zeros_like(block_q) * (
+            gathered_dependency + local_dependency
+        )
 
     if block_q.device.type == "cuda":
         block_output = _flex_block_only_attention_cuda(
@@ -428,6 +513,7 @@ def dflash_block_only_attention(
             block_k=block_k,
             block_v=block_v,
             scale=effective_scale,
+            sequence_layout=sequence_layout,
         )
     else:
         num_kv_heads = trunk_k.shape[2]
@@ -450,7 +536,7 @@ def dflash_block_only_attention(
             block_q,
             global_key,
             global_value,
-            _block_visibility(plan),
+            _block_visibility(plan, sequence_layout),
             scale=effective_scale,
         )
     return torch.where(
