@@ -454,8 +454,8 @@ class GymEnvironmentCheckpoint:
         }
         if any(stranded.values()):
             raise RuntimeError(
-                "Gym checkpoint holds parked agent sessions that are not an "
-                "agent's own /run episode, "
+                "Gym checkpoint holds parked agent sessions whose episode no "
+                "participant exported as its own, "
                 "so they can neither be restored nor finish while the deployment is "
                 f"prepared: stranded={_summarize_gym_episodes(stranded)}"
             )

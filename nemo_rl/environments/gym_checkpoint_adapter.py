@@ -91,8 +91,8 @@ class GymCheckpointCommitSummary:
                 f"unlisted={sorted(attributed - set(self.staging_keys))[:10]!r}"
             )
 
-    # Parked agent sessions that are not an agent's own /run episode. They
-    # cannot be restored and cannot finish while the deployment is prepared.
+    # Parked agent sessions whose episode no participant exported as its own.
+    # They cannot be restored and cannot finish while the deployment is prepared.
     unowned_live_episodes: tuple[GymCheckpointEpisode, ...] = ()
 
 
@@ -187,22 +187,6 @@ class GymCheckpointAdapter:
             return
         with _reraise_as_gym_checkpoint_unavailable():
             participants = await discover(self._client, auth_token=self._auth_token)
-        # Only typed environment servers take part in checkpoints, and turn
-        # recovery refuses them at setup; the legacy_agent relay is not a
-        # participant. Commits therefore assume every episode is an agent's own
-        # /run episode, so fail rather than misattribute one an environment
-        # server owns.
-        environment_servers = sorted(
-            member.server_name
-            for member in participants.members
-            if member.kind == "environment"
-        )
-        if environment_servers:
-            raise RuntimeError(
-                "Gym turn recovery does not support environment-server checkpoint "
-                f"participants yet: {environment_servers!r}. Route these rows through "
-                "a legacy_agent environment server or use target_level='sibling'."
-            )
         self._participants = participants
 
     async def restart_only_servers(self) -> list[str]:
@@ -272,9 +256,12 @@ class GymCheckpointAdapter:
             )
 
         requested_keys = {episode_id.capture_key for episode_id in episode_ids}
-        # A legacy_agent environment server only relays /run, so it never holds
-        # the episode: it is the agent's own /run episode instead.
-        run_episode_keys: set[str] = set()
+        # Each committed episode has exactly one owner. A typed environment
+        # server owns the episodes it runs, and the agent sessions it opens for
+        # them are not the agent's own. A legacy_agent environment server only
+        # relays /run and is no participant, so the agent's own /run episode is
+        # the one it owns.
+        owned_keys: set[str] = set()
         agent_session_keys: set[str] = set()
         staging_keys: set[str] = set()
         keys_by_capture_key: dict[str, set[str]] = {}
@@ -290,6 +277,10 @@ class GymCheckpointAdapter:
                     f"requested scope: participant={member.server_name!r}, "
                     f"unexpected={sorted(unexpected)!r}"
                 )
+            own_keys: set[str] = set()
+            if member.kind == "environment":
+                # Every episode an environment server exports is its own.
+                own_keys = capture_keys
             if member.kind == "agent" and capture_keys:
                 agent_session_keys.update(capture_keys)
                 # The committed episodes the agent's own /run drives.
@@ -301,13 +292,13 @@ class GymCheckpointAdapter:
                         f"participant={member.server_name!r}, "
                         f"unexported={sorted(unexported)!r}"
                     )
-                duplicate_owners = run_episode_keys.intersection(own_keys)
-                if duplicate_owners:
-                    raise RuntimeError(
-                        "Gym checkpoint episode was exported as their own /run episode "
-                        f"by multiple agent participants: {sorted(duplicate_owners)!r}"
-                    )
-                run_episode_keys.update(own_keys)
+            duplicate_owners = owned_keys.intersection(own_keys)
+            if duplicate_owners:
+                raise RuntimeError(
+                    "Gym checkpoint episode was exported as its own by multiple "
+                    f"participants: {sorted(duplicate_owners)!r}"
+                )
+            owned_keys.update(own_keys)
             if member.kind == "model":
                 staging_keys.update(reply["staging_keys"])
                 for capture_key, keys in reply["staging_keys_by_episode"].items():
@@ -324,9 +315,6 @@ class GymCheckpointAdapter:
                 )
             )
 
-        # An agent owns only its own /run episodes; discover refuses
-        # environment servers, the other kind of owner.
-        owned_keys = run_episode_keys
         return GymCheckpointCommitSummary(
             exported_episodes=_episodes(owned_keys),
             participants=tuple(
