@@ -24,6 +24,7 @@ import sys
 import warnings
 from types import SimpleNamespace
 from typing import get_args
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
@@ -47,7 +48,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     logprob_passes_required,
     validate_single_controller_config,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
+from nemo_rl.algorithms.single_controller_utils.setup import (
+    _build_retry_policy,
+    setup_single_controller,
+)
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
@@ -241,6 +245,19 @@ def test_refit_actor_rejected_with_non_nccl_refit_transport() -> None:
     cfg.policy["generation"]["refit_transport"] = "nixl"
     with pytest.raises(ValueError, match="NCCL refit transports"):
         validate_single_controller_config(cfg)
+
+
+def test_group_token_mean_requires_megatron_before_setup() -> None:
+    cfg = _master_config()
+    cfg.loss_fn.normalization = "group_token_mean"
+    cfg.policy["megatron_cfg"] = {"enabled": True}
+    validate_single_controller_config(cfg)
+    cfg.policy["megatron_cfg"]["enabled"] = False
+    # Missing setup fields must not hide this compatibility error.
+    with pytest.raises(
+        ValueError, match="group_token_mean requires SingleController GRPO"
+    ):
+        setup_single_controller(cfg, MagicMock(pad_token_id=0))
 
 
 class TestRolloutFailureValidation:
