@@ -80,7 +80,7 @@ grpo:
 - **`reward_shaping`**: When enabled, applies the overlong penalty mechanism described in the Reward Shaping section above. Responses whose total generated assistant-turn length exceeds `max_response_length - overlong_buffer_length` receive penalties proportional to their excess length, helping to reduce reward noise and stabilize training.
 
 > [!NOTE]
-> When dynamic sampling is enabled, monitor the `filtered_reward` metric to track the average reward of the prompts with std > 0.
+> When dynamic sampling is enabled, `reward` is the average reward of the prompts the step trains on (those with std > 0), so it can stay flat while the policy improves. Monitor `unfiltered_reward`, the average reward before filtering, to track progress.
 
 > [!NOTE]
 > **Clip-Higher** and **Token-Level Policy Gradient Loss** are already supported in NeMo RL and can be configured through the `loss_fn` section of your experiment config:
