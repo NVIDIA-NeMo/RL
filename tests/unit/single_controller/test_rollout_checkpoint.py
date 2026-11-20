@@ -20,6 +20,11 @@ from unittest.mock import Mock, call
 
 import pytest
 
+from nemo_rl.algorithms.loss import (
+    CISPOLossConfig,
+    ClippedPGLossConfig,
+    ClippedSurrogateLossConfig,
+)
 from nemo_rl.algorithms.rollout_checkpointing import manifest as snapshot_manifest
 from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION,
@@ -181,6 +186,20 @@ def test_bootstrap_anchor_mismatch_names_redacted_config_paths(tmp_path: Path) -
     manifest = (anchor / BOOTSTRAP_MANIFEST_FILENAME).read_text()
     assert "secret-one" not in manifest
     assert "custom-secret-one" not in manifest
+
+
+def test_bootstrap_identity_is_unchanged_by_tagging_the_loss_config() -> None:
+    settings = {"ratio_clip_max": 0.28, "reference_policy_kl_penalty": 0.0}
+
+    def identity(loss_fn: Any) -> BootstrapCompatibilityIdentity:
+        dumped = {"env": {}, "loss_fn": loss_fn.model_dump(mode="json")}
+        return bootstrap_compatibility_identity(cast(Any, _DumpedConfig(dumped)))
+
+    untagged = identity(ClippedPGLossConfig(**settings))
+    assert "kind" not in untagged.config["loss_fn"]
+    assert identity(ClippedSurrogateLossConfig(**settings)) == untagged
+    assert identity(ClippedSurrogateLossConfig()) != untagged
+    assert identity(CISPOLossConfig(**settings)) != untagged
 
 
 def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
