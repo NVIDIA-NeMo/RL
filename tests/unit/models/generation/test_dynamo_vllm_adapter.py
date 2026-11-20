@@ -49,7 +49,7 @@ from nemo_rl.models.generation.dynamo.rollout_client import (  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm import (  # noqa: E402
     adapter as vllm_adapter,
 )
-from nemo_rl.models.generation.dynamo.vllm.chat_engine import (  # noqa: E402
+from nemo_rl.models.generation.dynamo.chat_engine import (  # noqa: E402
     CALL_KEY,
     GYM_CALL_ANNOTATION,
     RUNTIME_DATA_KEY,

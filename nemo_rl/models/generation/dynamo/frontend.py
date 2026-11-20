@@ -14,17 +14,19 @@
 
 """Run Dynamo's frontend with NeMo RL's chat engine serving chat calls.
 
-``python -m nemo_rl.models.generation.dynamo.vllm.frontend <dynamo.frontend args>``
+``python -m nemo_rl.models.generation.dynamo.frontend <dynamo.frontend args>``
 
 The arguments are ``dynamo.frontend``'s own. Its ``main`` builds one
 ``EntrypointArgs``; this wraps that name to add NeMo RL's
 ``chat_engine_factory``, so every chat call reaches
-:mod:`~nemo_rl.models.generation.dynamo.vllm.chat_engine` and never Dynamo's
+:mod:`~nemo_rl.models.generation.dynamo.chat_engine` and never Dynamo's
 Rust preprocessor. ``/v1/completions`` (NeMo RL's own rollouts, token ids in)
 is unchanged. It wraps ``DistributedRuntime`` the same way, to serve NeMo-Gym's
 checkpoint generation cuts through the frontend's own runtime
-(:mod:`~nemo_rl.models.generation.dynamo.vllm.generation_cut`) and, in a run
-that serves chat, to start the render workers at launch.
+(:mod:`~nemo_rl.models.generation.dynamo.generation_cut`) and, in a run
+that serves chat, to start the render workers at launch. The generation
+backend the chat engine serves comes from the driver's environment
+(``CHAT_BACKEND_ENV``).
 """
 
 import os
@@ -34,15 +36,16 @@ import sys
 def main() -> None:
     import dynamo.frontend.main as frontend_main
 
-    from nemo_rl.models.generation.dynamo.managed_runtime import (
-        CHAT_SETTINGS_FILE_ENV,
-    )
-    from nemo_rl.models.generation.dynamo.vllm.chat_engine import ChatEngineFactory
-    from nemo_rl.models.generation.dynamo.vllm.generation_cut import (
+    from nemo_rl.models.generation.dynamo.chat_engine import ChatEngineFactory
+    from nemo_rl.models.generation.dynamo.generation_cut import (
         start_generation_cut_server,
     )
+    from nemo_rl.models.generation.dynamo.managed_runtime import (
+        CHAT_BACKEND_ENV,
+        CHAT_SETTINGS_FILE_ENV,
+    )
 
-    factory = ChatEngineFactory()
+    factory = ChatEngineFactory(os.environ[CHAT_BACKEND_ENV])
     entrypoint_args = frontend_main.EntrypointArgs
 
     def with_chat_engine(engine_type, **kwargs):

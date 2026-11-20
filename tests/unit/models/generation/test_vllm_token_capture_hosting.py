@@ -106,7 +106,7 @@ from nemo_rl.models.generation.prefix_recovery.state import (  # noqa: E402
     _FrozenCut,
     _RequestCaptureState,
 )
-from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
+from nemo_rl.models.generation.generation_cut_route import (  # noqa: E402
     GENERATION_CUT_ROUTE as RL_GENERATION_CUT_ROUTE,
 )
 from nemo_rl.models.generation.vllm.progress_reader import (  # noqa: E402

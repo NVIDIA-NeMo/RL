@@ -77,7 +77,7 @@ from nemo_rl.models.generation.prefix_recovery.restore import (
 from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
     CapturedChatLogprobsMixin,
 )
-from nemo_rl.models.generation.vllm.generation_cut_route import (
+from nemo_rl.models.generation.generation_cut_route import (
     register_generation_cut_route,
 )
 from nemo_rl.models.generation.vllm.prompt_and_capture import (

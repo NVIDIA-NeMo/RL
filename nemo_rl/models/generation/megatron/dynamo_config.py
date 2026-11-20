@@ -77,8 +77,11 @@ class MegatronDynamoFrontendArgs(BaseModel, extra="forbid"):
         "device-aware-weighted",
     ] = "kv"
     # Idle seconds a NeMo-Gym session stays on one engine; None disables it.
+    # DRAFT: off until a Megatron run measures it; Dynamo 1.5.1 drops a chat
+    # call's session id anyway (see the vLLM DynamoFrontendArgs).
     session_affinity_ttl_secs: Annotated[int, Field(gt=0, le=31_536_000)] | None = None
-    # Processes in the frontend that render chat calls; see the vLLM dynamo_cfg.
+    # Processes that render NeMo-Gym's chat calls and build their replies
+    # (the model's HF tokenizer and Megatron-LM's parsers); each uses one core.
     render_workers: PositiveInt = 8
     extra_cli_args: list[str] = Field(default_factory=list)
 
@@ -297,9 +300,4 @@ def validate_megatron_dynamo_generation(generation_cfg: Mapping[str, Any]) -> No
             "mcore_generation_config.kv_cache_management_mode must be 'persist' "
             "for Megatron prefill/decode engines; offload and recompute "
             "invalidate the registered KV transfer buffers"
-        )
-    if mcore["expose_http_server"]:
-        raise ValueError(
-            "mcore_generation_config.expose_http_server must be false when "
-            "policy.generation.dynamo=true; the Dynamo frontend is the HTTP surface"
         )

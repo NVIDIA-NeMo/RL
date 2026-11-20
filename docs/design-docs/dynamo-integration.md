@@ -8,7 +8,7 @@
 Both hold only if no process runs Dynamo-owned vLLM code. A vLLM bump can then break Dynamo serving only in NeMo RL's own `dynamo/vllm/` package:
 
 - the engine adapter (`adapter.py`) calls a few vLLM APIs native NeMo RL does not: the `get_kv_cache_group_metadata` engine utility and `KVCacheSpecKind` at registration, and `StatLoggerBase` for the router's load signal;
-- the frontend's chat engine (`chat_engine.py`, `render_pool.py`) builds the same vLLM renderer and chat serving the native server builds (`vllm/chat_server.py`), from the engine's own engine args.
+- the frontend's chat engine (`dynamo/chat_engine.py`, `dynamo/render_pool.py`, shared by every backend) builds, through `dynamo/vllm/chat_backend.py`, the same vLLM renderer and chat serving the native server builds (`vllm/chat_server.py`), from the engine's own engine args.
 
 A renamed import fails the vLLM-lane unit tests at collection, and the Dynamo functional overlays run registration and NeMo-Gym's chat calls.
 
@@ -44,9 +44,9 @@ No HTTP control routes are involved. The Rust Worker installs a SIGTERM handler 
 
 ## NeMo-Gym chat
 
-Dynamo's frontend hands chat calls to a Python `chat_engine_factory` when one is given. `dynamo/vllm/frontend.py` starts `dynamo.frontend`'s own `main` with NeMo RL's factory added to the `EntrypointArgs` it builds, so the frontend keeps its HTTP server, router and `/v1/completions` path, and only chat goes to NeMo RL's chat engine (`dynamo/vllm/chat_engine.py`).
+Dynamo's frontend hands chat calls to a Python `chat_engine_factory` when one is given. `dynamo/frontend.py` starts `dynamo.frontend`'s own `main` with NeMo RL's factory added to the `EntrypointArgs` it builds, so the frontend keeps its HTTP server, router and `/v1/completions` path, and only chat goes to NeMo RL's chat engine (`dynamo/chat_engine.py`).
 
-Each engine publishes, in its registration's `runtime_data`, its own engine args and the `policy.generation` chat settings. The chat engine builds a render pool (`dynamo/vllm/render_pool.py`) from them: `render_workers` spawned processes, each holding the vLLM renderer and chat serving the native server builds. Rendering is CPU-bound Python, and the frontend serves every call on one event loop, so it runs in the pool, first in first out.
+Each engine publishes, in its registration's `runtime_data`, its own engine args and the `policy.generation` chat settings. The chat engine builds a render pool (`dynamo/render_pool.py`, with the backend's render worker from `dynamo/<backend>/chat_backend.py`) from them: `render_workers` spawned processes, each holding the vLLM renderer and chat serving the native server builds. Rendering is CPU-bound Python, and the frontend serves every call on one event loop, so it runs in the pool, first in first out.
 
 When the engines expose chat (`vllm_cfg.expose_http_server`, which NeMo-Gym requires and the native worker starts its server on), the workers are built while the engines load, so NeMo-Gym's first calls do not wait for them:
 
@@ -69,7 +69,7 @@ A call that is refused or fails is answered through one map on both paths (`erro
 
 With `rollout_recovery.target_level: prefix`, a checkpoint cuts each running call (its decoded tokens are staged in TQ), and a restore resumes it from those tokens. The engines hold the calls and the worker-side state (`models/generation/prefix_recovery`), so both halves run there, with the native server's code:
 
-- **The cut.** NeMo-Gym posts it beside the URL its calls go to, the frontend. A Dynamo frontend route can only be a synchronous GET, so `dynamo/vllm/frontend.py` also wraps `DistributedRuntime` and serves the native route (`vllm/generation_cut_route.py`) on a second port, in the frontend process (`dynamo/vllm/generation_cut.py`). It sends the cut to every engine with `Client.direct`; the adapter's `nemo_rl:generation_cut` handler runs the worker's own cut and answers with the calls it cut; and the answers are merged into the one receipt Gym expects. A call no engine cut gets Gym's failure ack and regenerates after a restore. The frontend takes one deadline when the cut arrives and sends it along, so an engine stops cutting in time for its answer to reach the frontend; an engine that timed the cut itself would start later and answer too late.
+- **The cut.** NeMo-Gym posts it beside the URL its calls go to, the frontend. A Dynamo frontend route can only be a synchronous GET, so `dynamo/frontend.py` also wraps `DistributedRuntime` and serves the native route (`generation_cut_route.py`) on a second port, in the frontend process (`dynamo/generation_cut.py`). It sends the cut to every engine with `Client.direct`; the adapter's `nemo_rl:generation_cut` handler runs the worker's own cut and answers with the calls it cut; and the answers are merged into the one receipt Gym expects. A call no engine cut gets Gym's failure ack and regenerates after a restore. The frontend takes one deadline when the cut arrives and sends it along, so an engine stops cutting in time for its answer to reach the frontend; an engine that timed the cut itself would start later and answer too late.
 - **The resume.** The frontend renders and routes a re-sent call like any other. The adapter then runs the steps the native server runs (`start_capture` in `vllm/prompt_and_capture.py`): it reads and checks the saved rows, replaces the prompt with them, lowers the output budget, checks the call's reprocessed media against the digests the cut saved, and begins capture with the cut. A cut it cannot use (rows gone, or newer than its weights) is dropped, and the frontend's prompt runs. The engine's reply names what it resumed from, and the render pool puts the saved text back before vLLM's parsers run and counts the saved tokens as output (`prefix_recovery/restore.py`).
 
 The resolve is in the engine, not the frontend, because the check needs the engine's weight version and its capture state, and a cut the engine drops then needs no second pass through the frontend. The cost is that the KV router scores a resumed call on the prompt without its saved tokens.
@@ -87,7 +87,7 @@ The vLLM workers' venv (the `vllm` extra) carries the released `ai-dynamo` and `
 What a Dynamo upgrade has to re-check:
 - the `dynamo.common.backend` contract (`LLMEngine`, `Worker`, `WorkerConfig`, publisher and logprob helpers);
 - the request fields of Dynamo's preprocessed request, and `extra_args` reaching the engine;
-- the frontend's `chat_engine_factory` hook and the `EntrypointArgs` name `dynamo/vllm/frontend.py` wraps, which are internal API;
+- the frontend's `chat_engine_factory` hook and the `EntrypointArgs` name `dynamo/frontend.py` wraps, which are internal API;
 - the Python chat request the hook receives, its `nvext` and annotation fields, and `EngineConfig.runtime_data` reaching the frontend.
 
 The one vLLM↔Dynamo wire coupling is vLLM's KV-event msgpack, which Dynamo's router decodes. A change there degrades routing, not serving. The managed runtime logs the router's applied-event counts at shutdown, and the Dynamo functional overlays fail if the engines published events but none were applied (`tests/functional/check_dynamo_overlay.sh`).

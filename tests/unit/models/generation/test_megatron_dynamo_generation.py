@@ -30,6 +30,8 @@ from ray.exceptions import GetTimeoutError
 import nemo_rl.models.generation.megatron.dynamo_generation as generation_module
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation import resolve_generation_class
+from nemo_rl.models.generation.dynamo.managed_runtime import RUNTIME_DATA_KEY
+from nemo_rl.models.generation.dynamo.megatron.chat_backend import megatron_chat_spec
 from nemo_rl.models.generation.megatron.dynamo_config import (
     dynamo_enabled,
     engine_width,
@@ -270,6 +272,8 @@ class _FakeEngine:
         if method in ("prepare_for_generation", "set_rollout_weight_version"):
             (value,) = kwargs.values()
             return f"{self.short}.{method}({value})"
+        if method == "setup_token_capture":
+            return f"{self.short}.setup_token_capture({kwargs['staging_partition']})"
         return f"{self.short}.{short[method]}"
 
     @property
@@ -355,11 +359,16 @@ class _FakeRuntime:
         model_name,
         frontend_python,
         ray_address,
+        chat_backend,
         serves_chat,
     ):
         self.dynamo_cfg = dynamo_cfg
         self.ray_address = ray_address
+        self.chat_backend = chat_backend
         self.serves_chat = serves_chat
+        # What publish_chat_settings / publish_chat_capture were handed.
+        self.chat_settings: list[dict] = []
+        self.chat_capture: list[dict] = []
         self.model_name = model_name
         self.frontend_python = frontend_python
         self.log = env.log
@@ -371,6 +380,12 @@ class _FakeRuntime:
 
     def start(self):
         self.log.append("runtime up")
+
+    def publish_chat_settings(self, settings):
+        self.chat_settings.append(settings)
+
+    def publish_chat_capture(self, **kwargs):
+        self.chat_capture.append(kwargs)
 
     def wait_for_engines(self, expected_components, check_engines):
         check_engines()
@@ -447,6 +462,7 @@ class _Env:
         *,
         world_size: int = 6,
         policy: dict | None = None,
+        reserved_http_server_ports: dict[int, int] | None = None,
         **cluster_overrides,
     ) -> MegatronDynamoGeneration:
         policy = policy or {
@@ -465,6 +481,7 @@ class _Env:
             config=policy,  # type: ignore[arg-type]
             tokenizer="tok",  # type: ignore[arg-type]
             cluster=SimpleNamespace(**cluster),  # type: ignore[arg-type]
+            reserved_http_server_ports=reserved_http_server_ports,
         )
         self.generations.append(generation)
         return generation
@@ -593,7 +610,13 @@ def test_builds_one_cluster_and_engine_per_role(env):
     assert env.runtime.frontend_python == "/venvs/mcore/bin/python"
     assert env.runtime.model_name == "Qwen/Qwen3-0.6B"
     assert generation._dynamo_namespace == "ns"
-    assert generation.dp_openai_server_base_urls == ["http://10.0.0.1:3000/v1"]
+    assert generation._dynamo_frontend_url == "http://10.0.0.1:3000/v1"
+    # No NeMo-Gym: the frontend starts no render workers and gets no settings.
+    assert env.runtime.chat_backend == "megatron"
+    assert env.runtime.serves_chat is False
+    assert env.runtime.chat_settings == []
+    assert generation.dp_openai_server_base_urls == []
+    assert "reserved_http_server_ports" not in env.engines[0].kwargs
 
     cluster = env.clusters[0]
     assert cluster.kwargs == {
@@ -1273,7 +1296,7 @@ def test_pickled_copy_awaits_the_frontend_over_http(env, monkeypatch):
     generation = env.started()
     clone = pickle.loads(pickle.dumps(generation))
     assert clone._dynamo_runtime is None
-    assert clone.dp_openai_server_base_urls == ["http://10.0.0.1:3000/v1"]
+    assert clone._dynamo_frontend_url == "http://10.0.0.1:3000/v1"
     with pytest.raises(RuntimeError, match="copy .* owns no engines"):
         clone.engine_python()
     # The copy owns nothing: shutdown stops no engine and no service.
@@ -1313,7 +1336,88 @@ def test_pickled_copy_awaits_the_frontend_over_http(env, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The refit side: fan-out, rank placement, ordered pause, one-wave resume
+# NeMo-Gym: through the frontend's chat engine
+# ---------------------------------------------------------------------------
+
+
+def _gym_config() -> dict[str, Any]:
+    config = _megatron_config()
+    config["mcore_generation_config"].update(
+        expose_http_server=True, parsers=["deepseek-r1-reasoning"], max_model_len=4096
+    )
+    config.update(temperature=1.0, top_p=1.0, top_k=None)
+    return config
+
+
+def test_gym_calls_the_frontend_which_gets_the_chat_settings_up_front(env):
+    generation = env.generation(_gym_config())
+
+    # One URL for the whole fleet; Megatron engines take no generation cuts.
+    assert generation.client_base_urls == ["http://10.0.0.1:3000/v1"]
+    assert generation.generation_cut_control_urls is None
+    assert env.runtime.serves_chat is True
+    # The settings come from the config, before any engine has weights, and
+    # are what every engine registers (megatron_chat_spec).
+    (settings,) = env.runtime.chat_settings
+    assert settings == {RUNTIME_DATA_KEY: megatron_chat_spec(_gym_config())}
+    assert settings[RUNTIME_DATA_KEY]["generation"]["mcore_generation_config"] == {
+        "expose_http_server": True,
+        "parsers": ["deepseek-r1-reasoning"],
+        "max_model_len": 4096,
+    }
+    # No engine serves HTTP of its own.
+    assert generation.dp_openai_server_base_urls == []
+
+
+def test_engines_take_no_reserved_http_ports(env):
+    with pytest.raises(ValueError, match="no HTTP server of their own"):
+        env.generation(_gym_config(), reserved_http_server_ports={0: 5000})
+
+
+def test_plain_megatron_reservation_refuses_engines_behind_dynamo():
+    policy = {**MEGATRON_POLICY, "generation": _gym_config()}
+    with pytest.raises(ValueError, match="through the Dynamo frontend"):
+        MegatronGeneration.reserve_http_server_addresses("cluster", policy)  # type: ignore[arg-type]
+
+
+def test_token_capture_installs_on_every_engine_and_tells_the_frontend(env):
+    generation = env.started(generation_config=_gym_config())
+
+    assert generation.setup_token_capture({"backend": "simple"}, "staging") is None  # type: ignore[arg-type]
+
+    assert env.log == [f"{short}.setup_token_capture(staging)" for short in _NAMES]
+    assert env.runtime.chat_capture == [
+        {
+            "dp_cfg": {"backend": "simple"},
+            "staging_partition": "staging",
+            "capture_media": False,
+            "generation_cut_control_token": None,
+            "generation_cut_control_timeout_s": None,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        pytest.param({"top_logprobs": 2}, "sampler top-k", id="top_logprobs"),
+        pytest.param(
+            {"generation_prefix_cuts_enabled": True},
+            "generation-prefix recovery",
+            id="cuts",
+        ),
+        pytest.param({"capture_media": True}, "text prompts only", id="media"),
+    ],
+)
+def test_token_capture_refuses_what_the_engines_cannot_stage(env, kwargs, match):
+    generation = env.started(generation_config=_gym_config())
+    with pytest.raises(NotImplementedError, match=match):
+        generation.setup_token_capture({}, "staging", **kwargs)  # type: ignore[arg-type]
+    assert env.log == [] and env.runtime.chat_capture == []
+
+
+# ---------------------------------------------------------------------------
+# The refit side# The refit side: fan-out, rank placement, ordered pause, one-wave resume
 # ---------------------------------------------------------------------------
 
 
@@ -1771,8 +1875,6 @@ def test_rollouts_go_through_the_frontend(env, monkeypatch):
     assert output["gen_leader_worker_idx"] == [0]
     assert requests[0][0] == "http://10.0.0.1:3000/v1/completions"
     assert requests[0][2] is None, "request_timeout_s defaults to no deadline"
-    with pytest.raises(NotImplementedError, match="NeMo-Gym"):
-        generation.setup_token_capture({}, "staging")  # type: ignore[arg-type]
     assert generation.get_inference_world_size() == 6
 
 
@@ -1783,6 +1885,7 @@ def _master_config(
     data_plane: dict[str, Any] | None = None,
     gym: bool = False,
     is_vlm: bool = False,
+    token_capture: bool = False,
     generation_overrides: dict[str, Any] | None = None,
 ) -> SimpleNamespace:
     generation = _serving_config(**(generation_overrides or {}))
@@ -1795,6 +1898,7 @@ def _master_config(
         ),
         data_plane=data_plane or {"backend": "simple"},
         env={"should_use_nemo_gym": gym},
+        token_capture=SimpleNamespace(enabled=token_capture),
         policy={
             "megatron_cfg": {"enabled": megatron_trainer},
             "is_vlm": is_vlm,
@@ -1818,7 +1922,7 @@ _STORAGE_ON_INFERENCE = "must not include the 'inference'"
         pytest.param(
             {"recompute_kv_cache": True}, "kv_cache_management_mode='persist'", id="kv"
         ),
-        pytest.param({"gym": True}, "NeMo-Gym rollouts are not yet served", id="gym"),
+        pytest.param({"gym": True}, "expose_http_server=true", id="gym"),
         pytest.param({"is_vlm": True}, "text prompts only", id="vlm"),
         pytest.param(
             {"generation_overrides": {"colocated": {"enabled": True}}},
@@ -1893,12 +1997,12 @@ def test_validate_settings(settings, match) -> None:
             MegatronDynamoGeneration.validate_settings(master_config)  # type: ignore[arg-type]
 
 
-def test_validate_settings_refuses_gym_before_the_server_checks() -> None:
-    # A Gym config exposes the HTTP server (should_use_nemo_gym() asserts it
-    # does); it must hear about Gym, not about expose_http_server.
-    master_config = _master_config(gym=True)
+@pytest.mark.parametrize("token_capture", [False, True])
+def test_validate_settings_accepts_gym_through_the_frontend(token_capture) -> None:
+    # A Gym config exposes chat; the frontend's chat engine serves it, and
+    # the decode engines stage captured calls.
+    master_config = _master_config(gym=True, token_capture=token_capture)
     master_config.policy["generation"]["mcore_generation_config"][
         "expose_http_server"
     ] = True
-    with pytest.raises(NotImplementedError, match="NeMo-Gym rollouts are not yet"):
-        MegatronDynamoGeneration.validate_settings(master_config)  # type: ignore[arg-type]
+    MegatronDynamoGeneration.validate_settings(master_config)  # type: ignore[arg-type]

@@ -117,6 +117,9 @@ def test_dynamo_cfg_defaults_and_rejects_unknown_keys() -> None:
     cfg = megatron_dynamo_cfg({})
     assert cfg == MegatronDynamoCfg()
     assert cfg.frontend_args.router_mode == "kv" and cfg.request_timeout_s is None
+    # The managed runtime reads these for every backend's frontend.
+    assert cfg.frontend_args.render_workers == 8
+    assert cfg.frontend_args.session_affinity_ttl_secs is None
     assert cfg.role_overrides("prefill") == {} and cfg.role_overrides("decode") == {}
     with pytest.raises(ValidationError, match="extra_forbidden"):
         megatron_dynamo_cfg({"dynamo_cfg": {"engine": "megatron"}})
@@ -312,11 +315,6 @@ def test_engine_width_must_hold_the_expert_parallel_grid(layout, decode, match) 
             "persist",
             id="kv_cache_mode",
         ),
-        pytest.param(
-            _set("mcore_generation_config", "expose_http_server", value=True),
-            "expose_http_server",
-            id="http_server",
-        ),
     ],
 )
 def test_validation_rejects_unsupported_shapes(mutate, match) -> None:
@@ -362,11 +360,19 @@ def test_validation_rejects_native_refit_backends_the_engines_cannot_use(
         validate_megatron_dynamo_generation(config)
 
 
+def test_validation_accepts_the_http_server_for_nemo_gym() -> None:
+    # Each engine's rank zero serves NeMo-Gym over the frontend from that server.
+    config = _megatron_config()
+    config["mcore_generation_config"]["expose_http_server"] = True
+    validate_megatron_dynamo_generation(config)
+
+
 def _master_config(generation: dict) -> SimpleNamespace:
     """The fields MegatronGeneration.validate_settings reads, at accepted values."""
     return SimpleNamespace(
         policy=_policy(generation),
         env={"should_use_nemo_gym": False},
+        token_capture=SimpleNamespace(enabled=False),
         async_rl=SimpleNamespace(
             recompute_kv_cache_after_weight_updates=False,
             generation_fleet_health=SimpleNamespace(enabled=False),

@@ -31,8 +31,8 @@ pytest.importorskip("vllm")
 from dynamo.llm.exceptions import HttpError, InvalidArgument  # noqa: E402
 
 from nemo_rl.models.generation.dynamo import managed_runtime  # noqa: E402
-from nemo_rl.models.generation.dynamo.vllm import chat_engine  # noqa: E402
-from nemo_rl.models.generation.dynamo.vllm.render_pool import (  # noqa: E402
+from nemo_rl.models.generation.dynamo import chat_engine  # noqa: E402
+from nemo_rl.models.generation.dynamo.render_pool import (  # noqa: E402
     RenderedCall,
 )
 from nemo_rl.models.generation.gym_call import (  # noqa: E402
@@ -195,6 +195,7 @@ def _serve(pool, router, request, capture=None) -> list[dict]:
         routed_engine=router,
         spec={"generation": GENERATION},
         capture=capture or _Capture(),
+        backend=chat_engine.load_chat_backend("vllm"),
     )
 
     async def run():
@@ -488,7 +489,7 @@ def test_only_nemo_rls_engines_are_served() -> None:
     )
 
     async def build():
-        return await chat_engine.ChatEngineFactory().chat_engine_factory(
+        return await chat_engine.ChatEngineFactory("vllm").chat_engine_factory(
             0, model, _Router()
         )
 
@@ -503,7 +504,7 @@ def test_render_workers_start_at_registration_only_where_chat_is_served(
     started: list[int] = []
 
     class _StartedPool:
-        def __init__(self, *, workers: int) -> None:
+        def __init__(self, *, workers: int, renderer: str) -> None:
             self._workers = workers
 
         def build(self, spec: dict, model_dir: str) -> None:
@@ -524,7 +525,9 @@ def test_render_workers_start_at_registration_only_where_chat_is_served(
     )
 
     async def register() -> None:
-        await chat_engine.ChatEngineFactory().chat_engine_factory(0, model, _Router())
+        await chat_engine.ChatEngineFactory("vllm").chat_engine_factory(
+            0, model, _Router()
+        )
         # The start runs in the background; registration never waits for it.
         await asyncio.gather(*(asyncio.all_tasks() - {asyncio.current_task()}))
 
@@ -549,7 +552,7 @@ def test_registration_keeps_render_workers_built_from_the_same_settings(
     pools: list = []
 
     class _Pool:
-        def __init__(self, *, workers: int) -> None:
+        def __init__(self, *, workers: int, renderer: str) -> None:
             self.built: list[tuple[dict, str]] = []
             self.shut_down = False
             pools.append(self)
@@ -594,7 +597,7 @@ def test_registration_keeps_render_workers_built_from_the_same_settings(
     )
 
     async def launch_then_register() -> None:
-        factory = chat_engine.ChatEngineFactory()
+        factory = chat_engine.ChatEngineFactory("vllm")
         factory.start_render_workers()
         while sent_early is not None and not pools[0].built:
             await asyncio.sleep(0.01)

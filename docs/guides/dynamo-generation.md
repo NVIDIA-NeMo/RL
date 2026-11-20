@@ -267,8 +267,10 @@ Limits:
 
 - Prefill/decode only: aggregated Megatron engines behind Dynamo are rejected
   (leave `dynamo` false for that).
-- Native rollouts only; NeMo-Gym through the frontend is follow-up work, so
-  `env.should_use_nemo_gym` must be false.
+- NeMo-Gym calls the frontend, as on the vLLM path (see [NeMo-Gym](#nemo-gym)): with `mcore_generation_config.expose_http_server: true`, the frontend's chat engine renders each call and builds its reply with Megatron-LM's `ChatRenderer`, the render and reply half of Megatron-LM's own chat endpoint (chat template, the reasoning and tool parsers in `mcore_generation_config.parsers`), then sends the call's token ids across the prefill and decode engines. As that endpoint does, the model's earlier turns are spliced in by its EOS ids first and its BOS rule (the request's `add_BOS`, default off) is applied after the splice. No engine serves HTTP itself. The driver publishes the chat settings from the config when the frontend starts, so the render workers are built while the engines load.
+- NeMo-Gym through the frontend needs a Megatron-LM with `ChatRenderer` (NVIDIA/Megatron-LM#9579). The Megatron-LM pinned through Megatron-Bridge does not have it yet; the render workers fail to start until that pin is bumped.
+- Token capture (`token_capture.enabled`) reads each call's prefix from TQ in the frontend and stages the call on the decode engine that generated it, from that engine's rank zero. The engines get none of Megatron-LM's engine-side capture hooks (prompt preparer, payload stager), so no call carries `offload_params`; prefill engines open no TQ client. Text capture only: no media, no sampler top-k (`top_logprobs`), and no generation cuts (`rollout_recovery.target_level: prefix`).
+- A NeMo-Gym call's omitted `temperature`, `top_p` or `top_k` takes `policy.generation`'s, as Megatron-LM's endpoint does; a call that sets them keeps its own. Calls that ask for `top_logprobs` are refused.
 - Text prompts only (`policy.is_vlm` false); no router replay.
 - Each engine fits on one node; `refit_transport` must be null or `mcore`
   (with `refit_backend` `nccl` or `gloo`);

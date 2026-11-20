@@ -3473,6 +3473,62 @@ class TestSetup:
             assert metrics.generation_init_reserve_time_s is None
             assert metrics.weight_sync_time_s is None
 
+    @pytest.mark.mcore
+    def test_megatron_engines_behind_dynamo_give_gym_the_frontend(
+        self, patched_factories
+    ):
+        """Gym calls the Dynamo frontend, which the generation object starts.
+
+        No engine address is reserved: the generation is built before Gym,
+        with no reserved ports, Gym is handed its frontend URL, the initial
+        refit runs in setup, and the build task hands the same object back.
+        """
+        mc = self._make_gym_megatron_config()
+        mc.policy["generation"]["dynamo"] = True
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        tokenizer = MagicMock(pad_token_id=0)
+        patched_factories["_build_generation"].side_effect = _REAL_BUILD_GENERATION
+        fake_gym_actor = MagicMock(name="nemo_gym_actor")
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "resolve_generation_class"),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_actor
+            ) as mock_spinup,
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+            patch.object(
+                sc_setup_mod, "megatron_generation_cls"
+            ) as mock_megatron_generation_cls,
+            patch.object(sc_setup_mod, "ray"),
+        ):
+            mock_dynamo = MagicMock(name="MegatronDynamoGeneration")
+            mock_megatron_generation_cls.return_value = mock_dynamo
+            generation = mock_dynamo.return_value
+            generation.client_base_urls = ["http://10.0.0.1:3000/v1"]
+            generation.generation_cut_control_urls = None
+            actor_args, _ = setup_single_controller(mc, tokenizer)
+
+        mock_megatron.reserve_http_server_addresses.assert_not_called()
+        inference_cluster = patched_factories["_build_clusters"].return_value[1]
+        mock_dynamo.assert_called_once_with(
+            config=mc.policy,
+            tokenizer=tokenizer,
+            cluster=inference_cluster,
+            reserved_http_server_ports=None,
+            processor=None,
+            skip_weight_load=True,
+        )
+        _, spinup_kwargs = mock_spinup.call_args
+        assert spinup_kwargs["base_urls"] == ["http://10.0.0.1:3000/v1"]
+        # The frontend lists the model only once the engines hold weights, so
+        # the initial refit runs in setup, as for the per-engine servers.
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.sync_weights.assert_called_once_with()
+        assert actor_args.gen_handle is generation
+        assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
+
     def _make_megatron_token_capture_config(self) -> MasterConfig:
         """Gym-on Megatron config with token capture enabled (expose_http_server=true)."""
         mc = self._make_gym_megatron_config()

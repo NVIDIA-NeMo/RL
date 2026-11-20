@@ -16,23 +16,28 @@
 
 Dynamo's frontend hands every chat call to this engine (``chat_engine_factory``)
 instead of its Rust preprocessor, so NeMo-Gym's calls are rendered, spliced and
-parsed by the same code as NeMo RL's native vLLM server:
+parsed by the same code as the generation backend's native server:
 
 1. the call's :class:`~nemo_rl.models.generation.gym_call.GymCallExtras` and
-   on-policy sampling are checked;
+   its sampling are checked (:meth:`ChatBackend.checked_sampling`);
 2. a render-pool worker renders it (:mod:`render_pool`);
 3. here, the prompt is prepared as natively
-   (:func:`~nemo_rl.models.generation.vllm.prompt_and_capture.prepare_prompt`: the
-   token-capture prefix read from TQ, the splice and the clamp);
+   (:func:`~nemo_rl.models.generation.gym_prompt.prepare_prompt`: the
+   token-capture prefix read from TQ, the splice and the backend's clamp);
 4. the final token ids go through Dynamo's KV router to one engine, whose
-   adapter runs the capture and generation
-   (``adapter.DynamoVllmAdapter``);
-5. a render-pool worker builds the reply with vLLM's own parsers.
+   adapter runs the capture and generation (``vllm.adapter.DynamoVllmAdapter``,
+   ``megatron.adapter.NemoRLMegatronLLMEngine``);
+5. a render-pool worker builds the reply with the backend's own parsers.
 
-The engine publishes its engine args and chat settings at registration
+What differs per backend (the render worker, the sampling check, the clamp,
+how errors are answered, the engine's sampling options) is a
+:class:`ChatBackend`, loaded by name from the backend's ``dynamo/<backend>/``
+package, so this module imports no generation backend.
+
+The engine publishes its chat settings at registration
 (``EngineConfig.runtime_data``), so this engine renders exactly as it would.
-For a run that serves chat it also sends them before it loads, and the render
-workers are built from them meanwhile (:class:`ChatEngineFactory`).
+For a run that serves chat the driver also sends them before the engines load,
+and the render workers are built from them meanwhile (:class:`ChatEngineFactory`).
 """
 
 from __future__ import annotations
@@ -45,8 +50,8 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Coroutine
-from typing import Any, AsyncGenerator, Optional, TypedDict
+from collections.abc import Callable, Coroutine, Mapping
+from typing import Any, AsyncGenerator, Optional, Protocol, TypedDict
 
 from dynamo.llm import PythonAsyncEngine
 from dynamo.llm.exceptions import HttpError, InvalidArgument
@@ -55,10 +60,12 @@ from nemo_rl.models.generation.dynamo.engine_adapter import weight_free_model_pa
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     RAY_ADDRESS_ENV,
     RENDER_WORKERS_ENV,
+    RUNTIME_DATA_KEY,
     read_chat_capture,
     read_chat_settings,
 )
-from nemo_rl.models.generation.dynamo.vllm.render_pool import (
+from nemo_rl.models.generation.dynamo.render_pool import (
+    RenderedCall,
     RenderPool,
     RestoredReply,
 )
@@ -68,11 +75,10 @@ from nemo_rl.models.generation.gym_call import (
     GymCallResult,
     GymRequestFields,
 )
+from nemo_rl.models.generation.gym_prompt import PreparedPrompt
 
 LOGGER = logging.getLogger(__name__)
 
-# The key the engine publishes its chat settings under in runtime_data.
-RUNTIME_DATA_KEY = "nemo_rl_chat"
 # The annotation the adapter serves NeMo-Gym calls by; the ForwardedCall rides
 # in extra_args under CALL_KEY.
 GYM_CALL_ANNOTATION = "nemo_gym:rollout"
@@ -126,9 +132,99 @@ class GymEngineReply(TypedDict, total=False):
     refusal: GymCallRefusal
 
 
-# Fields of Dynamo's chat request that are not vLLM request fields
-# (chat_template_args is renamed to vLLM's chat_template_kwargs).
+# Fields of Dynamo's chat request that are not OpenAI request fields
+# (chat_template_args is renamed to chat_template_kwargs).
 _DYNAMO_ONLY_FIELDS = {"nvext", "chat_template_args", "unsupported_fields"}
+
+# The package each backend's ChatBackend lives in, by the backend name the
+# frontend is launched with (managed_runtime.CHAT_BACKEND_ENV).
+_CHAT_BACKEND_MODULES = {
+    "vllm": "nemo_rl.models.generation.dynamo.vllm.chat_backend",
+    "megatron": "nemo_rl.models.generation.dynamo.megatron.chat_backend",
+}
+
+
+class CallRefusal(Protocol):
+    """How a backend answers a call that failed before its reply."""
+
+    @property
+    def status(self) -> int: ...
+
+    @property
+    def message(self) -> str: ...
+
+    # Whether Gym is told its capture call was refused before it was staged.
+    @property
+    def acknowledge(self) -> bool: ...
+
+
+class ChatBackend(Protocol):
+    """What the chat engine needs from one generation backend.
+
+    Each method runs in the frontend process, which has the engines' own
+    environment; anything that imports the backend's libraries is deferred to
+    the call, so loading the backend imports none of them.
+    """
+
+    # "module:Class" of the render-pool worker (a render_pool.RenderWorker).
+    renderer: str
+    # Modules a call imports, imported in a thread while the render workers
+    # start so the first call does not wait for them.
+    warm_modules: tuple[str, ...]
+
+    def serves_chat(self, generation: Mapping[str, Any]) -> bool:
+        """Whether ``policy.generation`` serves NeMo-Gym's chat calls."""
+        ...
+
+    def checked_sampling(
+        self,
+        body: dict[str, Any],
+        *,
+        on_policy: bool,
+        generation: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """The sampling fields to serve ``body`` with; raises for one it refuses.
+
+        ``on_policy`` is False for a call Gym marks as an untrained caller's,
+        which keeps its own sampling.
+        """
+        ...
+
+    async def prepare_prompt(
+        self,
+        rendered: RenderedCall,
+        *,
+        resolve_prefix: Callable[[Any], list[int]],
+        render_info: Mapping[str, Any],
+        measure_only: bool,
+    ) -> PreparedPrompt:
+        """:func:`~nemo_rl.models.generation.gym_prompt.prepare_prompt` with the backend's clamp.
+
+        ``render_info`` is the render workers' ``RenderWorker.info()``: the
+        turn-end ids the splice cuts by, the context length, and whatever else
+        the backend's own steps read (Megatron: the BOS id).
+        """
+        ...
+
+    def error_reply(self, error: Exception) -> Optional[CallRefusal]:
+        """How to answer a call that raised ``error``; None for a server error."""
+        ...
+
+    def engine_options(
+        self, body: dict[str, Any], rendered: RenderedCall
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """The engine request's ``sampling_options`` and ``output_options``."""
+        ...
+
+
+def load_chat_backend(name: str) -> ChatBackend:
+    """The :class:`ChatBackend` of the generation backend ``name``."""
+    if name not in _CHAT_BACKEND_MODULES:
+        raise ValueError(
+            f"NeMo RL's Dynamo chat engine serves {sorted(_CHAT_BACKEND_MODULES)}; "
+            f"got backend {name!r}"
+        )
+    return importlib.import_module(_CHAT_BACKEND_MODULES[name]).CHAT_BACKEND
 
 
 def _capture_refusal_ack(extras: GymCallExtras) -> str:
@@ -238,18 +334,19 @@ def _log_failed_start(task: asyncio.Task[None]) -> None:
         )
 
 
-async def _start_chat_workers(pool: RenderPool) -> None:
+async def _start_chat_workers(pool: RenderPool, backend: ChatBackend) -> None:
     """Do what the first chat call would otherwise wait for.
 
     The render workers start, and the steps a call runs are imported (they
-    import vLLM) in a thread, so the frontend's event loop keeps serving.
-    A call that arrives first waits for the workers, as without this.
+    import the backend's libraries) in a thread, so the frontend's event loop
+    keeps serving. A call that arrives first waits for the workers, as without
+    this.
     """
     await asyncio.gather(
         pool.start(),
-        asyncio.to_thread(
-            importlib.import_module,
-            "nemo_rl.models.generation.vllm.prompt_and_capture",
+        *(
+            asyncio.to_thread(importlib.import_module, module)
+            for module in backend.warm_modules
         ),
     )
 
@@ -280,11 +377,13 @@ class NemoRLChatEngine:
         routed_engine: Any,
         spec: dict[str, Any],
         capture: _CaptureSource,
+        backend: ChatBackend,
     ):
         self._pool = pool
         self._routed_engine = routed_engine
         self._generation = spec["generation"]
         self._capture = capture
+        self._backend = backend
         # The first call, and the first one served, each log once: what the
         # frontend's start-up cost NeMo-Gym's first step.
         self._first_call = True
@@ -293,9 +392,6 @@ class NemoRLChatEngine:
     async def generate(
         self, request: dict[str, Any], context: Any = None
     ) -> AsyncGenerator[dict[str, Any], None]:
-        # Deferred: prompt_and_capture imports vLLM.
-        from nemo_rl.models.generation.vllm.prompt_and_capture import error_reply
-
         extras = GymCallExtras.from_annotations(
             (request.get("nvext") or {}).get("annotations") or ()
         )
@@ -313,7 +409,7 @@ class NemoRLChatEngine:
         except Exception as error:
             # The steps before the engine refuse a call with these, as
             # natively; the frontend holds no capture state to fail.
-            failure = error_reply(error)
+            failure = self._backend.error_reply(error)
             if failure is None:
                 raise
             ack = _capture_refusal_ack(extras) if failure.acknowledge else ""
@@ -323,44 +419,22 @@ class NemoRLChatEngine:
     async def _serve(
         self, request: dict[str, Any], extras: GymCallExtras, context: Any
     ) -> dict[str, Any]:
-        # Deferred: interfaces imports torch, and prompt_and_capture vLLM.
+        # Deferred: interfaces imports torch.
         from nemo_rl.experience.interfaces import NEMO_GYM_MODEL_SAMPLING_NULL
-        from nemo_rl.models.generation.vllm.prompt_and_capture import prepare_prompt
-        from nemo_rl.models.generation.vllm.utils import (
-            OffPolicySamplingError,
-            on_policy_sampling,
-        )
 
         body = _drop_none(
             {k: v for k, v in request.items() if k not in _DYNAMO_ONLY_FIELDS}
         )
         if request.get("chat_template_args"):
             body["chat_template_kwargs"] = request["chat_template_args"]
-        if (body.get("n") or 1) != 1:
-            # Capture stages one choice per call, and the trainer replays one.
-            raise OffPolicySamplingError(
-                f"request n={body['n']} is not supported; NeMo-Gym calls take n=1"
-            )
-        if body.get("stream"):
-            # vLLM's delta outputs would leave this path only the last piece.
-            raise OffPolicySamplingError(
-                "request stream=true is not supported; NeMo-Gym calls do not stream"
-            )
         # Gym marks an untrained caller's call, such as an LLM judge's, which keeps its own sampling.
-        if extras.ng_sampling != NEMO_GYM_MODEL_SAMPLING_NULL:
-            body.update(
-                on_policy_sampling(
-                    temperature=body.get("temperature"),
-                    top_p=body.get("top_p"),
-                    top_k=body.get("top_k"),
-                    min_p=body.get("min_p"),
-                    repetition_penalty=body.get("repetition_penalty"),
-                    presence_penalty=body.get("presence_penalty"),
-                    frequency_penalty=body.get("frequency_penalty"),
-                    logit_bias=body.get("logit_bias"),
-                    generation_config=self._generation,
-                )
+        body.update(
+            self._backend.checked_sampling(
+                body,
+                on_policy=extras.ng_sampling != NEMO_GYM_MODEL_SAMPLING_NULL,
+                generation=self._generation,
             )
+        )
         request_fields: set[str] = set(GymRequestFields.model_fields)
         body.update(extras.model_dump(include=request_fields))
         first_call, self._first_call = self._first_call, False
@@ -371,11 +445,10 @@ class NemoRLChatEngine:
             LOGGER.info("The first chat call waited for the %s", steps)
         rendered = await self._pool.render(body, measure=extras.ng_measure)
         steps.mark("render")
-        plan = await prepare_prompt(
+        plan = await self._backend.prepare_prompt(
             rendered,
             resolve_prefix=self._capture.resolve_prefix,
-            turn_end_token_ids=info["turn_end_token_ids"],
-            max_model_len=info["max_model_len"],
+            render_info=info,
             measure_only=extras.ng_measure,
         )
         steps.mark("prefix and splice")
@@ -402,15 +475,13 @@ class NemoRLChatEngine:
             "reasoning_ended": rendered.reasoning_ended,
             "reasoning_parser_kwargs": rendered.reasoning_parser_kwargs,
         }
+        sampling_options, output_options = self._backend.engine_options(body, rendered)
         preprocessed = {
             "model": request["model"],
             "token_ids": plan.prompt_token_ids,
             "stop_conditions": {"max_tokens": plan.max_tokens},
-            "sampling_options": {
-                "temperature": body["temperature"],
-                "top_p": body["top_p"],
-            },
-            "output_options": {},
+            "sampling_options": sampling_options,
+            "output_options": output_options,
             "eos_token_ids": [],
             "annotations": [GYM_CALL_ANNOTATION],
             "extra_args": {CALL_KEY: wire},
@@ -522,7 +593,9 @@ class ChatEngineFactory:
     engines register the same ``policy.generation``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, backend: str) -> None:
+        """Serve the chat calls of the generation backend named ``backend``."""
+        self._backend = load_chat_backend(backend)
         self._capture = _CaptureSource()
         # The workers started at launch and the settings they were built from
         # (None until those arrive), until a registration takes them.
@@ -545,9 +618,12 @@ class ChatEngineFactory:
         self._tasks.append(task)
 
     def _new_pool(self, *, start: bool) -> RenderPool:
-        pool = RenderPool(workers=int(os.environ[RENDER_WORKERS_ENV]))
+        pool = RenderPool(
+            workers=int(os.environ[RENDER_WORKERS_ENV]),
+            renderer=self._backend.renderer,
+        )
         if start:
-            self._run(_start_chat_workers(pool))
+            self._run(_start_chat_workers(pool, self._backend))
         return pool
 
     async def _build_early_pool(self, pool: RenderPool) -> None:
@@ -589,7 +665,7 @@ class ChatEngineFactory:
             return None
         if early_spec is None:
             # No settings came before registration: the workers have imported
-            # vLLM and build now.
+            # the backend's libraries and build now.
             pool.build(spec, model_dir)
             return pool
         early, registered = early_spec["generation"], spec["generation"]
@@ -627,13 +703,15 @@ class ChatEngineFactory:
             )
         pool = self._take_early_pool(spec, mdc.local_dir())
         if pool is None:
-            # NeMo-Gym's calls need this flag, and the native worker starts its
-            # chat server on it. Without it no chat call comes, so nothing starts.
-            pool = self._new_pool(
-                start=bool(spec["generation"]["vllm_cfg"].get("expose_http_server"))
-            )
+            # NeMo-Gym's calls need the backend's chat server switch. Without it
+            # no chat call comes, so nothing starts.
+            pool = self._new_pool(start=self._backend.serves_chat(spec["generation"]))
             pool.build(spec, mdc.local_dir())
         engine = NemoRLChatEngine(
-            pool=pool, routed_engine=routed_engine, spec=spec, capture=self._capture
+            pool=pool,
+            routed_engine=routed_engine,
+            spec=spec,
+            capture=self._capture,
+            backend=self._backend,
         )
         return PythonAsyncEngine(engine.generate, asyncio.get_running_loop())

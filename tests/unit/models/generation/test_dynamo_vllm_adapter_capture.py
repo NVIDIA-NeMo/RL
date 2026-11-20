@@ -63,7 +63,7 @@ from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm import (  # noqa: E402
     adapter as vllm_adapter,
 )
-from nemo_rl.models.generation.dynamo.vllm.generation_cut import (  # noqa: E402
+from nemo_rl.models.generation.dynamo.generation_cut import (  # noqa: E402
     CUT_PREFIXES_KEY,
     CUT_REPLY_MARGIN_S,
     DEADLINE_KEY,

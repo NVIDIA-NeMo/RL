@@ -190,6 +190,12 @@ class MegatronGeneration(GenerationInterface):
             referenced until the workers have adopted the sockets (worker init
             complete), then `ray.kill` them.
         """
+        if dynamo_enabled(config["generation"]):
+            raise ValueError(
+                "Megatron engines behind Dynamo serve NeMo-Gym through the Dynamo "
+                "frontend (MegatronDynamoGeneration.client_base_urls); no engine "
+                "server address is reserved"
+            )
         # Colocated generation shares the training policy's cluster and uses the
         # default placement-group init, triggered lazily by the read below.
         if not config["generation"]["colocated"]["enabled"]:
