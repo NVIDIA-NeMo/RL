@@ -37,7 +37,11 @@ from nemo_rl.data.megatron_sft_packed import (
 )
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
 from nemo_rl.data_plane.codec import pad_field
-from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS, OPD_FULL_FIELDS
+from nemo_rl.data_plane.schema import (
+    MICROBATCH_PADDED_FIELDS,
+    OPD_FULL_FIELDS,
+    ROUTER_EXCLUDED_ROWS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.alignment import get_fp8_token_alignment
@@ -885,6 +889,10 @@ def process_microbatch(
             if prepacked:
                 if delegate_pack_to_model:
                     raise ValueError("Prepacked input cannot use model-owned packing.")
+                if ROUTER_EXCLUDED_ROWS in data_dict:
+                    raise NotImplementedError(
+                        "Row-level router exclusion is not supported for prepacked input."
+                    )
                 (
                     input_ids,
                     input_ids_cp_sharded,
@@ -1062,7 +1070,7 @@ def process_microbatch(
                             cp_size=get_context_parallel_world_size(),
                         )
                     full_padding_mask = get_packed_seq_padding_mask(
-                        cu_seqlens=cu_seqlens,
+                        cu_seqlens=_router_cu_seqlens(cu_seqlens, data_dict),
                         cu_seqlens_padded=cu_seqlens_padded,
                         total_tokens=input_ids.shape[1],
                     )
@@ -1265,7 +1273,9 @@ def process_microbatch(
                         "Nonpacked router padding masks require input lengths "
                         f"in {lengths_key!r}."
                     )
-                lengths = data_dict[lengths_key].to(device=input_ids.device)
+                lengths = _router_valid_lengths(
+                    data_dict[lengths_key].to(device=input_ids.device), data_dict
+                )
                 padding_mask = torch.arange(
                     input_ids.shape[1], device=input_ids.device
                 ).unsqueeze(0) >= lengths.unsqueeze(1)
@@ -1668,6 +1678,29 @@ def _prepare_vlm_batch_for_megatron(
         None,
         cu_seqlens_padded,
     )
+
+
+def _router_valid_lengths(
+    lengths: torch.Tensor, data_dict: BatchedDataDict[Any]
+) -> torch.Tensor:
+    """Give rows excluded from expert-bias statistics no router-visible tokens."""
+    if ROUTER_EXCLUDED_ROWS not in data_dict:
+        return lengths
+    excluded = data_dict[ROUTER_EXCLUDED_ROWS].to(device=lengths.device).bool()
+    if excluded.shape != lengths.shape:
+        raise ValueError(f"{ROUTER_EXCLUDED_ROWS} must hold one flag per row")
+    return lengths.masked_fill(excluded, 0)
+
+
+def _router_cu_seqlens(
+    cu_seqlens: torch.Tensor, data_dict: BatchedDataDict[Any]
+) -> torch.Tensor:
+    """Packed counterpart of ``_router_valid_lengths``; padded offsets are unchanged."""
+    if ROUTER_EXCLUDED_ROWS not in data_dict:
+        return cu_seqlens
+    lengths = _router_valid_lengths(cu_seqlens[1:] - cu_seqlens[:-1], data_dict)
+    offsets = cu_seqlens[:1] + lengths.cumsum(0).to(cu_seqlens.dtype)
+    return torch.cat((cu_seqlens[:1], offsets))
 
 
 def _pack_sequences_for_megatron(

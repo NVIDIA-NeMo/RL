@@ -2647,6 +2647,7 @@ def _train_pump_controller(*, sampler) -> object:
         reference_logprobs_required=False,
         sampler_head_required=False,
     )
+    ctrl._router_excluded_fields = ()
     ctrl._advantage_estimator = None
     ctrl._partition_id = "rollout_data"
     ctrl._sampler = sampler
@@ -4053,7 +4054,9 @@ class _NoOpValue:
     def begin_train_step(self, loss_fn, **kwargs) -> None:
         self._record("begin_train_step")
 
-    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
         self._record("train_microbatches_from_meta")
 
     def train_from_meta(self, meta: KVBatchMeta, loss_fn, **kwargs) -> dict:

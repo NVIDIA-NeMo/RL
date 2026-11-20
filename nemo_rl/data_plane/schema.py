@@ -54,6 +54,10 @@ MASK_SAMPLE = "mask_sample"
 TRUNCATED = "truncated"
 META_IDX = "meta_idx"
 
+# Forest rows MoE expert-bias statistics must skip: execution padding and
+# failed owners' borrowed inputs. Bool, one per row; Forest batches only.
+ROUTER_EXCLUDED_ROWS = "router_excluded_rows"
+
 # Token-aligned message-violation fields consumed by SingleController advantages.
 INVALID_TOOL_CALL_MASK = "invalid_tool_call_mask"
 MALFORMED_THINKING_MASK = "malformed_thinking_mask"
