@@ -16,6 +16,7 @@ import pickle
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import (
@@ -28,9 +29,10 @@ from nemo_rl.algorithms.loss import (
     NLLLossFn,
     prepare_loss_input,
 )
+from nemo_rl.algorithms.loss.clipped_pg import clipped_pg_diagnostic_metrics
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
-from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.algorithms.utils import calculate_kl
 from nemo_rl.algorithms.x_token.loss_utils import (
     build_exact_token_map,
     chunk_average_log_probs,
@@ -42,6 +44,7 @@ from nemo_rl.distributed.model_utils import (
     cp_shift_next,
     vocab_parallel_gather_columns,
 )
+from nemo_rl.utils.tensor_ops import masked_mean
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
@@ -673,6 +676,52 @@ def test_clipped_pg_loss_tokenless_rows_are_not_survivors(seq_logprob_error_in_l
         assert metrics["seq_logprob_error_valid_seqs"] == 0
 
 
+def _clipped_pg_diagnostics(
+    ratios: torch.Tensor, mask: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    logprobs = torch.zeros_like(ratios)
+    return clipped_pg_diagnostic_metrics(
+        curr_logprobs=logprobs,
+        prev_logprobs=logprobs,
+        generation_logprobs=logprobs,
+        ratios=ratios,
+        ratios_clamped=ratios.clamp(0.8, 1.2),
+        mask=mask,
+        global_valid_toks=torch.tensor(1.0),
+        reference_policy_kl_type="k3",
+    )
+
+
+def test_clipped_pg_diagnostics_take_an_empty_microbatch() -> None:
+    """A rank whose microbatch is only a failed rollout's empty placeholder row
+    gets zero-size ratios; min/max must not raise on them."""
+    empty = torch.zeros(1, 0)
+
+    metrics = _clipped_pg_diagnostics(empty, empty)
+
+    assert metrics["probs_ratio_min"].item() == float("inf")
+    assert metrics["probs_ratio_max"].item() == float("-inf")
+    assert metrics["probs_ratio_clamped_min"].item() == float("inf")
+    assert metrics["probs_ratio_clamped_max"].item() == float("-inf")
+
+
+def test_clipped_pg_diagnostics_min_max_follow_the_mask() -> None:
+    ratios = torch.tensor([[0.5, 1.1, 3.0, 9.0]])
+    mask = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
+
+    metrics = _clipped_pg_diagnostics(ratios, mask)
+
+    assert metrics["probs_ratio_min"].item() == pytest.approx(0.5)
+    assert metrics["probs_ratio_max"].item() == pytest.approx(3.0)
+    assert metrics["probs_ratio_clamped_min"].item() == pytest.approx(0.8)
+    assert metrics["probs_ratio_clamped_max"].item() == pytest.approx(1.2)
+
+    # A fully masked microbatch yields the same sentinels as an empty one.
+    masked_out = _clipped_pg_diagnostics(ratios, torch.zeros_like(mask))
+    assert masked_out["probs_ratio_min"].item() == float("inf")
+    assert masked_out["probs_ratio_max"].item() == float("-inf")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_clipped_pg_loss_top_p_support_mismatch_backward():
     data, _, _, _ = _setup_clipped_pg_test_data(seq_len=3, vocab_size=4, device="cuda")
@@ -815,6 +864,15 @@ def test_clipped_pg_loss_force_on_policy_ratio_ignores_prev_logprobs():
     # Both should produce identical loss and ratios since prev_logprobs is ignored
     torch.testing.assert_close(loss_1, loss_2)
     assert metrics_1["probs_ratio"] == metrics_2["probs_ratio"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "setting", ["reference_policy_kl_type", "truncated_importance_sampling_type"]
+)
+def test_clipped_pg_loss_config_rejects_unknown_types(setting):
+    """An unknown KL or truncated-IS type fails when the config is built."""
+    with pytest.raises(ValidationError, match="literal_error"):
+        ClippedPGLossConfig(**{setting: "unknown"})
 
 
 @pytest.mark.parametrize(

@@ -34,6 +34,8 @@ run_test() {
     fi
 }
 
+# Two-phase SimpleStorage capture on real Ray/ZMQ actors (CPU only).
+run_test fast uv run --no-sync bash ./tests/functional/data_plane_simple_checkpoint_cpu.sh
 # Native TQ + metadata-only completed replay recovery (#3480).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh
 # Same recovery flow with Mooncake CPU storage and SSD offload on; skips
@@ -54,6 +56,8 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller
 # Token-capture (gate-authoritative) path: same SC+Gym smoke with the gate
 # custodying token lineage and the finalizer publishing training rows.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
+# Same SC+Gym smoke with the refit run in a separate RefitActor.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++async_rl.refit_actor.enabled=true
 # Score centering through capture, canonical TQ columns, trainer gather and loss.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_gym_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_filtered_gym_single_controller.sh
@@ -78,7 +82,12 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # the recovery (7-9 minutes locally). Full tier: it depends on three runs making
 # the same near-greedy choices, and local runs have failed for reasons outside
 # recovery, so it stays out of fast lanes until a CI-GPU pass rate is shown.
-run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh
+# Score centering with sampler replay: each cut also stages the sampler top-k,
+# and a resumed row trains with it (the settings of the H100 verification run).
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh ++policy.generation.top_logprobs=4 ++loss_fn.score_centering=true ++policy.generation.sampler_replay.enabled=true ++policy.generation.top_k=4
+# The same active-decode recovery with MoE router replay, on a tiny random MoE:
+# each restored call must stage the routes it restored for training.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_router_replay_prefix_recovery_single_controller_1n2g.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
