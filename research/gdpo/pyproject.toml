@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nemo-rl-gdpo"
+version = "0.1.0"
+description = "Group Diffusion Policy Optimization for NeMo RL"
+readme = "README.md"
+requires-python = ">=3.13.14,<3.14"
+dependencies = ["nemo-rl"]
+
+[dependency-groups]
+test = ["pytest>=7.0.0", "pytest-timeout", "pytest-cov"]
+
+[tool.uv.sources]
+nemo-rl = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["gdpo"]
+
+[tool.pytest.ini_options]
+addopts = "--durations=15 -s -rA -x"
+testpaths = ["tests"]
+python_files = "test_*.py"

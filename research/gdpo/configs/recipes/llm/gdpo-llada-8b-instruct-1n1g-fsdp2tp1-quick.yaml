@@ -1,0 +1,29 @@
+defaults: ../../gdpo_llada_8b.yaml
+# Single-GPU plumbing check with the official per-device GDPO batch:
+# 2 prompts x 6 generations, 12 policy updates per rollout batch.
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 6
+  max_num_steps: 10
+  val_period: 0
+  val_at_start: false
+checkpointing:
+  checkpoint_dir: results/gdpo-llada-8b-instruct-1n1g-fsdp2tp1-quick
+policy:
+  tokenizer:
+    name: GSAI-ML/LLaDA-8B-Instruct
+  train_global_batch_size: 12
+data:
+  train:
+    dataset_name: gsm8k
+    split: train
+  validation: null
+logger:
+  log_dir: logs/gdpo-llada-8b-instruct-1n1g-fsdp2tp1-quick
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: gdpo-llada-8b-instruct-1n1g-fsdp2tp1-quick
+cluster:
+  gpus_per_node: 1
