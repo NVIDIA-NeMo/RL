@@ -693,7 +693,6 @@ def test_an_unsharded_job_gets_the_registry_runtime_env(
             _env_configs(num_gpu_nodes=num_gpu_nodes),
             base_urls=["http://vllm-0"],
             model_name="test-model",
-            generation_backend="vllm",
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=True,
@@ -772,7 +771,6 @@ def test_spinup_nemo_gym_actor_cleans_up_after_startup_failure(
                 _env_configs(num_gpu_nodes=0),
                 base_urls=["http://vllm-0"],
                 model_name="test-model",
-                generation_backend="vllm",
                 tokenizer=MagicMock(),
                 enable_router_replay=False,
                 use_fastokens=False,
@@ -819,7 +817,6 @@ def test_spinup_nemo_gym_actor_preserves_startup_error_when_cleanup_fails(
                 _env_configs(num_gpu_nodes=0),
                 base_urls=["http://vllm-0"],
                 model_name="test-model",
-                generation_backend="vllm",
                 tokenizer=MagicMock(),
                 enable_router_replay=False,
                 use_fastokens=False,
@@ -1596,12 +1593,9 @@ def test_checkpointing_requires_token_capture(detected_uv_dirs):
         )
 
 
-@pytest.mark.parametrize(
-    "generation_backend", [None, "vllm", "megatron", "sglang", "trtllm"]
-)
 @pytest.mark.parametrize("sharded", [False, True])
-def test_gym_factory_normalizes_sglang_urls_for_every_actor(
-    detected_uv_dirs, generation_backend, sharded
+def test_gym_factory_passes_the_supplied_server_urls_to_every_actor(
+    detected_uv_dirs, sharded
 ):
     cluster = _FakeGymCluster()
     readiness = {
@@ -1622,10 +1616,6 @@ def test_gym_factory_normalizes_sglang_urls_for_every_actor(
     original_config = copy.deepcopy(env_configs)
     base_urls = ["http://engine-0/", "http://engine-1/v1/", "http://engine-2/v1"]
     original_urls = list(base_urls)
-    backend_args = (
-        {} if generation_backend is None else {"generation_backend": generation_backend}
-    )
-
     with _patched_cluster(cluster):
         shard_set = build_nemo_gym_actors(
             env_configs,
@@ -1636,17 +1626,11 @@ def test_gym_factory_normalizes_sglang_urls_for_every_actor(
             use_fastokens=False,
             turn_checkpointing_enabled=False,
             policy_api_key="per-job-key",
-            **backend_args,
         )
 
-    expected_urls = (
-        ["http://engine-0/v1", "http://engine-1/v1", "http://engine-2/v1"]
-        if generation_backend == "sglang"
-        else original_urls
-    )
     assert len(shard_set.all_handles) == (3 if sharded else 1)
     assert [config["base_urls"] for config in cluster.actor_configs] == [
-        expected_urls
+        original_urls
     ] * len(shard_set.all_handles)
     for config in cluster.actor_configs:
         assert config["policy_api_key"] == "per-job-key"
