@@ -2448,6 +2448,8 @@ def setup_single_controller(
         ),
     )
 
+    rollout_max_seq_len = resolve_generation_max_seq_len(generation)
+
     def _create_finalizers() -> list[Any]:
         """Rollout reassembler pool; needs the token-capture result, not the communicator."""
         lane_t0 = time.perf_counter()
@@ -2471,7 +2473,7 @@ def setup_single_controller(
                     pad_token_id=pad_id,
                     router_replay_enabled=router_replay_enabled(policy_config),
                     defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
-                    max_seq_len=resolve_generation_max_seq_len(generation),
+                    max_seq_len=rollout_max_seq_len,
                     capture_media=capture_media,
                     media_columns=media_columns,
                     effort_config=_get_effort_config(
@@ -2559,7 +2561,7 @@ def setup_single_controller(
         tokenizer=tokenizer,
         task_to_env=env_handles,
         num_generations_per_prompt=algo_cfg.num_generations_per_prompt,
-        max_seq_len=resolve_generation_max_seq_len(generation),
+        max_seq_len=rollout_max_seq_len,
         rollout_recovery_config=master_config.rollout_recovery,
         max_rollout_turns=algo_cfg.max_rollout_turns,
         policy_generation=generation,
