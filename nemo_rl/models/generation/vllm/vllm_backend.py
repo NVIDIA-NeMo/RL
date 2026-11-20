@@ -1057,36 +1057,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         # Reject before storing any refit state. The draft check needs this
         # refit's manifest, so it runs again once the manifest exists.
         self._validate_native_layerwise_refit()
-        pp_group = get_pp_group()
-        pp_rank = int(getattr(pp_group, "rank_in_group", 0))
-        pp_size = int(getattr(pp_group, "world_size", 1))
-        spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
-        speculator_type = getattr(spec_config, "method", None)
-        self._draft_runtime_adapter = None
-        if is_speculator_type(speculator_type):
-            self._draft_runtime_adapter = DraftRuntimeAdapter.resolve(
-                self.model_runner,
-                speculator_type=speculator_type,
-                vllm_version=vllm.__version__,
-                pp_rank=pp_rank,
-                pp_size=pp_size,
-            )
-        elif any(name.startswith("draft.") for name in state_dict_info):
-            raise SpeculatorRuntimeError(
-                f"draft weights require a supported speculator_type, got "
-                f"{speculator_type!r} with vLLM={vllm.__version__}"
-            )
-
-        draft_owner_ranks = (
-            self._draft_runtime_adapter.owner_ranks
-            if self._draft_runtime_adapter is not None
-            else ()
-        )
-        self._model_update_manifest = ModelUpdateManifest.from_state_dict_info(
-            state_dict_info,
-            target_owner_ranks=tuple(range(pp_size)),
-            draft_owner_ranks=draft_owner_ranks,
-        )
+        self._prepare_model_update_manifest(state_dict_info)
         self._reject_native_refit_of_trtllm_moe_draft()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
         _validate_draft_refit_info(
@@ -1118,6 +1089,39 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             for name in state_dict_info
             if fp8._is_fp8_weight(name, self.model_runner.model)
         ]
+
+    def _prepare_model_update_manifest(self, state_dict_info: dict[str, Any]) -> None:
+        """Bind target and draft metadata to the live speculative runtime."""
+        pp_group = get_pp_group()
+        pp_rank = int(getattr(pp_group, "rank_in_group", 0))
+        pp_size = int(getattr(pp_group, "world_size", 1))
+        spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
+        speculator_type = getattr(spec_config, "method", None)
+        self._draft_runtime_adapter = None
+        if is_speculator_type(speculator_type):
+            self._draft_runtime_adapter = DraftRuntimeAdapter.resolve(
+                self.model_runner,
+                speculator_type=speculator_type,
+                vllm_version=vllm.__version__,
+                pp_rank=pp_rank,
+                pp_size=pp_size,
+            )
+        elif any(name.startswith("draft.") for name in state_dict_info):
+            raise SpeculatorRuntimeError(
+                f"draft weights require a supported speculator_type, got "
+                f"{speculator_type!r} with vLLM={vllm.__version__}"
+            )
+
+        draft_owner_ranks = (
+            self._draft_runtime_adapter.owner_ranks
+            if self._draft_runtime_adapter is not None
+            else ()
+        )
+        self._model_update_manifest = ModelUpdateManifest.from_state_dict_info(
+            state_dict_info,
+            target_owner_ranks=tuple(range(pp_size)),
+            draft_owner_ranks=draft_owner_ranks,
+        )
 
     def prepare_sparse_delta_refit_info(
         self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]
@@ -2447,9 +2451,28 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         from nemo_rl.weight_sync.xferdtensor import follow_source_reshard_path
 
         follow_source_reshard_path(refit_info["source_uses_real_reshard_op"])
-        self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
-            restore_refit_info_placements(refit_info)
+        refit_info = restore_refit_info_placements(refit_info)
+        state_dict_info = {
+            param["name"]: (
+                tuple(param["global_shape"]),
+                _STR_TO_DTYPE[param["dtype"]],
+            )
+            for layer_name in refit_info["layer_names"]
+            for param in refit_info["per_layer_params"][layer_name]
+        }
+        state_dict_info.update(
+            {
+                name: (tuple(meta["shape"]), _STR_TO_DTYPE[meta["dtype"]])
+                for name, meta in refit_info.get("misc_meta", {}).items()
+            }
         )
+        self._prepare_model_update_manifest(state_dict_info)
+        # The draft check needs this refit's manifest, so it runs before storing.
+        self._reject_native_refit_of_trtllm_moe_draft()
+        self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
+            refit_info
+        )
+
         if self._uses_unquantized_flashinfer_trtllm() and not self.pp_comm_groups:
             # The TRTLLM expert map needs the per-PP-stage communicator ranks,
             # which init_nccl_reshard_comm_group establishes after prepare.
@@ -2940,12 +2963,19 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             for name, meta in misc_meta.items()
         }
 
+        # Bulk names never pass through _load_weights on this transport, so the
+        # coverage check is scoped to the misc stream, which carries the draft.
+        coverage = self._new_model_update_coverage()
         packed_broadcast_consumer(
             iterator=iter(misc_state_dict_info.items()),
             group=self.model_update_group,
             src=0,
-            post_unpack_func=self._load_weights,
+            post_unpack_func=lambda weights: self._load_weights(
+                weights, coverage=coverage
+            ),
         )
+        if coverage is not None:
+            coverage.require_covered(misc_state_dict_info)
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""

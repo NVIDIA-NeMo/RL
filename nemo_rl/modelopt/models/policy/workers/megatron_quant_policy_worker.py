@@ -564,12 +564,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             export_plan=plan,
         )
 
-        if self.draft_model is not None:
-            from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
-
-            for name, tensor in export_eagle_weights_to_hf(self.draft_model):
-                yield f"draft.{name}", tensor
-
         if not vllm_cfg["kv_cache_dtype"].startswith("fp8"):
             return
 
@@ -666,7 +660,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 if name not in existing_names:
                     yield name, amax
 
-    def _iter_params_with_optional_kv_scales(self, kv_scales=None):
+    def _iter_params_with_optional_kv_scales(
+        self, kv_scales=None, include_draft: bool = True
+    ):
         """Pre-fold weights on-the-fly via lazy proxy tasks.
 
         Wraps each conversion task so that reading task.param_weight returns
@@ -680,6 +676,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         """
         if self._use_real_quant_refit():
             yield from self._iter_real_quant_refit_params(kv_scales)
+            if include_draft:
+                yield from self._draft_weights_for_refit()
             return
 
         class _FoldedTask:
@@ -741,7 +739,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         self.refit_conversion_tasks = folded_tasks
         try:
             yielded_names = set()
-            for name, tensor in super()._iter_params_with_optional_kv_scales(kv_scales):
+            for name, tensor in super()._iter_params_with_optional_kv_scales(
+                kv_scales, include_draft=False
+            ):
                 if "weight_quantizer" in name:
                     continue
                 yielded_names.add(name)
@@ -761,3 +761,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             ) from e
         finally:
             self.refit_conversion_tasks = original_tasks
+
+        # Draft weights go last on every refit path, after the input amax
+        # params, so the live order matches the prepared refit metadata.
+        if include_draft:
+            yield from self._draft_weights_for_refit()

@@ -594,6 +594,31 @@ def test_iter_params_with_optional_kv_scales_uses_real_quant_export(monkeypatch)
     torch.testing.assert_close(output[0][1], torch.ones(1))
 
 
+def test_real_quant_refit_yields_draft_weights_last(monkeypatch):
+    worker = _make_real_quant_worker()
+    monkeypatch.setattr(
+        worker,
+        "_iter_real_quant_refit_params",
+        lambda kv_scales=None: iter(
+            [("real.weight", torch.ones(1)), ("k_scale", torch.ones(1))]
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_draft_weights_for_refit",
+        lambda metadata_only=False: iter([("draft.fc.weight", torch.zeros(1))]),
+    )
+
+    with_draft = [name for name, _ in worker._iter_params_with_optional_kv_scales()]
+    without_draft = [
+        name
+        for name, _ in worker._iter_params_with_optional_kv_scales(include_draft=False)
+    ]
+
+    assert with_draft == ["real.weight", "k_scale", "draft.fc.weight"]
+    assert without_draft == ["real.weight", "k_scale"]
+
+
 @requires_weight_folding
 def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
     from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
@@ -614,6 +639,7 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
     worker = object.__new__(worker_cls)
     worker.cfg = {"generation": {"backend": "vllm", "quant_cfg": "FP8_DEFAULT_CFG"}}
     worker.rank = 0
+    worker.draft_model = None
     worker.refit_conversion_tasks = [
         SimpleNamespace(
             param_name="decoder.layers.0.mlp.linear_fc2.weight",
@@ -634,7 +660,7 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
     monkeypatch.setattr(
         MegatronPolicyWorkerImpl,
         "_iter_params_with_optional_kv_scales",
-        lambda self, kv_scales=None: iter(
+        lambda self, kv_scales=None, **_kwargs: iter(
             [("model.layers.0.mlp.down_proj.weight", torch.ones(2, 2))]
         ),
     )
@@ -646,6 +672,19 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
         "model.layers.0.mlp.down_proj.input_quantizer._amax",
     ]
     torch.testing.assert_close(output[1][1], torch.tensor([3.0]))
+
+    # Draft weights follow the input amax params so the live order matches
+    # the prepared refit metadata.
+    monkeypatch.setattr(
+        worker,
+        "_draft_weights_for_refit",
+        lambda metadata_only=False: iter([("draft.fc.weight", torch.zeros(1))]),
+    )
+    assert [name for name, _ in worker._iter_params_with_optional_kv_scales()] == [
+        "model.layers.0.mlp.down_proj.weight",
+        "model.layers.0.mlp.down_proj.input_quantizer._amax",
+        "draft.fc.weight",
+    ]
 
 
 @requires_weight_folding
@@ -668,6 +707,7 @@ def test_folded_quantizer_error_includes_parameter_name(monkeypatch):
         }
     }
     worker.rank = 0
+    worker.draft_model = None
     task = SimpleNamespace(
         param_name="decoder.layers.0.mlp.linear_fc2.weight",
         global_param_name="decoder.layers.0.mlp.linear_fc2.weight",
@@ -683,7 +723,7 @@ def test_folded_quantizer_error_includes_parameter_name(monkeypatch):
         lambda *_args: FailingQuantizer(),
     )
 
-    def access_refit_task_weights(self, kv_scales=None):
+    def access_refit_task_weights(self, kv_scales=None, **_kwargs):
         for refit_task in self.refit_conversion_tasks:
             yield refit_task.param_name, refit_task.param_weight
 
@@ -1201,7 +1241,7 @@ def test_folded_refit_preserves_unquantized_output_rows(monkeypatch, dtype):
         )
     ]
 
-    def export_weights(self, kv_scales=None):
+    def export_weights(self, kv_scales=None, **_kwargs):
         for task in self.refit_conversion_tasks:
             yield task.param_name, task.param_weight
 

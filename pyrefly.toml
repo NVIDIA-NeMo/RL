@@ -351,6 +351,7 @@ project-includes = [
   "nemo_rl/models/megatron/ckpt_parallel_read.py",
   "nemo_rl/models/megatron/draft/__init__.py",
   "nemo_rl/models/megatron/draft/optimizer.py",
+  "nemo_rl/models/megatron/draft/refit.py",
   "nemo_rl/models/megatron/draft/step_state.py",
   "nemo_rl/models/megatron/draft/training.py",
   "nemo_rl/models/megatron/draft/utils.py",

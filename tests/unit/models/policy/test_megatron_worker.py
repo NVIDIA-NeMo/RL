@@ -269,6 +269,7 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     )
 
     worker.cfg = {"generation": {"backend": "vllm"}}
+    worker.draft_model = None
     list(worker._iter_params_with_optional_kv_scales())
     forwarded = worker.megatron_bridge.export_hf_weights.call_args.kwargs[
         "conversion_tasks"
@@ -418,9 +419,16 @@ def test_local_refit_names_are_expert_parallel_invariant(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
+def test_nccl_reshard_all_misc_refit_supports_empty_bulk(
+    monkeypatch: pytest.MonkeyPatch, pp_size: int
+) -> None:
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
+    )
+
+    monkeypatch.setattr(
+        worker_module, "assert_refit_weight_manifest_rank_agreement", MagicMock()
     )
 
     misc_name = "model.layers.0.mlp.experts.down_proj"
@@ -431,6 +439,8 @@ def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
         local_hf_param_specs=lambda: (),
     )
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {}
+    worker.draft_model = None
     worker.nccl_reshard_refit_infos = {}
     worker.refit_conversion_tasks = [task]
     worker.model = object()
@@ -499,6 +509,9 @@ def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
             local_hf_param_specs=lambda: (object(),) if safe else (),
         )
 
+    monkeypatch.setattr(
+        worker_module, "assert_refit_weight_manifest_rank_agreement", MagicMock()
+    )
     bulk_task = task(bulk_name, safe=True)
     export_tasks = [task(name) for name in values]
     compound_task = SimpleNamespace(
@@ -507,6 +520,8 @@ def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
     )
     export_tasks.append(compound_task)
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.cfg = {}
+    worker.draft_model = None
     worker.model = object()
     worker.model_update_group = object()
     worker.nccl_reshard_refit_infos = {}
@@ -565,7 +580,51 @@ def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
     worker._iter_params_with_optional_kv_scales.assert_called_with(
         kv_scales={"unused": 1.0},
         conversion_tasks=worker._misc_conversion_tasks,
+        include_draft=False,
     )
+
+
+@pytest.mark.parametrize("drift", [False, True])
+def test_nccl_reshard_misc_broadcast_appends_checked_draft_weights(
+    monkeypatch: pytest.MonkeyPatch, drift: bool
+) -> None:
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    target = ("model.norm.weight", torch.ones(2))
+    draft = ("draft.fc.weight", torch.zeros(3, 2) if drift else torch.zeros(2, 3))
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.model_update_group = object()
+    worker._misc_conversion_tasks = []
+    worker.nccl_reshard_refit_infos = {
+        0: {
+            "misc_meta": {
+                "model.norm.weight": {"shape": [2], "dtype": "torch.float32"},
+                "draft.fc.weight": {"shape": [2, 3], "dtype": "torch.float32"},
+            }
+        }
+    }
+    worker._iter_params_with_optional_kv_scales = MagicMock(
+        side_effect=lambda **_: iter([target])
+    )
+    worker._draft_weights_for_refit = MagicMock(side_effect=lambda: iter([draft]))
+    received = []
+    monkeypatch.setattr(
+        worker_module,
+        "packed_broadcast_producer",
+        lambda *, iterator, **kwargs: received.extend(iterator),
+    )
+
+    if drift:
+        with pytest.raises(ValueError, match="METADATA_DRIFT"):
+            worker._broadcast_misc_params_packed()
+        # The drift fails before the draft tensor reaches the broadcast.
+        assert [name for name, _ in received] == ["model.norm.weight"]
+    else:
+        worker._broadcast_misc_params_packed()
+        assert [name for name, _ in received] == [
+            "model.norm.weight",
+            "draft.fc.weight",
+        ]
 
 
 def test_refit_destination_uses_common_worker_interface(
@@ -3166,7 +3225,7 @@ def test_prepare_source_refit_info_resets_previous_prequantization_selection():
     worker._refit_prequant_names = {name}
     worker._calculate_refit_param_info = lambda: {}
 
-    def _iter_params():
+    def _iter_params(**_kwargs):
         dtype = (
             torch.float8_e4m3fn
             if name in worker._refit_prequant_names
@@ -3175,6 +3234,7 @@ def test_prepare_source_refit_info_resets_previous_prequantization_selection():
         yield name, torch.ones(2, 64, dtype=dtype)
 
     worker._iter_params_with_optional_kv_scales = _iter_params
+    worker._draft_weights_for_refit = lambda **_kwargs: ()
 
     info = worker._prepare_source_refit_info()
 
