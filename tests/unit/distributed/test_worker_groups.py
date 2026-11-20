@@ -14,6 +14,7 @@
 
 import os
 import sys
+from unittest.mock import Mock
 
 import pytest
 import ray
@@ -46,6 +47,77 @@ def test_dp_leaders_may_be_an_ascending_subset_of_the_group_leaders():
 def test_dp_leaders_outside_the_group_leaders_are_rejected(requested):
     with pytest.raises(ValueError, match="ascending subset"):
         _check_dp_leader_worker_indices(requested, tied_group_leaders=[0, 2, 4, 6])
+
+
+def _borrowed_gpu_cluster(indices: list[int]) -> RayVirtualCluster:
+    cluster = object.__new__(RayVirtualCluster)
+    cluster._placement_group_owner = object()
+    cluster._world_size = len(indices)
+    cluster._sorted_bundle_indices = indices
+    cluster._node_placement_groups = [Mock(bundle_count=32)]
+    return cluster
+
+
+@pytest.mark.parametrize("indices", [list(range(16, 32)), [7, 3, 12]])
+def test_default_workers_respect_borrowed_gpu_subset(
+    monkeypatch: pytest.MonkeyPatch, indices: list[int]
+) -> None:
+    cluster = _borrowed_gpu_cluster(indices)
+    create = Mock()
+    builder = Mock()
+    monkeypatch.setattr(RayWorkerGroup, "_create_workers_from_bundle_indices", create)
+
+    RayWorkerGroup(cluster, builder)
+
+    create.assert_called_once_with(
+        builder, [(0, [index]) for index in indices], env_vars={}
+    )
+    assert cluster.world_size() == len(indices)
+
+
+def test_borrowed_gpu_subset_requires_explicit_worker_count_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create = Mock()
+    monkeypatch.setattr(RayWorkerGroup, "_create_workers_from_bundle_indices", create)
+    with pytest.raises(ValueError, match="explicit bundle_indices_list"):
+        RayWorkerGroup(_borrowed_gpu_cluster([16, 17]), Mock(), workers_per_node=1)
+    create.assert_not_called()
+
+
+def test_borrowed_gpu_subset_preserves_explicit_tied_worker_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    groups = [(0, [16, 17]), (0, [18, 19])]
+    builder = Mock()
+    create = Mock()
+    monkeypatch.setattr(RayWorkerGroup, "_create_workers_from_bundle_indices", create)
+
+    RayWorkerGroup(
+        _borrowed_gpu_cluster([16, 17, 18, 19]),
+        builder,
+        bundle_indices_list=groups,
+        workers_per_node=2,
+    )
+
+    create.assert_called_once_with(builder, groups, env_vars={})
+
+
+def test_default_workers_of_owning_cluster_keep_all_placement_bundles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cluster = Mock(spec=RayVirtualCluster)
+    cluster._placement_group_owner = None
+    cluster.get_placement_groups.return_value = [Mock(bundle_count=4)]
+    builder = Mock()
+    create = Mock()
+    monkeypatch.setattr(RayWorkerGroup, "_create_workers_from_bundle_indices", create)
+
+    RayWorkerGroup(cluster, builder)
+
+    create.assert_called_once_with(
+        builder, [(0, [index]) for index in range(4)], env_vars={}
+    )
 
 
 def test_initializer_env_adds_hf_modules_cache_to_pythonpath(monkeypatch):

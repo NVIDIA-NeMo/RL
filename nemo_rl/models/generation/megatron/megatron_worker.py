@@ -21,9 +21,10 @@ import threading
 import time
 import warnings
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Mapping, Optional
 
+import ray
 import requests
 import torch
 from megatron.core.inference.config import (
@@ -87,7 +88,9 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.megatron.config import (
+    MAX_GENERATION_CALLS,
     MultimodalPromptConfigOverrides,
+    resolve_mamba_memory_ratio,
     resolve_refit_execution_batch_bytes,
 )
 from nemo_rl.models.generation.megatron.utils import (
@@ -98,6 +101,7 @@ from nemo_rl.models.generation.megatron.utils import (
     resolve_torch_dtype,
     sample_vision_tensors,
 )
+from nemo_rl.models.megatron import sm_partition
 from nemo_rl.models.megatron.memory_saver import (
     HAVE_TORCH_MEMORY_SAVER,
     pause_inference_weights,
@@ -295,7 +299,15 @@ def _apply_inference_cuda_graph_scope(
 
 
 if TYPE_CHECKING:
+    from megatron.core.resharding.utils import ParameterMetadata, ReshardPlan
+
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
+    from nemo_rl.models.megatron.coresident_reshard import LocalSourcePlan
+
+
+# Streaming calls occupy separate Ray slots so refit and pause RPCs can still run.
+GENERATION_CONCURRENCY_GROUP = "generation"
+WORKER_CONCURRENCY_GROUPS = {GENERATION_CONCURRENCY_GROUP: MAX_GENERATION_CALLS}
 
 
 class MegatronGenerationMixin:
@@ -574,6 +586,10 @@ class MegatronGenerationMixin:
             inference_wrapper_cls
         )
         engine_model = media_model if media_model is not None else self._gen_model()
+        # Dedicated inference parameters must use graph-owned gather scratch;
+        # the colocated learner model must retain its training gradient flags.
+        if not self.is_generation_colocated or self.inference_model is not None:
+            engine_model.requires_grad_(False)
         pg_collection = get_attr_wrapped_model(self._gen_model(), "pg_collection")
         model_config = inference_model.config
 
@@ -691,9 +707,10 @@ class MegatronGenerationMixin:
             ),
             "pg_collection": pg_collection,
             "mamba_inference_state_config": mamba_inference_state_config,
-            # Reserve more KV-cache space when speculative decoding is enabled.
-            "mamba_memory_ratio": (
-                0.1 + 0.1 * num_speculative_tokens if is_hybrid_model else None
+            "mamba_memory_ratio": resolve_mamba_memory_ratio(
+                is_hybrid_model=is_hybrid_model,
+                max_requests=max_requests,
+                num_speculative_tokens=num_speculative_tokens,
             ),
             "num_speculative_tokens": num_speculative_tokens,
             "logprobs_mode": mcore_generation_config["logprobs_mode"],
@@ -774,6 +791,46 @@ class MegatronGenerationMixin:
 
         self._inference_engine_asleep = False
 
+    # ---- co-resident engine (nemo_rl/models/megatron/sm_partition.py): refit without stand-down ----
+
+    def coresident_pause(self) -> None:
+        """Pause at a step boundary while retaining KV, recurrent state and graphs.
+
+        No-op before the engine exists; the first refit initializes it in
+        ``coresident_resume``.
+        """
+        if not self._inference_engine_initialized:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._coresident_pause(), self._inference_loop
+        ).result()
+
+    async def _coresident_pause(self) -> None:
+        if torch.distributed.get_rank() == 0:
+            self.inference_client.pause_engines()
+        await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
+        # PAUSED is a host state: work already enqueued (an async-scheduled forward, its copies) may still read the
+        # weights; with shared weights the learner writes them next.
+        torch.cuda.synchronize()
+
+    def coresident_resume(self) -> None:
+        """Resume after every rank publishes its refit weight epoch.
+
+        The driver serializes phases so every rank has updated its epoch before
+        any engine runs again. The first call starts the engine.
+        """
+        if not self._inference_engine_initialized:
+            self.prepare_for_generation()
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._coresident_unpause(), self._inference_loop
+        ).result()
+
+    async def _coresident_unpause(self) -> None:
+        if torch.distributed.get_rank() == 0:
+            self.inference_client.unpause_engines()
+        await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
+
     def _sleep(self) -> None:
         """Pause + suspend the engine. No-op if already asleep."""
         if self._inference_engine_asleep:
@@ -803,7 +860,8 @@ class MegatronGenerationMixin:
             self._wake_engine(), self._inference_loop
         )
         future.result()
-        torch.distributed.barrier()
+        # After RUNNING, EP forwards may already issue collectives; a barrier
+        # on this thread can race their collective order across ranks.
         self._inference_engine_asleep = False
         print(f"[Rank {self.rank}] resumed inference engine")
 
@@ -815,6 +873,29 @@ class MegatronGenerationMixin:
         if torch.distributed.get_rank() == 0:
             self.inference_client.unpause_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
+
+    def shutdown(self) -> bool:
+        """Drain inference before Ray kills workers holding CUDA IPC weights."""
+        if self._inference_engine_initialized:
+            future = asyncio.run_coroutine_threadsafe(
+                self._shutdown_inference_engine(), self._inference_loop
+            )
+            future.result(timeout=20)
+            self._inference_engine_initialized = False
+            self._inference_engine_asleep = True
+        return super().shutdown()
+
+    async def _shutdown_inference_engine(self) -> None:
+        if not self._inference_engine_asleep:
+            await self._sleep_engine()
+        # An MPS client must finish its CUDA work before Ray terminates it;
+        # otherwise its failure can fault peers and the next MPS session.
+        torch.cuda.synchronize()
+        if torch.distributed.get_rank() == 0:
+            self.inference_client.stop_engines()
+        await self.dynamic_inference_engine.wait_until(EngineState.STOPPED)
+        if torch.distributed.get_rank() == 0:
+            self.inference_client.shutdown_coordinator()
 
     def _start_inference_loop_thread(self):
         """Start a background thread with a persistent event loop for inference."""
@@ -1313,6 +1394,15 @@ class MegatronGenerationMixin:
         result: list,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Pack DynamicInferenceRequest results into a GenerationOutputSpec batch."""
+        for index, reply in enumerate(result):
+            token_count = len(reply.generated_tokens)
+            logprob_count = len(reply.generated_log_probs)
+            if token_count != logprob_count:
+                raise RuntimeError(
+                    f"Megatron inference result {index} has {token_count} generated "
+                    f"tokens but {logprob_count} log probabilities. "
+                    "Each generated token must have a log probability."
+                )
         input_lengths = data["input_lengths"]
         input_ids = data["input_ids"]
         batch_size = input_ids.size(0)
@@ -1424,6 +1514,7 @@ class MegatronGenerationMixin:
 
         return self._parse_result_to_batched_data_dict(data, result)
 
+    @ray.method(concurrency_group=GENERATION_CONCURRENCY_GROUP)
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
@@ -1526,6 +1617,14 @@ class MegatronGenerationMixin:
 class MegatronGenerationRefitMixin:
     """Refit collective, weight transfer, and engine suspend/resume around refits."""
 
+    _coresident_plan: Optional["LocalSourcePlan"]
+    _coresident_destination_fingerprint: Optional[str]
+    _coresident_reshard_plan: Optional["ReshardPlan"]
+    _coresident_reshard_service: Optional[NCCLCopyService]
+    _coresident_receive_module: Optional[torch.nn.Module]
+    _coresident_receive_metadata: Optional[dict[str, "ParameterMetadata"]]
+    _coresident_receive_fingerprint: Optional[str]
+
     def _init_generation_refit_state(self) -> None:
         """Reset every refit attribute to its unprepared state.
 
@@ -1560,6 +1659,13 @@ class MegatronGenerationRefitMixin:
         # Native MCore copy service, built by init_collective_mcore_generation.
         self.refit_copy_service = None
         self.refit_execution_batch_bytes: int | None = None
+        self._coresident_plan = None
+        self._coresident_destination_fingerprint = None
+        self._coresident_reshard_plan = None
+        self._coresident_reshard_service = None
+        self._coresident_receive_module = None
+        self._coresident_receive_metadata = None
+        self._coresident_receive_fingerprint = None
 
     def init_collective_mcore_generation(
         self,
@@ -1596,10 +1702,10 @@ class MegatronGenerationRefitMixin:
         local_rank = torch.distributed.get_rank()
         global_rank = local_rank + rank_offset
 
-        # port+1 to avoid collision with the caller's rendezvous on `port`.
+        # The caller reserves this port; its neighbor may already host a store.
         store = torch.distributed.TCPStore(
             host_name=ip,
-            port=port + 1,
+            port=port,
             world_size=world_size,
             is_master=(global_rank == 0),
         )
@@ -2413,6 +2519,161 @@ class MegatronGenerationRefitMixin:
         )
         # TODO: Optimize away the full synchronization.
         torch.cuda.synchronize()
+
+    def coresident_refit_placement(self) -> sm_partition.RefitPlacement:
+        """Identify the inference worker before installing shared storage."""
+        return sm_partition.RefitPlacement(
+            device_id=self.report_device_id(),
+            rank=torch.distributed.get_rank(),
+        )
+
+    def open_coresident_refit_handles(
+        self,
+        *,
+        local_placement: sm_partition.RefitPlacement,
+        local_handles: dict[str, tuple],
+        learner_world_size: int,
+        source_metadata: list[dict],
+        engine_to_learner: dict[int, int],
+        share: bool,
+    ) -> sm_partition.RefitBinding:
+        """Bind local shards and identify inference tensors needing remote shards."""
+        from megatron.core.resharding.utils import (
+            ParameterMetadata,
+            named_refit_tensors,
+        )
+
+        from nemo_rl.models.megatron.coresident_reshard import (
+            plan_local_sources,
+            remap_metadata,
+        )
+
+        if self._inference_engine_initialized or self._coresident_plan is not None:
+            raise RuntimeError(
+                "co-resident storage must be installed once, before inference initialization"
+            )
+        if local_placement.device_id != self.report_device_id():
+            raise ValueError("Co-resident IPC handles must come from the engine's GPU")
+        core = sm_partition.refit_core(self._gen_model())
+        plan = plan_local_sources(
+            sm_partition.open_refit_handles(local_handles),
+            [ParameterMetadata(**item) for item in source_metadata],
+            remap_metadata(
+                sm_partition.refit_metadata(core),
+                engine_to_learner,
+                learner_world_size=learner_world_size,
+            ),
+            learner_rank=local_placement.rank,
+        )
+        self._coresident_plan = plan
+        local_tensors = [
+            (name, tensor)
+            for name, tensor in named_refit_tensors(core)
+            if name in plan.local_sources
+        ]
+        stats: dict[str, float] = {"tensors_bound": 0, "tensors": len(local_tensors)}
+        if share:
+            stats = sm_partition.bind_shared(
+                plan.local_sources, local_tensors, {id(p) for p in core.parameters()}
+            )
+            stats.update(
+                sm_partition.bind_shared_expert_stacks(core, plan.local_sources)
+            )
+        stats["residual_tensors"] = len(plan.residual)
+        stats["tensors"] += len(plan.residual)
+        return sm_partition.RefitBinding(
+            [asdict(item) for item in plan.residual], stats
+        )
+
+    def export_coresident_refit_destinations(self) -> sm_partition.RefitDestination:
+        """Export current receive buffers after all admitted inference work finishes."""
+        if self._inference_engine_initialized:
+            return asyncio.run_coroutine_threadsafe(
+                self._coresident_export_destinations_on_loop(), self._inference_loop
+            ).result()
+        return self._coresident_export_destinations()
+
+    async def _coresident_export_destinations_on_loop(
+        self,
+    ) -> sm_partition.RefitDestination:
+        if self.dynamic_inference_engine.state != EngineState.PAUSED:
+            raise RuntimeError(
+                "co-resident receive buffers can only be exported while inference is paused"
+            )
+        torch.cuda.synchronize()
+        return self._coresident_export_destinations()
+
+    def _coresident_export_destinations(self) -> sm_partition.RefitDestination:
+        plan = self._coresident_plan
+        if plan is None:
+            raise RuntimeError("co-resident refit has not been planned")
+        tensors = plan.current_tensors(sm_partition.refit_core(self._gen_model()))
+        targets = {}
+        for metadata in plan.residual:
+            name = metadata.name
+            tensor = tensors[name]
+            if (
+                type(tensor) not in (torch.Tensor, torch.nn.Parameter)
+                or tensor.shape != metadata.shape
+                or tensor.dtype != metadata.dtype
+            ):
+                raise RuntimeError(
+                    f"co-resident receive storage changed layout or dtype: {name}"
+                )
+            targets[name] = tensor
+        fingerprint = sm_partition.storage_fingerprint(targets.items())
+        handles = None
+        if fingerprint != self._coresident_destination_fingerprint:
+            handles = sm_partition.export_refit_handles(targets.items())
+            self._coresident_destination_fingerprint = fingerprint
+        return sm_partition.RefitDestination(
+            self.report_device_id(), fingerprint, handles
+        )
+
+    def coresident_refit_copy(self) -> dict[str, float]:
+        """Copy private weights and refresh derived caches while every rank is paused.
+
+        Runs on the inference-loop thread once the engine has initialized.
+        """
+        if not self._inference_engine_initialized:
+            return self._coresident_copy_weights()
+        return asyncio.run_coroutine_threadsafe(
+            self._coresident_refit_on_loop(), self._inference_loop
+        ).result()
+
+    async def _coresident_refit_on_loop(self) -> dict[str, float]:
+        if self.dynamic_inference_engine.state != EngineState.PAUSED:
+            raise RuntimeError(
+                "Co-resident weights can only be updated while inference is paused"
+            )
+        # A host-side pause can precede completion of already-submitted GPU work.
+        torch.cuda.synchronize()
+        stats = self._coresident_copy_weights()
+        # Match MCore resume's prefix-cache invalidation without suspending live requests.
+        engine = self.dynamic_inference_engine
+        engine._weight_epoch += 1
+        engine._resalt_unprefilled_requests()
+        return stats
+
+    def _coresident_copy_weights(self) -> dict[str, float]:
+        # Load reshard cache hooks only for the IPC refit path.
+        from megatron.core.resharding.execution import refresh_module_caches
+
+        t0 = time.perf_counter()
+        plan = self._coresident_plan
+        if plan is None:
+            raise RuntimeError("co-resident refit has not been planned")
+        core = sm_partition.refit_core(self._gen_model())
+        tensors = plan.current_tensors(core)
+        stats = sm_partition.copy_refit(
+            plan.local_sources, ((name, tensors[name]) for name in plan.local_sources)
+        )
+        with torch.inference_mode():
+            refresh_module_caches(core)
+        # Derived weight storage, as every other refit path (FlashInfer MXFP8 experts; no-op otherwise).
+        self._refresh_flashinfer_mxfp8_weights()
+        torch.cuda.synchronize()
+        return {**stats, "seconds": time.perf_counter() - t0}
 
     def suspend_for_refit(self) -> None:
         """Pause+suspend the inference engine before a weight refit."""

@@ -75,8 +75,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     TokenCaptureConfig,
     logprob_passes_required,
-    resolve_ppo_chunk_alignment,
-    validate_grpo_chunk_cap_alignment,
+    resolve_streaming_chunk_alignment,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
@@ -253,8 +252,8 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         bootstrap_identity=None,
         rollout_checkpoint_load_metrics=None,
         restored_from_rollout_snapshot=False,
-        ppo_group_multiple=1,
-        ppo_min_remaining_groups=0,
+        train_group_multiple=1,
+        train_min_remaining_groups=0,
         trainer_warmup_kwargs=None,
     )
     args.update(overrides)
@@ -274,7 +273,7 @@ def _init_controller(master_config, actor_args):
     ("packed", "dynamic", "expected_groups"),
     [(False, False, 2), (True, False, 1), (False, True, 1)],
 )
-def test_ppo_group_multiple_requires_complete_microbatches(
+def test_train_group_multiple_requires_complete_microbatches(
     packed: bool, dynamic: bool, expected_groups: int
 ) -> None:
     config = MasterConfig.model_construct(
@@ -291,7 +290,10 @@ def test_ppo_group_multiple_requires_complete_microbatches(
         },
         async_rl=AsyncRLConfig(min_groups_for_streaming_train=expected_groups),
     )
-    assert resolve_ppo_chunk_alignment(config, 8, 8)[0] == expected_groups
+    assert (
+        resolve_streaming_chunk_alignment(config, policy_dp=8, value_dp=8)[0]
+        == expected_groups
+    )
 
 
 @pytest.mark.parametrize(
@@ -329,7 +331,7 @@ def test_ppo_chunk_validation_rejects_incomplete_chunks(
         ),
     )
     with pytest.raises(ValueError, match=error):
-        resolve_ppo_chunk_alignment(config, 8, 8)
+        resolve_streaming_chunk_alignment(config, policy_dp=8, value_dp=8)
 
 
 def test_ppo_accepts_a_chunk_cap_aligned_to_the_dp_layout() -> None:
@@ -351,7 +353,7 @@ def test_ppo_accepts_a_chunk_cap_aligned_to_the_dp_layout() -> None:
 
     # An aligned cap is accepted and leaves the alignment it would have had
     # uncapped: group multiple 2, tail floor (2 + 1) // 2.
-    assert resolve_ppo_chunk_alignment(config, 8, 8) == (2, 1)
+    assert resolve_streaming_chunk_alignment(config, policy_dp=8, value_dp=8) == (2, 1)
 
 
 def test_ppo_chunk_validation_accepts_complete_chunks() -> None:
@@ -367,7 +369,7 @@ def test_ppo_chunk_validation_accepts_complete_chunks() -> None:
         },
         async_rl=AsyncRLConfig(min_groups_for_streaming_train=2),
     )
-    assert resolve_ppo_chunk_alignment(config, 8, 8) == (2, 1)
+    assert resolve_streaming_chunk_alignment(config, policy_dp=8, value_dp=8) == (2, 1)
 
 
 @pytest.mark.parametrize(("min_groups", "expected"), [(32, (2, 0)), (2, (2, 1))])
@@ -397,7 +399,9 @@ def test_ppo_accepts_a_chunk_cap_that_cannot_bind(
         ),
     )
 
-    assert resolve_ppo_chunk_alignment(config, 8, 8) == expected
+    assert (
+        resolve_streaming_chunk_alignment(config, policy_dp=8, value_dp=8) == expected
+    )
 
 
 def _grpo_chunk_cap_config(
@@ -414,6 +418,7 @@ def _grpo_chunk_cap_config(
             num_prompts_per_step=8,
             num_generations_per_prompt=num_generations_per_prompt,
         ),
+        loss_fn=ClippedPGLossConfig(),
         policy={
             "train_micro_batch_size": train_micro_batch_size,
             "dynamic_batching": {"enabled": dynamic_batching},
@@ -429,14 +434,49 @@ def _grpo_chunk_cap_config(
     )
 
 
-def test_grpo_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp() -> None:
-    """GRPO passes no group_multiple, so the cap alone decides the chunk size.
+@pytest.mark.parametrize(
+    ("force_ratio", "reference_kl", "calibrates", "needs_logprob_batch"),
+    [
+        (True, 0, False, False),
+        (False, 0, False, True),
+        (True, 0.1, False, True),
+        (True, 0, True, True),
+    ],
+)
+def test_grpo_only_aligns_logprob_microbatches_for_active_forwards(
+    force_ratio: bool,
+    reference_kl: float,
+    calibrates: bool,
+    needs_logprob_batch: bool,
+) -> None:
+    config = _grpo_chunk_cap_config(None, dynamic_batching=False)
+    config.loss_fn = ClippedPGLossConfig(
+        force_on_policy_ratio=force_ratio, reference_policy_kl_penalty=reference_kl
+    )
+    config.policy["logprob_batch_size"] = 3
+    if needs_logprob_batch:
+        with pytest.raises(ValueError, match="num_prompts_per_step"):
+            resolve_streaming_chunk_alignment(
+                config, policy_dp=1, requires_kv_scale_sync=calibrates
+            )
+    else:
+        assert resolve_streaming_chunk_alignment(config, policy_dp=1) == (1, 0)
 
-    Three groups at two generations each is six samples, and the training
-    dispatch shards without allow_uneven_shards, so six cannot split four ways.
-    """
+
+def test_grpo_can_wait_for_more_than_its_streaming_floor() -> None:
+    config = _grpo_chunk_cap_config(4)
+    config.async_rl.min_groups_for_streaming_train = 1
+    assert resolve_streaming_chunk_alignment(config, policy_dp=8) == (4, 0)
+
+    config.async_rl.max_buffered_rollouts = 3
+    with pytest.raises(ValueError, match="max_buffered_rollouts"):
+        resolve_streaming_chunk_alignment(config, policy_dp=8)
+
+
+def test_grpo_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp() -> None:
+    """Three capped groups at two generations each cannot split across four ranks."""
     with pytest.raises(ValueError, match="max_groups_for_streaming_train"):
-        validate_grpo_chunk_cap_alignment(_grpo_chunk_cap_config(3), 4)
+        resolve_streaming_chunk_alignment(_grpo_chunk_cap_config(3), policy_dp=4)
 
 
 def test_grpo_rejects_a_cap_that_leaves_each_rank_a_partial_microbatch() -> None:
@@ -454,7 +494,7 @@ def test_grpo_rejects_a_cap_that_leaves_each_rank_a_partial_microbatch() -> None
     )
 
     with pytest.raises(ValueError, match="max_groups_for_streaming_train"):
-        validate_grpo_chunk_cap_alignment(config, 2)
+        resolve_streaming_chunk_alignment(config, policy_dp=2)
 
 
 @pytest.mark.parametrize("chunk_cap", [None, 2, 4, 8, 9])
@@ -463,7 +503,7 @@ def test_grpo_accepts_shardable_and_nonbinding_chunk_caps(
 ) -> None:
     # 2 and 4 shard evenly across DP 4; 8 and 9 are at or above
     # num_prompts_per_step and so never bind; None is the unbounded default.
-    validate_grpo_chunk_cap_alignment(_grpo_chunk_cap_config(chunk_cap), 4)
+    resolve_streaming_chunk_alignment(_grpo_chunk_cap_config(chunk_cap), policy_dp=4)
 
 
 @pytest.mark.parametrize(
@@ -485,7 +525,7 @@ def test_grpo_ignores_microbatch_sizes_when_the_consumer_bins_its_own(
         sequence_packing=sequence_packing,
     )
 
-    validate_grpo_chunk_cap_alignment(config, 2)
+    resolve_streaming_chunk_alignment(config, policy_dp=2)
 
 
 def test_forest_is_exempt_because_its_groups_are_padded_to_execution_rows() -> None:
@@ -494,27 +534,9 @@ def test_forest_is_exempt_because_its_groups_are_padded_to_execution_rows() -> N
     Its logical group count is therefore not its physical row count, so the
     sample arithmetic this guard does would be measuring the wrong thing.
     """
-    validate_grpo_chunk_cap_alignment(
-        _grpo_chunk_cap_config(3, forest_training=True), 4
-    )
-
-
-def test_the_grpo_chunk_cap_guard_leaves_ppo_to_its_own_alignment() -> None:
-    # 3 groups x 2 generations is 6 samples, which DP 4 cannot shard, so the
-    # GRPO guard would reject this config if it did not skip PPO runs.
-    config = MasterConfig.model_construct(
-        ppo=PPOConfig(num_prompts_per_step=32, num_generations_per_prompt=2),
-        policy={
-            "train_micro_batch_size": 1,
-            "dynamic_batching": {"enabled": True},
-        },
-        async_rl=AsyncRLConfig(
-            min_groups_for_streaming_train=2,
-            max_groups_for_streaming_train=3,
-        ),
-    )
-
-    validate_grpo_chunk_cap_alignment(config, 4)
+    assert resolve_streaming_chunk_alignment(
+        _grpo_chunk_cap_config(3, forest_training=True), policy_dp=4
+    ) == (1, 0)
 
 
 def _one_group_tags(count: int, *, weight_version: int = 0) -> list[dict[str, object]]:
@@ -2677,6 +2699,9 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._trainer_warmup_task = None
     ctrl._is_ppo = False
     ctrl._streaming_ppo = False
+    ctrl._train_group_multiple = 1
+    ctrl._train_min_remaining_groups = 0
+    ctrl._weight_synchronizer = SimpleNamespace(before_learner_write=lambda: None)
     ctrl._value_dedicated = False
     ctrl._ppo_epochs = 1
     ctrl._critic_ppo_epochs = 1
@@ -4667,8 +4692,8 @@ def _streaming_ppo_controller(
         policy_training_start_step=int(warmup),
     )
     ctrl._streaming_ppo = True
-    ctrl._ppo_group_multiple = 1
-    ctrl._ppo_min_remaining_groups = 1
+    ctrl._train_group_multiple = 1
+    ctrl._train_min_remaining_groups = 1
     ctrl._algo_cfg.num_prompts_per_step = len(metas)
     ctrl._master_config.policy = {"dynamic_batching": {"enabled": True}}
     ctrl._master_config.value = {"dynamic_batching": {"enabled": True}}
@@ -4864,7 +4889,7 @@ def test_streaming_ppo_tail_aware_wait_preserves_prep_and_full_batch_update(
     ctrl, _, calls = _streaming_ppo_controller(monkeypatch, valid_chunks=(True, True))
     ctrl._algo_cfg.num_prompts_per_step = 128
     ctrl._async_cfg.min_groups_for_streaming_train = minimum
-    ctrl._ppo_min_remaining_groups = (minimum + 1) // 2
+    ctrl._train_min_remaining_groups = (minimum + 1) // 2
     ctrl._rollout_exhausted.clear()
     metas = [
         KVBatchMeta(
@@ -5252,16 +5277,16 @@ def test_streaming_ppo_aligns_complete_groups_to_both_model_dp_sizes(
     if value_inference_mbs is not None:
         ctrl._master_config.value["logprob_batch_size"] = value_inference_mbs
     ctrl._async_cfg.min_groups_for_streaming_train = expected_multiple
-    ctrl._ppo_group_multiple, ctrl._ppo_min_remaining_groups = (
-        resolve_ppo_chunk_alignment(
+    ctrl._train_group_multiple, ctrl._train_min_remaining_groups = (
+        resolve_streaming_chunk_alignment(
             SimpleNamespace(
                 ppo=ctrl._algo_cfg,
                 policy=ctrl._master_config.policy,
                 value=ctrl._master_config.value,
                 async_rl=ctrl._async_cfg,
             ),
-            policy_dp,
-            value_dp,
+            policy_dp=policy_dp,
+            value_dp=value_dp,
         )
     )
     sample_count = expected_multiple * generations
@@ -5307,15 +5332,15 @@ def test_streaming_ppo_rejects_unshardable_full_batch_during_setup(
     ctrl._algo_cfg.num_generations_per_prompt = 1
     ctrl._algo_cfg.num_prompts_per_step = 10
     with pytest.raises(ValueError, match="multiple"):
-        resolve_ppo_chunk_alignment(
+        resolve_streaming_chunk_alignment(
             SimpleNamespace(
                 ppo=ctrl._algo_cfg,
                 policy=ctrl._master_config.policy,
                 value=ctrl._master_config.value,
                 async_rl=ctrl._async_cfg,
             ),
-            8,
-            4,
+            policy_dp=8,
+            value_dp=4,
         )
 
     assert calls == []

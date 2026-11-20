@@ -28,34 +28,18 @@ N0, N1, N2, N3, N4 = (str(i) * 56 for i in range(5))
 
 def _cluster(*pg_nodes: list[str]) -> SimpleNamespace:
     """A cluster whose placement groups put their bundles on ``pg_nodes``."""
-    pgs = [
-        SimpleNamespace(id=SimpleNamespace(hex=lambda n=nodes: "pg-" + "-".join(n)))
-        for nodes in pg_nodes
-    ]
-    return SimpleNamespace(get_placement_groups=lambda: pgs)
-
-
-def _use_clusters(monkeypatch, by_name: dict) -> dict:
-    """Serve ``by_name``'s placement groups from a fake placement-group table."""
-    table = {
-        pg.id.hex(): {"bundles_to_node_id": dict(enumerate(pg.id.hex()[3:].split("-")))}
-        for cluster in by_name.values()
-        for pg in cluster.get_placement_groups()
-    }
-    monkeypatch.setattr(msu, "placement_group_table", lambda: table)
-    return by_name
+    return SimpleNamespace(
+        get_node_ids=lambda: [n for nodes in pg_nodes for n in nodes]
+    )
 
 
 @pytest.fixture
-def clusters_by_name(monkeypatch):
-    return _use_clusters(
-        monkeypatch,
-        {
-            "train": _cluster([N0, N1]),
-            "inference": _cluster([N2], [N3]),
-            "teacher:math": _cluster([N4]),
-        },
-    )
+def clusters_by_name():
+    return {
+        "train": _cluster([N0, N1]),
+        "inference": _cluster([N2], [N3]),
+        "teacher:math": _cluster([N4]),
+    }
 
 
 @pytest.fixture
@@ -96,10 +80,10 @@ def test_unknown_cluster_name_fails_with_the_valid_names(clusters_by_name) -> No
         msu.select_clusters(["trian"], clusters_by_name)
 
 
-def test_colocated_names_share_nodes_once_and_warn(monkeypatch, caplog) -> None:
+def test_colocated_names_share_nodes_once_and_warn(caplog) -> None:
     """Colocated: one cluster under two names; excluding one excludes nothing."""
     shared = _cluster([N0, N1])
-    by_name = _use_clusters(monkeypatch, {"train": shared, "inference": shared})
+    by_name = {"train": shared, "inference": shared}
 
     assert msu.storage_node_ids(msu.select_clusters("all", by_name), None) == [
         N0,

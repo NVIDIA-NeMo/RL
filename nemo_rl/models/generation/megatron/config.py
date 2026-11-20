@@ -21,6 +21,22 @@ from nemo_rl.models.policy import Fp8Config, PolicyConfig
 from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
 
 
+# Ray fixes a concurrency group's size when it registers the worker class.
+MAX_GENERATION_CALLS = 1 << 16
+
+
+def check_generation_calls(
+    max_inflight_prompts: int, generations_per_prompt: int
+) -> None:
+    """Validate the maximum number of streaming calls sent to generation rank zero."""
+    calls = max_inflight_prompts * generations_per_prompt
+    if calls > MAX_GENERATION_CALLS:
+        raise ValueError(
+            f"async_rl.max_inflight_prompts x num_generations_per_prompt = {calls} "
+            f"generation calls in flight, above the Megatron worker limit of {MAX_GENERATION_CALLS}"
+        )
+
+
 def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
     """Resolve native MCore staging bytes using NeMo-RL's collective default."""
     if configured_bytes is None:
@@ -31,6 +47,15 @@ def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
             "refit_execution_batch_bytes must be positive or null."
         )
     return configured_bytes
+
+
+def resolve_mamba_memory_ratio(
+    *, is_hybrid_model: bool, max_requests: int | None, num_speculative_tokens: int
+) -> float | None:
+    """Let native inference budget exact state sizes for an explicit request limit."""
+    if not is_hybrid_model or max_requests is not None:
+        return None
+    return 0.1 + 0.1 * num_speculative_tokens
 
 
 class MediaPromptSpecOverrides(BaseModel):
@@ -194,7 +219,7 @@ class MCoreGenerationConfig(GenerationConfig):
 
     # None uses NeMo-RL's packed collective, mcore uses Megatron Core's native
     # refit, and nccl_reshard selects the non-colocated NCCL M-to-N transport.
-    refit_transport: NotRequired[Literal["mcore", "nccl_reshard"] | None]
+    refit_transport: NotRequired[Literal["mcore", "nccl_reshard", "ipc"] | None]
     mcore_generation_config: MCoreGenerationSpecificArgs
 
 

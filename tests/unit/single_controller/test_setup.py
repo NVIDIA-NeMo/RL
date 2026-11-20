@@ -169,6 +169,7 @@ def _make_master_config(
     }
     policy_config: dict = {
         "train_global_batch_size": num_prompts_per_step * 2,
+        "dynamic_batching": {"enabled": True},
         "max_total_sequence_length": 32,
         "tokenizer": {"use_fastokens": False},
         "megatron_cfg": {"enabled": megatron_enabled},
@@ -273,6 +274,7 @@ def patched_factories():
     # Real return objects; _build_generation and _build_trainer return (obj, elapsed_s) tuples.
     fake_gen = MagicMock(name="gen")
     fake_policy = MagicMock(name="policy")
+    fake_policy.sharding_annotations.get_axis_size.return_value = 1
 
     with (
         patch.object(
@@ -516,6 +518,95 @@ def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
         match="only supports vllm, sglang, or megatron generation; got 'trtllm'",
     ):
         sc_setup_mod._build_clusters(master_config)
+
+
+def test_build_clusters_reuses_all_training_gpus_for_mps(monkeypatch):
+    master_config = _make_master_config(backend="megatron", megatron_enabled=True)
+    master_config.policy["generation"]["colocated"]["engine_sm_fraction"] = 0.5
+    cluster_factory = MagicMock()
+    init_groups = MagicMock()
+    monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", cluster_factory)
+    monkeypatch.setattr(
+        sc_setup_mod.MegatronGeneration, "init_cluster_placement_groups", init_groups
+    )
+
+    train, inference, value, teacher_topology = sc_setup_mod._build_clusters(
+        master_config
+    )
+
+    assert train is inference is cluster_factory.return_value
+    assert value is None and teacher_topology is None
+    cluster_factory.assert_called_once()
+    assert cluster_factory.call_args.kwargs["bundle_ct_per_node_list"] == [8, 8]
+    assert cluster_factory.call_args.kwargs["max_colocated_worker_groups"] == 2
+    init_groups.assert_called_once_with(train, master_config.policy)
+
+
+def test_build_clusters_borrows_gpu_groups_from_one_mps_pool(monkeypatch):
+    cfg = _make_master_config(backend="megatron", megatron_enabled=True)
+    cfg.policy["megatron_cfg"].update(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=4,
+        expert_tensor_parallel_size=1,
+    )
+    placement = cfg.policy["generation"]["colocated"]
+    placement.update(engine_sm_fraction=0.42, engine_gpu_indices=list(range(8, 16)))
+    parent = MagicMock(num_gpus_per_node=8)
+    factory = MagicMock(return_value=parent)
+    monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", factory)
+    train, engine, value, teacher = sc_setup_mod._build_clusters(cfg)
+    assert train is parent and engine is parent.subset.return_value
+    assert value is teacher is None
+    factory.assert_called_once()
+    parent.subset.assert_called_once_with(list(range(8, 16)))
+    parent._init_placement_groups.assert_called_once_with(
+        strategy="PACK", use_unified_pg=True
+    )
+
+
+@pytest.mark.parametrize(
+    "nixl,expected",
+    [
+        ({"storage_unit_placement": ["inference"]}, ["engine-node"]),
+        (
+            {"storage_unit_placement": ["train", "inference"]},
+            ["engine-node", "learner-node"],
+        ),
+        ({"storage_unit_placement": "all"}, None),
+        (
+            {"storage_unit_placement": ["inference"], "node_ids": ["explicit-node"]},
+            ["explicit-node"],
+        ),
+    ],
+)
+def test_coresident_nixl_bootstrap_uses_nodes_of_the_requested_role(
+    patched_factories, monkeypatch, nixl, expected
+) -> None:
+    cfg = _make_master_config(backend="megatron", megatron_enabled=True)
+    cfg.data_plane.update(backend="nixl", nixl=nixl)
+    cfg.policy["generation"].update(refit_transport="ipc")
+    cfg.policy["generation"]["colocated"]["engine_sm_fraction"] = 0.5
+    cfg.policy["megatron_cfg"].update(
+        tensor_model_parallel_size=1,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
+    )
+    cfg.loss_fn.reference_policy_kl_penalty = 0
+    monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", "/tmp/test-mps")
+    train, inference, _, _ = patched_factories["_build_clusters"].return_value
+    train.get_node_ids.return_value = ["learner-node", "engine-node"]
+    inference.get_node_ids.return_value = ["engine-node"]
+    build = patched_factories["_build_trainer"]
+
+    setup_single_controller(cfg, MagicMock(pad_token_id=0))
+
+    assert (
+        sc_setup_mod.backend_config(build.call_args.kwargs["dp_config"]).node_ids
+        == expected
+    )
+    assert cfg.data_plane["nixl"] == nixl
 
 
 def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
@@ -792,6 +883,7 @@ def test_build_trainer_initializes_reference_model_only_for_nonzero_kl(
             master_config,
             MagicMock(name="tokenizer"),
             None,
+            dp_config=master_config.data_plane,
             weights_path=None,
             optimizer_path=None,
             checkpointing=True,
@@ -2529,6 +2621,7 @@ class TestSetup:
         )
         train_iters_at_build: list[int] = []
         stale_policy = MagicMock(name="stale_policy")
+        stale_policy.sharding_annotations.get_axis_size.return_value = 1
         final_policy = patched_factories["fake_policy"]
         policies = iter([stale_policy, final_policy])
         trainer_started = threading.Event()

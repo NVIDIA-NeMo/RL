@@ -14,6 +14,7 @@
 
 import asyncio
 from copy import deepcopy
+from math import lcm
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -104,9 +105,15 @@ class MegatronGeneration(GenerationInterface):
             config: The full `PolicyConfig` (megatron parallelism + colocation).
         """
         colocated = config["generation"]["colocated"]["enabled"]
+        placement = config["generation"]["colocated"]
+        explicit_placement = any(
+            placement.get(key) is not None
+            for key in ("learner_gpu_indices", "engine_gpu_indices")
+        )
         cluster._init_placement_groups(
             strategy=None if colocated else "PACK",
-            use_unified_pg=cls.nvlink_domain_span(config) > cluster.num_gpus_per_node,
+            use_unified_pg=explicit_placement
+            or cls.nvlink_domain_span(config) > cluster.num_gpus_per_node,
         )
 
     @staticmethod
@@ -185,6 +192,9 @@ class MegatronGeneration(GenerationInterface):
 
         placement_groups = cluster.get_placement_groups()
         placement = cls._rank_placement(cluster)
+        gpu_order = cls._coresident_gpu_order(config, cluster)
+        if gpu_order is not None:
+            placement = [placement[gpu] for gpu in gpu_order]
         ranks = cls.frontend_ranks(cluster, config)
 
         # Zero-gap reservation: a holder actor on each frontend's node binds and
@@ -314,10 +324,10 @@ class MegatronGeneration(GenerationInterface):
         self._policy_config = config
         self.cfg: MCoreGenerationConfig = config["generation"]
         refit_transport = self.cfg.get("refit_transport")
-        if refit_transport not in (None, "mcore", "nccl_reshard"):
+        if refit_transport not in (None, "mcore", "nccl_reshard", "ipc"):
             raise ValueError(
-                "policy.generation.refit_transport must be null, 'mcore', or "
-                f"'nccl_reshard' for Megatron generation, got {refit_transport!r}."
+                "policy.generation.refit_transport must be null, 'mcore', 'nccl_reshard' "
+                f"or 'ipc' for Megatron generation, got {refit_transport!r}."
             )
         if self.uses_native_refit:
             refit_backend = self.cfg["mcore_generation_config"].get("refit_backend")
@@ -365,6 +375,24 @@ class MegatronGeneration(GenerationInterface):
             **deepcopy(config),
             "megatron_cfg": self.effective_megatron_cfg(config),
         }
+        if any(
+            config["generation"]["colocated"].get(key) is not None
+            for key in ("learner_gpu_indices", "engine_gpu_indices")
+        ):
+            # Bridge validates dummy train/eval batch metadata even on inference-only workers.
+            # Preserve the learner batch; align the copied metadata to the engine's DP size.
+            model_cfg = self._policy_config["megatron_cfg"]
+            model_parallel = (
+                model_cfg["tensor_model_parallel_size"]
+                * model_cfg["pipeline_model_parallel_size"]
+                * model_cfg["context_parallel_size"]
+            )
+            if cluster.world_size() % model_parallel == 0:
+                dp = cluster.world_size() // model_parallel
+                self._policy_config["train_global_batch_size"] = lcm(
+                    self._policy_config["train_global_batch_size"],
+                    self._policy_config["train_micro_batch_size"] * dp,
+                )
         # Reserve GPUs before Policy workers grab them, to prevent disjoint NVLS domains.
         self.init_cluster_placement_groups(cluster, self._policy_config)
         self._policy = Policy(
@@ -378,6 +406,7 @@ class MegatronGeneration(GenerationInterface):
             skip_weight_load=skip_weight_load,
             is_refit_destination=True,
             reserved_http_server_ports=reserved_http_server_ports,
+            worker_gpu_order=self._coresident_gpu_order(config, cluster),
         )
 
         # Skip-load models do not have their final refit weight buffers yet.
@@ -385,6 +414,30 @@ class MegatronGeneration(GenerationInterface):
         # The engine + HTTP server then first come up at the initial refit.
         if not skip_weight_load:
             self.prepare_for_generation()
+
+    @staticmethod
+    def _coresident_gpu_order(
+        config: PolicyConfig, cluster: RayVirtualCluster
+    ) -> Optional[list[int]]:
+        """Match joint dense/expert shard ownership across the two rank layouts."""
+        from nemo_rl.models.megatron import sm_partition
+
+        if sm_partition.engine_sm_fraction(config) is None:
+            return None
+        placement_config = config["generation"]["colocated"]
+        if any(
+            placement_config.get(key) is not None
+            for key in ("learner_gpu_indices", "engine_gpu_indices")
+        ):
+            return None  # The borrowed views already establish both role orders.
+        placement = sm_partition.engine_rank_gpus(
+            cluster.world_size(),
+            learner=sm_partition.ParallelismLayout.from_config(config["megatron_cfg"]),
+            engine=sm_partition.ParallelismLayout.from_config(
+                MegatronGeneration.effective_megatron_cfg(config)
+            ),
+        )
+        return None if placement == list(range(cluster.world_size())) else placement
 
     @property
     def uses_native_refit(self) -> bool:
@@ -615,6 +668,23 @@ class MegatronGeneration(GenerationInterface):
             ray.cancel(futures)
             raise
 
+    def refresh_dp_openai_server_base_urls(
+        self, *, timeout_s: Optional[float] = None
+    ) -> None:
+        """Collect worker HTTP addresses after inference initialization completes."""
+        if (
+            not self.dp_openai_server_base_urls
+            and self.cfg["mcore_generation_config"]["expose_http_server"]
+        ):
+            url_futures = self._policy.worker_group.run_all_workers_single_data(
+                "report_dp_openai_server_base_url"
+            )
+            self.dp_openai_server_base_urls = [
+                url
+                for url in ray.get(url_futures, timeout=timeout_s)
+                if url is not None
+            ]
+
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Initialize / re-enter inference mode on every worker.
 
@@ -625,16 +695,7 @@ class MegatronGeneration(GenerationInterface):
             "prepare_for_generation", **kwargs
         )
         ray.get(futures)
-        if (
-            not self.dp_openai_server_base_urls
-            and self.cfg["mcore_generation_config"]["expose_http_server"]
-        ):
-            url_futures = self._policy.worker_group.run_all_workers_single_data(
-                "report_dp_openai_server_base_url"
-            )
-            self.dp_openai_server_base_urls = [
-                url for url in ray.get(url_futures) if url is not None
-            ]
+        self.refresh_dp_openai_server_base_urls()
         return True
 
     def finish_generation(self, *, release_gpu: bool = True) -> bool:

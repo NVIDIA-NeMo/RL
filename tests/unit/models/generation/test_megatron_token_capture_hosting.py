@@ -464,6 +464,7 @@ def test_initialize_inference_engine_repoints_router_registry_before_engine_setu
     )
     worker = object.__new__(MegatronGenerationMixin)
     worker._inference_engine_initialized = False
+    worker.is_generation_colocated = True
     worker._router_replay_enabled = router_replay_enabled
 
     with pytest.raises(_StopBeforeEngine):

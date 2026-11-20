@@ -117,6 +117,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         worker_extension_cls_fqn: Optional[str] = None,
         skip_weight_load: bool = False,
         is_refit_destination: bool = False,
+        worker_gpu_order: Optional[list[int]] = None,
         reserved_http_server_ports: Optional[dict[int, int]] = None,
     ):
         self.debug_payload_metrics = False
@@ -323,6 +324,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
             env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
+            # Co-resident generation: this process's MPS share of the GPU (engine or learner).
+            from nemo_rl.models.megatron import sm_partition
+
+            env_vars.update(
+                sm_partition.actor_env(
+                    config, "engine" if is_refit_destination else "learner"
+                )
+            )
 
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 raise RuntimeError(
@@ -445,13 +454,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             **worker_kwargs,
         )
 
+        if worker_gpu_order is not None and sorted(worker_gpu_order) != list(
+            range(actual_world_size)
+        ):
+            raise ValueError(
+                "worker_gpu_order must be a permutation of all cluster GPUs"
+            )
         if cluster._sorted_bundle_indices is not None:
             # The cluster has initialized a unified placemenet group across nodes
             # In this case, we need to create workers based on sorted bundle indices
             group_size = cluster.num_gpus_per_node
+            physical_order = (
+                range(actual_world_size)
+                if worker_gpu_order is None
+                else worker_gpu_order
+            )
             tied_groups = [
-                (i // group_size, [bundle_idx])
-                for i, bundle_idx in enumerate(cluster._sorted_bundle_indices)
+                (gpu // group_size, [cluster._sorted_bundle_indices[gpu]])
+                for gpu in physical_order
             ]
 
             self.worker_group = RayWorkerGroup(
@@ -463,6 +483,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 env_vars=env_vars or {},
             )
 
+        elif worker_gpu_order is not None:
+            # Rank r on cluster GPU worker_gpu_order[r] (co-resident engine ranks next to the learner ranks whose
+            # experts they read; sm_partition.engine_rank_gpus).
+            gpn = cluster.num_gpus_per_node
+            self.worker_group = RayWorkerGroup(
+                cluster,
+                worker_builder,
+                name_prefix=name_prefix,
+                bundle_indices_list=[(g // gpn, [g % gpn]) for g in worker_gpu_order],
+                sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars or {},
+            )
         else:
             self.worker_group = RayWorkerGroup(
                 cluster,

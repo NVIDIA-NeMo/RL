@@ -211,6 +211,34 @@ def test_mxfp8_skip_weight_load_defers_http_server_until_refit(
 
 
 @pytest.mark.mcore
+def test_subset_engine_batch_metadata_uses_its_own_dp_world(monkeypatch):
+    config = deepcopy(basic_megatron_test_config)
+    config["train_global_batch_size"] = 64
+    config["train_micro_batch_size"] = 2
+    config["generation"]["colocated"].update(
+        enabled=False, engine_sm_fraction=0.0, engine_gpu_indices=list(range(24))
+    )
+    config["generation"]["mcore_generation_config"].update(
+        tensor_model_parallel_size=2,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
+    )
+    original = deepcopy(config)
+    cluster = MagicMock()
+    cluster.world_size.return_value = 24
+    monkeypatch.setattr(lm_policy, "Policy", MagicMock())
+    monkeypatch.setattr(
+        MegatronGeneration, "init_cluster_placement_groups", MagicMock()
+    )
+    MegatronGeneration(
+        config=config, tokenizer=MagicMock(), cluster=cluster, skip_weight_load=True
+    )
+    assert lm_policy.Policy.call_args.kwargs["config"]["train_global_batch_size"] == 192
+    assert lm_policy.Policy.call_args.kwargs["worker_gpu_order"] is None
+    assert config == original
+
+
+@pytest.mark.mcore
 def test_nccl_m2n_refit_backend_requires_non_colocated_generation() -> None:
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["colocated"]["enabled"] = True
@@ -1563,8 +1591,9 @@ def patched_holder(monkeypatch):
         (None, 2),
     ],
 )
+@pytest.mark.parametrize("gpu_order", [None, [2, 0, 3, 1]])
 def test_reserve_http_server_addresses_pins_every_frontend_bundle(
-    patched_holder, sorted_bundle_indices, model_parallel_size
+    patched_holder, sorted_bundle_indices, model_parallel_size, gpu_order, monkeypatch
 ):
     """Each reserved address must sit on the bundle its frontend rank will occupy.
 
@@ -1613,6 +1642,11 @@ def test_reserve_http_server_addresses_pins_every_frontend_bundle(
         },
     }
 
+    monkeypatch.setattr(
+        MegatronGeneration,
+        "_coresident_gpu_order",
+        staticmethod(lambda config, cluster: gpu_order),
+    )
     urls, rank_to_port, holders = MegatronGeneration.reserve_http_server_addresses(
         cluster, config
     )
@@ -1621,6 +1655,8 @@ def test_reserve_http_server_addresses_pins_every_frontend_bundle(
     expected_placement = _bundles_via_worker_group(
         sorted_bundle_indices, cluster.num_gpus_per_node, placement_groups
     )
+    if gpu_order is not None:
+        expected_placement = [expected_placement[gpu] for gpu in gpu_order]
     assert list(rank_to_port) == expected_ranks
     assert len(urls) == len(holders) == len(expected_ranks)
 

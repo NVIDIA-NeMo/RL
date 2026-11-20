@@ -22,7 +22,7 @@ import time
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
@@ -85,6 +85,7 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.experience.route_assembly import RouteLayout
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.megatron_worker import (
+    WORKER_CONCURRENCY_GROUPS,
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
     _configure_inference_optimized_layer_spec,
@@ -97,6 +98,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS,
     NvFp4PerTokenRolloutConfig,
 )
+from nemo_rl.models.megatron import sm_partition
 from nemo_rl.models.megatron.common import (
     _unwrapped_chunks,
     clear_transient_megatron_caches,
@@ -983,9 +985,19 @@ class MegatronPolicyWorkerImpl(
         gpu_ids = ray.get_gpu_ids()
         local_rank = int(gpu_ids[0])
         os.environ["LOCAL_RANK"] = str(local_rank)
+        # Co-resident generation with MPS static SM partitions: pick this GPU's partition before CUDA init.
+        sm_partition.select_static_partition(
+            config, "engine" if is_refit_destination else "learner", local_rank
+        )
         # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
         enable_batch_invariant_mode(config)
         torch.cuda.set_device(local_rank)
+        # Co-resident generation (sm_partition.py): this process must run under its SM share.
+        sm_partition.check_worker(
+            config,
+            "engine" if is_refit_destination else "learner",
+            rank=get_rank_safe(),
+        )
 
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
@@ -1142,11 +1154,30 @@ class MegatronPolicyWorkerImpl(
             "skip_weight_load is only valid for inference-only policies "
             "(init_optimizer=False, init_reference_model=False)."
         )
+        shared_expert_hooks = None
+        if (
+            init_optimizer
+            and sm_partition.engine_sm_fraction(config) is not None
+            and sm_partition.engine_weights_mode(config) == "shared"
+            and self.megatron_cfg.ddp.use_distributed_optimizer
+            and not (
+                self.megatron_cfg.dist.use_torch_fsdp2
+                or self.megatron_cfg.dist.use_megatron_fsdp
+                or self.megatron_cfg.ddp.use_megatron_fsdp
+                or self.megatron_cfg.ddp.use_custom_fsdp
+                or self.megatron_cfg.optimizer.use_layer_wise_distributed_optimizer
+            )
+        ):
+            sm_partition.configure_shared_expert_checkpoint(
+                self.megatron_cfg.checkpoint
+            )
+            shared_expert_hooks = [sm_partition.prepare_shared_expert_layout]
         model_and_optimizer_state = setup_model_and_optimizer(
             config,
             self.megatron_cfg,
             init_optimizer,
             pre_load_checkpoint_hook=getattr(self, "_pre_load_checkpoint_hook", None),
+            additional_pre_wrap_hooks=shared_expert_hooks,
             load_weights=not skip_weight_load,
         )
 
@@ -5178,6 +5209,165 @@ class MegatronPolicyWorkerImpl(
         # Ensure exporters cannot observe a partially gathered buffer.
         torch.cuda.synchronize()
 
+    def export_coresident_refit_handles(self) -> sm_partition.RefitExport:
+        """Export stable CUDA IPC handles for this rank local refit tensors.
+
+        Co-resident learner, once: CUDA IPC handles of this rank's local refit tensors by Megatron's resolved name,
+        keyed by its GPU, with storage identity and native shard metadata.
+        """
+        from megatron.core.resharding.utils import named_refit_tensors
+
+        core = sm_partition.refit_core(self.model)
+        named = list(named_refit_tensors(core))
+        metadata = sm_partition.refit_metadata(core)
+        resolved = {item.name: item.resolved_name for item in metadata}
+        return sm_partition.RefitExport(
+            placement=sm_partition.RefitPlacement(
+                device_id=self.report_device_id(),
+                rank=torch.distributed.get_rank(),
+            ),
+            metadata=[asdict(item) for item in metadata],
+            handles=sm_partition.export_refit_handles(
+                (resolved[n], t) for n, t in named
+            ),
+            fingerprint=sm_partition.storage_fingerprint(named),
+        )
+
+    def init_coresident_reshard(
+        self, *, source_metadata: list[dict], residual_metadata: list[dict]
+    ) -> None:
+        """Plan residual transfers among learners, with one NCCL rank per GPU."""
+        # Native copy-service setup is only needed for nonlocal co-resident shards.
+        from megatron.core.resharding.copy_services.nccl_copy_service import (
+            NCCLCopyService,
+        )
+        from megatron.core.resharding.planner import index_metadata_rosters
+        from megatron.core.resharding.utils import ParameterMetadata
+
+        from nemo_rl.models.generation.megatron.config import (
+            resolve_refit_execution_batch_bytes,
+        )
+        from nemo_rl.models.megatron.coresident_reshard import build_residual_plan
+
+        if self._coresident_reshard_plan is not None:
+            raise RuntimeError("co-resident residual transfers are already initialized")
+        world = torch.distributed.get_world_size()
+        rosters = [([], []) for _ in range(world)]
+        for side, records in enumerate((source_metadata, residual_metadata)):
+            for record in records:
+                metadata = ParameterMetadata(**record)
+                if not 0 <= metadata.owner_rank < world:
+                    raise ValueError(
+                        "co-resident metadata owner is outside the learner world"
+                    )
+                rosters[metadata.owner_rank][side].append(metadata)
+        destinations, sources = index_metadata_rosters(rosters)
+        self._coresident_receive_metadata = {
+            item.name: item for item in rosters[torch.distributed.get_rank()][1]
+        }
+        self._coresident_reshard_plan = build_residual_plan(
+            destinations,
+            sources,
+            torch.distributed.get_rank(),
+            execution_batch_bytes=resolve_refit_execution_batch_bytes(
+                self.cfg["generation"]["mcore_generation_config"][
+                    "refit_execution_batch_bytes"
+                ]
+            ),
+        )
+        self._coresident_reshard_service = NCCLCopyService(
+            group=torch.distributed.group.WORLD
+        )
+
+    def coresident_reshard(
+        self, *, destinations: dict[str, sm_partition.RefitDestination]
+    ) -> None:
+        """Fill remote-dependent inference tensors through their same-GPU IPC views."""
+        # The executor consumes actual receive buffers without a shadow model allocation.
+        from megatron.core.resharding.execution import execute_reshard_plan
+
+        from nemo_rl.models.megatron.coresident_reshard import named_tensor_proxy
+
+        if (
+            self._coresident_reshard_plan is None
+            or self._coresident_reshard_service is None
+        ):
+            raise RuntimeError(
+                "co-resident residual transfers have not been initialized"
+            )
+        destination = destinations.get(self.report_device_id())
+        if destination is None:
+            if self._coresident_receive_metadata != {}:
+                raise ValueError(
+                    "Missing inference buffers for planned residual receives"
+                )
+            receive_module = None  # Source-only rank in the learner group.
+        elif destination.handles is not None:
+            tensors = sm_partition.open_refit_handles(destination.handles)
+            receive_metadata = self._coresident_receive_metadata
+            if receive_metadata is None or tensors.keys() != receive_metadata.keys():
+                raise ValueError(
+                    "co-resident receive handles do not cover the planned destinations"
+                )
+            for name, tensor in tensors.items():
+                metadata = receive_metadata[name]
+                if (
+                    tuple(tensor.shape) != tuple(metadata.shape)
+                    or tensor.dtype != metadata.dtype
+                ):
+                    raise ValueError(
+                        f"co-resident receive handle has a different layout or dtype: {name}"
+                    )
+            if any(
+                tensor.device != torch.device("cuda", torch.cuda.current_device())
+                for tensor in tensors.values()
+            ):
+                raise ValueError(
+                    "co-resident receive buffers must reside on the paired learner GPU"
+                )
+            self._coresident_receive_module = named_tensor_proxy(tensors)
+            self._coresident_receive_fingerprint = destination.fingerprint
+        if destination is not None:
+            if (
+                self._coresident_receive_module is None
+                or destination.fingerprint != self._coresident_receive_fingerprint
+            ):
+                raise RuntimeError(
+                    "co-resident receive storage changed without replacement IPC handles"
+                )
+            receive_module = self._coresident_receive_module
+        with torch.inference_mode():
+            execute_reshard_plan(
+                self._coresident_reshard_plan,
+                sm_partition.refit_core(self.model),
+                receive_module,
+                self._coresident_reshard_service,
+                group=torch.distributed.group.WORLD,
+            )
+
+    def release_coresident_receives(self) -> None:
+        """Release imported receive storage before inference owners shut down."""
+        torch.cuda.synchronize()
+        self._coresident_receive_module = None
+        self._coresident_receive_metadata = None
+        self._coresident_receive_fingerprint = None
+        self._coresident_reshard_service = None
+        self._coresident_reshard_plan = None
+
+    def coresident_refit_source_ready(self) -> str:
+        """Verify refit storage identity after learner weight writes complete.
+
+        Co-resident learner, per step: the optimizer step's writes are complete before the engine copies (with
+        overlap_param_gather the SC's sync_params_before_refit has already gathered them). Returns the storage
+        fingerprint: the engine reads this rank's memory through handles taken once, so it must not have moved.
+        """
+        from megatron.core.resharding.utils import named_refit_tensors
+
+        torch.cuda.synchronize()
+        return sm_partition.storage_fingerprint(
+            named_refit_tensors(sm_partition.refit_core(self.model))
+        )
+
     def _refit_is_trtllm_nccl_reshard(self) -> bool:
         """Whether this policy refits TRT-LLM engines shard-to-shard."""
         generation_cfg = self.cfg.get("generation") or {}
@@ -5800,11 +5990,11 @@ class MegatronPolicyWorkerImpl(
 
 
 # Every rollout sample is one generate_async call on rank 0, and the engine queues
-# requests past its own capacity. Ray's async-actor default of 1000 calls would
-# otherwise cap in-flight rows and queue control calls (finish_generation) behind them.
+# requests past its own capacity. A separate generation concurrency group keeps
+# control calls schedulable while allowing more than 1000 outstanding requests.
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker"),
-    max_concurrency=2**16,
+    concurrency_groups=WORKER_CONCURRENCY_GROUPS,
 )  # pragma: no cover
 class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
     pass

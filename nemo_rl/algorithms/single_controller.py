@@ -398,8 +398,8 @@ class SingleControllerActor:
             and self._async_cfg.min_groups_for_streaming_train
             < self._algo_cfg.num_prompts_per_step
         )
-        self._ppo_group_multiple = actor_args.ppo_group_multiple
-        self._ppo_min_remaining_groups = actor_args.ppo_min_remaining_groups
+        self._train_group_multiple = actor_args.train_group_multiple
+        self._train_min_remaining_groups = actor_args.train_min_remaining_groups
         self._value_dedicated: bool = dedicated_value_enabled(master_config)
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
@@ -2799,10 +2799,10 @@ class SingleControllerActor:
         forest_training = self._master_config.token_capture.forest_training
         selection_kwargs = (
             {
-                "group_multiple": self._ppo_group_multiple,
-                "min_remaining_groups": self._ppo_min_remaining_groups,
+                "group_multiple": self._train_group_multiple,
+                "min_remaining_groups": self._train_min_remaining_groups,
             }
-            if self._streaming_ppo
+            if self._train_group_multiple > 1 or self._streaming_ppo
             else {}
         )
 
@@ -3312,9 +3312,7 @@ class SingleControllerActor:
                                         await self._rollout_snapshots.begin_optimizer_commit(
                                             drain_snapshot=True
                                         )
-                                        policy_result = await asyncio.to_thread(
-                                            self._trainer.finish_train_step
-                                        )
+                                        policy_result = await self._optimizer_step()
                                         step_open = False
 
                     if train_meta.sequence_lengths:
@@ -3487,9 +3485,7 @@ class SingleControllerActor:
                                 tracer=self._tracer,
                             ),
                         ):
-                            policy_result = await asyncio.to_thread(
-                                self._trainer.finish_train_step
-                            )
+                            policy_result = await self._optimizer_step()
                         step_open = False
                     if is_policy_training_step and not self._gen.blocks_training():
                         # Publish exactly one policy version before full-batch
@@ -3577,9 +3573,7 @@ class SingleControllerActor:
                             tracer=self._tracer,
                         ),
                     ):
-                        policy_result = await asyncio.to_thread(
-                            self._trainer.finish_train_step
-                        )
+                        policy_result = await self._optimizer_step()
                     await self._rollout_snapshots.begin_optimizer_commit(
                         drain_snapshot=False
                     )
@@ -5016,6 +5010,15 @@ class SingleControllerActor:
         """How long to wait for the refit before giving up, or None to wait forever."""
         deadline = self._async_cfg.generation_fleet_health.refit_timeout_s
         return None if deadline is None else deadline + self._REFIT_UNWIND_GRACE_S
+
+    async def _optimizer_step(self) -> Any:
+        """Apply the optimizer update after shared-weight readers have paused.
+
+        The policy optimizer step. A generation engine that reads the policy's weight memory directly stops before
+        it (before_learner_write) and resumes in the next _sync_weights, the one place a new version is published.
+        """
+        await asyncio.to_thread(self._weight_synchronizer.before_learner_write)
+        return await asyncio.to_thread(self._trainer.finish_train_step)
 
     async def _sync_weights_within(self, kv_scales, what: str) -> None:
         """Run the refit off-loop, and stop waiting if it outlives the deadline.

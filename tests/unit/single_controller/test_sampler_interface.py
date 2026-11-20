@@ -48,6 +48,13 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_training_claims,
     sampler_supports_transactional_admission,
 )
+from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AsyncRLConfig,
+    MasterConfig,
+    resolve_streaming_chunk_alignment,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 
@@ -869,6 +876,55 @@ def aligned_sampler(request: pytest.FixtureRequest):
 
 
 class TestGroupAlignedSelection:
+    @pytest.mark.parametrize("policy_dp,generations", [(16, 8), (64, 8), (32, 4)])
+    def test_grpo_streaming_keeps_complete_dp_shards(
+        self, aligned_sampler: tuple, policy_dp: int, generations: int
+    ) -> None:
+        sampler, buffer = aligned_sampler
+        config = MasterConfig.model_construct(
+            grpo=GRPOConfig.model_construct(
+                num_prompts_per_step=32,
+                num_generations_per_prompt=generations,
+            ),
+            policy={"dynamic_batching": {"enabled": True}},
+            loss_fn=ClippedPGLossConfig(),
+            async_rl=AsyncRLConfig(min_groups_for_streaming_train=8),
+        )
+        group_multiple, tail = resolve_streaming_chunk_alignment(
+            config, policy_dp=policy_dp
+        )
+        for index in range(9):
+            buffer.add(str(index), weight=0, target_step=0)
+
+        first, count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=8,
+                max_prompt_groups=32,
+                group_multiple=group_multiple,
+                min_remaining_groups=tail,
+            )
+        )
+
+        assert count == 8
+        assert count * generations % policy_dp == 0
+        assert buffer.meta_list[0].sample_ids == ["8_g0"]
+        for index in range(9, 32):
+            buffer.add(str(index), weight=0, target_step=0)
+        final, count = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=8,
+                max_prompt_groups=24,
+                group_multiple=group_multiple,
+                min_remaining_groups=tail,
+            )
+        )
+        assert count == 24
+        assert count * generations % policy_dp == 0
+        assert first.sample_ids + final.sample_ids == [f"{i}_g0" for i in range(32)]
+        assert buffer.meta_list == []
+
     def test_keeps_unaligned_remainder_until_more_groups_arrive(self, aligned_sampler):
         sampler, buffer = aligned_sampler
         for index in range(53):

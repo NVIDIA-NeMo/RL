@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+import time
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Optional
 
 import ray
 
 from nemo_rl.models.generation.interfaces import reject_unenforceable_refit_deadline
+from nemo_rl.models.megatron import sm_partition
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.collective_weight_synchronizer import (
     CollectiveWeightSynchronizer,
@@ -70,7 +73,7 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         self._refit_timeout_s = refit_timeout_s
         self._offload_policy_before_refit = offload_policy_before_refit
         self._refit_backend: Optional[str] = None
-        self._transport: Optional[WeightSynchronizer] = None
+        self._transport: WeightSynchronizer | CoresidentRefit | None = None
         if colocated:
             # Colocated refit always uses the in-place wake-reshard, so
             # any other transport is inert. Reject rather than silently ignoring it:
@@ -84,7 +87,13 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
                     "collective or nccl_reshard transport."
                 )
         if not colocated and not generation.uses_native_refit:
-            if generation.cfg.get("refit_transport") == "nccl_reshard":
+            if generation.cfg.get("refit_transport") == "ipc":
+                self._transport = CoresidentRefit(
+                    policy=policy,
+                    generation=generation,
+                    refit_timeout_s=refit_timeout_s,
+                )
+            elif generation.cfg.get("refit_transport") == "nccl_reshard":
                 self._transport = NcclReshardWeightSynchronizer(
                     policy=policy,
                     generation=generation,
@@ -161,6 +170,13 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
             self._stale = False
             return {}
 
+        if isinstance(self._transport, CoresidentRefit):
+            # Publish local views and residual transfers while inference is paused.
+            with timed_phase("prepare_for_generation/transfer_and_update_weights"):
+                stats = self._transport.sync_weights(kv_scales=kv_scales)
+            self._stale = False
+            return stats
+
         # The engine serves continuously in non-colocated mode; pause it exactly
         # around the swap.
         with timed_phase("prepare_for_generation/suspend_for_refit"):
@@ -209,6 +225,10 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         self._stale = False
         return {}
 
+    def before_learner_write(self) -> None:
+        if isinstance(self._transport, CoresidentRefit):
+            self._transport.before_learner_write()
+
     @property
     def is_stale(self) -> bool:
         return self._stale
@@ -217,3 +237,201 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         """Release any resources owned by the delegated transport."""
         if self._transport is not None:
             self._transport.shutdown()
+
+
+class CoresidentRefit:
+    """Refit of a co-resident Megatron engine (nemo_rl/models/megatron/sm_partition.py).
+
+    Setup: every learner rank exports CUDA IPC handles of its local refit tensors once; the engine rank on the same GPU
+    maps them (and, with ``engine_weights=shared``, binds the matching ones as its own, before it captures its graphs).
+
+    Per step, ``sync_weights`` (the loop's refit, after its parameter all-gather): pause every engine at a step boundary
+    unless ``before_learner_write`` already did; check that the learners' writes are complete and their storage
+    unmoved; copy the non-shared tensors, refresh derived weights and bump the weight epoch on every engine rank; then
+    unpause. With shared weights the engine reads the learner's memory, so it is paused from before the optimizer step
+    writes it until this refit publishes the new version.
+
+    Actor calls use the configured refit timeout, or a 360-second fallback, so an unresponsive worker fails the run.
+    """
+
+    def __init__(
+        self, policy: Any, generation: Any, *, refit_timeout_s: Optional[float] = None
+    ) -> None:
+        self._policy = policy
+        self._generation = generation
+        self._fingerprints: list[str] = []
+        self._shared = sm_partition.engine_weights_mode(policy.cfg) == "shared"
+        self._engine_running = False
+        self._paused_at: Optional[float] = None
+        self._pause_s = 0.0
+        self._control_timeout_s = 360.0 if refit_timeout_s is None else refit_timeout_s
+        if self._control_timeout_s <= 0:
+            raise ValueError("co-resident refit timeout must be positive")
+        self._residual_bytes = 0
+        self._devices: set[str] = set()
+        self._closed = False
+
+    def _call_workers(self, owner: Any, method: str, **kwargs: Any) -> list[Any]:
+        refs = owner.worker_group.run_all_workers_single_data(method, **kwargs)
+        return ray.get(refs, timeout=self._control_timeout_s)
+
+    def init_communicator(self) -> None:
+        if self._closed:
+            raise RuntimeError("co-resident refit is closed")
+        exported = self._call_workers(self._policy, "export_coresident_refit_handles")
+        by_device = {item.placement.device_id: item for item in exported}
+        if len(by_device) != len(exported):
+            raise RuntimeError(
+                "co-resident refit: two learner ranks report the same GPU"
+            )
+        layouts = self._call_workers(self._generation, "coresident_refit_placement")
+        engine_devices = {layout.device_id for layout in layouts}
+        if (
+            not layouts
+            or len(engine_devices) != len(layouts)
+            or not engine_devices <= set(by_device)
+        ):
+            raise ValueError(
+                "co-resident refit requires each inference worker on a distinct learner GPU"
+            )
+        self._devices = engine_devices
+        if {item.placement.rank for item in exported} != set(range(len(exported))) or {
+            layout.rank for layout in layouts
+        } != set(range(len(layouts))):
+            raise ValueError(
+                "co-resident refit workers must report complete native rank worlds"
+            )
+        engine_to_learner = {
+            layout.rank: by_device[layout.device_id].placement.rank
+            for layout in layouts
+        }
+        source_metadata = [metadata for item in exported for metadata in item.metadata]
+        self._fingerprints = [item.fingerprint for item in exported]
+        # Both worker-group calls enumerate workers in the same order.
+        local_exports = [by_device[layout.device_id] for layout in layouts]
+        bound = ray.get(
+            self._generation.worker_group.run_all_workers_multiple_data(
+                "open_coresident_refit_handles",
+                local_placement=[item.placement for item in local_exports],
+                local_handles=[item.handles for item in local_exports],
+                common_kwargs={
+                    "source_metadata": ray.put(source_metadata),
+                    "engine_to_learner": engine_to_learner,
+                    "learner_world_size": len(exported),
+                    "share": self._shared,
+                },
+            ),
+            timeout=self._control_timeout_s,
+        )
+        residual_metadata = [
+            metadata for item in bound for metadata in item.residual_metadata
+        ]
+        self._residual_bytes = sum(
+            math.prod(item["shape"]) * item["element_size"]
+            for item in residual_metadata
+        )
+        if self._residual_bytes:
+            self._call_workers(
+                self._policy,
+                "init_coresident_reshard",
+                source_metadata=source_metadata,
+                residual_metadata=residual_metadata,
+            )
+        totals = {
+            key: sum(item.stats.get(key, 0) for item in bound)
+            for key in {key for item in bound for key in item.stats}
+        }
+        print(
+            f"[sm_partition] co-resident engine weights ({'shared' if self._shared else 'copy'}) bound: {totals}",
+            flush=True,
+        )
+
+    def _pause(self) -> float:
+        t0 = time.perf_counter()
+        self._call_workers(self._generation, "coresident_pause")
+        self._paused_at = t0
+        return time.perf_counter() - t0
+
+    def before_learner_write(self) -> None:
+        if self._closed:
+            raise RuntimeError("co-resident refit is closed")
+        if self._shared and self._engine_running:
+            self._pause_s = self._pause()
+
+    def sync_weights(
+        self, *, kv_scales: Optional[dict[str, float]] = None
+    ) -> dict[str, float]:
+        if self._closed:
+            raise RuntimeError("co-resident refit is closed")
+        if kv_scales:
+            raise NotImplementedError(
+                "co-resident refit with FP8 KV scales is not built yet"
+            )
+        if self._paused_at is None:
+            self._pause_s = self._pause()
+        paused_at = self._paused_at
+        assert paused_at is not None, "Co-resident readers must be paused before refit"
+        t0 = time.perf_counter()
+        ready = self._call_workers(self._policy, "coresident_refit_source_ready")
+        if ready != self._fingerprints:
+            raise RuntimeError(
+                "co-resident refit: a learner rank's refit tensors moved since their IPC handles were taken "
+                "(offload / reload / buffer rebuild); the engine would read freed memory"
+            )
+        t1 = time.perf_counter()
+        if self._residual_bytes:
+            targets = self._call_workers(
+                self._generation, "export_coresident_refit_destinations"
+            )
+            by_device = {item.device_id: item for item in targets}
+            if len(by_device) != len(targets) or set(by_device) != self._devices:
+                raise RuntimeError(
+                    "co-resident receive workers changed physical placement"
+                )
+            self._call_workers(
+                self._policy, "coresident_reshard", destinations=by_device
+            )
+        residual_done = time.perf_counter()
+        copies = self._call_workers(self._generation, "coresident_refit_copy")
+        t2 = time.perf_counter()
+        self._call_workers(self._generation, "coresident_resume")
+        if not self._engine_running:
+            self._generation.refresh_dp_openai_server_base_urls(
+                timeout_s=self._control_timeout_s
+            )
+        t3 = time.perf_counter()
+        stats = {
+            "coresident_pause_s": self._pause_s,
+            "coresident_source_check_s": t1 - t0,
+            "coresident_reshard_s": residual_done - t1,
+            "coresident_copy_s": t2 - t1,
+            "coresident_copy_s_max_rank": max(c["seconds"] for c in copies),
+            "coresident_unpause_s": t3 - t2,
+            "coresident_engine_paused_s": t3 - paused_at,
+            "coresident_copy_bytes_per_rank": (
+                sum(copy["bytes"] for copy in copies) + self._residual_bytes
+            )
+            / len(copies),
+            "coresident_shared_bytes_per_rank": sum(
+                copy["bytes_shared"] for copy in copies
+            )
+            / len(copies),
+            "coresident_copy_bytes_total": sum(copy["bytes"] for copy in copies)
+            + self._residual_bytes,
+            "coresident_residual_destination_bytes": self._residual_bytes,
+            "coresident_shared_bytes_total": sum(
+                copy["bytes_shared"] for copy in copies
+            ),
+        }
+        print(f"[sm_partition] refit: {stats}", flush=True)
+        self._paused_at = None
+        self._engine_running = True
+        return stats
+
+    def shutdown(self) -> None:
+        """Drop reverse IPC imports while their inference owners are still alive."""
+        if self._closed:
+            return
+        if self._residual_bytes:
+            self._call_workers(self._policy, "release_coresident_receives")
+        self._closed = True

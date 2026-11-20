@@ -79,11 +79,13 @@ from nemo_rl.experience.rollout_recovery import (
     RecoveryTargetLevel,
 )
 from nemo_rl.models.generation.interfaces import sampler_replay_enabled
+from nemo_rl.models.generation.megatron.config import check_generation_calls
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
     resolve_vllm_logprobs_mode,
 )
+from nemo_rl.models.megatron import sm_partition
 from nemo_rl.models.policy import AutomodelConfig, MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
@@ -1578,6 +1580,29 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "requires non-colocated vLLM rollout. Disable nvfp4_pertoken_rollout "
             "or use the supported GRPO entry point examples/run_grpo.py."
         )
+    if generation_config["backend"] == "megatron":
+        check_generation_calls(
+            async_config.max_inflight_prompts,
+            algo_cfg.num_generations_per_prompt,
+        )
+
+    if sm_partition.engine_sm_fraction(master_config.policy) is None:
+        sm_partition.validate(master_config.policy)
+    else:
+        sm_partition.validate(
+            master_config.policy,
+            unsupported={
+                "cluster.segment_size": master_config.cluster.segment_size is not None,
+                "PPO (a critic worker group)": is_ppo_run(master_config),
+                "policy.offload_policy_before_refit (learner storage must not move)": bool(
+                    master_config.policy.get("offload_policy_before_refit")
+                ),
+                "reference-policy weight swapping with shared engine weights": (
+                    sm_partition.engine_weights_mode(master_config.policy) == "shared"
+                    and logprob_passes_required(master_config, algo_cfg)[1]
+                ),
+            },
+        )
     if generation_config["colocated"]["enabled"]:
         if generation_config["backend"] != "megatron":
             raise ValueError(
@@ -1846,7 +1871,9 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
 
-def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
+def sample_multiple(
+    config: PolicyConfig | ValueConfig, dp_size: int, *, logprobs_required: bool = True
+) -> int:
     """Samples a dispatch must be a multiple of to split cleanly on this consumer.
 
     A dispatch is split twice: once across the DP ranks, and then on the static
@@ -1857,6 +1884,7 @@ def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
     Args:
         config: Policy or value configuration of the consuming trainer.
         dp_size: Data-parallel size of that trainer.
+        logprobs_required: Whether a forward uses the logprob microbatch size.
 
     Returns:
         The sample count both splits divide.
@@ -1866,108 +1894,85 @@ def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
     ):
         return dp_size
     train_micro_batch_size = config["train_micro_batch_size"]
-    logprob_batch_size = config.get("logprob_batch_size") or train_micro_batch_size
-    return dp_size * math.lcm(train_micro_batch_size, logprob_batch_size)
+    if logprobs_required and (logprob_batch_size := config.get("logprob_batch_size")):
+        return dp_size * math.lcm(train_micro_batch_size, logprob_batch_size)
+    return dp_size * train_micro_batch_size
 
 
-def resolve_ppo_chunk_alignment(
-    master_config: MasterConfig, policy_dp: int, value_dp: int
+def resolve_streaming_chunk_alignment(
+    master_config: MasterConfig,
+    *,
+    policy_dp: int,
+    value_dp: Optional[int] = None,
+    requires_kv_scale_sync: bool = False,
 ) -> tuple[int, int]:
-    """Validate PPO batch alignment and return sampler group and tail multiples."""
-    if not is_ppo_run(master_config):
+    """Return sampler alignment that fills every policy and value DP shard."""
+    ppo = is_ppo_run(master_config)
+    algorithm_name = "PPO" if ppo else "GRPO"
+    # Forest pads each group to the policy execution row multiple before dispatch.
+    if not ppo and master_config.token_capture.forest_training:
         return 1, 0
-    value_config = master_config.value
-    if value_config is None:
-        raise ValueError("PPO requires a value model configuration")
-
-    sample_alignment = math.lcm(
-        sample_multiple(master_config.policy, policy_dp),
-        sample_multiple(value_config, value_dp),
+    algorithm = algo_config(master_config)
+    sample_alignment = sample_multiple(
+        master_config.policy,
+        policy_dp,
+        logprobs_required=(
+            ppo
+            or requires_kv_scale_sync
+            or opd_module.is_opd_enabled(master_config)
+            or any(logprob_passes_required(master_config, algorithm))
+        ),
     )
-    ppo_config = master_config.ppo
-    assert ppo_config is not None
+    if ppo:
+        value_config = master_config.value
+        if value_config is None or value_dp is None:
+            raise ValueError("PPO requires a value model configuration and DP size")
+        sample_alignment = math.lcm(
+            sample_alignment,
+            sample_multiple(value_config, value_dp),
+        )
     group_multiple = sample_alignment // math.gcd(
-        sample_alignment, ppo_config.num_generations_per_prompt
+        sample_alignment, algorithm.num_generations_per_prompt
     )
-    if ppo_config.num_prompts_per_step % group_multiple:
+    if algorithm.num_prompts_per_step % group_multiple:
         raise ValueError(
-            "PPO num_prompts_per_step must be divisible by the policy/value "
+            f"{algorithm_name} num_prompts_per_step must be divisible by the policy/value "
             f"group multiple ({group_multiple}) to avoid an incomplete final chunk"
         )
     min_groups = master_config.async_rl.min_groups_for_streaming_train
-    if min_groups < group_multiple:
+    if ppo and min_groups < group_multiple:
         raise ValueError(
-            "PPO min_groups_for_streaming_train must be at least the "
+            f"{algorithm_name} min_groups_for_streaming_train must be at least the "
             f"policy/value group multiple ({group_multiple}) so each chunk "
             "contains complete microbatches on every DP rank"
+        )
+    if not ppo:
+        # The smallest eligible chunk must fit in the buffer even when the GRPO
+        # streaming floor is smaller than a complete set of policy shards.
+        validate_sampler_buffer_capacity(
+            master_config.async_rl,
+            required_capacity=math.ceil(min_groups / group_multiple) * group_multiple,
+            sampler_name=master_config.async_rl.sampler.name,
         )
     # Tail-aware selection refuses an unaligned max, and only a binding cap can
     # produce one: the uncapped max is the already-aligned step remainder.
     chunk_cap = master_config.async_rl.max_groups_for_streaming_train
     if (
         chunk_cap is not None
-        and chunk_cap < ppo_config.num_prompts_per_step
+        and chunk_cap < algorithm.num_prompts_per_step
         and chunk_cap % group_multiple != 0
     ):
         raise ValueError(
-            "PPO max_groups_for_streaming_train must be divisible by the "
+            f"{algorithm_name} max_groups_for_streaming_train must be divisible by the "
             f"policy/value group multiple ({group_multiple}) so each capped "
             "chunk contains complete microbatches on every DP rank"
         )
     min_remaining_groups = (
-        (min_groups + 1) // 2 if min_groups < ppo_config.num_prompts_per_step else 0
+        (min_groups + 1) // 2
+        if ppo and min_groups < algorithm.num_prompts_per_step
+        else 0
     )
     return group_multiple, min_remaining_groups
-
-
-def validate_grpo_chunk_cap_alignment(
-    master_config: MasterConfig, policy_dp: int
-) -> None:
-    """Reject a GRPO chunk cap whose samples cannot split across the policy.
-
-    GRPO passes no ``group_multiple`` to the sampler, so a chunk can be any size
-    from the floor up to the cap, and the training dispatch shards it without
-    ``allow_uneven_shards``. The chunk therefore has to satisfy the same
-    ``sample_multiple`` PPO aligns to: the DP split, and under static batching the
-    microbatch split inside each rank as well. This guards the full-cap chunk
-    only: a cap of 3 at 2 generations per prompt is 6 samples, which fails on a
-    DP of 4. An unaligned chunk below the cap stays reachable, as it already is
-    from an unaligned ``min_groups_for_streaming_train``, which no validator
-    covers today.
-
-    Only a cap below ``num_prompts_per_step`` can bind, and Forest is exempt: its
-    producer pads each group to the policy execution row multiple, so the logical
-    group count is not the physical row count.
-
-    Args:
-        master_config: The run configuration.
-        policy_dp: Data-parallel size of the policy trainer.
-
-    Raises:
-        ValueError: The capped chunk's sample count is not a multiple of the
-            policy's ``sample_multiple``.
-    """
-    if is_ppo_run(master_config):
-        return
-    chunk_cap = master_config.async_rl.max_groups_for_streaming_train
-    algo_cfg = algo_config(master_config)
-    if (
-        master_config.token_capture.forest_training
-        or chunk_cap is None
-        or chunk_cap >= algo_cfg.num_prompts_per_step
-    ):
-        return
-    chunk_multiple = sample_multiple(master_config.policy, policy_dp)
-    if (chunk_cap * algo_cfg.num_generations_per_prompt) % chunk_multiple != 0:
-        raise ValueError(
-            "GRPO async_rl.max_groups_for_streaming_train "
-            f"({chunk_cap}) x num_generations_per_prompt "
-            f"({algo_cfg.num_generations_per_prompt}) must be divisible by "
-            f"{chunk_multiple} -- the policy data-parallel size ({policy_dp}), "
-            "times the train/logprob microbatch multiple when sequence packing "
-            "and dynamic batching are both off -- so each capped chunk shards "
-            "evenly across the training ranks and into complete microbatches"
-        )
 
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:

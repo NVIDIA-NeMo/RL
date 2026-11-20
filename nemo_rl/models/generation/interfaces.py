@@ -225,6 +225,19 @@ class DisaggConfig(BaseModel, extra="allow"):
 class ColocationConfig(TypedDict):
     enabled: bool
     resources: OptionalResourcesConfig
+    # Co-resident Megatron generation uses dedicated processes on the training GPUs. With the default MPS backend,
+    # this fraction determines the learner TE grouped-GEMM margin; both clients remain uncapped.
+    engine_sm_fraction: NotRequired[float | None]
+    # Scheduling backend: "mps_gemm" (default, advisory learner GEMM budget),
+    # "mps_percentage" (learner cap), or "mps_static" (requires pre-created driver partitions).
+    sm_partition_backend: NotRequired[str | None]
+    # Co-resident engine weights: "copy" (default; own copy, per-step refit copy) or "shared" (maps the learner's
+    # weights where the local shards match; pauses only around the optimizer step).
+    engine_weights: NotRequired[str | None]
+    # Ordered indices in the topology-sorted GPU pool. Each engine GPU must
+    # be a learner GPU. None selects the full pool for the corresponding role.
+    learner_gpu_indices: NotRequired[list[int] | None]
+    engine_gpu_indices: NotRequired[list[int] | None]
 
 
 class CheckpointEngineConfig(TypedDict):

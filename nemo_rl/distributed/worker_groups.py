@@ -256,7 +256,12 @@ class RayWorkerBuilder:
             module = importlib.import_module(module_name)
             worker_class = getattr(module, class_name)
             worker_kwargs = dict(self.init_kwargs)
-            default_options = getattr(worker_class, "_default_options", {})
+            # Ray applies a class's concurrency_groups from @ray.remote and rejects them in .options().
+            default_options = {
+                k: v
+                for k, v in getattr(worker_class, "_default_options", {}).items()
+                if k != "concurrency_groups"
+            }
             options = recursive_merge_options(default_options, extra_options)
 
             # Use the worker's configuration interface if available
@@ -458,6 +463,19 @@ class RayWorkerGroup:
         self.name_prefix = name_prefix
         self.sharding_annotations = sharding_annotations
         self.dp_leader_worker_indices: list[int] = []
+
+        if bundle_indices_list is None and cluster._placement_group_owner is not None:
+            # A borrowed GPU view shares its owner's placement group, whose
+            # bundle count includes GPUs outside this view.
+            if workers_per_node is not None:
+                raise ValueError(
+                    "GPU subset worker groups require explicit bundle_indices_list "
+                    "when overriding workers_per_node"
+                )
+            assert cluster._sorted_bundle_indices is not None
+            bundle_indices_list = [
+                (0, [bundle]) for bundle in cluster._sorted_bundle_indices
+            ]
 
         # If explicit bundle indices are provided, use those
         if bundle_indices_list is None:

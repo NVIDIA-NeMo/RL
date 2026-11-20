@@ -34,7 +34,6 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
 import ray
-from ray.util.placement_group import placement_group_table
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
@@ -112,18 +111,7 @@ def storage_node_ids(
 
     ``count`` None means 2 per selected node.
     """
-    # Creates (and waits for) any placement group not yet reserved, so the
-    # table read below sees them all.
-    pgs = [pg for cluster in clusters for pg in cluster.get_placement_groups()]
-    # One GCS read for every placement group; no actor RPC.
-    table = placement_group_table()
-    nodes = sorted(
-        {
-            node_id
-            for pg in pgs
-            for node_id in table[pg.id.hex()]["bundles_to_node_id"].values()
-        }
-    )
+    nodes = sorted({node for cluster in clusters for node in cluster.get_node_ids()})
     # Every selected node gets count // len(nodes) units, or one more.
     return [nodes[i % len(nodes)] for i in range(count or 2 * len(nodes))]
 
