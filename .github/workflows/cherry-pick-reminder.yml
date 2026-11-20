@@ -1,0 +1,78 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: Cherry-pick reminder
+
+# Nightly nudge so cherry-picks from a release branch actually land on main.
+# cherry-pick-release-commit.yml opens a "cp: ... into main" PR (labelled
+# `cherry-pick`) for every release PR carrying `cherry-pick-to-main`. This
+# posts ONE Slack message listing every such PR still open, pinging rl-oncall
+# and tagging each PR's original author by GitHub handle. Silent when nothing is open.
+
+on:
+  schedule:
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  remind:
+    if: github.repository == 'NVIDIA-NeMo/RL'
+    runs-on: ubuntu-latest
+    # SLACK_TEAM_CHANNEL_WEBHOOK is an environment secret on `main`.
+    environment:
+      name: main
+      deployment: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Post reminder for open cherry-pick PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_TEAM_CHANNEL_WEBHOOK }}
+          # rl-oncall Slack usergroup (same one cherry-pick-release-commit.yml pings on failures)
+          ONCALL_MENTION: "<!subteam^S0C1W14AHS7>"
+        run: |
+          set -euo pipefail
+
+          gh pr list --repo "$GITHUB_REPOSITORY" --base main --state open \
+            --label cherry-pick --limit 200 \
+            --json number,title,url,createdAt,body,reviewRequests > prs.json
+
+          COUNT=$(jq length prs.json)
+          if [[ "$COUNT" -eq 0 ]]; then
+            echo "No open cherry-pick PRs to main; nothing to post."
+            exit 0
+          fi
+
+          # The bot opens these PRs, so the human is named in the body ("Hi @user")
+          # and requested as reviewer (only until they review).
+          TEXT=$(jq -r --arg oncall "$ONCALL_MENTION" '
+            def esc: gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;") | gsub("`";"") | gsub("\\|";"/");
+            def who:
+              (((.body // "") | capture("Hi @(?<u>[A-Za-z0-9-]+)").u)
+                // (.reviewRequests | map(.login // empty) | first) // null) as $a
+              | if $a == null then "unknown author" else "@\($a)" end;
+            def age: ((now - (.createdAt | fromdateiso8601)) / 86400 | floor);
+            "\($oncall) :cherries: \(length) cherry-pick PR(s) to `main` still open. Please merge so release fixes land on main:\n"
+            + (sort_by(.createdAt) | map("• <\(.url)|#\(.number) \(.title | esc)> — \(who) — open \(age)d") | join("\n"))
+          ' prs.json)
+
+          PAYLOAD=$(jq -n -c --arg text "$TEXT" '{text: $text}')
+          curl -sS --fail-with-body -X POST -H "Content-type: application/json" \
+            --data "$PAYLOAD" "$SLACK_WEBHOOK"
