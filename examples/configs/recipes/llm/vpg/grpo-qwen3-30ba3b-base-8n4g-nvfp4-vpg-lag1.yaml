@@ -1,0 +1,18 @@
+defaults: ./grpo-qwen3-30ba3b-base-8n4g-nvfp4-pertoken-async-4t4g.yaml
+grpo:
+  val_at_start: false
+  use_dynamic_sampling: false
+  batch_multiplier: 1
+  reward_scaling:
+    enabled: false
+  reward_shaping:
+    enabled: false
+  async_grpo:
+    max_trajectory_age_steps: 1
+    version_point_gradient: true
+policy:
+  logprob_chunk_size: 128
+  router_replay:
+    enabled: false
+logger:
+  wandb_enabled: false

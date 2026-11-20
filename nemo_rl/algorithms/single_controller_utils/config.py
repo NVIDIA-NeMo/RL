@@ -1938,6 +1938,18 @@ def validate_grpo_chunk_cap_alignment(
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    if (
+        master_config.grpo is not None
+        and master_config.grpo.async_grpo is not None
+        and (
+            master_config.grpo.async_grpo.version_point_gradient
+            or master_config.grpo.async_grpo.version_point_per_token
+        )
+    ):
+        raise ValueError(
+            "grpo.async_grpo.version_point_gradient requires legacy async GRPO; "
+            "it is not supported by SingleController."
+        )
     if master_config.loss_fn.seq_logprob_error_in_loss:
         _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)

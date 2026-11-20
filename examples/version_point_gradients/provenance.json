@@ -1,0 +1,115 @@
+{
+  "model": "Qwen/Qwen3-30B-A3B-Base",
+  "seed": 1,
+  "target_steps": 1500,
+  "topology": {
+    "gpus_per_node": 4,
+    "generation_nodes": 4,
+    "training_tensor_parallel": 1,
+    "training_expert_parallel": 4
+  },
+  "runtime": {
+    "megatron_lm_commit": "ec1e3e9294fdad6d72f3260f913f62849f815e80",
+    "megatron_bridge_commit": "abde8697e7c3a359982b437be7c09dfcbb917207",
+    "python": "3.13",
+    "pytorch": "2.11.0+cu130",
+    "transformer_engine": "2.19.0",
+    "flashinfer_python": "0.7.2.post1",
+    "nvidia_cutlass_dsl": "4.6.2",
+    "ray": "2.56.1",
+    "transformers": "5.8.1",
+    "triton": "3.6.0",
+    "bf16_vpg_control": {
+      "megatron_lm_base_commit": "ec1e3e9294fdad6d72f3260f913f62849f815e80",
+      "megatron_lm_commit": "f17de039317333e27ff8ff5a34780e4326f1caac",
+      "patch": "patches/megatron-native-te-bf16.patch",
+      "batch_invariant_backend": "te_native",
+      "grouped_gemm": "native TransformerEngine device-metadata GEMM",
+      "gpu_compute_capability": [
+        10,
+        0
+      ],
+      "cublasLt_version": 130501,
+      "deepgemm_used": false,
+      "triton_gemm_backend_used": false
+    },
+    "megatron_lm_base_commit": "ace931f8bf801f7af224877a391ffa33528a9574",
+    "megatron_lm_repository": "https://github.com/NVIDIA/Megatron-LM.git",
+    "megatron_bridge_repository": "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git",
+    "megatron_lm_patch": "patches/megatron-optimizer.patch"
+  },
+  "arms": {
+    "bf16_lag1": {
+      "original_commit": "38707462789f971c28c46a79c5539479a96ea610",
+      "lag": 1,
+      "batch_invariant": false,
+      "vpg": false,
+      "nodes": 8,
+      "training_nodes": 4,
+      "generation_nodes": 4,
+      "gpus": 32
+    },
+    "bf16_lag4": {
+      "original_commit": "7b3c35c795873d96edc7c592096c80f6ffea4604",
+      "lag": 4,
+      "batch_invariant": false,
+      "vpg": false,
+      "nodes": 8,
+      "training_nodes": 4,
+      "generation_nodes": 4,
+      "gpus": 32
+    },
+    "nvfp4_vpg_lag1": {
+      "original_commit": "3f14188c1b1618b83669af36ab5cd37749039514",
+      "lag": 1,
+      "batch_invariant": true,
+      "vpg": true,
+      "nodes": 8,
+      "training_nodes": 4,
+      "generation_nodes": 4,
+      "gpus": 32
+    },
+    "nvfp4_vpg_lag4": {
+      "original_commit": "8591a74f3b8f509627f71d51e7085f569db4f667",
+      "lag": 4,
+      "batch_invariant": true,
+      "vpg": true,
+      "nodes": 8,
+      "training_nodes": 4,
+      "generation_nodes": 4,
+      "gpus": 32
+    },
+    "bf16_vpg_lag1": {
+      "original_commit": "999a47ecc42380600f191aa35272eb730dd70e20",
+      "lag": 1,
+      "batch_invariant": true,
+      "vpg": true,
+      "nodes": 5,
+      "training_nodes": 1,
+      "generation_nodes": 4,
+      "gpus": 20,
+      "activation_recompute": "full, uniform, one layer",
+      "logprob_chunk_size": 8
+    },
+    "bf16_vpg_lag4": {
+      "original_commit": "76a7a125f19c8215d78f0b44bb0cd8f96c04016e",
+      "lag": 4,
+      "batch_invariant": true,
+      "vpg": true,
+      "nodes": 5,
+      "training_nodes": 1,
+      "generation_nodes": 4,
+      "gpus": 20,
+      "activation_recompute": "full, uniform, one layer",
+      "logprob_chunk_size": 8
+    }
+  },
+  "port_notes": [
+    "Study gradient_at_behavior=always maps to grpo.async_grpo.version_point_gradient=true; behavior snapshots are always checkpointed when VPG is enabled.",
+    "Study-only rho probes and paper2 diagnostics are excluded. Recipes preserve the training objective and sampling settings; numerical equivalence of this current-main port needs the startup gates.",
+    "BF16 VPG controls enable bias_activation_fusion to match inference SwiGLU rounding.",
+    "Megatron runtime fields without a first-class NeMo-RL key use the existing model_overrides passthrough; generation explicitly disables the training-only matched-expert mode.",
+    "BF16 VPG controls use 4 trainer GPUs and 16 rollout GPUs, with full activation recomputation; the 32-GPU study arms use 16 trainers, so FP32 gradient reduction order differs.",
+    "BF16 VPG logprob_chunk_size=8 bounds temporary loss memory. Four full-vocabulary GPU probes preserved exact forwards and exact native backward at the configured chunk size; changing from128 to8 differed by at most one BF16 ULP in the probed gradients."
+  ]
+}

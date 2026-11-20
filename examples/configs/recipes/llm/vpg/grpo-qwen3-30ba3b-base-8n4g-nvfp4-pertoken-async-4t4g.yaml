@@ -1,0 +1,74 @@
+defaults: ../grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken.yaml
+grpo:
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 2
+    recompute_kv_cache_after_weight_updates: false
+checkpointing:
+  keep_top_k: 1
+  metric_name: null
+  checkpoint_must_save_by: 00:03:40:00
+policy:
+  make_sequence_length_divisible_by: 64
+  offload_optimizer_for_logprob: false
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    sequence_parallel: false
+    expert_model_parallel_size: 4
+    fp4_cfg:
+      enabled: false
+    te_precision_config_file: null
+    first_last_layers_bf16: false
+    transformer_impl: inference_optimized
+    inference_grouped_gemm_backend: flashinfer
+    inference_moe_token_dispatcher_type: nvls
+    moe_permute_fusion: false
+    moe_pad_experts_for_cuda_graph_inference: false
+    zero_train_gen_mismatch: true
+    batch_invariant_mode: true
+    batch_invariant_backend: te_native
+    batch_invariant_collective: ordered
+    attention_backend: flash
+    flash_attention_version: 4
+    recompute_granularity: selective
+    recompute_modules:
+    - moe
+    model_overrides:
+      moe_use_grouped_tensor: false
+      use_transformer_engine_op_fuser: false
+      inference_moe_nvfp4_recipe: per_token
+      moe_training_matches_inference: true
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+    env_vars:
+      CUBLASLT_WORKSPACE_SIZE: '0'
+      CUBLAS_WORKSPACE_CONFIG: :0:0
+  generation:
+    backend: megatron
+    refit_transport: mcore
+    nvfp4_pertoken_rollout:
+      enabled: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 4
+    mcore_generation_config:
+      transformer_impl: inference_optimized
+      moe_router_dtype: fp32
+      logprobs_mode: raw_logprobs
+      enable_prefix_caching: false
+      inference_grouped_gemm_backend: flashinfer
+      inference_moe_token_dispatcher_type: nvls
+      refit_backend: nccl
+      kv_cache_management_mode: persist
+      moe_pad_experts_for_cuda_graph_inference: false
+      fp8_cfg:
+        enabled: false
+      max_tokens: 8192
+      max_requests: 128
+      inference_flashinfer_mxfp8_token_capacity: 512
+      buffer_size_gb: 80
+      model_overrides:
+        inference_moe_nvfp4_recipe: per_token
+        moe_training_matches_inference: false

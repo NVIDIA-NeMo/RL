@@ -138,6 +138,10 @@ from nemo_rl.models.megatron.train import (
     should_reduce_loss_across_context_parallel,
     strip_context_parallel_local_loss_metric,
 )
+from nemo_rl.models.megatron.version_snapshots import (
+    VersionSnapshots,
+    ddp_local_param_shards,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -170,7 +174,14 @@ from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
-from nemo_rl.utils.path_utils import maybe_enable_msc
+from nemo_rl.utils.path_utils import (
+    as_path,
+    listdir,
+    load_checkpoint_object,
+    maybe_enable_msc,
+    path_isdir,
+    save_checkpoint_object,
+)
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 from nemo_rl.utils.tensor_ops import pad_and_concat
 from nemo_rl.utils.timer import Timer
@@ -1004,13 +1015,12 @@ class MegatronPolicyWorkerImpl(
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
-        if (
+        if self.megatron_cfg.model.transformer_impl == "inference_optimized" and (
             not init_optimizer
-            and self.megatron_cfg.model.transformer_impl == "inference_optimized"
+            or getattr(self.megatron_cfg.model, "moe_training_matches_inference", False)
         ):
-            # Bridge's generic GPT provider defaults to its training layer spec.
-            # Dedicated inference workers need MCore inference linears instead.
-            # A model-specific provider already handles this itself.
+            # Matched-expert training and generation both need inference routers.
+            # Model-specific providers retain their own layer specifications.
             _configure_inference_optimized_layer_spec(self.megatron_cfg.model)
         self.dtype = runtime_config.dtype
         self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
@@ -1063,6 +1073,10 @@ class MegatronPolicyWorkerImpl(
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
         self._colocated_reshard_plan = model_and_optimizer_state.colocated_reshard_plan
+        # Version-point gradients (grpo.async_grpo.version_point_gradient): weight snapshots
+        # and the version the next train() computes its forward/backward at (None: current).
+        self._version_snapshots: Optional[VersionSnapshots] = None
+        self._version_point: Optional[int] = None
         log_gpu_memory_diagnostics(
             label="after_model_setup", worker_type="MegatronPolicyWorker"
         )
@@ -1549,7 +1563,11 @@ class MegatronPolicyWorkerImpl(
                         stage="train",
                         require=True,
                     )
-                    with maybe_r3_trace_stage("train", enabled=use_router_replay):
+                    with (
+                        maybe_r3_trace_stage("train", enabled=use_router_replay),
+                        # Exits (params restored bitwise) before optimizer.step() below.
+                        self._version_point_scope(enabled=not eval_mode),
+                    ):
                         losses_reduced = megatron_forward_backward(
                             model=self.model,
                             data_iterator=data_iterator,
@@ -2078,6 +2096,7 @@ class MegatronPolicyWorkerImpl(
     def train_microbatch(
         self,
         data: BatchedDataDict[Any],
+        version_point: Optional[int] = None,
     ) -> Optional[list[float]]:
         """One DP slice of data → one ``forward_backward_func`` invocation.
 
@@ -2097,7 +2116,18 @@ class MegatronPolicyWorkerImpl(
         if state.get("offloaded", False):
             raise RuntimeError("prepare_for_training must restore the offloaded step")
         try:
-            return self._train_microbatch_body(state, data)
+            if version_point is None:
+                return self._train_microbatch_body(state, data)
+            previous_version = self._version_point
+            try:
+                if not self.set_version_point(version_point):
+                    raise RuntimeError(
+                        f"Version-point snapshot {version_point} disappeared"
+                    )
+                with self._version_point_scope(enabled=True):
+                    return self._train_microbatch_body(state, data)
+            finally:
+                self._version_point = previous_version
         except Exception:
             # The body left all three mcore hooks nulled when begin_train_step
             # opened the step. If we propagate without restoring, future steps
@@ -2139,7 +2169,12 @@ class MegatronPolicyWorkerImpl(
         # the local sums, which is exactly what we're trying to defer.
         assert "sample_mask" in data, "sample_mask required on microbatch data"
         sample_mask = data["sample_mask"]
-        call_local_seqs = torch.sum(sample_mask).to(torch.float64)
+        sequence_count = (
+            data["version_point_sequence_count"]
+            if "version_point_sequence_count" in data
+            else sample_mask
+        )
+        call_local_seqs = torch.sum(sequence_count).to(torch.float64)
         if "token_mask" in data:
             token_mask = data["token_mask"]
             call_local_toks = torch.sum(
@@ -5255,6 +5290,127 @@ class MegatronPolicyWorkerImpl(
             and not getattr(ckpt_cfg, "async_ckpt_use_cpu_shm", False)
             and colocated_cfg.get("enabled", False)
         )
+
+    # ------------------------------------------------------------------
+    # Version-point gradients (grpo.async_grpo.version_point_gradient)
+    # ------------------------------------------------------------------
+    def _new_version_snapshots(self, keep_versions: int) -> VersionSnapshots:
+        if not isinstance(self.model, DistributedDataParallel):
+            raise NotImplementedError(
+                "Version-point gradients require a Megatron DistributedDataParallel model."
+            )
+        return VersionSnapshots(
+            local_shards=lambda: ddp_local_param_shards(self.model),
+            sync=lambda: self.model.start_param_sync(force_sync=True),
+            keep_versions=keep_versions,
+            invalidate_weight_caches=self._invalidate_version_point_weight_caches,
+        )
+
+    def _invalidate_version_point_weight_caches(self) -> None:
+        """Release cached casts derived from weights replaced through DDP buffers."""
+        for module in self.model.modules():
+            if hasattr(module, "is_first_microbatch"):
+                module.is_first_microbatch = True
+        if getattr(self._get_model_config(), "moe_training_matches_inference", False):
+            # The value-pass cache exists only in MCore builds supporting matched experts.
+            from megatron.core.transformer.moe.training_matches_inference import (
+                release_inference_value_pass_weights,
+            )
+
+            release_inference_value_pass_weights(self.model)
+
+    def snapshot_version_weights(
+        self, version: int, keep_versions: int
+    ) -> dict[str, Any]:
+        """Keep the current weights (the ones the generator receives) as ``version``.
+
+        Returns the host bytes held and whether a snapshot of the same version restored from
+        a checkpoint matched the current weights bitwise (if not, that version was dropped).
+        """
+        if self._version_snapshots is None:
+            self._version_snapshots = self._new_version_snapshots(keep_versions)
+        consistent = self._version_snapshots.snapshot(version)
+        return {
+            "stored_bytes": self._version_snapshots.stored_bytes(),
+            "consistent": consistent,
+        }
+
+    def has_version_weights(self, version: int) -> bool:
+        return self._version_snapshots is not None and self._version_snapshots.has(
+            version
+        )
+
+    def set_version_point(self, version: Optional[int]) -> bool:
+        """Compute the next train()'s forward/backward at snapshot ``version`` (None: current weights).
+
+        Returns whether this rank holds the version.
+        """
+        self._version_point = None
+        if version is None or not self.has_version_weights(version):
+            return False
+        self._version_point = version
+        return True
+
+    def _drain_param_gather(self) -> None:
+        """Wait for in-flight overlapped param all-gathers (they write into the param buffers)."""
+        for group in list(self.model.bucket_groups) + list(
+            self.model.expert_parallel_bucket_groups
+        ):
+            if group.param_gather_handle is not None:
+                group.finish_param_sync(skip_next_bucket_dispatch=True)
+
+    @contextmanager
+    def _version_point_scope(self, enabled: bool) -> Iterator[None]:
+        """Hold the weights of the version point in the param buffers while inside.
+
+        The precision-aware optimizer's master is the bf16 param bits plus an int16
+        remainder, so the current bits must be back before ``optimizer.step()``: callers exit
+        this scope first. Gradients accumulate in the separate grad buffers.
+        """
+        if not enabled or self._version_point is None:
+            yield
+            return
+        assert self._version_snapshots is not None
+        self._drain_param_gather()
+        with self._version_snapshots.swapped_in(self._version_point):
+            try:
+                yield
+            finally:
+                self._drain_param_gather()
+
+    def save_version_snapshots(self, path: str) -> None:
+        """Save this rank's snapshots into a checkpoint (one file per version)."""
+        if self._version_snapshots is None:
+            return
+        as_path(path).mkdir(parents=True, exist_ok=True)
+        for version in self._version_snapshots.versions():
+            save_checkpoint_object(
+                self._version_snapshots.snapshots[version],
+                os.path.join(path, f"rank_{self.rank}_version_{version}.pt"),
+            )
+
+    def load_version_snapshots(self, path: str, keep_versions: int) -> list[int]:
+        """Restore this rank's snapshots from a checkpoint; returns the restored versions."""
+        prefix = f"rank_{self.rank}_version_"
+        files = listdir(path) if path_isdir(path, strict=False) else []
+        versions = sorted(
+            int(name[len(prefix) : -len(".pt")])
+            for name in files
+            if name.startswith(prefix) and name.endswith(".pt")
+        )
+        if not versions:
+            return []
+        if self._version_snapshots is None:
+            self._version_snapshots = self._new_version_snapshots(keep_versions)
+        for version in versions[-keep_versions:]:
+            tensors = load_checkpoint_object(
+                os.path.join(path, f"{prefix}{version}.pt"),
+                map_location="cpu",
+                weights_only=True,
+            )
+            self._version_snapshots.restore(version, tensors)
+            del tensors
+        return self._version_snapshots.versions()
 
     def finalize_async_save(self):
         """Finalize an async write and release unsafe colocated CUDA IPC caches.

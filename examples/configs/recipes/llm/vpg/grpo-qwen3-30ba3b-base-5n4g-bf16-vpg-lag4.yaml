@@ -1,0 +1,4 @@
+defaults: ./grpo-qwen3-30ba3b-base-5n4g-bf16-vpg-lag1.yaml
+grpo:
+  async_grpo:
+    max_trajectory_age_steps: 4

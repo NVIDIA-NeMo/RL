@@ -24,6 +24,10 @@ from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.version_point_tokens import (
+    plan_token_version_passes,
+    token_version_pass_data,
+)
 from nemo_rl.data.megatron_sft_packed import (
     MEGATRON_SFT_PACKED_BATCH_FIELDS,
     is_direct_packed_row,
@@ -1053,7 +1057,87 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         results = self.worker_group.get_all_worker_results(futures)
 
-        # Aggregate the results
+        return self._aggregate_train_results(results)
+
+    def train_token_versions(
+        self,
+        data: BatchedDataDict[Any],
+        loss_fn: LossFunction,
+        versions: list[int],
+        *,
+        current_version: int,
+        timer: Optional[Timer] = None,
+    ) -> dict[str, Any]:
+        """Accumulate behavior-version token gradients and take one current-weight step."""
+        gbs = self.cfg["train_global_batch_size"]
+        mbs = self.cfg["train_micro_batch_size"]
+        if data.get_multimodal_dict():
+            raise ValueError("tokenwise VPG currently requires text-only rollouts")
+        if data.size != gbs or not versions:
+            raise ValueError(
+                "tokenwise VPG requires one complete nonempty rollout batch"
+            )
+        passes = plan_token_version_passes(
+            data, versions, row_multiple=self.data_parallel_size * mbs
+        )
+        if self.flops_tracker is not None:
+            self.flops_tracker.reset()
+        try:
+            ray.get(
+                self.worker_group.run_all_workers_single_data(
+                    "begin_train_step_presharded", loss_fn=loss_fn, gbs=gbs, mbs=mbs
+                )
+            )
+            for plan in passes:
+                with (
+                    timer.time("policy_training/sharding_data")
+                    if timer
+                    else nullcontext()
+                ):
+                    sub_batch = token_version_pass_data(data, plan)
+                    shards = self._shard_for_train(sub_batch, sub_batch.size)
+                if self.flops_tracker is not None:
+                    for shard in shards:
+                        self.flops_tracker.track_batch(shard["input_lengths"].tolist())
+                version_point = (
+                    None if plan.version == current_version else plan.version
+                )
+                futures = self.worker_group.run_all_workers_sharded_data(
+                    "train_microbatch",
+                    data=shards,
+                    in_sharded_axes=["data_parallel"],
+                    replicate_on_axes=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    output_is_replicated=[
+                        "context_parallel",
+                        "tensor_parallel",
+                        "pipeline_parallel",
+                    ],
+                    common_kwargs={"version_point": version_point},
+                )
+                self.worker_group.get_all_worker_results(futures)
+            results = ray.get(
+                self.worker_group.run_all_workers_single_data(
+                    "finish_train_step_presharded"
+                )
+            )
+            results = [result for result in results if result["is_replica_leader"]]
+        except Exception:
+            ray.get(self.worker_group.run_all_workers_single_data("abort_train_step"))
+            raise
+        aggregated = self._aggregate_train_results(results)
+        if "num_valid_samples" in aggregated["all_mb_metrics"]:
+            # A sequence can contribute to several version passes; count it once.
+            valid = data["token_mask"][:, 1:].bool().any(dim=1)
+            aggregated["all_mb_metrics"]["num_valid_samples"] = [
+                float((data["sample_mask"] * valid).sum())
+            ]
+        return aggregated
+
+    def _aggregate_train_results(self, results: list[dict[str, Any]]) -> dict[str, Any]:
         aggregated_results = {
             "loss": results[0]["global_loss"],
             "grad_norm": results[0]["grad_norm"],
@@ -1529,6 +1613,59 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 tokenizer_path=tokenizer_path,
             )
         ray.get(futures)
+
+    # Version-point gradients (grpo.async_grpo.version_point_gradient; Megatron policy).
+    def snapshot_version_weights(
+        self, version: int, keep_versions: int
+    ) -> dict[str, Any]:
+        """Snapshot the current weights as ``version`` on every worker (newest ``keep_versions`` kept).
+
+        Returns the largest per-worker host bytes held and whether every worker's restored
+        snapshot of the same version (after a resume) matched the current weights bitwise.
+        """
+        results = ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "snapshot_version_weights", version=version, keep_versions=keep_versions
+            )
+        )
+        return {
+            "stored_bytes": max(r["stored_bytes"] for r in results),
+            "consistent": all(r["consistent"] for r in results),
+        }
+
+    def has_version_weights(self, version: int) -> bool:
+        """Whether every worker holds a snapshot of ``version``."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "has_version_weights", version=version
+        )
+        return all(ray.get(futures))
+
+    def set_version_point(self, version: Optional[int]) -> bool:
+        """Compute the next train()'s gradient at snapshot ``version`` (None: at the current weights).
+
+        Returns whether every worker had the version.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "set_version_point", version=version
+        )
+        return all(ray.get(futures))
+
+    def save_version_snapshots(self, path: str) -> None:
+        """Save every worker's version snapshots into a checkpoint directory."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "save_version_snapshots", path=path
+            )
+        )
+
+    def load_version_snapshots(self, path: str, keep_versions: int) -> list[int]:
+        """Restore version snapshots from a checkpoint; returns the versions every worker restored."""
+        restored = ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "load_version_snapshots", path=path, keep_versions=keep_versions
+            )
+        )
+        return sorted(set.intersection(*(set(v) for v in restored)))
 
     def finalize_async_save(self) -> None:
         """Block until all workers' in-flight async checkpoint writes complete.

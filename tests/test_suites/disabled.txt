@@ -106,3 +106,18 @@ research/template_project/tests/test_suites/llm/single_update_1n8g.sh
 
 # Full Flow-GRPO recipe requires an externally served GenRM OCR judge.
 research/flow_grpo/tests/test_suites/flow_grpo_qwen_image_ocr.sh
+
+# Version-point gradients: manual 12-step lag-8 functional qualification.
+tests/test_suites/llm/grpo-qwen3-8b-base-1n4g-megatron-async-vpg.sh
+
+# Manual VPG reproduction gates require the pinned experimental Blackwell runtime.
+tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-5n4g-bf16-vpg-lag1.sh
+tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-5n4g-bf16-vpg-lag4.sh
+tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-8n4g-bf16-baseline-lag1.sh
+tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-8n4g-bf16-baseline-lag4.sh
+tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-8n4g-nvfp4-pertoken-async-4t4g.sh
+tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-8n4g-nvfp4-vpg-lag1.sh
+tests/test_suites/llm/vpg/grpo-qwen3-30ba3b-base-8n4g-nvfp4-vpg-lag4.sh
+
+# Tokenwise VPG: manual mixed-version qualification with the experimental native TE runtime.
+tests/test_suites/llm/grpo-qwen3-8b-base-1n4g-megatron-async-vpg-tokenwise.sh
