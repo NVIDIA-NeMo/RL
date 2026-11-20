@@ -294,6 +294,13 @@ rollout_recovery:
   # rollouts start over after a crash.
   # Set true to accept that with a warning; only valid with target_level: turn or prefix.
   allow_restart_only_gym_servers: false
+  # Per-generation-owner TQ I/O limits for saved partial responses with
+  # target_level: prefix. Rows per TQ write at a checkpoint cut.
+  prefix_write_max_rows: 256
+  # Tokens per TQ write at a checkpoint cut; a larger row is written alone.
+  prefix_write_max_tokens: 4194304
+  # Rows per TQ read at restore. 1 = each restore reads on its own.
+  prefix_read_max_rows: 256
 
 # Leaving either map above non-empty requires the top-level token_capture section
 # to set enabled: true.
