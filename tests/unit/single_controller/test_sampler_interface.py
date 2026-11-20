@@ -48,6 +48,10 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_training_claims,
     sampler_supports_transactional_admission,
 )
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AsyncRLConfig,
+    validate_sampler_buffer_capacity,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 
@@ -428,13 +432,13 @@ class TestReadyFirstConfig:
                 12,
                 id="gated_live_plus_lookahead",
             ),
-            # Unordered + evicting: any full buffer is selectable, so one
-            # select's minimum is the floor on both sides.
+            # Unordered + evicting, but claimed groups hold buffer permits until
+            # step close: capacity must cover the step, not the dispatch floor.
             pytest.param(
                 WindowedSamplerConfig(max_staleness_versions=1),
-                3,
-                3,
-                id="windowed_select_minimum",
+                4,
+                4,
+                id="windowed_step_size",
             ),
             # A custom sampler's bound is unknowable without importing the
             # target, so the config side reports None, like BaseSampler does.
@@ -461,6 +465,100 @@ class TestReadyFirstConfig:
             )
             assert (
                 sampler.required_buffer_capacity(groups_per_step=4) == instance_expected
+            )
+
+
+class TestWindowedCapacity:
+    """The streaming floor bounds a chunk; capacity must cover the whole step."""
+
+    @pytest.mark.parametrize(
+        ("groups_per_step", "floor"),
+        [(4, 3), (8, 2), (1, 1)],
+        ids=["step_above_floor", "step_above_lower_floor", "step_equals_floor"],
+    )
+    def test_capacity_is_the_step_size_not_the_streaming_floor(
+        self, groups_per_step, floor
+    ):
+        cfg = WindowedSamplerConfig(max_staleness_versions=1)
+
+        assert (
+            required_buffer_capacity_for_config(
+                cfg,
+                groups_per_step=groups_per_step,
+                min_groups_for_streaming_train=floor,
+            )
+            == groups_per_step
+        )
+        sampler = create_sampler(
+            FakeBuffer(), cfg, min_groups_for_streaming_train=floor
+        )
+        assert (
+            sampler.required_buffer_capacity(groups_per_step=groups_per_step)
+            == groups_per_step
+        )
+
+    @pytest.mark.parametrize(
+        ("max_buffered_rollouts", "should_raise"),
+        [(64, False), (32, True)],
+        ids=["capacity_equals_step", "capacity_at_streaming_floor"],
+    )
+    def test_setup_capacity_boundary_for_64_group_step(
+        self, max_buffered_rollouts, should_raise
+    ):
+        cfg = WindowedSamplerConfig(max_staleness_versions=1)
+        async_cfg = AsyncRLConfig(
+            sampler=cfg,
+            min_groups_for_streaming_train=32,
+            max_buffered_rollouts=max_buffered_rollouts,
+        )
+        required = required_buffer_capacity_for_config(
+            cfg, groups_per_step=64, min_groups_for_streaming_train=32
+        )
+        assert required == 64
+
+        if should_raise:
+            with pytest.raises(ValueError, match=r"required capacity \(64\)"):
+                validate_sampler_buffer_capacity(
+                    async_cfg,
+                    required_capacity=required,
+                    sampler_name=async_cfg.sampler.name,
+                )
+        else:
+            validate_sampler_buffer_capacity(
+                async_cfg,
+                required_capacity=required,
+                sampler_name=async_cfg.sampler.name,
+            )
+
+    def test_floor_may_stay_below_the_step_size(self):
+        """The floor bounds one dispatch, so it may sit below the step size."""
+        async_cfg = AsyncRLConfig(
+            sampler=WindowedSamplerConfig(max_staleness_versions=1),
+            min_groups_for_streaming_train=2,
+            max_buffered_rollouts=3,
+        )
+        required = required_buffer_capacity_for_config(
+            async_cfg.sampler,
+            groups_per_step=3,
+            min_groups_for_streaming_train=2,
+        )
+        assert required == 3
+        validate_sampler_buffer_capacity(
+            async_cfg,
+            required_capacity=required,
+            sampler_name=async_cfg.sampler.name,
+        )
+
+    def test_gated_capacity_is_unaffected_by_the_floor(self):
+        """A gated sampler keeps its own formula whatever the floor is."""
+        cfg = ReadyFirstSamplerConfig(max_staleness_versions=2)
+
+        for floor in (2, 3, 32):
+            assert (
+                required_buffer_capacity_for_config(
+                    cfg, groups_per_step=4, min_groups_for_streaming_train=floor
+                )
+                == 12
             )
 
 
