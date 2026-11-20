@@ -26,7 +26,10 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
+from pydantic import TypeAdapter
+
 from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+from nemo_rl.algorithms.loss import PolicyGradientLossConfig, as_clipped_pg_config
 from nemo_rl.experience.reward_penalties import CaptureRewardSettings
 from nemo_rl.experience.rollouts import get_effort_config, get_nemo_gym_thinking_tags
 
@@ -375,12 +378,30 @@ def _normalize_capture_reward_config(dumped: dict[str, Any]) -> None:
             dumped["env"].pop("nemo_gym")
 
 
+_LOSS_CONFIG = TypeAdapter(PolicyGradientLossConfig)
+
+
+def _normalize_loss_config(dumped: dict[str, Any]) -> None:
+    """Give a tagged loss config the identity of the untagged config it builds.
+
+    Selecting a loss config with ``loss_fn.kind`` does not change training, so
+    tagging a recipe must not invalidate snapshots taken before it was tagged.
+    An untagged config never dumps ``kind`` and is left as is.
+    """
+    loss = dumped.get("loss_fn")
+    if not isinstance(loss, Mapping) or "kind" not in loss:
+        return
+    config = _LOSS_CONFIG.validate_python(loss)
+    dumped["loss_fn"] = as_clipped_pg_config(config).model_dump(mode="json")
+
+
 def bootstrap_compatibility_identity(
     master_config: MasterConfig,
 ) -> BootstrapCompatibilityIdentity:
     """Remove explicitly operational paths from the fail-closed run identity."""
     dumped = master_config.model_dump(mode="json")
     _normalize_capture_reward_config(dumped)
+    _normalize_loss_config(dumped)
     rollout_checkpointing = dumped.get("rollout_checkpointing", {})
     if not isinstance(rollout_checkpointing, Mapping):
         raise TypeError("rollout_checkpointing config must be a mapping")
