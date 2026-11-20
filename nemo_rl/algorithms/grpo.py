@@ -5123,7 +5123,7 @@ def aggregate_rollout_metrics(
     - Metrics ending with "/std_in_group": summarize the per-group values
     - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
     - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
-    - "total_turns": summed
+    - "total_turns" and metrics ending with "/num_groups": summed
     - Non-numeric values: passed through as-is
     - All other numeric metrics: averaged
 
@@ -5147,7 +5147,8 @@ def aggregate_rollout_metrics(
             aggregated[k] = min(v)
         elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):
             aggregated[k] = max(v)
-        elif k == "total_turns":
+        elif k == "total_turns" or k.endswith("/num_groups"):
+            # Counts add up across groups; averaging would always give 1.
             aggregated[k] = sum(v)
         elif k == "trajectory_duration_s":
             sorted_v = sorted(v)
