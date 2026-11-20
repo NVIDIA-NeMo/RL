@@ -2053,3 +2053,94 @@ def test_effort_uses_terminal_call_with_carries_and_abandoned_branch(
         assert actual.token_ids == full_tokens
         assert actual.token_mask == masks
         assert actual.logprobs == logprobs
+
+
+@pytest.mark.parametrize("length_type", ["chars", "all_generated_tokens"])
+def test_length_penalty_published_rewards_match_shared_hook(
+    tq_client, partitions, length_type
+):
+    from nemo_rl.experience.reward_penalties import RewardChecks
+    from nemo_rl.utils.length_penalty import (
+        LengthPenaltyConfig,
+        LengthPenaltyParams,
+        apply_group_length_penalties,
+        prepare_length_penalty_input,
+    )
+
+    group_id = "length-penalty"
+    rollout_ids = [f"{group_id}_g{i}" for i in range(3)]
+    receipts, rows, results = [], [], []
+    for i in range(2):
+        receipt, _ = _stage_fixture(
+            tq_client, "worked_example", rollout_id=rollout_ids[i]
+        )
+        receipts.append(receipt)
+        rows.append(
+            _finalizer(tq_client).finalize_rollout(rollout_ids[i], receipt, reward=1.0)
+        )
+        results.append(
+            {
+                "agent_ref": {"name": "agent"},
+                "full_result": {
+                    "reward": 1.0,
+                    "response": {
+                        "output": [
+                            {
+                                "type": "message",
+                                "content": [{"text": "x" * (i + 1) * 10}],
+                            }
+                        ]
+                    },
+                },
+                "message_log": [
+                    {
+                        "role": "assistant",
+                        "token_ids": [
+                            token
+                            for token, mask in zip(
+                                rows[-1].token_ids, rows[-1].token_mask
+                            )
+                            if mask
+                        ],
+                    }
+                ],
+            }
+        )
+    config = LengthPenaltyConfig(
+        default=LengthPenaltyParams(
+            length_type=length_type, group_total_length_penalty_coeff=0.2
+        )
+    )
+    checks = [
+        RewardChecks(
+            False,
+            False,
+            False,
+            prepare_length_penalty_input(result, result, config, None),
+        )
+        for result in results
+    ]
+    expected_metrics = apply_group_length_penalties(results, config, 2)
+    finalizer = _finalizer(tq_client, length_penalty_config=config)
+    finalized = finalizer.finalize_group(
+        group_id,
+        rollout_ids,
+        receipts + [None],
+        [1.0, 1.0, 0.0],
+        mask_sample=[False] * 3,
+        fallback_weight_version=0,
+        prompt_idx=7,
+        reward_checks=checks + [None],
+    )
+    batch = _fetch_rows(tq_client, rollout_ids)
+    expected = [result["full_result"]["reward"] for result in results]
+    assert batch["total_reward"].flatten().tolist() == pytest.approx(expected + [0.0])
+    assert [
+        observation.reward for observation in finalized.reward_observations
+    ] == pytest.approx(expected)
+    assert {
+        key: finalized.metrics[f"finalize/{key}_sum"] / len(results)
+        for key in expected_metrics
+    } == pytest.approx(expected_metrics)
+    assert finalized.valid_row_count == 2
+    assert finalized.total_row_count == 3

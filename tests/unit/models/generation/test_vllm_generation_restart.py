@@ -93,10 +93,14 @@ class TestRestartShardTokenCapture:
         "dp_cfg": {"backend": "simple"},
         "staging_partition": "rollout_staging",
         "capture_media": False,
+        "media_family": None,
         "top_logprobs": 4,
         "generation_prefix_cuts_enabled": False,
         "generation_cut_control_token": None,
         "generation_cut_control_timeout_s": None,
+        "prefix_write_max_rows": 256,
+        "prefix_write_max_tokens": 4_194_304,
+        "prefix_read_max_rows": 256,
     }
 
     @staticmethod

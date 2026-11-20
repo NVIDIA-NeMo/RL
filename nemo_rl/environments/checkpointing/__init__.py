@@ -25,7 +25,6 @@ from nemo_rl.environments.checkpointing.interfaces import (
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
-    from nemo_rl.data_plane.interfaces import DataPlaneClient
     from nemo_rl.experience.rollout_manager import RolloutManager
     from nemo_rl.models.generation.interfaces import GenerationInterface
 
@@ -35,7 +34,6 @@ def build_environment_checkpoint(
     *,
     env_handles: dict[str, Any],
     rollout_manager: RolloutManager,
-    dp_client: DataPlaneClient,
     generation: Optional[GenerationInterface] = None,
 ) -> EnvironmentCheckpoint:
     """Return the environment checkpoint this run's config asks for.
@@ -56,6 +54,5 @@ def build_environment_checkpoint(
         master_config,
         env_handles=env_handles,
         rollout_manager=rollout_manager,
-        dp_client=dp_client,
         generation=generation,
     )

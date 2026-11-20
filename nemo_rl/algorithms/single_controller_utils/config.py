@@ -30,11 +30,15 @@ from pydantic import (
 )
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.advantage_estimator import create_advantage_estimator
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
     SamplerConfig,
+    require_drop_accounting_members,
     required_buffer_capacity_for_config,
+    sampler_requires_single_weight_batch,
+    sampler_uses_pooled_replacements,
 )
 from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
@@ -47,6 +51,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
@@ -84,6 +89,7 @@ from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.weight_sync.factory import validate_refit_actor_transport
 
 # ── User-facing SingleController configs ────────────────────────────────────
 
@@ -142,8 +148,9 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     absorbed, one that does not stops the run.
 
     Once a prompt has been given up on, ``on_dropped_prompt`` decides what happens to
-    the training step it was stamped for: train the step on fewer groups, or substitute
-    a fresh prompt so the step keeps its configured batch size.
+    the training step it is charged to (the step it was stamped for, or the step being
+    assembled when the sampler stamps none): train the step on fewer groups, or
+    substitute a fresh prompt so the step keeps its configured batch size.
     """
 
     # ── shared: consumed by generate_and_push, above the impl split ──
@@ -198,10 +205,10 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     # and should not be treated like losing 1 of 128. The floor is ceil(fraction * N),
     # so at the default a batch of 8 or fewer tolerates no drops at all.
     min_step_batch_fraction: Annotated[float, Field(gt=0.0, le=1.0)] = 0.9
-    # What becomes of the training step a given-up prompt was stamped for. Only stamped
-    # prompts are affected: with a sampler that does not stamp (WeightFifoSampler,
-    # whose admit returns None) a step fills from whatever is ready, so a drop costs
-    # throughput but strands nothing and there is nothing to substitute for.
+    # What becomes of the training step a given-up prompt is charged to: the step it was
+    # stamped for under in_order, the step being assembled under ready_first, and none
+    # under windowed (its rollout keeps producing, so later groups make up for it).
+    # weight_fifo cannot honour a drop at all, so a nonzero budget is rejected for it.
     #
     # "shrink" (the default, and the behaviour before this knob existed) closes the step
     # on fewer groups, bounded by min_step_batch_fraction above.
@@ -342,11 +349,11 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # wedge lasts longer before it is broken.
     #
     # DEFAULTED, not None, because the deadline is what makes reactive recovery possible
-    # at all rather than a nicety on top of it. A Ray actor runs one task at a time
-    # (nothing here raises max_concurrency) and this group is a raw StatelessProcessGroup
-    # with no torch process-group watchdog behind it, so a shard dying mid-collective
-    # leaves every trainer blocked inside NCCL. The driver sees RayActorError and calls
-    # _recover_from_failed_refit, whose init_collective then queues behind the still-blocked
+    # at all rather than a nicety on top of it. A sync method on an async Ray actor holds
+    # its event loop until it returns, regardless of max_concurrency, and this group is a
+    # raw StatelessProcessGroup with no torch process-group watchdog behind it, so a shard
+    # dying mid-collective leaves every trainer blocked inside NCCL. The driver sees
+    # RayActorError and calls _recover_from_failed_refit, whose init_collective then queues behind the still-blocked
     # task and never runs: the recovery itself wedges and the run ends on stall_timeout_s.
     # Only the abort releases those ranks. With None as the default, a config that turned
     # fleet health on got detection and quarantine but no refit recovery, silently.
@@ -488,6 +495,26 @@ class WatchdogConfig(BaseModel, extra="allow"):
         return self
 
 
+class RefitActorConfig(BaseModel, extra="allow"):
+    """Run the weight synchronizer in a separate CPU Ray actor (weight_sync/refit_actor.py)."""
+
+    # Run the weight synchronizer in a separate RefitActor. Off by default.
+    enabled: bool = False
+
+
+class TrainerWarmupConfig(BaseModel, extra="allow"):
+    """Synthetic first training pass, run while the trainer waits for generation."""
+
+    # Run one synthetic logprob pass and forward/backward on a Megatron trainer while
+    # it waits for generation or the first rollouts, so the first step's compiles and
+    # autotuning happen there. Needs non-colocated generation; setups it does not
+    # cover, such as PPO, router replay or CUDA graphs, skip it and log why.
+    enabled: bool = False
+    # Lengths of the synthetic sequences, each in [2, policy.max_total_sequence_length].
+    # None fills two microbatches near the microbatch token budget.
+    seqlens: Optional[list[int]] = None
+
+
 class AsyncRLConfig(BaseModel, extra="allow"):
     # Stream every consumed sample's untruncated token tensors to JSONL. Files
     # are published only after the optimizer step completes; disabled by default.
@@ -524,10 +551,19 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     generation_router: GenerationRouterConfig = Field(
         default_factory=GenerationRouterConfig
     )
+    # Where the weight synchronizer runs (see RefitActorConfig).
+    refit_actor: RefitActorConfig = Field(default_factory=RefitActorConfig)
     # Recompute generation KV caches after each weight update.
     recompute_kv_cache_after_weight_updates: bool = True
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
+    # Max groups the streaming trainer dispatches in one chunk. ``None`` leaves
+    # chunks unbounded, so a buffer that is already warm hands the whole step
+    # over at once and the trainers and advantage stage materialize a step's
+    # worth of rows together. A cap bounds that peak: the chunk is what gets
+    # sharded to the DP ranks and what the advantage stage fetches, so it is
+    # what decides host-memory high-water mark on a generation-bound run.
+    max_groups_for_streaming_train: Optional[int] = None
     # Cap on in-flight generate_and_push calls in the rollout pump.
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
@@ -539,14 +575,22 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # holds a whole cohort's advantage inputs in the controller's heap and
     # blocks the controller's event loop for the duration of the computation --
     # long enough at Ultra scale to miss Ray's actor liveness ping. A positive
-    # value moves both costs onto dedicated CPU actors. Only grpo and opd are
-    # sharded across the pool; other estimators run as one call on one actor.
+    # value moves both costs onto dedicated CPU actors. requires_global_batch
+    # keeps the batch on one actor; otherwise whole prompt groups may be sharded.
     # Under data_plane.backend=mooncake_cpu each worker is its own TQ client and
     # mounts a full global_segment_size + local_buffer_size, like each
     # token-capture finalizer; budget it on top of
     # gpus_per_node x (segment + buffer). With storage units on
     # (storage_unit_segment_size > 0) the segment is 0; only the buffer remains.
     num_advantage_workers: NonNegativeInt = 0
+    # Build the trainer while setup reserves the vLLM workers instead of after them,
+    # on NeMo-Gym runs with non-colocated vLLM, cluster.segment_size and no resume.
+    # Off by default: creating the trainer and vLLM actors at once adds load on the
+    # Ray GCS.
+    early_trainer_build: bool = False
+    # Synthetic first training pass that overlaps the trainer's first compiles with
+    # generation start-up.
+    trainer_warmup: TrainerWarmupConfig = Field(default_factory=TrainerWarmupConfig)
 
     @model_validator(mode="after")
     def _reject_renamed_blocks(self) -> "AsyncRLConfig":
@@ -572,6 +616,32 @@ class AsyncRLConfig(BaseModel, extra="allow"):
             raise ValueError(
                 "async_rl blocks have been renamed to say what they watch or route:\n"
                 + "\n".join(stale)
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_streaming_chunk_bounds(self) -> "AsyncRLConfig":
+        """The chunk cap must leave room for the floor it is capping.
+
+        ``_train_pump`` clamps the floor down to the cap so a short tail chunk can
+        still close the step. Set the cap below the floor and that clamp fires on
+        *every* chunk, so the configured floor never applies and the run streams at
+        the cap instead -- the floor becomes dead config rather than a bound.
+        """
+        max_groups = self.max_groups_for_streaming_train
+        if max_groups is None:
+            return self
+        if max_groups < 1:
+            raise ValueError(
+                f"async_rl.max_groups_for_streaming_train ({max_groups}) must be >= 1"
+            )
+        if max_groups < self.min_groups_for_streaming_train:
+            raise ValueError(
+                "async_rl.max_groups_for_streaming_train "
+                f"({max_groups}) must be >= "
+                "async_rl.min_groups_for_streaming_train "
+                f"({self.min_groups_for_streaming_train}): the cap would clamp the "
+                "floor on every chunk, leaving the floor with no effect."
             )
         return self
 
@@ -689,9 +759,12 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # derived at setup
     # under the run's log dir.
     capture_dir: Optional[str] = None
-    # Generation backend hosting token capture. This is derived from
-    # policy.generation.backend during setup; users should not set it separately.
-    generation_backend: Optional[Literal["vllm", "megatron"]] = None
+    # How NeMo-Gym reaches the capture host; derived during setup, users should not
+    # set it. "dynamo" = vLLM served through the Dynamo frontend
+    # (policy.generation.dynamo): same workers and capture code, but Gym's
+    # dynamo_worker handler sends capture fields in nvext, because the frontend
+    # carries only OpenAI fields plus nvext.
+    generation_backend: Optional[Literal["vllm", "megatron", "dynamo"]] = None
     # Keep routed_experts out of canonical rows and assemble them on policy
     # workers from strict staged-fragment plans.
     defer_routed_experts_to_policy: bool = False
@@ -764,6 +837,13 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     # every in-flight rollout over after a crash. False fails setup and names such
     # servers; true accepts them with a warning.
     allow_restart_only_gym_servers: bool = False
+    # Per-generation-owner TQ I/O limits for saved partial responses
+    # (target_level: prefix). Rows per TQ write at a checkpoint cut.
+    prefix_write_max_rows: Annotated[int, Field(gt=0)] = 256
+    # Tokens per TQ write at a checkpoint cut; a larger row is written alone.
+    prefix_write_max_tokens: Annotated[int, Field(gt=0)] = 4_194_304
+    # Rows per TQ read at restore. 1 = each restore reads on its own.
+    prefix_read_max_rows: Annotated[int, Field(gt=0)] = 256
 
     @model_validator(mode="after")
     def _validate_restart_only_opt_in(self) -> "RolloutRecoveryConfig":
@@ -1000,7 +1080,12 @@ def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> No
     """Keep the initial Forest objective identical at startup and before fanout."""
     unsupported = {
         "grpo.adv_estimator.name": grpo.adv_estimator.name != "grpo",
-        "loss_fn.token_level_loss": not loss.token_level_loss,
+        # Name whichever selector the user set; the default is global_token_mean.
+        (
+            "loss_fn.token_level_loss"
+            if loss.normalization is None and loss.token_level_loss is not None
+            else "loss_fn.normalization"
+        ): loss.resolved_normalization != "global_token_mean",
         "loss_fn.sequence_level_importance_ratios": loss.sequence_level_importance_ratios,
         "loss_fn.truncated_importance_sampling_type": loss.truncated_importance_sampling_type
         == "seq-mask-tis",
@@ -1093,6 +1178,11 @@ def rollout_snapshots_enabled(master_config: MasterConfig) -> bool:
         master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None
         or master_config.rollout_recovery.turn_checkpointing_enabled
     )
+
+
+def dedicated_value_enabled(master_config: MasterConfig) -> bool:
+    value_config = getattr(master_config, "value", None)
+    return bool(value_config and value_config.get("dedicated"))
 
 
 def algo_config(master_config: MasterConfig) -> GRPOConfig | PPOConfig:
@@ -1224,16 +1314,10 @@ def _validate_failure_settings(
     ``on_dropped_prompt="replace"`` unable to ever produce a replacement. These are the
     combinations it cannot see, because each depends on a field outside that block.
 
-    Warnings rather than errors for most of them, deliberately: a strict "never train a
-    short batch" run, one base YAML whose sampler is overridden per experiment, a
-    deliberately deep spare pool are all coherent things to have typed, so rejecting
-    them would forbid configurations somebody wants. What is not acceptable is finding
-    out hours into a run, or not at all.
-
-    The exception, and the only hard error here, is a drop budget under a sampler that
-    stamps no target step. That one is not a knob cancelling itself out; it converts a
-    recoverable prompt failure into a stalled run, so there is no configuration it
-    could be the intent of.
+    Most checks warn rather than raise: strict full batches, per-experiment sampler
+    overrides, and deep spare pools can be intentional. A nonzero drop budget
+    requires a boolean class declaration of the sampler's single-weight requirement
+    and rejects policies that need a complete single-weight batch.
     """
     failure_config = async_config.rollout_failure
     drop_budget = (
@@ -1241,46 +1325,32 @@ def _validate_failure_settings(
         + failure_config.max_consecutive_dropped_prompts
     )
     floor = math.ceil(num_prompts_per_step * failure_config.min_step_batch_fraction)
-    # InOrderSampler is the only built-in that stamps a target step, and only a
-    # stamped step can be credited short, so for the others the floor is unreachable
-    # and the spare pool is never filled. A "custom" sampler may or may not stamp,
-    # which is why it is in neither set -- a warning nobody can act on is noise.
-    #
-    # Named by exclusion rather than by list so that a sampler added later is guarded
-    # by default instead of silently exempt: every built-in but InOrderSampler leaves
-    # _GatedSampler._stamp returning None, and ready_first (#3582) landed doing exactly
-    # that after this check was first written.
+    # Only samplers that charge a drop to a step get the floor warning below.
     sampler_name = async_config.sampler.name
-    sampler_stamps = sampler_name == "in_order"
-    sampler_never_stamps = sampler_name not in ("in_order", "custom")
+    sampler_charges_drops_to_steps = sampler_name in (
+        "in_order",
+        "ready_first",
+        "weight_fifo",
+    )
 
-    # A budget that permits drops is worse than inert under an unstamped sampler: the
-    # prompt is still given up on, but _credit_shortfall has no step to charge it to,
-    # so the step's target never falls and the train pump waits on a group nobody is
-    # generating. How that ends depends on the sampler. Under weight_fifo the wait never
-    # does: the same gate that stops the rollout pump running ahead also stops it
-    # reaching exhaustion, so the "rollout exhausted" error never fires and the run
-    # holds its GPUs until the wall clock kills it. Under windowed and ready_first the
-    # shortfall instead migrates from batch to batch until the last one, which has none
-    # left to borrow from, and the run dies there hours in. A zero budget is exempt: no
-    # drop is tolerated at all then, so nothing reaches the shortfall path and the
-    # warnings below are the right register.
-    if sampler_never_stamps and drop_budget:
+    # Replacements may use newer weights, leaving the original weight bucket short.
+    if drop_budget and sampler_requires_single_weight_batch(async_config.sampler):
         raise ValueError(
-            f"async_rl.sampler.name={sampler_name!r} stamps no target step, so the drop "
-            f"budget (max_skipped_prompts={failure_config.max_skipped_prompts}, "
+            f"async_rl.sampler.name={sampler_name!r} cannot honour the drop budget "
+            f"(max_skipped_prompts={failure_config.max_skipped_prompts}, "
             f"max_consecutive_dropped_prompts="
-            f"{failure_config.max_consecutive_dropped_prompts}) cannot be honoured: a "
-            "prompt that is given up on is never subtracted from the step waiting for "
-            "it, so that step waits on a group no one is generating -- ending the run "
-            "at its final step, or stalling it outright with no error at all. Set "
-            "async_rl.sampler.name='in_order' to get the tolerance these budgets "
-            "promise, or set both budgets to 0 to end the run on the first dropped "
-            "prompt instead."
+            f"{failure_config.max_consecutive_dropped_prompts}): it builds each step "
+            "only from groups generated under one weight version, so a lost group can "
+            "be neither reliably replaced (its replacement is dispatched later, and "
+            "lands in a newer weight's bucket unless the trainer has not moved since) "
+            "nor charged to a step, and the step waits on a group no one is "
+            "generating. Set async_rl.sampler.name to 'in_order' or "
+            "'ready_first', or set both budgets to 0 to end the run on the first "
+            "dropped prompt instead."
         )
 
     if (
-        sampler_stamps
+        sampler_charges_drops_to_steps
         and drop_budget
         and floor >= num_prompts_per_step
         and failure_config.on_dropped_prompt == "shrink"
@@ -1298,13 +1368,14 @@ def _validate_failure_settings(
             stacklevel=2,
         )
 
-    if failure_config.on_dropped_prompt == "replace" and sampler_never_stamps:
+    if (
+        failure_config.on_dropped_prompt == "replace"
+        and not sampler_uses_pooled_replacements(async_config.sampler)
+    ):
         warnings.warn(
-            f"async_rl.rollout_failure.on_dropped_prompt='replace' does nothing with "
-            f"the {sampler_name} sampler: it does not stamp a target step, so no step "
-            "is ever left short, the spare pool is never filled, and every drop "
-            "behaves as 'shrink'. replaced_prompt_groups will stay at 0 whether or "
-            "not anything failed.",
+            "async_rl.rollout_failure.on_dropped_prompt='replace' does nothing "
+            "with this sampler: it does not use a spare pool. "
+            "replaced_prompt_groups will stay at 0 whether or not anything failed.",
             stacklevel=2,
         )
 
@@ -1321,6 +1392,104 @@ def _validate_failure_settings(
             "before admit(), outside the sampler gate and the buffer-capacity valve, "
             "so nothing is dispatched while the pool fills.",
             stacklevel=2,
+        )
+
+
+def _vlm_architecture_signature(
+    model_name: str, hf_config_overrides: Mapping[str, Any] | None
+) -> tuple[Any, ...]:
+    """Return the VLM structure that determines packed-media compatibility."""
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        **dict(hf_config_overrides or {}),
+    )
+    get_text_config = getattr(config, "get_text_config", None)
+    text_config = get_text_config() if callable(get_text_config) else None
+    vision_config = getattr(config, "vision_config", None)
+    media_token_fields = (
+        "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+    )
+    return (
+        getattr(config, "model_type", None),
+        tuple(getattr(config, "architectures", None) or ()),
+        getattr(text_config, "model_type", None),
+        getattr(vision_config, "model_type", None),
+        tuple((name, getattr(config, name, None)) for name in media_token_fields),
+    )
+
+
+def _vlm_tokenizer_signature(
+    tokenizer_config: Mapping[str, Any], fallback_name: str
+) -> tuple[Any, ...]:
+    """Fingerprint the token-to-id contract consumed by the critic."""
+    import hashlib
+
+    from transformers import AutoTokenizer
+
+    tokenizer_name = tokenizer_config.get("name") or fallback_name
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name,
+        trust_remote_code=True,
+        **dict(tokenizer_config.get("tokenizer_kwargs") or {}),
+    )
+    vocab = tokenizer.get_vocab()
+    digest = hashlib.sha256()
+    for token, token_id in sorted(vocab.items()):
+        token_bytes = token.encode("utf-8", errors="surrogatepass")
+        digest.update(len(token_bytes).to_bytes(8, "big"))
+        digest.update(token_bytes)
+        digest.update(int(token_id).to_bytes(8, "big", signed=True))
+    special_token_ids = tuple(
+        getattr(tokenizer, f"{name}_token_id", None)
+        for name in ("bos", "eos", "pad", "unk", "sep", "cls", "mask")
+    )
+    return len(vocab), digest.hexdigest(), special_token_ids
+
+
+def _validate_vlm_critic_compatibility(
+    policy_config: Mapping[str, Any], value_config: Mapping[str, Any]
+) -> None:
+    """Allow distinct checkpoints only when their media and token contracts match."""
+    policy_model_name = policy_config.get("model_name")
+    value_model_name = value_config.get("model_name")
+    if not policy_model_name or not value_model_name:
+        raise ValueError(
+            "Multimodal PPO requires model_name for both the policy and critic."
+        )
+
+    policy_hf_overrides = policy_config.get("hf_config_overrides") or {}
+    value_hf_overrides = value_config.get("hf_config_overrides") or {}
+    if (
+        policy_model_name != value_model_name
+        or policy_hf_overrides != value_hf_overrides
+    ) and _vlm_architecture_signature(
+        policy_model_name, policy_hf_overrides
+    ) != _vlm_architecture_signature(value_model_name, value_hf_overrides):
+        raise ValueError(
+            "Multimodal PPO requires compatible policy and critic VLM "
+            f"architectures; got {policy_model_name!r} and {value_model_name!r}."
+        )
+
+    policy_tokenizer_config = policy_config.get("tokenizer") or {}
+    value_tokenizer_config = value_config.get("tokenizer") or {}
+    policy_tokenizer_name = policy_tokenizer_config.get("name") or policy_model_name
+    value_tokenizer_name = value_tokenizer_config.get("name") or value_model_name
+    if (
+        policy_tokenizer_name != value_tokenizer_name
+        or (policy_tokenizer_config.get("tokenizer_kwargs") or {})
+        != (value_tokenizer_config.get("tokenizer_kwargs") or {})
+    ) and _vlm_tokenizer_signature(
+        policy_tokenizer_config, policy_model_name
+    ) != _vlm_tokenizer_signature(value_tokenizer_config, value_model_name):
+        raise ValueError(
+            "Multimodal PPO requires compatible policy and critic tokenizers; "
+            f"got {policy_tokenizer_name!r} and {value_tokenizer_name!r}."
         )
 
 
@@ -1351,23 +1520,35 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "directly, so nothing over-generates. Set it to 1."
         )
 
-    # An enabled one here describes shaping this run does not do. An entry leaves
-    # this list once the SC path implements it; overlong_filtering is applied in
-    # the advantage stage from the raw completion flags in the TransferQueue.
+    if (
+        master_config.grpo is not None
+        and master_config.grpo.length_penalty is not None
+        and not should_use_nemo_gym(master_config)
+    ):
+        raise ValueError(
+            "grpo.length_penalty requires env.should_use_nemo_gym=true on SingleController"
+        )
+
+    # An enabled one here describes shaping this run does not do. length_penalty is
+    # implemented for GRPO, so it only appears here for PPO; overlong_filtering is
+    # applied in the advantage stage from the raw completion flags in the TransferQueue.
     unsupported = [
         name
         for name, enabled in (
-            # getattr: PPO's config has no length_penalty field.
-            ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
+            (
+                "ppo.length_penalty",
+                master_config.ppo is not None
+                and getattr(algo_cfg, "length_penalty", None) is not None,
+            ),
         )
         if enabled
     ]
     if unsupported:
         names = ", ".join(unsupported)
         raise NotImplementedError(
-            f"{names} not supported on the SingleController path, which "
-            "implements none of them -- the run would silently skip the "
-            "shaping. Disable them."
+            f"{names} not supported for PPO on the SingleController path -- the "
+            "run would silently skip the shaping. Disable them. GRPO supports "
+            "grpo.length_penalty."
         )
 
     # Rejected here rather than at the first advantage call, which is a whole
@@ -1442,6 +1623,14 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             )
         # Reached only for GRPO (PPO is rejected above); name the key accordingly.
         algo_prefix = "grpo"
+        if sampler_requires_single_weight_batch(async_config.sampler):
+            raise ValueError(
+                "grpo.use_dynamic_sampling cannot be combined with "
+                f"async_rl.sampler.name={async_config.sampler.name!r}: the resolved sampler "
+                "requires a complete batch from one weight version. Replacements can carry a newer "
+                "weight version and leave the oldest bucket permanently short. "
+                "Use 'in_order', 'ready_first', or 'windowed'."
+            )
         grpo_cfg = cast(GRPOConfig, algo_cfg)
         if grpo_cfg.adv_estimator.name != "grpo":
             raise ValueError(
@@ -1454,31 +1643,12 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                     f"grpo.use_dynamic_sampling requires grpo.{key} to be 0 or null: "
                     "nonzero message-level overrides can train constant-reward groups."
                 )
-        # Capture cannot borrow future groups, so routine filtering would stall training.
-        if master_config.token_capture.enabled:
-            raise ValueError(
-                f"{algo_prefix}.use_dynamic_sampling is not supported together with "
-                "token_capture.enabled: on the capture path a replacement cannot borrow "
-                "a finished group from a later step, so every dropped group stalls its "
-                "step for a full fresh rollout. Disable one of the two."
-            )
         if grpo_cfg.dynamic_sampling_max_gen_batches < 1:
             raise ValueError(
                 f"{algo_prefix}.dynamic_sampling_max_gen_batches must be >= 1 when "
                 f"{algo_prefix}.use_dynamic_sampling is set (got "
                 f"{grpo_cfg.dynamic_sampling_max_gen_batches}): a step needs at least "
                 "the batch it was admitted with."
-            )
-        # By name: neither the stamping nor the interruptible admission wait this
-        # needs is knowable for a `custom` class at setup. #4784 reopens it.
-        if async_config.sampler.name != "in_order":
-            raise ValueError(
-                f"{algo_prefix}.use_dynamic_sampling requires "
-                "async_rl.sampler.name='in_order', but got "
-                f"'{async_config.sampler.name}': a filtered group is charged to the "
-                "target step the sampler stamps, and the spare pool is refilled while "
-                "the pump waits to admit, neither of which the other samplers "
-                "support yet."
             )
         if algo_cfg.num_generations_per_prompt < 2:
             raise ValueError(
@@ -1487,6 +1657,26 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "within-group spread, so every group would be filtered "
                 f"(got {algo_cfg.num_generations_per_prompt})."
             )
+
+    estimator = create_advantage_estimator(
+        algo_cfg.adv_estimator, master_config.loss_fn
+    )
+    if (
+        estimator.requires_global_batch
+        and async_config.min_groups_for_streaming_train < algo_cfg.num_prompts_per_step
+    ):
+        algo_prefix = "ppo" if is_ppo_run(master_config) else "grpo"
+        raise ValueError(
+            f"{algo_prefix}.adv_estimator.name={algo_cfg.adv_estimator.name!r} "
+            "requires the whole step's batch with its current settings "
+            "(reinforce_plus_plus always; gae and raw_reward with "
+            "normalize_advantages=true; opd with subtract_global_baseline=true). "
+            "Set async_rl.min_groups_for_streaming_train "
+            f"({async_config.min_groups_for_streaming_train}) == "
+            f"{algo_prefix}.num_prompts_per_step ({algo_cfg.num_prompts_per_step}). "
+            "To stream with gae/raw_reward, set normalize_advantages=false; "
+            "with opd, set subtract_global_baseline=false."
+        )
 
     if not is_ppo_run(master_config):
         # A value block without `ppo` is inert -- nothing builds the critic --
@@ -1509,10 +1699,15 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "See examples/configs/ppo_math_1B_megatron_single_controller.yaml."
             )
 
+    value_config = master_config.value
+    assert value_config is not None
+    if master_config.policy.get("is_vlm", False):
+        _validate_vlm_critic_compatibility(master_config.policy, value_config)
+
     # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
     # setup_data_plane unconditionally, so an Automodel critic dies in Ray with the
     # model already on GPU. ppo_math_1B.yaml ships automodel_cfg.enabled=true.
-    value_megatron_cfg = master_config.value.get("megatron_cfg", {})  # type: ignore
+    value_megatron_cfg = value_config.get("megatron_cfg", {})
     if not value_megatron_cfg.get("enabled"):
         raise ValueError(
             "PPO on the SingleController path requires a Megatron critic "
@@ -1560,13 +1755,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "share storage even when overlap_param_gather=false. Disable "
                 "policy.megatron_cfg.fp8_cfg.fp8_param or use full-batch PPO."
             )
-        if algo_cfg.adv_estimator.normalize_advantages:
-            warnings.warn(
-                "Streaming PPO with ppo.adv_estimator.normalize_advantages=true "
-                "normalizes GAE advantages per chunk instead of across the full "
-                "batch. Changing chunk boundaries can change normalized advantages.",
-                stacklevel=2,
-            )
 
     # A forced ratio equals the true one only on the first optimizer step taken
     # on a batch; later epochs would train without any trust region.
@@ -1593,10 +1781,36 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "Shortened PPO steps are not supported yet."
         )
 
+    value_resources = master_config.value.get("resources")  # type: ignore
+    if dedicated_value_enabled(master_config):
+        if not policy_megatron_cfg or not policy_megatron_cfg.get("enabled"):
+            raise ValueError(
+                "value.dedicated=true requires policy.megatron_cfg.enabled=true"
+            )
+        generation_config = master_config.policy["generation"]
+        if generation_config["colocated"]["enabled"]:
+            raise ValueError("value.dedicated=true requires non-colocated generation")
+        value_nodes = value_resources.num_nodes if value_resources is not None else None
+        if value_nodes is None or value_nodes < 1:
+            raise ValueError(
+                "value.dedicated=true requires value.resources.num_nodes >= 1"
+            )
+        cluster_gpus = master_config.cluster.gpus_per_node
+        inference_resources = generation_config["colocated"]["resources"]
+        if inference_resources["gpus_per_node"] != cluster_gpus:
+            raise ValueError(
+                "value.dedicated=true requires generation to use full nodes"
+            )
+        inference_nodes = inference_resources["num_nodes"] or 1
+        if master_config.cluster.num_nodes - value_nodes - inference_nodes < 1:
+            raise ValueError(
+                "cluster.num_nodes must leave at least one full policy node after "
+                "reserving generation and dedicated value nodes"
+            )
     if (
         getattr(algo_cfg, "policy_training_start_step", 0) > 0
-        and master_config.checkpointing["enabled"]
-        and master_config.checkpointing["save_optimizer"]
+        and master_config.checkpointing.enabled
+        and master_config.checkpointing.save_optimizer
         and policy_megatron_cfg is not None
         and policy_megatron_cfg.get("enabled")
         and cast(MegatronConfig, policy_megatron_cfg)
@@ -1632,6 +1846,30 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
 
+def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
+    """Samples a dispatch must be a multiple of to split cleanly on this consumer.
+
+    A dispatch is split twice: once across the DP ranks, and then on the static
+    batching path again inside each rank by the train and logprob microbatch
+    sizes. Packed and dynamically batched consumers form their own microbatches,
+    so for them only the DP split applies.
+
+    Args:
+        config: Policy or value configuration of the consuming trainer.
+        dp_size: Data-parallel size of that trainer.
+
+    Returns:
+        The sample count both splits divide.
+    """
+    if config["dynamic_batching"]["enabled"] or (
+        config.get("sequence_packing") and config["sequence_packing"]["enabled"]
+    ):
+        return dp_size
+    train_micro_batch_size = config["train_micro_batch_size"]
+    logprob_batch_size = config.get("logprob_batch_size") or train_micro_batch_size
+    return dp_size * math.lcm(train_micro_batch_size, logprob_batch_size)
+
+
 def resolve_ppo_chunk_alignment(
     master_config: MasterConfig, policy_dp: int, value_dp: int
 ) -> tuple[int, int]:
@@ -1641,15 +1879,6 @@ def resolve_ppo_chunk_alignment(
     value_config = master_config.value
     if value_config is None:
         raise ValueError("PPO requires a value model configuration")
-
-    def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
-        if config["dynamic_batching"]["enabled"] or (
-            config.get("sequence_packing") and config["sequence_packing"]["enabled"]
-        ):
-            return dp_size
-        train_micro_batch_size = config["train_micro_batch_size"]
-        logprob_batch_size = config.get("logprob_batch_size") or train_micro_batch_size
-        return dp_size * math.lcm(train_micro_batch_size, logprob_batch_size)
 
     sample_alignment = math.lcm(
         sample_multiple(master_config.policy, policy_dp),
@@ -1672,20 +1901,111 @@ def resolve_ppo_chunk_alignment(
             f"policy/value group multiple ({group_multiple}) so each chunk "
             "contains complete microbatches on every DP rank"
         )
+    # Tail-aware selection refuses an unaligned max, and only a binding cap can
+    # produce one: the uncapped max is the already-aligned step remainder.
+    chunk_cap = master_config.async_rl.max_groups_for_streaming_train
+    if (
+        chunk_cap is not None
+        and chunk_cap < ppo_config.num_prompts_per_step
+        and chunk_cap % group_multiple != 0
+    ):
+        raise ValueError(
+            "PPO max_groups_for_streaming_train must be divisible by the "
+            f"policy/value group multiple ({group_multiple}) so each capped "
+            "chunk contains complete microbatches on every DP rank"
+        )
     min_remaining_groups = (
         (min_groups + 1) // 2 if min_groups < ppo_config.num_prompts_per_step else 0
     )
     return group_multiple, min_remaining_groups
 
 
+def validate_grpo_chunk_cap_alignment(
+    master_config: MasterConfig, policy_dp: int
+) -> None:
+    """Reject a GRPO chunk cap whose samples cannot split across the policy.
+
+    GRPO passes no ``group_multiple`` to the sampler, so a chunk can be any size
+    from the floor up to the cap, and the training dispatch shards it without
+    ``allow_uneven_shards``. The chunk therefore has to satisfy the same
+    ``sample_multiple`` PPO aligns to: the DP split, and under static batching the
+    microbatch split inside each rank as well. This guards the full-cap chunk
+    only: a cap of 3 at 2 generations per prompt is 6 samples, which fails on a
+    DP of 4. An unaligned chunk below the cap stays reachable, as it already is
+    from an unaligned ``min_groups_for_streaming_train``, which no validator
+    covers today.
+
+    Only a cap below ``num_prompts_per_step`` can bind, and Forest is exempt: its
+    producer pads each group to the policy execution row multiple, so the logical
+    group count is not the physical row count.
+
+    Args:
+        master_config: The run configuration.
+        policy_dp: Data-parallel size of the policy trainer.
+
+    Raises:
+        ValueError: The capped chunk's sample count is not a multiple of the
+            policy's ``sample_multiple``.
+    """
+    if is_ppo_run(master_config):
+        return
+    chunk_cap = master_config.async_rl.max_groups_for_streaming_train
+    algo_cfg = algo_config(master_config)
+    if (
+        master_config.token_capture.forest_training
+        or chunk_cap is None
+        or chunk_cap >= algo_cfg.num_prompts_per_step
+    ):
+        return
+    chunk_multiple = sample_multiple(master_config.policy, policy_dp)
+    if (chunk_cap * algo_cfg.num_generations_per_prompt) % chunk_multiple != 0:
+        raise ValueError(
+            "GRPO async_rl.max_groups_for_streaming_train "
+            f"({chunk_cap}) x num_generations_per_prompt "
+            f"({algo_cfg.num_generations_per_prompt}) must be divisible by "
+            f"{chunk_multiple} -- the policy data-parallel size ({policy_dp}), "
+            "times the train/logprob microbatch multiple when sequence packing "
+            "and dynamic batching are both off -- so each capped chunk shards "
+            "evenly across the training ranks and into complete microbatches"
+        )
+
+
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
         _validate_seq_logprob_error_in_loss(master_config)
+    megatron_cfg = master_config.policy.get("megatron_cfg")
+    loss_config = master_config.loss_fn
+    reduction = make_objective_reduction(loss_config.resolved_normalization)
+    reduction.validate_setup(
+        trainer="single_controller",
+        algorithm="ppo" if is_ppo_run(master_config) else "grpo",
+        megatron_enabled=megatron_cfg is not None and megatron_cfg["enabled"],
+        on_policy_distillation=opd_module.is_opd_enabled(master_config),
+    )
+    # Also checked in ClippedPGLossFn.__init__; here it fails before the cluster starts.
+    reduction.validate_loss_options(
+        sequence_level_importance_ratios=loss_config.sequence_level_importance_ratios,
+        opd_full=opd_module.get_opd_full_config(master_config) is not None,
+        positive_example_nll_weight=loss_config.positive_example_nll_weight,
+        seq_logprob_error_in_loss=loss_config.seq_logprob_error_in_loss,
+    )
     _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+
+    # The sampler's drop-accounting members are read on the async SC path regardless
+    # of dynamic sampling, so a custom sampler missing one must fail validation here.
+    require_drop_accounting_members(async_config.sampler)
+
+    if async_config.refit_actor.enabled:
+        generation_config = master_config.policy["generation"]
+        validate_refit_actor_transport(
+            generation_backend=generation_config["backend"],
+            colocated=generation_config["colocated"]["enabled"],
+            refit_transport=cast(VllmConfig, generation_config).get("refit_transport"),
+        )
 
     if async_config.defer_async_checkpoint_finalize:
         megatron_cfg = master_config.policy.get("megatron_cfg")
@@ -1728,6 +2048,17 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
 
     generation_cfg = master_config.policy["generation"]
+    if (
+        generation_cfg["backend"] == "vllm"
+        and cast(VllmConfig, generation_cfg)["vllm_cfg"].get("http_api_server_count", 1)
+        > 1
+        and async_config.generation_fleet_health.enabled
+    ):
+        raise ValueError(
+            "Multiple HTTP API servers do not support fault tolerance with "
+            "async_rl.generation_fleet_health.enabled=true. "
+            "See https://github.com/NVIDIA-NeMo/RL/pull/5075."
+        )
     top_logprobs = generation_cfg.get("top_logprobs", 0)
     if (
         isinstance(top_logprobs, bool)
@@ -1865,9 +2196,9 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     # Top-k retention keys off checkpointing.metric_name, but SC has no
     # validation loop yet (see _save_checkpoint), so a "val:" metric would
     # never be collected and top-k would silently degrade to a no-op.
-    metric_name = master_config.checkpointing["metric_name"]
+    metric_name = master_config.checkpointing.metric_name
     if (
-        master_config.checkpointing["enabled"]
+        master_config.checkpointing.enabled
         and metric_name is not None
         and not metric_name.startswith("train:")
     ):
@@ -1908,6 +2239,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError(
                 "forest training does not support message-level advantage overrides"
             )
+        if master_config.grpo.length_penalty is not None:
+            raise ValueError("Forest training does not support grpo.length_penalty")
         if token_capture_config.defer_routed_experts_to_policy:
             raise ValueError("forest training requires direct routed-expert assembly")
         validate_forest_objective(master_config.grpo, master_config.loss_fn)
@@ -1935,13 +2268,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 f"token_capture.control_timeout_s ({gym_park_s}); a turn snapshot "
                 "can hold rollout dispatch that long."
             )
-    if recovery_config.generation_prefix_cuts_enabled and top_logprobs > 0:
-        # Sampler top-k is staged from a call's final response only, so a
-        # restored generation prefix would have no candidates for its tokens.
-        raise ValueError(
-            "rollout_recovery.target_level='prefix' does not support "
-            "policy.generation.top_logprobs > 0 (loss_fn.score_centering) yet"
-        )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled
     ):
@@ -2091,20 +2417,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         opd_module.assert_prev_logprobs_available(master_config)
         opd_module.assert_trust_region_supported(master_config)
         _validate_opd_full_config(master_config, opd_config)
-        if (
-            algo_cfg.adv_estimator.subtract_global_baseline
-            and async_config.min_groups_for_streaming_train
-            != algo_cfg.num_prompts_per_step
-        ):
-            # The advantage stage runs once per streaming chunk, so a smaller
-            # chunk would center each chunk on its own mean, not the step's.
-            raise ValueError(
-                "grpo.adv_estimator.subtract_global_baseline=true requires "
-                "async_rl.min_groups_for_streaming_train "
-                f"({async_config.min_groups_for_streaming_train}) == "
-                f"grpo.num_prompts_per_step ({algo_cfg.num_prompts_per_step}) "
-                "so the baseline covers the whole step."
-            )
 
     if (
         reference_policy_kl_penalty == 0

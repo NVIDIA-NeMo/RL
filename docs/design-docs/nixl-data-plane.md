@@ -1,14 +1,8 @@
 # NIXL Data Plane (`data_plane.backend: nixl`)
 
-> **Experimental.** A TransferQueue storage backend (`NixlStore`) that moves
-> rollout and training columns with one-sided NIXL RDMA.
+> **Experimental.** A TransferQueue storage backend (`NixlStore`) that moves rollout and training columns with one-sided NIXL RDMA.
 
-The NIXL data plane separates storage from compute. CPU `NixlStorageUnit` Ray
-actors each own one registered DRAM slab. Trainer, vLLM and controller processes
-are clients: they move bytes with NIXL READ/WRITE straight into or out of unit
-slabs, and send small control messages to units over ZMQ. Ray only starts the
-units. TransferQueue keeps keys, fields and readiness, so the NeMo-RL adapter is
-unchanged apart from selecting the backend.
+The NIXL data plane separates storage from compute. CPU `NixlStorageUnit` Ray actors each own one registered DRAM slab. Trainer, vLLM and controller processes are clients: they move bytes with NIXL READ/WRITE straight into or out of unit slabs, and send small control messages to units over ZMQ. Ray only starts the units. TransferQueue keeps keys, fields and readiness, so the NeMo-RL adapter is unchanged apart from selecting the backend.
 
 ```
 client (trainer / vLLM / controller)                 NixlStorageUnit gidx % N
@@ -22,8 +16,7 @@ client (trainer / vLLM / controller)                 NixlStorageUnit gidx % N
 
 ## Code layout
 
-Same split as the Mooncake backend: TransferQueue is imported only under
-`adapters/`, store-side code has no TQ dependency.
+Same split as the Mooncake backend: TransferQueue is imported only under `adapters/`, store-side code has no TQ dependency.
 
 ```
 nemo_rl/data_plane/
@@ -45,6 +38,8 @@ nemo_rl/utils/checkpoint_engines/nixl.py   shared NIXL agent factory
 
 ## Enabling it
 
+The SSD tier (`nixl.ssd`) is on by default: a unit spills only when its put area is full, and the driver logs one warning when `data_plane/nixl/ssd_spills_sum` first rises above 0 in a run.
+
 ```yaml
 data_plane:
   enabled: true
@@ -52,80 +47,46 @@ data_plane:
   backend: nixl
   nixl:
     num_storage_units: null        # default: one per Ray node (2x measured no faster)
-    unit_slab_bytes: 17179869184   # 16 GiB pinned per unit
+    unit_slab_bytes: 17179869184   # 16 GiB put area; 20 GiB pinned with the default SSD tier
 ```
 
-The transport is RDMA only. Every client and unit checks the UCX environment
-before creating a NIXL backend and refuses TCP:
+The transport is RDMA only. Every client and unit checks the UCX environment before creating a NIXL backend and refuses TCP:
 
 ```bash
 export UCX_TLS=rc,cuda_copy,cuda_ipc,self,sm      # what the driver sets
 export UCX_NET_DEVICES=<rdma dev>:1,<rdma dev>:1   # RDMA devices, never eth0
 ```
 
-NIXL's UCX backend honours `UCX_*` env vars over its own parameters, so the
-environment is the only reliable lever.
+NIXL's UCX backend honours `UCX_*` env vars over its own parameters, so the environment is the only reliable lever.
 
-You do not need to set either one. Before it starts Ray, the driver sets an
-unset or non-RDMA `UCX_TLS` to the list above and drops netdevs such as `eth0`
-from `UCX_NET_DEVICES`, warning when it replaces a value. Some clusters (OCI
-GB200) inject `UCX_TLS=tcp` and an `eth0` into every job.
+You do not need to set either one. Before it starts Ray, the driver sets an unset or non-RDMA `UCX_TLS` to the list above. It removes netdevs such as `eth0` from `UCX_NET_DEVICES` and keeps the RDMA devices the job named; if the job named only netdevs, it sets `UCX_NET_DEVICES` to this host's RDMA rails (without the management interface's RDMA port), and stops with an error if there are none. It warns when it replaces a value. Some clusters (OCI GB200) inject `UCX_TLS=tcp` and an `eth0` into every job.
 
-The `UCX_TLS` default is the list the NIXL checkpoint-engine refit uses
-(`refit_transport: nixl`, see the checkpoint-engine refit guide). The driver's
-`UCX_TLS` reaches every Ray worker, and the refit needs `cuda_copy` to register
-its GPU buffers (without it, refit hangs). `cuda_copy` and `cuda_ipc` never
-carry the data plane's CPU bytes off the node, so its cross-node traffic still
-goes over `rc` (RDMA) only. If you set `UCX_TLS` yourself with both features
-on, keep `cuda_copy,cuda_ipc` in it.
+The `UCX_TLS` default is the list the NIXL checkpoint-engine refit uses (`refit_transport: nixl`, see the checkpoint-engine refit guide). The driver's `UCX_TLS` reaches every Ray worker, and the refit needs `cuda_copy` to register its GPU buffers (without it, refit hangs). `cuda_copy` and `cuda_ipc` never carry the data plane's CPU bytes off the node, so its cross-node traffic still goes over `rc` (RDMA) only. If you set `UCX_TLS` yourself with both features on, keep `cuda_copy,cuda_ipc` in it.
 
-### Images with HPC-X: set `NCCL_NET_PLUGIN=none`
+### Images with HPC-X: `UCX_MODULES=^fuse`
 
-On images that ship HPC-X's NCCL network plugin
-(`/opt/hpcx/nccl_rdma_sharp_plugin/lib/libnccl-net.so`), NIXL can fail to start
-in the trainer processes with `NIXL_ERR_BACKEND`, after UCX warns that `rc`,
-`cuda_copy`, `cuda_ipc` and the `mlx5_*` devices are "not available":
+On images that ship HPC-X's NCCL network plugin (`/opt/hpcx/nccl_rdma_sharp_plugin/lib/libnccl-net.so`), every process that runs NCCL also loads HPC-X's UCX, next to the UCX that NIXL bundles:
 
 ```
-NCCL first collective ─▶ loads HPC-X SHARP net plugin ─▶ HPC-X libucs in process
-NIXL starts its bundled UCX ─▶ finds its plugin dir via the loaded HPC-X libucs
-  ─▶ HPC-X's IB/CUDA plugins register with the wrong UCX
-  ─▶ NIXL's UCX keeps only tcp/shm ─▶ NIXL_ERR_BACKEND
+NCCL init ─▶ HPC-X RDMA net plugin ─▶ HPC-X libucs loads its fuse module RTLD_GLOBAL
+  ─▶ HPC-X libucs becomes process-global
+NIXL starts its bundled UCX ─▶ its ucs_* calls bind into HPC-X libucs
+  ─▶ NIXL's IB/CUDA modules never load ─▶ rc/cuda "not available" ─▶ NIXL_ERR_BACKEND
 ```
 
-Fix: launch with `NCCL_NET_PLUGIN=none`. NCCL then uses its built-in
-InfiniBand transport over the same rails, HPC-X's UCX is never loaded, and
-NIXL finds its own plugins. Seen on GB200 with the `nightly-gym.2026-10-19`
-image (verified on 1 and 64 nodes); the GB300 runs in this doc did not need it.
-Effect on NCCL collective speed (no SHARP plugin) was not measured.
+With `backend: nixl`, `configure_engine_env` sets `UCX_MODULES=^fuse` when it is unset, so neither UCX loads `fuse` and each keeps its own symbols. If you set `UCX_MODULES` yourself, keep `^fuse` in it. NCCL keeps its plugin; only UCX's monitoring filesystem is off. Measured on GB200 (2 nodes x 4 GPUs, image `nightly.2026-11-12`): NIXL works after NCCL, the processes exit cleanly (without it they segfault at exit), and NCCL all_reduce / all_gather / reduce_scatter at 32 MiB to 1 GiB stay within 1% with MNNVL on. The same check on GB300 (1 node x 4 GPUs, image `nightly-gym.2026-11-05`): without the fix and without `NCCL_NET_PLUGIN=none`, the nixl single-controller recovery test fails with the error above; with the fix it passes, as does the `nixl_ssd` variant.
 
 ## Design points
 
-- **Index-addressed rows.** Like TransferQueue's SimpleStorage, row `gidx`
-  lives on unit `unit_ids[gidx % N]`, which keeps the row's
-  `field -> (blob, entry)` index. A put returns no location meta, so the TQ
-  controller holds no more than it does for SimpleStorage, and a new client
-  needs only the unit table.
-- **Pinned reads.** `resolve_keys` pins the blobs it returns for `read_pin_s`
-  (at least `transfer_timeout_s` + margin); a freed region is reused only
-  after its pins end.
+- **Index-addressed rows.** Like TransferQueue's SimpleStorage, row `gidx` lives on unit `unit_ids[gidx % N]`, which keeps the row's `field -> (blob, entry)` index. A put returns no location meta, so the TQ controller holds no more than it does for SimpleStorage, and a new client needs only the unit table.
+- **Pinned reads.** `resolve_keys` pins the blobs it returns for `read_pin_s` (at least `transfer_timeout_s` + margin); a freed region is reused only after its pins end.
 - **Put path.** Values of 1 to 32 MiB go zero-copy from the caller's memory.
   Larger values use torch's parallel copy into a registered buffer pool.
-  Registering a fresh 1 GiB mapping costs about 70 ms, while copying it costs
-  about 10 ms.
-- **Sockets.** With `numa: auto`, the k-th unit on a multi-socket node pins its
-  CPUs and slab memory to socket `k % sockets`. NICs are not restricted per
-  socket: doing so broke cross-node UCX endpoint creation at 86 nodes.
-- **Checkpointing.** `save_data_plane` writes one shard per unit, its live
-  rows, and a manifest. With the same units, each shard restores in place;
-  with a different count, the live rows are put again through a client.
-  It works with the SSD tier on: spilled blobs are saved from their files,
-  and a restore that RAM cannot hold spills the rest to disk. `simple` and
-  `mooncake_cpu` also checkpoint with their `ssd_offload` on. For
-  `mooncake_cpu` that is NeMo-RL's own SSD offload, not upstream TQ's:
-  each process that owns Mooncake memory spills to its own node's SSD
-  (`adapters/mooncake_ssd_offload.py`). TQ's `MooncakeStore.offload` (one
-  central SSD client on the driver) stays off, and TQ checkpoints refuse it.
+  Registering a fresh 1 GiB mapping costs about 70 ms, while copying it costs about 10 ms.
+- **Sockets.** With `numa: auto`, the k-th unit on a multi-socket node pins its CPUs and slab memory to socket `k % sockets`. NICs are not restricted per socket: doing so broke cross-node UCX endpoint creation at 86 nodes.
+- **Checkpointing.** `save_data_plane` writes one shard per unit, its live rows, and a manifest. With the same units, each shard restores in place; with a different count, the live rows are put again through a client.
+  It works with the SSD tier on: spilled blobs are saved from their files (or from their IO-area copy while the file is still being written), and a restore that RAM cannot hold spills the rest to disk. `simple` and `mooncake_cpu` also checkpoint with their `ssd_offload` on. For `mooncake_cpu` that is NeMo-RL's own SSD offload, not upstream TQ's: each process that owns Mooncake memory spills to its own node's SSD (`adapters/mooncake_ssd_offload.py`). TQ's `MooncakeStore.offload` (one central SSD client on the driver) stays off, and TQ checkpoints refuse it.
+- **A spilled put is acknowledged as soon as its bytes are in the unit.** The WRITE lands in the IO area and `commit` publishes the blob at once, the same guarantee a put-area blob has (both live in the unit's memory and die with it); the file write runs behind the ack on the unit's IO threads. Readers meanwhile read the IO-area copy, which stays after the write as a staged copy until the area needs the room. A failed write keeps that copy (then the only one) and the ticker retries it. Before this, a spilled put waited for its file write: on GB300 with half of each step spilled, put ran at 28 GB/s against 52 GB/s with nothing spilled; with the ack moved, 54-62 GB/s on the same workload, hash-verified.
 
 ## Measured (GB300, 2 nodes, 4 RDMA rails; ms, lower is better)
 
@@ -136,5 +97,4 @@ Effect on NCCL collective speed (no SHARP plugin) was not measured.
 | get same-node 1 GB | 99 | 89 |
 | get cross-node 1 GB | 136 | 99–102 |
 
-At 86 nodes with RDMA, data-plane time per RL step was about 11 s for NIXL
-against 16.5 s for Mooncake CPU.
+At 86 nodes with RDMA, data-plane time per RL step was about 11 s for NIXL against 16.5 s for Mooncake CPU.
