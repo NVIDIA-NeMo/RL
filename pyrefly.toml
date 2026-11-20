@@ -43,15 +43,18 @@ project-includes = [
 ]
 
 # Errors that existed when a file was last baselined. `pyrefly check` reports only
-# errors that are not in this file, so new code is type-checked everywhere, including
-# in files that still have old errors. Entries match on path, error kind, message and
-# column, not on line number, so they survive unrelated edits.
+# errors not recorded here. Entries match on path, error kind and column, not on line
+# number, and "column-ordered" also counts them: a key that shows up more often than
+# recorded is reported. Without it, one entry would hide every new error of the same
+# kind at the same column in that file.
 #
 # After fixing errors, drop their entries (never adds new ones):
 #   uv run --group dev pyrefly check --prune-baseline
 # To accept the current errors wholesale, for example after a Pyrefly upgrade:
 #   uv run --group dev pyrefly check --update-baseline
+# pyrefly-baseline.json must be written in this mode; rerun --update-baseline if it changes.
 baseline = "pyrefly-baseline.json"
+baseline-matching-mode = "column-ordered"
 
 # Disable TypedDict mutation errors since TypedDict objects are regular dicts at runtime
 [errors]

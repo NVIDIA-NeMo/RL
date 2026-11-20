@@ -1,4 +1,5 @@
 {
+  "min_severity": "error",
   "errors": [
     {
       "column": 23,
@@ -19,13 +20,6 @@
       "path": "examples/nemo_gym/prefetch_venvs.py",
       "name": "bad-index",
       "concise_description": "Cannot index into `list[Any]`",
-      "severity": "error"
-    },
-    {
-      "column": 34,
-      "path": "examples/nemo_gym/prefetch_venvs.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `str`",
       "severity": "error"
     },
     {
@@ -348,13 +342,6 @@
       "path": "examples/run_rm.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `dict[DictKeyType, Any] | list[Any] | str | Any | None` is not assignable to parameter `config` with type `dict[str, Any]` in function `nemo_rl.utils.outdated_config_checks.check_outdated_config`",
-      "severity": "error"
-    },
-    {
-      "column": 14,
-      "path": "examples/run_rm.py",
-      "name": "bad-context-manager",
-      "concise_description": "Cannot use `Logger` as a context manager",
       "severity": "error"
     },
     {
@@ -785,24 +772,10 @@
       "severity": "error"
     },
     {
-      "column": 21,
-      "path": "nemo_rl/algorithms/dpo.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `MegatronSchedulerConfig`",
-      "severity": "error"
-    },
-    {
       "column": 64,
       "path": "nemo_rl/algorithms/dpo.py",
       "name": "bad-typed-dict-key",
       "concise_description": "Invalid key for TypedDict `MegatronSchedulerConfig`, got `str`",
-      "severity": "error"
-    },
-    {
-      "column": 64,
-      "path": "nemo_rl/algorithms/dpo.py",
-      "name": "bad-typed-dict-key",
-      "concise_description": "Invalid key for TypedDict `MegatronSchedulerConfig`, got `Unknown`",
       "severity": "error"
     },
     {
@@ -838,20 +811,6 @@
       "path": "nemo_rl/algorithms/dpo.py",
       "name": "unsupported-operation",
       "concise_description": "`/` is not supported between `float` and `list[float]`",
-      "severity": "error"
-    },
-    {
-      "column": 32,
-      "path": "nemo_rl/algorithms/dpo.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `list[float]` and `float`",
-      "severity": "error"
-    },
-    {
-      "column": 32,
-      "path": "nemo_rl/algorithms/dpo.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `list[float]` and `list[float]`",
       "severity": "error"
     },
     {
@@ -953,13 +912,6 @@
       "severity": "error"
     },
     {
-      "column": 21,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `GenerationConfig` is not assignable to parameter `config` with type `VllmConfig` in function `nemo_rl.models.generation.vllm.vllm_generation.VllmGeneration.init_cluster_placement_groups`",
-      "severity": "error"
-    },
-    {
       "column": 25,
       "path": "nemo_rl/algorithms/grpo.py",
       "name": "bad-argument-type",
@@ -985,34 +937,6 @@
       "path": "nemo_rl/algorithms/grpo.py",
       "name": "bad-argument-type",
       "concise_description": "Unpacked keyword argument `dict[int, int]` is not assignable to parameter `name_prefix` with type `str` in function `nemo_rl.models.policy.lm_policy.Policy.__init__`",
-      "severity": "error"
-    },
-    {
-      "column": 13,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "bad-argument-type",
-      "concise_description": "Unpacked keyword argument `dict[int, int]` is not assignable to parameter `workers_per_node` with type `int | list[int] | None` in function `nemo_rl.models.policy.lm_policy.Policy.__init__`",
-      "severity": "error"
-    },
-    {
-      "column": 13,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "bad-argument-type",
-      "concise_description": "Unpacked keyword argument `dict[int, int]` is not assignable to parameter `worker_extension_cls_fqn` with type `str | None` in function `nemo_rl.models.policy.lm_policy.Policy.__init__`",
-      "severity": "error"
-    },
-    {
-      "column": 13,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "bad-argument-type",
-      "concise_description": "Unpacked keyword argument `dict[int, int]` is not assignable to parameter `skip_weight_load` with type `bool` in function `nemo_rl.models.policy.lm_policy.Policy.__init__`",
-      "severity": "error"
-    },
-    {
-      "column": 13,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "bad-argument-type",
-      "concise_description": "Unpacked keyword argument `dict[int, int]` is not assignable to parameter `is_refit_destination` with type `bool` in function `nemo_rl.models.policy.lm_policy.Policy.__init__`",
       "severity": "error"
     },
     {
@@ -1121,38 +1045,10 @@
       "severity": "error"
     },
     {
-      "column": 42,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "bad-typed-dict-key",
-      "concise_description": "TypedDict `SGLangConfig` does not have key `refit_cfg`",
-      "severity": "error"
-    },
-    {
-      "column": 42,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "bad-typed-dict-key",
-      "concise_description": "TypedDict `TrtllmConfig` does not have key `refit_cfg`",
-      "severity": "error"
-    },
-    {
       "column": 47,
       "path": "nemo_rl/algorithms/grpo.py",
       "name": "bad-typed-dict-key",
       "concise_description": "TypedDict `GenerationConfig` does not have key `vllm_cfg`",
-      "severity": "error"
-    },
-    {
-      "column": 47,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "bad-typed-dict-key",
-      "concise_description": "TypedDict `SGLangConfig` does not have key `vllm_cfg`",
-      "severity": "error"
-    },
-    {
-      "column": 47,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "bad-typed-dict-key",
-      "concise_description": "TypedDict `TrtllmConfig` does not have key `vllm_cfg`",
       "severity": "error"
     },
     {
@@ -1292,35 +1188,7 @@
       "column": 52,
       "path": "nemo_rl/algorithms/grpo.py",
       "name": "not-iterable",
-      "concise_description": "Type `float` is not iterable",
-      "severity": "error"
-    },
-    {
-      "column": 52,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable",
-      "severity": "error"
-    },
-    {
-      "column": 52,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "not-iterable",
       "concise_description": "Type `bool` is not iterable",
-      "severity": "error"
-    },
-    {
-      "column": 52,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "not-iterable",
-      "concise_description": "Type `float` is not iterable",
-      "severity": "error"
-    },
-    {
-      "column": 52,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable",
       "severity": "error"
     },
     {
@@ -1537,35 +1405,7 @@
       "column": 52,
       "path": "nemo_rl/algorithms/grpo.py",
       "name": "not-iterable",
-      "concise_description": "Type `float` is not iterable",
-      "severity": "error"
-    },
-    {
-      "column": 52,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable",
-      "severity": "error"
-    },
-    {
-      "column": 52,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "not-iterable",
       "concise_description": "Type `bool` is not iterable",
-      "severity": "error"
-    },
-    {
-      "column": 52,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "not-iterable",
-      "concise_description": "Type `float` is not iterable",
-      "severity": "error"
-    },
-    {
-      "column": 52,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable",
       "severity": "error"
     },
     {
@@ -1992,20 +1832,6 @@
       "column": 21,
       "path": "nemo_rl/algorithms/loss/loss_functions.py",
       "name": "unsupported-operation",
-      "concise_description": "`>=` is not supported between `None` and `float`",
-      "severity": "error"
-    },
-    {
-      "column": 21,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "unsupported-operation",
-      "concise_description": "`>=` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 21,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "unsupported-operation",
       "concise_description": "`<=` is not supported between `None` and `float`",
       "severity": "error"
     },
@@ -2069,7 +1895,7 @@
       "column": 21,
       "path": "nemo_rl/algorithms/loss/loss_functions.py",
       "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | Unknown | None` is not assignable to parameter `values` with type `Tensor` in function `nemo_rl.algorithms.utils.masked_mean`",
+      "concise_description": "Argument `Tensor | Unknown | None` is not assignable to parameter `values` with type `Tensor` in function `nemo_rl.utils.tensor_ops.masked_mean`",
       "severity": "error"
     },
     {
@@ -2297,20 +2123,6 @@
       "severity": "error"
     },
     {
-      "column": 26,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "unsupported-operation",
-      "concise_description": "`&` is not supported between `None` and `Tensor`",
-      "severity": "error"
-    },
-    {
-      "column": 26,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "unsupported-operation",
-      "concise_description": "`&` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
       "column": 29,
       "path": "nemo_rl/algorithms/loss/loss_functions.py",
       "name": "bad-argument-type",
@@ -2427,20 +2239,6 @@
       "path": "nemo_rl/algorithms/loss/wrapper.py",
       "name": "unsupported-operation",
       "concise_description": "`+=` is not supported between `list[Unknown]` and `bool`",
-      "severity": "error"
-    },
-    {
-      "column": 21,
-      "path": "nemo_rl/algorithms/loss/wrapper.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+=` is not supported between `list[Unknown]` and `float`",
-      "severity": "error"
-    },
-    {
-      "column": 21,
-      "path": "nemo_rl/algorithms/loss/wrapper.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+=` is not supported between `list[Unknown]` and `int`",
       "severity": "error"
     },
     {
@@ -2731,34 +2529,6 @@
       "severity": "error"
     },
     {
-      "column": 52,
-      "path": "nemo_rl/algorithms/ppo.py",
-      "name": "unsupported-delete",
-      "concise_description": "Key `current_epoch` in TypedDict `PPOSaveState` may not be deleted",
-      "severity": "error"
-    },
-    {
-      "column": 52,
-      "path": "nemo_rl/algorithms/ppo.py",
-      "name": "unsupported-delete",
-      "concise_description": "Key `current_step` in TypedDict `PPOSaveState` may not be deleted",
-      "severity": "error"
-    },
-    {
-      "column": 52,
-      "path": "nemo_rl/algorithms/ppo.py",
-      "name": "unsupported-delete",
-      "concise_description": "Key `total_steps` in TypedDict `PPOSaveState` may not be deleted",
-      "severity": "error"
-    },
-    {
-      "column": 52,
-      "path": "nemo_rl/algorithms/ppo.py",
-      "name": "unsupported-delete",
-      "concise_description": "Key `total_valid_tokens` in TypedDict `PPOSaveState` may not be deleted",
-      "severity": "error"
-    },
-    {
       "column": 29,
       "path": "nemo_rl/algorithms/ppo.py",
       "name": "unsupported-operation",
@@ -2822,34 +2592,6 @@
       "severity": "error"
     },
     {
-      "column": 52,
-      "path": "nemo_rl/algorithms/ppo.py",
-      "name": "unsupported-delete",
-      "concise_description": "Key `current_epoch` in TypedDict `PPOSaveState` may not be deleted",
-      "severity": "error"
-    },
-    {
-      "column": 52,
-      "path": "nemo_rl/algorithms/ppo.py",
-      "name": "unsupported-delete",
-      "concise_description": "Key `current_step` in TypedDict `PPOSaveState` may not be deleted",
-      "severity": "error"
-    },
-    {
-      "column": 52,
-      "path": "nemo_rl/algorithms/ppo.py",
-      "name": "unsupported-delete",
-      "concise_description": "Key `total_steps` in TypedDict `PPOSaveState` may not be deleted",
-      "severity": "error"
-    },
-    {
-      "column": 52,
-      "path": "nemo_rl/algorithms/ppo.py",
-      "name": "unsupported-delete",
-      "concise_description": "Key `total_valid_tokens` in TypedDict `PPOSaveState` may not be deleted",
-      "severity": "error"
-    },
-    {
       "column": 29,
       "path": "nemo_rl/algorithms/ppo.py",
       "name": "unsupported-operation",
@@ -2882,13 +2624,6 @@
       "path": "nemo_rl/algorithms/ppo.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `dict[str, EnvironmentInterface[Unknown]] | None` is not assignable to parameter `task_to_env` with type `dict[str, EnvironmentInterface[Unknown]]` in function `nemo_rl.experience.rollouts.run_multi_turn_rollout`",
-      "severity": "error"
-    },
-    {
-      "column": 29,
-      "path": "nemo_rl/algorithms/ppo.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dict[str, EnvironmentInterface[Unknown]] | None` is not assignable to parameter `task_to_env` with type `dict[str, EnvironmentInterface[Unknown]]` in function `nemo_rl.experience.rollouts.run_async_multi_turn_rollout`",
       "severity": "error"
     },
     {
@@ -2934,24 +2669,10 @@
       "severity": "error"
     },
     {
-      "column": 21,
-      "path": "nemo_rl/algorithms/rm.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `MegatronSchedulerConfig`",
-      "severity": "error"
-    },
-    {
       "column": 64,
       "path": "nemo_rl/algorithms/rm.py",
       "name": "bad-typed-dict-key",
       "concise_description": "Invalid key for TypedDict `MegatronSchedulerConfig`, got `str`",
-      "severity": "error"
-    },
-    {
-      "column": 64,
-      "path": "nemo_rl/algorithms/rm.py",
-      "name": "bad-typed-dict-key",
-      "concise_description": "Invalid key for TypedDict `MegatronSchedulerConfig`, got `Unknown`",
       "severity": "error"
     },
     {
@@ -2983,20 +2704,6 @@
       "severity": "error"
     },
     {
-      "column": 32,
-      "path": "nemo_rl/algorithms/rm.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `list[float]` and `float`",
-      "severity": "error"
-    },
-    {
-      "column": 32,
-      "path": "nemo_rl/algorithms/rm.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `list[float]` and `list[float]`",
-      "severity": "error"
-    },
-    {
       "column": 57,
       "path": "nemo_rl/algorithms/rm.py",
       "name": "unsupported-operation",
@@ -3015,20 +2722,6 @@
       "path": "nemo_rl/algorithms/sft.py",
       "name": "bad-index",
       "concise_description": "Cannot index into `DFlashDraftConfig`",
-      "severity": "error"
-    },
-    {
-      "column": 37,
-      "path": "nemo_rl/algorithms/sft.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `DSparkDraftConfig`",
-      "severity": "error"
-    },
-    {
-      "column": 37,
-      "path": "nemo_rl/algorithms/sft.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `Eagle3DraftConfig`",
       "severity": "error"
     },
     {
@@ -3057,20 +2750,6 @@
       "path": "nemo_rl/algorithms/sft.py",
       "name": "unsupported-operation",
       "concise_description": "`/` is not supported between `float` and `list[float]`",
-      "severity": "error"
-    },
-    {
-      "column": 32,
-      "path": "nemo_rl/algorithms/sft.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `list[float]` and `float`",
-      "severity": "error"
-    },
-    {
-      "column": 32,
-      "path": "nemo_rl/algorithms/sft.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `list[float]` and `list[float]`",
       "severity": "error"
     },
     {
@@ -3473,13 +3152,6 @@
       "severity": "error"
     },
     {
-      "column": 43,
-      "path": "nemo_rl/data/utils.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `tuple[str, Any]`",
-      "severity": "error"
-    },
-    {
       "column": 17,
       "path": "nemo_rl/data/utils.py",
       "name": "bad-argument-type",
@@ -3533,13 +3205,6 @@
       "path": "nemo_rl/data/utils.py",
       "name": "bad-index",
       "concise_description": "Cannot index into `str`",
-      "severity": "error"
-    },
-    {
-      "column": 51,
-      "path": "nemo_rl/data/utils.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `tuple[str, Any]`",
       "severity": "error"
     },
     {
@@ -4005,20 +3670,6 @@
       "severity": "error"
     },
     {
-      "column": 21,
-      "path": "nemo_rl/environments/nemo_gym.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `list[float]` and `float`",
-      "severity": "error"
-    },
-    {
-      "column": 21,
-      "path": "nemo_rl/environments/nemo_gym.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `list[float]` and `list[float]`",
-      "severity": "error"
-    },
-    {
       "column": 71,
       "path": "nemo_rl/environments/nemo_gym.py",
       "name": "bad-assignment",
@@ -4047,13 +3698,6 @@
       "severity": "error"
     },
     {
-      "column": 47,
-      "path": "nemo_rl/environments/reward_model_environment.py",
-      "name": "bad-typed-dict-key",
-      "concise_description": "Missing required key `sequence_length_round` for TypedDict `DynamicBatchingConfig`",
-      "severity": "error"
-    },
-    {
       "column": 59,
       "path": "nemo_rl/environments/reward_model_environment.py",
       "name": "bad-assignment",
@@ -4072,13 +3716,6 @@
       "path": "nemo_rl/environments/reward_model_environment.py",
       "name": "bad-typed-dict-key",
       "concise_description": "Missing required key `train_mb_tokens` for TypedDict `SequencePackingConfig`",
-      "severity": "error"
-    },
-    {
-      "column": 60,
-      "path": "nemo_rl/environments/reward_model_environment.py",
-      "name": "bad-typed-dict-key",
-      "concise_description": "Missing required key `algorithm` for TypedDict `SequencePackingConfig`",
       "severity": "error"
     },
     {
@@ -4299,13 +3936,6 @@
       "severity": "error"
     },
     {
-      "column": 20,
-      "path": "nemo_rl/experience/rollouts.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `int`",
-      "severity": "error"
-    },
-    {
       "column": 51,
       "path": "nemo_rl/experience/rollouts.py",
       "name": "bad-index",
@@ -4509,20 +4139,6 @@
       "severity": "error"
     },
     {
-      "column": 25,
-      "path": "nemo_rl/models/automodel/draft/draft_qwen3.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `Tensor`",
-      "severity": "error"
-    },
-    {
-      "column": 25,
-      "path": "nemo_rl/models/automodel/draft/draft_qwen3.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
       "column": 44,
       "path": "nemo_rl/models/automodel/draft/draft_qwen3.py",
       "name": "not-callable",
@@ -4695,20 +4311,6 @@
       "path": "nemo_rl/models/automodel/setup.py",
       "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `int` and `object`",
-      "severity": "error"
-    },
-    {
-      "column": 27,
-      "path": "nemo_rl/models/automodel/setup.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `object` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 27,
-      "path": "nemo_rl/models/automodel/setup.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `object` and `object`",
       "severity": "error"
     },
     {
@@ -5335,24 +4937,10 @@
       "severity": "error"
     },
     {
-      "column": 52,
-      "path": "nemo_rl/models/generation/vllm/quantization/fp8.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, str]`",
-      "severity": "error"
-    },
-    {
       "column": 56,
       "path": "nemo_rl/models/generation/vllm/quantization/fp8.py",
       "name": "unsupported-operation",
       "concise_description": "Cannot set item in `dict[str, list[int] | str]`",
-      "severity": "error"
-    },
-    {
-      "column": 56,
-      "path": "nemo_rl/models/generation/vllm/quantization/fp8.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, str]`",
       "severity": "error"
     },
     {
@@ -5370,13 +4958,6 @@
       "severity": "error"
     },
     {
-      "column": 48,
-      "path": "nemo_rl/models/generation/vllm/quantization/fp8.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, str]`",
-      "severity": "error"
-    },
-    {
       "column": 42,
       "path": "nemo_rl/models/generation/vllm/quantization/fp8.py",
       "name": "no-matching-overload",
@@ -5395,13 +4976,6 @@
       "path": "nemo_rl/models/generation/vllm/quantization/fp8.py",
       "name": "unsupported-operation",
       "concise_description": "Cannot set item in `dict[str, list[int] | str]`",
-      "severity": "error"
-    },
-    {
-      "column": 44,
-      "path": "nemo_rl/models/generation/vllm/quantization/fp8.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, str]`",
       "severity": "error"
     },
     {
@@ -5829,20 +5403,6 @@
       "path": "nemo_rl/models/megatron/data.py",
       "name": "unsupported-operation",
       "concise_description": "`-` is not supported between `Tensor` and `list[int]`",
-      "severity": "error"
-    },
-    {
-      "column": 27,
-      "path": "nemo_rl/models/megatron/data.py",
-      "name": "unsupported-operation",
-      "concise_description": "`-` is not supported between `list[int]` and `Tensor`",
-      "severity": "error"
-    },
-    {
-      "column": 27,
-      "path": "nemo_rl/models/megatron/data.py",
-      "name": "unsupported-operation",
-      "concise_description": "`-` is not supported between `list[int]` and `list[int]`",
       "severity": "error"
     },
     {
@@ -6980,20 +6540,6 @@
       "severity": "error"
     },
     {
-      "column": 40,
-      "path": "nemo_rl/models/policy/lm_policy.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `DSparkDraftConfig`",
-      "severity": "error"
-    },
-    {
-      "column": 40,
-      "path": "nemo_rl/models/policy/lm_policy.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `Eagle3DraftConfig`",
-      "severity": "error"
-    },
-    {
       "column": 15,
       "path": "nemo_rl/models/policy/lm_policy.py",
       "name": "bad-typed-dict-key",
@@ -7103,13 +6649,6 @@
       "path": "nemo_rl/models/policy/workers/automodel_policy_worker.py",
       "name": "inconsistent-inheritance",
       "concise_description": "Field `init_collective` has inconsistent types inherited from multiple base classes",
-      "severity": "error"
-    },
-    {
-      "column": 7,
-      "path": "nemo_rl/models/policy/workers/automodel_policy_worker.py",
-      "name": "inconsistent-inheritance",
-      "concise_description": "Field `nccl_reshard_refit` has inconsistent types inherited from multiple base classes",
       "severity": "error"
     },
     {
@@ -7414,24 +6953,10 @@
       "severity": "error"
     },
     {
-      "column": 9,
-      "path": "nemo_rl/models/policy/workers/megatron_policy_worker.py",
-      "name": "bad-override",
-      "concise_description": "Class member `MegatronPolicyWorkerImpl.prepare_nccl_reshard_refit_info` overrides parent class `ColocatablePolicyInterface` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
       "column": 15,
       "path": "nemo_rl/models/policy/workers/megatron_policy_worker.py",
       "name": "bad-override",
       "concise_description": "Class member `MegatronPolicyWorkerImpl.nccl_reshard_refit` overrides parent class `AbstractPolicyWorker` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "column": 15,
-      "path": "nemo_rl/models/policy/workers/megatron_policy_worker.py",
-      "name": "bad-override",
-      "concise_description": "Class member `MegatronPolicyWorkerImpl.nccl_reshard_refit` overrides parent class `ColocatablePolicyInterface` in an inconsistent manner",
       "severity": "error"
     },
     {
@@ -7586,13 +7111,6 @@
       "path": "nemo_rl/models/value/lm_value.py",
       "name": "bad-assignment",
       "concise_description": "`SlicedDataDict | list[SlicedDataDict]` is not assignable to `list[SlicedDataDict]`",
-      "severity": "error"
-    },
-    {
-      "column": 17,
-      "path": "nemo_rl/models/value/lm_value.py",
-      "name": "bad-assignment",
-      "concise_description": "`SlicedDataDict | list[int]` is not assignable to `list[int]`",
       "severity": "error"
     },
     {
@@ -7946,20 +7464,6 @@
       "severity": "error"
     },
     {
-      "column": 41,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 41,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
       "column": 9,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
@@ -8041,20 +7545,6 @@
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 41,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 41,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -8149,20 +7639,6 @@
       "severity": "error"
     },
     {
-      "column": 41,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 41,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
       "column": 9,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
@@ -8195,20 +7671,6 @@
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
       "concise_description": "`/` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 17,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 17,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -8265,20 +7727,6 @@
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
       "concise_description": "`//` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 14,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`//` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 14,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`//` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -8363,20 +7811,6 @@
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 12,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 12,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -8471,20 +7905,6 @@
       "severity": "error"
     },
     {
-      "column": 19,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`//` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 19,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`//` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
       "column": 29,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
@@ -8523,14 +7943,7 @@
       "column": 16,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 16,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `None` and `None`",
+      "concise_description": "`/` is not supported between `int` and `None`",
       "severity": "error"
     },
     {
@@ -8544,56 +7957,7 @@
       "column": 16,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 16,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 16,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
       "concise_description": "`/` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 16,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 16,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 16,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 16,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 16,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -8629,20 +7993,6 @@
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 22,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 22,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -8657,20 +8007,6 @@
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 20,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 20,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -8692,20 +8028,6 @@
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
       "concise_description": "`+` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 15,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 15,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -8751,20 +8073,6 @@
       "severity": "error"
     },
     {
-      "column": 16,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 16,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
       "column": 20,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
@@ -8783,20 +8091,6 @@
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
       "concise_description": "`+` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 20,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 20,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -8845,42 +8139,7 @@
       "column": 9,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 11,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 11,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 11,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -8901,39 +8160,11 @@
       "column": 11,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 11,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 11,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `int` and `None`",
       "severity": "error"
     },
     {
       "column": 11,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 11,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 16,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `int` and `None`",
@@ -8943,14 +8174,7 @@
       "column": 16,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 16,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
+      "concise_description": "`*` is not supported between `int` and `None`",
       "severity": "error"
     },
     {
@@ -8961,38 +8185,10 @@
       "severity": "error"
     },
     {
-      "column": 45,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 45,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
       "column": 12,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 12,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 12,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -9024,20 +8220,6 @@
       "severity": "error"
     },
     {
-      "column": 14,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 14,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
       "column": 32,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
@@ -9059,20 +8241,6 @@
       "severity": "error"
     },
     {
-      "column": 14,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 14,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
       "column": 29,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
@@ -9083,35 +8251,7 @@
       "column": 29,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 29,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 29,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 29,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 29,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -9136,38 +8276,10 @@
       "severity": "error"
     },
     {
-      "column": 10,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 10,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
       "column": 29,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 29,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 29,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -9185,20 +8297,6 @@
       "severity": "error"
     },
     {
-      "column": 30,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 30,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
       "column": 9,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
@@ -9206,38 +8304,10 @@
       "severity": "error"
     },
     {
-      "column": 9,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
       "column": 34,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 34,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 34,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -9363,20 +8433,6 @@
       "column": 12,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 12,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 12,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
       "concise_description": "`**` is not supported between `None` and `Literal[2]`",
       "severity": "error"
     },
@@ -9430,20 +8486,6 @@
       "severity": "error"
     },
     {
-      "column": 24,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 24,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
       "column": 9,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
@@ -9475,20 +8517,6 @@
       "column": 9,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `int` and `None`",
       "severity": "error"
     },
@@ -9503,35 +8531,7 @@
       "column": 11,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 11,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 11,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `int` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 11,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 11,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `None`",
       "severity": "error"
     },
     {
@@ -9636,20 +8636,6 @@
       "column": 15,
       "path": "nemo_rl/utils/flops_formulas.py",
       "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `None` and `int`",
-      "severity": "error"
-    },
-    {
-      "column": 15,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
-      "concise_description": "`/` is not supported between `None` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 15,
-      "path": "nemo_rl/utils/flops_formulas.py",
-      "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `float` and `None`",
       "severity": "error"
     },
@@ -9745,34 +8731,6 @@
       "severity": "error"
     },
     {
-      "column": 48,
-      "path": "nemo_rl/utils/flops_tracker.py",
-      "name": "bad-argument-type",
-      "concise_description": "Unpacked keyword argument `int | Any` is not assignable to parameter `model_pattern` with type `str | None` in function `nemo_rl.utils.flops_formulas.FLOPSConfig.__init__`",
-      "severity": "error"
-    },
-    {
-      "column": 48,
-      "path": "nemo_rl/utils/flops_tracker.py",
-      "name": "bad-argument-type",
-      "concise_description": "Unpacked keyword argument `int | Any` is not assignable to parameter `causal_self_attn` with type `bool | None` in function `nemo_rl.utils.flops_formulas.FLOPSConfig.__init__`",
-      "severity": "error"
-    },
-    {
-      "column": 48,
-      "path": "nemo_rl/utils/flops_tracker.py",
-      "name": "bad-argument-type",
-      "concise_description": "Unpacked keyword argument `int | Any` is not assignable to parameter `is_hybrid_model` with type `bool` in function `nemo_rl.utils.flops_formulas.FLOPSConfig.__init__`",
-      "severity": "error"
-    },
-    {
-      "column": 48,
-      "path": "nemo_rl/utils/flops_tracker.py",
-      "name": "bad-argument-type",
-      "concise_description": "Unpacked keyword argument `int | Any` is not assignable to parameter `hybrid_override_pattern` with type `str | None` in function `nemo_rl.utils.flops_formulas.FLOPSConfig.__init__`",
-      "severity": "error"
-    },
-    {
       "column": 9,
       "path": "nemo_rl/utils/flops_tracker.py",
       "name": "bad-assignment",
@@ -9791,13 +8749,6 @@
       "path": "nemo_rl/utils/length_penalty.py",
       "name": "bad-index",
       "concise_description": "Cannot index into `bool`",
-      "severity": "error"
-    },
-    {
-      "column": 13,
-      "path": "nemo_rl/utils/length_penalty.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `list[float]`",
       "severity": "error"
     },
     {
@@ -10069,13 +9020,6 @@
     {
       "column": 31,
       "path": "tools/refit_verifier.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `str`",
-      "severity": "error"
-    },
-    {
-      "column": 31,
-      "path": "tools/refit_verifier.py",
       "name": "unsupported-operation",
       "concise_description": "`None` is not subscriptable",
       "severity": "error"
@@ -10090,13 +9034,6 @@
     {
       "column": 21,
       "path": "tools/refit_verifier.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `str`",
-      "severity": "error"
-    },
-    {
-      "column": 21,
-      "path": "tools/refit_verifier.py",
       "name": "unsupported-operation",
       "concise_description": "`None` is not subscriptable",
       "severity": "error"
@@ -10106,13 +9043,6 @@
       "path": "tools/refit_verifier.py",
       "name": "bad-index",
       "concise_description": "Cannot index into `list[Any]`",
-      "severity": "error"
-    },
-    {
-      "column": 25,
-      "path": "tools/refit_verifier.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `str`",
       "severity": "error"
     },
     {
@@ -10127,13 +9057,6 @@
       "path": "tools/refit_verifier.py",
       "name": "bad-index",
       "concise_description": "Cannot index into `list[Any]`",
-      "severity": "error"
-    },
-    {
-      "column": 22,
-      "path": "tools/refit_verifier.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `str`",
       "severity": "error"
     },
     {
