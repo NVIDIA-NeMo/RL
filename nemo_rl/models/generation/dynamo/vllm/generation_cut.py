@@ -17,30 +17,33 @@
 At a checkpoint NeMo-Gym posts the calls it has in flight to
 ``/ng-control/v1/generation-cut`` beside the base URL they went to. Behind
 Dynamo that URL is the frontend, and the calls run in the engines. So the
-frontend process serves the route on a control port of its own and sends the
-cut to every engine over Dynamo's request plane. Each engine answers for the
-calls it cut, and the answers are merged into the one receipt Gym expects.
-
-The control port is there because a Dynamo frontend route can only be a
-synchronous GET (ai-dynamo/dynamo#18486). Once routes take POST and async
-handlers, this route can move onto the frontend's own port.
+frontend serves the route itself, as a Dynamo route extension (``routes``), and
+sends the cut to every engine over Dynamo's request plane. Each engine answers
+for the calls it cut, and the answers are merged into the one receipt Gym
+expects.
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib.util
+import json
 import logging
 import os
-import threading
 import time
 from collections.abc import Iterable, Sequence
 from typing import Any
 
 from nemo_rl.models.generation.dynamo.managed_runtime import (
+    CAPTURE_FILE_ENV,
     DYNAMO_COMPONENT,
     DYNAMO_ENDPOINT,
-    GENERATION_CUT_PORT_ENV,
+    HTTP_BODY_LIMIT_MB,
     read_chat_capture,
+)
+from nemo_rl.models.generation.vllm.generation_cut_route import (
+    GENERATION_CUT_ROUTE,
+    answer_generation_cut,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -55,6 +58,9 @@ CUT_PREFIXES_KEY = "prefixes"
 DEADLINE_KEY = "nemo_rl_generation_cut_deadline"
 # What an engine leaves of that deadline for its answer to reach the frontend.
 CUT_REPLY_MARGIN_S = 1.0
+# A cut times itself (the deadline above), so the route's own timeout is only a
+# backstop: the longest Dynamo accepts.
+_ROUTE_TIMEOUT_S = 365 * 24 * 60 * 60
 
 
 def merge_cut_receipts(inventory: Any, engine_prefixes: Iterable[Sequence[Any]]) -> Any:
@@ -89,14 +95,15 @@ def merge_cut_receipts(inventory: Any, engine_prefixes: Iterable[Sequence[Any]])
 class EngineCutFanOut:
     """Cuts a checkpoint's calls on every engine: what the cut route runs."""
 
-    def __init__(self, runtime: Any, loop: asyncio.AbstractEventLoop) -> None:
-        """Open the request-plane client. Call it on ``loop``, the frontend's.
+    def __init__(self, runtime: Any, capture_file: str) -> None:
+        """Open the request-plane client. Call it on the frontend's event loop.
 
-        The client is opened now, at startup, so that by the first checkpoint
-        it has discovered every engine.
+        Args:
+            runtime: The frontend's ``DistributedRuntime``.
+            capture_file: Where the driver publishes the capture config, which
+                holds a cut's bearer token and timeout.
         """
-        # The frontend's loop, which the runtime's request-plane client runs on.
-        self._loop = loop
+        self._capture_file = capture_file
         path = f"{os.environ['DYN_NAMESPACE']}.{DYNAMO_COMPONENT}.{DYNAMO_ENDPOINT}"
         # Dynamo returns a future here, not a coroutine.
         self._client = asyncio.ensure_future(runtime.endpoint(path).client())
@@ -104,20 +111,18 @@ class EngineCutFanOut:
     @property
     def control_token(self) -> str | None:
         """The bearer token a cut needs; None until capture is set up with cuts on."""
-        capture = read_chat_capture()
+        capture = read_chat_capture(self._capture_file)
         return None if capture is None else capture["generation_cut_control_token"]
 
     async def run_cut(self, inventory: Any) -> Any:
-        """Cut ``inventory``'s calls. Safe to await from the control server's loop."""
+        """Cut ``inventory``'s calls on every engine and merge their answers."""
         # One deadline, from the cut's arrival, for this wait and every engine:
         # an engine that started its own later would answer after this gave up.
-        timeout_s = (read_chat_capture() or {}).get("generation_cut_control_timeout_s")
-        deadline = None if timeout_s is None else time.time() + timeout_s
-        return await asyncio.wrap_future(
-            asyncio.run_coroutine_threadsafe(
-                self._cut_on_every_engine(inventory, deadline), self._loop
-            )
+        timeout_s = (read_chat_capture(self._capture_file) or {}).get(
+            "generation_cut_control_timeout_s"
         )
+        deadline = None if timeout_s is None else time.time() + timeout_s
+        return await self._cut_on_every_engine(inventory, deadline)
 
     async def _cut_on_every_engine(self, inventory: Any, deadline: float | None) -> Any:
         client = await self._client
@@ -177,29 +182,53 @@ class EngineCutFanOut:
         return prefixes
 
 
-def start_generation_cut_server(runtime: Any, loop: asyncio.AbstractEventLoop) -> None:
-    """Serve Gym's generation-cut route on this frontend process's control port."""
-    # Deferred: only the frontend process serves the route.
-    import uvicorn
-    from fastapi import FastAPI
+class CutRouteHandler:
+    """Answers NeMo-Gym's cut call from the context Dynamo hands a route's handler."""
 
-    from nemo_rl.models.generation.vllm.generation_cut_route import (
-        register_generation_cut_route,
-    )
+    def __init__(self, capture_file: str) -> None:
+        self._capture_file = capture_file
+        self._fan_out: EngineCutFanOut | None = None
 
-    fan_out = EngineCutFanOut(runtime, loop)
-    app = FastAPI()
-    register_generation_cut_route(app, lambda: fan_out)
-    server = uvicorn.Server(
-        uvicorn.Config(
-            app,
-            host="0.0.0.0",
-            port=int(os.environ[GENERATION_CUT_PORT_ENV]),
-            log_level="warning",
+    async def answer(self, context: Any) -> tuple[int, dict[str, Any]]:
+        """The call's HTTP status and JSON body, as the native route answers it."""
+        if self._fan_out is None:
+            # Dynamo hands over its runtime only with a request. The client
+            # shares the frontend's discovery watch, so it lists every engine.
+            self._fan_out = EngineCutFanOut(context.runtime, self._capture_file)
+        return await answer_generation_cut(
+            self._fan_out,
+            authorization=context.headers.get("authorization"),
+            inventory=json.loads(context.body),
         )
-    )
-    # A thread of its own, as each engine's HTTP server has: on the frontend's
-    # loop uvicorn would take over the frontend's signal handlers.
-    threading.Thread(
-        target=server.run, name="nrl-generation-cut-server", daemon=True
-    ).start()
+
+
+def routes() -> list[Any]:
+    """Dynamo's route extension provider: the cut route, on the frontend's own port."""
+    # Deferred: ai-dynamo is an optional dependency, and only the frontend
+    # process calls this.
+    from dynamo.llm import FrontendResponse, FrontendRoute
+
+    # Gym is imported at launch where it is installed: a lazy import that met
+    # another thread's first import of Gym midway would get a half-built package.
+    if importlib.util.find_spec("nemo_gym") is not None:
+        # Gym points an unset HF_HOME at its own cache directory, where the
+        # early render-worker build would then look for a Hub ID's files.
+        hf_home = os.environ.get("HF_HOME")
+        importlib.import_module("nemo_gym._checkpoint.generation_cut")
+        if hf_home is None:
+            os.environ.pop("HF_HOME", None)
+    handler = CutRouteHandler(os.environ[CAPTURE_FILE_ENV])
+
+    async def serve_cut(context: Any) -> Any:
+        status, body = await handler.answer(context)
+        return body if status == 200 else FrontendResponse(status, body)
+
+    return [
+        FrontendRoute(
+            "POST",
+            GENERATION_CUT_ROUTE,
+            serve_cut,
+            timeout_s=_ROUTE_TIMEOUT_S,
+            max_body_bytes=HTTP_BODY_LIMIT_MB << 20,
+        )
+    ]

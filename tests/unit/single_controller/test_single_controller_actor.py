@@ -66,6 +66,7 @@ from nemo_rl.algorithms.single_controller import (
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
     AdvantageStageConfig,
+    _train_fields_for_step,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -115,12 +116,12 @@ from tests.unit.single_controller._rollout_checkpoints import (
 
 
 def test_train_fields_add_the_sampler_topk_for_score_centering():
-    without = single_controller._train_fields_for_step(
+    without = _train_fields_for_step(
         policy_logprobs_required=True,
         reference_logprobs_required=False,
         sampler_head_required=False,
     )
-    with_topk = single_controller._train_fields_for_step(
+    with_topk = _train_fields_for_step(
         policy_logprobs_required=True,
         reference_logprobs_required=False,
         sampler_head_required=True,
@@ -254,6 +255,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         ppo_group_multiple=1,
         ppo_min_remaining_groups=0,
         grpo_group_multiple=1,
+        trainer_warmup_kwargs=None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -2680,7 +2682,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
-    ctrl._train_fields = single_controller._train_fields_for_step(
+    ctrl._train_fields = _train_fields_for_step(
         policy_logprobs_required=False,
         reference_logprobs_required=False,
         sampler_head_required=False,
@@ -2694,6 +2696,7 @@ def _train_pump_controller(*, sampler) -> object:
     attach_rollout_checkpointing(ctrl)
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
+    ctrl._trainer_warmup_task = None
     ctrl._is_ppo = False
     ctrl._streaming_ppo = False
     ctrl._value_dedicated = False
@@ -3550,7 +3553,7 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
         reference_logprobs_required = stage_cfg.reference_logprobs_required
     ctrl._policy_logprobs_required = policy_logprobs_required
     ctrl._reference_logprobs_required = reference_logprobs_required
-    ctrl._train_fields = single_controller._train_fields_for_step(
+    ctrl._train_fields = _train_fields_for_step(
         policy_logprobs_required=policy_logprobs_required,
         reference_logprobs_required=reference_logprobs_required,
         sampler_head_required=False,
@@ -3735,6 +3738,7 @@ def test_run_pumps_snapshots_generation_before_dispatch(
     )
     ctrl._trainer_version = 0
     ctrl._rollout_restorer = SimpleNamespace(restore=AsyncMock(return_value=False))
+    ctrl._trainer_warmup_kwargs = None
     events = []
 
     def snapshot() -> None:

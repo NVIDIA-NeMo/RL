@@ -38,6 +38,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     FleetHealthConfig,
     GenerationRouterConfig,
     MasterConfig,
+    RefitActorConfig,
     RolloutFailureConfig,
     TokenCaptureConfig,
     WatchdogConfig,
@@ -173,6 +174,27 @@ def test_streaming_uses_the_estimator_batch_requirement(monkeypatch) -> None:
 
     cfg.async_rl.min_groups_for_streaming_train = cfg.grpo.num_prompts_per_step
     validate_single_controller_config(cfg)
+
+
+def test_refit_actor_accepted_with_non_colocated_nccl_refit() -> None:
+    validate_single_controller_config(
+        _master_config(refit_actor=RefitActorConfig(enabled=True))
+    )
+
+
+def test_refit_actor_rejected_with_colocated_generation() -> None:
+    # Megatron is the one backend the SingleController runs colocated.
+    cfg = _master_config(refit_actor=RefitActorConfig(enabled=True))
+    cfg.policy["generation"] = {"backend": "megatron", "colocated": {"enabled": True}}
+    with pytest.raises(ValueError, match="non-colocated"):
+        validate_single_controller_config(cfg)
+
+
+def test_refit_actor_rejected_with_non_nccl_refit_transport() -> None:
+    cfg = _master_config(refit_actor=RefitActorConfig(enabled=True))
+    cfg.policy["generation"]["refit_transport"] = "nixl"
+    with pytest.raises(ValueError, match="NCCL refit transports"):
+        validate_single_controller_config(cfg)
 
 
 class TestRolloutFailureValidation:

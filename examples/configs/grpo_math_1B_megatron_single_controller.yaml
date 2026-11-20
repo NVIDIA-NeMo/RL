@@ -26,6 +26,10 @@ async_rl:
     name: in_order
     # How far generation may run ahead of the trainer.
     max_lookahead_versions: 1
+  # Run the weight synchronizer in its own CPU Ray actor instead of the controller's
+  # process. Requires non-colocated generation and an NCCL refit transport.
+  refit_actor:
+    enabled: false
   # Recompute generation KV caches after each weight update.
   recompute_kv_cache_after_weight_updates: true
   # Min ready groups the streaming trainer waits for before dispatching a batch.
@@ -56,6 +60,17 @@ async_rl:
   # process, which both holds a whole cohort's advantage inputs in the
   # controller's heap and blocks its event loop while the stage runs.
   num_advantage_workers: 0
+  # Build the trainer while setup reserves the vLLM workers (NeMo-Gym runs with
+  # non-colocated vLLM, cluster.segment_size and no resume). Adds load on the Ray GCS.
+  early_trainer_build: false
+  # Synthetic first training pass on a Megatron trainer, run while it waits for
+  # generation or the first rollouts (non-colocated generation). Setups it does not
+  # cover skip it and log why.
+  trainer_warmup:
+    enabled: false
+    # Lengths of the synthetic sequences; null fills two microbatches near the
+    # microbatch token budget.
+    seqlens: null
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are
