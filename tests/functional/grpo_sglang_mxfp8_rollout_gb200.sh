@@ -35,6 +35,7 @@ shared=(
     grpo.num_prompts_per_step=2
     grpo.num_generations_per_prompt=4
     grpo.max_num_steps=3
+    grpo.val_period=0
     policy.train_global_batch_size=4
     policy.train_micro_batch_size=1
     policy.max_total_sequence_length=256
