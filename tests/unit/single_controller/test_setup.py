@@ -24,7 +24,7 @@ import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 import torch
@@ -83,6 +83,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutCheckpointConfig,
     RolloutRecoveryConfig,
     TokenCaptureConfig,
+    TrainerWarmupConfig,
     _validate_opd_full_config,
     forest_execution_row_multiple,
     validate_single_controller_config,
@@ -1243,7 +1244,6 @@ class TestSetup:
                 ["http://generation"],
                 MagicMock(name="tokenizer"),
                 policy_api_key=None,
-                generation_cut_control_urls=None,
             )
 
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is False
@@ -1270,13 +1270,11 @@ class TestSetup:
                 ["http://generation"],
                 MagicMock(name="tokenizer"),
                 policy_api_key=None,
-                generation_cut_control_urls=["http://generation-cuts"],
             )
 
         kwargs = mock_spinup.call_args.kwargs
         assert kwargs["turn_checkpointing_enabled"] is True
         assert kwargs["generation_prefix_cuts_enabled"] is generation_prefix_cuts
-        assert kwargs["generation_cut_control_urls"] == ["http://generation-cuts"]
         # The flag is a typed keyword, not an undeclared key in the capture config.
         assert "generation_prefix_cuts_enabled" not in kwargs["token_capture"]
 
@@ -2707,10 +2705,6 @@ class TestSetup:
             use_fastokens=False,
             turn_checkpointing_enabled=False,
             generation_prefix_cuts_enabled=False,
-            # Where the generation backend takes Gym's checkpoint cuts.
-            generation_cut_control_urls=patched_factories[
-                "fake_gen"
-            ].generation_cut_control_urls,
             # The vLLM server's bearer token, handed to the Gym model server.
             policy_api_key=patched_factories["fake_gen"].http_server_api_key,
             token_capture=None,
@@ -2718,6 +2712,7 @@ class TestSetup:
         mock_validate.assert_called_once_with(
             fake_gym_shards,
             {"training": list(range(8)), "validation": None},
+            agent_names={"training": set(), "validation": set()},
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
         warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs[
@@ -2810,6 +2805,9 @@ class TestSetup:
                 "training": patched_factories["setup_response_data"].return_value[0],
                 "validation": None,
             },
+            # The taskset rows need the running stack's routes, so the scan
+            # leaves that split to the check.
+            agent_names={"validation": set()},
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
         fake_gym_shards.shutdown.assert_not_called()
@@ -3988,6 +3986,332 @@ class TestAdaptiveLossRestore:
         assert actor_args.loss_fn.cur_adaptive_ppo_clip_k == 0.5
 
 
+def _gym_vllm_config(**kwargs: Any) -> MasterConfig:
+    # One epoch of the patched 4-batch dataloader; more steps get clamped by the
+    # dataset, which rebuilds the trainer.
+    kwargs.setdefault("max_num_steps", 4)
+    mc = TestSetup._gym_vllm_config(**kwargs)
+    mc.policy["model_name"] = "test-model"
+    return mc
+
+
+class TestStartupOverlap:
+    """Startup work that setup overlaps with the generation and trainer builds."""
+
+    def test_early_submit_starts_the_trainer_before_the_vllm_reserve(
+        self, patched_factories
+    ):
+        mc = _gym_vllm_config()
+        mc.cluster.segment_size = 1
+        mc.async_rl.early_trainer_build = True
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        trainer_started = threading.Event()
+        trainer_started_before_reserve: list[bool] = []
+
+        def build_trainer(*args: Any, **kwargs: Any):
+            trainer_started.set()
+            return patched_factories["fake_policy"], 0.0
+
+        def build_generation(*args: Any, **kwargs: Any):
+            # Blocks the reserve until the trainer starts; times out if it starts later.
+            trainer_started_before_reserve.append(trainer_started.wait(timeout=5))
+            return patched_factories["fake_gen"], 0.0
+
+        patched_factories["_build_trainer"].side_effect = build_trainer
+        patched_factories["_build_generation"].side_effect = build_generation
+
+        with TestSetup._gym_patches():
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert trainer_started_before_reserve == [True]
+        patched_factories["_build_trainer"].assert_called_once()
+        train_cluster = patched_factories["_build_clusters"].return_value[0]
+        train_cluster.get_placement_groups.assert_called()
+        assert actor_args.trainer_handle is patched_factories["fake_policy"]
+        assert mc.policy["generation"]["model_name"] == "test-model"
+
+    @staticmethod
+    def _build_order(mc: MasterConfig, patched_factories) -> list[str]:
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        order: list[str] = []
+
+        def build_trainer(*args: Any, **kwargs: Any):
+            order.append("trainer")
+            return patched_factories["fake_policy"], 0.0
+
+        def build_generation(*args: Any, **kwargs: Any):
+            order.append("reserve")
+            return patched_factories["fake_gen"], 0.0
+
+        patched_factories["_build_trainer"].side_effect = build_trainer
+        patched_factories["_build_generation"].side_effect = build_generation
+
+        with TestSetup._gym_patches():
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+        return order
+
+    def test_no_early_submit_by_default(self, patched_factories):
+        mc = _gym_vllm_config()
+        mc.cluster.segment_size = 1
+
+        assert self._build_order(mc, patched_factories) == ["reserve", "trainer"]
+
+    def test_no_early_submit_without_a_segment_size(self, patched_factories):
+        mc = _gym_vllm_config()
+        mc.async_rl.early_trainer_build = True
+
+        assert self._build_order(mc, patched_factories) == ["reserve", "trainer"]
+
+    def test_early_trainer_is_rebuilt_when_the_dataset_clamps_the_steps(
+        self, patched_factories
+    ):
+        mc = _gym_vllm_config(
+            megatron_enabled=True, max_num_steps=100, max_num_epochs=1
+        )
+        mc.cluster.segment_size = 1
+        mc.async_rl.early_trainer_build = True
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with TestSetup._gym_patches():
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert patched_factories["_build_trainer"].call_count == 2
+        patched_factories["fake_policy"].shutdown.assert_called_once_with()
+        assert mc.policy["megatron_cfg"]["train_iters"] == 4
+        assert actor_args.trainer_handle is patched_factories["fake_policy"]
+
+    def test_route_scan_hands_its_names_to_the_check(self, patched_factories):
+        mc = _gym_vllm_config()
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        fake_gym_shards = MagicMock(name="nemo_gym_shards")
+        names = {"training": {"alpha"}, "validation": set()}
+
+        with (
+            TestSetup._gym_patches(fake_gym_shards),
+            patch.object(
+                sc_setup_mod, "collect_dataset_agent_names", return_value=names
+            ) as mock_collect,
+            patch.object(
+                sc_setup_mod, "validate_dataset_agent_coverage"
+            ) as mock_validate,
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        datasets = {"training": list(range(8)), "validation": None}
+        mock_collect.assert_called_once_with(datasets)
+        mock_validate.assert_called_once_with(
+            fake_gym_shards, datasets, agent_names=names
+        )
+
+    def test_vllm_generation_config_writes_are_idempotent(self):
+        # The early submit applies them before the reserve applies them again.
+        mc = _make_master_config(backend="vllm")
+        mc.policy["model_name"] = "test-model"
+        mc.policy["hf_config_overrides"] = {"rope_theta": 1.0}
+
+        sc_setup_mod._apply_vllm_generation_config(mc)
+        keys_after_first = set(mc.policy["generation"])
+        sc_setup_mod._apply_vllm_generation_config(mc)
+
+        assert set(mc.policy["generation"]) == keys_after_first
+        assert mc.policy["generation"]["model_name"] == "test-model"
+        assert mc.policy["generation"]["vllm_kwargs"] == {
+            "hf_overrides": {"rope_theta": 1.0}
+        }
+
+    @staticmethod
+    def _warmup_config() -> MasterConfig:
+        mc = _make_master_config(megatron_enabled=True)
+        mc.async_rl.trainer_warmup = TrainerWarmupConfig(enabled=True)
+        # Read by AdvantageStageConfig, which the warm-up's step fields come from.
+        mc.policy["generation"]["top_k"] = None
+        mc.policy["generation"]["top_p"] = 1.0
+        return mc
+
+    def test_trainer_warmup_starts_once_the_trainer_is_built(
+        self, patched_factories, capsys
+    ):
+        mc = self._warmup_config()
+        fake_policy = patched_factories["fake_policy"]
+        warmup_started = threading.Event()
+        order: list[str] = []
+
+        def start_warmup(*args: Any, **kwargs: Any) -> list[str]:
+            warmup_started.set()
+            return ["warmup_ref"]
+
+        def build_generation(*args: Any, **kwargs: Any):
+            # Generation stays down until the warm-up starts; times out without it.
+            order.append(f"generation waited: {warmup_started.wait(timeout=5)}")
+            return patched_factories["fake_gen"], 0.0
+
+        real_get = sc_setup_mod.ray.get
+
+        def get(refs: Any, *args: Any, **kwargs: Any) -> Any:
+            if refs == ["warmup_ref"]:
+                order.append("warmup waited")
+                return [{"total_s": 1.0}]
+            return real_get(refs, *args, **kwargs)
+
+        fake_policy.start_warmup_first_pass.side_effect = start_warmup
+        patched_factories["_build_generation"].side_effect = build_generation
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = lambda: order.append(
+            "init_communicator"
+        )
+
+        with patch.object(sc_setup_mod.ray, "get", side_effect=get):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert order == [
+            "generation waited: True",
+            "warmup waited",
+            "init_communicator",
+        ]
+        fake_policy.start_warmup_first_pass.assert_called_once_with(
+            patched_factories["ClippedPGLossFn"].return_value,
+            train_fields=ANY,
+            run_logprobs=True,
+            seqlens=None,
+        )
+        assert actor_args.trainer_warmup_kwargs is None
+        assert "Trainer warm-up (rank 0)" in capsys.readouterr().out
+
+    def test_generation_up_first_leaves_the_warmup_to_the_controller(
+        self, patched_factories
+    ):
+        mc = self._warmup_config()
+        trainer_released = threading.Event()
+        real_wait = sc_setup_mod.wait
+
+        def build_trainer(*args: Any, **kwargs: Any):
+            # Held until setup has seen generation finish first.
+            assert trainer_released.wait(timeout=5)
+            return patched_factories["fake_policy"], 0.0
+
+        def wait_then_release(*args: Any, **kwargs: Any):
+            done = real_wait(*args, **kwargs)
+            trainer_released.set()
+            return done
+
+        patched_factories["_build_trainer"].side_effect = build_trainer
+
+        with patch.object(sc_setup_mod, "wait", side_effect=wait_then_release):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["fake_policy"].start_warmup_first_pass.assert_not_called()
+        stage_cfg = AdvantageStageConfig.from_master_config(mc)
+        assert actor_args.trainer_warmup_kwargs == {
+            "train_fields": stage_cfg.train_fields(mc),
+            "run_logprobs": True,
+            "seqlens": None,
+        }
+
+
+class TestTrainerWarmupKwargs:
+    """Setup decides once whether the trainer warm-up runs, and prints why not."""
+
+    @staticmethod
+    def _master_config(
+        *,
+        enabled: bool = True,
+        megatron: bool = True,
+        colocated: bool = False,
+        score_centering: bool = False,
+        sampler_replay: bool = False,
+    ) -> Any:
+        return SimpleNamespace(
+            policy={
+                "megatron_cfg": {"enabled": megatron},
+                "generation": {
+                    "colocated": {"enabled": colocated},
+                    "sampler_replay": {"enabled": sampler_replay},
+                },
+            },
+            loss_fn=SimpleNamespace(score_centering=score_centering),
+            async_rl=SimpleNamespace(
+                trainer_warmup=TrainerWarmupConfig(enabled=enabled, seqlens=[64])
+            ),
+        )
+
+    @staticmethod
+    def _use_stage(monkeypatch, **overrides: Any) -> None:
+        stage_cfg = SimpleNamespace(
+            **{
+                "is_ppo": False,
+                "teacher_logprobs_required": False,
+                "policy_logprobs_required": True,
+                "algo": SimpleNamespace(max_num_steps=10),
+                "train_fields": lambda master_config: ("input_ids", "sample_mask"),
+                **overrides,
+            }
+        )
+        monkeypatch.setattr(
+            sc_setup_mod.AdvantageStageConfig,
+            "from_master_config",
+            lambda master_config: stage_cfg,
+        )
+
+    def test_off_returns_none_quietly(self, capsys):
+        kwargs = sc_setup_mod._trainer_warmup_kwargs(
+            self._master_config(enabled=False), current_step=0
+        )
+
+        assert kwargs is None
+        assert capsys.readouterr().out == ""
+
+    @pytest.mark.parametrize(
+        ("config", "stage", "current_step", "reason"),
+        [
+            ({"megatron": False}, {}, 0, "the trainer is not Megatron"),
+            ({"colocated": True}, {}, 0, "generation shares the trainer's GPUs"),
+            ({}, {"is_ppo": True}, 0, "PPO steps are not covered"),
+            (
+                {},
+                {"teacher_logprobs_required": True},
+                0,
+                "on-policy distillation is not covered",
+            ),
+            ({"score_centering": True}, {}, 0, "score centering is not covered"),
+            ({"sampler_replay": True}, {}, 0, "sampler replay is not covered"),
+            ({}, {}, 10, "no train step is left"),
+        ],
+        ids=[
+            "not-megatron",
+            "colocated",
+            "ppo",
+            "opd",
+            "score-centering",
+            "sampler-replay",
+            "no-step-left",
+        ],
+    )
+    def test_skipped_where_it_does_not_apply(
+        self, monkeypatch, capsys, config, stage, current_step, reason
+    ):
+        self._use_stage(monkeypatch, **stage)
+
+        kwargs = sc_setup_mod._trainer_warmup_kwargs(
+            self._master_config(**config), current_step=current_step
+        )
+
+        assert kwargs is None
+        assert f"Trainer warm-up skipped: {reason}." in capsys.readouterr().out
+
+    def test_applies_with_the_step_fields_and_seqlens(self, monkeypatch):
+        self._use_stage(monkeypatch)
+
+        kwargs = sc_setup_mod._trainer_warmup_kwargs(
+            self._master_config(), current_step=0
+        )
+
+        assert kwargs == {
+            "train_fields": ("input_ids", "sample_mask"),
+            "run_logprobs": True,
+            "seqlens": [64],
+        }
+
+
 class TestNativeTQRecoverySetup:
     def test_simple_storage_setup_loads_tq_before_creating_controller_client(
         self, tmp_path, patched_factories
@@ -4173,6 +4497,7 @@ class TestNativeTQRecoverySetup:
             save_state=save_state,
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
         )
 
         assert restored == metadata
@@ -4194,6 +4519,7 @@ class TestNativeTQRecoverySetup:
             save_state=_save_state(trainer_version=7),
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
         )
 
         assert restored == metadata
@@ -4211,6 +4537,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
         policy.load_data_plane_checkpoint.assert_not_called()
@@ -4243,6 +4570,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
     def test_checkpoint_without_replay_artifacts_does_not_load_tq(
@@ -4258,6 +4586,7 @@ class TestNativeTQRecoverySetup:
             save_state=_save_state(),
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
         )
 
         assert restored is None
@@ -4280,6 +4609,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
     def test_rejects_tq_checkpoint_from_different_training_step(self, tmp_path):
@@ -4296,6 +4626,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
     @pytest.mark.parametrize(
@@ -4332,6 +4663,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
                 opd_full_teacher_checkpoints=current,
             )
 
@@ -4350,7 +4682,71 @@ class TestNativeTQRecoverySetup:
             save_state=_save_state(),
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
             opd_full_teacher_checkpoints=["ckpt-a", "ckpt-b"],
+        )
+
+        assert restored == metadata
+
+    @pytest.mark.parametrize(
+        ("saved", "current"),
+        [
+            ("global_token_mean", "sequence_mean"),
+            ("sequence_mean", "global_token_mean"),
+            # Written before the field existed, so it can only have been one
+            # of the two original modes.
+            (None, "group_token_mean"),
+        ],
+    )
+    def test_rejects_tq_checkpoint_written_under_another_loss_normalization(
+        self, tmp_path, saved, current
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        metadata = _native_tq_metadata()
+        if saved is not None:
+            metadata["loss_normalization"] = saved
+        policy = MagicMock()
+        policy.load_data_plane_checkpoint.return_value = metadata
+
+        with pytest.raises(ValueError, match="new checkpoint_dir"):
+            sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+                load_checkpoint=policy.load_data_plane_checkpoint,
+                last_checkpoint_path=str(checkpoint_path),
+                save_state=_save_state(),
+                partition_id="rollout_data",
+                sampler_name="in_order",
+                loss_normalization=current,
+            )
+
+    @pytest.mark.parametrize(
+        ("saved", "current"),
+        [
+            ("sequence_mean", "sequence_mean"),
+            (None, "global_token_mean"),
+            (None, "sequence_mean"),
+        ],
+    )
+    def test_accepts_tq_checkpoint_with_a_compatible_loss_normalization(
+        self, tmp_path, saved, current
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        metadata = _native_tq_metadata()
+        if saved is not None:
+            metadata["loss_normalization"] = saved
+        policy = MagicMock()
+        policy.load_data_plane_checkpoint.return_value = metadata
+
+        restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+            load_checkpoint=policy.load_data_plane_checkpoint,
+            last_checkpoint_path=str(checkpoint_path),
+            save_state=_save_state(),
+            partition_id="rollout_data",
+            sampler_name="in_order",
+            loss_normalization=current,
         )
 
         assert restored == metadata

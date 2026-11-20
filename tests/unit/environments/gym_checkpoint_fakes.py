@@ -231,10 +231,6 @@ def gym_coordinator(
     )
 
 
-async def no_staging_keys() -> list[str]:
-    return []
-
-
 def deadline_pausing_manager(
     registry: Optional[RequestDeadlineRegistry] = None,
 ) -> SimpleNamespace:
@@ -251,7 +247,6 @@ def gym_environment_checkpoint(
     ledger: Optional[RolloutRecoveryLedger] = None,
     *,
     manager: Optional[Any] = None,
-    list_staging_keys: Callable[[], Awaitable[list[str]]] = no_staging_keys,
     allow_restart_only_servers: bool = False,
     obsolete_cut_rows: Optional[ObsoleteGenerationCutRows] = None,
 ) -> GymEnvironmentCheckpoint:
@@ -260,7 +255,6 @@ def gym_environment_checkpoint(
         coordinator,
         ledger=ledger if ledger is not None else RolloutRecoveryLedger(),
         rollout_manager=manager if manager is not None else deadline_pausing_manager(),
-        list_staging_keys=list_staging_keys,
         allow_restart_only_servers=allow_restart_only_servers,
         obsolete_cut_rows=obsolete_cut_rows,
     )

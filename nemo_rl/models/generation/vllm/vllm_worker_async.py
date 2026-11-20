@@ -831,21 +831,16 @@ class VllmAsyncGenerationWorkerImpl(
         # ai-dynamo is optional: import it only for engines served through Dynamo.
         from nemo_rl.models.generation.dynamo.engine_adapter import (
             start_dynamo_endpoint,
-            weight_free_model_path,
         )
         from nemo_rl.models.generation.dynamo.vllm.adapter import DynamoVllmAdapter
 
-        # Dynamo fetches a Hub ID's whole checkpoint before it registers; the engine's
-        # weights come from refit, so register the config and tokenizer files only.
-        model_path = await weight_free_model_path(self.model_name)
         kv_events = self.llm.vllm_config.kv_events_config
         publishes = kv_events is not None and kv_events.enable_kv_cache_events
         # The Dynamo functional overlays check the router applied these.
         print(f"  [Dynamo] engine publishes KV events: {publishes}", flush=True)
         self._dynamo_endpoint_task = start_dynamo_endpoint(
             DynamoVllmAdapter(self, leader_worker_idx=leader_worker_idx),
-            model_path=model_path,
-            served_model_name=self.model_name,
+            model_name=self.model_name,
             namespace=namespace,
             engine_env=engine_env,
         )

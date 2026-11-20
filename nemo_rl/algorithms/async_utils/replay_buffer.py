@@ -150,6 +150,9 @@ class DataPlaneCheckpointMetadata(TypedDict):
     forest_execution_row_multiple: NotRequired[int | None]
     # opd_full only: checkpoint path per teacher_index.
     opd_full_teacher_checkpoints: NotRequired[list[str]]
+    # Resolved loss_fn normalization the buffered rows were prepared for.
+    # Absent from checkpoints written before the field existed.
+    loss_normalization: NotRequired[str]
 
 
 def validate_forest_checkpoint_metadata(
