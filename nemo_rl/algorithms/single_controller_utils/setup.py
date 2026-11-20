@@ -1595,9 +1595,10 @@ def setup_single_controller(
             import secrets
 
             token_capture_cfg.control_auth_token = secrets.token_hex(32)
-        if token_capture_cfg.capture_dir is None:
+        # Assigned on every path, so a value left in a reused config cannot mark a configured directory for removal.
+        token_capture_cfg.capture_dir_derived = token_capture_cfg.capture_dir is None
+        if token_capture_cfg.capture_dir_derived:
             token_capture_cfg.capture_dir = _default_token_capture_dir()
-            token_capture_cfg.capture_dir_derived = True
 
     # Resolved once here so the student workers and the teacher worker group
     # (which deep-copies this config) read the same settings. Absent means the

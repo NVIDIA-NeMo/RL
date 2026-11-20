@@ -2902,12 +2902,13 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             rh, self.rh = self.rh, None
             if rh is not None:
                 _shut_down_gym_servers(rh)
-            # getattr: tests build actors with __new__ and set only rh.
-            _remove_derived_capture_dir(getattr(self, "cfg", {}).get("token_capture"))
         finally:
             # Ray reaps this actor, so no atexit handler runs: whatever the span
             # processor is still holding is dropped unless it is flushed here.
             shutdown_telemetry()
+        # After the flush: removing a long run's ledgers can outlast the shutdown timeout.
+        # getattr: tests build actors with __new__ and set only rh.
+        _remove_derived_capture_dir(getattr(self, "cfg", {}).get("token_capture"))
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.

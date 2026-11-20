@@ -3815,6 +3815,18 @@ class TestSetup:
         # Only a derived directory is removed when the run ends.
         assert token_capture["capture_dir_derived"] is False
 
+    def test_token_capture_ignores_a_configured_derived_flag(self, patched_factories):
+        """A reused config dump must not mark a configured directory for removal."""
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        mc = self._make_megatron_token_capture_config()
+        mc.token_capture.capture_dir = "/scratch/my_capture"
+        mc.token_capture.capture_dir_derived = True
+
+        token_capture = self._run_token_capture_setup(mc)
+
+        assert token_capture["capture_dir"] == "/scratch/my_capture"
+        assert token_capture["capture_dir_derived"] is False
+
     def test_megatron_token_capture_requires_exposed_http_server(
         self, patched_factories
     ):
