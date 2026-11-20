@@ -47,6 +47,7 @@ from nemo_rl.models.megatron.hybridep import (
     pad_packed_seq_for_hybridep,
     uses_hybridep_flex_dispatcher,
 )
+from nemo_rl.models.megatron.mtp_grad_mask import MTP_ROW_IDS_KEY
 from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
@@ -65,6 +66,7 @@ class ProcessedInputs:
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
     mtp_loss_mask: Optional[torch.Tensor] = None
+    mtp_row_ids: Optional[torch.Tensor] = None
     padding_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
@@ -103,6 +105,9 @@ class ProcessedMicrobatch:
         cu_seqlens_padded: Padded cumulative sequence lengths (None if not packing)
         mtp_loss_mask: Pre-computed MTP loss mask (token_mask × sample_mask).
             None when MTP is disabled or token/sample masks are absent.
+        mtp_row_ids: Row index + 1 per position in the MTP loss mask's layout
+            (0 for padding), present only with in-loss sequence filtering so its
+            per-row decision can mask the MTP gradient.
         padding_mask: Packed-sequence padding mask for MoE routing.
         routed_experts: Optional token-aligned routed expert ids
         routed_experts_cp_sharded: Context-parallel sharded routed expert ids
@@ -121,6 +126,7 @@ class ProcessedMicrobatch:
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
     mtp_loss_mask: Optional[torch.Tensor] = None
+    mtp_row_ids: Optional[torch.Tensor] = None
     padding_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
@@ -299,6 +305,7 @@ def make_processed_microbatch_iterator(
             packed_seq_params=processed_inputs.packed_seq_params,
             cu_seqlens_padded=processed_inputs.cu_seqlens_padded,
             mtp_loss_mask=processed_inputs.mtp_loss_mask,
+            mtp_row_ids=processed_inputs.mtp_row_ids,
             padding_mask=processed_inputs.padding_mask,
             labels_cp_sharded=processed_inputs.labels_cp_sharded,
             loss_mask_cp_sharded=processed_inputs.loss_mask_cp_sharded,
@@ -818,12 +825,19 @@ def process_microbatch(
         cu_seqlens = None
         cu_seqlens_padded = None
         mtp_loss_mask = None
+        mtp_row_ids = None
+        has_mtp_row_ids = MTP_ROW_IDS_KEY in data_dict
         padding_mask = None
         labels_cp_sharded = None
         loss_mask_cp_sharded = None
         media_token_validity_mask = None
 
         if is_direct_packed_row(data_dict):
+            if has_mtp_row_ids:
+                raise NotImplementedError(
+                    "MTP gradient masking for in-loss filtering is not supported "
+                    "for direct packed rows"
+                )
             if delegate_pack_to_model:
                 raise NotImplementedError(
                     "Megatron direct packed rows do not support "
@@ -885,6 +899,11 @@ def process_microbatch(
             if prepacked:
                 if delegate_pack_to_model:
                     raise ValueError("Prepacked input cannot use model-owned packing.")
+                if has_mtp_row_ids:
+                    raise NotImplementedError(
+                        "MTP gradient masking for in-loss filtering is not "
+                        "supported for prepacked input"
+                    )
                 (
                     input_ids,
                     input_ids_cp_sharded,
@@ -928,6 +947,11 @@ def process_microbatch(
                     raise NotImplementedError(
                         "Router padding masks require real-token validity through "
                         "model-owned sequence packing, which is not supported."
+                    )
+                if has_mtp_row_ids:
+                    raise NotImplementedError(
+                        "MTP gradient masking for in-loss filtering is not "
+                        "supported for models that pack sequences internally"
                     )
                 has_mtp_loss_mask = "mtp_loss_mask" in data_dict
                 assert not has_mtp_loss_mask or delegate_mtp_loss_mask_to_model, (
@@ -1181,6 +1205,23 @@ def process_microbatch(
                         if model_slices_context_parallel_inputs
                         else local_mtp_loss_mask
                     )
+                if has_mtp_row_ids:
+                    packed_row_ids, local_row_ids, _, _, _ = (
+                        _pack_sequences_for_megatron(
+                            data_dict[MTP_ROW_IDS_KEY],
+                            seq_lengths,
+                            pad_individual_seqs_to_multiple_of,
+                            pad_packed_seq_to_multiple_of,
+                            pad_full_seq_to,
+                            cp_rank=get_context_parallel_rank(),
+                            cp_size=get_context_parallel_world_size(),
+                        )
+                    )
+                    mtp_row_ids = (
+                        packed_row_ids
+                        if model_slices_context_parallel_inputs
+                        else local_row_ids
+                    )
 
                 # Pack the media-token validity mask the same way as input_ids.
                 # The mask answers a per-token question, so it only means
@@ -1313,6 +1354,8 @@ def process_microbatch(
             )
             if "mtp_loss_mask" in data_dict:
                 mtp_loss_mask = data_dict["mtp_loss_mask"]
+            if has_mtp_row_ids:
+                mtp_row_ids = data_dict[MTP_ROW_IDS_KEY]
             # Unpacked: rows still are samples, so the mask is already in the
             # layout the model will see.
             if "media_token_validity_mask" in data_dict:
@@ -1327,6 +1370,7 @@ def process_microbatch(
         packed_seq_params=packed_seq_params,
         cu_seqlens_padded=cu_seqlens_padded,
         mtp_loss_mask=mtp_loss_mask,
+        mtp_row_ids=mtp_row_ids,
         padding_mask=padding_mask,
         labels_cp_sharded=labels_cp_sharded,
         loss_mask_cp_sharded=loss_mask_cp_sharded,

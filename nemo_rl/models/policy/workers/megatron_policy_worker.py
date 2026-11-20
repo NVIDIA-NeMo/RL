@@ -105,6 +105,11 @@ from nemo_rl.models.megatron.draft.step_state import (
 )
 from nemo_rl.models.megatron.hybridep import uses_hybridep_flex_dispatcher
 from nemo_rl.models.megatron.manual_gc import ManualGCMixin
+from nemo_rl.models.megatron.mtp_grad_mask import (
+    MTP_ROW_IDS_KEY,
+    mtp_row_ids_like,
+    require_mtp_grad_mask_support,
+)
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -1480,6 +1485,9 @@ class MegatronPolicyWorkerImpl(
                         "sample_mask"
                     ].unsqueeze(-1)
                     batch["mtp_loss_mask"] = mtp_loss_mask
+                    if _uses_in_loss_seq_filter(loss_fn):
+                        require_mtp_grad_mask_support()
+                        batch[MTP_ROW_IDS_KEY] = mtp_row_ids_like(batch["token_mask"])
 
                 attach_media_token_validity_mask(batch, self.media_placeholder_token_id)
 
@@ -2159,6 +2167,9 @@ class MegatronPolicyWorkerImpl(
             data["mtp_loss_mask"] = data["token_mask"] * data["sample_mask"].unsqueeze(
                 -1
             )
+            if _uses_in_loss_seq_filter(state["loss_fn"]):
+                require_mtp_grad_mask_support()
+                data[MTP_ROW_IDS_KEY] = mtp_row_ids_like(data["token_mask"])
 
         # The number of chunks per optimizer step is a first-class property of
         # this path — it decides how many times gradients are accumulated before

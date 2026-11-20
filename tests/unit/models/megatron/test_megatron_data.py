@@ -2987,3 +2987,61 @@ def test_get_pack_sequence_parameters_for_megatron(get_pack_sequence_parameters_
         # Check that all workers succeeded
         for i, result in enumerate(results):
             assert result["success"], f"Worker {i} failed: {result['error']}"
+
+
+class TestMtpRowIdsLayout:
+    """``mtp_row_ids`` must land in exactly the MTP loss mask's layout."""
+
+    @staticmethod
+    def _batch() -> BatchedDataDict:
+        from nemo_rl.models.megatron.mtp_grad_mask import mtp_row_ids_like
+
+        token_mask = torch.tensor([[0.0, 1.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.tensor([[11, 12, 13, 0], [21, 22, 0, 0]]),
+                "input_lengths": torch.tensor([3, 2]),
+                "token_mask": token_mask,
+                "sample_mask": torch.tensor([1.0, 1.0]),
+            }
+        )
+        data["mtp_loss_mask"] = token_mask * data["sample_mask"].unsqueeze(-1)
+        data["mtp_row_ids"] = mtp_row_ids_like(token_mask)
+        return data
+
+    @pytest.mark.parametrize("pack_sequences", [False, True])
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=1
+    )
+    def test_row_ids_follow_the_mtp_loss_mask(
+        self, mock_cp_world, mock_cp_rank, pack_sequences
+    ):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        result = process_microbatch(
+            self._batch(),
+            seq_length_key="input_lengths",
+            pack_sequences=pack_sequences,
+        )
+        assert result.mtp_row_ids.shape == result.mtp_loss_mask.shape
+        expected = (
+            [[1.0, 1.0, 1.0, 2.0, 2.0]]
+            if pack_sequences
+            else [[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0]]
+        )
+        assert result.mtp_row_ids.tolist() == expected
+        # Every position the MTP loss counts belongs to a row.
+        assert bool((result.mtp_row_ids[result.mtp_loss_mask > 0] > 0).all())
+
+    def test_model_owned_packing_rejects_row_ids(self):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        with pytest.raises(NotImplementedError, match="pack sequences internally"):
+            process_microbatch(
+                self._batch(),
+                seq_length_key="input_lengths",
+                pack_sequences=True,
+                delegate_pack_to_model=True,
+                delegate_mtp_loss_mask_to_model=True,
+            )

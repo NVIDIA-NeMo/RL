@@ -52,7 +52,7 @@ from nemo_rl.algorithms.loss import (
     wrap_loss_fn_with_input_preparation,
 )
 from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import SEQ_LOGPROB_KEEP_MASK_KEY, LossFunction
 from nemo_rl.algorithms.loss.loss_input import sampler_support_logprobs
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
@@ -69,6 +69,7 @@ from nemo_rl.models.megatron.data import ProcessedMicrobatch
 from nemo_rl.models.megatron.draft.hidden_capture import (
     get_capture_context,
 )
+from nemo_rl.models.megatron.mtp_grad_mask import MTPRowGradMask
 from nemo_rl.models.megatron.opd_full_capture import get_opd_full_capture_context
 from nemo_rl.models.megatron.router_replay import (
     clear_router_replay,
@@ -357,6 +358,11 @@ def forward_with_post_processing_fn(
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
     original_seq_length = processed_mb.original_seq_length
     media_token_validity_mask = processed_mb.media_token_validity_mask
+    mtp_grad_mask = (
+        MTPRowGradMask(processed_mb.mtp_row_ids)
+        if processed_mb.mtp_row_ids is not None
+        else None
+    )
 
     if use_router_replay:
         if routed_experts_cp_sharded is None:
@@ -377,6 +383,8 @@ def forward_with_post_processing_fn(
     opd_full_capture_context, opd_full_capture = get_opd_full_capture_context(
         model, bool(enable_opd_full_capture)
     )
+    if mtp_grad_mask is not None:
+        mtp_grad_mask.register()
     try:
         with capture_context, opd_full_capture_context:
             output_tensor = model_forward(
@@ -403,6 +411,10 @@ def forward_with_post_processing_fn(
         if use_router_replay:
             clear_router_replay(model)
         raise
+    finally:
+        # The holder is captured by this forward's MTP loss; later forwards get their own.
+        if mtp_grad_mask is not None:
+            mtp_grad_mask.unregister()
 
     if use_router_replay:
         if router_replay_train:
@@ -469,6 +481,7 @@ def forward_with_post_processing_fn(
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
             prepacked_loss_mask=loss_mask_cp_sharded,
+            mtp_grad_mask=mtp_grad_mask,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
         assert original_seq_length is not None
@@ -653,6 +666,7 @@ class LossPostProcessor:
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
         prepacked_loss_mask: Optional[torch.Tensor] = None,
+        mtp_grad_mask: Optional[MTPRowGradMask] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a loss post-processing function for training.
 
@@ -667,6 +681,8 @@ class LossPostProcessor:
             global_valid_toks: Global valid token count for loss normalization
             prepacked_loss_mask: CP-local target-aligned mask when MCore returned
                 per-token losses for a direct packed row
+            mtp_grad_mask: This microbatch's MTP gradient mask, filled from the
+                loss's per-row keep mask once the loss has run
 
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
@@ -862,6 +878,16 @@ class LossPostProcessor:
             return loss * num_microbatches / cp_size, metrics
 
         loss_fn_wrapped = _counteract_mcore_loss_averaging
+
+        if mtp_grad_mask is not None:
+            loss_fn_before_mtp_mask = loss_fn_wrapped
+
+            def _fill_mtp_grad_mask(*args, **kwargs):
+                loss, metrics = loss_fn_before_mtp_mask(*args, **kwargs)
+                mtp_grad_mask.fill(metrics.get(SEQ_LOGPROB_KEEP_MASK_KEY))
+                return loss, metrics
+
+            loss_fn_wrapped = _fill_mtp_grad_mask
 
         return loss_fn_wrapped
 
