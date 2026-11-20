@@ -786,8 +786,9 @@ def _manifest_from_coords(coords: dict, *, mode: str) -> CallRecord:
     )
 
 
+@pytest.mark.parametrize("route_dtype", [np.int8, np.int16, np.int32])
 def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
-    tq_client, r3_partitions
+    tq_client, r3_partitions, route_dtype
 ):
     """MInf ``[T - 1, L, K]`` routes survive stager -> TQ -> reassembler end to end.
 
@@ -795,7 +796,8 @@ def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
     runs _delta_align_minf_routing_indices) and asserts the published
     ``[B, S, L, K]`` tensor. Call 1's last token is sampled but never fed in,
     so only call 2's prefill routes it; call 2's leading boundary row fills
-    that slot, leaving ``-1`` only on the row's final token.
+    that slot, leaving ``-1`` only on the row's final token. The published
+    tensor keeps the staged carry dtype.
     """
     group_id = "grpr3minf"
     rollout_id = f"{group_id}_g0"
@@ -804,7 +806,7 @@ def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
         require_routed_experts=True,
     )
     # Call 1: text root, prompt [10, 11] + generated [12, 13] -> 4 tokens, 3 routed.
-    routes_c1 = np.arange(3 * 2 * 2, dtype=np.int16).reshape(3, 2, 2)
+    routes_c1 = np.arange(3 * 2 * 2, dtype=route_dtype).reshape(3, 2, 2)
     coords_c1 = _stage_minf_call(
         stager,
         nemo_gym.CaptureAdmission(
@@ -817,7 +819,7 @@ def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
     # Call 2: continuation over the 4-token prefix plus a new user turn
     # [20, 21] and generated [22] -> 7 tokens, 6 routed, staged rows 3..6
     # (row 3 is the boundary row for call 1's last token).
-    routes_c2 = (100 + np.arange(6 * 2 * 2, dtype=np.int16)).reshape(6, 2, 2)
+    routes_c2 = (100 + np.arange(6 * 2 * 2, dtype=route_dtype)).reshape(6, 2, 2)
     coords_c2 = _stage_minf_call(
         stager,
         nemo_gym.CaptureAdmission(
@@ -883,6 +885,7 @@ def test_finalize_group_publishes_minf_routes_staged_through_the_stager(
     ]
     sentinel = [[-1, -1], [-1, -1]]
     published = torch.as_tensor(rows["routed_experts"][0]).reshape(-1, 2, 2)
+    assert published.dtype == torch.from_numpy(routes_c1).dtype
     assert published[:seq_len].tolist() == [
         *routes_c1.tolist(),
         routes_c2[3].tolist(),
