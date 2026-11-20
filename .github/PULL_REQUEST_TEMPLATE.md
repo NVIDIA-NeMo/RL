@@ -16,7 +16,10 @@
 
 <details><summary>PR commands and CI</summary>
 
-- Attach exactly one `CI:*` label (usually `CI:Lfast`; `CI:L1` for dependency changes or broad core changes). See `skills/cicd`.
+- CI label, exactly one:
+  - `CI:Lfast`: the default for most PRs. Runs a fast test subset on the main container.
+  - `CI:L1`: dependency or container changes (`pyproject.toml`, `uv.lock`, `Dockerfile`) or broad core changes. Builds a new image and runs unit and functional tests.
+  - `CI:docs`: docs-only changes. Runs doc tests only.
 - `/ok to test <full-commit-sha>`: start CI for that commit. Post again after each push.
 - `/review` or `/review mode=strict`: automated review. Locally: `/review-pr-team <pr-number>`.
 - [Contributor guidelines](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md)
