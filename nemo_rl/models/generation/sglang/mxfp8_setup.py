@@ -45,6 +45,7 @@ from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
     strip_weight_suffix,
 )
 from nemo_rl.models.generation.sglang.quantization_utils import (
+    _optional_string_tuple,
     build_dynamic_skip_substrings,
     expand_sglang_atomic_high_precision_substrings,
     get_dynamic_high_precision_substrings,
@@ -131,8 +132,8 @@ def convert_mxfp8(
     device: str = "cuda",
     num_layers_at_start_in_bf16: int = 0,
     num_layers_at_end_in_bf16: int = 0,
-    extra_high_precision_layers_hf: tuple[str, ...] = (),
-    modules_to_not_convert: tuple[str, ...] = (),
+    extra_high_precision_layers_hf: tuple[str, ...] | list[str] = (),
+    modules_to_not_convert: tuple[str, ...] | list[str] = (),
 ) -> None:
     """Convert an HF safetensors checkpoint to MXFP8 with UE8M0 scales.
 
@@ -316,29 +317,6 @@ def _get_num_hidden_layers(cfg: dict[str, Any], *, config_path: str) -> int:
     return num_hidden_layers
 
 
-def _validated_conversion_options(
-    quantization_cfg: Mapping[str, Any],
-    *,
-    num_hidden_layers: int,
-) -> tuple[tuple[str, ...], tuple[str, ...], int, int]:
-    """Validate and normalize the shared offline/online selection options."""
-    get_dynamic_high_precision_substrings(
-        quantization_config=quantization_cfg,
-        num_hidden_layers=num_hidden_layers,
-    )
-
-    extra_value = quantization_cfg.get("extra_high_precision_layers_hf")
-    modules_value = quantization_cfg.get("modules_to_not_convert")
-    start_value = quantization_cfg.get("num_layers_at_start_in_bf16")
-    end_value = quantization_cfg.get("num_layers_at_end_in_bf16")
-    return (
-        () if extra_value is None else tuple(item.strip() for item in extra_value),
-        () if modules_value is None else tuple(item.strip() for item in modules_value),
-        0 if start_value is None else start_value,
-        0 if end_value is None else end_value,
-    )
-
-
 def _merge_checkpoint_modules_to_not_convert(
     *,
     checkpoint_path: str,
@@ -354,10 +332,7 @@ def _merge_checkpoint_modules_to_not_convert(
         checkpoint_cfg,
         config_path=os.path.join(checkpoint_path, "config.json"),
     )
-    _, user_modules, _, _ = _validated_conversion_options(
-        quantization_cfg,
-        num_hidden_layers=num_hidden_layers,
-    )
+    user_modules = _optional_string_tuple(quantization_cfg, "modules_to_not_convert")
     requested_high_precision = get_dynamic_high_precision_substrings(
         quantization_config=quantization_cfg,
         num_hidden_layers=num_hidden_layers,
@@ -395,36 +370,31 @@ def _merge_checkpoint_modules_to_not_convert(
     )
 
 
-def _quantization_fingerprint(quantization_cfg: Mapping[str, Any]) -> str:
-    relevant_keys = (
-        "extra_high_precision_layers_hf",
-        "modules_to_not_convert",
-        "num_layers_at_start_in_bf16",
-        "num_layers_at_end_in_bf16",
-        # Legacy fingerprint inputs. No longer settable via
-        # SglangQuantizationConfig; kept so existing cache dirs stay valid.
-        "weight_block_size",
-        "scale_fmt",
-    )
-    payload = {k: quantization_cfg.get(k) for k in relevant_keys}
-    return hashlib.sha1(
-        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()[:12]
-
-
-def _hash_qualified_save_dir(
-    *, model_dir: str, cache_root: str, quantization_cfg: Mapping[str, Any]
-) -> str:
-    abs_model = os.path.abspath(model_dir)
+def mxfp8_cache_path(*, model_dir: str, quantization_cfg: Mapping[str, Any]) -> str:
+    """Locate the offline conversion for a local source and its effective skip policy."""
+    abs_model = os.path.realpath(model_dir)
     src_cfg = _read_source_config(model_dir)
     src_fingerprint = hashlib.sha1(
         json.dumps(src_cfg, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()[:12]
-    quant_fingerprint = _quantization_fingerprint(quantization_cfg)
+    selection = get_dynamic_high_precision_substrings(
+        quantization_config=quantization_cfg,
+        num_hidden_layers=_get_num_hidden_layers(
+            src_cfg, config_path=os.path.join(model_dir, "config.json")
+        ),
+    )
+    quant_fingerprint = json.dumps(sorted(selection))
     payload = f"{abs_model}|{src_fingerprint}|{quant_fingerprint}|v{CONVERTER_VERSION}"
     digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
     base = os.path.basename(os.path.normpath(abs_model)) or "hf"
-    return os.path.join(os.path.abspath(cache_root), f"{base}-mxfp8-{digest}")
+    cache_root = (
+        quantization_cfg.get("cache_root")
+        or os.environ.get("NRL_MXFP8_CACHE")
+        or os.path.join(os.path.expanduser("~"), ".cache", "nemo_rl", "mxfp8")
+    )
+    return os.path.join(
+        os.path.abspath(os.path.expanduser(cache_root)), f"{base}-mxfp8-{digest}"
+    )
 
 
 def is_existing_mxfp8_checkpoint(path: str) -> bool:
@@ -490,14 +460,8 @@ def ensure_mxfp8_checkpoint(
             "directory visible to every rollout worker."
         )
 
-    cache_root = (
-        quantization_cfg.get("cache_root")
-        or os.environ.get("NRL_MXFP8_CACHE")
-        or os.path.join(os.path.expanduser("~"), ".cache", "nemo_rl", "mxfp8")
-    )
-    save_dir = _hash_qualified_save_dir(
+    save_dir = mxfp8_cache_path(
         model_dir=local_model_path,
-        cache_root=cache_root,
         quantization_cfg=quantization_cfg,
     )
 
@@ -511,7 +475,8 @@ def ensure_mxfp8_checkpoint(
     raise ValueError(
         "SGLang MXFP8 startup does not quantize in the Ray driver because its "
         "base environment has no backend-specific FlashInfer package and may "
-        "have no assigned GPU. Run convert_mxfp8 offline in a GPU environment, "
+        "have no assigned GPU. Run examples/converters/convert_hf_to_mxfp8.py "
+        "offline in a GPU environment, "
         "then set quantization.converted_model_path to the output directory. "
         f"The deterministic cache path for this source and policy is {save_dir!r}."
     )

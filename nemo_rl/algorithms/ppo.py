@@ -95,6 +95,9 @@ from nemo_rl.models.generation.interfaces import (
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.quantization_utils import (
+    prepare_sglang_quantized_generation,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
@@ -974,10 +977,6 @@ def setup(
 
     elif backend == "sglang":
         generation_config = cast(SGLangConfig, generation_config)
-        from nemo_rl.models.generation.sglang.quantization_utils import (
-            prepare_sglang_quantized_generation,
-        )
-
         prepare_sglang_quantized_generation(
             generation_config=generation_config,
             policy_config=policy_config,

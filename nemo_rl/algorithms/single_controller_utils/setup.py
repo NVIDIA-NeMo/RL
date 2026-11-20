@@ -144,6 +144,9 @@ from nemo_rl.models.generation.generation_router import (
 )
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.quantization_utils import (
+    prepare_sglang_quantized_generation,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.generation.vllm.config import VllmConfig
@@ -656,10 +659,6 @@ def _build_generation(
             "defer_model_load is only supported for the vllm backend"
         )
         sglang_config = cast(SGLangConfig, generation_config)
-        from nemo_rl.models.generation.sglang.quantization_utils import (
-            prepare_sglang_quantized_generation,
-        )
-
         prepare_sglang_quantized_generation(
             generation_config=sglang_config,
             policy_config=master_config.policy,

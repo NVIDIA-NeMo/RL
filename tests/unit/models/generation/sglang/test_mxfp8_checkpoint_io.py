@@ -15,12 +15,15 @@
 """Checkpoint integrity at the offline-conversion/online-refit boundary."""
 
 import json
+import sys
+from functools import partial
 from pathlib import Path
 
 import pytest
 import safetensors.torch
 import torch
 
+from examples.converters import convert_hf_to_mxfp8
 from nemo_rl.models.generation.sglang import mxfp8_setup
 from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
     is_bf16_source_checkpoint,
@@ -186,12 +189,37 @@ def test_offline_checkpoint_matches_online_quantization(
             json.dumps({"weight_map": {name: "model.safetensors" for name in weights}})
         )
 
-    mxfp8_setup.convert_mxfp8(
-        str(source),
-        str(output),
-        device=device,
-        num_layers_at_start_in_bf16=1,
+    recipe = tmp_path / "recipe.yaml"
+    recipe.write_text(
+        "policy:\n"
+        f"  model_name: {source}\n"
+        "  generation:\n"
+        "    backend: sglang\n"
+        "    sglang_cfg:\n"
+        "      model_path: ${policy.model_name}\n"
+        "      quantization:\n"
+        "        scheme: bf16\n"
+        "        num_layers_at_start_in_bf16: 1\n"
     )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "convert_hf_to_mxfp8",
+            "--config",
+            str(recipe),
+            "policy.generation.sglang_cfg.quantization.scheme=mxfp8",
+            f"+policy.generation.sglang_cfg.quantization.converted_model_path={output}",
+        ],
+    )
+    if not real_quantization:
+        # Exercise the CLI and real safetensors I/O on CPU with just the kernel mocked.
+        monkeypatch.setattr(
+            convert_hf_to_mxfp8,
+            "convert_mxfp8",
+            partial(mxfp8_setup.convert_mxfp8, device="cpu"),
+        )
+    convert_hf_to_mxfp8.main()
 
     actual = safetensors.torch.load_file(output / "model.safetensors", device=device)
     scale_key = selected.removesuffix(".weight") + ".weight_scale_inv"
