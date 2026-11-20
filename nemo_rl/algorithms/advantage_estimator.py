@@ -18,6 +18,7 @@ This module provides different advantage estimation strategies:
 - GRPOAdvantageEstimator: Standard GRPO advantage with leave-one-out baseline
 - GDPOAdvantageEstimator: Multi-reward GDPO (per-component baselines, optional per-reward weights, then normalize)
 - ReinforcePlusPlusAdvantageEstimator: Reinforce++ with optional baseline subtraction (minus_baseline) and KL penalty in reward
+- ReinforceBaselineAdvantageEstimator: Per-rollout group-mean baseline, then step-wide whitening weighted by eligible action tokens
 - RawRewardAdvantageEstimator: Raw reward as advantage with optional batch normalization (no baseline, no value model)
 - GeneralizedAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
 - OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
@@ -60,7 +61,9 @@ from nemo_rl.utils.tensor_ops import masked_mean, masked_var
 class AdvEstimatorConfig(BaseModel, extra="allow"):
     """Configuration for advantage estimator (GRPO, GDPO, OPD, or Reinforce++)."""
 
-    name: Literal["grpo", "gdpo", "opd", "reinforce_plus_plus"] = "grpo"
+    name: Literal[
+        "grpo", "gdpo", "opd", "reinforce_baseline", "reinforce_plus_plus"
+    ] = "grpo"
     # GRPO specific
     normalize_rewards: bool = True
     use_leave_one_out_baseline: bool = True
@@ -375,6 +378,89 @@ class ReinforcePlusPlusAdvantageEstimator(AdvantageEstimator):
         adv = (adv - adv_mean) * adv_rstd
 
         return adv
+
+
+class ReinforceBaselineAdvantageEstimator(AdvantageEstimator):
+    """REINFORCE with a group-mean baseline, then action-token-weighted whitening.
+
+    The baseline is computed once per rollout. Each rollout's scalar is then
+    whitened across the whole step, weighted by its eligible action-token count,
+    so a rollout split into several segments counts once in the baseline and by
+    its total tokens in the whitening statistics.
+    """
+
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        del estimator_config, loss_config
+
+    @property
+    def requires_global_batch(self) -> bool:
+        return True
+
+    @staticmethod
+    def whiten_rollout_advantages(
+        rollout_advantages: torch.Tensor, action_token_counts: torch.Tensor
+    ) -> torch.Tensor:
+        """Whiten rollout scalars as if expanded over all eligible tokens."""
+        if rollout_advantages.ndim != 1 or action_token_counts.shape != (
+            rollout_advantages.shape[0],
+        ):
+            raise ValueError(
+                "Rollout advantages and action-token counts must be aligned vectors"
+            )
+        if torch.any(action_token_counts < 0):
+            raise ValueError("Action-token counts must be non-negative")
+        advantages = rollout_advantages.float()
+        weights = action_token_counts.to(
+            device=advantages.device, dtype=advantages.dtype
+        )
+        num_actions = weights.sum()
+        if num_actions.item() == 0:
+            return torch.zeros_like(advantages)
+        mean = (advantages * weights).sum() / num_actions
+        variance = ((advantages - mean).pow(2) * weights).sum() / num_actions
+        return (advantages - mean) * variance.clamp(min=1e-8).rsqrt()
+
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        valid_mask=None,
+        *,
+        action_token_counts: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        """Compute whitened advantages for a complete step.
+
+        Args:
+            prompt_ids: Group keys of shape [batch_size] or [batch_size, k].
+            rewards: Tensor of shape [batch_size], one reward per rollout.
+            mask: Tensor of shape [batch_size, seq_len] used for the output shape
+                and, when ``action_token_counts`` is None, as the token weights.
+            valid_mask: Optional [batch_size] mask of rollouts whose reward
+                participates in the group-mean baseline. None means all.
+            action_token_counts: Optional [batch_size] eligible action tokens per
+                rollout, summed over all of its segments.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            Advantages tensor of shape [batch_size, seq_len].
+        """
+        del kwargs
+        baseline, _, _ = calculate_baseline_and_std_per_prompt(
+            prompt_ids,
+            rewards,
+            torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),
+            leave_one_out_baseline=False,
+        )
+        if action_token_counts is None:
+            action_token_counts = mask.to(dtype=torch.float32).sum(dim=1)
+        advantages = self.whiten_rollout_advantages(
+            rewards - baseline, action_token_counts
+        )
+        return advantages.unsqueeze(-1).expand(mask.shape) * mask
 
 
 class RawRewardAdvantageEstimator(AdvantageEstimator):
@@ -853,6 +939,8 @@ def create_advantage_estimator(
         return GDPOAdvantageEstimator(config, loss_config)
     if config.name == "reinforce_plus_plus":
         return ReinforcePlusPlusAdvantageEstimator(config, loss_config)
+    if config.name == "reinforce_baseline":
+        return ReinforceBaselineAdvantageEstimator(config, loss_config)
     if config.name == "opd":
         return OPDAdvantageEstimator(config, loss_config)
     raise ValueError(f"Invalid adv_estimator name: {config.name}")

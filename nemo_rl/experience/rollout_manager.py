@@ -77,7 +77,11 @@ from nemo_rl.experience.interfaces import (
     PromptGroupRecord,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
-from nemo_rl.experience.reward_penalties import RewardLogContext, compute_reward_checks
+from nemo_rl.experience.reward_penalties import (
+    EPISODE_END_METRIC_PREFIX,
+    RewardLogContext,
+    compute_reward_checks,
+)
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     PromptGroupStatus,
@@ -126,10 +130,84 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
 
+_OSWORLD_LEGACY_IDENTITY_FIELDS = (
+    "context_compaction_contract_version",
+    "context_compaction_rollout_id",
+    "context_compaction_group_id",
+    "context_compaction_task_id",
+    "context_compaction_rollout_index",
+    "context_compaction_attempt_index",
+)
+
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
+
+
+def _osworld_task_id(row: Mapping[str, Any]) -> Optional[str]:
+    """Return a consistent OSWorld task id, or ``None`` for another route."""
+    agent_ref = row.get("agent_ref")
+    agent_name = agent_ref.get("name") if isinstance(agent_ref, Mapping) else None
+    metadata = row.get("verifier_metadata")
+    nested_task = (
+        metadata.get("osworld_task") if isinstance(metadata, Mapping) else None
+    )
+    legacy_task_id = row.get("context_compaction_task_id")
+    is_osworld = (
+        isinstance(nested_task, Mapping)
+        or legacy_task_id is not None
+        or (isinstance(agent_name, str) and "osworld" in agent_name.lower())
+    )
+    if not is_osworld:
+        return None
+
+    candidates = [
+        legacy_task_id,
+        metadata.get("task_id") if isinstance(metadata, Mapping) else None,
+        nested_task.get("id") if isinstance(nested_task, Mapping) else None,
+        metadata.get("id") if isinstance(metadata, Mapping) else None,
+    ]
+    task_ids = {value for value in candidates if isinstance(value, str) and value}
+    if len(task_ids) != 1:
+        raise ValueError(
+            "OSWorld trajectory identity requires one consistent non-empty task id"
+        )
+    return task_ids.pop()
+
+
+def _stamp_osworld_trajectory_identity(row: dict[str, Any]) -> None:
+    """Give an OSWorld capture row the caller-owned identity Gym records.
+
+    Partial legacy context-compaction coordinates in dataset rows are removed so
+    Gym does not read dataset provenance as its legacy identity contract.
+    """
+    task_id = _osworld_task_id(row)
+    if task_id is None:
+        return
+    if row.get("trajectory_identity") is not None:
+        raise ValueError(
+            "OSWorld trajectory_identity is runtime-owned and must not be present in dataset rows"
+        )
+    for field_name in _OSWORLD_LEGACY_IDENTITY_FIELDS:
+        row.pop(field_name, None)
+    row["trajectory_identity"] = {
+        "schema_version": 1,
+        "rollout_id": row["_ng_rollout_id"],
+        "group_id": row[NEMO_GYM_GROUP_ID_KEY],
+        "task_id": task_id,
+        "rollout_index": row[NEMO_GYM_ROLLOUT_INDEX_KEY],
+        "attempt_index": row[NEMO_GYM_GROUP_ATTEMPT_KEY],
+    }
+
+
+def _refresh_osworld_trajectory_identity(row: dict[str, Any]) -> None:
+    """Keep a stamped identity on the row's current rollout id and attempt."""
+    identity = row.get("trajectory_identity")
+    if identity is None:
+        return
+    identity["rollout_id"] = row["_ng_rollout_id"]
+    identity["attempt_index"] = row[NEMO_GYM_GROUP_ATTEMPT_KEY]
 
 
 def _contains_post_write_enrichment_error(error: BaseException) -> bool:
@@ -1317,6 +1395,7 @@ class AsyncNemoGymRolloutImpl:
                 # derives the id from the run body and stamps /ng-rollout/<id>
                 # on every model call, so the TQ sample id IS the capture key.
                 row["_ng_rollout_id"] = rollout_ids[i]
+                _stamp_osworld_trajectory_identity(row)
             rows.append(row)
         return rows
 
@@ -1525,17 +1604,21 @@ class AsyncNemoGymRolloutImpl:
                                 self._tokenizer,
                             ),
                         )
+                    logged_result = {
+                        key: value
+                        for key, value in result["full_result"].items()
+                        if key != "reward"
+                        and (
+                            self._log_full_result_tables
+                            or key.startswith(EPISODE_END_METRIC_PREFIX)
+                        )
+                    }
                     result["reward_log_context"] = RewardLogContext(
                         agent_name=_nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
                         full_result_json=json.dumps(
-                            {
-                                key: value
-                                for key, value in result["full_result"].items()
-                                if key != "reward"
-                            },
-                            separators=(",", ":"),
+                            logged_result, separators=(",", ":")
                         )
-                        if self._log_full_result_tables
+                        if logged_result
                         else None,
                     )
                 else:
@@ -1618,6 +1701,8 @@ class AsyncNemoGymRolloutImpl:
             # which keep their rollout IDs, move to the new attempt too.
             for row in pending:
                 row[NEMO_GYM_GROUP_ATTEMPT_KEY] = replaced.group_attempt
+        for row in pending:
+            _refresh_osworld_trajectory_identity(row)
 
     async def _run_rollouts(
         self,

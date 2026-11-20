@@ -579,6 +579,10 @@ def finalize_capture_reward(
 
 CAPTURE_PENALTY_METRICS = {spec.name: spec.metric for spec in CAPTURE_PENALTIES}
 
+# Gym one-hot fields describing how an episode ended (e.g. OSWorld's
+# ``episode_end_forced_fail``); logged per step as rates over valid rows.
+EPISODE_END_METRIC_PREFIX = "episode_end_"
+
 
 def aggregate_capture_reward_metrics(
     metrics: dict[str, list[float]],
@@ -618,6 +622,20 @@ def aggregate_capture_reward_metrics(
         result.update(
             calculate_single_metric(values, len(values), f"{agent_name}/reward")
         )
+    episode_ends: dict[str, list[float]] = {}
+    for row in observations:
+        if row.log_context is None or row.log_context.full_result_json is None:
+            continue
+        for key, value in json.loads(row.log_context.full_result_json).items():
+            if key.startswith(EPISODE_END_METRIC_PREFIX) and type(value) in (
+                int,
+                float,
+            ):
+                episode_ends.setdefault(
+                    f"{row.log_context.agent_name}/{key}", []
+                ).append(float(value))
+    for name, values in episode_ends.items():
+        result[name] = statistics.fmean(values)
     # finalize/truncated_count: pooled the same way into the termination rates.
     if "finalize/truncated_count" in metrics:
         truncated = sum(metrics["finalize/truncated_count"])

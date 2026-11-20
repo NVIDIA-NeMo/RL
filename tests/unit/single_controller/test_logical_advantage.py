@@ -26,6 +26,7 @@ from tensordict import TensorDict
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
     GRPOAdvantageEstimator,
+    ReinforceBaselineAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig
@@ -150,8 +151,13 @@ def _controller(
     ctrl._dp_client = _DataPlane(meta, data)
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._advantage_cfg = AdvantageConfig()
-    ctrl._advantage_estimator = GRPOAdvantageEstimator(
-        config.adv_estimator, ClippedPGLossConfig()
+    estimator_type = (
+        ReinforceBaselineAdvantageEstimator
+        if config.adv_estimator.name == "reinforce_baseline"
+        else GRPOAdvantageEstimator
+    )
+    ctrl._advantage_estimator = estimator_type(
+        config.adv_estimator, ClippedPGLossConfig(**(loss or {}))
     )
     ctrl._algo_cfg = config
     ctrl._master_config = SimpleNamespace(loss_fn=ClippedPGLossConfig(**(loss or {})))
@@ -864,3 +870,146 @@ def test_unsupported_forest_estimator_or_objective_is_rejected(grpo, loss):
     with pytest.raises(ValueError, match="Forest"):
         asyncio.run(ctrl._advantage_stage(meta))
     assert not ctrl._dp_client.puts
+
+
+def _molt_settings():
+    return (
+        {
+            "masked_reward_policy": "include",
+            "adv_estimator": {"name": "reinforce_baseline"},
+        },
+        {
+            "use_importance_sampling_correction": True,
+            "truncated_importance_sampling_type": "seq-mask-tis",
+            "truncated_importance_sampling_ratio_min": 0.99,
+            "truncated_importance_sampling_ratio": 1.01,
+            "force_on_policy_ratio": True,
+        },
+    )
+
+
+def test_molt_objective_is_a_supported_forest_objective():
+    grpo, loss = _molt_settings()
+    validate_forest_objective(GRPOConfig(**grpo), ClippedPGLossConfig(**loss))
+
+
+@pytest.mark.parametrize(
+    "grpo_update,loss_update,setting",
+    [
+        (
+            {"masked_reward_policy": "exclude"},
+            {},
+            "grpo.masked_reward_policy",
+        ),
+        (
+            {},
+            {"truncated_importance_sampling_type": None},
+            "loss_fn.truncated_importance_sampling_type",
+        ),
+        (
+            {},
+            {"use_importance_sampling_correction": False},
+            "loss_fn.use_importance_sampling_correction",
+        ),
+        (
+            {},
+            {"truncated_importance_sampling_ratio_min": 1.02},
+            "loss_fn.truncated_importance_sampling_ratio_min/ratio",
+        ),
+        ({}, {"force_on_policy_ratio": False}, "loss_fn.force_on_policy_ratio"),
+        ({}, {"disable_ppo_ratio": True}, "loss_fn.disable_ppo_ratio"),
+    ],
+)
+def test_molt_objective_rejects_unsupported_settings(grpo_update, loss_update, setting):
+    grpo, loss = _molt_settings()
+    with pytest.raises(ValueError, match=setting):
+        validate_forest_objective(
+            GRPOConfig(**(grpo | grpo_update)),
+            ClippedPGLossConfig(**(loss | loss_update)),
+        )
+
+
+def test_molt_whitening_uses_total_owner_tokens_across_unequal_segments():
+    meta, data = _batch([("a", [(1.0, 2), (3.0, 1)])])
+    data["token_mask"] = torch.tensor(
+        [[0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]
+    )
+    grpo, loss = _molt_settings()
+    ctrl = _controller(meta, data, grpo=grpo, loss=loss)
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    expected = torch.tensor([-0.8164966, -0.8164966, 1.2247449])
+    torch.testing.assert_close(data["advantages"][:, 1], expected)
+    eligible = data["token_mask"].bool()
+    torch.testing.assert_close(
+        data["advantages"][eligible].mean(), torch.tensor(0.0), atol=1e-6, rtol=1e-6
+    )
+    torch.testing.assert_close(
+        data["advantages"][eligible].pow(2).mean(),
+        torch.tensor(1.0),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_molt_owner_scalar_is_invariant_to_physical_segment_splitting():
+    split_meta, split_data = _batch([("a", [(1.0, 2), (3.0, 1)])])
+    split_data["token_mask"] = torch.tensor(
+        [[0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]
+    )
+    unsplit_meta, unsplit_data = _batch([("a", [(1.0, 1), (3.0, 1)])])
+    unsplit_data["token_mask"] = torch.tensor(
+        [[0.0, 1.0, 1.0, 1.0], [0.0, 1.0, 1.0, 0.0]]
+    )
+    grpo, loss = _molt_settings()
+
+    asyncio.run(
+        _controller(split_meta, split_data, grpo=grpo, loss=loss)._advantage_stage(
+            split_meta
+        )
+    )
+    asyncio.run(
+        _controller(unsplit_meta, unsplit_data, grpo=grpo, loss=loss)._advantage_stage(
+            unsplit_meta
+        )
+    )
+
+    torch.testing.assert_close(
+        split_data["advantages"][[0, 2], 1],
+        unsplit_data["advantages"][:, 1],
+    )
+
+
+def test_molt_reward_scaling_clips_before_owner_baseline():
+    meta, data = _batch([("a", [(-2.0, 2), (3.0, 1)])])
+    grpo, loss = _molt_settings()
+    grpo["reward_scaling"] = {"enabled": True}
+    ctrl = _controller(meta, data, grpo=grpo, loss=loss)
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    # Clipped rewards [0, 1] give owner scalars [-0.5, 0.5], whitened with
+    # owner token weights [4, 2].
+    torch.testing.assert_close(
+        data["advantages"][:, 1],
+        torch.tensor([-(0.5**0.5), -(0.5**0.5), 2.0**0.5]),
+    )
+
+
+def test_molt_failed_owner_placeholder_does_not_vote_in_baseline():
+    meta, data = _batch([("a", [(0.0, 2), (2.0, 1), (10.0, 1)])])
+    data["sample_mask"][-1] = 0
+    data["token_mask"][-1] = 0
+    grpo, loss = _molt_settings()
+    ctrl = _controller(meta, data, grpo=grpo, loss=loss)
+
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert valid
+    # The baseline is mean(0, 2); the placeholder carries no token weight.
+    torch.testing.assert_close(
+        data["advantages"][:, 1],
+        torch.tensor([-(0.5**0.5), -(0.5**0.5), 2.0**0.5, 0.0]),
+    )
+    assert data["sample_mask"][-1].item() == 0

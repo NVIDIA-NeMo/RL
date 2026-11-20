@@ -36,6 +36,10 @@ type SelectionPolicy = Callable[
 ]
 
 
+class NoAcceptedCapturedGenerationsError(ValueError):
+    """The returned trajectory accepted none of the captured calls."""
+
+
 def _output_items(
     result: dict[str, Any], *, captured_response_ids: set[str]
 ) -> tuple[list[dict[str, Any]], dict[int, str | None]]:
@@ -262,7 +266,7 @@ def select_captured_calls(
     else:
         selected = referenced
     if not selected:
-        raise ValueError("No accepted captured generations")
+        raise NoAcceptedCapturedGenerationsError("No accepted captured generations")
     if len({record.model_call_id for record in selected}) != len(selected):
         raise ValueError("Accepted generations are duplicated")
     if terminal is not None and terminal not in selected:

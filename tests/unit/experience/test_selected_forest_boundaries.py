@@ -540,6 +540,34 @@ def test_unsuccessful_selected_completion_masks_the_owner(
     assert_loss_once(forest, [], records)
 
 
+def test_rollout_without_accepted_generations_masks_only_its_owner(forest):
+    records, _ = forest.capture([None])
+    env = _env(forest.harness)
+    env._selection_policy = "returned_history"
+    output = {"response": {"id": "harness-local", "output": []}, "reward": 0.0}
+
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, output)
+    )
+
+    assert processed["receipt"]["capture_poisoned"] is True
+    assert processed["receipt"]["failure_reason"] == "capture_no_accepted_generations"
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [processed["receipt"]],
+        [0.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[processed["logical_selection"]],
+        execution_row_multiple=4,
+    )
+    assert result.valid_row_count == 0
+    assert_loss_once(forest, [], records)
+
+
 @pytest.mark.parametrize(
     "field,value,error",
     [

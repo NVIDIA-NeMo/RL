@@ -727,3 +727,32 @@ def test_checkpoint_inventory_retains_length_penalty_settings():
     }
     restored = CaptureRewardSettings.from_state(saved.to_state())
     restored.require_compatible(saved)
+
+
+def test_episode_end_fields_are_logged_as_rates_over_reporting_rows():
+    def context(agent, kind):
+        fields = {
+            f"episode_end_{k}": float(k == kind)
+            for k in ("done", "agent_fail", "forced_fail", "unterminated")
+        }
+        return RewardLogContext(agent, json.dumps({**fields, "answer": "ignored"}))
+
+    observations = [
+        FinalizedReward(f"sample-{i}", f"attempt-{i}", 0.0, log_context)
+        for i, log_context in enumerate(
+            [
+                context("osworld", "done"),
+                context("osworld", "done"),
+                context("osworld", "forced_fail"),
+                context("osworld", "unterminated"),
+                RewardLogContext("osworld", None),
+                None,
+            ]
+        )
+    ]
+    metrics = aggregate_capture_reward_metrics({}, observations)
+    assert metrics["osworld/episode_end_done"] == 0.5
+    assert metrics["osworld/episode_end_forced_fail"] == 0.25
+    assert metrics["osworld/episode_end_unterminated"] == 0.25
+    assert metrics["osworld/episode_end_agent_fail"] == 0.0
+    assert not any(key.endswith("answer") for key in metrics)
