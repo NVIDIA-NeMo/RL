@@ -23,6 +23,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
     ClippedSurrogateLossConfig,
+    GSPOLossConfig,
     PolicyGradientLossConfig,
     ReinforceLossConfig,
     as_clipped_pg_config,
@@ -116,6 +117,17 @@ VARIANTS = {
         },
         {"disable_ppo_ratio", "sequence_level_importance_ratios", "ratio_clip_c"},
     ),
+    "gspo": (
+        GSPOLossConfig,
+        {"sequence_level_importance_ratios": True, "token_level_loss": False},
+        {
+            **IS_CORRECTION,
+            "ratio_clip_max": 0.28,
+            "ratio_clip_c": 3.0,
+            "truncated_importance_sampling_type": "tis",
+        },
+        {"use_cispo", "disable_ppo_ratio", *ADAPTIVE_PPO_CLIP_SETTINGS},
+    ),
     "reinforce": (
         ReinforceLossConfig,
         {"disable_ppo_ratio": True},
@@ -183,6 +195,10 @@ def test_variant_rejects_settings_of_other_objectives(kind, setting):
         ("reinforce", "disable_ppo_ratio", True),
         ("reinforce", "force_on_policy_ratio", False),
         ("reinforce", "seq_logprob_error_in_loss", False),
+        ("gspo", "sequence_level_importance_ratios", True),
+        ("gspo", "token_level_loss", False),
+        ("gspo", "seq_logprob_error_in_loss", False),
+        ("gspo", "score_centering", False),
     ],
 )
 def test_variant_pins_the_switches_its_objective_fixes(kind, setting, fixed):
@@ -197,6 +213,8 @@ def test_variant_pins_the_switches_its_objective_fixes(kind, setting, fixed):
     [
         *((kind, "unknown") for kind in VARIANTS),
         ("reinforce", "adaptive-ppo-clip"),
+        ("gspo", "adaptive-ppo-clip"),
+        ("gspo", "seq-mask-tis"),
     ],
 )
 def test_variant_rejects_a_truncation_type_it_does_not_support(kind, truncation):
@@ -265,6 +283,7 @@ def test_block_inheriting_kind_ppo_with_a_legacy_setting_loads_as_before(
         ({"kind": "legacy_pg", "ratio_clip_max": 0.3}, ClippedPGLossConfig),
         ({"kind": "ppo"}, ClippedSurrogateLossConfig),
         ({"kind": "cispo"}, CISPOLossConfig),
+        ({"kind": "gspo"}, GSPOLossConfig),
         ({"kind": "reinforce"}, ReinforceLossConfig),
     ],
 )
