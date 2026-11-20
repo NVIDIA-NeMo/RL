@@ -40,7 +40,8 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_reload_refit.sh
 run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controller_streaming.sh
-run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh \
+    ++async_rl.trainer_warmup.enabled=true
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

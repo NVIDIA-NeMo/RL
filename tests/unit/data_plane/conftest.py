@@ -29,8 +29,10 @@ smoke / smoke-backend / smoke-1d / obj-backend / mix-e2e today).
 
 from __future__ import annotations
 
+import atexit
 import functools
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -49,6 +51,10 @@ def _make_tq_cfg(backend: str) -> dict:
         "mooncake_cpu": {
             "global_segment_size": 8589934592,  # 8 GiB — sized for CI host RAM
             "local_buffer_size": 1073741824,  # 1 GiB
+            # Off here: this process also holds the simple session client, and
+            # TQ builds one store per process, so the (default-on) offload could
+            # never swap it in. test_mooncake_ssd_offload_e2e covers offload.
+            "ssd_offload": {"enabled": False},
             # reuse_registered_buffers omitted on purpose: absent must mean on,
             # so the fixture exercises the default the same way a user config
             # that never mentions the flag does.
@@ -58,6 +64,68 @@ def _make_tq_cfg(backend: str) -> dict:
 
 # Ray is started by the parent autouse ``init_ray_cluster`` fixture in
 # ``tests/unit/conftest.py`` — no explicit init needed here.
+
+
+@pytest.fixture
+def fake_store(monkeypatch, tmp_path):
+    """A fake Mooncake store class, fresh SSD-offload state, and a clean env.
+
+    ``mooncake_ssd_offload.install`` swaps ``mooncake_client.MooncakeDistributedStore``
+    for a subclass; TQ then builds that class by name and calls its ``setup``.
+    This stands a recording fake in for Mooncake so tests can run that path
+    without the library, and resets the module's per-process state.
+    """
+    import ray
+    from transfer_queue.storage.clients import mooncake_client
+
+    from nemo_rl.data_plane.adapters import mooncake_ssd_offload as offload
+
+    calls = []
+
+    class FakeStore:
+        def setup(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return 0
+
+        def batch_is_exist(self, keys):
+            return [1] * len(keys)  # the sweep thread finds nothing cleared
+
+    class FakeClient:
+        """A fresh TQ store-client class with the retries install() patches."""
+
+        replica_config = None
+
+        def _batch_upsert_with_retry(self, keys, ptrs, sizes):
+            pass
+
+        _batch_get_into_with_retry = _batch_upsert_with_retry
+
+    monkeypatch.setattr(mooncake_client, "MooncakeDistributedStore", FakeStore)
+    monkeypatch.setattr(mooncake_client, "MooncakeStoreClient", FakeClient)
+    monkeypatch.setattr(
+        ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(get_job_id=lambda: "05000000"),
+    )
+    for var in offload.REQUIRED_ENV:
+        # setenv first so monkeypatch restores the var even if it was unset.
+        monkeypatch.setenv(var, "")
+        monkeypatch.delenv(var)
+    monkeypatch.setattr(offload, "_dir", None)
+    monkeypatch.setattr(offload, "_lock_fd", None)
+    monkeypatch.setattr(offload, "_offloading_store_set_up", False)
+    monkeypatch.setattr(offload, "_sweep_stop", None)
+    exit_hooks = []
+    monkeypatch.setattr(atexit, "register", exit_hooks.append)
+    yield SimpleNamespace(
+        module=mooncake_client,
+        cls=FakeStore,
+        client_cls=FakeClient,
+        calls=calls,
+        exit_hooks=exit_hooks,
+    )
+    if offload._sweep_stop is not None:
+        offload._sweep_stop.set()  # a fake store has nothing to sweep
 
 
 @pytest.fixture(scope="session")
