@@ -36,6 +36,7 @@ import torch
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.models.generation.disagg_layout import engine_key
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -127,13 +128,13 @@ class TrtllmAsyncGenerationWorkerImpl:
         engine_roles = self.cfg["trtllm_cfg"].get("_engine_roles")
         if not engine_roles or self._bundle_indices is None:
             return {}
-        key = f"{self._bundle_pg_idx}:" + ",".join(str(i) for i in self._bundle_indices)
+        key = engine_key(self._bundle_pg_idx, self._bundle_indices)
         entry = engine_roles.get(key)
         if entry is None:
             raise RuntimeError(
                 f"No engine role entry for {key!r}. Known keys: "
-                f"{sorted(engine_roles)}. TrtllmGeneration._engine_key() and this "
-                f"lookup must stay in sync."
+                f"{sorted(engine_roles)}. TrtllmGeneration did not create this "
+                f"worker from the bundles it recorded."
             )
         return entry
 

@@ -4043,6 +4043,36 @@ class TestValidateAndSetConfig:
                 assert runtime_config.offload_optimizer_for_refit is True
                 assert os.environ.get("NCCL_CUMEM_ENABLE") == expected_cumem
 
+    @pytest.mark.parametrize(
+        ("trainer_env", "expected_plugin"),
+        [(None, "none"), ({"NCCL_NET_PLUGIN": "ucx"}, None)],
+    )
+    @patch.dict(os.environ, {}, clear=True)
+    def test_refit_environment_follows_disaggregated_vllm_engines(
+        self, trainer_env, expected_plugin
+    ):
+        """The trainer joins the engines' refit communicator on the same NCCL transport.
+
+        Disaggregated NIXL engines run with NCCL_NET_PLUGIN=none; the trainer
+        adopts it unless megatron_cfg.env_vars (applied to the worker's
+        environment by the policy, not here) chooses one.
+        """
+        from nemo_rl.models.megatron.setup import configure_refit_environment
+
+        config = {
+            "generation": {
+                "backend": "vllm",
+                "colocated": {"enabled": False},
+                "disaggregation": {"enabled": True},
+                "vllm_cfg": {"tensor_parallel_size": 2},
+            },
+            "megatron_cfg": {"env_vars": trainer_env},
+        }
+
+        configure_refit_environment(config)
+
+        assert os.environ.get("NCCL_NET_PLUGIN") == expected_plugin
+
 
 @pytest.mark.mcore
 class TestModelAndOptimizerStateNamedTuple:

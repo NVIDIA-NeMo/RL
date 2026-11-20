@@ -1781,6 +1781,22 @@ def test_ppo_rejects_in_loss_filter_before_cluster_creation(
     cluster_cls.assert_not_called()
 
 
+def test_ppo_rejects_disaggregation_without_nemo_gym_before_cluster_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A disaggregated replica is reachable only through its HTTP frontends."""
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.policy["generation"]["disaggregation"] = {"enabled": True}
+
+    with pytest.raises(ValueError, match="disaggregation.enabled requires NeMo-Gym"):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
 def test_ppo_rejects_sampler_support_replay_before_cluster_creation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

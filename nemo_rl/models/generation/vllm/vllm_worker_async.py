@@ -65,6 +65,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.openai_server_utils import (
     PrefixSplice,
+    tokenize_shadow_rate,
 )
 from nemo_rl.models.generation.prefix_recovery import (
     CaptureRegistry,
@@ -105,6 +106,18 @@ from nemo_rl.telemetry.setup import shutdown_telemetry
 from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
 
 LOGGER = logging.getLogger(__name__)
+
+# How long reset_prefix_cache_async(release_kv_transfer_pins=True) waits for the
+# scheduler to free the pins the workers expired before giving up.
+_KV_PIN_RELEASE_TIMEOUT_S = 30.0
+_KV_PIN_RELEASE_POLL_S = 0.05
+
+# PD disaggregation: sampling rate for shadow-validating frontend-supplied
+# prompt ids on the prefill leg (chat_server.py). The engine recomputes the ids
+# from the messages it also received and logs a mismatch
+# (NRL_TOKENIZE_SHADOW_RATE, one variable for every backend; see
+# openai_server_utils).
+_TOKENIZE_SHADOW_RATE = tokenize_shadow_rate()
 
 
 # The captured model call the current HTTP request serves. Set when capture
@@ -327,6 +340,31 @@ class _AsyncLLMHTTPClient:
     async def is_tracing_enabled(self) -> bool:
         return await self._engine_client.is_tracing_enabled()
 
+    async def notify_kv_transfer_request_rejected(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        *,
+        data_parallel_rank: Optional[int] = None,
+    ) -> None:
+        """Free the KV-transfer resources of a request that will never run.
+
+        vLLM >= 0.29 wraps every response in
+        ``_with_kv_transfer_rejection_cleanup``: when a request carrying
+        ``kv_transfer_params`` fails or is cancelled before the engine ran it
+        (a client disconnect, a shutdown), the serving layer calls this so the
+        KV connector's ``request_finished`` hook releases what the handshake
+        already pinned, e.g. the prefill engine's blocks a decode engine would
+        have pulled. Without it the blocks stay leased until the lease expires
+        and every such request logs a traceback. Engine-loop bound: AsyncLLM
+        implements it by adding a pre-aborted request to the engine core.
+        """
+        await self._run_on_engine_loop(
+            lambda: self._engine_client.notify_kv_transfer_request_rejected(
+                request_id, kv_transfer_params, data_parallel_rank=data_parallel_rank
+            )
+        )
+
     async def captured_call_progress(self) -> list[list[Any]]:
         """Return ``[model_call_id, generated_tokens]`` for each running captured call.
 
@@ -366,6 +404,7 @@ class VllmAsyncGenerationWorkerImpl(
         seed=None,
         extra_env_vars: Optional[list[str]] = None,
         defer_model_load: bool = False,
+        bundle_pg_idx: Optional[int] = None,
     ):
         """Initialize an async vLLM worker.
 
@@ -382,7 +421,13 @@ class VllmAsyncGenerationWorkerImpl(
             extra_env_vars: Additional environment variable names to forward into
                           the vLLM worker subprocess.
             defer_model_load: If True, skip model loading and only reserve port
+            bundle_pg_idx: Placement-group index of the bundles; with them it
+                identifies the engine for PD disaggregation (see
+                BaseVllmGenerationWorker).
         """
+        # PD disaggregation: shadow-validate frontend-supplied prompt ids at
+        # this rate on the prefill leg.
+        self._tokenize_shadow_rate = _TOKENIZE_SHADOW_RATE
         # Deferred-loading state. Always initialized so every instance has a
         # consistent set of attributes regardless of init path.
         self._reserved_socket = None
@@ -409,6 +454,7 @@ class VllmAsyncGenerationWorkerImpl(
             seed,
             extra_env_vars,
             defer_model_load,
+            bundle_pg_idx=bundle_pg_idx,
         )
 
         if not self.is_model_owner or not defer_model_load:
@@ -863,6 +909,50 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
+
+    def _addr_of(self, base_url: str) -> dict[str, Any]:
+        hostport = base_url.rsplit("/v1", 1)[0].rsplit("//", 1)[1]
+        host, port = hostport.rsplit(":", 1)
+        return {
+            "host": host,
+            "port": int(port),
+            "node_id": ray.get_runtime_context().get_node_id(),
+        }
+
+    async def report_http_addr(self) -> Optional[dict[str, Any]]:
+        """This engine's ``{host, port, node_id}`` once its HTTP server runs.
+
+        Under PD disaggregation an address is all the replica's frontend is
+        given about an engine; the node id is what lets the driver put that
+        frontend's actor beside its engines.
+        """
+        if self.base_url is None:
+            return None
+        return self._addr_of(self.base_url)
+
+    async def report_reserved_addr(self) -> Optional[dict[str, Any]]:
+        """Like :meth:`report_http_addr`, from the port reserved before model load.
+
+        The deferred-load path hands the frontends their engine addresses, and
+        Gym the frontend URLs, while the models are still loading.
+        """
+        url = await self.get_reserved_url()
+        if url is None:
+            return None
+        return self._addr_of(url)
+
+    async def report_kv_cache_hashing(self) -> dict[str, Any]:
+        """The block size and hash algorithm this engine hashes prefixes with.
+
+        The kv_cache_aware frontend router hashes prompts the same way to match
+        them against the engines' KV events.
+        """
+        assert self.llm is not None, "report_kv_cache_hashing needs a running engine"
+        cache_config = self.llm.vllm_config.cache_config
+        return {
+            "block_size": int(cache_config.block_size),
+            "hash_algo": str(cache_config.prefix_caching_hash_algo),
+        }
 
     def install_token_capture(self, capture: Any) -> None:
         """Gym's ``install_capture`` seam (the ``CaptureHost`` contract)."""
@@ -2200,8 +2290,19 @@ class VllmAsyncGenerationWorkerImpl(
             traceback.print_exc()
             return False
 
-    async def reset_prefix_cache_async(self):
-        """Async version of reset_prefix_cache."""
+    async def reset_prefix_cache_async(
+        self, *, release_kv_transfer_pins: bool = False
+    ) -> bool:
+        """Async version of reset_prefix_cache; returns vLLM's verdict.
+
+        vLLM refuses the reset while any KV block is allocated. With
+        ``release_kv_transfer_pins`` (disaggregation, between steps) every
+        worker first expires the blocks its KV connector pins for a remote
+        reader (``VllmInternalWorkerExtension.release_kv_transfer_pins``) and
+        the reset is retried until the scheduler has freed them. A reset that
+        still fails raises: the next step would otherwise reuse KV computed
+        under the previous weights.
+        """
         assert self.llm is not None, (
             "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
         )
@@ -2211,9 +2312,24 @@ class VllmAsyncGenerationWorkerImpl(
                 "reset_prefix_cache_async can only be used with async_engine=True. Use reset_prefix_cache instead."
             )
 
-        await self.llm.reset_prefix_cache()
+        if release_kv_transfer_pins:
+            released = await resolve_collective_rpc_result(
+                self.llm.collective_rpc("release_kv_transfer_pins", args=())
+            )
+            deadline = time.monotonic() + _KV_PIN_RELEASE_TIMEOUT_S
+            while not (reset := await self.llm.reset_prefix_cache()):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"vLLM still holds KV blocks {_KV_PIN_RELEASE_TIMEOUT_S:.0f}s "
+                        f"after its workers expired {sum(released)} connector "
+                        "pins; the prefix cache was not reset"
+                    )
+                await asyncio.sleep(_KV_PIN_RELEASE_POLL_S)
+        else:
+            reset = await self.llm.reset_prefix_cache()
         gc.collect()
         torch.cuda.empty_cache()
+        return reset
 
     async def pause_generation_async(self, *, clear_cache: bool) -> bool:
         """Pause vLLM generation for an in-flight weight update."""

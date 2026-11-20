@@ -36,7 +36,9 @@ from nemo_rl.models.generation.vllm import VllmConfig
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     resolve_vllm_logprobs_mode,
+    resolve_vllm_role_overrides,
     validate_nvfp4_pertoken_generation,
+    validate_vllm_disaggregation,
     validate_vllm_quantization_config,
 )
 
@@ -258,6 +260,13 @@ def configure_generation_config(
                     flush=True,
                 )
                 config["vllm_cfg"]["async_engine"] = True
+        # PD disaggregation: resolve the per-role engine blocks once, here, so
+        # everything downstream reads complete engine configs; a no-op (the
+        # same object) without disaggregation. The architecture-dependent
+        # check (hybrid SSM needs equal TP) runs in VllmGeneration, which
+        # loads the HF config.
+        config = resolve_vllm_role_overrides(config)
+        validate_vllm_disaggregation(config)
         validate_vllm_quantization_config(config)
         validate_nvfp4_pertoken_generation(config, is_eval=is_eval)
         # Training replays the sampler's top-k/top-p on the policy logits,

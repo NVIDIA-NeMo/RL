@@ -1,8 +1,8 @@
-# NemoRL<>TRTLLM Disaggregation Rollout (Experimental)
+# NemoRL Disaggregation Rollout (Experimental)
 
-> **Experimental**: PD disaggregation is wired for the TensorRT-LLM backend on the NeMo-Gym rollout path only.
+> **Experimental**: PD disaggregation is wired for the TensorRT-LLM and vLLM backends on the NeMo-Gym rollout path only.
 
-NeMo RL owns the *replica* (which engines exist, how they are placed, and their lifecycle) and the *refit safety* (what happens when weights change mid-request). It delegates both the *KV handshake* and the *routing inside a replica* to the inference backend's own disaggregation front-end — for TensorRT-LLM, `OpenAIDisaggServer`.
+NeMo RL owns the *replica* (which engines exist, how they are placed, and their lifecycle) and the *refit safety* (what happens when weights change mid-request). It delegates both the *KV handshake* and the *routing inside a replica* to the inference backend's own disaggregation front-end — for TensorRT-LLM, `OpenAIDisaggServer`; for vLLM, NeMo RL's own frontend (`nemo_rl/models/generation/vllm/vllm_disagg_frontend.py`) over vLLM's `KVTransferConfig` connector (NixlConnector by default). The layout is the shared `generation.disaggregation` block for both backends; the vLLM specifics live under `vllm_cfg.prefill_engine`, `vllm_cfg.decode_engine`, `vllm_cfg.disagg_frontend` and `vllm_cfg.kv_transfer` (see Configuration below).
 
 ## Design
 
@@ -24,7 +24,7 @@ Every frontend of a replica is handed the *same* two address pools, so F changes
 
 Chat-template rendering and tokenization are the expensive part of serving a turn on the CPU side, and they scale badly with conversation length: `build_spliced_prompt_ids` runs over the *whole* conversation, so a turn-30 request re-renders and re-tokenizes all 30 turns. By default that work lands in the prefill adapter, which is one thread inside each prefill engine's worker process — it can only be grown by adding prefill engines, i.e. GPUs.
 
-Disaggregation makes a cheaper place available. `frontend_tokenize` moves the rendering and tokenization onto the frontends, which attach `prompt_token_ids_b64` to the prefill leg so the adapter does no template work at all (a sample is shadow-validated prefill-side under `NRL_TRTLLM_TOKENIZE_SHADOW_RATE`, since the ids have to be bit-identical to what the adapter would have produced). Frontends are CPU-only actors with no GPU in their budget, so raising F spreads the tokenization cost over F processes at no GPU cost — this is what F is for, and what to size it against.
+Disaggregation makes a cheaper place available. `frontend_tokenize` moves the rendering and tokenization onto the frontends, which attach `prompt_token_ids_b64` to the prefill leg so the adapter does no template work at all (a sample is shadow-validated prefill-side under `NRL_TOKENIZE_SHADOW_RATE`, since the ids have to be bit-identical to what the adapter would have produced). Frontends are CPU-only actors with no GPU in their budget, so raising F spreads the tokenization cost over F processes at no GPU cost — this is what F is for, and what to size it against.
 
 `TrtllmGeneration.dp_openai_server_base_urls` reports all N×F frontend URLs as one flat list, so NeMo-Gym sees "N×F instances" exactly as it sees N without disaggregation. Its existing per-session affinity (`responses_api_models/vllm_model/app.py::_resolve_client`, a `session_id -> client` map seeded by `sha256(session_id) % len(clients)`) binds a trajectory to one frontend — and therefore to one replica — for its whole lifetime. Since each replica contributes exactly F of the N×F slots, replicas stay uniformly loaded.
 
@@ -132,9 +132,54 @@ policy:
         backend: NIXL                 # DEFAULT | UCX | NIXL | MOONCAKE | MPI
 ```
 
-Colocated generation is not supported yet; set `colocated.enabled: false`.
+The `disaggregation` block is checked when the config loads: the three counts must be at least 1, and `frontend_base_port` must be a valid port. At setup, every training entrypoint (GRPO, PPO, distillation, SingleController) refuses the block on a backend that does not implement it, and without NeMo-Gym rollouts (`env.should_use_nemo_gym`), since a replica is reachable only through its frontends.
 
 With `backend: NIXL`, run with `export UCX_NET_DEVICES=all` so the KV transfer uses the RDMA HCAs instead of the image's management NIC (see `tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1.sh`).
+
+The same layout behind the vLLM backend (a runnable version is `examples/configs/recipes/llm/grpo-qwen3-1.7b-2n4g-megatron-vllm-disagg-swe1.yaml`):
+
+```yaml
+policy:
+  generation:
+    backend: vllm
+    disaggregation:                   # as above; shared with TRT-LLM
+      enabled: true
+      num_prefill_engines: 1
+      num_decode_engines: 1
+      num_frontend_workers: 2
+      frontend_tokenize: true
+      frontend_base_port: 8300
+    vllm_cfg:
+      tensor_parallel_size: 2
+      async_engine: true              # required: the frontends relay over HTTP
+      expose_http_server: true        # required: every engine needs an address
+      prefill_engine: {}              # per-role overrides, as for TRT-LLM
+      decode_engine: {}
+      # NeMo RL's frontend (the OpenAIDisaggServer counterpart). Defaults on
+      # VllmDisaggFrontendConfig; the exemplar grpo_math_1B.yaml documents each key.
+      disagg_frontend:
+        prefill_router: conversation  # conversation | round_robin | kv_cache_aware
+        decode_router: load_balancing # load_balancing | round_robin | conversation
+        bidirectional_kv_xfer: false  # opt in: prefill pulls the previous turn's KV back
+        decode_tokids_b64: true       # the gen_tokids_ctxbytes counterpart
+        decode_strip_message_history: true
+      # The KVTransferConfig every engine is built with; kv_role follows the
+      # engine's role. kv_connector_extra_config passes through to vLLM.
+      kv_transfer:
+        kv_connector: NixlConnector
+        kv_connector_extra_config: {backends: [UCX]}
+        kv_load_failure_policy: fail
+```
+
+vLLM-specific requirements, checked at setup: `colocated.enabled: false`, no Dynamo serving (`policy.generation.dynamo`), `async_engine` with `expose_http_server`, `pipeline_parallel_size: 1`, `http_api_server_count: 1`, no `refit_transport` override, and, with in-flight weight updates (`grpo.async_grpo.in_flight_weight_updates`, or any SingleController run), neither `bidirectional_kv_xfer` nor `recompute_kv_cache_after_weight_updates`: vLLM's cache reset at the pause raises while a decode request still holds blocks for KV in transit, so in-flight requests keep their KV and the prefix caches are left to eviction. Between steps (`finish_generation`, and `invalidate_kv_cache` after a drained update) the frontends drop their remembered handshakes first, then every engine expires the blocks its connector still pins for a remote reader (prefill leases, and under `bidirectional_kv_xfer` the finished turns the decode engines keep for `decoder_kv_blocks_ttl`) and resets its prefix cache. vLLM refuses that reset while any block is allocated, so a reset that still fails stops the step rather than letting the next one reuse KV computed under the previous weights. SingleController additionally refuses `token_capture.enabled` (the prefill leg never sees the ledger prefix the decode leg splices in) and `async_rl.generation_fleet_health.enabled` (shard loss and recovery are not wired for disaggregated replicas). The frontend ports (`frontend_base_port`, then one per replica and frontend) must lie in the frontend band, checked before any engine starts. Which layer types a connector can move, and at which TP ratios, is vLLM's own check at engine start. Engines get `VLLM_SSM_CONV_STATE_LAYOUT=DS` by default (NixlConnector asserts it for Mamba layers; inert otherwise) and, with GPU-staged KV, `NCCL_NET_PLUGIN=none` (HPC-X's NCCL plugin loads a UCX without CUDA support into TP>1 engines, which breaks NIXL's VRAM registration); `vllm_cfg.env_vars` overrides both. The training workers adopt the engines' `NCCL_NET_PLUGIN`: the refit collective is one NCCL communicator over the training ranks and every engine rank, and it cannot form when the two sides pick different network transports (`megatron_cfg.env_vars` / `automodel_cfg.env_vars` choose one for the trainer explicitly). Besides the frontend band, vLLM engines use two further per-node port bands from `virtual_cluster.py`: the NIXL side channel (8556-8571) and the KV-events publishers of the `kv_cache_aware` router (8572-8587), one port per engine on a node.
+
+On SingleController every weight update is in flight, so under disaggregation the KV caches are never cleared: prefix KV computed under earlier weights keeps being reused until it is evicted, and `token_mult_prob_error` / `gen_kl_error` grow as the weights move. The aggregated path does the same with `async_rl.recompute_kv_cache_after_weight_updates: false`; its default (`true`) clears the caches at every update, which disaggregation cannot do. On a workload whose prompts share almost their whole prefix (workplace_assistant, Qwen3-1.7B) 30 steps take `token_mult_prob_error` from 1.02 to about 1.3 either way. `examples/configs/recipes/llm/grpo-qwen3-1.7b-2n4g-megatron-vllm-disagg-gym-single-controller.yaml` is the nightly for this entrypoint.
+
+The `conversation` and `kv_cache_aware` prefill routers (and the bidirectional conversation cache) key on `conversation_params.conversation_id`, NeMo-Gym's per-rollout session id. NeMo RL turns the Gym knob that sends it, `policy_model.responses_api_models.vllm_model.forward_session_id_as_conversation_id`, on whenever the vLLM frontends are in use (`build_nemo_gym_actors`) and refuses a config that sets it to false. A request without the id (another client) is routed by a hash of the conversation's opening exchange (system prompt plus first user turn; the samples of one prompt share it) and gets nothing from the bidirectional cache; the frontend warns once.
+
+A leg that carries prompt ids is not rendered by its engine, and the ids hold the model's earlier turns with their reasoning, so the engine cannot tell from them whether reasoning is over before the turn generates (what vLLM's reasoning parser starts from). The render that produced the ids answers it: the frontend's under `frontend_tokenize`, else the prefill engine's, which returns it with the prefill response; the frontend hands it to the decode leg as `template_reasoning_ended`. The frontend also forwards NeMo-Gym's `x-ng-sampling` header to both legs, so a call that keeps its own sampling (an LLM judge's) is served as it is without disaggregation.
+
+Colocated generation is not supported yet; set `colocated.enabled: false`.
 
 GPU budget:
 

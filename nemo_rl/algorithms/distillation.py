@@ -60,6 +60,7 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
 )
+from nemo_rl.models.generation.disagg_layout import validate_disagg_entrypoint
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     sampler_replay_enabled,
@@ -70,6 +71,7 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
+    uses_vllm_disagg_frontends,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -313,6 +315,7 @@ def setup(
     # Set random seed
     set_seed(distillation_config.seed)
     enable_nemo_gym = bool(env_configs) and should_use_nemo_gym(master_config)
+    validate_disagg_entrypoint(generation_config, uses_nemo_gym=enable_nemo_gym)
 
     # ==========================
     #         Logger
@@ -572,6 +575,9 @@ def setup(
                     # one, so Gym's model server must send the same key.
                     policy_api_key=deferred_vllm.http_server_api_key,
                     turn_checkpointing_enabled=False,
+                    forward_session_id_as_conversation_id=uses_vllm_disagg_frontends(
+                        generation_config
+                    ),
                 )
                 try:
                     validate_dataset_agent_coverage(

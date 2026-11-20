@@ -138,6 +138,7 @@ from nemo_rl.experience.rollouts import (
     should_mask_flagged_samples,
 )
 from nemo_rl.models.generation import resolve_generation_class
+from nemo_rl.models.generation.disagg_layout import validate_disagg_entrypoint
 from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
@@ -152,7 +153,10 @@ from nemo_rl.models.generation.megatron.megatron_generation import MegatronGener
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    uses_vllm_disagg_frontends,
+)
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -861,6 +865,9 @@ def _spinup_gym(
         policy_api_key=policy_api_key,
         turn_checkpointing_enabled=(
             master_config.rollout_recovery.turn_checkpointing_enabled
+        ),
+        forward_session_id_as_conversation_id=uses_vllm_disagg_frontends(
+            generation_config
         ),
         generation_prefix_cuts_enabled=(
             master_config.rollout_recovery.generation_prefix_cuts_enabled
@@ -1727,6 +1734,7 @@ def setup_single_controller(
             f"{generation_config['backend']!r}"
         )
     # Backend settings checks are pure config: run them before anything builds.
+    validate_disagg_entrypoint(generation_config, uses_nemo_gym=use_nemo_gym)
     resolve_generation_class(generation_config).validate_settings(master_config)
 
     def _load_training_data() -> tuple[
