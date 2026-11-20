@@ -106,7 +106,7 @@ policy:
       gpu_memory_utilization: 0.85
       max_model_len: 32768
       enforce_eager: true             # v1 + Ali's fixture ran eager; CUDA-graph capture crashed the B200 gen workers in memory profiling (job 1968968)
-      enable_prefix_caching: false
+      enable_prefix_caching: true     # vLLM >= 0.33 returns routed experts (router replay) only with prefix caching on
       skip_tokenizer_init: false
       load_format: dummy
       logprobs_mode: raw_logprobs
@@ -135,7 +135,7 @@ policy:
       mm_processor_cache_gb: 0
       max_num_batched_tokens: 32768
       mamba_ssm_cache_dtype: float32
-      enable_chunked_prefill: false
+      enable_chunked_prefill: true    # vLLM asserts it for Mamba prefix caching (mamba_cache_mode defaults to align)
     colocated:
       enabled: false                # SC requires disaggregated generation
       resources:
