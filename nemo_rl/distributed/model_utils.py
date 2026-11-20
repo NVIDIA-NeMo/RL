@@ -314,34 +314,41 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             if reuse_logits_storage
             else torch.zeros_like(vocab_parallel_logits)
         )
-        zero = torch.zeros((), dtype=torch.float32, device="cpu")
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
             chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
 
-            logits = vocab_parallel_logits[:, chunk_start:chunk_end, :]
-            logits = logits.to(dtype=torch.float32)
-
-            softmax_output = _compute_distributed_log_softmax(
-                logits,
-                group=tp_group,
+            # Own one fp32 buffer even when the saved logits are already fp32.
+            # Reuse it for normalization and gradients; never mutate saved logits.
+            softmax_output = vocab_parallel_logits[:, chunk_start:chunk_end, :].to(
+                dtype=torch.float32, copy=True
             )
-            softmax_output = softmax_output.exp()
-
-            selected_indices = masked_target[:, chunk_start:chunk_end].unsqueeze(-1)
-            selected_grad = (
-                (~target_mask[:, chunk_start:chunk_end]).unsqueeze(-1).float()
+            logits_max = softmax_output.amax(dim=-1, keepdim=True)
+            torch.distributed.all_reduce(
+                logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group
             )
-            selected_grad.sub_(softmax_output.gather(-1, selected_indices))
-            # Subtract before scaling to preserve rounding, including zero's sign.
-            torch.sub(zero, softmax_output, out=softmax_output)
-            softmax_output.scatter_(-1, selected_indices, selected_grad)
+            softmax_output.sub_(logits_max).exp_()
+            sum_exp_logits = softmax_output.sum(dim=-1, keepdim=True)
+            torch.distributed.all_reduce(
+                sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+            softmax_output.div_(sum_exp_logits).neg_()
+
+            # Add the chosen-token term directly, avoiding an int64 [B, S, V]
+            # one-hot allocation and a second full-vocabulary gradient buffer.
+            softmax_output.scatter_add_(
+                -1,
+                masked_target[:, chunk_start:chunk_end].unsqueeze(-1),
+                (~target_mask[:, chunk_start:chunk_end])
+                .unsqueeze(-1)
+                .to(dtype=softmax_output.dtype),
+            )
             softmax_output.mul_(grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1))
             grad_input[:, chunk_start:chunk_end, :].copy_(softmax_output)
 
-            # Explicitly free before next iteration allocates
-            del softmax_output, logits, selected_grad, selected_indices
+            # Explicitly free before next iteration allocates.
+            del softmax_output, logits_max, sum_exp_logits
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None, None

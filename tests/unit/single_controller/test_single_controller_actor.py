@@ -66,6 +66,7 @@ from nemo_rl.algorithms.single_controller import (
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
     AdvantageStageConfig,
+    _train_fields_for_step,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -78,6 +79,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    DebugWriterConfig,
     JsonDebugWriter,
     TrainChunk,
 )
@@ -100,6 +102,7 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.weight_sync.sglang_weight_synchronizer import (
@@ -112,12 +115,12 @@ from tests.unit.single_controller._rollout_checkpoints import (
 
 
 def test_train_fields_add_the_sampler_topk_for_score_centering():
-    without = single_controller._train_fields_for_step(
+    without = _train_fields_for_step(
         policy_logprobs_required=True,
         reference_logprobs_required=False,
         sampler_head_required=False,
     )
-    with_topk = single_controller._train_fields_for_step(
+    with_topk = _train_fields_for_step(
         policy_logprobs_required=True,
         reference_logprobs_required=False,
         sampler_head_required=True,
@@ -169,18 +172,18 @@ class _InitRolloutManager:
         self.checkpoint_barrier = barrier
 
 
-def _checkpointing_config(tmp_path) -> dict:
+def _checkpointing_config(tmp_path) -> CheckpointingConfig:
     """Minimal checkpointing block for actors built through __init__."""
-    return {
-        "enabled": False,
-        "checkpoint_dir": str(tmp_path / "checkpoints"),
-        "metric_name": None,
-        "higher_is_better": True,
-        "keep_top_k": None,
-        "save_period": 10,
-        "save_optimizer": True,
-        "checkpoint_must_save_by": None,
-    }
+    return CheckpointingConfig.model_construct(
+        enabled=False,
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        metric_name=None,
+        higher_is_better=True,
+        keep_top_k=None,
+        save_period=10,
+        save_optimizer=True,
+        checkpoint_must_save_by=None,
+    )
 
 
 def _grpo_master_config(tmp_path) -> MasterConfig:
@@ -250,6 +253,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         restored_from_rollout_snapshot=False,
         train_group_multiple=1,
         train_min_remaining_groups=0,
+        trainer_warmup_kwargs=None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -560,6 +564,8 @@ def _stamp_advantage_stage_config(
         message_level_advantage_penalties_enabled=penalties_enabled,
         shardable=shardable,
         train_data_dump_dir=str(dump.log_dir) if dump is not None else None,
+        # The dumps installed here are JsonDebugWriters, so the stage writes JSONL.
+        debug_writer=DebugWriterConfig(target="json"),
     )
     ctrl._advantage_computer = AdvantageComputer(
         ctrl._dp_client,
@@ -640,8 +646,8 @@ def test_fresh_mooncake_init_registers_partition(
     dp_client = MagicMock(name="dp_client")
     master_config = _grpo_master_config(tmp_path)
     master_config.data_plane = _data_plane_config("mooncake_cpu")
-    master_config.checkpointing["enabled"] = checkpoint_enabled
-    master_config.checkpointing["save_data_plane"] = save_data_plane
+    master_config.checkpointing.enabled = checkpoint_enabled
+    master_config.checkpointing.save_data_plane = save_data_plane
     actor_args = _actor_args_for_init(dp_client=dp_client)
     if not checkpoint_enabled:
         actor_args.trainer_handle = None
@@ -701,7 +707,8 @@ def test_mooncake_checkpoint_workers_configured_before_restore(
     master_config = _grpo_master_config(tmp_path)
     master_config.data_plane = _data_plane_config("mooncake_cpu")
     master_config.token_capture.enabled = token_capture
-    master_config.checkpointing.update(enabled=True, save_data_plane=True)
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_data_plane = True
     workers = [object() for _ in range(10)]
 
     def group(members: list[object], leaders: tuple[int, ...] = ()) -> SimpleNamespace:
@@ -2594,7 +2601,9 @@ def _train_pump_controller(*, sampler) -> object:
         ),
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
-        checkpointing={"enabled": False, "save_period": 10},
+        checkpointing=CheckpointingConfig.model_construct(
+            enabled=False, save_period=10
+        ),
         rollout_recovery=SimpleNamespace(generation_prefix_cuts_enabled=False),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
@@ -2618,7 +2627,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
-    ctrl._train_fields = single_controller._train_fields_for_step(
+    ctrl._train_fields = _train_fields_for_step(
         policy_logprobs_required=False,
         reference_logprobs_required=False,
         sampler_head_required=False,
@@ -2632,11 +2641,13 @@ def _train_pump_controller(*, sampler) -> object:
     attach_rollout_checkpointing(ctrl)
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
+    ctrl._trainer_warmup_task = None
     ctrl._is_ppo = False
     ctrl._streaming_ppo = False
     ctrl._train_group_multiple = 1
     ctrl._train_min_remaining_groups = 0
     ctrl._weight_synchronizer = SimpleNamespace(before_learner_write=lambda: None)
+    ctrl._value_dedicated = False
     ctrl._ppo_epochs = 1
     ctrl._critic_ppo_epochs = 1
     ctrl._value = None
@@ -3489,7 +3500,7 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
         reference_logprobs_required = stage_cfg.reference_logprobs_required
     ctrl._policy_logprobs_required = policy_logprobs_required
     ctrl._reference_logprobs_required = reference_logprobs_required
-    ctrl._train_fields = single_controller._train_fields_for_step(
+    ctrl._train_fields = _train_fields_for_step(
         policy_logprobs_required=policy_logprobs_required,
         reference_logprobs_required=reference_logprobs_required,
         sampler_head_required=False,
@@ -3674,6 +3685,7 @@ def test_run_pumps_snapshots_generation_before_dispatch(
     )
     ctrl._trainer_version = 0
     ctrl._rollout_restorer = SimpleNamespace(restore=AsyncMock(return_value=False))
+    ctrl._trainer_warmup_kwargs = None
     events = []
 
     def snapshot() -> None:
@@ -4005,12 +4017,15 @@ class _NoOpValue:
     def __init__(self, calls: list[str] | None = None, prefix: str = "") -> None:
         self.calls: list[str] = [] if calls is None else calls
         self._prefix = prefix
+        self.resident_calls: list[tuple[str, bool]] = []
+        self._keep_resident = False
         self.trained_sample_ids: list[list[str]] = []
 
     def _record(self, name: str) -> None:
         self.calls.append(f"{self._prefix}{name}")
 
     def prepare_for_inference(self) -> None:
+        self.resident_calls.append(("prepare_for_inference", self._keep_resident))
         self._record("prepare_for_inference")
 
     def get_values_from_meta(self, meta: KVBatchMeta) -> None:
@@ -4018,9 +4033,11 @@ class _NoOpValue:
         self._record("get_values_from_meta")
 
     def finish_inference(self) -> None:
+        self.resident_calls.append(("finish_inference", self._keep_resident))
         self._record("finish_inference")
 
     def prepare_for_training(self) -> None:
+        self.resident_calls.append(("prepare_for_training", self._keep_resident))
         self._record("prepare_for_training")
 
     def begin_train_step(self, loss_fn) -> None:
@@ -4050,6 +4067,7 @@ class _NoOpValue:
         }
 
     def finish_training(self) -> None:
+        self.resident_calls.append(("finish_training", self._keep_resident))
         self._record("finish_training")
 
 
@@ -4175,6 +4193,45 @@ def test_train_pump_parks_the_policy_on_cpu_across_the_critic_stages(
         "critic.train_microbatches_from_meta",
         "critic.finish_train_step",
         "critic.finish_training",
+    ]
+
+
+@pytest.mark.parametrize("policy_logprobs_required", [False, True])
+def test_dedicated_value_keeps_both_models_resident_during_ppo_step(
+    monkeypatch, policy_logprobs_required
+) -> None:
+    meta = _single_group_meta()
+    calls: list[str] = []
+    value = _NoOpValue(calls=calls, prefix="critic.")
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta), value=value
+    )
+    ctrl._value_dedicated = True
+    value._keep_resident = True
+    ctrl._policy_logprobs_required = policy_logprobs_required
+    trainer = _OrderRecordingTrainer(calls)
+    trainer.prepare_for_lp_inference = MagicMock(wraps=trainer.prepare_for_lp_inference)
+    trainer.offload_to_cpu = MagicMock(wraps=trainer.offload_to_cpu)
+    trainer.finish_inference = MagicMock(wraps=trainer.finish_inference)
+    ctrl._trainer = trainer
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    trainer.offload_to_cpu.assert_not_called()
+    trainer.finish_inference.assert_not_called()
+    if policy_logprobs_required:
+        trainer.prepare_for_lp_inference.assert_called_once_with(
+            keep_train_buffers=True
+        )
+    else:
+        trainer.prepare_for_lp_inference.assert_not_called()
+    assert value.resident_calls == [
+        ("prepare_for_inference", True),
+        ("finish_inference", True),
+        ("prepare_for_training", True),
+        ("finish_training", True),
     ]
 
 
@@ -4642,6 +4699,25 @@ def test_streaming_ppo_split_value_replays_each_chunk_per_epoch(
     assert controller._trainer_version == controller._train_steps == 1
 
 
+def test_streaming_ppo_dedicated_value_keeps_policy_resident(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, metas, calls = _streaming_ppo_controller(monkeypatch)
+    controller._value_dedicated = True
+    controller._value._keep_resident = True
+
+    asyncio.run(asyncio.wait_for(controller._train_pump(), timeout=1.0))
+
+    assert calls.count("critic.get_values_from_meta") == len(metas)
+    assert calls.count("policy.train_microbatches_from_meta") == len(metas)
+    assert "policy.pause_train_step_with_offloading" not in calls
+    assert "policy.offload_to_cpu" not in calls
+    assert controller._value.resident_calls == [
+        ("prepare_for_inference", True),
+        ("finish_inference", True),
+    ] * len(metas) + [("prepare_for_training", True), ("finish_training", True)]
+
+
 @pytest.mark.parametrize("warmup", [False, True])
 @pytest.mark.parametrize(
     "valid_chunks",
@@ -5012,7 +5088,7 @@ def test_ppo_checkpoint_saves_both_updates_without_repeating_early_refit(
         ctrl, metas, calls = _streaming_ppo_controller(monkeypatch)
     else:
         ctrl, metas, calls = _full_batch_ppo_controller(monkeypatch, policy_epochs=3)
-    ctrl._master_config.checkpointing["enabled"] = True
+    ctrl._master_config.checkpointing.enabled = True
 
     async def save_checkpoint(metrics: dict, **kwargs: bool) -> None:
         assert kwargs == {

@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from nemo_rl.utils.tensor_ops import pad_and_concat
+from nemo_rl.utils.tensor_ops import masked_max, masked_min, pad_and_concat
 
 
 @pytest.mark.parametrize("trailing_shape", [(), (3,)], ids=["2d", "3d"])
@@ -31,3 +31,23 @@ def test_pad_and_concat_pads_seq_dim_only_and_keeps_dtype(trailing_shape):
     assert torch.all(out[:2, :3] == 7)
     assert torch.all(out[:2, 3:] == -1)  # only the sequence dim is padded
     assert torch.all(out[2] == 9)  # a chunk already at target_len is untouched
+
+
+def test_masked_min_max_reduce_the_masked_entries_only() -> None:
+    values = torch.tensor([[0.5, 9.0], [2.0, -7.0]])
+    mask = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+
+    assert masked_min(values, mask).item() == 0.5
+    assert masked_max(values, mask).item() == 2.0
+
+
+@pytest.mark.parametrize("shape", [(0, 4), (2, 3)], ids=["empty", "nothing_selected"])
+def test_masked_min_max_with_nothing_to_reduce(shape: tuple[int, int]) -> None:
+    values = torch.ones(shape, dtype=torch.float64)
+    mask = torch.zeros(shape)
+
+    lowest, highest = masked_min(values, mask), masked_max(values, mask)
+
+    assert lowest.item() == float("inf") and highest.item() == float("-inf")
+    assert lowest.shape == highest.shape == ()
+    assert lowest.dtype == highest.dtype == torch.float64

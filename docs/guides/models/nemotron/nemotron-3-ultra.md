@@ -156,6 +156,9 @@ Set the following before each `bash examples/nemo_gym/nemotron-3-ultra/ultra_lau
 | `VAL_PATH` | Validation data JSONL. |
 | `CONTAINER` | NeMo RL container image (`.sqsh` path or registry image URI). |
 | `SANDBOX_CONTAINER` | Sandbox image from [Build the sandbox container](#build-the-sandbox-container). |
+| `CODE_GEN_SANDBOX_IMAGE` | *(Student RLVR and MOPD)* The `code_gen` verifier image that OpenSandbox runs; see [NeMo Gym Code Generation Sandbox](../../environments.md#nemo-gym-code-generation-sandbox), which also covers running without OpenSandbox. |
+| `OPENSANDBOX_DOMAIN` | *(Student RLVR and MOPD)* The OpenSandbox endpoint, for example `https://opensandbox.example.com`. |
+| `OPENSANDBOX_API_KEY` | *(Student RLVR and MOPD)* Your OpenSandbox access key. |
 | `PERSISTENT_CACHE` | Directory on a shared filesystem (e.g. Lustre) where vLLM/Triton/Inductor compile caches are persisted across runs. |
 | `EXTRA_MOUNTS` | Comma-separated `host:container` mount pairs for any shared filesystems holding your data, model checkpoints, and `PERSISTENT_CACHE` (e.g. `EXTRA_MOUNTS=/lustre:/lustre,/scratch:/scratch`). |
 | `SLURM_PARTITION`, `SLURM_ACCOUNT` | Your SLURM cluster credentials. |
@@ -257,6 +260,9 @@ TRAIN_PATH=$DATA_DIR/rlvr1.train.jsonl \
 VAL_PATH=$DATA_DIR/rlvr1.val.jsonl \
 CONTAINER=/path/to/nemo-rl-container \
 SANDBOX_CONTAINER=/path/to/nemo-skills-sandbox.sqsh \
+CODE_GEN_SANDBOX_IMAGE=your-registry/code-gen-verifier:tag \
+OPENSANDBOX_DOMAIN=https://opensandbox.example.com \
+OPENSANDBOX_API_KEY=$OPENSANDBOX_API_KEY \
 PERSISTENT_CACHE=/path/to/persistent/cache \
 EXTRA_MOUNTS=/lustre:/lustre \
 SLURM_PARTITION=$SLURM_PARTITION \
@@ -284,6 +290,9 @@ TRAIN_PATH=$DATA_DIR/rlvr2.train.jsonl \
 VAL_PATH=$DATA_DIR/rlvr2.val.jsonl \
 CONTAINER=/path/to/nemo-rl-container \
 SANDBOX_CONTAINER=/path/to/nemo-skills-sandbox.sqsh \
+CODE_GEN_SANDBOX_IMAGE=your-registry/code-gen-verifier:tag \
+OPENSANDBOX_DOMAIN=https://opensandbox.example.com \
+OPENSANDBOX_API_KEY=$OPENSANDBOX_API_KEY \
 PERSISTENT_CACHE=/path/to/persistent/cache \
 EXTRA_MOUNTS=/lustre:/lustre \
 SLURM_PARTITION=$SLURM_PARTITION \
@@ -565,6 +574,9 @@ NRL_REASONING_TEACHER_PATH=/path/to/reasoning_teacher_output \
 NRL_SWE_TEACHER_PATH=/path/to/swe_teacher_output \
 CONTAINER=/path/to/nemo-rl-container \
 SANDBOX_CONTAINER=/path/to/nemo-skills-sandbox.sqsh \
+CODE_GEN_SANDBOX_IMAGE=your-registry/code-gen-verifier:tag \
+OPENSANDBOX_DOMAIN=https://opensandbox.example.com \
+OPENSANDBOX_API_KEY=$OPENSANDBOX_API_KEY \
 PERSISTENT_CACHE=/path/to/persistent/cache \
 EXTRA_MOUNTS=/lustre:/lustre \
 SLURM_PARTITION=$SLURM_PARTITION \

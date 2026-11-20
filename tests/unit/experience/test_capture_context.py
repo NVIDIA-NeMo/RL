@@ -322,7 +322,8 @@ async def test_worker_managed_root_clears_untrusted_prefix_and_keeps_media_check
     )
 
     renderer = _build_server(monkeypatch, {})[0][0]
-    renderer.renderer = SimpleNamespace()
+    renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
+    renderer.model_config = SimpleNamespace(max_model_len=4096)
     monkeypatch.setattr(
         VllmAsyncGenerationWorkerImpl, "token_capture", object(), raising=False
     )

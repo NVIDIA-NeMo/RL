@@ -44,13 +44,17 @@ from megatron.bridge.training.utils.train_utils import (
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
+from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV1,
     FullyShardedDataParallelV2,
 )
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
 from megatron.core.transformer.moe.router import Router, TopKRouter
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import get_model_config, unwrap_model
 from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
     FileSystemWriterAsync,
@@ -60,9 +64,17 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
 )
-from nemo_rl.algorithms.loss.interfaces import SEQ_LOGPROB_KEEP_MASK_KEY, LossFunction
+from nemo_rl.algorithms.loss.interfaces import (
+    SEQ_LOGPROB_KEEP_MASK_KEY,
+    LossFunction,
+    get_objective_reduction,
+)
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
-from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
+from nemo_rl.algorithms.loss.utils import (
+    metric_normalizer_scales,
+    rescale_loss_metrics,
+)
+from nemo_rl.algorithms.loss.wrapper import StreamingObjectiveLoss
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
@@ -140,12 +152,17 @@ from nemo_rl.models.megatron.train import (
     should_reduce_loss_across_context_parallel,
     strip_context_parallel_local_loss_metric,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import Fp4Config, PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
     TeacherFullPayloadOutputSpec,
+)
+from nemo_rl.models.policy.trainer_warmup import (
+    build_warmup_batch,
+    may_draw_token_id,
+    warmup_seqlens,
 )
 from nemo_rl.models.policy.utils import (
     broadcast_hf_buckets_via_distributed_impl,
@@ -191,6 +208,68 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+# megatron_cfg settings that torch.compile's shape profiles depend on, besides the
+# model and the world size.
+_SHAPE_PROFILE_LAYOUT = (
+    "tensor_model_parallel_size",
+    "pipeline_model_parallel_size",
+    "num_layers_in_first_pipeline_stage",
+    "num_layers_in_last_pipeline_stage",
+    "context_parallel_size",
+    "sequence_parallel",
+    "expert_model_parallel_size",
+    "expert_tensor_parallel_size",
+)
+
+
+def _validate_streaming_router_auxiliaries(model_config: Any) -> None:
+    """Reject router losses that need a separate streaming normalization."""
+    # Dense models instantiate no router, even if unused MoE fields remain.
+    if getattr(model_config, "num_moe_experts", None) is None:
+        return
+
+    def nonzero(value: Any) -> bool:
+        if isinstance(value, (list, tuple)):
+            return any(nonzero(item) for item in value)
+        return value is not None and float(value) != 0
+
+    # Mirrors Megatron-LM TopKRouter.get_aux_loss_coeff / is_aux_loss_enabled
+    # (modes gated by the configured balancing type, coefficient > 0) and
+    # apply_z_loss (fires whenever moe_z_loss_coeff is not None), at the pinned
+    # commit 3e95097b. Re-check on a Megatron-LM bump.
+    routing_type = getattr(model_config, "moe_router_load_balancing_type", None)
+    aux_coeff: Any = getattr(model_config, "moe_aux_loss_coeff", 0.0)
+    if isinstance(routing_type, (list, tuple)):
+        if not isinstance(aux_coeff, (list, tuple)) or len(routing_type) != len(
+            aux_coeff
+        ):
+            raise ValueError(
+                "Streaming non-token objective normalization requires matching "
+                "routing-mode and auxiliary-coefficient lists"
+            )
+    active_modes = []
+    for name in ("aux_loss", "seq_aux_loss", "global_aux_loss"):
+        coeff = 0.0
+        if routing_type == name:
+            coeff = aux_coeff
+        elif isinstance(routing_type, (list, tuple)) and name in routing_type:
+            coeff = aux_coeff[routing_type.index(name)]
+        if coeff is not None and float(coeff) > 0:
+            active_modes.append(name)
+    if active_modes:
+        raise ValueError(
+            "Streaming non-token objective normalization requires zero active MoE auxiliary losses; "
+            f"modes={active_modes}, moe_aux_loss_coeff={aux_coeff!r}; "
+            "auxiliary gradients use a different denominator"
+        )
+    # Router z-loss is independent of the load-balancing mode. A zero
+    # coefficient may still create a tracker, but contributes no gradient.
+    if nonzero(getattr(model_config, "moe_z_loss_coeff", None)):
+        raise ValueError(
+            "Streaming non-token objective normalization requires moe_z_loss_coeff=0; "
+            "auxiliary gradients use a different denominator"
+        )
 
 
 def _should_use_router_replay(
@@ -724,6 +803,7 @@ class MegatronPolicyWorkerImpl(
     _train_step_state: Optional[dict[str, Any]] = None
     _remote_sparse_refit: Any = None
     _async_checkpoint_cuda_cache_active: bool = False
+    _shape_profiles: Optional[compile_cache.ShapeProfiles] = None
 
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
@@ -961,6 +1041,21 @@ class MegatronPolicyWorkerImpl(
 
         # Step 1: Setup distributed
         setup_distributed(config)
+        # torch.compile reads this rank's shape profile once, at its first compile.
+        self._shape_profiles = compile_cache.ShapeProfiles.load(
+            "megatron",
+            {
+                "model": config["model_name"],
+                **{k: config["megatron_cfg"].get(k) for k in _SHAPE_PROFILE_LAYOUT},
+            },
+        )
+        if self.rank == 0:
+            compile_cache.warn_if_autotuning_is_shared(
+                bool(
+                    config["megatron_cfg"].get("zero_train_gen_mismatch")
+                    or config["megatron_cfg"].get("batch_invariant_mode")
+                )
+            )
         log_gpu_memory_diagnostics(
             label="after_nccl_init", worker_type="MegatronPolicyWorker"
         )
@@ -1395,19 +1490,22 @@ class MegatronPolicyWorkerImpl(
         # Multiplying by G/K, with K the global surviving token count, restores
         # S/K: the same normalization as filtering before training. Apply this
         # correction before optimizer.step() so gradient clipping sees S/K.
-        token_factor = float((global_valid_toks / token_denominator).item())
+        token_scale = global_valid_toks / token_denominator
+        token_factor = float(token_scale.item())
         sequence_factor = float((global_valid_seqs / sequence_denominator).item())
         if not eval_mode:
             # Finish any overlap on the comm stream before touching the reduced
             # gradient buffers (including distributed-optimizer gradient shards).
             torch.cuda.synchronize()
-            self.model.scale_gradients(token_factor)
+            self.model.scale_gradients(token_scale)
         metrics = [
             rescale_loss_metrics(
                 m,
                 loss_fn.metric_normalizations,
                 token_factor=token_factor,
                 sequence_factor=sequence_factor,
+                # The gradient was rescaled by token_factor above.
+                loss_divisor_factor=token_factor,
             )
             for m in metrics
         ]
@@ -1676,6 +1774,8 @@ class MegatronPolicyWorkerImpl(
                 )
                 if not eval_mode:
                     self._restore_first_train_step_param_sync(update_successful)
+                    if self._shape_profiles is not None:
+                        self._shape_profiles.step_done(update_successful)
 
                 warn_if_inf_grad_norm(grad_norm)
 
@@ -1911,21 +2011,25 @@ class MegatronPolicyWorkerImpl(
         mtp_detach_heads = bool(getattr(model_config, "mtp_detach_heads", False))
         mtp_loss_scaling_factor = getattr(model_config, "mtp_loss_scaling_factor", 0.1)
         loss_type = getattr(loss_fn, "loss_type", LossType.TOKEN_LEVEL)
+        objective_reduction = get_objective_reduction(loss_fn)
+        non_token_normalization = not objective_reduction.token_normalized
+        if non_token_normalization:
+            _validate_streaming_router_auxiliaries(model_config)
 
         # MTP is a token-summed auxiliary loss and therefore always needs the
-        # valid-token denominator. Under a sequence-level main loss, the split
-        # path can apply that distinct denominator only when mcore has isolated
+        # valid-token denominator. When the main objective uses another
+        # denominator, the split path can apply that denominator only when mcore has isolated
         # and tagged the detached MTP parameters. Attached-head gradients are
         # already mixed into the backbone and cannot be corrected after the
         # global counts become available at finish.
         if (
             mtp_enabled
             and mtp_loss_scaling_factor != 0
-            and loss_type != LossType.TOKEN_LEVEL
+            and non_token_normalization
             and not mtp_detach_heads
         ):
             raise ValueError(
-                "MTP with a nonzero loss weight and sequence-level loss requires "
+                "MTP with a nonzero loss weight and non-token objective normalization requires "
                 "policy.megatron_cfg.mtp_detach_heads=True on the SingleController "
                 "split training path because the MTP auxiliary gradient must be "
                 "normalized by valid tokens independently of the main loss. "
@@ -1936,6 +2040,10 @@ class MegatronPolicyWorkerImpl(
         return {
             "loss_fn": loss_fn,
             "loss_type": loss_type,
+            "objective_reduction": objective_reduction,
+            "local_objective_denominator": torch.zeros(
+                (), dtype=torch.float64, device="cuda"
+            ),
             "metric_normalizations": metric_normalizations,
             "mtp_enabled": mtp_enabled,
             "mtp_detach_heads": mtp_detach_heads,
@@ -2166,18 +2274,18 @@ class MegatronPolicyWorkerImpl(
         # call process_global_batch directly because it eagerly all_reduces
         # the local sums, which is exactly what we're trying to defer.
         assert "sample_mask" in data, "sample_mask required on microbatch data"
-        sample_mask = data["sample_mask"]
-        call_local_seqs = torch.sum(sample_mask).to(torch.float64)
-        if "token_mask" in data:
-            token_mask = data["token_mask"]
-            call_local_toks = torch.sum(
-                token_mask[:, 1:] * sample_mask.unsqueeze(-1)
-            ).to(torch.float64)
-        else:
-            call_local_toks = call_local_seqs * data["input_ids"].shape[1]
+        # Reuse one row-length reduction for diagnostics and the objective,
+        # before packing/CP; only DP partitions these full response rows.
+        objective_reduction = state["objective_reduction"]
+        call_local_seqs, call_local_toks, call_objective_denominator = (
+            objective_reduction.local_counts(data)
+        )
+        if objective_reduction.requires_explicit_denominator:
+            loss_fn = StreamingObjectiveLoss(loss_fn)
 
         state["local_valid_seqs"] = state["local_valid_seqs"] + call_local_seqs
         state["local_valid_toks"] = state["local_valid_toks"] + call_local_toks
+        state["local_objective_denominator"] += call_objective_denominator
 
         # Match the synchronous Megatron path: derive the mask on the worker
         # immediately before microbatch processing so sequence packing applies
@@ -2353,8 +2461,6 @@ class MegatronPolicyWorkerImpl(
         return result
 
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
-        from nemo_rl.algorithms.loss.interfaces import LossType
-
         # Recover policy and draft counts with one existing DP collective.
         # The draft slice is length-1 while the step is active and empty
         # otherwise, so every rank in the DP group has to agree on
@@ -2368,13 +2474,16 @@ class MegatronPolicyWorkerImpl(
         if in_loss_filter:
             # Chunks backpropagated unnormalized survivor sums, so divide by the
             # survivor counts. Metrics are already on every PP stage; reduce DP only.
-            policy_counts = _local_survivor_counts(
+            seq_and_tok_counts = _local_survivor_counts(
                 state["all_mb_metrics"], state["local_valid_toks"].device
             )
         else:
-            policy_counts = torch.stack(
+            seq_and_tok_counts = torch.stack(
                 [state["local_valid_seqs"], state["local_valid_toks"]]
             ).to(torch.float64)
+        policy_counts = torch.cat(
+            [seq_and_tok_counts, state["local_objective_denominator"].reshape(1)]
+        )
         to_reduce = torch.cat(
             [
                 policy_counts,
@@ -2386,22 +2495,25 @@ class MegatronPolicyWorkerImpl(
         )
         global_valid_seqs = to_reduce[0]
         global_valid_toks = to_reduce[1]
-        draft_step_state.set_global_counts(to_reduce[2:])
+        draft_step_state.set_global_counts(to_reduce[policy_counts.numel() :])
         if in_loss_filter:
             _raise_if_no_survivors(global_valid_toks)
 
-        if state["loss_type"] == LossType.TOKEN_LEVEL:
-            n_true = global_valid_toks
-        else:
-            n_true = global_valid_seqs
-        n_safe = n_true if n_true.item() > 0 else torch.tensor(1.0, device="cuda")
-        inv_n = float((1.0 / n_safe).item())
+        # Under in-loss filtering the token and sequence counts are survivors.
+        n_true = state["objective_reduction"].loss_divisor(
+            global_valid_toks=global_valid_toks,
+            global_valid_seqs=global_valid_seqs,
+            global_objective_denominator=to_reduce[2],
+        )
+        n_safe = n_true if n_true.item() > 0 else torch.ones_like(n_true)
+        gradient_scale = n_safe.reciprocal()
+        inv_n = float(gradient_scale.item())
 
         # Rescale all locally-accumulated gradients by 1/N. The reduce
         # below sees the rescaled grads; for all_reduce the result is the
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
-        self.model.scale_gradients(inv_n)
+        self.model.scale_gradients(gradient_scale)
         if draft_step_state.active:
             draft_step_state.correct_main_grads(
                 self.model.parameters(),
@@ -2409,7 +2521,7 @@ class MegatronPolicyWorkerImpl(
             )
         # The uniform rescale gives MTP the main loss's denominator. Correct
         # detached, MTP-tagged parameters back to the valid-token denominator
-        # used by the synchronous path. For token-level loss the factor is 1.
+        # used by the synchronous path. For global-token loss the factor is 1.
         # This runs before gradient reduction; scaling and reduction are linear.
         if state["mtp_enabled"] and state["mtp_detach_heads"]:
             self._scale_mtp_param_grads(
@@ -2507,6 +2619,8 @@ class MegatronPolicyWorkerImpl(
         # Mirrors train(): without re-enabling the pre-hook __init__ removed, the
         # param all-gather never runs and each forward sees only its own shard.
         self._restore_first_train_step_param_sync(update_successful)
+        if self._shape_profiles is not None:
+            self._shape_profiles.step_done(update_successful)
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
             torch.cuda.empty_cache()
@@ -2563,8 +2677,12 @@ class MegatronPolicyWorkerImpl(
             if global_valid_seqs.item() > 0
             else torch.tensor(1.0, device="cuda")
         )
-        inv_toks = float((1.0 / n_toks_safe).item())
-        inv_seqs = float((1.0 / n_seqs_safe).item())
+        scales = metric_normalizer_scales(
+            state["objective_reduction"],
+            global_valid_toks=n_toks_safe,
+            global_valid_seqs=n_seqs_safe,
+            global_objective_denominator=n_safe,
+        )
 
         from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 
@@ -2574,17 +2692,15 @@ class MegatronPolicyWorkerImpl(
             """Apply the loss-advertised per-metric denominator.
 
             Metrics the loss did not advertise fall back to the gradient
-            normalization (the ``loss_type`` denominator).
+            normalization (the objective denominator).
             """
             kind = metric_normalizations.get(name)
             if kind is MetricNormalizer.NONE:
                 return value
-            if kind is MetricNormalizer.TOKENS:
-                scale = inv_toks
-            elif kind is MetricNormalizer.SEQUENCES:
-                scale = inv_seqs
-            else:  # not advertised → same as gradient normalization
+            if kind is None:  # not advertised → same as gradient normalization
                 scale = inv_n
+            else:
+                scale = scales[kind]
             return (
                 value.detach() * scale
                 if isinstance(value, torch.Tensor)
@@ -2685,6 +2801,120 @@ class MegatronPolicyWorkerImpl(
             self.model.zero_grad_buffer()
             self.optimizer.zero_grad()
             self._train_step_state = None
+
+    def _trainer_warmup_skip_reason(self) -> Optional[str]:
+        """Why warmup_first_pass would leave state behind on this model, else None."""
+        megatron_cfg = self.cfg["megatron_cfg"]
+        fp8_recipe = self.fp8_cfg.get("fp8_recipe") if self.fp8_cfg else None
+        raw_fp4_cfg = megatron_cfg.get("fp4_cfg")
+        fp4_enabled = (
+            raw_fp4_cfg is not None and Fp4Config.model_validate(raw_fp4_cfg).enabled
+        )
+        if self.optimizer is None:
+            return "no optimizer"
+        if get_model_config(self.model).cuda_graph_impl != "none":
+            return "CUDA graphs would be captured on the synthetic batch's shapes"
+        if self._router_replay_enabled:
+            return "router replay needs the routes recorded during generation"
+        if self.fp8_cfg and self.fp8_cfg["enabled"] and fp8_recipe == "delayed":
+            return "FP8 delayed scaling would keep the synthetic batch's amax history"
+        if fp4_enabled or megatron_cfg.get("te_precision_config_file"):
+            return "FP4 and per-module precision recipes are not covered"
+        if "draft" in self.cfg and self.cfg["draft"].enabled:
+            return "draft-model training is not covered"
+        if self.delegate_pack_to_model:
+            return "models that pack their own inputs are not covered"
+        if self.media_placeholder_token_id is not None and may_draw_token_id(
+            self.media_placeholder_token_id
+        ):
+            return "the synthetic batch could hold the media placeholder token"
+        return None
+
+    def warmup_first_pass(
+        self,
+        loss_fn: LossFunction,
+        train_fields: tuple[str, ...],
+        run_logprobs: bool,
+        seqlens: Optional[list[int]],
+    ) -> dict[str, Any]:
+        """Run one synthetic logprob pass and forward/backward, keeping nothing.
+
+        Ends in ``abort_train_step`` instead of an optimizer step, then resets what
+        the first real step would otherwise count: the routers' token counts, the
+        MoE and MTP metric trackers, the RNG states and the step timer. Returns the
+        phase timings, or ``{"skipped": reason}``.
+        """
+        reason = self._trainer_warmup_skip_reason()
+        if reason is not None:
+            return {"skipped": reason}
+        if getattr(self, "_train_step_state", None) is not None:
+            raise RuntimeError(
+                "the trainer warm-up cannot run inside an open train step"
+            )
+
+        t0 = time.perf_counter()
+        lengths = warmup_seqlens(self.cfg, seqlens)
+        data = self._apply_packing_prep(
+            build_warmup_batch(
+                lengths,
+                train_fields=train_fields,
+                pad_to_multiple=self.cfg["make_sequence_length_divisible_by"],
+            )
+        )
+        rng_tracker = get_cuda_rng_tracker()
+        saved = {
+            n: s.get_state() if isinstance(s, torch.Generator) else s.clone()
+            for n, s in rng_tracker.get_states().items()
+        }
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state()
+        grad_enabled = torch.is_grad_enabled()
+        step_timer, self.timer = self.timer, Timer()
+        summary: dict[str, Any] = {"seqlens": lengths}
+        try:
+            if run_logprobs:
+                t = time.perf_counter()
+                self.prepare_for_lp_inference()
+                logprobs = self.get_logprobs(data=data, require_router_replay=False)[
+                    "logprobs"
+                ]
+                # As in a real step: the ratio to these logprobs starts at one.
+                if logprobs.shape == data["input_ids"].shape:
+                    for name in (
+                        "prev_logprobs",
+                        "generation_logprobs",
+                        "reference_policy_logprobs",
+                    ):
+                        if name in data:
+                            data[name] = logprobs.clone()
+                summary["logprobs_s"] = time.perf_counter() - t
+            t = time.perf_counter()
+            self.prepare_for_training()
+            self.begin_train_step(loss_fn)
+            self.train_microbatch(data)
+            torch.cuda.synchronize()
+            summary["train_s"] = time.perf_counter() - t
+        finally:
+            torch.set_grad_enabled(grad_enabled)
+            self.abort_train_step()
+            reset_model_temporary_tensors(get_model_config(self.model), [self.model])
+            clear_aux_losses_tracker()
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
+            torch.set_rng_state(cpu_rng_state)
+            torch.cuda.set_rng_state(cuda_rng_state)
+            live = rng_tracker.get_states()
+            for n, s in live.items():
+                if isinstance(s, torch.Generator):
+                    # In place: CUDA graphs see the same RNG state.
+                    s.set_state(saved[n])
+                else:
+                    live[n] = saved[n]
+            rng_tracker.set_states(live)
+            self.timer = step_timer
+            if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                torch.cuda.empty_cache()
+        summary["total_s"] = time.perf_counter() - t0
+        return summary
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(
@@ -3614,7 +3844,9 @@ class MegatronPolicyWorkerImpl(
         """Return True if the train side stores weights as TE blockwise FP8."""
         return is_blockwise_fp8_param_storage(self.fp8_cfg)
 
-    def _build_refit_conversion_tasks(self) -> list:
+    def _build_refit_conversion_tasks(
+        self, *, exclude_param_patterns: tuple[str, ...] = ()
+    ) -> list:
         """Keep the general/misc export format expected by each backend."""
         # Deferred import to avoid circular import issues.
         from nemo_rl.models.megatron.draft import draft_model_detached
@@ -3622,11 +3854,13 @@ class MegatronPolicyWorkerImpl(
         with draft_model_detached([self.model]):
             if self._is_fp8_export() and not self._generation_needs_logical_weights():
                 return self.megatron_bridge.get_export_fp8_tasks(self.model)
-            return [
-                task
-                for task in self.megatron_bridge.get_conversion_tasks([self.model])
-                if task is not None
-            ]
+            if exclude_param_patterns:
+                tasks = self.megatron_bridge.get_conversion_tasks(
+                    [self.model], exclude_param_patterns=exclude_param_patterns
+                )
+            else:
+                tasks = self.megatron_bridge.get_conversion_tasks([self.model])
+            return [task for task in tasks if task is not None]
 
     def _generation_needs_logical_weights(self) -> bool:
         """Megatron's existing non-bulk export consumes logical model weights."""
@@ -5747,6 +5981,9 @@ class MegatronPolicyWorkerImpl(
         return final_result
 
 
+# Every rollout sample is one generate_async call on rank 0, and the engine queues
+# requests past its own capacity. A separate generation concurrency group keeps
+# control calls schedulable while allowing more than 1000 outstanding requests.
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker"),
     concurrency_groups=WORKER_CONCURRENCY_GROUPS,
