@@ -92,7 +92,8 @@ def create_local_venv(
     # cluster with non-shared filesystems), you may encounter errors when workers
     # try to access the virtual environments
     #
-    # You can override this location by setting the NEMO_RL_VENV_DIR environment variable
+    # You can override this location by setting the NEMO_RL_VENV_DIR environment variable.
+    # Keep it on node-local disk; see "Python Environments on Shared Filesystems" in docs/cluster.md.
 
     NEMO_RL_VENV_DIR = os.path.normpath(
         os.environ.get("NEMO_RL_VENV_DIR", DEFAULT_VENV_DIR)

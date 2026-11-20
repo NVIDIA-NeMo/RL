@@ -77,6 +77,8 @@ VLLM_CACHE_DIR="${PERSISTENT_CACHE}/vllm_compile_cache"
 FLASHINFER_CUBIN_CACHE="${PERSISTENT_CACHE}/flashinfer_cubins"
 FLASHINFER_WS_BASE="${PERSISTENT_CACHE}/flashinfer_workspace"
 GYM_VENV_DIR="${GYM_VENV_DIR:-/opt/gym_venvs}"
+# A tar of opt/gym_venvs built in CONTAINER; see "Python Environments on Shared Filesystems" in docs/cluster.md.
+GYM_VENV_ARCHIVE="${GYM_VENV_ARCHIVE:-}"
 HF_MODULES_CACHE_DIR="${HF_MODULES_CACHE:-${PERSISTENT_CACHE}/hf_modules/${EXP_NAME}}"
 UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
 NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
@@ -96,6 +98,7 @@ echo " Cache root : ${PERSISTENT_CACHE}"
 echo " HF locks   : ${MEGATRON_CONFIG_LOCK_DIR}"
 echo " HF modules : ${HF_MODULES_CACHE_DIR}"
 echo " Gym venvs  : ${GYM_VENV_DIR}"
+echo " Gym archive: ${GYM_VENV_ARCHIVE:-<none>}"
 echo " Rebuild Ray venvs: ${NRL_FORCE_REBUILD_VENVS}"
 echo " Partition  : ${SLURM_PARTITION}"
 echo " Account    : ${SLURM_ACCOUNT}"
@@ -198,6 +201,11 @@ BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-
 
 export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 
+# GYM_VENV_DIR defaults to the image's /opt/gym_venvs, on the node's local disk.
+# shellcheck source=../gym_venv_launch_checks.sh
+source "${SNAPSHOT_DIR}/examples/nemo_gym/gym_venv_launch_checks.sh"
+gym_venv_launch_checks "${GYM_VENV_DIR}" "${GYM_VENV_ARCHIVE}" "${MOUNTS}" "${SNAPSHOT_DIR}"
+
 # ---- Read num_nodes from the config's cluster.num_nodes field ----
 NUM_NODES=$(awk '/^cluster:/{found=1} found && /num_nodes:/{print $2; exit}' "${CONFIG_PATH}")
 if [[ -z "$NUM_NODES" ]]; then
@@ -226,6 +234,8 @@ if [[ "$DRY_RUN" == true ]]; then
     echo ""
     echo "[dry-run] COMMAND:"
     echo "${COMMAND}"
+    echo ""
+    echo "[dry-run] SETUP_COMMAND: ${SETUP_COMMAND:-<none>}"
     echo ""
     echo "[dry-run] sbatch invocation:"
     echo "${SBATCH_CMD[*]}"
