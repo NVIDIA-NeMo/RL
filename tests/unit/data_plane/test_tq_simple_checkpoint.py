@@ -497,6 +497,42 @@ def test_distributed_capture_native_layout_and_metadata_detachment(
     assert not client.controller._controller_snapshot_views
 
 
+def test_persist_adds_extra_metadata_to_the_completion_marker(fake_cluster, tmp_path):
+    path = tmp_path / "data_plane"
+    captured = snapshot.capture_simple_checkpoint(
+        path, num_storage_units=2, timeout_s=5.0, metadata={"step": 5}
+    )
+    captured.persist(extra_metadata={"digest": "abc"})
+    assert json.loads((path / "metadata.json").read_text()) == {
+        "storage_saved": True,
+        "user_metadata": {"step": 5, "digest": "abc"},
+    }
+    captured.release()
+
+
+@pytest.mark.parametrize(
+    "extra_metadata, error",
+    [({"step": 6}, ValueError), ({"digest": object()}, TypeError)],
+)
+def test_persist_rejects_bad_extra_metadata_before_writing(
+    fake_cluster, tmp_path, extra_metadata, error
+):
+    path = tmp_path / "data_plane"
+    captured = snapshot.capture_simple_checkpoint(
+        path, num_storage_units=2, timeout_s=5.0, metadata={"step": 5}
+    )
+    with pytest.raises(error):
+        captured.persist(extra_metadata=extra_metadata)
+    assert not (path / "controller_state.pkl").exists()
+    assert not list((path / "simple_storage").iterdir())
+    # Nothing was written, so this capture can still be persisted.
+    captured.persist()
+    assert json.loads((path / "metadata.json").read_text())["user_metadata"] == {
+        "step": 5
+    }
+    captured.release()
+
+
 def test_partial_capture_failure_releases_every_unit(fake_cluster, tmp_path):
     units, client = fake_cluster
     # One already-retained snapshot must not be disturbed by failed new capture.
