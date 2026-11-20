@@ -472,6 +472,8 @@ loss_fn:
 
 Bootstrap snapshot fingerprints include the serialized configuration.
 Changes to the selector syntax or schema across code versions can invalidate a snapshot even when the resolved averaging is equivalent.
+To resume a bootstrap snapshot saved before the loss selector was removed, use the NeMo-RL version and configuration that wrote it.
+Let the resumed run save a trainer checkpoint before upgrading.
 
 Writing $\ell_{i,t}$ for the per-token objective of token $t$ in response $o_i$ — the quantity inside the expectation in the formula above — $|o_i|$ for the number of unmasked tokens in that response, and $N$ for the number of valid responses:
 

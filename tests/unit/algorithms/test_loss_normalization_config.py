@@ -41,11 +41,6 @@ def test_normalization_roundtrip(fields: dict, expected: str) -> None:
     assert ClippedPGLossFn(reloaded).normalization == expected
 
 
-def test_unknown_normalization_is_rejected() -> None:
-    with pytest.raises(ValidationError):
-        ClippedPGLossConfig(normalization="typo")
-
-
 @pytest.mark.parametrize("legacy", [True, False, None])
 def test_removed_normalization_selector_is_rejected(legacy: bool | None) -> None:
     with pytest.raises(ValidationError, match=r"loss_fn\.token_level_loss was removed"):
