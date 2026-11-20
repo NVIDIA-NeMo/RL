@@ -28,6 +28,50 @@ from nemo_rl.models.megatron import sm_partition as smp
 MPS = {"CUDA_MPS_PIPE_DIRECTORY": "/tmp/mps"}
 
 
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_bind_shared_expert_stacks_uses_native_megatron_buffers(contiguous):
+    # Use the installed class so the test cannot invent an unavailable Core API.
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    experts = InferenceGroupedMLP.__new__(InferenceGroupedMLP)
+    torch.nn.Module.__init__(experts)
+    experts.num_local_experts = 2
+    experts._concatenated_weights_built = False
+    sources = {}
+    for linear_name, shape in [("linear_fc1", (4, 3)), ("linear_fc2", (3, 4))]:
+        linear = torch.nn.Module()
+        packed = torch.arange(2 * shape[0] * shape[1], dtype=torch.float32).reshape(
+            2, *shape
+        )
+        for index in range(2):
+            source = packed[index] if contiguous else packed[index].clone()
+            linear.register_parameter(f"weight{index}", torch.nn.Parameter(source))
+            sources[f"{linear_name}.weight{index}"] = source
+        experts.add_module(linear_name, linear)
+
+    stats = smp.bind_shared_expert_stacks(experts, sources)
+    assert experts._concatenated_weights_built is contiguous
+    assert stats["shared_expert_layers"] == int(contiguous)
+    if contiguous:
+        assert stats["shared_expert_bytes"] == sum(
+            value.numel() * value.element_size() for value in sources.values()
+        )
+        sources["linear_fc1.weight0"].add_(7)
+        torch.testing.assert_close(
+            experts._fc1_weight[0], sources["linear_fc1.weight0"]
+        )
+        assert (
+            experts._fc1_weight.data_ptr() == sources["linear_fc1.weight0"].data_ptr()
+        )
+        assert (
+            experts._fc2_weight.data_ptr() == sources["linear_fc2.weight0"].data_ptr()
+        )
+    else:
+        assert stats["shared_expert_bytes"] == 0
+        assert "_fc1_weight" not in experts._buffers
+        assert "_fc2_weight" not in experts._buffers
+
+
 def _cfg(**over):
     c = {
         "megatron_cfg": {

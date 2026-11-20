@@ -733,6 +733,7 @@ def bind_shared_expert_stacks(
     # The co-resident engine is the only consumer of optional Megatron inference modules.
     from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 
+    weight_groups = (("linear_fc1", "_fc1_weight"), ("linear_fc2", "_fc2_weight"))
     layers = shared_bytes = 0
     for prefix, module in core.named_modules():
         if not isinstance(module, InferenceGroupedMLP):
@@ -742,7 +743,7 @@ def bind_shared_expert_stacks(
                 "shared expert stacks must be bound before the first inference forward"
             )
         stacks = {}
-        for linear_name, buffer_name in module._EXPERT_WEIGHT_GROUPS:
+        for linear_name, buffer_name in weight_groups:
             linear = getattr(module, linear_name)
             weights = []
             for index in range(module.num_local_experts):
@@ -762,7 +763,7 @@ def bind_shared_expert_stacks(
             if stack is None:
                 break
             stacks[buffer_name] = stack
-        if len(stacks) != len(module._EXPERT_WEIGHT_GROUPS):
+        if len(stacks) != len(weight_groups):
             continue
         for buffer_name, stack in stacks.items():
             module.register_buffer(buffer_name, stack, persistent=False)
