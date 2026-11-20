@@ -98,7 +98,8 @@ from nemo_rl.data.multimodal_utils import (
     WIRE_MULTIMODAL_FIELDS,
     per_token_multimodal_schema,
 )
-from nemo_rl.data.packing.shared_prefix_metadata import (
+from nemo_rl.data.packing.shared_prefix.columns import (
+    SHARED_PREFIX_PROMPT_HASHES,
     SHARED_PREFIX_PROMPT_LENGTHS,
 )
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
@@ -379,9 +380,10 @@ def _register_single_controller_partitions(
         )
         if master_config.policy["generation"]["top_logprobs"] > 0:
             partition_fields.extend(SAMPLER_TOPK_FIELDS)
-    # setup_single_controller has already required token capture for this.
-    if get_shared_prefix_training_config(policy_config).enabled_for(stage="logprobs"):
-        partition_fields.append(SHARED_PREFIX_PROMPT_LENGTHS)
+        # The rollout reassembler writes these on every row.
+        partition_fields.extend(
+            (SHARED_PREFIX_PROMPT_LENGTHS, SHARED_PREFIX_PROMPT_HASHES)
+        )
     if include_multimodal_fields:
         partition_fields.extend(
             field
@@ -2698,7 +2700,6 @@ def setup_single_controller(
                     max_seq_len=_generation_max_seq_len(generation_config),
                     capture_media=capture_media,
                     media_columns=media_columns,
-                    include_shared_prefix_metadata=shared_prefix_enabled,
                     effort_config=_get_effort_config(
                         cast(GRPOMasterConfig, master_config)
                     ),

@@ -13,6 +13,10 @@
 # limitations under the License.
 """Names of the row metadata that shared-prefix packing reads and writes."""
 
+import hashlib
+from array import array
+from collections.abc import Sequence
+
 SHARED_PREFIX_PROMPT_LENGTHS = "shared_prefix_prompt_lengths"
 """Column: tokens at the start of a row that it may share with rows of its group; 0 when none."""
 
@@ -24,3 +28,9 @@ SHARED_PREFIX_TREE_IDS = "shared_prefix_tree_ids"
 
 UNSHARED_ROW = -1
 """Tree id of a row that runs as an ordinary packed sequence."""
+
+
+def prompt_hash(token_ids: Sequence[int]) -> int:
+    """Hash prompt tokens to a non-negative int64 that is the same in every process."""
+    digest = hashlib.blake2b(array("q", token_ids).tobytes(), digest_size=8).digest()
+    return int.from_bytes(digest, "little") >> 1
