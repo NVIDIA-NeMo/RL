@@ -758,8 +758,8 @@ failed or cancelled capture cannot confirm its own release, it raises
 cancellation; the caller has no handle to retry with and must stop
 checkpointing.
 
-This API requires caller integration: setting the flag alone does not change
-the existing synchronous `save_checkpoint` calls. Other backends return `None`.
+Existing `save_checkpoint` calls remain synchronous. SC checkpoints use the
+optional capture API as described below. Other backends return `None`.
 SimpleStorage capture requires SSD offload disabled and writes the existing
 native TQ checkpoint format, so restore does not need a new format.
 
@@ -786,6 +786,10 @@ Use the capture as a context manager, or always call `release()` in `finally`.
 `persist()` is single-attempt, including after a partial failure. Reusing the
 handle raises a clear error; release it, discard the failed directory, and
 capture again. Exclusive file creation remains an overwrite guard.
+`persist(extra_metadata=...)` adds fields computed after capture, such as the
+hash of state serialized once traffic resumes, to the capture's metadata. It
+rejects a key given at capture, or a value JSON cannot record, before writing
+anything.
 
 ```python
 capture = client.capture_checkpoint(checkpoint_dir, metadata=metadata)
@@ -810,6 +814,17 @@ failure cleanup and restore into fresh actors, runs in
 ```bash
 bash tests/functional/data_plane_simple_checkpoint_cpu.sh
 ```
+
+### Using `async_checkpoint` with Single-Controller checkpoints
+
+Set `data_plane.simple.async_checkpoint: true` (needs `ssd_offload.enabled: false`) to shorten the data-plane pause during SC checkpoints:
+
+- **Rollout snapshots:** TQ is captured under the barrier, then rollouts and Gym resume while the shards are written. The snapshot is published only after the write finishes.
+- **Trainer checkpoints** (with `checkpointing.save_data_plane: true`): same capture, but the trainer save still waits for the write before saving model weights.
+- Other backends and configurations keep the synchronous save.
+- If a captured view cannot be released, checkpointing stops and keeps the unpublished directory; do not delete it while the run is alive.
+
+To measure the gain, compare `exclusive_hold_seconds` and `gym_parked_seconds` with the setting on and off. The phase names are mapped in `_CHECKPOINT_DURATION_PHASES` in `nemo_rl/telemetry/metrics.py`; see `docs/observability/metrics.md`.
 
 ## Async path (proposed)
 

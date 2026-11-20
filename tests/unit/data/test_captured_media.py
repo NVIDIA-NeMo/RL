@@ -69,6 +69,7 @@ from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from nemo_rl.experience.route_assembly import verify_route_fragment_integrity
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
 from nemo_rl.models.generation.prefix_recovery import PrefixRecovery
+from nemo_rl.models.generation.prefix_recovery.recovery import _ResolvedGenerationCut
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
@@ -933,8 +934,10 @@ def test_generation_cut_rebuild_rejects_extras_after_the_first_chunk(dp):
     recovery = SimpleNamespace(
         _parts=SimpleNamespace(
             staging_source=SimpleNamespace(
-                fetch_for_finalization=lambda keys: [chunk, later]
-            )
+                fetch_for_finalization=lambda keys, **include: [chunk, later]
+            ),
+            router_replay=False,
+            sampler_top_k=0,
         )
     )
     admission = SimpleNamespace(
@@ -1778,11 +1781,14 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     restored_request = chat_request(
         restored_capture, max_tokens=8, max_completion_tokens=None, min_tokens=None
     )
-    # resolve_restore's verified snapshot, as on main.
+    # resolve_restore's verified prefix.
     monkeypatch.setattr(
         worker._prefix_recovery,
         "resolve_restore",
-        lambda admission, prefix_token_ids: (admission, cut),
+        lambda admission, prefix_token_ids: (
+            admission,
+            _ResolvedGenerationCut(snapshot=cut),
+        ),
     )
     monkeypatch.setattr(
         renderer, "model_config", SimpleNamespace(max_model_len=64), raising=False
