@@ -76,6 +76,22 @@ class TelemetryConfig(BaseModel, extra="allow"):
     standard ``OTEL_EXPORTER_OTLP_*`` env vars, so any OTLP-compatible backend
     or an OpenTelemetry Collector works."""
 
+    device_memory_enabled: bool = False
+    """Split each rank's allocated device memory into parameters / gradients /
+    optimizer state / other, once per training step (opt-in).
+
+    Off by default because it is the only ``rl.*`` series whose cost scales
+    with the model rather than with the run: it walks every parameter and every
+    optimizer state tensor the rank owns, costing a few hundred nanoseconds
+    each on the worker's own thread, inline in the step. Cheap against a step
+    measured in seconds, but it is per rank and per step, and nothing else here
+    asks the training objects anything.
+
+    Its numbers also need reading with care -- sharded under a distributed
+    optimizer, replicated under CP, undercounted above a virtual-pipeline size
+    of 1 -- so it suits debugging a memory question rather than standing watch.
+    See :mod:`nemo_rl.telemetry.device_memory`."""
+
     vllm_native_tracing: bool = False
     """Enable vLLM's own OTLP tracing inside generation workers (opt-in). vLLM
     builds its exporter itself and defaults it to gRPC, reading only

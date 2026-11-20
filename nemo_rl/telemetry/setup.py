@@ -43,6 +43,7 @@ import functools
 import importlib.metadata
 import logging
 import os
+import sys
 import threading
 import uuid
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, cast
@@ -116,6 +117,8 @@ _ENV_FIELD_MAP = {
     "exporter": f"{_OTEL_PREFIX}_EXPORTER",
     # RL-owned flag consumed by the vLLM generation worker (not a lens field).
     "vllm_native_tracing": f"{_OTEL_PREFIX}_VLLM_NATIVE_TRACING",
+    # RL-owned flag consumed by the policy workers (not a lens field).
+    "device_memory_enabled": f"{_OTEL_PREFIX}_DEVICE_MEMORY",
 }
 
 # Standard-OTel env var that also propagates to workers via the Ray runtime_env.
@@ -148,6 +151,19 @@ def vllm_native_tracing_requested() -> bool:
     the one field.
     """
     return _is_env_truthy(f"{_OTEL_PREFIX}_VLLM_NATIVE_TRACING")
+
+
+def device_memory_requested() -> bool:
+    """Whether ``telemetry.device_memory_enabled`` reached this process as truthy.
+
+    Read on every step from the policy worker, so it is a plain env lookup
+    rather than anything cached: the cost of asking is far below the cost of
+    the walk it gates.
+
+    Callers must also honour :func:`telemetry_enabled_in_env`; this reports only
+    the one field.
+    """
+    return _is_env_truthy(f"{_OTEL_PREFIX}_DEVICE_MEMORY")
 
 
 def _config_to_env(tel: Any) -> None:
@@ -837,15 +853,27 @@ def shutdown_telemetry(timeout_ms: int = 5000) -> None:
     spans an unreachable collector was going to lose anyway, and being a daemon
     it never holds up process exit.
     """
-    # Deferred to break the cycle: host_memory reads get_telemetry_handle from
-    # this module.
-    from nemo_rl.telemetry.host_memory import stop_host_memory_monitoring
+    # Looked up rather than imported. The deferral breaks a cycle --
+    # host_memory reads get_telemetry_handle from this module -- but the
+    # lookup is not just a cheaper import: it must not *cause* one.
+    # host_memory declares its rows at import, declaration closes once the
+    # metric group is registered, and a worker registers that group the first
+    # time it records anything, so importing here would raise out of a
+    # `finally` in any process that had not already pulled it in.
+    #
+    # Plenty have: worker_groups and logger both import it at module scope, so
+    # presence here says nothing about whether a monitor is running -- only
+    # start_host_memory_monitoring does, and stopping one that never started is
+    # a no-op. Absence is the decisive case, and it is unambiguous: the starter
+    # lives in that module, so if it was never imported there is nothing to
+    # stop.
+    host_memory = sys.modules.get("nemo_rl.telemetry.host_memory")
 
     # Called before the early return below, and before the flush: the monitor
     # records through the providers this is about to shut down, so leaving it
     # sampling would have it writing into a closed meter for a whole interval.
-
-    stop_host_memory_monitoring()
+    if host_memory is not None:
+        host_memory.stop_host_memory_monitoring()
 
     global _TELEMETRY_HANDLE
     handle = _TELEMETRY_HANDLE
