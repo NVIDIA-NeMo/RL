@@ -50,6 +50,38 @@ The exposed vLLM HTTP server binds every interface of its node and, by default, 
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
+### SGLang with async GRPO
+
+The legacy async-GRPO entrypoint also supports SGLang-backed Gym rollouts. Use the [SGLang Gym recipe](../../examples/configs/recipes/llm/grpo-qwen3-0.6b-1n4g-megatron-sglang-noncolocated-async-gym.yaml) for the complete adapter and environment configuration. Its execution requirements include:
+
+```yaml
+grpo:
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: false
+
+loss_fn:
+  use_importance_sampling_correction: true
+
+policy:
+  generation:
+    backend: sglang
+    use_async_rollouts: true
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 1
+        gpus_per_node: 1
+```
+
+SGLang requires dedicated generation resources for this async entrypoint; size the training cluster and generation allocation separately for the model. Importance-sampling correction is required because rollout weights can lag training weights. Gym uses the stable SGLang router endpoint through the shared Gym actor factory, including sharded Gym deployments.
+
+Select Gym's `responses_api_models/sglang_model/configs/sglang_model_for_training.yaml`, introduced in [Gym #1787](https://github.com/NVIDIA-NeMo/Gym/pull/1787), and set its `context_length` to the SGLang engine's limit. This adapter calls `/generate` to preserve exact sampled token IDs and logprobs. The vLLM model server expects vLLM-specific integer-token metadata and cannot substitute for this adapter with the pinned SGLang version.
+
+Before every refit the collector drains outstanding trajectories. Async SGLang rejects `in_flight_weight_updates: true`; keep this setting disabled. Generation overlaps training between refits, but this does not provide request-preserving in-flight refits. See [async GRPO usage tips](../guides/async-grpo.md#usage-tips) for cache invalidation semantics. Validation leaves the dedicated generation engines resident so collection can resume without a separate wake.
+
+When `policy.generation.sglang_cfg.context_length` is null, Gym truncation checks use the effective context window reported by the running SGLang engines, not `policy.max_total_sequence_length`. An explicit context length still selects the engine limit.
+
 ### Multiple vLLM HTTP frontends
 
 Set `policy.generation.vllm_cfg.http_api_server_count` to run several HTTP frontend processes for each model-owner worker. They share one vLLM engine, its model weights, and one listening socket, so NeMo Gym keeps using the same URL. The count includes the owning worker's frontend: a value of `8` starts seven additional frontend processes.

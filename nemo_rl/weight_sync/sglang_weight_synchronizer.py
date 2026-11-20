@@ -40,12 +40,9 @@ Disaggregated:
 The policy offload steps are skipped when disaggregated: the trainer keeps
 its GPUs to itself, so there is nothing to make room for.
 
-``prepare_for_generation`` runs on both paths. It is gated internally on
-``sglang_server_config.needs_offload``, which is an independent knob — with
-``needs_offload: true`` (what every shipped config sets) these calls issue
-real ``resume_memory_occupation`` RPCs even when disaggregated, and the
-engines need them because ``finish_generation`` released that memory. They
-are only a no-op when ``needs_offload`` is false.
+``prepare_for_generation`` runs on both paths and restores only memory tags
+previously released by ``finish_generation``. Dedicated engines retain their
+weights and KV allocation between phases, so their prepare calls are no-ops.
 """
 
 import os

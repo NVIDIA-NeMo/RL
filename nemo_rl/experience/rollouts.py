@@ -99,6 +99,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
     GenerationSamplingParams,
+    resolve_generation_max_seq_len,
 )
 from nemo_rl.telemetry.instrumentation import dispatch_with_trace_context
 from nemo_rl.utils.length_penalty import (
@@ -2803,14 +2804,7 @@ async def run_async_nemo_gym_rollout(
     assert max_rollout_turns is None, (
         "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
-    if "vllm_cfg" in policy_generation.cfg:
-        engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
-    elif "mcore_generation_config" in policy_generation.cfg:
-        engine_max_model_len = policy_generation.cfg["mcore_generation_config"][
-            "max_model_len"
-        ]
-    else:
-        engine_max_model_len = policy_generation.cfg["max_total_sequence_length"]
+    engine_max_model_len = resolve_generation_max_seq_len(policy_generation)
     if max_seq_len is not None and max_seq_len > engine_max_model_len:
         warnings.warn(
             f"policy max_total_sequence_length ({max_seq_len}) is greater than the "
@@ -2938,10 +2932,10 @@ async def run_async_nemo_gym_rollout(
                         results=completed_group.results,
                         timer=timer,
                         timer_prefix=timer_prefix,
-                        policy_generation=policy_generation,
                         input_batch=group_input_batch,
                         tokenizer=tokenizer,
                         log_full_result_tables=log_full_result_tables,
+                        max_total_tokens_per_sample=engine_max_model_len,
                         effort_config=effort_config,
                         reward_penalty_config=reward_penalty_config,
                         length_penalty_config=length_penalty_config,
@@ -3267,7 +3261,7 @@ def nemo_gym_rollout_hit_max_tokens(
             ``incomplete_details``; agents that synthesize their terminal
             response do not, and fall back to the token-count check.
         total_tokens: Token count of the rollout's full message log.
-        max_total_tokens_per_sample: The generation backend's context limit.
+        max_total_tokens_per_sample: The generation backend's max sequence length.
 
     Returns:
         True if the rollout was cut off by a token limit.
@@ -3288,10 +3282,10 @@ def _postprocess_single_nemo_gym_group(
     results: list[dict],
     timer: Timer,
     timer_prefix: str,
-    policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
     tokenizer: TokenizerType,
     log_full_result_tables: bool,
+    max_total_tokens_per_sample: int,
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     length_penalty_config: LengthPenaltyConfig | dict[str, Any] | None = None,
@@ -3340,22 +3334,6 @@ def _postprocess_single_nemo_gym_group(
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
-        if "vllm_cfg" in policy_generation.cfg:
-            max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"][
-                "max_model_len"
-            ]
-        elif "trtllm_cfg" in policy_generation.cfg:
-            max_total_tokens_per_sample = policy_generation.cfg["trtllm_cfg"][
-                "max_model_len"
-            ]
-        elif "mcore_generation_config" in policy_generation.cfg:
-            max_total_tokens_per_sample = policy_generation.cfg[
-                "mcore_generation_config"
-            ]["max_model_len"]
-        else:
-            max_total_tokens_per_sample = policy_generation.cfg[
-                "max_total_sequence_length"
-            ]
         all_sample_metrics: list[dict[str, Any]] = [
             {
                 "total_reward": r["full_result"]["reward"],

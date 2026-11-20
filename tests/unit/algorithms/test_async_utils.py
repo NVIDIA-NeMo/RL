@@ -2864,6 +2864,20 @@ class TestAsyncTrajectoryCollector:
 
         collector.policy_generation.invalidate_kv_cache.assert_not_called()
 
+    def test_sglang_prepare_for_refit_drains_pending_generations(self):
+        """Supported SGLang refits drain asynchronous collection."""
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {
+            "backend": "sglang",
+            "use_async_rollouts": True,
+        }
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = False
+        collector.wait_for_pending_generations = mock.MagicMock()
+
+        collector.prepare_for_refit()
+
+        collector.wait_for_pending_generations.assert_called_once_with()
+
     def test_calculate_target_weights(self):
         """Test target weight calculation logic."""
         buffer = ReplayBuffer.remote(

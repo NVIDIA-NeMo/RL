@@ -1591,6 +1591,54 @@ def test_checkpointing_requires_token_capture(detected_uv_dirs):
 
 
 @pytest.mark.parametrize("sharded", [False, True])
+def test_gym_factory_passes_the_supplied_server_urls_to_every_actor(
+    detected_uv_dirs, sharded
+):
+    cluster = _FakeGymCluster()
+    readiness = {
+        "services": [
+            {
+                "name": "judge",
+                "url": "http://judge/health",
+                "expected_backends": 1,
+            }
+        ],
+        "timeout_seconds": 10,
+        "poll_interval_seconds": 1,
+        "request_timeout_seconds": 2,
+    }
+    env_configs = (_shard_env_configs if sharded else _env_configs)(
+        external_service_readiness=readiness
+    )
+    original_config = copy.deepcopy(env_configs)
+    base_urls = ["http://engine-0/", "http://engine-1/v1/", "http://engine-2/v1"]
+    original_urls = list(base_urls)
+    with _patched_cluster(cluster):
+        shard_set = build_nemo_gym_actors(
+            env_configs,
+            base_urls=base_urls,
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+            policy_api_key="per-job-key",
+        )
+
+    assert len(shard_set.all_handles) == (3 if sharded else 1)
+    assert [config["base_urls"] for config in cluster.actor_configs] == [
+        original_urls
+    ] * len(shard_set.all_handles)
+    for config in cluster.actor_configs:
+        assert config["policy_api_key"] == "per-job-key"
+        assert config["external_service_readiness"].model_dump() == readiness
+        assert "policy_api_key" not in config["initial_global_config_dict"]
+        assert "external_service_readiness" not in config["initial_global_config_dict"]
+    assert base_urls == original_urls
+    assert env_configs == original_config
+
+
+@pytest.mark.parametrize("sharded", [False, True])
 def test_actor_factory_reads_environment_server_routes_from_resolved_configs(
     detected_uv_dirs, sharded
 ):

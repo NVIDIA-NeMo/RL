@@ -119,6 +119,7 @@ from nemo_rl.models.generation.interfaces import (
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
@@ -2667,6 +2668,22 @@ def test_async_resume_plumbs_frontier_metadata_into_collector(
             },
             False,
         ),
+        (
+            {
+                "backend": "sglang",
+                "use_async_rollouts": True,
+                "vllm_cfg": {"async_engine": False},
+            },
+            True,
+        ),
+        (
+            {
+                "backend": "sglang",
+                "use_async_rollouts": False,
+                "vllm_cfg": {"async_engine": True},
+            },
+            False,
+        ),
         ({"backend": "megatron", "mcore_generation_config": {}}, True),
     ],
 )
@@ -2697,6 +2714,166 @@ def test_should_use_nemo_gym_accepts_megatron_always_async():
     }
 
     assert should_use_nemo_gym(master_config)
+
+
+def test_sglang_async_grpo_reaches_training_and_refit(mock_grpo_components):
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"].update(
+        {
+            "backend": "sglang",
+            "use_async_rollouts": True,
+            # An inherited inactive block must not select vLLM behavior.
+            "vllm_cfg": {"async_engine": False},
+            "colocated": {"enabled": False},
+        }
+    )
+
+    policy_generation = MagicMock(spec=SGLangGeneration)
+    policy_generation.weight_synchronizer = None
+    policy_generation.requires_kv_scale_sync = False
+    policy_generation.get_logger_metrics.return_value = {}
+    policy_generation.blocks_training.return_value = False
+    policy_generation.wake_carries_weight_updates.return_value = False
+
+    with (
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        _patched_logprob_phase(policy),
+        patch("nemo_rl.algorithms.grpo.refit_policy_generation") as refit,
+    ):
+        async_grpo_train(
+            policy,
+            policy_generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    policy.train.assert_called_once()
+    assert refit.call_count >= 1
+
+
+def test_sglang_async_rejects_in_flight_weight_updates(
+    mock_grpo_components: dict,
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"].update(backend="sglang", use_async_rollouts=True)
+    master_config.grpo.async_grpo.in_flight_weight_updates = True
+    generation = MagicMock(spec=SGLangGeneration)
+
+    with pytest.raises(NotImplementedError, match="in_flight_weight_updates=true"):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    generation.pause_generation_for_refit.assert_not_called()
+    mock_grpo_components["policy"].train.assert_not_called()
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("val_at_start", [False, True])
+@pytest.mark.parametrize("save_checkpoint", [False, True])
+def test_sglang_async_validation_keeps_engines_resident(
+    mock_grpo_components, tmp_path, val_at_start, save_checkpoint
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 2
+    master_config.grpo.max_num_epochs = 2
+    master_config.grpo.val_period = 1
+    master_config.grpo.val_at_start = val_at_start
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"].update(
+        backend="sglang",
+        use_async_rollouts=True,
+        colocated={"enabled": False},
+    )
+    master_config.checkpointing.enabled = save_checkpoint
+    master_config.checkpointing.save_period = 1
+    master_config.checkpointing.metric_name = None
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
+    checkpointer.checkpoint_dir = tmp_path
+    policy = mock_grpo_components["policy"]
+    generation = MagicMock(spec=SGLangGeneration)
+    generation.weight_synchronizer = None
+    generation.requires_kv_scale_sync = False
+    generation.get_logger_metrics.return_value = {}
+    generation.blocks_training.return_value = False
+    generation.wake_carries_weight_updates.return_value = False
+    generation.needs_offload = True
+    generation._colocated = False
+    generation._offloaded_memory_tags = set()
+    generation._health_monitor = None
+    generation.engines = [MagicMock()]
+    generation.finish_generation.side_effect = lambda **kwargs: (
+        SGLangGeneration.finish_generation(generation, **kwargs)
+    )
+    generation.prepare_for_generation.side_effect = lambda **kwargs: (
+        SGLangGeneration.prepare_for_generation(generation, **kwargs)
+    )
+
+    def check_resident() -> None:
+        assert not generation._offloaded_memory_tags
+
+    resume = MagicMock()
+    resume.remote.side_effect = check_resident
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    with (
+        mock_async_grpo_infrastructure(mock_batch, {"mean_gen_tokens_per_sample": 2.0}),
+        _patched_logprob_phase(policy),
+        patch.object(StubAsyncTrajectoryCollector, "resume", resume),
+        patch("nemo_rl.algorithms.grpo.torch.save"),
+        patch(
+            "nemo_rl.algorithms.grpo.validate", return_value=({"accuracy": 1.0}, {})
+        ) as validate,
+    ):
+        async_grpo_train(
+            policy,
+            generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert policy.train.call_count == 2
+    assert validate.call_count == 2 + int(val_at_start)
+    assert resume.remote.call_count >= validate.call_count
+    assert generation.finish_generation.call_count == validate.call_count
+    assert not generation._offloaded_memory_tags
 
 
 def test_initial_refit_completes_before_async_collection_starts(

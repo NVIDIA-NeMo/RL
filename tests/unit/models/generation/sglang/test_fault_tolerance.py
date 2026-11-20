@@ -47,6 +47,34 @@ WAIT_TIMEOUT = 5.0
 STOP_JOIN_TIMEOUT = CHECK_TIMEOUT + CHECK_INTERVAL + 5
 
 
+def test_worker_reads_effective_context_length(monkeypatch) -> None:
+    worker_class = sglang_worker.SGLangGenerationWorker.__ray_metadata__.modified_class
+    worker = worker_class.__new__(worker_class)
+    worker.server_base_url = "http://engine:3001"
+    response = MagicMock()
+    response.json.return_value = {
+        "data": [{"max_model_len": 8192}, {"max_model_len": None}]
+    }
+    request = MagicMock(return_value=response)
+    monkeypatch.setattr(sglang_worker.requests, "get", request)
+
+    assert worker.get_context_length() == 8192
+    request.assert_called_once_with("http://engine:3001/v1/models", timeout=30)
+    response.raise_for_status.assert_called_once()
+
+
+@pytest.mark.parametrize("context_length", [None, 0, -1, True, "8192"])
+def test_worker_rejects_invalid_context_length(monkeypatch, context_length) -> None:
+    worker_class = sglang_worker.SGLangGenerationWorker.__ray_metadata__.modified_class
+    worker = worker_class.__new__(worker_class)
+    worker.server_base_url = "http://engine:3001"
+    response = MagicMock()
+    response.json.return_value = {"data": [{"max_model_len": context_length}]}
+    monkeypatch.setattr(sglang_worker.requests, "get", MagicMock(return_value=response))
+    with pytest.raises(ValueError, match="invalid model context length"):
+        worker.get_context_length()
+
+
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------
@@ -82,6 +110,13 @@ class _FakeEngine:
         self.health_generate = _RemoteMethod(health_fn or self._health_generate)
         self.shutdown = _RemoteMethod(shutdown_fn or self._shutdown)
         self.is_alive = _RemoteMethod(alive_fn or (lambda: True))
+        self.memory_events = []
+        self.release_memory_occupation = _RemoteMethod(
+            lambda tags=None: self.memory_events.append(("release", tags))
+        )
+        self.resume_memory_occupation = _RemoteMethod(
+            lambda tags=None: self.memory_events.append(("resume", tags))
+        )
 
     def _health_generate(self, timeout=None):
         self.health_check_count += 1
@@ -152,6 +187,7 @@ def _wait_until(predicate, timeout=WAIT_TIMEOUT):
 def fake_ray(monkeypatch):
     ray_stub = _FakeRay()
     monkeypatch.setattr(fault_tolerance, "ray", ray_stub)
+    monkeypatch.setattr(sglang_generation, "ray", ray_stub)
     return ray_stub
 
 
@@ -455,12 +491,14 @@ def _make_generation(monitor):
     gen.weight_synchronizer = None
     gen.all_engines = []
     gen.needs_offload = True
+    gen._colocated = True
     gen.num_gpus_per_engine = 1
     gen.num_gpus_per_node = 1
     gen.gpu_offset = 0
     gen.num_new_engines = 0
     gen.rollout_engine_lock = None
     gen._health_monitor = monitor
+    gen._offloaded_memory_tags = set()
     gen._router_actor = None
     gen._http_client = None
     gen._async_loop = None
@@ -493,6 +531,40 @@ def test_finish_generation_pauses_monitoring():
     gen.finish_generation()
 
     assert monitor.events == ["pause"]
+
+
+def test_finish_generation_keeps_dedicated_engines_resident(fake_ray: object) -> None:
+    monitor = _RecordingMonitor()
+    engine = _FakeEngine()
+    gen = _make_generation(monitor)
+    gen._colocated = False
+    gen.all_engines = [engine]
+
+    gen.finish_generation(release_gpu=True)
+    gen.prepare_for_generation()
+
+    assert monitor.events == ["resume"]
+    assert engine.memory_events == []
+    assert not gen._offloaded_memory_tags
+
+
+def test_memory_transitions_are_idempotent(fake_ray):
+    engine = _FakeEngine()
+    gen = _make_generation(None)
+    gen.all_engines = [engine]
+
+    gen.finish_generation()
+    gen.finish_generation()
+    gen.prepare_for_generation(tags=["weights"])
+    gen.prepare_for_generation(tags=["weights"])
+    gen.prepare_for_generation(tags=["kv_cache"])
+    gen.prepare_for_generation(tags=["kv_cache"])
+
+    assert engine.memory_events == [
+        ("release", ["weights", "kv_cache"]),
+        ("resume", ["weights"]),
+        ("resume", ["kv_cache"]),
+    ]
 
 
 def test_monitoring_survives_a_full_offload_recover_onload_cycle():
@@ -651,6 +723,7 @@ def test_recover_probes_before_collecting_dead_slots(monitor_factory):
 def test_replacement_weights_are_onloaded_once_after_recovery(monkeypatch, fake_ray):
     monkeypatch.setattr(sglang_generation, "ray", fake_ray)
     gen = _make_generation(_RecordingMonitor())
+    gen._offloaded_memory_tags = {"weights", "kv_cache"}
     gen.all_engines = [None]
     gen.num_new_engines = 1
     events = []

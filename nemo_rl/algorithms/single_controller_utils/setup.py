@@ -148,6 +148,7 @@ from nemo_rl.models.generation.generation_router import (
     GenerationRouterActor,
     GenerationRouterImpl,
 )
+from nemo_rl.models.generation.interfaces import resolve_generation_max_seq_len
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -876,23 +877,6 @@ def _spinup_gym(
         ),
     )
     return shard_set, time.perf_counter() - t0
-
-
-def _generation_max_seq_len(generation_config) -> int:
-    """Return the per-backend max sequence length.
-
-    vllm uses vllm_cfg.max_model_len;
-    sglang uses sglang_cfg.context_length; megatron uses
-    mcore_generation_config.max_model_len.
-    """
-    backend = generation_config["backend"]
-    if backend == "vllm":
-        return generation_config["vllm_cfg"]["max_model_len"]
-    if backend == "sglang":
-        return generation_config["sglang_cfg"]["context_length"]
-    if backend == "megatron":
-        return generation_config["mcore_generation_config"]["max_model_len"]
-    raise ValueError(f"Unknown generation backend: {backend!r}")
 
 
 # On the overlapped path the trainer build waits up to this long for the dataset. Within it, the trainer is built once
@@ -2454,6 +2438,8 @@ def setup_single_controller(
         ),
     )
 
+    rollout_max_seq_len = resolve_generation_max_seq_len(generation)
+
     def _create_finalizers() -> list[Any]:
         """Rollout reassembler pool; needs the token-capture result, not the communicator."""
         lane_t0 = time.perf_counter()
@@ -2477,7 +2463,7 @@ def setup_single_controller(
                     pad_token_id=pad_id,
                     router_replay_enabled=router_replay_enabled(policy_config),
                     defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
-                    max_seq_len=_generation_max_seq_len(generation_config),
+                    max_seq_len=rollout_max_seq_len,
                     capture_media=capture_media,
                     media_columns=media_columns,
                     effort_config=_get_effort_config(
@@ -2565,7 +2551,7 @@ def setup_single_controller(
         tokenizer=tokenizer,
         task_to_env=env_handles,
         num_generations_per_prompt=algo_cfg.num_generations_per_prompt,
-        max_seq_len=_generation_max_seq_len(generation_config),
+        max_seq_len=rollout_max_seq_len,
         rollout_recovery_config=master_config.rollout_recovery,
         max_rollout_turns=algo_cfg.max_rollout_turns,
         policy_generation=generation,

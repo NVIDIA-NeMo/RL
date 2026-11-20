@@ -56,6 +56,7 @@ DETECT_TIMEOUT = 300
 def _make_fault_tolerant_cfg(pad_token_id: int) -> dict:
     return {
         "backend": "sglang",
+        "colocated": {"enabled": True},
         "model_name": MODEL_PATH,
         "model_path": MODEL_PATH,
         "tokenizer": {"name": MODEL_PATH},

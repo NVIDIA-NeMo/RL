@@ -448,6 +448,17 @@ class SGLangGenerationWorker:
             return None
         return self.server_base_url
 
+    def get_context_length(self) -> int:
+        """Read the effective model context window from a node-0 server."""
+        response = requests.get(f"{self.server_base_url}/v1/models", timeout=30)
+        response.raise_for_status()
+        context_length = response.json()["data"][0]["max_model_len"]
+        if type(context_length) is not int or context_length <= 0:
+            raise ValueError(
+                f"SGLang returned an invalid model context length: {context_length!r}"
+            )
+        return context_length
+
     def invalidate_kv_cache(self) -> None:
         """Flush this server's KV cache."""
         if self.node_rank != 0:

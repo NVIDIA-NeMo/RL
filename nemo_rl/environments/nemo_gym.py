@@ -510,6 +510,10 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         should_expose_http_server = generation_config.get(
             "mcore_generation_config", {}
         ).get("expose_http_server")
+    elif generation_config["backend"] == "sglang":
+        # SGLang always serves an OpenAI-compatible HTTP endpoint through its
+        # router; no additional expose-http-server switch is required.
+        should_expose_http_server = True
     elif generation_config["backend"] == "trtllm":
         should_expose_http_server = generation_config.get("trtllm_cfg", {}).get(
             "expose_http_server"
@@ -2980,6 +2984,9 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         # Megatron Inference is always async; should_use_async_rollouts rejects
         # an explicit mcore_generation_config.async_engine key.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
+    elif generation_config["backend"] == "sglang":
+        # SGLang is always an HTTP server; this selects its async rollout flow.
+        generation_config["use_async_rollouts"] = True
     elif generation_config["backend"] == "trtllm":
         # Must stay in sync with should_use_nemo_gym, which reads
         # trtllm_cfg.expose_http_server to decide Gym owns the rollouts. Under
@@ -2989,7 +2996,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         generation_config["trtllm_cfg"]["expose_http_server"] = True
     else:
         raise ValueError(
-            "NeMo-Gym setup supports vllm, megatron, or trtllm "
+            "NeMo-Gym setup supports vllm, megatron, sglang, or trtllm "
             f"generation; got {generation_config['backend']!r}"
         )
 

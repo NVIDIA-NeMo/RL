@@ -1722,7 +1722,7 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
 
 def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
     class _FakePolicyGeneration:
-        cfg = {"vllm_cfg": {"max_model_len": 100}}
+        cfg = {"backend": "vllm", "vllm_cfg": {"max_model_len": 100}}
 
     # stop_strings is truthy so the function hits the next assert and exits
     # right after emitting the warning — keeps this test free of any rollout work.
@@ -1743,6 +1743,64 @@ def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
     with pytest.warns(UserWarning, match="greater than the"):
         with pytest.raises(AssertionError, match="Stop strings"):
             asyncio.run(_consume_rollout())
+
+
+def test_nemo_gym_context_limit_uses_active_sglang_backend():
+    policy_generation = type(
+        "_PolicyGeneration",
+        (),
+        {
+            "cfg": {
+                "backend": "sglang",
+                "sglang_cfg": {"context_length": 256},
+                # Inherited inactive blocks must not select another backend.
+                "vllm_cfg": {"max_model_len": 1},
+            }
+        },
+    )()
+
+    assert (
+        rollouts_mod.resolve_generation_max_seq_len(
+            policy_generation,
+        )
+        == 256
+    )
+
+
+def test_nemo_gym_context_limit_uses_resolved_sglang_limit():
+    policy_generation = type(
+        "_PolicyGeneration",
+        (),
+        {
+            "cfg": {
+                "backend": "sglang",
+                "sglang_cfg": {"context_length": None},
+                "vllm_cfg": {"max_model_len": 1},
+            },
+            "context_length": 8192,
+        },
+    )()
+
+    assert (
+        rollouts_mod.resolve_generation_max_seq_len(
+            policy_generation,
+        )
+        == 8192
+    )
+    assert not nemo_gym_rollout_hit_max_tokens(
+        {"response": {"status": "completed", "incomplete_details": None}},
+        total_tokens=2048,
+        max_total_tokens_per_sample=rollouts_mod.resolve_generation_max_seq_len(
+            policy_generation
+        ),
+    )
+    assert nemo_gym_rollout_hit_max_tokens(
+        {"response": {"status": "completed", "incomplete_details": None}},
+        total_tokens=8192,
+        max_total_tokens_per_sample=rollouts_mod.resolve_generation_max_seq_len(
+            policy_generation
+        ),
+    )
 
 
 def test_native_rollout_groups_match_whole_batch(monkeypatch):
@@ -1992,7 +2050,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
             return _AsyncOnlyStream(values)
 
     class _PolicyGeneration:
-        cfg = {"vllm_cfg": {"max_model_len": 128}}
+        cfg = {"backend": "vllm", "vllm_cfg": {"max_model_len": 128}}
 
     rows = []
     for task_index in (10, 10, 11, 11):
@@ -2328,14 +2386,10 @@ def test_postprocess_nemo_gym_group_returns_task_index(
         results=results,
         timer=rollouts_mod.Timer(),
         timer_prefix="timing/rollout",
-        policy_generation=type(
-            "_PolicyGeneration",
-            (),
-            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
-        )(),
         input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=log_full_result_tables,
+        max_total_tokens_per_sample=128,
         length_penalty_config={
             "default": {
                 "group_total_length_penalty_coeff": 0.1,
@@ -2441,11 +2495,7 @@ def test_postprocess_nemo_gym_group_reads_profile_metadata_from_task_rows(
         results=results,
         timer=rollouts_mod.Timer(),
         timer_prefix="timing/rollout",
-        policy_generation=type(
-            "_PolicyGeneration",
-            (),
-            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
-        )(),
+        max_total_tokens_per_sample=128,
         input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=log_full_result_tables,
@@ -2516,14 +2566,10 @@ def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
         results=results,
         timer=rollouts_mod.Timer(),
         timer_prefix="timing/rollout",
-        policy_generation=type(
-            "_PolicyGeneration",
-            (),
-            {"cfg": {"vllm_cfg": {"max_model_len": 3}}},
-        )(),
         input_batch=BatchedDataDict({"loss_multiplier": torch.ones(4)}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=False,
+        max_total_tokens_per_sample=3,
     )
 
     metrics = rollout_result.rollout_metrics
@@ -2651,14 +2697,10 @@ def test_postprocess_nemo_gym_group_marks_context_overflow_truncated():
         results=results,
         timer=rollouts_mod.Timer(),
         timer_prefix="timing/rollout",
-        policy_generation=type(
-            "_PolicyGeneration",
-            (),
-            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
-        )(),
         input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=False,
+        max_total_tokens_per_sample=128,
     )
 
     # Both rollouts are 5 tokens, far below the limit: only the length-cut one
