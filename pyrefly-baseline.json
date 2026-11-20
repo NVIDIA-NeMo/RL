@@ -1682,6 +1682,13 @@
       "severity": "error"
     },
     {
+      "column": 17,
+      "path": "nemo_rl/algorithms/grpo_sync.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable",
+      "severity": "error"
+    },
+    {
       "column": 21,
       "path": "nemo_rl/algorithms/loss/loss_functions.py",
       "name": "invalid-type-var",
@@ -2708,6 +2715,13 @@
       "path": "nemo_rl/algorithms/rm.py",
       "name": "unsupported-operation",
       "concise_description": "`>` is not supported between `list[float]` and `Literal[0]`",
+      "severity": "error"
+    },
+    {
+      "column": 43,
+      "path": "nemo_rl/algorithms/rollout_checkpointing/restore.py",
+      "name": "unbound-name",
+      "concise_description": "`staging_partition` may be uninitialized",
       "severity": "error"
     },
     {
@@ -6873,6 +6887,13 @@
       "path": "nemo_rl/models/policy/workers/megatron_policy_worker.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `list[Number]` is not assignable to parameter `losses` with type `list[Tensor | float]` in function `nemo_rl.models.megatron.train.aggregate_training_statistics`",
+      "severity": "error"
+    },
+    {
+      "column": 29,
+      "path": "nemo_rl/models/policy/workers/megatron_policy_worker.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `object`",
       "severity": "error"
     },
     {
