@@ -452,6 +452,7 @@ def test_none_engine_is_skipped(monitor_factory, fake_ray):
 # ---------------------------------------------------------------------------
 def _make_generation(monitor):
     gen = SGLangGeneration.__new__(SGLangGeneration)
+    gen._owns_engines = True
     gen.weight_synchronizer = None
     gen.all_engines = []
     gen.needs_offload = True

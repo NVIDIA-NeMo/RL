@@ -38,6 +38,8 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_sglang_sync.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_sglang_async.sh
 run_test env EXPECT=survival uv run --no-sync bash ./tests/functional/grpo_sglang_fault_tolerance_chaos.sh
 run_test env EXPECT=bounded_failure uv run --no-sync bash ./tests/functional/grpo_sglang_fault_tolerance_chaos.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_sglang.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_rollout_only_sglang.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

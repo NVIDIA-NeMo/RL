@@ -76,6 +76,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     MasterConfig,
     NoOpTrainer,
     NoOpWeightSynchronizer,
+    SGLangNoOpWeightSynchronizer,
     SimulatorConfig,
     SingleControllerActorArgs,
     setup_single_controller,
@@ -183,6 +184,11 @@ def _make_master_config(
             "kv_cache_management_mode": "recompute",
         }
         policy_config["model_name"] = "test-model"
+    if backend == "sglang":
+        # The field SGLangGeneration.validate_settings reads, at an accepted value.
+        generation_config["sglang_cfg"] = {
+            "sglang_fault_tolerance_config": {"use_fault_tolerance": False}
+        }
     master_config = MasterConfig.model_construct(
         data_plane={
             "enabled": dp_enabled,
@@ -228,6 +234,9 @@ def _make_master_config(
             **({} if sampler_cfg is None else {"sampler": sampler_cfg}),
         ),
     )
+    if backend == "sglang":
+        # SGLang cannot enforce a refit deadline, so setup requires null.
+        master_config.async_rl.generation_fleet_health.refit_timeout_s = None
     return master_config
 
 
@@ -348,7 +357,6 @@ def test_build_generation_passes_sglang_config():
     """SGLangGeneration receives the complete generation config by keyword."""
     master_config = _make_master_config(backend="sglang")
     master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
-    master_config.policy["generation"]["sglang_cfg"] = {}
     inference_cluster = MagicMock(name="inference_cluster")
 
     with patch.object(sc_setup_mod, "SGLangGeneration") as mock_sglang:
@@ -365,6 +373,50 @@ def test_build_generation_passes_sglang_config():
         "Qwen/Qwen3-0.6B"
     )
     generation.finish_generation.assert_called_once_with()
+
+
+def test_setup_rejects_sglang_fault_tolerance_before_anything_builds(
+    patched_factories,
+):
+    """The health monitor cannot follow the handle into the SC actor."""
+    master_config = _make_master_config(backend="sglang")
+    master_config.policy["generation"]["sglang_cfg"][
+        "sglang_fault_tolerance_config"
+    ] = {"use_fault_tolerance": True}
+
+    with pytest.raises(NotImplementedError, match="fault tolerance"):
+        setup_single_controller(master_config, MagicMock(pad_token_id=0))
+
+    patched_factories["_build_clusters"].assert_not_called()
+    patched_factories["_build_generation"].assert_not_called()
+
+
+def test_setup_rejects_sglang_fleet_health_before_anything_builds(
+    patched_factories,
+):
+    """SGLang has no worker-group shards for fleet health to track."""
+    master_config = _make_master_config(backend="sglang")
+    master_config.async_rl.generation_fleet_health.enabled = True
+
+    with pytest.raises(ValueError, match="fleet_health.*backend='sglang'"):
+        setup_single_controller(master_config, MagicMock(pad_token_id=0))
+
+    patched_factories["_build_clusters"].assert_not_called()
+    patched_factories["_build_generation"].assert_not_called()
+
+
+def test_setup_rejects_sglang_refit_deadline_before_anything_builds(
+    patched_factories,
+):
+    """SGLang workers cannot abort a refit, so a deadline would be silently ignored."""
+    master_config = _make_master_config(backend="sglang")
+    master_config.async_rl.generation_fleet_health.refit_timeout_s = 300.0
+
+    with pytest.raises(ValueError, match="refit_timeout_s must be null.*'sglang'"):
+        setup_single_controller(master_config, MagicMock(pad_token_id=0))
+
+    patched_factories["_build_clusters"].assert_not_called()
+    patched_factories["_build_generation"].assert_not_called()
 
 
 def _make_forest_master_config() -> MasterConfig:
@@ -5268,6 +5320,44 @@ class TestSimulatorRolloutOnlySetup:
             patched_factories["build_data_plane_client"].return_value
         )
 
+    def test_sglang_recipe_gets_the_self_pausing_noop_refit(
+        self, patched_factories, monkeypatch
+    ):
+        mc = _make_master_config(backend="sglang", colocated=False)
+        mc.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 2,
+        }
+        mc.policy["generation"]["sglang_cfg"] = {
+            "sglang_server_config": {
+                "pause_generation_mode": "retract",
+                "needs_offload": False,
+            },
+            "sglang_fault_tolerance_config": {"use_fault_tolerance": False},
+        }
+        monkeypatch.setattr(
+            sc_setup_mod,
+            "_build_inference_only_cluster",
+            MagicMock(return_value=MagicMock(name="inference_cluster")),
+        )
+        monkeypatch.setattr(
+            sc_simulator_mod,
+            "build_data_plane_client",
+            patched_factories["build_data_plane_client"],
+        )
+
+        actor_args, _ = setup_single_controller(
+            mc, MagicMock(pad_token_id=0), simulator=SimulatorConfig(refit_time_s=2.0)
+        )
+
+        patched_factories["create_weight_synchronizer"].assert_not_called()
+        synchronizer = actor_args.weight_synchronizer
+        assert isinstance(synchronizer, SGLangNoOpWeightSynchronizer)
+        assert synchronizer._refit_time_s == 2.0
+        # The stand-in pauses the engine it was built beside.
+        assert synchronizer._generation is patched_factories["fake_gen"]
+        assert patched_factories["fake_gen"].weight_synchronizer is synchronizer
+
     def test_rejects_checkpointing_before_any_factory_runs(self, patched_factories):
         mc = self._rollout_only_config()
         mc.checkpointing.enabled = True
@@ -5281,10 +5371,10 @@ class TestSimulatorRolloutOnlySetup:
         patched_factories["_build_clusters"].assert_not_called()
         patched_factories["build_data_plane_client"].assert_not_called()
 
-    def test_rejects_non_vllm_generation_before_any_factory_runs(
+    def test_rejects_unsupported_generation_before_any_factory_runs(
         self, patched_factories
     ):
-        mc = _make_master_config(colocated=False, backend="sglang")
+        mc = _make_master_config(colocated=False, backend="trtllm")
 
         with pytest.raises(NotImplementedError, match="vllm"):
             setup_single_controller(
