@@ -2102,9 +2102,7 @@ Depending on your data shape, you may want to change these values."""
         the ledger has no manifest for them and TransferQueue holds nothing to
         rebuild. Under token capture the response carries no token ids either (the
         token echo is off), so the result keeps only what the Environment Server
-        returned: ``receipt`` is ``None`` and ``skip_token_capture`` is ``True``.
-        A rollout without the mark still needs its capture, and is masked as today
-        when it has none.
+        returned: ``receipt`` is ``None``.
         """
         return {
             "message_log": [],
@@ -2112,7 +2110,6 @@ Depending on your data shape, you may want to change these values."""
             "full_result": nemo_gym_result,
             "rollout_id": nemo_gym_row.get(_NG_ROLLOUT_ID_BODY_KEY),
             "receipt": None,
-            "skip_token_capture": True,
         }
 
     async def _postprocess_receipt_mode(

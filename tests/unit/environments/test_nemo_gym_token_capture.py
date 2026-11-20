@@ -106,7 +106,6 @@ def test_capture_stream_reads_no_manifest_for_a_rollout_rl_skipped() -> None:
         "full_result": gym_result,
         "rollout_id": "val-1",
         "receipt": None,
-        "skip_token_capture": True,
         "attribution_key": "agent",
     }
 
