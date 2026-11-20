@@ -29,6 +29,7 @@ from nemo_rl.models.generation.sglang.utils import patches
 @pytest.mark.parametrize(
     "patcher",
     [
+        patches._patch_sglang_qwen_mxfp8_inputs,
         patches._patch_sglang_non_gated_fp8_moe,
         patches._patch_sglang_mxfp8_moe_scale_layout,
         patches._patch_sglang_mxfp8_moe_hidden_size,
@@ -54,6 +55,58 @@ def test_upstream_anchor_drift_does_not_overwrite_files(tmp_path, monkeypatch, p
             path.read_text() == "# Upstream implementation with incompatible anchors.\n"
         )
         assert not list(path.parent.glob("*.tmp"))
+
+
+def test_qwen_mxfp8_cast_preserves_activations_before_quantization(
+    tmp_path, monkeypatch
+):
+    projections = {
+        "qwen3": ("qkv_proj", "hidden_states"),
+        "qwen2": ("gate_up_proj", "x"),
+    }
+    for model, (projection, activation) in projections.items():
+        (tmp_path / f"{model}.py").write_text(
+            f"class Layer:\n    def forward(self, {activation}):\n"
+            "        if (\n"
+            "            should_force_bfloat16_dense_tensor_math()\n"
+            f"            or {activation}.dtype != self.{projection}.weight.dtype\n"
+            "        ):\n"
+            f"            {activation} = {activation}.to(self.{projection}.weight.dtype)\n"
+            f"        return {activation}\n"
+        )
+    monkeypatch.setattr(
+        patches, "_get_sglang_file", lambda path: str(tmp_path / Path(path).name)
+    )
+    patches._patch_sglang_qwen_mxfp8_inputs()
+    for model, (projection, _) in projections.items():
+        scope = {"should_force_bfloat16_dense_tensor_math": lambda: False}
+        exec((tmp_path / f"{model}.py").read_text(), scope)
+        layer = scope["Layer"]()
+        values = torch.tensor([1.0625, 1.1875], dtype=torch.float32)
+        for compute_dtype in (torch.float16, torch.bfloat16):
+            setattr(
+                layer,
+                projection,
+                SimpleNamespace(
+                    weight=SimpleNamespace(dtype=torch.float8_e4m3fn),
+                    params_dtype=compute_dtype,
+                    quant_method=SimpleNamespace(use_mxfp8=True),
+                ),
+            )
+            for inputs in (values, values.to(compute_dtype)):
+                torch.testing.assert_close(
+                    layer.forward(inputs), values.to(compute_dtype)
+                )
+        setattr(
+            layer,
+            projection,
+            SimpleNamespace(
+                weight=SimpleNamespace(dtype=torch.bfloat16),
+                params_dtype=torch.float16,
+                quant_method=SimpleNamespace(),
+            ),
+        )
+        torch.testing.assert_close(layer.forward(values), values.bfloat16())
 
 
 @pytest.mark.parametrize("rows", [33, 128])
@@ -124,6 +177,8 @@ def test_installed_sglang_patches_preserve_hidden_padding_during_refit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     relative_paths = (
+        "srt/models/qwen3.py",
+        "srt/models/qwen2.py",
         "srt/layers/quantization/fp8.py",
         "srt/layers/moe/moe_runner/flashinfer_trtllm.py",
         "srt/layers/moe/fused_moe_triton/layer.py",
@@ -140,6 +195,7 @@ def test_installed_sglang_patches_preserve_hidden_padding_during_refit(
     monkeypatch.setattr(patches, "_get_sglang_file", lambda path: str(files[path]))
 
     patchers = (
+        patches._patch_sglang_qwen_mxfp8_inputs,
         patches._patch_sglang_non_gated_fp8_moe,
         patches._patch_sglang_mxfp8_moe_scale_layout,
         patches._patch_sglang_mxfp8_moe_hidden_size,
