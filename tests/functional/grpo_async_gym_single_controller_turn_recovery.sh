@@ -98,16 +98,6 @@ stop_phase1() {
         fi
         sleep 1
     done
-    # Behind Dynamo, NeMo RL runs etcd, NATS and the frontend in their own
-    # sessions and stops them only on a clean exit, so the kill orphans them.
-    # Each carries phase one's DYN_NAMESPACE in its environment.
-    local namespace pid
-    namespace=$(grep -aoE "'DYN_NAMESPACE': '[^']+'" "$BASE_RUN_LOG" | head -1 | cut -d"'" -f4 || true)
-    if [[ -n "$namespace" ]]; then
-        for pid in $(grep -lsxz "DYN_NAMESPACE=$namespace" /proc/[0-9]*/environ | cut -d/ -f3 || true); do
-            kill -KILL "$pid" 2>/dev/null || true
-        done
-    fi
 }
 
 cleanup() {

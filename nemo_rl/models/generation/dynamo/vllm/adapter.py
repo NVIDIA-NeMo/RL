@@ -371,6 +371,9 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
             }
         else:
             engine_prompt = TokensPrompt(prompt_token_ids=plan.prompt_token_ids)
+            if chat.cache_salt is not None:
+                # vLLM's render puts the request's salt on the engine prompt.
+                engine_prompt["cache_salt"] = chat.cache_salt
         await start_capture(
             host, chat, engine_prompt, plan, max_model_len=self._max_model_len
         )
@@ -465,6 +468,9 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
             context.id(),
             reasoning_ended=wire["reasoning_ended"],
             reasoning_parser_kwargs=wire["reasoning_parser_kwargs"],
+            # As the native server does with the call's traceparent, so vLLM's
+            # span joins the caller's trace.
+            trace_headers=context.trace_headers(),
         ):
             # Recorded before asking for the next output, which releases
             # vLLM's finished state for this request.
@@ -593,9 +599,10 @@ def _wire_logprobs(logprobs: Any) -> Optional[list[dict[str, list[Any]]]]:
 def _refusal(status: int, message: str, *, acknowledge: bool = False) -> GenerateChunk:
     """A Gym call the engine refused before it ran, answered in the chunk.
 
-    Dynamo hands an error the engine raises to the frontend's chat engine
-    without its status, so it could only answer 500; the chat engine answers
-    this with ``status``, as the native server does.
+    An error the engine raises reaches the frontend's chat engine with its
+    status, but only a 400 keeps its message and none carries ``acknowledge``.
+    The chat engine answers this with ``status`` and ``acknowledge`` as the
+    native server does, and with ``message`` when the status is 400.
     """
     reply: GymEngineReply = {
         "refusal": {

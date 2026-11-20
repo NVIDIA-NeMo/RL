@@ -27,10 +27,12 @@ This module holds what both backends need and must agree on:
 * reading the layout block as its schema,
 * resolving the role blocks into complete per-role engine configs,
 * sizing a replica in GPUs and planning the engine list that tiles the cluster,
-* mapping engines onto placement-group bundles and onto their owner workers.
+* mapping engines onto placement-group bundles and onto their owner workers,
+* the setup check every training entrypoint runs on the layout block.
 
-The TRT-LLM backend (``trtllm/config.py``) delegates its config helpers here; the
-vLLM backend builds on the whole module.
+Both backends build on it: each ``config.py`` binds the config helpers to its own
+block, and each generation class plans, keys and places its engines with the
+functions below. Starting the frontends stays per backend.
 """
 
 from collections.abc import Mapping
@@ -45,6 +47,11 @@ ROLES: tuple[Role, Role] = ("prefill", "decode")
 # NCCL variables every rank of the refit collective has to agree on: the
 # training ranks adopt the disaggregated engines' value of each.
 REFIT_PEER_ENV_KEYS = ("NCCL_NET_PLUGIN",)
+# Backends whose generation class reads ``generation.disaggregation``.
+DISAGG_BACKENDS: tuple[str, ...] = ("trtllm", "vllm", "sglang")
+# Of those, the ones whose replicas are reachable only through HTTP frontends.
+# SGLang's router serves the native /generate rollout instead.
+FRONTEND_DISAGG_BACKENDS: tuple[str, ...] = ("trtllm", "vllm")
 
 
 def as_dict(raw: Any) -> dict[str, Any]:
@@ -64,6 +71,36 @@ def resolve_disagg_layout(config: Mapping[str, Any]) -> DisaggConfig:
     of re-deriving a default per key at the call site.
     """
     return DisaggConfig.model_validate(as_dict(config.get("disaggregation")))
+
+
+def validate_disagg_entrypoint(
+    generation_config: Mapping[str, Any], *, uses_nemo_gym: bool
+) -> None:
+    """Refuse a disaggregation block the run would ignore or could not serve.
+
+    Every training entrypoint calls this at setup, before it builds a cluster.
+    ``generation.disaggregation`` is written in backend-agnostic terms, but only
+    the backends in :data:`DISAGG_BACKENDS` implement it: any other backend
+    would silently ignore the block and serve aggregated. A replica of a backend
+    in :data:`FRONTEND_DISAGG_BACKENDS` is reachable only through its HTTP
+    frontends, so without NeMo-Gym the whole fleet would come up and fail at
+    the first rollout.
+    """
+    if not resolve_disagg_layout(generation_config).enabled:
+        return
+    backend = generation_config["backend"]
+    if backend not in DISAGG_BACKENDS:
+        raise ValueError(
+            "policy.generation.disaggregation.enabled is only supported for "
+            f"backend in {DISAGG_BACKENDS}, got '{backend}'. Set it to false, or "
+            "switch the backend."
+        )
+    if backend in FRONTEND_DISAGG_BACKENDS and not uses_nemo_gym:
+        raise ValueError(
+            "policy.generation.disaggregation.enabled requires NeMo-Gym "
+            "rollouts (env.should_use_nemo_gym=true). Set it to false, or run "
+            "through the NeMo-Gym entrypoint."
+        )
 
 
 def deep_merge(base: Mapping[str, Any], update: Mapping[str, Any]) -> dict[str, Any]:
@@ -235,11 +272,6 @@ def plan_engines(
 
     num_prefill = layout.num_prefill_engines
     num_decode = layout.num_decode_engines
-    assert num_prefill >= 1 and num_decode >= 1, (
-        f"a replica needs at least one engine of each role, got "
-        f"num_prefill_engines={num_prefill}, num_decode_engines={num_decode}"
-    )
-
     width = num_prefill * prefill_width + num_decode * decode_width
     assert world_size % width == 0, (
         f"replica width {width} GPUs ({num_prefill} prefill x "

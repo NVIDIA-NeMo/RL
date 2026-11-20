@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import random
 import secrets
 import time
 import warnings
@@ -61,7 +62,11 @@ from nemo_rl.models.generation.disagg_layout import (
     slice_engines_on_unified_pg,
     tile_engines_on_per_node_pgs,
 )
-from nemo_rl.models.generation.dynamo.config import dynamo_cfg, dynamo_enabled
+from nemo_rl.models.generation.dynamo.config import (
+    dynamo_cfg,
+    dynamo_enabled,
+    trace_export_env,
+)
 from nemo_rl.models.generation.fleet_health import (
     GenerationFleetHealth,
     HealthyShardSelector,
@@ -294,11 +299,10 @@ class VllmGeneration(GenerationInterface):
     _disagg_frontend_cfg: Optional[VllmDisaggFrontendConfig] = None
 
     # Dynamo serving (policy.generation.dynamo): __init__ starts etcd, NATS and
-    # the frontend; each engine registers itself once its AsyncLLM runs. Class
+    # the frontends; each engine registers itself once its AsyncLLM runs. Class
     # defaults, so shutdown() also works when __init__ failed before starting them.
     _dynamo_runtime: Optional["ManagedDynamoRuntime"] = None
-    dynamo_frontend_url: Optional[str] = None
-    dynamo_generation_cut_url: Optional[str] = None
+    dynamo_frontend_urls: tuple[str, ...] = ()
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
@@ -310,7 +314,7 @@ class VllmGeneration(GenerationInterface):
                 raise ValueError(
                     "async_rl.generation_router.enabled=true does not apply with "
                     "policy.generation.dynamo=true: NeMo-Gym calls the Dynamo "
-                    "frontend, which routes the whole fleet behind one URL. "
+                    "frontends, each of which routes to the whole fleet. "
                     "Disable the generation router."
                 )
             if master_config.async_rl.generation_fleet_health.enabled:
@@ -330,6 +334,13 @@ class VllmGeneration(GenerationInterface):
                 )
         if not resolve_vllm_disagg_layout(generation_config).enabled:
             return
+        if master_config.async_rl.generation_fleet_health.enabled:
+            raise ValueError(
+                "async_rl.generation_fleet_health.enabled=true is not supported with "
+                "policy.generation.disaggregation.enabled=true: shard loss and "
+                "recovery are not wired for disaggregated replicas. Disable one of "
+                "them."
+            )
         # SingleController has no drain-before-refit mode: every weight update
         # pauses the engines with rollouts in flight, and whether that pause
         # clears their caches is async_rl.recompute_kv_cache_after_weight_updates
@@ -477,6 +488,8 @@ class VllmGeneration(GenerationInterface):
         # shards, i.e. replicas. Under disaggregation a replica is several
         # engines, so this is deliberately *not* the engine count.
         self.dp_size = self.num_replicas
+        if self._disagg_cfg.enabled:
+            self._check_frontend_port_band()
         # Global rank of each engine's model owner, in engine order -- the list
         # every per-engine call is dispatched on (see _run_on_engines). Owners
         # are the prefix sums of the engine widths because the worker group
@@ -674,9 +687,10 @@ class VllmGeneration(GenerationInterface):
         if draft_module_sharing_disable_required(self.cfg):
             env_vars[DRAFT_DISABLE_MODULE_SHARING_ENV] = "1"
         if dynamo_enabled(self.cfg):
-            # dynamo._core fixes its log format when the engine first imports it,
-            # before engine_env is applied, so it must be in the actor's env.
+            # dynamo._core fixes its log format and its trace context when the engine
+            # first imports it, before engine_env is applied: both go in the actor's env.
             env_vars["DYN_SDK_DISABLE_ANSI_LOGGING"] = "1"
+            env_vars.update(trace_export_env())
 
         if self._kv_cache_aware_routing():
             # The frontends hash prompts the way the engines hash prefix-cache
@@ -736,7 +750,7 @@ class VllmGeneration(GenerationInterface):
         self._rollout_weight_version: Optional[int] = None
 
         if dynamo_enabled(self.cfg):
-            self._start_dynamo_services()
+            self._start_dynamo_services(cluster)
 
         if defer_model_load:
             # Workers only reserved ports — collect URLs immediately and defer
@@ -945,6 +959,30 @@ class VllmGeneration(GenerationInterface):
         return int(engine_cfg["tensor_parallel_size"]) * int(
             engine_cfg["pipeline_parallel_size"]
         )
+
+    def _check_frontend_port_band(self) -> None:
+        """Refuse frontend ports outside the band reserved for them.
+
+        Frontends share their nodes with the engines' own bands (VLLM_PORT, KV
+        side channel, KV events), so every frontend port must stay inside the
+        frontend band; its 256 ports are also the replicas * frontends cap.
+        """
+        base_port = self._disagg_cfg.frontend_base_port
+        count = self.num_replicas * self._disagg_cfg.num_frontend_workers
+        if not (
+            DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
+            <= base_port
+            <= base_port + count
+            <= DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH
+        ):
+            raise ValueError(
+                f"generation.disaggregation: frontend ports {base_port}.."
+                f"{base_port + count - 1} (frontend_base_port, then one per "
+                f"replica x num_frontend_workers = {self.num_replicas} x "
+                f"{self._disagg_cfg.num_frontend_workers}) must lie in the "
+                f"frontend port band [{DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW}, "
+                f"{DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH})."
+            )
 
     def _kv_cache_aware_routing(self) -> bool:
         return (
@@ -1205,26 +1243,8 @@ class VllmGeneration(GenerationInterface):
         # Deterministic ports: a restarted frontend re-binds the same port on
         # its pinned node, so the URL Gym holds stays valid across crashes. The
         # offset carries BOTH indices because several replicas can share a
-        # node. 256 is the size of the frontend port band.
-        assert self.num_replicas * n_fe <= 256, (
-            "replicas * num_frontend_workers must fit the frontend port band: "
-            f"{self.num_replicas} * {n_fe} > 256"
-        )
+        # node.
         base_port = disagg.frontend_base_port
-        # Frontends share their nodes with the engines' own bands (VLLM_PORT,
-        # KV side channel, KV events), so every frontend port must stay inside
-        # the frontend band.
-        assert (
-            DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
-            <= base_port
-            < base_port + self.num_replicas * n_fe
-            <= DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH
-        ), (
-            f"frontend ports {base_port}..{base_port + self.num_replicas * n_fe - 1} "
-            "must lie in the frontend port band "
-            f"[{DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW}, "
-            f"{DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH})"
-        )
         render_settings = self._render_settings() if disagg.frontend_tokenize else None
         kv_hashing = self._kv_hashing_for_frontends() if engines_ready else {}
 
@@ -1478,27 +1498,16 @@ class VllmGeneration(GenerationInterface):
     def client_base_urls(self) -> list[Optional[str]]:
         """Where OpenAI clients such as NeMo-Gym send requests.
 
-        The Dynamo frontend when it serves this fleet (``policy.generation.dynamo``);
+        The Dynamo frontends when they serve this fleet (``policy.generation.dynamo``);
         otherwise every data-parallel shard's own server, as
         ``dp_openai_server_base_urls``. Known before a deferred model load.
         """
-        if self.dynamo_frontend_url is not None:
-            return [self.dynamo_frontend_url]
+        if self.dynamo_frontend_urls:
+            return list(self.dynamo_frontend_urls)
         return self.dp_openai_server_base_urls
 
-    @property
-    def generation_cut_control_urls(self) -> Optional[list[str]]:
-        """Where NeMo-Gym sends checkpoint generation cuts, one per ``client_base_urls`` entry.
-
-        None when each base URL takes its own cuts, as every shard's server
-        does. The Dynamo frontend takes them on a port of its own.
-        """
-        if self.dynamo_generation_cut_url is not None:
-            return [self.dynamo_generation_cut_url]
-        return None
-
-    def _start_dynamo_services(self) -> None:
-        """Start the etcd, NATS and frontend this fleet's engines register with."""
+    def _start_dynamo_services(self, cluster: RayVirtualCluster) -> None:
+        """Start the etcd, NATS and frontends this fleet's engines register with."""
         from nemo_rl.models.generation.dynamo.managed_runtime import (
             ManagedDynamoRuntime,
         )
@@ -1514,10 +1523,9 @@ class VllmGeneration(GenerationInterface):
             # its chat server on it.
             serves_chat=bool(self.cfg["vllm_cfg"].get("expose_http_server")),
         )
-        runtime.start()
+        runtime.start(frontend_node_ids=cluster.get_node_ids())
         self._dynamo_runtime = runtime
-        self.dynamo_frontend_url = runtime.frontend_url
-        self.dynamo_generation_cut_url = runtime.generation_cut_control_url
+        self.dynamo_frontend_urls = tuple(runtime.frontend_urls)
 
     def _publish_dynamo_chat_settings(
         self, chat_settings: RayQueue, loads: list[ray.ObjectRef]
@@ -2428,9 +2436,7 @@ class VllmGeneration(GenerationInterface):
         Media-backed prompts keep this class's own dispatch: the engine does not
         yet take them through the frontend.
         """
-        return self.dynamo_frontend_url is not None and not (
-            VLLM_PROMPT_KEYS & data.keys()
-        )
+        return bool(self.dynamo_frontend_urls) and not (VLLM_PROMPT_KEYS & data.keys())
 
     async def _generate_through_dynamo(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool
@@ -2460,7 +2466,7 @@ class VllmGeneration(GenerationInterface):
             greedy=greedy,
             stop_strings=stop_strings,
         )
-        url = f"{self.dynamo_frontend_url}/completions"
+        url = f"{random.choice(self.dynamo_frontend_urls)}/completions"
         try:
             engine_data = await post_rollout(
                 url, payload, dynamo_cfg(self.cfg).request_timeout_s
@@ -2858,7 +2864,11 @@ class VllmGeneration(GenerationInterface):
 
     def drain_latest_logger_metrics(self) -> dict[str, Any]:
         """Consume latest values without transferring full worker histories."""
-        return self.drain_latest_vllm_logger_metrics()
+        metrics = self.drain_latest_vllm_logger_metrics()
+        if metrics and self._dynamo_runtime is not None:
+            # A call waiting in a frontend is in no engine's counts.
+            metrics.update(self._dynamo_runtime.frontend_load())
+        return metrics
 
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.

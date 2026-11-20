@@ -1090,6 +1090,41 @@ def test_distillation_train_shuts_down_environments_after_success():
     shutdown.assert_called_once_with(task_to_env, task_to_env)
 
 
+def test_distillation_setup_rejects_disaggregation_on_a_backend_that_ignores_it():
+    """Megatron generation never reads the block, so it would serve aggregated."""
+    master_config = MasterConfig.model_construct(
+        policy={
+            "generation": {
+                "backend": "megatron",
+                "colocated": {"enabled": True},
+                "disaggregation": {"enabled": True},
+            },
+            "megatron_cfg": {"enabled": True},
+            "offload_policy_before_refit": False,
+            "model_name": "test-policy",
+        },
+        teacher={"model_name": "test-teacher"},
+        loss_fn=DistillationLossConfig(
+            kl_type="forward", mixed_kl_weight=0.5, zero_outside_topk=False
+        ),
+        distillation=DistillationConfig.model_construct(seed=42),
+        data={"shuffle": False},
+        logger=LoggerConfig.model_construct(),
+        checkpointing=CheckpointingConfig.model_construct(),
+        cluster=ClusterConfig(num_nodes=1, gpus_per_node=8),
+    )
+
+    with (
+        patch.object(distil_mod, "RayVirtualCluster") as cluster_cls,
+        patch.object(distil_mod, "Logger") as logger_cls,
+        pytest.raises(ValueError, match="disaggregation.enabled is only supported"),
+    ):
+        distil_mod.setup(master_config, MagicMock(), MagicMock(), None)
+
+    logger_cls.assert_not_called()
+    cluster_cls.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("refit_transport", "offload_policy_before_refit"),
     [(None, False), (None, True), ("nixl", False)],
@@ -1418,6 +1453,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         use_fastokens=False,
         policy_api_key="k",
         turn_checkpointing_enabled=False,
+        forward_session_id_as_conversation_id=False,
     )
     # Building the actor leaves the configured keys alone. setup() adds only the
     # Gym log dir, under this run's log dir.

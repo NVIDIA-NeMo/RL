@@ -131,6 +131,24 @@ def test_layout_asymmetric_tp_derives_replicas_and_owners():
     assert gen.widest_engine_gpus == 4
 
 
+@pytest.mark.parametrize(
+    "layout",
+    [
+        # Below the band, and a band that ends past its upper edge: 2 replicas
+        # of 2 frontends from 8554 would bind 8554..8557.
+        {"frontend_base_port": 8200},
+        {"frontend_base_port": 8554, "num_frontend_workers": 2},
+    ],
+)
+def test_frontend_ports_outside_their_band_are_refused(layout):
+    gen = _bare_generation(_config({**_DISAGG, **layout}), world_size=12)
+    assert gen.num_replicas == 2
+    with pytest.raises(ValueError, match="frontend_base_port"):
+        gen._check_frontend_port_band()
+    # The default base fits.
+    _bare_generation(_config(_DISAGG), world_size=12)._check_frontend_port_band()
+
+
 def test_fan_out_addresses_every_engine_owner_under_disaggregation():
     gen = _bare_generation(_config(_DISAGG), world_size=6)
     futures = gen._fan_out("reset_prefix_cache_async")
@@ -544,13 +562,16 @@ def test_render_settings_carry_what_the_engines_chat_server_is_built_from():
     }
 
 
-def _sc_master_config(cfg, *, recompute=False, token_capture=False):
+def _sc_master_config(cfg, *, recompute=False, token_capture=False, fleet_health=False):
     """The SingleController MasterConfig shape validate_settings reads."""
     return SimpleNamespace(
         policy={"generation": cfg},
         # SC nulls the legacy async_grpo block (it reads async_rl instead).
         grpo=SimpleNamespace(async_grpo=None),
-        async_rl=SimpleNamespace(recompute_kv_cache_after_weight_updates=recompute),
+        async_rl=SimpleNamespace(
+            recompute_kv_cache_after_weight_updates=recompute,
+            generation_fleet_health=SimpleNamespace(enabled=fleet_health),
+        ),
         token_capture=SimpleNamespace(enabled=token_capture),
     )
 
@@ -577,6 +598,14 @@ def test_validate_settings_refuses_ledger_token_capture_under_disaggregation():
             _sc_master_config(_config(_DISAGG), token_capture=True)
         )
     VllmGeneration.validate_settings(_sc_master_config(_config(), token_capture=True))
+
+
+def test_validate_settings_refuses_fleet_health_under_disaggregation():
+    with pytest.raises(ValueError, match="generation_fleet_health"):
+        VllmGeneration.validate_settings(
+            _sc_master_config(_config(_DISAGG), fleet_health=True)
+        )
+    VllmGeneration.validate_settings(_sc_master_config(_config(), fleet_health=True))
 
 
 def test_effective_vllm_kwargs_merges_late_shared_keys_under_the_role_block():
