@@ -37,7 +37,6 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from nemo_rl.algorithms.utils import masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     _EXACT_TOKEN_MAP_CACHE,
     _SPARSE_PROJECTION_CACHE,
@@ -72,6 +71,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.utils.tensor_ops import masked_mean
 
 
 def test_automodel_cp_layout_localizes_xtoken_windows_after_global_shift():

@@ -66,7 +66,6 @@ from nemo_rl.data_plane.interfaces import (
     gdr_enabled,
     storage_unit_placement,
 )
-from nemo_rl.data_plane.local_disk import note_ssd_dir_fallback_once
 from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
 from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
 
@@ -1007,11 +1006,7 @@ def _init_tq(
             _pin_simple_storage_units(storage_unit_node_ids)
         ssd = simple_cfg.ssd_offload
         if ssd.enabled:
-            # TQ raises on an empty path: send the resolved folder.
-            overlay["backend"]["SimpleStorage"]["ssd_offload"] = {
-                **ssd.model_dump(),
-                "path": ssd.dir(),
-            }
+            overlay["backend"]["SimpleStorage"]["ssd_offload"] = ssd.model_dump()
     elif backend == "mooncake_cpu":
         # The mooncake-transfer-engine wheel ships `mooncake_master` at
         # <site-packages>/mooncake/, NOT on $PATH. TQ's
@@ -1059,13 +1054,11 @@ def _init_tq(
         _patch_mooncake_master_metrics_port(
             metrics_port, mooncake_ssd_offload.master_args(mooncake_cfg)
         )
-        metrics_url = f"http://{local_ip}:{metrics_port}/metrics"
         if mooncake_cfg.ssd_offload.enabled:
-            if mooncake_cfg.ssd_offload.path is None:
-                note_ssd_dir_fallback_once(LOGGER)
             # Stop the run if Mooncake ever deletes an SSD copy for space.
             mooncake_ssd_offload.watch_master_disk_evictions(
-                metrics_url, mooncake_cfg.ssd_offload.dir()
+                f"http://{local_ip}:{metrics_port}/metrics",
+                str(mooncake_cfg.ssd_offload.path),
             )
         overlay = {
             **controller_overlay,
@@ -1081,10 +1074,6 @@ def _init_tq(
                     # mooncake_master + the metadata server bind to.
                     "metadata_server": f"{local_ip}:{metadata_port}",
                     "master_server_address": f"{local_ip}:{master_port}",
-                    # Read by the single controller every step
-                    # (mooncake_ssd_offload.step_metrics) from whichever process
-                    # it runs in; every client gets this block from the controller.
-                    "metrics_url": metrics_url,
                     # Runtime mode derived from the existing trainer settings,
                     # not a second user-facing checkpoint switch.
                     "checkpoint": {"enabled": checkpointing},
@@ -1113,8 +1102,6 @@ def _init_tq(
         import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
 
         nixl_cfg = backend_config(cfg)
-        if nixl_cfg.ssd.enabled and nixl_cfg.ssd.path is None:
-            note_ssd_dir_fallback_once(LOGGER)
         block = nixl_cfg.model_dump()
         placement = block.pop("storage_unit_placement")
         if not block.get("node_ids"):
@@ -1319,9 +1306,8 @@ class TQDataPlaneClient(DataPlaneClient):
             _connect_existing_with_segment_size(segment_size)
         if self._gdr_requested and torch.cuda.is_initialized():
             _bind_mooncake_cuda_device()
-        if cfg["backend"] == "mooncake_cpu":
-            # TQ has built this process's store by now; a no-op unless it owns memory.
-            mooncake_ssd_offload.require_offloading_store()
+        # TQ has built this process's store by now; a no-op unless it owns memory.
+        mooncake_ssd_offload.require_offloading_store()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._closed = False
         # TQ restore is non-transactional and requires a globally clean system.
