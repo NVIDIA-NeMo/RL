@@ -73,7 +73,7 @@ ppo:
   seq_logprob_error_threshold: null
 
 loss_fn:
-  disable_ppo_ratio: false
+  kind: ppo  # Clipped surrogate. See grpo_math_1B.yaml for the other loss kinds.
   reference_policy_kl_penalty: 0.0  # DAPO: no KL penalty
   reference_policy_kl_type: "k3"
   kl_input_clamp_value: 20.0
@@ -91,7 +91,6 @@ loss_fn:
   truncated_importance_sampling_adaptive_k_step: 0.25
   truncated_importance_sampling_adaptive_k_max: 1.0
   truncated_importance_sampling_adaptive_outer_bound: 50.0
-  sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false
   seq_logprob_error_in_loss: false  # Supported by Megatron GRPO trainers and SingleController PPO (ppo_epochs=1).
