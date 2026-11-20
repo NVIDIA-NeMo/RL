@@ -148,18 +148,8 @@ class _ClippedPGVariantConfig(BaseModel, extra="forbid"):
         return ClippedPGLossConfig.model_validate(self.model_dump(exclude={"kind"}))
 
 
-class CISPOLossConfig(_ClippedPGVariantConfig):
-    """CISPO (https://arxiv.org/abs/2506.13585), selected with ``kind: cispo``.
-
-    Has no ``disable_ppo_ratio``, ``sequence_level_importance_ratios`` or
-    ``ratio_clip_c``: CISPO is incompatible with them.
-    """
-
-    kind: Literal["cispo"] = "cispo"
-    # Fixed by the objective. Kept as fields so trainer code that reads these
-    # switches, and configs that still spell them out, keep working.
-    use_cispo: Literal[True] = True
-    token_level_loss: Literal[True] = True
+class _PolicyRatioVariantConfig(_ClippedPGVariantConfig):
+    """Settings shared by the variants that weight tokens by the policy ratio."""
 
     ratio_clip_min: float = 0.2
     ratio_clip_max: float = 0.2
@@ -179,6 +169,33 @@ class CISPOLossConfig(_ClippedPGVariantConfig):
     force_on_policy_ratio: bool = False
     seq_logprob_error_in_loss: bool = False
     score_centering: bool = False
+
+
+class ClippedSurrogateLossConfig(_PolicyRatioVariantConfig):
+    """PPO clipped surrogate, selected with ``kind: ppo``.
+
+    The objective of PPO, GRPO and DAPO, including dual clipping. Has no
+    ``use_cispo``, ``disable_ppo_ratio`` or ``sequence_level_importance_ratios``:
+    those select other objectives.
+    """
+
+    kind: Literal["ppo"] = "ppo"
+    token_level_loss: bool = True
+    ratio_clip_c: float | None = None
+
+
+class CISPOLossConfig(_PolicyRatioVariantConfig):
+    """CISPO (https://arxiv.org/abs/2506.13585), selected with ``kind: cispo``.
+
+    Has no ``disable_ppo_ratio``, ``sequence_level_importance_ratios`` or
+    ``ratio_clip_c``: CISPO is incompatible with them.
+    """
+
+    kind: Literal["cispo"] = "cispo"
+    # Fixed by the objective. Kept as fields so trainer code that reads these
+    # switches, and configs that still spell them out, keep working.
+    use_cispo: Literal[True] = True
+    token_level_loss: Literal[True] = True
 
 
 class ReinforceLossConfig(_ClippedPGVariantConfig):
@@ -210,14 +227,38 @@ class ReinforceLossConfig(_ClippedPGVariantConfig):
 # replaces each. They keep working, with a warning, until they are removed.
 _DEPRECATED_SWITCHES = {
     "use_cispo": "kind: cispo",
-    "disable_ppo_ratio": "kind: reinforce",
+    "disable_ppo_ratio": (
+        "kind: reinforce (or kind: ppo when force_on_policy_ratio is set, where "
+        "disable_ppo_ratio has no effect)"
+    ),
 }
+
+# Settings of ClippedPGLossConfig that ``kind: ppo`` does not have. A block that
+# inherits ``kind: ppo`` and still sets one of them is read as ClippedPGLossConfig,
+# so configs written before the exemplars selected a kind keep loading.
+_NOT_IN_PPO = ("use_cispo", "disable_ppo_ratio", "sequence_level_importance_ratios")
 
 
 def _select_legacy_config(value: Any) -> Any:
     """Read a ``loss_fn`` block that names no kind as ClippedPGLossConfig."""
     if not isinstance(value, Mapping):
         return value
+    if value.get("kind") == "ppo":
+        legacy_settings = [name for name in _NOT_IN_PPO if name in value]
+        if not legacy_settings:
+            return value
+        warnings.warn(
+            f"loss_fn sets {', '.join(legacy_settings)} together with kind: ppo, "
+            "which has no such setting, so the block is read as the untagged "
+            "config. This fallback will be removed in a future release: select "
+            "the objective with loss_fn.kind and replace the inherited block "
+            "with `_override_: true`.",
+            FutureWarning,
+        )
+        return {
+            "kind": "legacy_pg",
+            **{name: setting for name, setting in value.items() if name != "kind"},
+        }
     if "kind" in value:
         return value
     for switch, replacement in _DEPRECATED_SWITCHES.items():
@@ -235,7 +276,10 @@ def _select_legacy_config(value: Any) -> Any:
 # objective supports. An untagged block stays the all-in-one
 # ClippedPGLossConfig, so existing configs load unchanged.
 PolicyGradientLossConfig = Annotated[
-    ClippedPGLossConfig | CISPOLossConfig | ReinforceLossConfig,
+    ClippedPGLossConfig
+    | ClippedSurrogateLossConfig
+    | CISPOLossConfig
+    | ReinforceLossConfig,
     Field(discriminator="kind"),
     BeforeValidator(_select_legacy_config),
 ]
@@ -244,7 +288,7 @@ PolicyGradientLossConfig = Annotated[
 def as_clipped_pg_config(cfg: PolicyGradientLossConfig) -> ClippedPGLossConfig:
     """Return the settings of any loss config that ClippedPGLossFn implements."""
     match cfg:
-        case CISPOLossConfig() | ReinforceLossConfig():
+        case ClippedSurrogateLossConfig() | CISPOLossConfig() | ReinforceLossConfig():
             return cfg.as_clipped_pg_config()
         case ClippedPGLossConfig():
             return cfg

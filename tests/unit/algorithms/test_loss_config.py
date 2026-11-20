@@ -22,6 +22,7 @@ from nemo_rl.algorithms.loss import (
     CISPOLossConfig,
     ClippedPGLossConfig,
     ClippedPGLossFn,
+    ClippedSurrogateLossConfig,
     PolicyGradientLossConfig,
     ReinforceLossConfig,
     as_clipped_pg_config,
@@ -91,6 +92,17 @@ ADAPTIVE_PPO_CLIP_SETTINGS = {
 # objective, example settings, and the ClippedPGLossConfig settings it has no
 # field for because they belong to other objectives.
 VARIANTS = {
+    "ppo": (
+        ClippedSurrogateLossConfig,
+        {},
+        {
+            **IS_CORRECTION,
+            "ratio_clip_max": 0.28,
+            "ratio_clip_c": 3.0,
+            "truncated_importance_sampling_type": "tis",
+        },
+        {"use_cispo", "disable_ppo_ratio", "sequence_level_importance_ratios"},
+    ),
     "cispo": (
         CISPOLossConfig,
         {"use_cispo": True},
@@ -160,7 +172,7 @@ def test_variant_tracks_the_shared_config_fields_and_defaults(kind):
 @pytest.mark.parametrize(("kind", "setting"), UNSUPPORTED_SETTINGS)
 def test_variant_rejects_settings_of_other_objectives(kind, setting):
     with pytest.raises(ValidationError, match="extra_forbidden"):
-        LOSS_CONFIG.validate_python({"kind": kind, setting: None})
+        VARIANTS[kind][0](**{setting: None})
 
 
 @pytest.mark.parametrize(
@@ -218,6 +230,32 @@ def test_untagged_block_without_a_deprecated_switch_does_not_warn(loss_fn):
 
 
 @pytest.mark.parametrize(
+    "legacy_settings",
+    [
+        {"use_cispo": True},
+        {"use_cispo": False},
+        {"disable_ppo_ratio": True},
+        {"sequence_level_importance_ratios": True, "token_level_loss": False},
+    ],
+)
+def test_block_inheriting_kind_ppo_with_a_legacy_setting_loads_as_before(
+    legacy_settings,
+):
+    # What a recipe written before the exemplars selected a kind looks like
+    # after it is merged with a tagged exemplar.
+    inherited = {"kind": "ppo", "ratio_clip_max": 0.28}
+    with pytest.warns(FutureWarning, match="together with kind: ppo") as caught:
+        parsed = LOSS_CONFIG.validate_python({**inherited, **legacy_settings})
+
+    assert len(caught) == 1
+    assert type(parsed) is ClippedPGLossConfig
+    assert (
+        parsed.model_dump()
+        == ClippedPGLossConfig(ratio_clip_max=0.28, **legacy_settings).model_dump()
+    )
+
+
+@pytest.mark.parametrize(
     "master_config", [GRPOMasterConfig, PPOMasterConfig, SingleControllerMasterConfig]
 )
 @pytest.mark.parametrize(
@@ -225,6 +263,7 @@ def test_untagged_block_without_a_deprecated_switch_does_not_warn(loss_fn):
     [
         ({"ratio_clip_max": 0.3}, ClippedPGLossConfig),
         ({"kind": "legacy_pg", "ratio_clip_max": 0.3}, ClippedPGLossConfig),
+        ({"kind": "ppo"}, ClippedSurrogateLossConfig),
         ({"kind": "cispo"}, CISPOLossConfig),
         ({"kind": "reinforce"}, ReinforceLossConfig),
     ],
