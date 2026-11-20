@@ -334,6 +334,13 @@ class VllmGeneration(GenerationInterface):
                 )
         if not resolve_vllm_disagg_layout(generation_config).enabled:
             return
+        if master_config.async_rl.generation_fleet_health.enabled:
+            raise ValueError(
+                "async_rl.generation_fleet_health.enabled=true is not supported with "
+                "policy.generation.disaggregation.enabled=true: shard loss and "
+                "recovery are not wired for disaggregated replicas. Disable one of "
+                "them."
+            )
         # SingleController has no drain-before-refit mode: every weight update
         # pauses the engines with rollouts in flight, and whether that pause
         # clears their caches is async_rl.recompute_kv_cache_after_weight_updates
@@ -481,6 +488,8 @@ class VllmGeneration(GenerationInterface):
         # shards, i.e. replicas. Under disaggregation a replica is several
         # engines, so this is deliberately *not* the engine count.
         self.dp_size = self.num_replicas
+        if self._disagg_cfg.enabled:
+            self._check_frontend_port_band()
         # Global rank of each engine's model owner, in engine order -- the list
         # every per-engine call is dispatched on (see _run_on_engines). Owners
         # are the prefix sums of the engine widths because the worker group
@@ -951,6 +960,30 @@ class VllmGeneration(GenerationInterface):
             engine_cfg["pipeline_parallel_size"]
         )
 
+    def _check_frontend_port_band(self) -> None:
+        """Refuse frontend ports outside the band reserved for them.
+
+        Frontends share their nodes with the engines' own bands (VLLM_PORT, KV
+        side channel, KV events), so every frontend port must stay inside the
+        frontend band; its 256 ports are also the replicas * frontends cap.
+        """
+        base_port = self._disagg_cfg.frontend_base_port
+        count = self.num_replicas * self._disagg_cfg.num_frontend_workers
+        if not (
+            DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
+            <= base_port
+            <= base_port + count
+            <= DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH
+        ):
+            raise ValueError(
+                f"generation.disaggregation: frontend ports {base_port}.."
+                f"{base_port + count - 1} (frontend_base_port, then one per "
+                f"replica x num_frontend_workers = {self.num_replicas} x "
+                f"{self._disagg_cfg.num_frontend_workers}) must lie in the "
+                f"frontend port band [{DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW}, "
+                f"{DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH})."
+            )
+
     def _kv_cache_aware_routing(self) -> bool:
         return (
             self._disagg_frontend_cfg is not None
@@ -1210,26 +1243,8 @@ class VllmGeneration(GenerationInterface):
         # Deterministic ports: a restarted frontend re-binds the same port on
         # its pinned node, so the URL Gym holds stays valid across crashes. The
         # offset carries BOTH indices because several replicas can share a
-        # node. 256 is the size of the frontend port band.
-        assert self.num_replicas * n_fe <= 256, (
-            "replicas * num_frontend_workers must fit the frontend port band: "
-            f"{self.num_replicas} * {n_fe} > 256"
-        )
+        # node.
         base_port = disagg.frontend_base_port
-        # Frontends share their nodes with the engines' own bands (VLLM_PORT,
-        # KV side channel, KV events), so every frontend port must stay inside
-        # the frontend band.
-        assert (
-            DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
-            <= base_port
-            < base_port + self.num_replicas * n_fe
-            <= DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH
-        ), (
-            f"frontend ports {base_port}..{base_port + self.num_replicas * n_fe - 1} "
-            "must lie in the frontend port band "
-            f"[{DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW}, "
-            f"{DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH})"
-        )
         render_settings = self._render_settings() if disagg.frontend_tokenize else None
         kv_hashing = self._kv_hashing_for_frontends() if engines_ready else {}
 

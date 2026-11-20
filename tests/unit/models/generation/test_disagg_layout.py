@@ -14,6 +14,7 @@
 """The backend-agnostic prefill/decode layout helpers shared by TRT-LLM and vLLM."""
 
 import pytest
+from pydantic import ValidationError
 
 from nemo_rl.models.generation.disagg_layout import (
     engine_owner_indices,
@@ -23,6 +24,7 @@ from nemo_rl.models.generation.disagg_layout import (
     resolve_role_overrides,
     slice_engines_on_unified_pg,
     tile_engines_on_per_node_pgs,
+    validate_disagg_entrypoint,
 )
 from nemo_rl.models.generation.interfaces import DisaggConfig
 
@@ -214,6 +216,39 @@ def test_engine_owners_are_prefix_sums_of_the_widths():
 def test_resolve_disagg_layout_reads_absent_as_disabled():
     assert resolve_disagg_layout({}).enabled is False
     assert resolve_disagg_layout({"disaggregation": DisaggConfig(enabled=True)}).enabled
+
+
+@pytest.mark.parametrize(
+    "block, key",
+    [
+        ({"num_prefill_engines": 0}, "num_prefill_engines"),
+        ({"num_decode_engines": 0}, "num_decode_engines"),
+        ({"num_frontend_workers": 0}, "num_frontend_workers"),
+        ({"frontend_base_port": 0}, "frontend_base_port"),
+        ({"frontend_base_port": 70000}, "frontend_base_port"),
+    ],
+)
+def test_the_layout_block_names_the_key_it_refuses(block, key):
+    with pytest.raises(ValidationError, match=key):
+        resolve_disagg_layout({"disaggregation": {"enabled": True, **block}})
+
+
+@pytest.mark.parametrize("backend", ["megatron", "sglang"])
+def test_entrypoint_check_refuses_a_backend_that_would_ignore_the_block(backend):
+    cfg = {"backend": backend, "disaggregation": {"enabled": True}}
+    with pytest.raises(ValueError, match=f"got '{backend}'"):
+        validate_disagg_entrypoint(cfg, uses_nemo_gym=True)
+    # Disabled, the block constrains nothing.
+    cfg["disaggregation"] = {"enabled": False}
+    validate_disagg_entrypoint(cfg, uses_nemo_gym=False)
+
+
+@pytest.mark.parametrize("backend", ["trtllm", "vllm"])
+def test_entrypoint_check_requires_nemo_gym(backend):
+    cfg = {"backend": backend, "disaggregation": {"enabled": True}}
+    validate_disagg_entrypoint(cfg, uses_nemo_gym=True)
+    with pytest.raises(ValueError, match="requires NeMo-Gym"):
+        validate_disagg_entrypoint(cfg, uses_nemo_gym=False)
 
 
 # -------------------------------------------------------------------------- #

@@ -125,6 +125,7 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
 )
+from nemo_rl.models.generation.disagg_layout import validate_disagg_entrypoint
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
@@ -136,10 +137,7 @@ from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
-from nemo_rl.models.generation.trtllm.config import (
-    replica_width,
-    resolve_disagg_layout,
-)
+from nemo_rl.models.generation.trtllm.config import replica_width
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
@@ -823,31 +821,10 @@ def setup(
             ),
         )
 
-    # generation.disaggregation is written in backend-agnostic terms, but only
-    # the TRT-LLM and vLLM backends implement it: every other backend would
-    # silently ignore the block and serve aggregated, so refuse to start.
-    if resolve_disagg_layout(generation_config).enabled and generation_config[
-        "backend"
-    ] not in ("trtllm", "vllm"):
-        raise ValueError(
-            "policy.generation.disaggregation.enabled is only supported for "
-            f"backend='trtllm' or 'vllm', got '{generation_config['backend']}'. "
-            "Set it to false, or switch the backend."
-        )
-    # The disagg frontends are only reachable over HTTP, so without NeMo-Gym
-    # the whole fleet would come up and fail at the first rollout instead.
-    if resolve_disagg_layout(generation_config).enabled and not should_use_nemo_gym(
-        master_config
-    ):
-        raise ValueError(
-            "policy.generation.disaggregation.enabled requires NeMo-Gym "
-            "rollouts (env.should_use_nemo_gym=true). Set it to false, or run "
-            "through the NeMo-Gym entrypoint."
-        )
-
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
+    validate_disagg_entrypoint(generation_config, uses_nemo_gym=enable_nemo_gym)
 
     _validate_val_sampling(master_config)
     assert grpo_config.val_num_generations_per_prompt >= 1, (

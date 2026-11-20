@@ -60,6 +60,7 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
 )
+from nemo_rl.models.generation.disagg_layout import validate_disagg_entrypoint
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     sampler_replay_enabled,
@@ -314,6 +315,7 @@ def setup(
     # Set random seed
     set_seed(distillation_config.seed)
     enable_nemo_gym = bool(env_configs) and should_use_nemo_gym(master_config)
+    validate_disagg_entrypoint(generation_config, uses_nemo_gym=enable_nemo_gym)
 
     # ==========================
     #         Logger

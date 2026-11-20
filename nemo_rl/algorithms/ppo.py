@@ -88,6 +88,7 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
 )
+from nemo_rl.models.generation.disagg_layout import validate_disagg_entrypoint
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     sampler_replay_enabled,
@@ -393,6 +394,9 @@ def setup(
 
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
+    )
+    validate_disagg_entrypoint(
+        generation_config, uses_nemo_gym=should_use_nemo_gym(master_config)
     )
     configure_lora_refit(policy_config)
     if generation_config["backend"] == "vllm":

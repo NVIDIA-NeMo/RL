@@ -138,6 +138,7 @@ from nemo_rl.experience.rollouts import (
     should_mask_flagged_samples,
 )
 from nemo_rl.models.generation import resolve_generation_class
+from nemo_rl.models.generation.disagg_layout import validate_disagg_entrypoint
 from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
@@ -1733,6 +1734,7 @@ def setup_single_controller(
             f"{generation_config['backend']!r}"
         )
     # Backend settings checks are pure config: run them before anything builds.
+    validate_disagg_entrypoint(generation_config, uses_nemo_gym=use_nemo_gym)
     resolve_generation_class(generation_config).validate_settings(master_config)
 
     def _load_training_data() -> tuple[
