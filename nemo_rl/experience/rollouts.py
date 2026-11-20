@@ -66,7 +66,10 @@ from nemo_rl.environments.nemo_gym import (
     as_nemo_gym_shard_set,
     get_pad_dynamic_image_shapes,
 )
-from nemo_rl.environments.nemo_gym_multi_harness import harness_metric_namespace
+from nemo_rl.environments.nemo_gym_multi_harness import (
+    MultiHarnessRoutes,
+    harness_metric_namespace,
+)
 from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
     get_nemo_gym_task_input,
@@ -2949,6 +2952,7 @@ async def run_async_nemo_gym_rollout(
                         thinking_tags=thinking_tags,
                         mask_env_flagged_samples=mask_env_flagged_samples,
                         group_size=identity_num_generations,
+                        multi_harness=shard_set.multi_harness,
                     )
                     if accumulator.is_complete:
                         final_rollout_result = rollout_result
@@ -3299,6 +3303,7 @@ def _postprocess_single_nemo_gym_group(
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
     group_size: Optional[int] = None,
+    multi_harness: MultiHarnessRoutes | None = None,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream.
 
@@ -3451,6 +3456,11 @@ def _postprocess_single_nemo_gym_group(
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
             agent_sample_metrics = agent_to_sample_metrics[agent_name]
+            if group_size:
+                # Groups that ran on this harness, for one group or a whole batch.
+                per_agent_metrics[f"{agent_name}/num_groups"] = (
+                    len(agent_results) // group_size
+                )
             agent_truncations = [m["hit_max_tokens"] for m in agent_sample_metrics]
             per_agent_metrics[f"{agent_name}/truncation_rate"] = sum(
                 agent_truncations
@@ -3497,6 +3507,12 @@ def _postprocess_single_nemo_gym_group(
                     data=to_log, columns=["Full result"]
                 )
 
+        if group_size and multi_harness is not None:
+            # A harness of a multi-harness taskset that ran no group counts 0.
+            for taskset in {result["attribution_key"] for result in results}:
+                if taskset is not None and multi_harness.covers(taskset):
+                    for agent in multi_harness.agents_for(taskset):
+                        per_agent_metrics.setdefault(f"{taskset}/{agent}/num_groups", 0)
         rollout_metrics.update(per_agent_metrics)
 
     # Necessary for downstream nemo rl logging/printing.

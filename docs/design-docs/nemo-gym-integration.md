@@ -121,34 +121,59 @@ An Environment Server can report a failed episode as terminal, meaning a retry c
 
 #### Train a taskset on several harnesses
 
-A taskset is routed by exactly one of two settings:
+A taskset is routed by exactly one of two settings. The Gym Environment Servers are usually defined in a Gym config file listed in `config_paths`; they are shown inline here:
 
 ```yaml
 env:
   nemo_gym:
-    # One harness: every group of the taskset runs on this Environment Server.
+    # Gym Environment Servers: one per taskset and harness.
+    # Each pairs one agent (the harness) with the taskset's verifier.
+    swe_rebench_opencode:
+      environment_servers:
+        single_agent_turn:
+          agent_server: {type: responses_api_agents, name: opencode_agent}
+          resources_server: {type: resources_servers, name: swe_rebench_resources_server}
+    swe_rebench_pi:
+      environment_servers:
+        single_agent_turn:
+          agent_server: {type: responses_api_agents, name: pi_agent}
+          resources_server: {type: resources_servers, name: swe_rebench_resources_server}
+    scale_swe_opencode:
+      environment_servers:
+        single_agent_turn:
+          agent_server: {type: responses_api_agents, name: opencode_agent}
+          resources_server: {type: resources_servers, name: scale_swe_resources_server}
+    scale_swe_pi:
+      environment_servers:
+        single_agent_turn:
+          agent_server: {type: responses_api_agents, name: pi_agent}
+          resources_server: {type: resources_servers, name: scale_swe_resources_server}
+
+    # One harness per taskset: every group of the taskset runs on this server.
     environment_server_routes:
       math: math_environment
-    # Several harnesses: each group of the taskset runs on one of these servers.
+    # Several harnesses per taskset: each group runs on one of the taskset's servers.
     multi_harness:
-      routes:
+      routes:                  # taskset -> its servers, one per harness
         swe_rebench: [swe_rebench_opencode, swe_rebench_pi]
         scale_swe: [scale_swe_opencode, scale_swe_pi]
-      weights:  # optional; omit for equal weights, otherwise list every agent
-        opencode_agent: 2
-        pi_agent: 1
+      weights:                 # optional; keyed by the servers' agent_server names
+        opencode_agent: 2      # covers swe_rebench_opencode and scale_swe_opencode
+        pi_agent: 1            # covers swe_rebench_pi and scale_swe_pi
 ```
 
+`routes` lists server names. `weights` uses the servers' `agent_server` names, so one weight covers that agent in every taskset.
+
 - A taskset goes in `environment_server_routes` or in `multi_harness.routes`, never both. Setup stops if a taskset is in both.
-- Each listed server is an Environment Server from the Gym configuration, usually one per harness. NeMo RL reads the type of agent each server runs, its key under `responses_api_agents` such as `opencode_agent`. The servers of one taskset must run different agent types.
+- The servers of one taskset must run different agents.
 - Each prompt group runs on one of its taskset's servers, chosen at random in proportion to the weight of the server's agent. With the weights above, about two thirds of the groups run on OpenCode.
 - Weights apply to the whole run. A set `weights` must list exactly the agents the servers run. A weight of 0 disables an agent, but its servers must still be listed and running; to drop a harness, remove its servers and its weight.
 
-GRPO compares a group's generations with the group's mean reward, so a group that mixed harnesses would train on the differences between harnesses. The choice is a hash of the group's ID, so every generation of a group, including retries, runs on the same server. Changing `multi_harness`, or the Gym servers it lists, across a resume is not supported. With token capture, a restored group that would finish on a different agent type stops the run; a server replaced by another that runs the same agent type is not detected.
+GRPO compares a group's generations with the group's mean reward, so a group that mixed harnesses would train on the differences between harnesses. The choice is a hash of the group's ID, so every generation of a group, including retries, runs on the same server. Changing `multi_harness` across a resume is not supported: a checkpoint that carries unfinished rollouts records the resolved routes (each taskset's servers, their agents and weights), and a resume whose routes differ stops before any of them is restored. Changes inside a listed server's Gym config, such as its agent's turn limit, are not checked.
 
 Setup also checks that each listed server runs in exactly one shard (its replicas are fine) and that a taskset's servers share one Environment Server type and verifier: the same resources server for `single_agent_turn`, and the taskset in each server's `tasksets` for `harbor`. With `env.nemo_gym.shards`, every shard must use the shared `multi_harness` block.
 
-Metrics for a multi-harness taskset are named after the taskset and the agent, such as `swe_rebench/opencode_agent/reward/mean`. There are no `swe_rebench/...` keys, so select checkpoints on a run-wide key such as `total_reward`. Validation draws a fresh harness for each prompt on every pass, so per-harness validation numbers cover different prompts each time. Settings keyed by taskset, such as teacher selection and length or recovery overrides, still use the taskset name.
+Metrics for a multi-harness taskset are named after the taskset and the agent, such as `swe_rebench/opencode_agent/reward/mean`. There are no `swe_rebench/...` keys, so set `checkpointing.metric_name` to a run-wide key such as `train:total_reward/mean`. Each step also logs `<taskset>/<agent>/num_groups`, the number of groups each harness ran (0 for one that ran none), so the split can be checked against the weights. Validation draws a fresh harness for each prompt on every pass, so per-harness validation numbers cover different prompts each time. Settings keyed by taskset, such as teacher selection and length or recovery overrides, still use the taskset name.
 
 ### Shard NeMo Gym across nodes
 

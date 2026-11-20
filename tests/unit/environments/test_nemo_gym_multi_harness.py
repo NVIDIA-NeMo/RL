@@ -105,23 +105,26 @@ def _gym_server(server_type, agent, **fields):
     }
 
 
-def test_describe_reads_type_agent_verifier_and_harbor_tasksets():
+# The describe tests use Gym's own attribution helper, so they need Gym.
+@pytest.mark.nemo_gym
+def test_describe_names_each_servers_agent_as_gym_attributes_it():
     resources = {"type": "resources_servers", "name": "swe_rebench"}
-    global_config = {
-        "swe_opencode": _gym_server(
-            "single_agent_turn", "oc", resources_server=resources
-        ),
-        "hb_pi": _gym_server("harbor", "pi", tasksets={"hb": {}, "tb": {}}),
-        "user_sim": {"environment_servers": {"nemo_user_sim_environment": {}}},
-        "oc": _agent("opencode_agent"),
-        "pi": _agent("pi_agent"),
-    }
-
-    assert describe_environment_server("swe_opencode", global_config) == _turn(
-        "opencode_agent"
+    global_config = OmegaConf.create(
+        {
+            "swe_opencode": _gym_server(
+                "single_agent_turn", "oc", resources_server=resources
+            ),
+            "hb_pi": _gym_server("harbor", "pi", tasksets={"hb": {}, "tb": {}}),
+            "user_sim": {"environment_servers": {"nemo_user_sim_environment": {}}},
+            "oc": _agent("opencode_agent"),
+            "pi": _agent("pi_agent"),
+        }
     )
+
+    # The agent's name in Gym's config, which agent_server refers to, not its type.
+    assert describe_environment_server("swe_opencode", global_config) == _turn("oc")
     assert describe_environment_server("hb_pi", global_config) == EnvironmentServerInfo(
-        "harbor", "pi_agent", None, ("hb", "tb")
+        "harbor", "pi", None, ("hb", "tb")
     )
     # A server that binds no single agent has no harness.
     assert describe_environment_server("user_sim", global_config).agent is None
@@ -129,21 +132,60 @@ def test_describe_reads_type_agent_verifier_and_harbor_tasksets():
     assert describe_environment_server("missing", global_config) is None
 
 
+@pytest.mark.nemo_gym
 def test_describe_falls_back_to_the_agents_verifier_as_gym_does():
     resources = {"type": "resources_servers", "name": "explicit"}
-    global_config = {
-        "inherits": _gym_server("single_agent_turn_legacy", "simple"),
-        "explicit": _gym_server(
-            "single_agent_turn", "simple", resources_server=resources
-        ),
-        "simple": _agent("simple_agent", resources="from_agent"),
-    }
+    global_config = OmegaConf.create(
+        {
+            "inherits": _gym_server("single_agent_turn_legacy", "simple"),
+            "explicit": _gym_server(
+                "single_agent_turn", "simple", resources_server=resources
+            ),
+            "simple": _agent("simple_agent", resources="from_agent"),
+        }
+    )
 
     assert describe_environment_server("inherits", global_config).resources_server == (
         "from_agent"
     )
     assert describe_environment_server("explicit", global_config).resources_server == (
         "explicit"
+    )
+
+
+@pytest.mark.nemo_gym
+def test_harnesses_of_one_agent_type_are_told_apart_by_agent_name():
+    # Gym's harness_agent runs Pi, Codex or another CLI under one type.
+    resources = {"type": "resources_servers", "name": "workspace"}
+    global_config = OmegaConf.create(
+        {
+            "ws_pi": _gym_server(
+                "single_agent_turn", "ws_pi_agent", resources_server=resources
+            ),
+            "ws_codex": _gym_server(
+                "single_agent_turn", "ws_codex_agent", resources_server=resources
+            ),
+            "ws_pi_agent": _agent("harness_agent"),
+            "ws_codex_agent": _agent("harness_agent"),
+        }
+    )
+    servers = {
+        name: describe_environment_server(name, global_config)
+        for name in ("ws_pi", "ws_codex")
+    }
+
+    routes = resolve_multi_harness(
+        parse_multi_harness(
+            {
+                "routes": {"ws": ["ws_pi", "ws_codex"]},
+                "weights": {"ws_pi_agent": 2, "ws_codex_agent": 1},
+            }
+        ),
+        servers,
+    )
+
+    assert routes.candidates == (
+        ("ws", (("ws_codex_agent", "ws_codex", 1.0), ("ws_pi_agent", "ws_pi", 2.0))),
     )
 
 
@@ -273,6 +315,24 @@ def test_select_depends_only_on_the_group_id():
 def test_select_requires_a_group_id():
     with pytest.raises(ValueError, match="prompt-group ID"):
         _routes(("pi_agent", "swe_pi", 1.0)).select("swe", None)  # type: ignore[arg-type]
+
+
+def test_routes_state_records_the_selection_rule_and_every_candidate():
+    routes = _routes(
+        ("opencode_agent", "swe_opencode", 2.0), ("pi_agent", "swe_pi", 1.0)
+    )
+
+    assert routes.agents_for("swe") == ("opencode_agent", "pi_agent")
+    # A rollout checkpoint saves this; a resume compares it with its own routes.
+    assert routes.to_state() == {
+        "selection": "nemo-rl-multi-harness-v1",
+        "candidates": [
+            [
+                "swe",
+                [["opencode_agent", "swe_opencode", 2.0], ["pi_agent", "swe_pi", 1.0]],
+            ]
+        ],
+    }
 
 
 def test_metric_namespace_adds_the_agent_only_for_multi_harness_results():

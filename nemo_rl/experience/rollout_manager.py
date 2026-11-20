@@ -46,6 +46,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
 from nemo_rl.environments.nemo_gym_multi_harness import (
     HARNESS_RESULT_KEY,
+    MultiHarnessRoutes,
     harness_metric_namespace,
 )
 from nemo_rl.environments.nemo_gym_task import (
@@ -1851,17 +1852,16 @@ class AsyncNemoGymRolloutImpl:
                     completion.reward = reward
                     result["full_result"]["reward"] = reward
 
+        # One group runs on one harness, so its first result names it.
+        group_namespace = harness_metric_namespace(
+            _nemo_gym_metric_namespace(inputs[0]),
+            completed_results[0].get("full_result") if completed_results else None,
+        )
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):
             rollout_metrics = self._compute_rollout_metrics(
                 completions,
-                # One group runs on one harness, so its first result names it.
-                harness_metric_namespace(
-                    _nemo_gym_metric_namespace(inputs[0]),
-                    completed_results[0].get("full_result")
-                    if completed_results
-                    else None,
-                ),
+                group_namespace,
                 full_results=[
                     result.get("full_result") or {} for result in completed_results
                 ],
@@ -1885,8 +1885,23 @@ class AsyncNemoGymRolloutImpl:
             label = shard_set.instance_label(handle)
             rollout_metrics[f"{timer_prefix}/routing/group_share/{label}"] = 0
         rollout_metrics[f"{timer_prefix}/routing/group_share/{instance_label}"] = 1
+        # 1 for this group's harness and 0 for the taskset's others; steps sum these.
+        routes, taskset = (
+            shard_set.multi_harness,
+            get_nemo_gym_attribution_key(inputs[0]),
+        )
+        if routes is not None and taskset is not None and routes.covers(taskset):
+            for agent in routes.agents_for(taskset):
+                rollout_metrics[
+                    f"{_nemo_gym_metric_namespace(inputs[0])}/{agent}/num_groups"
+                ] = 0
+        rollout_metrics[f"{group_namespace}/num_groups"] = 1
 
         return completions, prompt_message_log, rollout_metrics
+
+    def multi_harness_routes(self) -> MultiHarnessRoutes | None:
+        """Return the env.nemo_gym.multi_harness routes resolved at startup, if any."""
+        return as_nemo_gym_shard_set(self._task_to_env["nemo_gym"]).multi_harness
 
     def metric_namespace_for_group(self, row: Mapping[str, Any], group_id: str) -> str:
         """Name the metric namespace a group gets under the current routes.
@@ -1895,7 +1910,7 @@ class AsyncNemoGymRolloutImpl:
         taskset, as each finished row records it in its reward log context.
         """
         namespace = _nemo_gym_metric_namespace(row)
-        routes = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"]).multi_harness
+        routes = self.multi_harness_routes()
         taskset = get_nemo_gym_attribution_key(row)
         if routes is None or taskset is None or not routes.covers(taskset):
             return namespace
@@ -3076,17 +3091,41 @@ class RolloutManager:
         self._stats.skipped += 1
         return None
 
+    def multi_harness_routes_state(self) -> dict[str, Any] | None:
+        """Return the multi-harness routes this run resolved, as a checkpoint saves them."""
+        if not isinstance(self._impl, AsyncNemoGymRolloutImpl):
+            return None
+        routes = self._impl.multi_harness_routes()
+        return routes.to_state() if routes is not None else None
+
+    def require_unchanged_multi_harness(self, saved: dict[str, Any] | None) -> None:
+        """Refuse to restore rollouts saved under different multi-harness routes.
+
+        A restored group continues on the server its current routes pick, so
+        under changed routes a generation restored mid-episode would continue
+        its saved episode on a server that never ran it. Restore calls this
+        before it restores any group, whether its generations finished or not.
+        """
+        current = self.multi_harness_routes_state()
+        if saved != current:
+            raise RestoredHarnessChanged(
+                "env.nemo_gym.multi_harness differs from when the checkpoint was "
+                f"saved (saved routes {saved!r}, current routes {current!r}). To "
+                "resume, use the env.nemo_gym.multi_harness block and Gym agent "
+                "configs from when the checkpoint was saved."
+            )
+
     def _require_unchanged_harness(
         self, input_sample: DatumSpec, recovery_group: PromptGroupRecoveryRecord
     ) -> None:
-        """Refuse to finish a restored group on a different agent type.
+        """Refuse to finish a restored group on a different agent.
 
         A group's harness is recomputed from its ID, so it changes only when
         ``env.nemo_gym.multi_harness`` or the Gym servers it lists changed
-        across a resume. Each sealed row recorded its agent type in its reward
-        log context; finishing the group on a different one would train one
-        GRPO group on two harnesses. A server replaced by another that runs the
-        same agent type is not detected.
+        across a resume, which restore already refuses through the routes the
+        checkpoint saved. This second check compares the agent each sealed row
+        recorded in its reward log context: finishing the group on a different
+        one would train one GRPO group on two harnesses.
         """
         row = input_sample.get("extra_env_info")
         if not isinstance(self._impl, AsyncNemoGymRolloutImpl) or not (

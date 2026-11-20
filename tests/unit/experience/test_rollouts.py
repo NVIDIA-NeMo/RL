@@ -51,6 +51,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
 from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.environments.nemo_gym_multi_harness import MultiHarnessRoutes
 from nemo_rl.experience.dynamic_sampling import mask_sample_flagged
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -2522,12 +2523,28 @@ def test_postprocess_nemo_gym_group_names_mixed_taskset_metrics_by_harness():
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=False,
         group_size=2,
+        multi_harness=MultiHarnessRoutes(
+            candidates=(
+                (
+                    "swe",
+                    (
+                        ("hermes_agent", "swe_hermes", 1.0),
+                        ("opencode_agent", "swe_opencode", 1.0),
+                        ("pi_agent", "swe_pi", 1.0),
+                    ),
+                ),
+            )
+        ),
     )
 
     metrics = rollout_result.rollout_metrics
     assert metrics["swe/opencode_agent/reward/mean"] == pytest.approx(0.5)
     assert metrics["swe/pi_agent/reward/mean"] == pytest.approx(2.5)
     assert "swe/reward/mean" not in metrics
+    # Groups per harness; a configured harness that ran none counts 0.
+    assert metrics["swe/opencode_agent/num_groups"] == 1
+    assert metrics["swe/pi_agent/num_groups"] == 1
+    assert metrics["swe/hermes_agent/num_groups"] == 0
     # Taskset-keyed settings and attribution keep the taskset name.
     assert rollout_result.final_batch["attribution_key"] == ["swe"] * 4
 

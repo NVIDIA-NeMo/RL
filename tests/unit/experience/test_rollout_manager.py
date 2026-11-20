@@ -1331,6 +1331,61 @@ def test_streamed_receipt_names_a_mixed_taskset_reward_by_harness():
     assert completion.env_extras["attribution_key"] == "swe"
 
 
+class _PiGroupGym:
+    """A Gym actor stand-in whose rows all ran on Pi."""
+
+    def options(self, **kwargs):
+        return self
+
+    def remote(self, pending, *args, **kwargs):
+        async def value(row):
+            result = _mask_gate_result()
+            result["input_message_log"] = [{"role": "user", "token_ids": [9]}]
+            result["full_result"]["_ng_harness"] = "pi_agent"
+            return row["_rowidx"], None, {**result, "attribution_key": "swe"}, None
+
+        async def stream():
+            for row in pending:
+                yield value(row)
+
+        return stream()
+
+
+def _run_one_pi_group(env):
+    from nemo_rl.utils.timer import Timer
+
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 2
+    impl._task_to_env = {"nemo_gym": env}
+    inputs = [
+        {"_rowidx": i, "task_id": {"taskset": "swe", "task_id": "1"}, "task_input": {}}
+        for i in range(2)
+    ]
+    _, _, metrics = _run(impl._run_rollouts(inputs, Timer(), "test"))
+    return metrics
+
+
+def test_group_rollout_metrics_are_named_by_the_groups_harness():
+    metrics = _run_one_pi_group(SimpleNamespace(run_rollouts=_PiGroupGym()))
+
+    # One group runs on one harness, so its metrics are named by that harness.
+    assert metrics["swe/pi_agent/reward/mean"] == pytest.approx(1.0)
+    assert "swe/reward/mean" not in metrics
+    assert metrics["swe/pi_agent/num_groups"] == 1
+
+
+def test_group_counts_zero_for_the_tasksets_other_harnesses():
+    env = NemoGymShardSet(
+        handles={"only": [SimpleNamespace(run_rollouts=_PiGroupGym())]},
+        multi_harness=_SWE_ROUTES,
+    )
+
+    metrics = _run_one_pi_group(env)
+
+    assert metrics["swe/pi_agent/num_groups"] == 1
+    assert metrics["swe/opencode_agent/num_groups"] == 0
+
+
 _SWE_ROUTES = MultiHarnessRoutes(
     candidates=(
         (
@@ -1458,6 +1513,84 @@ def test_harness_change_on_resume_is_not_retried():
         )
 
     assert manager._generate_for_finalization_attempt.await_count == 1
+
+
+_REWEIGHTED_SWE_ROUTES = MultiHarnessRoutes(
+    candidates=(
+        (
+            "swe",
+            (
+                ("opencode_agent", "swe_opencode", 1.0),
+                ("pi_agent", "swe_pi", 3.0),
+            ),
+        ),
+    )
+)
+
+
+def test_resume_requires_the_routes_the_checkpoint_saved():
+    manager = object.__new__(RolloutManager)
+    saved = _SWE_ROUTES.to_state()
+    manager._impl = _swe_impl(_SWE_ROUTES)
+    manager.require_unchanged_multi_harness(saved)
+
+    replaced = MultiHarnessRoutes(
+        candidates=(
+            (
+                "swe",
+                (
+                    ("opencode_agent", "swe_opencode_v2", 1.0),
+                    ("pi_agent", "swe_pi", 1.0),
+                ),
+            ),
+        )
+    )
+    for current, checkpoint in (
+        (_REWEIGHTED_SWE_ROUTES, saved),  # weights changed
+        (replaced, saved),  # a server replaced by another running the same agent
+        (_SWE_ROUTES, None),  # multi_harness added
+        (None, saved),  # multi_harness removed
+    ):
+        manager._impl = _swe_impl(current)
+        with pytest.raises(RestoredHarnessChanged, match="multi_harness differs"):
+            manager.require_unchanged_multi_harness(checkpoint)
+
+    # A run without multi_harness resumes a checkpoint saved without it.
+    manager._impl = _swe_impl(None)
+    manager.require_unchanged_multi_harness(None)
+
+
+def test_changed_routes_stop_restore_before_any_group_is_restored(
+    tmp_path, monkeypatch
+):
+    from nemo_rl.algorithms.rollout_checkpointing import restore as restore_mod
+
+    # A group whose generations were all mid-episode passes the per-group check.
+    _check_restored_group(_REWEIGHTED_SWE_ROUTES)
+    manager = object.__new__(RolloutManager)
+    manager._impl = _swe_impl(_REWEIGHTED_SWE_ROUTES)
+    manager._recovery_ledger = Mock()
+    restorer = object.__new__(restore_mod.RolloutRestorer)
+    restorer._resume = SimpleNamespace(
+        path=str(tmp_path),
+        data_plane_metadata={"rollout_recovery_payload_sha256": "sha"},
+    )
+    restorer._rollout_manager = manager
+    restorer._master_config = None
+    restorer._groups_to_regenerate = []
+    restorer._data_plane_checkpoint_barrier = Mock()
+    restorer._validate_forest_checkpoint_metadata = lambda: None
+
+    async def read_sidecar(*args, **kwargs):
+        return SimpleNamespace(multi_harness_routes=_SWE_ROUTES.to_state())
+
+    monkeypatch.setattr(restore_mod, "read_recovery_sidecar", read_sidecar)
+
+    with pytest.raises(RestoredHarnessChanged, match="multi_harness differs"):
+        _run(restorer._restore_recovery_ledger(restored_replay_groups=0))
+    # Refused before the ledger is touched, so no group is restored.
+    restorer._data_plane_checkpoint_barrier.mutation.assert_not_called()
+    manager._recovery_ledger.load_state_dict.assert_not_called()
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])

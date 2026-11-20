@@ -44,7 +44,7 @@ from nemo_rl.environments.nemo_gym import (
     spinup_nemo_gym_actor,
 )
 from nemo_rl.environments.nemo_gym_multi_harness import (
-    describe_environment_server,
+    EnvironmentServerInfo,
     parse_multi_harness,
     resolve_multi_harness,
 )
@@ -872,8 +872,19 @@ def _stub_gym_resolved_config(resolved):
     package = types.ModuleType("nemo_gym")
     module = types.ModuleType("nemo_gym.global_config")
     module.get_global_config_dict = MagicMock(return_value=resolved)
+    # Gym's attribution helper: the agent a server's agent_server names.
+    config_module = types.ModuleType("nemo_gym.config.global_config")
+    config_module.environment_server_attributed_agent = lambda server: (
+        server.get("agent_server") or {}
+    ).get("name")
     with patch.dict(
-        sys.modules, {"nemo_gym": package, "nemo_gym.global_config": module}
+        sys.modules,
+        {
+            "nemo_gym": package,
+            "nemo_gym.global_config": module,
+            "nemo_gym.config": types.ModuleType("nemo_gym.config"),
+            "nemo_gym.config.global_config": config_module,
+        },
     ):
         yield module.get_global_config_dict
 
@@ -1197,7 +1208,7 @@ class _FakeGymCluster:
             _, index, names = reference
             config = self.gym_configs_by_index.get(index, {})
             descriptions = {
-                name: describe_environment_server(name, config) for name in names
+                name: _describe_fixture_server(name, config) for name in names
             }
             return {name: info for name, info in descriptions.items() if info}
         if reference[0] == "install":
@@ -2568,8 +2579,9 @@ def test_shard_set_shutdown_releases_the_placement_group_once():
 
 _MULTI_HARNESS = {
     "routes": {"swe": ["swe_opencode", "swe_pi"]},
-    "weights": {"opencode_agent": 2, "pi_agent": 1},
+    "weights": {"oc": 2, "pi": 1},
 }
+# Agent names differ from their types: weights and labels use the names.
 _SWE_AGENTS = {"swe_opencode": ("oc", "opencode_agent"), "swe_pi": ("pi", "pi_agent")}
 
 
@@ -2600,11 +2612,27 @@ def _swe_gym_config(*servers, pi_resources="swe_rebench"):
     return config
 
 
+def _describe_fixture_server(name, config):
+    """What a Gym actor reports for a fixture server; the real reader needs Gym."""
+    servers = (config.get(name) or {}).get("environment_servers")
+    if not servers:
+        return None
+    server_type, server = next(iter(servers.items()))
+    return EnvironmentServerInfo(
+        server_type=server_type,
+        agent=(server.get("agent_server") or {}).get("name"),
+        resources_server=(server.get("resources_server") or {}).get("name"),
+        tasksets=tuple(server.get("tasksets") or ())
+        if server_type == "harbor"
+        else None,
+    )
+
+
 def _resolved_routes(multi_harness=_MULTI_HARNESS):
     gym_config = _swe_gym_config("swe_opencode", "swe_pi")
     return resolve_multi_harness(
         parse_multi_harness(multi_harness),
-        {name: describe_environment_server(name, gym_config) for name in _SWE_AGENTS},
+        {name: _describe_fixture_server(name, gym_config) for name in _SWE_AGENTS},
     )
 
 
@@ -2702,9 +2730,33 @@ def test_coverage_requires_every_server_a_group_can_use():
 
     # Groups never go to a weight-0 agent's server.
     shard_set.multi_harness = _resolved_routes(
-        {**_MULTI_HARNESS, "weights": {"opencode_agent": 1, "pi_agent": 0}}
+        {**_MULTI_HARNESS, "weights": {"oc": 1, "pi": 0}}
     )
     nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": rows})
+
+
+def test_stable_source_coverage_requires_every_server_a_group_can_use(tmp_path):
+    data_path = tmp_path / "gym.jsonl"
+    data_path.write_text(
+        json.dumps({"task_id": {"taskset": "swe", "task_id": "1"}, "task_input": {}})
+        + "\n"
+    )
+    source = nemo_gym_mod.NemoGymSourceIdentity.from_stat(
+        str(data_path.resolve()), data_path.stat()
+    )
+    rows = MagicMock()
+    dataset = SimpleNamespace(dataset=rows, agent_name_sources=frozenset({source}))
+    shard_set = _sharded_set({"swe_opencode": "left"})
+    shard_set.multi_harness = _resolved_routes()
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="swe_pi"):
+        nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
+
+    shard_set = _sharded_set({"swe_opencode": "left", "swe_pi": "right"})
+    shard_set.multi_harness = _resolved_routes()
+    nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
+    # Read from the source file, not by iterating the loaded rows.
+    rows.__iter__.assert_not_called()
 
 
 @pytest.mark.parametrize("sharded", [False, True])
@@ -2777,7 +2829,7 @@ def test_actor_factory_installs_multi_harness_routes_on_every_actor(
             ["swe_opencode"],
             _swe_gym_config("swe_opencode"),
             {},
-            {"opencode_agent": 1, "pi_agent": 0},
+            {"oc": 1, "pi": 0},
             nemo_gym_mod.ShardSetupError,
             r"not Environment Servers any Gym actor runs: \['swe_pi'\]",
         ),
@@ -2816,9 +2868,7 @@ def test_sharded_factory_rejects_a_shard_override_of_multi_harness(detected_uv_d
             {
                 "name": "tools",
                 "config_paths": ["tools.yaml"],
-                "overrides": {
-                    "multi_harness": {"weights": {"opencode_agent": 1, "pi_agent": 3}}
-                },
+                "overrides": {"multi_harness": {"weights": {"oc": 1, "pi": 3}}},
             },
         ],
     )
@@ -2843,7 +2893,7 @@ def test_actor_describes_its_servers_and_labels_rows_once_routes_are_installed()
         )
 
     assert set(descriptions) == {"swe_opencode", "swe_pi"}
-    assert descriptions["swe_pi"].agent == "pi_agent"
+    assert descriptions["swe_pi"].agent == "pi"
     assert actor._selected_harness(row) is None
     actor.set_multi_harness_routes(routes)
     assert actor._selected_harness(row) == routes.select("swe", "group-7").harness
