@@ -27,6 +27,7 @@ def decide_capture_input(
     *,
     messages: list[dict[str, Any]],
     allow_empty_tool_content: bool = False,
+    rendered_prefix_is_stable: bool = False,
 ) -> CaptureInputDecision:
     """Verify the converted boundary and renderer for a Gym-selected candidate.
 
@@ -35,6 +36,7 @@ def decide_capture_input(
     Managed roots retain media validation; legacy admissions are unchanged.
     ``allow_empty_tool_content`` is a worker-proven rendering fact, not a
     harness option. It permits only null/empty Chat assistant tool content.
+    System suffixes also require proof of a stable rendered historical prefix.
     """
     # Optional Gym contracts are required only on a captured serving request.
     from nemo_gym.token_id_capture.staging.records import CaptureAdmission
@@ -65,6 +67,12 @@ def decide_capture_input(
         return CaptureInputDecision(root, root_serving, True)
     suffix = current.items[previous.item_count :]
     suffix_roles = [item.role for item in suffix]
+    if "system" in suffix_roles and not rendered_prefix_is_stable:
+        LOGGER.warning(
+            "Call %s rewrites the rendered prefix before its system suffix; rooting a new segment.",
+            admission.model_call_id,
+        )
+        return CaptureInputDecision(root, root_serving, True)
     # The supported converter preserves these observations as separate messages.
     # Prove its cut explicitly; counting EOS tokens cannot establish this boundary.
     boundary = len(messages) - len(suffix)
@@ -102,6 +110,7 @@ def resolve_capture_input(
     messages: list[dict[str, Any]],
     conversation: list[dict[str, Any]],
     renderer_is_hf: bool,
+    rendered_prefix_is_stable: bool = False,
 ) -> CaptureInputDecision:
     """:func:`decide_capture_input` with the rendering fact the serving host proves.
 
@@ -115,10 +124,12 @@ def resolve_capture_input(
         messages: The request's messages, before rendering.
         conversation: The rendered conversation the template saw.
         renderer_is_hf: The host renders with vLLM's ``HfRenderer``.
+        rendered_prefix_is_stable: The full render begins with its historical render.
     """
     return decide_capture_input(
         admission,
         messages=messages,
+        rendered_prefix_is_stable=rendered_prefix_is_stable,
         allow_empty_tool_content=(
             renderer_is_hf
             and bool(conversation)

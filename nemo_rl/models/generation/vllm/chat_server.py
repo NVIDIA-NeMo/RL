@@ -210,10 +210,9 @@ class NeMoRLOpenAIServingMixin:
         """Render a chat call and decide how its capture prefix is served.
 
         The steps every host of the chat path shares, before any TQ read: the
-        render with the checkpoint's template and processor, the capture
-        decision for a Gym candidate, and, when a prefix will be
-        spliced, the render of the history up to the last assistant turn that
-        the splice cuts against. A chat request renders with an output budget
+        render with the checkpoint's template and processor, the historical
+        render used to verify and splice a candidate prefix, and the capture
+        decision. A chat request renders with an output budget
         of 1, so vLLM's pre-tokenization length check passes; start_capture sets the
         budget clamped to the final prompt.
         """
@@ -259,28 +258,16 @@ class NeMoRLOpenAIServingMixin:
                 engine_prompt["prompt_token_ids"],
             )
 
-        # Token capture: the admission is built once by the host and resolved
-        # here, before branching; the ``ng_capture`` dict is never mutated.
-        serving_admission = admission
-        verify_retained_media = False
-        if admission is not None and (
+        # Inline assistant token fields cannot override RL's decision.
+        managed_capture = admission is not None and (
             admission.mode == "candidate" or admission.request_replay is not None
-        ):
-            # Inline assistant token fields cannot override RL's decision.
+        )
+        if managed_capture:
             request.required_prefix_token_ids = None
-            decision = resolve_capture_input(
-                admission,
-                messages=messages_for_replace_prefix_tokens,
-                conversation=conversation,
-                renderer_is_hf=type(self.renderer) is HfRenderer,
-            )
-            admission = decision.storage
-            serving_admission = decision.serving
-            verify_retained_media = decision.verify_retained_media
 
         history_token_ids = None
         if getattr(request, "required_prefix_token_ids", None) is not None or (
-            serving_admission is not None and serving_admission.mode == "token_in"
+            admission is not None and admission.mode in ("candidate", "token_in")
         ):
             # The splice cuts the full render at the turn this history ends.
             last_assistant_message_idx = None
@@ -303,6 +290,25 @@ class NeMoRLOpenAIServingMixin:
                 **render_kwargs,
             )
             history_token_ids = history_prompt["prompt_token_ids"]
+
+        # Resolve before TQ reads without mutating the host's ng_capture dictionary.
+        serving_admission = admission
+        verify_retained_media = False
+        if managed_capture:
+            decision = resolve_capture_input(
+                admission,
+                messages=messages_for_replace_prefix_tokens,
+                conversation=conversation,
+                renderer_is_hf=type(self.renderer) is HfRenderer,
+                rendered_prefix_is_stable=(
+                    bool(history_token_ids)
+                    and engine_prompt["prompt_token_ids"][: len(history_token_ids)]
+                    == history_token_ids
+                ),
+            )
+            admission = decision.storage
+            serving_admission = decision.serving
+            verify_retained_media = decision.verify_retained_media
 
         return RenderedChat(
             template_token_ids=list(engine_prompt["prompt_token_ids"]),

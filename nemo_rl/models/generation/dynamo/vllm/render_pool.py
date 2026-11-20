@@ -21,7 +21,7 @@ call in flight. Each worker process builds the same vLLM objects NeMo RL's
 native chat server uses, from the engine's own engine args, and runs:
 
 - ``render``: the native server's render step (``_render_chat_call``: the
-  render, the capture decision, the history render the splice cuts against);
+  render, the historical-prefix verification and the capture decision);
 - ``respond``: vLLM's own non-streaming response builder over the engine's
   output, so the reply is the one the native server builds.
 

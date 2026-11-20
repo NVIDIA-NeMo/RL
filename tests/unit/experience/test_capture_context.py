@@ -365,3 +365,30 @@ async def test_worker_managed_root_clears_untrusted_prefix_and_keeps_media_check
     assert capture_media.call_args.kwargs["admission"].mode == "text"
     begin.assert_called_once()
     assert begin.call_args.args[1] == [10, 11]
+
+
+@pytest.mark.parametrize("stable", [False, True])
+@pytest.mark.parametrize("cut", [None, CUT])
+def test_system_suffix_requires_rendered_prefix_proof(
+    stable: bool, cut: GenerationCutContinuation | None
+) -> None:
+    messages = HISTORY + [{"role": "system", "content": "remaining budget: 100"}]
+    decision = decide_capture_input(
+        candidate(messages, generation_cut=cut),
+        messages=messages,
+        rendered_prefix_is_stable=stable,
+    )
+    assert decision.storage.mode == ("token_in" if stable else "text")
+    assert decision.storage.generation_cut == cut
+    assert (decision.serving is not None) == (stable or cut is not None)
+    if stable:
+        assert decision.storage.parent_call_id == "previous"
+    else:
+        assert decision.storage.parent_call_id is None
+
+
+def test_system_suffix_without_worker_proof_roots_safely() -> None:
+    messages = HISTORY + [{"role": "system", "content": "remaining budget: 100"}]
+    decision = decide_capture_input(candidate(messages), messages=messages)
+    assert decision.storage.mode == "text"
+    assert decision.serving is None

@@ -97,7 +97,7 @@ Completed attempt receipts retain unselected records for cleanup. Before publica
 
 ## Configuration and supported scope
 
-Enable `token_capture.enabled: true` and `token_capture.forest_training: true` on the SingleController GRPO configuration. The former `token_capture.context_compaction` key is rejected with a migration message; rename it while keeping its value. For the included example, select Gym's `simple_agent_with_compaction` and configure its `context_history` policy/guards. RL sets Gym's internal `parent_resolution: source_history` with external `vllm_worker` staging and `rebuild_response: false`.
+Enable `token_capture.enabled: true` and `token_capture.forest_training: true` on the SingleController GRPO configuration. The former `token_capture.context_compaction` key is rejected with a migration message; rename it while keeping its value. For the included example, select Gym's `simple_agent_with_compaction` and configure its `context_history` policy/guards. RL sets Gym's internal `parent_resolution: source_history` with external `vllm_worker` staging and `rebuild_response: false`. RL also enables Gym's `allow_system_suffix` gate for this backend. Appended system messages reuse captured tokens only when the full rendered prompt starts with the separately rendered historical prefix; otherwise capture starts a new root with the complete prompt. This requires Gym's system-suffix support (Gym PR #5771); older workers must leave the gate disabled.
 
 `token_capture.selection_policy` controls training membership:
 
