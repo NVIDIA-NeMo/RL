@@ -30,6 +30,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
@@ -174,6 +175,9 @@ def _controller(
         opd_full_enabled=False,
         message_level_advantage_penalties_enabled=ctrl._message_level_advantage_penalties_enabled,
         shardable=True,
+        objective_reduction=make_objective_reduction(
+            ctrl._master_config.loss_fn.resolved_normalization
+        ),
         train_data_dump_dir=None,
     )
     ctrl._advantage_computer = AdvantageComputer(
@@ -849,6 +853,7 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
         ({"invalid_tool_call_advantage": -5.0}, {}),
         ({"malformed_thinking_advantage": 0.0}, {}),
         ({}, {"token_level_loss": False}),
+        ({}, {"normalization": "sequence_mean"}),
         ({}, {"sequence_level_importance_ratios": True}),
         ({}, {"truncated_importance_sampling_type": "seq-mask-tis"}),
         ({}, {"use_kl_in_reward": True}),

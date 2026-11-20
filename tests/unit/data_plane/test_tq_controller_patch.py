@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 from tensordict import TensorDict
@@ -129,6 +131,27 @@ def test_override_matches_stock_kv_retrieve_meta():
     ]
 
 
+def test_list_keys_matches_stock_kv_list_without_custom_meta():
+    ctl = CONTROLLER(polling_mode=True)
+    for partition_id, keys in (("p", ["a", "b", "c"]), ("q", ["z"])):
+        indexes = list(
+            ctl.kv_retrieve_meta(keys, partition_id, create=True).global_indexes
+        )
+        ctl.set_custom_meta({partition_id: {g: {"route": "x" * 64} for g in indexes}})
+
+    for partition_id in ("p", "q", "missing"):
+        stock = ctl._handle_kv_list_request(
+            MagicMock(body={"partition_id": partition_id})
+        ).body["partition_info"]
+        assert sorted(patch.list_keys(ctl, partition_id)) == sorted(
+            stock.get(partition_id, {})
+        )
+    assert stock == {}
+    assert ctl._handle_kv_list_request(MagicMock(body={"partition_id": "p"})).body[
+        "partition_info"
+    ]["p"]["a"] == {"route": "x" * 64}
+
+
 def test_override_matches_stock_kv_retrieve_meta_with_create():
     stock, patched = CONTROLLER(polling_mode=True), CONTROLLER(polling_mode=True)
     for ctl, retrieve in (
@@ -168,6 +191,7 @@ def test_patched_controller_installs_both_overrides_on_start(monkeypatch):
     ).__ray_metadata__.modified_class
     # Ray wraps actor methods, so compare where the method comes from.
     assert patched.kv_retrieve_meta.__module__ == patch.__name__
+    assert patched.nrl_list_keys.__module__ == patch.__name__
     # Building the class patches nothing; starting the controller does.
     assert FieldMeta.remove_samples is STOCK_REMOVE
 

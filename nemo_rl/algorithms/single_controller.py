@@ -168,17 +168,17 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     configure_checkpoint_workers,
 )
 from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.checkpoint import checkpoint_io
 from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
 from nemo_rl.data_plane.observability import (
+    backend_health_metrics,
     log_step_metrics,
     metrics_never_fail_the_step,
 )
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
-    DP_TRAIN_FIELDS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
-    SAMPLER_TOPK_FIELDS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
@@ -200,7 +200,6 @@ from nemo_rl.experience.rollout_manager import (
 from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
-from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -304,24 +303,6 @@ def _pooled_opd_metrics(
         "on_policy_distillation/adv_mean": mean,
         "on_policy_distillation/adv_std": math.sqrt(max(variance, 0.0)),
     }
-
-
-def _train_fields_for_step(
-    *,
-    policy_logprobs_required: bool,
-    reference_logprobs_required: bool,
-    sampler_head_required: bool,
-) -> tuple[str, ...]:
-    """Return only the data-plane columns produced for this train step."""
-    fields = tuple(
-        field
-        for field in DP_TRAIN_FIELDS
-        if (policy_logprobs_required or field != "prev_logprobs")
-        and (reference_logprobs_required or field != "reference_policy_logprobs")
-    )
-    if sampler_head_required:
-        fields += SAMPLER_TOPK_FIELDS
-    return fields
 
 
 def _worker_group_snapshots(worker_group: Any) -> Callable[[], list[dict[str, Any]]]:
@@ -442,13 +423,7 @@ class SingleControllerActor:
         )
         self._reference_logprobs_required = stage_cfg.reference_logprobs_required
         self._teacher_logprobs_required = stage_cfg.teacher_logprobs_required
-        self._train_fields = _train_fields_for_step(
-            policy_logprobs_required=self._policy_logprobs_required,
-            reference_logprobs_required=self._reference_logprobs_required,
-            # Score centering and sampler replay both read the captured head.
-            sampler_head_required=master_config.loss_fn.score_centering
-            or sampler_replay_enabled(master_config.policy["generation"]),
-        )
+        self._train_fields = stage_cfg.train_fields(master_config)
         self._dp_client = actor_args.dp_client
         self._dp_backend = master_config.data_plane["backend"]
         if self._dp_backend == "mooncake_cpu":
@@ -491,6 +466,7 @@ class SingleControllerActor:
                     save_state=actor_args.save_state,
                     partition_id=self._partition_id,
                     sampler_name=master_config.async_rl.sampler.name,
+                    loss_normalization=master_config.loss_fn.resolved_normalization,
                     opd_full_teacher_checkpoints=(
                         opd_module.opd_full_teacher_checkpoints_by_index(master_config)
                     ),
@@ -535,6 +511,10 @@ class SingleControllerActor:
             advantage_estimator=self._advantage_estimator,
         )
         self._loss_fn = actor_args.loss_fn
+        self._train_fields = (
+            *self._train_fields,
+            *self._advantage_stage_config.objective_reduction.extra_fields,
+        )
         self._value_loss_fn: LossFunction | None = getattr(
             actor_args, "value_loss_fn", None
         )
@@ -562,7 +542,6 @@ class SingleControllerActor:
                 master_config,
                 env_handles=self._env_handles,
                 rollout_manager=self._rollout_manager,
-                dp_client=self._dp_client,
                 generation=self._gen,
             )
         )
@@ -756,6 +735,9 @@ class SingleControllerActor:
 
         self._inflight_by_group_id: dict[str, tuple[asyncio.Task[None], int]] = {}
 
+        self._trainer_warmup_task: Optional[asyncio.Task[dict[str, Any]]] = None
+        self._trainer_warmup_kwargs = actor_args.trainer_warmup_kwargs
+
         # Per-step counts of how each step got made whole with spare prompts (logged
         # so a step's batch size stays explainable after the fact).
         #
@@ -900,6 +882,8 @@ class SingleControllerActor:
         except RayActorError as error:
             log.warning("Skipping generation snapshot metrics: %s", error)
 
+        self._maybe_start_trainer_warmup()
+
         # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
@@ -987,6 +971,10 @@ class SingleControllerActor:
                 await self._finish_pending_save(blocking=True)
             except Exception as e:  # teardown must not mask the original failure
                 print(f"Error publishing the pending checkpoint: {e}", flush=True)
+            if self._trainer_warmup_task is not None:
+                # Not in `tasks`: the train pump awaits it and surfaces its failure.
+                self._trainer_warmup_task.cancel()
+                await asyncio.gather(self._trainer_warmup_task, return_exceptions=True)
             if self._engine_supervisor is not None:
                 # Not in `tasks`: the supervisor creates a task per restart, on demand, so
                 # there is nothing to cancel in that list. Without this an in-flight
@@ -1020,6 +1008,24 @@ class SingleControllerActor:
             "train_steps": self._train_steps,
             "trainer_version": self._trainer_version,
         }
+
+    def _maybe_start_trainer_warmup(self) -> None:
+        """Run the warm-up beside the first rollouts if setup chose it and did not run it."""
+        kwargs = self._trainer_warmup_kwargs
+        if kwargs is None:
+            return
+        self._trainer_warmup_task = asyncio.create_task(
+            asyncio.to_thread(self._trainer.warmup_first_pass, self._loss_fn, **kwargs)
+        )
+
+    async def _finish_trainer_warmup(self) -> None:
+        task = self._trainer_warmup_task
+        if task is None:
+            return
+        with self._timer.time("trainer_warmup_wait"):
+            summary = await task
+        self._trainer_warmup_task = None
+        print(f"  ✓ Trainer warm-up (rank 0): {summary}", flush=True)
 
     async def ping(self) -> dict[str, Any]:
         """Liveness check — returns immediately if event loop is running."""
@@ -1748,7 +1754,7 @@ class SingleControllerActor:
             await self._log_data_plane_metrics_impl(total_step_time)
 
     async def _log_data_plane_metrics_impl(self, total_step_time: float) -> None:
-        """Log this step's data-plane cost. No-op unless observability is enabled.
+        """Log this step's data-plane cost.
 
         This client's share depends on the configuration: it writes the rollout
         rows unless token capture moves that to the finalizer actors, and it
@@ -1758,18 +1764,15 @@ class SingleControllerActor:
         cluster view. The fan-out blocks on ``ray.get``, so it runs off the
         event loop.
 
-        nixl's unit metrics (retired memory, SSD spills) are logged even with
-        observability off: a leak only shows over a long run, in the runs that
-        need it.
+        nixl's unit metrics (retired memory, SSD spills) and Mooncake's master
+        counters (memory use, SSD offload) are logged even with observability
+        off: a leak only shows over a long run, in the runs that need it, and
+        the first SSD spill / offload of a run logs its warning from here.
         """
-        if self._dp_backend == "nixl":
-            from nemo_rl.data_plane.adapters.tq_nixl import unit_metrics
-
-            unit = unit_metrics()
-            if unit:
-                self._logger.log_metrics(
-                    unit, self._train_steps, prefix="data_plane/nixl"
-                )
+        health = await asyncio.to_thread(backend_health_metrics, self._dp_backend)
+        if health:
+            prefix, metrics = health
+            self._logger.log_metrics(metrics, self._train_steps, prefix=prefix)
         result = await asyncio.to_thread(
             self._trainer.get_data_plane_step_metrics,
             total_step_time,
@@ -3102,6 +3105,9 @@ class SingleControllerActor:
                         # the switch to training must not tick them down.
                         self._rollout_manager.suspend_request_deadlines()
                         await asyncio.to_thread(self._gen.finish_generation)
+
+                    if self._trainer_warmup_task is not None:
+                        await self._finish_trainer_warmup()
 
                     # ---- 2. Prepare the batch ----
                     if self._is_ppo:
@@ -4692,6 +4698,16 @@ class SingleControllerActor:
             metrics["vllm_requests_waiting"] = sum(waiting.values())
         if kv_usage:
             metrics["vllm_kv_cache_usage_mean"] = sum(kv_usage.values()) / len(kv_usage)
+        for state in ("queued", "inflight"):
+            frontend_calls = _latest_generation_values(
+                generation_metrics, f"dynamo_frontend_{state}_requests"
+            )
+            if frontend_calls:
+                metrics[f"dynamo_frontend_requests_{state}"] = sum(
+                    frontend_calls.values()
+                )
+            for frontend, calls in frontend_calls.items():
+                metrics[f"dynamo_frontend_{frontend}_requests_{state}"] = calls
         if generated_tokens is not None:
             metrics["generation_output_tokens"] = float(generated_tokens)
 
@@ -4844,29 +4860,41 @@ class SingleControllerActor:
         # contain a cursor without its prompt owner, or two durable owners for one
         # canonical group. The environment keeps running: its state lives only
         # in rollout snapshots taken after this checkpoint.
-        async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
-            save_state.current_step = self._train_steps
-            save_state.total_steps = self._train_steps
-            save_state.trainer_version = self._trainer_version
-            save_state.current_epoch = self._current_epoch
-            save_state.consumed_samples = self._consumed_samples
-            save_state.total_valid_tokens = self._total_valid_tokens
-            _save_adaptive_loss_state(save_state, self._loss_fn)
-            save_state.sampler_name = self._async_cfg.sampler.name
-            save_state.sampler_dispatch_index = self._sampler.dispatch_index
-            save_state.next_nemo_gym_task_index = (
-                self._rollout_manager.get_next_nemo_gym_task_index()
-            )
+        async with contextlib.AsyncExitStack() as capture_resources:
+            async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
+                save_state.current_step = self._train_steps
+                save_state.total_steps = self._train_steps
+                save_state.trainer_version = self._trainer_version
+                save_state.current_epoch = self._current_epoch
+                save_state.consumed_samples = self._consumed_samples
+                save_state.total_valid_tokens = self._total_valid_tokens
+                _save_adaptive_loss_state(save_state, self._loss_fn)
+                save_state.sampler_name = self._async_cfg.sampler.name
+                save_state.sampler_dispatch_index = self._sampler.dispatch_index
+                save_state.next_nemo_gym_task_index = (
+                    self._rollout_manager.get_next_nemo_gym_task_index()
+                )
 
-            checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
-                self._checkpointer.init_tmp_checkpoint,
-                self._train_steps,
-                vars(save_state),
-                self._master_config,
-            )
-            captured = await self._rollout_snapshots.capture(
-                cut, checkpoint_path, "trainer_checkpoint"
-            )
+                checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
+                    self._checkpointer.init_tmp_checkpoint,
+                    self._train_steps,
+                    vars(save_state),
+                    self._master_config,
+                )
+                captured_snapshot = await self._rollout_snapshots.capture(
+                    cut, checkpoint_path, "trainer_checkpoint", allow_deferred=True
+                )
+                captured = captured_snapshot.state
+                if captured_snapshot.data_plane is not None:
+                    capture_resources.push_async_callback(
+                        checkpoint_io, captured_snapshot.data_plane.release
+                    )
+
+            # Canonical publication can resume while the retained TQ cut and its
+            # recovery state are saved, which still finishes before model
+            # save/publication.
+            if captured_snapshot.data_plane is not None:
+                captured = await captured_snapshot.persist()
 
         # Save value model
         if self._is_ppo:
