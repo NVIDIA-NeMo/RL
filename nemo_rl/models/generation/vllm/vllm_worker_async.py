@@ -455,6 +455,9 @@ class VllmAsyncGenerationWorkerImpl(
         self._progress_reader: Any | None = None
         self._capture_media = False
         self._hash_captured_media = False
+        # Router replay with prefix cuts: the dtype a cut stages routes in;
+        # None when cuts stage no routes.
+        self._cut_routes_dtype: torch.dtype | None = None
         self._capture_patch_size: int | None = None
         self._capture_image_token_id: int | None = None
         # "omni" (Nemotron Omni dynamic tiler) or "pixtral" (vLLM Mistral3): the
@@ -828,21 +831,16 @@ class VllmAsyncGenerationWorkerImpl(
         # ai-dynamo is optional: import it only for engines served through Dynamo.
         from nemo_rl.models.generation.dynamo.engine_adapter import (
             start_dynamo_endpoint,
-            weight_free_model_path,
         )
         from nemo_rl.models.generation.dynamo.vllm.adapter import DynamoVllmAdapter
 
-        # Dynamo fetches a Hub ID's whole checkpoint before it registers; the engine's
-        # weights come from refit, so register the config and tokenizer files only.
-        model_path = await weight_free_model_path(self.model_name)
         kv_events = self.llm.vllm_config.kv_events_config
         publishes = kv_events is not None and kv_events.enable_kv_cache_events
         # The Dynamo functional overlays check the router applied these.
         print(f"  [Dynamo] engine publishes KV events: {publishes}", flush=True)
         self._dynamo_endpoint_task = start_dynamo_endpoint(
             DynamoVllmAdapter(self, leader_worker_idx=leader_worker_idx),
-            model_path=model_path,
-            served_model_name=self.model_name,
+            model_name=self.model_name,
             namespace=namespace,
             engine_env=engine_env,
         )
@@ -1003,6 +1001,11 @@ class VllmAsyncGenerationWorkerImpl(
         )
         self._prefix_recovery.shutdown()
         self._prefix_recovery = NoPrefixRecovery()
+        self._cut_routes_dtype = (
+            self.routed_experts_dtype
+            if generation_prefix_cuts_enabled and self._return_routed_experts_enabled()
+            else None
+        )
         if generation_prefix_cuts_enabled:
             if self._progress_reader is None:
                 self._progress_reader = VllmProgressReader(self._http_engine_client)
@@ -1018,6 +1021,8 @@ class VllmAsyncGenerationWorkerImpl(
                     control_token=generation_cut_control_token,
                     control_timeout_s=generation_cut_control_timeout_s,
                     progress_reader=self._progress_reader,
+                    router_replay=self._cut_routes_dtype is not None,
+                    sampler_top_k=self._capture_top_logprobs,
                     prefix_row_extras=self._generation_cut_record_payload,
                 )
             )
@@ -1122,6 +1127,8 @@ class VllmAsyncGenerationWorkerImpl(
         prefix_token_ids: list[int] | None = None,
         media: CapturedMedia | None = None,
         generation_cut: Any | None = None,
+        generation_cut_routed_experts: torch.Tensor | None = None,
+        generation_cut_sampler_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
         resumed_generation_token_ids: list[int] | None = None,
     ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
@@ -1174,6 +1181,9 @@ class VllmAsyncGenerationWorkerImpl(
                 if admission.generation_cut is not None
                 else ()
             ),
+            routed_experts_dtype=self._cut_routes_dtype,
+            restored_routed_experts=generation_cut_routed_experts,
+            restored_sampler_topk=generation_cut_sampler_topk,
         )
         self._capture_registry.add(request, state)
         # Counted once Gym's begin_call has accepted a restored cut.
@@ -1372,9 +1382,19 @@ class VllmAsyncGenerationWorkerImpl(
 
     @staticmethod
     def _delta_align_routed_experts(
-        payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
+        payload: dict[str, Any],
+        *,
+        prev_len: int,
+        prompt_len: int,
+        generated_len: int,
+        restored: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
-        """Slice native routes for the delta plus boundary row and bind metadata."""
+        """Slice native routes for the delta plus boundary row and bind metadata.
+
+        A resumed call's ``restored`` routes replace this call's rows for its
+        restored prefix; the boundary row, the row at the cut and the tail keep
+        this call's routes. Routes that do not fit are logged and dropped.
+        """
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
             return None
@@ -1382,6 +1402,11 @@ class VllmAsyncGenerationWorkerImpl(
         message = dict(choice.get("message") or {})
         routed = message.get("routed_experts")
         if routed is None:
+            if restored is not None:
+                LOGGER.warning(
+                    "resumed generation staged no routed_experts to restore its "
+                    "prefix's routes into"
+                )
             return None
         try:
             if not isinstance(routed, torch.Tensor):
@@ -1392,15 +1417,33 @@ class VllmAsyncGenerationWorkerImpl(
                     f"route shape {tuple(routed.shape)} does not match engine sequence "
                     f"length {expected_full_len}"
                 )
-            start = prev_len - boundary_route_rows(prev_len)
+            boundary_rows = boundary_route_rows(prev_len)
             # Keep this as a view: capture uses a local client, and SimpleStorage
             # serializes only the slice's bytes. Message routes sent through
             # Ray/pickle use slice_routed_experts() to copy only their token span.
-            routed = routed[start:]
+            routed = routed[prev_len - boundary_rows :]
+            if restored is not None:
+                restored = restored.to(dtype=routed.dtype)
+                if tuple(routed.shape[1:]) != tuple(restored.shape[1:]):
+                    raise ValueError("restored routed experts changed model dimensions")
+                if routed.shape[0] != boundary_rows + restored.shape[0] + generated_len:
+                    raise ValueError(
+                        "resumed routed experts do not match prefix plus generated tail"
+                    )
+                # A copy: the view above is the response's own routes. The
+                # restored final row is a placeholder; the current one is kept.
+                routed = routed.clone()
+                replace_len = restored.shape[0] - 1
+                routed[boundary_rows : boundary_rows + replace_len] = restored[
+                    :replace_len
+                ]
             message["routed_experts"] = routed_experts_tensor_metadata(routed)
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
-                "dropping invalid routed_experts from staged capture: %s", error
+                "dropping routed_experts the restored prefix does not fit: %s"
+                if restored is not None
+                else "dropping invalid routed_experts from staged capture: %s",
+                error,
             )
             message.pop("routed_experts", None)
             routed = None
@@ -1506,11 +1549,19 @@ class VllmAsyncGenerationWorkerImpl(
                 prev_len=call.admission.prev_len,
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
+                restored=state.restored_routed_experts,
             )
         attachments = dict(state.media.tensors or {}) if state.media is not None else {}
         if routed_experts is not None:
             attachments["routed_experts"] = routed_experts
         if sampler_topk is not None:
+            restored_topk = state.restored_sampler_topk
+            if restored_topk is not None:
+                # A resumed call's row covers its restored prefix, then its tail.
+                sampler_topk = (
+                    torch.cat([restored_topk[0], torch.as_tensor(sampler_topk[0])]),
+                    torch.cat([restored_topk[1], torch.as_tensor(sampler_topk[1])]),
+                )
             attachments.update(
                 sampler_topk_token_ids=sampler_topk[0],
                 sampler_topk_logprobs=sampler_topk[1],
@@ -1534,13 +1585,20 @@ class VllmAsyncGenerationWorkerImpl(
             LOGGER.info(
                 "generation prefix completed: rollout_id=%s model_call_id=%s "
                 "source_model_call_id=%s prefix_tokens=%d tail_tokens=%d "
-                "total_generation_tokens=%d",
+                "total_generation_tokens=%d prefix_routes=%s",
                 call.capture_key,
                 call.model_call_id,
                 call.generation_cut.model_call_id,
                 prefix_tokens,
                 len(generated_token_ids),
                 total_generation_token_count,
+                # Router replay: whether the staged row kept the restored
+                # prefix's routes, or dropped them as unfit.
+                "none"
+                if state.restored_routed_experts is None
+                else "kept"
+                if routed_experts is not None
+                else "dropped",
             )
         progress = state.snapshot()
         effective_output_limit = progress.effective_output_limit

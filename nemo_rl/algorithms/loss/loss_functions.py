@@ -48,7 +48,6 @@ from nemo_rl.algorithms.loss.score_centering import compute_score_centering_term
 from nemo_rl.algorithms.utils import (
     calculate_kl,
     compute_seq_logprob_errors,
-    masked_mean,
 )
 from nemo_rl.algorithms.x_token.loss_utils import (
     LocalizedAlignment,
@@ -74,6 +73,7 @@ from nemo_rl.distributed.model_utils import (
     vocab_parallel_log_softmax,
 )
 from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
+from nemo_rl.utils.tensor_ops import masked_mean
 
 if TYPE_CHECKING:
     # Import-time only: nemo_rl.algorithms.opd imports the data plane, which

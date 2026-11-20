@@ -2589,6 +2589,8 @@ class TestPeriodicRolloutCheckpoint:
                     "inflight_batch_sizes": {0: [2], 1: [1]},
                     "num_pending_samples": {0: [1], 1: [3]},
                     "kv_cache_usage_perc": {0: [0.5], 1: [0.7]},
+                    "dynamo_frontend_queued_requests": {0: [5.0], 1: [2.0]},
+                    "dynamo_frontend_inflight_requests": {0: [9.0], 1: [1.0]},
                 },
             ]
         )
@@ -2620,6 +2622,11 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["vllm_requests_running"] == 3
         assert logged["vllm_requests_waiting"] == 4
         assert logged["vllm_kv_cache_usage_mean"] == pytest.approx(0.6)
+        assert logged["dynamo_frontend_requests_queued"] == 7
+        assert logged["dynamo_frontend_requests_inflight"] == 10
+        # Each frontend's own counts show which one the calls pile up in.
+        assert logged["dynamo_frontend_0_requests_queued"] == 5
+        assert logged["dynamo_frontend_1_requests_inflight"] == 1
         assert logged["group_completion_seconds_p50"] == pytest.approx(2.0)
         assert logged["group_completion_seconds_p95"] == pytest.approx(4.0)
         assert logged["group_queue_wait_seconds_p95"] == pytest.approx(3.0)
