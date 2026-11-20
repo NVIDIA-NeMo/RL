@@ -846,8 +846,18 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
             # The request sampling params need to exactly match those as are set in NeMo RL.
             # If they do not match, the inference will be off policy and destroy training stability.
-            assert request.temperature == generation_config["temperature"]
-            assert request.top_p == generation_config["top_p"]
+            # [CUSTOM] This server is shared by every caller of `policy_model` (i.e. 
+            # rollouts and judge). Leaving sampling params unset adopts the training
+            # config's value (so nothing breaks). A caller that explicitly sets a
+            # *mismatching* value still hits the assert below and beraks instead.
+            if request.temperature is None:
+                request.temperature = generation_config["temperature"]
+            else:
+                assert request.temperature == generation_config["temperature"]
+            if request.top_p is None:
+                request.top_p = generation_config["top_p"]
+            else:
+                assert request.top_p == generation_config["top_p"]
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
