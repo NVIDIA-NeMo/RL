@@ -397,7 +397,7 @@ class DistributedLogprobWithSampling(torch.autograd.Function):
         BS_local = BS // world_size
 
         # Reshape to 2D for all_to_all
-        reshaped_vocab_parallel_logits = vocab_parallel_logits.view(BS, V_local)
+        reshaped_vocab_parallel_logits = vocab_parallel_logits.reshape(BS, V_local)
 
         # Flatten target: [B, S] -> [BS]
         target_flat = target.flatten()  # [BS]
@@ -528,7 +528,7 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
 
         # Convert chunk_size from sequence dimension to batch-sequence dimension
         effective_chunk_size = chunk_size * B
-        reshaped_vocab_parallel_logits = vocab_parallel_logits.view(BS, V_local)
+        reshaped_vocab_parallel_logits = vocab_parallel_logits.reshape(BS, V_local)
 
         # Make sure the effective chunk size is divisible by the world size
         # This ensure all the chunks (including the last one) meet the world size requirement.
@@ -627,7 +627,7 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
         BS = B * S
 
         effective_chunk_size = chunk_size * B
-        reshaped_vocab_parallel_logits = vocab_parallel_logits.view(BS, V_local)
+        reshaped_vocab_parallel_logits = vocab_parallel_logits.reshape(BS, V_local)
         target_flat = target.flatten()
 
         num_chunks = (BS + effective_chunk_size - 1) // effective_chunk_size
