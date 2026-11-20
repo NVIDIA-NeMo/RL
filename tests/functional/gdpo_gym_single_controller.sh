@@ -60,7 +60,6 @@ uv run python "${REPO_ROOT}/examples/run_grpo_single_controller.py" \
     checkpointing.enabled=false \
     data.train.data_path="${RUN_DIR}/train.jsonl" \
     data.validation.data_path="${RUN_DIR}/validation.jsonl" \
-    ++token_capture.enabled=false \
     ++data_plane.enabled=true ++data_plane.impl=transfer_queue \
     ++data_plane.backend=simple ++data_plane.simple.storage_capacity=1000000 \
     ++data_plane.simple.num_storage_units=2 \
@@ -72,8 +71,14 @@ uv run python "${REPO_ROOT}/examples/run_grpo_single_controller.py" \
 
 uv run "${REPO_ROOT}/tests/json_dump_tb_logs.py" "${RUN_DIR}/logs" \
     --output_path "${RUN_DIR}/metrics.json"
+EXTRA_CHECKS=()
+if [[ "$*" == *token_capture.enabled=true* ]]; then
+    # Nonzero only when a finalizer actor ran, i.e. capture really was on.
+    EXTRA_CHECKS+=('max(data["train/finalize/total_ms"]) > 0')
+fi
 uv run "${REPO_ROOT}/tests/check_metrics.py" "${RUN_DIR}/metrics.json" \
     'len(data["train/loss"]) == 3' \
     'all_finite(data["train/loss"])' \
     'max(data["train/reward"]) > 0' \
-    'min(data["train/global_valid_seqs"]) > 0'
+    'min(data["train/global_valid_seqs"]) > 0' \
+    ${EXTRA_CHECKS[@]+"${EXTRA_CHECKS[@]}"}
