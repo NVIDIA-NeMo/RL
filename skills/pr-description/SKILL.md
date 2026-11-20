@@ -6,7 +6,7 @@ when_to_use: Opening a PR; writing or editing a PR description; updating a descr
 
 # PR Description
 
-The template is [`.github/PULL_REQUEST_TEMPLATE.md`](../../.github/PULL_REQUEST_TEMPLATE.md). The `Check PR description` workflow ([`.github/scripts/check_pr_description.py`](../../.github/scripts/check_pr_description.py)) fails when the review box is unticked, a required heading is missing, or "What and why" is empty. It is a warning for now, not a required check.
+The template is [`.github/PULL_REQUEST_TEMPLATE.md`](../../.github/PULL_REQUEST_TEMPLATE.md). The `Check PR description` workflow ([`.github/workflows/pr-description-check.yml`](../../.github/workflows/pr-description-check.yml)) fails when the review box is unticked, a required heading is missing, or "What and why" is empty. It is a warning for now, not a required check.
 
 ## Rules
 
