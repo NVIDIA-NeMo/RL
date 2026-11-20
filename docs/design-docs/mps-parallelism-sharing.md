@@ -16,7 +16,7 @@ To run the eight-GPU Nano recipe with eight learner workers and four inference w
 bash examples/run_nemotron_nano_mps.sh 'policy.generation.colocated.engine_gpu_indices=[4,5,6,7]'
 ```
 
-`learner_gpu_indices` and `engine_gpu_indices` are ordered indices in the same topology-sorted physical GPU pool. Each index identifies a GPU across the full allocation. Each list orders that role’s distributed ranks. A null list uses the full pool. The engine list must be contained in the learner list, and each role must fill complete dense and expert model-parallel groups. For a 16-GPU pool, choosing engine indices 8 through 15 and leaving the learner list null places eight inference workers alongside 16 learner workers. With `mps_gemm`, only shared GPUs receive the learner GEMM margin. Learner-only GPUs can still send remote shards during publication. The conventional disjoint setup uses its existing resource split with `engine_sm_fraction` unset.
+`learner_gpu_indices` and `engine_gpu_indices` are ordered indices in the same topology-sorted physical GPU pool. Each index identifies a GPU across the full allocation. The order of each list defines that role’s logical GPU order. A null list selects the entire parent pool independently for that role. Every engine GPU must also be a learner GPU. If the learner list selects only part of the pool, leaving the engine list null fails validation. Each role must fill complete dense and expert model-parallel groups. For a 16-GPU pool, choosing engine indices 8 through 15 and leaving the learner list null places eight inference workers alongside 16 learner workers. With `mps_gemm`, only shared GPUs receive the learner GEMM margin. Learner-only GPUs can still send remote shards during publication. The conventional disjoint setup uses its existing resource split with `engine_sm_fraction` unset.
 
 Streaming GRPO aligns prompt-group dispatches to the learner data-parallel and static microbatch sizes so every learner shard receives complete work. Forest training retains its execution-row padding rules.
 
@@ -47,7 +47,7 @@ residual transfers; partial-coverage placements are not yet optimized globally.
 Residual transfers run only among learner ranks, with one NCCL participant per
 GPU. Each paired learner maps the inference-owned receive tensors through CUDA
 IPC; it does not allocate another full model. All inference readers are paused
-and drained before publication. If inference repacks a private tensor, its new
+and drained before the optimizer mutates shared weights. If inference repacks a private tensor, its new
 IPC handle is installed before the next transfer. Imported receive buffers are
 released before their inference owners shut down. Source storage changes fail
 closed. Every rank finishes copying and cache refresh before inference resumes.
@@ -77,8 +77,9 @@ The run exercised concurrent DynamicInferenceEngine graphs, generation, learner 
 Both nodes completed owned-process cleanup without CUDA IPC producer-lifetime or NCCL communicator teardown warnings, and the allocation completed successfully.
 
 That GPU qualification ran NeMo RL revision `8af83078` with Megatron-Core base `3e95097b` plus five reviewed native file corrections: the two MTP prefill helpers, per-forward MoE metadata, partial-destination planning, and NCCL communicator initialization.
-The full-model GPU result applies to revision `8af83078`. With the residual point-to-point planner, 1,213 focused CPU tests passed on the unmodified Core pin, and seven GPU tests skipped. The shard-planning and TP suite also passed on Core `a463e854` (52 passed, one GPU test skipped).
 The test establishes functional mixed-TP/training-CP behavior for the stated layout, not full-model per-tensor numerical parity, trajectory equivalence, convergence or performance.
+
+At NeMo RL revision `93770197`, the CPU regression suite passed 1,449 tests on the unmodified Megatron-Core pin `e0a4bfed`. Seven GPU tests and one optional NeMo Gym test were skipped. A focused suite of 60 placement, scheduling, port and refit tests passed on both that pin and Core `a463e854`. The 16-learner/eight-inference layout is covered by the placement tests. The GPU qualification reported above used eight GPUs.
 
 Existing Ultra training CP8 to inference CP1 evidence uses matching TP and covers a different layout.
 Inference CP is not a supported target; inference remains CP1 and PP1, and inference-optimized experts remain ETP1.
