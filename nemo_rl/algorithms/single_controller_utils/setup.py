@@ -62,7 +62,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, make_objective_reduction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossFn
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
@@ -409,6 +409,12 @@ def _register_single_controller_partitions(
         )
         if master_config.policy["generation"]["top_logprobs"] > 0:
             partition_fields.extend(SAMPLER_TOPK_FIELDS)
+    # Reducers declare their columns before any producer can publish values.
+    partition_fields.extend(
+        make_objective_reduction(
+            master_config.loss_fn.resolved_normalization
+        ).extra_fields
+    )
     if include_multimodal_fields:
         partition_fields.extend(
             field
@@ -2565,6 +2571,11 @@ def setup_single_controller(
             generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
             generation_cut_control_token=token_capture_cfg.control_auth_token,
             generation_cut_control_timeout_s=token_capture_cfg.control_timeout_s,
+            prefix_write_max_rows=master_config.rollout_recovery.prefix_write_max_rows,
+            prefix_write_max_tokens=(
+                master_config.rollout_recovery.prefix_write_max_tokens
+            ),
+            prefix_read_max_rows=master_config.rollout_recovery.prefix_read_max_rows,
         )
         if capture_media and media_columns is None:
             raise RuntimeError(
