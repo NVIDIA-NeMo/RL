@@ -62,6 +62,7 @@ from nemo_rl.distributed.model_utils import (
     get_cp_sharded_next_token_logprobs,
     get_logprobs_from_vocab_parallel_logits,
 )
+from nemo_rl.models.automodel.activation_offload import ActivationCpuOffload
 from nemo_rl.models.automodel.data import (
     ProcessedInputs,
     ProcessedMicrobatch,
@@ -316,6 +317,7 @@ def forward_with_post_processing_fn(
     global_valid_toks: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     sequence_dim: int = 1,
+    activation_offload: Optional[ActivationCpuOffload] = None,
 ) -> Tuple[Any, dict[str, Any], ProcessedMicrobatch]:
     """Perform forward pass with pre-processed microbatch and apply post-processing.
 
@@ -335,6 +337,9 @@ def forward_with_post_processing_fn(
         global_valid_toks: Global valid token count for loss normalization
         sampling_params: Sampling parameters (top-k, top-p, temperature)
         sequence_dim: Sequence dimension
+        activation_offload: When given, the model forward runs under it, so the
+            activations it saves for backward wait in host memory. Post-processing
+            runs outside it: its logits are consumed right away by the loss.
 
     Returns:
         tuple: (result, metrics, processed_microbatch)
@@ -351,7 +356,8 @@ def forward_with_post_processing_fn(
             "ContextParallelSharder is required when context_parallel_size > 1"
         )
     # Model forward pass
-    outputs = model_forward(model, prepared.model_batch)
+    with activation_offload if activation_offload is not None else nullcontext():
+        outputs = model_forward(model, prepared.model_batch)
 
     # Extract logits from model outputs
     logits = extract_logits(model, outputs)
@@ -462,6 +468,7 @@ def automodel_forward_backward(
     num_valid_microbatches: Optional[int] = None,
     on_microbatch_start: Optional[Callable[[int], None]] = None,
     router_replay_gates: Optional[list[ReplayGate]] = None,
+    activation_offload: Optional[ActivationCpuOffload] = None,
 ) -> list[Tuple[Any, dict[str, Any]]]:
     """Execute forward and backward passes for automodel.
 
@@ -494,11 +501,15 @@ def automodel_forward_backward(
             with the microbatch index. Useful for cache clearing, etc.
         router_replay_gates: When given, replay each microbatch's rollout
             ``routed_experts`` on these MoE gates (R3) for both its forward and backward.
+        activation_offload: When given and ``forward_only`` is False, each model
+            forward saves its activations for backward in host memory.
 
     Returns:
         List of (result, metrics) tuples from each microbatch
     """
     results = []
+    if forward_only:
+        activation_offload = None
 
     # Draft co-training's per-batch hooks live here (not in the worker) so
     # they bracket exactly the microbatches this call runs, the same way
@@ -553,6 +564,7 @@ def automodel_forward_backward(
                     global_valid_toks=global_valid_toks,
                     sampling_params=sampling_params,
                     sequence_dim=sequence_dim,
+                    activation_offload=activation_offload,
                 )
 
                 # Check if this is a dummy batch

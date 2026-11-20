@@ -118,6 +118,25 @@ To enable Automodel training:
 
 For multi-node runs, set `policy.automodel_cfg.dp_replicate_size > 1` to enable Hybrid Sharded Data Parallel (HSDP). This keeps FSDP collectives intra-node and only replicates gradients across nodes. See [HSDP (`dp_replicate_size`)](automodel-parallel-plan.md#hsdp-dp_replicate_size).
 
+#### Activation CPU offload
+
+With activation checkpointing, training still keeps the input of every checkpointed block on the GPU from forward until backward. `activation_offloading` moves those tensors to pinned host memory after the forward pass and copies each one back when backward needs it.
+
+```yaml
+policy:
+  automodel_cfg:
+    activation_checkpointing: true
+    activation_offloading: true
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `automodel_cfg.activation_offloading` | `false` | Keep the activations saved for backward during training forward passes in pinned host memory. Requires `activation_checkpointing: true`. |
+
+The option is independent of `cpu_offload`: parameters, gradients and optimizer state stay where they are. Logprob, reference and evaluation passes do not save activations and are unaffected, and the logits and loss computation stay on the GPU.
+
+Each rank needs host memory for one microbatch's block inputs, roughly `num_layers * tokens_per_microbatch * hidden_size * bytes_per_element`, rounded up by the pinned-memory allocator, so account for every rank on a node. FSDP casts each block's input to the training `precision` before the block saves it, so `bytes_per_element` is 2 for `bfloat16` whatever `fsdp_output_dtype` is. A tensor that several operations save is copied once. The copies run on the compute stream, so each microbatch pays one device-to-host and one host-to-device transfer of those tensors; benchmark the step time on the target hardware.
+
 ## Configuration Examples
 
 For comprehensive examples of each algorithm and backend, see the [examples/configs/recipes/llm](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs/recipes/llm) folder. This directory contains ready-to-use configurations for various supported combinations.
