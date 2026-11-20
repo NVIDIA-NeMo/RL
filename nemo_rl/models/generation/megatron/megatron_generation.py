@@ -14,6 +14,7 @@
 
 import asyncio
 from copy import deepcopy
+from math import lcm
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -104,9 +105,15 @@ class MegatronGeneration(GenerationInterface):
             config: The full `PolicyConfig` (megatron parallelism + colocation).
         """
         colocated = config["generation"]["colocated"]["enabled"]
+        placement = config["generation"]["colocated"]
+        explicit_placement = any(
+            placement.get(key) is not None
+            for key in ("learner_gpu_indices", "engine_gpu_indices")
+        )
         cluster._init_placement_groups(
             strategy=None if colocated else "PACK",
-            use_unified_pg=cls.nvlink_domain_span(config) > cluster.num_gpus_per_node,
+            use_unified_pg=explicit_placement
+            or cls.nvlink_domain_span(config) > cluster.num_gpus_per_node,
         )
 
     @staticmethod
@@ -368,6 +375,24 @@ class MegatronGeneration(GenerationInterface):
             **deepcopy(config),
             "megatron_cfg": self.effective_megatron_cfg(config),
         }
+        if any(
+            config["generation"]["colocated"].get(key) is not None
+            for key in ("learner_gpu_indices", "engine_gpu_indices")
+        ):
+            # Bridge validates dummy train/eval batch metadata even on inference-only workers.
+            # Preserve the learner batch; align the copied metadata to the engine's DP size.
+            model_cfg = self._policy_config["megatron_cfg"]
+            model_parallel = (
+                model_cfg["tensor_model_parallel_size"]
+                * model_cfg["pipeline_model_parallel_size"]
+                * model_cfg["context_parallel_size"]
+            )
+            if cluster.world_size() % model_parallel == 0:
+                dp = cluster.world_size() // model_parallel
+                self._policy_config["train_global_batch_size"] = lcm(
+                    self._policy_config["train_global_batch_size"],
+                    self._policy_config["train_micro_batch_size"] * dp,
+                )
         # Reserve GPUs before Policy workers grab them, to prevent disjoint NVLS domains.
         self.init_cluster_placement_groups(cluster, self._policy_config)
         self._policy = Policy(
@@ -399,6 +424,12 @@ class MegatronGeneration(GenerationInterface):
 
         if sm_partition.engine_sm_fraction(config) is None:
             return None
+        placement_config = config["generation"]["colocated"]
+        if any(
+            placement_config.get(key) is not None
+            for key in ("learner_gpu_indices", "engine_gpu_indices")
+        ):
+            return None  # The borrowed views already establish both role orders.
         placement = sm_partition.engine_rank_gpus(
             cluster.world_size(),
             learner=sm_partition.ParallelismLayout.from_config(config["megatron_cfg"]),

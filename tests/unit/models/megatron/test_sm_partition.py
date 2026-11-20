@@ -1091,6 +1091,65 @@ def test_gemm_budget_rejects_conflicting_environment(key: str, source: str) -> N
         smp.validate(config, env=env)
 
 
+@pytest.mark.parametrize(
+    "learner_indices, engine_indices, expected",
+    [
+        (None, [1, 3], [False, True, False, True]),
+        ([6, 2, 5], [2, 4], [False, True, False]),
+        ([3, 1], [1, 3], [True, True]),
+        ([6, 2], [0, 1], [False, False]),
+        ([7, 3], None, [True, True]),
+        (None, None, [True, True, True, True]),
+    ],
+)
+def test_gemm_hint_follows_partial_gpu_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+    learner_indices: list[int] | None,
+    engine_indices: list[int] | None,
+    expected: list[bool],
+) -> None:
+    config = _cfg(
+        **{
+            "generation.colocated.sm_partition_backend": "mps_gemm",
+            "generation.colocated.learner_gpu_indices": learner_indices,
+            "generation.colocated.engine_gpu_indices": engine_indices,
+        }
+    )
+    monkeypatch.setenv(smp.MPS_PCT_ENV, "100")
+    monkeypatch.setenv("NVTE_EXT_MARGIN_SM", "sentinel")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=152),
+    )
+    monkeypatch.setattr(smp, "_device_sm_count", lambda: 152)
+    monkeypatch.setattr(smp, "_check_uncapped_client", lambda *a, **k: {})
+    for rank, shared in enumerate(expected):
+        # All workers may have the same node-local CUDA index. Logical ranks,
+        # rather than that index or raw placement-bundle IDs, decide overlap.
+        info = smp.check_worker(config, "learner", rank=rank)
+        assert info["shares_engine_gpu"] is shared
+        assert info["te_grouped_gemm_target_sms"] == (88 if shared else 152)
+        assert os.environ["NVTE_EXT_MARGIN_SM"] == ("64" if shared else "0")
+        assert os.environ[smp.MPS_PCT_ENV] == "100"
+
+
+@pytest.mark.parametrize("rank", [-1, 2])
+@pytest.mark.parametrize("engine_indices", [None, [2, 4]])
+def test_gemm_hint_rejects_rank_outside_learner_view(
+    rank: int, engine_indices: list[int] | None
+) -> None:
+    config = _cfg(
+        **{
+            "generation.colocated.learner_gpu_indices": [6, 2],
+            "generation.colocated.engine_gpu_indices": engine_indices,
+        }
+    )
+    with pytest.raises(ValueError, match="outside its GPU subset"):
+        smp._learner_shares_engine_gpu(config, rank=rank)
+
+
 def test_uncapped_client_retries_transient_control_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1115,3 +1174,125 @@ def test_uncapped_client_retries_transient_control_failure(
         "mps_client_registered"
     ]
     assert len(calls) == 3
+
+
+def test_refit_subset_keeps_all_source_ranks_and_publishes_only_paired_destinations(
+    monkeypatch,
+):
+    from nemo_rl.weight_sync import megatron_weight_synchronizer as mws
+
+    class Fleet:
+        def __init__(self, replies):
+            self.replies = replies
+            self.calls = []
+
+        def run_all_workers_single_data(self, method, **kwargs):
+            self.calls.append((method, kwargs))
+            return self.replies.get(method, [])
+
+    exports = [
+        smp.RefitExport(smp.RefitPlacement(f"gpu{rank}", rank), [], {}, f"source{rank}")
+        for rank in range(4)
+    ]
+    learner = Fleet(
+        {
+            "export_coresident_refit_handles": exports,
+            "coresident_refit_source_ready": [item.fingerprint for item in exports],
+        }
+    )
+    destinations = [
+        smp.RefitDestination(f"gpu{rank}", f"receive{rank}", {}) for rank in [2, 3]
+    ]
+    engine = Fleet(
+        {
+            "coresident_refit_placement": [
+                smp.RefitPlacement(f"gpu{rank + 2}", rank) for rank in range(2)
+            ],
+            "open_coresident_refit_handles": [
+                smp.RefitBinding(
+                    [
+                        {
+                            "owner_rank": rank,
+                            "name": "weight",
+                            "shape": (2,),
+                            "element_size": 4,
+                        }
+                    ],
+                    {},
+                )
+                for rank in [2, 3]
+            ],
+            "export_coresident_refit_destinations": destinations,
+            "coresident_refit_copy": [
+                {"seconds": 0.0, "bytes": 8.0, "bytes_shared": 0.0}
+            ]
+            * 2,
+        }
+    )
+    monkeypatch.setattr(mws, "_get_fail_fast", lambda refs, **kwargs: list(refs))
+    refit = mws.CoresidentRefit(
+        SimpleNamespace(cfg=_cfg(), worker_group=learner),
+        SimpleNamespace(
+            worker_group=engine,
+            refresh_dp_openai_server_base_urls=lambda **kwargs: None,
+        ),
+    )
+    refit.init_communicator()
+    opened = next(
+        kwargs
+        for method, kwargs in engine.calls
+        if method == "open_coresident_refit_handles"
+    )
+    assert opened["engine_to_learner"] == {0: 2, 1: 3}
+    assert len(opened["exports_by_device"]) == 4
+    stats = refit.sync_weights()
+    assert stats["coresident_copy_bytes_total"] == 32
+    forwarded = next(
+        kwargs["destinations"]
+        for method, kwargs in learner.calls
+        if method == "coresident_reshard"
+    )
+    assert forwarded == {item.device_id: item for item in destinations}
+    assert any(method == "coresident_refit_source_ready" for method, _ in learner.calls)
+
+
+@pytest.mark.parametrize(
+    ("learner", "engine"),
+    [
+        (None, list(range(8, 16))),
+        (list(reversed(range(16))), list(range(8))),
+        (list(range(8, 16)), list(range(8, 12))),
+    ],
+)
+def test_validate_role_gpu_subsets(learner, engine):
+    cfg = _cfg(
+        **{
+            "megatron_cfg.context_parallel_size": 1,
+            "generation.colocated.learner_gpu_indices": learner,
+            "generation.colocated.engine_gpu_indices": engine,
+        }
+    )
+    smp.validate_gpu_subsets(cfg, 16)
+
+
+@pytest.mark.parametrize(
+    ("learner", "engine", "match"),
+    [
+        (None, [], "nonempty"),
+        (None, [0, 0], "unique"),
+        (None, [16], "in range"),
+        ([0, 1, 2, 3], [4, 5, 6, 7], "also be a learner"),
+        (None, [0, 1], "expert"),
+        ([0, 1, 2, 3], None, "also be a learner"),
+    ],
+)
+def test_validate_role_gpu_subsets_fails_before_placement(learner, engine, match):
+    cfg = _cfg(
+        **{
+            "megatron_cfg.context_parallel_size": 1,
+            "generation.colocated.learner_gpu_indices": learner,
+            "generation.colocated.engine_gpu_indices": engine,
+        }
+    )
+    with pytest.raises(ValueError, match=match):
+        smp.validate_gpu_subsets(cfg, 16)

@@ -516,6 +516,9 @@ def _build_clusters(
     if sm_partition.engine_sm_fraction(master_config.policy) is not None:
         # Co-resident generation: the stock non-colocated engine, placed on the training GPUs as its own processes (one
         # more worker group per bundle), each GPU's SMs shared by MPS limits (sm_partition.py).
+        sm_partition.validate_gpu_subsets(
+            master_config.policy, gpus_per_node * policy_nodes
+        )
         cluster = RayVirtualCluster(
             name="sc_coresident_cluster",
             bundle_ct_per_node_list=[gpus_per_node] * policy_nodes,
@@ -529,7 +532,16 @@ def _build_clusters(
         # Created here, once: the stock non-colocated path builds the engine and the trainer in parallel threads, and
         # both would otherwise lazily create this cluster's placement groups (a name race on multi-node).
         MegatronGeneration.init_cluster_placement_groups(cluster, master_config.policy)
-        return cluster, cluster, None, None
+        placement = generation_config["colocated"]
+        learner_indices = placement.get("learner_gpu_indices")
+        engine_indices = placement.get("engine_gpu_indices")
+        train_cluster = (
+            cluster if learner_indices is None else cluster.subset(learner_indices)
+        )
+        inference_cluster = (
+            cluster if engine_indices is None else cluster.subset(engine_indices)
+        )
+        return train_cluster, inference_cluster, None, None
 
     if colocated:
         # Policy (+ critic) + generation share GPUs — one cluster.

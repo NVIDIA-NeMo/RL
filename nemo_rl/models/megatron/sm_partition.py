@@ -13,9 +13,9 @@
 # limitations under the License.
 """Concurrent Megatron training and inference with shared GPU weight storage.
 
-Each GPU runs one learner and one inference process under MPS. The default
+Each selected inference GPU also runs a learner under MPS. The default
 ``mps_gemm`` backend gives both clients full SM access and applies an advisory
-Transformer Engine grouped-GEMM budget to the learner. Explicit
+Transformer Engine grouped-GEMM budget on shared learner GPUs. Explicit
 ``mps_percentage`` caps the learner instead. Neither reserves disjoint SMs.
 
 With ``engine_weights=shared``, compatible contiguous parameter views alias
@@ -129,6 +129,11 @@ def validate(
     """
     frac = engine_sm_fraction(policy_cfg)
     if frac is None:
+        gen = (policy_cfg or {}).get("generation") or {}
+        placement = gen.get("colocated") or {}
+        for key in ("learner_gpu_indices", "engine_gpu_indices"):
+            if placement.get(key) is not None:
+                raise ValueError(f"{key} requires co-resident Megatron generation")
         return
     env = os.environ if env is None else env
     if not 0.0 <= frac < 1.0:
@@ -275,7 +280,7 @@ def select_static_partition(
 def check_worker(
     policy_cfg: Any, role: Role, *, rank: int = 0
 ) -> Optional[dict[str, Any]]:
-    """Verify the worker cap or uncapped MPS registration after CUDA init."""
+    """Verify MPS registration; ``rank`` follows the role's logical GPU order."""
     if engine_sm_fraction(policy_cfg) is None:
         return None
     seen = torch.cuda.get_device_properties(
@@ -313,12 +318,30 @@ def check_worker(
     if expected_pct == 100:
         info = _check_uncapped_client(role, pct, seen=seen, full=full, rank=rank)
         if partition_backend(policy_cfg) == "mps_gemm":
-            margin = min(full - 1, max(0, round(full * engine_sm_fraction(policy_cfg))))
+            shares_engine_gpu = _learner_shares_engine_gpu(policy_cfg, rank=rank)
+            fraction = engine_sm_fraction(policy_cfg) if shares_engine_gpu else 0.0
+            margin = min(full - 1, max(0, round(full * fraction)))
             os.environ["NVTE_EXT_MARGIN_SM"] = str(margin)
+            info["shares_engine_gpu"] = shares_engine_gpu
             info["te_grouped_gemm_target_sms"] = full - margin
             print(f"[sm_partition] rank={rank} {info}", flush=True)
         return info
     return _check_limit(role, pct, seen, full, rank)
+
+
+def _learner_shares_engine_gpu(policy_cfg: Any, *, rank: int) -> bool:
+    """Map a learner rank through its ordered view into the parent GPU cluster."""
+    placement = policy_cfg["generation"]["colocated"]
+    learner_indices = placement.get("learner_gpu_indices")
+    if rank < 0 or (learner_indices is not None and rank >= len(learner_indices)):
+        raise ValueError(f"Learner rank {rank} is outside its GPU subset")
+    engine_indices = placement.get("engine_gpu_indices")
+    if engine_indices is None:
+        return True
+    # RayVirtualCluster.subset and Policy preserve this logical order even
+    # when the parent's topology sort permutes physical placement bundles.
+    parent_index = rank if learner_indices is None else learner_indices[rank]
+    return parent_index in engine_indices
 
 
 def _check_uncapped_client(
@@ -473,6 +496,57 @@ class ParallelismLayout:
             config["context_parallel_size"],
         )
 
+    def validate_world(self, world: int) -> None:
+        if type(world) is not int or world < 1:
+            raise ValueError(
+                "co-resident placement needs a positive integer world size"
+            )
+        if any(
+            type(size) is not int or size < 1
+            for size in (self.tp, self.ep, self.etp, self.pp, self.cp)
+        ):
+            raise ValueError("co-resident parallelism sizes must be positive integers")
+        if world % (self.tp * self.cp * self.pp) or world % (
+            self.etp * self.ep * self.pp
+        ):
+            raise ValueError(
+                "co-resident world size must be divisible by both dense and expert model-parallel group sizes"
+            )
+
+
+def validate_gpu_subsets(policy_cfg: Any, world: int) -> None:
+    """Validate ordered roles against the physical pool before Ray reserves GPUs."""
+    from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
+
+    placement = policy_cfg["generation"]["colocated"]
+    if all(
+        placement.get(key) is None
+        for key in ("learner_gpu_indices", "engine_gpu_indices")
+    ):
+        return
+    physical = range(world)
+    learner = placement.get("learner_gpu_indices")
+    engine = placement.get("engine_gpu_indices")
+    learner = physical if learner is None else learner
+    engine = physical if engine is None else engine
+    for role, indices in (("learner", learner), ("engine", engine)):
+        if (
+            not indices
+            or any(type(i) is not int or i not in physical for i in indices)
+            or len(set(indices)) != len(indices)
+        ):
+            raise ValueError(
+                f"{role}_gpu_indices must be nonempty, unique and in range [0, {world})"
+            )
+    if not set(engine) <= set(learner):
+        raise ValueError("Each engine_gpu_indices entry must also be a learner GPU")
+    ParallelismLayout.from_config(policy_cfg["megatron_cfg"]).validate_world(
+        len(learner)
+    )
+    ParallelismLayout.from_config(
+        merged_inference_megatron_cfg(policy_cfg)
+    ).validate_world(len(engine))
+
 
 def engine_rank_gpus(
     world: int, *, learner: ParallelismLayout, engine: ParallelismLayout
@@ -484,20 +558,8 @@ def engine_rank_gpus(
     their independent rank lattice. Unaligned layouts retain normal placement
     and use the residual transfer plan for missing local weights.
     """
-    if type(world) is not int or world < 1:
-        raise ValueError("co-resident placement needs a positive integer world size")
     for layout in (learner, engine):
-        if any(
-            type(size) is not int or size < 1
-            for size in (layout.tp, layout.ep, layout.etp, layout.pp, layout.cp)
-        ):
-            raise ValueError("co-resident parallelism sizes must be positive integers")
-        if world % (layout.tp * layout.cp * layout.pp) or world % (
-            layout.etp * layout.ep * layout.pp
-        ):
-            raise ValueError(
-                "co-resident world size must divide both dense and expert rank lattices"
-            )
+        layout.validate_world(world)
     identity = list(range(world))
     if learner.pp != 1 or engine.pp != 1:
         return identity

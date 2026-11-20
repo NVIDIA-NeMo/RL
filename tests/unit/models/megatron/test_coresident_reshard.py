@@ -386,3 +386,50 @@ def test_tied_output_head_reuses_native_embedding_alias(local_owner, source_name
         output = torch.empty_like(tensor)
         output[receive.my_slice].copy_(tensor[send.my_slice])
         torch.testing.assert_close(output, tensor, rtol=0, atol=0)
+
+
+def test_partial_world_refit_preserves_send_only_sources_and_full_destinations():
+    full = torch.arange(8, dtype=torch.float32)
+    sources = [full[:4].clone(), full[4:].clone()]
+    source_metadata = [
+        meta("source.weight", value, rank, [0, 1], resolved="weight")
+        for rank, value in enumerate(sources)
+    ]
+    outputs = [torch.empty_like(full), torch.empty_like(full)]
+    engine_metadata = [
+        meta("engine.weight", value, rank, [rank], resolved="weight")
+        for rank, value in enumerate(outputs)
+    ]
+    mapped = remap_metadata(engine_metadata, {0: 2, 1: 3}, learner_world_size=4)
+    assert [item.owner_rank for item in mapped] == [2, 3]
+    assert [item.tensor_parallel_group_ranks for item in mapped] == [[2], [3]]
+    rosters = [([source_metadata[0]], []), ([source_metadata[1]], [])]
+    rosters += [([], [item]) for item in mapped]
+    destinations, source_roster = index_metadata_rosters(rosters)
+    plans = [
+        build_residual_plan(destinations, source_roster, rank) for rank in range(4)
+    ]
+    assert all(plan.send_ops and not plan.recv_ops for plan in plans[:2])
+    assert list(named_tensor_proxy({}).named_parameters()) == []
+    for publication in range(2):
+        if publication:
+            for source in sources:
+                source.add_(10)
+        for rank, output in enumerate(outputs, start=2):
+            for recv in plans[rank].recv_ops:
+                send = next(
+                    op
+                    for op in plans[recv.peer_rank].send_ops
+                    if op.task_id == recv.task_id
+                )
+                output[recv.my_slice].copy_(sources[recv.peer_rank][send.my_slice])
+            torch.testing.assert_close(output, full + publication * 10, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "mapping,world",
+    [({0: 2, 1: 2}, 4), ({0: 2, 1: 4}, 4), ({0: 2, 2: 3}, 4), ({0: 2}, True)],
+)
+def test_partial_world_refit_rejects_invalid_embedding(mapping, world):
+    with pytest.raises(ValueError):
+        remap_metadata([], mapping, learner_world_size=world)

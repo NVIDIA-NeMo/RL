@@ -308,24 +308,25 @@ class CoresidentRefit:
             raise RuntimeError(
                 "co-resident refit: two learner ranks report the same GPU"
             )
-        self._devices = set(by_device)
         layouts = _get_fail_fast(
             self._generation.worker_group.run_all_workers_single_data(
                 "coresident_refit_placement"
             ),
             timeout_s=self._control_timeout_s,
         )
+        engine_devices = {layout.device_id for layout in layouts}
         if (
-            len(layouts) != len(exported)
-            or {layout.device_id for layout in layouts} != self._devices
+            not layouts
+            or len(engine_devices) != len(layouts)
+            or not engine_devices <= set(by_device)
         ):
             raise ValueError(
-                "co-resident refit requires one learner and one inference worker on each GPU"
+                "co-resident refit requires each inference worker on a distinct learner GPU"
             )
-        ranks = set(range(len(exported)))
-        if {item.placement.rank for item in exported} != ranks or {
+        self._devices = engine_devices
+        if {item.placement.rank for item in exported} != set(range(len(exported))) or {
             layout.rank for layout in layouts
-        } != ranks:
+        } != set(range(len(layouts))):
             raise ValueError(
                 "co-resident refit workers must report complete native rank worlds"
             )

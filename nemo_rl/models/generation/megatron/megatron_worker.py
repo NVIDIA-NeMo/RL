@@ -2573,7 +2573,11 @@ class MegatronGenerationRefitMixin:
         plan = plan_local_sources(
             sm_partition.open_refit_handles(exported.handles),
             [ParameterMetadata(**item) for item in source_metadata],
-            remap_metadata(sm_partition.refit_metadata(core), engine_to_learner),
+            remap_metadata(
+                sm_partition.refit_metadata(core),
+                engine_to_learner,
+                learner_world_size=len(exports_by_device),
+            ),
             learner_rank=exported.placement.rank,
         )
         self._coresident_src = plan.local_sources

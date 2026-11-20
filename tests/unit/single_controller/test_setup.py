@@ -541,6 +541,30 @@ def test_build_clusters_reuses_all_training_gpus_for_mps(monkeypatch):
     init_groups.assert_called_once_with(train, master_config.policy)
 
 
+def test_build_clusters_borrows_gpu_groups_from_one_mps_pool(monkeypatch):
+    cfg = _make_master_config(backend="megatron", megatron_enabled=True)
+    cfg.policy["megatron_cfg"].update(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=4,
+        expert_tensor_parallel_size=1,
+    )
+    placement = cfg.policy["generation"]["colocated"]
+    placement.update(engine_sm_fraction=0.42, engine_gpu_indices=list(range(8, 16)))
+    parent = MagicMock(num_gpus_per_node=8)
+    factory = MagicMock(return_value=parent)
+    monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", factory)
+    train, engine, value, teacher = sc_setup_mod._build_clusters(cfg)
+    assert train is parent and engine is parent.subset.return_value
+    assert value is teacher is None
+    factory.assert_called_once()
+    parent.subset.assert_called_once_with(list(range(8, 16)))
+    parent._init_placement_groups.assert_called_once_with(
+        strategy="PACK", use_unified_pg=True
+    )
+
+
 def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
     """Teacher nodes are removed before the student train/inference split."""
     master_config = _make_master_config(colocated=False)

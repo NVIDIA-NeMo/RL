@@ -234,6 +234,10 @@ class ColocationConfig(TypedDict):
     # Co-resident engine weights: "copy" (default; own copy, per-step refit copy) or "shared" (maps the learner's
     # weights where the local shards match; pauses only around the optimizer step).
     engine_weights: NotRequired[str | None]
+    # Ordered indices in the topology-sorted GPU pool. Each engine GPU must
+    # be a learner GPU. None selects the full pool for the corresponding role.
+    learner_gpu_indices: NotRequired[list[int] | None]
+    engine_gpu_indices: NotRequired[list[int] | None]
 
 
 class CheckpointEngineConfig(TypedDict):

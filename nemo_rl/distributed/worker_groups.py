@@ -464,6 +464,19 @@ class RayWorkerGroup:
         self.sharding_annotations = sharding_annotations
         self.dp_leader_worker_indices: list[int] = []
 
+        if bundle_indices_list is None and cluster._placement_group_owner is not None:
+            # A borrowed GPU view shares its owner's placement group, whose
+            # bundle count includes GPUs outside this view.
+            if workers_per_node is not None:
+                raise ValueError(
+                    "GPU subset worker groups require explicit bundle_indices_list "
+                    "when overriding workers_per_node"
+                )
+            assert cluster._sorted_bundle_indices is not None
+            bundle_indices_list = [
+                (0, [bundle]) for bundle in cluster._sorted_bundle_indices
+            ]
+
         # If explicit bundle indices are provided, use those
         if bundle_indices_list is None:
             # Create bundle_indices_list from workers_per_node specification

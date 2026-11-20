@@ -17,6 +17,7 @@ import random
 import socket
 import sys
 import time
+from collections import Counter
 from typing import NamedTuple, Optional, Sequence
 
 import ray
@@ -924,6 +925,8 @@ class RayVirtualCluster:
     - Node: A physical or virtual machine containing multiple bundles
     """
 
+    _placement_group_owner: Optional["RayVirtualCluster"] = None
+
     def __init__(
         self,
         bundle_ct_per_node_list: list[int],
@@ -967,6 +970,7 @@ class RayVirtualCluster:
 
         self._bundle_ct_per_node_list = bundle_ct_per_node_list
         self._world_size = sum(self._bundle_ct_per_node_list)
+        self._placement_group_owner = None
         self._node_placement_groups: Optional[list[PlacementGroup]] = None
         self._sorted_bundle_indices: Optional[list[int]] = None
         self._nvlink_domain_per_bundle_index: Optional[tuple[str, ...]] = None
@@ -1145,6 +1149,50 @@ class RayVirtualCluster:
 
     def world_size(self) -> int:
         return self._world_size
+
+    def subset(self, gpu_indices: Sequence[int]) -> "RayVirtualCluster":
+        """Borrow selected logical GPUs without reserving or owning more resources.
+
+        Worker ranks follow ``gpu_indices`` in the parent's topology-sorted order.
+        The parent owns the placement group for both fleets. Keeping a reference
+        to it also prevents its destructor from releasing a live borrowed group.
+        """
+        indices = list(gpu_indices)
+        if (
+            not indices
+            or any(type(index) is not int for index in indices)
+            or len(set(indices)) != len(indices)
+            or any(index < 0 or index >= self.world_size() for index in indices)
+        ):
+            raise ValueError("GPU subset indices must be nonempty, unique and in range")
+        if not self.use_gpus or self._placement_group_owner is not None:
+            raise ValueError("GPU subsets require an owning GPU cluster")
+        placement_groups = self.get_placement_groups()
+        if len(placement_groups) != 1 or self._sorted_bundle_indices is None:
+            raise ValueError(
+                "GPU subsets require an initialized unified placement group"
+            )
+
+        bundles = [self._sorted_bundle_indices[index] for index in indices]
+        bundle_nodes = placement_group_table(placement_groups[0])["bundles_to_node_id"]
+        node_counts = Counter(bundle_nodes[bundle] for bundle in bundles)
+        if any(not node for node in node_counts):
+            raise RuntimeError("GPU subset contains an unassigned placement bundle")
+        view = RayVirtualCluster(
+            bundle_ct_per_node_list=list(node_counts.values()),
+            use_gpus=True,
+            max_colocated_worker_groups=self.max_colocated_worker_groups,
+            num_gpus_per_node=self.num_gpus_per_node,
+            name=f"{self.name}_subset",
+            port_range_low=self.port_range_low,
+            port_range_high=self.port_range_high,
+        )
+        view._placement_group_owner = self
+        view._node_placement_groups = placement_groups
+        view._sorted_bundle_indices = bundles
+        view._nvlink_domain_per_bundle_index = self._nvlink_domain_per_bundle_index
+        view._allocated_master_ports = self._allocated_master_ports
+        return view
 
     def node_count(self) -> int:
         return sum(1 for count in self._bundle_ct_per_node_list if count > 0)
@@ -1357,6 +1405,8 @@ class RayVirtualCluster:
 
         This method is idempotent and can be safely called multiple times.
         """
+        if self._placement_group_owner is not None:
+            return True
         # Skip if Ray is already gone (typically from __del__ during _Py_Finalize
         # after Ray's atexit teardown). Any Ray API call would trigger a fatal
         # core_worker_process.cc:88 CHECK. Placement groups die with Ray.

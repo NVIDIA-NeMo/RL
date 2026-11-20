@@ -1588,7 +1588,9 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
     from nemo_rl.models.megatron import sm_partition
 
-    if sm_partition.engine_sm_fraction(master_config.policy) is not None:
+    if sm_partition.engine_sm_fraction(master_config.policy) is None:
+        sm_partition.validate(master_config.policy)
+    else:
         sm_partition.validate(
             master_config.policy,
             unsupported={

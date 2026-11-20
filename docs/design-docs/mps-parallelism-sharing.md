@@ -1,14 +1,22 @@
 # MPS parallelism sharing
 
-This experimental path uses one learner and one Megatron inference process per
-GPU. Training and inference can have different tensor and expert layouts while
+This experimental path places a Megatron inference process on each selected
+learner GPU. The default places both roles on every GPU. Training and inference can have different tensor and expert layouts while
 sharing compatible local parameter storage. The inference backend still requires
 CP1 and PP1; `inference_optimized` experts require ETP1. Training CP and PP
 are represented by native shard metadata, with one model chunk per worker. Virtual
 pipeline chunks, GTP rematerialization, quantized refit tensors, differing tensor
-dtypes, and unequal worker worlds are rejected.
+dtypes, and inference GPUs outside the learner pool are rejected.
 
 The default `sm_partition_backend: mps_gemm` gives both processes full SM access. `engine_sm_fraction` controls only the learner Transformer Engine grouped-GEMM margin: `0.42` targets approximately 58% of the SMs for those GEMMs, while other kernels can use the whole GPU. This hint does not reserve SMs. Use `mps_percentage` explicitly to cap the learner process instead. A zero fraction leaves both processes and learner GEMMs uncapped. Startup verifies that the uncapped learner is registered with the MPS daemon. The Nano recipe gives the learner lower MPS client priority (`1`) than inference (`0`), matching the benchmarked scheduling setup.
+
+To run the eight-GPU Nano recipe with eight learner workers and four inference workers, keep its TP1/EP4 settings and choose a complete four-GPU inference group:
+
+```bash
+bash examples/run_nemotron_nano_mps.sh 'policy.generation.colocated.engine_gpu_indices=[4,5,6,7]'
+```
+
+`learner_gpu_indices` and `engine_gpu_indices` are ordered indices in the same topology-sorted physical GPU pool. Each index identifies a GPU across the full allocation. Each list orders that role’s distributed ranks. A null list uses the full pool. The engine list must be contained in the learner list, and each role must fill complete dense and expert model-parallel groups. For a 16-GPU pool, choosing engine indices 8 through 15 and leaving the learner list null places eight inference workers alongside 16 learner workers. With `mps_gemm`, only shared GPUs receive the learner GEMM margin. Learner-only GPUs can still send remote shards during publication. The conventional disjoint setup uses its existing resource split with `engine_sm_fraction` unset.
 
 Streaming GRPO aligns prompt-group dispatches to the learner data-parallel and static microbatch sizes so every learner shard receives complete work. Forest training retains its execution-row padding rules.
 

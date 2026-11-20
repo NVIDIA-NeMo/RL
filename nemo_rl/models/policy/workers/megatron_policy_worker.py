@@ -994,7 +994,9 @@ class MegatronPolicyWorkerImpl(
         torch.cuda.set_device(local_rank)
         # Co-resident generation (sm_partition.py): this process must run under its SM share.
         sm_partition.check_worker(
-            config, "engine" if is_refit_destination else "learner", rank=local_rank
+            config,
+            "engine" if is_refit_destination else "learner",
+            rank=get_rank_safe(),
         )
 
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
@@ -5293,8 +5295,14 @@ class MegatronPolicyWorkerImpl(
             raise RuntimeError(
                 "co-resident residual transfers have not been initialized"
             )
-        destination = destinations[self.report_device_id()]
-        if destination.handles is not None:
+        destination = destinations.get(self.report_device_id())
+        if destination is None:
+            if self._coresident_receive_metadata != {}:
+                raise ValueError(
+                    "Missing inference buffers for planned residual receives"
+                )
+            receive_module = None  # Source-only rank in the learner group.
+        elif destination.handles is not None:
             tensors = sm_partition.open_refit_handles(destination.handles)
             receive_metadata = self._coresident_receive_metadata
             if receive_metadata is None or tensors.keys() != receive_metadata.keys():
@@ -5319,18 +5327,20 @@ class MegatronPolicyWorkerImpl(
                 )
             self._coresident_receive_module = named_tensor_proxy(tensors)
             self._coresident_receive_fingerprint = destination.fingerprint
-        if (
-            self._coresident_receive_module is None
-            or destination.fingerprint != self._coresident_receive_fingerprint
-        ):
-            raise RuntimeError(
-                "co-resident receive storage changed without replacement IPC handles"
-            )
+        if destination is not None:
+            if (
+                self._coresident_receive_module is None
+                or destination.fingerprint != self._coresident_receive_fingerprint
+            ):
+                raise RuntimeError(
+                    "co-resident receive storage changed without replacement IPC handles"
+                )
+            receive_module = self._coresident_receive_module
         with torch.inference_mode():
             execute_reshard_plan(
                 self._coresident_reshard_plan,
                 sm_partition.refit_core(self.model),
-                self._coresident_receive_module,
+                receive_module,
                 self._coresident_reshard_service,
                 group=torch.distributed.group.WORLD,
             )
