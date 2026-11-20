@@ -18,18 +18,18 @@ This keeps gradients flowing through `log pi_theta` for every token while boundi
 
 ## Configuration
 
-CISPO uses the same GRPO training path and `ClippedPGLossFn` as GRPO. Enable it in the `loss_fn` block:
+CISPO uses the same GRPO training path and `ClippedPGLossFn` as GRPO. Select it in the `loss_fn` block:
 
 ```yaml
 loss_fn:
-  use_cispo: true
-  token_level_loss: true
-  sequence_level_importance_ratios: false
+  _override_: true  # replace the loss block inherited from `defaults`
+  kind: cispo
   force_on_policy_ratio: false
   ratio_clip_min: 1.0
   ratio_clip_max: 5.0
-  ratio_clip_c: null
 ```
+
+See the [CISPO guide](../../guides/cispo.md#configuration) for what `kind: cispo` accepts and why the block is replaced. The older `use_cispo: true` switch is deprecated.
 
 `ratio_clip_min` and `ratio_clip_max` follow the paper's additive epsilon convention. The effective clamp range is:
 

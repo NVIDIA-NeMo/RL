@@ -43,6 +43,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
     ClippedPGLossFn,
     PolicyGradientLossConfig,
+    as_clipped_pg_config,
     build_policy_gradient_loss,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
@@ -3091,7 +3092,8 @@ def _create_advantage_estimator(master_config: MasterConfig):
         ValueError: If the advantage estimator name is not recognized.
     """
     grpo_config = master_config.grpo
-    loss_config = master_config.loss_fn
+    # The estimators read settings of the shared loss implementation.
+    loss_config = as_clipped_pg_config(master_config.loss_fn)
 
     adv_estimator_config = grpo_config.adv_estimator
 

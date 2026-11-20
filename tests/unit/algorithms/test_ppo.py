@@ -656,7 +656,7 @@ def test_create_advantage_estimator_raw_reward():
         ppo=PPOConfig(
             adv_estimator={"name": "raw_reward", "normalize_advantages": True},
         ),
-        loss_fn={"reference_policy_kl_penalty": 0.0},
+        loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
     )
 
     estimator = _create_advantage_estimator(master_config)
@@ -716,7 +716,7 @@ def test_create_advantage_estimator_rejects_unsupported_name():
         ppo=PPOConfig.model_construct(
             adv_estimator=GAEConfig.model_construct(name="grpo")
         ),
-        loss_fn={"reference_policy_kl_penalty": 0.0},
+        loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
     )
 
     with pytest.raises(ValueError, match="only supports 'gae' or 'raw_reward'"):

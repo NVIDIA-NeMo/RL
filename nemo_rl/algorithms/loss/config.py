@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, Optional
+import warnings
+from collections.abc import Mapping
+from typing import Annotated, Any, Literal, Optional, assert_never
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
 
 
 class ClippedPGLossConfig(BaseModel, extra="allow"):
@@ -115,7 +117,103 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     score_centering: bool = False
 
 
-# The ``loss_fn`` block of the policy-gradient trainers. It has one member
-# today; objective-specific configs join it as a union discriminated on
-# ``kind``, each carrying only the settings its objective supports.
-PolicyGradientLossConfig = ClippedPGLossConfig
+class CISPOLossConfig(BaseModel, extra="forbid"):
+    """CISPO (https://arxiv.org/abs/2506.13585), selected with ``kind: cispo``.
+
+    Carries only the settings CISPO supports, so a setting of another objective
+    (``disable_ppo_ratio``, ``sequence_level_importance_ratios``,
+    ``ratio_clip_c``) is rejected when the config is loaded. Field names,
+    defaults and meanings match ClippedPGLossConfig, which documents them.
+    """
+
+    kind: Literal["cispo"] = "cispo"
+    # Fixed by the objective. Kept as fields so trainer code that reads these
+    # switches, and configs that still spell them out, keep working.
+    use_cispo: Literal[True] = True
+    token_level_loss: Literal[True] = True
+
+    # --- Clipping ---
+    ratio_clip_min: float = 0.2
+    ratio_clip_max: float = 0.2
+
+    # --- KL regularization ---
+    reference_policy_kl_penalty: float = Field(default=0.01, ge=0, allow_inf_nan=False)
+    reference_policy_kl_type: Literal["k1", "k2", "k3"] = "k3"
+    kl_input_clamp_value: float | None = 20.0
+    kl_output_clamp_value: float | None = 10.0
+    use_kl_in_reward: bool = False
+    use_on_policy_kl_approximation: bool = False
+
+    # --- Importance sampling correction ---
+    use_importance_sampling_correction: bool = False
+    truncated_importance_sampling_ratio: float | None = None
+    truncated_importance_sampling_ratio_min: float | None = None
+    truncated_importance_sampling_type: (
+        Literal["tis", "icepop", "adaptive-ppo-clip", "seq-mask-tis"] | None
+    ) = None
+    truncated_importance_sampling_adaptive_target_entropy: float = Field(
+        default=0.3, ge=0.0
+    )
+    truncated_importance_sampling_adaptive_k_step: float = Field(default=0.25, gt=0.0)
+    truncated_importance_sampling_adaptive_k_max: float = Field(default=1.0, ge=0.0)
+    truncated_importance_sampling_adaptive_outer_bound: float = Field(
+        default=50.0, gt=0.0
+    )
+
+    # --- On-policy ---
+    force_on_policy_ratio: bool = False
+    seq_logprob_error_in_loss: bool = False
+
+    positive_example_nll_weight: float = 0.0
+    metrics_level: Literal["full", "minimal"] = "full"
+    enable_torch_compile: bool = False
+    score_centering: bool = False
+
+    def as_clipped_pg_config(self) -> ClippedPGLossConfig:
+        """Express these settings as the config of the shared loss implementation."""
+        return ClippedPGLossConfig.model_validate(self.model_dump(exclude={"kind"}))
+
+
+# Switches of ClippedPGLossConfig that select an objective, and the kind that
+# replaces each. They keep working, with a warning, until they are removed.
+_DEPRECATED_SWITCHES = {
+    "use_cispo": "kind: cispo",
+}
+
+
+def _select_legacy_config(value: Any) -> Any:
+    """Read a ``loss_fn`` block that names no kind as ClippedPGLossConfig."""
+    if not isinstance(value, Mapping):
+        return value
+    if "kind" in value:
+        return value
+    for switch, replacement in _DEPRECATED_SWITCHES.items():
+        if value.get(switch):
+            warnings.warn(
+                f"loss_fn.{switch} is deprecated and will be removed in a future "
+                f"release. Select the objective with loss_fn.{replacement}.",
+                FutureWarning,
+            )
+    return {"kind": "legacy_pg", **value}
+
+
+# The ``loss_fn`` block of the policy-gradient trainers, discriminated on
+# ``kind`` so each objective-specific config carries only the settings its
+# objective supports. An untagged block stays the all-in-one
+# ClippedPGLossConfig, so existing configs load unchanged.
+PolicyGradientLossConfig = Annotated[
+    ClippedPGLossConfig | CISPOLossConfig,
+    Field(discriminator="kind"),
+    BeforeValidator(_select_legacy_config),
+]
+
+
+def as_clipped_pg_config(cfg: PolicyGradientLossConfig) -> ClippedPGLossConfig:
+    """Return the settings of any loss config that ClippedPGLossFn implements."""
+    match cfg:
+        case CISPOLossConfig():
+            return cfg.as_clipped_pg_config()
+        case ClippedPGLossConfig():
+            return cfg
+        case _:
+            assert_never(cfg)

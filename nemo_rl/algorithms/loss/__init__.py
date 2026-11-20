@@ -13,8 +13,10 @@
 # limitations under the License.
 
 from nemo_rl.algorithms.loss.config import (
+    CISPOLossConfig,
     ClippedPGLossConfig,
     PolicyGradientLossConfig,
+    as_clipped_pg_config,
 )
 from nemo_rl.algorithms.loss.loss_functions import (
     ClippedPGLossDataDict,
@@ -48,6 +50,7 @@ from nemo_rl.algorithms.loss.wrapper import (
 )
 
 __all__ = [
+    "CISPOLossConfig",
     "ClippedPGLossConfig",
     "ClippedPGLossDataDict",
     "ClippedPGLossFn",
@@ -65,6 +68,7 @@ __all__ = [
     "PolicyGradientLossConfig",
     "PreferenceLossDataDict",
     "PreferenceLossFn",
+    "as_clipped_pg_config",
     "build_policy_gradient_loss",
     "prepare_loss_input",
     "prepare_packed_loss_input",

@@ -50,7 +50,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
 )
-from nemo_rl.algorithms.loss import ClippedPGLossConfig, PolicyGradientLossConfig
+from nemo_rl.algorithms.loss import PolicyGradientLossConfig, as_clipped_pg_config
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
@@ -1047,8 +1047,10 @@ class MasterConfig(BaseModel, extra="allow"):
         return self
 
 
-def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
+def validate_forest_objective(grpo: GRPOConfig, loss: PolicyGradientLossConfig) -> None:
     """Keep the initial Forest objective identical at startup and before fanout."""
+    # Not every loss config has every setting checked below.
+    loss = as_clipped_pg_config(loss)
     unsupported = {
         "grpo.adv_estimator.name": grpo.adv_estimator.name != "grpo",
         "loss_fn.token_level_loss": not loss.token_level_loss,
