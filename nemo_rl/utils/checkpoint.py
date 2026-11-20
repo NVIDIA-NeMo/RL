@@ -355,6 +355,11 @@ class CheckpointManager:
             # which store common state in common.pt, and current torch_dist
             # checkpoints, which embed it as a common_state ShardedObject.
             iteration_dir = weights_path / "iter_0000000"
+            # The TrainingEngine policy names the directory after its update count
+            # and records it in Megatron's tracker file.
+            tracker = weights_path / "latest_checkpointed_iteration.txt"
+            if not iteration_dir.exists() and tracker.exists():
+                iteration_dir = weights_path / f"iter_{int(tracker.read_text()):07d}"
             is_megatron_checkpoint = (iteration_dir / "common.pt").exists() or (
                 iteration_dir / "metadata.json"
             ).exists()

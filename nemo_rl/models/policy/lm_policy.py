@@ -55,6 +55,12 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
     TopkLogitsOutputSpec,
 )
+from nemo_rl.models.policy.training_engine_adapter.config import (
+    align_policy_config_with_recipe,
+)
+from nemo_rl.models.policy.training_engine_adapter.worker_environment import (
+    TRAINING_ENGINE_WORKER_FQN,
+)
 from nemo_rl.models.policy.utils import (
     DETERMINISTIC_ENV_VARS,
     aggregate_per_sample_handles,
@@ -313,11 +319,25 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "Use refit_transport=null (collective/CUDA-IPC) or a "
                     "checkpoint-engine transport ('nixl' / 'module:ClassName')."
                 )
+        if "training_engine" in config:
+            # Writes the recipe's layout into megatron_cfg and the packing budgets,
+            # which are read below and by the workers.
+            align_policy_config_with_recipe(config)
+            if extension_fqn is not None or config.get("quant_cfg") is not None:
+                raise ValueError(
+                    "policy.training_engine selects its own policy worker; it cannot "
+                    "be combined with worker_extension_cls_fqn or quant_cfg."
+                )
         if megatron_enabled:
-            worker_builder_cls_fqn = resolve_policy_worker_cls(
-                "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
-                config,
-            )
+            if "training_engine" in config:
+                # The engine worker runs the model through Megatron-Bridge's
+                # TrainingEngine; megatron_cfg holds the recipe's layout by now.
+                worker_builder_cls_fqn = TRAINING_ENGINE_WORKER_FQN
+            else:
+                worker_builder_cls_fqn = resolve_policy_worker_cls(
+                    "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
+                    config,
+                )
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
