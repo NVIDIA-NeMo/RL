@@ -134,6 +134,9 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.quantization_utils import (
+    prepare_sglang_quantized_generation,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
 from nemo_rl.models.generation.trtllm.config import (
@@ -1923,10 +1926,11 @@ def setup(
 
     elif backend == "sglang":
         generation_config = cast(SGLangConfig, generation_config)
-
-        # Set model_path if not already set
-        if "model_path" not in generation_config["sglang_cfg"]:
-            generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
+        # SGLang must boot with the same precision/layout that every refit sends.
+        prepare_sglang_quantized_generation(
+            generation_config=generation_config,
+            policy_config=policy_config,
+        )
 
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_sglang,

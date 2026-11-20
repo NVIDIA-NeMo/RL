@@ -51,6 +51,11 @@ run_test env REFIT_PREQUANTIZE=false LINEAR_BACKEND=flashinfer_trtllm uv run --n
 # MXFP8 inference is Blackwell-only, which is what this runner provides.
 run_test env REFIT_PRECISION=mxfp8 uv run --no-sync bash ./tests/functional/grpo_megatron_generation_nccl_reshard_refit.sh
 
+# Exercise FlashInfer on Blackwell for indexed and single-shard SGLang checkpoints.
+run_test fast uv run --extra sglang pytest -q --sglang-only \
+    tests/unit/models/generation/sglang/test_mxfp8_checkpoint_io.py
+run_test bash ./tests/functional/grpo_sglang_mxfp8_rollout_gb200.sh
+
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
     coverage combine .coverage*
