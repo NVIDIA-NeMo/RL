@@ -1551,6 +1551,18 @@ def test_turn_restore_target_is_persisted_separately_from_live_retry() -> None:
     assert restored.restore_level is RecoveryTargetLevel.TURN
 
 
+def _relabelled(state: dict[str, Any], version: int) -> dict[str, Any]:
+    """Return ``state`` labelled ``version`` (6 or later), without newer fields."""
+    old = copy.deepcopy(state)
+    old["schema_version"] = version
+    if version < 9:
+        for group in old["groups"]:
+            for sibling in group["siblings"]:
+                for attempt in sibling["attempts"]:
+                    del attempt["environment_task_index"]
+    return old
+
+
 def _pre_turn_recovery_state(state: dict[str, Any], version: int) -> dict[str, Any]:
     """Return ``state`` without turn-level recovery fields, labelled ``version``.
 
@@ -1565,6 +1577,7 @@ def _pre_turn_recovery_state(state: dict[str, Any], version: int) -> dict[str, A
         for sibling in group["siblings"]:
             for attempt in sibling["attempts"]:
                 del attempt["gym_instance_id"], attempt["gym_attempt"]
+                del attempt["environment_task_index"]
     return old
 
 
@@ -1664,8 +1677,7 @@ def test_turn_restart_preserves_gym_owner_and_advances_attempt(version: int) -> 
         )
     )
 
-    state = ledger.state_dict()
-    state["schema_version"] = version
+    state = _relabelled(ledger.state_dict(), version)
     if version == 6:
         state["groups"][0].pop("attribution_key")
     attempt_state = state["groups"][0]["siblings"][0]["attempts"][0]
@@ -2075,7 +2087,7 @@ def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> Non
     if version < 6:
         state = _pre_turn_recovery_state(state, version)
     else:
-        state["schema_version"] = version
+        state = _relabelled(state, version)
     for group in state["groups"]:
         group.pop("resolved_agent_name", None)
         group.pop("attribution_key", None)
@@ -2108,7 +2120,7 @@ def test_legacy_flat_checkpoint_restores_attribution_from_agent_name(
     if version < 6:
         state = _written_by_schema(state, version)
     else:
-        state["schema_version"] = version
+        state = _relabelled(state, version)
     group_state = state["groups"][0]
     group_state["resolved_agent_name"] = "flat-agent"
     group_state.pop("attribution_key", None)
@@ -2534,6 +2546,134 @@ def test_refused_restored_turn_stays_gym_owned() -> None:
         restored.get_group("g7").environment_episode(1)
         in restored.environment_inventory({"tools/replica-0"})["tools/replica-0"]
     )
+
+
+def _restored_turn_group_with_task_index(task_index: int) -> RolloutRecoveryLedger:
+    """Dispatch a turn group under ``task_index``, checkpoint it, and continue it."""
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut,
+            "g7",
+            environment_instance_id="tools/replica-0",
+            environment_task_indices={0: task_index, 1: task_index},
+        )
+    )
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    _bind(restored, "g7", _prompt())
+    episodes = restored.environment_inventory({"tools/replica-0"})["tools/replica-0"]
+    _mutate(
+        lambda cut: restored.prepare_for_restart(
+            cut,
+            continued_attempts={
+                ("tools/replica-0", episode.rollout_id, episode.attempt)
+                for episode in episodes
+            },
+        )
+    )
+    return restored
+
+
+def test_continued_turn_keeps_the_task_index_it_was_dispatched_with() -> None:
+    """Gym resumes a restored episode only for the task it recorded."""
+    restored = _restored_turn_group_with_task_index(5)
+
+    for sibling in restored.get_group("g7").siblings:
+        assert sibling.current_attempt.environment_attempt == 1
+        assert sibling.current_attempt.environment_task_index == 5
+
+    _mutate(
+        lambda cut: restored.mark_group_dispatched(
+            cut,
+            "g7",
+            environment_instance_id="tools/replica-0",
+            environment_task_indices={0: 5, 1: 5},
+        )
+    )
+    assert all(
+        sibling.current_attempt.environment_task_index == 5
+        for sibling in restored.get_group("g7").siblings
+    )
+
+
+def test_continued_turn_refuses_a_new_task_index() -> None:
+    restored = _restored_turn_group_with_task_index(5)
+
+    with pytest.raises(ValueError, match="must keep its task index"):
+        _mutate(
+            lambda cut: restored.mark_group_dispatched(
+                cut,
+                "g7",
+                environment_instance_id="tools/replica-0",
+                environment_task_indices={0: 5, 1: 9},
+            )
+        )
+
+
+def test_task_index_must_be_recorded_for_every_dispatched_row() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+
+    with pytest.raises(ValueError, match="must cover every dispatched"):
+        _mutate(
+            lambda cut: ledger.mark_group_dispatched(
+                cut,
+                "g7",
+                environment_instance_id="tools/replica-0",
+                environment_task_indices={0: 5},
+            )
+        )
+
+
+def test_schema_8_attempts_restore_without_a_task_index() -> None:
+    """A checkpoint from before the field restores; its continuations start over."""
+    ledger = RolloutRecoveryLedger()
+    _dispatched_turn_group(ledger)
+    state = ledger.state_dict()
+    state["schema_version"] = 8
+    for sibling in state["groups"][0]["siblings"]:
+        for attempt in sibling["attempts"]:
+            del attempt["environment_task_index"]
+
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+
+    assert all(
+        sibling.current_attempt.environment_task_index is None
+        for sibling in restored.get_group("g7").siblings
+    )
+
+
+def test_current_schema_requires_the_task_index_field() -> None:
+    ledger = RolloutRecoveryLedger()
+    _dispatched_turn_group(ledger)
+    state = ledger.state_dict()
+    del state["groups"][0]["siblings"][0]["attempts"][0]["environment_task_index"]
+
+    with pytest.raises(ValueError, match="missing environment_task_index"):
+        RolloutRecoveryLedger.from_state_dict(state)
 
 
 def test_refusal_requires_a_dispatched_attempt() -> None:
