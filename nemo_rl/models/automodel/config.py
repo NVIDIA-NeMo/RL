@@ -36,6 +36,7 @@ class DistributedContext(NamedTuple):
     dp_size: int
     tp_size: int
     cp_size: int
+    pp_size: int = 1
 
 
 class RuntimeConfig(NamedTuple):
@@ -98,3 +99,5 @@ class ModelAndOptimizerState(NamedTuple):
     # Draft co-training runtime (loss, hidden capture, grad-norm reporting);
     # built alongside draft_model, None when draft co-training is disabled.
     draft_runtime: Optional[Any] = None
+    # AutoPipeline owning this rank's model stage, or None without PP.
+    pipeline: Optional[Any] = None

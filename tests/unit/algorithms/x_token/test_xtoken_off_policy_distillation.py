@@ -946,6 +946,23 @@ def test_setup_rejects_same_vocab_teacher_with_mismatched_vocab():
     assert mock_cluster.call_count == 0
 
 
+def test_setup_rejects_teacher_automodel_pipeline_parallel():
+    cfg = _make_master_config()
+    cfg.teachers[0].automodel_cfg["pipeline_parallel_size"] = 2
+    with (
+        patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
+        pytest.raises(ValueError, match="xtoken distillation does not support"),
+    ):
+        setup(
+            cfg,
+            student_tokenizer=_make_tokenizer(32),
+            teacher_tokenizers=[_make_tokenizer(24)],
+            train_dataset=MagicMock(),
+            val_dataset=None,
+        )
+    assert mock_cluster.call_count == 0
+
+
 @pytest.mark.parametrize(
     "student_cp,student_div,teacher_cp,teacher_div,same_vocab,match",
     [

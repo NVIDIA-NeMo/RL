@@ -93,7 +93,7 @@ Each process sets stable-for-the-run values on its OTel `Resource` — `init_tel
 | `nv.dl.provider.name` | always the literal `nemo-rl`: which training framework produced the telemetry, for a backend collecting several. Separate from the service name, which a user may rename |
 | `nv.dl.run.uuid` | lens's `derive_nv_dl_run_uuid` over the run id — a uuid5, not the raw id, which is reported separately as `nemo.run.id`. A backend joining RL runs to Megatron ones groups on the derived value, so the raw id under this key would match nothing |
 | `nv.dl.topology.size.tp` | TP size, read from whichever backend `policy.megatron_cfg.enabled` selects. Every config carries both blocks populated and only the live one is read, so a disabled `megatron_cfg` never contributes |
-| `nv.dl.topology.size.pp` | PP size, Megatron runs only — Automodel has no pipeline dimension |
+| `nv.dl.topology.size.pp` | PP size, read from whichever backend is enabled (`megatron_cfg.pipeline_model_parallel_size` or `automodel_cfg.pipeline_parallel_size`) |
 | `nv.dl.training.config.global_batch_size` | `policy.train_global_batch_size` |
 | `nv.dl.training.config.micro_batch_size` | `policy.train_micro_batch_size` |
 | `nv.dl.training.config.sequence_length` | `policy.max_total_sequence_length` |

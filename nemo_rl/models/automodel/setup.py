@@ -43,6 +43,7 @@ from nemo_automodel.components.distributed.config import (
     MoEParallelizerConfig,
 )
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
+from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from safetensors import safe_open
@@ -69,6 +70,10 @@ from nemo_rl.models.automodel.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
+from nemo_rl.models.automodel.pipeline_parallel import (
+    pipeline_loss_fn,
+    pipeline_optimizer_part_ids,
+)
 from nemo_rl.models.automodel.router_replay import (
     enable_routing_replay_in_automodel_kwargs,
     require_automodel_moe_model,
@@ -78,11 +83,15 @@ from nemo_rl.models.automodel.utils import resolve_model_class
 from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import (
+    AutomodelPipelineConfig,
     LoRAConfig,
     PolicyConfig,
     TokenizerConfig,
 )
-from nemo_rl.models.policy.utils import configure_dynamo_cache
+from nemo_rl.models.policy.utils import (
+    automodel_pipeline_parallel_size,
+    configure_dynamo_cache,
+)
 from nemo_rl.models.value.config import ValueConfig
 
 STRING_TO_DTYPE = {
@@ -526,11 +535,12 @@ def setup_distributed(
     tp_size = config["automodel_cfg"].get("tensor_parallel_size", 1)
     cp_size = config["automodel_cfg"].get("context_parallel_size", 1)
     ep_size = config["automodel_cfg"].get("expert_parallel_size", 1)
+    pp_size = automodel_pipeline_parallel_size(config["automodel_cfg"])
     dp_replicate_size = config["automodel_cfg"].get("dp_replicate_size", 1)
     sequence_parallel_enabled = config["automodel_cfg"]["sequence_parallel"]
 
     # HSDP requires the data-parallel axis to evenly contain the replicate dim.
-    model_parallel_size = tp_size * cp_size * ep_size
+    model_parallel_size = pp_size * tp_size * cp_size * ep_size
     dp_size = world_size // model_parallel_size
     if dp_size % dp_replicate_size != 0:
         raise ValueError(
@@ -567,13 +577,13 @@ def setup_distributed(
             "If you need this feature, please file an issue on https://github.com/NVIDIA-NeMo/Automodel."
         )
 
-    # Create device meshes (dp_size is derived from world_size / (tp * cp * ep))
+    # Mesh order (pp, dp_replicate, dp_shard, cp, tp) matches the Ray worker layout.
     mesh_context = MeshContext.build(
         fsdp2_config,
         ParallelismSizes(
             dp_replicate_size=dp_replicate_size,
             tp_size=tp_size,
-            pp_size=1,
+            pp_size=pp_size,
             cp_size=cp_size,
             ep_size=ep_size,
         ),
@@ -585,6 +595,7 @@ def setup_distributed(
     resolved_dp_size = device_mesh["dp"].size()
     resolved_tp_size = device_mesh["tp"].size()
     resolved_cp_size = device_mesh["cp"].size()
+    resolved_pp_size = device_mesh["pp"].size()
 
     return DistributedContext(
         device_mesh=device_mesh,
@@ -594,6 +605,7 @@ def setup_distributed(
         dp_size=resolved_dp_size,
         tp_size=resolved_tp_size,
         cp_size=resolved_cp_size,
+        pp_size=resolved_pp_size,
     )
 
 
@@ -944,11 +956,13 @@ def setup_model_and_optimizer(
     # r0.6.0's from_pretrained rejects the old separate distributed kwargs
     # (moe_mesh/distributed_config/moe_config/activation_checkpointing/pipeline_config/tp_plan
     # -- see _reject_separate_distributed_kwargs) and requires them via distributed_setup.
-    # pipeline_config=None: PP is not used here.
+    pp_enabled = distributed_context.pp_size > 1
     distributed_setup = DistributedSetup(
         mesh_context=MeshContext.from_meshes(device_mesh, moe_mesh),
         strategy_config=fsdp2_config,
-        pipeline_config=None,
+        pipeline_config=(
+            build_pipeline_config(config, fsdp2_config) if pp_enabled else None
+        ),
         moe_parallel_config=moe_config if ep_size > 1 else None,
         activation_checkpointing=config["automodel_cfg"]["activation_checkpointing"],
     )
@@ -967,11 +981,26 @@ def setup_model_and_optimizer(
         **automodel_kwargs,
     )
 
+    pipeline = None
+    if pp_enabled:
+        # 1F1B returns one model stage per rank.
+        pipeline = model
+        (model,) = pipeline.parts
+
     print(model)
 
     # Compute model metadata after from_pretrained
     model_state_dict_keys = list(model.state_dict().keys())
     is_moe_model = any(["expert" in key for key in model_state_dict_keys])
+    if pipeline is not None:
+        # Dense-only stages of an MoE model must use the same autocast setting.
+        has_experts = torch.tensor([is_moe_model], device="cuda")
+        torch.distributed.all_reduce(
+            has_experts,
+            op=torch.distributed.ReduceOp.MAX,
+            group=pipeline.pp_mesh.get_group(),
+        )
+        is_moe_model = bool(has_experts.item())
     is_hf_model = (
         model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
     )
@@ -1156,6 +1185,7 @@ def setup_model_and_optimizer(
                 optimizer=optimizer,
                 optimizer_path=optimizer_path,
                 scheduler=scheduler,
+                optimizer_part_ids=pipeline_optimizer_part_ids(pipeline),
             )
     elif lora_enabled and lora_cfg.get("restore_from") is not None:
         # Warm start: base weights were already loaded by from_pretrained above;
@@ -1190,4 +1220,28 @@ def setup_model_and_optimizer(
         draft_model=draft_model,
         composite_model=composite_model,
         draft_runtime=draft_runtime,
+        pipeline=pipeline,
+    )
+
+
+def build_pipeline_config(
+    config: PolicyConfig, fsdp2_config: FSDP2Config
+) -> PipelineConfig:
+    """Build a 1F1B schedule with one stage per rank.
+
+    The loss function owns gradient scaling. Stage metadata uses the maximum
+    sequence length and FSDP's output dtype for inter-stage activations.
+    """
+    pipeline_cfg = AutomodelPipelineConfig.model_validate(
+        config["automodel_cfg"]["pipeline"]
+    )
+    micro_batch_size = config["train_micro_batch_size"]
+    return PipelineConfig(
+        pp_schedule="1F1B",
+        pp_microbatch_size=micro_batch_size,
+        pp_batch_size=micro_batch_size * pipeline_cfg.microbatches_per_step,
+        dtype=fsdp2_config.mp_policy.output_dtype,
+        scale_grads_in_schedule=False,
+        loss_fn=pipeline_loss_fn,
+        pp_seq_len=config["max_total_sequence_length"],
     )
