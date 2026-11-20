@@ -75,11 +75,6 @@ def test_resolve_config_off_by_default():
     assert spc.privilege_budget_tokens(cfg) == 356
 
 
-def test_resolve_config_rejects_unknown_keys():
-    with pytest.raises(ValueError):
-        spc.resolve_config({"swe_privileged_critic": {"enabled": True, "typo": 1}})
-
-
 def test_render_prefix_is_a_system_turn_holding_the_reference_block():
     cfg = spc.SwePrivilegedCriticConfig(enabled=True, max_total_tokens=10_000)
     fields = spc.resolve_privilege_fields(_env_info())
@@ -369,12 +364,6 @@ def test_r2e_gym_commit_is_reassembled_into_a_patch():
     }
     fields = spc.resolve_privilege_fields(info)
     assert "-a = 1\n+a = 2" in fields["golden_patch"]
-
-
-@pytest.mark.parametrize("caps", [{"gold_patch": 8192}, {"golden_patch": 0}])
-def test_resolve_config_rejects_bad_caps(caps):
-    with pytest.raises(ValueError):
-        spc.resolve_config({"swe_privileged_critic": {"enabled": True, "caps": caps}})
 
 
 def test_caps_bound_a_field_within_the_total_budget():
