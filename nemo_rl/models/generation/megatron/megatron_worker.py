@@ -295,6 +295,14 @@ def _apply_inference_cuda_graph_scope(
 
 
 if TYPE_CHECKING:
+    from megatron.core.inference.contexts.dynamic_context import (
+        DynamicInferenceContext,
+    )
+    from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+    from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+        TextGenerationController,
+    )
+
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 
@@ -346,6 +354,26 @@ class MegatronGenerationMixin:
         self._token_capture_enabled = False
         self._request_payload_stager = None
         self._request_prompt_preparer = None
+
+    def _inference_config_overrides(self) -> dict[str, Any]:
+        """Extra ``InferenceConfig`` kwargs; the plain engine needs none."""
+        return {}
+
+    def _build_dynamic_inference_engine(
+        self,
+        controller: "TextGenerationController",
+        context: "DynamicInferenceContext",
+    ) -> "DynamicInferenceEngine":
+        """The engine for ``controller``; the plain dynamic engine by default."""
+        from megatron.core.inference.engines.dynamic_engine import (
+            DynamicInferenceEngine,
+        )
+
+        return DynamicInferenceEngine(controller, context)
+
+    def _coordinator_kwargs(self) -> dict[str, Any]:
+        """Extra kwargs for the coordinator launch; none for a local-only engine."""
+        return {}
 
     def _get_megatron_inference_wrapper_cls(self) -> Optional[type]:
         """Resolve the configured Megatron inference wrapper, if any.
@@ -558,9 +586,6 @@ class MegatronGenerationMixin:
         from megatron.core.inference.contexts.dynamic_context import (
             DynamicInferenceContext,
         )
-        from megatron.core.inference.engines.dynamic_engine import (
-            DynamicInferenceEngine,
-        )
         from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
             GPTInferenceWrapper,
         )
@@ -705,6 +730,7 @@ class MegatronGenerationMixin:
         _apply_optional_inference_config_kwargs(
             inference_config_kwargs, mcore_generation_config
         )
+        inference_config_kwargs.update(self._inference_config_overrides())
 
         inference_config = InferenceConfig(**inference_config_kwargs)
 
@@ -748,7 +774,7 @@ class MegatronGenerationMixin:
             inference_wrapped_model=self.inference_wrapped_model,
             tokenizer=self.megatron_tokenizer,
         )
-        self.dynamic_inference_engine = DynamicInferenceEngine(
+        self.dynamic_inference_engine = self._build_dynamic_inference_engine(
             text_generation_controller, self.inference_context
         )
 
@@ -761,6 +787,7 @@ class MegatronGenerationMixin:
         self.coordinator_addr = await self.dynamic_inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=None,
             launch_inference_coordinator=True,
+            **self._coordinator_kwargs(),
         )
         if torch.distributed.get_rank() == 0:
             from megatron.core.inference.inference_client import InferenceClient

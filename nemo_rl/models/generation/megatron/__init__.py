@@ -16,12 +16,33 @@ from nemo_rl.models.generation.megatron.config import (
     MCoreGenerationConfig,
     MCoreGenerationSpecificArgs,
 )
+from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.megatron.dynamo_config import dynamo_enabled
 from nemo_rl.models.generation.megatron.megatron_generation import (
     MegatronGeneration,
 )
+
+
+def megatron_generation_cls(generation_config: dict) -> type[GenerationInterface]:
+    """``MegatronGeneration``, or the class that serves prefill/decode engines through Dynamo.
+
+    ``policy.generation.dynamo=true`` picks ``MegatronDynamoGeneration``, which
+    owns one ``MegatronGeneration`` per prefill or decode engine instead of one
+    dedicated inference policy.
+    """
+    if dynamo_enabled(generation_config):
+        # Deferred: the plain backend never needs the Dynamo engines.
+        from nemo_rl.models.generation.megatron.dynamo_generation import (
+            MegatronDynamoGeneration,
+        )
+
+        return MegatronDynamoGeneration
+    return MegatronGeneration
+
 
 __all__ = [
     "MCoreGenerationConfig",
     "MCoreGenerationSpecificArgs",
     "MegatronGeneration",
+    "megatron_generation_cls",
 ]

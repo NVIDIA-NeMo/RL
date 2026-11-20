@@ -302,3 +302,12 @@ def test_script_skips_by_extra_not_by_name():
         "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
         in listed
     )
+
+
+def test_dynamo_megatron_worker_has_the_megatron_policy_worker_extras():
+    """The prefill/decode engine worker builds; it needs the same packages as its base."""
+    module = "nemo_rl.models.policy.workers.megatron_policy_worker"
+    assert (
+        ACTOR_ENVIRONMENTS[f"{module}.MegatronDynamoPolicyWorker"]
+        == ACTOR_ENVIRONMENTS[f"{module}.MegatronPolicyWorker"]
+    )
