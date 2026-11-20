@@ -46,7 +46,9 @@ closed. Every rank finishes copying and cache refresh before inference resumes.
 
 Residual transfers use Megatron's native reshard planner and NCCL copy service. Every learner rank participates in communicator setup, including ranks without transfers. All workers must use the same Megatron-Core build.
 
-The public Nano recipe uses matching TP1/EP4 layouts on eight GPUs. Layouts that require remote shards depend on the upstream communicator reuse fix. If local aliases leave a partial destination mesh, they also depend on the upstream planner fix. The Megatron-Bridge revision `ae0a1b02` pins Megatron-Core `e0a4bfed`, which predates both. On this pin the native planner raises `KeyError` for the TP2-to-TP4 partial-mesh case. For residual transfers use a Core build containing both fixes. [Megatron-LM #9465](https://github.com/NVIDIA/Megatron-LM/pull/9465) · [Megatron-LM #9485](https://github.com/NVIDIA/Megatron-LM/pull/9485)
+The public Nano recipe uses matching TP1/EP4 layouts on eight GPUs. For mixed layouts, the co-resident planner builds point-to-point sends and receives from Megatron’s native transfer schedule. It retains the original TP coordinates while omitting destinations already bound locally. Both ends use the same native task and batch IDs.
+
+The Megatron-Bridge revision `ae0a1b02` pins Megatron-Core `e0a4bfed`. This pin supports residual point-to-point planning, including TP2-to-TP4 partial meshes. Its NCCL copy service still uses private eager initialization on the learner’s existing process group. For GPU runs with remote shards, use a Core build containing the upstream communicator reuse fix to avoid leaking a communicator on affected PyTorch versions. [Megatron-LM #9485](https://github.com/NVIDIA/Megatron-LM/pull/9485)
 
 Validation is staged. CPU tests cover native shard planning, both TP directions,
 packed projections, expert/pipeline naming, rank permutations and publication
@@ -67,7 +69,7 @@ The run exercised concurrent DynamicInferenceEngine graphs, generation, learner 
 Both nodes completed owned-process cleanup without CUDA IPC producer-lifetime or NCCL communicator teardown warnings, and the allocation completed successfully.
 
 That GPU qualification ran NeMo RL revision `8af83078` with Megatron-Core base `3e95097b` plus five reviewed native file corrections: the two MTP prefill helpers, per-forward MoE metadata, partial-destination planning, and NCCL communicator initialization.
-The full-model GPU result applies to revision `8af83078`. The later NeMo RL integration at `8945edc7` passed 1,212 focused CPU tests with the two native reshard fixes applied to the pinned Core. Seven tests skipped in that environment.
+The full-model GPU result applies to revision `8af83078`. With the residual point-to-point planner, 1,213 focused CPU tests passed on the unmodified Core pin, and seven GPU tests skipped. The shard-planning and TP suite also passed on Core `a463e854` (52 passed, one GPU test skipped).
 The test establishes functional mixed-TP/training-CP behavior for the stated layout, not full-model per-tensor numerical parity, trajectory equivalence, convergence or performance.
 
 Existing Ultra training CP8 to inference CP1 evidence uses matching TP and covers a different layout.

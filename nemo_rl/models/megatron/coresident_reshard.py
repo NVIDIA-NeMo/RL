@@ -16,14 +16,14 @@
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from nemo_rl.models.megatron.sm_partition import RefitSlices, RefitSource
 
 if TYPE_CHECKING:
-    from megatron.core.resharding.utils import ParameterMetadata
+    from megatron.core.resharding.utils import ParameterMetadata, ReshardPlan
 
 _FLOAT_BYTES = {torch.float16: 2, torch.bfloat16: 2, torch.float32: 4}
 _GROUP_FIELDS = (
@@ -218,6 +218,71 @@ def plan_local_sources(
         else:
             mapped[destination.name] = RefitSlices(tuple(destination.shape), parts)
     return LocalSourcePlan(mapped, tuple(residual))
+
+
+def build_residual_plan(
+    destinations: dict[int, dict[str, "ParameterMetadata"]],
+    sources: dict[str, list["ParameterMetadata"]],
+    rank: int,
+    *,
+    execution_batch_bytes: Optional[int] = None,
+) -> "ReshardPlan":
+    """Build the native point-to-point schedule for private inference tensors.
+
+    Residual rosters retain the logical TP coordinates of locally bound shards.
+    Only private destinations receive data, so a whole-mesh collective would
+    write into weights that may alias the learner.
+    """
+    from megatron.core.resharding.planner import (
+        _build_execution_batch_ids,
+        _iter_global_transfer_ops,
+    )
+    from megatron.core.resharding.utils import ReshardPlan, TransferOp
+
+    batches, num_batches = _build_execution_batch_ids(
+        destinations, sources, max_batch_bytes=execution_batch_bytes
+    )
+    plan = ReshardPlan(
+        [], [], num_batches=num_batches, execution_batch_bytes=execution_batch_bytes
+    )
+    total_tasks = 0
+    for (
+        task_id,
+        dst,
+        src,
+        src_slice,
+        dst_slice,
+        sender,
+        receiver,
+    ) in _iter_global_transfer_ops(destinations, sources):
+        total_tasks = task_id + 1
+        batch_id = batches[receiver.resolved_name or receiver.name]
+        if src == rank:
+            plan.send_ops.append(
+                TransferOp(
+                    param_name=sender.name,
+                    peer_rank=dst,
+                    is_send=True,
+                    my_slice=src_slice,
+                    peer_slice=dst_slice,
+                    task_id=task_id,
+                    batch_id=batch_id,
+                )
+            )
+        if dst == rank:
+            plan.recv_ops.append(
+                TransferOp(
+                    param_name=receiver.name,
+                    peer_rank=src,
+                    is_send=False,
+                    my_slice=dst_slice,
+                    peer_slice=src_slice,
+                    task_id=task_id,
+                    batch_id=batch_id,
+                )
+            )
+    plan.total_tasks = total_tasks
+    return plan
 
 
 def named_tensor_proxy(tensors: dict[str, torch.Tensor]) -> torch.nn.Module:

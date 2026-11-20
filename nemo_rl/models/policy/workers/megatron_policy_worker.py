@@ -5239,15 +5239,13 @@ class MegatronPolicyWorkerImpl(
         from megatron.core.resharding.copy_services.nccl_copy_service import (
             NCCLCopyService,
         )
-        from megatron.core.resharding.planner import (
-            build_plan_from_rosters,
-            index_metadata_rosters,
-        )
+        from megatron.core.resharding.planner import index_metadata_rosters
         from megatron.core.resharding.utils import ParameterMetadata
 
         from nemo_rl.models.generation.megatron.config import (
             resolve_refit_execution_batch_bytes,
         )
+        from nemo_rl.models.megatron.coresident_reshard import build_residual_plan
 
         if self._coresident_reshard_plan is not None:
             raise RuntimeError("co-resident residual transfers are already initialized")
@@ -5265,7 +5263,7 @@ class MegatronPolicyWorkerImpl(
         self._coresident_receive_metadata = {
             item.name: item for item in rosters[torch.distributed.get_rank()][1]
         }
-        self._coresident_reshard_plan = build_plan_from_rosters(
+        self._coresident_reshard_plan = build_residual_plan(
             destinations,
             sources,
             torch.distributed.get_rank(),

@@ -18,13 +18,11 @@ from dataclasses import replace
 
 import pytest
 import torch
-from megatron.core.resharding.planner import (
-    build_plan_from_rosters,
-    index_metadata_rosters,
-)
+from megatron.core.resharding.planner import index_metadata_rosters
 from megatron.core.resharding.utils import ParameterMetadata, named_refit_tensors
 
 from nemo_rl.models.megatron.coresident_reshard import (
+    build_residual_plan,
     named_tensor_proxy,
     plan_local_sources,
     remap_metadata,
@@ -108,7 +106,23 @@ def test_native_residual_plans_and_local_views_cover_exact_full_tensor(
     ]
     rosters = [([src_meta[r]], list(classified[r].residual)) for r in range(world)]
     dst_roster, src_roster = index_metadata_rosters(rosters)
-    plans = [build_plan_from_rosters(dst_roster, src_roster, r) for r in range(world)]
+    plans = [build_residual_plan(dst_roster, src_roster, r) for r in range(world)]
+    # A rank can send, receive, do both, or sit idle. Send and receive IDs
+    # must match even when the first TP shard has a local alias.
+    sends = {
+        (rank, op.peer_rank, op.task_id, op.batch_id)
+        for rank, plan in enumerate(plans)
+        for op in plan.send_ops
+    }
+    receives = {
+        (op.peer_rank, rank, op.task_id, op.batch_id)
+        for rank, plan in enumerate(plans)
+        for op in plan.recv_ops
+    }
+    assert sends == receives
+    assert all(plan.total_tasks == len(sends) for plan in plans)
+    for rank, plan in enumerate(plans):
+        assert bool(plan.recv_ops) == bool(classified[rank].residual)
     for publication in range(2):
         if publication:
             for source in sources:
@@ -305,6 +319,40 @@ def test_proxy_rejects_identical_tensor_alias_names():
         named_tensor_proxy({"a": value, "b": value})
 
 
+def test_residual_batches_agree_on_all_ranks_including_idle_ranks():
+    tensor = torch.zeros(4, 4)
+    sources = [meta(name, tensor, 0, [0], is_tp=False) for name in ("a", "b")]
+    # Only rank 2 needs these two private weights. Ranks 1 and 3 are idle.
+    destinations = [
+        replace(
+            item,
+            owner_rank=2,
+            name="engine." + item.name,
+            tensor_parallel_group_ranks=[2],
+            data_parallel_group_ranks=[2],
+        )
+        for item in sources
+    ]
+    dst, src = index_metadata_rosters(
+        [(sources, []), ([], []), ([], destinations), ([], [])]
+    )
+    plans = [
+        build_residual_plan(dst, src, rank, execution_batch_bytes=64)
+        for rank in range(4)
+    ]
+
+    assert all(plan.num_batches == 2 and plan.total_tasks == 2 for plan in plans)
+    assert all(not plans[rank].recv_ops and not plans[rank].send_ops for rank in (1, 3))
+    assert [
+        (op.peer_rank, op.param_name, op.task_id, op.batch_id)
+        for op in plans[0].send_ops
+    ] == [(2, "a", 0, 0), (2, "b", 1, 1)]
+    assert [
+        (op.peer_rank, op.param_name, op.task_id, op.batch_id)
+        for op in plans[2].recv_ops
+    ] == [(0, "engine.a", 0, 0), (0, "engine.b", 1, 1)]
+
+
 @pytest.mark.parametrize("local_owner", [True, False])
 @pytest.mark.parametrize(
     "source_name", ["embedding.word_embeddings.weight", "word_embeddings.weight"]
@@ -331,7 +379,7 @@ def test_tied_output_head_reuses_native_embedding_alias(local_owner, source_name
         assert not result.local_sources
         assert result.residual[0].name == target.name
         dst, src = index_metadata_rosters([([], list(result.residual)), ([source], [])])
-        plans = [build_plan_from_rosters(dst, src, rank) for rank in range(2)]
+        plans = [build_residual_plan(dst, src, rank) for rank in range(2)]
         receive = plans[0].recv_ops[0]
         send = plans[1].send_ops[0]
         assert receive.param_name == target.name and send.param_name == source_name
