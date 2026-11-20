@@ -54,7 +54,10 @@ policy:
     attention_backend: flash
     flash_attention_version: 4
     moe_permute_fusion: false
+    # Training and generation share the GPUs; also empty the allocator cache after training.
+    empty_unused_memory_level: 2
     env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False,garbage_collection_threshold:0.8
       CUBLASLT_WORKSPACE_SIZE: '0'
       CUBLAS_WORKSPACE_CONFIG: :0:0
     tensor_model_parallel_size: 1
@@ -107,7 +110,7 @@ policy:
       max_tokens: 8192
       max_requests: 128
       inference_flashinfer_mxfp8_token_capacity: 512
-      buffer_size_gb: 80
+      buffer_size_gb: 20
 data:
   max_input_seq_length: 2048
   train:
