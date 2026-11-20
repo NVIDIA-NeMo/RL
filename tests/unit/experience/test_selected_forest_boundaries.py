@@ -1146,6 +1146,62 @@ def test_shared_paths_need_loss_ownership_beyond_planning(
     assert loss_tokens == Counter([1001, 1002, 1003])
 
 
+class _MalformedTokenTokenizer:
+    def __init__(self, malformed_token: int | None) -> None:
+        self.malformed_token = malformed_token
+
+    def decode(self, token_ids, skip_special_tokens: bool) -> str:
+        return "<think>" if self.malformed_token in token_ids else "answer"
+
+
+# 1001 is the shared root call, 1002 only the unscored segment, 1003 the scored call.
+@pytest.mark.parametrize("malformed_token", [None, 1001, 1002, 1003])
+def test_malformed_think_tag_in_any_segment_zeroes_owner_reward_once(
+    forest: ForestCapture, malformed_token: int | None
+) -> None:
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+
+    finalizer = RolloutReassembler(
+        forest.plane,
+        partition_id="canonical",
+        staging_partition="staged",
+        pad_token_id=0,
+        max_seq_len=1024,
+        reward_penalty_config=RewardPenaltyConfig(penalize_malformed_think_tag=True),
+        tokenizer=_MalformedTokenTokenizer(malformed_token),
+        thinking_tags=("<think>", "</think>"),
+    )
+    records, _ = forest.capture([None, 0, 0])
+    segments = []
+    for indices in ([0, 1], [0, 2]):
+        path = [records[i] for i in indices]
+        segments.append(
+            SegmentReceipt(
+                "attempt",
+                receipt(path, terminal=path[-1]),
+                tuple(r.response_id for r in path),
+                action_flags=selection(path).action_flags,
+            )
+        )
+    prepared = finalizer._finalize_logical_rows(
+        "group",
+        ["attempt"],
+        [segments],
+        [1.0],
+        [False],
+        canonical_sample_ids=["group_g0"],
+        receipts=[receipt(records, terminal=records[-1])],
+        reward_checks=(None,),
+    )
+    assert prepared.valid_owner_count == 1
+    malformed = malformed_token is not None
+    assert [row.reward for row in prepared.rows] == [0.0 if malformed else 1.0] * 2
+    assert [row.penalty_counts["malformed_think_tag"] for row in prepared.rows] == [
+        0,
+        int(malformed),
+    ]
+
+
 @pytest.mark.parametrize("bad_parent", ["missing", "self", "future"])
 def test_invalid_selected_edges_fail_before_publication(
     forest: ForestCapture, bad_parent: str

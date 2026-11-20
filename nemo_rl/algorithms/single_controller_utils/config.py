@@ -2323,9 +2323,18 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         if token_capture_config.defer_routed_experts_to_policy:
             raise ValueError("forest training requires direct routed-expert assembly")
         validate_forest_objective(forest_algo_cfg, master_config.loss_fn)
-        if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
+        # The malformed-think-tag check covers every segment of an owner and
+        # zeroes the logical reward once; other penalties are segment-local.
+        forest_unsupported_penalties = [
+            flag
+            for flag in _REWARD_PENALTY_FLAGS
+            if flag != "penalize_malformed_think_tag"
+            and getattr(master_config.reward_penalties, flag)
+        ]
+        if forest_unsupported_penalties or opd_module.is_opd_enabled(master_config):
             raise ValueError(
-                "Forest does not support reward penalties or on-policy distillation"
+                "Forest supports only the malformed-think-tag reward penalty and no "
+                f"on-policy distillation; got {forest_unsupported_penalties or 'OPD'}"
             )
         # Validate the fixed-batch policy and critic shapes before
         # workers/generation start. Setup recomputes Q from the actual DP meshes.
