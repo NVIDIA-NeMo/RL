@@ -19,9 +19,12 @@ import os
 import pickle
 import sys
 import time
+from datetime import timedelta
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import torch
 
 from nemo_rl.models.policy import provider_override_allowed
 
@@ -295,3 +298,52 @@ def test_conversion_requires_every_referenced_shard(monkeypatch, tmp_path):
         )
     )
     assert not module.megatron_conversion_is_complete(str(tmp_path))
+
+
+def _check_conversion_across_ranks(rank: int, tmp_path: Path) -> None:
+    dist = torch.distributed
+    dist.init_process_group(
+        "gloo",
+        init_method=(tmp_path / "rendezvous").as_uri(),
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            module = _load_community_import_module(mp)
+        module.torch = torch
+        # Each process sees its own view of the same logical conversion.
+        checkpoint = tmp_path / f"rank-{rank}"
+        _stage_conversion(checkpoint)
+        shard = checkpoint / "iter_0000000" / "__0_0.distcp"
+        if rank == 1:
+            shard.unlink()
+
+        # Even the rank with a complete checkpoint must fail before model loading.
+        with pytest.raises(RuntimeError, match=r"rank 1 on .*rank-1") as exc:
+            module._wait_for_published_conversion(str(checkpoint), timeout_seconds=0)
+        assert "rank 0 on" not in str(exc.value)
+
+        with pytest.MonkeyPatch.context() as mp:
+            if rank == 1:
+                shard.write_bytes(b"checkpoint tensors")
+                staging = checkpoint.rename(tmp_path / "staging")
+                mp.setattr(
+                    module,
+                    "time",
+                    SimpleNamespace(
+                        monotonic=time.monotonic,
+                        sleep=lambda _: staging.rename(checkpoint),
+                    ),
+                )
+            module._wait_for_published_conversion(str(checkpoint), timeout_seconds=5)
+        assert shard.is_file()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_distributed_conversion_visibility(tmp_path: Path) -> None:
+    torch.multiprocessing.spawn(
+        _check_conversion_across_ranks, args=(tmp_path,), nprocs=2, join=True
+    )
