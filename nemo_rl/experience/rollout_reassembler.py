@@ -103,6 +103,10 @@ from nemo_rl.utils.length_penalty import (
     apply_group_length_penalties_from_inputs,
 )
 
+# Finish reasons of a generation stopped by its output-token cap (vLLM / OpenAI
+# chat, completions, Responses), as the receipt path checks them for Forest rows.
+_OUTPUT_CAP_FINISH_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
+
 if TYPE_CHECKING:
     from nemo_rl.algorithms.grpo import RewardPenaltyConfig
     from nemo_rl.experience.rollouts import EffortLevelsConfig
@@ -142,6 +146,10 @@ class FinalizedRollout:
     # (model call ID, weight version stamped when it began, tokens it generated)
     # for the same owned calls.
     call_versions: tuple[tuple[str, int, int], ...] = ()
+    # The scored terminal call stopped at its output-token cap (finish reason
+    # length / max_tokens / max_output_tokens), whether or not the row fills
+    # max_seq_len.
+    stopped_at_output_cap: bool = False
 
 
 @dataclass(frozen=True)
@@ -732,10 +740,16 @@ class RolloutReassembler:
                     flags.malformed_thinking and call_id not in loss_excluded_call_ids
                 ] * generation_len
                 position = end
+        terminal_record = records_by_call.get(parsed.terminal_model_call_id)
+        stopped_at_output_cap = (
+            getattr(terminal_record, "finish_reason", None)
+            in _OUTPUT_CAP_FINISH_REASONS
+        )
         return FinalizedRollout(
             rollout_id=rollout_id,
             valid=True,
             rejection_reason=None,
+            stopped_at_output_cap=stopped_at_output_cap,
             token_ids=row.token_ids,
             token_mask=token_mask,
             generation_lengths=tuple(
@@ -1218,12 +1232,18 @@ class RolloutReassembler:
     ) -> list[bool]:
         """Per-row truncation, shared by the TRUNCATED column and termination rates.
 
-        Forest rows carry their rollout's Gym-reported truncation; ordinary rows
-        count as truncated when they fill ``max_seq_len``.
+        Forest rows carry their rollout's Gym-reported truncation. Ordinary rows
+        count as truncated when they fill ``max_seq_len`` or when the scored
+        generation stopped at its output-token cap, as the non-capture NeMo-Gym
+        path (``nemo_gym_rollout_hit_max_tokens``) counts them: an answer cut at
+        ``max_new_tokens`` usually ends well short of ``max_seq_len``.
         """
         if logical is not None:
             return list(logical.truncated)
-        return [len(row.token_ids) == self._max_seq_len for row in rows]
+        return [
+            len(row.token_ids) == self._max_seq_len or row.stopped_at_output_cap
+            for row in rows
+        ]
 
     def _publish_rows(
         self,
