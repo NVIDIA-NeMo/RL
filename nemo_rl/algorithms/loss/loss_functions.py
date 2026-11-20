@@ -34,6 +34,7 @@ from nemo_rl.algorithms.loss.clipped_pg import (
 from nemo_rl.algorithms.loss.config import (
     ClippedPGLossConfig,
     PolicyGradientLossConfig,
+    as_clipped_pg_config,
 )
 from nemo_rl.algorithms.loss.draft import (
     DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
@@ -1355,7 +1356,7 @@ def build_policy_gradient_loss(
     dispatched in one place instead of at every trainer.
     """
     return ClippedPGLossFn(
-        cfg,
+        as_clipped_pg_config(cfg),
         use_fused_linear_logprobs=use_fused_linear_logprobs,
         opd_full=opd_full,
         seq_logprob_error_threshold=seq_logprob_error_threshold,

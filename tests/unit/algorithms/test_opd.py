@@ -1451,13 +1451,10 @@ def test_create_advantage_estimator_opd_branch():
         OPDAdvantageEstimator,
     )
     from nemo_rl.algorithms.grpo import GRPOConfig, _create_advantage_estimator
+    from nemo_rl.algorithms.loss import ClippedPGLossConfig
 
-    # loss_fn not MOPD-configured -> the 3 recommendation warnings fire.
-    loss_fn = SimpleNamespace(
-        disable_ppo_ratio=False,
-        use_importance_sampling_correction=False,
-        truncated_importance_sampling_type="none",
-    )
+    # The default loss_fn is not MOPD-configured -> the 3 recommendation warnings fire.
+    loss_fn = ClippedPGLossConfig()
     master_config = SimpleNamespace(
         grpo=GRPOConfig(
             adv_estimator=AdvEstimatorConfig(
@@ -1491,6 +1488,7 @@ def test_create_advantage_estimator_rejects_tropd_with_full_vocab_opd(
 
     from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
     from nemo_rl.algorithms.grpo import GRPOConfig, _create_advantage_estimator
+    from nemo_rl.algorithms.loss import ClippedPGLossConfig
     from nemo_rl.algorithms.opd import (
         OnPolicyDistillationConfig,
         OnPolicyDistillationFullConfig,
@@ -1500,7 +1498,7 @@ def test_create_advantage_estimator_rejects_tropd_with_full_vocab_opd(
         grpo=GRPOConfig(
             adv_estimator=AdvEstimatorConfig(name="opd", **tropd_overrides)
         ),
-        loss_fn=SimpleNamespace(force_on_policy_ratio=False),
+        loss_fn=ClippedPGLossConfig(),
         on_policy_distillation=OnPolicyDistillationConfig(
             enabled=True,
             full=OnPolicyDistillationFullConfig(enabled=True),

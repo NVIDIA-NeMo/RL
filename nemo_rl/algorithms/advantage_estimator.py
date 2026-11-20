@@ -48,7 +48,11 @@ from typing import Annotated, Callable, ClassVar, Literal, Optional
 import torch
 from pydantic import BaseModel, Field
 
-from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss import (
+    ClippedPGLossConfig,
+    PolicyGradientLossConfig,
+    as_clipped_pg_config,
+)
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_kl,
@@ -827,7 +831,7 @@ class OPDAdvantageEstimator(AdvantageEstimator):
 
 
 def create_advantage_estimator(
-    config: AdvEstimatorConfig | GAEConfig, loss_config: ClippedPGLossConfig
+    config: AdvEstimatorConfig | GAEConfig, loss_config: PolicyGradientLossConfig
 ) -> AdvantageEstimator:
     """Create the advantage estimator selected by the algorithm configuration.
 
@@ -838,6 +842,8 @@ def create_advantage_estimator(
     Returns:
         The configured advantage estimator.
     """
+    # The estimators read settings of the shared loss implementation.
+    loss_config = as_clipped_pg_config(loss_config)
     if isinstance(config, GAEConfig):
         if config.name == "gae":
             return GeneralizedAdvantageEstimator(config, loss_config)

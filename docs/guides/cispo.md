@@ -36,24 +36,29 @@ where `sg(.)` is the stop-gradient operator. Because the clipped ratio is detach
 
 ## Configuration
 
-CISPO is enabled through the `loss_fn` block:
+CISPO is selected in the `loss_fn` block with `kind: cispo`:
 
 ```yaml
 loss_fn:
-  use_cispo: true
-  token_level_loss: true
-  sequence_level_importance_ratios: false
+  _override_: true  # replace the loss block inherited from `defaults`
+  kind: cispo
   force_on_policy_ratio: false
   ratio_clip_min: 1.0
   ratio_clip_max: 5.0
-  ratio_clip_c: null
 ```
 
+`kind: cispo` selects a config that accepts only the settings CISPO supports, so a setting that belongs to another objective fails when the config is loaded instead of when the loss is constructed. `use_cispo` and `token_level_loss` are fixed to `true`, and `disable_ppo_ratio`, `sequence_level_importance_ratios` and `ratio_clip_c` are not accepted.
+
+A recipe that inherits a `loss_fn` block through `defaults` needs `_override_: true`, because the inherited block carries settings CISPO does not accept. The block then replaces the inherited one instead of merging with it, so restate any other loss setting the recipe relies on.
+
+> [!WARNING]
+> Enabling CISPO with `use_cispo: true` in a `loss_fn` block without `kind` is deprecated and will be removed in a future release. It still works and logs a `FutureWarning`.
+
 **Key Parameters:**
-- **`use_cispo`**: Enables the CISPO objective in the shared `ClippedPGLossFn`.
+- **`kind: cispo`**: Selects the CISPO objective in the shared `ClippedPGLossFn`.
 - **`ratio_clip_min` / `ratio_clip_max`**: Follow the paper's additive epsilon convention. The effective clamp range is `[1 - ratio_clip_min, 1 + ratio_clip_max]`. For example, `ratio_clip_min: 1.0` and `ratio_clip_max: 5.0` clamp ratios to `[0, 6]`; since policy ratios are non-negative, this is effectively an upper-only clamp at `6`.
-- **`ratio_clip_c`**: Must be `null` for CISPO — dual clipping is incompatible with the CISPO objective.
-- **`token_level_loss`**: CISPO is defined per token, so keep this `true`. Setting it to `false` is rejected at construction time. See [Loss Normalization](grpo.md#loss-normalization-token_level_loss) for what this parameter controls.
+- **`ratio_clip_c`**: Not accepted with `kind: cispo` — dual clipping is incompatible with the CISPO objective.
+- **`token_level_loss`**: CISPO is defined per token, so this is fixed to `true`. Setting it to `false` is rejected when the config is loaded. See [Loss Normalization](grpo.md#loss-normalization-token_level_loss) for what this parameter controls.
 
 > [!NOTE]
 > When `use_importance_sampling_correction: true`, the shared GRPO loss path additionally multiplies the CISPO token loss by the actor-vs-generation correction `exp(prev_logprobs - generation_logprobs)`. This correction is separate from CISPO's clipped `pi_theta / pi_old` weight.
