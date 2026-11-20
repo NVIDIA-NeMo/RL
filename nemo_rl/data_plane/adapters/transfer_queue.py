@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import psutil
+import ray
 import torch
 
 # Loading this loads mooncake, which snapshots MC_* on the way in. Configure the
@@ -817,7 +818,6 @@ def _connect_existing_with_segment_size(segment_size: int) -> None:
     process only. ``tq.init()`` ignores any config once a controller exists,
     so the client is attached from a copy of the controller's config.
     """
-    import ray
     from transfer_queue import interface as tq_interface
 
     controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
@@ -1619,10 +1619,12 @@ class TQDataPlaneClient(DataPlaneClient):
         return _from_wire(td)
 
     def list_sample_ids(self, partition_id: str) -> list[str]:
-        """List TQ keys in ``partition_id`` without fetching tensor payloads."""
+        """List TQ keys in ``partition_id`` without fetching payloads or tags."""
         self._mark_data_operation_started()
-        listing = tq.kv_list(partition_id=partition_id)
-        return sorted(listing.get(partition_id, {}).keys())
+        controller = ray.get_actor(
+            "TransferQueueController", namespace="transfer_queue"
+        )
+        return list(ray.get(controller.nrl_list_keys.remote(partition_id)))
 
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         cleared_via_none = sample_ids is None

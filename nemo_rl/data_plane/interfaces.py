@@ -819,8 +819,8 @@ class DataPlaneClient(ABC):
             partition_id: Partition whose stored keys should be listed.
 
         Returns:
-            Stable, sorted sample IDs. An unknown or empty partition returns
-            an empty list.
+            The sample IDs, in no particular order. An unknown or empty
+            partition returns an empty list.
         """
 
     @abstractmethod
