@@ -57,8 +57,10 @@ grpo:
 
 loss_fn:
   # REINFORCE form (drop the PPO probability-ratio clipping); on-policy
-  # correction is handled by the ICE-POP gate below instead.
-  disable_ppo_ratio: true
+  # correction is handled by the ICE-POP gate below instead. REINFORCE accepts
+  # only its own settings, so this block replaces the one inherited from `defaults`.
+  _override_: true
+  kind: reinforce
   # ICE-POP hard gate: zero tokens whose train/inference importance-sampling
   # weight falls outside bounds, correcting async off-policy drift.
   use_importance_sampling_correction: true

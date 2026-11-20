@@ -16,6 +16,7 @@ from nemo_rl.algorithms.loss.config import (
     CISPOLossConfig,
     ClippedPGLossConfig,
     PolicyGradientLossConfig,
+    ReinforceLossConfig,
     as_clipped_pg_config,
 )
 from nemo_rl.algorithms.loss.loss_functions import (
@@ -68,6 +69,7 @@ __all__ = [
     "PolicyGradientLossConfig",
     "PreferenceLossDataDict",
     "PreferenceLossFn",
+    "ReinforceLossConfig",
     "as_clipped_pg_config",
     "build_policy_gradient_loss",
     "prepare_loss_input",
