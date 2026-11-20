@@ -30,6 +30,7 @@ except ImportError:
 import torch
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.config import DistributedContext
 from nemo_rl.models.automodel.setup import (
@@ -3230,3 +3231,75 @@ class TestLoadInitialLoraAdapterEndToEnd:
                 lora_cfg=_lora_cfg(),
                 model_name="tiny-model",
             )
+
+
+@pytest.mark.automodel
+class TestValidateFusedLinearLogprobsConfig:
+    """Settings the fused linear logprob path cannot honor fail at setup."""
+
+    @staticmethod
+    def _config(**overrides):
+        config = {
+            "automodel_cfg": {
+                "use_fused_linear_logprobs": True,
+                "fused_linear_logprobs_chunk_size": 1024,
+            },
+            "draft": None,
+        }
+        config.update(overrides)
+        return config
+
+    @staticmethod
+    def _validate(config, **overrides):
+        from nemo_rl.models.automodel.setup import (
+            _validate_fused_linear_logprobs_config,
+        )
+
+        kwargs = {
+            "tp_size": 1,
+            "cp_size": 1,
+            "enable_seq_packing": False,
+            "is_reward_model": False,
+            "sampling_params": None,
+        }
+        kwargs.update(overrides)
+        _validate_fused_linear_logprobs_config(config, **kwargs)
+
+    def test_accepts_supported_setup(self):
+        self._validate(
+            self._config(),
+            sampling_params=TrainingSamplingParams(
+                top_k=None, top_p=1.0, temperature=0.7
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"tp_size": 2}, "tensor_parallel_size"),
+            ({"cp_size": 2}, "context_parallel_size"),
+            ({"enable_seq_packing": True}, "sequence_packing"),
+            ({"is_reward_model": True}, "reward_model_cfg"),
+            (
+                {
+                    "sampling_params": TrainingSamplingParams(
+                        top_k=8, top_p=1.0, temperature=1.0
+                    )
+                },
+                "top-k/top-p",
+            ),
+        ],
+    )
+    def test_rejects_unsupported_setting(self, overrides, message):
+        with pytest.raises(ValueError, match=message):
+            self._validate(self._config(), **overrides)
+
+    def test_rejects_draft_co_training(self):
+        with pytest.raises(ValueError, match="policy.draft.enabled"):
+            self._validate(self._config(draft=SimpleNamespace(enabled=True)))
+
+    def test_requires_chunk_size(self):
+        config = self._config()
+        del config["automodel_cfg"]["fused_linear_logprobs_chunk_size"]
+        with pytest.raises(ValueError, match="fused_linear_logprobs_chunk_size"):
+            self._validate(config)

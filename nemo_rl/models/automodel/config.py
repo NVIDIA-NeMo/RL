@@ -20,6 +20,7 @@ import torch
 from nemo_automodel.components._peft.lora import PeftConfig
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.models.automodel.fused_logprobs import FusedLogprobLMHead
 
 
 class DistributedContext(NamedTuple):
@@ -98,3 +99,5 @@ class ModelAndOptimizerState(NamedTuple):
     # Draft co-training runtime (loss, hidden capture, grad-norm reporting);
     # built alongside draft_model, None when draft co-training is disabled.
     draft_runtime: Optional[Any] = None
+    # Set when policy.automodel_cfg.use_fused_linear_logprobs is enabled.
+    fused_logprob_head: Optional[FusedLogprobLMHead] = None

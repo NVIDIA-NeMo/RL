@@ -54,7 +54,11 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+    replays_sampler_support,
+)
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.deepseek_v4_tokenizer import (
     get_deepseek_v4_tokenizer,
@@ -69,6 +73,7 @@ from nemo_rl.models.automodel.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
+from nemo_rl.models.automodel.fused_logprobs import FusedLogprobLMHead
 from nemo_rl.models.automodel.router_replay import (
     enable_routing_replay_in_automodel_kwargs,
     require_automodel_moe_model,
@@ -457,6 +462,16 @@ def validate_and_prepare_config(
             "Enable tp_size > 1 to use sequence parallelism."
         )
 
+    if config["automodel_cfg"].get("use_fused_linear_logprobs"):
+        _validate_fused_linear_logprobs_config(
+            config,
+            tp_size=tp_size,
+            cp_size=cp_size,
+            enable_seq_packing=enable_seq_packing,
+            is_reward_model=is_reward_model,
+            sampling_params=sampling_params,
+        )
+
     return RuntimeConfig(
         model_class=model_class,
         model_config=model_config,
@@ -472,6 +487,49 @@ def validate_and_prepare_config(
         sampling_params=sampling_params,
         is_reward_model=is_reward_model,
     )
+
+
+def _validate_fused_linear_logprobs_config(
+    config: PolicyConfig | ValueConfig,
+    *,
+    tp_size: int,
+    cp_size: int,
+    enable_seq_packing: bool,
+    is_reward_model: bool,
+    sampling_params: Optional[TrainingSamplingParams],
+) -> None:
+    """Reject settings the fused linear logprob path would silently compute wrong.
+
+    The fused path returns logprobs of the realized next token from unsharded,
+    unfiltered LM-head inputs, and never full-vocabulary logits.
+    """
+    if "fused_linear_logprobs_chunk_size" not in config["automodel_cfg"]:
+        raise ValueError(
+            "policy.automodel_cfg.use_fused_linear_logprobs=true requires "
+            "policy.automodel_cfg.fused_linear_logprobs_chunk_size."
+        )
+    unsupported = []
+    if tp_size > 1:
+        unsupported.append("policy.automodel_cfg.tensor_parallel_size > 1")
+    if cp_size > 1:
+        unsupported.append("policy.automodel_cfg.context_parallel_size > 1")
+    if enable_seq_packing:
+        unsupported.append("policy.sequence_packing.enabled=true")
+    if is_reward_model:
+        unsupported.append("policy.reward_model_cfg.enabled=true")
+    draft_config = config.get("draft")
+    if draft_config is not None and draft_config.enabled:
+        unsupported.append("policy.draft.enabled=true")
+    if need_top_k_or_top_p_filtering(sampling_params) or replays_sampler_support(
+        sampling_params
+    ):
+        unsupported.append("policy.generation top-k/top-p filtering or sampler_replay")
+    if unsupported:
+        raise ValueError(
+            "policy.automodel_cfg.use_fused_linear_logprobs=true does not support "
+            + ", ".join(unsupported)
+            + ". Disable these settings or set use_fused_linear_logprobs=false."
+        )
 
 
 def setup_reference_model_state(
@@ -990,6 +1048,15 @@ def setup_model_and_optimizer(
     if is_tied_lm_head:
         model.tie_weights()
 
+    fused_logprob_head = (
+        FusedLogprobLMHead(
+            model,
+            chunk_size=config["automodel_cfg"]["fused_linear_logprobs_chunk_size"],
+        )
+        if config["automodel_cfg"].get("use_fused_linear_logprobs")
+        else None
+    )
+
     # CPU offload if needed
     if cpu_offload:
         # Move buffers to CPU for FSDP modules
@@ -1190,4 +1257,5 @@ def setup_model_and_optimizer(
         draft_model=draft_model,
         composite_model=composite_model,
         draft_runtime=draft_runtime,
+        fused_logprob_head=fused_logprob_head,
     )

@@ -638,6 +638,16 @@ def test_generation_top_logprobs_requires_capture():
     validate_single_controller_config(mc)
 
 
+def test_rejects_automodel_fused_linear_logprobs():
+    """SingleController's loss reads logits, so the AutoModel fused head is rejected before setup."""
+    mc = _make_master_config()
+    mc.policy["automodel_cfg"] = {"enabled": True, "use_fused_linear_logprobs": True}
+    with pytest.raises(
+        ValueError, match="use_fused_linear_logprobs=true is supported only by GRPO"
+    ):
+        validate_single_controller_config(mc)
+
+
 def test_token_capture_top_logprobs_rejects_megatron_generation():
     mc = _make_master_config(
         backend="megatron",

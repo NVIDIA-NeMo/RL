@@ -35,6 +35,7 @@ from nemo_rl.models.policy.utils import (
     get_megatron_checkpoint_dir,
     make_empty_cache_best_effort_under_expandable_segments,
     rebuild_cuda_tensor_from_ipc,
+    reject_automodel_fused_linear_logprobs,
     stream_weights_via_ipc_zmq_impl,
 )
 
@@ -768,3 +769,31 @@ def test_empty_cache_guard_requires_opt_in_env(monkeypatch):
         assert torch.cuda.empty_cache is original
     finally:
         torch.cuda.empty_cache = original
+
+
+@pytest.mark.parametrize(
+    ("policy_config", "rejected"),
+    [
+        ({"automodel_cfg": {"enabled": True, "use_fused_linear_logprobs": True}}, True),
+        (
+            {"automodel_cfg": {"enabled": True, "use_fused_linear_logprobs": False}},
+            False,
+        ),
+        (
+            {"automodel_cfg": {"enabled": False, "use_fused_linear_logprobs": True}},
+            False,
+        ),
+        ({"megatron_cfg": {"enabled": True, "use_fused_linear_logprobs": True}}, False),
+    ],
+)
+def test_reject_automodel_fused_linear_logprobs(policy_config, rejected):
+    """Only an enabled AutoModel backend with the fused head on is rejected."""
+    if rejected:
+        with pytest.raises(ValueError, match=r"teacher\.automodel_cfg.*not by SFT"):
+            reject_automodel_fused_linear_logprobs(
+                policy_config, config_name="teacher", algorithm="SFT"
+            )
+    else:
+        reject_automodel_fused_linear_logprobs(
+            policy_config, config_name="teacher", algorithm="SFT"
+        )

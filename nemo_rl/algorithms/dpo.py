@@ -38,6 +38,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.utils import reject_automodel_fused_linear_logprobs
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     RL_ITERATION_ATTR,
@@ -219,6 +220,9 @@ def setup(
             "Linear CE fusion loss is not supported with sequence packing in DPO. "
             "The fusion path has not been validated with cu_seqlens-based logprob aggregation."
         )
+    reject_automodel_fused_linear_logprobs(
+        policy_config, config_name="policy", algorithm=algorithm_config_name.upper()
+    )
 
     # ==========================
     #         Logger

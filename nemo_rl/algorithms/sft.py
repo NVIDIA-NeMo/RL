@@ -48,6 +48,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.utils import reject_automodel_fused_linear_logprobs
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     RL_ITERATION_ATTR,
@@ -309,6 +310,9 @@ def setup(
         megatron_cfg is not None
         and megatron_cfg["enabled"]
         and megatron_cfg.get("use_fused_linear_logprobs")
+    )
+    reject_automodel_fused_linear_logprobs(
+        policy_config, config_name="policy", algorithm="SFT"
     )
     loss_fn = NLLLossFn(use_fused_linear_logprobs=use_fused_linear_logprobs)
     _validate_direct_megatron_sft_setup(

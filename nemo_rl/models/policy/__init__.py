@@ -232,6 +232,17 @@ class AutomodelConfig(TypedDict):
     # Bitwise-reproducible forward/backward via deterministic kernels, at some
     # step-time cost. Applies to policy workers only.
     deterministic: NotRequired[bool]
+    # When True, GRPO's training loss and its previous/reference logprobs are
+    # computed directly from the LM-head input in chunks of
+    # fused_linear_logprobs_chunk_size tokens, so the full [batch, seq_len, vocab]
+    # logits and their gradient are never materialized. GRPO only; requires
+    # tensor_parallel_size=1 and context_parallel_size=1, and is not compatible
+    # with sequence packing, draft co-training, top-k/top-p filtering, a biased or
+    # LoRA-wrapped LM head, or models that post-process their logits.
+    use_fused_linear_logprobs: NotRequired[bool]
+    # Tokens per chunk for the fused path. The largest temporary buffers hold
+    # about chunk_size * vocab_size float32 values; larger chunks run faster.
+    fused_linear_logprobs_chunk_size: NotRequired[int]
 
 
 class SequencePackingConfigDisabled(TypedDict):

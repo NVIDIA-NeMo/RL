@@ -191,6 +191,12 @@ policy:
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
+    # Compute GRPO's next-token logprobs directly from the LM-head input in chunks,
+    # avoiding the full [batch, seq_len, vocab_size] logits and their gradient.
+    # Requires TP=1 and CP=1; not compatible with sequence packing, draft
+    # co-training, or top-k/top-p training-time filtering.
+    use_fused_linear_logprobs: false
+    fused_linear_logprobs_chunk_size: 1024
 
     # Automodel kwargs passed to from_pretrained.
     # Uncomment force_hf if the custom model's adapter doesn't support per-tensor

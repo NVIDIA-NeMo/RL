@@ -87,6 +87,53 @@ def is_lora_enabled(policy_config: "PolicyConfig") -> bool:
     )
 
 
+def is_fused_linear_logprobs_enabled(policy_config: "PolicyConfig") -> bool:
+    """Return whether the enabled training backend computes fused linear logprobs."""
+    automodel_config = policy_config.get("automodel_cfg") or {}
+    megatron_config = policy_config.get("megatron_cfg") or {}
+    return bool(
+        (
+            automodel_config.get("enabled")
+            and automodel_config.get("use_fused_linear_logprobs")
+        )
+        or (
+            megatron_config.get("enabled")
+            and megatron_config.get("use_fused_linear_logprobs")
+        )
+    )
+
+
+def reject_automodel_fused_linear_logprobs(
+    policy_config: "PolicyConfig", *, config_name: str, algorithm: str
+) -> None:
+    """Raise if AutoModel fused linear logprobs are on for an algorithm that cannot use them.
+
+    The AutoModel fused LM head returns next-token logprobs instead of logits,
+    and only the GRPO loss built in ``nemo_rl/algorithms/grpo.py`` consumes
+    them.
+
+    Args:
+        policy_config: The policy config to check.
+        config_name: Where ``policy_config`` sits in the master config, for the
+            error message (for example ``"policy"`` or ``"teacher"``).
+        algorithm: The algorithm being set up, for the error message.
+
+    Raises:
+        ValueError: If ``automodel_cfg`` is enabled with
+            ``use_fused_linear_logprobs=true``.
+    """
+    automodel_config = policy_config.get("automodel_cfg") or {}
+    if automodel_config.get("enabled") and automodel_config.get(
+        "use_fused_linear_logprobs"
+    ):
+        raise ValueError(
+            f"{config_name}.automodel_cfg.use_fused_linear_logprobs=true is "
+            "supported only by GRPO (nemo_rl/algorithms/grpo.py), not by "
+            f"{algorithm}. Set {config_name}.automodel_cfg."
+            "use_fused_linear_logprobs=false."
+        )
+
+
 def validate_lora_refit_policy_config(
     policy_config: "PolicyConfig",
 ) -> LoraRefitMode | None:
