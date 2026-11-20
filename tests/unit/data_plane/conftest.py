@@ -29,6 +29,9 @@ smoke / smoke-backend / smoke-1d / obj-backend / mix-e2e today).
 
 from __future__ import annotations
 
+import functools
+import os
+
 import pytest
 
 from nemo_rl.data_plane import build_data_plane_client
@@ -118,3 +121,104 @@ def _isolate_codec_timer():
     drain_codec_ms()
     yield
     drain_codec_ms()
+
+
+# ----------------------------------------------------------------------------- nixl backend
+# Tests marked ``nixl`` need NIXL importable and UCX restricted to RDMA (the
+# NIXL data plane refuses TCP) and an RDMA device; tests marked ``gpu`` need a
+# CUDA device. Both are skipped otherwise, so CPU-only runners execute only the
+# pure tests. ``_nixl_ready`` sets the RDMA-only UCX env itself, through
+# ``configure_engine_env``. CI sets NEMO_RL_REQUIRE_NIXL=1 on runners with an
+# RDMA device, which turns a nixl skip into a failure there, as
+# NEMO_RL_REQUIRE_MOONCAKE does.
+
+
+@functools.cache
+def _nixl_ready() -> str | None:
+    try:
+        from nixl._api import nixl_agent  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        return f"nixl not importable: {e}"
+    from nemo_rl.data_plane.adapters.transfer_queue import rdma_devices
+    from nemo_rl.data_plane.adapters.transfer_queue_env import configure_engine_env
+    from nemo_rl.data_plane.nixl.errors import TransportPolicyError
+
+    # configure_engine_env fills in UCX_TLS, so the UCX env no longer tells a
+    # host with RDMA from one without: look for the device itself.
+    if not rdma_devices():
+        return "no RDMA device"
+    try:
+        configure_engine_env({"backend": "nixl"})  # ends with check_rdma_only
+    except TransportPolicyError as e:
+        return f"UCX not restricted to RDMA: {e}"
+    return None
+
+
+def _require_nixl() -> bool:
+    return os.environ.get("NEMO_RL_REQUIRE_NIXL") == "1"
+
+
+def pytest_runtest_setup(item):
+    if item.get_closest_marker("nixl") and _require_nixl():
+        why = _nixl_ready()
+        if why:
+            pytest.fail(f"NEMO_RL_REQUIRE_NIXL=1 but {why}")
+
+
+def _has_cuda() -> bool:
+    try:
+        import torch
+
+        return torch.cuda.is_available() and torch.cuda.device_count() > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def pytest_collection_modifyitems(config, items):
+    marked = [
+        it
+        for it in items
+        if it.get_closest_marker("nixl") or it.get_closest_marker("gpu")
+    ]
+    if not marked:
+        return
+    # TransferQueue keeps one process-global client, and tq.init() reuses it.
+    # Run the nixl tests before anything builds the session simple/mooncake
+    # clients below, or their tq.init(NixlStore) would attach to that client.
+    nixl = [it for it in items if it.get_closest_marker("nixl")]
+    if nixl:
+        ids = {id(it) for it in nixl}
+        items[:] = nixl + [it for it in items if id(it) not in ids]
+    why = None if _require_nixl() else _nixl_ready()  # required: fails in setup
+    cuda = _has_cuda()
+    for item in marked:
+        if item.get_closest_marker("nixl") and why:
+            item.add_marker(pytest.mark.skip(reason=why))
+        if item.get_closest_marker("gpu") and not cuda:
+            item.add_marker(pytest.mark.skip(reason="no CUDA device"))
+
+
+@pytest.fixture(scope="session")
+def ray_cluster(init_ray_cluster):
+    """Ray is already up (tests/unit/conftest.py); the NIXL tests only need it."""
+    yield
+
+
+@pytest.fixture(scope="module")
+def tq_system(ray_cluster):
+    """A live TransferQueue with the NixlStore backend (2 small units)."""
+    import transfer_queue as tq
+
+    import nemo_rl.data_plane.adapters.tq_nixl as tq_nixl  # registers the backend
+
+    from ._nixl_helpers import make_tq_conf
+
+    conf = make_tq_conf()
+    tq.init(conf)
+    manager = tq.get_client().storage_manager
+    assert isinstance(manager, tq_nixl.NixlStorageManager), (
+        f"tq.init attached to an existing {type(manager).__name__}, not NixlStore"
+    )
+    yield conf
+    tq.close()
+    tq_nixl.shutdown(conf)

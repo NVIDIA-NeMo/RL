@@ -48,6 +48,18 @@ class _WorkerGroup:
         return self.replies
 
 
+def test_generation_refuses_generation_prefix_cuts():
+    """Setup refuses `prefix` with Megatron first; this backs it up per backend."""
+    generation = object.__new__(MegatronGeneration)
+
+    with pytest.raises(NotImplementedError, match="not implemented for Megatron"):
+        generation.setup_token_capture(
+            {"backend": "simple"},
+            "rollout_staging",
+            generation_prefix_cuts_enabled=True,
+        )
+
+
 def test_generation_setup_token_capture_fans_tq_config_to_workers(monkeypatch):
     generation = object.__new__(MegatronGeneration)
     generation.cfg = {"mcore_generation_config": {"expose_http_server": True}}
@@ -87,10 +99,30 @@ def test_generation_setup_token_capture_returns_the_coordinators_media_spec(
     )
     assert (
         generation.setup_token_capture(
-            {"backend": "simple"}, "rollout_staging", capture_media=True
+            {"backend": "simple"},
+            "rollout_staging",
+            capture_media=True,
+            media_family="omni",
         )
         is spec
     )
+
+
+@pytest.mark.parametrize("media_family", ["pixtral", None])
+def test_generation_setup_token_capture_captures_omni_media_only(media_family):
+    generation = object.__new__(MegatronGeneration)
+    generation.cfg = {"mcore_generation_config": {"expose_http_server": True}}
+    worker_group = _WorkerGroup()
+    generation._policy = SimpleNamespace(worker_group=worker_group)
+
+    with pytest.raises(NotImplementedError, match="Omni media only"):
+        generation.setup_token_capture(
+            {"backend": "simple"},
+            "rollout_staging",
+            capture_media=True,
+            media_family=media_family,
+        )
+    assert worker_group.calls == []
 
 
 def test_generation_setup_token_capture_requires_exposed_http_server() -> None:

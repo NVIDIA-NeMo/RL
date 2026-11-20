@@ -16,7 +16,7 @@ bash tests/test_suites/llm/grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-
 
 The corresponding config is [examples/configs/recipes/llm/grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-3n8g-megatron-cispo.yaml](../../examples/configs/recipes/llm/grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-3n8g-megatron-cispo.yaml). It uses `Qwen/Qwen3-30B-A3B`, Megatron policy training, async GRPO with `max_trajectory_age_steps: 1`, and a separate non-colocated vLLM generation node.
 
-**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for gated models.
+**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `hf auth login` as well for gated models.
 
 ## The CISPO Objective
 
@@ -68,7 +68,7 @@ For single-update training, override these fields in the `loss_fn` example above
   truncated_importance_sampling_ratio: 6.0
 ```
 
-Both the GRPO trainer and SingleController skip the previous-policy forward in this mode unless `grpo.seq_logprob_error_threshold` is set (the GRPO trainer also skips it when `loss_fn.seq_logprob_error_in_loss: true`). This mode needs one optimizer update per rollout batch (`policy.train_global_batch_size == grpo.num_prompts_per_step * grpo.num_generations_per_prompt`). A reference-policy forward is still required when reference KL is enabled.
+Both the GRPO trainer and SingleController skip the previous-policy forward in this mode unless `grpo.seq_logprob_error_threshold` is set (both also skip it when `loss_fn.seq_logprob_error_in_loss: true`). This mode needs one optimizer update per rollout batch (`policy.train_global_batch_size == grpo.num_prompts_per_step * grpo.num_generations_per_prompt`). A reference-policy forward is still required when reference KL is enabled.
 
 ## References
 

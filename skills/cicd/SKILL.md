@@ -1,7 +1,7 @@
 ---
 name: cicd
 description: CI/CD reference for NeMo-RL. Covers GitHub Actions pipeline structure, CI triggering via /ok to test, and CI failure investigation.
-when_to_use: Investigating a CI failure; understanding the pipeline structure; triggering CI; 'CI is red', 'how do I trigger CI', '/ok to test', 'PR workflow', 'where are the logs', 'CI did not run', 'copy-pr-bot'.
+when_to_use: Investigating a CI failure; understanding the pipeline structure; triggering CI; re-running CI; 'CI is red', 'how do I trigger CI', '/ok to test', 'PR workflow', 'where are the logs', 'CI did not run', 'copy-pr-bot', 're-run', 'rerun', 'retry CI', 'flaky test'.
 ---
 
 # CI/CD Guide
@@ -13,8 +13,7 @@ when_to_use: Investigating a CI failure; understanding the pipeline structure; t
 NeMo-RL CI runs on GitHub Actions. Workflows live in `.github/workflows/`.
 
 The main test workflow triggers on pushes to `pull-request/<number>` branches.
-These branches are created automatically by **copy-pr-bot** when a contributor
-pushes to their fork and the PR receives a trust signal:
+These branches are created automatically by **copy-pr-bot** when a contributor pushes to their fork and the PR receives a trust signal:
 - The commit is GPG-signed by a maintainer, **or**
 - A maintainer posts `/ok to test <full-sha>` as a PR comment.
 
@@ -30,17 +29,13 @@ After pushing a new commit to your PR, trigger CI with:
 
 Use `git rev-parse HEAD` (not the short form) to get the full SHA.
 
-> **Re-triggering after new commits**: each `/ok to test <sha>` is specific to
-> that SHA. After pushing additional commits, post a new comment with the
-> updated SHA.
+> **Re-triggering after new commits**: each `/ok to test <sha>` is specific to that SHA. After pushing additional commits, post a new comment with the updated SHA.
 
 ---
 
 ## CI Labels
 
-Every PR **must** have exactly one `CI:*` label — the quality-check job stays
-red until one is attached. Labels control which test tier runs and whether a
-new container image is built.
+Every PR **must** have exactly one `CI:*` label — the quality-check job stays red until one is attached. Labels control which test tier runs and whether a new container image is built.
 
 | Label | What runs | Container |
 |-------|-----------|-----------|
@@ -48,7 +43,7 @@ new container image is built.
 | `CI:Lfast` | Fast test subset | Reuses main container (PRs to a release branch such as `r0.8.0` reuse that branch's container, published only by pushes to that branch after merges) |
 | `CI:L0` | Unit tests + docs + lint | Builds new image |
 | `CI:L1` | L0 + functional tests | Builds new image |
-| `CI:L2` | L1 + convergence tests | Builds new image |
+| `CI:L2` | Same as L1 today (plan to add convergence tests) | Builds new image |
 | `Skip CICD` | Nothing (skips all tests) | — |
 
 **Default on merge group / push to main**: L1.
@@ -58,10 +53,10 @@ new container image is built.
 | Changed paths / nature of change | Label |
 |----------------------------------|-------|
 | Docs only (`docs/`, `*.md`, docstrings) | `CI:docs` |
-| Trivial fix, no logic change | `CI:Lfast` |
-| New code, bug fix, refactor | `CI:L0` |
-| Changes that could affect model behaviour | `CI:L1` |
-| Changes that could affect convergence | `CI:L2` |
+| Default, including new features and bug fixes | `CI:Lfast` |
+| (Rarely needed) | `CI:L0` |
+| Large refactor, broad changes to core code, or dependency changes | `CI:L1` |
+| (Not needed: it runs the same jobs as `CI:L1` today) | `CI:L2` |
 
 ---
 
@@ -86,3 +81,24 @@ Common failure patterns:
 | `semantic-pull-request` fails | PR title doesn't follow Conventional Commits | Fix PR title; see `contributing` skill |
 | Linting fails | Style violation | Run `uv run ruff check --fix . && uv run ruff format .` |
 | Unit test failure | Code regression or missing dependency | Reproduce locally; see `testing` skill |
+| `CPU config checks` fails (on a PR, the rest of the run is cancelled) | A recipe config, test-suite list or nightly GPU-hour budget check failed (`tests/unit/test_recipes_and_test_suites.py`, `tests/unit/test_config_validation.py`) | Reproduce on Linux (the lockfile has no macOS wheels) with `cd tests && RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 HF_HOME=${HF_HOME:-$HOME/.cache/huggingface} uv run --group test pytest unit/test_recipes_and_test_suites.py unit/test_config_validation.py`; the job runs on a GitHub-hosted CPU runner with these two variables set |
+
+---
+
+## Re-running CI
+
+To retry a failed run on the **same commit**, re-run only the failed jobs:
+
+```bash
+gh run rerun <run-id> --failed --repo NVIDIA-NeMo/RL
+```
+
+In the UI this is **Re-run jobs → Re-run failed jobs**. It keeps every job that already passed and also re-runs jobs that were cancelled or skipped because of a failed job, including a run cancelled by a failing `CPU config checks` job.
+
+Rules for agents:
+
+- **Never run `gh run rerun <run-id>` without `--failed`**, and never suggest **Re-run all jobs**. A full re-run repeats every GPU job on a commit that already passed most of them.
+- **Read the failure first** (`gh run view <run-id> --log-failed`). Re-run only when the failure is unrelated to the change: a known flaky test, a download or network error, a runner or container problem.
+- **If the failure comes from the change, fix it and push.** A new commit needs a new `/ok to test <full-sha>` comment; do not re-run the old commit.
+- **Do not push empty commits** to re-trigger CI; use `--failed` on the existing run.
+

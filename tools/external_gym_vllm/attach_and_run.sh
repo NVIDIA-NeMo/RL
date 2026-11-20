@@ -15,8 +15,9 @@
 
 # Batch script for a NeMo RL training job attached to a persistent pool job
 # (run_in_allocation.sh, EXTERNAL_VLLM_MODE=serve). At job start it waits until
-# the expected pool job publishes READY, resolves COMMAND's URL placeholders and
-# the external-service readiness gate from the pool's manifest, then runs ray.sub
+# the expected pool job has published its URLs (READY, with EXTERNAL_VLLM_ATTACH_EARLY=0),
+# resolves COMMAND's URL placeholders and the external-service readiness gate from
+# the pool's manifest, then runs ray.sub
 # while watching the pool: if the pool job stops, is replaced or goes silent,
 # the training job is stopped rather than left training against dead judges.
 #
@@ -99,21 +100,48 @@ pool_is_ready() {
   [[ -n "${heartbeat_age}" ]] && (( heartbeat_age <= heartbeat_stale_s ))
 }
 
-echo "[INFO] $(date -Iseconds) waiting for pool job ${pool_job} (${pool_dir})"
+# manifest_is_published: the pool job has fixed its URLs (manifest.tsv, written as soon as its load balancers are
+# placed), comes from the expected pool job, and its heartbeat is fresh. Replicas may still be loading.
+manifest_is_published() {
+  local generation heartbeat_age
+  [[ -f "${pool_dir}/manifest.tsv" ]] || return 1
+  # The pool's exit trap removes READY but leaves manifest.tsv; STOPPED marks a generation that is over.
+  [[ ! -f "${pool_dir}/STOPPED" ]] || return 1
+  generation=$(cat "${pool_dir}/generation" 2>/dev/null || true)
+  [[ "${generation%%-*}" == "${pool_job}" ]] || return 1
+  heartbeat_age=$(external_vllm_file_age_s "${pool_dir}/heartbeat")
+  [[ -n "${heartbeat_age}" ]] && (( heartbeat_age <= heartbeat_stale_s ))
+}
+
+# Start ray.sub once the URLs are published (the default), as an inline hetjob does. The readiness gate substituted
+# into COMMAND below still holds rollout setup until every pool reports its full backend count, so Ray, the trainer
+# and Gym init overlap the judges' model load. EXTERNAL_VLLM_ATTACH_EARLY=0 waits for READY instead.
+wait_for=manifest_is_published
+[[ "${EXTERNAL_VLLM_ATTACH_EARLY:-1}" == 0 ]] && wait_for=pool_is_ready
+
+echo "[INFO] $(date -Iseconds) waiting for pool job ${pool_job} (${pool_dir}) via ${wait_for}"
 deadline=$((SECONDS + timeout_s))
-until pool_is_ready; do
+until "${wait_for}"; do
   if pool_job_gone; then
     echo "[FATAL] pool job ${pool_job} is gone" >&2
     exit 1
   fi
   if (( SECONDS >= deadline )); then
-    echo "[FATAL] pool job ${pool_job} not READY after ${timeout_s}s" >&2
+    if [[ "${wait_for}" == manifest_is_published ]]; then
+      echo "[FATAL] pool job ${pool_job} has not published its manifest after ${timeout_s}s" >&2
+    else
+      echo "[FATAL] pool job ${pool_job} not READY after ${timeout_s}s" >&2
+    fi
     exit 1
   fi
   sleep "${poll_s}"
 done
 generation=$(cat "${pool_dir}/generation")
-echo "[INFO] $(date -Iseconds) pool generation ${generation} READY since $(cut -d' ' -f2 "${pool_dir}/READY" 2>/dev/null || true)"
+if [[ -f "${pool_dir}/READY" ]]; then
+  echo "[INFO] $(date -Iseconds) pool generation ${generation} READY since $(cut -d' ' -f2 "${pool_dir}/READY" 2>/dev/null || true)"
+else
+  echo "[INFO] $(date -Iseconds) pool generation ${generation} manifest published, replicas still loading; starting ray.sub now (readiness gate waits for backends)"
+fi
 
 # The pool must outlive this job, or it stops serving mid-run.
 pool_end=$(cat "${pool_dir}/end_time" 2>/dev/null || true)

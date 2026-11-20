@@ -19,7 +19,7 @@ import torch
 import torch.distributed
 
 from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import SEQ_LOGPROB_KEEP_MASK_KEY, LossFunction
 from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.sequence_lengths import CpuIntTuple
@@ -68,7 +68,8 @@ class SequencePackingLossWrapper:
             vocab_parallel_group: Vocab parallel group.
             context_parallel_group: Context parallel group.
 
-            vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
+            Parallel groups are supplied by Megatron and Automodel workers.
+            Automodel uses a singleton vocabulary group for chunked local logprobs.
 
         Returns:
             Sequence packing loss wrapper.
@@ -162,6 +163,9 @@ class SequencePackingLossWrapper:
             # aggregate loss and metrics
             loss_accum += loss
             for k, v in metrics.items():
+                if k == SEQ_LOGPROB_KEEP_MASK_KEY:
+                    metrics_accum.setdefault(k, []).extend(v)
+                    continue
                 if k not in metrics_accum:
                     if k in _SEQ_METRIC_MIN:
                         metrics_accum[k] = float("inf")

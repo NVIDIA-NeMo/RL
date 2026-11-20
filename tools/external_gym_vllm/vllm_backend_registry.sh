@@ -52,7 +52,7 @@ registry_list() {
   (
     flock -s -w 10 200
     cat "${REGISTRY_FILE}"
-  ) 200>"${REGISTRY_LOCK}"
+  ) 200<>"${REGISTRY_LOCK}"
 }
 
 registry_list_ready() {

@@ -15,6 +15,7 @@
 import base64
 import inspect
 import logging
+import math
 import re
 import uuid
 from collections import defaultdict
@@ -198,6 +199,37 @@ def present_multimodal_fields(meta: "KVBatchMeta") -> list[str]:
     deterministic field list across ranks.
     """
     return sorted(WIRE_MULTIMODAL_FIELDS & set(meta.fields or ()))
+
+
+def teacher_multimodal_fields(meta: "KVBatchMeta") -> list[str]:
+    """Omit packed columns whose row shapes prove the whole teacher batch empty.
+
+    Capture keeps empty media columns for the trainer's partition schema, but
+    text teachers do not accept media arguments. Keep per-token fields and any
+    packed field with missing or malformed shapes for the decoder to validate.
+    """
+    fields = present_multimodal_fields(meta)
+    if not meta.tags or len(meta.tags) != meta.size:
+        return fields
+
+    def row_is_empty(tag: dict[str, Any], field: str) -> bool:
+        geometry = tag.get(row_shapes_key(field))
+        if not isinstance(geometry, dict):
+            return False
+        shapes = geometry.get(ROW_GEOMETRY_SHAPES)
+        return isinstance(shapes, (list, tuple)) and all(
+            isinstance(shape, (list, tuple))
+            and all(type(dim) is int and dim >= 0 for dim in shape)
+            and math.prod(shape) == 0
+            for shape in shapes
+        )
+
+    return [
+        field
+        for field in fields
+        if field not in PACKED_MULTIMODAL_FIELDS
+        or not all(row_is_empty(tag, field) for tag in meta.tags)
+    ]
 
 
 def multimodal_row_tags(
@@ -1305,6 +1337,16 @@ def get_multimodal_keys_from_processor(processor) -> list[str]:
     return list(all_keys)
 
 
+def per_token_multimodal_schema(processor) -> tuple[str, ...]:
+    """Per-token media fields a multimodal run writes on every row; none if text-only."""
+    if processor is None:
+        return ()
+    keys = set(get_multimodal_keys_from_processor(processor))
+    return tuple(
+        sorted({"media_token_validity_mask"} | (keys & PER_TOKEN_MULTIMODAL_FIELDS))
+    )
+
+
 def get_multimodal_default_settings_from_processor(
     processor,
 ) -> dict[str, dict[str, Any]]:
@@ -2002,9 +2044,9 @@ def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) 
     Args:
         batch: Batch with ``[B, S]`` ``input_ids``.
         media_token_id: Media placeholder token ID, or None if the model does not
-            accept the mask, in which case any existing mask is removed. The
-            Megatron policy worker passes None when
-            ``_model_accepts_media_token_validity_mask`` is False.
+            accept the mask, in which case any existing mask is removed.
+            ``model_media_placeholder_token_id`` performs that capability check
+            for Megatron policy and value workers.
     """
     if media_token_id is None:
         batch.pop("media_token_validity_mask", None)

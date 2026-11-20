@@ -16,7 +16,8 @@ from typing import Optional
 
 import torch
 
-from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.algorithms.utils import calculate_kl
+from nemo_rl.utils.tensor_ops import masked_max, masked_mean, masked_min
 
 
 def materialize_scalar_metrics(
@@ -33,6 +34,21 @@ def materialize_scalar_metrics(
         .tolist()
     )
     return dict(zip(metrics, values, strict=True))
+
+
+def adaptive_ppo_clip_kept_mask(
+    importance_weights: torch.Tensor,
+    *,
+    advantages: torch.Tensor,
+    lower_bound: float,
+    upper_bound: float,
+    outer_bound: float,
+) -> torch.Tensor:
+    return (
+        (importance_weights <= outer_bound)
+        & ((advantages >= 0) | (importance_weights >= lower_bound))
+        & ((advantages <= 0) | (importance_weights <= upper_bound))
+    )
 
 
 @torch.no_grad()
@@ -90,9 +106,6 @@ def clipped_pg_diagnostic_metrics(
         global_normalization_factor=global_valid_toks,
     )
 
-    valid_mask = mask.bool()
-    inf = torch.full_like(ratios, float("inf"))
-    neg_inf = torch.full_like(ratios, float("-inf"))
     return {
         "probs_ratio": masked_mean(
             ratios, mask, global_normalization_factor=global_valid_toks
@@ -100,12 +113,10 @@ def clipped_pg_diagnostic_metrics(
         "probs_ratio_clamped": masked_mean(
             ratios_clamped, mask, global_normalization_factor=global_valid_toks
         ),
-        "probs_ratio_min": torch.where(valid_mask, ratios, inf).min(),
-        "probs_ratio_max": torch.where(valid_mask, ratios, neg_inf).max(),
-        "probs_ratio_clamped_min": torch.where(valid_mask, ratios_clamped, inf).min(),
-        "probs_ratio_clamped_max": torch.where(
-            valid_mask, ratios_clamped, neg_inf
-        ).max(),
+        "probs_ratio_min": masked_min(ratios, mask),
+        "probs_ratio_max": masked_max(ratios, mask),
+        "probs_ratio_clamped_min": masked_min(ratios_clamped, mask),
+        "probs_ratio_clamped_max": masked_max(ratios_clamped, mask),
         "gen_kl_error": gen_kl_error,
         "policy_kl_error": policy_kl_error,
         "js_divergence_error": js_divergence_error,

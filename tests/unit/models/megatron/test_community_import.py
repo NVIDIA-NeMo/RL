@@ -23,6 +23,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from nemo_rl.models.policy import provider_override_allowed
+
 
 def _ensure_package(monkeypatch, name: str) -> ModuleType:
     """Create a minimal package module in sys.modules for import stubbing."""
@@ -63,9 +65,10 @@ def _load_community_import_module(monkeypatch):
     megatron_transformer.ModuleSpec = type("ModuleSpec", (), {})
     monkeypatch.setitem(sys.modules, "megatron.core.transformer", megatron_transformer)
 
-    # Stub MegatronConfig type import.
+    # Stub the config type while retaining the real override policy.
     nemo_policy = ModuleType("nemo_rl.models.policy")
     nemo_policy.MegatronConfig = dict
+    nemo_policy.provider_override_allowed = provider_override_allowed
     monkeypatch.setitem(sys.modules, "nemo_rl.models.policy", nemo_policy)
 
     module_name = "nemo_rl.models.megatron.community_import"

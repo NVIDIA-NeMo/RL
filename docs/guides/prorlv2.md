@@ -23,7 +23,7 @@ uv run examples/run_grpo.py --config examples/configs/prorlv2.v2.yaml {overrides
 
 `prorlv2.v2.yaml` inherits from [`examples/configs/grpo_math_1B.yaml`](../../examples/configs/grpo_math_1B.yaml) and only overrides a small set of fields under `grpo` and `loss_fn`, plus output directories.
 
-**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for gated models.
+**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `hf auth login` as well for gated models.
 
 ## DAPO: Dynamic Sampling
 
@@ -32,7 +32,7 @@ Standard GRPO will train on all generated responses, even when a prompt's `num_g
 - **Config**: enable with `grpo.use_dynamic_sampling: true` and tune:
   - `grpo.batch_multiplier`: how many extra prompts to generate to compensate filtering
   - `grpo.dynamic_sampling_max_gen_batches`: upper bound before raising an error
-- **Implementation**: see `dynamic_sampling()` in [`nemo_rl/algorithms/grpo.py`](../../nemo_rl/algorithms/grpo.py).
+- **Implementation**: see `dynamic_sampling()` in [`nemo_rl/algorithms/grpo.py`](../../nemo_rl/algorithms/grpo.py). On the single-controller path, `dynamic_sampling_max_gen_batches` bounds one training step rather than a batch accumulation loop, and `batch_multiplier` is rejected; see [Dynamic sampling](single-controller.md#dynamic-sampling).
 
 ## Decoupled local/global advantage normalization
 

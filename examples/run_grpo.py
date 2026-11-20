@@ -90,6 +90,12 @@ def main() -> None:
         config = OmegaConf.to_container(config, resolve=True)
         check_outdated_config(config)
         config = MasterConfig(**config)
+        if config.env.get("should_use_nemo_gym"):
+            raise ValueError(
+                "env.should_use_nemo_gym=true: run this config with "
+                "examples/nemo_gym/run_grpo_nemo_gym.py, which prepares the "
+                "NeMo-Gym config and binds the Gym actor. This launcher does neither."
+            )
         print("Applied CLI overrides")
 
     # Print config
@@ -99,10 +105,8 @@ def main() -> None:
     # Get the next experiment directory with incremented ID
     config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
     print(f"📊 Using log directory: {config.logger.log_dir}")
-    if config.checkpointing["enabled"]:
-        print(
-            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
-        )
+    if config.checkpointing.enabled:
+        print(f"📊 Using checkpoint directory: {config.checkpointing.checkpoint_dir}")
 
     # Initialise telemetry on the driver BEFORE init_ray() so the resolved
     # NEMO_RL_OTEL_* env is snapshotted into the Ray runtime_env and inherited

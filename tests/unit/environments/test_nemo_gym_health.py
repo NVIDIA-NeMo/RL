@@ -26,10 +26,14 @@ state and previously surfaced it as an AttributeError from deep inside a rollout
 
 import asyncio
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
+from ray import cloudpickle
 
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.nemo_gym import NemoGym
 
 # NemoGym is a Ray actor; grab the plain class so these run without a cluster.
@@ -39,7 +43,13 @@ NemoGymClass = NemoGym.__ray_metadata__.modified_class
 def _unspun() -> NemoGymClass:
     """A NemoGym exactly as Ray would recreate it after a restart."""
     return NemoGymClass(
-        {"model_name": "m", "base_urls": [], "initial_global_config_dict": {}}
+        {
+            "model_name": "m",
+            "base_urls": [],
+            "initial_global_config_dict": {},
+            "checkpoint_instance": GymCheckpointInstance("nemo_gym", 0),
+            "turn_checkpointing_enabled": False,
+        }
     )
 
 
@@ -48,6 +58,8 @@ class _FakeRunHelper:
         self.error = error
         self.polls = 0
         self.shutdowns = 0
+        # Read by NemoGym.shutdown() to find the servers Gym launched; none here.
+        self._processes: dict = {}
 
     def poll(self) -> None:
         self.polls += 1
@@ -62,9 +74,14 @@ class _TaskSourceResolvingRolloutHelper:
     """Mimic Gym's synchronous task_source-to-agent_ref resolution."""
 
     def run_examples(
-        self, examples: list[dict[str, Any]], head_server_config: str
+        self,
+        examples: list[dict[str, Any]],
+        head_server_config: str,
+        route_failures_to_sidecar: bool = False,
     ) -> list[Any]:
         assert head_server_config == "head-server"
+        # A failed /run must come back as its row so a refusal can name it.
+        assert route_failures_to_sidecar is True
         assert all("agent_ref" not in example for example in examples)
         for example in examples:
             example["agent_ref"] = {
@@ -76,9 +93,16 @@ class _TaskSourceResolvingRolloutHelper:
 
 class _TaskSourceResolvingRolloutHelperWithResult(_TaskSourceResolvingRolloutHelper):
     def run_examples(
-        self, examples: list[dict[str, Any]], head_server_config: str
+        self,
+        examples: list[dict[str, Any]],
+        head_server_config: str,
+        route_failures_to_sidecar: bool = False,
     ) -> list[Any]:
-        super().run_examples(examples, head_server_config)
+        super().run_examples(
+            examples,
+            head_server_config,
+            route_failures_to_sidecar=route_failures_to_sidecar,
+        )
 
         async def completed(example):
             return example, {}
@@ -92,6 +116,67 @@ async def _drain(async_generator: AsyncIterator[Any]) -> None:
 
 
 class TestHealthCheck:
+    @pytest.mark.nemo_gym
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("serialize_spinup", [False, True])
+    async def test_spinup_reuses_rollout_client_and_refreshes_it_on_restart(
+        self, monkeypatch: pytest.MonkeyPatch, serialize_spinup: bool
+    ) -> None:
+        import nemo_gym.cli
+        import nemo_gym.server_utils as gym_utils
+        from omegaconf import OmegaConf
+
+        import nemo_rl.environments.nemo_gym as env_module
+
+        monkeypatch.setattr(env_module, "_get_node_ip_local", lambda: "127.0.0.1")
+        ports = iter([11000, 11001])
+        monkeypatch.setattr(env_module, "_get_free_port_local", lambda *_: next(ports))
+        monkeypatch.setattr(env_module.ray, "is_initialized", lambda: True)
+        monkeypatch.setattr(
+            env_module.ray,
+            "get_runtime_context",
+            lambda: SimpleNamespace(gcs_address="127.0.0.1:1200"),
+        )
+        start = MagicMock()
+        monkeypatch.setattr(
+            nemo_gym.cli, "RunHelper", lambda: SimpleNamespace(start=start)
+        )
+        load = MagicMock(
+            side_effect=lambda head: gym_utils.ServerClient(
+                head_server_config=head, global_config_dict=OmegaConf.create({})
+            )
+        )
+        monkeypatch.setattr(gym_utils.ServerClient, "load_from_global_config", load)
+        # Keep the real ServerClient/config-load path without opening sockets.
+        monkeypatch.setattr(gym_utils, "is_global_aiohttp_client_setup", lambda: True)
+
+        env = _unspun()
+        spinup = NemoGymClass._spinup
+        if serialize_spinup:
+            # Ray ships the method by value; annotation-only globals can be lost.
+            spinup = cloudpickle.loads(cloudpickle.dumps(spinup))
+        clients = []
+        for _ in range(2):
+            spinup(env)
+            assert load.call_count == len(clients) * 2 + 1
+            clients.append(env.rch.setup_server_client(env.head_server_config))
+            for _ in range(64):
+                assert (
+                    env.rch.setup_server_client(env.head_server_config) is clients[-1]
+                )
+                assert list(env.rch.run_examples([], env.head_server_config)) == []
+            assert load.call_count == len(clients) * 2 - 1
+            # The existing control client remains independently cached.
+            control = env._control_client()
+            assert env._control_client() is control
+        assert start.call_count == 2
+        assert load.call_count == 4
+        assert clients[0] is not clients[1]
+        assert [client.head_server_config.port for client in clients] == [11000, 11001]
+        with pytest.raises(ValueError, match="different Gym deployment"):
+            env.rch.setup_server_client(clients[0].head_server_config)
+        assert env.rch.setup_server_client() is clients[1]
+
     def test_a_healthy_gym_polls_the_run_helper(self):
         env = _unspun()
         env.rh = _FakeRunHelper()

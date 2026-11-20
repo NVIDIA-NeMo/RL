@@ -24,7 +24,7 @@ import torch
 from megatron.bridge import AutoBridge
 from megatron.core.transformer import ModuleSpec
 
-from nemo_rl.models.policy import MegatronConfig
+from nemo_rl.models.policy import MegatronConfig, provider_override_allowed
 
 
 def iter_vlm_config_overrides(
@@ -193,6 +193,8 @@ def import_model_from_hf_name(
 
     if megatron_config is not None:
         for key, value in iter_vlm_config_overrides(megatron_config):
+            if not provider_override_allowed(megatron_config, key):
+                continue
             # Match the import-time behaviour in megatron/setup.py: a key the
             # recipe set explicitly must not be dropped just because this
             # provider lacks the field, or a frozen tower silently trains.

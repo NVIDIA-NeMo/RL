@@ -45,6 +45,7 @@ from nemo_rl.environments.nemo_gym_request import (
     _deep_merge_dict,
     _json_mapping,
 )
+from nemo_rl.environments.nemo_gym_task import get_nemo_gym_task_input
 from nemo_rl.environments.nemotron_utils import (
     NEMOTRON_VIDEO_PROCESSOR_NAMES,
     process_nemotron_video_frames,
@@ -75,7 +76,11 @@ def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
         tuple[dict, tuple[str, str, str], str, str, bool, Any, str]
     ] = []
     for example in nemo_gym_examples:
-        input_items = example.get("responses_create_params", {}).get("input", [])
+        input_items = (
+            get_nemo_gym_task_input(example)
+            .get("responses_create_params", {})
+            .get("input", [])
+        )
         if not isinstance(input_items, list):
             continue
         for item in input_items:
@@ -185,23 +190,6 @@ def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
     return nemo_gym_examples
 
 
-# WARNING: A function-call output beginning with HTTP(S) is accepted here and
-# passed to ``resolve_to_image``, which performs an outbound request during
-# postprocessing even when the tool result is not actually an image.
-_IMAGE_SRC_PREFIXES = ("data:image/", "http://", "https://", "file://")
-
-
-def _looks_like_image_src(src: str) -> bool:
-    """True when ``src`` plausibly points at an image the loader can open.
-
-    Guards against tool responses (e.g. ``{"x": 0.65, "y": 0.83}`` from a
-    click tool) that are strings but not image URLs. Without this, the
-    indexer forwards the JSON payload to ``resolve_to_image`` → PIL.open,
-    which treats it as a filesystem path and raises ``FileNotFoundError``.
-    """
-    return src.startswith(_IMAGE_SRC_PREFIXES)
-
-
 def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     """Pull PIL images out of a non-assistant Responses-API item.
 
@@ -213,9 +201,11 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     """
     images: list[Image.Image] = []
     if item.get("type") == "function_call_output":
+        # Tool outputs are free text. Only an inline image data URL is an image
+        # here; printed HTTP/file URLs and tool errors must remain text.
         src = item.get("output")
-        if isinstance(src, str) and _looks_like_image_src(src):
-            images.append(resolve_to_image(src))
+        if isinstance(src, str) and src.startswith("data:image/"):
+            _append_resolved_image(images, src)
         return images
     content = item.get("content") or []
     if not isinstance(content, list):
@@ -231,6 +221,19 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
         if src is not None:
             images.append(resolve_to_image(src))
     return images
+
+
+def _append_resolved_image(images: list[Image.Image], src: Any) -> None:
+    """Append a resolved image, skipping malformed or unavailable sources."""
+    try:
+        images.append(resolve_to_image(src))
+    except (FileNotFoundError, OSError, ValueError) as error:
+        preview = src if isinstance(src, str) else type(src).__name__
+        print(
+            "[nemo_gym] skipping non-image source in trajectory "
+            f"({type(error).__name__}): {preview[:120]!r}",
+            flush=True,
+        )
 
 
 def _is_trainable_output_item(item: dict) -> bool:
@@ -252,7 +255,7 @@ def _has_image_before_first_trainable_output(output: list[dict]) -> bool:
             continue
         if item.get("type") == "function_call_output":
             source = item.get("output")
-            if isinstance(source, str) and _looks_like_image_src(source):
+            if isinstance(source, str) and source.startswith("data:image/"):
                 return True
         content = item.get("content") or []
         if not isinstance(content, list):
@@ -394,8 +397,10 @@ def _extract_static_video_messages(
     sequence of cached ``input_image`` parts carrying ``_is_video_frame``. The
     latter is the on-disk frame-cache format used by the video Gym recipes.
     """
-    response_input = nemo_gym_example.get("responses_create_params", {}).get(
-        "input", []
+    response_input = (
+        get_nemo_gym_task_input(nemo_gym_example)
+        .get("responses_create_params", {})
+        .get("input", [])
     )
     if isinstance(response_input, str):
         return None
@@ -486,7 +491,18 @@ def _extract_static_video_messages(
                 "Gym video training requires cached frames from exactly one "
                 f"video per row; received {len(frame_groups)} sources."
             )
-        cached_metadata = build_cached_video_frame_metadata(len(cached_frame_sources))
+        cached_parts = [
+            part
+            for message in hf_messages
+            if isinstance(message.get("content"), list)
+            for part in message["content"]
+            if part.get("_is_video_frame")
+        ]
+        cached_metadata = build_cached_video_frame_metadata(
+            len(cached_parts),
+            frame_indices=[part.get("_video_frame_index") for part in cached_parts],
+            frame_fps=[part.get("_video_fps") for part in cached_parts],
+        )
         cached_frame_position = 0
         for message in hf_messages:
             content = message.get("content")
@@ -511,7 +527,9 @@ def _inject_vllm_mm_processor_kwargs(
     nemo_gym_example: dict[str, Any],
     mm_processor_kwargs: dict[str, Any],
 ) -> None:
-    params = nemo_gym_example.setdefault("responses_create_params", {})
+    params = get_nemo_gym_task_input(nemo_gym_example).setdefault(
+        "responses_create_params", {}
+    )
     if not isinstance(params, dict):
         raise TypeError("responses_create_params must be a dict")
     metadata = params.setdefault("metadata", {})
@@ -531,7 +549,9 @@ def _inject_vllm_mm_processor_kwargs(
 def _remove_vllm_mm_processor_kwargs(
     nemo_gym_example: dict[str, Any], names: set[str]
 ) -> None:
-    params = nemo_gym_example.get("responses_create_params", {})
+    params = get_nemo_gym_task_input(nemo_gym_example).get(
+        "responses_create_params", {}
+    )
     if not isinstance(params, dict):
         return
     metadata = params.get("metadata", {})
@@ -556,11 +576,17 @@ def _replace_cached_video_frames_with_native_video(
     nemo_gym_example: dict[str, Any],
 ) -> None:
     """Replace cached image parts with one lossless native-video manifest."""
-    input_items = nemo_gym_example.get("responses_create_params", {}).get("input", [])
+    input_items = (
+        get_nemo_gym_task_input(nemo_gym_example)
+        .get("responses_create_params", {})
+        .get("input", [])
+    )
     if not isinstance(input_items, list):
         raise TypeError("responses_create_params.input must be a list")
 
     frame_paths = []
+    frame_indices = []
+    frame_fps = []
     video_sources = set()
     for item in input_items:
         if not isinstance(item, dict):
@@ -579,6 +605,8 @@ def _replace_cached_video_frames_with_native_video(
                     "Cached Gym video frames require a non-empty image URL."
                 )
             frame_paths.append(frame_path)
+            frame_indices.append(part.get("_video_frame_index"))
+            frame_fps.append(part.get("_video_fps"))
             video_source = part.get("_video_source")
             if video_source:
                 video_sources.add(str(video_source))
@@ -591,7 +619,9 @@ def _replace_cached_video_frames_with_native_video(
             f"received {len(video_sources)}."
         )
 
-    video_url = build_cached_video_frame_data_url(frame_paths)
+    video_url = build_cached_video_frame_data_url(
+        frame_paths, frame_indices=frame_indices, frame_fps=frame_fps
+    )
     inserted_video = False
     for item in input_items:
         if not isinstance(item, dict):
@@ -619,7 +649,11 @@ def _replace_cached_video_frames_with_native_video(
 
 
 def _strip_local_media_metadata(nemo_gym_example: dict[str, Any]) -> None:
-    input_items = nemo_gym_example.get("responses_create_params", {}).get("input", [])
+    input_items = (
+        get_nemo_gym_task_input(nemo_gym_example)
+        .get("responses_create_params", {})
+        .get("input", [])
+    )
     if not isinstance(input_items, list):
         return
     for item in input_items:
@@ -707,7 +741,7 @@ def _make_overlength_filtered_video_example(
     nemo_gym_example: dict[str, Any],
 ) -> dict[str, Any]:
     filtered = copy.deepcopy(nemo_gym_example)
-    params = filtered.setdefault("responses_create_params", {})
+    params = get_nemo_gym_task_input(filtered).setdefault("responses_create_params", {})
     params["input"] = [
         {
             "role": "user",

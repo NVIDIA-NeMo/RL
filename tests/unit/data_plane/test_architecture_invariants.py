@@ -18,11 +18,17 @@
 * Every launcher picks trainer *and* policy through those shared helpers,
   so the two choices cannot drift apart.
 * The ``DataPlaneClient`` ABC carries every method adapters depend on.
+* Only ``nemo_rl/data_plane`` imports ``transfer_queue``.
 """
 
 from __future__ import annotations
 
+import ast
+import importlib
 import pathlib
+from argparse import Namespace
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 
@@ -96,6 +102,63 @@ def test_launchers_dispatch_through_the_shared_helpers(launcher: str):
         "nemo_rl.data_plane.factory.make_policy_factory, so it can run the "
         "sync trainer against a plain Policy."
     )
+
+
+@pytest.mark.parametrize("use_nemo_gym", [True, False], ids=["gym", "native"])
+@pytest.mark.parametrize("launcher", ["run_grpo", "run_vlm_grpo"])
+def test_generic_launchers_reject_nemo_gym_configs(
+    monkeypatch: pytest.MonkeyPatch, launcher: str, use_nemo_gym: bool
+) -> None:
+    """Reject Gym configs before Ray while allowing native configs through."""
+    module = importlib.import_module(f"examples.{launcher}")
+    calls: list[str] = []
+
+    class ReachedRay(Exception):
+        pass
+
+    def reach_ray() -> None:
+        calls.append("init_ray")
+        raise ReachedRay
+
+    config = SimpleNamespace(
+        policy={"generation": {}},
+        data={},
+        env={"should_use_nemo_gym": use_nemo_gym},
+        data_plane=None,
+        logger=SimpleNamespace(log_dir="logs"),
+        checkpointing=SimpleNamespace(enabled=False),
+    )
+    common_fakes = {
+        "register_omegaconf_resolvers": lambda: None,
+        "parse_args": lambda: (Namespace(config="config.yaml"), []),
+        "load_config": lambda _: {},
+        "check_outdated_config": lambda _: None,
+        "MasterConfig": lambda **_: config,
+        "log_container_init_timing": lambda: None,
+        "get_next_experiment_dir": lambda log_dir: log_dir,
+        "maybe_configure_data_plane_env": lambda _: calls.append("data_plane_env"),
+        "init_ray": reach_ray,
+    }
+    launcher_fakes = {
+        "run_grpo": {
+            "init_telemetry_driver": lambda *_, **__: None,
+            "shutdown_telemetry": lambda: None,
+            "startup_span": nullcontext,
+        },
+        "run_vlm_grpo": {"materialize_vllm_video_config": lambda *_: None},
+    }
+    for name, fake in {**common_fakes, **launcher_fakes[launcher]}.items():
+        monkeypatch.setattr(module, name, fake)
+    monkeypatch.setattr(module.OmegaConf, "to_container", lambda *_, **__: {})
+
+    if use_nemo_gym:
+        with pytest.raises(ValueError, match="examples/nemo_gym/run_grpo_nemo_gym.py"):
+            module.main()
+        assert calls == []
+    else:
+        with pytest.raises(ReachedRay):
+            module.main()
+        assert calls == ["data_plane_env", "init_ray"]
 
 
 def test_sync_trainer_is_call_compatible_with_legacy_trainer():
@@ -204,4 +267,28 @@ def test_data_plane_client_abc_method_present(method: str) -> None:
     assert hasattr(DataPlaneClient, method), (
         f"DataPlaneClient ABC is missing required method {method!r}. "
         "This is a breaking change for every adapter."
+    )
+
+
+def test_only_the_data_plane_imports_transfer_queue():
+    """Only ``nemo_rl/data_plane`` may import ``transfer_queue``.
+
+    So no other code can read TQ metadata, such as the nested label that
+    ``tq_controller_patch`` stops relabeling.
+    """
+    offenders = []
+    for path in sorted((REPO / "nemo_rl").rglob("*.py")):
+        if path.is_relative_to(REPO / "nemo_rl" / "data_plane"):
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                names = [node.module or ""]
+            else:
+                continue
+            if any(n.split(".")[0] == "transfer_queue" for n in names):
+                offenders.append(f"{path.relative_to(REPO)}:{node.lineno}")
+    assert offenders == [], (
+        f"import transfer_queue outside nemo_rl/data_plane: {offenders}"
     )

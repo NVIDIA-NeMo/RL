@@ -540,7 +540,7 @@ def sort_and_cut_projection_matrix(
         if valid_mask.any():
             valid_likelihoods = row_likelihoods[valid_mask]
             # Find position of maximum element in the final matrix
-            max_pos_in_valid = torch.argmax(valid_likelihoods).item()
+            max_pos_in_valid = int(torch.argmax(valid_likelihoods).item())
             # Convert back to original position in the row
             valid_positions = torch.nonzero(valid_mask).squeeze(-1)
             actual_max_pos = valid_positions[max_pos_in_valid].item()

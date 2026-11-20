@@ -19,11 +19,11 @@ To get started quickly, use the example configuration [examples/configs/recipes/
 uv run examples/run_grpo.py --config examples/configs/recipes/llm/dapo-qwen2.5-7b.v2.yaml {overrides}
 ```
 
-**Reminder**: Don't forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for LLaMA models.
+**Reminder**: Don't forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `hf auth login` as well for LLaMA models.
 
 ## Dynamic Sampling
 
-Standard GRPO trains on all generated responses, even when they have identical rewards (zero gradient signal) within a prompt group of generations. Dynamic sampling filters to keep only groups with diverse rewards (`std > 0`), and accumulates them across batches until reaching the target batch size. Dynamic sampling can be enabled by setting `use_dynamic_sampling=True` in your configuration. For implementation details, see the [`dynamic_sampling`](../../nemo_rl/algorithms/grpo.py) function. 
+Standard GRPO trains on all generated responses, even when they have identical rewards (zero gradient signal) within a prompt group of generations. Dynamic sampling filters to keep only groups with diverse rewards (`std > 0`), and accumulates them across batches until reaching the target batch size. Dynamic sampling can be enabled by setting `use_dynamic_sampling=True` in your configuration. For implementation details, see the [`dynamic_sampling`](../../nemo_rl/algorithms/grpo.py) function. The single-controller path supports it too, by resampling a substitute for each filtered group instead of accumulating batches; see [Dynamic sampling](single-controller.md#dynamic-sampling) for its requirements.
 
 **Algorithm**: For each training step:
 
