@@ -1,0 +1,28 @@
+defaults: grpo-nemotron35-lightning-30ba3b-8n4g-megatron-te-nvfp4-pertoken.yaml
+# Bounded integration test on the same 8n4g topology; not a convergence recipe.
+grpo:
+  max_num_steps: 20
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 2
+  val_at_start: false
+  val_at_end: false
+  val_period: 0
+  use_dynamic_sampling: false
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+policy:
+  train_global_batch_size: 16
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  generation:
+    max_new_tokens: 1024
+data:
+  max_input_seq_length: 1024
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-nemotron35-lightning-30ba3b-8n4g-megatron-te-nvfp4-pertoken-quick
+logger:
+  log_dir: logs/grpo-nemotron35-lightning-30ba3b-8n4g-megatron-te-nvfp4-pertoken-quick
+  wandb:
+    name: grpo-nemotron35-lightning-30ba3b-8n4g-megatron-te-nvfp4-pertoken-quick
