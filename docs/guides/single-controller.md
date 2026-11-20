@@ -153,7 +153,7 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 - A `replacement_reserve.pt` sidecar containing a dictionary with independent `replacement` (fault tolerance) and `filtered` (dynamic sampling) prompt pools, including empty lists for empty pools. The reader also accepts the legacy single-list format; schema-3 checkpoints may omit an empty reserve.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 
-The TQ snapshot and replay index are captured under the same checkpoint barrier. Generation may continue while the snapshot is written, but completed-group commits and destructive TQ clears wait at the barrier. This ensures that the TQ snapshot and replay index describe the same set of groups.
+The TQ snapshot and replay index are captured under the same checkpoint barrier. Completed-group commits and destructive TQ clears wait while the barrier is held. With `data_plane.simple.async_checkpoint: true`, the barrier covers only the capture, and the snapshot files are written after commits resume. This ensures that the TQ snapshot and replay index describe the same set of groups.
 
 On resume, Single-Controller validates the TQ snapshot against the trainer checkpoint, restores the replay index, and makes completed, committed, unconsumed groups available to the sampler before training resumes.
 

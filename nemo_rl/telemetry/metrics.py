@@ -208,6 +208,13 @@ _CHECKPOINT_PREFIXES = {
 _CHECKPOINT_DURATION_PHASES = {
     "total_save_seconds": "total",
     "tq_save_seconds": "tq",
+    "tq_capture_seconds": "tq_capture",
+    "tq_persist_seconds": "tq_persist",
+    "tq_release_seconds": "tq_release",
+    "replay_inventory_seconds": "replay_inventory",
+    "recovery_state_build_seconds": "recovery_state_build",
+    "recovery_state_serialize_seconds": "recovery_state_serialize",
+    "staging_inventory_seconds": "staging_inventory",
     "barrier_wait_seconds": "barrier_wait",
     "exclusive_hold_seconds": "exclusive_hold",
     "sidecar_save_seconds": "sidecar_save",
