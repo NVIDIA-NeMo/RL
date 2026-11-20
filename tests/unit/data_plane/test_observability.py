@@ -46,6 +46,7 @@ from nemo_rl.data_plane.observability import (
     headline_series,
     merge_snapshots,
     metrics_never_fail_the_step,
+    reduce_step_snapshots,
 )
 from nemo_rl.telemetry.instrumentation import is_span_group_enabled
 from nemo_rl.telemetry.span_groups import RLSpanGroup
@@ -603,6 +604,30 @@ def test_no_quantile_finer_than_the_sample_size_can_resolve():
 
 
 # ── cross-process aggregation ──────────────────────────────────────────
+
+
+def test_step_reduction_reports_the_cluster_and_hands_back_its_baseline():
+    driver = _emit(_client(register=False), [10.0])
+    snapshots = [driver.snapshot(reset_step_window=True), _rank([20.0, 30.0])]
+
+    metrics, scope, baseline = reduce_step_snapshots(driver, snapshots, {}, 1.0, 0.0)
+
+    assert scope == "cluster"
+    assert metrics["now/n_processes"] == 2
+    assert baseline == merge_snapshots(snapshots)
+
+
+def test_step_reduction_falls_back_to_the_driver_and_keeps_the_cluster_baseline():
+    driver = _emit(_client(register=False), [10.0])
+    previous = merge_snapshots([_rank([20.0])])
+
+    metrics, scope, baseline = reduce_step_snapshots(
+        driver, [driver.snapshot(reset_step_window=True)], previous, 1.0, 0.0
+    )
+
+    assert scope == "driver"
+    assert metrics
+    assert baseline is previous
 
 
 def test_merge_of_nothing_is_empty():

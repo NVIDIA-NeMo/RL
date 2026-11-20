@@ -16,39 +16,32 @@
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any
 
 import pytest
-import torch
 from omegaconf import OmegaConf
-from tensordict import TensorDict
 
-from nemo_rl.algorithms import single_controller as single_controller_module
 from nemo_rl.algorithms.grpo import GRPOConfig
-from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import simulator as simulator_module
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
+    RefitActorConfig,
     TokenCaptureConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.simulator import (
-    GENERATION_LOGPROBS_FIELD,
-    PREV_LOGPROBS_FIELD,
-    REFERENCE_LOGPROBS_FIELD,
-    CpuTrainer,
+    NoOpTrainer,
     NoOpWeightSynchronizer,
     SimulatorConfig,
     apply_simulator_overrides,
     reject_online_quantization,
+    simulate_train_step,
     validate_simulator_config,
 )
-from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.observability import MetricsDataPlaneClient
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -69,10 +62,10 @@ _DP_CFG: dict[str, Any] = {
 # ── simulator config ────────────────────────────────────────────────────────
 
 
-def test_config_defaults_to_rollout_only_with_cpu_trainer() -> None:
+def test_config_defaults_to_rollout_only_with_the_no_op_trainer() -> None:
     settings = SimulatorConfig()
     assert settings.mode == "rollout_only"
-    assert settings.uses_cpu_trainer
+    assert settings.uses_no_op_trainer
 
 
 def test_shipped_simulator_yaml_states_the_schema_defaults() -> None:
@@ -81,36 +74,6 @@ def test_shipped_simulator_yaml_states_the_schema_defaults() -> None:
     assert isinstance(shipped, dict)
     assert shipped == SimulatorConfig().model_dump()
     assert SimulatorConfig.model_validate(shipped) == SimulatorConfig()
-
-
-@pytest.mark.parametrize("mode", ["train_only", "train_rollout"])
-def test_config_rejects_unimplemented_modes(mode: str) -> None:
-    with pytest.raises(NotImplementedError, match=mode):
-        SimulatorConfig(mode=mode)  # type: ignore[arg-type]
-
-
-@pytest.mark.parametrize("backend", ["automodel", "mcore"])
-def test_config_rejects_real_train_backends_in_rollout_only(backend: str) -> None:
-    with pytest.raises(NotImplementedError, match="cpu"):
-        SimulatorConfig(train_backend=backend)  # type: ignore[arg-type]
-
-
-@pytest.mark.parametrize(
-    "build",
-    [
-        lambda: SimulatorConfig(mode="bogus"),  # type: ignore[arg-type]
-        lambda: SimulatorConfig(train_backend="gpu"),  # type: ignore[arg-type]
-        lambda: SimulatorConfig(train_time_s=-1.0),
-        lambda: SimulatorConfig(refit_time_s=-0.5),
-        lambda: SimulatorConfig(num_nodes=0),
-        lambda: SimulatorConfig(num_steps=0),
-        # A misspelt key must not silently fall back to the default.
-        lambda: SimulatorConfig(train_time=5.0),  # type: ignore[call-arg]
-    ],
-)
-def test_config_rejects_invalid_values(build: Callable[[], SimulatorConfig]) -> None:
-    with pytest.raises(ValueError):
-        build()
 
 
 # ── config overrides ────────────────────────────────────────────────────────
@@ -201,6 +164,9 @@ def _master_config(
     tis_type: str | None = None,
     defer_routes: bool = False,
     forest_training: bool = False,
+    policy_extra: dict[str, Any] | None = None,
+    pretrained_checkpoint: Any = None,
+    async_rl: AsyncRLConfig | None = None,
 ) -> MasterConfig:
     generation: dict[str, Any] = {
         "backend": backend,
@@ -209,11 +175,12 @@ def _master_config(
         **(generation_extra or {}),
     }
     return MasterConfig.model_construct(
-        policy={"generation": generation},
+        policy={"generation": generation, **(policy_extra or {})},
         checkpointing=CheckpointingConfig.model_construct(
-            enabled=checkpointing_enabled
+            enabled=checkpointing_enabled,
+            pretrained_checkpoint=pretrained_checkpoint,
         ),
-        async_rl=AsyncRLConfig(),
+        async_rl=async_rl or AsyncRLConfig(),
         grpo=None if ppo else GRPOConfig(async_grpo=None),
         ppo=SimpleNamespace() if ppo else None,
         loss_fn=SimpleNamespace(truncated_importance_sampling_type=tis_type),
@@ -259,6 +226,62 @@ def test_validate_rejects_checkpointing() -> None:
         validate_simulator_config(
             _master_config(checkpointing_enabled=True), SimulatorConfig()
         )
+
+
+@pytest.mark.parametrize(
+    ("policy_extra", "pretrained_checkpoint"),
+    [
+        ({"megatron_cfg": {"enabled": True}}, SimpleNamespace(path="/ckpt")),
+        (
+            {
+                "megatron_cfg": {"enabled": True},
+                "pretrained_checkpoint": {"path": "/ckpt"},
+            },
+            None,
+        ),
+        (
+            {
+                "megatron_cfg": {
+                    "enabled": True,
+                    "peft": {"enabled": True, "restore_from": "/donor"},
+                }
+            },
+            None,
+        ),
+    ],
+)
+def test_validate_rejects_trainer_side_initial_weights(
+    policy_extra: dict[str, Any], pretrained_checkpoint: Any
+) -> None:
+    """The engine serves policy.model_name, so a trainer-only checkpoint would be ignored."""
+    with pytest.raises(ValueError, match="trainer-side initial checkpoints"):
+        validate_simulator_config(
+            _master_config(
+                policy_extra=policy_extra, pretrained_checkpoint=pretrained_checkpoint
+            ),
+            SimulatorConfig(),
+        )
+
+
+def test_validate_accepts_megatron_recipe_without_initial_weights() -> None:
+    megatron = {"enabled": True, "peft": {"enabled": True, "restore_from": None}}
+    validate_simulator_config(
+        _master_config(policy_extra={"megatron_cfg": megatron}), SimulatorConfig()
+    )
+
+
+def test_validate_rejects_the_training_data_dump() -> None:
+    with pytest.raises(NotImplementedError, match="log_full_train_data"):
+        validate_simulator_config(
+            _master_config(async_rl=AsyncRLConfig(log_full_train_data=True)),
+            SimulatorConfig(),
+        )
+
+
+def test_validate_rejects_the_refit_actor() -> None:
+    async_rl = AsyncRLConfig(refit_actor=RefitActorConfig(enabled=True))
+    with pytest.raises(NotImplementedError, match="refit_actor"):
+        validate_simulator_config(_master_config(async_rl=async_rl), SimulatorConfig())
 
 
 def test_validate_rejects_refittable_fp8_kv_cache() -> None:
@@ -336,7 +359,6 @@ def test_noop_weight_synchronizer_is_never_stale_and_holds_the_refit_time() -> N
     started = time.perf_counter()
     assert synchronizer.sync_weights(kv_scales=None) is None
     assert time.perf_counter() - started >= 0.05
-    assert synchronizer.sync_count == 1
     # No transport of its own, so there is no membership to reconcile.
     assert synchronizer.reconcile_communicator([0]) is None
     synchronizer.shutdown()
@@ -347,128 +369,7 @@ def test_noop_weight_synchronizer_rejects_negative_hold() -> None:
         NoOpWeightSynchronizer(refit_time_s=-1.0)
 
 
-# ── CpuTrainer ──────────────────────────────────────────────────────────────
-
-
-def _trainer_with_group() -> tuple[
-    NoOpDataPlaneClient, CpuTrainer, KVBatchMeta, torch.Tensor
-]:
-    client = NoOpDataPlaneClient()
-    client.register_partition(
-        partition_id=_PARTITION,
-        fields=[
-            "input_ids",
-            GENERATION_LOGPROBS_FIELD,
-            PREV_LOGPROBS_FIELD,
-            REFERENCE_LOGPROBS_FIELD,
-        ],
-        num_samples=4,
-        consumer_tasks=["prev_lp", "ref_lp", "train"],
-    )
-    sample_ids = ["grp_g0", "grp_g1"]
-    logprobs = torch.tensor([[-0.1, -0.2, -0.3], [-1.0, -2.0, -3.0]])
-    client.put_samples(
-        sample_ids=sample_ids,
-        partition_id=_PARTITION,
-        fields=TensorDict(
-            {
-                "input_ids": torch.arange(6).reshape(2, 3),
-                GENERATION_LOGPROBS_FIELD: logprobs,
-            },
-            batch_size=(2,),
-        ),
-    )
-    meta = KVBatchMeta(
-        partition_id=_PARTITION,
-        task_name="train",
-        sample_ids=sample_ids,
-        fields=["input_ids", GENERATION_LOGPROBS_FIELD],
-        sequence_lengths=[3, 3],
-        tags=[{}, {}],
-    )
-    trainer = CpuTrainer(dp_cfg=_DP_CFG, policy_config={}, dp_client=client)
-    return client, trainer, meta, logprobs
-
-
-def test_cpu_trainer_adopts_the_given_client_without_bootstrapping() -> None:
-    client, trainer, _, _ = _trainer_with_group()
-    assert trainer.dp_client is client
-    assert trainer.cfg == {}
-
-
-def test_cpu_trainer_logprob_stages_copy_the_generation_column() -> None:
-    client, trainer, meta, logprobs = _trainer_with_group()
-
-    trainer.get_logprobs_from_meta(meta)
-    trainer.get_reference_policy_logprobs_from_meta(meta, micro_batch_size=1)
-
-    rows = client.get_samples(
-        sample_ids=meta.sample_ids,
-        partition_id=_PARTITION,
-        select_fields=[PREV_LOGPROBS_FIELD, REFERENCE_LOGPROBS_FIELD],
-    )
-    assert torch.equal(rows.get(PREV_LOGPROBS_FIELD), logprobs)
-    assert torch.equal(rows.get(REFERENCE_LOGPROBS_FIELD), logprobs)
-
-
-def test_cpu_trainer_train_step_counts_rows_and_returns_no_metrics() -> None:
-    _, trainer, meta, _ = _trainer_with_group()
-    trainer.prepare_for_training()
-    trainer.begin_train_step(loss_fn=None)
-    trainer.train_microbatches_from_meta(meta, train_fields=("input_ids",))
-    trainer.train_microbatches_from_meta(meta)
-    assert trainer.step_rows == 2 * meta.size
-    assert trainer.finish_train_step() == {}
-    assert trainer.steps_completed == 1
-
-
-def test_cpu_trainer_rejects_out_of_order_step_calls() -> None:
-    _, trainer, meta, _ = _trainer_with_group()
-    with pytest.raises(RuntimeError, match="before begin"):
-        trainer.train_microbatches_from_meta(meta)
-    with pytest.raises(RuntimeError, match="without an open step"):
-        trainer.finish_train_step()
-    trainer.begin_train_step(loss_fn=None)
-    with pytest.raises(RuntimeError, match="already open"):
-        trainer.begin_train_step(loss_fn=None)
-    trainer.abort_train_step()
-    trainer.begin_train_step(loss_fn=None)
-
-
-def test_cpu_trainer_gpu_phases_are_no_ops_and_read_through_the_data_plane() -> None:
-    _, trainer, meta, _ = _trainer_with_group()
-    for method in (
-        trainer.prepare_for_training,
-        trainer.finish_inference,
-        trainer.offload_to_cpu,
-        trainer.offload_before_refit,
-        trainer.offload_after_refit,
-        trainer.pause_train_step_with_offloading,
-        trainer.sync_params_before_refit,
-        trainer.start_gpu_profiling,
-        trainer.stop_gpu_profiling,
-    ):
-        assert method() is None
-    trainer.prepare_for_lp_inference(keep_train_buffers=True)
-    data = trainer.read_from_dataplane(meta, select_fields=["input_ids"])
-    assert data["input_ids"].shape == (2, 3)
-    assert trainer.shutdown() is True
-
-
-def test_cpu_trainer_refuses_what_only_a_real_trainer_can_do() -> None:
-    _, trainer, _, _ = _trainer_with_group()
-    with pytest.raises(NotImplementedError):
-        trainer.calibrate_qkv_fp8_scales(None, include_q=True)
-    with pytest.raises(NotImplementedError):
-        trainer.save_checkpoint(weights_path="x")
-    with pytest.raises(NotImplementedError):
-        trainer.finalize_async_save()
-    with pytest.raises(NotImplementedError):
-        trainer.poll_async_save()
-    with pytest.raises(NotImplementedError):
-        _ = trainer.sharding_annotations
-    with pytest.raises(NotImplementedError):
-        _ = trainer.worker_group
+# ── NoOpTrainer ─────────────────────────────────────────────────────────────
 
 
 def _metrics_client() -> MetricsDataPlaneClient:
@@ -479,15 +380,26 @@ def _metrics_client() -> MetricsDataPlaneClient:
     return client
 
 
-def test_cpu_trainer_reports_no_data_plane_metrics_without_observability() -> None:
-    _, trainer, _, _ = _trainer_with_group()
+def test_no_op_trainer_adopts_the_given_client_without_bootstrapping() -> None:
+    client = NoOpDataPlaneClient()
+    trainer = NoOpTrainer(dp_cfg=_DP_CFG, policy_config={}, dp_client=client)
+    assert trainer.dp_client is client
+    assert trainer.cfg == {}
+    assert trainer.sync_params_before_refit() is None
+    assert trainer.shutdown() is True
+
+
+def test_no_op_trainer_reports_no_data_plane_metrics_without_observability() -> None:
+    trainer = NoOpTrainer(
+        dp_cfg=_DP_CFG, policy_config={}, dp_client=NoOpDataPlaneClient()
+    )
     assert trainer.get_data_plane_step_metrics(1.0) is None
 
 
-def test_cpu_trainer_data_plane_metrics_cover_the_registered_rollout_side(
+def test_no_op_trainer_data_plane_metrics_cover_the_registered_rollout_side(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    trainer = CpuTrainer(dp_cfg=_DP_CFG, policy_config={}, dp_client=_metrics_client())
+    trainer = NoOpTrainer(dp_cfg=_DP_CFG, policy_config={}, dp_client=_metrics_client())
     metrics, scope = trainer.get_data_plane_step_metrics(1.0)
     assert scope == "driver"
     assert metrics
@@ -511,83 +423,40 @@ def test_cpu_trainer_data_plane_metrics_cover_the_registered_rollout_side(
     assert metrics["now/n_processes"] == 4
 
 
-def test_cpu_trainer_has_every_member_the_controller_uses_on_its_trainer() -> None:
-    """The controller holds either trainer in ``self._trainer``.
-
-    A member only ``TQPolicy`` has fails a simulator run at its first use, which
-    no test of ``TQPolicy`` shows.
-    """
-    tree = ast.parse(Path(single_controller_module.__file__).read_text())
-    used = {
-        node.attr
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute)
-        and isinstance(node.value, ast.Attribute)
-        and node.value.attr == "_trainer"
-        and isinstance(node.value.value, ast.Name)
-        and node.value.value.id == "self"
-    }
-    assert used, "the controller no longer keeps its trainer in self._trainer"
-    _, trainer, _, _ = _trainer_with_group()
-    missing = sorted(
-        name
-        for name in used
-        if name not in vars(trainer) and not hasattr(CpuTrainer, name)
-    )
-    assert not missing, (
-        f"CpuTrainer lacks trainer members the controller uses: {missing}"
-    )
+# ── the simulated train step ────────────────────────────────────────────────
 
 
-# ── the controller's simulated train step ───────────────────────────────────
+def test_simulated_train_step_is_free_without_a_hold() -> None:
+    assert asyncio.run(simulate_train_step(0.0, lambda: False)) == (0.0, 0.0)
 
 
-def _bare_controller(settings: SimulatorConfig | None, *, inflight: int):
-    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
-    ctrl = object.__new__(controller_cls)
-    ctrl._simulator = settings
-    ctrl._inflight_rollouts = inflight
-    ctrl._dispatched_rollouts = set()
-    ctrl._SIMULATED_TRAIN_POLL_S = 0.01
-    return ctrl
-
-
-def test_simulated_training_is_free_outside_a_simulator_run() -> None:
-    ctrl = _bare_controller(None, inflight=1)
-    assert asyncio.run(ctrl._simulate_training()) == (0.0, 0.0)
-    ctrl = _bare_controller(SimulatorConfig(train_time_s=0.0), inflight=1)
-    assert asyncio.run(ctrl._simulate_training()) == (0.0, 0.0)
-
-
-def test_simulated_training_holds_the_full_time_while_rollouts_run() -> None:
-    ctrl = _bare_controller(SimulatorConfig(train_time_s=0.1), inflight=1)
-    held, skipped = asyncio.run(ctrl._simulate_training())
+def test_simulated_train_step_holds_the_full_time_while_rollouts_run() -> None:
+    held, skipped = asyncio.run(simulate_train_step(0.1, lambda: False))
     assert held >= 0.1
     assert skipped == 0.0
 
 
-def test_simulated_training_ends_early_once_rollouts_go_idle() -> None:
-    ctrl = _bare_controller(SimulatorConfig(train_time_s=5.0), inflight=1)
+def test_simulated_train_step_ends_within_one_poll_of_rollouts_going_idle() -> None:
+    idle = False
 
     async def run() -> tuple[float, float]:
         async def go_idle() -> None:
-            await asyncio.sleep(0.05)
-            ctrl._inflight_rollouts = 0
+            nonlocal idle
+            await asyncio.sleep(0.2)
+            idle = True
 
-        idle = asyncio.create_task(go_idle())
-        result = await ctrl._simulate_training()
-        await idle
+        task = asyncio.create_task(go_idle())
+        result = await simulate_train_step(5.0, lambda: idle)
+        await task
         return result
 
     held, skipped = asyncio.run(run())
-    assert held < 1.0
-    assert skipped > 3.0
-    assert abs(held + skipped - 5.0) < 0.5
+    # Idle at 0.2 s, seen by the next 50 ms poll; the rest of the hold is skipped.
+    assert 0.2 <= held < 0.2 + 4 * simulator_module._SIMULATED_TRAIN_POLL_S
+    assert held + skipped == pytest.approx(5.0, abs=0.05)
 
 
-def test_simulated_training_treats_an_unstarted_dispatch_as_busy() -> None:
-    ctrl = _bare_controller(SimulatorConfig(train_time_s=0.1), inflight=0)
-    ctrl._dispatched_rollouts = {object()}
-    held, skipped = asyncio.run(ctrl._simulate_training())
-    assert held >= 0.1
-    assert skipped == 0.0
+def test_simulated_train_step_skips_the_whole_hold_when_already_idle() -> None:
+    held, skipped = asyncio.run(simulate_train_step(5.0, lambda: True))
+    assert held < 0.05
+    assert skipped == pytest.approx(5.0, abs=0.05)

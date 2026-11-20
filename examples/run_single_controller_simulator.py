@@ -18,13 +18,11 @@ Keeps the SingleController's own pumps, TransferQueue data plane, sampler and
 refit lifecycle, and swaps one side of the loop for a stand-in that uses no GPU:
 
   rollout_only    real generation and environments, ``cpu`` train backend
-  train_only      real trainer fed by a ``cpu`` rollout backend (not implemented)
-  train_rollout   both real: the ordinary run_grpo_single_controller.py run
 
-Only ``rollout_only`` is implemented. It serves a recipe's rollouts exactly as
-training would -- same engines, same Gym, same sampler, same pause/resume around
-every refit -- while a CpuTrainer stands in for the train step and the weight
-version advances without moving any weights.
+It serves a recipe's rollouts exactly as training would -- same engines, same
+Gym, same sampler, same pause/resume around every refit -- while the train pump
+consumes each batch without training on it and the weight version advances
+without moving any weights.
 
 Takes two YAML files: ``--config`` is an SC recipe, loaded as
 run_grpo_single_controller.py loads it, and ``--simulator-config`` holds what

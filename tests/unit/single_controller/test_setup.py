@@ -73,8 +73,8 @@ from nemo_rl.algorithms.rollout_checkpointing.manifest import (
 )
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
-    CpuTrainer,
     MasterConfig,
+    NoOpTrainer,
     NoOpWeightSynchronizer,
     SimulatorConfig,
     SingleControllerActorArgs,
@@ -5107,7 +5107,7 @@ def test_generation_top_logprobs_requires_score_centering_or_replay():
         validate_single_controller_config(mc)
 
 
-# ── simulator (rollout_only): inference-only cluster, cpu trainer, no-op refit ──
+# ── simulator (rollout_only): inference-only cluster, no-op trainer and refit ──
 
 
 class _FakeClusterRecorder:
@@ -5150,9 +5150,7 @@ def test_build_inference_only_cluster_gives_every_node_to_generation(
 ):
     master_config = _inference_only_master_config(num_nodes=2, gpus_per_node=8)
 
-    inference_cluster, teacher_topology = sc_setup_mod._build_inference_only_cluster(
-        master_config
-    )
+    inference_cluster = sc_setup_mod._build_inference_only_cluster(master_config)
 
     assert len(fake_cluster_cls.constructed) == 1
     assert inference_cluster.kwargs["name"] == "sc_inference_cluster"
@@ -5161,7 +5159,6 @@ def test_build_inference_only_cluster_gives_every_node_to_generation(
     assert inference_cluster.kwargs["max_colocated_worker_groups"] == 1
     assert inference_cluster.kwargs["segment_size"] is None
     assert inference_cluster.kwargs["node_resource_constraints"] is None
-    assert teacher_topology is None
 
 
 def test_build_inference_only_cluster_pins_multi_node_instances_to_a_domain(
@@ -5181,14 +5178,11 @@ def test_build_inference_only_cluster_pins_multi_node_instances_to_a_domain(
 
     monkeypatch.setattr(sc_setup_mod, "prepare_segment_topology", fake_prepare)
 
-    inference_cluster, teacher_topology = sc_setup_mod._build_inference_only_cluster(
-        master_config
-    )
+    inference_cluster = sc_setup_mod._build_inference_only_cluster(master_config)
 
     assert seen == {"segment_size": 2, "num_nodes": 4, "role": "inference"}
     assert inference_cluster.kwargs["segment_size"] == 2
     assert inference_cluster.kwargs["node_resource_constraints"] is constraints
-    assert teacher_topology == {"node4": ("domain-a", 4)}
 
 
 def test_build_inference_only_cluster_skips_topology_when_nodes_do_not_divide(
@@ -5200,14 +5194,11 @@ def test_build_inference_only_cluster_skips_topology_when_nodes_do_not_divide(
     prepare = MagicMock(name="prepare_segment_topology")
     monkeypatch.setattr(sc_setup_mod, "prepare_segment_topology", prepare)
 
-    inference_cluster, teacher_topology = sc_setup_mod._build_inference_only_cluster(
-        master_config
-    )
+    inference_cluster = sc_setup_mod._build_inference_only_cluster(master_config)
 
     prepare.assert_not_called()
     assert inference_cluster.kwargs["segment_size"] is None
     assert inference_cluster.kwargs["node_resource_constraints"] is None
-    assert teacher_topology is None
     assert "not divisible" in capsys.readouterr().out
 
 
@@ -5230,16 +5221,16 @@ class TestSimulatorRolloutOnlySetup:
         mc.policy["generation"]["vllm_cfg"] = {}
         return mc
 
-    def test_builds_cpu_trainer_and_noop_refit_without_a_training_cluster(
+    def test_builds_no_op_trainer_and_refit_without_a_training_cluster(
         self, patched_factories, monkeypatch
     ):
         mc = self._rollout_only_config()
         inference_cluster = MagicMock(name="inference_cluster")
-        build_inference_only = MagicMock(return_value=(inference_cluster, None))
+        build_inference_only = MagicMock(return_value=inference_cluster)
         monkeypatch.setattr(
             sc_setup_mod, "_build_inference_only_cluster", build_inference_only
         )
-        # CpuTrainer bootstraps TQ through its own module's import of the
+        # NoOpTrainer bootstraps TQ through its own module's import of the
         # factory, so it needs the same mock the fixture gave setup.py.
         monkeypatch.setattr(
             sc_simulator_mod,
@@ -5259,15 +5250,15 @@ class TestSimulatorRolloutOnlySetup:
         assert actor_args.train_cluster is None
         assert actor_args.inference_cluster is inference_cluster
         assert actor_args.simulator is settings
-        assert isinstance(actor_args.trainer_handle, CpuTrainer)
+        assert isinstance(actor_args.trainer_handle, NoOpTrainer)
         assert actor_args.trainer_handle.cfg is mc.policy
         assert isinstance(actor_args.weight_synchronizer, NoOpWeightSynchronizer)
-        assert actor_args.weight_synchronizer.refit_time_s == 1.5
+        assert actor_args.weight_synchronizer._refit_time_s == 1.5
         # The engine is handed the no-op transport, as it is handed the real one.
         assert patched_factories["fake_gen"].weight_synchronizer is (
             actor_args.weight_synchronizer
         )
-        # The cpu trainer bootstraps TQ where TQPolicy would; the driver connects.
+        # The no-op trainer bootstraps TQ where TQPolicy would; the driver connects.
         bootstrap_flags = [
             call.kwargs.get("bootstrap")
             for call in patched_factories["build_data_plane_client"].call_args_list
@@ -5312,7 +5303,7 @@ class TestSimulatorRolloutOnlySetup:
         monkeypatch.setattr(
             sc_setup_mod,
             "_build_inference_only_cluster",
-            MagicMock(return_value=(MagicMock(name="inference_cluster"), None)),
+            MagicMock(return_value=MagicMock(name="inference_cluster")),
         )
         monkeypatch.setattr(
             sc_simulator_mod,

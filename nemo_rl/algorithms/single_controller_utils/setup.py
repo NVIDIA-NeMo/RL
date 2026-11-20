@@ -92,7 +92,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.simulator import (
-    CpuTrainer,
+    NoOpTrainer,
     NoOpWeightSynchronizer,
     SimulatorConfig,
     validate_simulator_config,
@@ -189,7 +189,7 @@ class SingleControllerActorArgs:
     gen_handle: Any
     trainer_handle: Any  # driver-side TQPolicy
     env_handles: dict[str, EnvironmentInterface]
-    # None on a simulator run with the cpu train backend: every node is inference.
+    # None on a simulator run with the no-op trainer: every node is inference.
     train_cluster: Optional[RayVirtualCluster]
     inference_cluster: RayVirtualCluster
     dp_client: DataPlaneClient
@@ -465,7 +465,7 @@ def _inference_gpus_per_instance(master_config: MasterConfig) -> int:
 
 def _build_inference_only_cluster(
     master_config: MasterConfig,
-) -> tuple[RayVirtualCluster, Optional[dict[str, tuple[str, int]]]]:
+) -> RayVirtualCluster:
     """Allocate every node to generation: a simulator run with no trainer.
 
     Sized by ``policy.generation.colocated.resources``, as the non-colocated
@@ -475,8 +475,7 @@ def _build_inference_only_cluster(
     does for the inference cluster of a training run.
 
     Returns:
-        ``(inference_cluster, teacher_topology)``; the topology is the nodes
-        left unselected when ``cluster.segment_size`` is set, else None.
+        The inference cluster.
     """
     cluster_config = master_config.cluster
     generation_config = master_config.policy["generation"]
@@ -497,7 +496,6 @@ def _build_inference_only_cluster(
 
     inference_constraints = None
     inference_segment_size = None
-    teacher_topology = None
     if segment_size is not None:
         gpus_per_instance = _inference_gpus_per_instance(master_config)
         nodes_per_instance = (
@@ -505,12 +503,11 @@ def _build_inference_only_cluster(
         ) // inference_gpus_per_node
         if inference_nodes % nodes_per_instance == 0:
             inference_segment_size = nodes_per_instance
-            inference_constraints, remaining_ids, topology = prepare_segment_topology(
+            inference_constraints, _, _ = prepare_segment_topology(
                 inference_segment_size,
                 inference_nodes,
                 role="inference",
             )
-            teacher_topology = {node_id: topology[node_id] for node_id in remaining_ids}
         else:
             print(
                 f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
@@ -530,7 +527,7 @@ def _build_inference_only_cluster(
         segment_size=inference_segment_size,
         node_resource_constraints=inference_constraints,
     )
-    return inference_cluster, teacher_topology
+    return inference_cluster
 
 
 def _build_clusters(
@@ -1302,9 +1299,8 @@ def setup_single_controller(
         simulator: Settings of a simulator run
             (examples/run_single_controller_simulator.py), or None for a
             training run. With the ``cpu`` train backend no trainer is built:
-            every node is an inference node, a ``CpuTrainer`` bootstraps the
-            data plane and stands in for the train step, and the refit is a
-            ``NoOpWeightSynchronizer``.
+            every node is an inference node, a ``NoOpTrainer`` bootstraps the
+            data plane, and the refit is a ``NoOpWeightSynchronizer``.
 
     Returns:
         A tuple of (pre-built SC actor args, driver-side per-phase timings
@@ -1313,7 +1309,7 @@ def setup_single_controller(
     validate_single_controller_config(master_config)
     if simulator is not None:
         validate_simulator_config(master_config, simulator)
-    cpu_trainer = simulator is not None and simulator.uses_cpu_trainer
+    no_op_trainer = simulator is not None and simulator.uses_no_op_trainer
 
     generation_config = master_config.policy["generation"]
     # Normalize the optional request count once before partitions/workers start.
@@ -1692,11 +1688,9 @@ def setup_single_controller(
     # Checkpointing
     # ==========================
     checkpointer = CheckpointManager(master_config.checkpointing)
-    # A cpu trainer has no state to resume. checkpointing.enabled=false only stops
-    # saves, and the recipe's checkpoint_dir may hold a training run's checkpoints:
-    # resuming at their step would end a rollout-only run after no new steps.
+    # No-op trainer runs start fresh even when training checkpoints already exist.
     trainer_checkpoint_path = (
-        None if cpu_trainer else checkpointer.get_latest_checkpoint_path()
+        None if no_op_trainer else checkpointer.get_latest_checkpoint_path()
     )
     loaded_state = cast(
         Optional[dict[str, Any]],
@@ -1921,13 +1915,12 @@ def setup_single_controller(
     setup_timing_metrics = SetupTimingMetrics()
 
     # Create clusters
-    if cpu_trainer:
+    if no_op_trainer:
         # Every node serves generation: there is no trainer to hand GPUs to.
         train_cluster = None
         value_cluster = None
-        inference_cluster, teacher_segment_topology = _build_inference_only_cluster(
-            master_config
-        )
+        inference_cluster = _build_inference_only_cluster(master_config)
+        teacher_segment_topology = None
     else:
         train_cluster, inference_cluster, value_cluster, teacher_segment_topology = (
             _build_clusters(master_config)
@@ -2024,7 +2017,7 @@ def setup_single_controller(
             A tuple of (TQPolicy trainer, TQValue critic or None, per-phase wall
             times keyed as "trainer_time" and "value_time").
         """
-        # Only the cpu train backend runs without a training cluster, and it
+        # Only the no-op trainer runs without a training cluster, and it
         # never calls this builder.
         assert train_cluster is not None, "building a trainer needs a train cluster"
         nonlocal ppo_group_multiple, ppo_min_remaining_groups
@@ -2076,25 +2069,26 @@ def setup_single_controller(
             trainer.prepare_for_training()
         return trainer, value, time_metrics
 
-    def _build_cpu_trainer() -> tuple[Any, Optional[TQValue], dict[str, float]]:
+    def _build_no_op_trainer() -> tuple[Any, Optional[TQValue], dict[str, float]]:
         """Build the simulator's trainer stand-in.
 
         It bootstraps the TransferQueue controller exactly where TQPolicy would,
         so the connect-only clients built later find it.
 
         Returns:
-            A tuple of (CpuTrainer, None, per-phase wall time keyed "trainer_time").
+            A tuple of (NoOpTrainer, None, per-phase wall time keyed "trainer_time").
         """
         t0 = time.perf_counter()
-        trainer = CpuTrainer(
+        trainer = NoOpTrainer(
             dp_cfg=dp_config,
             policy_config=policy_config,
-            checkpointing=False,
             storage_unit_node_ids=storage_unit_node_ids,
         )
         return trainer, None, {"trainer_time": time.perf_counter() - t0}
 
-    trainer_factory = _build_cpu_trainer if cpu_trainer else _build_trainer_and_value
+    trainer_factory = (
+        _build_no_op_trainer if no_op_trainer else _build_trainer_and_value
+    )
 
     def _build_generation_then_trainer(
         defer_generation_model_load: bool, generation=None
@@ -2283,9 +2277,9 @@ def setup_single_controller(
             return existing_synchronizer
         t0 = time.perf_counter()
         new_synchronizer: WeightSynchronizer
-        if cpu_trainer:
-            # The engine loaded the checkpoint itself (is_eval), so the refit
-            # moves nothing; it only holds for the simulated transfer time.
+        if no_op_trainer:
+            # The engine loads the checkpoint itself, so refit only holds for
+            # the simulated transfer time.
             assert simulator is not None
             new_synchronizer = NoOpWeightSynchronizer(
                 refit_time_s=simulator.refit_time_s
@@ -2371,9 +2365,9 @@ def setup_single_controller(
                     flush=True,
                 )
                 final_train_iters = _megatron_train_iters(master_config)
-                # The cpu trainer has no scheduler horizon, so a clamp changes
+                # The no-op trainer has no scheduler horizon, so a clamp changes
                 # nothing for it; rebuilding would only bootstrap TQ twice.
-                if final_train_iters != speculative_train_iters and not cpu_trainer:
+                if final_train_iters != speculative_train_iters and not no_op_trainer:
                     # Correct but slow: the speculative trainer has the wrong
                     # scheduler horizon, so it is replaced.
                     print(

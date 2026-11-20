@@ -37,6 +37,7 @@ def _trainer(own, workers=(), fns=()):
         dp_client=own,
         _extra_snapshot_sources=[],
         _extra_snapshot_fns=list(fns),
+        _prev_cluster_snapshot={},
         run_all_workers_single_data=lambda *_a, **_k: [{"w": i} for i in workers],
     )
     trainer.collect_data_plane_snapshots = (

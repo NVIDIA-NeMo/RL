@@ -214,7 +214,7 @@ def test_a_dedicated_ray_head_claims_the_whole_unit(
         lambda: {"ray_head": 1.0, "GPU": 8.0},
     )
 
-    assert entrypoint_utils.controller_placement() == {"resources": {"ray_head": 1}}
+    assert entrypoint_utils._controller_placement() == {"resources": {"ray_head": 1}}
 
 
 def test_no_dedicated_head_leaves_the_controller_unpinned(
@@ -231,7 +231,7 @@ def test_no_dedicated_head_leaves_the_controller_unpinned(
         lambda: {"GPU": 8.0},
     )
 
-    assert entrypoint_utils.controller_placement() == {}
+    assert entrypoint_utils._controller_placement() == {}
 
 
 @pytest.mark.parametrize("entrypoint", _ENTRYPOINTS)
@@ -434,7 +434,7 @@ def test_simulator_main_passes_the_simulator_config_to_setup(
     main_context: SimpleNamespace,
 ) -> None:
     """The simulator YAML reaches setup, with simulator.* overrides applied."""
-    main_context.overrides.append("simulator.refit_time_s=3")
+    main_context.overrides.extend(["simulator.refit_time_s=3", "+recipe_key=1"])
 
     run_single_controller_simulator.main()
 
@@ -442,8 +442,10 @@ def test_simulator_main_passes_the_simulator_config_to_setup(
     main_context.setup_single_controller.assert_called_once_with(
         main_context.config, "tokenizer", processor=None, simulator=simulator
     )
-    # The recipe dict the stand-in rewrites no longer carries the simulator block.
-    main_context.apply_simulator_overrides.assert_called_once_with({}, simulator)
+    # Each override reaches only the YAML it addresses.
+    main_context.apply_simulator_overrides.assert_called_once_with(
+        {"recipe_key": 1}, simulator
+    )
 
 
 def test_simulator_main_configures_generation_as_training_without_refit_weights(
@@ -465,17 +467,6 @@ def test_simulator_main_configures_generation_as_training_without_refit_weights(
     assert (
         main_context.config.policy["generation"] is main_context.configured_generation
     )
-
-
-def test_simulator_main_rejects_a_recipe_that_uses_the_simulator_key(
-    main_context: SimpleNamespace,
-) -> None:
-    main_context.yaml_files[_RECIPE_PATH] = {"simulator": {"train_time_s": 1.0}}
-
-    with pytest.raises(ValueError, match="reserves"):
-        run_single_controller_simulator.main()
-
-    main_context.setup_single_controller.assert_not_called()
 
 
 def test_simulator_main_rejects_an_unknown_simulator_key(
