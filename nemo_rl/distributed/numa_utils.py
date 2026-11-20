@@ -49,8 +49,9 @@ def bind_to_gpu_numa(gpu_id: int) -> bool:
 
     Reads the GPU→cpulist mapping written by topology_probe.sh at node
     startup, then calls os.sched_setaffinity() for CPU pinning and
-    numa_set_preferred() for memory policy. Best-effort: failures are
-    logged, never raised.
+    numa_set_preferred() for memory policy. The memory policy is set even when
+    the CPU pinning fails, e.g. when the process's cpuset has none of the GPU's
+    CPUs. Best-effort: failures are logged, never raised.
 
     Args:
         gpu_id: Node-global physical GPU index (``nvidia-smi`` numbering), which
@@ -76,10 +77,22 @@ def bind_to_gpu_numa(gpu_id: int) -> bool:
                 idx, cpulist = line.split(":", 1)
                 if idx == gpu:
                     cpus = _parse_cpulist(cpulist)
-                    os.sched_setaffinity(0, cpus)
-                    logger.info("NUMA CPU binding: GPU %s → CPUs %s", gpu, cpulist)
+                    try:
+                        os.sched_setaffinity(0, cpus)
+                        bound = True
+                        logger.info("NUMA CPU binding: GPU %s → CPUs %s", gpu, cpulist)
+                    except OSError as exc:
+                        # EINVAL when the cpuset (e.g. a k8s pod's) has none of
+                        # these CPUs; memory can still sit next to the GPU.
+                        bound = False
+                        logger.warning(
+                            "NUMA CPU binding skipped: GPU %s → CPUs %s: %s",
+                            gpu,
+                            cpulist,
+                            exc,
+                        )
                     _set_numa_preferred(cpus)
-                    return True
+                    return bound
         logger.debug("NUMA binding: GPU %s not found in %s", gpu, GPU_CPU_AFFINITY_PATH)
     except FileNotFoundError:
         logger.debug("NUMA binding skipped: %s not found", GPU_CPU_AFFINITY_PATH)
