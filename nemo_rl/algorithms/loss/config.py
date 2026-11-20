@@ -198,6 +198,33 @@ class CISPOLossConfig(_PolicyRatioVariantConfig):
     token_level_loss: Literal[True] = True
 
 
+class GSPOLossConfig(_ClippedPGVariantConfig):
+    """GSPO (https://arxiv.org/abs/2507.18071), selected with ``kind: gspo``.
+
+    The clipped surrogate with one policy ratio and one importance weight per
+    sequence. Has no CISPO, REINFORCE, adaptive-ppo-clip or seq-mask-tis
+    settings: they act on token-level ratios.
+    """
+
+    kind: Literal["gspo"] = "gspo"
+    # Fixed by the objective. Kept as fields so trainer code that reads these
+    # switches, and configs that still spell them out, keep working.
+    sequence_level_importance_ratios: Literal[True] = True
+    token_level_loss: Literal[False] = False
+    # In-loss sequence filtering needs a token-level loss, and score centering
+    # needs token-level ratios.
+    seq_logprob_error_in_loss: Literal[False] = False
+    score_centering: Literal[False] = False
+
+    ratio_clip_min: float = 0.2
+    ratio_clip_max: float = 0.2
+    ratio_clip_c: float | None = None
+
+    truncated_importance_sampling_type: Literal["tis", "icepop"] | None = None
+
+    force_on_policy_ratio: bool = False
+
+
 class ReinforceLossConfig(_ClippedPGVariantConfig):
     """REINFORCE / RLOO (https://arxiv.org/abs/2402.14740), selected with ``kind: reinforce``.
 
@@ -279,6 +306,7 @@ PolicyGradientLossConfig = Annotated[
     ClippedPGLossConfig
     | ClippedSurrogateLossConfig
     | CISPOLossConfig
+    | GSPOLossConfig
     | ReinforceLossConfig,
     Field(discriminator="kind"),
     BeforeValidator(_select_legacy_config),
@@ -288,7 +316,12 @@ PolicyGradientLossConfig = Annotated[
 def as_clipped_pg_config(cfg: PolicyGradientLossConfig) -> ClippedPGLossConfig:
     """Return the settings of any loss config that ClippedPGLossFn implements."""
     match cfg:
-        case ClippedSurrogateLossConfig() | CISPOLossConfig() | ReinforceLossConfig():
+        case (
+            ClippedSurrogateLossConfig()
+            | CISPOLossConfig()
+            | GSPOLossConfig()
+            | ReinforceLossConfig()
+        ):
             return cfg.as_clipped_pg_config()
         case ClippedPGLossConfig():
             return cfg
