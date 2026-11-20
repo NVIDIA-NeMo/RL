@@ -15,6 +15,7 @@
 import logging
 import multiprocessing
 import time
+from typing import Any
 
 import ray
 
@@ -57,7 +58,18 @@ class RouterActor:
     (router_ip, router_port) without ever importing sglang_router itself.
     """
 
-    def init(self, router_cfg: SGLangRouterConfig) -> tuple[str, int]:
+    def init(
+        self,
+        router_cfg: SGLangRouterConfig,
+        pd_args: dict[str, Any] | None = None,
+    ) -> tuple[str, int]:
+        """Start the router; ``pd_args`` switches it to prefill/decode mode.
+
+        ``pd_args`` carries ``prefill_policy`` and ``decode_policy``. The
+        router then starts with empty prefill and decode pools and the engines
+        register themselves with their role (and, for prefill, their
+        bootstrap port) once they are healthy.
+        """
         _validate_router_retry_options(router_cfg)
         from sglang_router.launch_router import RouterArgs
 
@@ -86,6 +98,10 @@ class RouterActor:
             router_args.retry_max_retries = router_cfg["retry_max_retries"]
         if "cb_failure_threshold" in router_cfg:
             router_args.cb_failure_threshold = router_cfg["cb_failure_threshold"]
+        if pd_args is not None:
+            router_args.pd_disaggregation = True
+            router_args.prefill_policy = pd_args["prefill_policy"]
+            router_args.decode_policy = pd_args["decode_policy"]
 
         self.start(router_args)
         return router_ip, router_port
@@ -116,6 +132,7 @@ class RouterActor:
 
 def _start_router(
     router_cfg: SGLangRouterConfig,
+    pd_args: dict[str, Any] | None = None,
 ) -> tuple[str, int, ray.actor.ActorHandle | None]:
     """Start sgl router, returning ``(router_ip, router_port, actor_handle)``.
 
@@ -123,8 +140,15 @@ def _start_router(
     launched router at ``(sglang_router_ip, sglang_router_port)`` and return
     ``actor_handle=None`` (we do not own that router and must not terminate it).
     Otherwise spawn a ``RouterActor`` in sglang env to own the router process.
+    ``pd_args`` (see :meth:`RouterActor.init`) starts it in prefill/decode
+    mode; it is refused together with an external router, whose mode and
+    policies are not ours to set.
     """
     if router_cfg.get("use_external_router"):
+        assert pd_args is None, (
+            "use_external_router cannot be combined with prefill/decode "
+            "disaggregation; NeMo RL must own the PD routers"
+        )
         assert (
             router_cfg.get("sglang_router_ip") is not None
             and router_cfg.get("sglang_router_port") is not None
@@ -140,6 +164,8 @@ def _start_router(
             "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker"
         ),
     ).remote()
-    router_ip, router_port = ray.get(router_actor.init.remote(dict(router_cfg)))
+    router_ip, router_port = ray.get(
+        router_actor.init.remote(dict(router_cfg), pd_args=pd_args)
+    )
     logger.info(f"Router launched at {router_ip}:{router_port}")
     return router_ip, router_port, router_actor

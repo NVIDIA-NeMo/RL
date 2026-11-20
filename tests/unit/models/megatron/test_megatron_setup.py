@@ -4073,6 +4073,35 @@ class TestValidateAndSetConfig:
 
         assert os.environ.get("NCCL_NET_PLUGIN") == expected_plugin
 
+    @pytest.mark.parametrize(
+        ("transfer_backend", "expected_plugin"),
+        [("nixl", "none"), ("mooncake", None)],
+    )
+    @patch.dict(os.environ, {}, clear=True)
+    def test_refit_environment_follows_disaggregated_sglang_engines(
+        self, transfer_backend, expected_plugin
+    ):
+        """The trainer joins the SGLang engines' refit group on the same NCCL transport.
+
+        Only the nixl KV transport takes NCCL's network plugin out of the
+        engines; Mooncake's own variable stays on the engines.
+        """
+        from nemo_rl.models.megatron.setup import configure_refit_environment
+
+        config = {
+            "generation": {
+                "backend": "sglang",
+                "colocated": {"enabled": False},
+                "disaggregation": {"enabled": True},
+                "sglang_cfg": {"disagg": {"transfer_backend": transfer_backend}},
+            },
+        }
+
+        configure_refit_environment(config)
+
+        assert os.environ.get("NCCL_NET_PLUGIN") == expected_plugin
+        assert "WITH_NVIDIA_PEERMEM" not in os.environ
+
 
 @pytest.mark.mcore
 class TestModelAndOptimizerStateNamedTuple:

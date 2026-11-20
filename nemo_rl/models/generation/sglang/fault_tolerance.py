@@ -89,14 +89,15 @@ class RolloutHealthMonitor:
                     alive = False
                 if not alive:
                     self._kill_engine(
-                        rollout_engine_id=index
-                        // self._sglang_generation.nodes_per_engine
+                        rollout_engine_id=self._sglang_generation.engine_index_of_slot(
+                            index
+                        )
                     )
 
     def record_restart_attempts(self, dead_indices: list[int]) -> None:
         """Reserve one attempt per logical engine, aborting before any boot at the cap."""
         engine_ids = sorted(
-            {i // self._sglang_generation.nodes_per_engine for i in dead_indices}
+            {self._sglang_generation.engine_index_of_slot(i) for i in dead_indices}
         )
         exhausted = [
             i
@@ -278,10 +279,7 @@ class RolloutHealthMonitor:
     def _kill_engine(self, rollout_engine_id: int):
         logger.info(f"Killing server group {rollout_engine_id}...")
         self._remove_router_worker(rollout_engine_id)
-        for i in range(
-            rollout_engine_id * self._sglang_generation.nodes_per_engine,
-            (rollout_engine_id + 1) * self._sglang_generation.nodes_per_engine,
-        ):
+        for i in self._sglang_generation.engine_slot_range(rollout_engine_id):
             engine = self._sglang_generation.all_engines[i]
             if engine:
                 logger.info(f"Shutting down and killing engine at index {i}")
@@ -303,12 +301,13 @@ class RolloutHealthMonitor:
     def _remove_router_worker(self, rollout_engine_id: int) -> None:
         """Deregister using cached endpoints, without contacting a failed actor."""
         generation = self._sglang_generation
-        worker_url = generation._engine_urls[
-            rollout_engine_id * generation.nodes_per_engine
-        ]
+        worker_url = generation.engine_url(rollout_engine_id)
         if worker_url is None:
             return
-        workers_url = f"http://{generation.router_ip}:{generation.router_port}/workers"
+        router_ip, router_port = generation.router_endpoint_for_engine(
+            rollout_engine_id
+        )
+        workers_url = f"http://{router_ip}:{router_port}/workers"
         try:
             response = requests.get(workers_url, timeout=self._check_timeout)
             response.raise_for_status()

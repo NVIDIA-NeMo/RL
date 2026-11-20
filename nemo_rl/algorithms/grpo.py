@@ -134,7 +134,11 @@ from nemo_rl.models.generation.interfaces import (
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
-from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.config import (
+    SGLangConfig,
+    sglang_replica_width,
+    validate_sglang_disaggregation,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
 from nemo_rl.models.generation.trtllm.config import replica_width
@@ -825,6 +829,10 @@ def setup(
     _validate_seq_logprob_error_in_loss(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
     validate_disagg_entrypoint(generation_config, uses_nemo_gym=enable_nemo_gym)
+    if generation_config["backend"] == "sglang":
+        validate_sglang_disaggregation(
+            cast(SGLangConfig, generation_config), use_nemo_gym=enable_nemo_gym
+        )
 
     _validate_val_sampling(master_config)
     assert grpo_config.val_num_generations_per_prompt >= 1, (
@@ -1312,9 +1320,9 @@ def setup(
                 # so cross-node all-reduce uses NVLink, not InfiniBand.
                 #
                 # For vLLM: total GPUs per instance = TP * PP (separate dimensions).
-                # For SGLang: gpus_per_server already includes all parallelism
-                #   dimensions (TP, DP-attention, PP are internal subdivisions),
-                #   so we use it directly without multiplying by pp_size.
+                # For SGLang: num_gpus_per_engine already includes all parallelism
+                #   dimensions (TP, DP-attention, PP are internal subdivisions);
+                #   under PD disaggregation the unit is the whole replica.
                 # For Megatron: the NVLink-domain span of the parallelism the
                 #   generation workers actually run with.
                 if generation_config["backend"] == "megatron":
@@ -1334,8 +1342,9 @@ def setup(
                         cast(TrtllmConfig, generation_config)
                     )
                 else:
-                    sglang_cfg = generation_config.get("sglang_cfg", {})
-                    gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
+                    gpus_per_instance = sglang_replica_width(
+                        cast(SGLangConfig, generation_config)
+                    )
                 nodes_per_instance = (
                     gpus_per_instance + inference_gpus_per_node - 1
                 ) // inference_gpus_per_node

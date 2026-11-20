@@ -224,7 +224,6 @@ def _make_minimal_sglang_gen_for_clamp_test(
     sglang_gen = SGLangGeneration.__new__(SGLangGeneration)
     sglang_gen.all_engines = []
     sglang_gen._health_monitor = None
-    sglang_gen._router_actor = None
     sglang_gen._http_client = None
     sglang_gen.sglang_cfg = _make_sglang_generation_cfg()
     sglang_gen.sglang_cfg["max_new_tokens"] = max_new_tokens
