@@ -1149,8 +1149,14 @@ class MegatronDynamoGeneration(GenerationInterface):
                         manager_env=dict(engine_env),
                         model_name=model_name,
                         served_model_name=model_name,
-                        # Native rollouts post token-ID completions; chat stays off.
-                        endpoint_types=["completions"],
+                        # Native rollouts post token-ID completions. NeMo-Gym's chat
+                        # calls need the chat route too: Dynamo builds it (and hands it
+                        # to the frontend's chat engine) only for a chat model.
+                        endpoint_types=(
+                            ["chat", "completions"]
+                            if self.cfg["mcore_generation_config"]["expose_http_server"]
+                            else ["completions"]
+                        ),
                         engine_start_timeout_s=self._dynamo_cfg.startup_timeout_s,
                         excluded_ports=sorted(used_ports),
                     ),

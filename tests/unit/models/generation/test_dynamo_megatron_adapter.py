@@ -406,14 +406,17 @@ def test_rollouts_are_megatrons_own(modules):
     assert [c["token_ids"] for c in chunks] == [[9], [EOS], []]
 
 
-def test_the_prefill_leg_is_megatrons_own(modules):
+def test_the_prefill_leg_samples_the_first_token_as_the_call_asks(modules):
     engine = _engine(modules, "prefill")
-    request = _gym_request(modules)
-    request["extra_args"] = {}
-    chunks = _run(engine, request)
+    chat = {"model": "m", "temperature": 0.6, "top_p": 0.95, "logprobs": True}
+    chunks = _run(engine, _gym_request(modules, chat=chat))
 
-    # Unchanged, and no plan needed: prefill generates nothing.
-    assert engine.requests == [request]
+    # Prefill samples the first token, whose log probability decode checks, so
+    # it gets the call's sampling; its chunks are Megatron-LM's own.
+    (sent,) = engine.requests
+    assert sent["sampling_options"]["temperature"] == 0.6
+    assert sent["sampling_options"]["top_p"] == 0.95
+    assert sent["output_options"] == {"logprobs": 0}
     assert chunks == [
         {"token_ids": [], "finish_reason": "length", "disaggregated_params": {}}
     ]

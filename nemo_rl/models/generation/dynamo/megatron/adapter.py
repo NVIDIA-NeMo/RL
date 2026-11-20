@@ -167,13 +167,8 @@ class NemoRLMegatronLLMEngine(MegatronLLMEngine):
     async def generate(
         self, request: dict[str, Any], context: Any
     ) -> AsyncGenerator[dict[str, Any], None]:
-        if self.config.role == "prefill" or GYM_CALL_ANNOTATION not in (
-            request.get("annotations") or ()
-        ):
-            # NeMo RL's rollouts, and every prefill leg: the prefill engine only
-            # fills the KV cache the decode engine pulls, and generates nothing.
-            # DRAFT: assumes Dynamo's prefill router hands the decode leg the
-            # request's annotations and extra_args as the frontend sent them.
+        if GYM_CALL_ANNOTATION not in (request.get("annotations") or ()):
+            # NeMo RL's rollouts: token-ID completions with their own sampling.
             async for chunk in super().generate(request, context):
                 yield chunk
             return
@@ -195,6 +190,16 @@ class NemoRLMegatronLLMEngine(MegatronLLMEngine):
             max_tokens=plan.max_tokens,
             captured=plan.admission is not None,
         )
+        if self.config.role == "prefill":
+            # The prefill leg samples the call's first token, so it needs the
+            # call's sampling too: its log probability is handed to decode, which
+            # rejects a handoff whose log-probability count differs from its own.
+            # Otherwise it only fills the KV cache the decode engine pulls.
+            # DRAFT: assumes Dynamo's prefill router hands the decode leg the
+            # request's annotations and extra_args as the frontend sent them.
+            async for chunk in super().generate(request, context):
+                yield chunk
+            return
         try:
             chunk = await self._serve_gym_call(request, wire, plan, context)
         except ValueError as error:
