@@ -179,6 +179,15 @@ response token and values do not bootstrap across rows, which matters when
 
 Batch cardinality counts logical rollouts; GRPO advantages are per logical rollout, PPO advantages are per physical row. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` or `ppo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping, reward penalties, and message-level advantage overrides remain unsupported for forest training. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
 
+`token_capture.forest_padding_scope: step` (Forest only; default `group`) pads
+each training batch once to the row multiple, instead of padding every
+published group. With few rollouts per group, per-group padding can multiply
+the rows each step trains on. Padding repeats the batch's first row with its
+loss masked out.
+A rollout snapshot taken during a step keeps that step's padding copies; resume
+deletes them before checking the replay inventory. Streaming PPO trains each chunk
+separately, so this scope pads every chunk.
+
 Captured-rollout length metrics are emitted after tensor verification, with one observation per logical rollout. `gen_tokens_per_sample` sums uniquely owned generated tokens across its rows; `max_gen_tokens_per_turn` is the largest actual model generation, and `total_tokens_per_sample` is its longest verified context chain. Rewritten input, shared-prefix copies, and execution padding do not count as generated output. Environment masking does not erase verified generations; unverifiable owners contribute zero. These are generation statistics before learner-side filtering, not counts of tokens ultimately used in the loss.
 
 The implementation supports concurrent capture through Responses and Chat, bounded resampling of definite responses, ordinary text/images supported by the foundation processor path, token-level GRPO, PPO with GAE, and direct route assembly. It retains existing forest-training guards on deferred route assembly, incompatible objectives, message-level advantage overrides and non-unit dataset loss multipliers. Buffered Responses SSE is supported through a non-streaming upstream call. Incremental engine streaming, provider-managed conversation state, assistant prefill, and engine prompt truncation are rejected. Ordinary capture keeps its existing path with the option disabled.
