@@ -2589,6 +2589,8 @@ class TestPeriodicRolloutCheckpoint:
                     "inflight_batch_sizes": {0: [2], 1: [1]},
                     "num_pending_samples": {0: [1], 1: [3]},
                     "kv_cache_usage_perc": {0: [0.5], 1: [0.7]},
+                    "dynamo_frontend_queued_requests": {0: [5.0], 1: [2.0]},
+                    "dynamo_frontend_inflight_requests": {0: [9.0], 1: [1.0]},
                 },
             ]
         )
@@ -2620,6 +2622,11 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["vllm_requests_running"] == 3
         assert logged["vllm_requests_waiting"] == 4
         assert logged["vllm_kv_cache_usage_mean"] == pytest.approx(0.6)
+        assert logged["dynamo_frontend_requests_queued"] == 7
+        assert logged["dynamo_frontend_requests_inflight"] == 10
+        # Each frontend's own counts show which one the calls pile up in.
+        assert logged["dynamo_frontend_0_requests_queued"] == 5
+        assert logged["dynamo_frontend_1_requests_inflight"] == 1
         assert logged["group_completion_seconds_p50"] == pytest.approx(2.0)
         assert logged["group_completion_seconds_p95"] == pytest.approx(4.0)
         assert logged["group_queue_wait_seconds_p95"] == pytest.approx(3.0)
@@ -4006,16 +4013,25 @@ class _OrderRecordingCritic:
 
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
+        self._keep_resident = False
 
     def prepare_for_training(self) -> None:
-        self.calls.append("critic.prepare_for_training")
+        self.calls.append(
+            "critic.prepare_for_training:resident"
+            if self._keep_resident
+            else "critic.prepare_for_training"
+        )
 
     def save_checkpoint(self, **kwargs: Any) -> None:
         self.save_kwargs = kwargs
         self.calls.append("critic.save_checkpoint")
 
     def finish_training(self) -> None:
-        self.calls.append("critic.finish_training")
+        self.calls.append(
+            "critic.finish_training:resident"
+            if self._keep_resident
+            else "critic.finish_training"
+        )
 
 
 def _ppo_save_actor(tmp_path: Path, calls: list[str]):
@@ -4058,12 +4074,85 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     attach_rollout_checkpointing(actor)
     actor._is_ppo = True
     actor._loss_fn = object()
+    actor._value_dedicated = False
     actor._trainer = _OrderRecordingPolicy(calls)
     actor._value = _OrderRecordingCritic(calls)
     return actor
 
 
 class TestPPOSaveOrder:
+    def test_dedicated_models_save_without_migration(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.single_controller._write_latest_checkpoint_status",
+            lambda *args, **kwargs: None,
+        )
+        calls: list[str] = []
+        actor = _ppo_save_actor(tmp_path, calls)
+        actor._value_dedicated = True
+        actor._value._keep_resident = True
+
+        asyncio.run(
+            actor._save_checkpoint(
+                {}, is_policy_training_step=True, is_final_checkpoint=True
+            )
+        )
+
+        assert calls == [
+            "critic.prepare_for_training:resident",
+            "critic.save_checkpoint",
+            "critic.finish_training:resident",
+            "policy.save_checkpoint",
+        ]
+
+    def test_failed_dedicated_critic_save_does_not_start_cleanup(self, tmp_path):
+        calls: list[str] = []
+        actor = _ppo_save_actor(tmp_path, calls)
+        actor._value_dedicated = True
+        actor._value._keep_resident = True
+        actor._value.save_checkpoint = MagicMock(
+            side_effect=RuntimeError("critic save failed")
+        )
+
+        with pytest.raises(RuntimeError, match="critic save failed"):
+            asyncio.run(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=True, is_final_checkpoint=True
+                )
+            )
+
+        assert calls == ["critic.prepare_for_training:resident"]
+
+    def test_cancelled_critic_save_does_not_start_cleanup(self, tmp_path):
+        calls: list[str] = []
+        actor = _ppo_save_actor(tmp_path, calls)
+        actor._value_dedicated = True
+        actor._value._keep_resident = True
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_save(**kwargs: Any) -> None:
+            started.set()
+            release.wait(timeout=5)
+
+        actor._value.save_checkpoint = blocked_save
+
+        async def cancel_save() -> None:
+            task = asyncio.create_task(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=True, is_final_checkpoint=True
+                )
+            )
+            try:
+                assert await asyncio.to_thread(started.wait, 2)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 1)
+            finally:
+                release.set()
+
+        asyncio.run(cancel_save())
+        assert "critic.finish_training:resident" not in calls
+
     def test_the_policy_is_offloaded_across_the_critic_save(
         self, tmp_path, monkeypatch
     ):

@@ -662,6 +662,9 @@ ARG NATS_VERSION=v2.11.6
 # Space-separated config paths whose NeMo Gym venvs are prefetched into the image
 # (empty default = skip). Consumed by the gym prefetch RUN below.
 ARG NEMO_GYM_PREFETCH_CONFIGS=
+# Sandbox image for Gym's code_gen server, whose config rejects a null image. The prefetch
+# dry run below starts it, so builds whose prefetch configs include code_gen must pass one.
+ARG CODE_GEN_SANDBOX_IMAGE
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF

@@ -11,6 +11,7 @@ NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 # ~25 min startup (30B-MoE load + CUDA-graph warmup + nemo_gym servers) plus ~130 min for 8 steps
 # 180 min leaves margin for teardown + metric-dump within the 4 h job allocation.
 NUM_MINUTES=180
+USES_OPENSANDBOX=1
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

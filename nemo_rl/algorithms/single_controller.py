@@ -130,6 +130,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
     algo_config,
+    dedicated_value_enabled,
     is_ppo_run,
     rollout_snapshots_enabled,
     validate_forest_objective,
@@ -240,6 +241,7 @@ from nemo_rl.utils.path_utils import (
     is_msc_path,
 )
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.weight_sync.refit_actor import RemoteWeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -417,6 +419,7 @@ class SingleControllerActor:
         )
         self._ppo_group_multiple = actor_args.ppo_group_multiple
         self._ppo_min_remaining_groups = actor_args.ppo_min_remaining_groups
+        self._value_dedicated: bool = dedicated_value_enabled(master_config)
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -663,6 +666,9 @@ class SingleControllerActor:
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
         self._inference_cluster = actor_args.inference_cluster
+        if isinstance(self._weight_synchronizer, RemoteWeightSynchronizer):
+            # The proxy arrived pickled inside actor_args, with only its actor handle.
+            self._weight_synchronizer.attach(self._gen)
 
         restored_trainer_version = (
             actor_args.save_state.trainer_version
@@ -877,7 +883,8 @@ class SingleControllerActor:
         """Start the rollout / train / watchdog pumps and run until one finishes."""
         await self._environment_checkpoint.check_startup()
         # Synchronize weights before starting the pumps, unless setup already delivered them.
-        if self._weight_synchronizer.is_stale:
+        # The RefitActor proxy answers is_stale with blocking calls to the actor.
+        if await asyncio.to_thread(lambda: self._weight_synchronizer.is_stale):
             await self._sync_weights()
         self._rollout_manager.set_weight_version(self._trainer_version)
         self._rollout_manager.set_tally_step_provider(
@@ -3102,7 +3109,7 @@ class SingleControllerActor:
                         # per model, which is saving the offload/onloading cost.
                         # Keep accumulated policy gradients resident while
                         # offloading policy parameters/optimizer for the critic.
-                        if not value_inference_prepared:
+                        if not value_inference_prepared and not self._value_dedicated:
                             with (
                                 self._timer.time("value_inference_prep"),
                                 managed_span(
@@ -3160,7 +3167,7 @@ class SingleControllerActor:
                             # normalizer still counts all of them.
                             await asyncio.to_thread(
                                 self._trainer.prepare_for_lp_inference,
-                                keep_train_buffers=step_open,
+                                keep_train_buffers=step_open or self._value_dedicated,
                             )
                         with (
                             self._timer.time("policy_and_reference_logprobs"),
@@ -3179,7 +3186,6 @@ class SingleControllerActor:
                                     self._trainer.get_reference_policy_logprobs_from_meta,
                                     train_meta,
                                 )
-
                     # Compute advantages
                     with (
                         self._timer.time("advantage_calculation"),
@@ -3382,12 +3388,15 @@ class SingleControllerActor:
                                 tracer=self._tracer,
                             ),
                         ):
-                            if step_open:
-                                await asyncio.to_thread(
-                                    self._trainer.pause_train_step_with_offloading
-                                )
-                            else:
-                                await asyncio.to_thread(self._trainer.offload_to_cpu)
+                            if not self._value_dedicated:
+                                if step_open:
+                                    await asyncio.to_thread(
+                                        self._trainer.pause_train_step_with_offloading
+                                    )
+                                else:
+                                    await asyncio.to_thread(
+                                        self._trainer.offload_to_cpu
+                                    )
                             await asyncio.to_thread(self._value.prepare_for_inference)
                         value_inference_prepared = True
 
@@ -3511,7 +3520,8 @@ class SingleControllerActor:
                             await asyncio.to_thread(
                                 self._trainer.sync_params_before_refit
                             )
-                        await asyncio.to_thread(self._trainer.offload_to_cpu)
+                        if not self._value_dedicated:
+                            await asyncio.to_thread(self._trainer.offload_to_cpu)
                         if self._gen.blocks_training():
                             await asyncio.to_thread(self._trainer.finish_inference)
                     # GAE has produced the frozen predictions and targets for
@@ -4682,6 +4692,16 @@ class SingleControllerActor:
             metrics["vllm_requests_waiting"] = sum(waiting.values())
         if kv_usage:
             metrics["vllm_kv_cache_usage_mean"] = sum(kv_usage.values()) / len(kv_usage)
+        for state in ("queued", "inflight"):
+            frontend_calls = _latest_generation_values(
+                generation_metrics, f"dynamo_frontend_{state}_requests"
+            )
+            if frontend_calls:
+                metrics[f"dynamo_frontend_requests_{state}"] = sum(
+                    frontend_calls.values()
+                )
+            for frontend, calls in frontend_calls.items():
+                metrics[f"dynamo_frontend_{frontend}_requests_{state}"] = calls
         if generated_tokens is not None:
             metrics["generation_output_tokens"] = float(generated_tokens)
 
@@ -4864,7 +4884,8 @@ class SingleControllerActor:
             # serialized. The critic goes first because offloading the policy runs
             # finalize_async_save, which would block on the policy's own write if
             # that had already been staged.
-            await asyncio.to_thread(self._trainer.offload_to_cpu)
+            if not self._value_dedicated:
+                await asyncio.to_thread(self._trainer.offload_to_cpu)
             # The value model writes synchronously, so unlike the policy below it is
             # fully on disk when this returns and needs no finalize wait.
             await asyncio.to_thread(self._value.prepare_for_training)
@@ -4880,7 +4901,8 @@ class SingleControllerActor:
             await asyncio.to_thread(self._value.finish_training)
             # Also covers a warmup step, which never ran prepare_for_training in
             # the pump and would otherwise save from CPU-resident params.
-            await asyncio.to_thread(self._trainer.prepare_for_training)
+            if not self._value_dedicated:
+                await asyncio.to_thread(self._trainer.prepare_for_training)
 
         # Save policy model
         # With async_save this returns after D2H staging; disk writes finish
@@ -5006,6 +5028,9 @@ class SingleControllerActor:
         is bounded-failure-first rather than resume-and-forget.
         """
         budget_s = self._refit_await_budget_s()
+        if isinstance(self._weight_synchronizer, RemoteWeightSynchronizer):
+            await self._sync_weights_in_refit_actor(kv_scales, what, budget_s)
+            return
         if budget_s is None:
             await asyncio.to_thread(
                 self._weight_synchronizer.sync_weights, kv_scales=kv_scales
@@ -5039,6 +5064,30 @@ class SingleControllerActor:
                 "bound has passed, so a generation rank is most likely alive but not "
                 "answering -- a Ray actor call has no timeout of its own, so waiting here "
                 "is unbounded. Giving up so the fleet can be reconciled and retried."
+            ) from None
+
+    async def _sync_weights_in_refit_actor(
+        self,
+        kv_scales: Optional[dict[str, float]],
+        what: str,
+        budget_s: Optional[float],
+    ) -> None:
+        """``_sync_weights_within`` for a RefitActor: await its ObjectRef, no thread."""
+        synchronizer = cast(RemoteWeightSynchronizer, self._weight_synchronizer)
+        try:
+            refit_ref = await asyncio.to_thread(
+                synchronizer.submit_sync_weights, kv_scales
+            )
+            await asyncio.wait_for(asyncio.wrap_future(refit_ref.future()), budget_s)
+        except RayActorError as error:
+            await asyncio.to_thread(synchronizer.raise_if_actor_died, error)
+            raise
+        except asyncio.TimeoutError:
+            raise RefitAborted(
+                f"the {what} refit did not return from the RefitActor within "
+                f"{budget_s}s. Every worker-side bound has passed, so a generation rank "
+                "is most likely alive but not answering. Giving up so the fleet can be "
+                "reconciled and retried."
             ) from None
 
     async def _sync_weights(
@@ -5264,9 +5313,9 @@ class SingleControllerActor:
 
         Tensors never touch SC: workers fetch the sequence columns from
         DataPlane and commit the per-token prediction back under ``values``,
-        which the advantage stage then reads alongside the rewards. The model is
-        offloaded after the forward. Streaming may prepare it before the chunk's
-        rollout data is ready to overlap the residency switch with generation.
+        which the advantage stage then reads alongside the rewards. Shared
+        workers offload after the forward; dedicated workers keep it resident.
+        Streaming may prepare it before the chunk's rollout data is ready.
 
         Args:
             meta: Selected chunk's metadata.
@@ -5298,8 +5347,8 @@ class SingleControllerActor:
                     self._value.train_from_meta, full_meta, value_loss_fn
                 )
         else:
-            # Split prepares the API for per-chunk value streaming in a later PR;
-            # this controller still trains the critic after policy refit.
+            # Split exposes the per-chunk API, but this controller still collects
+            # all step chunks before training the critic.
             for _ in range(num_epochs):
                 await asyncio.to_thread(self._value.begin_train_step, value_loss_fn)
                 for meta in metas:
@@ -5349,7 +5398,7 @@ class SingleControllerActor:
             return meta, True
 
         # Split on prompt-group boundaries so the pool works a chunk in
-        # parallel. SHARD_INVARIANT_ESTIMATORS says which estimators allow it.
+        # parallel when the estimator does not require the global batch.
         stage_cfg = self._advantage_stage_config
         num_actors = len(self._advantage_actors)
         shards = (

@@ -41,10 +41,14 @@ async_rl:
     # warmup is not also a generation stall. null keeps the value above
     # throughout. Buffer capacity below must cover the wider of the two.
     warmup_lookahead_versions: null
+  # Run the weight synchronizer in its own CPU Ray actor instead of the controller's
+  # process. Requires non-colocated generation and an NCCL refit transport.
+  refit_actor:
+    enabled: false
   # Recompute generation KV caches after each weight update.
   recompute_kv_cache_after_weight_updates: true
   # Full-batch default. Reduce this to stream forwards, GAE, and policy backward;
-  # requires ppo_epochs=1. normalize_advantages=true then normalizes per chunk.
+  # requires ppo_epochs=1 and normalize_advantages=false.
   # Value training stays full batch.
   min_groups_for_streaming_train: ${ppo.num_prompts_per_step}
   # Max groups dispatched in one chunk; null leaves chunks unbounded, so a warm
@@ -58,13 +62,14 @@ async_rl:
   max_buffered_rollouts: 64
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
-  # Stream every consumed sample to train_data_step<N>.jsonl in the log dir (debug).
+  # Write every consumed sample to the log dir (debug); the format follows debug_writer.
   log_full_train_data: false
-  # Writer used by log_full_train_data. json writes JSONL files; set target to a
+  # Writer used by log_full_train_data. parquet writes Parquet chunks, json writes
+  # train_data_step<N>.jsonl files; set target to a
   # dotted import path of a DebugWriter defined outside this repo to store the dump
   # elsewhere (extra keys are passed to its constructor).
   debug_writer:
-    target: json
+    target: parquet
   # With policy.megatron_cfg.checkpoint.async_save: finalize async checkpoints at a
   # later step boundary so the disk write overlaps training. The overlap is shorter
   # here than for GRPO: the critic handoff blocks on the finalize once per chunk.

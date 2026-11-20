@@ -225,6 +225,34 @@ class TestValidateModelPaths:
         assert "model_" in pretrained_path
         assert pt_checkpoint_exists is False
 
+    def test_local_path_aliases_share_one_conversion(self, tmp_path):
+        """A symlink and its target key the same conversion cache directory.
+
+        MOPD names teachers that share one checkpoint through distinct links,
+        so keying by the path as written would convert it once per alias.
+        """
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        target = tmp_path / "sft_ckpt"
+        target.mkdir()
+        alias = tmp_path / "teachers" / "rlhf"
+        alias.parent.mkdir()
+        alias.symlink_to(target)
+
+        with patch(
+            "nemo_rl.models.megatron.setup.get_megatron_checkpoint_dir",
+            return_value=str(tmp_path / "checkpoints"),
+        ):
+            alias_name, alias_path, _ = validate_model_paths({"model_name": str(alias)})
+            _, target_path, _ = validate_model_paths({"model_name": str(target)})
+
+        # The configured name is untouched; only the cache key is resolved.
+        assert alias_name == str(alias)
+        assert alias_path == target_path
+        assert target_path == (
+            f"{tmp_path}/checkpoints/model_{str(target.resolve()).replace('/', '_')}"
+        )
+
     @pytest.mark.parametrize("complete", [True, False])
     def test_checkpoint_exists(self, tmp_path, complete):
         """Only a completed conversion counts; a bare iter_0000000/ (interrupted) must not."""
@@ -6019,6 +6047,7 @@ class TestPeftWarmStart:
             "megatron.bridge.training.checkpointing",
             reason="requires the mcore extra (Megatron-Bridge)",
         )
+        from megatron.bridge.training.config import OptimizerConfig
         from megatron.bridge.training.state import TrainState
 
         load_dir = "/donor/iter_0000005"
@@ -6042,7 +6071,7 @@ class TestPeftWarmStart:
                 fp16=False,
                 bf16=False,
             ),
-            optimizer=SimpleNamespace(use_distributed_optimizer=False),
+            optimizer=OptimizerConfig(use_distributed_optimizer=False),
             rng=SimpleNamespace(data_parallel_random_init=False),
             ddp=SimpleNamespace(
                 use_megatron_fsdp=False,
