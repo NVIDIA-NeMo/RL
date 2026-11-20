@@ -491,7 +491,7 @@ def test_training_reader_and_processor_preserve_materialized_rows(tmp_path, sele
     ],
 )
 def test_acceptance_guard_rejects_unsupported_runtime_combinations(
-    tmp_path, monkeypatch, overrides, error
+    tmp_path, monkeypatch, capsys, overrides, error
 ):
     from omegaconf import OmegaConf
 
@@ -516,6 +516,18 @@ def test_acceptance_guard_rejects_unsupported_runtime_combinations(
         ),
         config_path,
     )
-    guard.check_training_config(EXAMPLE / "mm_coding_mixed.yaml")
+    monkeypatch.setattr(guard, "check_runtime", lambda **kwargs: [])
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "check_mm_coding_runtime",
+            "--mode",
+            "mixed",
+            "--config",
+            str(EXAMPLE / "mm_coding_mixed.yaml"),
+        ],
+    )
+    guard.main()
+    assert json.loads(capsys.readouterr().out)["compatible"]
     with pytest.raises(ValueError, match=error):
         guard.check_training_config(config_path)

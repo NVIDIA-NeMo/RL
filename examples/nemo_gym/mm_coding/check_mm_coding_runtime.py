@@ -14,9 +14,11 @@
 """Check Gym API and component discovery before allocating MM-coding training GPUs."""
 
 import argparse
+import contextlib
 import importlib
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 REQUIRED_MODULES = (
@@ -103,7 +105,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     if args.config is not None:
-        check_training_config(args.config)
+        with contextlib.redirect_stdout(sys.stderr):
+            check_training_config(args.config)
     missing = check_runtime(mode=args.mode, harnesses=tuple(args.harnesses))
     print(
         json.dumps(
