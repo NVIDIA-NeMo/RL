@@ -22,7 +22,8 @@
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
-# Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
+# Optional etcd and nats-server binaries for Dynamo serving
+# (policy.generation.dynamo=true; ai-dynamo itself ships in the vLLM venvs):
 #   --build-arg BUILD_DYNAMO=1
 # Optional: drop the uv cache from the image (smaller, but no offline `uv run --extra`):
 #   --build-arg STRIP_UV_CACHE=1
@@ -126,6 +127,17 @@ apt install -y --only-upgrade gnupg
 # Upgrade rsync to address security vulnerabilities
 apt-get install -y --only-upgrade rsync
 
+# Upgrade openssl and libssl3t64 to address security vulnerabilities. --only-upgrade never
+# installs a package that is not already present, but a newer version can still declare new
+# dependencies, so simulate first and fail the build if apt would install or remove anything
+# other than these two packages.
+if apt-get install -s --only-upgrade --no-install-recommends openssl libssl3t64 \
+    | grep -E '^(Inst|Remv) ' | grep -vE '^Inst (openssl|libssl3t64) '; then
+    echo "[ERROR] upgrading openssl/libssl3t64 would change additional packages" >&2
+    exit 1
+fi
+apt-get install -y --only-upgrade --no-install-recommends openssl libssl3t64
+
 # Remove ffmpeg (from base image) to reduce attack surface
 apt-get remove -y --purge ffmpeg || true
 apt-get autoremove -y
@@ -168,7 +180,8 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 ENV UV_CACHE_DIR=/opt/nemo_rl_cache/uv
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
         | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && \
-    uv python install ${PYTHON_VERSION}
+    uv python install ${PYTHON_VERSION} && \
+    find /opt/uv/python -path "*/pip/_vendor/distlib/*.exe" -delete
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
 # Users are encouraged to enable if the wish.
@@ -242,7 +255,7 @@ ENV HYBRID_EP_MULTINODE=${HYBRID_EP_MULTINODE}
 ENV CUDA_HOME=/usr/local/cuda
 
 ## CUDA 13 moved standard library headers under include/cccl; expose that path so
-## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
+## builds that include <cuda/std/...> (e.g., deep_ep) can find them.
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 
 # Point TE at the pip-installed cuDNN instead of the system one.
@@ -264,13 +277,17 @@ ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/z3/lib:/opt/
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
-COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
+# transformers_compat.py comes along because __init__.py imports it, and setuptools imports the
+# package to resolve the dynamic version whenever `uv lock --check` below has to build root metadata.
+COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py nemo_rl/transformers_compat.py ./nemo_rl/
 # The single source of truth for which extras each Ray actor's venv needs. Run as a
 # script by the prefetch below; imported by nemo_rl.distributed.ray_actor_environment_registry
 # at runtime. Kept dependency-free so it can be copied in without the rest of the source.
 COPY --from=nemo-rl nemo_rl/distributed/actor_environments.py ./nemo_rl/distributed/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
+# Part of this recipe, not of the selected source: an older NRL_GIT_REF has no such script.
+COPY docker/prune_uv_cache.py /usr/local/bin/prune_uv_cache.py
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link \
     --exclude=TensorRT-LLM-workspace \
@@ -279,7 +296,8 @@ COPY --from=nemo-rl --link \
 
 RUN --mount=type=ssh \
     --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
-    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked \
+    --mount=type=bind,source=docker/install_mooncake.sh,target=/tmp/install_mooncake.sh <<"EOF" bash -exu
 # /root/.uv-cache-store is a BuildKit cache mount: durable across builds on
 # this id (seeded from the :uv-cache registry image on first-ever use), but
 # never part of this or any layer's diff by construction. uv's installs below
@@ -290,7 +308,7 @@ RUN --mount=type=ssh \
 # downloads persist for the next build. This is the first uv-writing RUN in
 # the stage, so it force-copies the whole store in and prunes on sync-back
 # (see docker/uv_cache_mount.sh). Every later RUN in this stage that also
-# invokes uv (TRT-LLM build, Dynamo install, worker-venv prefetch phase 2,
+# invokes uv (TRT-LLM build, worker-venv prefetch phase 2,
 # Gym prefetch) sources the same helper but only tops up what it adds,
 # instead of re-shipping the whole store again in its own layer.
 # Whether the materialized copy also ships in the final image (for the
@@ -301,6 +319,17 @@ uv_cache_restore force
 trap 'uv_cache_persist prune' EXIT
 
 uv venv --seed
+# Drop what the restored cache carried in that uv.lock no longer pins -- versions from
+# older locks, which neither the seed export's `uv cache prune --ci` (it keeps every
+# source-built version) nor the durable cache mount ever evict (see
+# docker/prune_uv_cache.py). It runs before any sync, so it only ever judges restored
+# content: build-isolation deps the syncs below resolve outside uv.lock (setuptools, a
+# build-time torch, ...) are kept. It runs in this RUN because deleting files in a later
+# layer only hides them, and the image would still ship every byte; and the
+# `uv_cache_persist prune` trap above mirrors the result back into the cache mount.
+du -sh "${UV_CACHE_DIR}"
+"${UV_PROJECT_ENVIRONMENT}/bin/python" /usr/local/bin/prune_uv_cache.py --lock uv.lock --cache-dir "${UV_CACHE_DIR}"
+du -sh "${UV_CACHE_DIR}"
 # The custom build scripts will alter the pyproject.toml and uv.lock
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     UV_LINK_MODE=hardlink bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL:-} ${BUILD_CUSTOM_VLLM_REF:-} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION:-}
@@ -321,7 +350,6 @@ apt-get update
 # DeepEP's multinode link needs the exact filename libnvidia-ml.so.1; the CUDA base
 # only ships stubs/libnvidia-ml.so. Purged again after the syncs below.
 apt-get install -y --no-install-recommends libnvidia-ml-dev
-uv cache clean deep-ep
 # Everything is hardlinked against the uv cache; this layer holds exactly one real copy of every wheel.
 UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
@@ -382,6 +410,15 @@ while IFS=$'\t' read -r venv_name stage extras; do
     UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --frozen $extras --no-install-project
 done < /opt/actor_venvs.tsv
 
+# Rebuild the Go library bundled in the mooncake-transfer-engine wheel (libetcd_wrapper.so)
+# with a patched Go toolchain and patched etcd/grpc/x-net/x-text; the upstream wheel ships
+# it built with versions that carry known CVEs. This must run HERE, in the layer that created
+# the venvs: the script overwrites each file in place, so the venvs that hardlink the uv cache
+# all share the patched inode, whereas patching in a later layer would make overlayfs copy
+# every path up separately. Venvs created later (release stage) hardlink/symlink the patched
+# file from the cache. See docker/install_mooncake.sh.
+bash /tmp/install_mooncake.sh "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" "${UV_CACHE_DIR}"
+
 apt-get purge -y libnvidia-ml-dev
 apt-get autoremove -y
 rm -rf /var/lib/apt/lists/*
@@ -392,6 +429,32 @@ rm -rf /var/lib/apt/lists/*
 find "${UV_CACHE_DIR}" -type d \
     \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
        -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
+
+# Remove setuptools < 80.10.2 from the uv cache. Megatron-Bridge's [build-system] requires
+# setuptools<80, and [tool.uv] override-dependencies does not apply to isolated build
+# environments, so its build caches setuptools 79.x. That release vendors wheel 0.45.1 and
+# jaraco.context 5.3.0 (flagged CVEs); 80.10.2+ vendors wheel 0.46.3 and jaraco.context 6.1.0.
+# No venv uses the old copy (every venv resolves setuptools from uv.lock), so it is only
+# cache residue. The wheels-v6 index entries are removed too so uv has no dangling pointer
+# and simply re-downloads if it ever needs that version.
+prune_stale_setuptools_cache() {
+    local cache="$1" min=80.10.2 path ver
+    for path in "${cache}"/archive-v0/*/setuptools-*.dist-info; do
+        [[ -d "${path}" ]] || continue
+        ver="${path##*/setuptools-}"; ver="${ver%.dist-info}"
+        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
+            rm -rf "${path%/*}"
+        fi
+    done
+    for path in "${cache}"/wheels-v6/pypi/setuptools/*-py3-none-any*; do
+        [[ -e "${path}" || -L "${path}" ]] || continue
+        ver="${path##*/}"; ver="${ver%%-py3-none-any*}"
+        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
+            rm -rf "${path}"
+        fi
+    done
+}
+prune_stale_setuptools_cache "${UV_CACHE_DIR}"
 
 # Hand the cache and the venvs built from it to the runtime UID in the layer that creates
 # them. The venvs are hardlinked against the cache, so each inode changes owner once and
@@ -611,6 +674,26 @@ find "${UV_CACHE_DIR}" -type d \
     \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
        -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
 
+# Same for stale setuptools (see the comment in the preceding dependency layer).
+prune_stale_setuptools_cache() {
+    local cache="$1" min=80.10.2 path ver
+    for path in "${cache}"/archive-v0/*/setuptools-*.dist-info; do
+        [[ -d "${path}" ]] || continue
+        ver="${path##*/setuptools-}"; ver="${ver%.dist-info}"
+        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
+            rm -rf "${path%/*}"
+        fi
+    done
+    for path in "${cache}"/wheels-v6/pypi/setuptools/*-py3-none-any*; do
+        [[ -e "${path}" || -L "${path}" ]] || continue
+        ver="${path##*/}"; ver="${ver%%-py3-none-any*}"
+        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
+            rm -rf "${path}"
+        fi
+    done
+}
+prune_stale_setuptools_cache "${UV_CACHE_DIR}"
+
 # Hand this layer's new cache and venv entries to the runtime UID. Entries from the
 # dependency layer already belong to it, so only files created here change owner and none
 # is copied up. Stays unconditional even when STRIP_UV_CACHE is set -- see the dependency
@@ -641,12 +724,14 @@ ARG BASE_IMAGE
 ARG UV_VERSION
 ARG HYBRID_EP_MULTINODE
 ARG BUILD_DYNAMO
-ARG DYNAMO_PYTHON_VERSION=3.12.11
 ARG ETCD_VERSION=v3.5.21
 ARG NATS_VERSION=v2.11.6
 # Space-separated config paths whose NeMo Gym venvs are prefetched into the image
 # (empty default = skip). Consumed by the gym prefetch RUN below.
 ARG NEMO_GYM_PREFETCH_CONFIGS=
+# Sandbox image for Gym's code_gen server, whose config rejects a null image. The prefetch
+# dry run below starts it, so builds whose prefetch configs include code_gen must pass one.
+ARG CODE_GEN_SANDBOX_IMAGE
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF
@@ -661,7 +746,7 @@ ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
-ENV NEMO_RL_DYNAMO_VENV_DIR=/opt/dynamo_venv
+ENV NEMO_RL_DYNAMO_BIN_DIR=/opt/dynamo/bin
 
 # AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
 # The host's aws-efa-installer places libnccl-net-ofi.so under
@@ -678,22 +763,14 @@ ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_P
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
 COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 
-# Keep Dynamo's Python 3.12 dependency graph isolated from NeMo-RL's normal
-# Ray/vLLM environments. Default image builds do not create this environment.
-RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
-    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu -o pipefail
+# The control-plane binaries Dynamo serving starts. Default image builds skip them.
+# Not a uv-writing RUN (install.sh only downloads etcd and nats-server), so it
+# needs no uv cache mount.
+RUN <<"EOF" bash -exu -o pipefail
 if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
-    echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo runtime"
+    echo "BUILD_DYNAMO is not 1; skipping the Dynamo service binaries"
     exit 0
 fi
-# Same materialize/sync-back/strip dance as the other uv-writing RUNs --
-# docker/dynamo/install.sh calls uv sync with no explicit UV_CACHE_DIR override, so
-# it uses the image-wide UV_CACHE_DIR (set in base), which must be a plain
-# same-filesystem directory for hardlink installs. Already exists from the
-# hermetic stage unless STRIP_UV_CACHE removed it there.
-source /tmp/uv-cache-helper/uv_cache_mount.sh
-uv_cache_restore
-trap 'uv_cache_persist' EXIT
 bash docker/dynamo/install.sh
 EOF
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
@@ -862,7 +939,7 @@ echo "Exporting uv cache for build ${UV_CACHE_EXPORT_NONCE:-local}"
 # RUN command, leaving this builder-local mount empty. Restore the seed only in
 # that case; unconditionally merging it would resurrect wheels uv evicted.
 if [[ -z "$(find /root/.uv-cache-store -mindepth 1 -print -quit)" ]]; then
-    rsync -a /tmp/uv-cache-seed/ /root/.uv-cache-store/
+    rsync -aH /tmp/uv-cache-seed/ /root/.uv-cache-store/
 fi
 mkdir -p /tmp/uv-cache-export
 cp -a /root/.uv-cache-store/. /tmp/uv-cache-export/

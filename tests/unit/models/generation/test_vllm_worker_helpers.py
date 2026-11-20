@@ -38,6 +38,10 @@ from nemo_rl.models.generation.vllm.worker_utils import (
             ["Gemma4ForConditionalGeneration"],
         ),
         (
+            ["Qwen2_5_VLForConditionalGeneration"],
+            ["Qwen2_5_VLForConditionalGeneration"],
+        ),
+        (
             [
                 "Gemma4ForCausalLM",
                 "Gemma4UnifiedForConditionalGeneration",

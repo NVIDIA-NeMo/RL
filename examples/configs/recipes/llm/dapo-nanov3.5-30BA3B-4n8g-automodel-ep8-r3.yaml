@@ -9,8 +9,8 @@ policy:
     enabled: true
   generation:
     vllm_cfg:
-      # R3 needs vLLM to return routes for every prompt token, not cached prefixes.
-      enable_prefix_caching: false
+      # vLLM returns routed experts through its prefix-cache blocks, so R3 needs this on.
+      enable_prefix_caching: true
 logger:
   wandb:
     name: dapo-nanov3.5-30BA3B-4n8g-automodel-ep8-r3

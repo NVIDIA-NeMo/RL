@@ -51,6 +51,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.rollout_checkpointing.inventory import (
     capture_reward_settings,
+    list_staging_keys,
     validate_replay_inventory,
     validate_rollout_recovery_inventory,
 )
@@ -69,7 +70,6 @@ from nemo_rl.experience.rollout_recovery import (
     SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS,
     ParsedRolloutRecoveryState,
     PromptGroupPhase,
-    RecoveryTargetLevel,
     parse_rollout_recovery_state,
 )
 from nemo_rl.utils.path_utils import (
@@ -336,7 +336,7 @@ class RolloutRestorer(_UsesRolloutParts):
             buffer_state, dp_client=self._dp_client, partition_id=self._partition_id
         )
 
-        if self._master_config.checkpointing.get("load_replay_buffer") is False:
+        if not self._master_config.checkpointing.load_replay_buffer:
             # Validate and load the native snapshot before discarding it. This keeps
             # replay-free resume fail-closed: a mismatched/corrupt checkpoint must
             # not silently turn into a different training stream.
@@ -400,30 +400,34 @@ class RolloutRestorer(_UsesRolloutParts):
         ) as cut:
             recovery_ledger.load_state_dict(cut, parsed_state.ledger_state)
             recovery_ledger.assert_checkpoint_safe()
-            turn_groups = [
+            environment_state_groups = [
                 group
                 for group in recovery_ledger.groups()
-                if group.restore_level is RecoveryTargetLevel.TURN
+                if group.restore_level.requires_environment_checkpoint
             ]
             restored = RestoredEnvironmentRollouts()
             # The environment stays restored until the rest of this restore
             # succeeds; on any failure it drops what it restored before it reopens.
             async with contextlib.AsyncExitStack() as environment_restore:
-                if turn_groups and not self._resume.from_rollout_snapshot:
+                if environment_state_groups and not self._resume.from_rollout_snapshot:
                     # A trainer checkpoint never holds environment state; with no
                     # later rollout snapshot, its unfinished turns start over below.
                     print(
                         "📦 Restoring a trainer checkpoint without environment "
-                        f"state: {len(turn_groups)} unfinished turn-level group(s) "
+                        f"state: {len(environment_state_groups)} unfinished turn/prefix "
+                        "group(s) "
                         "restart from their tasks",
                         flush=True,
                     )
-                elif turn_groups:
+                elif environment_state_groups:
                     restored = await environment_restore.enter_async_context(
                         self._environment_checkpoint.restored(Path(self._resume.path))
                     )
 
                 self._rollout_runtime.batch_shortfall = parsed_state.batch_shortfall
+                self._rollout_runtime.steps_allowed_short = (
+                    parsed_state.steps_allowed_short
+                )
                 canonical_state = self._buffer.metadata_state_dict(
                     saved_capacity=self._async_cfg.max_buffered_rollouts
                 )
@@ -441,15 +445,22 @@ class RolloutRestorer(_UsesRolloutParts):
                     for group_id, rows in parsed_state.finalizer_rewards_by_group.items()
                     if group_id in canonical_group_ids
                 }
+                staging_keys: frozenset[str] = frozenset()
                 if self._master_config.token_capture.enabled:
+                    staging_partition = (
+                        self._master_config.token_capture.staging_partition
+                    )
+                    # Both checks run under this cut, so TQ cannot change between them.
+                    staging_keys = await list_staging_keys(
+                        self._dp_client, staging_partition
+                    )
                     # Validate saved custody before restart normalization can discard it.
                     await validate_rollout_recovery_inventory(
                         cut,
                         dp_client=self._dp_client,
                         recovery_ledger=self._rollout_recovery_ledger,
-                        staging_partition=(
-                            self._master_config.token_capture.staging_partition
-                        ),
+                        staging_partition=staging_partition,
+                        actual_staging_keys=staging_keys,
                         replay_metadata=canonical_state,
                         clear_unreferenced=False,
                         additional_expected_staging_keys=set(restored.staging_keys),
@@ -463,9 +474,8 @@ class RolloutRestorer(_UsesRolloutParts):
                         cut,
                         dp_client=self._dp_client,
                         recovery_ledger=self._rollout_recovery_ledger,
-                        staging_partition=(
-                            self._master_config.token_capture.staging_partition
-                        ),
+                        staging_partition=staging_partition,
+                        actual_staging_keys=staging_keys,
                         replay_metadata=canonical_state,
                         clear_unreferenced=True,
                         additional_expected_staging_keys=set(restored.staging_keys),
@@ -475,13 +485,7 @@ class RolloutRestorer(_UsesRolloutParts):
         self._rollout_runtime.sampler_stamps_target_steps = (
             parsed_state.sampler_stamps_target_steps
             if parsed_state.sampler_stamps_target_steps is not None
-            else any(
-                group.target_step is not None for group in recovery_ledger.groups()
-            )
-            or any(
-                group.get("target_step") is not None
-                for group in canonical_state["groups"]
-            )
+            else bool(recovery_ledger.groups()) or bool(canonical_state["groups"])
         )
 
         groups_to_recover = recovery_ledger.groups()
@@ -792,7 +796,18 @@ class RolloutRestorer(_UsesRolloutParts):
         reserve_state = await asyncio.to_thread(
             load_checkpoint_object, reserve_path, weights_only=False
         )
-        self._rollout_runtime.replacement_reserve.extend(reserve_state)
+        if isinstance(reserve_state, dict):
+            self._rollout_runtime.replacement_reserve.extend(
+                reserve_state.get("replacement", [])
+            )
+            self._rollout_runtime.filtered_reserve.extend(
+                reserve_state.get("filtered", [])
+            )
+            reserve_state = list(self._rollout_runtime.replacement_reserve) + list(
+                self._rollout_runtime.filtered_reserve
+            )
+        else:
+            self._rollout_runtime.replacement_reserve.extend(reserve_state)
         print(
             f"📦 Restored {len(reserve_state)} pooled spare prompt(s) from checkpoint: "
             f"{reserve_path}",
