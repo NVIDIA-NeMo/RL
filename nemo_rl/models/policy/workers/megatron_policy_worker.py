@@ -105,6 +105,7 @@ from nemo_rl.models.megatron.draft.step_state import (
 )
 from nemo_rl.models.megatron.hybridep import uses_hybridep_flex_dispatcher
 from nemo_rl.models.megatron.manual_gc import ManualGCMixin
+from nemo_rl.models.megatron.optimizer_offload import OptimizerStateOffloader
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -1018,6 +1019,11 @@ class MegatronPolicyWorkerImpl(
             runtime_config.offload_optimizer_for_logprob
         )
         self.offload_optimizer_for_refit = runtime_config.offload_optimizer_for_refit
+        self._optimizer_offloader = OptimizerStateOffloader(
+            pinned_buffer_gb=self.cfg["megatron_cfg"].get(
+                "optimizer_offload_pinned_buffer_gb"
+            )
+        )
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
         self.sampling_params = runtime_config.sampling_params
@@ -5101,27 +5107,14 @@ class MegatronPolicyWorkerImpl(
         return model
 
     def move_optimizer(self, device: str):
-        # Iterate through the state dictionaries for each parameter group
-        if isinstance(self.optimizer, ChainedOptimizer):
-            optimizer_state = self.optimizer.state
+        if device == "cpu":
+            self._optimizer_offloader.offload(self.optimizer)
+        elif device == "cuda":
+            self._optimizer_offloader.reload(self.optimizer)
         else:
-            optimizer_state = self.optimizer._get_state()
-        for _, state in optimizer_state.items():
-            # Iterate through the state items (e.g., momentum, variance) for a parameter
-            for k, v in state.items():
-                # Check if the item is a tensor
-                if torch.is_tensor(v):
-                    # Move the tensor to device and update the state dictionary
-                    if device == "cpu":
-                        if v.is_cuda:
-                            state[k] = v.to("cpu")
-                    elif device == "cuda":
-                        if not v.is_cuda:
-                            state[k] = v.to("cuda")
-                    else:
-                        raise ValueError(
-                            f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
-                        )
+            raise ValueError(
+                f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
+            )
 
     def save_checkpoint(
         self,

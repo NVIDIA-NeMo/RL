@@ -411,6 +411,13 @@ class MegatronConfig(TypedDict):
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
+    # Cap, in GiB per rank, on the page-locked host buffers that stage optimizer
+    # state offloads (offload_optimizer_for_refit/_for_logprob, PPO streaming
+    # offload). Buffers within the cap are allocated and pinned once and reused
+    # every step; state beyond it goes through pageable buffers allocated per
+    # offload and freed on reload. null (the default) pins all of it; 0 keeps no
+    # host memory between steps.
+    optimizer_offload_pinned_buffer_gb: NotRequired[float | None]
     # Megatron-style manual garbage collection. An automatic full Python GC lands on
     # whichever rank crosses its threshold, and every other rank then waits for it
     # in the next collective. When True, the Megatron policy workers (and, under
