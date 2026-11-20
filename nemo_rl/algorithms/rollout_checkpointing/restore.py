@@ -445,9 +445,11 @@ class RolloutRestorer(_UsesRolloutParts):
                     for group_id, rows in parsed_state.finalizer_rewards_by_group.items()
                     if group_id in canonical_group_ids
                 }
-                staging_partition = self._master_config.token_capture.staging_partition
                 staging_keys: frozenset[str] = frozenset()
                 if self._master_config.token_capture.enabled:
+                    staging_partition = (
+                        self._master_config.token_capture.staging_partition
+                    )
                     # Both checks run under this cut, so TQ cannot change between them.
                     staging_keys = await list_staging_keys(
                         self._dp_client, staging_partition
