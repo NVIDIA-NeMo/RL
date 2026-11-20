@@ -102,6 +102,7 @@ class FusedLogprobLMHead:
         self._fp8_enabled = _validate_lm_head(lm_head)
 
         self._lm_head = lm_head
+        self._model_name = type(model).__name__
         self._chunk_size = chunk_size
         self._original_forward: Callable[..., torch.Tensor] = lm_head.forward
         self._active: Optional[SelectedLogprobsCapture] = None
@@ -131,6 +132,40 @@ class FusedLogprobLMHead:
             yield capture
         finally:
             self._active = None
+
+    def verify_model_logits(
+        self, capture: SelectedLogprobsCapture, model_logits: torch.Tensor
+    ) -> None:
+        """Raise unless the model returned the LM head's output unchanged as its logits.
+
+        A model that rescales or caps its logits after the LM head returns a
+        different tensor, and the captured log-probabilities would not match
+        its distribution.
+
+        Args:
+            capture: The capture the model's forward ran in.
+            model_logits: The logits the model's forward returned.
+
+        Raises:
+            ValueError: If ``model_logits`` differs from the LM head's output.
+        """
+        head_output = capture.logprobs
+        if model_logits is head_output:
+            return
+        # A cast of the head output, such as AutoModel's fp32_lm_head casting
+        # back to the hidden-state dtype, keeps the values.
+        if (
+            head_output is not None
+            and model_logits.shape == head_output.shape
+            and torch.equal(model_logits, head_output.to(model_logits.dtype))
+        ):
+            return
+        raise ValueError(
+            "Fused linear logprobs need the model to return the LM head's output "
+            f"as its logits, but {self._model_name} changed it after the "
+            "LM head (for example a logit scale or softcap). Set "
+            "policy.automodel_cfg.use_fused_linear_logprobs=false for this model."
+        )
 
     def _forward(
         self, hidden_states: torch.Tensor, *args: Any, **kwargs: Any
@@ -239,19 +274,40 @@ def _validate_lm_head(lm_head: nn.Module) -> Optional[Callable[[], bool]]:
     return FP8GlobalStateManager.is_fp8_enabled
 
 
+# Config attributes of Transformers models that scale their logits after the LM
+# head: Cohere (logit_scale), Granite and HyperCLOVAX (logits_scaling),
+# Falcon-H1 (lm_head_multiplier).
+_LOGIT_MULTIPLIER_ATTRIBUTES = (
+    "output_multiplier",
+    "logit_scale",
+    "logits_scaling",
+    "lm_head_multiplier",
+)
+
+
 def _reject_logit_post_processing(model: nn.Module) -> None:
-    """Raise if the model transforms its logits after the LM head."""
+    """Raise if the model's config says it transforms its logits after the LM head.
+
+    This catches the known cases at setup; :meth:`FusedLogprobLMHead.verify_model_logits`
+    catches any other model at every forward.
+    """
     config = getattr(model, "config", None)
     for cfg in (config, getattr(config, "text_config", None)):
         if cfg is None:
             continue
-        if (
-            getattr(cfg, "final_logit_softcapping", None)
-            or getattr(cfg, "output_multiplier", 1.0) != 1.0
-            or getattr(cfg, "use_mup", False)
-        ):
+        post_processing = [
+            name
+            for name in _LOGIT_MULTIPLIER_ATTRIBUTES
+            if getattr(cfg, name, None) not in (None, 1.0)
+        ]
+        if getattr(cfg, "final_logit_softcapping", None):
+            post_processing.append("final_logit_softcapping")
+        if getattr(cfg, "use_mup", False):
+            post_processing.append("use_mup")
+        if post_processing:
             raise ValueError(
                 "Fused linear logprobs compute log_softmax(lm_head(h)), but this "
-                "model post-processes its logits after the LM head "
-                "(final_logit_softcapping / output_multiplier / MuP)."
+                "model post-processes its logits after the LM head ("
+                + ", ".join(f"{type(cfg).__name__}.{name}" for name in post_processing)
+                + ")."
             )

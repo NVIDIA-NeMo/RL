@@ -74,7 +74,10 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.models.policy.utils import configure_lora_refit
+from nemo_rl.models.policy.utils import (
+    configure_lora_refit,
+    reject_automodel_fused_linear_logprobs,
+)
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     RL_ITERATION_ATTR,
@@ -247,6 +250,12 @@ def setup(
             "NeMo Gym + vLLM; distillation does not capture sampler tensors."
         )
     teacher_config = master_config.teacher
+    reject_automodel_fused_linear_logprobs(
+        policy_config, config_name="policy", algorithm="distillation"
+    )
+    reject_automodel_fused_linear_logprobs(
+        teacher_config, config_name="teacher", algorithm="distillation"
+    )
     loss_config = master_config.loss_fn
     data_config = master_config.data
     env_configs = getattr(master_config, "env", {}) or {}

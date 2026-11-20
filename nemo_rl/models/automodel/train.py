@@ -364,8 +364,9 @@ def forward_with_post_processing_fn(
             f"{type(post_processing_fn).__name__} has fused_linear_logprobs="
             f"{post_processing_fn.fused_linear_logprobs}, but the model "
             f"{'has' if fused_logprob_head is not None else 'has no'} fused "
-            "LM head (policy.automodel_cfg.use_fused_linear_logprobs). Only GRPO "
-            "supports fused linear logprobs on the AutoModel backend."
+            "LM head (policy.automodel_cfg.use_fused_linear_logprobs). The loss "
+            "function's use_fused_linear_logprobs must match that setting; only "
+            "the GRPO setup in nemo_rl/algorithms/grpo.py sets it."
         )
 
     if fused_logprob_head is not None and isinstance(
@@ -377,8 +378,10 @@ def forward_with_post_processing_fn(
         with fused_logprob_head.capture(
             prepared.model_batch["input_ids"], temperature=temperature
         ) as capture:
-            model_forward(model, prepared.model_batch)
+            outputs = model_forward(model, prepared.model_batch)
         logits = capture.next_token_logprobs
+        fused_logprob_head.verify_model_logits(capture, extract_logits(model, outputs))
+        del outputs
     else:
         # Model forward pass
         outputs = model_forward(model, prepared.model_batch)

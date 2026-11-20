@@ -65,6 +65,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.utils import reject_automodel_fused_linear_logprobs
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -252,6 +253,15 @@ def setup(
     policy_config = master_config.policy
     teachers = master_config.teachers
     teacher_configs = [t.policy_config() for t in teachers]
+    reject_automodel_fused_linear_logprobs(
+        policy_config, config_name="policy", algorithm="cross-tokenizer distillation"
+    )
+    for i, teacher_config in enumerate(teacher_configs):
+        reject_automodel_fused_linear_logprobs(
+            teacher_config,
+            config_name=f"teachers[{i}]",
+            algorithm="cross-tokenizer distillation",
+        )
     loss_config = master_config.loss_fn
     distillation_config = master_config.distillation
     data_config = master_config.data

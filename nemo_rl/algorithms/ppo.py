@@ -104,7 +104,10 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.models.policy.utils import configure_lora_refit
+from nemo_rl.models.policy.utils import (
+    configure_lora_refit,
+    reject_automodel_fused_linear_logprobs,
+)
 from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
 from nemo_rl.telemetry.config import TelemetryConfig
@@ -412,6 +415,10 @@ def setup(
                 "default collective path. Set policy.generation.refit_transport=null. "
                 "Tracked in https://github.com/NVIDIA-NeMo/RL/issues/3275."
             )
+
+    reject_automodel_fused_linear_logprobs(
+        policy_config, config_name="policy", algorithm="PPO"
+    )
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
         policy_megatron_config = cast(MegatronConfig, policy_config["megatron_cfg"])

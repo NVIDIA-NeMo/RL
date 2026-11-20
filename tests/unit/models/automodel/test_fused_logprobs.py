@@ -212,6 +212,16 @@ class _AdapterLinear(nn.Linear):
             lambda m: setattr(m.config, "final_logit_softcapping", 30.0),
             id="softcapping",
         ),
+        pytest.param(
+            lambda m: setattr(m.config, "logits_scaling", 8.0), id="granite_scaling"
+        ),
+        pytest.param(
+            lambda m: setattr(m.config, "logit_scale", 0.0625), id="cohere_scale"
+        ),
+        pytest.param(
+            lambda m: setattr(m.config, "lm_head_multiplier", 2.0),
+            id="falcon_h1_multiplier",
+        ),
     ],
 )
 def test_rejects_heads_it_would_compute_wrongly(break_model) -> None:
@@ -219,6 +229,21 @@ def test_rejects_heads_it_would_compute_wrongly(break_model) -> None:
     break_model(model)
     with pytest.raises(ValueError):
         FusedLogprobLMHead(model, chunk_size=5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_verify_model_logits_rejects_post_processed_logits() -> None:
+    """Only the head's output itself, or a cast of it, passes as the model's logits."""
+    model = _tiny_llama(tie_word_embeddings=False)
+    head = FusedLogprobLMHead(model, chunk_size=5)
+    input_ids, _ = _batch(seed=1)
+    with torch.no_grad(), head.capture(input_ids, temperature=1.0) as capture:
+        model_logits = model(input_ids=input_ids, use_cache=False).logits
+
+    head.verify_model_logits(capture, model_logits)
+    head.verify_model_logits(capture, model_logits.to(torch.bfloat16))
+    with pytest.raises(ValueError, match="changed it after the LM head"):
+        head.verify_model_logits(capture, model_logits / 8.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

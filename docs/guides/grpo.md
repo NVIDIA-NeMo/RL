@@ -429,9 +429,9 @@ The AutoModel path replaces the forward of the model's LM head (`get_output_embe
 
 **Notes:**
 
-- Supported on the Megatron backend (`policy.megatron_cfg.enabled: true`) and, for GRPO, on the AutoModel backend (`policy.automodel_cfg.enabled: true`).
+- Supported on the Megatron backend (`policy.megatron_cfg.enabled: true`) and, for GRPO, on the AutoModel backend (`policy.automodel_cfg.enabled: true`). The other algorithms and SingleController reject `policy.automodel_cfg.use_fused_linear_logprobs: true` at setup.
 - Context parallelism is not supported when fused linear logprobs are enabled. The AutoModel path also requires `tensor_parallel_size: 1`.
-- The AutoModel path rejects an LM head with a bias or a custom forward (for example a LoRA adapter on the LM head), Transformer Engine FP8 autocast, and models that post-process their logits after the LM head (`final_logit_softcapping`, `output_multiplier`, MuP).
+- The AutoModel path rejects an LM head with a bias or a custom forward (for example a LoRA adapter on the LM head), Transformer Engine FP8 autocast, and models that post-process their logits after the LM head. Setup rejects the known config keys (`final_logit_softcapping`, `output_multiplier`, `logit_scale`, `logits_scaling`, `lm_head_multiplier`, MuP), and every forward checks that the model returns the LM head's output unchanged.
 - Sequence packing is not supported with fused linear logprobs; set `policy.sequence_packing.enabled: false`. The fused forward rolls labels over the whole packed sequence and would mix tokens across packed-sequence boundaries.
 - Online EAGLE-3 draft training (`policy.draft.enabled: true`) is not supported with fused linear logprobs: draft distillation needs the full next-token logits for the teacher distribution, which the fused path never materializes.
 - Top-k/top-p training-time filtering is not supported with fused linear logprobs (set `policy.generation.top_k: null` and `policy.generation.top_p: 1.0`), because the fused path gathers logprobs from the unfiltered logits.

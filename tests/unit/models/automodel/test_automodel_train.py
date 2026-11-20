@@ -2659,7 +2659,7 @@ class TestFusedLinearLogprobs:
             cp_size=1,
             dp_size=1,
         )
-        with pytest.raises(RuntimeError, match="Only GRPO"):
+        with pytest.raises(RuntimeError, match="must match that setting"):
             forward_with_post_processing_fn(
                 model=model,
                 prepared=prepared,
@@ -2667,6 +2667,36 @@ class TestFusedLinearLogprobs:
                 processed_mb=processed_mb,
                 global_valid_seqs=torch.tensor(FUSED_BATCH),
                 global_valid_toks=torch.tensor(FUSED_BATCH * (FUSED_SEQ - 1)),
+                fused_logprob_head=FusedLogprobLMHead(model, chunk_size=4),
+            )
+
+    def test_rejects_model_that_changes_logits_after_head(self) -> None:
+        """A logit scale applied after the LM head (as Granite does) fails instead of being dropped."""
+        from nemo_rl.models.automodel.fused_logprobs import FusedLogprobLMHead
+
+        model = _fused_test_model()
+        original_forward = model.forward
+
+        def scaled_forward(*args, **kwargs):
+            outputs = original_forward(*args, **kwargs)
+            outputs.logits = outputs.logits / 8.0
+            return outputs
+
+        model.forward = scaled_forward
+        processed_mb = _fused_test_microbatch()
+        with (
+            torch.no_grad(),
+            pytest.raises(ValueError, match="changed it after the LM head"),
+        ):
+            forward_with_post_processing_fn(
+                model=model,
+                prepared=_prepare_cp1(
+                    model, processed_mb.processed_inputs, allow_flash_attn_args=False
+                ),
+                post_processing_fn=LogprobsPostProcessor(
+                    cfg={"logprob_chunk_size": None}, fused_linear_logprobs=True
+                ),
+                processed_mb=processed_mb,
                 fused_logprob_head=FusedLogprobLMHead(model, chunk_size=4),
             )
 

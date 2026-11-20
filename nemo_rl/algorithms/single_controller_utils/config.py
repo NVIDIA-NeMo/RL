@@ -84,6 +84,7 @@ from nemo_rl.models.generation.vllm.config import (
     resolve_vllm_logprobs_mode,
 )
 from nemo_rl.models.policy import AutomodelConfig, MegatronConfig, PolicyConfig
+from nemo_rl.models.policy.utils import reject_automodel_fused_linear_logprobs
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -1931,6 +1932,9 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     if master_config.loss_fn.seq_logprob_error_in_loss:
         _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)
+    reject_automodel_fused_linear_logprobs(
+        master_config.policy, config_name="policy", algorithm="SingleController"
+    )
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
