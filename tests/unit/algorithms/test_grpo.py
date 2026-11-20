@@ -79,7 +79,11 @@ from nemo_rl.algorithms.grpo import (
     validate,
 )
 from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
-from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss import (
+    ClippedPGLossConfig,
+    ClippedPGLossFn,
+    build_policy_gradient_loss,
+)
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -4442,12 +4446,12 @@ def test_setup_restores_adaptive_ppo_clip_state_from_checkpoint(
     monkeypatch.setattr(grpo_mod, "load_dataloader_state", MagicMock())
     built_losses = []
 
-    class RecordingLossFn(ClippedPGLossFn):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            built_losses.append(self)
+    def recording_build(*args, **kwargs):
+        loss_fn = build_policy_gradient_loss(*args, **kwargs)
+        built_losses.append(loss_fn)
+        return loss_fn
 
-    monkeypatch.setattr(grpo_mod, "ClippedPGLossFn", RecordingLossFn)
+    monkeypatch.setattr(grpo_mod, "build_policy_gradient_loss", recording_build)
 
     class ClusterReached(Exception):
         pass
@@ -4611,7 +4615,7 @@ def test_setup_hands_the_vllm_http_server_api_key_to_nemo_gym(monkeypatch) -> No
         grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
     )
     monkeypatch.setattr(
-        grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
+        grpo_mod, "build_policy_gradient_loss", lambda *_args, **_kwargs: MagicMock()
     )
     monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
     monkeypatch.setattr(
@@ -4848,7 +4852,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
         grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
     )
     monkeypatch.setattr(
-        grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
+        grpo_mod, "build_policy_gradient_loss", lambda *_args, **_kwargs: MagicMock()
     )
     monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
     monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
@@ -4966,7 +4970,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
     )
     monkeypatch.setattr(
-        grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
+        grpo_mod, "build_policy_gradient_loss", lambda *_args, **_kwargs: MagicMock()
     )
     monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
     monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
@@ -5106,7 +5110,7 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
         grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: checkpointer
     )
     monkeypatch.setattr(
-        grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
+        grpo_mod, "build_policy_gradient_loss", lambda *_args, **_kwargs: MagicMock()
     )
     monkeypatch.setattr(
         grpo_mod, "StatefulDataLoader", lambda *_args, **_kwargs: [None]

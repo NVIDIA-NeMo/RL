@@ -40,9 +40,10 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import (
-    ClippedPGLossConfig,
     ClippedPGLossDataDict,
     ClippedPGLossFn,
+    PolicyGradientLossConfig,
+    build_policy_gradient_loss,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import (
@@ -565,7 +566,7 @@ def _save_adaptive_loss_state(
 
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
-    loss_fn: ClippedPGLossConfig
+    loss_fn: PolicyGradientLossConfig
     env: dict[str, Any]
     data: DataConfig
     grpo: GRPOConfig
@@ -775,7 +776,7 @@ def setup(
     # Extract individual configs for easier access
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
-    loss_config: ClippedPGLossConfig = master_config.loss_fn
+    loss_config: PolicyGradientLossConfig = master_config.loss_fn
     if loss_config.score_centering or sampler_replay_enabled(generation_config):
         raise ValueError(
             "Score centering and policy.generation.sampler_replay.enabled require SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
@@ -1022,7 +1023,7 @@ def setup(
             "policy.generation.top_p=1.0)."
         )
 
-    loss_fn = ClippedPGLossFn(
+    loss_fn = build_policy_gradient_loss(
         loss_config,
         use_fused_linear_logprobs=use_fused_linear_logprobs,
         seq_logprob_error_threshold=grpo_config.seq_logprob_error_threshold,

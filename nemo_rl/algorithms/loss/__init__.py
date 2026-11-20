@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_rl.algorithms.loss.loss_functions import (
+from nemo_rl.algorithms.loss.config import (
     ClippedPGLossConfig,
+    PolicyGradientLossConfig,
+)
+from nemo_rl.algorithms.loss.loss_functions import (
     ClippedPGLossDataDict,
     ClippedPGLossFn,
     DistillationLossConfig,
@@ -30,6 +33,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     NLLLossFn,
     PreferenceLossDataDict,
     PreferenceLossFn,
+    build_policy_gradient_loss,
 )
 from nemo_rl.algorithms.loss.loss_input import (
     prepare_loss_input,
@@ -58,8 +62,10 @@ __all__ = [
     "MseValueLossConfig",
     "MseValueLossFn",
     "NLLLossFn",
+    "PolicyGradientLossConfig",
     "PreferenceLossDataDict",
     "PreferenceLossFn",
+    "build_policy_gradient_loss",
     "prepare_loss_input",
     "prepare_packed_loss_input",
     "SequencePackingFusionLossWrapper",

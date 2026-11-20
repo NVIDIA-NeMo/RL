@@ -43,9 +43,10 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import (
-    ClippedPGLossConfig,
     ClippedPGLossDataDict,
     ClippedPGLossFn,
+    PolicyGradientLossConfig,
+    build_policy_gradient_loss,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
@@ -319,7 +320,7 @@ def _apply_ppo_seq_logprob_error_masking(
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     value: ValueConfig
-    loss_fn: ClippedPGLossConfig
+    loss_fn: PolicyGradientLossConfig
     value_loss_fn: MseValueLossConfig
     env: dict[str, Any]
     data: DataConfig
@@ -374,7 +375,7 @@ def setup(
         )
     generation_config = master_config.policy["generation"]
     env_configs = master_config.env
-    loss_config: ClippedPGLossConfig = master_config.loss_fn
+    loss_config: PolicyGradientLossConfig = master_config.loss_fn
     if loss_config.score_centering or sampler_replay_enabled(generation_config):
         raise ValueError(
             "Score centering and policy.generation.sampler_replay.enabled require SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy PPO trainer does not capture sampler tensors."
@@ -521,7 +522,7 @@ def setup(
     # ==========================
     #        Loss Function
     # ==========================
-    loss_fn = ClippedPGLossFn(loss_config)
+    loss_fn = build_policy_gradient_loss(loss_config)
     if loss_fn.has_adaptive_loss_state():
         raise ValueError(
             "loss_fn.truncated_importance_sampling_type='adaptive-ppo-clip' needs "

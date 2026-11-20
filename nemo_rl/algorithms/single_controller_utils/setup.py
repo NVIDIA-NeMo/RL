@@ -61,7 +61,7 @@ from nemo_rl.algorithms.grpo import (
     _restore_adaptive_loss_state,
 )
 from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
-from nemo_rl.algorithms.loss import ClippedPGLossFn
+from nemo_rl.algorithms.loss import build_policy_gradient_loss
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossFn
 from nemo_rl.algorithms.metric_utils import (
@@ -2423,7 +2423,7 @@ def setup_single_controller(
     # Setup Algorithm + Rollout Wiring
     # ==========================
     advantage_estimator = _build_advantage_estimator(master_config)
-    loss_fn = ClippedPGLossFn(
+    loss_fn = build_policy_gradient_loss(
         master_config.loss_fn,
         opd_full=opd_module.get_opd_full_config(master_config),
         seq_logprob_error_threshold=algo_cfg.seq_logprob_error_threshold,

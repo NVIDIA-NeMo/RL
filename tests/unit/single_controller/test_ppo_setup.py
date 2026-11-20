@@ -1179,7 +1179,9 @@ def patched_ppo_factories():
         patch.object(
             sc_setup_mod, "create_weight_synchronizer", return_value=MagicMock()
         ),
-        patch.object(sc_setup_mod, "ClippedPGLossFn", return_value=MagicMock()),
+        patch.object(
+            sc_setup_mod, "build_policy_gradient_loss", return_value=MagicMock()
+        ),
         patch(
             "nemo_rl.algorithms.grpo._create_advantage_estimator",
             return_value=MagicMock(),
