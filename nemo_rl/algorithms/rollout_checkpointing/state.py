@@ -101,7 +101,7 @@ CheckpointKind = Literal["trainer_checkpoint", "rollout_snapshot"]
 class CapturedRolloutState:
     """Controller state captured under one exclusive cut, with its TQ save."""
 
-    dataloader_state: dict[str, Any]
+    dataloader_states_by_suffix: dict[str, dict[str, Any]]
     sampler_dispatch_index: int
     next_nemo_gym_task_index: int
     replacement_reserve: dict[str, list[DatumSpec]]
