@@ -1502,28 +1502,6 @@ def test_checkpointing_leaves_the_callers_policy_model_untouched(detected_uv_dir
     assert env_configs == env_configs_before
 
 
-@pytest.mark.parametrize("as_omegaconf", [False, True])
-def test_turn_recovery_rejects_typed_environment_servers(as_omegaconf):
-    """A typed environment server rejects the attempt-qualified ``<id>-a<N>``."""
-    from omegaconf import OmegaConf
-
-    relay = {
-        "policy_model": {"responses_api_models": {"vllm_model": {}}},
-        "env": {"environment_servers": {"legacy_agent": {"entrypoint": "app.py"}}},
-    }
-    typed = {
-        **relay,
-        "tool_env": {"environment_servers": {"single_agent_turn_legacy": {}}},
-    }
-
-    def as_config(config):
-        return OmegaConf.create(config) if as_omegaconf else config
-
-    nemo_gym_mod._reject_typed_environment_servers(as_config(relay))
-    with pytest.raises(ValueError, match="tool_env=single_agent_turn_legacy"):
-        nemo_gym_mod._reject_typed_environment_servers(as_config(typed))
-
-
 def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
     detected_uv_dirs,
 ):

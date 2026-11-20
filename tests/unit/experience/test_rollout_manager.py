@@ -69,11 +69,15 @@ from nemo_rl.experience.rollout_manager import (
     RolloutRetryPolicy,
     RolloutStats,
     _nemo_gym_metric_namespace,
+    _nemo_gym_task_indices,
 )
 from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
     RecoveryTargetLevel,
+    RolloutAttemptRecord,
+    RolloutAttemptStatus,
     RolloutRecoveryLedger,
+    RolloutSiblingRecord,
 )
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
@@ -1530,6 +1534,69 @@ def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
     ]
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [2, 2]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1]
+
+
+def test_nemo_gym_build_inputs_stamps_each_rows_own_task_index():
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 3
+    input_sample = {"extra_env_info": {"responses_create_params": {}}}
+
+    rows = impl._build_inputs(
+        input_sample, task_indices={0: 4, 2: 9}, generation_indices=[0, 2]
+    )
+
+    assert [row[NEMO_GYM_TASK_INDEX_KEY] for row in rows] == [4, 9]
+    with pytest.raises(ValueError, match="cover every generation index"):
+        impl._build_inputs(input_sample, task_indices={0: 4}, generation_indices=[0, 2])
+    with pytest.raises(ValueError, match="exactly one of task_index"):
+        impl._build_inputs(input_sample, task_index=4, task_indices={0: 4})
+
+
+def _sibling(generation_index: int, *, environment_attempt: int, task_index):
+    return RolloutSiblingRecord(
+        generation_index=generation_index,
+        attempts=[
+            RolloutAttemptRecord(
+                attempt_uuid=uuid.uuid4(),
+                status=RolloutAttemptStatus.RESERVED,
+                environment_instance_id="tools/replica-0",
+                environment_attempt=environment_attempt,
+                environment_task_index=task_index,
+            )
+        ],
+    )
+
+
+def test_continued_rows_keep_their_task_index_and_the_rest_share_a_fresh_one():
+    """Gym resumes a restored episode only for the task it recorded."""
+    impl = _nemo_gym_impl(True)
+    impl.set_next_nemo_gym_task_index(11)
+    record = SimpleNamespace(
+        siblings=[
+            _sibling(0, environment_attempt=1, task_index=5),
+            # Restarted from its prompt: it must not reuse the dead attempt's keys.
+            _sibling(1, environment_attempt=0, task_index=5),
+            _sibling(2, environment_attempt=0, task_index=None),
+            # Restored from a checkpoint that predates the recorded index.
+            _sibling(3, environment_attempt=1, task_index=None),
+        ]
+    )
+
+    task_indices = _nemo_gym_task_indices(record, [0, 1, 2, 3], impl)
+
+    assert task_indices == {0: 5, 1: 11, 2: 11, 3: 11}
+    assert impl.get_next_nemo_gym_task_index() == 12
+
+
+def test_all_continued_rows_take_no_fresh_task_index():
+    impl = _nemo_gym_impl(True)
+    impl.set_next_nemo_gym_task_index(11)
+    record = SimpleNamespace(
+        siblings=[_sibling(0, environment_attempt=2, task_index=5)]
+    )
+
+    assert _nemo_gym_task_indices(record, [0], impl) == {0: 5}
+    assert impl.get_next_nemo_gym_task_index() == 11
 
 
 @pytest.mark.parametrize("dataset_task_index", [None, 99])

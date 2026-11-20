@@ -76,6 +76,7 @@ class _InstrumentedNemoGymRolloutImpl:
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
         environment_instance_id: str | None = None,
         dispatch_recorder: Any = None,
+        task_indices: dict[int, int] | None = None,
     ) -> Any:
         if rollout_ids is None or generation_indices is None or on_completion is None:
             raise RuntimeError(
@@ -158,6 +159,7 @@ class _InstrumentedNemoGymRolloutImpl:
             recovery_granularity=recovery_granularity,
             environment_instance_id=environment_instance_id,
             dispatch_recorder=dispatch_recorder,
+            task_indices=task_indices,
         )
         append_event(self._events_path, "capture_complete", **fields)
         return result
