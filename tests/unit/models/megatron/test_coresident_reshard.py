@@ -22,6 +22,7 @@ from megatron.core.resharding.planner import index_metadata_rosters
 from megatron.core.resharding.utils import ParameterMetadata, named_refit_tensors
 
 from nemo_rl.models.megatron.coresident_reshard import (
+    LocalSourcePlan,
     build_residual_plan,
     named_tensor_proxy,
     plan_local_sources,
@@ -277,6 +278,20 @@ def test_destination_dtype_mismatch_rejected_before_transport():
     destination = meta("weight", value.to(torch.bfloat16), 0, [0])
     with pytest.raises(ValueError, match="matching dtypes"):
         plan_local_sources({"weight": value}, [source], [destination], learner_rank=0)
+
+
+def test_refit_plan_resolves_replaced_engine_storage():
+    engine = torch.nn.Linear(2, 1)
+    bias_metadata = meta("bias", engine.bias, 0, [0], is_tp=False)
+    plan = LocalSourcePlan({"weight": engine.weight}, (bias_metadata,))
+    before = plan.current_tensors(engine)
+    engine.bias = torch.nn.Parameter(torch.zeros_like(engine.bias))
+    after = plan.current_tensors(engine)
+    assert before["bias"] is not after["bias"]
+    assert after["bias"] is engine.bias
+    del engine.bias
+    with pytest.raises(RuntimeError, match="tensor names changed"):
+        plan.current_tensors(engine)
 
 
 def test_named_proxy_has_exact_views_without_new_storage():

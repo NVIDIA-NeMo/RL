@@ -41,6 +41,19 @@ class LocalSourcePlan:
     local_sources: dict[str, RefitSource]
     residual: tuple["ParameterMetadata", ...]
 
+    def current_tensors(self, core: torch.nn.Module) -> dict[str, torch.Tensor]:
+        """Resolve live engine tensors because inference may repack weights after binding."""
+        from megatron.core.resharding.utils import named_refit_tensors
+
+        tensors = dict(named_refit_tensors(core))
+        if tensors.keys() != self.local_sources.keys() | {
+            item.name for item in self.residual
+        }:
+            raise RuntimeError(
+                "co-resident inference tensor names changed after planning"
+            )
+        return tensors
+
 
 def _validate_metadata(metadata: "ParameterMetadata") -> str:
     resolved = metadata.resolved_name

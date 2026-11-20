@@ -639,7 +639,7 @@ def test_coresident_refit_rejects_wrong_gpu_before_opening_ipc():
 
     worker = SimpleNamespace(
         _inference_engine_initialized=False,
-        _coresident_src=None,
+        _coresident_plan=None,
         report_device_id=lambda: "engine-gpu",
     )
     with pytest.raises(ValueError, match="must come from the engine's GPU"):

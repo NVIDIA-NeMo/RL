@@ -302,6 +302,7 @@ if TYPE_CHECKING:
     from megatron.core.resharding.utils import ParameterMetadata, ReshardPlan
 
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
+    from nemo_rl.models.megatron.coresident_reshard import LocalSourcePlan
 
 
 # Streaming calls occupy separate Ray slots so refit and pause RPCs can still run.
@@ -1616,8 +1617,7 @@ class MegatronGenerationMixin:
 class MegatronGenerationRefitMixin:
     """Refit collective, weight transfer, and engine suspend/resume around refits."""
 
-    _coresident_src: Optional[dict[str, sm_partition.RefitSource]]
-    _coresident_residual_metadata: Optional[tuple["ParameterMetadata", ...]]
+    _coresident_plan: Optional["LocalSourcePlan"]
     _coresident_destination_fingerprint: Optional[str]
     _coresident_reshard_plan: Optional["ReshardPlan"]
     _coresident_reshard_service: Optional[NCCLCopyService]
@@ -1659,8 +1659,7 @@ class MegatronGenerationRefitMixin:
         # Native MCore copy service, built by init_collective_mcore_generation.
         self.refit_copy_service = None
         self.refit_execution_batch_bytes: int | None = None
-        self._coresident_src = None
-        self._coresident_residual_metadata = None
+        self._coresident_plan = None
         self._coresident_destination_fingerprint = None
         self._coresident_reshard_plan = None
         self._coresident_reshard_service = None
@@ -2549,7 +2548,7 @@ class MegatronGenerationRefitMixin:
             remap_metadata,
         )
 
-        if self._inference_engine_initialized or self._coresident_src is not None:
+        if self._inference_engine_initialized or self._coresident_plan is not None:
             raise RuntimeError(
                 "co-resident storage must be installed once, before inference initialization"
             )
@@ -2566,8 +2565,7 @@ class MegatronGenerationRefitMixin:
             ),
             learner_rank=local_placement.rank,
         )
-        self._coresident_src = plan.local_sources
-        self._coresident_residual_metadata = plan.residual
+        self._coresident_plan = plan
         local_tensors = [
             (name, tensor)
             for name, tensor in named_refit_tensors(core)
@@ -2606,20 +2604,13 @@ class MegatronGenerationRefitMixin:
         return self._coresident_export_destinations()
 
     def _coresident_export_destinations(self) -> sm_partition.RefitDestination:
-        from megatron.core.resharding.utils import named_refit_tensors
-
-        if self._coresident_src is None or self._coresident_residual_metadata is None:
+        plan = self._coresident_plan
+        if plan is None:
             raise RuntimeError("co-resident refit has not been planned")
-        tensors = dict(named_refit_tensors(sm_partition.refit_core(self._gen_model())))
-        residual = {
-            metadata.name: metadata for metadata in self._coresident_residual_metadata
-        }
-        if tensors.keys() != self._coresident_src.keys() | residual.keys():
-            raise RuntimeError(
-                "co-resident inference tensor names changed after planning"
-            )
+        tensors = plan.current_tensors(sm_partition.refit_core(self._gen_model()))
         targets = {}
-        for name, metadata in residual.items():
+        for metadata in plan.residual:
+            name = metadata.name
             tensor = tensors[name]
             if (
                 type(tensor) not in (torch.Tensor, torch.nn.Parameter)
@@ -2667,23 +2658,15 @@ class MegatronGenerationRefitMixin:
     def _coresident_copy_weights(self) -> dict[str, float]:
         # Load reshard cache hooks only for the IPC refit path.
         from megatron.core.resharding.execution import refresh_module_caches
-        from megatron.core.resharding.utils import named_refit_tensors
 
         t0 = time.perf_counter()
-        core = sm_partition.refit_core(self._gen_model())
-        if self._coresident_src is None or self._coresident_residual_metadata is None:
+        plan = self._coresident_plan
+        if plan is None:
             raise RuntimeError("co-resident refit has not been planned")
-        tensors = dict(named_refit_tensors(core))
-        residual_names = {
-            metadata.name for metadata in self._coresident_residual_metadata
-        }
-        if tensors.keys() != self._coresident_src.keys() | residual_names:
-            raise RuntimeError(
-                "co-resident inference tensor names changed after planning"
-            )
+        core = sm_partition.refit_core(self._gen_model())
+        tensors = plan.current_tensors(core)
         stats = sm_partition.copy_refit(
-            self._coresident_src,
-            ((name, tensors[name]) for name in self._coresident_src),
+            plan.local_sources, ((name, tensors[name]) for name in plan.local_sources)
         )
         with torch.inference_mode():
             refresh_module_caches(core)

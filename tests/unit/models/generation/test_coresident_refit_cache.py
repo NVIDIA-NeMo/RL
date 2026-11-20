@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from nemo_rl.models.megatron import sm_partition
+from nemo_rl.models.megatron.coresident_reshard import LocalSourcePlan
 
 
 pytestmark = [
@@ -70,8 +71,7 @@ def test_coresident_refit_refreshes_captured_mamba_cache(shared: bool) -> None:
     )
 
     worker = SimpleNamespace(
-        _coresident_src=source,
-        _coresident_residual_metadata=(),
+        _coresident_plan=LocalSourcePlan(source, ()),
         _gen_model=lambda: mixer,
         _refresh_flashinfer_mxfp8_weights=lambda: None,
     )
