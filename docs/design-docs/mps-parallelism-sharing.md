@@ -32,7 +32,7 @@ Inference pauses and drains active GPU work before the optimizer writes shared p
 
 Where dense and expert ownership permit it, the planner reorders ranks to keep aligned TP/ETP/EP increases local, including across CP replicas. Otherwise it retains the normal placement. Remote shards use Megatron’s point-to-point transfer schedule with the original TP coordinates and task and batch IDs. Every learner joins the communicator, including learner-only GPUs and ranks with no transfers.
 
-All workers must use the same Megatron-Core build. Bridge `ae0a1b02` pins Core `e0a4bfed`, which supports point-to-point planning for partial meshes. GPU runs with remote shards require the NCCL communicator reuse fix on affected PyTorch versions. [Megatron-LM #9485](https://github.com/NVIDIA/Megatron-LM/pull/9485)
+All workers must use the same Megatron-Core build. NeMo RL asks Core’s `build_plan_from_rosters` to plan the private copies. On Bridge’s pinned Core (`e0a4bfed`), NeMo RL falls back to Core’s point-to-point schedule if the planner fails because the first TP shard is already shared. Core `a463e854` handles that case directly. GPU runs with remote shards require the NCCL communicator reuse fix on affected PyTorch versions. [Megatron-LM #9485](https://github.com/NVIDIA/Megatron-LM/pull/9485)
 
 ## Validation and limits
 

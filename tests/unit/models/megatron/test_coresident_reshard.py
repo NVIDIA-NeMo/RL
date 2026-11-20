@@ -349,6 +349,8 @@ def test_residual_batches_agree_on_all_ranks_including_idle_ranks():
     ]
 
     assert all(plan.num_batches == 2 and plan.total_tasks == 2 for plan in plans)
+    # Disjoint, complete meshes also get Core's native whole-tensor specs.
+    assert all(plan.tensor_reshard_specs is not None for plan in plans)
     assert all(not plans[rank].recv_ops and not plans[rank].send_ops for rank in (1, 3))
     assert [
         (op.peer_rank, op.param_name, op.task_id, op.batch_id)
@@ -358,6 +360,25 @@ def test_residual_batches_agree_on_all_ranks_including_idle_ranks():
         (op.peer_rank, op.param_name, op.task_id, op.batch_id)
         for op in plans[2].recv_ops
     ] == [(0, "engine.a", 0, 0), (0, "engine.b", 1, 1)]
+
+
+@pytest.mark.parametrize("key", ["missing.weight", 0, 2])
+def test_residual_plan_propagates_unrelated_core_errors(monkeypatch, key):
+    from megatron.core.resharding import planner
+
+    tensor = torch.zeros(4)
+    # Rank 0 needs a copy and rank 1 shares locally. Rank 1 is the only
+    # missing representative for this ordered TP mesh.
+    item = meta("weight", tensor, 0, [1, 0])
+    dst, src = index_metadata_rosters([([item], [item]), ([], [])])
+
+    def fail(*args, **kwargs):
+        raise KeyError(key)
+
+    monkeypatch.setattr(planner, "build_plan_from_rosters", fail)
+    with pytest.raises(KeyError) as exc:
+        build_residual_plan(dst, src, 0)
+    assert exc.value.args == (key,)
 
 
 @pytest.mark.parametrize("local_owner", [True, False])

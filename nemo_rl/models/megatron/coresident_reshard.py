@@ -253,6 +253,28 @@ def build_residual_plan(
     Only private destinations receive data, so a whole-mesh collective would
     write into weights that may alias the learner.
     """
+    from megatron.core.resharding.planner import build_plan_from_rosters
+
+    try:
+        return build_plan_from_rosters(
+            destinations, sources, rank, execution_batch_bytes=execution_batch_bytes
+        )
+    except KeyError as exc:
+        # Core e0a4bfed indexes the first TP rank before checking whether
+        # its optional whole-mesh spec covers all ranks. This occurs when
+        # the first shard is locally shared and absent from the copy roster.
+        if len(exc.args) != 1 or type(exc.args[0]) is not int:
+            raise
+        missing_rank = exc.args[0]
+        if not any(
+            item.tensor_parallel_group_ranks
+            and item.tensor_parallel_group_ranks[0] == missing_rank
+            and name not in destinations.get(missing_rank, {})
+            for params in destinations.values()
+            for name, item in params.items()
+        ):
+            raise
+
     from megatron.core.resharding.planner import (
         _build_execution_batch_ids,
         _iter_global_transfer_ops,
