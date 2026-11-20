@@ -757,7 +757,7 @@ Dynamic sampling uses a separate whole-group test, $\min_j r_j = \max_j r_j$ ove
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 
-`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described below. Set it to `minimal` to skip optional diagnostic kernels; the loss and objective bookkeeping remain unchanged. Both modes report `token_mult_prob_error` to monitor training–generation logprob mismatch.
+`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described below. Set it to `minimal` to skip optional diagnostic kernels; the loss and objective bookkeeping remain unchanged. Both modes report `token_mult_prob_error` and `gen_prev_logprob_mismatch_tokens` to monitor training–generation logprob mismatch.
 `loss_fn.enable_torch_compile` can be enabled separately to compile the tensor-only actor objective (it is opt-in because backend and distributed-layout support should be validated first).
 
 ### Multiplicative Token Probability Error
@@ -768,6 +768,9 @@ $$
 $$
 
 Intuitively, this measures the average multiplicative probability error for sampled tokens, where samples are drawn as $x \sim \pi_{\text{inference-framework}}$. The purpose of this is to highlight any obvious sampling errors or discrepancies between the inference backend and training framework. If it trends upward steeply over the course of training past $\sim 1-2\%$, there is usually a problem with how your weights are being updated. If these metrics are very spiky, they can indicate a bug in the inference framework or buggy weight refitting.
+
+### Mismatched Logprob Token Count
+`gen_prev_logprob_mismatch_tokens` counts the valid tokens whose generation logprob differs from the training logprob; a NaN counts as a difference. It is a raw count, not normalized by tokens or sequences. A run with zero train/generation mismatch reports 0 on every step, including differences too small to move `gen_kl_error` away from 0.
 
 ### KL Divergence Error
 This feature is controlled by the following metrics:
