@@ -267,7 +267,6 @@ class CoresidentRefit:
         self._control_timeout_s = 360.0 if refit_timeout_s is None else refit_timeout_s
         if self._control_timeout_s <= 0:
             raise ValueError("co-resident refit timeout must be positive")
-        self._has_residual_transfers = False
         self._residual_bytes = 0
         self._devices: set[str] = set()
         self._closed = False
@@ -327,12 +326,11 @@ class CoresidentRefit:
         residual_metadata = [
             metadata for item in bound for metadata in item.residual_metadata
         ]
-        self._has_residual_transfers = bool(residual_metadata)
         self._residual_bytes = sum(
             math.prod(item["shape"]) * item["element_size"]
             for item in residual_metadata
         )
-        if self._has_residual_transfers:
+        if self._residual_bytes:
             self._call_workers(
                 self._policy,
                 "init_coresident_reshard",
@@ -381,7 +379,7 @@ class CoresidentRefit:
                 "(offload / reload / buffer rebuild); the engine would read freed memory"
             )
         t1 = time.perf_counter()
-        if self._has_residual_transfers:
+        if self._residual_bytes:
             targets = self._call_workers(
                 self._generation, "export_coresident_refit_destinations"
             )
@@ -434,6 +432,6 @@ class CoresidentRefit:
         """Drop reverse IPC imports while their inference owners are still alive."""
         if self._closed:
             return
-        if self._has_residual_transfers:
+        if self._residual_bytes:
             self._call_workers(self._policy, "release_coresident_receives")
         self._closed = True

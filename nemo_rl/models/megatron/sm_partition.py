@@ -232,9 +232,7 @@ def actor_env(
     return out
 
 
-def select_static_partition(
-    policy_cfg: Any, role: Role, gpu_index: int
-) -> Optional[str]:
+def select_static_partition(policy_cfg: Any, role: Role, gpu_index: int) -> None:
     """Select the worker static MPS partition before CUDA initializes.
 
     ``mps_static``: in a co-resident worker BEFORE its first CUDA call, pick this GPU's partition for ``role``
@@ -244,14 +242,13 @@ def select_static_partition(
         engine_sm_fraction(policy_cfg) is None
         or partition_backend(policy_cfg) != "mps_static"
     ):
-        return None
+        return
     import json
 
     with open(os.environ[MPS_PARTITION_MAP_ENV]) as f:
         part = json.load(f)[str(gpu_index)]
     os.environ["CUDA_MPS_SM_PARTITION"] = str(part[role])
     os.environ["NRL_MPS_SM_PARTITION_SMS"] = str(part[f"{role}_sms"])
-    return os.environ["CUDA_MPS_SM_PARTITION"]
 
 
 def check_worker(
@@ -303,7 +300,13 @@ def check_worker(
             info["te_grouped_gemm_target_sms"] = full - margin
             print(f"[sm_partition] rank={rank} {info}", flush=True)
         return info
-    return _check_limit(role, pct, seen, full, rank)
+    info = {"role": role, "mps_pct": pct, "sms_seen": seen, "sms_device": full}
+    if seen >= full:
+        raise RuntimeError(
+            f"co-resident {role} worker is not running under its MPS limit (no MPS daemon?): {info}"
+        )
+    print(f"[sm_partition] rank={rank} {info}", flush=True)
+    return info
 
 
 def _learner_shares_engine_gpu(policy_cfg: Any, *, rank: int) -> bool:
@@ -373,18 +376,6 @@ def _check_uncapped_client(
         "sms_device": full,
         "mps_client_registered": True,
     }
-    print(f"[sm_partition] rank={rank} {info}", flush=True)
-    return info
-
-
-def _check_limit(
-    role: Role, pct: Optional[str], seen: int, full: int, rank: int
-) -> dict[str, Any]:
-    info = {"role": role, "mps_pct": pct, "sms_seen": seen, "sms_device": full}
-    if pct is None or not seen < full:
-        raise RuntimeError(
-            f"co-resident {role} worker is not running under its MPS limit (no MPS daemon?): {info}"
-        )
     print(f"[sm_partition] rank={rank} {info}", flush=True)
     return info
 

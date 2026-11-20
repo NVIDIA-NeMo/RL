@@ -222,53 +222,44 @@ def test_actor_env():
     assert smp.actor_env(c, "learner", env={}) == {smp.MPS_PCT_ENV: "58"}
 
 
-def test_check_limit():
-    assert smp._check_limit("engine", "42", 62, 152, 0)["sms_seen"] == 62
-    with pytest.raises(
-        RuntimeError, match="not running under its MPS limit"
-    ):  # no daemon: the full GPU is seen
-        smp._check_limit("engine", "42", 152, 152, 0)
-    with pytest.raises(
-        RuntimeError, match="not running under its MPS limit"
-    ):  # launched without its percentage
-        smp._check_limit("learner", None, 88, 152, 0)
-
-
 @pytest.mark.parametrize(
-    "role,pct,accepted",
+    "role,pct,seen,error",
     [
-        ("engine", None, True),
-        ("engine", "100", True),
-        ("engine", "42", False),
-        ("engine", "58", False),
-        ("learner", "58", True),
-        ("learner", "42", False),
-        ("learner", "100", False),
-        ("learner", None, False),
+        ("engine", None, 152, None),
+        ("engine", "100", 152, None),
+        ("engine", "42", 152, "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"),
+        ("engine", "58", 152, "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"),
+        ("learner", "58", 88, None),
+        ("learner", "58", 152, "not running under its MPS limit"),
+        ("learner", "42", 88, "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"),
+        ("learner", "100", 88, "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"),
+        ("learner", None, 88, "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"),
     ],
 )
 def test_check_worker_verifies_role_percentage(
-    monkeypatch: pytest.MonkeyPatch, role: smp.Role, pct: str | None, accepted: bool
+    monkeypatch: pytest.MonkeyPatch,
+    role: smp.Role,
+    pct: str | None,
+    seen: int,
+    error: str | None,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda device: SimpleNamespace(
-            multi_processor_count=152 if role == "engine" else 88
-        ),
+        lambda device: SimpleNamespace(multi_processor_count=seen),
     )
     monkeypatch.setattr(smp, "_device_sm_count", lambda: 152)
     if pct is None:
         monkeypatch.delenv(smp.MPS_PCT_ENV, raising=False)
     else:
         monkeypatch.setenv(smp.MPS_PCT_ENV, pct)
-    if accepted:
+    if error is None:
         info = smp.check_worker(_cfg(), role)
         assert info["mps_pct"] == pct
-        assert info["sms_seen"] == (152 if role == "engine" else 88)
+        assert info["sms_seen"] == seen
     else:
-        with pytest.raises(RuntimeError, match="CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"):
+        with pytest.raises(RuntimeError, match=error):
             smp.check_worker(_cfg(), role)
 
 
@@ -447,7 +438,7 @@ def test_storage_fingerprint_moves_with_storage():
     assert fp != smp.storage_fingerprint([("a", a), ("b", b)])
 
 
-def test_partition_backend_swap_point(tmp_path):
+def test_partition_backend_swap_point(tmp_path, monkeypatch):
     assert smp.partition_backend(_cfg()) == "mps_percentage"
     with pytest.raises(ValueError, match="must be one of"):
         smp.validate(
@@ -465,20 +456,14 @@ def test_partition_backend_swap_point(tmp_path):
     assert smp.actor_env(static, "engine", env=env) == {
         **env
     }  # no percentage under the static backend
-    import os
-
-    os.environ[smp.MPS_PARTITION_MAP_ENV] = str(m)
-    try:
-        assert smp.select_static_partition(static, "learner", 0) == "8"
-        assert os.environ["NRL_MPS_SM_PARTITION_SMS"] == "88"
-        assert smp.select_static_partition(_cfg(), "learner", 0) is None
-    finally:
-        for k in (
-            smp.MPS_PARTITION_MAP_ENV,
-            "CUDA_MPS_SM_PARTITION",
-            "NRL_MPS_SM_PARTITION_SMS",
-        ):
-            os.environ.pop(k, None)
+    monkeypatch.setenv(smp.MPS_PARTITION_MAP_ENV, str(m))
+    monkeypatch.setenv("CUDA_MPS_SM_PARTITION", "existing")
+    monkeypatch.setenv("NRL_MPS_SM_PARTITION_SMS", "152")
+    smp.select_static_partition(_cfg(), "learner", 0)
+    assert os.environ["CUDA_MPS_SM_PARTITION"] == "existing"
+    smp.select_static_partition(static, "learner", 0)
+    assert os.environ["CUDA_MPS_SM_PARTITION"] == "8"
+    assert os.environ["NRL_MPS_SM_PARTITION_SMS"] == "88"
 
 
 def test_bind_shared_then_copy_whatever_is_not_aliased(
