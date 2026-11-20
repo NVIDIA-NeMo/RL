@@ -464,6 +464,9 @@ def _init_ray(log_dir: Optional[str] = None) -> str:
     # that boundary. This covers both V1 worker groups and direct V2/SC actors.
     env_vars = add_hf_modules_cache_to_pythonpath(dict(os.environ))
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+    # Excluded names must retain their worker-local values.
+    for key in os.environ.get("NRL_WORKER_ENV_EXCLUDE", "").split(","):
+        env_vars.pop(key.strip(), None)
 
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
