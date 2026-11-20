@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -29,6 +30,7 @@ from nemo_rl.models.generation.interfaces import (
     _warn_unsupported_in_flight_refit_pause_once,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.weight_sync.membership import RefitMembership
 
 
 @pytest.fixture
@@ -37,8 +39,11 @@ def generation(monkeypatch: pytest.MonkeyPatch) -> VllmGeneration:
     gen.cfg = {"vllm_cfg": {"async_engine": True}}
     gen.dp_size = 3
     gen.worker_group = SimpleNamespace(workers=[MagicMock() for _ in range(6)])
-    gen._refit_membership = SimpleNamespace(
-        shard_prefixes={0: 0, 2: 2}, workers_per_shard=2
+    gen._refit_membership = RefitMembership(
+        world_size=12,
+        train_world_size=8,
+        shard_prefixes={0: 0, 2: 2},
+        workers_per_shard=(2, 2, 2),
     )
     gen.fleet_monitor = GenerationFleetHealth(
         shard_count=3, policy=FleetHealthPolicy(min_healthy_shards=1)
@@ -112,9 +117,12 @@ def test_resume_maps_leader_failures_to_the_original_shard(
         )
         expected_shards = (0, 1, 2)
     else:
-        generation._refit_membership.shard_prefixes = {
-            shard_idx: rank * 2 for rank, shard_idx in enumerate(membership_shards)
-        }
+        generation._refit_membership = replace(
+            generation._refit_membership,
+            shard_prefixes={
+                shard_idx: rank * 2 for rank, shard_idx in enumerate(membership_shards)
+            },
+        )
         expected_shards = membership_shards
 
     workers = generation.worker_group.workers
