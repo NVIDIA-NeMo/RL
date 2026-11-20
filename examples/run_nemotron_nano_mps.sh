@@ -24,8 +24,7 @@
 #   bash examples/run_nemotron_nano_mps.sh grpo.max_num_steps=3
 #
 # This starts a private MPS daemon before the driver creates its local Ray cluster.
-# Both clients have full SM access. The learner has an advisory TE grouped-GEMM
-# budget; MPS schedules concurrent work without disjoint SM reservations.
+# Both MPS clients have full SM access, including learner TE grouped GEMMs.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

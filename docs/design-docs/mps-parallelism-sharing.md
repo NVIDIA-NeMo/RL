@@ -1,88 +1,47 @@
 # MPS parallelism sharing
 
-This experimental path places a Megatron inference process on each selected
-learner GPU. The default places both roles on every GPU. Training and inference can have different tensor and expert layouts while
-sharing compatible local parameter storage. The inference backend still requires
-CP1 and PP1; `inference_optimized` experts require ETP1. Training CP and PP
-are represented by native shard metadata, with one model chunk per worker. Virtual
-pipeline chunks, GTP rematerialization, quantized refit tensors, differing tensor
-dtypes, and inference GPUs outside the learner pool are rejected.
+Megatron training and inference run in separate processes under CUDA MPS. Each inference GPU also hosts a learner. Training and inference can use different model-parallel layouts and share compatible weights through CUDA IPC.
 
-The default `sm_partition_backend: mps_gemm` gives both processes full SM access. `engine_sm_fraction` controls only the learner Transformer Engine grouped-GEMM margin: `0.42` targets approximately 58% of the SMs for those GEMMs, while other kernels can use the whole GPU. This hint does not reserve SMs. Use `mps_percentage` explicitly to cap the learner process instead. A zero fraction leaves both processes and learner GEMMs uncapped. Startup verifies that the uncapped learner is registered with the MPS daemon. The Nano recipe gives the learner lower MPS client priority (`1`) than inference (`0`), matching the benchmarked scheduling setup.
+## GPU placement and scheduling
 
-To run the eight-GPU Nano recipe with eight learner workers and four inference workers, keep its TP1/EP4 settings and choose a complete four-GPU inference group:
+The eight-GPU Nano recipe uses TP1/EP4 for both roles. By default, all eight GPUs run both processes. To train on all eight and run one four-GPU inference group, use
 
 ```bash
 bash examples/run_nemotron_nano_mps.sh 'policy.generation.colocated.engine_gpu_indices=[4,5,6,7]'
 ```
 
-`learner_gpu_indices` and `engine_gpu_indices` are ordered indices in the same topology-sorted physical GPU pool. Each index identifies a GPU across the full allocation. The order of each list defines that role’s logical GPU order. A null list selects the entire parent pool independently for that role. Every engine GPU must also be a learner GPU. If the learner list selects only part of the pool, leaving the engine list null fails validation. Each role must fill complete dense and expert model-parallel groups. For a 16-GPU pool, choosing engine indices 8 through 15 and leaving the learner list null places eight inference workers alongside 16 learner workers. With `mps_gemm`, only shared GPUs receive the learner GEMM margin. Learner-only GPUs can still send remote shards during publication. The conventional disjoint setup uses its existing resource split with `engine_sm_fraction` unset.
+`learner_gpu_indices` and `engine_gpu_indices` specify each role’s logical GPU order within the same topology-sorted parent pool. A null list selects the entire parent pool independently for that role. Every engine GPU must also be a learner GPU, and each role must fill complete dense and expert model-parallel groups. For 16 learners and eight inference workers on the last eight GPUs, leave the learner list null and select engine indices 8 through 15. Reversing those selections fails validation. The conventional disjoint setup uses its existing resource split with `engine_sm_fraction` unset.
 
-Streaming GRPO aligns prompt-group dispatches to the learner data-parallel and static microbatch sizes so every learner shard receives complete work. Forest training retains its execution-row padding rules.
+The default `mps_gemm` backend gives both processes full SM access. The Nano recipe sets `engine_sm_fraction: 0.0`, giving learner GEMMs full access as well. With an explicit override of `0.42`, learner Transformer Engine grouped GEMMs on shared GPUs target approximately 58% of the SMs. Other kernels and learner-only GPUs retain full access. The `mps_percentage` backend applies a process-wide learner cap. Startup verifies uncapped learner registration with the MPS daemon. The Nano recipe sets the learner’s MPS client priority to low (`1`) and inference to normal (`0`).
 
-Use the existing MPS configuration with `refit_transport: ipc` and
-`engine_weights: shared`. Set inference parallelism in
-`policy.generation.mcore_generation_config`. With `inference_optimized` and TP>1,
-set `sequence_parallel: true`. Changing inference TP changes its data-parallel
-degree and aggregate request capacity; account for both when comparing runs.
-Training CP greater than one requires `policy.sequence_packing.enabled: true` and `policy.megatron_cfg.use_fused_linear_logprobs: false`, as enforced by native Megatron setup. Inference remains CP1.
+Set inference parallelism in `policy.generation.mcore_generation_config`. Inference requires CP1 and PP1. The `inference_optimized` experts require ETP1, and TP greater than one requires sequence parallelism with that implementation. Training CP greater than one requires `policy.sequence_packing.enabled: true` and `policy.megatron_cfg.use_fused_linear_logprobs: false`. Changing inference TP also changes data parallelism and aggregate rollout capacity. Streaming GRPO fits dispatches to the learner’s data-parallel and microbatch sizes. Forest training pads execution rows within each prompt group.
 
-| Destination storage | Publication behavior |
+## Publishing learner weights to inference
+
+With `refit_transport: ipc` and `engine_weights: shared`, each inference worker opens its paired learner’s weight handles before CUDA graph capture. Megatron’s global tensor names and logical shard coordinates determine how each inference tensor gets its weights.
+
+| Inference tensor | How it receives updated weights |
 |---|---|
-| Complete contiguous local parameter view, matching dtype | Aliases learner storage; no weight copy |
+| Complete contiguous local parameter with matching dtype | Reads learner memory directly |
+| Compatible packed expert stack | Reads the learner’s packed experts directly |
 | Local strided view or packed fragments | Copies into existing inference storage |
-| Any required fragment on another learner GPU | Native learner-world reshard writes into existing inference storage |
-| Compatible local expert stack | Retains shared packed expert storage |
-| Persistent buffer | Remains private and is refreshed during publication |
+| Tensor requiring a remote shard | Learner ranks assemble it in the engine’s private storage using NCCL and CUDA IPC |
+| Persistent buffer | Refreshes the engine’s private copy |
 
-One planner classifies destinations using Megatron's resolved global tensor names
-and logical shard coordinates. Equal names and shapes alone do not establish
-compatibility. A destination requiring remote fragments remains wholly private;
-the current backend does not execute a GEMM from pieces resident on several GPUs.
-Aligned TP/ETP/EP increases use a deterministic permutation when the joint
-dense/expert ownership signatures admit a complete local assignment. CP replica
-ranks participate in the assignment. Other layouts use normal placement and
-residual transfers; partial-coverage placements are not yet optimized globally.
+Inference pauses and drains active GPU work before the optimizer writes shared parameters. It resumes after every engine rank completes its copies and refreshes derived caches. If inference repacks a private tensor, its learner imports the replacement handle before the next transfer. A change to exported learner storage stops publication. Learners release imported buffers before their inference owners shut down.
 
-Residual transfers run only among learner ranks, with one NCCL participant per
-GPU. Each paired learner maps the inference-owned receive tensors through CUDA
-IPC; it does not allocate another full model. All inference readers are paused
-and drained before the optimizer mutates shared weights. If inference repacks a private tensor, its new
-IPC handle is installed before the next transfer. Imported receive buffers are
-released before their inference owners shut down. Source storage changes fail
-closed. Every rank finishes copying and cache refresh before inference resumes.
+Where dense and expert ownership permit it, the planner reorders ranks to keep aligned TP/ETP/EP increases local, including across CP replicas. Otherwise it retains the normal placement. Remote shards use Megatron’s point-to-point transfer schedule with the original TP coordinates and task and batch IDs. Every learner joins the communicator, including learner-only GPUs and ranks with no transfers.
 
-Residual transfers use Megatron's native reshard planner and NCCL copy service. Every learner rank participates in communicator setup, including ranks without transfers. All workers must use the same Megatron-Core build.
+All workers must use the same Megatron-Core build. Bridge `ae0a1b02` pins Core `e0a4bfed`, which supports point-to-point planning for partial meshes. GPU runs with remote shards require the NCCL communicator reuse fix on affected PyTorch versions. [Megatron-LM #9485](https://github.com/NVIDIA/Megatron-LM/pull/9485)
 
-The public Nano recipe uses matching TP1/EP4 layouts on eight GPUs. For mixed layouts, the co-resident planner builds point-to-point sends and receives from Megatron’s native transfer schedule. It retains the original TP coordinates while omitting destinations already bound locally. Both ends use the same native task and batch IDs.
+## Validation and limits
 
-The Megatron-Bridge revision `ae0a1b02` pins Megatron-Core `e0a4bfed`. This pin supports residual point-to-point planning, including TP2-to-TP4 partial meshes. Its NCCL copy service still uses private eager initialization on the learner’s existing process group. For GPU runs with remote shards, use a Core build containing the upstream communicator reuse fix to avoid leaking a communicator on affected PyTorch versions. [Megatron-LM #9485](https://github.com/NVIDIA/Megatron-LM/pull/9485)
+| Coverage | Result |
+|---|---|
+| CPU at NeMo RL `93770197` | 1,449 tests passed on stock Core `e0a4bfed`. Seven GPU cases and one optional NeMo Gym case skipped. Sixty focused placement, scheduling, port and refit tests passed on both that pin and Core `a463e854`, including coverage of the 16-learner/eight-inference placement. |
+| Distributed component tests | Twelve layouts on four ranks completed two publications each. Separate-process IPC tests checked values and storage lifetime in both TP2-to-TP4 and TP4-to-TP2 directions, including clean teardown. |
+| Eight-GPU Nano Math GRPO at NeMo RL `8af83078` | Training TP4/CP2/EP4/ETP1, inference TP2/CP1/EP4/ETP1, PP1 for both. Concurrent inference CUDA graphs, sequence packing and a GPU-only optimizer completed three updates with 192 accepted sequences, finite nonzero gradients, mixed-sign advantages and four weight publications. Both nodes completed process cleanup without IPC or NCCL teardown warnings. |
 
-Validation is staged. CPU tests cover native shard planning, both TP directions,
-packed projections, expert/pipeline naming, rank permutations and publication
-failure ordering. The earlier GPU IPC test covered TP1-to-TP2 local views only.
-The native distributed projection gate passed 12 layouts on four ranks with two
-publications each, including both TP directions and packed projections. The
-separate-process reverse-IPC gate passed TP2-to-TP4 and TP4-to-TP2 numerical and
-storage-lifetime checks. The corrected copy service also passed owned-process
-cleanup: all consumer imports were released, all native process groups were
-destroyed, and preserved logs contained no CUDA IPC producer-lifetime or NCCL
-communicator teardown warnings. These small gates serialize the two worker
-worlds; they do not exercise concurrent DynamicInferenceEngine, CP2 or GRPO
-lifecycle behavior.
+The full-model run used Core `3e95097b` with fixes for two MTP prefill helpers, per-forward MoE metadata, partial-destination planning and NCCL communicator initialization. It qualified functional execution for that layout. Full-model per-tensor parity, convergence and throughput require separate measurements. Earlier Ultra training CP8 to inference CP1 evidence uses matching TP. Training ETP greater than one, training PP and changed-EP full-model layouts still need GPU qualification.
 
-An eight-GPU Nano full-model qualification passed with training TP4/CP2/EP4/ETP1 and inference TP2/CP1/EP4/ETP1, with PP1 in both roles.
-Native SingleController completed three Math GRPO updates with 192 accepted sequences, finite nonzero gradients and mixed-sign advantages, using sequence packing and a GPU-only optimizer configuration.
-The run exercised concurrent DynamicInferenceEngine graphs, generation, learner forward/backward and optimizer updates, and four native refits combining local aliases with remote residual transfers.
-Both nodes completed owned-process cleanup without CUDA IPC producer-lifetime or NCCL communicator teardown warnings, and the allocation completed successfully.
-
-That GPU qualification ran NeMo RL revision `8af83078` with Megatron-Core base `3e95097b` plus five reviewed native file corrections: the two MTP prefill helpers, per-forward MoE metadata, partial-destination planning, and NCCL communicator initialization.
-The test establishes functional mixed-TP/training-CP behavior for the stated layout, not full-model per-tensor numerical parity, trajectory equivalence, convergence or performance.
-
-At NeMo RL revision `93770197`, the CPU regression suite passed 1,449 tests on the unmodified Megatron-Core pin `e0a4bfed`. Seven GPU tests and one optional NeMo Gym test were skipped. A focused suite of 60 placement, scheduling, port and refit tests passed on both that pin and Core `a463e854`. The 16-learner/eight-inference layout is covered by the placement tests. The GPU qualification reported above used eight GPUs.
-
-Existing Ultra training CP8 to inference CP1 evidence uses matching TP and covers a different layout.
-Inference CP is not a supported target; inference remains CP1 and PP1, and inference-optimized experts remain ETP1.
-Training ETP greater than one, pipeline training, arbitrary PP changes and changed-EP full-model layouts remain unqualified by these GPU tests.
-Native metadata and CPU planning coverage do not establish those runtime cases.
-No speedup is implied by sharing coverage or functional qualification.
+The implementation supports one model chunk per worker and matching refit dtypes. It rejects virtual pipeline chunks, GTP rematerialization and quantized refit storage.

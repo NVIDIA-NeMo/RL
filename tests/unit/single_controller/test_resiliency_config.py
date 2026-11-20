@@ -20,9 +20,7 @@ combinations that would silently do nothing are rejected at load time rather tha
 hour three of a run.
 """
 
-import sys
 import warnings
-from types import SimpleNamespace
 from typing import get_args
 from unittest.mock import MagicMock
 
@@ -161,12 +159,6 @@ def test_mps_shared_weights_reject_reference_policy_swaps(
         "mcore_generation_config": {"expert_model_parallel_size": 4},
     }
     monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", "/tmp/test-mps")
-    # GPU worker imports are optional for driver-side config validation.
-    monkeypatch.setitem(
-        sys.modules,
-        "nemo_rl.models.generation.megatron.megatron_worker",
-        SimpleNamespace(check_generation_calls=lambda *args: None),
-    )
     if engine_weights == "shared" and reference_kl > 0:
         with pytest.raises(
             ValueError,

@@ -101,8 +101,8 @@ policy:
       resources:
         gpus_per_node: null
         num_nodes: null
-      # Both MPS clients have full SM access; learner TE grouped GEMMs target ~58%.
-      engine_sm_fraction: 0.42
+      # Give both MPS clients and learner TE grouped GEMMs full SM access.
+      engine_sm_fraction: 0.0
       engine_weights: shared
       sm_partition_backend: mps_gemm
     refit_transport: ipc

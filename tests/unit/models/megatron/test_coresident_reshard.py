@@ -232,21 +232,13 @@ def test_rank_remap_preserves_order_names_and_input():
     item.data_parallel_group_ranks = [1, 2]
     item.pipeline_parallel_group_ranks = [1, 0]
     original = deepcopy(item)
-    result = remap_metadata([item], {0: 2, 1: 0, 2: 3, 3: 1})[0]
+    result = remap_metadata([item], {0: 2, 1: 0, 2: 3, 3: 1}, learner_world_size=4)[0]
     assert item == original and result is not item
     assert result.owner_rank == 0 and result.tensor_parallel_group_ranks == [2, 0]
     assert result.expert_parallel_group_ranks == [0, 1]
     assert result.data_parallel_group_ranks == [0, 3]
     assert result.pipeline_parallel_group_ranks == [0, 2]
     assert (result.name, result.resolved_name) == ("local.weight", "global.weight")
-
-
-@pytest.mark.parametrize(
-    "mapping", [{}, {0: 0, 1: 0}, {0: 0, 2: 1}, {0: 1}, {False: 0}]
-)
-def test_invalid_rank_maps_rejected(mapping):
-    with pytest.raises(ValueError, match="bijection"):
-        remap_metadata([], mapping)
 
 
 @pytest.mark.parametrize(
@@ -428,8 +420,15 @@ def test_partial_world_refit_preserves_send_only_sources_and_full_destinations()
 
 @pytest.mark.parametrize(
     "mapping,world",
-    [({0: 2, 1: 2}, 4), ({0: 2, 1: 4}, 4), ({0: 2, 2: 3}, 4), ({0: 2}, True)],
+    [
+        ({}, 4),
+        ({False: 0}, 1),
+        ({0: 2, 1: 2}, 4),
+        ({0: 2, 1: 4}, 4),
+        ({0: 2, 2: 3}, 4),
+        ({0: 2}, True),
+    ],
 )
-def test_partial_world_refit_rejects_invalid_embedding(mapping, world):
+def test_rank_remap_rejects_invalid_placement(mapping, world):
     with pytest.raises(ValueError):
         remap_metadata([], mapping, learner_world_size=world)

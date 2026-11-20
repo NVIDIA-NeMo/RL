@@ -17,7 +17,6 @@ the same-GPU CUDA IPC refit between two processes (GPU)."""
 import os
 import subprocess
 import tempfile
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -368,31 +367,34 @@ def test_ipc_refit_two_processes():
             proc.join(10)
 
 
-def test_refit_fails_fast():
+def test_refit_fails_fast() -> None:
     ray = pytest.importorskip("ray")
-    from nemo_rl.weight_sync.megatron_weight_synchronizer import _get_fail_fast
+    from nemo_rl.weight_sync.megatron_weight_synchronizer import CoresidentRefit
 
     with tempfile.TemporaryDirectory(prefix="nrl-smp-") as ray_dir:
         try:
-            ray.init(
-                num_cpus=2,
-                num_gpus=0,
-                include_dashboard=False,
-                _temp_dir=ray_dir,
-            )
+            ray.init(num_cpus=1, num_gpus=0, include_dashboard=False, _temp_dir=ray_dir)
+
+            @ray.remote(num_gpus=1)
+            def pending() -> None:
+                pass  # Cannot start on this CPU-only cluster.
 
             @ray.remote
-            def slow():
-                time.sleep(60)
-
-            @ray.remote
-            def boom():
+            def boom() -> None:
                 raise KeyError("engine failed mid-refit")
 
-            t0 = time.perf_counter()
-            with pytest.raises(Exception, match="engine failed mid-refit"):
-                _get_fail_fast([slow.remote(), boom.remote()])
-            assert time.perf_counter() - t0 < 5
+            group = _Group(
+                [], "engine", {"coresident_pause": [pending.remote(), boom.remote()]}
+            )
+            refit = CoresidentRefit(
+                SimpleNamespace(cfg=_cfg()),
+                SimpleNamespace(worker_group=group),
+                refit_timeout_s=60.0,
+            )
+            with pytest.raises(
+                ray.exceptions.RayTaskError, match="engine failed mid-refit"
+            ):
+                refit.sync_weights()
         finally:
             ray.shutdown()
 
@@ -544,37 +546,50 @@ def test_engine_rank_gpus_put_experts_on_their_learner(world, l_ep, e_ep):
 
 
 class _Group:
-    """A worker group stand-in that records the calls the synchronizer makes, in order."""
+    """Record worker calls and return one reply per rank in worker order."""
 
-    def __init__(self, log, role, replies):
+    def __init__(self, log: list, role: str, replies: dict) -> None:
         self.log, self.role, self.replies = log, role, replies
+        self.calls = []
 
-    def run_all_workers_single_data(self, method, **kwargs):
+    def run_all_workers_single_data(self, method: str, **kwargs) -> list:
         self.log.append(f"{self.role}.{method}")
-        return [self.replies.get(method)]
+        self.calls.append((method, kwargs))
+        return self.replies.get(method, [])
+
+    run_all_workers_multiple_data = run_all_workers_single_data
 
 
-@pytest.mark.parametrize("weights", ["copy", "shared"])
-def test_coresident_refit_publishes_only_in_sync_weights(monkeypatch, weights):
-    """Shared weights: the engine pauses before the optimizer write and stays paused until sync_weights (the loop's
-    refit, after its parameter all-gather) copies the rest, bumps the epoch and resumes it. Copy: the write needs no
-    pause. Either way the new version is published in exactly one place."""
-    from types import SimpleNamespace
-
+@pytest.fixture
+def local_refit_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
     from nemo_rl.weight_sync import megatron_weight_synchronizer as mws
 
-    monkeypatch.setattr(mws, "_get_fail_fast", lambda refs, **kwargs: list(refs))
+    def get(refs: list, *, timeout: float) -> list:
+        assert timeout == 360.0
+        for ref in refs:
+            if isinstance(ref, Exception):
+                raise ref
+        return refs
+
+    monkeypatch.setattr(mws.ray, "get", get)
+    monkeypatch.setattr(mws.ray, "put", lambda value: value)
+
+
+@pytest.fixture
+def single_rank_workers(
+    local_refit_rpc,
+) -> tuple[SimpleNamespace, SimpleNamespace, list]:
     log = []
     policy = SimpleNamespace(
-        cfg=_cfg(**{"generation.colocated.engine_weights": weights}),
+        cfg=_cfg(),
         worker_group=_Group(
             log,
             "learner",
             {
-                "export_coresident_refit_handles": smp.RefitExport(
-                    smp.RefitPlacement("gpu0", 0), [], {}, "fp"
-                ),
-                "coresident_refit_source_ready": "fp",
+                "export_coresident_refit_handles": [
+                    smp.RefitExport(smp.RefitPlacement("gpu0", 0), [], {}, "fp")
+                ],
+                "coresident_refit_source_ready": ["fp"],
             },
         ),
     )
@@ -586,16 +601,30 @@ def test_coresident_refit_publishes_only_in_sync_weights(monkeypatch, weights):
             log,
             "engine",
             {
-                "coresident_refit_placement": smp.RefitPlacement("gpu0", 0),
-                "open_coresident_refit_handles": smp.RefitBinding([], {}),
-                "coresident_refit_copy": {
-                    "seconds": 0.0,
-                    "bytes": 1.0,
-                    "bytes_shared": 0.0,
-                },
+                "coresident_refit_placement": [smp.RefitPlacement("gpu0", 0)],
+                "open_coresident_refit_handles": [smp.RefitBinding([], {})],
+                "coresident_refit_copy": [
+                    {
+                        "seconds": 0.0,
+                        "bytes": 1.0,
+                        "bytes_shared": 0.0,
+                    }
+                ],
             },
         ),
     )
+    return policy, generation, log
+
+
+@pytest.mark.parametrize("weights", ["copy", "shared"])
+def test_coresident_refit_publishes_only_in_sync_weights(single_rank_workers, weights):
+    """Shared weights: the engine pauses before the optimizer write and stays paused until sync_weights (the loop's
+    refit, after its parameter all-gather) copies the rest, bumps the epoch and resumes it. Copy: the write needs no
+    pause. Either way the new version is published in exactly one place."""
+    from nemo_rl.weight_sync import megatron_weight_synchronizer as mws
+
+    policy, generation, log = single_rank_workers
+    policy.cfg["generation"]["colocated"]["engine_weights"] = weights
     refit = mws.CoresidentRefit(policy=policy, generation=generation)
     refit.init_communicator()
     refit.before_learner_write()  # before the engine runs: nothing to pause
@@ -611,7 +640,7 @@ def test_coresident_refit_publishes_only_in_sync_weights(monkeypatch, weights):
         "engine.coresident_refit_copy",
         "engine.coresident_resume",
     ]
-    policy.worker_group.replies["coresident_refit_source_ready"] = "moved"
+    policy.worker_group.replies["coresident_refit_source_ready"] = ["moved"]
     with pytest.raises(RuntimeError, match="moved"):
         refit.sync_weights()
 
@@ -637,33 +666,16 @@ def test_coresident_wrapper_rejects_unsupported_kv_scales() -> None:
     assert sync.is_stale
 
 
-def test_coresident_worker_wait_has_a_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    from nemo_rl.weight_sync import megatron_weight_synchronizer as mws
-
-    ticks = iter([0.0, 0.1, 1.1])
-    waits = []
-
-    def wait(refs: list, *, num_returns: int, timeout: float) -> tuple[list, list]:
-        waits.append(timeout)
-        return [], refs
-
-    monkeypatch.setattr(mws, "time", SimpleNamespace(perf_counter=lambda: next(ticks)))
-    monkeypatch.setattr(mws, "ray", SimpleNamespace(wait=wait, get=lambda refs: []))
-    with pytest.raises(TimeoutError, match="1 worker call"):
-        mws._get_fail_fast(["stalled"], timeout_s=1.0)
-    assert waits == [pytest.approx(0.9)]
-
-
 def test_coresident_failed_pause_does_not_mark_engine_paused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from nemo_rl.weight_sync import megatron_weight_synchronizer as mws
 
-    def timed_out(refs: list, *, timeout_s: float) -> list:
-        assert timeout_s == 0.25
-        raise TimeoutError("engine pause did not finish")
+    def timed_out(refs: list, *, timeout: float) -> list:
+        assert timeout == 0.25
+        raise mws.ray.exceptions.GetTimeoutError("engine pause did not finish")
 
-    monkeypatch.setattr(mws, "_get_fail_fast", timed_out)
+    monkeypatch.setattr(mws.ray, "get", timed_out)
     log = []
     refit = mws.CoresidentRefit(
         policy=SimpleNamespace(cfg=_cfg()),
@@ -676,56 +688,16 @@ def test_coresident_failed_pause_does_not_mark_engine_paused(
     assert log == ["engine.coresident_pause"]
 
 
-def test_coresident_copy_failure_keeps_engine_paused(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_coresident_copy_failure_keeps_engine_paused(single_rank_workers) -> None:
     from nemo_rl.weight_sync import megatron_weight_synchronizer as mws
 
-    def get(refs: list, **kwargs) -> list:
-        for ref in refs:
-            if isinstance(ref, Exception):
-                raise ref
-        return list(refs)
-
-    monkeypatch.setattr(mws, "_get_fail_fast", get)
-    log = []
-    policy = SimpleNamespace(
-        cfg=_cfg(),
-        worker_group=_Group(
-            log,
-            "learner",
-            {
-                "export_coresident_refit_handles": smp.RefitExport(
-                    smp.RefitPlacement("gpu0", 0), [], {}, "fp"
-                ),
-                "coresident_refit_source_ready": "fp",
-            },
-        ),
-    )
-    generation = SimpleNamespace(
-        refresh_dp_openai_server_base_urls=lambda **kwargs: log.append(
-            "engine.refresh_urls"
-        ),
-        worker_group=_Group(
-            log,
-            "engine",
-            {
-                "coresident_refit_placement": smp.RefitPlacement("gpu0", 0),
-                "open_coresident_refit_handles": smp.RefitBinding([], {}),
-                "coresident_refit_copy": {
-                    "seconds": 0.0,
-                    "bytes": 1.0,
-                    "bytes_shared": 0.0,
-                },
-            },
-        ),
-    )
+    policy, generation, log = single_rank_workers
     refit = mws.CoresidentRefit(policy, generation)
     refit.init_communicator()
     refit.sync_weights()
-    generation.worker_group.replies["coresident_refit_copy"] = ValueError(
-        "invalid weights"
-    )
+    generation.worker_group.replies["coresident_refit_copy"] = [
+        ValueError("invalid weights")
+    ]
     log.clear()
     with pytest.raises(ValueError, match="invalid weights"):
         refit.sync_weights()
@@ -821,30 +793,12 @@ def test_expert_parameter_order_leaves_incompatible_parameters_untouched() -> No
     "failure", [None, "export_coresident_refit_destinations", "coresident_reshard"]
 )
 def test_residual_transfer_precedes_publication_and_failures_keep_engine_paused(
-    monkeypatch: pytest.MonkeyPatch, failure: str | None
+    local_refit_rpc, failure: str | None
 ) -> None:
     from nemo_rl.weight_sync import megatron_weight_synchronizer as mws
 
     log = []
 
-    class Fleet:
-        def __init__(self, role: str, replies: dict) -> None:
-            self.role = role
-            self.replies = replies
-            self.calls = []
-
-        def run_all_workers_single_data(self, method: str, **kwargs) -> list:
-            log.append(f"{self.role}.{method}")
-            self.calls.append((method, kwargs))
-            return self.replies.get(method, [None, None])
-
-    def get(refs: list, **kwargs) -> list:
-        for value in refs:
-            if isinstance(value, Exception):
-                raise value
-        return refs
-
-    monkeypatch.setattr(mws, "_get_fail_fast", get)
     exports = [
         smp.RefitExport(smp.RefitPlacement(f"gpu{rank}", rank), [], {}, f"source{rank}")
         for rank in range(2)
@@ -853,14 +807,16 @@ def test_residual_transfer_precedes_publication_and_failures_keep_engine_paused(
         {"owner_rank": rank, "name": "weight", "shape": (8, 4), "element_size": 4}
         for rank in range(2)
     ]
-    learner = Fleet(
+    learner = _Group(
+        log,
         "learner",
         {
             "export_coresident_refit_handles": exports,
             "coresident_refit_source_ready": [item.fingerprint for item in exports],
         },
     )
-    engine = Fleet(
+    engine = _Group(
+        log,
         "engine",
         {
             "coresident_refit_placement": [item.placement for item in exports],
@@ -1177,36 +1133,36 @@ def test_uncapped_client_retries_transient_control_failure(
 
 
 def test_refit_subset_keeps_all_source_ranks_and_publishes_only_paired_destinations(
-    monkeypatch,
+    local_refit_rpc,
 ):
     from nemo_rl.weight_sync import megatron_weight_synchronizer as mws
 
-    class Fleet:
-        def __init__(self, replies):
-            self.replies = replies
-            self.calls = []
-
-        def run_all_workers_single_data(self, method, **kwargs):
-            self.calls.append((method, kwargs))
-            return self.replies.get(method, [])
-
     exports = [
-        smp.RefitExport(smp.RefitPlacement(f"gpu{rank}", rank), [], {}, f"source{rank}")
+        smp.RefitExport(
+            smp.RefitPlacement(f"gpu{rank}", rank),
+            [{"rank": rank}],
+            {"w": (rank,)},
+            f"source{rank}",
+        )
         for rank in range(4)
     ]
-    learner = Fleet(
+    learner = _Group(
+        [],
+        "learner",
         {
             "export_coresident_refit_handles": exports,
             "coresident_refit_source_ready": [item.fingerprint for item in exports],
-        }
+        },
     )
     destinations = [
         smp.RefitDestination(f"gpu{rank}", f"receive{rank}", {}) for rank in [2, 3]
     ]
-    engine = Fleet(
+    engine = _Group(
+        [],
+        "engine",
         {
             "coresident_refit_placement": [
-                smp.RefitPlacement(f"gpu{rank + 2}", rank) for rank in range(2)
+                smp.RefitPlacement(f"gpu{rank + 2}", rank) for rank in [1, 0]
             ],
             "open_coresident_refit_handles": [
                 smp.RefitBinding(
@@ -1227,9 +1183,8 @@ def test_refit_subset_keeps_all_source_ranks_and_publishes_only_paired_destinati
                 {"seconds": 0.0, "bytes": 8.0, "bytes_shared": 0.0}
             ]
             * 2,
-        }
+        },
     )
-    monkeypatch.setattr(mws, "_get_fail_fast", lambda refs, **kwargs: list(refs))
     refit = mws.CoresidentRefit(
         SimpleNamespace(cfg=_cfg(), worker_group=learner),
         SimpleNamespace(
@@ -1243,8 +1198,16 @@ def test_refit_subset_keeps_all_source_ranks_and_publishes_only_paired_destinati
         for method, kwargs in engine.calls
         if method == "open_coresident_refit_handles"
     )
-    assert opened["engine_to_learner"] == {0: 2, 1: 3}
-    assert len(opened["exports_by_device"]) == 4
+    assert opened == {
+        "local_placement": [exports[3].placement, exports[2].placement],
+        "local_handles": [exports[3].handles, exports[2].handles],
+        "common_kwargs": {
+            "source_metadata": [item for export in exports for item in export.metadata],
+            "engine_to_learner": {1: 3, 0: 2},
+            "learner_world_size": 4,
+            "share": False,
+        },
+    }
     stats = refit.sync_weights()
     assert stats["coresident_copy_bytes_total"] == 32
     forwarded = next(

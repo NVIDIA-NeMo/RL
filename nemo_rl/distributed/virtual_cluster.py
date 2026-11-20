@@ -971,6 +971,7 @@ class RayVirtualCluster:
         self._bundle_ct_per_node_list = bundle_ct_per_node_list
         self._world_size = sum(self._bundle_ct_per_node_list)
         self._placement_group_owner = None
+        self._subset_node_ids: Optional[list[str]] = None
         self._node_placement_groups: Optional[list[PlacementGroup]] = None
         self._sorted_bundle_indices: Optional[list[int]] = None
         self._nvlink_domain_per_bundle_index: Optional[tuple[str, ...]] = None
@@ -1139,11 +1140,19 @@ class RayVirtualCluster:
 
     def get_node_ids(self) -> list[str]:
         """The distinct Ray nodes this cluster's placement groups occupy, in order."""
+        if self._subset_node_ids is not None:
+            return list(self._subset_node_ids)
+        groups = self.get_placement_groups()
+        if len(groups) == 1:
+            bundle_nodes = placement_group_table(groups[0])["bundles_to_node_id"]
+            return list(dict.fromkeys(bundle_nodes.values()))
+        # Fetch all node placements in one GCS call, including on multi-node fleets.
+        table = placement_group_table()
         return list(
             dict.fromkeys(
                 node_id
-                for pg in self.get_placement_groups()
-                for node_id in placement_group_table(pg)["bundles_to_node_id"].values()
+                for pg in groups
+                for node_id in table[pg.id.hex()]["bundles_to_node_id"].values()
             )
         )
 
@@ -1188,6 +1197,7 @@ class RayVirtualCluster:
             port_range_high=self.port_range_high,
         )
         view._placement_group_owner = self
+        view._subset_node_ids = list(node_counts)
         view._node_placement_groups = placement_groups
         view._sorted_bundle_indices = bundles
         view._nvlink_domain_per_bundle_index = self._nvlink_domain_per_bundle_index

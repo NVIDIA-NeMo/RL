@@ -21,7 +21,12 @@ import torch
 from nemo_rl.models.megatron import sm_partition
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+pytestmark = [
+    pytest.mark.mcore,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
+]
+
+
 @pytest.mark.parametrize("shared", [False, True])
 def test_coresident_refit_refreshes_captured_mamba_cache(shared: bool) -> None:
     # The standalone CPU suite does not need the optional Megatron inference dependencies.
@@ -66,6 +71,7 @@ def test_coresident_refit_refreshes_captured_mamba_cache(shared: bool) -> None:
 
     worker = SimpleNamespace(
         _coresident_src=source,
+        _coresident_residual_metadata=(),
         _gen_model=lambda: mixer,
         _refresh_flashinfer_mxfp8_weights=lambda: None,
     )
@@ -80,7 +86,6 @@ def test_coresident_refit_refreshes_captured_mamba_cache(shared: bool) -> None:
         assert mixer.A_log.data_ptr() == weight_ptr
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize("packed", [False, True])
 def test_shared_expert_stacks_keep_graph_addresses_and_refit_values(
     packed: bool,
@@ -142,7 +147,6 @@ def test_shared_expert_stacks_keep_graph_addresses_and_refit_values(
         assert (stats["bytes"] == 0) == packed
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_shared_expert_order_uses_native_optimizer_storage_layout() -> None:
     # Validate the pinned optimizer's actual packing, not a simulated reversal.
     from megatron.core.distributed import DistributedDataParallelConfig

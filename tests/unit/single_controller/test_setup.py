@@ -566,6 +566,49 @@ def test_build_clusters_borrows_gpu_groups_from_one_mps_pool(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    "nixl,expected",
+    [
+        ({"storage_unit_placement": ["inference"]}, ["engine-node"]),
+        (
+            {"storage_unit_placement": ["train", "inference"]},
+            ["engine-node", "learner-node"],
+        ),
+        ({"storage_unit_placement": "all"}, None),
+        (
+            {"storage_unit_placement": ["inference"], "node_ids": ["explicit-node"]},
+            ["explicit-node"],
+        ),
+    ],
+)
+def test_coresident_nixl_bootstrap_uses_nodes_of_the_requested_role(
+    patched_factories, monkeypatch, nixl, expected
+) -> None:
+    cfg = _make_master_config(backend="megatron", megatron_enabled=True)
+    cfg.data_plane.update(backend="nixl", nixl=nixl)
+    cfg.policy["generation"].update(refit_transport="ipc")
+    cfg.policy["generation"]["colocated"]["engine_sm_fraction"] = 0.5
+    cfg.policy["megatron_cfg"].update(
+        tensor_model_parallel_size=1,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
+    )
+    cfg.loss_fn.reference_policy_kl_penalty = 0
+    monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", "/tmp/test-mps")
+    train, inference, _, _ = patched_factories["_build_clusters"].return_value
+    train.get_node_ids.return_value = ["learner-node", "engine-node"]
+    inference.get_node_ids.return_value = ["engine-node"]
+    build = patched_factories["_build_trainer"]
+
+    setup_single_controller(cfg, MagicMock(pad_token_id=0))
+
+    assert (
+        sc_setup_mod.backend_config(build.call_args.kwargs["dp_config"]).node_ids
+        == expected
+    )
+    assert cfg.data_plane["nixl"] == nixl
+
+
 def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
     """Teacher nodes are removed before the student train/inference split."""
     master_config = _make_master_config(colocated=False)
@@ -840,6 +883,7 @@ def test_build_trainer_initializes_reference_model_only_for_nonzero_kl(
             master_config,
             MagicMock(name="tokenizer"),
             None,
+            dp_config=master_config.data_plane,
             weights_path=None,
             optimizer_path=None,
             checkpointing=True,

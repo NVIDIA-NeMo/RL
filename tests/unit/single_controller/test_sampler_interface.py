@@ -49,6 +49,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_transactional_admission,
 )
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
@@ -886,6 +887,7 @@ class TestGroupAlignedSelection:
                 num_generations_per_prompt=generations,
             ),
             policy={"dynamic_batching": {"enabled": True}},
+            loss_fn=ClippedPGLossConfig(),
             async_rl=AsyncRLConfig(min_groups_for_streaming_train=8),
         )
         group_multiple, tail = resolve_streaming_chunk_alignment(

@@ -94,40 +94,38 @@ def remap_metadata(
     metadata: list["ParameterMetadata"],
     engine_to_learner: dict[int, int],
     *,
-    learner_world_size: int | None = None,
+    learner_world_size: int,
 ) -> list["ParameterMetadata"]:
     """Copy engine metadata into learner-world ranks, retaining group order and names."""
     world = set(range(len(engine_to_learner)))
-    learner_world = len(world) if learner_world_size is None else learner_world_size
     if (
         not world
-        or type(learner_world) is not int
-        or learner_world < len(world)
+        or type(learner_world_size) is not int
         or any(
             type(rank) is not int for pair in engine_to_learner.items() for rank in pair
         )
         or set(engine_to_learner) != world
         or len(set(engine_to_learner.values())) != len(world)
-        or any(rank < 0 or rank >= learner_world for rank in engine_to_learner.values())
+        or any(
+            rank not in range(learner_world_size) for rank in engine_to_learner.values()
+        )
     ):
         raise ValueError(
-            "Engine-to-learner mapping must be a complete equal-world bijection"
-            if learner_world_size is None
-            else "Engine-to-learner mapping must cover the engine world with distinct, bounded learner ranks"
+            "Engine-to-learner mapping must cover the engine world with distinct, bounded learner ranks"
         )
     remapped = deepcopy(metadata)
     for item in remapped:
         _validate_metadata(item)
-        ranks = {item.owner_rank}
-        for field in _GROUP_FIELDS:
-            ranks.update(getattr(item, field) or ())
-        if not ranks <= world:
-            raise ValueError(f"Metadata rank is outside the placement map: {item.name}")
-        item.owner_rank = engine_to_learner[item.owner_rank]
-        for field in _GROUP_FIELDS:
-            group = getattr(item, field)
-            if group is not None:
-                setattr(item, field, [engine_to_learner[rank] for rank in group])
+        try:
+            item.owner_rank = engine_to_learner[item.owner_rank]
+            for field in _GROUP_FIELDS:
+                group = getattr(item, field)
+                if group is not None:
+                    setattr(item, field, [engine_to_learner[rank] for rank in group])
+        except KeyError as exc:
+            raise ValueError(
+                f"Metadata rank is outside the placement map: {item.name}"
+            ) from exc
     return remapped
 
 

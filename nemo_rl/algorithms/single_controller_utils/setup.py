@@ -104,6 +104,7 @@ from nemo_rl.data_plane import (
     build_data_plane_client,
     data_plane_supports_checkpointing,
 )
+from nemo_rl.data_plane.interfaces import DataPlaneConfig, backend_config
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     SAMPLER_TOPK_FIELDS,
@@ -154,6 +155,7 @@ from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.megatron import sm_partition
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -517,11 +519,8 @@ def _build_clusters(
     # the PPO path.
     train_worker_groups = 1 if not is_ppo_run(master_config) or dedicated_value else 2
 
-    from nemo_rl.models.megatron import sm_partition
-
     if sm_partition.engine_sm_fraction(master_config.policy) is not None:
-        # Co-resident generation: the stock non-colocated engine, placed on the training GPUs as its own processes (one
-        # more worker group per bundle), each GPU's SMs shared by MPS limits (sm_partition.py).
+        # The engine uses its own worker processes on the training GPUs.
         sm_partition.validate_gpu_subsets(
             master_config.policy, gpus_per_node * policy_nodes
         )
@@ -535,8 +534,7 @@ def _build_clusters(
             port_range_high=port_range_high,
             segment_size=segment_size,
         )
-        # Created here, once: the stock non-colocated path builds the engine and the trainer in parallel threads, and
-        # both would otherwise lazily create this cluster's placement groups (a name race on multi-node).
+        # Reserve once before the trainer and generation builders start on separate threads.
         MegatronGeneration.init_cluster_placement_groups(cluster, master_config.policy)
         placement = generation_config["colocated"]
         learner_indices = placement.get("learner_gpu_indices")
@@ -834,6 +832,7 @@ def _build_trainer(
     tokenizer,
     processor,
     *,
+    dp_config: DataPlaneConfig,
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
     checkpointing: bool,
@@ -847,6 +846,7 @@ def _build_trainer(
         master_config: SC MasterConfig.
         tokenizer: Tokenizer used by the policy.
         processor: Optional AutoProcessor for VLM paths.
+        dp_config: Data-plane configuration with bootstrap placement resolved.
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
         checkpointing: Whether data-plane checkpoint save or restore is needed.
@@ -870,7 +870,7 @@ def _build_trainer(
         optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=init_reference_model,
-        dp_cfg=master_config.data_plane,
+        dp_cfg=dp_config,
         checkpointing=checkpointing,
         storage_unit_node_ids=storage_unit_node_ids,
         reserved_http_server_ports=reserved_http_server_ports,
@@ -1982,18 +1982,6 @@ def setup_single_controller(
         )
         setup_timing_metrics.teacher_reservation_time_s = time.perf_counter() - t0
 
-    # NIXL units with storage_unit_placement=inference read the inference
-    # placement groups when TQ bootstraps inside the trainer build, which runs
-    # in parallel with the generation build: reserve them first.
-    from nemo_rl.data_plane.interfaces import backend_config
-
-    if (
-        not colocated
-        and dp_config["backend"] == "nixl"
-        and backend_config(dp_config).storage_unit_placement == "inference"
-    ):
-        inference_cluster.get_placement_groups()
-
     # Storage-unit plan, one Ray node ID per unit (None: units off). Made once,
     # after the train/teacher claims above, and used twice: TQ's bootstrap in
     # the trainer pins SimpleStorageUnits to it, and start_storage_units below
@@ -2009,7 +1997,23 @@ def setup_single_controller(
         **({"value": value_cluster} if value_cluster is not None else {}),
         **{f"teacher:{name}": c for name, c in teacher_clusters.items()},
     }
+    trainer_dp_config = dp_config
     storage_unit_node_ids = plan_storage_unit_nodes(dp_config, clusters_by_name)
+    if (
+        dp_config["backend"] == "nixl"
+        and sm_partition.engine_sm_fraction(master_config.policy) is not None
+    ):
+        # Co-resident roles share a Ray placement group, so its name cannot locate either role.
+        nixl_config = backend_config(dp_config)
+        if not nixl_config.node_ids and nixl_config.storage_unit_placement != "all":
+            nixl_config.node_ids = sorted(
+                {
+                    node
+                    for role in nixl_config.storage_unit_placement
+                    for node in clusters_by_name[role].get_node_ids()
+                }
+            )
+            trainer_dp_config = {**dp_config, "nixl": nixl_config}
 
     # Create build tasks for generation / trainer / (nemo-gym) workers
     build_tasks: dict[str, Callable[[], Any]] = {}
@@ -2026,7 +2030,6 @@ def setup_single_controller(
     megatron_port_holders: list[Any] = []
     reserved_http_server_ports = None
     weight_synchronizer: Optional[WeightSynchronizer] = None
-    train_group_multiple, train_min_remaining_groups = (1, 0)
     if megatron_backend:
         generation_config["model_name"] = master_config.policy["model_name"]
 
@@ -2047,13 +2050,13 @@ def setup_single_controller(
             A tuple of (TQPolicy trainer, TQValue critic or None, per-phase wall
             times keyed as "trainer_time" and "value_time").
         """
-        nonlocal train_group_multiple, train_min_remaining_groups
         time_metrics: dict[str, float] = {}
         trainer, time_metrics["trainer_time"] = _build_trainer(
             train_cluster,
             master_config,
             tokenizer,
             processor,
+            dp_config=trainer_dp_config,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             checkpointing=bool(
@@ -2067,14 +2070,6 @@ def setup_single_controller(
             reserved_http_server_ports=reserved_http_server_ports,
         )
         if not is_ppo_run(master_config):
-            train_group_multiple, train_min_remaining_groups = (
-                resolve_streaming_chunk_alignment(
-                    master_config,
-                    policy_dp=trainer.sharding_annotations.get_axis_size(
-                        "data_parallel"
-                    ),
-                )
-            )
             return trainer, None, time_metrics
 
         if not dedicated_value:
@@ -2086,13 +2081,6 @@ def setup_single_controller(
             seed=algo_cfg.seed,
             weights_path=value_weights_path,
             optimizer_path=value_optimizer_path,
-        )
-        train_group_multiple, train_min_remaining_groups = (
-            resolve_streaming_chunk_alignment(
-                master_config,
-                policy_dp=trainer.sharding_annotations.get_axis_size("data_parallel"),
-                value_dp=value.sharding_annotations.get_axis_size("data_parallel"),
-            )
         )
         if dedicated_value:
             value.prepare_for_training()
@@ -2445,6 +2433,18 @@ def setup_single_controller(
                         f"  ✓ Trainer warm-up (rank 0): {ray.get(refs)[0]}", flush=True
                     )
                     warmup_kwargs = None  # done; the controller must not run it again
+            train_group_multiple, train_min_remaining_groups = (
+                resolve_streaming_chunk_alignment(
+                    master_config,
+                    policy_dp=trainer.sharding_annotations.get_axis_size(
+                        "data_parallel"
+                    ),
+                    requires_kv_scale_sync=generation.requires_kv_scale_sync,
+                    value_dp=value.sharding_annotations.get_axis_size("data_parallel")
+                    if value is not None
+                    else None,
+                )
+            )
             if start_communicator_early:
                 communicator_future = _start_on_daemon_thread(
                     _init_communicator, name="refit-communicator"

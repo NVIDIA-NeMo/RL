@@ -21,6 +21,22 @@ from nemo_rl.models.policy import Fp8Config, PolicyConfig
 from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
 
 
+# Ray fixes a concurrency group's size when it registers the worker class.
+MAX_GENERATION_CALLS = 1 << 16
+
+
+def check_generation_calls(
+    max_inflight_prompts: int, generations_per_prompt: int
+) -> None:
+    """Validate the maximum number of streaming calls sent to generation rank zero."""
+    calls = max_inflight_prompts * generations_per_prompt
+    if calls > MAX_GENERATION_CALLS:
+        raise ValueError(
+            f"async_rl.max_inflight_prompts x num_generations_per_prompt = {calls} "
+            f"generation calls in flight, above the Megatron worker limit of {MAX_GENERATION_CALLS}"
+        )
+
+
 def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
     """Resolve native MCore staging bytes using NeMo-RL's collective default."""
     if configured_bytes is None:

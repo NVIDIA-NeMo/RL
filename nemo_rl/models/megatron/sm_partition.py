@@ -11,36 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Concurrent Megatron training and inference with shared GPU weight storage.
+"""GPU scheduling and same-GPU CUDA IPC weight sharing for co-resident Megatron.
 
-Each selected inference GPU also runs a learner under MPS. The default
-``mps_gemm`` backend gives both clients full SM access and applies an advisory
-Transformer Engine grouped-GEMM budget on shared learner GPUs. Explicit
-``mps_percentage`` caps the learner instead. Neither reserves disjoint SMs.
-
-With ``engine_weights=shared``, compatible contiguous parameter views alias
-learner storage through same-GPU CUDA IPC. Strided/packed weights and persistent
-buffers retain inference storage. Native logical shard metadata identifies local
-sources across different TP, EP, ETP and training CP/PP layouts. When a destination
-needs another GPU's shard, the native reshard executor runs among learner ranks
-and writes directly into the paired inference process's exported receive buffers.
-There is no additional persistent shadow weight model.
-
-Inference pauses and drains admitted CUDA work before the optimizer can write
-shared weights. Publication verifies learner storage, refreshes receive handles
-when inference rehomes private tensors, completes residual and local copies,
-refreshes derived caches, and advances the inference weight epoch before resume.
-The same publication protocol serves ``engine_weights=copy``.
-
-Native DDP learners can pack expert projections in inference order before buffer
-allocation. Compatible full expert stacks remain shared; other layouts use
-Megatron's own packing. Optimizer checkpoints for reordered parameters must use
-model-space names rather than bucket positions.
-
-Both worker worlds use the same GPUs. Inference remains subject to its backend's
-CP1/PP1 and expert-TP constraints. Virtual pipeline chunks, GTP rematerialization
-and quantized refit storage are unsupported. New layouts require distributed GPU
-and full-model validation before performance or deployment claims.
+Each inference GPU also hosts a learner. The default MPS backend gives both
+processes full SM access and can apply a grouped-GEMM margin on shared GPUs.
+Compatible local parameters share storage. Private tensors are refreshed while
+inference is paused. See docs/design-docs/mps-parallelism-sharing.md for the
+placement constraints, publication protocol, and supported parallelism.
 """
 
 from __future__ import annotations
@@ -462,7 +439,7 @@ def export_refit_handles(named: Iterable[tuple[str, torch.Tensor]]) -> dict[str,
 
 
 def storage_fingerprint(named: Iterable[tuple[str, torch.Tensor]]) -> str:
-    """Host-only hash of (name, data_ptr, numel) of the refit tensors: changes iff any of them moved."""
+    """Identify exported tensor addresses and layouts without reading GPU memory."""
     import hashlib
 
     h = hashlib.sha1()
@@ -857,7 +834,7 @@ def copy_refit(
     dst = dict(named_dst)
     _check_names(src, dst)
     copied = shared = 0
-    copy_groups = {}
+    copy_groups = defaultdict(lambda: ([], []))
     # The engine's tensors can be inference tensors (allocated lazily under inference mode); write them there too.
     with torch.inference_mode():
         for name, d in dst.items():
@@ -882,12 +859,9 @@ def copy_refit(
             ):
                 # Mixed dtype lists force foreach back to one copy per tensor.
                 key = (s.device, d.device, s.dtype, d.dtype)
-                group = copy_groups.get(key)
-                if group is None:
-                    group = ([], [])
-                    copy_groups[key] = group
-                group[0].append(s)
-                group[1].append(d)
+                sources, destinations = copy_groups[key]
+                sources.append(s)
+                destinations.append(d)
             else:
                 # Enqueue large copies while the host prepares subsequent tensors.
                 d.copy_(s)

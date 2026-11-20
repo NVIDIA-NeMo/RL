@@ -76,7 +76,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     TokenCaptureConfig,
     logprob_passes_required,
     resolve_streaming_chunk_alignment,
-    validate_grpo_chunk_cap_alignment,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
@@ -419,6 +418,7 @@ def _grpo_chunk_cap_config(
             num_prompts_per_step=8,
             num_generations_per_prompt=num_generations_per_prompt,
         ),
+        loss_fn=ClippedPGLossConfig(),
         policy={
             "train_micro_batch_size": train_micro_batch_size,
             "dynamic_batching": {"enabled": dynamic_batching},
@@ -434,14 +434,49 @@ def _grpo_chunk_cap_config(
     )
 
 
-def test_grpo_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp() -> None:
-    """GRPO passes no group_multiple, so the cap alone decides the chunk size.
+@pytest.mark.parametrize(
+    ("force_ratio", "reference_kl", "calibrates", "needs_logprob_batch"),
+    [
+        (True, 0, False, False),
+        (False, 0, False, True),
+        (True, 0.1, False, True),
+        (True, 0, True, True),
+    ],
+)
+def test_grpo_only_aligns_logprob_microbatches_for_active_forwards(
+    force_ratio: bool,
+    reference_kl: float,
+    calibrates: bool,
+    needs_logprob_batch: bool,
+) -> None:
+    config = _grpo_chunk_cap_config(None, dynamic_batching=False)
+    config.loss_fn = ClippedPGLossConfig(
+        force_on_policy_ratio=force_ratio, reference_policy_kl_penalty=reference_kl
+    )
+    config.policy["logprob_batch_size"] = 3
+    if needs_logprob_batch:
+        with pytest.raises(ValueError, match="num_prompts_per_step"):
+            resolve_streaming_chunk_alignment(
+                config, policy_dp=1, requires_kv_scale_sync=calibrates
+            )
+    else:
+        assert resolve_streaming_chunk_alignment(config, policy_dp=1) == (1, 0)
 
-    Three groups at two generations each is six samples, and the training
-    dispatch shards without allow_uneven_shards, so six cannot split four ways.
-    """
+
+def test_grpo_can_wait_for_more_than_its_streaming_floor() -> None:
+    config = _grpo_chunk_cap_config(4)
+    config.async_rl.min_groups_for_streaming_train = 1
+    assert resolve_streaming_chunk_alignment(config, policy_dp=8) == (4, 0)
+
+    config.async_rl.max_buffered_rollouts = 3
+    with pytest.raises(ValueError, match="max_buffered_rollouts"):
+        resolve_streaming_chunk_alignment(config, policy_dp=8)
+
+
+def test_grpo_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp() -> None:
+    """Three capped groups at two generations each cannot split across four ranks."""
     with pytest.raises(ValueError, match="max_groups_for_streaming_train"):
-        validate_grpo_chunk_cap_alignment(_grpo_chunk_cap_config(3), 4)
+        resolve_streaming_chunk_alignment(_grpo_chunk_cap_config(3), policy_dp=4)
 
 
 def test_grpo_rejects_a_cap_that_leaves_each_rank_a_partial_microbatch() -> None:
@@ -459,7 +494,7 @@ def test_grpo_rejects_a_cap_that_leaves_each_rank_a_partial_microbatch() -> None
     )
 
     with pytest.raises(ValueError, match="max_groups_for_streaming_train"):
-        validate_grpo_chunk_cap_alignment(config, 2)
+        resolve_streaming_chunk_alignment(config, policy_dp=2)
 
 
 @pytest.mark.parametrize("chunk_cap", [None, 2, 4, 8, 9])
@@ -468,7 +503,7 @@ def test_grpo_accepts_shardable_and_nonbinding_chunk_caps(
 ) -> None:
     # 2 and 4 shard evenly across DP 4; 8 and 9 are at or above
     # num_prompts_per_step and so never bind; None is the unbounded default.
-    validate_grpo_chunk_cap_alignment(_grpo_chunk_cap_config(chunk_cap), 4)
+    resolve_streaming_chunk_alignment(_grpo_chunk_cap_config(chunk_cap), policy_dp=4)
 
 
 @pytest.mark.parametrize(
@@ -490,7 +525,7 @@ def test_grpo_ignores_microbatch_sizes_when_the_consumer_bins_its_own(
         sequence_packing=sequence_packing,
     )
 
-    validate_grpo_chunk_cap_alignment(config, 2)
+    resolve_streaming_chunk_alignment(config, policy_dp=2)
 
 
 def test_forest_is_exempt_because_its_groups_are_padded_to_execution_rows() -> None:
@@ -499,27 +534,9 @@ def test_forest_is_exempt_because_its_groups_are_padded_to_execution_rows() -> N
     Its logical group count is therefore not its physical row count, so the
     sample arithmetic this guard does would be measuring the wrong thing.
     """
-    validate_grpo_chunk_cap_alignment(
-        _grpo_chunk_cap_config(3, forest_training=True), 4
-    )
-
-
-def test_the_grpo_chunk_cap_guard_leaves_ppo_to_its_own_alignment() -> None:
-    # 3 groups x 2 generations is 6 samples, which DP 4 cannot shard, so the
-    # GRPO guard would reject this config if it did not skip PPO runs.
-    config = MasterConfig.model_construct(
-        ppo=PPOConfig(num_prompts_per_step=32, num_generations_per_prompt=2),
-        policy={
-            "train_micro_batch_size": 1,
-            "dynamic_batching": {"enabled": True},
-        },
-        async_rl=AsyncRLConfig(
-            min_groups_for_streaming_train=2,
-            max_groups_for_streaming_train=3,
-        ),
-    )
-
-    validate_grpo_chunk_cap_alignment(config, 4)
+    assert resolve_streaming_chunk_alignment(
+        _grpo_chunk_cap_config(3, forest_training=True), policy_dp=4
+    ) == (1, 0)
 
 
 def _one_group_tags(count: int, *, weight_version: int = 0) -> list[dict[str, object]]:

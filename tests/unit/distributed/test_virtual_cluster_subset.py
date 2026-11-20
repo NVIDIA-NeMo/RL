@@ -47,6 +47,7 @@ def test_subset_borrows_parent_resources_in_requested_rank_order(cluster) -> Non
     assert view.world_size() == 16 and view.node_count() == 4
     assert parent.world_size() == 32
     assert view._sorted_bundle_indices == list(range(16))
+    assert view.get_node_ids() == ["node0", "node1", "node2", "node3"]
     assert view.get_placement_groups() == parent.get_placement_groups()
     view.shutdown()
     removed.assert_not_called()

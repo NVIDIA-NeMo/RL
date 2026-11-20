@@ -95,8 +95,8 @@ def world(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             raise ray.exceptions.GetTimeoutError("HTTP URL query exceeded deadline")
         return urls
 
-    def wait(refs: list, *, timeout_s: float | None = None) -> list:
-        assert timeout_s == 17.0
+    def wait(refs: list, *, timeout: float) -> list:
+        assert timeout == 17.0
         method = refs[0][1]
         if method == "coresident_refit_source_ready":
             return ["stable"]
@@ -110,7 +110,7 @@ def world(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             assert method == "coresident_pause"
         return [None]
 
-    monkeypatch.setattr(synchronizer, "_get_fail_fast", wait)
+    monkeypatch.setattr(synchronizer.ray, "get", wait)
     generation = generation_type(SimpleNamespace(get=get))()
     generation.cfg = {"mcore_generation_config": {"expose_http_server": True}}
     generation.dp_openai_server_base_urls = []

@@ -631,3 +631,35 @@ def test_shutdown_synchronizes_cuda_before_stopping_coordinator(
         EngineState.STOPPED
     )
     worker.inference_client.shutdown_coordinator.assert_called_once()
+
+
+@pytest.mark.mcore
+def test_coresident_refit_rejects_wrong_gpu_before_opening_ipc():
+    from nemo_rl.models.megatron.sm_partition import RefitPlacement
+
+    worker = SimpleNamespace(
+        _inference_engine_initialized=False,
+        _coresident_src=None,
+        report_device_id=lambda: "engine-gpu",
+    )
+    with pytest.raises(ValueError, match="must come from the engine's GPU"):
+        MegatronGenerationRefitMixin.open_coresident_refit_handles(
+            worker,
+            local_placement=RefitPlacement(device_id="other-gpu", rank=0),
+            local_handles={},
+            learner_world_size=1,
+            source_metadata=[],
+            engine_to_learner={0: 0},
+            share=True,
+        )
+
+
+@pytest.mark.mcore
+def test_coresident_refit_rejects_running_engine():
+    from megatron.core.inference.engines.dynamic_engine import EngineState
+
+    worker = SimpleNamespace(
+        dynamic_inference_engine=SimpleNamespace(state=EngineState.RUNNING)
+    )
+    with pytest.raises(RuntimeError, match="only be updated while inference is paused"):
+        asyncio.run(MegatronGenerationRefitMixin._coresident_refit_on_loop(worker))

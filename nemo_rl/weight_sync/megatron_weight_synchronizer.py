@@ -239,30 +239,6 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
             self._transport.shutdown()
 
 
-def _get_fail_fast(refs: list, *, timeout_s: Optional[float] = None) -> list:
-    """Return worker results or raise the first failure without waiting for peers.
-
-    ray.get that raises the first failure as soon as it lands (a peer of a failed call may otherwise block until its
-    own timeout). O(1) driver calls while nothing fails.
-    """
-    if timeout_s is not None and timeout_s <= 0:
-        raise ValueError("co-resident refit timeout must be positive")
-    deadline = None if timeout_s is None else time.perf_counter() + timeout_s
-    pending = list(refs)
-    while pending:
-        wait_s = 1.0
-        if deadline is not None:
-            remaining = deadline - time.perf_counter()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"co-resident refit: {len(pending)} worker call(s) did not return within {timeout_s}s"
-                )
-            wait_s = min(wait_s, remaining)
-        done, pending = ray.wait(pending, num_returns=len(pending), timeout=wait_s)
-        ray.get(done)
-    return ray.get(list(refs))
-
-
 class CoresidentRefit:
     """Refit of a co-resident Megatron engine (nemo_rl/models/megatron/sm_partition.py).
 
@@ -289,31 +265,27 @@ class CoresidentRefit:
         self._paused_at: Optional[float] = None
         self._pause_s = 0.0
         self._control_timeout_s = 360.0 if refit_timeout_s is None else refit_timeout_s
+        if self._control_timeout_s <= 0:
+            raise ValueError("co-resident refit timeout must be positive")
         self._has_residual_transfers = False
         self._residual_bytes = 0
         self._devices: set[str] = set()
         self._closed = False
 
+    def _call_workers(self, owner: Any, method: str, **kwargs: Any) -> list[Any]:
+        refs = owner.worker_group.run_all_workers_single_data(method, **kwargs)
+        return ray.get(refs, timeout=self._control_timeout_s)
+
     def init_communicator(self) -> None:
         if self._closed:
             raise RuntimeError("co-resident refit is closed")
-        exported = _get_fail_fast(
-            self._policy.worker_group.run_all_workers_single_data(
-                "export_coresident_refit_handles"
-            ),
-            timeout_s=self._control_timeout_s,
-        )
+        exported = self._call_workers(self._policy, "export_coresident_refit_handles")
         by_device = {item.placement.device_id: item for item in exported}
         if len(by_device) != len(exported):
             raise RuntimeError(
                 "co-resident refit: two learner ranks report the same GPU"
             )
-        layouts = _get_fail_fast(
-            self._generation.worker_group.run_all_workers_single_data(
-                "coresident_refit_placement"
-            ),
-            timeout_s=self._control_timeout_s,
-        )
+        layouts = self._call_workers(self._generation, "coresident_refit_placement")
         engine_devices = {layout.device_id for layout in layouts}
         if (
             not layouts
@@ -336,15 +308,21 @@ class CoresidentRefit:
         }
         source_metadata = [metadata for item in exported for metadata in item.metadata]
         self._fingerprints = [item.fingerprint for item in exported]
-        bound = _get_fail_fast(
-            self._generation.worker_group.run_all_workers_single_data(
+        # Both worker-group calls enumerate workers in the same order.
+        local_exports = [by_device[layout.device_id] for layout in layouts]
+        bound = ray.get(
+            self._generation.worker_group.run_all_workers_multiple_data(
                 "open_coresident_refit_handles",
-                exports_by_device=by_device,
-                source_metadata=source_metadata,
-                engine_to_learner=engine_to_learner,
-                share=self._shared,
+                local_placement=[item.placement for item in local_exports],
+                local_handles=[item.handles for item in local_exports],
+                common_kwargs={
+                    "source_metadata": ray.put(source_metadata),
+                    "engine_to_learner": engine_to_learner,
+                    "learner_world_size": len(exported),
+                    "share": self._shared,
+                },
             ),
-            timeout_s=self._control_timeout_s,
+            timeout=self._control_timeout_s,
         )
         residual_metadata = [
             metadata for item in bound for metadata in item.residual_metadata
@@ -355,13 +333,11 @@ class CoresidentRefit:
             for item in residual_metadata
         )
         if self._has_residual_transfers:
-            _get_fail_fast(
-                self._policy.worker_group.run_all_workers_single_data(
-                    "init_coresident_reshard",
-                    source_metadata=source_metadata,
-                    residual_metadata=residual_metadata,
-                ),
-                timeout_s=self._control_timeout_s,
+            self._call_workers(
+                self._policy,
+                "init_coresident_reshard",
+                source_metadata=source_metadata,
+                residual_metadata=residual_metadata,
             )
         totals = {
             key: sum(item.stats.get(key, 0) for item in bound)
@@ -374,12 +350,7 @@ class CoresidentRefit:
 
     def _pause(self) -> float:
         t0 = time.perf_counter()
-        _get_fail_fast(
-            self._generation.worker_group.run_all_workers_single_data(
-                "coresident_pause"
-            ),
-            timeout_s=self._control_timeout_s,
-        )
+        self._call_workers(self._generation, "coresident_pause")
         self._paused_at = t0
         return time.perf_counter() - t0
 
@@ -402,14 +373,8 @@ class CoresidentRefit:
             self._pause_s = self._pause()
         paused_at = self._paused_at
         assert paused_at is not None, "Co-resident readers must be paused before refit"
-        gen = self._generation.worker_group
         t0 = time.perf_counter()
-        ready = _get_fail_fast(
-            self._policy.worker_group.run_all_workers_single_data(
-                "coresident_refit_source_ready"
-            ),
-            timeout_s=self._control_timeout_s,
-        )
+        ready = self._call_workers(self._policy, "coresident_refit_source_ready")
         if ready != self._fingerprints:
             raise RuntimeError(
                 "co-resident refit: a learner rank's refit tensors moved since their IPC handles were taken "
@@ -417,31 +382,21 @@ class CoresidentRefit:
             )
         t1 = time.perf_counter()
         if self._has_residual_transfers:
-            targets = _get_fail_fast(
-                gen.run_all_workers_single_data("export_coresident_refit_destinations"),
-                timeout_s=self._control_timeout_s,
+            targets = self._call_workers(
+                self._generation, "export_coresident_refit_destinations"
             )
             by_device = {item.device_id: item for item in targets}
             if len(by_device) != len(targets) or set(by_device) != self._devices:
                 raise RuntimeError(
                     "co-resident receive workers changed physical placement"
                 )
-            _get_fail_fast(
-                self._policy.worker_group.run_all_workers_single_data(
-                    "coresident_reshard", destinations=by_device
-                ),
-                timeout_s=self._control_timeout_s,
+            self._call_workers(
+                self._policy, "coresident_reshard", destinations=by_device
             )
         residual_done = time.perf_counter()
-        copies = _get_fail_fast(
-            gen.run_all_workers_single_data("coresident_refit_copy"),
-            timeout_s=self._control_timeout_s,
-        )
+        copies = self._call_workers(self._generation, "coresident_refit_copy")
         t2 = time.perf_counter()
-        _get_fail_fast(
-            gen.run_all_workers_single_data("coresident_resume"),
-            timeout_s=self._control_timeout_s,
-        )
+        self._call_workers(self._generation, "coresident_resume")
         if not self._engine_running:
             self._generation.refresh_dp_openai_server_base_urls(
                 timeout_s=self._control_timeout_s
@@ -480,10 +435,5 @@ class CoresidentRefit:
         if self._closed:
             return
         if self._has_residual_transfers:
-            _get_fail_fast(
-                self._policy.worker_group.run_all_workers_single_data(
-                    "release_coresident_receives"
-                ),
-                timeout_s=self._control_timeout_s,
-            )
+            self._call_workers(self._policy, "release_coresident_receives")
         self._closed = True
