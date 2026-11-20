@@ -23,6 +23,17 @@ The template is [`.github/PULL_REQUEST_TEMPLATE.md`](../../.github/PULL_REQUEST_
    - No colleagues' emails or chat handles, no ticket IDs, credentials, or paths that show internal infrastructure.
    - No unreleased model names or internal numbers.
 
+## Changing the template
+
+The template, the check and this skill must agree. When you add, rename or remove a section, or change the review box wording, update all of them in the same PR:
+
+1. [`.github/PULL_REQUEST_TEMPLATE.md`](../../.github/PULL_REQUEST_TEMPLATE.md).
+2. [`.github/workflows/pr-description-check.yml`](../../.github/workflows/pr-description-check.yml): the `box` text and the list of required headings.
+3. This skill's rules and the section names they mention.
+4. For a new box wording: the never-tick line in `AGENTS.md` (`CLAUDE.md` links to it) and in [`contributing`](../contributing/SKILL.md).
+
+Then open a test PR with the new template and confirm the check passes when filled in and fails when a section is missing.
+
 ## Fixing a red `Check PR description`
 
 Read the check's log. Each line names one problem: add the missing heading, fill "What and why", or, for the review box, ask the human to tick it (rule 1).

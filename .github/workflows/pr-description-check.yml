@@ -49,6 +49,7 @@ jobs:
           body=$(gh pr view "$PR_NUMBER" -R "$REPO" --json body --jq '.body // ""' \
             | perl -0pe 's/<!--.*?-->//gs; s/^\s*(```|~~~).*?^\s*\1[^\n]*$//gms')
 
+          # Keep the box text and headings in sync with PULL_REQUEST_TEMPLATE.md and skills/pr-description.
           box='I, the PR author, have personally reviewed every line of this PR'
           problems=()
           if grep -qiE "^\s*[-*]\s+\[x\]\s+$box\.?\s*$" <<<"$body"; then
