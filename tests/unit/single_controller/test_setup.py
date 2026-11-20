@@ -91,6 +91,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import (
+    GROUP_TOKEN_MEAN_WEIGHT,
     OPD_FULL_TEACHER_INDEX_FIELD,
     SC_ROLLOUT_SCHEMA_FIELDS,
 )
@@ -5215,9 +5216,8 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
 ):
     """Capture rows carry their own media, so dedup has nothing to share: a GRPO
     run asking for it is rejected. A PPO run has no ``grpo`` block; the guard
-    must not read it. The guard is the last check in the token-capture block,
-    so reaching the OPD lookup that follows it proves the guard let the PPO
-    config through.
+    must not read it. Reaching seed initialization after the token-capture
+    block proves that the PPO config passed the guard.
     """
 
     class _PassedTokenCaptureBlock(Exception):
@@ -5238,8 +5238,8 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
         patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
         patch.object(sc_setup_mod, "media_capture_family", return_value="omni"),
         patch.object(
-            sc_setup_mod.opd_module,
-            "get_opd_full_config",
+            sc_setup_mod,
+            "set_seed",
             side_effect=_PassedTokenCaptureBlock,
         ) as mock_gate,
         expectation,
@@ -5510,3 +5510,16 @@ def test_generation_top_logprobs_requires_score_centering_or_replay():
     mc.policy["generation"]["top_logprobs"] = 4
     with pytest.raises(ValueError, match="only read by loss_fn.score_centering"):
         validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize("normalization", ["global_token_mean", "group_token_mean"])
+def test_partition_warmup_registers_reducer_columns(patched_factories, normalization):
+    mc = _make_master_config(
+        megatron_enabled=True,
+        loss_cfg=ClippedPGLossConfig(normalization=normalization),
+    )
+    actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+    warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs["fields"]
+    assert (GROUP_TOKEN_MEAN_WEIGHT in warmup_fields) is (
+        normalization == "group_token_mean"
+    )
