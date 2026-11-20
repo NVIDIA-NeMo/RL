@@ -539,3 +539,31 @@ def test_storage_unit_settings_need_the_single_controller_plan(
     )
     with pytest.raises(ValueError, match="only supported by the SingleController"):
         adapter._init_tq(cfg)
+
+
+@pytest.mark.parametrize("port", [None, 8200])
+def test_controller_metrics_configuration(
+    monkeypatch: pytest.MonkeyPatch, port: int | None
+) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    captured = {}
+    monkeypatch.setattr(
+        adapter.tq, "init", lambda *, conf: captured.setdefault("conf", conf)
+    )
+    cfg = _cfg("simple", simple={"num_storage_units": 1})
+    if port is not None:
+        cfg["metrics_port"] = port
+    adapter._init_tq(cfg)
+    metrics = captured["conf"].get("metrics", {})
+    assert bool(metrics.get("enabled", False)) is (port is not None)
+    if port is not None:
+        assert metrics["port"] == port
+
+
+@pytest.mark.parametrize("port", [True, "8200", 1023, 65536])
+def test_controller_metrics_port_rejects_invalid_values(port: object) -> None:
+    with pytest.raises(pydantic.ValidationError):
+        TypeAdapter(DataPlaneConfig).validate_python(
+            _cfg("simple", simple={"num_storage_units": 1}, metrics_port=port)
+        )

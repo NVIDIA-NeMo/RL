@@ -1115,6 +1115,10 @@ def _init_tq(
     else:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
+    metrics_port = cfg.get("metrics_port")
+    if metrics_port is not None:
+        overlay["metrics"] = {"enabled": True, "port": metrics_port}
+
     conf = OmegaConf.merge(base, overlay)
 
     configure_controller_patch()
