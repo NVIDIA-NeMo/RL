@@ -879,6 +879,9 @@ class VllmAsyncGenerationWorkerImpl(
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
+        prefix_write_max_rows: int,
+        prefix_write_max_tokens: int,
+        prefix_read_max_rows: int,
     ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
@@ -999,6 +1002,7 @@ class VllmAsyncGenerationWorkerImpl(
             weight_version_fn=lambda: self._rollout_weight_version,
             adapter=VLLMCaptureAdapter(),
         )
+        await self._prefix_recovery.aclose()
         self._prefix_recovery.shutdown()
         self._prefix_recovery = NoPrefixRecovery()
         self._cut_routes_dtype = (
@@ -1024,11 +1028,21 @@ class VllmAsyncGenerationWorkerImpl(
                     router_replay=self._cut_routes_dtype is not None,
                     sampler_top_k=self._capture_top_logprobs,
                     prefix_row_extras=self._generation_cut_record_payload,
+                    prefix_write_max_rows=prefix_write_max_rows,
+                    prefix_write_max_tokens=prefix_write_max_tokens,
+                    prefix_read_max_rows=prefix_read_max_rows,
                 )
             )
         if self._api_server_pool is not None:
             await self._api_server_pool.command(
-                "capture", dp_cfg, staging_partition, capture_media, top_logprobs
+                "capture",
+                dp_cfg,
+                staging_partition,
+                capture_media,
+                top_logprobs,
+                prefix_write_max_rows,
+                prefix_write_max_tokens,
+                prefix_read_max_rows,
             )
         if not capture_media:
             return None
@@ -2305,6 +2319,7 @@ class VllmAsyncGenerationWorkerImpl(
             # Waiting for a wedged TQ write here would make actor shutdown hang.
             prefix_recovery = getattr(self, "_prefix_recovery", None)
             if prefix_recovery is not None:
+                await prefix_recovery.aclose()
                 prefix_recovery.shutdown()
             if self._api_server_pool is not None:
                 await self._api_server_pool.command("stop")
