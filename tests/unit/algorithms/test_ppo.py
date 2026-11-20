@@ -306,6 +306,62 @@ def test_gae_equal_explicit_lambdas_compute_once():
     torch.testing.assert_close(returns, advantages + values)
 
 
+def test_gae_streaming_chunks_match_full_batch_with_nano_config():
+    config = GAEConfig(
+        gae_lambda=1.0,
+        gae_gamma=1.0,
+        gae_lambda_value=1.0,
+        gae_lambda_policy=1.0,
+        length_adaptive_alpha=0.0,
+        normalize_advantages=False,
+    )
+    estimator = GeneralizedAdvantageEstimator(config, _make_loss_config())
+    prompt_ids = torch.arange(5).unsqueeze(-1)
+    rewards = torch.tensor([1.0, -0.5, 0.25, 2.0, -1.0])
+    mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1],
+            [1, 1, 1, 0, 0],
+            [1, 0, 1, 1, 0],
+            [1, 1, 0, 1, 1],
+            [1, 1, 1, 1, 0],
+        ],
+        dtype=torch.float32,
+    )
+    values = torch.tensor(
+        [
+            [0.1, 0.2, 0.3, 0.4, 0.5],
+            [0.2, -0.1, 0.4, 0.0, 0.0],
+            [0.3, 0.0, 0.1, -0.2, 0.0],
+            [-0.1, 0.2, 0.0, 0.3, 0.4],
+            [0.5, 0.2, -0.1, 0.3, 0.0],
+        ]
+    )
+
+    full_advantages, full_returns = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+        values=values,
+    )
+    chunk_results = [
+        estimator.compute_advantage(
+            prompt_ids=prompt_ids[chunk],
+            rewards=rewards[chunk],
+            mask=mask[chunk],
+            values=values[chunk],
+        )
+        for chunk in (slice(0, 1), slice(1, 3), slice(3, 5))
+    ]
+
+    torch.testing.assert_close(
+        torch.cat([advantages for advantages, _ in chunk_results]), full_advantages
+    )
+    torch.testing.assert_close(
+        torch.cat([returns for _, returns in chunk_results]), full_returns
+    )
+
+
 def test_gae_length_adaptive_lambda():
     """Test VAPO length-adaptive lambda: lambda_policy = 1 - 1/(alpha * length)."""
     config = GAEConfig(length_adaptive_alpha=0.05, normalize_advantages=False)
