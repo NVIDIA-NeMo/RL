@@ -177,10 +177,8 @@ from nemo_rl.data_plane.observability import (
 )
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
-    DP_TRAIN_FIELDS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
-    SAMPLER_TOPK_FIELDS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
@@ -202,7 +200,6 @@ from nemo_rl.experience.rollout_manager import (
 from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
-from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -306,24 +303,6 @@ def _pooled_opd_metrics(
         "on_policy_distillation/adv_mean": mean,
         "on_policy_distillation/adv_std": math.sqrt(max(variance, 0.0)),
     }
-
-
-def _train_fields_for_step(
-    *,
-    policy_logprobs_required: bool,
-    reference_logprobs_required: bool,
-    sampler_head_required: bool,
-) -> tuple[str, ...]:
-    """Return only the data-plane columns produced for this train step."""
-    fields = tuple(
-        field
-        for field in DP_TRAIN_FIELDS
-        if (policy_logprobs_required or field != "prev_logprobs")
-        and (reference_logprobs_required or field != "reference_policy_logprobs")
-    )
-    if sampler_head_required:
-        fields += SAMPLER_TOPK_FIELDS
-    return fields
 
 
 def _worker_group_snapshots(worker_group: Any) -> Callable[[], list[dict[str, Any]]]:
@@ -444,13 +423,7 @@ class SingleControllerActor:
         )
         self._reference_logprobs_required = stage_cfg.reference_logprobs_required
         self._teacher_logprobs_required = stage_cfg.teacher_logprobs_required
-        self._train_fields = _train_fields_for_step(
-            policy_logprobs_required=self._policy_logprobs_required,
-            reference_logprobs_required=self._reference_logprobs_required,
-            # Score centering and sampler replay both read the captured head.
-            sampler_head_required=master_config.loss_fn.score_centering
-            or sampler_replay_enabled(master_config.policy["generation"]),
-        )
+        self._train_fields = stage_cfg.train_fields(master_config)
         self._dp_client = actor_args.dp_client
         self._dp_backend = master_config.data_plane["backend"]
         if self._dp_backend == "mooncake_cpu":
@@ -757,6 +730,9 @@ class SingleControllerActor:
 
         self._inflight_by_group_id: dict[str, tuple[asyncio.Task[None], int]] = {}
 
+        self._trainer_warmup_task: Optional[asyncio.Task[dict[str, Any]]] = None
+        self._trainer_warmup_kwargs = actor_args.trainer_warmup_kwargs
+
         # Per-step counts of how each step got made whole with spare prompts (logged
         # so a step's batch size stays explainable after the fact).
         #
@@ -901,6 +877,8 @@ class SingleControllerActor:
         except RayActorError as error:
             log.warning("Skipping generation snapshot metrics: %s", error)
 
+        self._maybe_start_trainer_warmup()
+
         # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
@@ -988,6 +966,10 @@ class SingleControllerActor:
                 await self._finish_pending_save(blocking=True)
             except Exception as e:  # teardown must not mask the original failure
                 print(f"Error publishing the pending checkpoint: {e}", flush=True)
+            if self._trainer_warmup_task is not None:
+                # Not in `tasks`: the train pump awaits it and surfaces its failure.
+                self._trainer_warmup_task.cancel()
+                await asyncio.gather(self._trainer_warmup_task, return_exceptions=True)
             if self._engine_supervisor is not None:
                 # Not in `tasks`: the supervisor creates a task per restart, on demand, so
                 # there is nothing to cancel in that list. Without this an in-flight
@@ -1021,6 +1003,24 @@ class SingleControllerActor:
             "train_steps": self._train_steps,
             "trainer_version": self._trainer_version,
         }
+
+    def _maybe_start_trainer_warmup(self) -> None:
+        """Run the warm-up beside the first rollouts if setup chose it and did not run it."""
+        kwargs = self._trainer_warmup_kwargs
+        if kwargs is None:
+            return
+        self._trainer_warmup_task = asyncio.create_task(
+            asyncio.to_thread(self._trainer.warmup_first_pass, self._loss_fn, **kwargs)
+        )
+
+    async def _finish_trainer_warmup(self) -> None:
+        task = self._trainer_warmup_task
+        if task is None:
+            return
+        with self._timer.time("trainer_warmup_wait"):
+            summary = await task
+        self._trainer_warmup_task = None
+        print(f"  ✓ Trainer warm-up (rank 0): {summary}", flush=True)
 
     async def ping(self) -> dict[str, Any]:
         """Liveness check — returns immediately if event loop is running."""
@@ -3100,6 +3100,9 @@ class SingleControllerActor:
                         # the switch to training must not tick them down.
                         self._rollout_manager.suspend_request_deadlines()
                         await asyncio.to_thread(self._gen.finish_generation)
+
+                    if self._trainer_warmup_task is not None:
+                        await self._finish_trainer_warmup()
 
                     # ---- 2. Prepare the batch ----
                     if self._is_ppo:

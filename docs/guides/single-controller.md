@@ -367,6 +367,19 @@ The reward totals are kept in memory only, so after a checkpoint resume the in-f
 `train/reward` means different things on the two paths, so the curves are not comparable. With dynamic sampling on, v1 reports the **pre-filter** mean as `reward` and the kept rows as `filtered_reward`; SC keeps `reward` as the **trained-rows** mean and reports the pre-filter mean as `unfiltered_reward`. Comparing a v1 run against an SC run means lining up v1's `reward` with SC's `unfiltered_reward`, and v1's `filtered_reward` with SC's `reward`. SC's naming is the one to keep: every other metric on both paths describes the data actually trained on, and only v1's dynamic-sampling branch redefines `reward` to mean something else. Aligning v1 to this naming is tracked in [#5039](https://github.com/NVIDIA-NeMo/RL/issues/5039); it changes a metric existing dashboards already consume, so it lands on its own.
 ```
 
+## Opt-In Startup Optimizations
+
+These settings shorten the time from job start to the end of the first training step. All are off by default. Set the `NRL_MEGATRON_*` variables in the driver's environment, which `init_ray` passes to every Ray actor.
+
+| Setting | Effect | Needs |
+| ------- | ------ | ----- |
+| `NRL_MEGATRON_TRITON_CACHE_AUTOTUNING=1`, `NRL_MEGATRON_TORCH_COMPILE_JOB_ID=<id>` | Keep Triton autotune results and torch.compile shape profiles in the Megatron compile cache between jobs. The trainer saves all ranks' shape profiles as one set after steps 1, 2, 4, 8 and so on when one changed, and a job loads the newest set for its job id, user, model, parallel layout, world size and torch version, or none. `NRL_MEGATRON_TRITON_PRINT_AUTOTUNING=1` logs each benchmark. | The [persistent JIT compile caches](persistent-jit-caches.md), and the same job id in every run. |
+| `async_rl.early_trainer_build: true` | Builds the trainer while setup reserves the vLLM workers, not after. Creating both sets of actors at once adds load on the Ray GCS. | NeMo-Gym, non-colocated vLLM, `cluster.segment_size` and no resume. |
+| `async_rl.trainer_warmup.enabled: true` | Runs a synthetic first training pass while the trainer waits for generation or the first rollouts. | A Megatron trainer and non-colocated generation. Setups it does not cover, such as PPO, router replay or CUDA graphs, skip it and log why. |
+| `async_rl.trainer_warmup.seqlens: [<a>, <b>, ...]` | Sets the warm-up's sequence lengths. The default, `null`, fills two microbatches near the microbatch token budget. | `async_rl.trainer_warmup.enabled: true`. |
+
+With cached autotune results, a kernel runs the config of whichever job tuned it first, which a job without the cache may not pick; the trainer warns about this when `zero_train_gen_mismatch` or `batch_invariant_mode` is on. On Mamba-hybrid models the backward SSD kernels are still benchmarked in every job.
+
 ## Implementation Structure
 
 The SC path splits the async-GRPO loop across a rollout pump and a train pump that share a `TQReplayBuffer` and are orchestrated by the `SingleControllerActor`.
