@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -120,6 +121,12 @@ def test_qwen3_flops_wide_attention():
     assert wide > standard
 
 
+def test_flops_formula_names_the_unset_config_field():
+    config = replace(_qwen3_flops_config(None), vocab_size=None)
+    with pytest.raises(ValueError, match=r"FLOPSConfig\.vocab_size is required"):
+        qwen3(config)
+
+
 def _glm_moe_dsa_flops_config(
     index_topk: int = 2048, index_compute_layers: int = 78
 ) -> FLOPSConfig:
@@ -183,6 +190,12 @@ def test_glm_moe_dsa_flops_components():
     # Per input: 15,168 linear + 2,880 sparse attention + 736 indexer
     # + 3,072 vocabulary projection FLOPs; gbs=2.
     assert glm_moe_dsa(config) == 43_712
+
+
+def test_glm_moe_dsa_flops_all_dense_layers_need_no_router_topk():
+    dense_config = replace(_glm_moe_dsa_flops_config(), moe_layer_freq=[0] * 78)
+    without_router_topk = replace(dense_config, moe_router_topk=None)
+    assert glm_moe_dsa(without_router_topk) == glm_moe_dsa(dense_config)
 
 
 def _glm_5_2_indexer_types() -> list[str]:
