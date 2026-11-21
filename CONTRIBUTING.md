@@ -146,9 +146,9 @@ If you have write access to the repository (NVIDIA contributors):
 
 7. Run CI tests. CI tests do not run automatically when a pull request is opened.
    - The CI label is set automatically from the changed files; only maintainers can change it. The labels mean:
-      - CI:docs - Runs doctests only
-      - CI:L0 - Runs doctests and unit tests
-      - CI:L1 - Runs doctests, unit tests, and functional tests
+      - CI:docs - Runs lint and the Sphinx docs build only
+      - CI:L0 - Runs unit tests
+      - CI:L1 - Runs unit tests and functional tests
       - CI:Lfast - Runs fast unit tests and functional tests only. Skips the container build.
       - The rules are in `skills/cicd/SKILL.md`. Ask a maintainer to set `CI:L1` for a large refactor or broad changes to core code. See [docs/ci-cd.md](docs/ci-cd.md) for the full guide.
    - Comment `/ok to test commit-sha`. Replace `commit-sha` with the most recent commit to test such as `/ok to test 7166bce`.

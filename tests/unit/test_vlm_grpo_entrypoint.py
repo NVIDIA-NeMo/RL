@@ -29,7 +29,9 @@ def test_vlm_entrypoint_materializes_video_contract(monkeypatch):
         "to_container",
         lambda *_args, **_kwargs: {},
     )
-    monkeypatch.setattr(run_vlm_grpo, "MasterConfig", lambda **_: config)
+    monkeypatch.setattr(
+        run_vlm_grpo, "MasterConfig", SimpleNamespace(model_validate=lambda _: config)
+    )
     monkeypatch.setattr(run_vlm_grpo, "materialize_vllm_video_config", materialize)
 
     with pytest.raises(Materialized):

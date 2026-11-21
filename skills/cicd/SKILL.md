@@ -39,7 +39,7 @@ Every PR **must** have exactly one `CI:*` label — the quality-check job stays 
 
 | Label | What runs | Container |
 |-------|-----------|-----------|
-| `CI:docs` | Doc tests only | Reuses main container (PRs to a release branch such as `r0.8.0` reuse that branch's container, same as `CI:Lfast`) |
+| `CI:docs` | Lint + Sphinx docs build only | None (no GPU) |
 | `CI:Lfast` | Fast test subset | Reuses main container (PRs to a release branch such as `r0.8.0` reuse that branch's container, published only by pushes to that branch after merges) |
 | `CI:L0` | Unit tests + docs + lint | Builds new image |
 | `CI:L1` | L0 + functional tests | Builds new image |
