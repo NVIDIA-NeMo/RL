@@ -146,9 +146,9 @@ If you have write access to the repository (NVIDIA contributors):
 
 7. Run CI tests. CI tests do not run automatically when a pull request is opened.
    - Apply a CI label based on the test suite to run.
-      - CI:docs - Runs doctests only
-      - CI:L0 - Runs doctests and unit tests
-      - CI:L1 - Runs doctests, unit tests, and functional tests
+      - CI:docs - Runs lint and the Sphinx docs build only
+      - CI:L0 - Runs unit tests
+      - CI:L1 - Runs unit tests and functional tests
       - CI:Lfast - Runs fast unit tests and functional tests only. Skips the container build.
       - Use `CI:docs` for docs-only changes. Otherwise use `CI:Lfast` by default, including for new features and bug fixes; use `CI:L1` only for a large refactor, broad changes to core code, or dependency changes. See [docs/ci-cd.md](docs/ci-cd.md) for the full guide.
    - Comment `/ok to test commit-sha`. Replace `commit-sha` with the most recent commit to test such as `/ok to test 7166bce`.
