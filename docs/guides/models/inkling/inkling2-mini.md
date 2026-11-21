@@ -14,8 +14,8 @@ this branch.
 > [!IMPORTANT]
 > This is an early-access integration. Mini training needs the looped-Inkling2
 > AutoModel support in
-> [HuiyingLi/Automodel-day0#13](https://github.com/HuiyingLi/Automodel-day0/pull/13),
-> which is not in this branch's AutoModel submodule, and Mini serving needs the
+> [NVIDIA-NeMo/Automodel#4861](https://github.com/NVIDIA-NeMo/Automodel/pull/4861),
+> which is not in this branch's AutoModel submodule pin, and Mini serving needs the
 > SGLang source that ships with the checkpoint (`sglang.zip`), which is not the
 > `sglang` extra pinned here. Both are mounted over a prebuilt container; see
 > [Build Environment](#build-environment).
@@ -49,7 +49,7 @@ has no step-0 base-model evaluation.
 | Component | Requirement |
 | --- | --- |
 | Container | The Inkling 2 Small SGLang BF16 container: NeMo RL, AutoModel, and a pre-release Inkling2 SGLang source drop with `torch==2.14.1`, `sglang-kernel==0.4.9`, FlashInfer `0.7.0.post1`, Transformers `5.19.0`. Mini's SGLang drop pins the same versions, so no new image is needed. |
-| AutoModel | [HuiyingLi/Automodel-day0#13](https://github.com/HuiyingLi/Automodel-day0/pull/13) (branch `huiyingl/feat/inkling2-loop`), mounted with `AM_OVERRIDE` pointing at its `nemo_automodel` directory. This branch's submodule pin is unchanged. |
+| AutoModel | [NVIDIA-NeMo/Automodel#4861](https://github.com/NVIDIA-NeMo/Automodel/pull/4861) (merged to AutoModel main), mounted with `AM_OVERRIDE` pointing at the `nemo_automodel` directory of a checkout that contains it. The reference runs used the same change from its pre-merge development PR. This branch's submodule pin is unchanged. |
 | SGLang | The `sglang.zip` in the Mini checkpoint, staged by [`tools/inkling2/stage_mini_sglang.py`](../../../../tools/inkling2/stage_mini_sglang.py) and mounted with `SGLANG_OVERRIDE` |
 | Hardware | GB200; the reference run used 2 nodes |
 
@@ -118,7 +118,7 @@ recipe and `mini-smoke` runs the 1-node smoke test:
 ACCOUNT=<slurm-account> CONTAINER=<nemo-rl-image.sqsh> WORKDIR=<shared-dir> \
 SECRETS_FILE=<file exporting WANDB_API_KEY> \
 QOS_OVERRIDE=<qos> TIME_OVERRIDE=02:00:00 \
-AM_OVERRIDE=<automodel-pr13>/nemo_automodel SGLANG_OVERRIDE=<staged-sglang-dir> \
+AM_OVERRIDE=<automodel-checkout>/nemo_automodel SGLANG_OVERRIDE=<staged-sglang-dir> \
 DATA_MOUNTS=<release-dir>:<release-dir> \
 EXTRA_OVERRIDES='checkpointing.enabled=true policy.model_name=<mini-release> policy.generation.sglang_cfg.model_path=<sglang-bf16-view>' \
 bash tools/inkling2/launch_slurm.sh mini
@@ -234,10 +234,10 @@ from a dump of the W&B runs.
   sending them as BF16 fails the refit's dtype check.
 - **Pins differ from the Small branch.** This branch's `sglang` extra tracks
   sgl-project/sglang#50186 (`sglang-kernel==0.4.11`), and its AutoModel submodule
-  tracks AutoModel main; Mini ran on the container's SGLang drop and AutoModel PR
-  13 mounted over it. The exact dependency set pinned in this branch has not
+  tracks AutoModel main; Mini ran on the container's SGLang drop and the pre-merge AutoModel change
+  (now #4861) mounted over it. The exact dependency set pinned in this branch has not
   completed a Mini run.
-- **Transformer Engine.** AutoModel PR 13 asks for Transformer Engine ≥ 2.19; the
+- **Transformer Engine.** AutoModel #4861 asks for Transformer Engine ≥ 2.19; the
   container has 2.18, and the reference run worked with it.
 - **Synchronous checkpoints.** Inkling2 checkpoints are saved synchronously, as
   for Small.

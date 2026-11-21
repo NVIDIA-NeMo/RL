@@ -15,7 +15,7 @@
 #                            with load_format: dummy and the first refit fills every weight.
 #
 # SGLang needs Mini's own build (model_type inkling2_loop); see tools/inkling2/launch_slurm.sh
-# SGLANG_OVERRIDE. Automodel needs the looped-Inkling2 PR (HuiyingLi/Automodel-day0#13).
+# SGLANG_OVERRIDE. Automodel needs the looped-Inkling2 PR (NVIDIA-NeMo/Automodel#4861).
 #
 # Layout: ~27B params. Training uses EP8 across both nodes and SGLang runs two TP4/EP4
 # engines (one per node). EP4 across two nodes (FSDP over an extra data-parallel dim)
