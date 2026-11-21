@@ -1223,6 +1223,15 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         *,
         runtime_adapter: DraftRuntimeAdapter | None = None,
     ) -> bool:
+        """Load the trainer's ``draft.*`` refit payload into the drafter.
+
+        Names arrive with the ``draft.`` prefix stripped. ``_is_full_draft_stream``
+        reads them to tell the Automodel full drafter, whose embed_tokens and
+        lm_head must not alias the target, from a megatron partial stream.
+
+        Returns:
+            Whether the drafter loaded the payload.
+        """
         if not draft_weights:
             return False
 
@@ -1239,9 +1248,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 )
         else:
             method = self._speculative_method()
-            # Without an adapter (MTP disk load, direct calls), the warn-and-skip
-            # branch below guards non-cotrained methods and a drafter that
-            # disappears between prepare and load.
+            # Without an adapter, the warn-and-skip branch below guards
+            # non-cotrained methods and a drafter that vanished after prepare.
             draft_model = self._get_drafter_model()
             if draft_model is None:
                 if strict_cotraining:
@@ -1351,6 +1359,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         the MTP layer(s) are read, avoiding a full base-model load (~1.3 TB for
         DeepSeek-V3) on every inference replica.
 
+        The weights go straight to the drafter's loader. vLLM's MTP drafter can
+        share embed_tokens and the output head with the target model; checkpoint
+        copies written through that alias land in the target's dummy weights,
+        which the first policy refit overwrites.
+
         Args:
             model_path: Path to the HF checkpoint directory.
 
@@ -1383,6 +1396,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 f"found in checkpoint at {model_path}. The checkpoint must "
                 f"include MTP layer weights to run deepseek_mtp speculative decoding."
             )
+        weights = self._trim_vocab_padding(draft_model, weights)
 
         draft_model_config = (
             self.model_runner.vllm_config.speculative_config.draft_model_config
@@ -1404,7 +1418,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             with set_current_vllm_config(self.model_runner.vllm_config):
                 with torch.device(self.device):
                     initialize_layerwise_reload(draft_model)
-                    self._load_draft_weights(weights)
+                    draft_model.load_weights(weights=weights)
                     finalize_layerwise_reload(draft_model, draft_model_config)
                     _refresh_hpc_modules_after_layerwise_reload(draft_model)
         else:
@@ -1412,7 +1426,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 process_weights_after_loading,
             )
 
-            self._load_draft_weights(weights)
+            draft_model.load_weights(weights=weights)
             with set_current_vllm_config(self.model_runner.vllm_config):
                 process_weights_after_loading(
                     draft_model, draft_model_config, self.device

@@ -707,23 +707,31 @@ def _write_sharded_checkpoint(model_dir, shards):
 
 
 def _make_extension_with_drafter(mtp_start_layer_idx, num_mtp_layers):
-    """Build a VllmInternalWorkerExtension with a mocked drafter and stubbed refit."""
+    """Build a VllmInternalWorkerExtension with a mocked MTP drafter.
+
+    Like vLLM's MTP speculator, the drafter shares embed_tokens with the target.
+    """
     from nemo_rl.models.generation.vllm.vllm_backend import (
         VllmInternalWorkerExtension,
     )
 
     ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
     ext.device = torch.device("cpu")
+    shared_embed = torch.nn.Embedding(8, 4)
     predictor = SimpleNamespace(
-        mtp_start_layer_idx=mtp_start_layer_idx, num_mtp_layers=num_mtp_layers
+        mtp_start_layer_idx=mtp_start_layer_idx,
+        num_mtp_layers=num_mtp_layers,
+        embed_tokens=shared_embed,
     )
     ext.model_runner = MagicMock()
     ext.model_runner.get_draft_model = None
+    ext.model_runner.model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=shared_embed)
+    )
     draft_model = torch.nn.Module()
     setattr(draft_model, "model", predictor)
+    draft_model.load_weights = MagicMock()
     ext.model_runner.drafter.model = draft_model
-    # Isolate this test from _load_draft_weights internals.
-    ext._load_draft_weights = MagicMock()
     return ext
 
 
@@ -3732,7 +3740,11 @@ def test_read_mtp_layer_weights_from_checkpoint_reads_local_mtp_namespace(tmp_pa
 
 @pytest.mark.vllm
 def test_load_mtp_weights_from_disk_loads_only_mtp_layer(tmp_path, monkeypatch):
-    """Success path: only MTP-layer weights are handed to the drafter, then post-loaded."""
+    """Success path: only MTP-layer weights reach the drafter, then post-loaded.
+
+    The MTP layer's embed_tokens loads even though the drafter shares that
+    module with the target; the draft co-training alias guard does not apply.
+    """
     model_dir = tmp_path / "ckpt"
     _write_sharded_checkpoint(
         model_dir,
@@ -3751,8 +3763,9 @@ def test_load_mtp_weights_from_disk_loads_only_mtp_layer(tmp_path, monkeypatch):
     result = ext.load_mtp_weights_from_disk(str(model_dir))
 
     assert result is True
-    ext._load_draft_weights.assert_called_once()
-    loaded_names = {name for name, _ in ext._load_draft_weights.call_args[0][0]}
+    load_weights = ext._get_drafter_model().load_weights
+    load_weights.assert_called_once()
+    loaded_names = {name for name, _ in load_weights.call_args.kwargs["weights"]}
     assert loaded_names == {
         "model.layers.2.mlp.up_proj.weight",
         "model.layers.2.embed_tokens.weight",
@@ -3801,7 +3814,7 @@ def test_load_mtp_weights_from_disk_uses_layerwise_reload_for_trtllm(
         "vllm.model_executor.model_loader.utils.process_weights_after_loading",
         lambda *_: pytest.fail("TRTLLM draft reload must use the layerwise path"),
     )
-    ext._load_draft_weights.side_effect = lambda _: call_order.append("load")
+    draft_model.load_weights.side_effect = lambda **_: call_order.append("load")
 
     assert ext.load_mtp_weights_from_disk(str(model_dir)) is True
     assert call_order == [
@@ -3834,7 +3847,6 @@ def test_load_mtp_weights_from_disk_without_drafter(
     # otherwise conjure a `speculator.model` for the v2-runner lookup.
     ext.model_runner.drafter = None
     ext.model_runner.speculator = None
-    ext._load_draft_weights = MagicMock()
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_backend.get_pp_group",
         lambda: SimpleNamespace(is_last_rank=is_last_rank),
@@ -3845,7 +3857,6 @@ def test_load_mtp_weights_from_disk_without_drafter(
             ext.load_mtp_weights_from_disk(str(tmp_path))
     else:
         assert ext.load_mtp_weights_from_disk(str(tmp_path)) is False
-    ext._load_draft_weights.assert_not_called()
 
 
 @pytest.mark.vllm
@@ -3868,7 +3879,7 @@ def test_load_mtp_weights_from_disk_raises_when_mtp_weights_missing(
 
     with pytest.raises(ValueError, match="No MTP layer weights"):
         ext.load_mtp_weights_from_disk(str(model_dir))
-    ext._load_draft_weights.assert_not_called()
+    ext._get_drafter_model().load_weights.assert_not_called()
 
 
 @pytest.mark.vllm
