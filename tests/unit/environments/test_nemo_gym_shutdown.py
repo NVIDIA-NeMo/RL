@@ -387,3 +387,64 @@ def test_stops_servers_that_gym_run_command_launches(run_dir):
         assert _gone(server_pid)
         assert (run_dir / f"{name}.stopped").exists()
         assert f"{name} stopped on SIGINT" in (log_dir / f"{name}.log").read_text()
+
+
+def _derived_capture(run_root: Path, replica: int) -> dict:
+    instance_dir = run_root / "gym-instances" / "nemo_gym" / f"replica-{replica}"
+    (instance_dir / "lineage").mkdir(parents=True)
+    (instance_dir / "lineage" / "rollout-0.tokens.jsonl").write_text("{}\n")
+    (instance_dir / "lineage" / "rollout-0.tokens.lock").touch()
+    return {
+        "enabled": True,
+        "capture_dir": str(instance_dir),
+        "capture_root": str(run_root),
+        "capture_dir_derived": True,
+    }
+
+
+def test_nemo_gym_shutdown_removes_its_derived_capture_dir(tmp_path):
+    """A derived node-local capture dir must not outlive the run on the node."""
+    base = tmp_path / "token_capture"
+    run_root = base / "4242-abcd"
+    first = _derived_capture(run_root, 0)
+    second = _derived_capture(run_root, 1)
+
+    nemo_gym_mod.NemoGym.__ray_metadata__.modified_class(
+        {"token_capture": first}
+    ).shutdown()
+
+    assert not Path(first["capture_dir"]).exists()
+    # A sibling actor on the same node keeps its ledgers.
+    assert (Path(second["capture_dir"]) / "lineage").is_dir()
+
+    nemo_gym_mod.NemoGym.__ray_metadata__.modified_class(
+        {"token_capture": second}
+    ).shutdown()
+
+    # The last actor removes the run's directory, but not the shared parent.
+    assert not run_root.exists()
+    assert base.is_dir()
+
+
+def test_nemo_gym_shutdown_keeps_a_configured_capture_dir(tmp_path):
+    capture = _derived_capture(tmp_path / "mine", 0)
+    capture["capture_dir_derived"] = False
+
+    nemo_gym_mod.NemoGym.__ray_metadata__.modified_class(
+        {"token_capture": capture}
+    ).shutdown()
+
+    assert (Path(capture["capture_dir"]) / "lineage").is_dir()
+
+
+def test_nemo_gym_shutdown_twice_reports_no_capture_cleanup_failure(tmp_path, capsys):
+    capture = _derived_capture(tmp_path / "4242-abcd", 0)
+    actor = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class(
+        {"token_capture": capture}
+    )
+
+    actor.shutdown()
+    actor.shutdown()
+
+    assert not (tmp_path / "4242-abcd").exists()
+    assert "Failed to remove token capture path" not in capsys.readouterr().out
