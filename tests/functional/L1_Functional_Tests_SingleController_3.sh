@@ -74,6 +74,9 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # deltas from MCore rather than the vLLM worker. The vLLM run above cannot
 # cover that custody path.
 run_test fast env SC_SIBLING_RECOVERY_GENERATION_BACKEND=megatron uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
+# The same vLLM recovery under GDPO on a multi-reward environment: the sealed
+# sibling's reward components are restored from the checkpoint.
+run_test fast env SC_SIBLING_RECOVERY_ADV_ESTIMATOR=gdpo uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
 # Periodic native-TQ snapshot while a streamed step owns only part of its
 # rollout batch, followed by SIGKILL and rollback to the durable trainer anchor.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_streaming_recovery.sh

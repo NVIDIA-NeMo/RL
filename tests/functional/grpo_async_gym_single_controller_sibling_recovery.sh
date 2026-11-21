@@ -4,23 +4,39 @@
 # SC_SIBLING_RECOVERY_GENERATION_BACKEND selects the SC+Gym smoke that both
 # phases run through: vllm (default) or megatron. The hook, overrides and
 # assertions are backend-agnostic; only the base test and its log path differ.
+#
+# SC_SIBLING_RECOVERY_ADV_ESTIMATOR=gdpo runs the vLLM flow through the GDPO
+# smoke on a multi-reward environment, and also checks that the sealed
+# sibling's reward components are in the checkpoint.
 
 set -eou pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(realpath "$SCRIPT_DIR/../..")
 GENERATION_BACKEND=${SC_SIBLING_RECOVERY_GENERATION_BACKEND:-vllm}
-case "$GENERATION_BACKEND" in
-    vllm)
+ADV_ESTIMATOR=${SC_SIBLING_RECOVERY_ADV_ESTIMATOR:-grpo}
+BASE_OVERRIDES=()
+case "$GENERATION_BACKEND:$ADV_ESTIMATOR" in
+    vllm:gdpo)
+        BASE_NAME=gdpo_gym_single_controller
+        TEST_DIR=$SCRIPT_DIR/gdpo_gym_single_controller_sibling_recovery
+        # The hook and the assertions below expect the grouping of the GRPO smoke.
+        BASE_OVERRIDES=(
+            grpo.num_prompts_per_step=4
+            grpo.num_generations_per_prompt=2
+            async_rl.min_groups_for_streaming_train=4
+        )
+        ;;
+    vllm:grpo)
         BASE_NAME=grpo_async_gym_single_controller
         TEST_DIR=$SCRIPT_DIR/grpo_async_gym_single_controller_sibling_recovery
         ;;
-    megatron)
+    megatron:grpo)
         BASE_NAME=grpo_megatron_generation_gym_single_controller
         TEST_DIR=$SCRIPT_DIR/grpo_megatron_generation_gym_single_controller_sibling_recovery
         ;;
     *)
-        echo "Unsupported SC_SIBLING_RECOVERY_GENERATION_BACKEND=$GENERATION_BACKEND (expected vllm or megatron)"
+        echo "Unsupported SC_SIBLING_RECOVERY_GENERATION_BACKEND=$GENERATION_BACKEND with SC_SIBLING_RECOVERY_ADV_ESTIMATOR=$ADV_ESTIMATOR (expected vllm or megatron with grpo, or vllm with gdpo)"
         exit 2
         ;;
 esac
@@ -64,6 +80,7 @@ SC_SIBLING_RECOVERY_TEST_EVENTS="$PHASE1_EVENTS" \
 SC_SIBLING_RECOVERY_BLOCK_TARGET_STEP=1 \
 RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" \
     "${COMMON_OVERRIDES[@]}" \
+    ${BASE_OVERRIDES[@]+"${BASE_OVERRIDES[@]}"} \
     checkpointing.checkpoint_must_save_by=0:0:0:1
 cp "$BASE_RUN_LOG" "$PHASE1_LOG"
 
@@ -77,12 +94,18 @@ PARTIAL_GROUP_ID=$(uv run --directory "$PROJECT_ROOT" --no-sync python -c \
 uv run --directory "$PROJECT_ROOT" --no-sync python -c \
     'import sys, torch; state = torch.load(sys.argv[1], weights_only=True); group_id = sys.argv[2]; groups = [group for group in state["groups"] if group["group_id"] == group_id]; assert len(groups) == 1, state; group = groups[0]; statuses = [sibling["attempts"][-1]["status"] for sibling in group["siblings"]]; assert group["restore_level"] == "sibling", group; assert sorted(statuses) == ["dispatched", "sealed"], statuses' \
     "$STEP1/rollout_recovery.pt" "$PARTIAL_GROUP_ID"
+if [[ "$ADV_ESTIMATOR" == gdpo ]]; then
+    uv run --directory "$PROJECT_ROOT" --no-sync python -c \
+        'import sys, torch; state = torch.load(sys.argv[1], weights_only=True); group = next(group for group in state["groups"] if group["group_id"] == sys.argv[2]); sealed = [sibling["attempts"][-1] for sibling in group["siblings"] if sibling["attempts"][-1]["status"] == "sealed"]; components = sealed[0]["reward_components"]; assert components and all(name.startswith("reward/") for name in components), sealed; assert abs(sum(components.values()) - sealed[0]["reward"]) < 1e-6, sealed' \
+        "$STEP1/rollout_recovery.pt" "$PARTIAL_GROUP_ID"
+fi
 
 echo "=== Phase 2: reuse the sealed sibling and regenerate only its peer ==="
 SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
 SC_SIBLING_RECOVERY_TEST_EVENTS="$PHASE2_EVENTS" \
 RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" \
-    "${COMMON_OVERRIDES[@]}"
+    "${COMMON_OVERRIDES[@]}" \
+    ${BASE_OVERRIDES[@]+"${BASE_OVERRIDES[@]}"}
 cp "$BASE_RUN_LOG" "$PHASE2_LOG"
 
 # Token capture must not reject or poison any rollout in the resumed run. Phase 1
@@ -106,4 +129,4 @@ uv run --directory "$PROJECT_ROOT" --no-sync python -c \
     'import sys, torch; state = torch.load(sys.argv[1], weights_only=True); group_id = sys.argv[2]; assert group_id not in {group["group_id"] for group in state["groups"]}, state' \
     "$CHECKPOINT_DIR/step_2/rollout_recovery.pt" "$PARTIAL_GROUP_ID"
 
-echo "Sibling-level token-capture recovery functional test passed ($GENERATION_BACKEND backend)."
+echo "Sibling-level token-capture recovery functional test passed ($GENERATION_BACKEND backend, $ADV_ESTIMATOR)."
