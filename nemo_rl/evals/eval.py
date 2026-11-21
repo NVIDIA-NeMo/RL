@@ -17,11 +17,11 @@ import json
 import os
 from collections import Counter
 from itertools import combinations
-from typing import NotRequired, Optional, TypedDict
+from typing import Literal, NotRequired, Optional, TypedDict
 
 import ray
 import torch
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, PositiveInt, model_validator
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
@@ -44,21 +44,16 @@ from nemo_rl.models.policy import TokenizerConfig
 
 
 class EvalConfig(BaseModel, extra="allow"):
-    # pass@k and cons@k are supported
-    metric: str = "pass@k"
+    metric: Literal["pass@k", "cons@k"] = "pass@k"
     # Every prompt is tested num_tests_per_prompt times; the average is the score.
     num_tests_per_prompt: int = 1
     seed: int = 42
-    k_value: int = 1
+    k_value: PositiveInt = 1
     # Where to save the evaluation results and config. None disables saving.
     save_path: Optional[str] = None
 
     @model_validator(mode="after")
-    def _validate_metric_and_k(self) -> "EvalConfig":
-        if self.metric not in ("pass@k", "cons@k"):
-            raise ValueError(f"Invalid metric: {self.metric}")
-        if self.k_value < 1:
-            raise ValueError("k_value must be greater than or equal to 1")
+    def _validate_tests_cover_k(self) -> "EvalConfig":
         if self.num_tests_per_prompt < self.k_value:
             raise ValueError(
                 "num_tests_per_prompt must be greater than or equal to k_value"
@@ -115,14 +110,10 @@ def setup(
     set_seed(eval_config.seed)
 
     # Check settings
-    metric = eval_config.metric
-    k_value = eval_config.k_value
     num_tests_per_prompt = eval_config.num_tests_per_prompt
     temperature = generation_config["temperature"]
     top_k = generation_config["top_k"]
 
-    # metric / k_value / num_tests_per_prompt are validated by EvalConfig at
-    # config load; this check spans eval and generation so it stays here.
     if num_tests_per_prompt > 1:
         assert temperature > 0 and top_k != 1, (
             "temperature > 0 and top_k != 1 are required for multiple samples"
