@@ -456,6 +456,101 @@ def test_batched_message_log_to_flat_message_carries_routed_experts(
     assert torch.all(routed[1, 3:] == 0)
 
 
+def _pad_rows_and_stack(
+    rows: list[torch.Tensor], max_len: int, pad_value: int
+) -> torch.Tensor:
+    """Reference: pad each row on its own, then stack."""
+    return torch.stack(
+        [
+            torch.cat(
+                [
+                    row,
+                    torch.full(
+                        (max_len - row.size(0), *row.shape[1:]),
+                        pad_value,
+                        dtype=row.dtype,
+                    ),
+                ]
+            )
+            for row in rows
+        ]
+    )
+
+
+@pytest.mark.parametrize("make_sequence_length_divisible_by", [1, 8])
+def test_batched_message_log_to_flat_message_matches_per_row_padding(
+    make_sequence_length_divisible_by: int,
+) -> None:
+    """Padding into one tensor gives the same rows as padding each row and stacking.
+
+    Keys have different dtypes, a key with trailing dims, a key only some
+    messages carry, and a key some conversations lack entirely.
+    """
+    generator = torch.Generator().manual_seed(0)
+    message_log_batch: list[LLMMessageLogType] = []
+    for sample in range(24):
+        message_log: LLMMessageLogType = []
+        for turn in range(1 + (sample + 1) % 3):
+            n = int(torch.randint(0, 9, (1,), generator=generator))
+            message: dict[str, Any] = {
+                "role": "user" if turn % 2 == 0 else "assistant",
+                "content": f"{sample}-{turn}",
+                "token_ids": torch.randint(0, 100, (n,), generator=generator),
+                "token_loss_mask": torch.randint(
+                    0, 2, (n,), generator=generator, dtype=torch.bool
+                ),
+                "routed_experts": torch.randint(
+                    0, 8, (n, 2, 3), generator=generator, dtype=torch.int16
+                ),
+            }
+            if turn % 2 == 1:
+                message["generation_logprobs"] = torch.randn(n, generator=generator)
+            message_log.append(message)
+        message_log_batch.append(message_log)
+    pad_value_dict = {"token_ids": -100, "routed_experts": 7}
+
+    result, input_lengths = batched_message_log_to_flat_message(
+        message_log_batch,
+        pad_value_dict=pad_value_dict,
+        make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+    )
+
+    flat_logs = [message_log_to_flat_messages(log) for log in message_log_batch]
+    lengths = [log["token_ids"].size(0) for log in flat_logs]
+    max_len = -(-max(lengths) // make_sequence_length_divisible_by)
+    max_len *= make_sequence_length_divisible_by
+    assert torch.equal(input_lengths, torch.tensor(lengths, dtype=torch.int32))
+    for key in ("token_ids", "token_loss_mask", "routed_experts"):
+        expected = _pad_rows_and_stack(
+            [log[key] for log in flat_logs], max_len, pad_value_dict.get(key, 0)
+        )
+        assert result[key].dtype == expected.dtype
+        assert torch.equal(result[key], expected)
+    logprob_rows = [log.get("generation_logprobs", torch.zeros(0)) for log in flat_logs]
+    assert torch.equal(
+        result["generation_logprobs"], _pad_rows_and_stack(logprob_rows, max_len, 0)
+    )
+    assert result["content"] == [log["content"] for log in flat_logs]
+
+
+@pytest.mark.parametrize("second_row_shape", [(3, 1), (3, 3), (3, 2, 1)])
+def test_batched_message_log_to_flat_message_rejects_mismatched_trailing_shape(
+    second_row_shape: tuple[int, ...],
+) -> None:
+    """Rows whose trailing dims differ raise instead of broadcasting into the batch."""
+    message_log_batch: list[LLMMessageLogType] = [
+        [{"token_ids": torch.tensor([1, 2, 3]), "routed_experts": torch.zeros(3, 2)}],
+        [
+            {
+                "token_ids": torch.tensor([4, 5, 6]),
+                "routed_experts": torch.zeros(second_row_shape),
+            }
+        ],
+    ]
+    with pytest.raises(RuntimeError, match="must have the same trailing shape"):
+        batched_message_log_to_flat_message(message_log_batch)
+
+
 @pytest.mark.parametrize(
     "model_id, chat_log_transform",
     [
