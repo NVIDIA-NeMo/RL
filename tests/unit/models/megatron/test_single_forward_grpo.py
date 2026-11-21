@@ -367,7 +367,11 @@ def test_train_normalizes_survivors_before_optimizer_step(
     monkeypatch.setattr(torch, "tensor", cpu_tensor)
     with pytest.raises(OptimizerReached):
         worker_module.MegatronPolicyWorkerImpl.train(
-            worker, SimpleNamespace(size=2), loss_fn, gbs=2, mbs=2
+            worker,
+            SimpleNamespace(size=2, micro_batch_cp_sizes=None),
+            loss_fn,
+            gbs=2,
+            mbs=2,
         )
     assert events == (
         ["backward", "scale", "step"] if in_loss else ["backward", "step"]

@@ -228,6 +228,33 @@ packed:
 
 Internally, Automodel and Megatron-Core are made aware of sequence packing with either `FlashAttentionArgs` or `PackedSeqParams`, which contain `cu_seqlens_q` and `cu_seqlens_kv`, which are the cumulative sequence lengths of the sequence in the packed batch without CP.
 
+### Dynamic Context Parallelism
+
+A static `context_parallel_size` is sized for the longest sequence a run must fit, so every microbatch is split across the whole CP group, also when its sequences would fit on one GPU. With the Megatron backend, dynamic context parallelism lets Megatron-Core's `default_dynamic_cp` scheduler size the CP group of every packed microbatch from its sequence lengths instead. Short sequences then train on single ranks, exactly as under data parallelism, and a longer sequence borrows as many adjacent ranks as it needs.
+
+| Key | With dynamic context parallelism |
+|-----|----------------------------------|
+| `policy.megatron_cfg.dynamic_context_parallel` | `true` |
+| `policy.megatron_cfg.context_parallel_size` | `1`. Every data-parallel rank is one rank the scheduler can add to a CP group. |
+| `policy.sequence_packing.train_mb_tokens`, `logprob_mb_tokens` | Token capacity of one rank per microbatch. A sequence of up to `k` times this length runs on a CP group of `k` ranks, where `k` is a power of two up to all data-parallel ranks. |
+| `policy.make_sequence_length_divisible_by` | Needs no CP factor: each microbatch is padded to `2 * cp_size` for the group it runs on. |
+| `policy.sequence_packing.algorithm` | Not used: the scheduler forms the packs. |
+
+```
+4 data-parallel ranks, 4096 tokens per rank, sequences a (10000 tokens), b (6000), c..h (short)
+
+          rank 0     rank 1     rank 2     rank 3
+round 0   [ a          a          a          a ]      one CP-4 group
+round 1   [ b          b ]      [ c d ]    [ e f ]    one CP-2 group, two ranks without CP
+round 2   [ g ]      [ h ]      ...
+```
+
+Every rank runs one pack per round, so all ranks execute the same number of microbatches. The pack of a CP group is sent to each of its ranks, which shard it exactly like a static CP group of that size and hand the group to Megatron-Core in `PackedSeqParams`. Each rank of the group computes the pack's loss; the first rank accounts for it in the global token and sequence counts and in the reported metrics, and the driver keeps one copy of the logprobs.
+
+Dynamic context parallelism pays off when static CP is only needed for a long tail: the larger the share of tokens in sequences that fit on one rank, the more CP communication it removes. When nearly every sequence needs the full CP group, it matches static CP.
+
+Not supported with dynamic context parallelism, and rejected: pipeline parallelism, `context_parallel_size > 1`, the data plane (`data_plane.enabled: true`), models that pack or CP-slice their own inputs, direct Megatron-LM prepacked SFT rows and other prepacked inputs, `moe_hybridep_prepad_packed_inputs`, `use_fused_linear_logprobs`, draft training, the `pair_grouping_key`, `max_sequences_per_bin` and `microbatch_order: largest_first` packing options, top-k logits and full-payload teacher scoring, and the limits of Megatron-Core itself (CUDA graphs, deterministic mode, `moe_z_loss_coeff`).
+
 ### Nuances
 - With using Sequence Packing with Megatron + Pipeline Parallelism (PP), note that all packed sequences will be padded up to the maximum packed sequence length because PP requires maintaining a fixed-size batch x seqlen buffer for PP communications. In practice, however, we find that packing is _so efficient_ that this hardly makes a difference.
 
@@ -377,6 +404,10 @@ class SequencePackingArgs(TypedDict):
     algorithm: str                     # Packing algorithm name
     microbatch_order: NotRequired[Literal["packer", "largest_first"]]
     sequence_length_pad_multiple: int  # CP/TP alignment factor
+    # Dynamic CP: schedules the packs of one global batch in place of 'algorithm'
+    dynamic_cp_schedule: NotRequired[
+        Callable[[tuple[int, ...], int], list[list[list[int]]]]
+    ]
 ```
 
 `microbatch_order` controls only the execution order of bins already assigned to each data-parallel rank. `packer` (and an omitted value for backward compatibility) preserves the packer's order. `largest_first` executes each rank's bins by nonincreasing padded-token count, allowing smaller microbatches to reuse allocator segments established by the largest shape. It does not change bin contents, rank assignment, or total padded tokens.

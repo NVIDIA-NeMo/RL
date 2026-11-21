@@ -279,6 +279,10 @@ policy:
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
     context_parallel_size: 1
+    # Megatron-Core dynamic context parallelism: the scheduler sizes the CP group of
+    # every packed microbatch from its sequence lengths. Needs sequence_packing with
+    # context_parallel_size: 1; *_mb_tokens is then the token capacity of one rank.
+    dynamic_context_parallel: false
     pipeline_dtype: ${policy.precision}
     sequence_parallel: false
     freeze_moe_router: true
