@@ -1705,6 +1705,17 @@ class RolloutRecoveryLedger:
     def get_group(self, group_id: str) -> PromptGroupRecoveryRecord:
         return self._copy_group(self._require_group(group_id))
 
+    def current_gate_rollout_id(self, group_id: str, generation_index: int) -> str:
+        """Read the current physical sibling identity without copying its group."""
+        record = self._require_group(group_id)
+        self._require_sibling(record, generation_index)
+        return record.gate_rollout_id(generation_index)
+
+    def finalization_routing(self, group_id: str) -> tuple[str | None, str | None]:
+        """Return immutable agent/task attribution without copying sibling receipts."""
+        record = self._require_group(group_id)
+        return record.resolved_agent_name, record.attribution_key
+
     def __len__(self) -> int:
         return len(self._groups)
 
