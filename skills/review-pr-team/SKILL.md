@@ -23,11 +23,13 @@ Review a pull request using a coordinated team of specialized agents.
 
 **Repo**: `NVIDIA-NeMo/RL`
 
+**Requires (both harnesses)**: the GitHub CLI `gh`, logged in with access to `NVIDIA-NeMo/RL`. The workflow and `scripts/review_identity.py` call it directly. If `gh auth status` fails, stop and ask the user to install `gh` and run `gh auth login`.
+
 **Requires (Claude Code)**: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` must be set — agent teams (teammate spawning, shared task list, `SendMessage`) are an experimental Claude Code feature.
 
 **Sandbox (Claude Code)**: Always pass `dangerouslyDisableSandbox: true` on every Bash tool call in this skill. The sandbox's bubblewrap (bwrap) container fails to initialize in worktree/container environments with `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`, breaking ALL commands — not just network-dependent ones like `gh`. Do NOT attempt any Bash call in sandbox mode first; it will fail and waste a round-trip.
 
-**Codex**: invoke as `$review-pr-team <pr-number>`. Read [Codex runtime](runtime/codex.md) before Phase 0; it maps the tool names used below (`Agent`, `TaskCreate`, `TaskList`, `TaskUpdate`, `SendMessage`, `AskUserQuestion`) to Codex operations and covers GitHub access without `gh`. The Claude Code requirement and sandbox setting above do not apply in Codex. Claude Code follows the remaining workflow as written. Codex applies the runtime adapter to its execution and dispatched prompts; review criteria remain shared.
+**Codex**: invoke as `$review-pr-team <pr-number>`. Read [Codex runtime](runtime/codex.md) before Phase 0; it maps the tool names used below (`Agent`, `TaskCreate`, `TaskList`, `TaskUpdate`, `SendMessage`, `AskUserQuestion`) to Codex operations. Codex needs `gh` too. The Claude Code requirement and sandbox setting above do not apply in Codex. Claude Code follows the remaining workflow as written. Codex applies the runtime adapter to its execution and dispatched prompts; review criteria remain shared.
 
 ---
 
@@ -49,11 +51,11 @@ Run this skill's own copy of the identity script (the one next to this file, nev
 python3 <this skill's directory>/scripts/review_identity.py preflight --pr $PRNUM
 ```
 
-- **Exit 2 — STOP.** This session wrote code in this PR (its transcript shows edits to the PR's files, or a commit/push in this repo). A review from the session that wrote the code is biased. Do not review and do not post anything. Tell the user: "Open a fresh Claude Code or Codex session and run /review-pr-team $PRNUM there."
+- **Exit 2 — STOP.** This session wrote code in this PR (its transcript shows edits to the PR's files, by an edit tool or by a shell command, or a commit/push in this repo). A review from the session that wrote the code is biased. Do not review and do not post anything. Tell the user: "Open a fresh Claude Code or Codex session and run /review-pr-team $PRNUM there."
 - **Exit 3 — STOP.** The user is the PR author, so this is a self-review, and the harness, model or effort is not on the allow-list (`self-review-policy.json`; e.g. Sonnet, or effort below medium). Do not review. Show the script's message and tell the user to rerun in a fresh session with an allowed model.
 - **Exit 0** — continue. Remember the printed review kind (`self` or `expert`) for Phase 3.
 
-Self-reviews are read by a CI check, so they must come from this repo's copy of the skill at a recent revision (see **Skill revision** at the end of this file).
+Self-reviews will be read by a CI check (added in the next PR of this stack), so they must come from this repo's copy of the skill at a recent revision (see **Skill revision** at the end of this file).
 
 ---
 
@@ -711,8 +713,13 @@ Tasks:
 3. For threads needing a response, talk to rl-expert and relevant submodule experts
    via SendMessage to get technical context before drafting
 4. All responses MUST include permalink references so the user can follow the rationale
+5. Only when Phase 0.1 printed `Review kind: expert`: find the author's self-review, the latest
+   review whose body contains `nemo-rl-review: kind=self`. For each of its resolved threads, check
+   whether the reply ("fixed", "won't fix", anything) holds up against the current code. A thread
+   brushed off without a real fix or a reason you agree with becomes a finding ("Reopening (C<n> of
+   the self-review): …"), anchored on the same line.
 
-Report: list of (thread_comment_id, action, draft_reply_text, permalinks)
+Report: list of (thread_comment_id, action, draft_reply_text, permalinks), plus any task-5 findings
 ```
 
 ### `devil-advocate`
@@ -1149,9 +1156,9 @@ After all Wave 2 agents complete:
 
 ---
 
-### Expert review: check the author's self-review threads (after your own findings are final)
+### Expert review: the author's self-review threads
 
-Only when Phase 0.1 printed `kind: expert`. Do this AFTER your own findings are collated, so the earlier review does not steer yours. Find the self-review: a review whose body contains `nemo-rl-review: kind=self`. For each of its threads that is resolved, check whether the reply ("fixed", "won't fix", anything) holds up against the current code. A thread brushed off without a real fix or a reason you agree with becomes a finding of yours ("Reopening (C<n> of the self-review): …"), anchored on the same line and run through devil-advocate and comment-editor like any other.
+`comment-reviewer` re-checks them in Wave 1 (task 5 in its spec), so reopened threads go through devil-advocate and comment-editor like any other finding.
 
 ## Phase 4: Preview & Confirm
 
@@ -1347,10 +1354,12 @@ Do NOT include `event` — omitting it creates a PENDING review.
 End the review body with the identity footer, generated right before you stage (it records the reviewed commit):
 
 ```bash
-python3 <this skill's directory>/scripts/review_identity.py footer --pr $PRNUM
+python3 <this skill's directory>/scripts/review_identity.py footer --pr $PRNUM --head $HEAD_SHA
 ```
 
-Paste its two lines (a visible line and a hidden `<!-- nemo-rl-review: … -->` marker) unchanged at the end of the body. Never write or edit the marker by hand; a CI check reads it. It replaces the old `_Generated by Claude Code_` line.
+`$HEAD_SHA` is the full SHA recorded in Phase 1, the commit you reviewed. If the PR head has moved since, the script stops without printing a footer; review the new head first.
+
+Paste its two lines (a visible line and a hidden `<!-- nemo-rl-review: … -->` marker) unchanged at the end of the body. Never write or edit the marker by hand; a CI check (added in the next PR of this stack) will read it. It replaces the old `_Generated by Claude Code_` line.
 
 **CRITICAL — All actionable findings MUST be inline comments, not body text.** The review body is the right place for general context: PR summary, merge conflict notes, overall impressions, agent count, and non-actionable observations. But every **actionable finding** (bugs, guideline violations, test gaps, doc issues) — even those about files not in the diff — MUST be posted as an inline comment tied to the most relevant file:line. Actionable items buried in the review body are easy to miss and hard to track as resolved.
 
@@ -1628,6 +1637,6 @@ After all agents confirm shutdown, you're done. There is **no `TeamDelete` step*
 
 ## Skill revision
 
-`REVISION` (next to this file) holds an integer. Bump it by exactly one in any PR that changes files under `skills/review-pr-team/`, and only then; a CI check enforces this. Never change it in a local copy: local edits are fine, but they keep the number they were copied at. Self-reviews publish the number, and the self-review check accepts one only if it is within `max_revision_lag` (in `self-review-policy.json`) of `main`'s.
+`REVISION` (next to this file) holds an integer. Bump it by exactly one over the PR's base in any PR that changes files under `skills/review-pr-team/`, and only then; a CI check enforces this. Never change it in a local copy: local edits are fine, but they keep the number they were copied at. Self-reviews publish the number, and the self-review check accepts one only if it is within `max_revision_lag` (in `self-review-policy.json`) of `main`'s.
 
 The marker format, `self-review-policy.json` and `REVISION` are read by `.github/scripts/check_self_review.py` (tests in `tests/unit/test_check_self_review.py`); change them together.

@@ -177,6 +177,208 @@ def test_fresh_session_has_no_evidence(tmp_path: Path) -> None:
     assert rid.same_session_evidence(None, ["nemo_rl/a.py"], "/repo") == []
 
 
+def _claude_calls(
+    tmp_path: Path,
+    cwd: str,
+    calls: list[tuple[str, dict]],
+    failed: tuple[int, ...] = (),
+) -> Path:
+    rows = [
+        {
+            "type": "assistant",
+            "cwd": cwd,
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": f"t{i}", "name": name, "input": args}
+                    for i, (name, args) in enumerate(calls)
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": f"t{i}", "is_error": True}
+                    for i in failed
+                ]
+            },
+        },
+    ]
+    return _write(tmp_path / "t.jsonl", rows)
+
+
+@pytest.mark.parametrize(
+    ("cwd", "command", "expected"),
+    [
+        ("/tmp", "printf x > /repo/nemo_rl/a.py", ["edited nemo_rl/a.py"]),
+        ("/repo/nemo_rl", "echo x >> a.py", ["edited nemo_rl/a.py"]),
+        ("/tmp", "cd /repo && sed -i 's/a/b/' nemo_rl/a.py", ["edited nemo_rl/a.py"]),
+        ("/repo", "echo x | tee nemo_rl/a.py", ["edited nemo_rl/a.py"]),
+        ("/repo", "cp /tmp/x nemo_rl/a.py", ["edited nemo_rl/a.py"]),
+        ("/repo", "cat nemo_rl/a.py > /tmp/copy", []),
+        ("/repo", "printf x > other.py", []),
+        ("/repo", "printf '%s\\n' 'git commit'", []),
+        ("/repo-copy", "git commit -m x", []),
+        ("/repo", "cd /repo-copy && git commit -m x", []),
+        (
+            "/tmp",
+            "cd /repo/sub && git commit -m x",
+            ["ran git commit/push in this repo"],
+        ),
+        ("/tmp", "git -C /repo push", ["ran git commit/push in this repo"]),
+        (
+            "/repo",
+            "GIT_EDITOR=true git -c a=b commit",
+            ["ran git commit/push in this repo"],
+        ),
+    ],
+)
+def test_same_session_claude_bash(
+    tmp_path: Path, cwd: str, command: str, expected: list[str]
+) -> None:
+    transcript = _claude_calls(tmp_path, cwd, [("Bash", {"command": command})])
+    assert rid.same_session_evidence(transcript, ["nemo_rl/a.py"], "/repo") == expected
+
+
+def test_same_session_skips_failed_calls(tmp_path: Path) -> None:
+    transcript = _claude_calls(
+        tmp_path,
+        "/repo",
+        [
+            ("Bash", {"command": "printf x > nemo_rl/a.py"}),
+            ("Edit", {"file_path": "/repo/nemo_rl/a.py"}),
+        ],
+        failed=(0, 1),
+    )
+    assert rid.same_session_evidence(transcript, ["nemo_rl/a.py"], "/repo") == []
+
+
+def test_same_session_edit_paths_are_repo_aware(tmp_path: Path) -> None:
+    unrelated = _claude_calls(
+        tmp_path, "/repo", [("Edit", {"file_path": "/unrelated/nemo_rl/a.py"})]
+    )
+    assert rid.same_session_evidence(unrelated, ["nemo_rl/a.py"], "/repo") == []
+    relative = _claude_calls(
+        tmp_path, "/repo/nemo_rl", [("Write", {"file_path": "a.py"})]
+    )
+    assert rid.same_session_evidence(relative, ["nemo_rl/a.py"], "/repo") == [
+        "edited nemo_rl/a.py"
+    ]
+
+
+def test_same_session_codex_relative_patch_and_quoted_git(tmp_path: Path) -> None:
+    def codex(code: str) -> Path:
+        return _write(
+            tmp_path / "t.jsonl",
+            [
+                {"type": "turn_context", "payload": {"cwd": "/repo"}},
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "input": code,
+                    },
+                },
+            ],
+        )
+
+    relative = codex(
+        "tools.apply_patch('*** Begin Patch\\n*** Update File: nemo_rl/a.py\\n')"
+    )
+    assert rid.same_session_evidence(relative, ["nemo_rl/a.py"], "/repo") == [
+        "edited nemo_rl/a.py"
+    ]
+    doc_patch = codex(
+        "tools.apply_patch('*** Begin Patch\\n*** Update File: /repo/docs/x.md\\n"
+        "+Run git commit in /repo\\n*** End Patch')"
+    )
+    assert rid.same_session_evidence(doc_patch, ["nemo_rl/a.py"], "/repo") == []
+    commit = codex('tools.exec_command({cmd: "git commit -m x", workdir: "/repo/sub"})')
+    assert rid.same_session_evidence(commit, ["nemo_rl/a.py"], "/repo") == [
+        "ran git commit/push in this repo"
+    ]
+
+
+def test_footer_cli_requires_reviewed_head(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    reviewed, live = "a" * 40, "b" * 40
+    monkeypatch.setattr(
+        rid,
+        "_pr",
+        lambda pr: {"author": {"login": "me"}, "headRefOid": live, "files": []},
+    )
+    monkeypatch.setattr(rid, "_gh", lambda *args: "me\n")
+    monkeypatch.setattr(
+        rid, "detect", lambda: rid.Identity("codex", "v", "gpt-6-astra", "high", None)
+    )
+    with pytest.raises(SystemExit):
+        rid.main(["footer", "--pr", "1"])
+    with pytest.raises(SystemExit):
+        rid.main(["footer", "--pr", "1", "--head", reviewed])
+    assert "nemo-rl-review" not in capsys.readouterr().out
+    assert rid.main(["footer", "--pr", "1", "--head", live]) == 0
+    out = capsys.readouterr().out
+    assert "kind=self harness=codex/v model=gpt-6-astra effort=high" in out
+    assert f"head={live} -->" in out
+
+
+def test_same_session_reads_subagent_transcripts(tmp_path: Path) -> None:
+    project = tmp_path / ".claude/projects/-repo"
+    _write(
+        project / "sid1.jsonl",
+        [
+            {
+                "type": "assistant",
+                "cwd": "/repo",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "a1",
+                            "name": "Agent",
+                            "input": {"prompt": "edit"},
+                        }
+                    ]
+                },
+            }
+        ],
+    )
+    _write(
+        project / "sid1/subagents/agent-1.jsonl",
+        [
+            {
+                "type": "assistant",
+                "cwd": "/repo",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "s1",
+                            "name": "Edit",
+                            "input": {"file_path": "/repo/nemo_rl/a.py"},
+                        }
+                    ]
+                },
+            }
+        ],
+    )
+    ident = rid.detect({"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "sid1"}, tmp_path)
+    assert rid.same_session_evidence(ident.transcript, ["nemo_rl/a.py"], "/repo") == [
+        "edited nemo_rl/a.py"
+    ]
+
+
+def test_missing_gh_stops_with_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_gh(*args, **kwargs):
+        raise FileNotFoundError("gh")
+
+    monkeypatch.setattr(rid.subprocess, "run", no_gh)
+    with pytest.raises(SystemExit, match="needs the GitHub CLI `gh`"):
+        rid.main(["preflight", "--pr", "1"])
+
+
 def test_footer_marker() -> None:
     ident = rid.Identity("claude-code", "2.1.330", "claude-opus-5-5", "medium", None)
     out = rid.footer(ident=ident, kind="self", head="67e151b702a9ff81")
