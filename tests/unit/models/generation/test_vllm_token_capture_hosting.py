@@ -129,6 +129,13 @@ from nemo_rl.weight_sync.membership import RefitMembership  # noqa: E402
 
 pytestmark = pytest.mark.nemo_gym
 
+# ``setup_token_capture`` takes these from ``rollout_recovery`` with no defaults.
+_PREFIX_BATCH_LIMITS = {
+    "prefix_write_max_rows": 256,
+    "prefix_write_max_tokens": 4_194_304,
+    "prefix_read_max_rows": 256,
+}
+
 
 class _MemorySink:
     def __init__(self) -> None:
@@ -149,14 +156,14 @@ class _MemorySink:
         self.attachments.append(attachments)
         return StageResult(ok=True, staging_key=record.staging_key)
 
-    def stage_generation_prefix(
+    def _stage_prefix_row(
         self,
         record: StagedCallRecord,
         *,
         checkpoint_id: str,
         chunk_sequence: int,
         attachments: dict | None = None,
-    ) -> StageResult:
+    ) -> str:
         self.generation_prefix_records.append((checkpoint_id, record))
         self.generation_prefix_attachments.append(attachments)
         key = (
@@ -164,7 +171,36 @@ class _MemorySink:
             f"{record.model_call_id}/{chunk_sequence}"
         )
         self.generation_prefix_keys.append(key)
-        return StageResult(ok=True, staging_key=key)
+        return key
+
+    def stage_generation_prefix_batch(
+        self,
+        records: list[StagedCallRecord],
+        *,
+        checkpoint_id: str,
+        chunk_sequences: list[int],
+        attachments: list[dict | None] | None = None,
+    ) -> list[str]:
+        if attachments is None:
+            attachments = [None] * len(records)
+        written: list[str] = []
+        try:
+            for record, sequence, row_attachments in zip(
+                records, chunk_sequences, attachments, strict=True
+            ):
+                written.append(
+                    self._stage_prefix_row(
+                        record,
+                        checkpoint_id=checkpoint_id,
+                        chunk_sequence=sequence,
+                        attachments=row_attachments,
+                    )
+                )
+        except Exception:
+            # Like TQTokenSink: a failed batch discards what it wrote, then raises.
+            self.clear(written)
+            raise
+        return written
 
     def clear(self, staging_keys: list[str]) -> None:
         self.cleared_generation_prefix_keys.extend(staging_keys)
@@ -197,12 +233,26 @@ def _fake_worker(*, is_model_owner: bool = True) -> VllmAsyncGenerationWorkerImp
     return worker
 
 
+def _rebuild(recovery, admission, prefix_token_ids):
+    """Rebuild a restored prefix from the rows its admission names."""
+    chunks = recovery._fetch_rows(list(admission.generation_cut.staging_keys))
+    return recovery._rebuild_prefix(admission, prefix_token_ids, chunks)
+
+
+def _resolve(recovery, admission, prefix_token_ids):
+    """Resolve one restore on its own event loop, as a serving loop would."""
+    return asyncio.run(recovery.resolve_restore(admission, prefix_token_ids))
+
+
 def _cuts(
     worker,
     *,
     staging_source=None,
     progress_reader=None,
     tokenizer=None,
+    batch_size=None,
+    batch_max_tokens=None,
+    read_max_rows=None,
 ) -> PrefixRecovery:
     """The worker's prefix recovery, turning generation-prefix cuts on if off.
 
@@ -211,6 +261,7 @@ def _cuts(
     recovery = worker._prefix_recovery
     if isinstance(recovery, PrefixRecovery) and (
         staging_source is progress_reader is tokenizer is None
+        and batch_size is batch_max_tokens is read_max_rows is None
     ):
         return recovery
     recovery = PrefixRecovery(
@@ -227,6 +278,9 @@ def _cuts(
             prefix_row_extras=worker._generation_cut_record_payload,
             router_replay=worker._cut_routes_dtype is not None,
             sampler_top_k=worker._capture_top_logprobs,
+            prefix_write_max_rows=batch_size or 256,
+            prefix_write_max_tokens=batch_max_tokens or 4_194_304,
+            prefix_read_max_rows=read_max_rows or 256,
         )
     )
     worker._prefix_recovery = recovery
@@ -261,6 +315,7 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
             dp_cfg={"backend": "simple"},
             staging_partition="rollout_staging",
             top_logprobs=4,
+            **_PREFIX_BATCH_LIMITS,
         )
     )
 
@@ -280,7 +335,11 @@ def test_setup_token_capture_skips_non_model_owners(monkeypatch):
     worker = _fake_worker(is_model_owner=False)
     installed = asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
-            worker, dp_cfg={}, staging_partition="rollout_staging", top_logprobs=0
+            worker,
+            dp_cfg={},
+            staging_partition="rollout_staging",
+            top_logprobs=0,
+            **_PREFIX_BATCH_LIMITS,
         )
     )
     assert installed is None
@@ -304,7 +363,11 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     worker = _fake_worker()
     asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
-            worker, dp_cfg={}, staging_partition="rollout_staging", top_logprobs=0
+            worker,
+            dp_cfg={},
+            staging_partition="rollout_staging",
+            top_logprobs=0,
+            **_PREFIX_BATCH_LIMITS,
         )
     )
 
@@ -345,6 +408,7 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         "rollout_staging",
         top_logprobs=4,
         generation_cut_control_timeout_s=60.0,
+        **_PREFIX_BATCH_LIMITS,
     )
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
         "setup_token_capture",
@@ -356,6 +420,7 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         generation_prefix_cuts_enabled=False,
         generation_cut_control_token=None,
         generation_cut_control_timeout_s=60.0,
+        **_PREFIX_BATCH_LIMITS,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
@@ -374,6 +439,7 @@ def test_generation_setup_token_capture_forwards_the_media_family(monkeypatch):
             "rollout_staging",
             capture_media=True,
             media_family="omni",
+            **_PREFIX_BATCH_LIMITS,
         )
         is spec
     )
@@ -386,7 +452,9 @@ def test_generation_setup_token_capture_forwards_the_media_family(monkeypatch):
 def test_generation_setup_token_capture_requires_async_engine():
     gen = _generation_with_mock_group(async_engine=False)
     with pytest.raises(AssertionError, match="async vLLM engine"):
-        gen.setup_token_capture({}, "rollout_staging", top_logprobs=0)
+        gen.setup_token_capture(
+            {}, "rollout_staging", top_logprobs=0, **_PREFIX_BATCH_LIMITS
+        )
 
 
 def test_obsolete_generation_cut_row_flush_fans_out(monkeypatch):
@@ -443,6 +511,7 @@ def test_prefix_capture_setup_requires_a_control_token(monkeypatch):
                 {},
                 "rollout_staging",
                 generation_prefix_cuts_enabled=True,
+                **_PREFIX_BATCH_LIMITS,
             )
         )
 
@@ -1174,6 +1243,7 @@ def test_generation_setup_token_capture_keeps_its_arguments_for_restarts(
         "rollout_staging",
         top_logprobs=top_logprobs,
         **cut_arguments,
+        **_PREFIX_BATCH_LIMITS,
     )
     # A restarted shard replays these, so a prefix run's shard keeps cutting.
     assert asdict(gen._token_capture_setup) == {
@@ -1183,6 +1253,7 @@ def test_generation_setup_token_capture_keeps_its_arguments_for_restarts(
         "media_family": None,
         "top_logprobs": top_logprobs,
         **cut_arguments,
+        **_PREFIX_BATCH_LIMITS,
     }
     assert gen._token_capture_media is None
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
@@ -1845,6 +1916,7 @@ def _record_cut_constraints(state, sampling_params) -> None:
             prefix_row_extras=lambda state: None,
             router_replay=False,
             sampler_top_k=0,
+            **_PREFIX_BATCH_LIMITS,
         )
     ).on_sampling_params(object(), sampling_params)
 
@@ -2095,8 +2167,8 @@ def _cut_again_after_restore(sink, worker, ack, monkeypatch):
     )
     resumed._capture_media = resumed._hash_captured_media = True
     request = _restore_request(ack)
-    admission, resolved = _cuts(resumed).resolve_restore(
-        resumed._capture_admission(request), []
+    admission, resolved = _resolve(
+        _cuts(resumed), resumed._capture_admission(request), []
     )
     assert resolved is not None
     snapshot = resolved.snapshot
@@ -2175,11 +2247,9 @@ def test_generation_cut_digest_written_at_the_cut_is_the_one_restore_rebuilds(
             sink, records=staged, weight_version=worker._rollout_weight_version
         )
         request = _restore_request(ack, source=source)
-        return (
-            _cuts(resumed)
-            ._rebuild_prefix(resumed._capture_admission(request), [])
-            .snapshot
-        )
+        return _rebuild(
+            _cuts(resumed), resumed._capture_admission(request), []
+        ).snapshot
 
     # Restore recomputes the cumulative digest from the staged chunks, the
     # first chunk's media extras included, and must reach the cut's digest:
@@ -2202,10 +2272,10 @@ class _BlockingPrefixSink(_MemorySink):
         self.prefix_write_started = threading.Event()
         self.release_prefix_write = threading.Event()
 
-    def stage_generation_prefix(self, *args, **kwargs) -> StageResult:
+    def _stage_prefix_row(self, *args, **kwargs) -> str:
         self.prefix_write_started.set()
         assert self.release_prefix_write.wait(5)
-        return super().stage_generation_prefix(*args, **kwargs)
+        return super()._stage_prefix_row(*args, **kwargs)
 
 
 def _assert_stages_captured_tensors(attachments, tensors) -> None:
@@ -2296,11 +2366,11 @@ class _FailOncePrefixSink(_MemorySink):
         super().__init__()
         self._fail_next_prefix = True
 
-    def stage_generation_prefix(self, *args, **kwargs) -> StageResult:
+    def _stage_prefix_row(self, *args, **kwargs) -> str:
         if self._fail_next_prefix:
             self._fail_next_prefix = False
             raise RuntimeError("injected generation-prefix staging failure")
-        return super().stage_generation_prefix(*args, **kwargs)
+        return super()._stage_prefix_row(*args, **kwargs)
 
 
 def test_generation_cut_rolls_back_tokens_after_staging_failure(caplog):
@@ -2328,8 +2398,21 @@ def test_generation_cut_rolls_back_tokens_after_staging_failure(caplog):
     assert sink.generation_prefix_records[-1][1].token_ids_delta == [10, 11, 12]
 
 
+class _FailingCallPrefixSink(_MemorySink):
+    """Fails every prefix row of one call, as a corrupt row would."""
+
+    def __init__(self, model_call_id: str) -> None:
+        super().__init__()
+        self._model_call_id = model_call_id
+
+    def _stage_prefix_row(self, record, **kwargs) -> str:
+        if record.model_call_id == self._model_call_id:
+            raise RuntimeError("injected generation-prefix staging failure")
+        return super()._stage_prefix_row(record, **kwargs)
+
+
 def test_one_failed_call_does_not_fail_the_rest_of_the_cut():
-    sink = _FailOncePrefixSink()
+    sink = _FailingCallPrefixSink("failing")
     worker = _worker_with_capture(sink)
     inventory, (failing, healthy) = _active_call_inventory(
         worker, ("failing", [11, 12]), ("healthy", [13, 14])
@@ -2444,7 +2527,7 @@ def test_usable_restored_prefix_is_resumed():
     worker = _resumed_worker(sink, records={cut_key: cut_record})
     admission = worker._capture_admission(request)
 
-    served, resolved = _cuts(worker).resolve_restore(admission, [])
+    served, resolved = _resolve(_cuts(worker), admission, [])
 
     assert served is admission
     assert resolved.snapshot.digest == cut_record.digest
@@ -2478,7 +2561,7 @@ def test_unusable_restored_prefix_regenerates_instead_of_failing(failure, caplog
             }
         )
     with caplog.at_level(logging.WARNING):
-        served, resolved = _cuts(worker).resolve_restore(admission, [])
+        served, resolved = _resolve(_cuts(worker), admission, [])
 
     assert resolved is None
     assert served.generation_cut is None
@@ -2502,7 +2585,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
     resumed_worker = _resumed_worker(sink, records={cut_key: cut_record})
     admission = resumed_worker._capture_admission(request)
     with caplog.at_level(logging.INFO):
-        cut = _cuts(resumed_worker)._rebuild_prefix(admission, []).snapshot
+        cut = _rebuild(_cuts(resumed_worker), admission, []).snapshot
     expected_sha = hashlib.sha256(b"12,13").hexdigest()
     assert f"prefix_ids_sha256={expected_sha}" in caplog.text
     # Gym's begin_call rejects a cut whose digest disagrees with its admission.
@@ -2520,9 +2603,9 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
             [10, 12, 13],
             admission=bad_digest_admission,
             prefix_token_ids=[],
-            generation_cut=_cuts(resumed_worker)
-            ._rebuild_prefix(bad_digest_admission, [])
-            .snapshot,
+            generation_cut=_rebuild(
+                _cuts(resumed_worker), bad_digest_admission, []
+            ).snapshot,
             resumed_generation_token_ids=[12, 13],
         )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
@@ -2793,8 +2876,7 @@ def _rebuild_from_chunks(
     chunks: list[FetchedStagedCall],
 ) -> _ResolvedGenerationCut:
     """Rebuild a restored prefix on ``worker`` from the given fetched chunks."""
-    parts = replace(_cuts(worker)._parts, staging_source=_FetchedChunks(chunks))
-    return PrefixRecovery(parts)._rebuild_prefix(admission, prefix_token_ids)
+    return _cuts(worker)._rebuild_prefix(admission, prefix_token_ids, chunks)
 
 
 def _resumed_request(
@@ -2838,8 +2920,8 @@ def _restore_through_start_capture(
     resolve_restore = recovery.resolve_restore
     resolved = []
 
-    def recording_resolve_restore(admission, prefix_token_ids):
-        served, cut = resolve_restore(admission, prefix_token_ids)
+    async def recording_resolve_restore(admission, prefix_token_ids):
+        served, cut = await resolve_restore(admission, prefix_token_ids)
         resolved.append(cut)
         return served, cut
 
@@ -3325,12 +3407,13 @@ def test_router_replay_prefix_resume_keeps_the_parent_boundary_route() -> None:
     for sequence, (record, attachments) in enumerate(
         zip(cut_records, sink.generation_prefix_attachments, strict=True)
     ):
-        assert validating_sink.stage_generation_prefix(
-            record,
+        # Raises if the row's route length does not match its tokens.
+        validating_sink.stage_generation_prefix_batch(
+            [record],
             checkpoint_id="checkpoint",
-            chunk_sequence=sequence,
-            attachments=attachments,
-        ).ok
+            chunk_sequences=[sequence],
+            attachments=[attachments],
+        )
 
     resumed, resumed_request, resolved = _resume(
         sink, ack, source=ng_capture, prefix_token_ids=(10, 11, 12)
@@ -3847,7 +3930,7 @@ def test_score_centering_survives_prefix_cuts_and_resume():
         }
     )
     admission = resumed._capture_admission(resumed_request)
-    served, resolved = _cuts(resumed).resolve_restore(admission, [])
+    served, resolved = _resolve(_cuts(resumed), admission, [])
     assert served is admission
     assert resolved.sampler_topk[0].tolist() == [[12, 112], [13, 113], [14, 114]]
 
@@ -3939,6 +4022,106 @@ def test_score_centering_restore_through_start_capture_stages_the_saved_top_k(
     assert _staged_topk_ids(sink.attachments[-1]) == expected
 
 
+def test_score_centering_batch_cut_restores_each_calls_top_k_in_one_read():
+    sink = _MemorySink()
+    worker = _score_centering_worker(sink, weight_version=7)
+    generated = {"c1": [12, 13], "c2": [14]}
+    prefixes = []
+    for index, (model_call_id, token_ids) in enumerate(generated.items()):
+        request = _score_centering_request(
+            {"rollout_id": f"r{index}", "model_call_id": model_call_id, "mode": "text"}
+        )
+        VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10])
+        worker._capture_registry.get(request).set_effective_output_limit(128)
+        _observe_decoding(worker, request, token_ids, _sampler_rows(token_ids))
+        prefixes.append(
+            GenerationCutPrefix(
+                ticket_id=f"ticket-{index}",
+                rollout_id=f"r{index}",
+                attempt=0,
+                model_call_id=model_call_id,
+                admitted_at=1.0,
+            )
+        )
+    acks = (
+        _cuts(worker)
+        .checkpoint_cut(
+            GenerationCutInventory.build(
+                checkpoint_id="checkpoint-1",
+                server_name="policy_model",
+                active_prefixes=prefixes,
+            )
+        )
+        .prefixes
+    )
+    # Both calls' rows, with their top-k, went in one batched write.
+    assert [ack.disposition for ack in acks] == ["durable_prefix"] * 2
+    assert len(sink.generation_prefix_keys) == 2
+
+    source = _MemoryPrefixSource(
+        {},
+        records=dict(
+            zip(
+                sink.generation_prefix_keys,
+                [record for _, record in sink.generation_prefix_records],
+                strict=True,
+            )
+        ),
+        sampler_topk={
+            key: (
+                attachments["sampler_topk_token_ids"],
+                attachments["sampler_topk_logprobs"],
+            )
+            for key, attachments in zip(
+                sink.generation_prefix_keys,
+                sink.generation_prefix_attachments,
+                strict=True,
+            )
+        },
+    )
+    resumed = _score_centering_worker(sink, weight_version=9, staging_source=source)
+    admissions = [
+        resumed._capture_admission(
+            _score_centering_request(
+                {
+                    "rollout_id": f"{prefix.rollout_id}-a1",
+                    "model_call_id": f"{prefix.model_call_id}-resumed",
+                    "mode": "text",
+                    "generation_cut": {
+                        "source_capture_key": prefix.rollout_id,
+                        "source_model_call_id": prefix.model_call_id,
+                        "staging_keys": list(ack.staging_keys),
+                        "prefix_token_count": ack.prefix_token_count,
+                        "prefix_digest": ack.prefix_digest,
+                        "effective_output_limit": ack.effective_output_limit,
+                    },
+                }
+            )
+        )
+        for prefix, ack in zip(prefixes, acks, strict=True)
+    ]
+    recovery = _cuts(resumed)
+
+    async def restore_both():
+        try:
+            return await asyncio.gather(
+                *(recovery.resolve_restore(admission, []) for admission in admissions)
+            )
+        finally:
+            await recovery.aclose()
+
+    results = asyncio.run(restore_both())
+    # One shared read served both restores.
+    assert len(source.calls) == 1
+    for admission, (served, resolved), token_ids in zip(
+        admissions, results, generated.values(), strict=True
+    ):
+        assert served is admission
+        assert resolved.sampler_topk[0].tolist() == [
+            [token_id, token_id + 100] for token_id in token_ids
+        ]
+
+
 def test_score_centering_cut_without_the_tokens_top_k_fails_that_call():
     sink = _MemorySink()
     worker = _score_centering_worker(sink, weight_version=7)
@@ -3979,8 +4162,8 @@ def test_restored_prefix_without_each_chunks_top_k_regenerates(chunk_topk, caplo
     )
 
     with caplog.at_level(logging.WARNING):
-        served, resolved = _cuts(worker).resolve_restore(
-            worker._capture_admission(request), []
+        served, resolved = _resolve(
+            _cuts(worker), worker._capture_admission(request), []
         )
 
     assert resolved is None
@@ -4123,11 +4306,15 @@ def test_omni_capture_setup_rejects_video_pruning(
     if pruning_rate:
         with pytest.raises(ValueError, match="video token pruning"):
             asyncio.run(
-                VllmAsyncGenerationWorkerImpl.setup_token_capture(worker, {}, **kwargs)
+                VllmAsyncGenerationWorkerImpl.setup_token_capture(
+                    worker, {}, **kwargs, **_PREFIX_BATCH_LIMITS
+                )
             )
     else:
         spec = asyncio.run(
-            VllmAsyncGenerationWorkerImpl.setup_token_capture(worker, {}, **kwargs)
+            VllmAsyncGenerationWorkerImpl.setup_token_capture(
+                worker, {}, **kwargs, **_PREFIX_BATCH_LIMITS
+            )
         )
         # The engine's model dtype and the HF patch size, as pinned on the sink.
         assert spec == MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=2)
@@ -4167,6 +4354,7 @@ def test_pixtral_capture_setup_reads_the_mistral3_config(monkeypatch):
             staging_partition="staging",
             capture_media=True,
             media_family="pixtral",
+            **_PREFIX_BATCH_LIMITS,
         )
     )
     # The engine's model dtype and the vision tower's patch size, as pinned on the sink.
@@ -4227,6 +4415,7 @@ def test_media_capture_setup_checks_the_driver_family(
                 staging_partition="staging",
                 capture_media=True,
                 media_family=media_family,
+                **_PREFIX_BATCH_LIMITS,
             )
         )
     assert worker.token_capture is None
@@ -4322,3 +4511,402 @@ def test_route_delta_preserves_actual_predecessor_tail(prev_len):
     torch.testing.assert_close(staged_routes, routes[max(0, prev_len - 1) :])
     assert extras["routed_experts"] == routed_experts_tensor_metadata(staged_routes)
     assert "predecessor_tail_route" not in extras
+
+
+class _BatchPrefixSink(_MemorySink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[list[int]] = []
+        self.fail_after_write = False
+        self.before_write = lambda: None
+
+    def stage_generation_prefix_batch(
+        self, records, *, checkpoint_id, chunk_sequences, attachments=None
+    ):
+        self.batches.append([len(record.token_ids_delta) for record in records])
+        self.before_write()
+        keys = super().stage_generation_prefix_batch(
+            records,
+            checkpoint_id=checkpoint_id,
+            chunk_sequences=chunk_sequences,
+            attachments=attachments,
+        )
+        if self.fail_after_write:
+            # Like TQTokenSink after a failed put: discard the batch, then raise.
+            self.clear(keys)
+            raise RuntimeError("injected batch transport failure after writes")
+        return keys
+
+
+def _batch_worker_fixture(lengths, *, batch_size=256, max_tokens=4_194_304):
+    """Live calls with the given generated lengths; first chunks add the prompt."""
+    sink = _BatchPrefixSink()
+    worker = _worker_with_capture(sink)
+    recovery = _cuts(worker, batch_size=batch_size, batch_max_tokens=max_tokens)
+    inventory, states = _active_call_inventory(
+        worker,
+        *((f"c{i}", list(range(20, 20 + length))) for i, length in enumerate(lengths)),
+        output_limit=128,
+    )
+    return recovery, sink, states, inventory
+
+
+def _next_inventory(inventory, checkpoint_id):
+    return GenerationCutInventory.build(
+        checkpoint_id=checkpoint_id,
+        server_name="policy_model",
+        active_prefixes=inventory.active_prefixes,
+    )
+
+
+def _assert_rolled_back(state, generated: int) -> None:
+    progress = state.snapshot()
+    assert not progress.cut_in_progress
+    assert progress.staged_token_count == 0
+    assert not progress.staging_keys
+    assert len(progress.generated_token_ids) == generated
+    assert state._lifecycle_lock.acquire(blocking=False)
+    state._lifecycle_lock.release()
+
+
+def test_worker_batches_1000_prefixes_and_caches_receipt():
+    recovery, sink, states, inventory = _batch_worker_fixture([2] * 1000)
+    receipt = recovery.checkpoint_cut(inventory)
+
+    assert [len(batch) for batch in sink.batches] == [256, 256, 256, 232]
+    assert [ack.ticket_id for ack in receipt.prefixes] == [
+        prefix.ticket_id for prefix in inventory.active_prefixes
+    ]
+    assert all(ack.prefix_token_count == 2 for ack in receipt.prefixes)
+    assert not any(state.snapshot().cut_in_progress for state in states)
+    assert recovery.checkpoint_cut(inventory) is receipt
+    assert len(sink.batches) == 4
+
+
+def test_worker_batch_token_limit_handles_ragged_and_oversized_rows():
+    recovery, sink, _, inventory = _batch_worker_fixture([1, 2, 8, 1], max_tokens=5)
+    recovery.checkpoint_cut(inventory)
+    assert sink.batches == [[2, 3], [9], [2]]  # First chunks include the prompt.
+
+
+@pytest.mark.parametrize("batch_size", [1, 256])
+def test_worker_batch_consecutive_cuts_reuse_then_append(batch_size):
+    recovery, sink, states, inventory = _batch_worker_fixture(
+        [2, 3], batch_size=batch_size
+    )
+    first = recovery.checkpoint_cut(inventory)
+    second = recovery.checkpoint_cut(_next_inventory(inventory, "second-cut"))
+    assert [ack.staging_keys for ack in second.prefixes] == [
+        ack.staging_keys for ack in first.prefixes
+    ]
+    assert len(sink.generation_prefix_keys) == 2
+    if batch_size == 1:
+        assert sink.batches == [[3], [4]]
+
+    for state in states:
+        state.record([99], [-0.2])
+    third = recovery.checkpoint_cut(_next_inventory(inventory, "third-cut"))
+    assert [ack.prefix_token_count for ack in third.prefixes] == [3, 4]
+    assert all(len(ack.staging_keys) == 2 for ack in third.prefixes)
+    assert [
+        list(record.token_ids_delta)
+        for _, record in sink.generation_prefix_records[-2:]
+    ] == [[99], [99]]
+
+
+def test_worker_batch_mixes_zero_token_and_active_calls():
+    recovery, sink, _, inventory = _batch_worker_fixture([2, 0, 3])
+    receipt = recovery.checkpoint_cut(inventory)
+    assert [len(batch) for batch in sink.batches] == [2]
+    assert [ack.disposition for ack in receipt.prefixes] == [
+        "durable_prefix",
+        "durable_failure",
+        "durable_prefix",
+    ]
+
+
+def test_worker_failed_puts_fail_their_calls_and_roll_back():
+    recovery, sink, states, inventory = _batch_worker_fixture([2, 3, 4])
+    sink.fail_after_write = True
+
+    receipt = recovery.checkpoint_cut(inventory)
+
+    # The batch put fails, then each row's own put fails too.
+    assert sink.batches == [[3, 4, 5], [3], [4], [5]]
+    assert [ack.disposition for ack in receipt.prefixes] == ["durable_failure"] * 3
+    assert set(sink.generation_prefix_keys) <= set(sink.cleared_generation_prefix_keys)
+    for state, length in zip(states, [2, 3, 4], strict=True):
+        _assert_rolled_back(state, length)
+
+    sink.fail_after_write = False
+    retried = recovery.checkpoint_cut(_next_inventory(inventory, "retry-cut"))
+    assert [ack.prefix_token_count for ack in retried.prefixes] == [2, 3, 4]
+
+
+def test_worker_batch_ack_failure_fails_only_its_call(monkeypatch):
+    from nemo_gym._checkpoint import generation_cut
+
+    recovery, sink, states, inventory = _batch_worker_fixture([2, 3, 4])
+    original = generation_cut.GenerationCutPrefixAck
+
+    def reject_second(**kwargs):
+        if kwargs["model_call_id"] == "c1":
+            raise ValueError("injected acknowledgement failure")
+        return original(**kwargs)
+
+    # The rejected call is still acknowledged, as a failure.
+    reject_second.failure = original.failure
+    monkeypatch.setattr(generation_cut, "GenerationCutPrefixAck", reject_second)
+    receipt = recovery.checkpoint_cut(inventory)
+
+    assert [ack.disposition for ack in receipt.prefixes] == [
+        "durable_prefix",
+        "durable_failure",
+        "durable_prefix",
+    ]
+    _assert_rolled_back(states[1], 3)
+    assert [states[i].snapshot().staged_token_count for i in (0, 2)] == [2, 4]
+    # Only the rejected call's row is cleared; the others stay advertised.
+    assert sink.cleared_generation_prefix_keys == [sink.generation_prefix_keys[1]]
+
+
+def test_worker_batch_interruption_clears_rows_no_call_received(monkeypatch):
+    from nemo_gym._checkpoint import generation_cut
+
+    class _Interrupted(BaseException):
+        pass
+
+    # The middle ack is interrupted after the first call sealed, so the last
+    # row is written but never reaches its call: only the batch's own cleanup
+    # can discard it.
+    recovery, sink, states, inventory = _batch_worker_fixture([2, 3, 4])
+    original = generation_cut.GenerationCutPrefixAck
+
+    def interrupt_second(**kwargs):
+        if kwargs["model_call_id"] == "c1":
+            raise _Interrupted
+        return original(**kwargs)
+
+    monkeypatch.setattr(generation_cut, "GenerationCutPrefixAck", interrupt_second)
+    with pytest.raises(_Interrupted):
+        recovery.checkpoint_cut(inventory)
+
+    assert states[0].snapshot().staged_token_count == 2
+    _assert_rolled_back(states[1], 3)
+    _assert_rolled_back(states[2], 4)
+    assert len(sink.generation_prefix_keys) == 3
+    assert set(sink.cleared_generation_prefix_keys) == set(
+        sink.generation_prefix_keys[1:]
+    )
+
+
+def test_worker_later_batch_failure_keeps_earlier_cuts():
+    recovery, sink, states, inventory = _batch_worker_fixture([2] * 3, batch_size=2)
+
+    def fail_second():
+        if len(sink.batches) == 2:
+            sink.fail_after_write = True
+
+    sink.before_write = fail_second
+    receipt = recovery.checkpoint_cut(inventory)
+
+    assert [ack.disposition for ack in receipt.prefixes] == [
+        "durable_prefix",
+        "durable_prefix",
+        "durable_failure",
+    ]
+    earlier_keys = set(sink.generation_prefix_keys[:2])
+    assert earlier_keys.isdisjoint(sink.cleared_generation_prefix_keys)
+    sink.fail_after_write = False
+    sink.before_write = lambda: None
+    for state in states:
+        state.record([99], [-0.2])
+    retried = recovery.checkpoint_cut(_next_inventory(inventory, "retry-cut"))
+    assert [ack.prefix_token_count for ack in retried.prefixes] == [3, 3, 3]
+    assert [len(ack.staging_keys) for ack in retried.prefixes] == [2, 2, 1]
+    assert earlier_keys.isdisjoint(sink.cleared_generation_prefix_keys)
+
+
+def test_worker_batch_call_without_output_limit_fails_alone():
+    recovery, sink, states, inventory = _batch_worker_fixture([2, 3])
+    # vLLM never resolved this call's output budget.
+    with states[1]._lock:
+        states[1]._effective_output_limit = None
+
+    receipt = recovery.checkpoint_cut(inventory)
+
+    assert [ack.disposition for ack in receipt.prefixes] == [
+        "durable_prefix",
+        "durable_failure",
+    ]
+    assert sink.batches == [[3]]
+    _assert_rolled_back(states[1], 3)
+
+
+def test_worker_batch_past_deadline_fails_calls_not_yet_written(monkeypatch):
+    from nemo_rl.models.generation.prefix_recovery import recovery as recovery_module
+
+    recovery, sink, states, inventory = _batch_worker_fixture([2, 3, 4], batch_size=2)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(
+        recovery_module, "time", SimpleNamespace(monotonic=lambda: clock["now"])
+    )
+
+    def expire_during_first_write():
+        clock["now"] = 10.0
+
+    sink.before_write = expire_during_first_write
+    receipt = recovery.checkpoint_cut(inventory, deadline=5.0)
+
+    # The batch already writing completes; the call not yet reached fails.
+    receipt.validate_for(inventory)
+    assert sink.batches == [[3, 4]]  # First chunks include the prompt.
+    assert [ack.disposition for ack in receipt.prefixes] == [
+        "durable_prefix",
+        "durable_prefix",
+        "durable_failure",
+    ]
+    _assert_rolled_back(states[2], 4)
+
+
+def test_worker_batch_past_deadline_rolls_back_pending_calls(monkeypatch):
+    from nemo_rl.models.generation.prefix_recovery import recovery as recovery_module
+
+    recovery, sink, states, inventory = _batch_worker_fixture([2, 3, 4], batch_size=3)
+    # The progress read and every freeze see the deadline ahead; it passes
+    # before their batch is written.
+    readings = iter([0.0] * 4)
+    monkeypatch.setattr(
+        recovery_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(readings, 10.0)),
+    )
+
+    receipt = recovery.checkpoint_cut(inventory, deadline=5.0)
+
+    receipt.validate_for(inventory)
+    assert not sink.batches
+    assert [ack.disposition for ack in receipt.prefixes] == ["durable_failure"] * 3
+    for state, length in zip(states, [2, 3, 4], strict=True):
+        _assert_rolled_back(state, length)
+
+
+def test_worker_batch_observation_continues_while_lifecycle_waits():
+    recovery, sink, states, inventory = _batch_worker_fixture([2, 3])
+    state = states[0]
+    write_started = threading.Event()
+    release_write = threading.Event()
+    lifecycle_done = threading.Event()
+
+    def block_write():
+        write_started.set()
+        assert release_write.wait(5)
+
+    sink.before_write = block_write
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cut = executor.submit(recovery.checkpoint_cut, inventory)
+        assert write_started.wait(5)
+
+        def terminal_operation():
+            with state.lifecycle():
+                lifecycle_done.set()
+
+        terminal = executor.submit(terminal_operation)
+        try:
+            assert not lifecycle_done.wait(0.05)
+            state.record([99], [-0.2])
+        finally:
+            release_write.set()
+        receipt = cut.result(timeout=5)
+        terminal.result(timeout=5)
+
+    assert receipt.prefixes[0].prefix_token_count == 2
+    progress = state.snapshot()
+    assert progress.generated_token_ids[progress.staged_token_count :] == [99]
+    assert progress.generated_token_ids[: progress.staged_token_count] == [20, 21]
+
+
+@pytest.mark.vllm
+def test_concurrent_restores_through_resolve_restored_call_share_one_read():
+    """Native and Dynamo serving both restore through ``resolve_restored_call``;
+    restores arriving together there must share one TQ read."""
+    # Both dependency markers select the combined vLLM + Gym lane.
+    pytest.importorskip("vllm")
+    from nemo_rl.models.generation.vllm.prompt_and_capture import (
+        resolve_restored_call,
+    )
+
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    worker._rollout_weight_version = 7
+    calls = [(f"c{index}", [12 + index, 13 + index]) for index in range(4)]
+    inventory, _ = _active_call_inventory(worker, *calls)
+    acks = _cuts(worker).checkpoint_cut(inventory).prefixes
+    records = dict(
+        zip(
+            sink.generation_prefix_keys,
+            [record for _, record in sink.generation_prefix_records],
+            strict=True,
+        )
+    )
+    resumed = _resumed_worker(sink, records=records)
+    requests = [
+        _resumed_request(
+            ack, {"rollout_id": f"r{index}", "model_call_id": call_id, "mode": "text"}
+        )
+        for index, ((call_id, _), ack) in enumerate(zip(calls, acks, strict=True))
+    ]
+    admissions = [resumed._capture_admission(request) for request in requests]
+
+    async def restore_four():
+        try:
+            return await asyncio.gather(
+                *(
+                    resolve_restored_call(resumed, request, admission, [])
+                    for request, admission in zip(requests, admissions, strict=True)
+                )
+            )
+        finally:
+            await resumed._prefix_recovery.aclose()
+
+    results = asyncio.run(restore_four())
+
+    # Every call resumed; none fell back to regenerating.
+    assert all(restored is not None for _, restored in results)
+    # One multi-key read served all four restores.
+    assert [sorted(keys) for keys in resumed._staging_source.calls] == [sorted(records)]
+
+
+def test_one_row_restore_reads_run_in_parallel_without_the_batcher():
+    sink = _MemorySink()
+    cut_key, cut_record, request = _restorable_cut(sink)
+    worker = _resumed_worker(sink, records={cut_key: cut_record})
+    admission = worker._capture_admission(request)
+    recovery = _cuts(worker, read_max_rows=1)
+    fetch_rows = recovery._fetch_rows
+    # Each read waits for all four, so this passes only if they run at once.
+    together = threading.Barrier(4, timeout=5)
+    calls = []
+
+    def fetch_together(keys):
+        calls.append(keys)
+        together.wait()
+        return fetch_rows(keys)
+
+    recovery._fetch_rows = fetch_together
+
+    async def restore_four():
+        try:
+            return await asyncio.gather(
+                *(recovery.resolve_restore(admission, []) for _ in range(4))
+            )
+        finally:
+            await recovery.aclose()
+
+    results = asyncio.run(restore_four())
+
+    assert recovery._reader is None
+    assert calls == [[cut_key]] * 4
+    for served, resolved in results:
+        assert served is admission
+        assert resolved.snapshot.digest == cut_record.digest
