@@ -13,8 +13,9 @@
 # limitations under the License.
 
 # Sets the CI:* label from the changed files; only maintainers can override it.
-# pull_request_target runs the base branch's copy of this file and the script, so a PR
-# cannot change its own rules. It never checks out or runs the PR's code.
+# pull_request_target runs the default branch's copy of this file, and the checkout below
+# takes the script from that same commit, so a PR cannot change its own rules. It never
+# checks out or runs the PR's code.
 name: Set CI label
 
 on:
@@ -41,10 +42,9 @@ jobs:
         github.event.label.name == 'Skip CICD'
       }}
     steps:
-      - name: Checkout base branch scripts
+      - name: Checkout the script (same commit as this workflow, never the PR's code)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
           sparse-checkout: .github/scripts
 
       - name: Set CI label
