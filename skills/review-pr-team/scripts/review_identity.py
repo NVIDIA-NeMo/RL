@@ -20,7 +20,7 @@ REVISION file next to this copy of the skill.
 
     review_identity.py preflight --pr N             # exit 2: this session wrote the PR's code
                                                     # exit 3: self-review with a harness/model/effort not allowed
-    review_identity.py footer --pr N --head SHA     # the review-body footer: visible line + hidden marker
+    review_identity.py footer --pr N --head SHA     # the review-body footer: one `nemo-rl-review: …` line
 
 Standard library only, and runs on the older system `python3` some harnesses use (e.g. Codex).
 Needs the GitHub CLI `gh`, logged in, to read the PR, even in Codex sessions that use HTTP elsewhere.
@@ -322,16 +322,18 @@ def _pr(pr: int) -> dict:
 
 
 def footer(*, ident: Identity, kind: str, head: str) -> str:
-    rev = skill_revision()
-    visible = (
-        f"_{kind.capitalize()}-review: {ident.label()} · {ident.model} · effort {ident.effort} · "
-        f"review-pr-team rev {rev} · reviewed {head[:7]}_"
-    )
-    marker = (
-        f"<!-- {MARKER}: kind={kind} harness={ident.harness}/{ident.version} model={ident.model} "
-        f"effort={ident.effort} skill_rev={rev} head={head} -->"
-    )
-    return f"{visible}\n{marker}"
+    """The one-line identity footer, a code span of space-separated key=value pairs."""
+    fields = {
+        "kind": kind,
+        "harness": f"{ident.harness}/{ident.version}",
+        "model": ident.model,
+        "effort": ident.effort,
+        "review-pr-team": f"v{skill_revision()}",
+        "reviewed": head[:7],
+    }
+    # Values are split on spaces by the reader, so none may contain one.
+    pairs = " ".join(k + "=" + re.sub(r"\s+", "-", v) for k, v in fields.items())
+    return f"`{MARKER}: {pairs}`"
 
 
 def main(argv: list[str] | None = None) -> int:
