@@ -330,6 +330,42 @@ class TestBindToGpuNuma:
                 os.unlink(f.name)
                 _reset_all_bindings()
 
+    def test_memory_policy_set_when_cpus_outside_cpuset(self, monkeypatch, caplog):
+        """A cpuset without the GPU's CPUs skips CPU pinning, not the memory policy.
+
+        ``sched_setaffinity`` raises EINVAL when the process's cpuset (e.g. a k8s
+        pod's) has none of the requested CPUs.
+        """
+        import errno
+
+        import nemo_rl.distributed.numa_utils as mod
+
+        monkeypatch.delenv("NRL_DISABLE_NUMA_BINDING", raising=False)
+
+        def _no_permitted_cpus(pid, cpus):
+            raise OSError(errno.EINVAL, "Invalid argument")
+
+        preferred_calls = []
+        monkeypatch.setattr(mod.os, "sched_setaffinity", _no_permitted_cpus)
+        monkeypatch.setattr(mod, "_set_numa_preferred", preferred_calls.append)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("0:0-3\n1:4-7\n")
+            f.flush()
+
+            old_path = _patch_affinity_path(f.name)
+            try:
+                with caplog.at_level(
+                    "WARNING", logger="nemo_rl.distributed.numa_utils"
+                ):
+                    assert bind_to_gpu_numa(1) is False
+            finally:
+                _patch_affinity_path(old_path)
+                os.unlink(f.name)
+
+        assert preferred_calls == [{4, 5, 6, 7}]
+        assert "NUMA CPU binding skipped: GPU 1" in caplog.text
+
 
 class TestSetNumaPreferred:
     """Test the preferred-node memory policy with libnuma (skipped if libnuma unavailable)."""
