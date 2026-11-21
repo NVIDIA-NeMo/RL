@@ -52,15 +52,22 @@ from pydantic import (
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.checkpoint import CheckpointCapture
+from nemo_rl.data_plane.local_disk import default_ssd_dir
 
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
+# Default SSD-tier directories, under the node's NVMe (local_disk.default_ssd_dir).
+MOONCAKE_SSD_DIRNAME = "nrl_mooncake_ssd_offload"
+NIXL_SSD_DIRNAME = "nrl_nixl_ssd"
+SIMPLE_SSD_DIRNAME = "nrl_simple_ssd_offload"
 
 
 class SsdOffloadConfig(BaseModel, extra="allow"):
     """TQ SimpleStorage SSD offload: large field values live on node-local SSD.
 
     Each storage unit writes under ``path`` on its own node, so no shared
-    filesystem is needed. Values whose encoded size is ``>= threshold_bytes``
+    filesystem is needed; ``path: null`` is the node's NVMe
+    (``local_disk.default_ssd_dir``, resolved on the driver since TQ creates
+    the directory in its own actor). Values whose encoded size is ``>= threshold_bytes``
     go to SSD; smaller ones stay in host memory. The data is temporary:
     ``tq.close()`` removes it, and a run that dies without closing leaves its
     ``<path>/transfer_queue_ssd_offload/<run_id>`` directory behind.
@@ -71,20 +78,24 @@ class SsdOffloadConfig(BaseModel, extra="allow"):
     """
 
     enabled: bool = False
-    path: str | None = None  # absolute; required when enabled
+    path: str | None = None  # absolute; null: the node's NVMe (dir())
     threshold_bytes: PositiveInt = 1048576  # 1 MiB
 
     @model_validator(mode="after")
-    def _require_absolute_path_when_enabled(self) -> "SsdOffloadConfig":
+    def _require_absolute_path(self) -> "SsdOffloadConfig":
         # Storage actors resolve a relative path against their own cwd, which
         # differs per node/process, so it would not be one node-local dir.
-        if self.enabled and not (self.path and Path(self.path).is_absolute()):
+        if self.path is not None and not Path(self.path).is_absolute():
             raise ValueError(
-                "data_plane.simple.ssd_offload.enabled=true requires "
-                "data_plane.simple.ssd_offload.path to be an absolute "
-                f"node-local SSD directory, got {self.path!r}."
+                "data_plane.simple.ssd_offload.path must be an absolute "
+                "node-local SSD directory, or null for the node's NVMe; got "
+                f"{self.path!r}."
             )
         return self
+
+    def dir(self) -> str:
+        """The offload directory: ``path``, or the NVMe default (picked on the driver)."""
+        return self.path or default_ssd_dir(SIMPLE_SSD_DIRNAME)
 
 
 class SimpleStorageConfig(BaseModel, extra="allow"):
@@ -132,21 +143,32 @@ class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
     offloaded at once): owners delete the files of cleared keys every 30 s.
     Operation, cleanup and the full-disk data-loss risk are described under
     "Mooncake SSD offload" in nemo_rl/data_plane/README.md.
+
+    On by default: data stays in memory while there is room and spills only
+    past ``offload_threshold``. The first spill logs a warning, since reads of
+    spilled objects go through the SSD. ``path: null`` (the default) is the
+    node's NVMe: ``/raid/nrl_mooncake_ssd_offload-<uid>`` when the node mounts
+    ``/raid``, else ``/tmp/nrl_mooncake_ssd_offload-<uid>``
+    (``local_disk.default_ssd_dir``). Either must be a disk, not a RAM-backed
+    tmpfs.
     """
 
-    enabled: bool = False
-    path: str | None = None  # absolute; required when enabled
-    offload_threshold: Annotated[float, Field(gt=0, le=1)] = 0.5
+    enabled: bool = True
+    path: str | None = None  # absolute; null: the node's NVMe (dir())
+    offload_threshold: Annotated[float, Field(gt=0, le=1)] = 0.8
 
     @model_validator(mode="after")
-    def _require_absolute_path_when_enabled(self) -> "MooncakeSsdOffloadConfig":
-        if self.enabled and not (self.path and Path(self.path).is_absolute()):
+    def _require_absolute_path(self) -> "MooncakeSsdOffloadConfig":
+        if self.path is not None and not Path(self.path).is_absolute():
             raise ValueError(
-                "data_plane.mooncake_cpu.ssd_offload.enabled=true requires "
-                "data_plane.mooncake_cpu.ssd_offload.path to be an absolute "
-                f"node-local SSD directory, got {self.path!r}."
+                "data_plane.mooncake_cpu.ssd_offload.path must be an absolute "
+                f"node-local SSD directory, or null for the node's NVMe; got {self.path!r}."
             )
         return self
+
+    def dir(self) -> str:
+        """The offload directory on this node: ``path``, or the NVMe default."""
+        return self.path or default_ssd_dir(MOONCAKE_SSD_DIRNAME)
 
 
 class MooncakeCpuConfig(BaseModel, extra="allow"):
@@ -230,21 +252,38 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
 class NixlSsdConfig(BaseModel, extra="forbid"):
     """SSD tier of the nixl storage units (see ``tq_nixl.ssd_config``).
 
-    A put the unit's RAM cannot take goes to a file under ``path`` (node-local,
-    absolute) through an IO area of ``staging_bytes`` carved from the slab.
+    A put the unit's put area cannot take goes to a file under ``path``
+    (node-local, absolute) through an IO area of ``staging_bytes`` (default a
+    quarter of ``unit_slab_bytes``) that the unit pins beside its slab, so the
+    put area keeps its configured size: with the tier on a unit holds
+    ``unit_slab_bytes + staging_bytes`` of pinned memory.
+    A spilled put is acknowledged once its bytes are in the IO area; the file
+    write runs behind the ack on the unit's ``io_threads`` file-I/O threads,
+    which also read spilled blobs back. One thread moves about 2.5 GB/s on
+    NVMe, so a workload that spills a large share of every step needs several.
+
+    On by default: a put spills only when the unit's put area is full, and the
+    driver logs a warning at the first spill of a run (reads of spilled blobs
+    wait for the SSD). ``path: null`` (the default) is the node's NVMe:
+    ``/raid/nrl_nixl_ssd-<uid>`` when the node mounts ``/raid``, else
+    ``/tmp/nrl_nixl_ssd-<uid>`` (``local_disk.default_ssd_dir``). Either must
+    be a disk, not a RAM-backed tmpfs.
     """
 
-    enabled: bool = False
-    path: str | None = None  # absolute; required when enabled
-    staging_bytes: PositiveInt | None = None  # None: unit_slab_bytes // 4
+    enabled: bool = True
+    path: str | None = None  # absolute; null: the node's NVMe (dir())
+    staging_bytes: PositiveInt | None = (
+        None  # pinned beside the slab; None: unit_slab_bytes // 4
+    )
     pickup_s: float = 10.0
+    io_threads: PositiveInt = 4
 
     @model_validator(mode="after")
-    def _require_absolute_path_when_enabled(self) -> "NixlSsdConfig":
-        if self.enabled and not (self.path and Path(self.path).is_absolute()):
+    def _require_absolute_path(self) -> "NixlSsdConfig":
+        if self.path is not None and not Path(self.path).is_absolute():
             raise ValueError(
-                "data_plane.nixl.ssd.enabled=true requires data_plane.nixl.ssd.path "
-                f"to be an absolute node-local SSD directory, got {self.path!r}."
+                "data_plane.nixl.ssd.path must be an absolute node-local SSD "
+                f"directory, or null for the node's NVMe; got {self.path!r}."
             )
         return self
 
@@ -286,9 +325,11 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     storage_unit_placement: list[Literal["train", "inference"]] | Literal["all"] = "all"
     # Explicit unit nodes; when unset, _init_tq resolves storage_unit_placement.
     node_ids: list[str] | None = None
-    unit_slab_bytes: int = 17179869184  # 16 GiB pinned per unit
+    unit_slab_bytes: int = (
+        17179869184  # 16 GiB put area; 20 GiB pinned with the default SSD tier
+    )
     # A put over this is split at key boundaries; None: a quarter of the put
-    # area (the slab minus SSD staging).
+    # area (the slab).
     max_blob_bytes: PositiveInt | None = None
     numa: Literal["auto", "off"] = "auto"
     # Client registered-buffer pool: base buffers plus kept-registered oversize ones.
@@ -819,8 +860,8 @@ class DataPlaneClient(ABC):
             partition_id: Partition whose stored keys should be listed.
 
         Returns:
-            Stable, sorted sample IDs. An unknown or empty partition returns
-            an empty list.
+            The sample IDs, in no particular order. An unknown or empty
+            partition returns an empty list.
         """
 
     @abstractmethod

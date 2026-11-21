@@ -89,7 +89,7 @@ def main() -> None:
 
         config = OmegaConf.to_container(config, resolve=True)
         check_outdated_config(config)
-        config = MasterConfig(**config)
+        config = MasterConfig.model_validate(config)
         if config.env.get("should_use_nemo_gym"):
             raise ValueError(
                 "env.should_use_nemo_gym=true: run this config with "

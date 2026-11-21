@@ -71,6 +71,9 @@ from nemo_rl.models.generation.dynamo.vllm.generation_cut import (  # noqa: E402
     INVENTORY_KEY,
 )
 from nemo_rl.models.generation.prefix_recovery import NoPrefixRecovery  # noqa: E402
+from nemo_rl.models.generation.prefix_recovery.recovery import (  # noqa: E402
+    _ResolvedGenerationCut,
+)
 from nemo_rl.models.generation.vllm.utils import R3_MISSING_ROUTE_SENTINEL  # noqa: E402
 from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
     routed_experts_tensor_metadata,
@@ -526,11 +529,11 @@ def test_a_restored_media_call_is_checked_against_its_cuts_tensor_digests(
     llm = _FakeLLM([_output([*image, 20], _completion([21], "stop"))])
     host = _capturing_host(llm)
     host._capture_media = host._hash_captured_media = True
-    monkeypatch.setattr(
-        host._prefix_recovery,
-        "resolve_restore",
-        lambda admission, prefix_token_ids: (admission, saved),
-    )
+
+    async def resolve_restore(admission, prefix_token_ids):
+        return admission, _ResolvedGenerationCut(snapshot=saved)
+
+    monkeypatch.setattr(host._prefix_recovery, "resolve_restore", resolve_restore)
     # What vLLM's processor made of the image the re-sent call carries.
     tensors = dict(saved_media.tensors)
     if changed:

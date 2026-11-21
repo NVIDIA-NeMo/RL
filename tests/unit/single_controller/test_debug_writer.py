@@ -507,7 +507,9 @@ def test_background_dump_writes_what_the_sync_dump_writes(
 ) -> None:
     sync, background = tmp_path / "sync", tmp_path / "background"
     sync_receipt = JsonDebugWriter(str(sync)).add_chunk(chunk)
-    writer = make_debug_writer(DebugWriterConfig(), str(background), background=True)
+    writer = make_debug_writer(
+        DebugWriterConfig(target="json"), str(background), background=True
+    )
     # Three chunks: the third waits for the first (at most two pending), and
     # a retried step still truncates the previous attempt's part.
     stale = replace(chunk, sample_ids=["stale", "stale2"])
