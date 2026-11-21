@@ -14,8 +14,9 @@ distillation:
     seed: 42
 
 loss_fn:
-    kl_type: "mixed" # forward, reverse, mixed
+    kl_type: "mixed" # forward, reverse, mixed, jsd
     mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
+    jsd_beta: 0.5 # when kl_type is "jsd", interpolates forward KL (0) to reverse KL (1); 0.5 is the symmetric JSD
     zero_outside_topk: false # zero out the teacher logits outside the top k when calculate forward KL loss
 
 checkpointing:
