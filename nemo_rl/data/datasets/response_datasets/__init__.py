@@ -37,6 +37,9 @@ from nemo_rl.data.datasets.response_datasets.intent import (
     IntentBenchDataset,
     IntentTrainDataset,
 )
+from nemo_rl.data.datasets.response_datasets.livecodebench import (
+    LiveCodeBenchDataset,
+)
 from nemo_rl.data.datasets.response_datasets.megatron_sft_packed import (
     MegatronSFTPackedDataset,
 )
@@ -81,6 +84,7 @@ DATASET_REGISTRY = {
     "geometry3k": Geometry3KDataset,
     "mmpr-tiny": MMPRTinyDataset,
     "HelpSteer3": HelpSteer3Dataset,
+    "livecodebench_v6": LiveCodeBenchDataset,
     "intent-train": IntentTrainDataset,
     "intent-bench": IntentBenchDataset,
     "megatron_sft_packed": MegatronSFTPackedDataset,
@@ -169,6 +173,7 @@ __all__ = [
     "DeepScalerDataset",
     "Geometry3KDataset",
     "HelpSteer3Dataset",
+    "LiveCodeBenchDataset",
     "IntentBenchDataset",
     "IntentTrainDataset",
     "MegatronSFTPackedDataset",

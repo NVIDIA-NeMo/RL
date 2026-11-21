@@ -2484,3 +2484,161 @@ class TestAggregateTrainingStatistics:
 
         # Verify global_loss is on CPU
         assert metrics["global_loss"].device == torch.device("cpu")
+
+
+class TestTopkGatherAtIndices:
+    """Gather-at-indices mode of TopkLogitsPostProcessor (SDPO trust-region teacher)."""
+
+    def _make_processor(self, k, enable_seq_packing=False):
+        from nemo_rl.models.automodel.train import TopkLogitsPostProcessor
+
+        return TopkLogitsPostProcessor(
+            cfg={},
+            tp_mesh=None,
+            k=k,
+            enable_seq_packing=enable_seq_packing,
+        )
+
+    def test_gather_matches_torch_gather_unpacked(self):
+        torch.manual_seed(0)
+        B, S, V, K = 2, 5, 16, 3
+        logits = torch.randn(B, S, V)
+        idx = torch.randint(0, V, (B, S, K))
+        proc = self._make_processor(k=K)
+        vals, out_idx = proc._gather_at_indices(logits, idx, None, torch.tensor([S, S]))
+        expected = torch.gather(logits.to(torch.float32), -1, idx)
+        assert torch.allclose(vals, expected)
+        assert torch.equal(out_idx, idx)
+
+    def test_gather_trims_indices_to_microbatch_seq_len(self):
+        # The forward may trim the microbatch below the full-batch padded S.
+        torch.manual_seed(0)
+        B, S_mb, S_full, V, K = 2, 4, 6, 16, 3
+        logits = torch.randn(B, S_mb, V)
+        idx = torch.randint(0, V, (B, S_full, K))
+        proc = self._make_processor(k=K)
+        vals, out_idx = proc._gather_at_indices(
+            logits, idx, None, torch.tensor([S_mb, S_mb])
+        )
+        assert vals.shape == (B, S_mb, K)
+        expected = torch.gather(logits.to(torch.float32), -1, idx[:, :S_mb, :])
+        assert torch.allclose(vals, expected)
+
+    def test_gather_packed_roundtrip(self):
+        # Pack indices -> gather on packed logits; values must match the
+        # per-sequence unpacked gather.
+        from types import SimpleNamespace
+
+        torch.manual_seed(0)
+        V, K = 16, 3
+        lengths = [3, 5]
+        S = max(lengths)
+        T_packed = sum(lengths) + 2  # packed padding tail
+        cu_seqlens = torch.tensor([0, 3, 8])
+        packed_logits = torch.randn(1, T_packed, V)
+        idx = torch.randint(0, V, (len(lengths), S, K))
+        proc = self._make_processor(k=K, enable_seq_packing=True)
+        processed_inputs = SimpleNamespace(
+            flash_attn_kwargs=SimpleNamespace(cu_seqlens_q=cu_seqlens)
+        )
+        vals, out_idx = proc._gather_at_indices(
+            packed_logits, idx, processed_inputs, torch.tensor(lengths)
+        )
+        assert vals.shape == (1, T_packed, K)
+        for i, (start, ln) in enumerate(zip([0, 3], lengths)):
+            expected = torch.gather(
+                packed_logits[0, start : start + ln, :].to(torch.float32),
+                -1,
+                idx[i, :ln, :],
+            )
+            assert torch.allclose(vals[0, start : start + ln, :], expected)
+            assert torch.equal(out_idx[0, start : start + ln, :], idx[i, :ln, :])
+
+    def test_gather_rejects_wrong_k(self):
+        torch.manual_seed(0)
+        logits = torch.randn(1, 4, 16)
+        idx = torch.randint(0, 16, (1, 4, 5))
+        proc = self._make_processor(k=3)
+        with pytest.raises(AssertionError, match="must equal k"):
+            proc._gather_at_indices(logits, idx, None, torch.tensor([4]))
+
+
+class TestTopkReturnLogsumexp:
+    """return_logsumexp mode returns a 3-tuple through the full __call__ path."""
+
+    def test_call_returns_three_tuple_with_correct_lse(self):
+        from nemo_rl.models.automodel.train import TopkLogitsPostProcessor
+
+        torch.manual_seed(0)
+        B, S, V, K = 2, 6, 32, 4
+        logits = torch.randn(B, S, V)
+        proc = TopkLogitsPostProcessor(
+            cfg={},
+            tp_mesh=None,
+            k=K,
+            enable_seq_packing=False,
+            return_logsumexp=True,
+        )
+        data_dict = BatchedDataDict({"input_lengths": torch.tensor([S, S])})
+        result = proc(
+            logits=logits,
+            data_dict=data_dict,
+            processed_inputs=None,
+            original_batch_size=B,
+            original_seq_len=S,
+            cp_sharder=None,
+        )
+        assert len(result) == 3
+        vals, idx, lse = result
+        exp_vals, exp_idx = torch.topk(logits.to(torch.float32), k=K, dim=-1)
+        assert torch.allclose(vals, exp_vals)
+        assert torch.equal(idx, exp_idx)
+        assert torch.allclose(
+            lse, torch.logsumexp(logits.to(torch.float32), dim=-1), atol=1e-5
+        )
+        # True log-probs derived the way sdpo_train does it sum to <= 1
+        p_sum = (vals - lse.unsqueeze(-1)).exp().sum(-1)
+        assert (p_sum <= 1.0 + 1e-5).all()
+
+    def test_forward_wrapper_metrics_handle_three_tuple(self):
+        # The exact unpack that crashed job 20549: forward_with_post_processing_fn
+        # builds its metrics dict from the post-processor result.
+        from nemo_rl.models.automodel import train as am_train
+
+        torch.manual_seed(0)
+        B, S, V, K = 1, 4, 16, 3
+        logits = torch.randn(B, S, V)
+        model = MagicMock()
+        model.return_value = MagicMock(logits=logits)
+        proc = am_train.TopkLogitsPostProcessor(
+            cfg={},
+            tp_mesh=None,
+            k=K,
+            enable_seq_packing=False,
+            return_logsumexp=True,
+        )
+        input_ids = torch.randint(0, V, (B, S))
+        processed_inputs = ProcessedInputs(
+            input_ids=input_ids,
+            seq_len=S,
+            attention_mask=torch.ones(B, S, dtype=torch.bool),
+            position_ids=torch.arange(S).repeat(B, 1),
+            flash_attn_kwargs={},
+            vlm_kwargs={},
+        )
+        processed_mb = ProcessedMicrobatch(
+            data_dict=BatchedDataDict(
+                {"input_ids": input_ids, "input_lengths": torch.tensor([S])}
+            ),
+            processed_inputs=processed_inputs,
+            original_batch_size=B,
+            original_seq_len=S,
+        )
+        result, metrics, _ = am_train.forward_with_post_processing_fn(
+            model=model,
+            prepared=_prepare_cp1(model, processed_inputs),
+            post_processing_fn=proc,
+            processed_mb=processed_mb,
+        )
+        assert len(result) == 3
+        assert set(metrics) == {"topk_logits", "topk_indices", "logsumexp"}

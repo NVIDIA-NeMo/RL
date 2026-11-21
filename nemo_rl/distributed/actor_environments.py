@@ -90,6 +90,7 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     "nemo_rl.environments.code_environment.CodeEnvironment": None,
     "nemo_rl.environments.reward_model_environment.RewardModelEnvironment": None,
     "nemo_rl.environments.code_jaccard_environment.CodeJaccardEnvironment": None,
+    "nemo_rl.environments.livecodebench_environment.LiveCodeBenchEnvironment": None,
     "nemo_rl.environments.games.sliding_puzzle.SlidingPuzzleEnv": None,
     # AsyncTrajectoryCollector needs the vLLM environment to handle exceptions
     # from VllmGenerationWorker.

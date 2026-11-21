@@ -509,6 +509,7 @@ class LossInputType(enum.Enum):
     LOGPROB = "logprob"
     OPD_FULL = "opd_full"
     DISTILLATION = "distillation"
+    DISTILLATION_AND_LOGPROB = "distillation_and_logprob"
     DISTILLATION_CROSS_TOKENIZER = "distillation_cross_tokenizer"
     DRAFT = "draft"
 
@@ -560,7 +561,8 @@ class LossFunction(Protocol):
                 - For LossInputType.LOGIT: logits (torch.Tensor)
                 - For LossInputType.OPD_FULL: opd_full_divergence, and optionally
                   opd_full_entropy / opd_full_cross_entropy (torch.Tensor)
-                - For LossInputType.DISTILLATION: student_topk_logprobs, teacher_topk_logprobs, H_all (torch.Tensor)
+                - For LossInputType.DISTILLATION: student_topk_logprobs, teacher_topk_logprobs, H_all (torch.Tensor); plus next_token_logprobs (torch.Tensor) when the loss has reference_policy_kl
+                - For LossInputType.DISTILLATION_AND_LOGPROB: student_topk_logprobs, teacher_topk_logprobs, H_all, next_token_logprobs (torch.Tensor)
                 - For LossInputType.DISTILLATION_CROSS_TOKENIZER: logits (torch.Tensor), teacher_full_logits_by_idx (dict[int, torch.Tensor])
                 - For LossInputType.DRAFT: teacher_logits, student_logits, mask (torch.Tensor)
 

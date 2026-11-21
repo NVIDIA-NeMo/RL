@@ -59,6 +59,7 @@ from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
+    gather_logits_at_global_indices,
     get_cp_sharded_next_token_logprobs,
     get_logprobs_from_vocab_parallel_logits,
 )
@@ -409,6 +410,10 @@ def forward_with_post_processing_fn(
         )
         if isinstance(post_processing_fn, LogprobsPostProcessor):
             metrics = {"logprobs": result}
+        elif len(result) == 3:
+            # TopkLogitsPostProcessor with return_logsumexp=True
+            vals, idx, lse = result
+            metrics = {"topk_logits": vals, "topk_indices": idx, "logsumexp": lse}
         else:
             vals, idx = result
             metrics = {"topk_logits": vals, "topk_indices": idx}
@@ -1024,6 +1029,7 @@ class TopkLogitsPostProcessor:
         tp_mesh: Any,
         k: int,
         enable_seq_packing: bool = False,
+        return_logsumexp: bool = False,
     ):
         """Initialize TopkLogitsPostProcessor.
 
@@ -1034,11 +1040,17 @@ class TopkLogitsPostProcessor:
                 ``cp_sharder``.
             k: Number of top logits to return
             enable_seq_packing: Whether sequence packing is enabled
+            return_logsumexp: Also return the per-position full-vocab
+                logsumexp [B, S], so callers can convert the returned raw
+                top-k logits into TRUE log-probs (needed by the SDPO K+1
+                tail-bucket construction, where 1 − Σ p over the top-k must
+                be meaningful).
         """
         self.cfg = cfg
         self.tp_mesh = tp_mesh
         self.k = k
         self.enable_seq_packing = enable_seq_packing
+        self.return_logsumexp = return_logsumexp
 
     def __call__(
         self,
@@ -1068,7 +1080,35 @@ class TopkLogitsPostProcessor:
         """
         input_lengths = data_dict["input_lengths"]
 
-        if cp_sharder is not None:
+        # Gather-at-indices mode: when the microbatch carries
+        # "topk_gather_indices" [b, S, k], evaluate the logits at those global
+        # vocab indices instead of computing top-k. Used by SDPO: the
+        # trust-region teacher evaluates the reference policy at the
+        # distillation indices, and topk_source="student" evaluates the
+        # teacher forward at the student's top-k (paper §2.2).
+        lse: Optional[torch.Tensor] = None
+        if self.return_logsumexp:
+            if cp_sharder is not None:
+                raise NotImplementedError(
+                    "return_logsumexp does not support context parallelism yet"
+                )
+            # Computed on the raw (possibly packed / microbatch-trimmed)
+            # logits so it shares vals' layout at this point; the packing
+            # unpack below handles it alongside vals/idx.
+            lse = self._full_vocab_logsumexp(logits)
+
+        if "topk_gather_indices" in data_dict:
+            if cp_sharder is not None:
+                raise NotImplementedError(
+                    "topk_gather_indices does not support context parallelism yet"
+                )
+            vals, idx = self._gather_at_indices(
+                logits,
+                data_dict["topk_gather_indices"],
+                processed_inputs,
+                input_lengths,
+            )
+        elif cp_sharder is not None:
             # Deal with TP first; the logits are already this rank's CP shard.
             local_logits = to_local_if_dtensor(logits)  # [B, S_cp, V_tp]
 
@@ -1133,6 +1173,16 @@ class TopkLogitsPostProcessor:
             )
             input_lengths_cpu = to_cpu_int_tuple(input_lengths)
 
+            unpacked_lse = (
+                torch.zeros(
+                    (original_batch_size, original_seq_len),
+                    dtype=lse.dtype,
+                    device=lse.device,
+                )
+                if lse is not None
+                else None
+            )
+
             for i in range(original_batch_size):
                 start = cu_seqlens_cpu[i]
                 end = cu_seqlens_cpu[i + 1]
@@ -1142,11 +1192,106 @@ class TopkLogitsPostProcessor:
                 # Note: vals and idx are [1, packed_seq_len, k] due to packing
                 unpacked_vals[i, :seq_len_actual, :] = vals[0, start:end, :]
                 unpacked_idx[i, :seq_len_actual, :] = idx[0, start:end, :]
+                if unpacked_lse is not None:
+                    unpacked_lse[i, :seq_len_actual] = lse[0, start:end]
 
             vals = unpacked_vals
             idx = unpacked_idx
+            lse = unpacked_lse
 
+        if self.return_logsumexp:
+            return vals, idx, lse
         return vals, idx
+
+    def _full_vocab_logsumexp(self, logits: torch.Tensor) -> torch.Tensor:
+        """Per-position logsumexp over the FULL vocab, TP-aware, seq-chunked.
+
+        Returns [B, S] float32 in the same (possibly packed) layout as
+        ``logits``. Chunked along the sequence dim to bound the fp32 working
+        set on long packed sequences.
+        """
+        chunk = 1024
+        if isinstance(logits, DTensor):
+            local_logits = logits.to_local()  # [B, S, V_local]
+            tp_group = self.tp_mesh.get_group()
+            out = []
+            for s0 in range(0, local_logits.shape[1], chunk):
+                piece = local_logits[:, s0 : s0 + chunk, :].to(torch.float32)
+                m = piece.max(dim=-1).values
+                torch.distributed.all_reduce(
+                    m, op=torch.distributed.ReduceOp.MAX, group=tp_group
+                )
+                s = (piece - m.unsqueeze(-1)).exp().sum(dim=-1)
+                torch.distributed.all_reduce(
+                    s, op=torch.distributed.ReduceOp.SUM, group=tp_group
+                )
+                out.append(m + s.log())
+            return torch.cat(out, dim=1)
+        out = []
+        for s0 in range(0, logits.shape[1], chunk):
+            out.append(
+                torch.logsumexp(logits[:, s0 : s0 + chunk, :].to(torch.float32), dim=-1)
+            )
+        return torch.cat(out, dim=1)
+
+    def _gather_at_indices(
+        self,
+        logits: torch.Tensor,
+        gather_indices: torch.Tensor,
+        processed_inputs: ProcessedInputs,
+        input_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate logits at caller-provided global vocab indices.
+
+        Returns (values, indices) in the same packed/unpacked format the top-k
+        path produces at this point, so the sequence-packing unpack step in
+        __call__ applies unchanged. Differentiability is not needed here (the
+        teacher forward runs under no_grad).
+        """
+        assert gather_indices.shape[-1] == self.k, (
+            f"topk_gather_indices last dim ({gather_indices.shape[-1]}) must equal k ({self.k})"
+        )
+        device = to_local_if_dtensor(logits).device
+        gi = gather_indices.to(device=device, dtype=torch.long)
+
+        if self.enable_seq_packing:
+            # Pack [b, S, k] -> [1, T_packed, k]: the inverse of the unpack
+            # loop in __call__. Positions beyond each sequence's real length
+            # (and the packed padding tail) stay 0; the unpack step never
+            # reads them.
+            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            packed_len = int(logits.shape[1])
+            gi_packed = torch.zeros(
+                (1, packed_len, self.k), dtype=torch.long, device=device
+            )
+            for i in range(gi.shape[0]):
+                start = int(cu_seqlens[i].item())
+                seq_len_actual = int(input_lengths[i].item())
+                gi_packed[0, start : start + seq_len_actual, :] = gi[
+                    i, :seq_len_actual, :
+                ]
+            gi = gi_packed
+        else:
+            # The forward may trim the microbatch to its own max length; the
+            # provided indices are padded to the full-batch S.
+            gi = gi[:, : int(logits.shape[1]), :]
+
+        if isinstance(logits, DTensor):
+            local_logits = logits.to_local()
+            tp_group = self.tp_mesh.get_group()
+            tp_rank = torch.distributed.get_rank(tp_group)
+            v_local = int(local_logits.shape[-1])
+            vals = gather_logits_at_global_indices(
+                local_logits,
+                gi,
+                tp_group=tp_group,
+                cp_group=None,
+                vocab_start_index=tp_rank * v_local,
+                vocab_end_index=(tp_rank + 1) * v_local,
+            )
+        else:
+            vals = torch.gather(logits.to(torch.float32), dim=-1, index=gi)
+        return vals, gi
 
 
 class FullLogitsPostProcessor:
