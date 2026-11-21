@@ -1,0 +1,340 @@
+---
+title: "Generation Interface"
+---
+This document explains the token generation interface and various backends for the NeMo RL framework. The generation system is designed with a unified interface that allows different backends (like VLLM, Megatron, Hugging Face, SGLang, and TRT-LLM) to provide token generation capabilities while adhering to the same API.
+
+## Generation Interface
+
+The core of the generation system is defined in `interfaces.py`, which establishes an abstract interface that all generation backends must implement. This ensures consistency across different implementations and makes it easy to swap backends without changing the calling code.
+
+### Key Components
+
+1. **GenerationConfig**: A TypedDict that defines the configuration for generation:
+   ```python
+   class GenerationConfig(TypedDict):
+       """Configuration for generation."""
+       backend: str              # The backend to use (e.g., "vllm", "megatron", "hf")
+       max_new_tokens: int       # Maximum number of tokens to generate
+       temperature: float        # Sampling temperature
+       top_p: float              # Top-p sampling parameter
+       top_k: int | None         # Top-k sampling parameter
+       model_name: str           # Name or path of the model
+   ```
+
+2. **GenerationDatumSpec**: A TypedDict that defines the input data format:
+   ```python
+   class GenerationDatumSpec(TypedDict):
+       input_ids: torch.Tensor         # Input token IDs
+       attention_mask: torch.Tensor    # Attention mask
+       __extra__: Any                  # Additional data specific to the backend
+   ```
+
+3. **GenerationOutputSpec**: A TypedDict that defines output data format:
+   ```python
+   class GenerationOutputSpec(TypedDict):
+       output_ids: torch.Tensor
+       generation_lengths: torch.Tensor  # Length of just the generated response part
+       unpadded_sequence_lengths: torch.Tensor  # Length of full valid sequence (input + generated response)
+       logprobs: torch.Tensor
+       __extra__: Any                  # Additional output data specific to the backend
+   ```
+
+4. **GenerationInterface**: An abstract base class that all generation backends must implement:
+   ```python
+   class GenerationInterface(ABC):
+       """Abstract base class defining the interface for RL policies."""
+
+       @abstractmethod
+       def generate(
+           self, data: BatchedDataDict["GenerationDatumSpec"], greedy: bool
+       ) -> BatchedDataDict["GenerationOutputSpec"]:
+           pass
+
+       @abstractmethod
+       def prepare_for_generation(self, *args, **kwargs):
+           pass
+
+       @abstractmethod
+       def finish_generation(self, *args, **kwargs):
+           pass
+   ```
+
+A key design principle for generation backends is that they process tokens directly, without involving the tokenizer. By ensuring that only tokens are exchanged, we eliminate the risk of inconsistencies arising from different tokenizer versions or specifications between the training and generation frameworks.
+
+## Generation Backends
+
+NeMo RL supports multiple generation backends that implement the `GenerationInterface <nemo_rl.models.generation.interfaces.GenerationInterface>` to provide efficient text generation for different use cases.
+
+## SGLang Fault Tolerance
+
+SGLang fault tolerance is opt-in. Its serving-health monitor checks engines
+during generation; a separate bounded actor/process liveness probe covers the
+training and offloaded windows. The latter does not detect a live-but-wedged
+server, so both detectors are necessary. Replacements wait until the next refit
+to receive current policy weights before rollout resumes. Failure after a
+weight transfer starts is outside this recovery boundary.
+
+The SGLang exemplar documents the defaults below. Fault-tolerance and client
+defaults are centralized in `SGLangFaultToleranceConfig` and
+`SGLangHttpClientConfig`, respectively:
+
+```yaml
+policy:
+  generation:
+    sglang_cfg:
+      sglang_fault_tolerance_config:
+        use_fault_tolerance: false
+        rollout_health_check_interval: 60
+        rollout_health_check_timeout: 60
+        rollout_health_check_first_wait: 60
+        rollout_max_restart_attempts: 3
+      sglang_router_config:
+        use_external_router: false
+        retry_max_retries: 5
+        cb_failure_threshold: 10
+      sglang_http_client_config:
+        max_retries: 3
+```
+
+Health intervals and timeouts are positive, finite seconds; the first-wait grace
+can be zero. The restart limit is a nonnegative integer per logical engine over
+the run's lifetime. Exhaustion aborts refit; zero disables restarts. The
+`sglang_fault_tolerance_config` block is required and inherited from the SGLang
+exemplar. An empty block uses the defaults above, including disabled recovery.
+
+The two router knobs require positive integers and configure only a router
+launched by NeMo-RL. Omitting them retains the pinned router's defaults. An
+external router owns its own retry/circuit configuration. The independent
+client budget still applies with `use_external_router: true`.
+
+Despite their names, `retry_max_retries` and client `max_retries` count **total
+attempts including the first**, not additional retries. A client attempt can
+therefore contain several router attempts. Distributed HTTP dispatch uses the
+client budget, and its existing local fallback gets that budget again if the
+actor call fails. These settings permit tuning bounded nonstreaming recovery;
+they do not guarantee survival after fleet loss or retry exhaustion. A streaming
+response that has already started cannot be replayed.
+
+## VLLM Backend
+
+The VLLM backend (`models/generation/vllm/vllm_generation.py`) implements the `GenerationInterface <nemo_rl.models.generation.interfaces.GenerationInterface>` to provide efficient text generation using the VLLM library, which is optimized for large language models.
+
+### VllmGeneration Class
+
+The `VllmGeneration <nemo_rl.models.generation.vllm.VllmGeneration>` class is the main implementation of the `GenerationInterface <nemo_rl.models.generation.interfaces.GenerationInterface>` for VLLM. It performs the following functions:
+
+1. Sets up VLLM workers in a distributed environment using Ray.
+2. Manages the lifecycle of these workers (initialization, generation, shutdown).
+3. Distributes inputs to workers and collects outputs.
+4. Handles weight updates and synchronization.
+
+### VllmGenerationWorker
+
+The `VllmGenerationWorker <nemo_rl.models.generation.vllm.VllmGenerationWorker>` is a Ray actor that:
+
+1. Initializes and manages a VLLM model instance.
+2. Performs the actual generation on a GPU.
+3. Supports dynamic weight updates through IPC handles.
+4. Implements sleep/wake mechanisms for efficient resource utilization.
+
+### Custom VLLM Extensions
+
+The `UpdatableVllmInternalWorker <nemo_rl.models.generation.vllm_backend.UpdatableVllmInternalWorker>` class in `vllm_backend.py` extends the VLLM worker with additional capabilities:
+
+1. Reporting device IDs to allow mapping of workers to specific GPUs.
+2. Updating weights from IPC handles for efficient weight sharing.
+3. Checking if weights have been updated correctly.
+
+## Megatron Backend
+
+The Megatron backend provides native Megatron-Core inference capabilities, eliminating the need for weight conversion between training and generation. This backend is particularly beneficial when using Megatron for training, as it enables seamless integration and optimal performance.
+
+### Key Features
+
+1. **No Weight Conversion**: Uses the same Megatron model format for both training and generation, eliminating conversion overhead and potential inconsistencies.
+2. **CUDA Graph Support**: Leverages CUDA graphs for optimized inference performance.
+3. **Dynamic Inference Engine**: Utilizes Megatron Core's `DynamicInferenceEngine` for efficient batched generation.
+4. **Integrated with Training**: The generation capability is built directly into the `MegatronPolicyWorker`, enabling efficient co-located training and generation.
+
+### MegatronPolicyWorker Generation
+
+The Megatron generation backend is implemented within the `MegatronPolicyWorker <nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker>` class. The `generate <nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker.generate>` method performs the following:
+
+1. Wraps the Megatron model with `GPTInferenceWrapper` for inference optimization.
+2. Creates a `DynamicInferenceContext` to manage inference state and memory.
+3. Initializes a `DynamicInferenceEngine` with CUDA graph support enabled.
+4. Processes batched requests with proper sampling parameters (temperature, top_k, top_p).
+5. Returns outputs conforming to `GenerationOutputSpec <nemo_rl.models.generation.interfaces.GenerationOutputSpec>`.
+
+### Configuration
+
+To use the Megatron generation backend, configure your YAML file as follows:
+
+```yaml
+policy:
+  megatron_cfg:
+    enabled: true
+  generation:
+    backend: megatron
+    max_new_tokens: 512
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    mcore_generation_config:
+      buffer_size_gb: 10               # Memory buffer size for requests, total buffer size is 2x this value (active requests + paused requests)
+      num_cuda_graphs: 16              # Number of CUDA graphs to pre-allocate
+      max_tokens: 16384                # Maximum number of tokens for inference
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
+      http_server_num_replicas: 8
+```
+
+### Configuration Parameters
+
+The `mcore_generation_config` section controls Megatron Core inference engine behavior:
+
+- **buffer_size_gb**: Buffer size reserved for active requests that live on the GPU. The total buffer size (stored in unified memory) is 2x this value, with the other half of the buffer reserved for paused requests that live on the CPU.
+- **num_cuda_graphs**: Number of CUDA graphs to pre-allocate for different batch sizes. More graphs can improve performance by avoiding runtime graph capture, but consume more memory.
+- **max_tokens**: Maximum total number of tokens (across all requests) that can be processed simultaneously. This limits the maximum batch size and sequence length combinations. Increasing this might throw OOM depending on vocab size and buffer size allocated. 
+
+#### CUDA-graph capture
+
+- **cuda_graph_sizing_distribution** (`hybrid`) and **cuda_graph_max_tokens** (`512`) bound graph-capture cost while keeping decode graphs dense and prefill graphs compact. Use `exponential` or `linear` when one layout is a better fit for a known workload.
+- **inference_cuda_graph_scope** controls where local inference graphs live: `layer` owns them per Transformer/Mamba layer and `block` owns them per enclosing block. `none` runs eagerly. This setting only applies with `cuda_graph_impl: local`.
+
+#### Prefix-cache routing and HTTP frontends
+
+- **prefix_caching_mamba_gb** (`null`) leaves Mamba-state prefix caching disabled until a hybrid Mamba model has an explicit GPU budget.
+- **prefix_caching_eviction_policy** (`lru`), **prefix_caching_coordinator_policy** (`longest_prefix`), **prefix_cache_ttl_seconds** (`300.0`), and **prefix_caching_routing_alpha** (`1.0`) retain useful prefixes while steering requests toward cache hits without ignoring an overloaded inference rank.
+- **http_server_num_replicas** (`8`) sets the number of CPU HTTP frontends per model-parallel coordinator. These frontends spread request parsing, prompt processing, and cache-key work across CPU cores.
+
+### Multimodal Megatron Generation
+
+Megatron inference supports image and video inputs in NeMo-RL. Enable multimodal processing with `policy.is_vlm: true`, use the `megatron` generation backend, and provide a `megatron_inference_wrapper`. The wrapper must subclass `megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper.AbstractModelInferenceWrapper` in Megatron-Core and declare `supports_<modality> = True` for each supported modality.
+
+```yaml
+policy:
+  is_vlm: true
+  generation:
+    backend: megatron
+    mcore_generation_config:
+      megatron_inference_wrapper: megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper
+      image_dynamic_resolution: true
+      video_num_frames: 16
+      video_temporal_patch_size: 2
+      video_target_num_patches: 2048
+      video_maintain_aspect_ratio: true
+      vision_embedding_cache_max_bytes: 0
+      allow_stale_multimodal_embeddings: false
+data:
+  default:
+    num_frames: 16
+    video_temporal_patch_size: 2
+    video_target_num_patches: 2048
+    video_maintain_aspect_ratio: true
+```
+
+- `image_dynamic_resolution` preserves variable image shapes instead of forcing one fixed resolution; for example, a wide image uses a wider patch grid than a square image.
+- `vision_model_type` optionally selects the MCore vision encoder type used by image and video preprocessing. Set it to the encoder expected by the inference wrapper; when omitted, MCore uses its default (`radio`).
+- `num_frames` controls uniform video-frame sampling. Use `video_num_frames` for the corresponding MCore key.
+- `video_temporal_patch_size` groups sampled frames into temporal tubelets; for example, size `2` turns 16 frames into 8 temporal groups.
+- `video_target_num_patches` sets `num_patches_per_frame = patch_height * patch_width <= video_target_num_patches`, which produces `num_patches_per_frame * num_frames / video_temporal_patch_size` total video patches prior to spatial merging (i.e. further grouped / concatenated into MxM patch blocks) that are provided to the vision encoder.
+- `video_maintain_aspect_ratio=true` keeps `patch_width / patch_height ~= source_width / source_height`; `false` uses `patch_width = patch_height ~= sqrt(video_target_num_patches)` (for example, `sqrt(256) = 16`).
+- `vision_embedding_cache_max_bytes` limits GPU memory used to reuse vision embeddings for repeated media; `0` disables the cache, while `1073741824` permits up to 1 GiB.
+- `allow_stale_multimodal_embeddings` controls whether cached embeddings survive model-weight changes. Keep it `false` for RL refits; use `true` only when weights remain fixed.
+- `expose_http_server` should be `true` for NeMo Gym.
+
+Keep the video preprocessing values identical in `data.default` and `mcore_generation_config` to avoid disparity between the training policy and inference generation.
+
+## Usage Examples
+
+### Using VLLM Backend
+
+To use the VLLM generation backend:
+
+```python
+from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.interfaces import configure_generation_config
+from nemo_rl.models.generation.vllm import VllmGeneration, VllmConfig
+
+# Set up the configuration
+config = VllmConfig(
+    model_name="Qwen/Qwen2.5-1.5B",
+    max_new_tokens=100,
+    temperature=0.7,
+    top_p=1,
+    top_k=None,
+    backend="vllm",
+    vllm_cfg={
+        "tensor_parallel_size": 1,
+        "gpu_memory_utilization": 0.8,
+        "max_model_len": 2048,
+    }
+)
+
+# Configure config with tokenizer
+tokenizer = get_tokenizer(config["model_name"])
+config = configure_generation_config(config, tokenizer)
+
+# Initialize the cluster and generation backend
+cluster = RayVirtualCluster(...)
+generator = VllmGeneration(cluster, config)
+
+# Prepare input data
+input_data = BatchedDataDict(...)
+
+# Generate text
+generator.prepare_for_generation()
+output = generator.generate(input_data, greedy=False)
+generator.finish_generation()
+```
+
+### Using Megatron Backend
+
+To use the Megatron generation backend, configure your YAML file:
+
+```yaml
+policy:
+  model_name: meta-llama/Llama-3.2-1B-Instruct
+  megatron_cfg:
+    enabled: true
+  generation:
+    backend: megatron
+    max_new_tokens: 512
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    mcore_generation_config:
+      buffer_size_gb: 10
+      num_cuda_graphs: 16
+      max_tokens: 16384
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
+      http_server_num_replicas: 8
+```
+
+For a complete example, see
+`examples/configs/recipes/llm/grpo-llama3.2-1b-instruct-1n8g-megatron_generation.yaml`.
+
+## Extend with New Backends
+
+To add a new generation backend:
+
+1. Create a new class that implements `GenerationInterface <nemo_rl.models.generation.interfaces.GenerationInterface>`.
+2. Implement the required methods: `generate <nemo_rl.models.generation.interfaces.GenerationInterface.generate>`, `prepare_for_generation <nemo_rl.models.generation.interfaces.GenerationInterface.prepare_for_generation>`, and `finish_generation <nemo_rl.models.generation.interfaces.GenerationInterface.finish_generation>`.
+3. Ensure your implementation works with the standard `GenerationConfig <nemo_rl.models.generation.interfaces.GenerationConfig>` and `GenerationDatumSpec <nemo_rl.models.generation.interfaces.GenerationDatumSpec>` structures.
+4. Register your backend with the system (if needed) to make it accessible.
+
+This modular design allows for easy extension with new backends while maintaining a consistent interface for the rest of the system.

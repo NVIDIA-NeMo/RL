@@ -1,0 +1,203 @@
+---
+title: "FP8 Quantization in NeMo RL"
+---
+This module provides a suite of tools to enable FP8 quantization for large language models. It is currently under active development.
+
+## Supported Features
+
+### FP8 Generation
+- Implements **DeepSeek-style FP8** quantization using **sub-channel scaling**.
+
+### FP8 Training
+- Uses **TransformerEngine** for linear layer implementation.
+- Supports both **DeepSeek-style sub-channel scaling** and **per-tensor scaling**.
+
+### Recommended recipe
+- For Hopper GPUs we recommend using FP8 (DeepSeek-style) precision for both generation and training for best convergence and speedup
+- For Blackwell GPUs, FP8 (DeepSeek-style) with FP32 scaling factor is not supported in training. Currently we recommend using FP8 precision for generation and BF16 for training. We are actively exploring other recipes for better performance.
+
+## Integration with NeMo RL
+
+NeMo RL applies monkey patches to several core `vLLM` components to enable FP8 generation for reinforcement learning.  
+When the `init_fp8` function is called, it modifies the following:
+
+### RayDistributedExecutor
+- For multi-GPU inference, the executor is patched to ensure that every worker process applies the same FP8 patches **before model initialization**.
+
+### Quantization Utilities
+- Functions within `vllm.model_executor.layers.quantization` are replaced with custom implementations that support:
+  - **Power-of-2 scaling**
+  - Other custom features
+
+### Weight Loading
+- A custom `load_weights` function performs on-the-fly quantization of model weights from higher-precision formats to FP8.
+
+## Usage
+
+FP8 generations are recommended to be configured with the following settings:
+
+   ```text
+    loss_fn:
+        # importance sampling helps improve stability
+        use_importance_sampling_correction: true
+
+    policy:
+        generation:
+            vllm_cfg:
+                precision: 'fp8'
+                # DeepGemm is much more performant than vLLM's default cutlass fp8 subchannel scaling kernels
+                use_deep_gemm: true
+                # Users can specify number of layers to be kept in BF16 precision in their experiments
+                # and by default they are set to 0
+                num_last_layers_in_bf16: 0
+                num_first_layers_in_bf16: 0
+                # Use FP32 scaling factors. Rounding scaling factors to the nearest pow2 may improve quantization 
+                # fidelity however this feature is still under research.
+                pow2_weight_scaling_factors: False
+                pow2_activation_scaling_factors: False
+```
+
+For MXFP8, `quantization_ignore_patterns` accepts exact module names,
+substrings, and `fnmatch` wildcards. Matching modules remain in BF16. For
+example, the following scope quantizes only Qwen3 routed experts while keeping
+attention, the router, and the language-model head in BF16:
+
+```text
+    policy:
+        generation:
+            vllm_cfg:
+                precision: "fp8"
+                is_mx: true
+                quantization_ignore_patterns:
+                    - model.layers.*.self_attn.*
+                    - model.layers.*.mlp.gate
+```
+
+`num_first_layers_in_bf16` and `num_last_layers_in_bf16` keep complete
+transformer layers in BF16. NeMo RL reads the model configuration and parameter
+names, so these options do not require a model-specific `model.layers` or
+`backbone.layers` prefix. The patterns above still apply to every middle layer.
+
+For example, this Nemotron 3.5 Lightning scope keeps the first two and last six
+layers in BF16. In the middle layers it quantizes only the non-shared routed
+experts. Attention, Mamba projections, routers, shared experts, latent
+projections, and MTP remain in BF16:
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      precision: fp8
+      is_mx: true
+      num_first_layers_in_bf16: 2
+      num_last_layers_in_bf16: 6
+      quantization_ignore_patterns:
+        - "*layers.*.mixer.qkv_proj"
+        - "*layers.*.mixer.o_proj"
+        - "*layers.*.mixer.in_proj"
+        - "*layers.*.mixer.out_proj"
+        - "*layers.*.mixer.up_proj"
+        - "*layers.*.mixer.down_proj"
+        - "*layers.*.mixer.gate"
+        - "*layers.*.mixer.shared_experts.*"
+        - "*layers.*.mixer.fc1_latent_proj"
+        - "*layers.*.mixer.fc2_latent_proj"
+        - "*mtp.*"
+```
+
+To quantize QKVO as well as the routed experts, remove the `qkv_proj` and
+`o_proj` entries. The first two and last six layers still remain entirely in
+BF16. Check the logged effective ignore list when adding a new model family;
+an ignore pattern that matches no module is usually a naming error.
+
+`lm_head` is always excluded from FP8 and MXFP8 quantization, even when it is
+not listed in `quantization_ignore_patterns` in the YAML configuration.
+Models with MTP layers must list their MTP module names explicitly, for example
+`mtp.*` and `language_model.mtp.*`. External speculative-decoding drafts use a
+separate vLLM model configuration and must configure their precision separately.
+
+`quantization_ignored_layer_kws` is deprecated for MXFP8 in NeMo RL 0.8; new
+MXFP8 configurations should use `quantization_ignore_patterns` instead.
+`quantization_ignore_patterns` requires `is_mx: true`. Non-MX FP8
+(`precision: "fp8"` without `is_mx`) has no pattern-based replacement yet and
+must continue to use `quantization_ignored_layer_kws`.
+
+To train with FP8, you need to set the Megatron path and configure it using the following settings:
+
+```yaml
+    policy:
+        megatron_cfg:
+            fp8_cfg:
+                fp8: "hybrid"               # choices: [hybrid, e4m3]
+                fp8_recipe: "tensorwise"    # choices: [tensorwise, blockwise, mxfp8, custom]
+                fp8_param: false            # boolean value
+                fp8_quantizer_factory: null # required for "custom" recipe; importable Python path e.g. package.module.quantizer_factory
+```
+
+### Per-module Transformer Engine precision recipes
+
+For finer-grained Megatron training precision, point
+`policy.megatron_cfg.te_precision_config_file` at a Megatron-LM Transformer
+Engine precision recipe:
+
+```text
+    policy:
+        megatron_cfg:
+            fp8_cfg:
+                enabled: true
+                fp8: "hybrid"
+                fp8_recipe: "mxfp8"
+                fp8_param: false
+            te_precision_config_file: "/path/to/te_precision.yaml"
+```
+
+A minimal recipe that applies MXFP8 training precision to all matched modules
+and keeps evaluation in BF16 looks like:
+
+```yaml
+configs:
+  mxfp8:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe: {fp8_quantization_recipe: mxfp8}
+    evaluation_recipe: {}
+matchers:
+  all: {config: mxfp8, type: glob, pattern: "*", enabled: true}
+```
+
+Each matcher must set `enabled: true`; omitted or false `enabled` values are
+parsed but do not match any modules. By default, a precision recipe by itself
+does not enable FP8 compute in the usual training path, so keep
+`fp8_cfg.enabled: true` when the matched modules should run under FP8 autocast.
+
+When both `fp8_cfg` and `te_precision_config_file` are set, matched modules use
+the recipe's per-module quantization config. NeMo RL still derives sequence
+padding and FP8 refit behavior from `fp8_cfg`, so matched FP8 recipes must use
+the same `fp8_quantization_recipe` as `fp8_cfg.fp8_recipe`. Recipe
+`training_recipe` and `evaluation_recipe` fields `fp8_param` and `fp4_param`
+are rejected; use `fp8_cfg.fp8_param` for supported FP8 parameter storage.
+
+## Compatibility Note for DeepSeek-Style FP8 Training
+
+The TransformerEngine implementation for this recipe requires **CUDA version ≥ 12.9**. The current NeMo RL container uses CUDA 13.2 (via `docker/Dockerfile`), which satisfies this requirement. Users on older setups should check out the latest code and build the container from `docker/Dockerfile` ([instructions](/containers/docker)).
+
+If you are using nemo-rl before this [commit](https://github.com/NVIDIA-NeMo/RL/commit/3f36d14b53e906b27c01c06e36dbbd2b8eb300cd), you will see the following error when trying to use fp8 training:
+
+```text
+File "/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/lib/python3.12/site-packages/transformer_engine/pytorch/fp8.py", line 646, in fp8_autocast
+FP8GlobalStateManager.fp8_autocast_enter(
+File "/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/lib/python3.12/site-packages/transformer_engine/pytorch/fp8.py", line 465, in fp8_autocast_enter
+assert fp8_block_available, reason_for_no_fp8_block
+           ^^^^^^^^^^^^^^^^^^^
+AssertionError: FP8 block scaled GEMM requires Hopper and CUDA >= 12.9.
+```
+
+## Accuracy
+
+![Llama-3.1-8B-Instruct GRPO Curve BF16 vs FP8](assets/fp8_e2e_curve.png)
+
+The above results are from Llama-3.1-8B-Instruct GRPO experiments. You can run them with the following example configs:
+* For BF16: `examples/configs/grpo_math_8B_megatron.yaml`
+* For FP8: `examples/configs/grpo_math_8B_megatron_fp8.yaml`
+
+In the experiment in this figure, enabling FP8 rollout and training gives 15%-25% decrease in step time, and the validation accuracy curves match up to 1000 steps.
+Efforts are ongoing to perform longer runs and further optimize performance.
