@@ -142,7 +142,7 @@ Start the repo's own lint/format/type suite in the background early, so results 
 uv run --group dev pre-commit run --all-files
 ```
 
-Do NOT run `ruff`/`pyrefly` directly — `pre-commit` runs the repo's pinned hook versions and config, and calling the tools directly can use the wrong versions/args and produce misleading results. Fallback only when `pre-commit` cannot run at all: run the pinned version with `uvx ruff@<version from .pre-commit-config.yaml>` and run every ruff hook the config lists (plain `ruff check` misses `I001`). When collating, attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`); `--all-files` also surfaces pre-existing issues unrelated to this PR — don't report those. Also flag any NEW source file in the diff that isn't added to `pyrefly.toml` `project-includes` (untracked files silently escape type-checking).
+Do NOT run `ruff`/`pyrefly` directly — `pre-commit` runs the repo's pinned hook versions and config, and calling the tools directly can use the wrong versions/args and produce misleading results. Fallback only when `pre-commit` cannot run at all: run the pinned version with `uvx ruff@<version from .pre-commit-config.yaml>` and run every ruff hook the config lists (plain `ruff check` misses `I001`). When collating, attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`); `--all-files` also surfaces pre-existing issues unrelated to this PR — don't report those. Also flag any new entry the diff adds to `pyrefly-baseline.json` (new errors should be fixed, not baselined).
 
 ### 1.6 Teams are MANDATORY — never substitute plain subagents
 
@@ -1129,7 +1129,7 @@ After all Wave 2 agents complete:
      corrected code here
      ```
      ````
-7. Incorporate linter results from the background `pre-commit` run (§1.5b) — attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`), and flag any new source file missing from `pyrefly.toml`
+7. Incorporate linter results from the background `pre-commit` run (§1.5b) — attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`), and flag any new entry the diff adds to `pyrefly-baseline.json` (new errors should be fixed, not baselined)
 8. Incorporate comment-reviewer's thread response drafts
 9. Incorporate test-agent's verified test suggestions
 
