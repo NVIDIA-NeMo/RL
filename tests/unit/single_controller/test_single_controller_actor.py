@@ -75,8 +75,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     TokenCaptureConfig,
     logprob_passes_required,
+    resolve_grpo_chunk_alignment,
+    resolve_grpo_group_multiple,
     resolve_ppo_chunk_alignment,
-    validate_grpo_chunk_cap_alignment,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
@@ -255,6 +256,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         restored_from_rollout_snapshot=False,
         ppo_group_multiple=1,
         ppo_min_remaining_groups=0,
+        grpo_group_multiple=1,
         trainer_warmup_kwargs=None,
     )
     args.update(overrides)
@@ -410,6 +412,7 @@ def _grpo_chunk_cap_config(
     sequence_packing: bool = False,
 ) -> MasterConfig:
     return MasterConfig.model_construct(
+        loss_fn=ClippedPGLossConfig(),
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=8,
             num_generations_per_prompt=num_generations_per_prompt,
@@ -429,14 +432,73 @@ def _grpo_chunk_cap_config(
     )
 
 
+@pytest.mark.parametrize(
+    ("policy_dp", "generations", "dynamic_batching", "forest", "expected_groups"),
+    [
+        # Static batching also needs whole microbatches of 4 on each rank.
+        (2, 4, False, False, 2),
+        # Forest pads each group, so its group count needs no alignment.
+        (32, 16, True, True, 1),
+    ],
+)
+def test_grpo_group_multiple_aligns_chunks_to_policy_shards(
+    policy_dp: int,
+    generations: int,
+    dynamic_batching: bool,
+    forest: bool,
+    expected_groups: int,
+) -> None:
+    config = _grpo_chunk_cap_config(
+        None,
+        num_generations_per_prompt=generations,
+        forest_training=forest,
+        train_micro_batch_size=4,
+        dynamic_batching=dynamic_batching,
+    )
+    assert resolve_grpo_group_multiple(config, policy_dp) == expected_groups
+
+
+def test_grpo_rejects_a_step_size_that_cannot_shard_across_policy_dp() -> None:
+    """A step size that is not a group multiple strands the last chunk.
+
+    Eight groups at two generations each is sixteen samples. DP 6 needs a
+    multiple of three groups, so no selection can fill the last chunk.
+    """
+    with pytest.raises(ValueError, match="num_prompts_per_step"):
+        resolve_grpo_chunk_alignment(_grpo_chunk_cap_config(None), 6)
+
+
+def test_grpo_group_multiple_ignores_logprob_batch_size_without_a_logprob_pass() -> (
+    None
+):
+    """On-policy ratio and no KL skip every logprob forward.
+
+    The dispatch then splits only on the train microbatch size, so a logprob
+    batch size of 6 must not widen the multiple to lcm(4, 6) = 12.
+    """
+    config = _grpo_chunk_cap_config(
+        None,
+        num_generations_per_prompt=16,
+        train_micro_batch_size=4,
+        dynamic_batching=False,
+    )
+    config.policy["logprob_batch_size"] = 6
+    config.loss_fn = ClippedPGLossConfig(
+        force_on_policy_ratio=True, reference_policy_kl_penalty=0
+    )
+    assert not any(logprob_passes_required(config, config.grpo))
+    # 32 x 4 = 128 samples is 8 groups of 16; lcm(4, 6) would give 384 -> 24.
+    assert resolve_grpo_group_multiple(config, 32) == 8
+
+
 def test_grpo_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp() -> None:
-    """GRPO passes no group_multiple, so the cap alone decides the chunk size.
+    """A cap that is not a group multiple would be shortened, so it is rejected.
 
     Three groups at two generations each is six samples, and the training
     dispatch shards without allow_uneven_shards, so six cannot split four ways.
     """
     with pytest.raises(ValueError, match="max_groups_for_streaming_train"):
-        validate_grpo_chunk_cap_alignment(_grpo_chunk_cap_config(3), 4)
+        resolve_grpo_chunk_alignment(_grpo_chunk_cap_config(3), 4)
 
 
 def test_grpo_rejects_a_cap_that_leaves_each_rank_a_partial_microbatch() -> None:
@@ -454,7 +516,7 @@ def test_grpo_rejects_a_cap_that_leaves_each_rank_a_partial_microbatch() -> None
     )
 
     with pytest.raises(ValueError, match="max_groups_for_streaming_train"):
-        validate_grpo_chunk_cap_alignment(config, 2)
+        resolve_grpo_chunk_alignment(config, 2)
 
 
 @pytest.mark.parametrize("chunk_cap", [None, 2, 4, 8, 9])
@@ -463,7 +525,7 @@ def test_grpo_accepts_shardable_and_nonbinding_chunk_caps(
 ) -> None:
     # 2 and 4 shard evenly across DP 4; 8 and 9 are at or above
     # num_prompts_per_step and so never bind; None is the unbounded default.
-    validate_grpo_chunk_cap_alignment(_grpo_chunk_cap_config(chunk_cap), 4)
+    assert resolve_grpo_chunk_alignment(_grpo_chunk_cap_config(chunk_cap), 4) == 2
 
 
 @pytest.mark.parametrize(
@@ -485,7 +547,7 @@ def test_grpo_ignores_microbatch_sizes_when_the_consumer_bins_its_own(
         sequence_packing=sequence_packing,
     )
 
-    validate_grpo_chunk_cap_alignment(config, 2)
+    resolve_grpo_chunk_alignment(config, 2)
 
 
 def test_forest_is_exempt_because_its_groups_are_padded_to_execution_rows() -> None:
@@ -494,9 +556,7 @@ def test_forest_is_exempt_because_its_groups_are_padded_to_execution_rows() -> N
     Its logical group count is therefore not its physical row count, so the
     sample arithmetic this guard does would be measuring the wrong thing.
     """
-    validate_grpo_chunk_cap_alignment(
-        _grpo_chunk_cap_config(3, forest_training=True), 4
-    )
+    resolve_grpo_chunk_alignment(_grpo_chunk_cap_config(3, forest_training=True), 4)
 
 
 def test_the_grpo_chunk_cap_guard_leaves_ppo_to_its_own_alignment() -> None:
@@ -514,7 +574,7 @@ def test_the_grpo_chunk_cap_guard_leaves_ppo_to_its_own_alignment() -> None:
         ),
     )
 
-    validate_grpo_chunk_cap_alignment(config, 4)
+    resolve_grpo_chunk_alignment(config, 4)
 
 
 def _one_group_tags(count: int, *, weight_version: int = 0) -> list[dict[str, object]]:
@@ -2678,6 +2738,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._is_ppo = False
     ctrl._streaming_ppo = False
     ctrl._value_dedicated = False
+    ctrl._grpo_group_multiple = 1
     ctrl._ppo_epochs = 1
     ctrl._critic_ppo_epochs = 1
     ctrl._value = None

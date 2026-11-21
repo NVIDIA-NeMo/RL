@@ -86,9 +86,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     forest_execution_row_multiple,
     is_ppo_run,
     logprob_passes_required,
+    resolve_grpo_chunk_alignment,
     resolve_ppo_chunk_alignment,
     rollout_snapshots_enabled,
-    validate_grpo_chunk_cap_alignment,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.utils import set_seed
@@ -225,6 +225,7 @@ class SingleControllerActorArgs:
     value_loss_fn: Optional[LossFunction] = None
     ppo_group_multiple: int = 1
     ppo_min_remaining_groups: int = 0
+    grpo_group_multiple: int = 1
     # warmup_first_pass's arguments when the controller runs the trainer warm-up;
     # None when setup already ran it or it does not run.
     trainer_warmup_kwargs: Optional[dict[str, Any]] = None
@@ -1996,6 +1997,7 @@ def setup_single_controller(
     reserved_http_server_ports = None
     weight_synchronizer: Optional[WeightSynchronizer] = None
     ppo_group_multiple, ppo_min_remaining_groups = (1, 0)
+    grpo_group_multiple = 1
     if megatron_backend:
         generation_config["model_name"] = master_config.policy["model_name"]
 
@@ -2016,7 +2018,7 @@ def setup_single_controller(
             A tuple of (TQPolicy trainer, TQValue critic or None, per-phase wall
             times keyed as "trainer_time" and "value_time").
         """
-        nonlocal ppo_group_multiple, ppo_min_remaining_groups
+        nonlocal ppo_group_multiple, ppo_min_remaining_groups, grpo_group_multiple
         time_metrics: dict[str, float] = {}
         trainer, time_metrics["trainer_time"] = _build_trainer(
             train_cluster,
@@ -2036,10 +2038,8 @@ def setup_single_controller(
             reserved_http_server_ports=reserved_http_server_ports,
         )
         if not is_ppo_run(master_config):
-            validate_grpo_chunk_cap_alignment(
-                master_config,
-                trainer.sharding_annotations.get_axis_size("data_parallel"),
-            )
+            policy_dp = trainer.sharding_annotations.get_axis_size("data_parallel")
+            grpo_group_multiple = resolve_grpo_chunk_alignment(master_config, policy_dp)
             return trainer, None, time_metrics
 
         if not dedicated_value:
@@ -2819,5 +2819,6 @@ def setup_single_controller(
         value_loss_fn=value_loss_fn,
         ppo_group_multiple=ppo_group_multiple,
         ppo_min_remaining_groups=ppo_min_remaining_groups,
+        grpo_group_multiple=grpo_group_multiple,
     )
     return actor_args, setup_timing_metrics

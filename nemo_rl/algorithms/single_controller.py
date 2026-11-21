@@ -401,6 +401,7 @@ class SingleControllerActor:
         self._ppo_group_multiple = actor_args.ppo_group_multiple
         self._ppo_min_remaining_groups = actor_args.ppo_min_remaining_groups
         self._value_dedicated: bool = dedicated_value_enabled(master_config)
+        self._grpo_group_multiple = actor_args.grpo_group_multiple
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -2805,6 +2806,8 @@ class SingleControllerActor:
             if self._streaming_ppo
             else {}
         )
+        if not self._is_ppo and self._grpo_group_multiple > 1:
+            selection_kwargs["group_multiple"] = self._grpo_group_multiple
 
         while self._train_steps < self._algo_cfg.max_num_steps:
             maybe_gpu_profile_step(self._trainer, self._train_steps + 1)
@@ -2992,13 +2995,19 @@ class SingleControllerActor:
                         if train_meta is None:
                             if self._rollout_exhausted.is_set():
                                 buffered_groups = len(self._buffer)
-                                if groups_dispatched == 0 and buffered_groups == 0:
-                                    print(
-                                        "train_pump: rollout exhausted and "
-                                        "buffer drained",
-                                        flush=True,
-                                    )
-                                    return
+                                if groups_dispatched == 0:
+                                    if buffered_groups == 0:
+                                        print(
+                                            "train_pump: rollout exhausted and buffer drained",
+                                            flush=True,
+                                        )
+                                        return
+                                    if buffered_groups < self._grpo_group_multiple:
+                                        print(
+                                            f"train_pump: rollout exhausted and {buffered_groups} unaligned groups remain",
+                                            flush=True,
+                                        )
+                                        return
                                 if self._sampler.closes_short_at_exhaustion:
                                     # At EOF, later groups cannot fill these slots.
                                     missing = target_groups - groups_dispatched
@@ -3747,7 +3756,8 @@ class SingleControllerActor:
                 self._timeout.mark_iteration()
 
                 is_last_step = self._train_steps >= self._algo_cfg.max_num_steps or (
-                    self._rollout_exhausted.is_set() and len(self._buffer) == 0
+                    self._rollout_exhausted.is_set()
+                    and len(self._buffer) < self._grpo_group_multiple
                 )
                 ft_save_period = self._master_config.checkpointing.ft_save_period
                 # _train_steps was already incremented above, so it equals

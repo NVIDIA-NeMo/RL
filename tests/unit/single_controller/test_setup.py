@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dataclasses
 import json
@@ -45,6 +46,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     CustomSamplerConfig,
+    InOrderSampler,
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
     SamplerConfig,
@@ -97,6 +99,7 @@ from nemo_rl.data_plane.schema import (
     SC_ROLLOUT_SCHEMA_FIELDS,
 )
 from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.nemo_gym import validate_dataset_agent_coverage
 from nemo_rl.experience.rollout_recovery import RecoveryTargetLevel
@@ -109,6 +112,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import LoggerConfig, WandbConfig
+from tests.unit.single_controller._dp_fakes import _ReadyGroupBuffer
 
 # Captured at import, before the patched_factories fixture swaps it for a mock.
 _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
@@ -171,6 +175,7 @@ def _make_master_config(
     policy_config: dict = {
         "train_global_batch_size": num_prompts_per_step * 2,
         "max_total_sequence_length": 32,
+        "dynamic_batching": {"enabled": True},
         "tokenizer": {"use_fastokens": False},
         "megatron_cfg": {"enabled": megatron_enabled},
         "generation": generation_config,
@@ -274,6 +279,7 @@ def patched_factories():
     # Real return objects; _build_generation and _build_trainer return (obj, elapsed_s) tuples.
     fake_gen = MagicMock(name="gen")
     fake_policy = MagicMock(name="policy")
+    fake_policy.sharding_annotations.get_axis_size.return_value = 1
 
     with (
         patch.object(
@@ -1673,6 +1679,34 @@ class TestSetup:
             is patched_factories["build_data_plane_client"].return_value
         )
 
+    def test_grpo_streaming_chunk_shards_across_policy_dp(self, patched_factories):
+        """21 ready groups of 16 samples on policy DP 32 must not reach training as 336."""
+        patched_factories[
+            "fake_policy"
+        ].sharding_annotations.get_axis_size.return_value = 32
+        mc = _make_master_config(num_prompts_per_step=32)
+        mc.grpo.num_generations_per_prompt = 16
+        mc.policy["train_global_batch_size"] = 512
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+        buffer = _ReadyGroupBuffer(generations=16)
+        buffer.add_groups(21)
+
+        chunk, _ = asyncio.run(
+            InOrderSampler(buffer, max_lookahead_versions=1).select(
+                current_train_weight=0,
+                min_prompt_groups=1,
+                max_prompt_groups=32,
+                group_multiple=actor_args.grpo_group_multiple,
+            )
+        )
+
+        assert actor_args.grpo_group_multiple == 2
+        assert len(chunk.sample_ids) == 20 * 16, (
+            "the 21st group waits for the next chunk"
+        )
+        batch = BatchedDataDict({"x": torch.zeros(len(chunk.sample_ids))})
+        assert len(batch.shard_by_batch_size(32)) == 32
+
     def test_rejects_windowed_checkpointing_without_native_tq(self):
         mc = _make_master_config()
         mc.checkpointing.enabled = True
@@ -2542,6 +2576,7 @@ class TestSetup:
         )
         train_iters_at_build: list[int] = []
         stale_policy = MagicMock(name="stale_policy")
+        stale_policy.sharding_annotations.get_axis_size.return_value = 1
         final_policy = patched_factories["fake_policy"]
         policies = iter([stale_policy, final_policy])
         trainer_started = threading.Event()
@@ -3929,8 +3964,6 @@ def test_grpo_setup_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp(
     mc.async_rl.min_groups_for_streaming_train = 1
     # 3 groups x 2 generations is 6 samples, which DP 4 cannot shard.
     mc.async_rl.max_groups_for_streaming_train = 3
-    # The guard reads the batching mode, which the shared fixture leaves out.
-    mc.policy["dynamic_batching"] = {"enabled": True}
     trainer = patched_factories["fake_policy"]
     trainer.cfg = mc.policy
     trainer.sharding_annotations.get_axis_size.return_value = 4

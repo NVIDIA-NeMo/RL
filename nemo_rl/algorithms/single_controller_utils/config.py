@@ -1858,7 +1858,9 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
 
-def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
+def sample_multiple(
+    config: PolicyConfig | ValueConfig, dp_size: int, *, logprob_required: bool = True
+) -> int:
     """Samples a dispatch must be a multiple of to split cleanly on this consumer.
 
     A dispatch is split twice: once across the DP ranks, and then on the static
@@ -1869,6 +1871,9 @@ def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
     Args:
         config: Policy or value configuration of the consuming trainer.
         dp_size: Data-parallel size of that trainer.
+        logprob_required: Whether a logprob pass splits the dispatch. When False,
+            the logprob microbatch size does not constrain it. FP8 KV-scale
+            calibration still reuses ``logprob_batch_size`` on the whole step.
 
     Returns:
         The sample count both splits divide.
@@ -1878,6 +1883,8 @@ def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
     ):
         return dp_size
     train_micro_batch_size = config["train_micro_batch_size"]
+    if not logprob_required:
+        return dp_size * train_micro_batch_size
     logprob_batch_size = config.get("logprob_batch_size") or train_micro_batch_size
     return dp_size * math.lcm(train_micro_batch_size, logprob_batch_size)
 
@@ -1932,54 +1939,100 @@ def resolve_ppo_chunk_alignment(
     return group_multiple, min_remaining_groups
 
 
-def validate_grpo_chunk_cap_alignment(
-    master_config: MasterConfig, policy_dp: int
-) -> None:
-    """Reject a GRPO chunk cap whose samples cannot split across the policy.
+def resolve_grpo_group_multiple(master_config: MasterConfig, policy_dp: int) -> int:
+    """Return the prompt groups a GRPO chunk must be a multiple of to shard evenly.
 
-    GRPO passes no ``group_multiple`` to the sampler, so a chunk can be any size
-    from the floor up to the cap, and the training dispatch shards it without
-    ``allow_uneven_shards``. The chunk therefore has to satisfy the same
-    ``sample_multiple`` PPO aligns to: the DP split, and under static batching the
-    microbatch split inside each rank as well. This guards the full-cap chunk
-    only: a cap of 3 at 2 generations per prompt is 6 samples, which fails on a
-    DP of 4. An unaligned chunk below the cap stays reachable, as it already is
-    from an unaligned ``min_groups_for_streaming_train``, which no validator
-    covers today.
-
-    Only a cap below ``num_prompts_per_step`` can bind, and Forest is exempt: its
-    producer pads each group to the policy execution row multiple, so the logical
+    The training dispatch shards a chunk without ``allow_uneven_shards``, so its
+    samples must be a multiple of the policy's ``sample_multiple``, which counts
+    the logprob microbatch size only when a logprob pass runs. Forest is exempt:
+    its producer pads each group to the execution row multiple, so the logical
     group count is not the physical row count.
 
     Args:
         master_config: The run configuration.
         policy_dp: Data-parallel size of the policy trainer.
 
-    Raises:
-        ValueError: The capped chunk's sample count is not a multiple of the
-            policy's ``sample_multiple``.
+    Returns:
+        The group multiple to pass to the sampler; 1 imposes no alignment.
     """
-    if is_ppo_run(master_config):
-        return
-    chunk_cap = master_config.async_rl.max_groups_for_streaming_train
+    if master_config.token_capture.forest_training:
+        return 1
     algo_cfg = algo_config(master_config)
+    chunk_multiple = sample_multiple(
+        master_config.policy,
+        policy_dp,
+        logprob_required=any(logprob_passes_required(master_config, algo_cfg)),
+    )
+    return chunk_multiple // math.gcd(
+        chunk_multiple, algo_cfg.num_generations_per_prompt
+    )
+
+
+def resolve_grpo_chunk_alignment(master_config: MasterConfig, policy_dp: int) -> int:
+    """Validate GRPO step and chunk-cap alignment and return the group multiple.
+
+    The sampler claims whole multiples of :func:`resolve_grpo_group_multiple`
+    groups. A step size that is not a multiple would leave a last chunk that no
+    selection can fill, and a cap that is not a multiple would not align. A cap of
+    3 at 2 generations per prompt is 6 samples, which fails on a DP of 4.
+
+    The step size is always checked. The cap is checked only when it is below
+    ``num_prompts_per_step``, because a higher cap never binds. Forest is exempt:
+    its producer pads each group to the policy execution row multiple, so the
+    logical group count is not the physical row count.
+
+    Args:
+        master_config: The run configuration.
+        policy_dp: Data-parallel size of the policy trainer.
+
+    Returns:
+        The group multiple to pass to the sampler; 1 imposes no alignment.
+
+    Raises:
+        ValueError: ``num_prompts_per_step`` or the chunk cap is not a multiple
+            of the group multiple.
+    """
+    if is_ppo_run(master_config) or master_config.token_capture.forest_training:
+        return 1
+    algo_cfg = algo_config(master_config)
+    group_multiple = resolve_grpo_group_multiple(master_config, policy_dp)
+    if algo_cfg.num_prompts_per_step % group_multiple:
+        raise ValueError(
+            f"GRPO num_prompts_per_step ({algo_cfg.num_prompts_per_step}) must be "
+            f"divisible by {group_multiple} -- the prompt groups whose samples "
+            f"split evenly across the policy data-parallel ranks ({policy_dp}), "
+            "and into complete microbatches when sequence packing and dynamic "
+            "batching are both off -- so the last chunk of a step shards evenly"
+        )
+    failure_config = master_config.async_rl.rollout_failure
+    drop_budget = (
+        failure_config.max_skipped_prompts
+        + failure_config.max_consecutive_dropped_prompts
+    )
+    if group_multiple > 1 and drop_budget:
+        warnings.warn(
+            f"GRPO chunks are selected in multiples of {group_multiple} prompt groups, "
+            "but async_rl.rollout_failure permits dropped prompts. A step shrunk by a "
+            f"drop that is not a multiple of {group_multiple} fails with "
+            "'No multiple of N fits selection bounds'. Set both drop budgets to 0, or "
+            "use on_dropped_prompt='replace' with enough spare prompts.",
+            stacklevel=2,
+        )
+    chunk_cap = master_config.async_rl.max_groups_for_streaming_train
     if (
-        master_config.token_capture.forest_training
-        or chunk_cap is None
-        or chunk_cap >= algo_cfg.num_prompts_per_step
+        chunk_cap is not None
+        and chunk_cap < algo_cfg.num_prompts_per_step
+        and chunk_cap % group_multiple
     ):
-        return
-    chunk_multiple = sample_multiple(master_config.policy, policy_dp)
-    if (chunk_cap * algo_cfg.num_generations_per_prompt) % chunk_multiple != 0:
         raise ValueError(
             "GRPO async_rl.max_groups_for_streaming_train "
-            f"({chunk_cap}) x num_generations_per_prompt "
-            f"({algo_cfg.num_generations_per_prompt}) must be divisible by "
-            f"{chunk_multiple} -- the policy data-parallel size ({policy_dp}), "
-            "times the train/logprob microbatch multiple when sequence packing "
-            "and dynamic batching are both off -- so each capped chunk shards "
-            "evenly across the training ranks and into complete microbatches"
+            f"({chunk_cap}) must be divisible by {group_multiple} -- the prompt "
+            "groups whose samples split evenly across the policy data-parallel "
+            f"ranks ({policy_dp}), and into complete microbatches when sequence "
+            "packing and dynamic batching are both off -- so each capped chunk "
+            "shards evenly"
         )
+    return group_multiple
 
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
