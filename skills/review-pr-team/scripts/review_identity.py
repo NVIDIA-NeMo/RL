@@ -50,6 +50,7 @@ _PATCH_FILE = re.compile(r"\*\*\* (?:Update|Add|Delete) File: ([^\s\\'\"]+)")
 _PATCH_BODY = re.compile(r"\*\*\* Begin Patch.*?(?:\*\*\* End Patch|$)", re.S)
 _JS_STRING = re.compile(r"\"((?:[^\"\\]|\\.)*)\"|'((?:[^'\\]|\\.)*)'|`([^`]*)`")
 _JS_WORKDIR = re.compile(r"\b(?:workdir|cwd)\b\s*[:=]\s*[\"'`]([^\"'`]+)")
+_HEREDOC = re.compile(r"(?<!<)<<-?\s*['\"]?(\w+)['\"]?")
 _SHELL_SEPARATORS = {"&&", "||", ";", "|", "&", "(", ")"}
 _REDIRECTS = {">", ">>", ">|", "&>", "&>>"}
 _GIT_OPTS_WITH_VALUE = {"-c", "--git-dir", "--work-tree", "--namespace"}
@@ -148,7 +149,9 @@ def _resolve(base: str | None, target: str) -> str | None:
 def _repo_path(path: str, cwd: str | None, repo_root: str) -> str | None:
     """`path` relative to `repo_root`, or None if it lies outside the repo."""
     full = _resolve(cwd, path)
-    root = os.path.normpath(repo_root)
+    if full is not None:
+        full = os.path.realpath(full)
+    root = os.path.realpath(repo_root)
     if full is None or (full != root and not full.startswith(root.rstrip("/") + "/")):
         return None
     return os.path.relpath(full, root)
@@ -177,18 +180,50 @@ def _written_files(prog: str, args: list[str]) -> list[str]:
     return []
 
 
+def _drop_heredoc_bodies(command: str) -> list[str]:
+    """The command's lines without heredoc bodies, which are data, not shell."""
+    lines, end = [], None
+    for line in command.split("\n"):
+        if end is not None:
+            if line.strip() == end:
+                end = None
+            continue
+        lines.append(line)
+        if m := _HEREDOC.search(line):
+            end = m.group(1)
+    return lines
+
+
+def _lex_lines(lines: list[str]) -> list[str]:
+    """Shell tokens, lexed line by line so a `#` comment or a stray quote only hides its own line.
+
+    A quote may span lines (e.g. a multi-line `git commit -m`), so a line that does not lex is
+    retried joined with the lines after it; if that never lexes, only that line is skipped.
+    """
+    tokens: list[str] = []
+    i = 0
+    while i < len(lines):
+        for j in range(i, len(lines)):
+            lexer = shlex.shlex(
+                "\n".join(lines[i : j + 1]), posix=True, punctuation_chars=True
+            )
+            lexer.whitespace_split = True
+            try:
+                tokens += [*lexer, ";"]
+                break
+            except ValueError:
+                continue
+        else:
+            j = i  # Never balanced: skip this line alone.
+        i = j + 1
+    return tokens
+
+
 def _shell_actions(
     command: str, cwd: str | None, repo_root: str
 ) -> tuple[list[str], bool]:
     """Repo-relative files a shell command writes, and whether it runs git commit/push in the repo."""
-    lexer = shlex.shlex(
-        command.replace("\n", " ; "), posix=True, punctuation_chars=True
-    )
-    lexer.whitespace_split = True
-    try:
-        tokens = list(lexer)
-    except ValueError:  # Unbalanced quotes: the shell would not have run it either.
-        return [], False
+    tokens = _lex_lines(_drop_heredoc_bodies(command))
     segments: list[list[str]] = [[]]
     for tok in tokens:
         if tok in _SHELL_SEPARATORS:
@@ -344,9 +379,15 @@ def _gh(*args: str) -> str:
 
 
 def _pr(pr: int) -> dict:
-    return json.loads(
-        _gh("pr", "view", str(pr), "-R", REPO, "--json", "author,headRefOid,files")
+    info = json.loads(
+        _gh("pr", "view", str(pr), "-R", REPO, "--json", "author,headRefOid")
     )
+    # `gh pr view --json files` stops at 100 files; the REST list pages through all of them.
+    paths = _gh(
+        "api", "--paginate", f"repos/{REPO}/pulls/{pr}/files", "--jq", ".[].filename"
+    )
+    info["files"] = [{"path": p} for p in paths.splitlines() if p]
+    return info
 
 
 def footer(*, ident: Identity, kind: str, head: str) -> str:
