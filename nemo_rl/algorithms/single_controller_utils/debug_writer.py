@@ -15,14 +15,16 @@
 """Stream untruncated training tensors without retaining a second step batch."""
 
 import dataclasses
+import functools
 import json
 import multiprocessing
 import os
+import uuid
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 from hydra.utils import get_class
@@ -30,12 +32,15 @@ from pydantic import BaseModel
 
 from nemo_rl.utils.json_utils import json_safe_nonfinite
 
+if TYPE_CHECKING:
+    import pyarrow as pa
+
 
 class DebugWriterConfig(BaseModel, extra="allow"):
     # Key in DEBUG_WRITER_REGISTRY, or a dotted import path to a DebugWriter defined
     # outside this repo. Extra keys are forwarded to the constructor after log_dir
     # and shard_id.
-    target: str = "json"
+    target: str = "parquet"
 
 
 @dataclass(frozen=True)
@@ -47,8 +52,8 @@ class TrainChunk:
         sample_ids: One id per sample in the chunk.
         tags: Per-sample metadata dicts, or None for empty metadata.
         input_lengths: Valid token count per sample, used to trim sequence columns.
-        sequences: Per-sample columns trimmed to input_lengths, such as token ids
-            and advantages.
+        sequences: Per-sample columns, dense or jagged, that the writer trims to
+            input_lengths, such as token ids and advantages.
         scalars: Per-sample columns written as given; variable-length values must
             be jagged tensors rather than padded.
 
@@ -318,6 +323,170 @@ class JsonDebugWriter(DebugWriter):
             part.unlink()
 
 
+@functools.cache
+def _parquet_schema() -> "pa.Schema":
+    """Return the Parquet schema of a training dump row."""
+    import pyarrow as pa
+
+    def floats() -> "pa.DataType":
+        return pa.list_(pa.float32())
+
+    return pa.schema(
+        [
+            ("step", pa.int64()),
+            ("sample_id", pa.string()),
+            ("group_id", pa.string()),
+            ("input_lengths", pa.int64()),
+            ("metadata", pa.string()),
+            ("token_ids", pa.list_(pa.int64())),
+            ("prompt_ids", pa.list_(pa.int64())),
+            ("token_loss_mask", floats()),
+            ("advantages", floats()),
+            ("generation_logprobs", floats()),
+            ("prev_logprobs", floats()),
+            ("teacher_logprobs", floats()),
+            ("reference_logprobs", floats()),
+            ("values", floats()),
+            ("returns", floats()),
+            ("sample_loss_mask", pa.float32()),
+            ("pre_seq_error_sample_loss_mask", pa.float32()),
+            ("rewards", pa.float32()),
+        ]
+    )
+
+
+class ParquetDebugWriter(DebugWriter):
+    """Write each chunk as its own Parquet file, listed by a per-step manifest.
+
+    Files go under train_data_parquet/step-<N>/ in the log directory. Columns a
+    step does not produce are null. A step is complete only once _manifest.json
+    exists in its directory; read only the files it lists. Shards must share a
+    filesystem with the controller. pyarrow is imported when a chunk is written,
+    so the json writer does not need it.
+    """
+
+    def _validate(self, chunk: TrainChunk) -> None:
+        """Also raise ValueError for a column the Parquet schema lacks, before any background write."""
+        super()._validate(chunk)
+        names = _parquet_schema().names
+        unknown = [k for k in (*chunk.sequences, *chunk.scalars) if k not in names]
+        if unknown:
+            raise ValueError(
+                f"Parquet training dump has no column(s) {unknown}; add them to "
+                "_parquet_schema."
+            )
+
+    def _step_dir(self, step: int) -> Path:
+        """Return the directory holding the step's chunk files and manifest."""
+        return self.log_dir / "train_data_parquet" / f"step-{step + 1:08d}"
+
+    def _write_chunk(self, chunk: TrainChunk, *, replace: bool) -> ChunkReceipt:
+        """Write the chunk to a new Parquet file; _publish_step drops the files of earlier attempts."""
+        directory = self._step_dir(chunk.step)
+        directory.mkdir(parents=True, exist_ok=True)
+        name = (
+            f"step-{chunk.step + 1:08d}-shard-{self.shard_id}-{uuid.uuid4().hex}"
+            ".parquet"
+        )
+        receipt = ChunkReceipt(
+            shard_id=self.shard_id, rows=len(chunk.sample_ids), ref=name
+        )
+        if not self._background:
+            self._write_file(directory, name, chunk)
+            return receipt
+        self._submit(self._write_file, directory, name, chunk)
+        return receipt
+
+    @staticmethod
+    def _write_file(directory: Path, name: str, chunk: TrainChunk) -> None:
+        """Write one validated chunk to directory/name atomically (maybe in the background)."""
+        import numpy as np
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        schema = _parquet_schema()
+        size = len(chunk.sample_ids)
+        lengths = chunk.input_lengths.detach().cpu().reshape(-1).tolist()
+        columns: dict[str, Any] = {
+            "step": [chunk.step + 1] * size,
+            "sample_id": chunk.sample_ids,
+            "input_lengths": lengths,
+        }
+        if chunk.tags is not None:
+            columns["group_id"] = [tag.get("group_id") for tag in chunk.tags]
+            columns["metadata"] = [
+                json.dumps(json_safe_nonfinite(tag), allow_nan=False)
+                for tag in chunk.tags
+            ]
+        for key, tensor in {**chunk.sequences, **chunk.scalars}.items():
+            dtype = schema.field(key).type
+            tensor = tensor.detach().cpu()
+            if tensor.is_floating_point():
+                tensor = tensor.float()
+            if not pa.types.is_list(dtype):
+                columns[key] = pa.array(tensor.reshape(size).numpy(), type=dtype)
+                continue
+            # unbind() yields per-row views of dense and jagged columns alike.
+            rows = tensor.unbind()
+            if key in chunk.sequences:
+                rows = [row[:length] for row, length in zip(rows, lengths)]
+            parts = [row.numpy() for row in rows]
+            offsets = np.zeros(len(parts) + 1, dtype=np.int32)
+            np.cumsum([len(part) for part in parts], out=offsets[1:])
+            flat = (
+                np.concatenate(parts)
+                if parts
+                else np.empty(0, dtype=dtype.value_type.to_pandas_dtype())
+            )
+            columns[key] = pa.ListArray.from_arrays(
+                pa.array(offsets), pa.array(flat, type=dtype.value_type)
+            )
+        table = pa.Table.from_arrays(
+            [
+                pa.array(columns[field.name], type=field.type)
+                if field.name in columns
+                else pa.nulls(size, type=field.type)
+                for field in schema
+            ],
+            schema=schema,
+        )
+        partial = directory / f".{name}.partial"
+        pq.write_table(table, partial, compression="zstd")
+        os.replace(partial, directory / name)
+
+    def _publish_step(self, step: int, receipts: list[ChunkReceipt]) -> None:
+        """Write _manifest.json listing the step's chunk files, after checking them against the receipts."""
+        import pyarrow.parquet as pq
+
+        directory = self._step_dir(step)
+        files = [receipt.ref for receipt in receipts]
+        if not files:
+            raise RuntimeError("Completed optimizer step has no training dump")
+        missing = [name for name in files if not (directory / name).is_file()]
+        if missing:
+            raise RuntimeError(
+                f"Training dump chunk(s) {missing} not found; the advantage pool "
+                "must share this filesystem with the controller"
+            )
+        rows = sum(pq.ParquetFile(directory / name).metadata.num_rows for name in files)
+        expected_rows = sum(receipt.rows for receipt in receipts)
+        if rows != expected_rows:
+            raise RuntimeError(
+                f"Training dump holds {rows} row(s) in {len(files)} chunk(s) but "
+                f"the receipts report {expected_rows}"
+            )
+        final = directory / "_manifest.json"
+        partial = directory / f"._manifest-{uuid.uuid4().hex}.partial"
+        partial.write_text(json.dumps({"step": step + 1, "files": files}) + "\n")
+        os.replace(partial, final)
+        # A retried step leaves the failed attempt's chunks, the previous manifest's
+        # chunks and any `.partial` file from a failed write behind; drop them only
+        # after the new manifest is in place.
+        for stale in (*directory.glob("step-*.parquet"), *directory.glob(".*.partial")):
+            if stale.name not in files:
+                stale.unlink()
+
+
 def _share_tensor_storage(tensor: torch.Tensor) -> torch.Tensor:
     """Move the tensor's CPU storages, jagged values and offsets included, to shared memory."""
     tensor = tensor.detach().cpu()
@@ -344,6 +513,7 @@ def _share_chunk_storage(chunk: TrainChunk) -> TrainChunk:
 
 DEBUG_WRITER_REGISTRY: dict[str, Callable[..., DebugWriter]] = {
     "json": JsonDebugWriter,
+    "parquet": ParquetDebugWriter,
 }
 
 

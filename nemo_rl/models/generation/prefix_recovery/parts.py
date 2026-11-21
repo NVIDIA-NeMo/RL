@@ -52,6 +52,19 @@ class PrefixRecoveryParts:
     # Bound on one cut, measured from its arrival; None waits indefinitely.
     control_timeout_s: float | None
     progress_reader: ProgressReader
+    # Whether calls carry router-replay routes; a restore then requires every
+    # chunk's routes.
+    router_replay: bool
+    # Score centering's sampler top-k width (policy.generation.top_logprobs);
+    # 0 when off. Each cut then stages its tokens' top-k, and a restore
+    # requires every chunk's.
+    sampler_top_k: int
     # Extras for a call's first prefix row, from the media its capture state
     # holds; None for a call without media.
     prefix_row_extras: Callable[[_RequestCaptureState], dict[str, Any] | None]
+    # Most rows per TQ write at a checkpoint cut.
+    prefix_write_max_rows: int
+    # Most tokens per TQ write at a checkpoint cut; a larger row is written alone.
+    prefix_write_max_tokens: int
+    # Most rows per TQ read at restore; 1 reads each restore on its own.
+    prefix_read_max_rows: int

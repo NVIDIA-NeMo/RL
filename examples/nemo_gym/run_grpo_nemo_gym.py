@@ -152,17 +152,15 @@ def main() -> None:
 
         config = OmegaConf.to_container(config, resolve=True)
         check_outdated_config(config)
-        config = MasterConfig(**config)
+        config = MasterConfig.model_validate(config)
         materialize_vllm_video_config(config.policy, config.data)
         print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
     config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
     print(f"📊 Using log directory: {config.logger.log_dir}")
-    if config.checkpointing["enabled"]:
-        print(
-            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
-        )
+    if config.checkpointing.enabled:
+        print(f"📊 Using checkpoint directory: {config.checkpointing.checkpoint_dir}")
 
     with rl_init_timer.time("tokenizer"):
         is_vlm = bool(config.policy.get("is_vlm"))
@@ -211,7 +209,7 @@ def main() -> None:
         config.grpo.val_period > 0 or config.grpo.val_at_start or config.grpo.val_at_end
     )
 
-    # NeMo-Gym environment needs to get dp_openai_server_base_urls from policy_generation, so we don't setup env here.
+    # NeMo-Gym environment needs to get client_base_urls from policy_generation, so we don't setup env here.
     with rl_init_timer.time("data"):
         print("\n▶ Setting up data...")
         data_tokenizer = processor if processor is not None else tokenizer
