@@ -3415,7 +3415,7 @@ def test_grpo_train_dynamic_sampling_reports_trained_rows_as_reward(
     monkeypatch: pytest.MonkeyPatch,
     mock_grpo_components: dict[str, Any],
 ) -> None:
-    """`reward` is the trained-rows mean; `unfiltered_reward` is the pre-filter mean."""
+    """`reward` and the jsonl dump use the trained rows; `unfiltered_reward` is pre-filter."""
     uniform_prompt = torch.tensor([1, 2, 3])
     diverse_prompt = torch.tensor([7, 8, 9])
     two_prompt_batch = BatchedDataDict[DatumSpec](
@@ -3506,6 +3506,16 @@ def test_grpo_train_dynamic_sampling_reports_trained_rows_as_reward(
         unfiltered_rewards.mean().item()
     )
     assert "filtered_reward" not in train_metrics
+
+    (train_dump,) = [
+        call.args[0]
+        for call in mock_grpo_components[
+            "logger"
+        ].log_batched_dict_as_jsonl.call_args_list
+        if call.args[1].startswith("train_data_step")
+    ]
+    assert train_dump["rewards"] == trained_rewards.tolist()
+    assert "filtered_rewards" not in train_dump
 
 
 @pytest.mark.parametrize("policy", ["exclude", "include"])
