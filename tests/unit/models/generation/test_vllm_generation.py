@@ -3392,23 +3392,20 @@ def test_vllm_dynamo_routes_only_the_shards_in_service(monkeypatch):
     generation.dynamo_frontend_urls = ("http://frontend/v1",)
     generation._dynamo_namespace = "ns"
     generation._dynamo_engine_env = {"DYN_REQUEST_PLANE": "tcp"}
-    generation._dynamo_routed_shards = frozenset({0, 1, 2, 3})
-    generation._dynamo_routing_calls = {}
+    # Shard 4 was restarted: the record still holds the leader it replaced.
+    generation._dynamo_routed_shards = {**dict(enumerate(leaders[:4])), 4: MagicMock()}
     refs = [leader.set_dynamo_routed_async.remote.return_value for leader in leaders]
-    # Shard 1's engine died; shards 2 and 3 do not answer in time.
-    silent = [refs[2], refs[3]]
-    monkeypatch.setattr(
-        ray,
-        "wait",
-        lambda pending, **_: (
-            [ref for ref in pending if ref not in silent],
-            [ref for ref in pending if ref in silent],
-        ),
-    )
+    # Shard 1's engine died, shard 2 does not answer in time, shard 3 is unreachable.
+    errors = {
+        refs[1]: ray.exceptions.ActorDiedError(),
+        refs[2]: ray.exceptions.GetTimeoutError(),
+        refs[3]: ray.exceptions.ActorUnavailableError("unreachable", None),
+    }
+    monkeypatch.setattr(ray, "wait", lambda pending, **_: (pending, []))
 
-    def get(ref):
-        if ref is refs[1]:
-            raise ray.exceptions.ActorDiedError()
+    def get(ref, timeout):
+        if ref in errors:
+            raise errors[ref]
 
     monkeypatch.setattr(ray, "get", get)
     killed = []
@@ -3426,15 +3423,17 @@ def test_vllm_dynamo_routes_only_the_shards_in_service(monkeypatch):
             engine_env={"DYN_REQUEST_PLANE": "tcp"},
             leader_worker_idx=shard,
         )
-    # A dead engine's registration goes with it, and so does a killed one's.
+    # Unreachable is not dead: a quarantined shard that does not confirm is killed.
     assert killed == [leaders[3]]
-    assert generation._dynamo_routed_shards == {0, 2, 4}
+    assert generation._dynamo_routed_shards == {
+        shard: leaders[shard] for shard in (0, 2, 4)
+    }
 
-    # Shard 2 is waited on, not asked again, and leaves once it answers.
-    silent.clear()
+    # Shard 2 is asked again, and leaves once it answers.
+    del errors[refs[2]]
     generation.set_serving_shards(**serving, timeout_s=1.0)
-    leaders[2].set_dynamo_routed_async.remote.assert_called_once()
-    assert generation._dynamo_routed_shards == {0, 4}
+    assert leaders[2].set_dynamo_routed_async.remote.call_count == 2
+    assert generation._dynamo_routed_shards.keys() == {0, 4}
 
 
 @pytest.mark.parametrize("announced", [True, False])

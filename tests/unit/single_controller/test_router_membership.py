@@ -301,12 +301,16 @@ class TestPumpContainment:
     ):
         """A backend behind its own router (Dynamo) follows the fleet from here.
 
-        Mid-recovery every shard is out of service with its engine paused, so a push
-        there would take the whole fleet out of that router for nothing.
+        Mid-recovery an aborted transfer takes every shard out of service until the
+        retry lands, so a push there would take the whole fleet out of that router
+        for nothing.
         """
         ctrl = _controller()
         ctrl._recovering_from_refit = recovering
         ctrl._gen_fleet.record_actor_death(1)
+        # The backend may kill a quarantined shard, so a restarting one is not one.
+        ctrl._gen_fleet.record_actor_death(2)
+        ctrl._gen_fleet.mark_restarting(2)
         probes = 0
 
         async def _probe() -> None:
@@ -329,7 +333,7 @@ class TestPumpContainment:
             ctrl._gen.set_serving_shards.assert_not_called()
         else:
             assert ctrl._gen.set_serving_shards.call_args == mock.call(
-                {0, 2}, quarantined_shards={1}, timeout_s=1.0
+                {0}, quarantined_shards={1}, timeout_s=1.0
             )
 
 

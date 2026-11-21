@@ -25,6 +25,7 @@ property that matters: "no group has landed" is the symptom, whatever the cause.
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import ray.exceptions
@@ -286,7 +287,11 @@ class TestGenerationFleetProbe:
                 return _completed()
             return _failed(ray.exceptions.ActorDiedError())
 
-        ctrl._gen = SimpleNamespace(shard_liveness_ref=_liveness)
+        ctrl._gen = SimpleNamespace(
+            shard_liveness_ref=_liveness, set_serving_shards=MagicMock()
+        )
+        # The pump pushes the serving shards after every probe.
+        ctrl._serving_shards_push_lock = asyncio.Lock()
         return ctrl
 
     def test_a_live_fleet_stays_serving(self):

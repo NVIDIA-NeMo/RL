@@ -87,9 +87,10 @@ class DynamoEngineAdapter(LLMEngine):
         # The worker's index in its group; rollouts report it, as
         # generate_async results do.
         self._leader_worker_idx = leader_worker_idx
-        # The Dynamo endpoint serving this engine, once the Worker hands it over;
-        # it takes the engine in and out of the frontends' routing.
-        self.endpoint: Optional[Endpoint] = None
+        # The endpoint the Worker serves this engine on, and whether the frontends
+        # route to it; the Worker registers it as it starts serving.
+        self._endpoint: Optional[Endpoint] = None
+        self._routed = True
 
     @classmethod
     async def from_args(cls, argv=None):
@@ -97,7 +98,22 @@ class DynamoEngineAdapter(LLMEngine):
 
     async def on_endpoint_ready(self, endpoint: Endpoint) -> None:
         """Keep the endpoint; the Worker registers it with discovery after this."""
-        self.endpoint = endpoint
+        self._endpoint = endpoint
+
+    async def set_routed(self, routed: bool) -> None:
+        """Put this engine in or out of the frontends' routing.
+
+        Out removes only its discovery record, so requests in flight finish.
+        """
+        if routed == self._routed:
+            return
+        if self._endpoint is None:
+            raise RuntimeError("The Dynamo endpoint has not started serving yet.")
+        if routed:
+            await self._endpoint.register_endpoint_instance()
+        else:
+            await self._endpoint.unregister_endpoint_instance()
+        self._routed = routed
 
     def _handlers(self) -> dict[str, RequestHandler]:
         """The request kinds served, keyed by the annotation prefix that marks them."""

@@ -415,11 +415,9 @@ class VllmAsyncGenerationWorkerImpl(
         self._deferred_seed = None
 
         # The task serving this engine through Dynamo, when it is registered, and
-        # the adapter whose endpoint takes it in and out of the frontends' routing.
+        # the adapter that takes it in and out of the frontends' routing.
         self._dynamo_endpoint_task: Optional[asyncio.Task] = None
         self._dynamo_adapter: Optional["DynamoVllmAdapter"] = None
-        # Whether the frontends route to this engine; it registers as it starts.
-        self._dynamo_routed = False
         # Where this engine sends its chat settings before it loads, when asked to.
         self._dynamo_chat_settings_queue: Optional[RayQueue] = None
 
@@ -866,16 +864,15 @@ class VllmAsyncGenerationWorkerImpl(
         publishes = kv_events is not None and kv_events.enable_kv_cache_events
         # The Dynamo functional overlays check the router applied these.
         print(f"  [Dynamo] engine publishes KV events: {publishes}", flush=True)
-        self._dynamo_adapter = DynamoVllmAdapter(
-            self, leader_worker_idx=leader_worker_idx
-        )
+        adapter = DynamoVllmAdapter(self, leader_worker_idx=leader_worker_idx)
         self._dynamo_endpoint_task = start_dynamo_endpoint(
-            self._dynamo_adapter,
+            adapter,
             model_name=self.model_name,
             namespace=namespace,
             engine_env=engine_env,
         )
-        self._dynamo_routed = True
+        # After the start: a start that raised is tried again by the next call.
+        self._dynamo_adapter = adapter
 
     async def set_dynamo_routed_async(
         self,
@@ -887,31 +884,17 @@ class VllmAsyncGenerationWorkerImpl(
     ) -> None:
         """Put this engine in or out of the Dynamo frontends' routing.
 
-        Out removes only its discovery record, so requests in flight finish. In
-        registers it again, and an engine Dynamo has not served yet (a restarted
-        shard) starts its endpoint, which registers it.
+        An engine Dynamo has not served yet (a restarted shard) starts its endpoint,
+        which registers it.
         """
-        adapter = self._dynamo_adapter
-        if adapter is None:
-            if routed:
-                await self.start_dynamo_endpoint_async(
-                    namespace=namespace,
-                    engine_env=engine_env,
-                    leader_worker_idx=leader_worker_idx,
-                )
-            return
-        if routed == self._dynamo_routed:
-            return
-        if adapter.endpoint is None:
-            raise RuntimeError(
-                "The Dynamo endpoint has not started serving yet; it registers when "
-                "it does."
+        if self._dynamo_adapter is not None:
+            await self._dynamo_adapter.set_routed(routed)
+        elif routed:
+            await self.start_dynamo_endpoint_async(
+                namespace=namespace,
+                engine_env=engine_env,
+                leader_worker_idx=leader_worker_idx,
             )
-        if routed:
-            await adapter.endpoint.register_endpoint_instance()
-        else:
-            await adapter.endpoint.unregister_endpoint_instance()
-        self._dynamo_routed = routed
 
     async def dynamo_endpoint_error(self) -> Optional[str]:
         """Why this engine's Dynamo endpoint stopped serving; None while it serves."""

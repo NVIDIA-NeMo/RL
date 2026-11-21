@@ -776,6 +776,13 @@ if [[ "$*" == *generation.dynamo=true* ]]; then
             echo "[recovery] FAIL: the replacement did not join the Dynamo frontends' routing after its refit (joined at line ${JOINED_LINE:-never}, healthy at line $HEALTHY_LINE)"
             grep -E "\[Dynamo\]|fleet: shard" "$RUN_LOG" | tail -20; exit 1
         fi
+        # The frontends log the engine each request went to; a restarted one has a new id.
+        ENGINES=$(grep -oE 'route request completed request.outcome="success".* worker_id=[0-9]+' "$RUN_LOG" \
+            | grep -oE 'worker_id=[0-9]+$' | sort -u | wc -l || true)
+        if (( ENGINES <= GEN_GPUS )); then
+            echo "[recovery] FAIL: the frontends routed requests to $ENGINES engine(s), so the replacement never took one"
+            exit 1
+        fi
     fi
 fi
 

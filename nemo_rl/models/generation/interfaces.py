@@ -624,8 +624,7 @@ class GenerationInterface(ABC):
         A no-op by default: a backend that dispatches its own requests asks the
         fleet selector on every request. One behind an external router, such as
         vLLM served through Dynamo's frontends, takes shards in and out of that
-        router here. Called on every fleet probe and after a refit returns shards
-        to service; it must not raise over one unresponsive shard.
+        router here. It must not raise over one unresponsive shard.
 
         Args:
             serving_shards: Every shard that may be handed requests.

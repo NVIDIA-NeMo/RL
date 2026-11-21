@@ -35,7 +35,8 @@ run_test() {
 
 # Dynamo overlays: native SingleController tests rerun with policy.generation.dynamo=true.
 # Each keeps the native test's checks and adds check_dynamo_overlay.sh's.
-run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh ++policy.generation.dynamo=true
+# Fleet health on: the lane's only run of its probe and serving-shard push behind real frontends.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh ++policy.generation.dynamo=true ++async_rl.generation_fleet_health.enabled=true
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true ++policy.generation.dynamo=true ++policy.generation.dynamo_cfg.frontend_args.num_frontends=2
 # Gym's default mode: token arrays come back in the reply's nvext.nemo_rl.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++policy.generation.dynamo=true
@@ -52,7 +53,12 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # The tiny DeepSeek model adds a second routing layout to the native run's Qwen3-MoE build.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_router_replay_prefix_recovery_single_controller_1n2g.sh ++policy.generation.dynamo=true policy.model_name=silence09/DeepSeek-R1-Small-2layers policy.tokenizer.name=silence09/DeepSeek-R1-Small-2layers
 # Fleet health: a lost shard leaves the frontends' routing, and a restarted one joins it after a refit.
-# Both need 3 GPUs and skip below that, as the native variants do.
+# Both need 3 GPUs and skip below that, as the native variants do. A skip and a pass
+# look the same in the lane's verdict, so say which it was in the run summary.
+_DYNAMO_GPUS=$(nvidia-smi --list-gpus 2>/dev/null | wc -l) || _DYNAMO_GPUS=0
+if (( _DYNAMO_GPUS < 3 )); then
+    echo "::warning title=Dynamo fleet health tests skipped::A shard loss behind Dynamo needs >= 3 GPUs; this runner has ${_DYNAMO_GPUS}. Those tests self-skipped and this lane proves nothing about them."
+fi
 run_test uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh ++policy.generation.dynamo=true
 run_test env RESTART_DEAD_SHARDS=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh ++policy.generation.dynamo=true
 

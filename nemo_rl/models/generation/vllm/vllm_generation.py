@@ -205,15 +205,6 @@ def _record_vllm_generation_metrics(
 
 
 @dataclass(frozen=True)
-class _DynamoRoutingCall:
-    """One shard's change to the Dynamo frontends' routing, until its engine answers."""
-
-    routed: bool
-    ref: ray.ObjectRef
-    workers: list[ray.actor.ActorHandle]
-
-
-@dataclass(frozen=True)
 class _TokenCaptureSetup:
     """The arguments setup_token_capture fanned out, kept for restart_shard."""
 
@@ -236,16 +227,13 @@ class VllmGeneration(GenerationInterface):
     # defaults, so shutdown() also works when __init__ failed before starting them.
     _dynamo_runtime: Optional["ManagedDynamoRuntime"] = None
     dynamo_frontend_urls: tuple[str, ...] = ()
-    # What an engine registers with. Kept apart from the runtime, which stays
-    # with the driver, so a copy shipped to the SingleController can start a
-    # restarted shard's endpoint.
+    # What an engine registers with. The runtime stays with the driver, so the
+    # SingleController's copy starts a restarted shard's endpoint from these.
     _dynamo_namespace: Optional[str] = None
     _dynamo_engine_env: Optional[dict[str, str]] = None
-    # Shards the frontends route to; set_serving_shards keeps it in step with
-    # fleet health.
-    _dynamo_routed_shards: frozenset[int] = frozenset()
-    # Routing changes an engine has not answered yet, by shard; set at registration.
-    _dynamo_routing_calls: dict[int, _DynamoRoutingCall]
+    # The leader each routed shard registered from. A restart swaps the leader,
+    # and its replacement starts outside the routing. Set at registration.
+    _dynamo_routed_shards: dict[int, ray.actor.ActorHandle]
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
@@ -890,8 +878,10 @@ class VllmGeneration(GenerationInterface):
         runtime.wait_for_engines(
             self.dp_size, check_engines=self._check_dynamo_endpoints
         )
-        self._dynamo_routed_shards = frozenset(range(self.dp_size))
-        self._dynamo_routing_calls = {}
+        self._dynamo_routed_shards = {
+            shard: self.worker_group.workers[idx]
+            for shard, idx in enumerate(leader_indices)
+        }
 
     def set_serving_shards(
         self,
@@ -902,87 +892,79 @@ class VllmGeneration(GenerationInterface):
     ) -> None:
         """Route the Dynamo frontends to exactly ``serving_shards``.
 
-        Without Dynamo there is nothing to do: native dispatch asks the fleet
-        selector on every request. Behind the frontends, which pick engines
-        themselves, a shard leaving service unregisters and one returning
-        registers; a restarted shard starts its endpoint the first time. A shard
-        that does not confirm within ``timeout_s`` is waited on again by the next
-        call, unless it is leaving and in ``quarantined_shards``: its workers are
-        killed, and its registration lapses with them.
+        A no-op without Dynamo. A shard leaving service unregisters its engine, one
+        returning registers it, and a restarted shard starts its endpoint. A shard
+        that does not confirm within ``timeout_s`` is asked again by the next call,
+        unless it is leaving and in ``quarantined_shards``: its workers are killed,
+        and its registration lapses with them.
         """
         if not self.dynamo_frontend_urls:
             return
-        workers = self.worker_group.workers
-        calls: dict[int, _DynamoRoutingCall] = {}
-        for shard in serving_shards ^ self._dynamo_routed_shards:
-            routed = shard in serving_shards
-            call = self._dynamo_routing_calls.get(shard)
-            if call is None or call.routed != routed:
-                leader_idx = self.worker_group.get_dp_leader_worker_idx(shard)
-                call = _DynamoRoutingCall(
-                    routed=routed,
-                    ref=workers[leader_idx].set_dynamo_routed_async.remote(
-                        routed,
-                        namespace=self._dynamo_namespace,
-                        engine_env=self._dynamo_engine_env,
-                        leader_worker_idx=leader_idx,
-                    ),
-                    # The handles as of now: a restart swaps in the replacement's.
-                    workers=workers[leader_idx : leader_idx + self.model_parallel_size],
-                )
-            calls[shard] = call
-        answered: list[ray.ObjectRef] = []
-        if calls:
-            answered, _ = ray.wait(
-                [call.ref for call in calls.values()],
-                num_returns=len(calls),
-                timeout=timeout_s,
+        routed = self._dynamo_routed_shards
+        leader_idx_of = self.worker_group.get_dp_leader_worker_idx
+        # A copy: restart_shard swaps handles into this list from another thread.
+        workers = list(self.worker_group.workers)
+
+        def left(shard: int, why: str) -> None:
+            del routed[shard]
+            print(
+                f"  [Dynamo] generation shard {shard} out of the frontends' "
+                f"routing ({why})",
+                flush=True,
             )
-        routed_shards = set(self._dynamo_routed_shards)
-        waiting: dict[int, _DynamoRoutingCall] = {}
-        for shard, call in sorted(calls.items()):
-            outcome: Optional[str] = None
-            if call.ref not in answered:
-                waiting[shard] = call
-            else:
-                try:
-                    ray.get(call.ref)
-                    outcome = "registered" if call.routed else "unregistered"
-                except ray.exceptions.RayActorError:
-                    # A dead engine's registration goes with its process, and it
-                    # registers again only once restarted.
-                    if call.routed:
-                        continue
-                    outcome = "its process is gone"
-                except ray.exceptions.RayTaskError as error:
-                    print(
-                        f"  [Dynamo] routing change for generation shard {shard} "
-                        f"failed: {error}",
-                        flush=True,
-                    )
-            if outcome is None and not call.routed and shard in quarantined_shards:
-                for worker in call.workers:
-                    ray.kill(worker, no_restart=True)
-                waiting.pop(shard, None)
-                outcome = "did not confirm, so its workers were killed"
-            if outcome is None:
-                continue
-            if call.routed:
-                routed_shards.add(shard)
+
+        # A replacement has no endpoint until it is asked to join.
+        for shard, leader in list(routed.items()):
+            if workers[leader_idx_of(shard)] is not leader:
+                left(shard, "its process was replaced")
+        calls = {
+            shard: workers[leader_idx_of(shard)].set_dynamo_routed_async.remote(
+                shard in serving_shards,
+                namespace=self._dynamo_namespace,
+                engine_env=self._dynamo_engine_env,
+                leader_worker_idx=leader_idx_of(shard),
+            )
+            for shard in sorted(serving_shards ^ routed.keys())
+        }
+        if not calls:
+            return
+        ray.wait(list(calls.values()), num_returns=len(calls), timeout=timeout_s)
+        for shard, ref in calls.items():
+            joining = shard in serving_shards
+            leader_idx = leader_idx_of(shard)
+            shard_workers = workers[leader_idx : leader_idx + self.model_parallel_size]
+            failure: Optional[Exception] = None
+            try:
+                ray.get(ref, timeout=0)
+            except (
+                ray.exceptions.GetTimeoutError,
+                ray.exceptions.RayActorError,
+                ray.exceptions.RayTaskError,
+            ) as error:
+                failure = error
+            if failure is None and joining:
+                routed[shard] = shard_workers[0]
                 print(
                     f"  [Dynamo] generation shard {shard} back in the frontends' "
                     "routing",
                     flush=True,
                 )
+            elif failure is None:
+                left(shard, "unregistered")
+            elif not joining and isinstance(failure, ray.exceptions.ActorDiedError):
+                # A dead engine's registration goes with its process.
+                left(shard, "its process is gone")
+            elif not joining and shard in quarantined_shards:
+                # Unanswered or unreachable is not dead: it may still be routed to.
+                for worker in shard_workers:
+                    ray.kill(worker, no_restart=True)
+                left(shard, "did not confirm, so its workers were killed")
             else:
-                routed_shards.discard(shard)
                 print(
-                    f"  [Dynamo] generation shard {shard} out of the frontends' "
-                    f"routing ({outcome})",
+                    f"  [Dynamo] generation shard {shard} did not confirm its routing "
+                    f"change, the next push asks again: {failure!r}",
                     flush=True,
                 )
-        self._dynamo_routing_calls = waiting
-        self._dynamo_routed_shards = frozenset(routed_shards)
 
     def _check_dynamo_endpoints(self) -> None:
         """Raise if a DP leader exited or its Dynamo endpoint stopped serving."""

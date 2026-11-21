@@ -402,7 +402,6 @@ def test_an_engine_leaves_and_rejoins_the_frontends_routing(monkeypatch) -> None
     host = _host(_FakeLLM())
     host._dynamo_endpoint_task = None
     host._dynamo_adapter = None
-    host._dynamo_routed = False
     endpoint_args = {"namespace": "ns", "engine_env": env, "leader_worker_idx": 0}
 
     async def run() -> None:

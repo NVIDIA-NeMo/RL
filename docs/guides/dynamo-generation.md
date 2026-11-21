@@ -95,8 +95,8 @@ Two things differ from the native endpoint:
 | Shard | Behind Dynamo |
 |---|---|
 | Leaves service, engine answers | The engine unregisters. Every frontend stops sending it requests; the ones it holds finish. |
-| Leaves service, process gone | Its registration goes with its process, when its etcd lease expires. Calls a frontend sends it until then fail and are retried. |
-| Quarantined, does not answer | Its workers are killed, so its registration goes with them. |
+| Leaves service, process gone | Its registration goes with its process, when its etcd lease expires (up to 30 s). Calls a frontend sends it until then fail. NeMo RL's rollouts and NeMo-Gym retry them on another engine; the frontends do not. A NeMo-Gym token-capture session kept on that engine (`frontend_args.session_affinity_ttl_secs`) keeps failing until the lease expires. |
+| Quarantined, does not answer within `probe_timeout_s` | Its workers are killed, so its registration goes with them. |
 | Restarted (`restart_dead_shards`) | Registers only once a refit has given it current weights. |
 
 Two things differ from the native endpoint:

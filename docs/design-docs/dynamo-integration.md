@@ -46,7 +46,6 @@ With `async_rl.generation_fleet_health`, the SingleController calls `set_serving
 - The adapter keeps the `Endpoint` the Worker hands it (`on_endpoint_ready`). A shard leaving service calls `unregister_endpoint_instance()`, which removes only its discovery record: every frontend stops routing to it, and its requests in flight finish.
 - Only the engine's own process can remove its registration. A quarantined shard that does not confirm is killed, so the registration goes with its etcd lease.
 - `restart_shard` does not start the replacement's endpoint, because it holds init weights. The endpoint starts when a refit returns the shard to service.
-- The SingleController's copy of `VllmGeneration` has no managed runtime, so the namespace and engine environment an endpoint starts with are kept as plain fields.
 
 ## NeMo-Gym chat
 
@@ -92,6 +91,7 @@ The vLLM workers' venv (the `vllm` extra) carries the released `ai-dynamo` and `
 
 What a Dynamo upgrade has to re-check:
 - the `dynamo.common.backend` contract (`LLMEngine`, `Worker`, `WorkerConfig`, publisher and logprob helpers);
+- the `Endpoint` the Worker hands to `on_endpoint_ready`: `unregister_endpoint_instance()` removes only the instance's discovery record and lets requests in flight finish, `register_endpoint_instance()` puts the same instance back, and a killed engine's record goes with its etcd lease;
 - the request fields of Dynamo's preprocessed request, and `extra_args` reaching the engine;
 - the custom chat processor contract: `--dyn-chat-processor`, its config, and the `chat_engine_factory` the provider returns;
 - the route extension contract: `--frontend-route-extension`, `FrontendRoute`, and the `body`, `headers` and `runtime` of the context a handler receives;
