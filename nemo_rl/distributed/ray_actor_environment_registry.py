@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 import tomllib
+from importlib.metadata import metadata
 from pathlib import Path
 
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
@@ -46,15 +48,32 @@ def _reject_undeclared_extras() -> None:
     must stay dependency-free: docker/Dockerfile runs it from a layer where the
     rest of the source tree does not exist.
     """
-    with open(Path(git_root) / "pyproject.toml", "rb") as f:
-        declared = set(tomllib.load(f)["project"]["optional-dependencies"])
+    project = Path(git_root) / "pyproject.toml"
+    source_project = {}
+    if project.is_file():
+        with project.open("rb") as f:
+            source_project = tomllib.load(f).get("project", {})
+    if source_project.get("name") == "nemo-rl":
+        # Source checkouts must validate the working tree, including edits to extras.
+        declared = set(source_project["optional-dependencies"])
+        declaration = "[project.optional-dependencies] of pyproject.toml"
+    else:
+        # Wheels expose declared extras through distribution metadata.
+        declared = set(metadata("nemo-rl").get_all("Provides-Extra", []))
+        declaration = "Provides-Extra metadata of the installed nemo-rl distribution"
+    # Core metadata normalizes extra names (e.g. nemo_gym becomes nemo-gym).
+    declared = {re.sub(r"[-_.]+", "-", extra).lower() for extra in declared}
     for actor_fqn, extras in ACTOR_ENVIRONMENTS.items():
-        unknown = set(extras or ()) - declared
+        unknown = {
+            extra
+            for extra in extras or ()
+            if re.sub(r"[-_.]+", "-", extra).lower() not in declared
+        }
         if unknown:
             raise ValueError(
                 f"{actor_fqn!r} in nemo_rl/distributed/actor_environments.py names "
                 f"extras {sorted(unknown)} that are not in "
-                "[project.optional-dependencies] of pyproject.toml"
+                f"{declaration}"
             )
 
 
