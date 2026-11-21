@@ -56,7 +56,7 @@ Run from the NeMo-RL checkout. `$GITHUB_TOKEN` (`public_repo` scope) must be set
      - Clean: `manually cp #<N> into <rel> branch since it was merged into main instead of <rel> first.`
      - Conflict: append the conflict, e.g. `... first. There's a conflict in `<file>` (<why, e.g. depends on #M which is not in <rel>>).`
 
-6. **Labels + CI.** Copy the original's `CI:*` labels (`POST /issues/<pr>/labels`). Do not copy `cherry-pick-to-main` (it makes the bot cherry-pick the PR back to main) or release labels such as `r0.8.0`. Then post `/ok to test <full head sha>` as an issue comment.
+6. **Labels + CI.** Copy the original's `CI:*` labels (`POST /issues/<pr>/labels`); release branches have no `Set CI label` workflow, so the label must be set by hand. Do not copy `cherry-pick-to-main` (it makes the bot cherry-pick the PR back to main) or release labels such as `r0.8.0`. Then post `/ok to test <full head sha>` as an issue comment.
 
 7. **Report**: PR number (bare `#N`), base, commit sha, labels, that `/ok to test` was posted, and the worktree path (`git worktree remove <path>` to clean up).
 

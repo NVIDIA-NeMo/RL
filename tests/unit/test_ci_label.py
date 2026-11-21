@@ -103,17 +103,84 @@ def test_extra_labels_reduced_to_one() -> None:
     )
 
 
-@pytest.mark.parametrize(("maintainer", "removed"), [(False, True), (True, False)])
-def test_skip_cicd_only_for_maintainers(maintainer: bool, removed: bool) -> None:
+@pytest.mark.parametrize(
+    ("maintainer", "pick_changed", "removed", "reported"),
+    [
+        (False, False, True, True),
+        (False, True, True, True),
+        (True, False, False, False),
+        (True, True, True, False),
+    ],
+)
+def test_skip_cicd_only_for_maintainers_until_pick_changes(
+    maintainer: bool, pick_changed: bool, removed: bool, reported: bool
+) -> None:
     labels = {"CI:Lfast": ("bot", False), "Skip CICD": ("someone", maintainer)}
-    plan = ci_label.decide(pick="CI:Lfast", pick_changed=False, labels=labels)
+    plan = ci_label.decide(pick="CI:Lfast", pick_changed=pick_changed, labels=labels)
     assert ("Skip CICD" in plan.remove) is removed
+    assert (("Skip CICD", "someone") in plan.reverted) is reported
+
+
+def test_newest_maintainer_label_wins() -> None:
+    labels = {"CI:L1": ("terrykong", True), "CI:L0": ("terrykong", True)}
+    plan = ci_label.decide(pick="CI:Lfast", pick_changed=False, labels=labels)
+    assert (plan.kept, plan.add, plan.remove, plan.reverted) == (
+        "CI:L0",
+        [],
+        ["CI:L1"],
+        [],
+    )
+
+
+def test_newer_non_maintainer_label_does_not_displace_override() -> None:
+    labels = {"CI:L1": ("terrykong", True), "CI:L0": ("someone", False)}
+    plan = ci_label.decide(pick="CI:Lfast", pick_changed=False, labels=labels)
+    assert (plan.kept, plan.remove, plan.reverted) == (
+        "CI:L1",
+        ["CI:L0"],
+        [("CI:L0", "someone")],
+    )
+
+
+def test_label_set_after_push_survives_pick_change() -> None:
+    labels = {"CI:L0": ("terrykong", True), "Skip CICD": ("terrykong", True)}
+    plan = ci_label.decide(
+        pick="CI:L1",
+        pick_changed=True,
+        labels=labels,
+        set_after_push=frozenset({"CI:L0", "Skip CICD"}),
+    )
+    assert (plan.kept, plan.add, plan.remove) == ("CI:L0", [], [])
+
+
+def test_label_set_before_push_expires_on_pick_change() -> None:
+    labels = {"CI:docs": ("terrykong", True), "CI:L0": ("terrykong", True)}
+    plan = ci_label.decide(
+        pick="CI:L1",
+        pick_changed=True,
+        labels=labels,
+        set_after_push=frozenset({"CI:L0"}),
+    )
+    assert (plan.kept, plan.add, plan.remove) == ("CI:L0", [], ["CI:docs"])
 
 
 def test_comment_names_removed_label_without_mention() -> None:
     body = ci_label.comment_body(
-        pick="CI:Lfast", reason="default", reverted=[("CI:docs", "someone")]
+        label="CI:Lfast",
+        pick="CI:Lfast",
+        reason="default",
+        reverted=[("CI:docs", "someone")],
     )
     assert body.startswith(ci_label.COMMENT_MARKER)
     assert "`CI:docs` added by `someone`" in body
     assert "@" not in body
+
+
+def test_comment_shows_kept_override_not_pick() -> None:
+    labels = {"CI:L1": ("terrykong", True), "Skip CICD": ("someone", False)}
+    plan = ci_label.decide(pick="CI:Lfast", pick_changed=False, labels=labels)
+    body = ci_label.comment_body(
+        label=plan.kept, pick="CI:Lfast", reason="default", reverted=plan.reverted
+    )
+    assert "**CI label:** `CI:L1`, set by a maintainer" in body
+    assert "set automatically" not in body

@@ -20,9 +20,9 @@ Rules (first match wins):
   CI:Lfast everything else
 
 The bot never picks CI:L0 or CI:L2. A CI:* or "Skip CICD" label set by a repo
-maintainer (admin or maintain role) is kept until a push changes the bot's own
-pick; one set by anyone else is replaced, with one PR comment that is edited
-in place.
+maintainer (admin or maintain role) is kept until a later push changes the bot's
+own pick; if a maintainer set several CI:* labels, the newest one stays. One set
+by anyone else is replaced, with one PR comment that is edited in place.
 
 The rules and `decide` are pure, so other CI systems can reuse them; `main`
 is the GitHub Actions entry point and uses only the standard library.
@@ -92,6 +92,7 @@ class Plan:
     add: list[str] = field(default_factory=list)
     remove: list[str] = field(default_factory=list)
     reverted: list[tuple[str, str]] = field(default_factory=list)  # (label, who set it)
+    kept: str | None = None  # The maintainer's CI:* label that stays, if any.
 
 
 def decide(
@@ -99,39 +100,52 @@ def decide(
     pick: str,
     pick_changed: bool,
     labels: dict[str, tuple[str, bool]],
+    set_after_push: frozenset[str] = frozenset(),
 ) -> Plan:
     """Plan label changes.
 
-    `labels` maps each current CI:* / Skip CICD label to (who set it, is that person a maintainer).
-    `pick_changed` is True when this push changed the bot's own pick.
+    `labels` maps each current CI:* / Skip CICD label to (who set it, is that person a maintainer), oldest first.
+    `pick_changed` is True when the push this run handles changed the bot's own pick.
+    Labels in `set_after_push` were set after that push, so the push does not expire them.
     """
+
+    def kept_override(name: str) -> bool:
+        maintainer = labels[name][1]
+        return maintainer and (not pick_changed or name in set_after_push)
+
     plan = Plan()
-    ci = {name: setter for name, setter in labels.items() if name.startswith("CI:")}
-    kept = None
-    for name, (who, maintainer) in ci.items():
-        if maintainer and not pick_changed and kept is None:
-            kept = name
-    for name, (who, maintainer) in ci.items():
-        if name == kept or (kept is None and name == pick):
+    ci = [name for name in labels if name.startswith("CI:")]
+    overrides = [name for name in ci if kept_override(name)]
+    if overrides:
+        plan.kept = overrides[-1]  # The newest maintainer choice wins.
+    for name in ci:
+        if name == plan.kept or (plan.kept is None and name == pick):
             continue
         plan.remove.append(name)
+        who, maintainer = labels[name]
         if not maintainer and who != "bot":
             plan.reverted.append((name, who))
-    if kept is None and pick not in ci:
+    if plan.kept is None and pick not in ci:
         plan.add.append(pick)
-    if SKIP_LABEL in labels:
+    if SKIP_LABEL in labels and not kept_override(SKIP_LABEL):
+        plan.remove.append(SKIP_LABEL)
         who, maintainer = labels[SKIP_LABEL]
         if not maintainer:
-            plan.remove.append(SKIP_LABEL)
             plan.reverted.append((SKIP_LABEL, who))
     return plan
 
 
-def comment_body(*, pick: str, reason: str, reverted: list[tuple[str, str]]) -> str:
-    lines = [COMMENT_MARKER, f"**CI label:** `{pick}`, set automatically ({reason})."]
-    for label, who in reverted:
+def comment_body(
+    *, label: str, pick: str, reason: str, reverted: list[tuple[str, str]]
+) -> str:
+    if label == pick:
+        status = f"**CI label:** `{pick}`, set automatically ({reason})."
+    else:
+        status = f"**CI label:** `{label}`, set by a maintainer. The automatic pick is `{pick}` ({reason})."
+    lines = [COMMENT_MARKER, status]
+    for name, who in reverted:
         lines.append(
-            f"- Removed `{label}` added by `{who}`: only repo maintainers can change the CI label or skip CI."
+            f"- Removed `{name}` added by `{who}`: only repo maintainers can change the CI label or skip CI."
         )
     lines.append("If this label is wrong, ask a maintainer to set the right one.")
     return "\n".join(lines)
@@ -199,26 +213,38 @@ def main() -> int:
                 False  # Previous head is gone (force-push): keep a maintainer's choice.
             )
 
+    # Read the labels now, not from the event: a queued run must see labels set while it waited.
     current = [
         l["name"]
-        for l in pr["labels"]
+        for l in gh.pages(f"/issues/{number}/labels")
         if l["name"].startswith("CI:") or l["name"] == SKIP_LABEL
     ]
+    # Events come oldest first; re-inserting keeps `setters` ordered by each label's last "labeled" event.
     setters = {}
     for ev in gh.pages(f"/issues/{number}/events"):
-        if ev.get("event") == "labeled" and ev["label"]["name"] in current:
-            setters[ev["label"]["name"]] = ev["actor"][
-                "login"
-            ]  # Last "labeled" event wins.
+        name = (ev.get("label") or {}).get("name")
+        if ev.get("event") == "labeled" and name in current:
+            setters.pop(name, None)
+            setters[name] = (ev["actor"]["login"], ev["created_at"])
     labels = {}
-    for name in current:
-        who = setters.get(name, "unknown")
+    for name in [n for n in current if n not in setters] + list(setters):
+        who = setters[name][0] if name in setters else "unknown"
         labels[name] = (
             "bot" if who == "github-actions[bot]" else who,
             gh.is_maintainer(who),
         )
+    # A synchronize event's updated_at is the push time; a label set later was chosen after this push.
+    pushed_at = pr["updated_at"]
+    set_after_push = frozenset(
+        name for name, (_, at) in setters.items() if pick_changed and at > pushed_at
+    )
 
-    plan = decide(pick=pick, pick_changed=pick_changed, labels=labels)
+    plan = decide(
+        pick=pick,
+        pick_changed=pick_changed,
+        labels=labels,
+        set_after_push=set_after_push,
+    )
     print(
         f"PR #{number}: pick={pick} ({reason}); pick_changed={pick_changed}; labels={labels}; plan={plan}"
     )
@@ -231,11 +257,14 @@ def main() -> int:
     if plan.add:
         gh.call("POST", f"/issues/{number}/labels", {"labels": plan.add})
     if plan.reverted:
-        body = comment_body(pick=pick, reason=reason, reverted=plan.reverted)
+        body = comment_body(
+            label=plan.kept or pick, pick=pick, reason=reason, reverted=plan.reverted
+        )
         mine = [
             c
             for c in gh.pages(f"/issues/{number}/comments")
-            if COMMENT_MARKER in (c.get("body") or "")
+            if c["user"]["login"] == "github-actions[bot]"
+            and COMMENT_MARKER in (c.get("body") or "")
         ]
         if mine:
             gh.call("PATCH", f"/issues/comments/{mine[-1]['id']}", {"body": body})

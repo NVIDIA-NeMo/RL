@@ -58,7 +58,7 @@ Every PR **must** have exactly one `CI:*` label — the quality-check job stays 
 
 These `.github/` files feed the main CI run, so they still mean `CI:Lfast`: `workflows/cicd-main.yml`, `workflows/_build_container.yml`, `actions/test-template/*`, `scripts/plan-tests.sh`, `scripts/checkout-megatron-lm-commit.sh`, `scripts/install-megatron-lock-artifact.sh` and `scripts/known-flake-patterns.txt`.
 
-Only repo maintainers (admin or maintain role) can change it, for example to `CI:L1` for a broad core change, or add `Skip CICD`. A label anyone else sets is replaced, and the bot says so in one PR comment. A maintainer's label stays until a push changes the bot's own pick. Agents: do not set or change `CI:*` labels.
+Only repo maintainers (admin or maintain role) can change it, for example to `CI:L1` for a broad core change, or add `Skip CICD`. A label anyone else sets is replaced, and the bot says so in one PR comment. A maintainer's label stays until a push changes the bot's own pick. Agents: do not set or change `CI:*` labels on PRs to `main`. Release branches have no label bot, so `cp-to-release` still copies the original PR's label.
 
 ---
 
