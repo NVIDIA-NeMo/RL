@@ -15,7 +15,8 @@
 
 Rules (first match wins):
   CI:L1    any dependency or container file, or a 3rdparty/ submodule bump
-  CI:docs  every file is docs, skill text, Autobot config, or the PR template
+  CI:docs  every file is docs, skill text, or a .github/ file the main CI run
+           does not read
   CI:Lfast everything else
 
 The bot never picks CI:L0 or CI:L2. A CI:* or "Skip CICD" label set by a repo
@@ -51,8 +52,17 @@ DOCS_GLOBS = (
     "skills/*",
     ".agents/*",
     ".claude/*",
-    ".github/autobot/*",
-    ".github/PULL_REQUEST_TEMPLATE.md",
+    ".github/*",
+)
+# The .github/ files the main CI run reads; changing one still needs CI:Lfast.
+MAIN_CI_FILES = (
+    ".github/workflows/cicd-main.yml",
+    ".github/workflows/_build_container.yml",
+    ".github/actions/test-template/*",
+    ".github/scripts/plan-tests.sh",
+    ".github/scripts/checkout-megatron-lm-commit.sh",
+    ".github/scripts/install-megatron-lock-artifact.sh",
+    ".github/scripts/known-flake-patterns.txt",
 )
 SKIP_LABEL = "Skip CICD"
 COMMENT_MARKER = "<!-- ci-label-bot -->"
@@ -67,9 +77,14 @@ def pick_label(files: list[str]) -> tuple[str, str]:
     l1 = [f for f in files if _matches(f, L1_GLOBS)]
     if l1:
         return "CI:L1", f"dependency, container or submodule change (`{l1[0]}`)"
-    if files and all(_matches(f, DOCS_GLOBS) for f in files):
-        return "CI:docs", "only docs, skills, Autobot config or the PR template changed"
-    return "CI:Lfast", "default for code changes"
+    if files and all(
+        _matches(f, DOCS_GLOBS) and not _matches(f, MAIN_CI_FILES) for f in files
+    ):
+        return (
+            "CI:docs",
+            "only docs, skills or .github/ files the main CI run does not read changed",
+        )
+    return "CI:Lfast", "default for code and main CI changes"
 
 
 @dataclass
