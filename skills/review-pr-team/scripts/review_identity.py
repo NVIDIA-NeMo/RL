@@ -86,7 +86,8 @@ def detect(env: dict[str, str] | None = None, home: Path | None = None) -> Ident
     home = Path.home() if home is None else home
     if env.get("CLAUDECODE") == "1" and env.get("CLAUDE_CODE_SESSION_ID"):
         sid = env["CLAUDE_CODE_SESSION_ID"]
-        found = glob.glob(str(home / ".claude/projects/*" / f"{sid}.jsonl"))
+        claude_root = Path(env.get("CLAUDE_CONFIG_DIR") or home / ".claude")
+        found = glob.glob(str(claude_root / "projects/*" / f"{sid}.jsonl"))
         transcript = Path(found[0]) if found else None
         model = "unknown"
         if transcript:
@@ -104,8 +105,9 @@ def detect(env: dict[str, str] | None = None, home: Path | None = None) -> Ident
         )
     if env.get("CODEX_SESSION_ID") or env.get("CODEX_THREAD_ID"):
         sid = env.get("CODEX_SESSION_ID") or env["CODEX_THREAD_ID"]
+        codex_root = Path(env.get("CODEX_HOME") or home / ".codex")
         found = glob.glob(
-            str(home / ".codex/sessions/**" / f"rollout-*-{sid}.jsonl"), recursive=True
+            str(codex_root / "sessions/**" / f"rollout-*-{sid}.jsonl"), recursive=True
         )
         transcript = Path(found[0]) if found else None
         model = effort = "unknown"
@@ -284,11 +286,11 @@ def same_session_evidence(
         payload = row.get("payload") or {}
         if row.get("type") == "turn_context":  # Codex
             codex_cwd = payload.get("cwd") or codex_cwd
-        if (
-            row.get("type") == "response_item"
-            and payload.get("type") == "custom_tool_call"
-        ):  # Codex
-            text = payload.get("input") or ""
+        if row.get("type") != "response_item":
+            continue
+        if payload.get("type") in ("custom_tool_call", "function_call"):  # Codex
+            # Patches (apply_patch, or a patch passed to a command) name their files.
+            text = payload.get("input") or payload.get("arguments") or ""
             record(
                 [
                     _repo_path(p, codex_cwd, repo_root) or ""
@@ -296,12 +298,38 @@ def same_session_evidence(
                 ],
                 False,
             )
-            code = _PATCH_BODY.sub("", text)
+        if payload.get("type") == "custom_tool_call":  # Codex code mode
+            code = _PATCH_BODY.sub("", payload.get("input") or "")
             workdir = _JS_WORKDIR.search(code)
             shell_dir = _resolve(codex_cwd, workdir.group(1)) if workdir else codex_cwd
             for literal in _js_strings(code):
                 record(*_shell_actions(literal, shell_dir, repo_root))
+        if payload.get("type") == "function_call":  # Codex exec_command / shell
+            command, workdir = _function_call_command(payload.get("arguments") or "")
+            shell_dir = _resolve(codex_cwd, workdir) if workdir else codex_cwd
+            record(*_shell_actions(_PATCH_BODY.sub("", command), shell_dir, repo_root))
     return sorted(set(evidence))
+
+
+def _function_call_command(arguments: str) -> tuple[str, str | None]:
+    """The shell command and working directory in a Codex function call's JSON arguments."""
+    try:
+        args = json.loads(arguments)
+    except json.JSONDecodeError:
+        return "", None
+    if not isinstance(args, dict):
+        return "", None
+    command = args.get("cmd") or args.get("command") or ""
+    if isinstance(command, list):
+        words = [str(w) for w in command]
+        is_shell_c = (
+            len(words) >= 3
+            and os.path.basename(words[0]) in ("bash", "sh", "zsh")
+            and words[1] in ("-c", "-lc")
+        )
+        command = words[2] if is_shell_c else shlex.join(words)
+    workdir = args.get("workdir")
+    return str(command), workdir if isinstance(workdir, str) and workdir else None
 
 
 def _gh(*args: str) -> str:
@@ -387,7 +415,12 @@ def main(argv: list[str] | None = None) -> int:
             f"Run /review-pr-team {args.pr} in a fresh Claude Code or Codex session with an allowed model."
         )
         return 3
-    print("OK")
+    if ident.transcript is None:
+        print(
+            "WARNING: no session log found, so same-session edits could not be checked"
+        )
+    else:
+        print("OK")
     return 0
 
 
