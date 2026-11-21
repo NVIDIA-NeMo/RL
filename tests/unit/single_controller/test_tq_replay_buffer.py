@@ -36,7 +36,10 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayBuffer,
     replay_manifest_digest,
 )
-from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSampler,
+    WindowedSampler,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -2201,3 +2204,142 @@ class TestTQReplayBufferEvictedCommit:
         # The written rows were un-written.
         assert dp.depth() == 0
         assert len(dp.clear_calls) == 1
+
+
+class RewardColumnDataPlaneClient(FakeDataPlaneClient):
+    """Keeps the ``reward/<name>`` value written for each sample."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reward_columns: dict[str, dict[str, float]] = {}
+
+    def put_samples(
+        self,
+        sample_ids: list[str],
+        partition_id: str,
+        fields: Any = None,
+        tags: list[dict[str, Any]] | None = None,
+    ) -> KVBatchMeta:
+        meta = super().put_samples(sample_ids, partition_id, fields, tags)
+        for name in fields.keys():
+            if name.startswith("reward/"):
+                column = self.reward_columns.setdefault(name, {})
+                column.update(zip(sample_ids, fields[name].tolist()))
+        return meta
+
+
+class TestTQReplayBufferRewardComponentFill:
+    """Groups claimed together end up with the same reward component columns."""
+
+    @pytest.fixture(autouse=True)
+    def _component_converter(self, monkeypatch):
+        def convert(record: PromptGroupRecord, **kwargs: Any) -> BatchedDataDict[Any]:
+            del kwargs
+            batch = BatchedDataDict[Any](
+                {
+                    "input_ids": torch.ones((2, 3), dtype=torch.long),
+                    "input_lengths": torch.full((2,), 3, dtype=torch.long),
+                    "total_reward": torch.zeros(2, dtype=torch.float32),
+                }
+            )
+            for name, values in record.metadata.items():
+                batch[name] = torch.tensor(values, dtype=torch.float32)
+            return batch
+
+        monkeypatch.setattr(_replay_buffer_module, "record_to_train_batch", convert)
+
+    @staticmethod
+    def _add(buf: TQReplayBuffer, components: dict[str, list[float]]) -> KVBatchMeta:
+        record = _make_record()
+        record.metadata.update(components)
+        group_id = buf.reserve(weight_version=0, target_step=None)
+        return _run(
+            buf.commit(group_id, record, start_weight_version=0, end_weight_version=0)
+        )
+
+    @staticmethod
+    def _column(
+        dp: RewardColumnDataPlaneClient, name: str, metas: list[KVBatchMeta]
+    ) -> list[float]:
+        return [
+            dp.reward_columns[name][sample_id]
+            for meta in metas
+            for sample_id in meta.sample_ids
+        ]
+
+    def test_claim_zero_fills_a_group_without_components(self):
+        dp = RewardColumnDataPlaneClient()
+        buf = _make_buffer(dp)
+        with_components = self._add(
+            buf, {"reward/a": [1.0, 0.0], "reward/b": [1.0, 0.0]}
+        )
+        without = self._add(buf, {})
+
+        assert _run(buf.claim_for_training([0, 1])) == 2
+
+        fill = dp.put_calls[-1]
+        assert len(dp.put_calls) == 3
+        assert fill["sample_ids"] == without.sample_ids
+        assert sorted(fill["fields"].keys()) == ["reward/a", "reward/b"]
+        assert fill["fields"]["reward/a"].dtype == torch.float32
+        metas = [with_components, without]
+        assert self._column(dp, "reward/a", metas) == [1.0, 0.0, 0.0, 0.0]
+        assert self._column(dp, "reward/b", metas) == [1.0, 0.0, 0.0, 0.0]
+        claimed_fields = [
+            group["meta"].fields for group in buf.training_owned_replay_groups()
+        ]
+        assert all({"reward/a", "reward/b"} <= set(fields) for fields in claimed_fields)
+
+    def test_claim_fills_the_union_of_differing_components(self):
+        dp = RewardColumnDataPlaneClient()
+        buf = _make_buffer(dp)
+        metas = [
+            self._add(buf, {"reward/a": [1.0, 2.0]}),
+            self._add(buf, {"reward/b": [3.0, 4.0]}),
+        ]
+
+        _run(buf.claim_for_training([0, 1]))
+
+        assert self._column(dp, "reward/a", metas) == [1.0, 2.0, 0.0, 0.0]
+        assert self._column(dp, "reward/b", metas) == [0.0, 0.0, 3.0, 4.0]
+
+    @pytest.mark.parametrize(
+        "components",
+        [{}, {"reward/a": [1.0, 0.0], "reward/b": [0.0, 1.0]}],
+        ids=["all_scalar", "all_complete"],
+    )
+    def test_claim_writes_nothing_when_no_column_is_missing(self, components):
+        dp = RewardColumnDataPlaneClient()
+        buf = _make_buffer(dp)
+        self._add(buf, components)
+        self._add(buf, components)
+
+        _run(buf.claim_for_training([0, 1]))
+
+        assert len(dp.put_calls) == 2
+
+    def test_selected_rows_all_have_the_selected_component_columns(self):
+        dp = RewardColumnDataPlaneClient()
+        buf = _make_buffer(dp)
+        self._add(buf, {"reward/a": [1.0, 0.0], "reward/b": [1.0, 0.0]})
+        self._add(buf, {})
+        sampler = WindowedSampler(buf, max_staleness_versions=0)
+
+        meta, num_groups = _run(
+            sampler.select(
+                current_train_weight=0, min_prompt_groups=2, max_prompt_groups=2
+            )
+        )
+
+        assert num_groups == 2
+        component_fields = [
+            field for field in meta.fields if field.startswith("reward/")
+        ]
+        assert component_fields == ["reward/a", "reward/b"]
+        for field in component_fields:
+            assert [dp.reward_columns[field][s] for s in meta.sample_ids] == [
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+            ]

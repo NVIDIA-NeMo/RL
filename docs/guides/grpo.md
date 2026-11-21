@@ -935,6 +935,8 @@ grpo:
 ```
 Note that this method only has an effect when training involves more than one reward function.
 
+GDPO also runs on the Single-Controller path, for multi-reward native environments and for NeMo Gym rollouts, with token capture disabled; see [Known Missing Features](single-controller.md#known-missing-features) for its limits there.
+
 #### Per-reward weights
 
 The aggregation weights \\( w_n \\) in \\( A^{(i,j)} = \sum_{n=1}^{N} w_n A_n^{(i,j)} \\) are configurable via `reward_weights`, an optional list with one entry per reward component, ordered alphabetically by component name (matching the sorted `reward/<name>` keys). When omitted, all weights default to `1.0` (equal weighting). For example, to down-weight the second and third rewards:
