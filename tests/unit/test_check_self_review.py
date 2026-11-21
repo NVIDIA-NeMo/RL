@@ -38,11 +38,11 @@ def marker(
     harness: str = "claude-code/2.1.330",
     model: str = "claude-opus-5-5",
     effort: str = "medium",
-    rev: str = "2",
+    rev: str = "v2",
 ) -> str:
     return (
-        f"Review body.\n<!-- nemo-rl-review: kind={kind} harness={harness} model={model} "
-        f"effort={effort} skill_rev={rev} head=abc123 -->"
+        f"Review body.\n\n`nemo-rl-review: kind={kind} harness={harness} model={model} "
+        f"effort={effort} review-pr-team={rev} reviewed=3672697`\n"
     )
 
 
@@ -64,8 +64,27 @@ def test_parse_marker() -> None:
     got = check.parse_marker(marker())
     assert got["kind"] == "self"
     assert got["harness"] == "claude-code/2.1.330"
-    assert got["skill_rev"] == "2"
-    assert check.parse_marker("no marker") is None
+    assert got["review-pr-team"] == "v2"
+    assert got["reviewed"] == "3672697"
+    # Backticks are optional, and the last footer line wins.
+    bare = "nemo-rl-review: kind=self model=a\nmore text\nnemo-rl-review: kind=self model=b"
+    assert check.parse_marker(bare)["model"] == "b"
+    assert check.parse_marker("no footer") is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # The old HTML-comment form is no longer read.
+        "<!-- nemo-rl-review: kind=self skill_rev=2 -->",
+        # Examples in docs use a different prefix, so they never count.
+        "`nemo-rl-review-example: kind=self review-pr-team=v2`",
+        # The footer must start its line, not sit inside a sentence.
+        "Add a nemo-rl-review: kind=self line at the end.",
+    ],
+)
+def test_parse_marker_ignores_non_footers(body: str) -> None:
+    assert check.parse_marker(body) is None
 
 
 @pytest.mark.parametrize(
@@ -74,6 +93,8 @@ def test_parse_marker() -> None:
         [],
         # Written by someone else.
         [check.Review(1, "bob", marker(), "t")],
+        # Someone else's review that quotes the author's footer line.
+        [check.Review(1, "bob", "Re your review:\n" + marker(), "t")],
         # Author's review without a marker (e.g. a plain comment review).
         [check.Review(1, "alice", "LGTM", "t")],
         # An expert review by the author is not a self-review.
@@ -94,8 +115,10 @@ def test_no_self_review(reviews) -> None:
         ({"model": "claude-sonnet-5-5"}, 2, "model claude-sonnet-5-5 is not allowed"),
         ({"harness": "pi/1.0"}, 2, "harness pi is not allowed"),
         ({"effort": "low"}, 2, "effort low is below medium"),
-        ({"rev": "x"}, 2, "no skill revision"),
-        ({"rev": "2"}, 6, "rev 2 is too old"),
+        ({"rev": "vx"}, 2, "no skill revision in the footer"),
+        # The number needs its "v".
+        ({"rev": "2"}, 2, "no skill revision in the footer"),
+        ({"rev": "v2"}, 6, "rev 2 is too old"),
         ({"harness": "codex/0.167.2", "model": "gpt-5.6-sol"}, 2, "model gpt-5.6-sol"),
     ],
 )
@@ -108,8 +131,17 @@ def test_not_accepted(kwargs: dict, main_rev: int, reason: str) -> None:
     assert len(desc) <= 140
 
 
+def test_footer_without_revision_is_not_accepted() -> None:
+    body = "`nemo-rl-review: kind=self harness=claude-code/2.1.330 model=claude-opus-5-5 effort=medium`"
+    review = check.Review(1, "alice", body, "t")
+    assert run([review], []) == (
+        "failure",
+        "Not accepted: no skill revision in the footer",
+    )
+
+
 def test_revision_within_lag_is_accepted() -> None:
-    review = check.Review(1, "alice", marker(rev="2"), "t")
+    review = check.Review(1, "alice", marker(rev="v2"), "t")
     assert run([review], [], main_rev=5) == ("success", "Resolved (0 threads)")
 
 
