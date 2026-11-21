@@ -35,6 +35,7 @@ from nemo_rl.models.generation.vllm.draft_utils import (
     DRAFT_DISABLE_MODULE_SHARING_ENV,
     _assert_drafter_owns_modules,
     _draft_owns_speculator,
+    _drafter_shares_target_embed_tokens,
     _is_full_draft_stream,
     _validate_draft_refit_info,
     disable_draft_module_sharing,
@@ -1383,6 +1384,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 f"found in checkpoint at {model_path}. The checkpoint must "
                 f"include MTP layer weights to run deepseek_mtp speculative decoding."
             )
+        if _drafter_shares_target_embed_tokens(self.model_runner, draft_model):
+            # vLLM gives an MTP drafter the target model's embed_tokens, which the
+            # policy refit fills. Loading the checkpoint's copy would overwrite
+            # the policy's serving embedding.
+            weights = [(name, w) for name, w in weights if "embed_tokens" not in name]
 
         draft_model_config = (
             self.model_runner.vllm_config.speculative_config.draft_model_config

@@ -3761,6 +3761,35 @@ def test_load_mtp_weights_from_disk_loads_only_mtp_layer(tmp_path, monkeypatch):
 
 
 @pytest.mark.vllm
+def test_load_mtp_weights_from_disk_skips_embed_shared_with_target(
+    tmp_path, monkeypatch
+):
+    """A drafter that uses the target's embed_tokens must not load the checkpoint's copy."""
+    model_dir = tmp_path / "ckpt"
+    _write_sharded_checkpoint(
+        model_dir,
+        {
+            "model-00001-of-00001.safetensors": {
+                "model.layers.2.mlp.up_proj.weight": torch.randn(4, 4),
+                "model.layers.2.embed_tokens.weight": torch.randn(8, 4),
+            }
+        },
+    )
+    ext = _make_extension_with_drafter(mtp_start_layer_idx=2, num_mtp_layers=1)
+    shared_embed = SimpleNamespace(weight=torch.zeros(8, 4))
+    ext.model_runner.model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=shared_embed)
+    )
+    ext.model_runner.drafter.model.model.embed_tokens = shared_embed
+    _patch_vllm_postload(monkeypatch)
+
+    assert ext.load_mtp_weights_from_disk(str(model_dir)) is True
+
+    loaded_names = {name for name, _ in ext._load_draft_weights.call_args[0][0]}
+    assert loaded_names == {"model.layers.2.mlp.up_proj.weight"}
+
+
+@pytest.mark.vllm
 def test_load_mtp_weights_from_disk_uses_layerwise_reload_for_trtllm(
     tmp_path, monkeypatch
 ):
