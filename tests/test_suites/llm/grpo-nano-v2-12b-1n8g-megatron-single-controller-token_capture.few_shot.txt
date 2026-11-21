@@ -1,0 +1,104 @@
+Solve the math problem that follows the worked examples. Reason step by step, then give the final answer in the form \boxed{answer}. The worked examples show the expected format.
+
+Example 1
+Problem: A rectangle has a perimeter of 54 and its length is twice its width. What is its area?
+Solution: Let the width be w. The length is 2w, so the perimeter is 2(w + 2w) = 6w = 54, which gives w = 9. The length is 18. The area is 9 * 18 = 162.
+Final answer: \boxed{162}
+
+Example 2
+Problem: How many positive divisors does 360 have?
+Solution: Factor 360 = 2^3 * 3^2 * 5. A divisor picks an exponent of 2 from 0 to 3, an exponent of 3 from 0 to 2, and an exponent of 5 from 0 to 1. The count is 4 * 3 * 2 = 24.
+Final answer: \boxed{24}
+
+Example 3
+Problem: Find the sum of all integers from 1 to 200 that are divisible by 7.
+Solution: The multiples of 7 up to 200 are 7 * 1, 7 * 2, ..., 7 * 28, because 7 * 28 = 196 and 7 * 29 = 203. Their sum is 7 * (1 + 2 + ... + 28) = 7 * (28 * 29 / 2) = 7 * 406 = 2842.
+Final answer: \boxed{2842}
+
+Example 4
+Problem: Solve for x: 3^(2x + 1) = 243.
+Solution: Write 243 = 3^5. Equal bases give equal exponents, so 2x + 1 = 5 and x = 2.
+Final answer: \boxed{2}
+
+Example 5
+Problem: A fair six-sided die is rolled twice. What is the probability that the two rolls sum to 8?
+Solution: There are 36 equally likely ordered outcomes. The pairs that sum to 8 are (2, 6), (3, 5), (4, 4), (5, 3) and (6, 2), which is 5 outcomes. The probability is 5/36.
+Final answer: \boxed{\frac{5}{36}}
+
+Example 6
+Problem: The roots of x^2 - 7x + 10 = 0 are r and s. Find r^2 + s^2.
+Solution: By Vieta's formulas, r + s = 7 and rs = 10. Then r^2 + s^2 = (r + s)^2 - 2rs = 49 - 20 = 29.
+Final answer: \boxed{29}
+
+Example 7
+Problem: In how many ways can a committee of 3 people be chosen from 9 people?
+Solution: The order of the members does not matter, so the count is the binomial coefficient C(9, 3) = (9 * 8 * 7) / (3 * 2 * 1) = 504 / 6 = 84.
+Final answer: \boxed{84}
+
+Example 8
+Problem: A right triangle has legs of length 20 and 21. What is the length of its hypotenuse?
+Solution: By the Pythagorean theorem the hypotenuse is the square root of 20^2 + 21^2 = 400 + 441 = 841. Since 29^2 = 841, the hypotenuse is 29.
+Final answer: \boxed{29}
+
+Example 9
+Problem: What is the remainder when 2^100 is divided by 7?
+Solution: The powers of 2 modulo 7 repeat with period 3: 2^1 = 2, 2^2 = 4 and 2^3 = 8, which is 1 modulo 7. Since 100 = 3 * 33 + 1, 2^100 = (2^3)^33 * 2, which is 1 * 2 = 2 modulo 7.
+Final answer: \boxed{2}
+
+Example 10
+Problem: An arithmetic sequence has third term 11 and ninth term 35. Find its twentieth term.
+Solution: The common difference d satisfies 6d = 35 - 11 = 24, so d = 4. The first term is 11 - 2d = 3. The twentieth term is 3 + 19d = 3 + 76 = 79.
+Final answer: \boxed{79}
+
+Example 11
+Problem: Find the area of the triangle with vertices (0, 0), (8, 0) and (3, 5).
+Solution: Take the side from (0, 0) to (8, 0) as the base. Its length is 8. The height is the distance from (3, 5) to the x-axis, which is 5. The area is (1/2) * 8 * 5 = 20.
+Final answer: \boxed{20}
+
+Example 12
+Problem: A store raises the price of a jacket by 25% and later lowers the new price by 20%. The final price is 90 dollars. What was the original price in dollars?
+Solution: Let the original price be p. After the increase the price is 1.25p. After the decrease it is 0.8 * 1.25p = p. The final price equals the original price, so p = 90.
+Final answer: \boxed{90}
+
+Example 13
+Problem: How many four-digit positive integers have digits that sum to 3?
+Solution: The first digit is 1, 2 or 3. If it is 3, the other digits are 0, which gives 1 number. If it is 2, one of the other three digits is 1, which gives 3 numbers. If it is 1, the other three digits sum to 2: either one digit is 2, which gives 3 numbers, or two digits are 1, which gives 3 numbers. The total is 1 + 3 + 3 + 3 = 10.
+Final answer: \boxed{10}
+
+Example 14
+Problem: If log_2(x) + log_2(x - 2) = 3, find x.
+Solution: Combine the logarithms: log_2(x(x - 2)) = 3, so x(x - 2) = 8 and x^2 - 2x - 8 = 0. This factors as (x - 4)(x + 2) = 0. The logarithms need x > 2, so x = 4.
+Final answer: \boxed{4}
+
+Example 15
+Problem: A circle is inscribed in a square of side length 10. What is the area of the region inside the square and outside the circle?
+Solution: The circle has radius 5 and area 25\pi. The square has area 100. The region has area 100 - 25\pi.
+Final answer: \boxed{100 - 25\pi}
+
+Example 16
+Problem: Find the least common multiple of 84 and 90.
+Solution: Factor 84 = 2^2 * 3 * 7 and 90 = 2 * 3^2 * 5. Take the largest power of each prime: 2^2 * 3^2 * 5 * 7 = 4 * 9 * 35 = 1260.
+Final answer: \boxed{1260}
+
+Example 17
+Problem: The function f satisfies f(x) = 2x + 3 and g satisfies g(x) = x^2 - 1. Find f(g(4)) - g(f(4)).
+Solution: First g(4) = 16 - 1 = 15, so f(g(4)) = 2 * 15 + 3 = 33. Next f(4) = 8 + 3 = 11, so g(f(4)) = 121 - 1 = 120. The difference is 33 - 120 = -87.
+Final answer: \boxed{-87}
+
+Example 18
+Problem: A car travels 150 miles at 50 miles per hour and then 150 miles at 75 miles per hour. What is its average speed for the whole trip in miles per hour?
+Solution: The first part takes 150 / 50 = 3 hours and the second part takes 150 / 75 = 2 hours. The total distance is 300 miles and the total time is 5 hours. The average speed is 300 / 5 = 60.
+Final answer: \boxed{60}
+
+Example 19
+Problem: Find the sum of the infinite geometric series 12 + 4 + 4/3 + 4/9 + ...
+Solution: The first term is 12 and the common ratio is 4 / 12 = 1/3. The sum of an infinite geometric series with ratio of absolute value below 1 is the first term divided by 1 minus the ratio: 12 / (1 - 1/3) = 12 / (2/3) = 18.
+Final answer: \boxed{18}
+
+Example 20
+Problem: How many integers n satisfy |2n - 5| < 9?
+Solution: The inequality means -9 < 2n - 5 < 9, so -4 < 2n < 14 and -2 < n < 7. The integers are -1, 0, 1, 2, 3, 4, 5 and 6, which is 8 integers.
+Final answer: \boxed{8}
+
+Now solve the following problem in the same format.
+
