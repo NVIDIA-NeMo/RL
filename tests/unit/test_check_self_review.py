@@ -149,23 +149,77 @@ def test_threads(threads, expected) -> None:
 
 
 @pytest.mark.parametrize(
-    ("files", "main_rev", "head_rev", "ok"),
+    ("files", "base_rev", "head_rev", "ok"),
     [
         (["nemo_rl/a.py"], 1, 1, True),
         (["skills/review-pr-team/SKILL.md"], 1, 2, True),
         (["skills/review-pr-team/SKILL.md"], 1, 1, False),
         (["skills/review-pr-team/SKILL.md"], 1, 3, False),
-        # The PR that adds REVISION: main has none (0), head has 1.
+        # The PR that adds REVISION: the base has none (0), head has 1.
         (["skills/review-pr-team/REVISION"], 0, 1, True),
     ],
 )
 def test_revision_bump(
-    files: list[str], main_rev: int, head_rev: int, ok: bool
+    files: list[str], base_rev: int, head_rev: int, ok: bool
 ) -> None:
-    problem = check.revision_bump_problem(files, main_rev, head_rev)
+    problem = check.revision_bump_problem(files, base_rev, head_rev)
     assert (problem is None) is ok
     if not ok:
-        assert f"set it to {main_rev + 1}" in problem
+        assert f"set it to {base_rev + 1}" in problem
+
+
+@pytest.mark.parametrize(("head_rev", "ok"), [(3, True), (2, False), (4, False)])
+def test_main_bumps_against_base_and_checks_freshness_against_main(
+    tmp_path, monkeypatch, capsys, head_rev: int, ok: bool
+) -> None:
+    # Default branch at 5, PR base (e.g. a release branch) at 2.
+    skill = tmp_path / "skills/review-pr-team"
+    skill.mkdir(parents=True)
+    (skill / "REVISION").write_text("5\n")
+    (skill / "self-review-policy.json").write_text(json.dumps(POLICY))
+    event = tmp_path / "event.json"
+    pr = {
+        "number": 7,
+        "head": {"sha": "headsha"},
+        "base": {"sha": "basesha"},
+        "user": {"login": "alice"},
+    }
+    event.write_text(json.dumps({"pull_request": pr}))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REPO", "o/r")
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+
+    revs = {"basesha": "2", "headsha": str(head_rev)}
+
+    def fake_call(self, method, url, body=None, raw=False):
+        if url.startswith("/contents/"):
+            return revs[url.rsplit("ref=", 1)[1]]
+        if url.endswith("graphql"):
+            conn = {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": conn}}}}
+        return None  # status POST
+
+    def fake_pages(self, path):
+        if path.endswith("/files"):
+            return [{"filename": "skills/review-pr-team/SKILL.md"}]
+        return []  # reviews
+
+    seen = {}
+    real_evaluate = check.evaluate
+
+    def spy_evaluate(**kwargs):
+        seen["main_rev"] = kwargs["main_rev"]
+        return real_evaluate(**kwargs)
+
+    monkeypatch.setattr(check.GitHub, "call", fake_call)
+    monkeypatch.setattr(check.GitHub, "pages", fake_pages)
+    monkeypatch.setattr(check, "evaluate", spy_evaluate)
+
+    assert check.main() == (0 if ok else 1)
+    assert seen["main_rev"] == 5
+    if not ok:
+        assert "set it to 3 (base is 2)" in capsys.readouterr().out
 
 
 def test_threads_follow_every_page(monkeypatch) -> None:

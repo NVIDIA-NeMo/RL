@@ -126,16 +126,16 @@ def evaluate(
 
 
 def revision_bump_problem(
-    changed_files: list[str], main_rev: int, head_rev: int
+    changed_files: list[str], base_rev: int, head_rev: int
 ) -> str | None:
-    """A PR that changes the review skill must bump its REVISION by exactly one."""
+    """A PR that changes the review skill must bump its REVISION by exactly one over its base."""
     if not any(f.startswith(SKILL_DIR) for f in changed_files):
         return None
-    if head_rev == main_rev + 1:
+    if head_rev == base_rev + 1:
         return None
     return (
         f"This PR changes {SKILL_DIR} but {SKILL_DIR}REVISION is {head_rev}; "
-        f"set it to {main_rev + 1} (main is {main_rev})."
+        f"set it to {base_rev + 1} (base is {base_rev})."
     )
 
 
@@ -218,6 +218,18 @@ def _read_rev(text: str | None) -> int:
         return 0
 
 
+def _rev_at(gh: GitHub, ref: str) -> int:
+    """The skill REVISION at a commit, read as data; 0 when the file doesn't exist there."""
+    try:
+        return _read_rev(
+            gh.call("GET", f"/contents/{SKILL_DIR}REVISION?ref={ref}", raw=True)
+        )
+    except urllib.error.HTTPError as err:
+        if err.code != 404:
+            raise
+        return 0
+
+
 def main() -> int:
     gh = GitHub(os.environ["REPO"], os.environ["GITHUB_TOKEN"])
     event = json.load(open(os.environ["GITHUB_EVENT_PATH"]))
@@ -258,16 +270,11 @@ def main() -> int:
     print(f"{CONTEXT}: {state} — {description}")
 
     changed = [f["filename"] for f in gh.pages(f"/pulls/{number}/files")]
-    head_rev = 0
+    base_rev = head_rev = 0
     if any(f.startswith(SKILL_DIR) for f in changed):
-        try:
-            head_rev = _read_rev(
-                gh.call("GET", f"/contents/{SKILL_DIR}REVISION?ref={head}", raw=True)
-            )
-        except urllib.error.HTTPError as err:
-            if err.code != 404:
-                raise
-    problem = revision_bump_problem(changed, main_rev, head_rev)
+        base_rev = _rev_at(gh, pr["base"]["sha"])
+        head_rev = _rev_at(gh, head)
+    problem = revision_bump_problem(changed, base_rev, head_rev)
     if problem:
         print(f"::error title=review-pr-team REVISION::{problem}")
         return 1
