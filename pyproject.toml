@@ -74,7 +74,7 @@ dependencies = [
   "nccl-extensions==0.1.0; sys_platform != 'darwin'",
   "cuda-bindings; sys_platform != 'darwin'",          # for non-colocated refit
   # Worker venvs run a base sync before backend extras, so NIXL must be available here.
-  "nixl==1.3.1; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nixl==1.3.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "pybase64",                                                                                                 # for sglang refit
   "awscrt>=0.35.0",                                                                                           # for parallel S3 refit transport
   "multi-storage-client[boto3]>=0.50",                                                                        # for msc:// (S3) checkpoint storage; the driver's CheckpointManager runs in the base venv
