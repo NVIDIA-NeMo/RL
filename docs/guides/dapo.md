@@ -58,6 +58,7 @@ grpo:
   num_generations_per_prompt: 16  # Generations per prompt
   batch_multiplier: 3    # Dataloader batch size = batch_multiplier × num_prompts_per_step
   dynamic_sampling_max_gen_batches: 10     # Maximum number of batches to be used for accumulating non-zero std prompts
+  dynamic_sampling_reward_source: processed  # Reward the filter compares: processed or raw
   reward_scaling:
     enabled: true
     source_min: 0.0
@@ -76,6 +77,7 @@ grpo:
 - **`use_dynamic_sampling`**: When enabled, activates DAPO's dynamic sampling algorithm to filter and accumulate prompt groups with nonzero standard deviation
 - **`batch_multiplier`**: Factor that scales the initial prompt pool size for sampling.
 - **`dynamic_sampling_max_gen_batches`**: Maximum number of batches to be used for accumulating nonzero standard deviation prompts.
+- **`dynamic_sampling_reward_source`**: Which reward the filter compares within a prompt group. `processed` (default) is the reward the group trains on, after `env.nemo_gym.effort_levels` shaping, `reward_penalties` and `grpo.length_penalty`, so a group that only one of them splits is kept. `raw` is the environment's reward before all three, so that group is dropped; only the single controller supports it. Neither includes `reward_scaling` or `reward_shaping`: the filter always reads the reward from before them.
 - **`reward_scaling`**: When enabled, clamps each reward in the batch to [source_min, source_max] and linearly rescales it to [target_min, target_max]. Defaults: source_min=0.0, source_max=1.0, target_min=0.0, target_max=1.0.
 - **`reward_shaping`**: When enabled, applies the overlong penalty mechanism described in the Reward Shaping section above. Responses whose total generated assistant-turn length exceeds `max_response_length - overlong_buffer_length` receive penalties proportional to their excess length, helping to reduce reward noise and stabilize training.
 

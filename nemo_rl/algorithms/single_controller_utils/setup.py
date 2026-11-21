@@ -2771,6 +2771,12 @@ def setup_single_controller(
             else cast(GRPOConfig, algo_cfg).masked_reward_policy
         ),
         overlong_filtering=algo_cfg.overlong_filtering,
+        # A GRPO-only key. PPO cannot filter, so its reward tallies read the trained reward.
+        dynamic_sampling_reward_source=(
+            "processed"
+            if is_ppo_run(master_config)
+            else cast(GRPOConfig, algo_cfg).dynamic_sampling_reward_source
+        ),
     )
 
     # Print setup timing metrics

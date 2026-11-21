@@ -48,6 +48,7 @@ from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.experience.dynamic_sampling import voting_rewards_from_record
 from nemo_rl.experience.failures import (
     GenerationUnavailable,
     GymTerminalEpisodeFailure,
@@ -386,6 +387,7 @@ def _make_manager(
     # group-relative baseline, so every row votes -- the shape these tests assert on.
     mgr._masked_reward_policy = None
     mgr._overlong_filtering = False
+    mgr._dynamic_sampling_reward_source = "processed"
     mgr._step_rewards = {}
     return mgr
 
@@ -2980,7 +2982,10 @@ def test_receipt_raw_metrics_preserve_mask_but_defer_reward(honor_mask: bool) ->
     assert ("mask_sample" in completions[0].env_extras) is honor_mask
 
 
-def _scored_record(*rewards: float) -> PromptGroupRecord:
+def _scored_record(
+    *rewards: float, gym_rewards: list[float] | None = None
+) -> PromptGroupRecord:
+    """A group's trained ``rewards``; ``gym_rewards`` are what Gym returned for them."""
     return PromptGroupRecord(
         prompt_idx=0,
         prompt=[],
@@ -2988,9 +2993,12 @@ def _scored_record(*rewards: float) -> PromptGroupRecord:
         metadata={},
         completions=[
             SimpleNamespace(
-                reward=reward, reward_original=None, env_extras=None, truncated=False
+                reward=reward,
+                reward_original=None if gym_rewards is None else gym_rewards[index],
+                env_extras=None,
+                truncated=False,
             )
-            for reward in rewards
+            for index, reward in enumerate(rewards)
         ],
         rollout_metrics={},
     )
@@ -3038,6 +3046,39 @@ class TestStepRewardMetrics:
 
         assert outcome is RolloutOutcome.FILTERED
         assert mgr._consecutive_infra_drops == 0
+
+    @pytest.mark.parametrize(
+        ("trained", "gym", "reward_source", "outcome"),
+        [
+            # Every generation is correct and a length penalty splits them: only
+            # "processed" keeps the group and its length signal.
+            ([1.1, 0.9], [1.0, 1.0], "processed", RolloutOutcome.COMMITTED),
+            ([1.1, 0.9], [1.0, 1.0], "raw", RolloutOutcome.FILTERED),
+            # Every generation is correct and penalized alike: no signal either way.
+            ([0.9, 0.9], [1.0, 1.0], "processed", RolloutOutcome.FILTERED),
+            ([0.9, 0.9], [1.0, 1.0], "raw", RolloutOutcome.FILTERED),
+            # A reward penalty zeroed the one correct generation: only "raw" still
+            # sees the task outcomes differ.
+            ([0.0, 0.0], [0.0, 1.0], "processed", RolloutOutcome.FILTERED),
+            ([0.0, 0.0], [0.0, 1.0], "raw", RolloutOutcome.COMMITTED),
+        ],
+    )
+    def test_the_filter_decides_on_the_reward_the_source_names(
+        self, trained, gym, reward_source, outcome
+    ):
+        buf = _FakeBuffer()
+        mgr = _make_manager(
+            buf, _FakeImpl(record=_scored_record(*trained, gym_rewards=gym))
+        )
+        mgr._filter_zero_variance_groups = True
+        mgr._dynamic_sampling_reward_source = reward_source
+
+        assert _run(mgr.generate_and_push({"idx": 0}, target_step=2)) is outcome
+        assert len(buf.remove_calls) == int(outcome is RolloutOutcome.FILTERED)
+        # The metric counts the same decision the filter made.
+        assert mgr.drain_step_reward_metrics(2)["zero_variance_prompt_groups"] == float(
+            outcome is RolloutOutcome.FILTERED
+        )
 
     def test_zero_variance_is_counted_even_when_the_filter_is_off(self):
         mgr = _make_manager(
@@ -3123,3 +3164,29 @@ def test_length_penalty_runs_after_group_collection_or_is_saved_for_capture(capt
         )
         assert metrics["length_penalty/env_reward_mean"] == 1.0
         assert metrics["length_penalty/adjusted_frac"] == 1.0
+        # Both Gym rewards are 1.0, so only "processed" sees the length signal.
+        record = SimpleNamespace(completions=completions, loss_multiplier=1.0)
+        assert voting_rewards_from_record(
+            record,
+            reward_source="processed",
+            masked_reward_policy="include",
+            overlong_filtering=False,
+        ) == pytest.approx([1.1, 0.9])
+        assert voting_rewards_from_record(
+            record,
+            reward_source="raw",
+            masked_reward_policy="include",
+            overlong_filtering=False,
+        ) == [1.0, 1.0]
+        # The same group through the filter itself: an all-correct group that the
+        # real length penalty split is kept under "processed" and dropped under "raw".
+        for reward_source, outcome in (
+            ("processed", RolloutOutcome.COMMITTED),
+            ("raw", RolloutOutcome.FILTERED),
+        ):
+            group = _scored_record()
+            group.completions = completions
+            mgr = _make_manager(_FakeBuffer(), _FakeImpl(record=group))
+            mgr._filter_zero_variance_groups = True
+            mgr._dynamic_sampling_reward_source = reward_source
+            assert _run(mgr.generate_and_push({"idx": 0}, target_step=0)) is outcome

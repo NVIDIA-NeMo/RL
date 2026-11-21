@@ -58,6 +58,7 @@ from nemo_rl.algorithms.grpo import (
     _logprob_sample_mask,
     _maybe_restore_async_replay_buffer_checkpoint,
     _needs_hf_refit_handshake,
+    _raise_if_dynamic_sampling_filters_on_raw_reward,
     _raise_if_length_penalty_enabled_without_nemo_gym,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
@@ -1498,6 +1499,29 @@ def test_raise_if_reward_penalties_enabled_without_nemo_gym_allows_nemo_gym(
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=True
     )
+
+
+@pytest.mark.parametrize(
+    ("use_dynamic_sampling", "reward_source", "raises"),
+    [
+        (True, "processed", False),
+        # Inert without the filter, so nothing would be silently ignored.
+        (False, "raw", False),
+        (True, "raw", True),
+    ],
+)
+def test_raise_if_dynamic_sampling_filters_on_raw_reward(
+    mock_grpo_components, use_dynamic_sampling, reward_source, raises
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.use_dynamic_sampling = use_dynamic_sampling
+    master_config.grpo.dynamic_sampling_reward_source = reward_source
+
+    if not raises:
+        _raise_if_dynamic_sampling_filters_on_raw_reward(master_config)
+        return
+    with pytest.raises(ValueError, match="requires the single controller"):
+        _raise_if_dynamic_sampling_filters_on_raw_reward(master_config)
 
 
 def test_raise_if_length_penalty_enabled_without_nemo_gym_noops_when_unset(

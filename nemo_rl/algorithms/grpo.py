@@ -455,6 +455,12 @@ class GRPOConfig(BaseModel, extra="allow"):
     # When using dynamic sampling, the maximum number of batches to generate
     # before throwing an error
     dynamic_sampling_max_gen_batches: int = 10
+    # Which reward dynamic sampling compares within a prompt group. "processed"
+    # (default): the reward the group trains on, after effort shaping, reward
+    # penalties and length_penalty. "raw": the environment's reward, before all
+    # three; single controller only. Neither includes reward_scaling or
+    # reward_shaping.
+    dynamic_sampling_reward_source: Literal["raw", "processed"] = "processed"
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: float = 1.0
@@ -1168,6 +1174,7 @@ def setup(
     _raise_if_length_penalty_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
+    _raise_if_dynamic_sampling_filters_on_raw_reward(master_config)
     nemo_gym_actor = None
 
     def _spinup_nemo_gym(base_urls, model_name, policy_api_key=None):
@@ -2616,6 +2623,29 @@ def _raise_if_length_penalty_enabled_without_nemo_gym(
         "grpo.length_penalty requires the NeMo-Gym path "
         "(env.should_use_nemo_gym=true); it is not supported with the native "
         "generation path."
+    )
+
+
+def _raise_if_dynamic_sampling_filters_on_raw_reward(
+    master_config: MasterConfig,
+) -> None:
+    """Validate the v1 loops are not asked to filter on the environment's reward.
+
+    They read the rollout's ``total_reward``, which effort shaping, reward penalties
+    and ``grpo.length_penalty`` have already rewritten, so a ``raw`` run would
+    filter on the processed reward without any error.
+    """
+    grpo_config = master_config.grpo
+    if (
+        not grpo_config.use_dynamic_sampling
+        or grpo_config.dynamic_sampling_reward_source == "processed"
+    ):
+        return
+
+    raise ValueError(
+        "grpo.dynamic_sampling_reward_source='raw' requires the single controller: "
+        "this loop keeps only the reward after effort shaping, reward penalties and "
+        "grpo.length_penalty. Set it to 'processed'."
     )
 
 

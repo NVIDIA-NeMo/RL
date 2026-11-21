@@ -31,6 +31,10 @@ grpo:
   seed: 42
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
+  # Reward dynamic sampling compares within a group: processed (default) is the
+  # trained reward after effort shaping, reward penalties and length_penalty; raw is
+  # the environment's reward before them (single controller only).
+  dynamic_sampling_reward_source: processed
   batch_multiplier: 1
   reward_shaping:
     enabled: false

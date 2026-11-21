@@ -2108,6 +2108,7 @@ def test_pump_claims_and_pops_a_filtered_spare_for_a_real_zero_variance_rejectio
         def __init__(self) -> None:
             self._masked_reward_policy = "include"
             self._overlong_filtering = False
+            self._dynamic_sampling_reward_source = "processed"
             self.stats = SimpleNamespace(committed=0, zero_variance_groups=0)
             self.record_group_rewards = MagicMock()
             self.record_finalizer_dropped_prompt = MagicMock()

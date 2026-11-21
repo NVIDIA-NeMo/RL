@@ -55,8 +55,10 @@ class Completion:
     env_extras: Optional[dict[str, Any]]
     truncated: bool
     reward: float
-    # The environment's reward before effort shaping and reward penalties, which
-    # dynamic sampling filters on. ``None`` means nothing rewrote ``reward``.
+    # The environment's reward before effort shaping, reward penalties and
+    # ``grpo.length_penalty``, which dynamic sampling filters on under
+    # ``grpo.dynamic_sampling_reward_source: raw``. ``None`` means nothing rewrote
+    # ``reward``.
     reward_original: Optional[float] = None
 
 
