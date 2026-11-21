@@ -145,12 +145,12 @@ If you have write access to the repository (NVIDIA contributors):
 6. Create a pull request from your branch to the `main` branch.
 
 7. Run CI tests. CI tests do not run automatically when a pull request is opened.
-   - Apply a CI label based on the test suite to run.
+   - The CI label is set automatically from the changed files; only maintainers can change it. The labels mean:
       - CI:docs - Runs doctests only
       - CI:L0 - Runs doctests and unit tests
       - CI:L1 - Runs doctests, unit tests, and functional tests
       - CI:Lfast - Runs fast unit tests and functional tests only. Skips the container build.
-      - Use `CI:docs` for docs-only changes. Otherwise use `CI:Lfast` by default, including for new features and bug fixes; use `CI:L1` only for a large refactor, broad changes to core code, or dependency changes. See [docs/ci-cd.md](docs/ci-cd.md) for the full guide.
+      - The rules are in `skills/cicd/SKILL.md`. Ask a maintainer to set `CI:L1` for a large refactor or broad changes to core code. See [docs/ci-cd.md](docs/ci-cd.md) for the full guide.
    - Comment `/ok to test commit-sha`. Replace `commit-sha` with the most recent commit to test such as `/ok to test 7166bce`.
       - A bot will acknowledge the comment with a thumbs-up and begin the CI.
       - It is possible to simplify the comment to `/ok to test` without the commit-sha. However, this is only allowed if all commits are from a trusted Nvidia developer and [cryptographically signed](https://docs.github.com/en/authentication/managing-commit-signature-verification).

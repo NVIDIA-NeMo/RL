@@ -35,7 +35,7 @@ Use `git rev-parse HEAD` (not the short form) to get the full SHA.
 
 ## CI Labels
 
-Every PR **must** have exactly one `CI:*` label — the quality-check job stays red until one is attached. Labels control which test tier runs and whether a new container image is built.
+Every PR **must** have exactly one `CI:*` label — the quality-check job stays red until one is attached. A bot sets it (see below). Labels control which test tier runs and whether a new container image is built.
 
 | Label | What runs | Container |
 |-------|-----------|-----------|
@@ -48,15 +48,15 @@ Every PR **must** have exactly one `CI:*` label — the quality-check job stays 
 
 **Default on merge group / push to main**: L1.
 
-**Which label to attach when opening a PR:**
+**The label is set automatically.** The `Set CI label` workflow (`.github/scripts/ci_label.py`) picks it from the changed files on every push, first match wins:
 
-| Changed paths / nature of change | Label |
-|----------------------------------|-------|
-| Docs only (`docs/`, `*.md`, docstrings) | `CI:docs` |
-| Default, including new features and bug fixes | `CI:Lfast` |
-| (Rarely needed) | `CI:L0` |
-| Large refactor, broad changes to core code, or dependency changes | `CI:L1` |
-| (Not needed: it runs the same jobs as `CI:L1` today) | `CI:L2` |
+| Changed files | Label |
+|---------------|-------|
+| Any `pyproject.toml`, `uv.lock`, `Dockerfile*` or `3rdparty/**` | `CI:L1` |
+| Only `*.md`, `docs/**`, `skills/**`, `.github/autobot/**` or the PR template | `CI:docs` |
+| Anything else | `CI:Lfast` |
+
+Only repo maintainers (admin or maintain role) can change it, for example to `CI:L1` for a broad core change, or add `Skip CICD`. A label anyone else sets is replaced, and the bot says so in one PR comment. A maintainer's label stays until a push changes the bot's own pick. Agents: do not set or change `CI:*` labels.
 
 ---
 

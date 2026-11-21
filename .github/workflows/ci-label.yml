@@ -1,0 +1,54 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Sets the CI:* label from the changed files; only maintainers can override it.
+# pull_request_target runs the base branch's copy of this file and the script, so a PR
+# cannot change its own rules. It never checks out or runs the PR's code.
+name: Set CI label
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: ci-label-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  ci-label:
+    runs-on: ubuntu-latest
+    # Only label events for CI:* or Skip CICD matter; other labels are left alone.
+    if: >-
+      ${{
+        !contains(fromJSON('["labeled", "unlabeled"]'), github.event.action) ||
+        startsWith(github.event.label.name, 'CI:') ||
+        github.event.label.name == 'Skip CICD'
+      }}
+    steps:
+      - name: Checkout base branch scripts
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: .github/scripts
+
+      - name: Set CI label
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: python3 .github/scripts/ci_label.py
