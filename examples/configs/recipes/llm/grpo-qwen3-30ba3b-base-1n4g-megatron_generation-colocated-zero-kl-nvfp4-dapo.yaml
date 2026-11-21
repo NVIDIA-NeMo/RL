@@ -1,0 +1,137 @@
+# Qwen3-30B-A3B-Base zero train/generation KL with per-token NVFP4 routed experts on FlashInfer
+# (SwiGLU), on the DAPO-Math setup of grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken.yaml
+# (same data, lengths, dynamic sampling and optimizer), for comparison with the vLLM NVFP4 runs.
+# 1 node: training (EP4) and Megatron generation colocated on the same workers. The batch is
+# 1/4 of that run's (8 prompts, 128 samples per step).
+defaults: ../../grpo_math_qwen30ba3b_megatron.yaml
+grpo:
+  max_num_steps: 1500
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 16
+  val_at_start: true
+  val_period: 10
+  use_dynamic_sampling: true
+  batch_multiplier: 3
+  dynamic_sampling_max_gen_batches: 20
+  use_leave_one_out_baseline: false
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    max_response_length: 20480
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-1n4g-megatron_generation-colocated-zero-kl-nvfp4-dapo
+  metric_name: val:accuracy
+  keep_top_k: 3
+  save_period: 10
+  checkpoint_must_save_by: 00:04:15:00
+policy:
+  model_name: Qwen/Qwen3-30B-A3B-Base
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  max_total_sequence_length: 22528
+  make_sequence_length_divisible_by: 64
+  logprob_chunk_size: 2048
+  # grpo_math_qwen30ba3b_megatron turns packing off; without it every microbatch is one
+  # response padded to the batch's longest. logprob_mb_tokens is set explicitly because the
+  # default scales with logprob_batch_size (4) to ~90K tokens.
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${policy.max_total_sequence_length}
+    logprob_mb_tokens: ${policy.max_total_sequence_length}
+  megatron_cfg:
+    zero_train_gen_mismatch: true
+    batch_invariant_mode: true
+    batch_invariant_backend: te_native
+    batch_invariant_collective: ordered
+    attention_backend: flash
+    flash_attention_version: 4
+    moe_permute_fusion: false
+    # Training and generation share the GPUs; also empty the allocator cache after training.
+    empty_unused_memory_level: 2
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False,garbage_collection_threshold:0.8
+      CUBLASLT_WORKSPACE_SIZE: '0'
+      CUBLAS_WORKSPACE_CONFIG: :0:0
+    tensor_model_parallel_size: 1
+    expert_model_parallel_size: 4
+    moe_router_dtype: fp32
+    defer_fp32_logits: true
+    transformer_impl: inference_optimized
+    inference_grouped_gemm_backend: flashinfer
+    inference_moe_token_dispatcher_type: nvls
+    moe_training_matches_inference: true
+    inference_moe_nvfp4_recipe: per_token
+    activation_checkpointing: true
+    recompute_granularity: selective
+    recompute_modules:
+      - moe
+    te_precision_config_file: null
+    fp8_cfg:
+      enabled: false
+    optimizer:
+      use_precision_aware_optimizer: false
+      lr: 1.0e-06
+      min_lr: 1.0e-07
+      weight_decay: 0.1
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-08
+  generation:
+    backend: megatron
+    refit_transport: mcore
+    max_new_tokens: 20480
+    colocated:
+      enabled: true
+    mcore_generation_config:
+      transformer_impl: inference_optimized
+      moe_router_dtype: fp32
+      logprobs_mode: raw_logprobs
+      # Batch-invariant generation stays bitwise-exact with chunked prefill.
+      enable_chunked_prefill: true
+      enable_prefix_caching: false  # Exactness gate: keep every prefill token recomputed.
+      inference_grouped_gemm_backend: flashinfer
+      inference_moe_token_dispatcher_type: nvls
+      refit_backend: nccl
+      moe_pad_experts_for_cuda_graph_inference: false
+      fp8_cfg:
+        enabled: false
+      # FlashInfer MoE processes the full round_up(max_tokens) / TP * EP dispatcher
+      # buffer on steps where any EP rank prefills; steps where every EP rank decodes
+      # are bounded to the token capacity, which must cover max_requests * EP.
+      # ~96 rollouts land on each generation GPU.
+      max_tokens: 8192
+      max_requests: 128
+      inference_flashinfer_mxfp8_token_capacity: 512
+      buffer_size_gb: 20
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-base-1n4g-megatron_generation-colocated-zero-kl-nvfp4-dapo
+  num_val_samples_to_print: 8
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-30ba3b-base-1n4g-megatron_generation-colocated-zero-kl-nvfp4-dapo

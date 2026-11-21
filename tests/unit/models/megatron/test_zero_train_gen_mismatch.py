@@ -298,13 +298,6 @@ def test_validate_rejects_a_non_megatron_generation_backend():
     assert any("generation.backend must be 'megatron'" in v for v in result.violations)
 
 
-def test_validate_rejects_colocated_generation():
-    config = _policy_config()
-    config["generation"]["colocated"] = {"enabled": True}
-    result = _validate(config)
-    assert any("does not support colocated generation" in v for v in result.violations)
-
-
 def test_validate_rejects_missing_generation_block():
     config = _policy_config()
     del config["generation"]
@@ -491,6 +484,125 @@ def test_validate_rejects_flashinfer_grouped_gemm_with_mxfp8():
     assert any("flashinfer" in v for v in _validate(config).violations)
 
 
+def _training_matches_inference_config(precision: str) -> dict[str, Any]:
+    """FlashInfer experts on both sides, with the training forward running that kernel."""
+    config = _policy_config()
+    config["megatron_cfg"].update(
+        transformer_impl="inference_optimized",
+        inference_grouped_gemm_backend="flashinfer",
+        inference_moe_token_dispatcher_type="nvls",
+        moe_token_dispatcher_type="alltoall",
+        activation_checkpointing=True,
+        recompute_granularity="selective",
+        recompute_modules=["moe"],
+        moe_training_matches_inference=True,
+    )
+    if precision == "mxfp8":
+        config["megatron_cfg"]["fp8_cfg"] = dict(_MXFP8)
+    else:
+        config["megatron_cfg"]["inference_moe_nvfp4_recipe"] = "per_token"
+    return config
+
+
+@pytest.mark.parametrize("precision", ["mxfp8", "nvfp4"])
+def test_validate_accepts_flashinfer_with_training_matches_inference(precision):
+    assert _validate(_training_matches_inference_config(precision)).violations == []
+
+
+def test_validate_rejects_flashinfer_nvfp4_without_training_matches_inference():
+    config = _training_matches_inference_config("nvfp4")
+    config["megatron_cfg"]["moe_training_matches_inference"] = False
+    assert any(
+        "requires policy.megatron_cfg.moe_training_matches_inference=true" in v
+        for v in _validate(config).violations
+    )
+
+
+def _set_generation(config: dict[str, Any], key: str, value: Any) -> None:
+    config["generation"]["mcore_generation_config"][key] = value
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (
+            lambda c: c["megatron_cfg"].update(transformer_impl="transformer_engine"),
+            "transformer_impl='inference_optimized'",
+        ),
+        (
+            lambda c: _set_generation(c, "inference_grouped_gemm_backend", "torch"),
+            "mcore_generation_config.inference_grouped_gemm_backend='flashinfer'",
+        ),
+        (
+            lambda c: c["megatron_cfg"].update(activation_checkpointing=False),
+            "recompute_granularity='selective'",
+        ),
+        (
+            lambda c: c["megatron_cfg"].update(recompute_granularity="full"),
+            "recompute_granularity='selective'",
+        ),
+        (
+            lambda c: c["megatron_cfg"].update(recompute_modules=["core_attn"]),
+            "'moe' in recompute_modules",
+        ),
+        (
+            lambda c: c["megatron_cfg"].update(cuda_graph_impl="local"),
+            "cuda_graph_impl other than 'local'",
+        ),
+        (
+            lambda c: c["megatron_cfg"].update(moe_token_dispatcher_type="flex"),
+            "moe_token_dispatcher_type='alltoall'",
+        ),
+        (
+            lambda c: _set_generation(c, "inference_moe_nvfp4_recipe", None),
+            "inference_moe_nvfp4_recipe",
+        ),
+        (
+            lambda c: _set_generation(c, "expert_model_parallel_size", 2),
+            "expert_model_parallel_size",
+        ),
+        (
+            lambda c: c["megatron_cfg"].pop("inference_moe_nvfp4_recipe"),
+            "FlashInfer BF16 kernel is not batch invariant",
+        ),
+    ],
+)
+def test_validate_rejects_unsupported_training_matches_inference(mutate, expected):
+    config = _training_matches_inference_config("nvfp4")
+    mutate(config)
+    assert any(expected in v for v in _validate(config).violations)
+
+
+def test_generation_config_never_runs_the_training_matches_inference():
+    from nemo_rl.models.generation.megatron.config import (
+        merged_inference_megatron_cfg,
+    )
+
+    config = _training_matches_inference_config("mxfp8")
+    assert (
+        merged_inference_megatron_cfg(config)["moe_training_matches_inference"] is False
+    )
+
+
+@pytest.mark.parametrize("precision", ["mxfp8", "nvfp4"])
+def test_dedicated_generation_policy_passes_validation(precision):
+    from nemo_rl.models.generation.megatron.config import (
+        merged_inference_megatron_cfg,
+    )
+
+    config = _training_matches_inference_config(precision)
+    generation_policy = {
+        **config,
+        "megatron_cfg": merged_inference_megatron_cfg(config),
+    }
+
+    assert _validate(generation_policy, generation_only=True).violations == []
+    assert any(
+        "requires policy.megatron_cfg.moe_training_matches_inference=true" in v
+        for v in _validate(generation_policy).violations
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Package and platform gates
 # --------------------------------------------------------------------------- #
@@ -626,6 +738,10 @@ def test_enable_batch_invariant_kernels_passes_the_recipe_settings(monkeypatch):
     shimmed: list[bool] = []
     monkeypatch.setattr(
         zgm, "_use_full_vocab_log_softmax", lambda: shimmed.append(True)
+    )
+    tuned: list[bool] = []
+    monkeypatch.setattr(
+        zgm, "_enable_mcore_deterministic_tuning", lambda: tuned.append(True)
     )
     tuned: list[bool] = []
     monkeypatch.setattr(
