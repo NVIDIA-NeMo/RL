@@ -61,6 +61,7 @@ from nemo_rl.experience.interfaces import (
     Completion,
     PromptGroupRecord,
 )
+from nemo_rl.experience.mask_sample_rules import parse_mask_sample_rules
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     AsyncRolloutImpl,
@@ -1013,6 +1014,35 @@ def test_rollout_manager_forwards_log_full_result_tables():
     assert manager._impl._log_full_result_tables is True
 
 
+def test_rollout_manager_forwards_mask_sample_rules():
+    common = {
+        "tokenizer": None,
+        "task_to_env": {},
+        "num_generations_per_prompt": 1,
+        "max_seq_len": 1,
+        "rollout_recovery_config": RolloutRecoveryConfig(),
+        "generation_config": {
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        },
+        "use_nemo_gym": True,
+    }
+    rules = parse_mask_sample_rules(
+        {"mask_sample_rules": [{"field": "evaluation_completed", "equals": False}]}
+    )
+
+    assert RolloutManager(**common)._impl._mask_sample_rules == ()
+    manager = RolloutManager(**common, mask_sample_rules=rules)
+    assert manager._impl._mask_sample_rules == rules
+    # The controller drains the step totals through the manager.
+    manager._impl._results_to_completions(
+        [{"message_log": [], "full_result": {"reward": 1.0}}], record_rule_hits=True
+    )
+    assert manager.pop_mask_rule_metrics()["mask_rules/rollouts_seen"] == 1.0
+    assert manager.pop_mask_rule_metrics() == {}
+
+
 @pytest.mark.parametrize("backend,accepted", [("vllm", True), ("megatron", False)])
 def test_nemo_gym_rollout_accepts_top_k_only_with_vllm(backend, accepted):
     """NeMo-Gym requests leave top_k unset; only NeMo-RL's vLLM server pins it."""
@@ -1042,6 +1072,7 @@ def _nemo_gym_impl(
     reward_penalty_config=None,
     *,
     log_full_result_tables=False,
+    mask_sample_rules=(),
 ):
     return AsyncNemoGymRolloutImpl(
         tokenizer=None,
@@ -1058,6 +1089,7 @@ def _nemo_gym_impl(
             "top_k": None,
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
+        mask_sample_rules=mask_sample_rules,
         log_full_result_tables=log_full_result_tables,
         reward_penalty_config=reward_penalty_config,
     )
@@ -1135,7 +1167,7 @@ def test_gate_off_keeps_the_mask_flag_in_the_per_agent_metrics():
     still holds, not the completions."""
     impl = _nemo_gym_impl(False)
     result = _mask_gate_result()
-    completions, _ = impl._results_to_completions([result])
+    completions, _, _ = impl._results_to_completions([result])
     assert "mask_sample" not in completions[0].env_extras
     # The caller's result is untouched by the gate.
     assert result["full_result"]["mask_sample"] is True
@@ -1144,6 +1176,41 @@ def test_gate_off_keeps_the_mask_flag_in_the_per_agent_metrics():
         completions, "agent", full_results=[result["full_result"]]
     )
     assert metrics["agent/mask_sample/mean"] == 1.0
+
+
+def test_mask_sample_rules_survive_gate_and_count_group_hits_once():
+    """Rules apply after the env-flag gate, and only the group conversion records hits."""
+    rules = parse_mask_sample_rules(
+        {
+            "mask_sample_rules": [
+                {
+                    "name": "eval_incomplete",
+                    "field": "evaluation_completed",
+                    "equals": False,
+                }
+            ]
+        }
+    )
+    # Gate off: the environment's own mask_sample flags are dropped.
+    impl = _nemo_gym_impl(False, mask_sample_rules=rules)
+    flagged, clean = _mask_gate_result(), _mask_gate_result()
+    flagged["full_result"]["evaluation_completed"] = False
+    clean["full_result"]["evaluation_completed"] = True
+
+    # The streamed per-row conversion masks the row but records nothing.
+    (row,), _, _ = impl._results_to_completions([flagged])
+    assert row.env_extras["instance_config"]["mask_sample"] is True
+    assert impl.pop_mask_rule_metrics() == {}
+
+    completions, _, _ = impl._results_to_completions(
+        [flagged, clean], record_rule_hits=True
+    )
+    assert completions[0].env_extras["instance_config"]["mask_sample"] is True
+    assert "mask_sample" not in completions[1].env_extras["instance_config"]
+    metrics = impl.pop_mask_rule_metrics()
+    assert metrics["mask_rules/rollouts_seen"] == 2.0
+    assert metrics["mask_rules/eval_incomplete_count"] == 1.0
+    assert impl.pop_mask_rule_metrics() == {}
 
 
 def _mask_gate_receipt_result():
@@ -1471,7 +1538,7 @@ def test_nemo_gym_reward_penalties_match_legacy_rewards_counts_and_metrics(
     result = _reward_penalty_result(output, assistant_overrides, assistant_tokens)
     result["reward_original"] = 1.0
 
-    completions, penalty_counts = impl._results_to_completions([result])
+    completions, penalty_counts, _ = impl._results_to_completions([result])
 
     assert completions[0].reward == 0.0
     # Dynamic sampling still sees the reward the penalty overwrote.
@@ -2916,7 +2983,7 @@ def test_capture_completion_preserves_checks_and_raw_reward_until_finalization()
         "input_message_log": [],
         "full_result": {"reward": -2.0, "response": {"output": []}},
     }
-    completions, counts = impl._results_to_completions([result])
+    completions, counts, _ = impl._results_to_completions([result])
     assert completions[0].reward == -2.0
     assert completions[0].env_extras["ng_reward_checks"] == checks
     assert sum(counts.values()) == 0
@@ -2968,7 +3035,7 @@ def test_capture_manager_seals_checks_and_forwards_them_to_reassembly(
 def test_receipt_raw_metrics_preserve_mask_but_defer_reward(honor_mask: bool) -> None:
     impl = _nemo_gym_impl(honor_mask)
     result = _mask_gate_receipt_result()
-    completions, _ = impl._results_to_completions([result])
+    completions, _, _ = impl._results_to_completions([result])
     metrics = impl._compute_rollout_metrics(
         completions, "agent", full_results=[result["full_result"]]
     )
