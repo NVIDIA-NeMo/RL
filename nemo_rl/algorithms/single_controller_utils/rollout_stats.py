@@ -52,6 +52,10 @@ on. The ``groups/*`` block is computed over the rows the estimator's
 baseline/std saw instead (``baseline_mask``), which ``grpo.masked_reward_policy``
 selects: under ``include`` (the default) masked rows with a nonzero dataset
 weight vote too.
+
+Statistics are per physical row, so these metrics are not emitted under Forest
+training (``token_capture.forest_training``), where a row is one segment of a
+rollout or execution padding.
 """
 
 from __future__ import annotations

@@ -167,6 +167,8 @@ Per-step metrics, logged under `train/`:
 - `masking/*`: why rows were masked (placeholder, env flag, truncated, sequence-logprob error), trained vs masked vs baseline rows, and the mean reward of each population.
 - Rollout distributions: `gen_tokens/*`, `turns/*`, `seq_len/*`, `groups/*`, `reward/{std,pass_frac}` and `truncated_frac`.
 
+`masking/*` and the rollout distributions are counted per physical row, so they are not emitted under Forest training (`token_capture.forest_training`).
+
 ## Checkpointing and Replay Recovery
 
 With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:

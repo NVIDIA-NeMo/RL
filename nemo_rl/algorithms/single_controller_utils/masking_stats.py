@@ -42,6 +42,10 @@ placeholder rows are reported but do not dilute the fractions.
   step and the fraction left with fewer than two trained rows. Under
   ``grpo.masked_reward_policy: exclude`` those groups get no gradient; under
   ``include`` a lone trained row can still be scored against masked siblings.
+
+Counts are per physical row, so these metrics are not emitted under Forest
+training (``token_capture.forest_training``), where a row is one segment of a
+rollout or execution padding.
 """
 
 from __future__ import annotations

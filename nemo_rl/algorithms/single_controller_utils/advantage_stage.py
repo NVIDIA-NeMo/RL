@@ -947,6 +947,6 @@ class AdvantageComputer:
             opd_gap_sum=opd_gap_sum,
             train_data_dump_s=train_data_dump_s,
             train_data_dump_receipt=train_data_dump_receipt,
-            masking_stats=stats_accumulator_to_rpc(masking_stats),
-            rollout_stats=stats_accumulator_to_rpc(rollout_stats),
+            masking_stats=None if logical else stats_accumulator_to_rpc(masking_stats),
+            rollout_stats=None if logical else stats_accumulator_to_rpc(rollout_stats),
         )
