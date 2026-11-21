@@ -36,7 +36,7 @@ run_test() {
 # Dynamo overlays: native SingleController tests rerun with policy.generation.dynamo=true.
 # Each keeps the native test's checks and adds check_dynamo_overlay.sh's.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh ++policy.generation.dynamo=true
-run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true ++policy.generation.dynamo=true
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true ++policy.generation.dynamo=true ++policy.generation.dynamo_cfg.frontend_args.num_frontends=2
 # Gym's default mode: token arrays come back in the reply's nvext.nemo_rl.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++policy.generation.dynamo=true
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_reload_refit.sh ++policy.generation.dynamo=true

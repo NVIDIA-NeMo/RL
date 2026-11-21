@@ -145,6 +145,9 @@ class _FakeCluster:
     def get_placement_groups(self):
         return [self.placement_group]
 
+    def get_node_ids(self):
+        return list(dict.fromkeys(self.placement_group.bundle_nodes))
+
     def shutdown(self):
         self.log.append(f"cluster {self.name} down")
         return True
@@ -366,10 +369,12 @@ class _FakeRuntime:
         self.waits: list[Any] = []
         self.namespace = "ns"
         self.engine_env = {"ETCD_ENDPOINTS": "http://etcd:2379"}
-        self.frontend_url = "http://10.0.0.1:3000/v1"
+        self.frontend_urls = ["http://10.0.0.1:1313/v1", "http://10.0.0.2:1313/v1"]
+        self.frontend_node_ids: list[str] | None = None
         env.runtimes.append(self)
 
-    def start(self):
+    def start(self, *, frontend_node_ids):
+        self.frontend_node_ids = list(frontend_node_ids)
         self.log.append("runtime up")
 
     def wait_for_engines(self, expected_components, check_engines):
@@ -592,8 +597,13 @@ def test_builds_one_cluster_and_engine_per_role(env):
     assert env.log == expected_log + ["runtime up"] and env.endpoints == []
     assert env.runtime.frontend_python == "/venvs/mcore/bin/python"
     assert env.runtime.model_name == "Qwen/Qwen3-0.6B"
+    # Frontends go on the engines' nodes, never the parent cluster's.
+    assert env.runtime.frontend_node_ids == list(dict.fromkeys(env.nodes[:3]))
     assert generation._dynamo_namespace == "ns"
-    assert generation.dp_openai_server_base_urls == ["http://10.0.0.1:3000/v1"]
+    assert generation.dp_openai_server_base_urls == [
+        "http://10.0.0.1:1313/v1",
+        "http://10.0.0.2:1313/v1",
+    ]
 
     cluster = env.clusters[0]
     assert cluster.kwargs == {
@@ -1273,7 +1283,10 @@ def test_pickled_copy_awaits_the_frontend_over_http(env, monkeypatch):
     generation = env.started()
     clone = pickle.loads(pickle.dumps(generation))
     assert clone._dynamo_runtime is None
-    assert clone.dp_openai_server_base_urls == ["http://10.0.0.1:3000/v1"]
+    assert clone.dp_openai_server_base_urls == [
+        "http://10.0.0.1:1313/v1",
+        "http://10.0.0.2:1313/v1",
+    ]
     with pytest.raises(RuntimeError, match="copy .* owns no engines"):
         clone.engine_python()
     # The copy owns nothing: shutdown stops no engine and no service.
@@ -1293,7 +1306,7 @@ def test_pickled_copy_awaits_the_frontend_over_http(env, monkeypatch):
     assert [e.name for e in env.endpoints] == _IDS
     assert waits == [
         {
-            "frontend_url": "http://10.0.0.1:3000/v1",
+            "frontend_urls": ("http://10.0.0.1:1313/v1", "http://10.0.0.2:1313/v1"),
             "namespace": "ns",
             "expected_components": {"prefill": 1, "backend": 2},
             "model_name": "Qwen/Qwen3-0.6B",

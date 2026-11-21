@@ -396,6 +396,23 @@ def test_dynamo_frontend_args_without_router_reset_states_pass():
     check_outdated_config(_dynamo_frontend_config({"router_mode": "kv"}))
 
 
+# ============================================================================
+# reject_outdated_dynamo_router_mode
+# ============================================================================
+
+
+def test_dynamo_power_of_two_router_is_rejected():
+    with pytest.raises(
+        ValueError, match=r"router_mode='power-of-two' was removed.*least-loaded"
+    ):
+        check_outdated_config(_dynamo_frontend_config({"router_mode": "power-of-two"}))
+
+
+@pytest.mark.parametrize("frontend_args", [{"router_mode": "least-loaded"}, {}])
+def test_dynamo_router_modes_that_still_exist_pass(frontend_args):
+    check_outdated_config(_dynamo_frontend_config(frontend_args))
+
+
 @pytest.mark.parametrize(
     "generation",
     [
