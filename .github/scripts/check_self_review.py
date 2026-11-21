@@ -176,30 +176,39 @@ class GitHub:
 
     def threads(self, number: int) -> list[Thread]:
         owner, name = self.repo.split("/")
-        query = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){
-          pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved
-          comments(first:1){totalCount nodes{pullRequestReview{databaseId}}}}}}}}"""
-        data = self.call(
-            "POST",
-            "https://api.github.com/graphql",
-            {
-                "query": query,
-                "variables": {"owner": owner, "name": name, "number": number},
-            },
-        )
-        nodes = data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
-        out = []
-        for n in nodes:
-            first = n["comments"]["nodes"]
-            review = (first[0].get("pullRequestReview") or {}) if first else {}
-            out.append(
-                Thread(
-                    n["isResolved"],
-                    n["comments"]["totalCount"],
-                    review.get("databaseId"),
-                )
+        query = """query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+          repository(owner:$owner,name:$name){pullRequest(number:$number){
+          reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor}
+          nodes{isResolved comments(first:1){totalCount nodes{pullRequestReview{databaseId}}}}}}}}"""
+        out, cursor = [], None
+        while True:
+            data = self.call(
+                "POST",
+                "https://api.github.com/graphql",
+                {
+                    "query": query,
+                    "variables": {
+                        "owner": owner,
+                        "name": name,
+                        "number": number,
+                        "cursor": cursor,
+                    },
+                },
             )
-        return out
+            conn = data["data"]["repository"]["pullRequest"]["reviewThreads"]
+            for n in conn["nodes"]:
+                first = n["comments"]["nodes"]
+                review = (first[0].get("pullRequestReview") or {}) if first else {}
+                out.append(
+                    Thread(
+                        n["isResolved"],
+                        n["comments"]["totalCount"],
+                        review.get("databaseId"),
+                    )
+                )
+            if not conn["pageInfo"]["hasNextPage"]:
+                return out
+            cursor = conn["pageInfo"]["endCursor"]
 
 
 def _read_rev(text: str | None) -> int:

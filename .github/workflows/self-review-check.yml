@@ -36,7 +36,8 @@ permissions:
   statuses: write
 
 concurrency:
-  group: self-review-${{ github.event.pull_request.number }}
+  # Fork review events get a read-only token; their own group keeps them from cancelling a run that can post.
+  group: self-review-${{ github.event.pull_request.number }}-${{ github.event_name != 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository }}
   cancel-in-progress: true
 
 jobs:

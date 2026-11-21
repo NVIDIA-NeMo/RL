@@ -166,3 +166,45 @@ def test_revision_bump(
     assert (problem is None) is ok
     if not ok:
         assert f"set it to {main_rev + 1}" in problem
+
+
+def test_threads_follow_every_page(monkeypatch) -> None:
+    def page(nodes, next_cursor):
+        conn = {
+            "pageInfo": {
+                "hasNextPage": next_cursor is not None,
+                "endCursor": next_cursor,
+            },
+            "nodes": nodes,
+        }
+        return {"data": {"repository": {"pullRequest": {"reviewThreads": conn}}}}
+
+    def node(resolved, count, review_id):
+        return {
+            "isResolved": resolved,
+            "comments": {
+                "totalCount": count,
+                "nodes": [{"pullRequestReview": {"databaseId": review_id}}],
+            },
+        }
+
+    # 100 threads from another review, then one open thread from the self-review.
+    pages = {
+        None: page([node(True, 2, 99)] * 100, "c1"),
+        "c1": page([node(False, 1, 1)], None),
+    }
+    cursors = []
+
+    def fake_call(method, url, body=None, raw=False):
+        cursors.append(body["variables"]["cursor"])
+        return pages[cursors[-1]]
+
+    gh = check.GitHub("o/r", "t")
+    monkeypatch.setattr(gh, "call", fake_call)
+    threads = gh.threads(7)
+    assert cursors == [None, "c1"]
+    assert len(threads) == 101
+    assert run([SELF], threads) == (
+        "failure",
+        "Not resolved: 1 of 1 threads open or unanswered",
+    )
