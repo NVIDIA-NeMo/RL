@@ -23,13 +23,11 @@ Review a pull request using a coordinated team of specialized agents.
 
 **Repo**: `NVIDIA-NeMo/RL`
 
-**Requires (both harnesses)**: the GitHub CLI `gh`, logged in with access to `NVIDIA-NeMo/RL`. The workflow and `scripts/review_identity.py` call it directly. If `gh auth status` fails, stop and ask the user to install `gh` and run `gh auth login`.
-
 **Requires (Claude Code)**: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` must be set — agent teams (teammate spawning, shared task list, `SendMessage`) are an experimental Claude Code feature.
 
 **Sandbox (Claude Code)**: Always pass `dangerouslyDisableSandbox: true` on every Bash tool call in this skill. The sandbox's bubblewrap (bwrap) container fails to initialize in worktree/container environments with `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`, breaking ALL commands — not just network-dependent ones like `gh`. Do NOT attempt any Bash call in sandbox mode first; it will fail and waste a round-trip.
 
-**Codex**: invoke as `$review-pr-team <pr-number>`. Read [Codex runtime](runtime/codex.md) before Phase 0; it maps the tool names used below (`Agent`, `TaskCreate`, `TaskList`, `TaskUpdate`, `SendMessage`, `AskUserQuestion`) to Codex operations. Codex needs `gh` too. The Claude Code requirement and sandbox setting above do not apply in Codex. Claude Code follows the remaining workflow as written. Codex applies the runtime adapter to its execution and dispatched prompts; review criteria remain shared.
+**Codex**: invoke as `$review-pr-team <pr-number>`. Read [Codex runtime](runtime/codex.md) before Phase 0; it maps the tool names used below (`Agent`, `TaskCreate`, `TaskList`, `TaskUpdate`, `SendMessage`, `AskUserQuestion`) to Codex operations and covers GitHub access without `gh`. The Claude Code requirement and sandbox setting above do not apply in Codex. Claude Code follows the remaining workflow as written. Codex applies the runtime adapter to its execution and dispatched prompts; review criteria remain shared.
 
 ---
 
@@ -45,7 +43,7 @@ If invalid, ask the user for a valid PR number.
 
 ### 0.1 Preflight: who is reviewing (MANDATORY, before anything else)
 
-Run this skill's own copy of the identity script (the one next to this file, never another copy):
+Run this skill's own copy of the identity script (the one next to this file, never another copy). This script needs the GitHub CLI `gh`, logged in, in both Claude Code and Codex. In Codex it is the only step that does; the rest can use the HTTP path in [Codex runtime](runtime/codex.md). If `gh` is missing, the script says so and exits; ask the user to install `gh` and run `gh auth login`.
 
 ```bash
 python3 <this skill's directory>/scripts/review_identity.py preflight --pr $PRNUM

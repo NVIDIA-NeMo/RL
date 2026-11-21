@@ -23,7 +23,7 @@ REVISION file next to this copy of the skill.
     review_identity.py footer --pr N --head SHA     # the review-body footer: visible line + hidden marker
 
 Standard library only, and runs on the older system `python3` some harnesses use (e.g. Codex).
-Needs the GitHub CLI `gh`, logged in, to read the PR.
+Needs the GitHub CLI `gh`, logged in, to read the PR, even in Codex sessions that use HTTP elsewhere.
 """
 
 from __future__ import annotations
@@ -311,7 +311,7 @@ def _gh(*args: str) -> str:
         ).stdout
     except FileNotFoundError:
         sys.exit(
-            "review-pr-team needs the GitHub CLI `gh`. Install it and run `gh auth login`."
+            "The review-pr-team preflight needs the GitHub CLI `gh`. Install it and run `gh auth login`."
         )
 
 
