@@ -15,10 +15,10 @@
 
 set -euo pipefail
 REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-EXP_DIR="${REPO_ROOT}/tests/functional/gdpo_gym_single_controller"
-mkdir -m 755 -p "${EXP_DIR}"
-RUN_DIR=$(mktemp -d "${EXP_DIR}/run-XXXXXX")
-chmod 755 "${RUN_DIR}"
+RUN_DIR="${REPO_ROOT}/tests/functional/gdpo_gym_single_controller"
+SC_ENTRYPOINT=${SC_TEST_ENTRYPOINT:-${REPO_ROOT}/examples/run_grpo_single_controller.py}
+rm -rf "${RUN_DIR}"
+mkdir -m 755 -p "${RUN_DIR}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 cd "${REPO_ROOT}"
 
@@ -34,7 +34,7 @@ for _ in $(seq 1 60); do
     cat "${RUN_DIR}/validation.jsonl"
 done > "${RUN_DIR}/train.jsonl"
 
-uv run python "${REPO_ROOT}/examples/run_grpo_single_controller.py" \
+uv run python "${SC_ENTRYPOINT}" \
     --config "${REPO_ROOT}/examples/nemo_gym/gdpo_example_tool_call_multireward.yaml" \
     policy.model_name=Qwen/Qwen2.5-1.5B-Instruct \
     policy.automodel_cfg.enabled=false \
@@ -69,6 +69,10 @@ uv run python "${REPO_ROOT}/examples/run_grpo_single_controller.py" \
     ++async_rl.max_inflight_prompts=2 ++async_rl.max_buffered_rollouts=2 \
     "$@" 2>&1 | tee "${RUN_DIR}/run.log"
 
+# A recovery test runs this script once per process and checks the metrics itself.
+if [[ "${RUN_CONVERGENCE_CHECKS:-1}" != "1" ]]; then
+    exit 0
+fi
 uv run "${REPO_ROOT}/tests/json_dump_tb_logs.py" "${RUN_DIR}/logs" \
     --output_path "${RUN_DIR}/metrics.json"
 EXTRA_CHECKS=()
