@@ -36,9 +36,16 @@ environment would, so everything downstream is unchanged: the finalizer's
 ``mask_sample`` column, the advantage stage's ``final_sample_mask`` and
 ``train/num_mask_sample_filtered``; ``grpo.masked_reward_policy`` decides
 whether the row's reward still votes in its group baseline. A missing
-field never matches. Per-group match rates are logged as
-``mask_rules/<name>_rate`` (with ``mask_rules/<name>_reward_mean`` and
-``mask_rules/any_rate``).
+field never matches.
+
+Two metric families are logged under ``train/mask_rules/``:
+
+* per group, averaged over the groups trained in the step:
+  ``<name>_rate`` and ``any_rate``;
+* per step, over every rollout generated since the previous step, including
+  groups that are filtered or retried: ``<name>_count``, ``<name>_frac``,
+  ``any_count``, ``any_frac`` and ``rollouts_seen``, plus ``<name>_reward_mean``,
+  the mean reward of the rollouts the rule matched.
 
 The rules run after the ``env.should_mask_flagged_samples`` gate: that gate
 drops the environment's own (possibly too coarse) flags, while these rules

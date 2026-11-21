@@ -1095,9 +1095,8 @@ class AsyncNemoGymRolloutImpl:
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._mask_sample_rules = tuple(mask_sample_rules)
-        # Step-level rule hits, drained by pop_mask_rule_metrics() once per
-        # training step (the per-group rollout_metrics do not reach the
-        # controller's logger on the token-capture path).
+        # Rule hits since the last pop_mask_rule_metrics(). Unlike the per-group
+        # rollout_metrics, these also count groups that are filtered or retried.
         self._mask_rule_step_counts: dict[str, int] = {}
         self._mask_rule_step_reward_sums: dict[str, float] = {}
         self._mask_rule_step_any = 0

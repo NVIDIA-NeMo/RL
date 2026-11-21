@@ -163,7 +163,9 @@ A masked row never contributes a gradient. `grpo.masked_reward_policy` decides w
 
 Per-step metrics, logged under `train/`:
 
-- `mask_rules/*`: per-rule `<name>_count`, `<name>_frac` and `<name>_reward_mean`, plus `any_count` / `any_frac` and `rollouts_seen`.
+- `mask_rules/*`, two families:
+  - Per group, averaged over the groups trained in the step: `<name>_rate` and `any_rate`.
+  - Per step, over every rollout generated since the previous step, including groups that are filtered or retried: `<name>_count`, `<name>_frac`, `any_count`, `any_frac` and `rollouts_seen`, plus `<name>_reward_mean`, the mean reward of the rollouts the rule matched.
 - `masking/*`: why rows were masked (placeholder, env flag, truncated, sequence-logprob error), trained vs masked vs baseline rows, and the mean reward of each population.
 - Rollout distributions: `gen_tokens/*`, `turns/*`, `seq_len/*`, `groups/*`, `reward/{std,pass_frac}` and `truncated_frac`.
 
