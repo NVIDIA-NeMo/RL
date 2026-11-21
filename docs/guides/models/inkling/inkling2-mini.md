@@ -24,8 +24,8 @@ this branch.
 
 | Stage | Evidence |
 | --- | --- |
-| Functionally ready | 3-step smoke test on 1 node; full 24-layer training, dummy-load first refit, timed checkpoint save, and optimizer resume across five 2 h allocation windows. |
-| Reference training completed | 88 GRPO steps and 8 AIME evaluations with SGLang BF16 sync on 2 GB200 nodes. |
+| Functionally ready | 3-step smoke test on 1 node; full 24-layer training, dummy-load first refit, timed checkpoint save, and optimizer resume across six 2 h allocation windows. |
+| Reference training completed | 106 GRPO steps and 10 AIME evaluations with SGLang BF16 sync on 2 GB200 nodes. |
 | Broader convergence validation | Multiple seeds, longer runs, other hardware, and a controlled comparison with Inkling 2 Small are not established by these results. |
 
 The experiment began from the original weights and continued across four 2 h
@@ -137,7 +137,7 @@ logged a separate run (named `…mini-1n4g…`, from before the recipe was renam
 
 | Experiment | W&B runs (in order) |
 | --- | --- |
-| Inkling 2 Mini, SGLang BF16, sync | [`o9a09uon`](https://wandb.ai/nvidia/GRPO%20Inkling/runs/o9a09uon) (1–18), [`mzbiffl5`](https://wandb.ai/nvidia/GRPO%20Inkling/runs/mzbiffl5) (19–35), [`ut8wcjr4`](https://wandb.ai/nvidia/GRPO%20Inkling/runs/ut8wcjr4) (36–52), [`ylcel63d`](https://wandb.ai/nvidia/GRPO%20Inkling/runs/ylcel63d) (53–70), [`d3yyqxn5`](https://wandb.ai/nvidia/GRPO%20Inkling/runs/d3yyqxn5) (71–88) |
+| Inkling 2 Mini, SGLang BF16, sync | [`o9a09uon`](https://wandb.ai/nvidia/GRPO%20Inkling/runs/o9a09uon) (1–18), [`mzbiffl5`](https://wandb.ai/nvidia/GRPO%20Inkling/runs/mzbiffl5) (19–35), [`ut8wcjr4`](https://wandb.ai/nvidia/GRPO%20Inkling/runs/ut8wcjr4) (36–52), [`ylcel63d`](https://wandb.ai/nvidia/GRPO%20Inkling/runs/ylcel63d) (53–70), [`d3yyqxn5`](https://wandb.ai/nvidia/GRPO%20Inkling/runs/d3yyqxn5) (71–88), [`1y5hd4k1`](https://wandb.ai/nvidia/GRPO%20Inkling/runs/1y5hd4k1) (89–106) |
 
 The Small SGLang BF16 sync runs are listed in the
 [Small guide](inkling2-small.md#reference-results). The figure overlays Mini on
@@ -153,18 +153,19 @@ dashed: Inkling 2 Mini.**
 | AIME 2024 accuracy, step 20 | 78.91% | 33.20% |
 | AIME 2024 accuracy, step 40 | 78.91% | 41.41% |
 | AIME 2024 accuracy, step 70 (Small's last evaluation) | **83.20%** | 61.33% |
-| AIME 2024 accuracy, step 80 (Mini's last evaluation) | not run | **64.06%** |
+| AIME 2024 accuracy, step 80 | not run | 64.06% |
+| AIME 2024 accuracy, step 100 (Mini's last evaluation) | not run | **64.84%** |
 | AIME mean response length, step 70 | 1,664 tokens | 2,234 tokens |
-| Training reward, mean of last 10 steps | 0.868 | 0.733 |
-| Training truncation, step 1 → mean of last 10 steps | 39.45% → 6.4% | 60.55% → 20.9% |
+| Training reward, mean of last 10 steps | 0.868 | 0.732 |
+| Training truncation, step 1 → mean of last 10 steps | 39.45% → 6.4% | 60.55% → 21.6% |
 | Generation KL, median | 0.0011 | 0.0009 |
-| Step time, median (including validation steps) | 224 s on 128 GPUs | 311 s on 8 GPUs |
+| Step time, median (including validation steps) | 224 s on 128 GPUs | 310 s on 8 GPUs |
 
-Mini starts well below Small and keeps improving through step 88: its AIME
-accuracy rises from 29% at step 10 to 61% at step 70 and 64% at step 80, still
-climbing but more slowly after step 70, while Small plateaus near 79–83% after step 20. Mini's responses
+Mini starts well below Small and keeps improving through step 106: its AIME
+accuracy rises from 29% at step 10 to 61% at step 70, then flattens near 64–65%
+at steps 80–100, while Small plateaus near 79–83% after step 20. Mini's responses
 start longer and truncate more often (61% of step-1 responses hit the
-3,072-token limit, 21% in the last 10 steps), so a larger share of its early
+3,072-token limit, 22% in the last 10 steps), so a larger share of its early
 reward signal is lost to truncation. With a 0/1 math-verify reward, training reward equals
 training accuracy on the sampled prompts.
 
@@ -182,8 +183,8 @@ How to read the comparison:
   discrepancy, not a reference-policy KL loss. Mini's stays below 0.0013
   throughout.
 - **Policy KL** uses a logarithmic axis and keeps its outliers. Mini has large
-  spikes at steps 5 (about 10⁴), 6, 9 (about 10³), and 62 (about 2), and a
-  smaller one at step 18 (0.26); Small has one at step 10. After the early
+  spikes at steps 5 (about 10⁴), 6, 9 (about 10³), and 62 (about 2), and
+  smaller ones at steps 18 (0.26) and 103 (0.09); Small has one at step 10. After the early
   spikes Mini's policy KL settles near 10⁻³. The cause of the spikes has not been
   isolated, and training reward and AIME accuracy kept improving through them.
 - **Step time** is measured on different GPU counts; it is reported for
