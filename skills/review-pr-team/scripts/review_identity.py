@@ -23,7 +23,7 @@ REVISION file next to this copy of the skill.
     review_identity.py footer --pr N --head SHA     # the review-body footer: visible line + hidden marker
 
 Standard library only, and runs on the older system `python3` some harnesses use (e.g. Codex).
-`gh` is used to read the PR.
+Needs the GitHub CLI `gh`, logged in, to read the PR.
 """
 
 from __future__ import annotations
@@ -303,9 +303,14 @@ def same_session_evidence(
 
 
 def _gh(*args: str) -> str:
-    return subprocess.run(
-        ["gh", *args], check=True, capture_output=True, text=True
-    ).stdout
+    try:
+        return subprocess.run(
+            ["gh", *args], check=True, capture_output=True, text=True
+        ).stdout
+    except FileNotFoundError:
+        sys.exit(
+            "review-pr-team needs the GitHub CLI `gh`. Install it and run `gh auth login`."
+        )
 
 
 def _pr(pr: int) -> dict:

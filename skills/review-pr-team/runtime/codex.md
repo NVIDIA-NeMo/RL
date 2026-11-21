@@ -101,22 +101,11 @@ The shared workflow's exception allowing continuation after a failed DA nudge do
 
 ## GitHub transport
 
-Discover installed GitHub tools first and prefer them when they provide the needed read/write operation. Otherwise check for `gh`. The shared `gh` examples are conveniences, not a dependency. Without `gh`, use an authenticated HTTP client such as Python `urllib.request` or `curl` against `https://api.github.com`:
+`review-pr-team` needs the GitHub CLI `gh`, logged in with access to `NVIDIA-NeMo/RL`; the shared phases and `scripts/review_identity.py` call it directly. Run `gh auth status` before Phase 0.1. If `gh` is missing or not logged in, stop and ask the user to install it and run `gh auth login`. Installed GitHub connector tools may be used alongside `gh`, but they do not replace it.
 
-| Shared example | HTTP equivalent |
-| --- | --- |
-| `gh pr view N` | `GET /repos/NVIDIA-NeMo/RL/pulls/N`; map `base.ref`, `base.sha`, `head.ref`, `head.sha`, `user.login`, and body/title |
-| PR changed files | Paginated `GET /repos/NVIDIA-NeMo/RL/pulls/N/files` |
-| PR commits | Paginated `GET /repos/NVIDIA-NeMo/RL/pulls/N/commits` |
-| PR diff | `GET /repos/NVIDIA-NeMo/RL/pulls/N` with `Accept: application/vnd.github.diff`, or local merge-base/head diff |
-| PR conversation/reviews | Paginated `GET /repos/NVIDIA-NeMo/RL/issues/N/comments`, `/pulls/N/reviews`, and `/pulls/N/comments` under the repo |
-| Linked issue | `GET /repos/NVIDIA-NeMo/RL/issues/N` plus its paginated comments |
-| `gh api PATH --method POST --input payload.json` | `POST /PATH` with the same JSON body |
-| `gh api graphql --input payload.json` | `POST /graphql` with the same query/variables JSON |
+Use GraphQL (`gh api graphql`) to obtain `mergeable`/`mergeStateStatus`, review requests, full review threads, and pending-review comment counts as required by the shared phases. Follow pagination (`--paginate`); do not silently review only the first page. Never print credentials. Generate request bodies with `json.dump` and pass them with `--input`; do not expand markdown or credentials through shell interpolation. Use a unique temporary directory for the review rather than shared `/tmp/q.json` filenames.
 
-Use GraphQL to obtain `mergeable`/`mergeStateStatus`, review requests, full review threads, and pending-review comment counts as required by the shared phases. Follow pagination; do not silently review only the first page. Use the current checkout's credential setup in the same shell, without printing credentials. Generate request bodies with `json.dump` and submit files/structured arguments; do not expand markdown or credentials through shell interpolation. Use a unique temporary directory for the review rather than shared `/tmp/q.json` filenames.
-
-The approval gates apply equally to connectors and HTTP clients: the review request authorizes reading, not posting messages. Show the reviewed draft before creating a pending review, then get separate explicit approval before publishing. Do not overwrite an existing user-owned pending review to make room for yours.
+The approval gates apply equally to `gh` and connectors: the review request authorizes reading, not posting messages. Show the reviewed draft before creating a pending review, then get separate explicit approval before publishing. Do not overwrite an existing user-owned pending review to make room for yours.
 
 ## Teardown
 

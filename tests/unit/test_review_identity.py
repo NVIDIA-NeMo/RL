@@ -324,6 +324,15 @@ def test_footer_cli_requires_reviewed_head(
     assert f"head={live} -->" in out
 
 
+def test_missing_gh_stops_with_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_gh(*args, **kwargs):
+        raise FileNotFoundError("gh")
+
+    monkeypatch.setattr(rid.subprocess, "run", no_gh)
+    with pytest.raises(SystemExit, match="needs the GitHub CLI `gh`"):
+        rid.main(["preflight", "--pr", "1"])
+
+
 def test_footer_marker() -> None:
     ident = rid.Identity("claude-code", "2.1.330", "claude-opus-5-5", "medium", None)
     out = rid.footer(ident=ident, kind="self", head="67e151b702a9ff81")
