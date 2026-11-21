@@ -57,6 +57,7 @@ from nemo_rl.data.packing.shared_prefix.row_metadata import (
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
+    AGENT_NAME_TAG,
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
@@ -417,8 +418,12 @@ class RolloutReassembler:
         tokenizer: Any = None,
         thinking_tags: Sequence[str] | None = None,
         top_logprobs: int = 0,
+        stamp_agent_names: bool = False,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
+        # grpo.agent_overrides: stamp each published row's tag with its group's
+        # NeMo-Gym agent so the advantage stage can apply per-agent settings.
+        self._stamp_agent_names = bool(stamp_agent_names)
         self._length_penalty_config = length_penalty_config
         # Decodes generations for the malformed-think-tag string check.
         self._tokenizer = tokenizer
@@ -1145,10 +1150,16 @@ class RolloutReassembler:
             else list(range(len(rows))),
             log_contexts,
         )
+        slot_agent_names = (
+            [c.agent_name if c is not None else None for c in log_contexts]
+            if self._stamp_agent_names
+            else None
+        )
         finalized = self._publish_rows(
             group_id,
             rows,
             rollout_ids,
+            slot_agent_names=slot_agent_names,
             mask_sample=mask_sample,
             fallback_weight_version=fallback_weight_version,
             prompt_idx=prompt_idx,
@@ -1225,6 +1236,7 @@ class RolloutReassembler:
         rows: list[FinalizedRollout],
         rollout_ids: list[str],
         *,
+        slot_agent_names: Optional[list[Optional[str]]] = None,
         mask_sample: list[bool],
         fallback_weight_version: int,
         prompt_idx: int,
@@ -1472,6 +1484,20 @@ class RolloutReassembler:
                 raise ValueError("Forest publication IDs differ from the cleanup plan")
             for tag, owner_tag in zip(tags, logical.tags, strict=True):
                 tag.update(owner_tag)
+        if slot_agent_names is not None:
+            # grpo.agent_overrides: each row's tag names its rollout's agent
+            # (Forest rows by logical slot). Rows without one, e.g. execution
+            # padding, take the group's agent: a prompt group has one agent.
+            group_agent = next((name for name in slot_agent_names if name), None)
+            for index, tag in enumerate(tags):
+                slot = tag.get("logical_slot") if logical is not None else index
+                name = (
+                    slot_agent_names[slot]
+                    if slot is not None and 0 <= slot < len(slot_agent_names)
+                    else None
+                ) or group_agent
+                if name is not None:
+                    tag[AGENT_NAME_TAG] = name
         _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
         _put_t0 = time.perf_counter()
         self._call_dp(

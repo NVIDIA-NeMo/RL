@@ -313,6 +313,57 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
 
 
+def test_finalize_group_stamps_agent_names_for_agent_overrides(tq_client, partitions):
+    """grpo.agent_overrides: every published row's tag names its rollout's agent."""
+    group_id = "grp_agent_tags"
+    rollout_ids = [f"{group_id}_g{i}" for i in range(3)]
+    receipts = []
+    for rollout_id in rollout_ids:
+        receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_id)
+        receipt["capture_key"] = rollout_id
+        receipts.append(receipt)
+    contexts = [
+        RewardLogContext("rubric_judge_agent", None),
+        None,
+        RewardLogContext("rubric_judge_agent", None),
+    ]
+    finalized = _finalizer(tq_client, stamp_agent_names=True).finalize_group(
+        group_id,
+        rollout_ids,
+        receipts,
+        [1.0, 0.0, 1.0],
+        mask_sample=[False, False, False],
+        fallback_weight_version=9,
+        prompt_idx=3,
+        reward_log_contexts=contexts,
+    )
+    # The row without a context takes its group's agent.
+    assert [tag["agent_name"] for tag in finalized.meta.tags] == [
+        "rubric_judge_agent"
+    ] * 3
+
+
+def test_finalize_group_does_not_stamp_agent_names_by_default(tq_client, partitions):
+    group_id = "grp_no_agent_tags"
+    rollout_ids = [f"{group_id}_g{i}" for i in range(2)]
+    receipts = []
+    for rollout_id in rollout_ids:
+        receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_id)
+        receipt["capture_key"] = rollout_id
+        receipts.append(receipt)
+    finalized = _finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        receipts,
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=9,
+        prompt_idx=3,
+        reward_log_contexts=[RewardLogContext("rubric_judge_agent", None)] * 2,
+    )
+    assert all("agent_name" not in tag for tag in finalized.meta.tags)
+
+
 def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):
     group_id = "grp_unset"
     receipt, expected = _stage_fixture(
