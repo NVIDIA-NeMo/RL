@@ -742,11 +742,19 @@ class TrtllmGeneration(GenerationInterface):
         if self._disagg_cfg.enabled:
             return self._start_disagg_servers()
         if not self.cfg["trtllm_cfg"].get("expose_http_server"):
-            return [cast(Optional[str], None)] * self.dp_size
+            # Empty rather than one None per DP rank: with no server running there is
+            # no per-rank slot to hold open, and the length said otherwise.
+            return []
         futures = self._run_on_engines(
             "report_dp_openai_server_base_url",
         )
-        return ray.get(futures)
+        results = ray.get(futures)
+        # All-or-nothing, like the guarded branch above: expose_http_server is one
+        # config value for every worker. Collapsing the whole list rather than
+        # filtering keeps one entry per DP shard for anything that reads it by index.
+        if not any(results):
+            return []
+        return results
 
     def _report_device_id(self) -> list[list[str]]:
         futures = self._run_on_engines(
