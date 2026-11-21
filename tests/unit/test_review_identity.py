@@ -370,6 +370,160 @@ def test_same_session_reads_subagent_transcripts(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (
+            {"cmd": "git commit -s -m fix", "workdir": "/repo"},
+            ["ran git commit/push in this repo"],
+        ),
+        (
+            {"command": ["bash", "-lc", "git push"], "workdir": "/repo/sub"},
+            ["ran git commit/push in this repo"],
+        ),
+        ({"cmd": "git commit -m x", "workdir": "/repo-copy"}, []),
+        (
+            {
+                "cmd": "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: nemo_rl/a.py\n"
+                "+Run git commit\n*** End Patch\nEOF"
+            },
+            ["edited nemo_rl/a.py"],
+        ),
+    ],
+)
+def test_same_session_codex_function_call(
+    tmp_path: Path, arguments: dict, expected: list[str]
+) -> None:
+    transcript = _write(
+        tmp_path / "t.jsonl",
+        [
+            {"type": "turn_context", "payload": {"cwd": "/repo"}},
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": json.dumps(arguments),
+                },
+            },
+        ],
+    )
+    assert rid.same_session_evidence(transcript, ["nemo_rl/a.py"], "/repo") == expected
+
+
+@pytest.mark.parametrize("override", ["custom", "", None])
+def test_detect_uses_configured_session_roots(
+    tmp_path: Path, override: str | None
+) -> None:
+    root = tmp_path / "custom" if override == "custom" else None
+    claude_root = root or tmp_path / ".claude"
+    codex_root = root or tmp_path / ".codex"
+    _write(
+        claude_root / "projects/-repo/sid1.jsonl",
+        [{"type": "assistant", "message": {"model": "claude-opus-5-5"}}],
+    )
+    _write(
+        codex_root / "sessions/2026/11/21/rollout-x-cid.jsonl",
+        [
+            {
+                "type": "turn_context",
+                "payload": {"model": "gpt-6-astra", "effort": "high"},
+            }
+        ],
+    )
+    claude_env = {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "sid1"}
+    codex_env = {"CODEX_SESSION_ID": "cid"}
+    if override is not None:
+        value = str(root) if root else ""
+        claude_env["CLAUDE_CONFIG_DIR"] = value
+        codex_env["CODEX_HOME"] = value
+    assert rid.detect(claude_env, tmp_path).model == "claude-opus-5-5"
+    assert rid.detect(codex_env, tmp_path).model == "gpt-6-astra"
+
+
+def _preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    reviewer: str,
+    model: str,
+    rows: list[dict] | None,
+) -> int:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    rid.subprocess.run(["git", "init", "--quiet", str(repo_root)], check=True)
+    monkeypatch.chdir(repo_root)
+    transcript = None if rows is None else _write(tmp_path / "session.jsonl", rows)
+    monkeypatch.setattr(
+        rid,
+        "_pr",
+        lambda _: {
+            "author": {"login": "author"},
+            "headRefOid": "a" * 40,
+            "files": [{"path": "nemo_rl/a.py"}],
+        },
+    )
+    monkeypatch.setattr(rid, "_gh", lambda *args: reviewer)
+    monkeypatch.setattr(
+        rid,
+        "detect",
+        lambda: rid.Identity("claude-code", "v", model, "high", transcript),
+    )
+    return rid.main(["preflight", "--pr", "1"])
+
+
+@pytest.mark.parametrize(
+    ("reviewer", "model", "edited", "expected"),
+    [
+        ("author", "claude-opus-5-5", False, 0),
+        ("author", "claude-sonnet-5-5", False, 3),
+        ("expert", "claude-sonnet-5-5", False, 0),
+        ("author", "claude-opus-5-5", True, 2),
+        ("expert", "claude-opus-5-5", True, 2),
+    ],
+)
+def test_preflight_exit_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reviewer: str,
+    model: str,
+    edited: bool,
+    expected: int,
+) -> None:
+    repo = str((tmp_path / "repo").resolve())
+    rows = [
+        {
+            "type": "assistant",
+            "cwd": repo,
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Edit" if edited else "Read",
+                        "input": {"file_path": repo + "/nemo_rl/a.py"},
+                    }
+                ]
+            },
+        }
+    ]
+    got = _preflight(tmp_path, monkeypatch, reviewer=reviewer, model=model, rows=rows)
+    assert got == expected
+
+
+def test_preflight_warns_without_session_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    got = _preflight(
+        tmp_path, monkeypatch, reviewer="expert", model="unknown", rows=None
+    )
+    out = capsys.readouterr().out
+    assert got == 0
+    assert "WARNING: no session log found" in out
+    assert "\nOK\n" not in out
+
+
 def test_missing_gh_stops_with_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
     def no_gh(*args, **kwargs):
         raise FileNotFoundError("gh")
