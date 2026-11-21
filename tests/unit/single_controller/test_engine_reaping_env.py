@@ -139,7 +139,9 @@ class TestTheClusterLauncher:
         ]
         # Command lines only; the surrounding comments talk about `ray start` too.
         starts = [
-            i for i, line in enumerate(lines) if line.strip().startswith("ray start")
+            i
+            for i, line in enumerate(lines)
+            if line.strip().startswith(("ray start", "\\${CC_RAY_BIN:-ray} start"))
         ]
         assert exports, (
             f"ray.sub does not export {FLAG}. The raylet reads it at its own startup, "
