@@ -1014,6 +1014,35 @@ def test_rollout_manager_forwards_log_full_result_tables():
     assert manager._impl._log_full_result_tables is True
 
 
+def test_rollout_manager_forwards_mask_sample_rules():
+    common = {
+        "tokenizer": None,
+        "task_to_env": {},
+        "num_generations_per_prompt": 1,
+        "max_seq_len": 1,
+        "rollout_recovery_config": RolloutRecoveryConfig(),
+        "generation_config": {
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        },
+        "use_nemo_gym": True,
+    }
+    rules = parse_mask_sample_rules(
+        {"mask_sample_rules": [{"field": "evaluation_completed", "equals": False}]}
+    )
+
+    assert RolloutManager(**common)._impl._mask_sample_rules == ()
+    manager = RolloutManager(**common, mask_sample_rules=rules)
+    assert manager._impl._mask_sample_rules == rules
+    # The controller drains the step totals through the manager.
+    manager._impl._results_to_completions(
+        [{"message_log": [], "full_result": {"reward": 1.0}}], record_rule_hits=True
+    )
+    assert manager.pop_mask_rule_metrics()["mask_rules/rollouts_seen"] == 1.0
+    assert manager.pop_mask_rule_metrics() == {}
+
+
 @pytest.mark.parametrize("backend,accepted", [("vllm", True), ("megatron", False)])
 def test_nemo_gym_rollout_accepts_top_k_only_with_vllm(backend, accepted):
     """NeMo-Gym requests leave top_k unset; only NeMo-RL's vLLM server pins it."""

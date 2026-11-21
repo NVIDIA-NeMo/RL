@@ -77,6 +77,10 @@ def test_matching_is_type_strict_and_missing_fields_never_match():
     assert matching_rules({"evaluation_completed": 0}, rules) == []
     assert matching_rules({"evaluation_completed": ""}, rules) == []
     assert matching_rules({"evaluation_completed": None}, rules) == []
+    # ...and `equals: 0` must not match False.
+    zero = parse_mask_sample_rules({"mask_sample_rules": [{"field": "n", "equals": 0}]})
+    assert matching_rules({"n": False}, zero) == []
+    assert matching_rules({"n": 0}, zero) == ["n"]
     # Absent fields are not a match.
     assert matching_rules({"reward": 1.0}, rules) == []
     # Dotted paths descend into nested mappings.

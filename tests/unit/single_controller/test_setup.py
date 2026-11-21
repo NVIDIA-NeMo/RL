@@ -99,6 +99,7 @@ from nemo_rl.data_plane.schema import (
 from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.nemo_gym import validate_dataset_agent_coverage
+from nemo_rl.experience.mask_sample_rules import MaskSampleRule
 from nemo_rl.experience.rollout_recovery import RecoveryTargetLevel
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.interfaces import SamplerReplayConfig
@@ -2204,6 +2205,40 @@ class TestSetup:
         _, call_kwargs = mock_rollout_manager.call_args
         assert call_kwargs["effort_config"] == EffortLevelsConfig(
             low_weight=1.0, low_penalty=2.0, low_ub=500, low_string="<budget>"
+        )
+
+    def test_mask_sample_rules_reach_the_rollout_manager(self, patched_factories):
+        """env.mask_sample_rules is parsed into RolloutManager's kwarg."""
+        mc = _make_master_config(
+            env={
+                "mask_sample_rules": [
+                    {"field": "evaluation_completed", "equals": False}
+                ]
+            }
+        )
+
+        mc.policy["generation"]["model_name"] = "test-model"
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "RolloutManager") as mock_rollout_manager,
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        _, call_kwargs = mock_rollout_manager.call_args
+        assert call_kwargs["mask_sample_rules"] == (
+            MaskSampleRule(
+                name="evaluation_completed",
+                field="evaluation_completed",
+                equals=False,
+            ),
         )
 
     @pytest.mark.parametrize(
