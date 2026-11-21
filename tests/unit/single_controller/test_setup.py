@@ -52,6 +52,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     WindowedSamplerConfig,
 )
 from nemo_rl.algorithms.grpo import (
+    AgentOverrideConfig,
     GRPOConfig,
     GRPOSaveState,
     RewardPenaltyConfig,
@@ -1191,6 +1192,18 @@ class TestSetup:
         )
 
         with pytest.raises(ValueError, match="requires token_capture.enabled=true"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_agent_overrides_require_token_capture(self):
+        """Without token capture no row is tagged, so the overrides would be ignored."""
+        mc = _make_master_config()
+        mc.grpo.agent_overrides = {
+            "rubric_judge_agent": AgentOverrideConfig(normalize_rewards=False)
+        }
+
+        with pytest.raises(
+            ValueError, match="grpo.agent_overrides requires token_capture.enabled=true"
+        ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_periodic_checkpointing_requires_replay_capable_sampler(self):
@@ -3224,6 +3237,41 @@ class TestSetup:
         assert setup_kwargs["prefix_write_max_rows"] == 17
         assert setup_kwargs["prefix_write_max_tokens"] == 4096
         assert setup_kwargs["prefix_read_max_rows"] == 5
+
+    @pytest.mark.parametrize("with_overrides", [False, True])
+    def test_finalizers_stamp_agent_names_only_with_agent_overrides(
+        self, patched_factories, with_overrides: bool
+    ):
+        """grpo.agent_overrides turns on the finalizers' per-row agent tag."""
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.token_capture.enabled = True
+        mc.env = {"should_use_nemo_gym": True, "nemo_gym": {"effort_levels": None}}
+        if with_overrides:
+            mc.grpo.agent_overrides = {
+                "rubric_judge_agent": AgentOverrideConfig(overlong_filtering=True)
+            }
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with (
+            _patched_gym_token_capture([MagicMock(name="finalizer")]) as (
+                _,
+                mock_create_finalizer_actors,
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        (_, actor_config), _ = mock_create_finalizer_actors.call_args
+        assert actor_config.stamp_agent_names is with_overrides
 
     def test_dynamo_token_capture_tells_gym_to_speak_dynamo(self, patched_factories):
         """The same vLLM workers stage the calls; Gym reaches them through the frontend."""
