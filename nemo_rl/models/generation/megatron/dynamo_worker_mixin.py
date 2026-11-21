@@ -14,6 +14,7 @@
 """Worker-side hooks for a Megatron engine served through Dynamo."""
 
 import asyncio
+import dataclasses
 import logging
 import os
 import uuid
@@ -362,8 +363,11 @@ class MegatronDynamoGenerationMixin:
             # Megatron-LM's adapter, serving NeMo-Gym's chat calls too: they
             # are staged here, on the rank that holds the capture stager.
             engine = NemoRLMegatronLLMEngine(config, registration_model, host=self)
-            worker_config = NemoRLMegatronLLMEngine.worker_config(
-                config, registration_model
+            # This is NeMo RL's process: Dynamo's setup would replace its root
+            # handler and level.
+            worker_config = dataclasses.replace(
+                NemoRLMegatronLLMEngine.worker_config(config, registration_model),
+                configure_logging=False,
             )
             # Dynamo's Worker installs SIGTERM/SIGINT handlers in this actor
             # process and, on those signals, shuts the adapter down its own way

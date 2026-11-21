@@ -46,7 +46,6 @@ import asyncio
 import base64
 import importlib
 import logging
-import os
 import threading
 import time
 import uuid
@@ -54,13 +53,12 @@ from collections.abc import Callable, Coroutine, Mapping
 from typing import Any, AsyncGenerator, Optional, Protocol, TypedDict
 
 from dynamo.llm import PythonAsyncEngine
-from dynamo.llm.exceptions import HttpError, InvalidArgument
+from dynamo.llm.exceptions import HttpError, InvalidArgument, RoutedEngineError
 
 from nemo_rl.models.generation.dynamo.engine_adapter import weight_free_model_path
 from nemo_rl.models.generation.dynamo.managed_runtime import (
-    RAY_ADDRESS_ENV,
-    RENDER_WORKERS_ENV,
     RUNTIME_DATA_KEY,
+    ChatProcessorOptions,
     read_chat_capture,
     read_chat_settings,
 )
@@ -137,7 +135,7 @@ class GymEngineReply(TypedDict, total=False):
 _DYNAMO_ONLY_FIELDS = {"nvext", "chat_template_args", "unsupported_fields"}
 
 # The package each backend's ChatBackend lives in, by the backend name the
-# frontend is launched with (managed_runtime.CHAT_BACKEND_ENV).
+# frontend is launched with (ChatProcessorOptions.chat_backend).
 _CHAT_BACKEND_MODULES = {
     "vllm": "nemo_rl.models.generation.dynamo.vllm.chat_backend",
     "megatron": "nemo_rl.models.generation.dynamo.megatron.chat_backend",
@@ -227,21 +225,35 @@ def load_chat_backend(name: str) -> ChatBackend:
     return importlib.import_module(_CHAT_BACKEND_MODULES[name]).CHAT_BACKEND
 
 
-def _capture_refusal_ack(extras: GymCallExtras) -> str:
-    """Gym's acknowledgement that a capture call was refused before it ran.
+def _refusal_error(
+    context: Any,
+    extras: GymCallExtras,
+    *,
+    status: int,
+    message: str,
+    acknowledge: bool,
+) -> Exception:
+    """The error that answers a refused call as the native server does.
 
-    The native route sends it as a header; Dynamo's frontend forwards only an
-    error's status and message, so it ends the message instead.
+    A 400 carries ``message``. Dynamo answers any other status with the status's
+    standard text and only logs ``message``. With ``acknowledge``, Gym is told
+    its capture call was refused before it ran, in the native route's header.
     """
-    if extras.ng_capture is None or extras.ng_measure:
-        # Native's /tokenize never acknowledges a measure call.
-        return ""
-    # Deferred: Gym is installed wherever a call carries ng_capture.
-    from nemo_gym.token_id_capture.external_capture import (
-        dynamo_capture_refusal_suffix,
-    )
+    # Native's /tokenize never acknowledges a measure call.
+    if acknowledge and extras.ng_capture is not None and not extras.ng_measure:
+        # Deferred: Gym is installed wherever a call carries ng_capture.
+        from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER
 
-    return dynamo_capture_refusal_suffix(extras.ng_capture["model_call_id"])
+        if not context.set_response_header(
+            CAPTURE_REFUSAL_HEADER, extras.ng_capture["model_call_id"]
+        ):
+            LOGGER.warning(
+                "The frontend could not carry %s for a refused capture call",
+                CAPTURE_REFUSAL_HEADER,
+            )
+    if status == 400:
+        return InvalidArgument(message)
+    return HttpError(status, message)
 
 
 # Free-form JSON the client wrote (a tool's parameters, a response_format
@@ -275,7 +287,8 @@ class _CaptureSource:
     for the frontend: capture starts after the engines register.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, options: ChatProcessorOptions) -> None:
+        self._options = options
         self._prefix_cache: Any = None
         # Calls run resolve_prefix on several threads at once; connect once.
         self._connect_lock = threading.Lock()
@@ -296,21 +309,20 @@ class _CaptureSource:
                     )
         return resolve_admission_prefix(serving_admission, self._prefix_cache)
 
-    @staticmethod
-    def _connect() -> Any:
+    def _connect(self) -> Any:
         import ray
 
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache, TQTokenSource
 
-        capture = read_chat_capture()
+        capture = read_chat_capture(self._options.capture_file)
         if capture is None:
             raise RuntimeError(
                 "a token-capture call reached the Dynamo frontend before token "
                 "capture was set up for it"
             )
         if not ray.is_initialized():
-            ray.init(address=os.environ[RAY_ADDRESS_ENV], log_to_driver=False)
+            ray.init(address=self._options.ray_address, log_to_driver=False)
         client = build_data_plane_client(
             capture["data_plane"], bootstrap=False, segment_size=0
         )
@@ -396,15 +408,14 @@ class NemoRLChatEngine:
             (request.get("nvext") or {}).get("annotations") or ()
         )
         if extras is None:
-            raise HttpError(
-                400,
+            raise InvalidArgument(
                 "NeMo RL's Dynamo frontend serves NeMo-Gym's calls (the "
                 "nemo_rl:gym: annotation) on chat; NeMo RL's own rollouts use "
-                "/v1/completions.",
+                "/v1/completions."
             )
         try:
             chunk = await self._serve(request, extras, context)
-        except HttpError:
+        except (HttpError, InvalidArgument, RoutedEngineError):
             raise
         except Exception as error:
             # The steps before the engine refuse a call with these, as
@@ -412,8 +423,13 @@ class NemoRLChatEngine:
             failure = self._backend.error_reply(error)
             if failure is None:
                 raise
-            ack = _capture_refusal_ack(extras) if failure.acknowledge else ""
-            raise HttpError(failure.status, failure.message + ack) from error
+            raise _refusal_error(
+                context,
+                extras,
+                status=failure.status,
+                message=failure.message,
+                acknowledge=failure.acknowledge,
+            ) from error
         yield chunk
 
     async def _serve(
@@ -490,8 +506,13 @@ class NemoRLChatEngine:
         steps.mark("engine")
         if (refusal := engine_data.get("refusal")) is not None:
             # The engine refused the call before it ran, with the native status.
-            ack = _capture_refusal_ack(extras) if refusal["acknowledge"] else ""
-            raise HttpError(refusal["status"], refusal["message"] + ack)
+            raise _refusal_error(
+                context,
+                extras,
+                status=refusal["status"],
+                message=refusal["message"],
+                acknowledge=refusal["acknowledge"],
+            )
         result = GymCallResult.model_validate(engine_data["result"])
         reply_request = rendered.request
         if result.ng_commit_coords is not None:
@@ -528,11 +549,12 @@ class NemoRLChatEngine:
                 data = item.data()
                 if data and data.get("engine_data"):
                     engine_data = data["engine_data"]
+        except RoutedEngineError:
+            # An engine that is gone or overloaded: the status its error maps to.
+            raise
         except (ValueError, InvalidArgument) as error:
-            # Dynamo raises an engine's error as a ValueError, or from 1.7 the
-            # engine adapter's InvalidArgument as itself (not a ValueError), and
-            # would answer either with 400. The engine sends every status it means
-            # as a refusal, so anything raised is an engine failure: 500, as natively.
+            # Dynamo would answer either with 400, but the engine sends every status
+            # it means as a refusal: this is an engine failure, 500 as natively.
             raise HttpError(500, str(error)) from error
         if engine_data is None:
             raise HttpError(500, "the engine returned no result for this call")
@@ -593,10 +615,11 @@ class ChatEngineFactory:
     engines register the same ``policy.generation``.
     """
 
-    def __init__(self, backend: str) -> None:
-        """Serve the chat calls of the generation backend named ``backend``."""
-        self._backend = load_chat_backend(backend)
-        self._capture = _CaptureSource()
+    def __init__(self, options: ChatProcessorOptions) -> None:
+        """Serve the chat calls of the generation backend ``options`` names."""
+        self._options = options
+        self._backend = load_chat_backend(options.chat_backend)
+        self._capture = _CaptureSource(options)
         # The workers started at launch and the settings they were built from
         # (None until those arrive), until a registration takes them.
         self._early_pool: Optional[RenderPool] = None
@@ -604,13 +627,14 @@ class ChatEngineFactory:
         # Held here: the event loop keeps only a weak reference to its tasks.
         self._tasks: list[asyncio.Task[None]] = []
 
-    def start_render_workers(self) -> None:
+    def start_render_workers(self, chat_settings_file: str) -> None:
         """Start the render workers before any engine registers.
 
-        Call it on the frontend's loop, in a run that serves chat.
+        Call it on the frontend's loop, in a run that serves chat. The workers
+        are built from the settings the driver writes to ``chat_settings_file``.
         """
         self._early_pool = self._new_pool(start=True)
-        self._run(self._build_early_pool(self._early_pool))
+        self._run(self._build_early_pool(self._early_pool, chat_settings_file))
 
     def _run(self, work: Coroutine[Any, Any, None]) -> None:
         task = asyncio.get_running_loop().create_task(work)
@@ -619,23 +643,23 @@ class ChatEngineFactory:
 
     def _new_pool(self, *, start: bool) -> RenderPool:
         pool = RenderPool(
-            workers=int(os.environ[RENDER_WORKERS_ENV]),
-            renderer=self._backend.renderer,
+            workers=self._options.render_workers, renderer=self._backend.renderer
         )
         if start:
             self._run(_start_chat_workers(pool, self._backend))
         return pool
 
-    async def _build_early_pool(self, pool: RenderPool) -> None:
+    async def _build_early_pool(
+        self, pool: RenderPool, chat_settings_file: str
+    ) -> None:
         """Build ``pool`` from the settings an engine sends before it loads."""
         launched = time.monotonic()
-        while (runtime_data := read_chat_settings()) is None:
+        while (runtime_data := read_chat_settings(chat_settings_file)) is None:
             if self._early_pool is not pool:
                 return
             await asyncio.sleep(0.2)
         spec = runtime_data[RUNTIME_DATA_KEY]
-        # The directory an engine registers from; registration brings Dynamo's
-        # copy of the same files.
+        # The model's config and tokenizer files; registration brings Dynamo's copy.
         model_dir = await weight_free_model_path(spec["generation"]["model_name"])
         if self._early_pool is not pool:
             # The engines registered meanwhile, and their settings built it.
@@ -715,3 +739,17 @@ class ChatEngineFactory:
             backend=self._backend,
         )
         return PythonAsyncEngine(engine.generate, asyncio.get_running_loop())
+
+
+def provider(config: Any, options: dict[str, Any]) -> Any:
+    """Dynamo's custom chat processor provider: NeMo RL's ``chat_engine_factory``.
+
+    The frontend calls it once, on its event loop, with its own configuration and
+    the ``--dyn-chat-processor-config`` the managed runtime launched it with.
+    """
+    del config
+    chat_options = ChatProcessorOptions(**options)
+    factory = ChatEngineFactory(chat_options)
+    if chat_options.chat_settings_file is not None:
+        factory.start_render_workers(chat_options.chat_settings_file)
+    return factory.chat_engine_factory

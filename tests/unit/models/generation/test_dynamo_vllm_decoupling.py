@@ -43,9 +43,6 @@ DYNAMO_SDK_MODULES = {
     # Megatron engines resolve their model files through it; it reaches only
     # dynamo._core, dynamo.llm and dynamo.common.snapshot, never dynamo.vllm.
     "dynamo.common.model_fetch",
-    # The frontend's entrypoint and chat-engine hook; the frontend loads Dynamo's
-    # own vLLM chat processor only for --dyn-chat-processor, which NeMo RL rejects.
-    "dynamo.frontend.main",
     "dynamo.llm",
     "dynamo.llm.exceptions",
 }
@@ -113,12 +110,11 @@ def test_nemo_rl_imports_only_dynamos_backend_sdk() -> None:
 def test_the_shared_dynamo_side_imports_no_generation_backend() -> None:
     modules = _backend_neutral_modules()
     assert "models/generation/dynamo/engine_adapter.py" in modules
-    # The chat engine, its render pool, the frontend and the cut fan-out serve
-    # every backend; each backend's part is loaded by name.
+    # The chat engine, its render pool and the cut route serve every backend;
+    # each backend's part is loaded by name.
     assert {
         "models/generation/dynamo/chat_engine.py",
         "models/generation/dynamo/render_pool.py",
-        "models/generation/dynamo/frontend.py",
         "models/generation/dynamo/generation_cut.py",
     } <= set(modules)
     backends = {

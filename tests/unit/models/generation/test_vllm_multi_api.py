@@ -211,7 +211,10 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             connection = Mock()
             lifecycle.attach_mock(connection.send, "send")
             connection.recv.side_effect = [
-                ("capture", ({"impl": "transfer_queue"}, "stage", True, 4)),
+                (
+                    "capture",
+                    ({"impl": "transfer_queue"}, "stage", True, 4, 256, 4_194_304, 1),
+                ),
                 ("version", (10,)),
                 ("progress", ()),
                 ("snapshot", ()),
@@ -281,6 +284,9 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                 "stage",
                 capture_media=True,
                 top_logprobs=4,
+                prefix_write_max_rows=256,
+                prefix_write_max_tokens=4_194_304,
+                prefix_read_max_rows=1,
             )
             hosts[0].set_rollout_weight_version.assert_awaited_once_with(10)
             hosts[0].captured_call_progress.assert_awaited_once_with()
@@ -294,6 +300,9 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                         "stage",
                         capture_media=True,
                         top_logprobs=4,
+                        prefix_write_max_rows=256,
+                        prefix_write_max_tokens=4_194_304,
+                        prefix_read_max_rows=1,
                     )
                 ),
             )

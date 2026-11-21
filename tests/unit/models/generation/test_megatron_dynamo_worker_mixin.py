@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import dataclasses
 import sys
 import threading
 import types
@@ -27,6 +28,16 @@ from nemo_rl.models.generation.megatron.dynamo_worker_mixin import (
     require_megatron_dynamo_integration,
 )
 from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
+
+
+@dataclasses.dataclass
+class _WorkerConfig:
+    """Stands in for Dynamo's ``WorkerConfig`` dataclass."""
+
+    role: str
+    model_name: str | None
+    configure_logging: bool = True
+
 
 pytestmark = pytest.mark.mcore
 
@@ -227,7 +238,7 @@ def dynamo_endpoint_env(monkeypatch):
 
         @staticmethod
         def worker_config(config, registration_model=None):
-            return ("worker-config", config.role, registration_model)
+            return _WorkerConfig(config.role, registration_model)
 
     class Worker:
         def __init__(self, engine, config):
@@ -444,10 +455,9 @@ def test_dynamo_endpoint_registers_the_model_with_the_adapter(
     assert engine.host is env.worker
     (dynamo_worker,) = env.records.workers
     assert dynamo_worker.engine is engine
-    assert dynamo_worker.config == (
-        "worker-config",
-        "prefill",
-        engine.registration_model,
+    # Dynamo leaves NeMo RL's logging alone.
+    assert dynamo_worker.config == _WorkerConfig(
+        "prefill", engine.registration_model, configure_logging=False
     )
 
 

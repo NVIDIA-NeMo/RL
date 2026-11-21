@@ -43,6 +43,7 @@ import multiprocessing
 import os
 import shutil
 import tempfile
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -155,8 +156,28 @@ def _wait_for_settings(path: str) -> tuple[dict[str, Any], str]:
     return settings["spec"], settings["model_dir"]
 
 
+def _exit_with_the_frontend() -> None:
+    """End this worker once the frontend that started it is gone.
+
+    A worker waiting for a job never sees the frontend die, because the workers
+    hold the write end of the job queue themselves. A frontend that is killed
+    outright (Ray kills a dead actor's frontend with SIGKILL, which reaches only
+    its main process) would otherwise leave every worker running.
+    """
+    frontend = multiprocessing.parent_process()
+    if frontend is None:
+        return
+
+    def wait() -> None:
+        frontend.join()
+        os._exit(1)
+
+    threading.Thread(target=wait, name="nrl-frontend-watch", daemon=True).start()
+
+
 def _init_worker(settings_path: str, renderer: str) -> None:
     global _WORKER
+    _exit_with_the_frontend()
     worker_cls = _renderer_class(renderer)
     # Before the wait, so that only the build is left once the settings arrive.
     worker_cls.prepare_process()

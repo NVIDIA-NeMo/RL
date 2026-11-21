@@ -120,6 +120,7 @@ def test_dynamo_cfg_defaults_and_rejects_unknown_keys() -> None:
     # The managed runtime reads these for every backend's frontend.
     assert cfg.frontend_args.render_workers == 8
     assert cfg.frontend_args.session_affinity_ttl_secs is None
+    assert cfg.frontend_args.num_frontends == 1 and cfg.frontend_args.extra_env == {}
     assert cfg.role_overrides("prefill") == {} and cfg.role_overrides("decode") == {}
     with pytest.raises(ValidationError, match="extra_forbidden"):
         megatron_dynamo_cfg({"dynamo_cfg": {"engine": "megatron"}})
@@ -127,6 +128,16 @@ def test_dynamo_cfg_defaults_and_rejects_unknown_keys() -> None:
         megatron_dynamo_cfg(
             {"dynamo_cfg": {"decode_engine": {"context_parallel_size": 2}}}
         )
+
+
+def test_frontend_args_reject_power_of_two_and_zero_frontends() -> None:
+    # Dynamo 1.8 dropped the power-of-two router.
+    with pytest.raises(ValidationError, match="literal_error"):
+        megatron_dynamo_cfg(
+            {"dynamo_cfg": {"frontend_args": {"router_mode": "power-of-two"}}}
+        )
+    with pytest.raises(ValidationError, match="greater_than"):
+        megatron_dynamo_cfg({"dynamo_cfg": {"frontend_args": {"num_frontends": 0}}})
 
 
 @pytest.mark.parametrize("size", [0, -2])

@@ -28,6 +28,7 @@ import copy
 import dataclasses
 import functools
 import logging
+import random
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -530,7 +531,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         self._dynamo_runtime: Optional[ManagedDynamoRuntime] = None
         self._dynamo_namespace = ""
         self._dynamo_engine_env: dict[str, str] = {}
-        self._dynamo_frontend_url = ""
+        self._dynamo_frontend_urls: tuple[str, ...] = ()
         self._dynamo_fleet_ready = False
 
         validate_megatron_dynamo_generation(self.cfg)
@@ -553,10 +554,13 @@ class MegatronDynamoGeneration(GenerationInterface):
                 ),
             )
             self._dynamo_runtime = runtime
-            runtime.start()
+            # The frontends run on the engines' nodes, spread round-robin. Not
+            # cluster.get_node_ids(): that would materialize the parent
+            # cluster's placement groups and book the engines' GPUs twice.
+            runtime.start(frontend_node_ids=self._engine_node_ids())
             if runtime.serves_chat:
                 # Megatron's chat settings come from the config alone, so the
-                # frontend builds its render workers while the engines load;
+                # frontends build their render workers while the engines load;
                 # each engine registers the same settings.
                 runtime.publish_chat_settings(
                     {RUNTIME_DATA_KEY: megatron_chat_spec(self.cfg)}
@@ -566,8 +570,11 @@ class MegatronDynamoGeneration(GenerationInterface):
             raise
         self._dynamo_namespace = runtime.namespace
         self._dynamo_engine_env = runtime.engine_env
-        self._dynamo_frontend_url = runtime.frontend_url
-        print(f"  [Dynamo] Forwarding rollouts to {runtime.frontend_url}", flush=True)
+        self._dynamo_frontend_urls = tuple(runtime.frontend_urls)
+        print(
+            f"  [Dynamo] Forwarding rollouts to {list(self._dynamo_frontend_urls)}",
+            flush=True,
+        )
 
     # ------------------------------------------------------------------
     # Pickling: the SingleController actor gets a handles-only copy
@@ -1098,9 +1105,9 @@ class MegatronDynamoGeneration(GenerationInterface):
             )
         else:
             # A copy without the service processes (the controller's) waits on
-            # the frontend over HTTP alone.
+            # every frontend over HTTP alone.
             wait_for_engine_registrations(
-                frontend_url=self._dynamo_frontend_url,
+                frontend_urls=self._dynamo_frontend_urls,
                 namespace=self._dynamo_namespace,
                 expected_components=self.expected_components(),
                 model_name=model_name,
@@ -1202,12 +1209,13 @@ class MegatronDynamoGeneration(GenerationInterface):
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
-        """Post the batch to the frontend, one request per prompt; yield the assembled batch."""
+        """Post the batch to a frontend, one request per prompt; yield the assembled batch."""
         if len(data["input_ids"]) == 0:
             return
         output = await generate_through_frontend(
             self.cfg,
-            frontend_url=self._dynamo_frontend_url,
+            # Every frontend routes to the whole fleet; spread the batches.
+            frontend_url=random.choice(self._dynamo_frontend_urls),
             data=data,
             greedy=greedy,
             request_timeout_s=self._dynamo_cfg.request_timeout_s,
@@ -1217,13 +1225,8 @@ class MegatronDynamoGeneration(GenerationInterface):
 
     @property
     def client_base_urls(self) -> list[Optional[str]]:
-        """Where OpenAI clients such as NeMo-Gym send requests: the Dynamo frontend."""
-        return [self._dynamo_frontend_url]
-
-    @property
-    def generation_cut_control_urls(self) -> Optional[list[str]]:
-        """None: Megatron engines take no generation cuts (see setup_token_capture)."""
-        return None
+        """Where OpenAI clients such as NeMo-Gym send requests: every Dynamo frontend."""
+        return list(self._dynamo_frontend_urls)
 
     def setup_token_capture(
         self,
@@ -1477,6 +1480,16 @@ class MegatronDynamoGeneration(GenerationInterface):
                 "behind Dynamo."
             )
         return next(iter(node_ips))
+
+    def _engine_node_ids(self) -> list[str]:
+        """The distinct Ray nodes the engines run on, in engine order."""
+        return list(
+            dict.fromkeys(
+                node_id
+                for cluster in self._clusters
+                for node_id in cluster.get_node_ids()
+            )
+        )
 
     def _prefill_coordinator_addresses(self) -> dict[int, str]:
         """Each listening prefill engine's coordinator address, by engine index.

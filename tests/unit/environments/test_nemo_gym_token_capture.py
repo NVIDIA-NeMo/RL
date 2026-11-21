@@ -930,18 +930,14 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
         ),
         # The frontend answers every request carrying bad_words with a 400.
         ({"extra_body": {"bad_words": ["x"]}}, "bad_words"),
-        # The frontend accepts stop_token_ids but drops it before our chat engine.
-        ({"extra_body": {"stop_token_ids": [7]}}, "stop_token_ids"),
         # Gym sends sampling_overrides keys on every request too.
         ({"sampling_overrides": {"bad_words": ["x"]}}, "sampling_overrides.bad_words"),
-        (
-            {"sampling_overrides": {"logprob_token_ids": [7]}},
-            "sampling_overrides.*logprob_token_ids",
-        ),
+        # The frontend hands vLLM's token-level fields to NeMo RL's chat engine.
+        ({"extra_body": {"stop_token_ids": [7]}}, None),
     ],
 )
 def test_gym_actor_config_dynamo_turns_on_gyms_dynamo_dialect(
-    vllm_model: dict, expected: dict | str
+    vllm_model: dict, expected: dict | str | None
 ) -> None:
     from responses_api_models.vllm_model.app import VLLMModelConfig
 
@@ -1014,6 +1010,8 @@ def test_gym_actor_config_dynamo_turns_on_gyms_dynamo_dialect(
     assert gym_model.dynamo_frontend is True
     # The frontend refuses reasoning under both of Gym's keys.
     assert gym_model.reasoning_field == "reasoning_content"
+    # One frontend: Gym keeps its unlimited connection retries.
+    assert "route_around_failing_endpoints" not in composed
     assert gym_model.chat_template_kwargs == expected
     assert "dynamo_dialect" not in gym_config
     # The user's overlay is left as written.
