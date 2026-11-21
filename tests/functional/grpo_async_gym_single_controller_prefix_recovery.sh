@@ -205,7 +205,6 @@ setsid env \
         logger.log_dir="$PHASE1_LOG_DIR" \
         "$@" &
 PHASE1_PID=$!
-PHASE1_RUN_LOG=$BASE_RUN_LOG
 
 uv run --directory "$PROJECT_ROOT" --no-sync python "$SNAPSHOT_HELPER" select \
     "$CHECKPOINT_DIR/bootstrap/rollout_snapshots" \
@@ -250,6 +249,7 @@ grep -Fq "Selected rollout recovery snapshot: $SNAPSHOT_DIR" "$PHASE2_LOG"
 grep -q "Native TQ checkpoint restored and validated" "$PHASE2_LOG"
 grep -q "Loaded .* unfinished rollout group(s)" "$PHASE2_LOG"
 grep -q "generation prefix restored:" "$PHASE2_LOG"
+grep -q "generation_prefix_read_batch keys=" "$PHASE2_LOG"
 grep -q "train step $PHASE2_STEPS/$PHASE2_STEPS" "$PHASE2_LOG"
 
 uv run --directory "$PROJECT_ROOT" --no-sync tests/json_dump_tb_logs.py \

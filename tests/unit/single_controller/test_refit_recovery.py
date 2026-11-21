@@ -28,6 +28,7 @@ monitor whose verdict arrives on a probe schedule.
 """
 
 import asyncio
+import concurrent.futures
 import threading
 import time
 from types import SimpleNamespace
@@ -49,6 +50,7 @@ from nemo_rl.models.generation.fleet_health import (
     ShardState,
 )
 from nemo_rl.utils.timer import Timer
+from nemo_rl.weight_sync.refit_actor import RemoteWeightSynchronizer
 
 
 async def _completed(value=None):
@@ -656,6 +658,53 @@ class TestTheControllerStopsWaitingForASilentRank:
         ctrl = self._ctrl(30.0, lambda **kw: calls.append(kw))
         asyncio.run(ctrl._sync_weights_within({"k": 1}, "first"))
         assert calls == [{"kv_scales": {"k": 1}}], "kv_scales must still reach the sync"
+
+    def _refit_actor_ctrl(self, refit_timeout_s, refit_done, calls):
+        # object.__new__ takes the isinstance branch without starting a RefitActor.
+        proxy = object.__new__(RemoteWeightSynchronizer)
+
+        def submit_sync_weights(kv_scales):
+            calls.append(kv_scales)
+            return SimpleNamespace(future=lambda: refit_done)
+
+        proxy.submit_sync_weights = submit_sync_weights
+        ctrl = self._ctrl(refit_timeout_s, sync_weights=None)
+        ctrl._weight_synchronizer = proxy
+        return ctrl
+
+    def test_a_refit_actor_that_never_returns_gives_up(self):
+        calls = []
+        ctrl = self._refit_actor_ctrl(0.2, concurrent.futures.Future(), calls)
+        ctrl._REFIT_UNWIND_GRACE_S = 0.3
+
+        started = time.monotonic()
+        with pytest.raises(
+            RefitAborted, match="did not return from the RefitActor within"
+        ):
+            asyncio.run(ctrl._sync_weights_within(None, "first"))
+        assert time.monotonic() - started < 10.0
+        assert calls == [None]
+
+    def test_a_refit_actor_that_succeeds_is_untouched(self):
+        done = concurrent.futures.Future()
+        done.set_result(None)
+        calls = []
+        ctrl = self._refit_actor_ctrl(30.0, done, calls)
+        asyncio.run(ctrl._sync_weights_within({"k": 1}, "first"))
+        assert calls == [{"k": 1}], "kv_scales must still reach the RefitActor"
+
+    def test_a_dead_refit_actor_stops_the_run_instead_of_recovering(self):
+        """RuntimeError is not in the recovery except, so the real cause surfaces."""
+        died = concurrent.futures.Future()
+        died.set_exception(ray.exceptions.RayActorError())
+        ctrl = self._refit_actor_ctrl(30.0, died, [])
+
+        def raise_if_actor_died(error):
+            raise RuntimeError("the RefitActor died") from error
+
+        ctrl._weight_synchronizer.raise_if_actor_died = raise_if_actor_died
+        with pytest.raises(RuntimeError, match="RefitActor died"):
+            asyncio.run(ctrl._sync_weights_within(None, "first"))
 
     def test_a_real_failure_propagates_rather_than_becoming_a_timeout(self):
         """A genuine refit bug must not be relabelled as a silent rank and retried."""

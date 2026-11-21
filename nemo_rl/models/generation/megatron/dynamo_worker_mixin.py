@@ -14,6 +14,7 @@
 """Worker-side hooks for a Megatron engine served through Dynamo."""
 
 import asyncio
+import dataclasses
 import os
 import uuid
 from concurrent.futures import Future as ConcurrentFuture
@@ -314,7 +315,12 @@ class MegatronDynamoGenerationMixin:
                 else str(await fetch_model(model_name, ignore_weights=True))
             )
             engine = MegatronLLMEngine(config, registration_model)
-            worker_config = MegatronLLMEngine.worker_config(config, registration_model)
+            # This is NeMo RL's process: Dynamo's setup would replace its root
+            # handler and level.
+            worker_config = dataclasses.replace(
+                MegatronLLMEngine.worker_config(config, registration_model),
+                configure_logging=False,
+            )
             # Dynamo's Worker installs SIGTERM/SIGINT handlers in this actor
             # process and, on those signals, shuts the adapter down its own way
             # (it force-exits the process if that overruns its deadline).

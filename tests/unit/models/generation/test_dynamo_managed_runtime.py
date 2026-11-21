@@ -12,17 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
-import pickle
+import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from nemo_rl.models.generation.dynamo import managed_runtime
 from nemo_rl.models.generation.dynamo.config import DynamoCfg, DynamoFrontendArgs
 from nemo_rl.models.generation.dynamo.managed_runtime import (
+    ChatProcessorOptions,
+    FrontendHost,
     ManagedDynamoRuntime,
     _managed_namespace,
     _service_executable,
@@ -32,6 +36,8 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
 from nemo_rl.models.generation.megatron.dynamo_config import MegatronDynamoCfg
 
 _MODULE = "nemo_rl.models.generation.dynamo.managed_runtime"
+
+FRONTEND_URLS = ["http://10.0.0.2:3000/v1", "http://10.0.0.3:3000/v1"]
 
 
 def _runtime(serves_chat: bool = False, **frontend_args) -> ManagedDynamoRuntime:
@@ -47,11 +53,45 @@ def _runtime(serves_chat: bool = False, **frontend_args) -> ManagedDynamoRuntime
 
 
 class _FakeProcess:
-    returncode = None
+    def __init__(self, returncode: int | None = None) -> None:
+        self.returncode = returncode
+        self.stopped = False
 
-    @staticmethod
-    def poll():
-        return None
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+class _Remote:
+    """A fake actor method: ``.remote()`` returns its value, or raises it."""
+
+    def __init__(self, value=None):
+        self._value = value
+
+    def remote(self):
+        if isinstance(self._value, Exception):
+            raise self._value
+        return self._value
+
+
+class _FakeFrontendHost:
+    def __init__(self, returncode=None, stop_error=None):
+        self.returncode = _Remote(returncode)
+        self.stop = _Remote(stop_error)
+
+
+@pytest.fixture
+def fake_ray(monkeypatch):
+    """Frontend hosts are plain objects; ``ray.get`` returns what they return."""
+    killed = []
+    monkeypatch.setattr(
+        managed_runtime,
+        "ray",
+        SimpleNamespace(get=lambda refs: refs, kill=killed.append),
+    )
+    return killed
 
 
 class _FakeHttpResponse:
@@ -70,14 +110,17 @@ class _FakeHttpResponse:
         return json.dumps(self._payload).encode()
 
 
-def _started(runtime: ManagedDynamoRuntime) -> ManagedDynamoRuntime:
+def _started(
+    runtime: ManagedDynamoRuntime, *hosts: _FakeFrontendHost
+) -> ManagedDynamoRuntime:
+    """``runtime`` as started, with one frontend per host (default: one, alive)."""
+    hosts = hosts or (_FakeFrontendHost(),)
     runtime._started = True
-    runtime._host = "10.0.0.1"
-    runtime._frontend_port = 3000
     runtime._namespace = "nemo-rl-test"
     runtime._etcd_process = _FakeProcess()
     runtime._nats_process = _FakeProcess()
-    runtime._frontend_process = _FakeProcess()
+    runtime._frontend_hosts = list(hosts)
+    runtime._frontend_urls = FRONTEND_URLS[: len(hosts)]
     return runtime
 
 
@@ -108,7 +151,7 @@ def test_runtime_construction_is_inert_and_namespace_is_driver_owned(
     assert runtime._started is False
     assert runtime._etcd_process is None
     with pytest.raises(RuntimeError, match="not been started"):
-        _ = runtime.frontend_url
+        _ = runtime.frontend_urls
     with pytest.raises(RuntimeError, match="not been started"):
         _ = runtime.engine_env
 
@@ -129,7 +172,7 @@ def test_managed_service_and_frontend_environments_are_runtime_owned(
     monkeypatch.setenv("NATS_STALE_SETTING", "remove-me")
     monkeypatch.setenv("NCCL_DEBUG", "INFO")
 
-    service_env = runtime._service_env()
+    service_env = managed_runtime._service_env(runtime._manager_env)
     assert service_env["DYN_NAMESPACE"] == "managed"
     assert service_env["ETCD_ENDPOINTS"] == "http://managed-etcd:2379"
     assert service_env["NATS_SERVER"] == "nats://managed-nats:4222"
@@ -186,38 +229,84 @@ def test_stop_process_escalates_its_process_group(monkeypatch) -> None:
         lambda pid, sig: signals.append((pid, sig)),
     )
     process = EscalatingProcess()
-    ManagedDynamoRuntime._stop_process(process, "frontend", timeout_s=0.01)
+    managed_runtime._stop_process(process, "frontend", timeout_s=0.01)
     assert signals == [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)]
 
 
-def test_shutdown_guards_each_owned_resource_independently(monkeypatch) -> None:
-    runtime = _runtime()
-    runtime._frontend_process = object()
-    runtime._nats_process = object()
-    runtime._etcd_process = object()
-    calls = []
+def _exited(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    return stat.rsplit(")", 1)[1].split()[0] == "Z"
 
-    def stop_process(process, label, timeout_s=15):
-        if process is None:
-            return
-        calls.append(label)
-        if label == "frontend":
-            raise RuntimeError("frontend failure")
 
-    monkeypatch.setattr(runtime, "_stop_process", stop_process)
+def test_a_service_stops_when_the_process_that_started_it_is_sigkilled() -> None:
+    # The service prints its own PID (exec keeps it) to the starter's stdout.
+    starter_code = (
+        "import os, time\n"
+        "from nemo_rl.models.generation.dynamo.managed_runtime import _ServiceProcess\n"
+        "_ServiceProcess(['sh', '-c', 'echo $$; exec sleep 600'],"
+        " env=dict(os.environ), label='sleep')\n"
+        "time.sleep(600)\n"
+    )
+    with subprocess.Popen(
+        [sys.executable, "-c", starter_code],
+        cwd=Path(__file__).resolve().parents[4],
+        stdout=subprocess.PIPE,
+        text=True,
+    ) as starter:
+        assert starter.stdout is not None
+        line = starter.stdout.readline()
+        assert line, "the starter exited before it started the service"
+        service_pid = int(line)
+        # SIGKILL runs no shutdown or atexit handler, and the service's own
+        # session keeps it out of the starter's process group.
+        starter.send_signal(signal.SIGKILL)
+    deadline = time.monotonic() + 20
+    try:
+        while not _exited(service_pid):
+            assert time.monotonic() < deadline, "the service outlived its starter"
+            time.sleep(0.1)
+    finally:
+        if not _exited(service_pid):
+            os.killpg(service_pid, signal.SIGKILL)
+
+
+def test_stopping_a_service_also_stops_its_watchdog() -> None:
+    service = managed_runtime._ServiceProcess(
+        ["sleep", "600"], env=dict(os.environ), label="sleep"
+    )
+    service.stop()
+    assert service.poll() == -signal.SIGTERM
+    assert service._watchdog.returncode is not None
+
+
+def test_shutdown_guards_each_owned_resource_independently(
+    monkeypatch, fake_ray
+) -> None:
+    failing = _FakeFrontendHost(stop_error=RuntimeError("frontend failure"))
+    healthy = _FakeFrontendHost()
+    runtime = _started(_runtime(), failing, healthy)
+    monkeypatch.setattr(runtime, "_log_router_kv_events", lambda: None)
+    stopped = []
+    runtime._nats_process = SimpleNamespace(stop=lambda: stopped.append("NATS"))
+    runtime._etcd_process = SimpleNamespace(stop=lambda: stopped.append("etcd"))
     runtime.shutdown()
     runtime.shutdown()
 
-    assert calls == ["frontend", "NATS", "etcd"]
-    assert runtime._frontend_process is None
+    # The failing frontend does not keep the others, NATS or etcd running.
+    assert fake_ray == [healthy]
+    assert stopped == ["NATS", "etcd"]
+    assert runtime._frontend_hosts == [] and runtime._frontend_urls == []
     assert runtime._nats_process is None
     assert runtime._etcd_process is None
 
 
-def test_engines_are_ready_once_registered_and_the_model_is_served(
-    monkeypatch,
+def test_every_frontend_must_route_to_the_engines_and_serve_the_model(
+    monkeypatch, fake_ray
 ) -> None:
-    runtime = _started(_runtime())
+    runtime = _started(_runtime(), _FakeFrontendHost(), _FakeFrontendHost())
     health = {
         "instances": [
             {
@@ -244,6 +333,8 @@ def test_engines_are_ready_once_registered_and_the_model_is_served(
             {"data": []},
             health,
             {"data": [{"id": "model"}]},
+            health,
+            {"data": [{"id": "model"}]},
         ]
     )
     urls: list[str] = []
@@ -260,56 +351,75 @@ def test_engines_are_ready_once_registered_and_the_model_is_served(
         "nemo_rl.models.generation.dynamo.managed_runtime.time.sleep", lambda _: None
     )
     runtime.wait_for_engines(2, check_engines=lambda: None)
-    assert (
-        urls
-        == [
-            "http://127.0.0.1:3000/health",
-            "http://127.0.0.1:3000/v1/models",
-        ]
-        * 2
-    )
+    first, second = (url.removesuffix("/v1") for url in FRONTEND_URLS)
+    assert urls == [
+        f"{first}/health?instances=true",
+        f"{first}/v1/models",
+    ] * 2 + [f"{second}/health?instances=true", f"{second}/v1/models"]
+
+
+def _engine_stopped() -> None:
+    raise RuntimeError("endpoint of generation shard 0 stopped serving")
 
 
 @pytest.mark.parametrize(
-    ("stopped", "error"),
+    "frontend_code, check_engines, error",
     [
-        ("engine", "shard 0 stopped serving"),
-        # A bad frontend_args.extra_cli_args flag makes the frontend exit at once.
-        ("frontend", r"frontend is not alive \(code=2\)"),
+        (None, _engine_stopped, "shard 0 stopped serving"),
+        (2, lambda: None, "frontend http://10.0.0.2:3000/v1 is not alive .code=2"),
     ],
 )
-def test_engine_wait_fails_immediately_when_an_engine_or_service_stops(
-    stopped, error
+def test_engine_wait_fails_immediately_when_an_engine_or_frontend_stops(
+    fake_ray, frontend_code, check_engines, error
 ) -> None:
-    runtime = _started(_runtime())
-    if stopped == "frontend":
-        runtime._frontend_process.poll = lambda: 2
-        runtime._frontend_process.returncode = 2
-
-    def check_engines() -> None:
-        if stopped == "engine":
-            raise RuntimeError("endpoint of generation shard 0 stopped serving")
+    runtime = _started(_runtime(), _FakeFrontendHost(returncode=frontend_code))
 
     with pytest.raises(RuntimeError, match=error):
         runtime.wait_for_engines(1, check_engines=check_engines)
 
 
-@pytest.mark.parametrize("serves_chat", [True, False])
-def test_frontend_launches_nemo_rls_chat_engine_from_the_given_interpreter(
-    monkeypatch, serves_chat: bool
-) -> None:
-    runtime = _runtime(serves_chat, render_workers=3)
-    runtime._frontend_port = 3000
-    runtime._generation_cut_port = 2400
-    runtime._namespace = "nemo-rl-test"
-    launched = []
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.managed_runtime.subprocess.Popen",
-        lambda command, **kwargs: launched.append((command, kwargs["env"]))
-        or _FakeProcess(),
-    )
+class _FakeFrontendHostActor:
+    """Records where each frontend is placed and what it is started with."""
 
-    runtime._start_frontend()
+    def __init__(self):
+        self.node_ids: list[str] = []
+        self.started: list[dict] = []
+        self.captures: list[dict] = []
+        self.chat_settings: list[dict] = []
+
+    def options(self, scheduling_strategy):
+        self.node_ids.append(scheduling_strategy.node_id)
+        return self
+
+    def remote(self):
+        def start(**kwargs):
+            self.started.append(kwargs)
+            return f"http://frontend-{len(self.started)}:3000/v1"
+
+        return SimpleNamespace(
+            start=SimpleNamespace(remote=start),
+            publish_chat_capture=SimpleNamespace(remote=self.captures.append),
+            publish_chat_settings=SimpleNamespace(remote=self.chat_settings.append),
+        )
+
+
+def test_frontends_spread_over_the_nodes_with_the_extra_environment(
+    monkeypatch, fake_ray
+) -> None:
+    hosts = _FakeFrontendHostActor()
+    monkeypatch.setattr(managed_runtime, "_FrontendHostActor", hosts)
+    runtime = _runtime(
+        True,
+        num_frontends=3,
+        extra_env={"DYN_TCP_LISTEN_BACKLOG": "8192"},
+    )
+    runtime._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
+    # What the driver sets after init_ray() is only in its own environment.
+    monkeypatch.setenv("VLLM_USE_FASTOKENS", "1")
+
+    node_a, node_b = "a" * 56, "b" * 56  # Ray node IDs are hex
+    runtime._start_frontends([node_a, node_b])
+    runtime._started = True
     runtime.publish_chat_capture(
         dp_cfg={"backend": "simple"},
         staging_partition="staging",
@@ -317,45 +427,169 @@ def test_frontend_launches_nemo_rls_chat_engine_from_the_given_interpreter(
         generation_cut_control_token="secret",
         generation_cut_control_timeout_s=60.0,
     )
+    runtime.publish_chat_settings({"nemo_rl_chat": {"engine_args": {}}})
 
-    ((command, env),) = launched
-    # Dynamo's frontend, with NeMo RL's chat engine serving chat calls.
-    assert command[:3] == [
-        "/venvs/vllm/bin/python",
-        "-m",
-        "nemo_rl.models.generation.dynamo.vllm.frontend",
+    assert hosts.node_ids == [node_a, node_b, node_a]
+    assert runtime.frontend_urls == [f"http://frontend-{i}:3000/v1" for i in (1, 2, 3)]
+    for started in hosts.started:
+        assert started["env"]["DYN_TCP_LISTEN_BACKLOG"] == "8192"
+        assert started["env"]["DYN_NAMESPACE"] == "nemo-rl-test"
+        assert started["env"]["VIRTUAL_ENV"] == "/venvs/vllm"
+        assert started["env"]["VLLM_USE_FASTOKENS"] == "1"
+        # The open-file limit a frontend had as the driver's child.
+        assert started["env"]["DYN_FRONTEND_FD_LIMIT_TARGET"] == "65536"
+        # The Ray cluster its chat engine reads token-capture prefixes through.
+        assert started["ray_address"] == "10.0.0.1:6379"
+        # It starts its render workers at launch.
+        assert started["serves_chat"] is True
+    # The two frontends on node_a pick their ports from separate slices.
+    assert [started["port_range"] for started in hosts.started] == [
+        (1313, 1356),
+        (1313, 1356),
+        (1356, 1399),
     ]
-    assert env[managed_runtime.RENDER_WORKERS_ENV] == "3"
-    assert env[managed_runtime.RAY_ADDRESS_ENV] == "10.0.0.1:6379"
-    # NeMo-Gym's checkpoint generation cuts go to a port of the frontend's own.
-    assert env[managed_runtime.GENERATION_CUT_PORT_ENV] == "2400"
-    # Capture is set up after the engines register; the chat engine reads it
-    # from the file the frontend was told about.
-    with open(env[managed_runtime.CAPTURE_FILE_ENV], "rb") as capture_file:
-        assert pickle.load(capture_file) == {
+    # Every frontend's chat engine reads token-capture prefixes, and checks a
+    # cut's bearer token, the same way.
+    assert hosts.captures == 3 * [
+        {
             "data_plane": {"backend": "simple"},
             "staging_partition": "staging",
             "capture_media": False,
             "generation_cut_control_token": "secret",
             "generation_cut_control_timeout_s": 60.0,
         }
+    ]
+
+    # Every frontend builds its render workers from the chat settings an engine
+    # sends before it loads.
+    assert hosts.chat_settings == 3 * [{"nemo_rl_chat": {"engine_args": {}}}]
+
+    for managed in ("DYN_NAMESPACE", managed_runtime.CAPTURE_FILE_ENV):
+        clashing = _runtime(extra_env={managed: "mine"})
+        clashing._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
+        with pytest.raises(ValueError, match=rf"\['{managed}'\] is set by both"):
+            clashing._start_frontends([node_a])
+
+
+@pytest.mark.parametrize("serves_chat", [True, False])
+def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
+    monkeypatch, tmp_path, serves_chat: bool
+) -> None:
+    launched = []
+    monkeypatch.setattr(
+        managed_runtime,
+        "_ServiceProcess",
+        lambda command, *, env, label: launched.append((command, env))
+        or _FakeProcess(),
+    )
+    monkeypatch.setattr(
+        managed_runtime, "_get_free_port_local", lambda low, high, **kwargs: 3000
+    )
+    monkeypatch.setattr(managed_runtime, "_answers_health", lambda port: True)
+    monkeypatch.setattr(managed_runtime, "_get_node_ip_local", lambda: "10.0.0.2")
+    monkeypatch.setattr(managed_runtime.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("DYN_STALE_SETTING", "remove-me")
+    host = FrontendHost()
+
+    base_url = host.start(
+        frontend_python="/venvs/vllm/bin/python",
+        namespace="nemo-rl-test",
+        dynamo_cfg=DynamoCfg(frontend_args=DynamoFrontendArgs(render_workers=3)),
+        env={"DYN_NAMESPACE": "nemo-rl-test"},
+        ray_address="10.0.0.1:6379",
+        serves_chat=serves_chat,
+        port_range=(1313, 1400),
+    )
+    host.publish_chat_capture({"staging_partition": "staging"})
+
+    assert base_url == "http://10.0.0.2:3000/v1"
+    ((command, env),) = launched
+    assert command[:3] == ["/venvs/vllm/bin/python", "-m", "dynamo.frontend"]
+    assert command[command.index("--http-port") + 1] == "3000"
+    # NeMo RL's chat engine serves chat calls, as Dynamo's chat processor.
+    assert (
+        command[command.index("--dyn-chat-processor") + 1]
+        == managed_runtime.CHAT_PROCESSOR
+    )
+    chat_options = ChatProcessorOptions(
+        **json.loads(command[command.index("--dyn-chat-processor-config") + 1])
+    )
+    assert (chat_options.render_workers, chat_options.ray_address) == (
+        3,
+        "10.0.0.1:6379",
+    )
+    # NeMo-Gym's checkpoint generation cuts are a route on the same port.
+    assert (
+        command[command.index("--frontend-route-extension") + 1]
+        == managed_runtime.CUT_ROUTES
+    )
+    assert env["DYN_NAMESPACE"] == "nemo-rl-test"
+    assert "DYN_STALE_SETTING" not in env
+    assert host.returncode() is None
+    # Capture is set up after the engines register; the chat engine and the
+    # cut route read it from the file on this node the frontend was told about.
+    assert env[managed_runtime.CAPTURE_FILE_ENV] == chat_options.capture_file
+    assert managed_runtime.read_chat_capture(chat_options.capture_file) == {
+        "staging_partition": "staging"
+    }
     # Only a run that serves chat names the file an engine's chat settings
     # arrive in before it loads; the frontend starts its render workers on it.
-    assert (managed_runtime.CHAT_SETTINGS_FILE_ENV in env) is serves_chat
-    if serves_chat:
-        monkeypatch.setenv(
-            managed_runtime.CHAT_SETTINGS_FILE_ENV,
-            env[managed_runtime.CHAT_SETTINGS_FILE_ENV],
+    assert (chat_options.chat_settings_file is not None) is serves_chat
+    if chat_options.chat_settings_file is not None:
+        assert (
+            managed_runtime.read_chat_settings(chat_options.chat_settings_file) is None
         )
-        assert managed_runtime.read_chat_settings() is None
-        runtime.publish_chat_settings({"nemo_rl_chat": {"engine_args": {}}})
-        assert managed_runtime.read_chat_settings() == {
+        host.publish_chat_settings({"nemo_rl_chat": {"engine_args": {}}})
+        assert managed_runtime.read_chat_settings(chat_options.chat_settings_file) == {
             "nemo_rl_chat": {"engine_args": {}}
         }
-    runtime.shutdown()
 
 
-def test_shutdown_logs_the_kv_events_the_router_applied(monkeypatch, capsys) -> None:
+def test_a_frontend_that_loses_its_port_is_launched_on_another(
+    monkeypatch, tmp_path
+) -> None:
+    launched: list[_FakeProcess] = []
+    excluded: list[set[int]] = []
+    ports = iter([1320, 1330])
+
+    def launch(command, *, env, label):
+        # Dynamo exits when another process took the port it was told to bind.
+        port = command[command.index("--http-port") + 1]
+        launched.append(_FakeProcess(returncode=1 if port == "1320" else None))
+        return launched[-1]
+
+    def free_port(low, high, *, max_retries, excluded_ports):
+        excluded.append(set(excluded_ports))
+        return next(ports)
+
+    monkeypatch.setattr(managed_runtime, "_ServiceProcess", launch)
+    monkeypatch.setattr(managed_runtime, "_get_free_port_local", free_port)
+    monkeypatch.setattr(managed_runtime, "_answers_health", lambda port: port == 1330)
+    monkeypatch.setattr(managed_runtime, "_get_node_ip_local", lambda: "10.0.0.2")
+    monkeypatch.setattr(managed_runtime.tempfile, "tempdir", str(tmp_path))
+    host = FrontendHost()
+
+    base_url = host.start(
+        frontend_python="/venvs/vllm/bin/python",
+        namespace="nemo-rl-test",
+        dynamo_cfg=DynamoCfg(),
+        env={},
+        ray_address="10.0.0.1:6379",
+        serves_chat=False,
+        port_range=(1313, 1400),
+    )
+
+    assert base_url == "http://10.0.0.2:1330/v1"
+    # The second pick leaves out the port the first launch lost.
+    assert excluded == [set(), {1320}]
+    first, second = launched
+    assert first.stopped and not second.stopped
+    assert host.returncode() is None
+
+
+def test_shutdown_logs_the_kv_events_the_router_applied(
+    monkeypatch, capsys, fake_ray
+) -> None:
     runtime = _started(_runtime())
     metrics = (
         "# HELP dynamo_component_kv_cache_events_applied KV events applied\n"
@@ -365,6 +599,9 @@ def test_shutdown_logs_the_kv_events_the_router_applied(monkeypatch, capsys) -> 
         # Every prefix-cache reset applies one; it says nothing about block events.
         'dynamo_component_kv_cache_events_applied{event_type="cleared",status="ok",worker_id="1"} 5\n'
         'dynamo_component_requests_total{status="ok"} 9\n'
+        'dynamo_frontend_queued_requests{model="a"} 4\n'
+        'dynamo_frontend_queued_requests{model="b"} 3\n'
+        'dynamo_frontend_inflight_requests{model="a"} 9\n'
     )
 
     class _Metrics(_FakeHttpResponse):
@@ -376,11 +613,15 @@ def test_shutdown_logs_the_kv_events_the_router_applied(monkeypatch, capsys) -> 
         "urllib.request.urlopen",
         lambda url, timeout: urls.append(url) or _Metrics(None),
     )
-    monkeypatch.setattr(runtime, "_stop_process", lambda *args, **kwargs: None)
 
+    # Calls waiting in a frontend are in no engine's counts.
+    assert runtime.frontend_load() == {
+        "dynamo_frontend_queued_requests": {0: [7.0]},
+        "dynamo_frontend_inflight_requests": {0: [9.0]},
+    }
     runtime.shutdown()
 
-    assert urls == ["http://127.0.0.1:3000/metrics"]
+    assert urls == 2 * ["http://10.0.0.2:3000/metrics"]
     assert (
         '[Dynamo] router applied KV events: {"ok": 42.0, "parent_block_not_found": 3.0}'
         in capsys.readouterr().out
@@ -408,16 +649,34 @@ def _instance(component: str, instance_id: str, namespace: str = "ns") -> dict:
     }
 
 
+_CHAT_OPTIONS = ChatProcessorOptions(
+    render_workers=8,
+    ray_address="10.0.0.1:6379",
+    capture_file="/tmp/capture.pkl",
+    chat_settings_file=None,
+)
+
+
+def _argv(cfg: MegatronDynamoCfg) -> list[str]:
+    return frontend_argv(
+        host="0.0.0.0",
+        port=1313,
+        namespace="ns",
+        dynamo_cfg=cfg,
+        chat_options=_CHAT_OPTIONS,
+    )
+
+
 def test_frontend_argv_rejects_repeated_options() -> None:
     cfg = MegatronDynamoCfg(
         frontend_args={"extra_cli_args": ["--kv-overlap-score-weight=2"]}
     )
-    argv = frontend_argv(host="0.0.0.0", port=3000, namespace="ns", dynamo_cfg=cfg)
-    assert argv[:4] == ["--http-host", "0.0.0.0", "--http-port", "3000"]
+    argv = _argv(cfg)
+    assert argv[:4] == ["--http-host", "0.0.0.0", "--http-port", "1313"]
     assert "--router-mode" in argv and argv[-1] == "--kv-overlap-score-weight=2"
     cfg = MegatronDynamoCfg(frontend_args={"extra_cli_args": ["--router_mode=kv"]})
     with pytest.raises(ValueError, match="--router-mode is set by both"):
-        frontend_argv(host="0.0.0.0", port=3000, namespace="ns", dynamo_cfg=cfg)
+        _argv(cfg)
     # Spellings that differ only in "_" vs "-" are the same option.
     cfg = MegatronDynamoCfg(
         frontend_args={
@@ -428,7 +687,7 @@ def test_frontend_argv_rejects_repeated_options() -> None:
         }
     )
     with pytest.raises(ValueError, match="--kv-overlap-score-weight is repeated"):
-        frontend_argv(host="0.0.0.0", port=3000, namespace="ns", dynamo_cfg=cfg)
+        _argv(cfg)
 
 
 def test_wait_counts_every_component_then_the_model(monkeypatch) -> None:
@@ -464,7 +723,7 @@ def test_wait_counts_every_component_then_the_model(monkeypatch) -> None:
     probes = []
 
     wait_for_engine_registrations(
-        frontend_url="http://127.0.0.1:3000/v1/",
+        frontend_urls=["http://127.0.0.1:1313/v1/"],
         namespace="ns",
         expected_components={"prefill": 1, "backend": 2},
         model_name="model",
@@ -473,7 +732,12 @@ def test_wait_counts_every_component_then_the_model(monkeypatch) -> None:
     )
 
     assert (
-        urls == ["http://127.0.0.1:3000/health", "http://127.0.0.1:3000/v1/models"] * 3
+        urls
+        == [
+            "http://127.0.0.1:1313/health?instances=true",
+            "http://127.0.0.1:1313/v1/models",
+        ]
+        * 3
     )
     assert len(probes) == 3
 
@@ -485,13 +749,51 @@ def test_wait_fails_at_once_when_an_engine_died(monkeypatch) -> None:
     monkeypatch.setattr(f"{_MODULE}.time.sleep", lambda _: None)
     with pytest.raises(RuntimeError, match="died: decode-0"):
         wait_for_engine_registrations(
-            frontend_url="http://127.0.0.1:3000/v1",
+            frontend_urls=["http://127.0.0.1:1313/v1"],
             namespace="ns",
             expected_components={"prefill": 1, "backend": 1},
             model_name="model",
             timeout_s=5,
             check_alive=dead,
         )
+
+
+def test_wait_checks_every_frontend_in_turn(monkeypatch) -> None:
+    """Each frontend has its own router, so each must see the whole fleet."""
+    fleet = {"instances": [_instance("prefill", "p0"), _instance("backend", "d0")]}
+    seen = {
+        "http://10.0.0.2:1313": iter([fleet]),
+        # The second frontend's watcher lags: it lists the decode engine late.
+        "http://10.0.0.3:1313": iter(
+            [{"instances": [_instance("prefill", "p0")]}, fleet]
+        ),
+    }
+    urls: list[str] = []
+
+    def fake_urlopen(url, timeout):
+        urls.append(url)
+        root = url.split("/health")[0].split("/v1")[0]
+        if "/health" in url:
+            return _FakeHttpResponse(next(seen[root]))
+        return _FakeHttpResponse({"data": [{"id": "model"}]})
+
+    monkeypatch.setattr(f"{_MODULE}.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(f"{_MODULE}.time.sleep", lambda _: None)
+
+    wait_for_engine_registrations(
+        frontend_urls=["http://10.0.0.2:1313/v1", "http://10.0.0.3:1313/v1"],
+        namespace="ns",
+        expected_components={"prefill": 1, "backend": 1},
+        model_name="model",
+        timeout_s=5,
+        check_alive=lambda: None,
+    )
+
+    assert [url.split("/")[2] for url in urls if "/health" in url] == [
+        "10.0.0.2:1313",
+        "10.0.0.3:1313",
+        "10.0.0.3:1313",
+    ]
 
 
 def test_wait_times_out_naming_what_is_missing(monkeypatch) -> None:
@@ -509,7 +811,7 @@ def test_wait_times_out_naming_what_is_missing(monkeypatch) -> None:
         RuntimeError, match=r"registered=\{'prefill': 1, 'backend': 0\}"
     ):
         wait_for_engine_registrations(
-            frontend_url="http://127.0.0.1:3000/v1",
+            frontend_urls=["http://127.0.0.1:1313/v1"],
             namespace="ns",
             expected_components={"prefill": 1, "backend": 1},
             model_name="model",
@@ -533,7 +835,7 @@ def test_runtime_wait_takes_a_count_or_one_per_component(
     monkeypatch, expected_engines, components
 ) -> None:
     runtime = _megatron_runtime(startup_timeout_s=7.0)
-    runtime._frontend_port = 3000
+    runtime._frontend_urls = ["http://10.0.0.2:1313/v1", "http://10.0.0.3:1313/v1"]
     runtime._namespace = "ns"
     monkeypatch.setattr(runtime, "_assert_services_alive", lambda: None)
     waits = []
@@ -550,7 +852,7 @@ def test_runtime_wait_takes_a_count_or_one_per_component(
     wait.pop("check_alive")()
     assert probes == [1]
     assert wait == {
-        "frontend_url": "http://127.0.0.1:3000/v1",
+        "frontend_urls": ["http://10.0.0.2:1313/v1", "http://10.0.0.3:1313/v1"],
         "namespace": "ns",
         "expected_components": components,
         "model_name": "model",
@@ -560,7 +862,7 @@ def test_runtime_wait_takes_a_count_or_one_per_component(
 
 def test_runtime_wait_checks_its_own_processes(monkeypatch) -> None:
     runtime = _megatron_runtime()
-    runtime._frontend_port = 3000
+    runtime._frontend_urls = ["http://10.0.0.2:1313/v1"]
     runtime._namespace = "ns"
     # No service process was started: the probe says so before any HTTP call.
     monkeypatch.setattr(

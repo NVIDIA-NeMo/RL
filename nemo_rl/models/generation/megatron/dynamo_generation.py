@@ -426,7 +426,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         self._dynamo_runtime: Optional[ManagedDynamoRuntime] = None
         self._dynamo_namespace = ""
         self._dynamo_engine_env: dict[str, str] = {}
-        self._dynamo_frontend_url = ""
+        self._dynamo_frontend_urls: tuple[str, ...] = ()
         self._dynamo_fleet_ready = False
 
         validate_megatron_dynamo_generation(self.cfg)
@@ -446,15 +446,21 @@ class MegatronDynamoGeneration(GenerationInterface):
                 serves_chat=False,
             )
             self._dynamo_runtime = runtime
-            runtime.start()
+            # The frontends run on the engines' nodes, spread round-robin. Not
+            # cluster.get_node_ids(): that would materialize the parent
+            # cluster's placement groups and book the engines' GPUs twice.
+            runtime.start(frontend_node_ids=self._engine_node_ids())
         except Exception:
             self.shutdown()
             raise
         self._dynamo_namespace = runtime.namespace
         self._dynamo_engine_env = runtime.engine_env
-        self._dynamo_frontend_url = runtime.frontend_url
-        self.dp_openai_server_base_urls = [runtime.frontend_url]
-        print(f"  [Dynamo] Forwarding rollouts to {runtime.frontend_url}", flush=True)
+        self._dynamo_frontend_urls = tuple(runtime.frontend_urls)
+        self.dp_openai_server_base_urls = list(self._dynamo_frontend_urls)
+        print(
+            f"  [Dynamo] Forwarding rollouts to {list(self._dynamo_frontend_urls)}",
+            flush=True,
+        )
 
     # ------------------------------------------------------------------
     # Pickling: the SingleController actor gets a handles-only copy
@@ -920,9 +926,9 @@ class MegatronDynamoGeneration(GenerationInterface):
             )
         else:
             # A copy without the service processes (the controller's) waits on
-            # the frontend over HTTP alone.
+            # every frontend over HTTP alone.
             wait_for_engine_registrations(
-                frontend_url=self._dynamo_frontend_url,
+                frontend_urls=self._dynamo_frontend_urls,
                 namespace=self._dynamo_namespace,
                 expected_components=self.expected_components(),
                 model_name=model_name,
@@ -1187,6 +1193,16 @@ class MegatronDynamoGeneration(GenerationInterface):
                 "behind Dynamo."
             )
         return next(iter(node_ips))
+
+    def _engine_node_ids(self) -> list[str]:
+        """The distinct Ray nodes the engines run on, in engine order."""
+        return list(
+            dict.fromkeys(
+                node_id
+                for cluster in self._clusters
+                for node_id in cluster.get_node_ids()
+            )
+        )
 
     def shutdown(self) -> bool:
         """Stop every engine's endpoint and policy, then the frontend, NATS and etcd.

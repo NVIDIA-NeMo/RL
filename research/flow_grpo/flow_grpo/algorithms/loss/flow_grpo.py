@@ -34,7 +34,7 @@ from typing import Any
 import torch
 from pydantic import BaseModel
 
-from nemo_rl.algorithms.utils import masked_mean
+from nemo_rl.utils.tensor_ops import masked_mean
 
 
 class FlowGRPOLossConfig(BaseModel, extra="allow"):

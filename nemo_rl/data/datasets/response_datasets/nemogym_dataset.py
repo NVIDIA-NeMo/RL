@@ -40,10 +40,11 @@ class NemoGymDataset(RawDataset):
         is_jsonl_source = os.path.isfile(source_path) and data_path.lower().endswith(
             ".jsonl"
         )
-        if is_jsonl_source:
-            source_identity = NemoGymSourceIdentity.from_stat(
-                source_path, os.stat(source_path)
-            )
+        source_identity = (
+            NemoGymSourceIdentity.from_stat(source_path, os.stat(source_path))
+            if is_jsonl_source
+            else None
+        )
 
         # Preserve JSONL records as raw strings because the NeMo-Gym processor
         # intentionally parses the nested payload later. The Hugging Face text
@@ -56,7 +57,9 @@ class NemoGymDataset(RawDataset):
         self.dataset = load_dataset_from_path(
             data_path, data_split=None, preserve_jsonl_rows=True
         )
-        if is_jsonl_source and source_identity.matches(os.stat(source_path)):
+        if source_identity is not None and source_identity.matches(
+            os.stat(source_path)
+        ):
             self.agent_name_sources = frozenset({source_identity})
         else:
             self.agent_name_sources = None

@@ -42,9 +42,6 @@ DYNAMO_SDK_MODULES = {
     # Megatron engines resolve their model files through it; it reaches only
     # dynamo._core, dynamo.llm and dynamo.common.snapshot, never dynamo.vllm.
     "dynamo.common.model_fetch",
-    # The frontend's entrypoint and chat-engine hook; the frontend loads Dynamo's
-    # own vLLM chat processor only for --dyn-chat-processor, which NeMo RL rejects.
-    "dynamo.frontend.main",
     "dynamo.llm",
     "dynamo.llm.exceptions",
 }
