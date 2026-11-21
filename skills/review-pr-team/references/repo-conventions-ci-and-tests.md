@@ -2,7 +2,7 @@
 
 NeMo-RL CI and test facts.
 
-- **Run `gh pr checks` in setup before any lint or test claim; the Lint job also fails when a file becomes pyrefly-clean but is not in `project-includes`.** Seven lanes said "clean" while Lint was red (#3837). Details: [run-gh-pr-checks-before-any-lint-or-test-claim](details/run-gh-pr-checks-before-any-lint-or-test-claim.md).
+- **Run `gh pr checks` in setup before any lint or test claim; a local tool run is not the CI job.** Seven lanes said "clean" while Lint was red (#3837). Details: [run-gh-pr-checks-before-any-lint-or-test-claim](details/run-gh-pr-checks-before-any-lint-or-test-claim.md).
 - **If `pre-commit` cannot run, use `uvx ruff@<pinned>` and run all three hooks; plain `ruff check` misses `I001`.** (#2957) Details: [run-pinned-ruff-directly-when-precommit-cannot-run](details/run-pinned-ruff-directly-when-precommit-cannot-run.md).
 - **Before "no lane runs this test", grep function-level marks and read the L0 lane scripts' `--ignore` lists.** (#3331)
 - **A module-level `pytest.importorskip` is a lane marker; stubbing the module may let the tests run.** 29 of the PR's own tests failed at head (#4108). Details: [importorskip-is-a-lane-guard-not-a-verdict](details/importorskip-is-a-lane-guard-not-a-verdict.md).
