@@ -2351,8 +2351,9 @@ class VllmAsyncGenerationWorkerImpl(
         """Clean up vLLM resources."""
         try:
             # Teardown must unblock an in-flight remote PUT, not await it forever.
-            if self._prefix_writer is not None:
-                self._prefix_writer.close()
+            prefix_writer = getattr(self, "_prefix_writer", None)
+            if prefix_writer is not None:
+                prefix_writer.close()
                 self._prefix_writer = None
             # Waiting for a wedged TQ write here would make actor shutdown hang.
             prefix_recovery = getattr(self, "_prefix_recovery", None)
