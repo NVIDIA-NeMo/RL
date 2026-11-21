@@ -167,7 +167,7 @@ def test_meta_keys_identity_across_dp_shards():
         fb, sample_ids=keys_from_uids(uids), dp_client=client, partition_id="train"
     )
 
-    rank_metas, _ = shard_meta_for_dp(meta, dp_world=4, batch_size=8)
+    rank_metas = shard_meta_for_dp(meta, dp_world=4, batch_size=8)
     flat = {k for m in rank_metas for k in m.sample_ids}
     assert flat == set(meta.sample_ids), (
         "shard_meta_for_dp introduced or dropped keys — should be a "
@@ -191,7 +191,7 @@ def test_kv_clear_uses_meta_keys_minted_at_rollout():
 
     # Workers / driver write deltas — keys still meta.sample_ids.
     write_columns(client, meta, {"advantages": torch.zeros(4)})
-    rank_metas, _ = shard_meta_for_dp(meta, dp_world=2, batch_size=4)
+    rank_metas = shard_meta_for_dp(meta, dp_world=2, batch_size=4)
     for rm in rank_metas:
         for k in rm.sample_ids:
             assert k in set(rollout_keys), (

@@ -288,7 +288,7 @@ def _stub_tq_policy(monkeypatch, captured: dict[str, KVBatchMeta]):
 
     def fake_shard(meta, **kwargs):
         captured[meta.task_name] = meta
-        return [meta], None
+        return [meta]
 
     monkeypatch.setattr(tq_policy_mod, "shard_meta_for_dp", fake_shard)
 

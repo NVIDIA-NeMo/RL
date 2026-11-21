@@ -265,6 +265,7 @@ policy:
     algorithm: "modified_first_fit_decreasing"
     microbatch_order: "packer"
     sequence_length_round: 64
+    share_prefixes: false
 
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   max_grad_norm: 1.0

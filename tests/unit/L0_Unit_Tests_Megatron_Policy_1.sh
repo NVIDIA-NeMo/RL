@@ -17,4 +17,7 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
+# Fail, instead of skip, when Megatron-LM lacks the shared-prefix modules.
+export NRL_REQUIRE_SHARED_PREFIX_TESTS=1
+
 uv run --extra mcore bash -x ./tests/run_unit.sh "unit/models/policy/" "${EXCLUDED_UNIT_TESTS[@]}" --shard-id=0 --num-shards=4 --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated --mcore-only

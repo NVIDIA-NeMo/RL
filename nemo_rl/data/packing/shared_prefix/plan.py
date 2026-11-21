@@ -13,17 +13,18 @@
 # limitations under the License.
 """Plan the forwards of a batch whose rows share prompts.
 
-Rows of one prompt group that start with the same prompt form a prefix tree: a forward runs the
-prompt once, followed by each row's completion. A forward is either a pack of trees or a dense
-bin of rows that share with nothing. The driver plans every data-parallel rank's forwards here,
-from row lengths alone, so all ranks run the same number of forwards.
+Rows of one prompt group that start with the same prompt form a tree: a forward runs the prompt
+once, followed by each row's completion. A forward is either a pack of trees or a dense bin of
+rows that share with nothing. The driver plans every data-parallel rank's forwards here, from row
+lengths alone. In each global batch every rank runs the same number of packs and then the same
+number of dense bins, so a forward has the same kind on every rank.
 """
 
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 from nemo_rl.data.packing.algorithms import get_packer
-from nemo_rl.data.packing.shared_prefix.columns import UNSHARED_ROW
+from nemo_rl.data.packing.shared_prefix.row_metadata import UNSHARED_ROW
 
 MAX_TREE_ROWS = 16
 """Most rows behind one prompt copy. A larger group is split into trees of even size."""
@@ -52,10 +53,10 @@ class SharedPrefixShard:
 
 @dataclass(frozen=True)
 class _Forward:
-    """One planned forward: the trees of a pack, or the rows of a dense bin."""
+    """One planned forward: its rows in execution order, their tree ids and its token count."""
 
-    trees: tuple[tuple[int, ...], ...]
-    dense_rows: tuple[int, ...]
+    rows: tuple[int, ...]
+    tree_ids: tuple[int, ...]
     length: int
 
 
@@ -110,8 +111,12 @@ def _plan_global_batch(
     pad_multiple: int,
     algorithm: str,
     bound_by_full_length: bool,
-) -> list[_Forward]:
-    """Plan one global batch: a multiple of ``num_shards`` forwards over rows ``0..n-1``."""
+) -> tuple[list[_Forward], list[_Forward]]:
+    """Plan one global batch over rows ``0..n-1``.
+
+    Returns:
+        The packs and the dense bins. Each count is a multiple of ``num_shards``.
+    """
     prompt_length = {
         row: key[1] for row, key in enumerate(share_keys) if key is not None
     }
@@ -159,48 +164,51 @@ def _plan_global_batch(
             if dense_rows
             else []
         )
-        natural = len(tree_bins) + len(dense_bins)
-        target = max(natural, num_shards)
-        target += -target % num_shards
-        extra = target - natural
-        spare_dense = len(dense_rows) - len(dense_bins)
-        spare_trees = len(trees) - len(tree_bins)
-        if extra <= spare_dense + spare_trees:
-            dense_bins = _grow_bins(dense_bins, min(extra, spare_dense))
-            tree_bins = _grow_bins(tree_bins, extra - min(extra, spare_dense))
-            break
-        if not trees:
-            raise ValueError(
-                f"Cannot create {target} forwards with only {len(padded_lengths)} rows. Each "
-                f"of the {num_shards} data-parallel ranks needs at least one row per global batch."
-            )
-        # Too few items for one forward per rank: divide the largest tree, or stop sharing it.
-        largest = max(range(len(trees)), key=lambda index: len(trees[index]))
-        rows = list(trees.pop(largest))
-        if len(rows) >= 4:
-            trees.extend((tuple(rows[0::2]), tuple(rows[1::2])))
+        num_packs = _round_up(len(tree_bins), num_shards)
+        num_dense_bins = _round_up(len(dense_bins), num_shards)
+        largest = max(trees, key=len, default=())
+        if len(trees) < num_packs and len(largest) >= 4:
+            # Fewer trees than packs: halve the largest tree.
+            trees.remove(largest)
+            trees.extend((largest[0::2], largest[1::2]))
+        elif len(trees) < num_packs or len(dense_rows) < num_dense_bins:
+            # No tree can be halved, or there are fewer dense rows than dense bins: the
+            # smallest tree stops sharing.
+            if not trees:
+                raise ValueError(
+                    f"Cannot create {num_dense_bins} forwards with only {len(dense_rows)} "
+                    f"rows. Each of the {num_shards} data-parallel ranks needs the same "
+                    "number of forwards per global batch."
+                )
+            smallest = min(trees, key=len)
+            trees.remove(smallest)
+            dense_rows = sorted(dense_rows + list(smallest))
         else:
-            dense_rows = sorted(dense_rows + rows)
+            break
+    tree_bins = _grow_bins(tree_bins, num_packs - len(tree_bins))
+    dense_bins = _grow_bins(dense_bins, num_dense_bins - len(dense_bins))
 
-    forwards = [
+    packs = [
         _Forward(
-            trees=tuple(trees[index] for index in items),
-            dense_rows=(),
+            rows=tuple(row for index in items for row in trees[index]),
+            tree_ids=tuple(
+                tree_id for tree_id, index in enumerate(items) for _ in trees[index]
+            ),
             length=_round_up(
                 sum(tree_lengths(trees[index])[0] for index in items), pad_multiple
             ),
         )
         for items in tree_bins
     ]
-    forwards += [
+    dense = [
         _Forward(
-            trees=(),
-            dense_rows=tuple(dense_rows[index] for index in items),
+            rows=tuple(dense_rows[index] for index in items),
+            tree_ids=(UNSHARED_ROW,) * len(items),
             length=sum(padded_lengths[dense_rows[index]] for index in items),
         )
         for items in dense_bins
     ]
-    return forwards
+    return packs, dense
 
 
 def plan_shared_prefix_shards(
@@ -220,8 +228,17 @@ def plan_shared_prefix_shards(
     """Plan every rank's forwards for a batch, sharing each prompt among the rows that have it.
 
     Two rows share when they have the same group, prompt length and prompt hash, and a prompt
-    length between 1 and their length minus 1. Every rank gets the same number of forwards, and
-    the forwards are dealt longest first to the rank with the fewest tokens so far.
+    length between 1 and their length minus 1.
+
+    In each global batch every rank runs the same number of packs, then the same number of dense
+    bins. A pack and a dense bin can run different collectives, so a forward must have the same
+    kind on every rank. Forwards of one kind are dealt longest first to the rank with the fewest
+    tokens so far.
+
+    The number of packs, and the number of dense bins, is therefore rounded up to a multiple of
+    ``num_shards``. When there are fewer trees than packs, the largest tree with at least four
+    rows is halved. When no tree can be halved, the smallest tree stops sharing and its rows run
+    dense. The smallest tree also stops sharing when there are fewer dense rows than dense bins.
 
     Args:
         sequence_lengths: Token count of each row.
@@ -236,14 +253,15 @@ def plan_shared_prefix_shards(
         bound_by_full_length: Count a tree at its full length, with the prompt in every row,
             against the budget. Needed when the model also processes the rows in full, as the
             multi-token-prediction heads do.
-        largest_first: Run each rank's forwards from longest to shortest.
+        largest_first: Run each rank's packs, and then its dense bins, from longest to shortest.
 
     Returns:
         One ``SharedPrefixShard`` per rank.
 
     Raises:
         ValueError: If a row is empty or exceeds the budget, the rows do not divide into global
-            batches, or a global batch has fewer rows than ranks.
+            batches, or a global batch has too few rows to give every rank the same number of
+            forwards.
     """
     num_rows = len(sequence_lengths)
     if batch_size is None:
@@ -276,7 +294,7 @@ def plan_shared_prefix_shards(
     micro_batch_lengths: list[list[list[int]]] = [[] for _ in range(num_shards)]
     elem_counts: list[list[int]] = [[] for _ in range(num_shards)]
     for start in range(0, num_rows, batch_size):
-        forwards = _plan_global_batch(
+        packs, dense_bins = _plan_global_batch(
             padded_lengths=padded_lengths[start : start + batch_size],
             share_keys=share_keys[start : start + batch_size],
             num_shards=num_shards,
@@ -285,42 +303,41 @@ def plan_shared_prefix_shards(
             algorithm=algorithm,
             bound_by_full_length=bound_by_full_length,
         )
-        quota = len(forwards) // num_shards
-        dealt: list[list[int]] = [[] for _ in range(num_shards)]
+        dealt: list[list[_Forward]] = [[] for _ in range(num_shards)]
         tokens = [0] * num_shards
-        # A stable sort, so forwards of equal length keep the planning order.
-        for index in sorted(
-            range(len(forwards)), key=lambda index: -forwards[index].length
-        ):
-            shard = min(
-                (shard for shard in range(num_shards) if len(dealt[shard]) < quota),
-                key=lambda shard: tokens[shard],
-            )
-            dealt[shard].append(index)
-            tokens[shard] += forwards[index].length
+        # Packs are dealt first, so every rank runs its packs before its dense bins.
+        for forwards in (packs, dense_bins):
+            quota = len(forwards) // num_shards
+            taken: list[list[int]] = [[] for _ in range(num_shards)]
+            # A stable sort, so forwards of equal length keep the planning order.
+            for index in sorted(
+                range(len(forwards)), key=lambda index: -forwards[index].length
+            ):
+                shard = min(
+                    (shard for shard in range(num_shards) if len(taken[shard]) < quota),
+                    key=lambda shard: tokens[shard],
+                )
+                taken[shard].append(index)
+                tokens[shard] += forwards[index].length
+            for shard in range(num_shards):
+                dealt[shard].extend(
+                    forwards[index]
+                    for index in (
+                        taken[shard] if largest_first else sorted(taken[shard])
+                    )
+                )
         for shard in range(num_shards):
             indices: list[list[int]] = []
-            lengths: list[int] = []
             count = 0
-            for index in dealt[shard] if largest_first else sorted(dealt[shard]):
-                forward = forwards[index]
-                rows = [row for tree in forward.trees for row in tree] or list(
-                    forward.dense_rows
-                )
-                row_indices[shard].extend(start + row for row in rows)
-                tree_ids[shard].extend(
-                    [
-                        tree_id
-                        for tree_id, tree in enumerate(forward.trees)
-                        for _ in tree
-                    ]
-                    or [UNSHARED_ROW] * len(rows)
-                )
-                indices.append([count, count + len(rows)])
-                lengths.append(forward.length)
-                count += len(rows)
+            for forward in dealt[shard]:
+                row_indices[shard].extend(start + row for row in forward.rows)
+                tree_ids[shard].extend(forward.tree_ids)
+                indices.append([count, count + len(forward.rows)])
+                count += len(forward.rows)
             micro_batch_indices[shard].append(indices)
-            micro_batch_lengths[shard].append(lengths)
+            micro_batch_lengths[shard].append(
+                [forward.length for forward in dealt[shard]]
+            )
             elem_counts[shard].append(count)
     return [
         SharedPrefixShard(

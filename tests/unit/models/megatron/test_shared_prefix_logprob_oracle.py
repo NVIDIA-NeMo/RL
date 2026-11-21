@@ -11,59 +11,39 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Exactness oracle for NeMo-RL's shared-prefix logprob and loss consumer.
+"""Exactness oracle for the logprobs and the loss of shared-prefix packs.
 
-The model is a table lookup: the logits at a token are the row of a trainable
-table selected by a hash of that token's causal history. For a prompt token the
-history is the prompt prefix; for a completion token it is the prompt plus the
-branch's own completion prefix. Every physical token of a shared star or forest
-therefore gets the logits that the dense row gets at the same logical position.
-A correct consumer must reproduce the dense per-row logprobs, the dense loss and
-the dense table gradient. Both paths are also checked against an fp64
-single-process computation of the same loss, so a scale error common to both
-fails too.
+A tree is one prompt followed by the completions of the rows that start with that
+prompt. A pack is one model forward that holds several trees and runs each prompt
+once.
 
-Shared batches run through the worker's entry points: ``get_microbatch_iterator``,
-``forward_with_post_processing_fn`` (MCore layout lowering, temperature, chunked
-extraction), ``LossPostProcessor`` / ``LogprobsPostProcessor`` and the worker's
-source-order restore. Dense fallback units take the conventional packed loss path.
+The model is a table lookup. The logits at a token are the row of a trainable table
+that a hash of the token's causal history selects. For a prompt token the history is
+the prompt up to that token. For a completion token it is the prompt followed by the
+row's own completion up to that token. Every token of a pack therefore gets the
+logits that a dense forward gives the same token of the same row. Correct pack code
+must reproduce the dense logprobs of every row, the dense loss and the dense table
+gradient. Both paths are also checked against an fp64 single-process computation of
+the same loss, so a scale error common to both fails too.
 
-TP1/CP1 runs in-process on one GPU. The TP/CP variants spawn one process per GPU
-and skip when fewer GPUs are visible. Run them with four visible GPUs, e.g.
+Batches take the production path. ``plan_shared_prefix_shards`` plans the forwards as
+the driver does. The rows get the two columns that the Megatron worker attaches.
+``get_microbatch_iterator`` then yields packs and dense bins, and
+``forward_with_post_processing_fn`` runs them with ``LossPostProcessor`` and
+``LogprobsPostProcessor``.
+
+TP1/CP1 runs in-process on one GPU. The TP/CP variants spawn one process per GPU.
+A test skips when it lacks its GPUs. With ``NRL_REQUIRE_SHARED_PREFIX_TESTS=1``, which
+the Megatron lanes set, it fails instead, except the TP2/CP2 variant: it needs four
+GPUs, and a lane guarantees only two. Run it with four visible GPUs, e.g.
 ``CUDA_VISIBLE_DEVICES=0,1,2,3 pytest --mcore-only <this file> -k distributed``.
-
-Cross-repo and cross-module API assumptions. Other review fixes edit these
-modules concurrently; update this file if one of them changes:
-
-- ``nemo_rl.models.megatron.data``: ``get_microbatch_iterator(data, cfg, mbs,
-  straggler_timer, shared_prefix_bin_capacity=, shared_prefix_execution_units=,
-  shared_prefix_stage=)`` returns ``(iterator, num_units, 1, width,
-  padded_seq_length)`` in shared mode, stamps ``SHARED_PREFIX_SOURCE_ROW_INDEX``
-  on every unit, and keeps unit rows in ``layout.row_indices`` order. The units
-  come from ``plan_shared_prefix_execution_units(data, cfg=, bin_capacity=,
-  forward_only=)``.
-- ``nemo_rl.models.megatron.shared_prefix_dense_bins``: ``plan_dense_training_bins``
-  and ``share_prefixes_in_dense_training_bins(data, units, cfg=, bin_capacity=)``.
-- ``nemo_rl.models.megatron.train``: a shared unit calls the model with a
-  ``shared_prefix_layout`` keyword (MCore ``SharedPrefixLayout`` with
-  ``prefix_len``/``completion_lens``, or ``SharedPrefixForestLayout.roots``) and
-  without ``packed_seq_params``, and ``forward_with_post_processing_fn`` returns
-  the restored ``[rows, width - 1]`` logprobs for it.
-- ``nemo_rl.models.policy.workers.megatron_policy_worker._restore_logprobs_in_source_order(
-  outputs, sequence_length=, expected_rows=)``.
-- ``megatron.rl`` (MLM #7914): ``SharedPrefixTensorBin.layout`` with
-  ``row_indices``, ``physical_total_length`` and ``iter_roots()`` yielding roots
-  with ``prompt_length``, ``row_indices``, ``branch_starts`` (root-relative) and
-  ``completion_lengths``; ``packed_input_ids``.
-- ``nemo_rl.models.policy.SharedPrefixTrainingConfig`` accepts the flag sets in
-  ``_CASES`` (valid under the stricter flag-combination validator as well).
 """
 
 import functools
 import hashlib
-import importlib.util
+import os
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -74,44 +54,27 @@ import torch.distributed as dist
 
 pytest.importorskip("megatron.core")
 
-
-def _has_shared_prefix_stack() -> bool:
-    try:
-        return all(
-            importlib.util.find_spec(name) is not None
-            for name in (
-                "megatron.rl.shared_prefix_tensors",
-                "megatron.core.models.hybrid.shared_prefix",
-            )
-        )
-    except ImportError:
-        return False
-
-
-# Only the planning oracle needs the Megatron-LM shared-prefix stack (the megatron.rl packing
-# library and MCore's HybridModel shared-prefix forward); the restore and inactive-mode tests
-# run against any Megatron-LM.
-requires_megatron_rl = pytest.mark.skipif(
-    not _has_shared_prefix_stack(),
-    reason="needs the Megatron-LM shared-prefix stack (megatron.rl and MCore shared_prefix)",
-)
-
 from megatron.core import parallel_state  # noqa: E402
+from megatron.core.datasets.shared_prefix.layout import SharedPrefixPack  # noqa: E402
 
 from nemo_rl.algorithms.logits_sampling_utils import (  # noqa: E402
     TrainingSamplingParams,
 )
 from nemo_rl.algorithms.loss.interfaces import LossInputType, LossType  # noqa: E402
-from nemo_rl.data.packing.shared_prefix_metadata import (  # noqa: E402
-    SHARED_PREFIX_GROUP_ID,
+from nemo_rl.data.packing.shared_prefix.plan import (  # noqa: E402
+    SharedPrefixShard,
+    plan_shared_prefix_shards,
+)
+from nemo_rl.data.packing.shared_prefix.row_metadata import (  # noqa: E402
     SHARED_PREFIX_PROMPT_LENGTHS,
+    SHARED_PREFIX_TREE_IDS,
+    UNSHARED_ROW,
+    prompt_hash,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict  # noqa: E402
 from nemo_rl.models.megatron.data import (  # noqa: E402
-    SHARED_PREFIX_SOURCE_ROW_INDEX,
     ProcessedMicrobatch,
     get_microbatch_iterator,
-    plan_shared_prefix_execution_units,
 )
 from nemo_rl.models.megatron.train import (  # noqa: E402
     LogprobsPostProcessor,
@@ -119,6 +82,7 @@ from nemo_rl.models.megatron.train import (  # noqa: E402
     forward_with_post_processing_fn,
 )
 from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple  # noqa: E402
+from nemo_rl.utils.tensor_ops import pad_and_concat  # noqa: E402
 
 pytestmark = pytest.mark.mcore
 
@@ -134,10 +98,9 @@ _TABLE = (
     )
     * 2.0
 )
-# Observed maxima on GB200 at TP{1,2} x CP{1,2}: logprob error 1.3e-6 against
-# the fp64 reference (fp32 rounding; the model has no matmul, so TF32 cannot
-# enter), gradient relative error 7e-8. A misrouted logprob or a CP/TP scale
-# error is orders of magnitude larger.
+# The logprob error against the fp64 reference is fp32 rounding: the model has no
+# matmul, so TF32 cannot enter. A misrouted logprob or a CP/TP scale error is orders
+# of magnitude larger than these tolerances.
 _LOGPROB_ATOL = 1e-5
 _LOSS_RTOL = 1e-5
 _GRAD_RTOL = 1e-6
@@ -148,43 +111,49 @@ class _Case:
     # (group id, prompt length, completions); rows are interleaved at random.
     groups: tuple[tuple[str, int, int], ...]
     seed: int
-    shared_prefix: dict[str, Any]
-    bin_capacity: int
+    # Token budget of one forward.
+    max_tokens: int
+    # Whether the driver counts a training tree at its full length, with the prompt
+    # in every row. It does when the model runs MTP.
+    bound_by_full_length: bool = False
     # Groups that get one invalid placeholder row (prompt length 0, masked).
     placeholders: tuple[str, ...] = ()
-    # TransferQueue delivers group IDs as a numpy object array.
-    numpy_group_ids: bool = False
+    # Whether the batch also holds one group with the rows of forest training.
+    forest_training: bool = False
     mtp_loss_mask: bool = False
-    # Structure the case must exercise beyond at least one shared unit: "stars",
-    # "forest", "partial_stars" (only placeholders and single-row groups run
-    # dense), "fragments" (a prompt split across shared units) or
-    # "forest_fragments" (a prompt split across roots of one forest).
+    # What the training plan must contain besides one pack: "several_trees" (a pack
+    # of two or more trees), "several_packs", "split_group" (one group in two or
+    # more trees) or "dense_rows" (exactly the rows without a prompt and the rows
+    # whose prompt no other row of their group has run in dense bins).
     expect: Optional[str] = None
 
 
-_PACK = {"mode": "train", "pack_groups": True}
-_DENSE_BINS = {**_PACK, "align_data_parallel": True, "training_dense_bins": True}
 _SPEC_A = (("g0", 5, 3), ("g1", 7, 4), ("g2", 9, 2), ("g3", 3, 5))
-# A singleton group (G=1), more siblings than one star holds, and a one-token prompt.
+# A one-row group, a group with more rows than one tree holds, and a one-token prompt.
 _SPEC_B = (("g0", 5, 3), ("big", 6, 17), ("one", 4, 1), ("p1", 1, 4), ("g4", 8, 2))
 _CASES = {
-    "stars": _Case(
-        _SPEC_A, 11, {"mode": "train"}, 512, mtp_loss_mask=True, expect="stars"
+    "one_pack": _Case(_SPEC_A, 11, 512, mtp_loss_mask=True, expect="several_trees"),
+    "small_budget": _Case(_SPEC_A, 13, 160, expect="several_packs"),
+    "full_length_bound": _Case(
+        _SPEC_A,
+        14,
+        160,
+        bound_by_full_length=True,
+        mtp_loss_mask=True,
+        expect="several_packs",
     ),
-    "forest": _Case(_SPEC_A, 12, _PACK, 512, numpy_group_ids=True, expect="forest"),
-    "forest_small_bins": _Case(_SPEC_A, 13, _PACK, 160, expect="forest"),
-    # The worker splits the 17-row group past the branch limit into stars of 9
-    # and 8. Without pack_groups each star is its own forward; with it, the two
-    # stars become roots of one forest next to the singleton's dense fallback.
-    "split_group": _Case(_SPEC_B, 21, {"mode": "train"}, 1024, expect="fragments"),
-    "split_group_packed": _Case(_SPEC_B, 24, _PACK, 1024, expect="forest_fragments"),
-    "dense_bins": _Case(_SPEC_A, 14, _DENSE_BINS, 160),
-    # With pack_groups, the placeholder runs dense on its own; the rest of its
-    # group keeps the star it shares.
-    "fallbacks": _Case(
-        _SPEC_B, 22, _PACK, 1024, placeholders=("g4",), expect="partial_stars"
+    "single_tree": _Case((("g0", 6, 5),), 15, 512),
+    # The planner divides the 17-row group into trees of 9 and 8 rows.
+    "split_group": _Case(_SPEC_B, 21, 1024, expect="split_group"),
+    "placeholder": _Case(_SPEC_B, 22, 1024, placeholders=("g4",), expect="dense_rows"),
+    "forest_training": _Case(
+        _SPEC_A,
+        23,
+        512,
+        forest_training=True,
+        mtp_loss_mask=True,
+        expect="dense_rows",
     ),
-    "fallbacks_dense_bins": _Case(_SPEC_B, 23, _DENSE_BINS, 256),
 }
 
 
@@ -213,22 +182,17 @@ def _local_positions(
     return positions
 
 
-def _star_features(ids: Sequence[int], layout: Any) -> list[int]:
-    """Causal-history features of the MCore lowering ``[prefix, branch, ...]``."""
+def _pack_features(ids: Sequence[int], layout: SharedPrefixPack) -> list[int]:
+    """Causal-history features of a packed sequence: each prompt, then its rows."""
     features = [_feature(("pad", position)) for position in range(len(ids))]
-    offset = 0
-    for root in getattr(layout, "roots", (layout,)):
-        prompt = list(ids[offset : offset + root.prefix_len])
-        features[offset : offset + root.prefix_len] = _causal_features(prompt)
-        start = offset + root.prefix_len
-        for length in root.completion_lens:
-            branch = prompt + list(ids[start : start + length])
-            features[start : start + length] = _causal_features(branch)[
-                root.prefix_len :
-            ]
+    for offset, tree in layout.iter_roots():
+        prompt = list(ids[offset : offset + tree.prefix_len])
+        features[offset : offset + tree.prefix_len] = _causal_features(prompt)
+        start = offset + tree.prefix_len
+        for length in tree.completion_lens:
+            row = prompt + list(ids[start : start + length])
+            features[start : start + length] = _causal_features(row)[tree.prefix_len :]
             start += length
-        offset = start
-    assert offset <= len(ids)
     return features
 
 
@@ -241,9 +205,9 @@ def _table_shard(tp_rank: int, tp_size: int) -> torch.Tensor:
 class _CausalHistoryModel(torch.nn.Module):
     """Logits from a table row keyed by each token's causal history.
 
-    It reconstructs the global token sequence from the CP-local inputs and the
-    layout it is given, exactly as attention would see it: a shared unit as the
-    MCore star/forest lowering, a fallback unit as THD sequences.
+    It rebuilds the whole token sequence from the CP-local inputs and the layout it
+    is given, as attention would see it: a pack as each prompt followed by its rows,
+    a dense bin as packed sequences.
     """
 
     def __init__(self, tp_rank: int, tp_size: int, cp_rank: int, cp_size: int):
@@ -257,7 +221,7 @@ class _CausalHistoryModel(torch.nn.Module):
         input_ids: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        shared_prefix_layout: Any = None,
+        shared_prefix_layout: Optional[SharedPrefixPack] = None,
         packed_seq_params: Any = None,
         **unused: Any,
     ) -> torch.Tensor:
@@ -267,14 +231,14 @@ class _CausalHistoryModel(torch.nn.Module):
             assert packed_seq_params is None
             segments = [(0, input_ids.shape[1] * self.cp_size)]
         else:
-            assert packed_seq_params is not None, "shared mode ran an unpacked unit"
+            assert packed_seq_params is not None, "a planned forward ran unpacked"
             boundaries = to_cpu_int_tuple(packed_seq_params.cu_seqlens_q_padded)
             segments = list(zip(boundaries[:-1], boundaries[1:]))
         local = _local_positions(segments, self.cp_rank, self.cp_size)
         assert len(local) == input_ids.shape[1], (len(local), input_ids.shape)
         ids = self._global_ids(input_ids[0], segments)
         if shared_prefix_layout is not None:
-            features = _star_features(ids, shared_prefix_layout)
+            features = _pack_features(ids, shared_prefix_layout)
         else:
             features = [
                 feature
@@ -329,35 +293,76 @@ class _PolicyGradientLoss:
         return -weighted.sum() / global_valid_toks, {}
 
 
-def _build_batch(case: _Case) -> BatchedDataDict[Any]:
+@dataclass(frozen=True)
+class _Rows:
+    data: BatchedDataDict[Any]
+    # What the rollout reassembler stamps on every row for the driver.
+    group_ids: list[str]
+    prompt_lengths: list[int]
+
+
+# Group, prompt length, tokens and the column spans that carry loss. A row without a
+# span is invalid: its sample mask is 0.
+_Row = tuple[str, int, list[int], tuple[tuple[int, int], ...]]
+
+
+def _forest_training_rows(rng: np.random.Generator) -> list[_Row]:
+    """Rows of one forest-training group: two rollouts and two execution-padding rows.
+
+    In forest training a rollout owns one row per selected path of its model calls.
+    The first rollout owns rows 0 to 2. Row 0 holds its first call and a second call
+    that continues it. Row 1 branches after the first call, whose loss row 0 owns.
+    Row 2 starts from a rewritten prompt, as after a compaction. Row 3 is the second
+    rollout. The padding rows copy row 0 and carry no loss.
+    """
+
+    def tokens(count: int) -> list[int]:
+        return rng.integers(1, _VOCAB, count).tolist()
+
+    prompt = tokens(5)
+    # Same length as the prompt, and different in every token.
+    rewritten_prompt = [token % (_VOCAB - 1) + 1 for token in prompt]
+    # The prompt, the 4 tokens of the first call and 3 tokens that carry no loss.
+    shared_calls = prompt + tokens(4) + tokens(3)
+    continuation = shared_calls + tokens(6)
+    branch = shared_calls + tokens(3)
+    return [
+        ("forest", 5, continuation, ((5, 9), (12, 18))),
+        ("forest", 5, branch, ((12, 15),)),
+        ("forest", 5, rewritten_prompt + tokens(7), ((5, 12),)),
+        ("forest", 5, prompt + tokens(8), ((5, 13),)),
+        ("forest", 0, continuation, ()),
+        ("forest", 0, continuation, ()),
+    ]
+
+
+def _build_rows(case: _Case) -> _Rows:
     rng = np.random.default_rng(case.seed)
-    rows: list[tuple[str, int, list[int], bool]] = []
+    rows: list[_Row] = []
     for group, prompt_length, completions in case.groups:
         prompt = rng.integers(1, _VOCAB, prompt_length).tolist()
         for _ in range(completions):
             completion_length = int(rng.integers(1, _WIDTH - prompt_length + 1))
             completion = rng.integers(0, _VOCAB, completion_length).tolist()
-            rows.append((group, prompt_length, prompt + completion, True))
+            tokens = prompt + completion
+            rows.append((group, prompt_length, tokens, ((prompt_length, len(tokens)),)))
         if group in case.placeholders:
             # Reassembler placeholder: one pad token, prompt length 0, masked.
-            rows.append((group, 0, [0], False))
+            rows.append((group, 0, [0], ()))
+    if case.forest_training:
+        rows.extend(_forest_training_rows(rng))
     rows = [rows[index] for index in rng.permutation(len(rows))]
     size = len(rows)
     input_ids = torch.zeros(size, _WIDTH, dtype=torch.long)
     token_mask = torch.zeros(size, _WIDTH)
-    for index, (_, prompt_length, tokens, valid) in enumerate(rows):
+    for index, (_, _, tokens, loss_spans) in enumerate(rows):
         input_ids[index, : len(tokens)] = torch.tensor(tokens)
-        if valid:
-            token_mask[index, prompt_length : len(tokens)] = 1.0
-    group_ids = [group for group, *_ in rows]
-    sample_mask = torch.tensor([1.0 if valid else 0.0 for *_, valid in rows])
+        for start, end in loss_spans:
+            token_mask[index, start:end] = 1.0
+    sample_mask = torch.tensor([1.0 if loss_spans else 0.0 for *_, loss_spans in rows])
     data: dict[str, Any] = {
         "input_ids": input_ids,
         "input_lengths": torch.tensor([len(tokens) for _, _, tokens, _ in rows]),
-        SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([length for _, length, *_ in rows]),
-        SHARED_PREFIX_GROUP_ID: (
-            np.asarray(group_ids, dtype=object) if case.numpy_group_ids else group_ids
-        ),
         "token_mask": token_mask,
         "sample_mask": sample_mask,
         "advantages": torch.randn(
@@ -366,12 +371,14 @@ def _build_batch(case: _Case) -> BatchedDataDict[Any]:
     }
     if case.mtp_loss_mask:
         data["mtp_loss_mask"] = token_mask * sample_mask.unsqueeze(-1)
-    return BatchedDataDict(data)
+    return _Rows(
+        data=BatchedDataDict(data),
+        group_ids=[group for group, *_ in rows],
+        prompt_lengths=[length for _, length, *_ in rows],
+    )
 
 
-def _policy_cfg(
-    case: _Case, chunk_size: Optional[int], tp_size: int, cp_size: int
-) -> dict[str, Any]:
+def _policy_cfg(chunk_size: Optional[int], tp_size: int, cp_size: int) -> dict:
     multiple = 2 * tp_size * cp_size if tp_size > 1 or cp_size > 1 else 1
     return {
         "make_sequence_length_divisible_by": multiple,
@@ -386,27 +393,86 @@ def _policy_cfg(
             "pipeline_model_parallel_size": 1,
             "sequence_parallel": tp_size > 1,
         },
-        "shared_prefix_training": dict(case.shared_prefix),
         "logprob_chunk_size": chunk_size,
     }
 
 
-def _plan_training_units(
-    case: _Case, batch: BatchedDataDict[Any], cfg: dict[str, Any]
-) -> tuple[Any, ...]:
-    if not case.shared_prefix.get("training_dense_bins"):
-        return plan_shared_prefix_execution_units(
-            batch, cfg=cfg, bin_capacity=case.bin_capacity
-        )
-    from nemo_rl.models.megatron.shared_prefix_dense_bins import (
-        plan_dense_training_bins,
-        share_prefixes_in_dense_training_bins,
+def _plan_rank_batch(
+    rows: _Rows, case: _Case, cfg: dict, *, bound_by_full_length: bool
+) -> tuple[BatchedDataDict[Any], SharedPrefixShard]:
+    """Plan the forwards on the driver and attach the plan as the worker does."""
+    input_ids = rows.data["input_ids"].tolist()
+    (shard,) = plan_shared_prefix_shards(
+        sequence_lengths=rows.data["input_lengths"].tolist(),
+        group_ids=rows.group_ids,
+        prompt_lengths=rows.prompt_lengths,
+        prompt_hashes=[
+            prompt_hash(tokens[:length])
+            for tokens, length in zip(input_ids, rows.prompt_lengths)
+        ],
+        num_shards=1,
+        batch_size=None,
+        max_tokens_per_microbatch=case.max_tokens,
+        sequence_length_pad_multiple=cfg["make_sequence_length_divisible_by"],
+        algorithm=cfg["sequence_packing"]["algorithm"],
+        bound_by_full_length=bound_by_full_length,
+        largest_first=False,
     )
+    assert sorted(shard.row_indices) == list(range(rows.data.size))
+    data = rows.data.select_indices(shard.row_indices)
+    data.micro_batch_indices = shard.micro_batch_indices
+    data.micro_batch_lengths = shard.micro_batch_lengths
+    data.elem_counts_per_gb = shard.elem_counts_per_gb
+    data[SHARED_PREFIX_TREE_IDS] = torch.tensor(shard.tree_ids)
+    data[SHARED_PREFIX_PROMPT_LENGTHS] = torch.tensor(
+        [rows.prompt_lengths[row] for row in shard.row_indices]
+    )
+    return data, shard
 
-    units = plan_dense_training_bins(batch, cfg=cfg, bin_capacity=case.bin_capacity)
-    return share_prefixes_in_dense_training_bins(
-        batch, units, cfg=cfg, bin_capacity=case.bin_capacity
-    )
+
+def _check_plan(case: _Case, rows: _Rows, shard: SharedPrefixShard) -> None:
+    """Check that the plan has the forwards that the case is meant to exercise."""
+    tree_ids = shard.tree_ids
+    forwards = [
+        (shard.row_indices[start:end], tree_ids[start:end])
+        for start, end in shard.micro_batch_indices[0]
+    ]
+    packs = [forward for forward in forwards if forward[1][0] != UNSHARED_ROW]
+    # A plan of dense bins only would pass every numeric check trivially.
+    assert packs
+    if case.expect == "several_trees":
+        assert any(max(forward_tree_ids) > 0 for _, forward_tree_ids in packs)
+    elif case.expect == "several_packs":
+        assert len(packs) > 1
+    elif case.expect == "split_group":
+        trees = {
+            (pack, tree_id, rows.group_ids[row])
+            for pack, (forward_rows, forward_tree_ids) in enumerate(packs)
+            for row, tree_id in zip(forward_rows, forward_tree_ids)
+        }
+        trees_per_group = Counter(group for _, _, group in trees)
+        assert max(trees_per_group.values()) > 1, trees_per_group
+    elif case.expect == "dense_rows":
+        prompts = [
+            (group, tuple(tokens[:length]))
+            for group, length, tokens in zip(
+                rows.group_ids, rows.prompt_lengths, rows.data["input_ids"].tolist()
+            )
+        ]
+        rows_with_prompt = Counter(
+            prompt for prompt, length in zip(prompts, rows.prompt_lengths) if length
+        )
+        dense_rows = sorted(
+            row
+            for row, tree_id in zip(shard.row_indices, tree_ids)
+            if tree_id == UNSHARED_ROW
+        )
+        assert 0 in rows.prompt_lengths
+        assert dense_rows == [
+            row
+            for row, (prompt, length) in enumerate(zip(prompts, rows.prompt_lengths))
+            if length == 0 or rows_with_prompt[prompt] == 1
+        ]
 
 
 @dataclass
@@ -462,13 +528,13 @@ def _cp_summed(grad: torch.Tensor, cp_size: int) -> torch.Tensor:
 
 def _dense_reference(
     batch: BatchedDataDict[Any],
-    cfg: dict[str, Any],
+    cfg: dict,
     truth: _Truth,
     temperature: float,
     global_valid: tuple[torch.Tensor, torch.Tensor],
     topology: tuple[int, int, int, int],
 ) -> tuple[float, torch.Tensor]:
-    """NeMo's conventional unpacked loss on CP-zigzag logits, as one microbatch."""
+    """NeMo-RL's unpacked loss on CP-zigzag logits, as one microbatch."""
     tp_rank, tp_size, cp_rank, cp_size = topology
     table = torch.nn.Parameter(_table_shard(tp_rank, tp_size))
     positions = _local_positions([(0, _WIDTH)], cp_rank, cp_size)
@@ -493,63 +559,79 @@ def _recording(
         yield microbatch
 
 
-def _check_shared_unit(
+def _check_pack_inputs(
     microbatch: ProcessedMicrobatch,
-    logprobs: torch.Tensor,
-    batch: BatchedDataDict[Any],
-    truth: _Truth,
+    row_indices: Sequence[int],
+    rows: _Rows,
+    cfg: dict,
     cp_rank: int,
     cp_size: int,
 ) -> None:
-    shared = microbatch.shared_prefix
-    assert shared is not None
-    layout = shared.tensor_bin.layout
-    rows = list(layout.row_indices)
-    # Unit rows are stamped with their source index and follow layout order.
-    assert microbatch.data_dict[SHARED_PREFIX_SOURCE_ROW_INDEX].tolist() == rows
-    assert torch.equal(
-        microbatch.data_dict["input_ids"].cpu(), batch["input_ids"][rows]
-    )
-
-    # Model input: the minimally padded packed star in zigzag CP order.
-    padded_length = shared.padded_total_length
-    assert padded_length is not None
-    assert padded_length % shared.padding_multiple == 0
-    assert 0 <= padded_length - layout.physical_total_length < shared.padding_multiple
-    padded_ids = torch.nn.functional.pad(
-        shared.tensor_bin.packed_input_ids.cpu(),
-        (0, padded_length - layout.physical_total_length),
-    )
-    local = _local_positions([(0, padded_length)], cp_rank, cp_size)
-    assert microbatch.input_ids_cp_sharded[0].tolist() == padded_ids[local].tolist()
-
-    if "mtp_loss_mask" in batch:
-        # The MTP mask follows each completion token; prompts and padding are 0.
-        expected = torch.zeros(padded_length)
-        for offset, root in layout.iter_roots():
-            for branch, row in enumerate(root.row_indices):
-                start = offset + root.branch_starts[branch]
-                length = root.completion_lengths[branch]
-                prompt = root.prompt_length
-                expected[start : start + length] = batch["mtp_loss_mask"][
-                    row, prompt : prompt + length
-                ]
-        assert microbatch.mtp_loss_mask is not None
-        assert torch.equal(
-            microbatch.mtp_loss_mask[0].float().cpu(), expected[local].float()
-        )
-
-    # Restored logprobs equal the dense per-row reference; padding columns are 0.
-    assert logprobs.shape == (len(rows), _WIDTH - 1)
-    for local_row, row in enumerate(rows):
+    """Check the model inputs of one pack against the rows it was built from."""
+    params = microbatch.shared_prefix_params
+    assert params is not None and microbatch.packed_seq_params is None
+    multiple = cfg["make_sequence_length_divisible_by"]
+    batch = rows.data
+    tree_ids = microbatch.data_dict[SHARED_PREFIX_TREE_IDS].tolist()
+    # The packed sequence: each tree's prompt once, then every row's completion,
+    # padded with zeros until prompt plus completion is a multiple of M.
+    tokens: list[int] = []
+    positions: list[int] = []
+    mtp_loss_mask: list[float] = []
+    for position, row in enumerate(row_indices):
+        ids = batch["input_ids"][row].tolist()
         length = int(batch["input_lengths"][row])
-        torch.testing.assert_close(
-            logprobs[local_row, : length - 1].detach().double().cpu(),
-            truth.logprobs[row, : length - 1],
-            atol=_LOGPROB_ATOL,
-            rtol=0.0,
+        prompt_length = rows.prompt_lengths[row]
+        padded_length = -(-length // multiple) * multiple
+        if position == 0 or tree_ids[position] != tree_ids[position - 1]:
+            tokens += ids[:prompt_length]
+            positions += range(prompt_length)
+            mtp_loss_mask += [0.0] * prompt_length
+        tokens += ids[prompt_length:length] + [0] * (padded_length - length)
+        positions += range(prompt_length, padded_length)
+        if "mtp_loss_mask" in batch:
+            mtp_loss_mask += batch["mtp_loss_mask"][row, prompt_length:length].tolist()
+            mtp_loss_mask += [0.0] * (padded_length - length)
+    assert isinstance(params.inputs.layout, SharedPrefixPack)
+    assert params.inputs.layout.mtp_loss_group_root_counts == (max(tree_ids) + 1,)
+    assert params.inputs.packed_input_ids.tolist() == tokens
+
+    # The model gets this rank's zigzag part of the pack, padded at its end to M.
+    padded_length = params.cp_shard.padded_total_length
+    assert padded_length == -(-len(tokens) // multiple) * multiple
+    padding = padded_length - len(tokens)
+    local = _local_positions([(0, padded_length)], cp_rank, cp_size)
+
+    def local_part(values: list) -> list:
+        padded = values + [0] * padding
+        return [padded[position] for position in local]
+
+    assert microbatch.input_ids_cp_sharded.tolist() == [local_part(tokens)]
+    assert microbatch.position_ids.tolist() == [local_part(positions)]
+    if "mtp_loss_mask" in batch:
+        assert microbatch.mtp_loss_mask is not None
+        assert microbatch.mtp_loss_mask.tolist() == [local_part(mtp_loss_mask)]
+    else:
+        assert microbatch.mtp_loss_mask is None
+
+
+def _check_pack_logprobs(
+    microbatch: ProcessedMicrobatch, logprobs: torch.Tensor
+) -> None:
+    """Check that every row of a tree holds the same copy of the prompt logprobs."""
+    tree_ids = microbatch.data_dict[SHARED_PREFIX_TREE_IDS].tolist()
+    prompt_lengths = microbatch.data_dict[SHARED_PREFIX_PROMPT_LENGTHS].tolist()
+    lengths = microbatch.data_dict["input_lengths"].tolist()
+    first_row = 0
+    for position, tree_id in enumerate(tree_ids):
+        if tree_id != tree_ids[first_row]:
+            first_row = position
+        prompt_length = prompt_lengths[position]
+        assert torch.equal(
+            logprobs[position, 1:prompt_length], logprobs[first_row, 1:prompt_length]
         )
-        assert not logprobs[local_row, length - 1 :].detach().any()
+        # Columns past the last token of a row stay 0.
+        assert not logprobs[position, lengths[position] :].any()
 
 
 def _check_case(
@@ -560,8 +642,9 @@ def _check_case(
     cp_rank = parallel_state.get_context_parallel_rank()
     cp_size = parallel_state.get_context_parallel_world_size()
     topology = (tp_rank, tp_size, cp_rank, cp_size)
-    batch = _build_batch(case)
-    cfg = _policy_cfg(case, chunk_size, tp_size, cp_size)
+    rows = _build_rows(case)
+    batch = rows.data
+    cfg = _policy_cfg(chunk_size, tp_size, cp_size)
     sampling = TrainingSamplingParams(temperature=temperature)
     truth = _truth(batch, temperature, tp_rank, tp_size)
     valid = batch["token_mask"][:, 1:] * batch["sample_mask"].unsqueeze(-1)
@@ -577,30 +660,28 @@ def _check_case(
     assert abs(dense_loss - truth.loss) <= _LOSS_RTOL * truth.loss_scale
     assert _relative_error(dense_grad, truth.grad) < _GRAD_RTOL
 
-    # Training stage, with units planned once and handed to the iterator as the
-    # worker does.
-    units = _plan_training_units(case, batch, cfg)
-    model = _CausalHistoryModel(tp_rank, tp_size, cp_rank, cp_size)
-    iterator, num_units, micro_batch_size, width, padded_seq_length = (
-        get_microbatch_iterator(
-            batch,
-            cfg,
-            mbs=batch.size,
-            straggler_timer=None,
-            shared_prefix_bin_capacity=case.bin_capacity,
-            shared_prefix_execution_units=units,
-            shared_prefix_stage="train",
-        )
+    # Training: the driver's plan, run forward by forward as the worker does.
+    data, shard = _plan_rank_batch(
+        rows, case, cfg, bound_by_full_length=case.bound_by_full_length
     )
-    assert (num_units, micro_batch_size, width) == (len(units), 1, _WIDTH)
-    assert padded_seq_length % cfg["make_sequence_length_divisible_by"] == 0
+    _check_plan(case, rows, shard)
+    model = _CausalHistoryModel(tp_rank, tp_size, cp_rank, cp_size)
+    iterator, num_microbatches, micro_batch_size, width, _ = get_microbatch_iterator(
+        data,
+        cfg,
+        mbs=data.size,
+        straggler_timer=None,
+        mtp_enabled=case.mtp_loss_mask,
+    )
+    forwards = list(zip(shard.micro_batch_indices[0], shard.micro_batch_lengths[0]))
+    assert (num_microbatches, micro_batch_size, width) == (len(forwards), 1, _WIDTH)
     seen: list[ProcessedMicrobatch] = []
     stream = _recording(iterator, seen)
     processor = LossPostProcessor(
-        _PolicyGradientLoss(), cfg, num_microbatches=num_units
+        _PolicyGradientLoss(), cfg, num_microbatches=num_microbatches
     )
-    shared_loss = 0.0
-    for _ in range(num_units):
+    planned_loss = 0.0
+    for (start, end), planned_length in forwards:
         output, loss_fn = forward_with_post_processing_fn(
             data_iterator=stream,
             model=model,
@@ -610,173 +691,82 @@ def _check_case(
             sampling_params=sampling,
         )
         loss, _ = loss_fn(output)
-        scaled = loss * cp_size / num_units
+        scaled = loss * cp_size / num_microbatches
         scaled.backward()
-        shared_loss += float(scaled)
+        planned_loss += float(scaled)
         microbatch = seen[-1]
-        assert microbatch.input_ids_cp_sharded.shape[1] * cp_size <= padded_seq_length
-        if microbatch.shared_prefix is not None:
-            _check_shared_unit(microbatch, output, batch, truth, cp_rank, cp_size)
-        else:
+        row_indices = shard.row_indices[start:end]
+        # The rows of a forward keep the driver's order.
+        assert torch.equal(
+            microbatch.data_dict["input_ids"].cpu(), batch["input_ids"][row_indices]
+        )
+        # The worker builds a forward of the length that the driver planned.
+        assert microbatch.input_ids_cp_sharded.shape[1] * cp_size == planned_length
+        if shard.tree_ids[start] == UNSHARED_ROW:
+            # A dense bin takes the ordinary packed path.
+            assert microbatch.shared_prefix_params is None
             assert microbatch.packed_seq_params is not None
+        else:
+            _check_pack_inputs(microbatch, row_indices, rows, cfg, cp_rank, cp_size)
     assert next(stream, None) is None
 
-    source_rows = sorted(
-        row
-        for microbatch in seen
-        for row in microbatch.data_dict[SHARED_PREFIX_SOURCE_ROW_INDEX].tolist()
-    )
-    assert source_rows == list(range(batch.size))
-    roots = [
-        None
-        if microbatch.shared_prefix is None
-        else len(tuple(microbatch.shared_prefix.tensor_bin.layout.iter_roots()))
-        for microbatch in seen
-    ]
-    # An all-dense plan would pass the numeric checks below trivially.
-    assert any(count is not None for count in roots), roots
-    group_ids = batch[SHARED_PREFIX_GROUP_ID]
-    layouts = [
-        microbatch.shared_prefix.tensor_bin.layout
-        for microbatch in seen
-        if microbatch.shared_prefix is not None
-    ]
-    if case.expect == "stars":
-        assert all(count == 1 for count in roots), roots
-    elif case.expect == "forest":
-        assert any(count is not None and count > 1 for count in roots), roots
-    elif case.expect == "partial_stars":
-        prompt_lengths = batch[SHARED_PREFIX_PROMPT_LENGTHS].tolist()
-        sharing_rows = Counter(
-            group for group, length in zip(group_ids, prompt_lengths) if length
-        )
-        dense_rows = sorted(
-            row
-            for microbatch in seen
-            if microbatch.shared_prefix is None
-            for row in microbatch.data_dict[SHARED_PREFIX_SOURCE_ROW_INDEX].tolist()
-        )
-        assert 0 in prompt_lengths, prompt_lengths
-        assert dense_rows == [
-            row
-            for row, (group, length) in enumerate(zip(group_ids, prompt_lengths))
-            if length == 0 or sharing_rows[group] == 1
-        ], dense_rows
-    elif case.expect == "fragments":
-        units_per_group = Counter(
-            group
-            for layout in layouts
-            for group in {group_ids[row] for row in layout.row_indices}
-        )
-        assert max(units_per_group.values()) >= 2, units_per_group
-    elif case.expect == "forest_fragments":
-        roots_per_group = [
-            Counter(
-                group
-                for _, root in layout.iter_roots()
-                for group in {group_ids[row] for row in root.row_indices}
-            )
-            for layout in layouts
-        ]
-        assert None in roots, roots
-        assert any(max(counts.values()) >= 2 for counts in roots_per_group), (
-            roots_per_group
-        )
-
-    # Summed unit losses equal the dense loss, and the CP/TP-summed gradient
-    # matches it too: a dropped CP normalization or a non-differentiable CP
-    # reduction changes the gradient scale without changing any logprob.
-    shared_loss *= cp_size
-    assert abs(shared_loss - dense_loss) <= _LOSS_RTOL * truth.loss_scale
+    # The CP/TP-summed gradient must match too: a dropped CP normalization or a
+    # non-differentiable CP reduction changes its scale without changing any logprob.
+    planned_loss *= cp_size
+    assert abs(planned_loss - dense_loss) <= _LOSS_RTOL * truth.loss_scale
     assert _relative_error(_cp_summed(model.table.grad, cp_size), dense_grad) < (
         _GRAD_RTOL
     )
 
-    # Logprob stage: forward-only units, and the worker's restore returns the
-    # conventional [batch, width] layout.
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        _restore_logprobs_in_source_order,
-    )
-
-    units = plan_shared_prefix_execution_units(
-        batch, cfg=cfg, bin_capacity=case.bin_capacity, forward_only=True
-    )
+    # Logprobs: forward-only, planned by packed length. The worker concatenates the
+    # forwards in order, so row r of the result is row r of the rank's batch.
+    data, shard = _plan_rank_batch(rows, case, cfg, bound_by_full_length=False)
     with torch.no_grad():
-        iterator, num_units, *_ = get_microbatch_iterator(
-            batch,
-            cfg,
-            mbs=batch.size,
-            straggler_timer=None,
-            shared_prefix_bin_capacity=case.bin_capacity,
-            shared_prefix_execution_units=units,
-            shared_prefix_stage="logprobs",
+        iterator, num_microbatches, *_ = get_microbatch_iterator(
+            data, cfg, mbs=data.size, straggler_timer=None
         )
+        seen = []
+        stream = _recording(iterator, seen)
         processor = LogprobsPostProcessor(cfg, sampling_params=sampling)
         outputs = []
-        for _ in range(num_units):
+        for _ in range(num_microbatches):
             output, post_fn = forward_with_post_processing_fn(
-                data_iterator=iterator,
+                data_iterator=stream,
                 model=model,
                 post_processing_fn=processor,
                 sampling_params=sampling,
             )
-            outputs.append(post_fn(output)[1])
-        assert next(iterator, None) is None
-    restored = _restore_logprobs_in_source_order(
-        outputs, sequence_length=_WIDTH, expected_rows=batch.size
-    )
-    assert not restored[:, 0].any()
-    for row in range(batch.size):
+            outputs.append(post_fn(output)[1]["logprobs"])
+            if seen[-1].shared_prefix_params is not None:
+                _check_pack_logprobs(seen[-1], outputs[-1])
+        assert next(stream, None) is None
+    logprobs = pad_and_concat(outputs, target_len=_WIDTH)
+    assert logprobs.shape == (batch.size, _WIDTH)
+    assert not logprobs[:, 0].any()
+    for position, row in enumerate(shard.row_indices):
         length = int(batch["input_lengths"][row])
         torch.testing.assert_close(
-            restored[row, 1:length].double().cpu(),
+            logprobs[position, 1:length].double().cpu(),
             truth.logprobs[row, : length - 1],
             atol=_LOGPROB_ATOL,
             rtol=0.0,
         )
 
 
-@pytest.mark.parametrize(
-    "unit_rows, error",
-    [
-        (((2, 0), (1,)), None),
-        (((0, 0), (2,)), "did not cover every source row exactly once"),
-        (((0,), (2,)), "unexpected row count"),
-    ],
-    ids=["permuted", "duplicate_row", "missing_row"],
-)
-def test_logprob_restore_returns_source_order_or_fails(unit_rows, error):
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        _restore_logprobs_in_source_order,
-    )
-
-    # Each row's logprobs hold its source index; a fallback unit is wider.
-    outputs = [
-        {
-            "logprobs": torch.tensor(rows, dtype=torch.float32)[:, None].expand(
-                -1, width
-            ),
-            SHARED_PREFIX_SOURCE_ROW_INDEX: torch.tensor(rows),
-        }
-        for rows, width in zip(unit_rows, (3, 4))
-    ]
-    if error is not None:
-        with pytest.raises(RuntimeError, match=error):
-            _restore_logprobs_in_source_order(
-                outputs, sequence_length=4, expected_rows=3
-            )
-        return
-    restored = _restore_logprobs_in_source_order(
-        outputs, sequence_length=4, expected_rows=3
-    )
-    assert restored.tolist() == [[0, 0, 0, 0], [1, 1, 1, 1], [2, 2, 2, 0]]
+def _unavailable(reason: str) -> None:
+    """Skip a test that lacks its GPUs, or fail it where the lane must run it."""
+    if os.environ.get("NRL_REQUIRE_SHARED_PREFIX_TESTS") == "1":
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 @pytest.fixture(scope="module")
-def single_rank_model_parallel(tmp_path_factory):
+def single_rank_model_parallel(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[None]:
     """TP1/CP1 Megatron parallel state in this process on one GPU."""
     if not torch.cuda.is_available():
-        pytest.skip("the shared-prefix iterator moves batches to CUDA")
+        _unavailable("the microbatch iterator moves batches to CUDA")
     created = False
     if not dist.is_initialized():
         init_file = tmp_path_factory.mktemp("shared_prefix_oracle") / "pg_init"
@@ -786,7 +776,7 @@ def single_rank_model_parallel(tmp_path_factory):
         )
         created = True
     elif dist.get_world_size() != 1:
-        pytest.skip("needs a single-rank default process group")
+        _unavailable("needs a single-rank default process group")
     parallel_state.destroy_model_parallel()
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size=1, context_parallel_size=1
@@ -799,80 +789,23 @@ def single_rank_model_parallel(tmp_path_factory):
             dist.destroy_process_group()
 
 
-@requires_megatron_rl
 @pytest.mark.parametrize("chunk_size", [None, 7], ids=["unchunked", "chunk7"])
 @pytest.mark.parametrize("case_name", list(_CASES))
-def test_shared_prefix_consumer_matches_dense_oracle(
-    single_rank_model_parallel, case_name, chunk_size
-):
+def test_packs_match_dense_oracle(
+    single_rank_model_parallel: None, case_name: str, chunk_size: Optional[int]
+) -> None:
     _check_case(_CASES[case_name], chunk_size=chunk_size)
 
 
-@requires_megatron_rl
-def test_shared_prefix_consumer_matches_dense_oracle_with_temperature(
-    single_rank_model_parallel,
-):
-    _check_case(_CASES["fallbacks"], chunk_size=7, temperature=0.7)
+def test_packs_match_dense_oracle_with_temperature(
+    single_rank_model_parallel: None,
+) -> None:
+    _check_case(_CASES["placeholder"], chunk_size=7, temperature=0.7)
 
 
-@pytest.mark.parametrize(
-    "mode, stage",
-    [(None, "train"), ("disabled", "train"), ("dense", "train"), ("logprobs", "train")],
-    ids=["absent", "disabled", "dense", "logprobs_at_train_stage"],
-)
-def test_inactive_shared_prefix_modes_keep_the_conventional_iterator(
-    single_rank_model_parallel, mode, stage
-):
-    case = _CASES["forest_small_bins"]
-    shared_batch = _build_batch(case)
-    conventional = BatchedDataDict(
-        {
-            key: value
-            for key, value in shared_batch.items()
-            if key not in (SHARED_PREFIX_PROMPT_LENGTHS, SHARED_PREFIX_GROUP_ID)
-        }
-    )
-    baseline_cfg = _policy_cfg(case, None, 1, 1)
-    baseline_cfg["sequence_packing"]["enabled"] = False
-    del baseline_cfg["shared_prefix_training"]
-    cfg = _policy_cfg(case, None, 1, 1)
-    cfg["sequence_packing"]["enabled"] = False
-    if mode is None:
-        del cfg["shared_prefix_training"]
-    else:
-        cfg["shared_prefix_training"] = {"mode": mode}
-
-    def processed(data, policy_cfg):
-        iterator, *metadata = get_microbatch_iterator(
-            data.select_indices(list(range(data.size))),
-            policy_cfg,
-            mbs=7,
-            straggler_timer=None,
-            shared_prefix_stage=stage,
-        )
-        return list(iterator), metadata
-
-    expected, expected_metadata = processed(conventional, baseline_cfg)
-    actual, actual_metadata = processed(shared_batch, cfg)
-    assert actual_metadata == expected_metadata
-    assert len(actual) == len(expected)
-    for got, want in zip(actual, expected):
-        assert got.shared_prefix is None
-        assert SHARED_PREFIX_SOURCE_ROW_INDEX not in got.data_dict
-        for field in ("input_ids_cp_sharded", "attention_mask", "position_ids"):
-            assert torch.equal(getattr(got, field), getattr(want, field)), field
-    with pytest.raises(ValueError, match="only meaningful in shared-prefix"):
-        get_microbatch_iterator(
-            shared_batch,
-            cfg,
-            mbs=7,
-            straggler_timer=None,
-            shared_prefix_execution_units=(),
-            shared_prefix_stage=stage,
-        )
-
-
-def _distributed_oracle(rank: int, world_size: int, *, tp_size: int, cp_size: int):
+def _distributed_oracle(
+    rank: int, world_size: int, *, tp_size: int, cp_size: int
+) -> None:
     del rank, world_size
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
@@ -881,19 +814,22 @@ def _distributed_oracle(rank: int, world_size: int, *, tp_size: int, cp_size: in
         for case in _CASES.values():
             for chunk_size in (None, 7):
                 _check_case(case, chunk_size=chunk_size)
-        _check_case(_CASES["fallbacks"], chunk_size=7, temperature=0.7)
+        _check_case(_CASES["placeholder"], chunk_size=7, temperature=0.7)
     finally:
         parallel_state.destroy_model_parallel()
 
 
-@requires_megatron_rl
 @pytest.mark.parametrize(
     "tp_size, cp_size", [(1, 2), (2, 1), (2, 2)], ids=["tp1cp2", "tp2cp1", "tp2cp2"]
 )
-def test_shared_prefix_consumer_matches_dense_oracle_distributed(
-    distributed_test_runner, tp_size, cp_size
-):
+def test_packs_match_dense_oracle_distributed(
+    distributed_test_runner: Callable[..., None], tp_size: int, cp_size: int
+) -> None:
+    world_size = tp_size * cp_size
+    # run_unit.sh guarantees two GPUs. The runner skips a variant that needs more.
+    if world_size <= 2 and torch.cuda.device_count() < world_size:
+        _unavailable(f"needs {world_size} GPUs")
     distributed_test_runner(
         functools.partial(_distributed_oracle, tp_size=tp_size, cp_size=cp_size),
-        world_size=tp_size * cp_size,
+        world_size=world_size,
     )

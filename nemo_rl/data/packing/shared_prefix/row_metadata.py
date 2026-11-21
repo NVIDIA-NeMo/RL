@@ -11,20 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Names of the row metadata that shared-prefix packing reads and writes."""
+"""Row metadata of shared-prefix execution.
+
+The rollout reassembler stamps two tags on every row it writes. The driver plans forwards from
+those tags and ships one tree id per row to each worker. The worker turns the tags and tree ids
+into batch columns.
+"""
 
 import hashlib
 from array import array
 from collections.abc import Sequence
 
-SHARED_PREFIX_PROMPT_LENGTHS = "shared_prefix_prompt_lengths"
-"""Column: tokens at the start of a row that it may share with rows of its group; 0 when none."""
+PROMPT_LENGTH_TAG = "shared_prefix_prompt_length"
+"""Row tag: tokens at the start of the row that it may share with rows of its group; 0 for none."""
 
-SHARED_PREFIX_PROMPT_HASHES = "shared_prefix_prompt_hashes"
-"""Column: hash of those prompt tokens, so the driver can match prompts without reading them."""
+PROMPT_HASH_TAG = "shared_prefix_prompt_hash"
+"""Row tag: ``prompt_hash`` of those tokens, so the driver can match prompts without reading them."""
 
 SHARED_PREFIX_TREE_IDS = "shared_prefix_tree_ids"
-"""Per-row plan entry: the row's prefix tree within its forward, or ``UNSHARED_ROW``."""
+"""Plan entry in ``KVBatchMeta.extra_info`` and batch column: each row's tree within its forward."""
+
+SHARED_PREFIX_PROMPT_LENGTHS = "shared_prefix_prompt_lengths"
+"""Batch column the worker builds from ``PROMPT_LENGTH_TAG``."""
 
 UNSHARED_ROW = -1
 """Tree id of a row that runs as an ordinary packed sequence."""

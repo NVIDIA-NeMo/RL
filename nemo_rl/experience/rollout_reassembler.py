@@ -50,9 +50,9 @@ from nemo_rl.data.captured_media import (
     verify_media_geometry,
 )
 from nemo_rl.data.multimodal_utils import PackedTensor
-from nemo_rl.data.packing.shared_prefix.columns import (
-    SHARED_PREFIX_PROMPT_HASHES,
-    SHARED_PREFIX_PROMPT_LENGTHS,
+from nemo_rl.data.packing.shared_prefix.row_metadata import (
+    PROMPT_HASH_TAG,
+    PROMPT_LENGTH_TAG,
     prompt_hash,
 )
 from nemo_rl.data_plane import KVBatchMeta
@@ -1422,25 +1422,19 @@ class RolloutReassembler:
             assert self._media_columns is not None
             media_fields = _empty_trainer_media(self._media_columns, len(rows))
         train_batch.update(media_fields)
-        # Read by shared-prefix packing (sequence_packing.share_prefixes); other consumers
-        # ignore them. Placeholders keep 0, so they run dense.
-        prompt_lengths = [int(row.prompt_len) if row.valid else 0 for row in rows]
-        train_batch[SHARED_PREFIX_PROMPT_LENGTHS] = torch.tensor(
-            prompt_lengths, dtype=torch.long
-        )
-        train_batch[SHARED_PREFIX_PROMPT_HASHES] = torch.tensor(
-            [
-                prompt_hash(row.token_ids[:length])
-                for row, length in zip(rows, prompt_lengths, strict=True)
-            ],
-            dtype=torch.long,
-        )
         sample_ids, fields, tags = pack_payload(
             train_batch,
             weight_version=group_min_wv,
             group_id=group_id,
             prompt_idx=prompt_idx,
         )
+        # Read by shared-prefix execution (policy.sequence_packing.share_prefixes).
+        # Only a verified row with no loss inside its prompt may share it.
+        for tag, row in zip(tags, rows, strict=True):
+            shares_prompt = row.valid and not any(row.token_mask[: row.prompt_len])
+            prompt_length = row.prompt_len if shares_prompt else 0
+            tag[PROMPT_LENGTH_TAG] = prompt_length
+            tag[PROMPT_HASH_TAG] = prompt_hash(row.token_ids[:prompt_length])
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
             span_count = 0

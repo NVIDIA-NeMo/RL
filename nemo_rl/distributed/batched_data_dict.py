@@ -115,6 +115,11 @@ class SequencePackingArgs(TypedDict):
     )
     pair_grouping_key: NotRequired[str]
     max_sequences_per_bin: NotRequired[int]
+    # Run a prompt once per forward for the rows of a prompt group that start with it.
+    # Only shard_meta_for_dp reads this key and the next one.
+    share_prefixes: NotRequired[bool]
+    # With share_prefixes: count the prompt in every row against max_tokens_per_microbatch.
+    bound_by_full_length: NotRequired[bool]
 
 
 class DynamicBatchingArgs(TypedDict):

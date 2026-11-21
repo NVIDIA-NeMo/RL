@@ -450,6 +450,10 @@ policy:
     algorithm: "modified_first_fit_decreasing"
     microbatch_order: "packer"
     sequence_length_round: 64
+    # Run a prompt once per forward for all the rows that share it, instead of once
+    # per row. Requires the single-controller path with token capture and the
+    # Megatron backend. See docs/design-docs/shared-prefix-execution.md.
+    share_prefixes: false
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training

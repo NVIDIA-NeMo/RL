@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dense NeMo RL imports must not require the optional Megatron backend.
+"""Driver-side packing must not require the optional Megatron backend.
 
+The driver packs rows, and plans shared-prefix forwards, for every backend.
 This module deliberately has no Megatron import and no ``mcore`` marker, so it
 runs in the default lane where the guarantee matters.
 """
@@ -22,7 +23,7 @@ import sys
 from pathlib import Path
 
 
-def test_dense_nemo_imports_do_not_require_optional_megatron_backend():
+def test_driver_packing_does_not_import_megatron() -> None:
     repo = Path(__file__).resolve().parents[4]
     code = """
 import importlib.abc
@@ -31,20 +32,39 @@ sys.path.insert(0, sys.argv[1])
 class NoMegatron(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname == "megatron" or fullname.startswith("megatron."):
-            raise AssertionError("Dense-only import unexpectedly loaded Megatron")
+            raise AssertionError("Driver-side packing unexpectedly loaded Megatron")
 sys.meta_path.insert(0, NoMegatron())
-from nemo_rl.data import packing
 from nemo_rl.data.packing import get_packer
-from nemo_rl.models.policy import get_shared_prefix_training_config
-from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.data.packing.shared_prefix_metadata import with_prompt_length_tags
-assert get_shared_prefix_training_config({}).mode == "disabled"
-assert with_prompt_length_tags(None, prompt_lengths=[2], sequence_lengths=[4])
+from nemo_rl.data.packing.shared_prefix.row_metadata import (
+    PROMPT_HASH_TAG,
+    PROMPT_LENGTH_TAG,
+    SHARED_PREFIX_TREE_IDS,
+)
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.preshard import shard_meta_for_dp
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from nemo_rl.models.policy.tq_policy import TQPolicy
 bins = get_packer("first_fit_decreasing", bin_capacity=8).pack([4, 4])
 assert len(bins) == 1 and sorted(bins[0]) == [0, 1]
-# The package root exports only dense packers; introspection stays Megatron-free.
-assert not hasattr(packing, "SharedPrefixPlan")
-exec("from nemo_rl.data.packing import *", {})
+meta = KVBatchMeta(
+    partition_id="train",
+    task_name="train",
+    sample_ids=["a", "b"],
+    sequence_lengths=[6, 7],
+    tags=[{GROUP_ID_TAG: "group", PROMPT_LENGTH_TAG: 4, PROMPT_HASH_TAG: 1}] * 2,
+)
+(shard,) = shard_meta_for_dp(
+    meta,
+    dp_world=1,
+    sequence_packing_args={
+        "max_tokens_per_microbatch": 16,
+        "sequence_length_pad_multiple": 1,
+        "algorithm": "first_fit_decreasing",
+        "share_prefixes": True,
+        "bound_by_full_length": False,
+    },
+)
+assert shard.extra_info[SHARED_PREFIX_TREE_IDS] == [0, 0]
 assert not any(k == "megatron" or k.startswith("megatron.") for k in sys.modules)
 """
     subprocess.run([sys.executable, "-c", code, str(repo)], check=True)

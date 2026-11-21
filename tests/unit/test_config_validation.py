@@ -52,6 +52,7 @@ from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
 from nemo_rl.models.megatron.zero_train_gen_mismatch import (
     validate_zero_train_gen_kl,
 )
+from nemo_rl.models.policy.shared_prefix import validate_shared_prefix_config
 from nemo_rl.utils.config import (
     load_config_with_inheritance,
     register_omegaconf_resolvers,
@@ -335,6 +336,7 @@ def _check_single_controller_config(config: DictConfig) -> None:
     # Validate the SingleController config
     master_config = SingleControllerMasterConfig.model_validate(config_dict)
     validate_single_controller_config(master_config)
+    validate_shared_prefix_config(master_config)
 
     # Validate the ClippedPGLossFn against the OPD full config
     ClippedPGLossFn(master_config.loss_fn, opd_full=get_opd_full_config(master_config))

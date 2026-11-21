@@ -365,10 +365,9 @@ class MegatronGeneration(GenerationInterface):
             **deepcopy(config),
             "megatron_cfg": self.effective_megatron_cfg(config),
         }
-        # This policy only serves generation from refitted weights, so the trainer's
-        # shared-prefix execution and its validation do not apply to its inference layout.
-        if "shared_prefix_training" in self._policy_config:
-            self._policy_config["shared_prefix_training"] = {"mode": "disabled"}
+        # This policy only generates. Turning the trainer's option off keeps the
+        # option's worker setup checks from running on the inference layout.
+        self._policy_config["sequence_packing"]["share_prefixes"] = False
         # Reserve GPUs before Policy workers grab them, to prevent disjoint NVLS domains.
         self.init_cluster_placement_groups(cluster, self._policy_config)
         self._policy = Policy(

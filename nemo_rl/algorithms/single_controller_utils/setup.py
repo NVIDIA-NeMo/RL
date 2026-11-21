@@ -98,10 +98,6 @@ from nemo_rl.data.multimodal_utils import (
     WIRE_MULTIMODAL_FIELDS,
     per_token_multimodal_schema,
 )
-from nemo_rl.data.packing.shared_prefix.columns import (
-    SHARED_PREFIX_PROMPT_HASHES,
-    SHARED_PREFIX_PROMPT_LENGTHS,
-)
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -163,11 +159,8 @@ from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
 )
-from nemo_rl.models.policy import (
-    OnPolicyDistillationFullTransport,
-    PolicyConfig,
-    get_shared_prefix_training_config,
-)
+from nemo_rl.models.policy import OnPolicyDistillationFullTransport, PolicyConfig
+from nemo_rl.models.policy.shared_prefix import validate_shared_prefix_config
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.models.value.tq_value import TQValue
@@ -1331,6 +1324,7 @@ def setup_single_controller(
         logged by the SC actor).
     """
     validate_single_controller_config(master_config)
+    validate_shared_prefix_config(master_config)
     generation_config = master_config.policy["generation"]
     # Normalize the optional request count once before partitions/workers start.
     top_logprobs = generation_config.setdefault("top_logprobs", 0)
@@ -1612,104 +1606,6 @@ def setup_single_controller(
                 "continuous post-step coverage.",
                 UserWarning,
                 stacklevel=2,
-            )
-    shared_prefix_enabled = get_shared_prefix_training_config(
-        policy_config
-    ).enabled_for(stage="logprobs")
-    if shared_prefix_enabled:
-        # Checked here, before any worker is allocated, rather than when the
-        # partitions are registered after every cluster is already built.
-        if not token_capture_cfg.enabled:
-            raise ValueError(
-                "policy.shared_prefix_training requires token_capture.enabled=true: "
-                "the rollout reassembler produces the per-row prompt lengths"
-            )
-        # Forest training publishes several segment rows and execution-padding
-        # rows per rollout. Shared-prefix sharding and planning expect one row
-        # per sampled completion and never add dummy rows.
-        if token_capture_cfg.forest_training:
-            raise ValueError(
-                "policy.shared_prefix_training does not support "
-                "token_capture.forest_training=true: forest segment and "
-                "execution-padding rows are not shared-prefix completions"
-            )
-        # Shared-prefix training hands the loss next-token logprobs that were
-        # already extracted, not vocabulary logits, so the loss cannot gather
-        # the policy logprobs at the sampler top-k ids.
-        if master_config.loss_fn.score_centering and get_shared_prefix_training_config(
-            policy_config
-        ).enabled_for(stage="train"):
-            raise ValueError(
-                "policy.shared_prefix_training.mode=train does not support "
-                "loss_fn.score_centering=true: shared-prefix training units "
-                "do not expose vocabulary logits to the loss. Use mode=logprobs "
-                "or disable score centering"
-            )
-        # The in-loss filter writes its keep flags back in microbatch row order,
-        # which shared-prefix training units do not keep.
-        if (
-            master_config.loss_fn.seq_logprob_error_in_loss
-            and get_shared_prefix_training_config(policy_config).enabled_for(
-                stage="train"
-            )
-        ):
-            raise ValueError(
-                "policy.shared_prefix_training.mode=train does not support "
-                "loss_fn.seq_logprob_error_in_loss=true: shared-prefix training "
-                "units do not keep the fetched row order. Use mode=logprobs or "
-                "disable the in-loss filter"
-            )
-        # A dropped prompt shrinks its step target (InOrderSampler) to a count
-        # that need not split into complete DP groups, and "replace" falls back
-        # to shrinking once its spares run out.
-        failure_cfg = master_config.async_rl.rollout_failure
-        if (
-            failure_cfg.max_skipped_prompts
-            or failure_cfg.max_consecutive_dropped_prompts
-        ):
-            raise ValueError(
-                "policy.shared_prefix_training requires "
-                "async_rl.rollout_failure.max_skipped_prompts=0 and "
-                "max_consecutive_dropped_prompts=0: a dropped prompt can leave a "
-                "step that no longer splits into complete data-parallel groups"
-            )
-        # A group below the valid-row threshold with no replacement shrinks its step
-        # the same way.
-        if token_capture_cfg.min_valid_fraction_per_group is not None:
-            raise ValueError(
-                "policy.shared_prefix_training does not support "
-                "token_capture.min_valid_fraction_per_group: a group dropped below "
-                "the threshold can leave a step that no longer splits into complete "
-                "data-parallel groups"
-            )
-        # Streaming PPO aligns chunks to both models' layouts through the same
-        # sampler group_multiple; the two alignments are not combined.
-        if (
-            is_ppo_run(master_config)
-            and master_config.async_rl.min_groups_for_streaming_train
-            < master_config.ppo.num_prompts_per_step
-        ):
-            raise ValueError(
-                "policy.shared_prefix_training does not support streaming PPO "
-                "(async_rl.min_groups_for_streaming_train < "
-                "ppo.num_prompts_per_step): its chunk alignment does not "
-                "guarantee complete policy data-parallel groups"
-            )
-        # Weight FIFO selects from one weight version at a time. A streaming chunk
-        # rounded to whole DP groups can leave that version with fewer ready
-        # groups than the DP size, and the step then never fills.
-        if (
-            master_config.async_rl.sampler.name == "weight_fifo"
-            and master_config.async_rl.min_groups_for_streaming_train
-            < algo_config(master_config).num_prompts_per_step
-        ):
-            raise ValueError(
-                "policy.shared_prefix_training does not support the weight_fifo "
-                "sampler with streaming training (async_rl.min_groups_for_streaming_train "
-                "< num_prompts_per_step): a weight version can be left with fewer "
-                "ready groups than the data-parallel size, and the step stalls. Use "
-                "in_order, ready_first or windowed, or set "
-                "min_groups_for_streaming_train to num_prompts_per_step"
             )
     if token_capture_cfg.enabled:
         if not should_use_nemo_gym(master_config):

@@ -163,7 +163,6 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 - `test_shard_meta_for_dp_preserves_partition_id` — partition_id preserved across DP shards.
 - `test_shard_meta_for_dp_permutes_tags_with_sample_ids` — Each shard's row-shape tags stay paired with their own `sample_id` under the length-sort permutation.
 - `test_shard_meta_for_dp_leaves_tags_none_when_absent` — Text-only runs keep `tags=None` rather than a list of empty dicts.
-- `test_shard_meta_for_dp_unsorted_round_trip` — `unsorted_indices` reconstructs input order from concat.
 - `test_kvbatchmeta_subset_filters_keys_and_seqlens` — `subset` filters keys + seq_lengths.
 - `test_kvbatchmeta_concat_joins_keys_and_seqlens` — `concat` joins.
 - `test_kvbatchmeta_slice_takes_range` — `slice` takes a contiguous range.

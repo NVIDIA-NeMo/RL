@@ -67,8 +67,8 @@ class _SplitStubWorker(TQWorkerMixin):
         self.calls.append(("fetch", meta))
         return {"data_from": meta} if self._fetched is None else self._fetched
 
-    def _attach_or_repack_with_order(self, data, meta, *, stage):
-        self.calls.append(("attach", meta, stage))
+    def _attach_or_repack_with_order(self, data, meta):
+        self.calls.append(("attach", meta))
         return data, self._row_order
 
     def _write_back(self, meta, fields):
@@ -118,7 +118,6 @@ class TestPreshardedWrappers:
         out = w.train_microbatch_presharded(meta=meta)
         assert out is None  # metrics accumulate in the open-step state
         assert [c[0] for c in w.calls] == ["fetch", "attach", "train_microbatch"]
-        assert w.calls[1][2] == "train"
         assert w.calls[-1][1] == {"data_from": meta}
 
     def test_in_loss_rejections_land_in_sample_mask_in_meta_order(self):
@@ -214,7 +213,7 @@ class TestTQPolicySplitFanout:
             patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as mock_shard,
         ):
             out = p.train_microbatches_from_meta(meta)
@@ -243,7 +242,7 @@ class TestTQPolicySplitFanout:
             patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as mock_shard,
         ):
             p.train_microbatches_from_meta(meta, train_fields=train_fields)
@@ -260,7 +259,7 @@ class TestTQPolicySplitFanout:
             patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as mock_shard,
         ):
             p.train_microbatches_from_meta(meta)
@@ -359,7 +358,7 @@ class TestTQPolicyOPDFullColumn:
             patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as mock_shard,
         ):
             p.train_microbatches_from_meta(meta)

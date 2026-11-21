@@ -28,7 +28,12 @@ from typing import Any, Optional
 
 import torch
 
-from nemo_rl.data.packing.shared_prefix_metadata import SHARED_PREFIX_PROMPT_LENGTHS
+from nemo_rl.data.packing.shared_prefix.plan import plan_shared_prefix_shards
+from nemo_rl.data.packing.shared_prefix.row_metadata import (
+    PROMPT_HASH_TAG,
+    PROMPT_LENGTH_TAG,
+    SHARED_PREFIX_TREE_IDS,
+)
 from nemo_rl.data_plane.grouping import row_group_ids
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import (
@@ -50,9 +55,7 @@ def shard_meta_for_dp(
     batch_size: Optional[int] = None,
     sequence_packing_args: Optional[dict[str, Any]] = None,
     dynamic_batching_args: Optional[dict[str, Any]] = None,
-    shared_prefix_groups: bool = False,
-    shared_prefix_work_weights: tuple[int, int] | None = None,
-) -> tuple[list[KVBatchMeta], Optional[list[int]]]:
+) -> list[KVBatchMeta]:
     """Pure key-list split: assign ``meta.sample_ids`` to ``dp_world`` ranks.
 
     Seq-len-aware on top of ``shard_by_batch_size``. No I/O, no key
@@ -65,109 +68,49 @@ def shard_meta_for_dp(
     shard's ``extra_info`` so the ``*_presharded`` worker can reattach
     packing as it does on the legacy fan-out path.
 
+    With ``sequence_packing_args["share_prefixes"]``, forwards run a shared
+    prompt once (see :func:`_shard_meta_with_shared_prefixes`). A batch with
+    a row that lacks a prompt tag is packed without sharing.
+
     Args:
         meta: Full-batch ``KVBatchMeta`` with ``sequence_lengths`` populated.
         dp_world: Number of DP ranks.
         batch_size: Total samples; ``None`` for the logprob path, GBS for train.
         sequence_packing_args: Packing config dict for ``shard_by_batch_size``.
         dynamic_batching_args: Dynamic-batching config dict; mutually exclusive with the above.
-        shared_prefix_groups: Assign complete prompt groups (rows sharing a
-            ``GROUP_ID_TAG`` tag) coherently to DP ranks. This supersedes
-            ordinary row-level sequence packing; each worker performs the
-            structured star planning locally. Every row must fit
-            ``max_tokens_per_microbatch`` after padding to
-            ``sequence_length_pad_multiple``.
 
     Returns:
-        ``(per_rank_metas, unsorted_indices)``. ``unsorted_indices`` contains
-        the original-row index for each row in DP-rank concatenation order,
-        matching :meth:`BatchedDataDict.reorder_data`. ``None`` means no
-        reorder occurred.
+        One ``KVBatchMeta`` per DP rank, in rank order.
     """
     n = len(meta.sample_ids)
     if n == 0:
         raise ValueError("shard_meta_for_dp: empty meta — nothing to shard")
-    sequence_lengths = meta.sequence_lengths
-    if sequence_lengths is None or len(sequence_lengths) != n:
+    if meta.sequence_lengths is None or len(meta.sequence_lengths) != n:
         raise ValueError(
             "shard_meta_for_dp requires meta.sequence_lengths populated and "
-            f"of length {n} (got {sequence_lengths!r}). The rollout "
+            f"of length {n} (got {meta.sequence_lengths!r}). The rollout "
             "actor's fan-out should populate this from input_lengths."
         )
     if sequence_packing_args is not None and dynamic_batching_args is not None:
         raise ValueError(
             "Pass at most one of sequence_packing_args / dynamic_batching_args."
         )
-    if shared_prefix_work_weights is not None and not shared_prefix_groups:
-        raise ValueError("Shared work weights require complete-group sharding")
-    if shared_prefix_groups:
-        if dynamic_batching_args is not None:
-            raise ValueError(
-                "shared-prefix group sharding does not support dynamic batching"
-            )
-        # The explicit row tag the advantage baseline reads, rather than the
-        # "{group_id}_g{i}" sample-id naming convention.
-        group_ids = row_group_ids(meta)
-        if sequence_packing_args is None:
-            raise ValueError(
-                "shared-prefix group sharding requires sequence-packing arguments"
-            )
-        for key in ("max_tokens_per_microbatch", "sequence_length_pad_multiple"):
-            if key not in sequence_packing_args:
-                raise ValueError(
-                    f"shared-prefix group sharding requires sequence_packing_args.{key}"
-                )
-        # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds,
-        # and dense sharding must stay importable without it.
-        from megatron.rl.shared_prefix_cost import estimate_shared_prefix_row_work
-        from megatron.rl.shared_prefix_metadata import plan_group_coherent_shards
 
-        # Each worker splits its own prompt groups into forwards. Reject a row
-        # that cannot fit one forward here, before any worker fetches the batch.
-        bin_capacity = int(sequence_packing_args["max_tokens_per_microbatch"])
-        pad_multiple = int(sequence_packing_args["sequence_length_pad_multiple"])
-        for row_index, sequence_length in enumerate(sequence_lengths):
-            padded_length = (
-                (int(sequence_length) + pad_multiple - 1) // pad_multiple * pad_multiple
-            )
-            if not 0 < padded_length <= bin_capacity:
-                raise ValueError(
-                    "shared-prefix row must be nonempty and fit the execution bin "
-                    f"capacity after padding: row={row_index}, "
-                    f"length={sequence_length}, padded_length={padded_length}, "
-                    f"capacity={bin_capacity}"
-                )
-        assignment_lengths = sequence_lengths
-        if shared_prefix_work_weights is not None:
-            if meta.tags is None or any(
-                SHARED_PREFIX_PROMPT_LENGTHS not in tag for tag in meta.tags
-            ):
-                raise ValueError(
-                    "Shared work balancing requires row-aligned prompt length tags"
-                )
-            assignment_lengths = estimate_shared_prefix_row_work(
-                group_ids=group_ids,
-                sequence_lengths=sequence_lengths,
-                prompt_lengths=[tag[SHARED_PREFIX_PROMPT_LENGTHS] for tag in meta.tags],
-                physical_weight=shared_prefix_work_weights[0],
-                expanded_weight=shared_prefix_work_weights[1],
-            )
-        plan = plan_group_coherent_shards(
-            group_ids=group_ids,
-            sequence_lengths=assignment_lengths,
-            num_shards=dp_world,
+    seq_lens = list(meta.sequence_lengths)
+    tags = meta.tags
+    if (
+        sequence_packing_args is not None
+        and sequence_packing_args.get("share_prefixes")
+        and tags is not None
+        and all(PROMPT_LENGTH_TAG in tag and PROMPT_HASH_TAG in tag for tag in tags)
+    ):
+        return _shard_meta_with_shared_prefixes(
+            meta,
+            dp_world=dp_world,
             batch_size=batch_size,
-        )
-        return (
-            [meta.subset(indices) for indices in plan.shard_indices],
-            (
-                list(plan.rank_order_permutation)
-                if plan.rank_order_permutation is not None
-                else None
-            ),
+            sequence_packing_args=sequence_packing_args,
         )
 
-    seq_lens = list(sequence_lengths)
     # Skeleton BatchedDataDict — `shard_by_batch_size` only needs
     # input_ids (placeholder), input_lengths (real), sample_mask (ones).
     # ``meta_idx`` lets us recover which original meta index each shard row
@@ -214,11 +157,9 @@ def shard_meta_for_dp(
 
     base_extra: dict[str, Any] = dict(meta.extra_info or {})
     out: list[KVBatchMeta] = []
-    flat_idx: list[int] = []
     for shard in sharded:
         # pyrefly: ignore  # no-matching-overload
         idx_list: list[int] = shard[META_IDX].tolist()
-        flat_idx.extend(idx_list)
         rank_extra = dict(base_extra)
         # Per-shard packing metadata — set by ``shard_by_batch_size`` when
         # sequence_packing or dynamic_batching is enabled. Workers'
@@ -240,10 +181,63 @@ def shard_meta_for_dp(
         # ``KVBatchMeta`` later cannot go missing on the presharded path.
         # Only ``extra_info`` is per-shard rather than per-sample.
         out.append(replace(meta.subset(idx_list), extra_info=rank_extra))
+    return out
 
-    # ``reorder_data`` expects the forward permutation: row `j` in the
-    # DP-rank-concatenated aggregate came from original row ``flat_idx[j]``.
-    unsorted: Optional[list[int]] = None
-    if flat_idx != list(range(n)):
-        unsorted = flat_idx
-    return out, unsorted
+
+def _shard_meta_with_shared_prefixes(
+    meta: KVBatchMeta,
+    *,
+    dp_world: int,
+    batch_size: Optional[int],
+    sequence_packing_args: dict[str, Any],
+) -> list[KVBatchMeta]:
+    """Split ``meta`` among the ranks into forwards that run a shared prompt once.
+
+    Rows of one prompt group that start with the same prompt run that prompt
+    once per forward. ``plan_shared_prefix_shards`` plans those forwards from
+    the ``GROUP_ID_TAG``, ``PROMPT_LENGTH_TAG`` and ``PROMPT_HASH_TAG`` row
+    tags.
+
+    Args:
+        meta: Full-batch ``KVBatchMeta`` whose rows all carry the three tags.
+        dp_world: Number of DP ranks.
+        batch_size: Total samples; ``None`` for the logprob path, GBS for train.
+        sequence_packing_args: Packing config dict with ``bound_by_full_length``.
+
+    Returns:
+        One ``KVBatchMeta`` per DP rank, in rank order. Each ``extra_info``
+        carries the packing metadata of ordinary sequence packing and
+        ``SHARED_PREFIX_TREE_IDS``, one tree id per row.
+    """
+    tags = meta.tags
+    sequence_lengths = meta.sequence_lengths
+    # shard_meta_for_dp checked both before it called this function.
+    assert tags is not None and sequence_lengths is not None
+    shards = plan_shared_prefix_shards(
+        sequence_lengths=sequence_lengths,
+        group_ids=row_group_ids(meta),
+        prompt_lengths=[tag[PROMPT_LENGTH_TAG] for tag in tags],
+        prompt_hashes=[tag[PROMPT_HASH_TAG] for tag in tags],
+        num_shards=dp_world,
+        batch_size=batch_size,
+        max_tokens_per_microbatch=sequence_packing_args["max_tokens_per_microbatch"],
+        sequence_length_pad_multiple=sequence_packing_args[
+            "sequence_length_pad_multiple"
+        ],
+        algorithm=sequence_packing_args["algorithm"],
+        bound_by_full_length=sequence_packing_args["bound_by_full_length"],
+        largest_first=sequence_packing_args.get("microbatch_order") == "largest_first",
+    )
+    return [
+        replace(
+            meta.subset(shard.row_indices),
+            extra_info={
+                **(meta.extra_info or {}),
+                MICRO_BATCH_INDICES: shard.micro_batch_indices,
+                MICRO_BATCH_LENGTHS: shard.micro_batch_lengths,
+                ELEM_COUNTS_PER_GB: shard.elem_counts_per_gb,
+                SHARED_PREFIX_TREE_IDS: shard.tree_ids,
+            },
+        )
+        for shard in shards
+    ]

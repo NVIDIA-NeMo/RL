@@ -11,36 +11,46 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Standard GRPO must reject sharing before allocating policy resources."""
+"""Standard GRPO setup rejects ``policy.sequence_packing.share_prefixes``."""
 
-from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
-from nemo_rl.algorithms.grpo import setup
+from nemo_rl.algorithms.grpo import MasterConfig, setup
 
 
-@pytest.mark.parametrize("mode", ["logprobs", "train"])
-def test_standard_grpo_rejects_missing_metadata_producer(mode):
-    # The deliberately minimal config ensures the guard runs before other setup.
-    config = SimpleNamespace(policy={"shared_prefix_training": {"mode": mode}})
+def test_setup_rejects_share_prefixes() -> None:
+    master_config = MasterConfig.model_construct(
+        policy={"sequence_packing": {"enabled": True, "share_prefixes": True}}
+    )
+
     with pytest.raises(
-        ValueError, match="SingleController.*token_capture.enabled=true"
+        ValueError, match="share_prefixes needs the single-controller GRPO path"
     ):
-        setup(config, tokenizer=None, dataset=None, val_dataset=None)
+        setup(master_config, tokenizer=None, dataset=None, val_dataset=None)
 
 
-@pytest.mark.parametrize("mode", [None, "disabled", "dense"])
-def test_standard_grpo_keeps_nonshared_setup_path(mode):
-    policy = {} if mode is None else {"shared_prefix_training": {"mode": mode}}
-    config = SimpleNamespace(policy=policy)
-
-    class SetupReached(Exception):
+@pytest.mark.parametrize(
+    "policy_config",
+    [
+        {},
+        {"sequence_packing": {"enabled": True}},
+        {"sequence_packing": {"enabled": True, "share_prefixes": False}},
+    ],
+    ids=["no sequence_packing block", "key absent", "key false"],
+)
+def test_setup_continues_when_share_prefixes_is_off(
+    policy_config: dict[str, Any],
+) -> None:
+    class SetupContinued(Exception):
         pass
 
+    master_config = MasterConfig.model_construct(policy=policy_config)
+
     with (
-        patch("nemo_rl.algorithms.grpo.time.perf_counter", side_effect=SetupReached),
-        pytest.raises(SetupReached),
+        patch("nemo_rl.algorithms.grpo.time.perf_counter", side_effect=SetupContinued),
+        pytest.raises(SetupContinued),
     ):
-        setup(config, tokenizer=None, dataset=None, val_dataset=None)
+        setup(master_config, tokenizer=None, dataset=None, val_dataset=None)

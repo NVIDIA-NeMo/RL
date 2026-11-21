@@ -309,35 +309,29 @@ def test_inference_optimized_rejects_explicit_generation_etp_above_one() -> None
 
 
 @pytest.mark.mcore
-def test_refit_destination_policy_runs_with_shared_prefix_disabled(monkeypatch):
+def test_refit_destination_policy_turns_off_share_prefixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The inference-only policy of non-colocated generation never trains.
 
-    The trainer's shared-prefix mode and its validation would otherwise run against the
-    generation layout (inference TP/SP, generation CUDA graphs) and fail at setup.
+    The worker setup checks of the trainer's ``share_prefixes`` option would otherwise
+    run against the generation layout (inference TP/SP, generation CUDA graphs).
     """
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["colocated"]["enabled"] = False
-    config["shared_prefix_training"] = {"mode": "train"}
-    created = {}
-
-    class RecordingPolicy:
-        def __init__(self, **kwargs):
-            created.update(kwargs)
-
-    monkeypatch.setattr(lm_policy, "Policy", RecordingPolicy)
+    config["sequence_packing"]["share_prefixes"] = True
+    monkeypatch.setattr(lm_policy, "Policy", MagicMock())
     monkeypatch.setattr(
-        MegatronGeneration,
-        "init_cluster_placement_groups",
-        lambda self, cluster, cfg: None,
+        MegatronGeneration, "init_cluster_placement_groups", MagicMock()
     )
-    monkeypatch.setattr(MegatronGeneration, "prepare_for_generation", lambda self: None)
+    monkeypatch.setattr(MegatronGeneration, "prepare_for_generation", MagicMock())
 
     MegatronGeneration(config=config, tokenizer=MagicMock(), cluster=MagicMock())
 
-    assert created["is_refit_destination"] is True
-    assert created["config"]["shared_prefix_training"] == {"mode": "disabled"}
+    policy_config = lm_policy.Policy.call_args.kwargs["config"]
+    assert policy_config["sequence_packing"]["share_prefixes"] is False
     # The caller's (trainer's) config is untouched.
-    assert config["shared_prefix_training"] == {"mode": "train"}
+    assert config["sequence_packing"]["share_prefixes"] is True
 
 
 @pytest.mark.mcore

@@ -51,8 +51,8 @@ class _ValueStubWorker(TQWorkerMixin):
         self.calls.append(("fetch", meta))
         return {"data_from": meta}
 
-    def _attach_or_repack_pack_metadata(self, data, meta, *, stage):
-        self.calls.append(("attach", meta, stage))
+    def _attach_or_repack_pack_metadata(self, data, meta):
+        self.calls.append(("attach", meta))
         return data
 
     def _is_replica_leader(self) -> bool:
@@ -82,7 +82,6 @@ class TestGetValuesPresharded:
         # The [B, S] tensor goes to TQ, not through Ray.
         assert out is None
         assert [c[0] for c in w.calls] == ["fetch", "attach", "get_values"]
-        assert w.calls[1][2] is None  # the value forward is no policy stage
         assert w.calls[2][1] == {"data_from": meta}
         assert w.calls[2][2] == 4
         written = write_columns.call_args.args[2]
@@ -131,7 +130,7 @@ class TestTQValueFanout:
             ) as mock_packing,
             patch(
                 "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as mock_shard,
         ):
             out = v.get_values_from_meta(meta)
@@ -179,7 +178,7 @@ class TestTQValueFanout:
             patch.object(TQValue, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as mock_shard,
         ):
             if dispatch == "get_values":
@@ -220,7 +219,7 @@ class TestTQValueFanout:
             patch.object(TQValue, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as mock_shard,
         ):
             out = v.train_from_meta(meta, loss_fn="LF")
@@ -258,7 +257,7 @@ class TestTQValueFanout:
             patch.object(TQValue, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ),
         ):
             out = v.train_from_meta(meta, loss_fn="LF")
@@ -283,7 +282,7 @@ class TestPadTargetIsolation:
         )
         with patch(
             "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-            return_value=([meta, meta], None),
+            return_value=[meta, meta],
         ) as mock_shard:
             v.get_values_from_meta(meta)
 
@@ -305,7 +304,7 @@ class TestPadTargetIsolation:
         )
         with patch(
             "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-            return_value=([meta, meta], None),
+            return_value=[meta, meta],
         ) as mock_shard:
             v.get_values_from_meta(meta)
 
@@ -363,7 +362,7 @@ class TestTQValueSplitFanout:
             patch.object(TQValue, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as shard,
             patch(
                 "nemo_rl.models.value.tq_value.trace_context_kwargs",
