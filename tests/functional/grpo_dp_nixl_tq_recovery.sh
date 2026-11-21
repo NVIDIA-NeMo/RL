@@ -1,6 +1,7 @@
 #!/bin/bash
 # Run native TQ recovery with the nixl backend. The units' SSD tier is on by
-# default; pass nixl_ssd for a put area so small that every step spills.
+# default; pass nixl_ssd for a put area so small that every step spills,
+# or nixl_no_ssd to disable the SSD tier without changing the put area.
 
 set -eou pipefail
 
