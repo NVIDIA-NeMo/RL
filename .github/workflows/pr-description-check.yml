@@ -24,12 +24,19 @@ on:
       - reopened
 
 permissions:
+  contents: read
   pull-requests: read
 
 jobs:
   pr-description:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout the check script
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          sparse-checkout: .github/scripts
+
+      # Reads the live description, so re-running an old job sees the current text.
       - name: Check PR description against the template
         env:
           GH_TOKEN: ${{ github.token }}
@@ -38,46 +45,6 @@ jobs:
           PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
           REPO: ${{ github.repository }}
         run: |
-          # svc* service accounts are GitHub type "User", so list them by name.
-          if [[ "$PR_AUTHOR_TYPE" == "Bot" || "$PR_AUTHOR" == *"[bot]" || "$PR_AUTHOR" =~ ^(svcnvidia-nemo-ci|svcnemo-autobot)$ ]]; then
-            echo "Bot-authored PR ($PR_AUTHOR), skipped."
-            exit 0
-          fi
-
-          # Read the live description, so re-running an old job sees the current text.
-          # Replace code (fenced, unclosed fences, inline) first, then drop HTML comments,
-          # so neither can tick the box, add a heading, or hide a real one.
-          body=$(gh pr view "$PR_NUMBER" -R "$REPO" --json body --jq '.body // ""' \
-            | perl -0pe 's/^[ \t]*(`{3,}|~{3,}).*?(?:^[ \t]*\1[^\n]*$|\z)/[code]/gms; s/`[^`\n]*`/[code]/g; s/<!--.*?-->//gs')
-
-          # Keep the box text and headings in sync with PULL_REQUEST_TEMPLATE.md and skills/pr-description.
-          box='I, the PR author, have personally reviewed every line of this PR'
-          problems=()
-          if grep -qiE "^\s*[-*]\s+\[x\]\s+$box\.?\s*$" <<<"$body"; then
-            :
-          elif grep -qE "^\s*[-*]\s+\[ \]\s+$box\.?\s*$" <<<"$body"; then
-            problems+=("Review box not ticked: \"$box.\"")
-          else
-            problems+=("Review box missing: add \"- [ ] $box.\" at the top.")
-          fi
-          for heading in "What and why" "Convergence / perf / functionality proof" "Needs upstream changes"; do
-            grep -qiE "^#{1,6}\s+$heading\s*$" <<<"$body" || problems+=("Missing heading: \"## $heading\"")
-          done
-          # Subsections belong to this section; stop only at a peer or parent heading.
-          what_and_why=$(perl -0ne 'print $2 if /^(#{1,6})\s+What and why\s*\n(.*?)(?=^(?!\1#)#{1,6}\s|\z)/msi' <<<"$body")
-          if grep -qiE "^#{1,6}\s+What and why\s*$" <<<"$body" && [[ -z "${what_and_why//[[:space:]]/}" ]]; then
-            problems+=('Empty section: "## What and why"')
-          fi
-
-          if (( ${#problems[@]} == 0 )); then
-            echo "PR description follows the template."
-            exit 0
-          fi
-          {
-            echo "PR description does not follow the template:"
-            printf '  - %s\n' "${problems[@]}"
-            echo "Template: https://github.com/NVIDIA-NeMo/RL/blob/main/.github/PULL_REQUEST_TEMPLATE.md"
-            echo "Agents: see skills/pr-description. Only a human may tick the review box."
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          printf '::error title=PR description::%s\n' "${problems[@]}"
-          exit 1
+          set -o pipefail
+          gh pr view "$PR_NUMBER" -R "$REPO" --json body --jq '.body // ""' \
+            | python3 .github/scripts/check_pr_description.py

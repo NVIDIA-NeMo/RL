@@ -6,7 +6,7 @@ when_to_use: Opening a PR; writing or editing a PR description; updating a descr
 
 # PR Description
 
-The template is [`.github/PULL_REQUEST_TEMPLATE.md`](../../.github/PULL_REQUEST_TEMPLATE.md). The `Check PR description` workflow ([`.github/workflows/pr-description-check.yml`](../../.github/workflows/pr-description-check.yml)) fails when the review box is unticked, a required heading is missing, or "What and why" is empty. It is a warning for now, not a required check.
+The template is [`.github/PULL_REQUEST_TEMPLATE.md`](../../.github/PULL_REQUEST_TEMPLATE.md). The `Check PR description` workflow runs [`.github/scripts/check_pr_description.py`](../../.github/scripts/check_pr_description.py), which fails when the review box is unticked, a required heading is missing, or "What and why" is empty. It is a warning for now, not a required check.
 
 ## Rules
 
@@ -28,7 +28,7 @@ The template is [`.github/PULL_REQUEST_TEMPLATE.md`](../../.github/PULL_REQUEST_
 The template, the check and this skill must agree. When you add, rename or remove a section, or change the review box wording, update all of them in the same PR:
 
 1. [`.github/PULL_REQUEST_TEMPLATE.md`](../../.github/PULL_REQUEST_TEMPLATE.md).
-2. [`.github/workflows/pr-description-check.yml`](../../.github/workflows/pr-description-check.yml): the `box` text and the list of required headings.
+2. [`.github/scripts/check_pr_description.py`](../../.github/scripts/check_pr_description.py): `REVIEW_BOX_TEXT` and `REQUIRED_HEADINGS`, plus its tests in `tests/unit/test_pr_description_check.py`.
 3. This skill's rules and the section names they mention.
 4. For a new box wording: the never-tick line in `AGENTS.md` (`CLAUDE.md` links to it) and in [`contributing`](../contributing/SKILL.md).
 
