@@ -490,7 +490,11 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Compaction, mixed image/video conversations, native audio, video token pruning, static tiling (`image_num_patches`), other processor families, and `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo Gym rollouts; multimodal/VLM MOPD is not yet supported. See [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
-- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). vLLM generation can also serve through Dynamo (`policy.generation.dynamo: true`); see [Dynamo serving](dynamo-generation.md). SGLang and TRT-LLM have not been tested on SC.
+- Generation backend: vLLM, Megatron and SGLang generation are supported.
+  - vLLM: non-colocated only. It can also serve through Dynamo (`policy.generation.dynamo: true`); see [Dynamo serving](dynamo-generation.md).
+  - Megatron: both non-colocated and colocated modes.
+  - SGLang: non-colocated, native rollout path only, without fault tolerance (`sglang_fault_tolerance_config.use_fault_tolerance` must be `false`).
+  - TRT-LLM has not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, but each critic epoch must contain exactly `value.train_global_batch_size` samples in either value-training mode, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
 - Reward shaping and sample filtering — setup rejects what is unimplemented rather than silently skipping it.
