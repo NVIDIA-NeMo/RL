@@ -542,6 +542,7 @@ def rm_train(
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
         for batch in train_dataloader:
+            checkpointer.raise_if_finalization_failed()
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config.rm.max_num_steps if master_config.rm.max_num_steps != -1 else len(train_dataloader))} {'=' * 25}"
             )
