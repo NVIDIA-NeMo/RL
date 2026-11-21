@@ -831,21 +831,16 @@ class VllmAsyncGenerationWorkerImpl(
         # ai-dynamo is optional: import it only for engines served through Dynamo.
         from nemo_rl.models.generation.dynamo.engine_adapter import (
             start_dynamo_endpoint,
-            weight_free_model_path,
         )
         from nemo_rl.models.generation.dynamo.vllm.adapter import DynamoVllmAdapter
 
-        # Dynamo fetches a Hub ID's whole checkpoint before it registers; the engine's
-        # weights come from refit, so register the config and tokenizer files only.
-        model_path = await weight_free_model_path(self.model_name)
         kv_events = self.llm.vllm_config.kv_events_config
         publishes = kv_events is not None and kv_events.enable_kv_cache_events
         # The Dynamo functional overlays check the router applied these.
         print(f"  [Dynamo] engine publishes KV events: {publishes}", flush=True)
         self._dynamo_endpoint_task = start_dynamo_endpoint(
             DynamoVllmAdapter(self, leader_worker_idx=leader_worker_idx),
-            model_path=model_path,
-            served_model_name=self.model_name,
+            model_name=self.model_name,
             namespace=namespace,
             engine_env=engine_env,
         )
@@ -884,6 +879,9 @@ class VllmAsyncGenerationWorkerImpl(
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
+        prefix_write_max_rows: int,
+        prefix_write_max_tokens: int,
+        prefix_read_max_rows: int,
     ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
@@ -1004,6 +1002,7 @@ class VllmAsyncGenerationWorkerImpl(
             weight_version_fn=lambda: self._rollout_weight_version,
             adapter=VLLMCaptureAdapter(),
         )
+        await self._prefix_recovery.aclose()
         self._prefix_recovery.shutdown()
         self._prefix_recovery = NoPrefixRecovery()
         self._cut_routes_dtype = (
@@ -1029,11 +1028,21 @@ class VllmAsyncGenerationWorkerImpl(
                     router_replay=self._cut_routes_dtype is not None,
                     sampler_top_k=self._capture_top_logprobs,
                     prefix_row_extras=self._generation_cut_record_payload,
+                    prefix_write_max_rows=prefix_write_max_rows,
+                    prefix_write_max_tokens=prefix_write_max_tokens,
+                    prefix_read_max_rows=prefix_read_max_rows,
                 )
             )
         if self._api_server_pool is not None:
             await self._api_server_pool.command(
-                "capture", dp_cfg, staging_partition, capture_media, top_logprobs
+                "capture",
+                dp_cfg,
+                staging_partition,
+                capture_media,
+                top_logprobs,
+                prefix_write_max_rows,
+                prefix_write_max_tokens,
+                prefix_read_max_rows,
             )
         if not capture_media:
             return None
@@ -2310,6 +2319,7 @@ class VllmAsyncGenerationWorkerImpl(
             # Waiting for a wedged TQ write here would make actor shutdown hang.
             prefix_recovery = getattr(self, "_prefix_recovery", None)
             if prefix_recovery is not None:
+                await prefix_recovery.aclose()
                 prefix_recovery.shutdown()
             if self._api_server_pool is not None:
                 await self._api_server_pool.command("stop")

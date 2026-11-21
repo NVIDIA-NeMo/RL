@@ -42,7 +42,6 @@ from dynamo.common.backend import (
     Worker,
     WorkerConfig,
 )
-from dynamo.common.backend import worker as dynamo_worker
 from dynamo.common.backend.publisher import KvEventSource
 from dynamo.llm.exceptions import InvalidArgument
 
@@ -71,14 +70,6 @@ class ServedRollout:
     finish_reason: str
     # The OpenAI completion usage; None when no new token fit.
     usage: Optional[dict[str, Any]]
-
-
-def _keep_host_logging(*args: object, **kwargs: object) -> None:
-    """Replaces Dynamo's ``configure_dynamo_logging`` (ai-dynamo/dynamo#18447).
-
-    ``Worker.run()`` calls it first, and it would replace this process's Python
-    logging: NeMo RL's root handler and level, and vLLM's handlers.
-    """
 
 
 def _annotation_value(request: GenerateRequest, prefix: str) -> Optional[str]:
@@ -195,17 +186,16 @@ async def weight_free_model_path(model: str) -> str:
 def start_dynamo_endpoint(
     adapter: DynamoEngineAdapter,
     *,
-    model_path: str,
-    served_model_name: str,
+    model_name: str,
     namespace: str,
     engine_env: dict[str, str],
 ) -> asyncio.Task:
     """Register ``adapter``'s engine with Dynamo and serve it on the running loop.
 
-    ``model_path`` is a local directory with the model's config and tokenizer
-    files; the engine is served under ``served_model_name``. Chat calls are
-    rendered by NeMo RL's chat engine in the frontend, not Dynamo's renderer,
-    so no template or parser is registered.
+    ``model_name`` is the engine's model, a local path or a Hub ID, and the name
+    it is served under. Dynamo registers a Hub ID from its config and tokenizer
+    files alone. Chat calls are rendered by NeMo RL's chat engine in the
+    frontend, not Dynamo's renderer, so no template or parser is registered.
 
     The Rust Worker serves until the process gets SIGTERM. It installs a chained
     handler, so Ray's actor handler still runs and the actor exits as usual;
@@ -213,18 +203,19 @@ def start_dynamo_endpoint(
     """
     # The Rust runtime reads these when the first Worker is constructed.
     os.environ.update(engine_env)
-    # The generation worker keeps its own logging until WorkerConfig can opt out.
-    dynamo_worker.configure_dynamo_logging = _keep_host_logging
     config = WorkerConfig(
         namespace=namespace,
         component=DYNAMO_COMPONENT,
         endpoint=DYNAMO_ENDPOINT,
-        model_name=model_path,
-        served_model_name=served_model_name,
+        model_name=model_name,
+        served_model_name=model_name,
         # NeMo RL's rollouts go to /v1/completions; NeMo-Gym calls chat.
         endpoint_types="chat,completions",
         discovery_backend=engine_env["DYN_DISCOVERY_BACKEND"],
         request_plane=engine_env["DYN_REQUEST_PLANE"],
         event_plane=engine_env["DYN_EVENT_PLANE"],
+        # This is NeMo RL's process: Dynamo's setup would replace its root
+        # handler and level, and vLLM's handlers.
+        configure_logging=False,
     )
     return asyncio.get_running_loop().create_task(Worker(adapter, config).run())
