@@ -173,17 +173,36 @@ def test_shard_meta_for_dp_leaves_tags_none_when_absent():
 
 
 def test_shard_meta_for_dp_unsorted_round_trip():
-    """unsorted_indices must reconstruct the input order from DP-rank concat."""
-    n, dp = 8, 4
-    metas, unsorted = shard_meta_for_dp(_meta(n), dp_world=dp, batch_size=n)
-    if unsorted is None:
-        # No reorder happened — DP-rank concat IS the original order.
-        return
-    # Build a tensor whose row i is i; permute via dispatch order; reorder back.
+    """``reorder_data(unsorted)`` must restore input order from the DP-rank concat.
+
+    Sequence packing reorders rows across ranks, so ``unsorted`` is non-None
+    here; without packing it is None and the round trip would assert nothing.
+    """
+    n, dp = 16, 4
+    meta = _meta(n)
+    meta.sequence_lengths = [5 + (37 * i) % 113 for i in range(n)]
+    metas, unsorted = shard_meta_for_dp(
+        meta,
+        dp_world=dp,
+        sequence_packing_args={
+            "max_tokens_per_microbatch": 256,
+            "algorithm": "modified_first_fit_decreasing",
+            "sequence_length_pad_multiple": 1,
+            "input_key": "input_ids",
+            "input_lengths_key": "input_lengths",
+        },
+    )
+    assert unsorted is not None
     flat = [k for m in metas for k in m.sample_ids]
-    aggregated = torch.tensor([_meta(n).sample_ids.index(k) for k in flat])
-    restored = aggregated[torch.tensor(unsorted)]
-    assert restored.tolist() == list(range(n))
+    aggregated = BatchedDataDict(
+        {
+            "ids": flat,
+            "rows": torch.tensor([meta.sample_ids.index(k) for k in flat]),
+        }
+    )
+    aggregated.reorder_data(unsorted)
+    assert aggregated["ids"] == meta.sample_ids
+    assert aggregated["rows"].tolist() == list(range(n))
 
 
 # ── meta utility helpers ──────────────────────────────────────────────
