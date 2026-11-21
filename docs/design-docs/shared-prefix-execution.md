@@ -49,7 +49,7 @@ Run the recipe with the single-controller launcher:
 uv run examples/run_grpo_single_controller.py --config <recipe>.yaml
 ```
 
-`examples/run_grpo.py` rejects the key at setup, because that launcher does not write the row tags that planning reads. The other launchers do not check the key. A run with one of them packs densely when the key is `true`. A Megatron worker of such a run still runs the model check at setup.
+The legacy GRPO `setup()` in `nemo_rl/algorithms/grpo.py` rejects the key, because the launchers that call it do not write the row tags that planning reads. Those launchers are `examples/run_grpo.py`, `examples/run_vlm_grpo.py`, `examples/run_grpo_sliding_puzzle.py` and `examples/nemo_gym/run_grpo_nemo_gym.py`. Launchers of other algorithms do not check the key. A run with one of them packs densely when the key is `true`. A Megatron worker of such a run still runs the model check at setup.
 
 `examples/configs/recipes/llm/grpo-nano-v2-12b-1n8g-megatron-single-controller-token_capture-shared-prefix.yaml` is a complete recipe.
 
@@ -146,7 +146,7 @@ The option needs every item below. A config that misses one is rejected at setup
 
 The launcher:
 
-- The single-controller launcher, `examples/run_grpo_single_controller.py`. Its setup requires `data_plane.enabled: true` for every run. `examples/run_grpo.py` raises when the key is `true`. The other launchers do not check the key and pack densely (see [Configuration](#configuration)).
+- The single-controller launcher, `examples/run_grpo_single_controller.py`. Its setup requires `data_plane.enabled: true` for every run. The launchers that call the legacy GRPO `setup()` raise when the key is `true`. Launchers of other algorithms do not check the key and pack densely (see [Configuration](#configuration)).
 
 Checked once on the driver by `validate_shared_prefix_config`, before any worker starts. Each rule is one error that names the key to change:
 
