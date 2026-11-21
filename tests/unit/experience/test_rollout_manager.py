@@ -55,6 +55,7 @@ from nemo_rl.experience.failures import (
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     Completion,
@@ -1610,7 +1611,7 @@ def test_rollout_manager_task_counter_only_applies_to_gym(use_nemo_gym: bool) ->
     assert manager.get_next_nemo_gym_task_index() == (42 if use_nemo_gym else 0)
 
 
-def test_nemo_gym_build_inputs_preserves_materialized_task_and_clamps_sampling():
+def test_nemo_gym_build_inputs_preserves_materialized_task_and_stamps_sampling():
     impl = _nemo_gym_impl(True)
     impl._num_generations_per_prompt = 2
     impl._generation_config.update(temperature=0.7, top_p=0.9, max_new_tokens=64)
@@ -1631,20 +1632,43 @@ def test_nemo_gym_build_inputs_preserves_materialized_task_and_clamps_sampling()
 
     rows = impl._build_inputs(input_sample, task_index=7)
 
+    task_params = original["extra_env_info"]["task_input"]["responses_create_params"]
     assert input_sample == original
     assert len(rows) == 2
     for row in rows:
         assert row["task_id"] == original["extra_env_info"]["task_id"]
         assert row["task_input"]["task_data"] == {"state": ["meeting-1"]}
-        params = row["task_input"]["responses_create_params"]
-        assert params["temperature"] == 0.7
-        assert params["top_p"] == 0.9
-        assert params["max_output_tokens"] == 32
-        assert params["metadata"] == {"extra_body": '{"seed": 8}'}
+        # The task is left as the dataset wrote it; the values ride beside it.
+        assert row["task_input"]["responses_create_params"] == task_params
+        assert row[NEMO_GYM_MODEL_SAMPLING_KEY] == {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 64,
+        }
         assert "responses_create_params" not in row
     assert [row["_rowidx"] for row in rows] == [0, 1]
     rows[0]["task_input"]["task_data"]["state"].append("meeting-2")
     assert rows[1]["task_input"]["task_data"] == {"state": ["meeting-1"]}
+
+
+def test_nemo_gym_build_inputs_stamps_a_task_without_responses_create_params():
+    impl = _nemo_gym_impl(True)
+    input_sample = {
+        "extra_env_info": {
+            # A multi-turn Harbor task has no top-level responses_create_params.
+            "task_id": {"taskset": "harbor:train", "task_id": "7"},
+            "task_input": {"task_data": {"repo": "demo"}},
+        }
+    }
+
+    rows = impl._build_inputs(input_sample, task_index=3)
+
+    assert rows[0]["task_input"] == {"task_data": {"repo": "demo"}}
+    assert rows[0][NEMO_GYM_MODEL_SAMPLING_KEY] == {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_output_tokens": 100,
+    }
 
 
 @pytest.mark.parametrize(
@@ -3044,3 +3068,58 @@ class TestStepRewardMetrics:
         _run(mgr.generate_and_push({"idx": 0}))
 
         assert mgr._step_rewards == {}
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_length_penalty_runs_after_group_collection_or_is_saved_for_capture(capture):
+    from nemo_rl.utils.length_penalty import LengthPenaltyConfig, LengthPenaltyParams
+    from nemo_rl.utils.timer import Timer
+
+    class Remote:
+        def options(self, **kwargs):
+            return self
+
+        def remote(self, pending, *args, **kwargs):
+            async def value(row):
+                index = row["_rowidx"]
+                result = _mask_gate_receipt_result() if capture else _mask_gate_result()
+                result["input_message_log"] = [{"role": "user", "token_ids": [9]}]
+                result["full_result"]["response"] = {
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"text": "x" * (index + 1) * 10}],
+                        }
+                    ]
+                }
+                return index, {"name": "agent"}, result, None
+
+            async def stream():
+                for row in reversed(pending):
+                    yield value(row)
+
+            return stream()
+
+    impl = _nemo_gym_impl(True)
+    impl._length_penalty_config = LengthPenaltyConfig(
+        default=LengthPenaltyParams(
+            length_type="chars", group_total_length_penalty_coeff=0.2
+        )
+    )
+    impl._num_generations_per_prompt = 2
+    impl._task_to_env = {"nemo_gym": SimpleNamespace(run_rollouts=Remote())}
+    inputs = [{"_rowidx": i, "agent_ref": {"name": "agent"}} for i in range(2)]
+    completions, _, metrics = _run(impl._run_rollouts(inputs, Timer(), "test"))
+    if capture:
+        assert [completion.reward for completion in completions] == [1.0, 1.0]
+        assert [
+            completion.env_extras["ng_reward_checks"].length_penalty.answer_length
+            for completion in completions
+        ] == [10, 20]
+        assert "length_penalty/adjusted_frac" not in metrics
+    else:
+        assert [completion.reward for completion in completions] == pytest.approx(
+            [1.1, 0.9]
+        )
+        assert metrics["length_penalty/env_reward_mean"] == 1.0
+        assert metrics["length_penalty/adjusted_frac"] == 1.0

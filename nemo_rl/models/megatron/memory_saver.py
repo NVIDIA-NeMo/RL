@@ -17,7 +17,7 @@ from contextlib import nullcontext
 from typing import ContextManager
 
 try:
-    from torch_memory_saver import (  # pyrefly: ignore[import-error]
+    from torch_memory_saver import (  # pyrefly: ignore[missing-import]
         torch_memory_saver,
     )
 

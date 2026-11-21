@@ -308,6 +308,57 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
 
 
+def test_finalize_group_stamps_agent_names_for_agent_overrides(tq_client, partitions):
+    """grpo.agent_overrides: every published row's tag names its rollout's agent."""
+    group_id = "grp_agent_tags"
+    rollout_ids = [f"{group_id}_g{i}" for i in range(3)]
+    receipts = []
+    for rollout_id in rollout_ids:
+        receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_id)
+        receipt["capture_key"] = rollout_id
+        receipts.append(receipt)
+    contexts = [
+        RewardLogContext("rubric_judge_agent", None),
+        None,
+        RewardLogContext("rubric_judge_agent", None),
+    ]
+    finalized = _finalizer(tq_client, stamp_agent_names=True).finalize_group(
+        group_id,
+        rollout_ids,
+        receipts,
+        [1.0, 0.0, 1.0],
+        mask_sample=[False, False, False],
+        fallback_weight_version=9,
+        prompt_idx=3,
+        reward_log_contexts=contexts,
+    )
+    # The row without a context takes its group's agent.
+    assert [tag["agent_name"] for tag in finalized.meta.tags] == [
+        "rubric_judge_agent"
+    ] * 3
+
+
+def test_finalize_group_does_not_stamp_agent_names_by_default(tq_client, partitions):
+    group_id = "grp_no_agent_tags"
+    rollout_ids = [f"{group_id}_g{i}" for i in range(2)]
+    receipts = []
+    for rollout_id in rollout_ids:
+        receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_id)
+        receipt["capture_key"] = rollout_id
+        receipts.append(receipt)
+    finalized = _finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        receipts,
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=9,
+        prompt_idx=3,
+        reward_log_contexts=[RewardLogContext("rubric_judge_agent", None)] * 2,
+    )
+    assert all("agent_name" not in tag for tag in finalized.meta.tags)
+
+
 def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):
     group_id = "grp_unset"
     receipt, expected = _stage_fixture(
@@ -2053,3 +2104,94 @@ def test_effort_uses_terminal_call_with_carries_and_abandoned_branch(
         assert actual.token_ids == full_tokens
         assert actual.token_mask == masks
         assert actual.logprobs == logprobs
+
+
+@pytest.mark.parametrize("length_type", ["chars", "all_generated_tokens"])
+def test_length_penalty_published_rewards_match_shared_hook(
+    tq_client, partitions, length_type
+):
+    from nemo_rl.experience.reward_penalties import RewardChecks
+    from nemo_rl.utils.length_penalty import (
+        LengthPenaltyConfig,
+        LengthPenaltyParams,
+        apply_group_length_penalties,
+        prepare_length_penalty_input,
+    )
+
+    group_id = "length-penalty"
+    rollout_ids = [f"{group_id}_g{i}" for i in range(3)]
+    receipts, rows, results = [], [], []
+    for i in range(2):
+        receipt, _ = _stage_fixture(
+            tq_client, "worked_example", rollout_id=rollout_ids[i]
+        )
+        receipts.append(receipt)
+        rows.append(
+            _finalizer(tq_client).finalize_rollout(rollout_ids[i], receipt, reward=1.0)
+        )
+        results.append(
+            {
+                "agent_ref": {"name": "agent"},
+                "full_result": {
+                    "reward": 1.0,
+                    "response": {
+                        "output": [
+                            {
+                                "type": "message",
+                                "content": [{"text": "x" * (i + 1) * 10}],
+                            }
+                        ]
+                    },
+                },
+                "message_log": [
+                    {
+                        "role": "assistant",
+                        "token_ids": [
+                            token
+                            for token, mask in zip(
+                                rows[-1].token_ids, rows[-1].token_mask
+                            )
+                            if mask
+                        ],
+                    }
+                ],
+            }
+        )
+    config = LengthPenaltyConfig(
+        default=LengthPenaltyParams(
+            length_type=length_type, group_total_length_penalty_coeff=0.2
+        )
+    )
+    checks = [
+        RewardChecks(
+            False,
+            False,
+            False,
+            prepare_length_penalty_input(result, result, config, None),
+        )
+        for result in results
+    ]
+    expected_metrics = apply_group_length_penalties(results, config, 2)
+    finalizer = _finalizer(tq_client, length_penalty_config=config)
+    finalized = finalizer.finalize_group(
+        group_id,
+        rollout_ids,
+        receipts + [None],
+        [1.0, 1.0, 0.0],
+        mask_sample=[False] * 3,
+        fallback_weight_version=0,
+        prompt_idx=7,
+        reward_checks=checks + [None],
+    )
+    batch = _fetch_rows(tq_client, rollout_ids)
+    expected = [result["full_result"]["reward"] for result in results]
+    assert batch["total_reward"].flatten().tolist() == pytest.approx(expected + [0.0])
+    assert [
+        observation.reward for observation in finalized.reward_observations
+    ] == pytest.approx(expected)
+    assert {
+        key: finalized.metrics[f"finalize/{key}_sum"] / len(results)
+        for key in expected_metrics
+    } == pytest.approx(expected_metrics)
+    assert finalized.valid_row_count == 2
+    assert finalized.total_row_count == 3

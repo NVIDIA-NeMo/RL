@@ -402,6 +402,9 @@ class MultiAPIServerPool:
                             args[1],
                             capture_media=args[2],
                             top_logprobs=args[3],
+                            prefix_write_max_rows=args[4],
+                            prefix_write_max_tokens=args[5],
+                            prefix_read_max_rows=args[6],
                         )
                     elif name == "version":
                         await host.set_rollout_weight_version(args[0])

@@ -75,7 +75,7 @@ def main() -> None:
 
         config = OmegaConf.to_container(config, resolve=True)
         check_outdated_config(config)
-        config = MasterConfig(**config)
+        config = MasterConfig.model_validate(config)
         # Materialize the video sampling contract before constructing the
         # processor or vLLM workers.  In particular, this overrides vLLM
         # VideoMediaIO's independent 32-frame default for 64-frame recipes.
@@ -95,10 +95,8 @@ def main() -> None:
     # Get the next experiment directory with incremented ID
     config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
     print(f"📊 Using log directory: {config.logger.log_dir}")
-    if config.checkpointing["enabled"]:
-        print(
-            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
-        )
+    if config.checkpointing.enabled:
+        print(f"📊 Using checkpoint directory: {config.checkpointing.checkpoint_dir}")
 
     with rl_init_timer.time("ray_connect"):
         # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
