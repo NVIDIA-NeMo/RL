@@ -61,6 +61,11 @@ def configure_hybridep_packed_input_padding(
             raise ValueError(
                 "HybridEP input prepadding currently requires MTP disabled."
             )
+        if megatron_cfg.get("dynamic_context_parallel"):
+            raise ValueError(
+                "HybridEP input prepadding is not supported with dynamic "
+                "context parallelism."
+            )
 
 
 def _get_hybridep_aligned_seq_len(

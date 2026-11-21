@@ -13,7 +13,8 @@
 # limitations under the License.
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from itertools import repeat
 from math import lcm
 from typing import Any, Iterator, Optional, Sequence, Tuple
 
@@ -21,11 +22,15 @@ import torch
 from megatron.bridge.training.utils.packed_seq_utils import (
     get_packed_seq_cp_partition_indices,
 )
+from megatron.core.datasets.data_schedule import DefaultDynamicCPScheduler
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_context_parallel_rank,
     get_context_parallel_world_size,
+    get_data_parallel_world_size,
+    get_dynamic_data_context_parallel_group_map,
+    get_dynamic_data_context_parallel_groups,
 )
 from megatron.core.utils import StragglerDetector, get_batch_on_this_cp_rank
 
@@ -228,6 +233,7 @@ def make_processed_microbatch_iterator(
     prepad_packed_seq_for_hybridep: bool = False,
     mtp_enabled: bool = False,
     create_nonpacked_router_padding_mask: bool = False,
+    dynamic_cp_sizes: Optional[Sequence[int]] = None,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -248,13 +254,23 @@ def make_processed_microbatch_iterator(
         mtp_enabled: Whether the model uses multi-token prediction layers.
         create_nonpacked_router_padding_mask: Use input lengths to exclude dense
             right padding from expert-bias statistics on supported MoE models.
+        dynamic_cp_sizes: Context-parallel group size of every microbatch under
+            dynamic context parallelism.
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
     """
     pack_sequences = cfg["sequence_packing"]["enabled"]
 
-    for data_dict in raw_iterator:
+    for data_dict, dynamic_cp_size in zip(
+        raw_iterator, repeat(None) if dynamic_cp_sizes is None else dynamic_cp_sizes
+    ):
+        # Zigzag sharding splits every sequence into 2 * cp_size chunks.
+        cp_pad_factor = (
+            2 * dynamic_cp_size
+            if dynamic_cp_size is not None and dynamic_cp_size > 1
+            else 1
+        )
         for key, pad in MICROBATCH_PADDED_FIELDS.items():
             if key in data_dict:
                 data_dict[key] = pad_field(
@@ -275,8 +291,10 @@ def make_processed_microbatch_iterator(
         processed_inputs = process_microbatch(
             data_dict=data_dict,
             seq_length_key=seq_length_key,
-            pad_individual_seqs_to_multiple_of=pad_individual_seqs_to_multiple_of,
-            pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+            pad_individual_seqs_to_multiple_of=(
+                pad_individual_seqs_to_multiple_of * cp_pad_factor
+            ),
+            pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of * cp_pad_factor,
             pad_full_seq_to=pad_full_seq_to,
             pack_sequences=pack_sequences,
             delegate_pack_to_model=delegate_pack_to_model,
@@ -288,6 +306,7 @@ def make_processed_microbatch_iterator(
             create_nonpacked_router_padding_mask=create_nonpacked_router_padding_mask,
             prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
             mtp_enabled=mtp_enabled,
+            dynamic_cp_size=dynamic_cp_size,
         )
 
         yield ProcessedMicrobatch(
@@ -397,6 +416,7 @@ def get_microbatch_iterator(
     pad_packed_seq_to_multiple_of = 1
     create_packed_seq_padding_mask = False
     prepad_packed_seq_for_hybridep = False
+    dynamic_cp_sizes = None
 
     direct_packed_rows = is_direct_packed_row(data)
     if direct_packed_rows:
@@ -434,6 +454,13 @@ def get_microbatch_iterator(
         raise ValueError("Prepacked input requires fused sequence packing only.")
     if not cfg["sequence_packing"]["enabled"]:
         pad_factor = _get_non_packed_sequence_pad_factor(cfg)
+    if cfg["megatron_cfg"].get("dynamic_context_parallel"):
+        if prepacked or data.micro_batch_cp_sizes is None:
+            raise ValueError(
+                "Dynamic context parallelism runs packs scheduled by the policy "
+                "driver; this batch carries no schedule."
+            )
+        dynamic_cp_sizes = data.micro_batch_cp_sizes[0]
 
     if direct_packed_rows:
         raw_iterator = data.make_microbatch_iterator(1)
@@ -505,6 +532,7 @@ def get_microbatch_iterator(
         delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
         mtp_enabled=mtp_enabled,
+        dynamic_cp_sizes=dynamic_cp_sizes,
     )
 
     # Compute padded sequence length for pipeline parallelism
@@ -772,11 +800,16 @@ def process_microbatch(
     prepad_packed_seq_for_hybridep: bool = False,
     mtp_enabled: bool = False,
     create_nonpacked_router_padding_mask: bool = False,
+    dynamic_cp_size: Optional[int] = None,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass.
 
     ``create_nonpacked_router_padding_mask`` opts supported MoE models into
     right-padding exclusion using input lengths, independent of the loss mask.
+
+    ``dynamic_cp_size`` is the size of the context-parallel group that runs this
+    microbatch under dynamic context parallelism. The packed sequences are then
+    sharded over that group, which ``PackedSeqParams`` carries to the model.
     """
     prepacked = "cu_seqlens" in data_dict
     if (
@@ -792,6 +825,16 @@ def process_microbatch(
         raise NotImplementedError(
             "HybridEP input prepadding requires NeMo-owned sequence packing."
         )
+    dynamic_cp_group = None
+    if dynamic_cp_size is None:
+        cp_rank = get_context_parallel_rank()
+        cp_size = get_context_parallel_world_size()
+    else:
+        dynamic_cp_group = get_dynamic_data_context_parallel_groups(
+            group_size=dynamic_cp_size
+        )
+        cp_rank = dynamic_cp_group.rank()
+        cp_size = dynamic_cp_size
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
     with ctx:
         input_ids = data_dict["input_ids"]
@@ -833,7 +876,6 @@ def process_microbatch(
                 raise NotImplementedError(
                     "Router replay is not supported with Megatron direct packed rows"
                 )
-            cp_size = get_context_parallel_world_size()
             if direct_packed_metadata is None:
                 direct_packed_metadata = _validate_direct_packed_microbatch(
                     data_dict,
@@ -858,7 +900,7 @@ def process_microbatch(
                 cu_seqlens,
                 packed_max_seqlen,
                 cp_size=cp_size,
-                cp_rank=get_context_parallel_rank(),
+                cp_rank=cp_rank,
                 direct_packed_metadata=direct_packed_metadata,
             )
             input_ids_cp_sharded = cp_batch["tokens"]
@@ -1013,9 +1055,15 @@ def process_microbatch(
                     pad_individual_seqs_to_multiple_of,
                     pad_packed_seq_to_multiple_of,
                     pad_full_seq_to,
-                    cp_rank=get_context_parallel_rank(),
-                    cp_size=get_context_parallel_world_size(),
+                    cp_rank=cp_rank,
+                    cp_size=cp_size,
                 )
+                if dynamic_cp_size is not None:
+                    packed_seq_params = replace(
+                        packed_seq_params,
+                        local_cp_size=cp_size,
+                        cp_group=dynamic_cp_group,
+                    )
                 if model_slices_context_parallel_inputs:
                     packed_seq_params = PackedSeqParams(
                         cu_seqlens_q=cu_seqlens,
@@ -1058,26 +1106,24 @@ def process_microbatch(
                             packed_seq_params=packed_seq_params,
                             cu_seqlens_padded=cu_seqlens_padded,
                             pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
-                            cp_rank=get_context_parallel_rank(),
-                            cp_size=get_context_parallel_world_size(),
+                            cp_rank=cp_rank,
+                            cp_size=cp_size,
                         )
                     full_padding_mask = get_packed_seq_padding_mask(
                         cu_seqlens=cu_seqlens,
                         cu_seqlens_padded=cu_seqlens_padded,
                         total_tokens=input_ids.shape[1],
                     )
-                    if (
-                        model_slices_context_parallel_inputs
-                        or get_context_parallel_world_size() == 1
-                    ):
+                    if model_slices_context_parallel_inputs or cp_size == 1:
                         padding_mask = full_padding_mask
                     else:
                         cp_partition_indices = get_packed_seq_cp_partition_indices(
                             packed_seq_params,
                             total_tokens=input_ids.shape[1],
-                            cp_size=get_context_parallel_world_size(),
-                            cp_rank=get_context_parallel_rank(),
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
                             device=input_ids.device,
+                            cp_group=dynamic_cp_group,
                         )
                         padding_mask = full_padding_mask.index_select(
                             1, cp_partition_indices
@@ -1101,15 +1147,15 @@ def process_microbatch(
                         seq_lengths,
                         cu_seqlens,
                         cu_seqlens_padded,
-                        get_context_parallel_rank(),
-                        get_context_parallel_world_size(),
+                        cp_rank,
+                        cp_size,
                     )
                     if model_slices_context_parallel_inputs:
                         cp_partition_indices = get_packed_seq_cp_partition_indices(
                             packed_seq_params,
                             total_tokens=input_ids.shape[1],
-                            cp_size=get_context_parallel_world_size(),
-                            cp_rank=get_context_parallel_rank(),
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
                             device=input_ids.device,
                         )
                         routed_experts_cp_sharded = routed_experts.index_select(
@@ -1150,8 +1196,8 @@ def process_microbatch(
                         else input_ids_cp_sharded
                     ),
                     cp_token_identity_verified_count=verified_token_count,
-                    cp_rank=get_context_parallel_rank(),
-                    cp_size=get_context_parallel_world_size(),
+                    cp_rank=cp_rank,
+                    cp_size=cp_size,
                 )
 
                 # Pack pre-computed mtp_loss_mask the same way as input_ids
@@ -1168,8 +1214,8 @@ def process_microbatch(
                         pad_individual_seqs_to_multiple_of,
                         pad_packed_seq_to_multiple_of,
                         pad_full_seq_to,
-                        cp_rank=get_context_parallel_rank(),
-                        cp_size=get_context_parallel_world_size(),
+                        cp_rank=cp_rank,
+                        cp_size=cp_size,
                     )
                     # Mirror the input_ids layout choice above. A model that
                     # slices CP itself receives the full THD row so it can insert
@@ -1207,8 +1253,8 @@ def process_microbatch(
                         pad_individual_seqs_to_multiple_of,
                         pad_packed_seq_to_multiple_of,
                         pad_full_seq_to,
-                        cp_rank=get_context_parallel_rank(),
-                        cp_size=get_context_parallel_world_size(),
+                        cp_rank=cp_rank,
+                        cp_size=cp_size,
                     )
                     # Mirror the input_ids layout choice above, for the same
                     # reason the MTP mask does: a model that slices CP itself
@@ -1246,8 +1292,8 @@ def process_microbatch(
                         pad_individual_seqs_to_multiple_of,
                         pad_packed_seq_to_multiple_of,
                         pad_full_seq_to,
-                        cp_rank=get_context_parallel_rank(),
-                        cp_size=get_context_parallel_world_size(),
+                        cp_rank=cp_rank,
+                        cp_size=cp_size,
                     )
                     position_ids = (
                         packed_position_ids
@@ -1299,8 +1345,8 @@ def process_microbatch(
                 token_identity_cp_sharded=token_identity_cp_sharded,
                 input_ids_cp_sharded=input_ids_cp_sharded,
                 cp_token_identity_verified_count=verified_token_count,
-                cp_rank=get_context_parallel_rank(),
-                cp_size=get_context_parallel_world_size(),
+                cp_rank=cp_rank,
+                cp_size=cp_size,
             )
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                 data=input_ids,
@@ -1487,6 +1533,16 @@ def _fill_routed_experts_padding(
     return repaired
 
 
+def owns_dynamic_cp_pack(cp_size: int) -> bool:
+    """Whether this rank accounts for a pack run by its CP group of ``cp_size`` ranks.
+
+    Under dynamic context parallelism every rank of the group holds the pack and
+    computes its loss. Only the group's first rank adds it to the statistics that
+    are reduced over the data-parallel ranks.
+    """
+    return get_dynamic_data_context_parallel_groups(group_size=cp_size).rank() == 0
+
+
 def process_global_batch(
     data: BatchedDataDict[Any],
     loss_fn: LossFunction,
@@ -1514,18 +1570,25 @@ def process_global_batch(
 
     assert "sample_mask" in batch, "sample_mask must be present in the data!"
 
+    sample_mask = batch["sample_mask"]
+    if batch.micro_batch_cp_sizes is not None:
+        owned_rows = torch.zeros_like(sample_mask)
+        for (start, end), cp_size in zip(
+            batch.micro_batch_indices[0], batch.micro_batch_cp_sizes[0]
+        ):
+            owned_rows[start:end] = owns_dynamic_cp_pack(cp_size)
+        sample_mask = sample_mask * owned_rows
+
     # Get the normalization factor for the loss
-    local_valid_seqs = torch.sum(batch["sample_mask"])
+    local_valid_seqs = torch.sum(sample_mask)
 
     if "token_mask" not in batch:
         local_valid_toks = local_valid_seqs * batch["input_ids"].shape[1]
     elif is_direct_packed_row(batch):
-        local_valid_toks = torch.sum(
-            batch["token_mask"] * batch["sample_mask"].unsqueeze(-1)
-        )
+        local_valid_toks = torch.sum(batch["token_mask"] * sample_mask.unsqueeze(-1))
     else:
         local_valid_toks = torch.sum(
-            batch["token_mask"][:, 1:] * batch["sample_mask"].unsqueeze(-1)
+            batch["token_mask"][:, 1:] * sample_mask.unsqueeze(-1)
         )
 
     to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
@@ -2040,6 +2103,53 @@ def _get_pack_sequence_parameters_for_megatron(
         pad_packed_seq_to_multiple_of,
         pad_packed_seq_to,
     )
+
+
+def schedule_dynamic_cp(
+    seq_lengths: Sequence[int], max_tokens_per_rank: int, cfg: dict[str, Any]
+) -> list[list[list[int]]]:
+    """Group one global batch into rounds of packs with MCore's dynamic-CP scheduler.
+
+    Every data-parallel rank runs one pack per round, and the ranks that share a
+    pack run it as one context-parallel group. The scheduler counts in units of
+    the sequence alignment, so that its padding of a sequence to ``2 * cp_size``
+    units equals the padding ``make_processed_microbatch_iterator`` applies.
+
+    Args:
+        seq_lengths: Sequence lengths, padded to ``make_sequence_length_divisible_by``.
+        max_tokens_per_rank: Token capacity of one rank per microbatch.
+        cfg: Policy configuration.
+
+    Returns:
+        For every round and data-parallel rank, the indices into ``seq_lengths``
+        of the rank's pack.
+    """
+    unit, pad_packed_seq_to_multiple_of, _ = _get_pack_sequence_parameters_for_megatron(
+        cfg["megatron_cfg"],
+        cfg["make_sequence_length_divisible_by"],
+        max_tokens_per_rank,
+    )
+    # A pack must stay within capacity after its CP group rounds the packed
+    # length up to twice the packed multiple per rank.
+    capacity_alignment = lcm(unit, 2 * pad_packed_seq_to_multiple_of)
+    capacity = max_tokens_per_rank - max_tokens_per_rank % capacity_alignment
+    scheduler = DefaultDynamicCPScheduler(
+        max_seqlen_per_dp_cp_rank=capacity // unit,
+        cp_size=1,
+        dp_size=get_data_parallel_world_size(),
+        microbatch_group_size_per_vp_stage=None,
+        pad_sequences=True,
+        cp_group_sizes=tuple(get_dynamic_data_context_parallel_group_map()),
+    )
+    rounds = scheduler.get_groups_and_subsamples(
+        [(index, -(-length // unit)) for index, length in enumerate(seq_lengths)]
+    )
+    # MCore builds the groups of a size from consecutive blocks of ranks, and the
+    # scheduler can leave a group across two blocks. Largest groups first never does.
+    return [
+        sorted(packs, key=lambda pack: (-packs.count(pack), packs.index(pack)))
+        for packs in rounds
+    ]
 
 
 def _unpack_sequences_from_megatron(
