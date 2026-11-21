@@ -57,9 +57,12 @@ from nemo_rl.data.multimodal_utils import (  # noqa: E402
 from nemo_rl.data.packing.shared_prefix.row_metadata import (  # noqa: E402
     PROMPT_HASH_TAG,
     PROMPT_LENGTH_TAG,
+    SHARED_PREFIX_TREE_IDS,
     prompt_hash,
 )
+from nemo_rl.data_plane.preshard import shard_meta_for_dp  # noqa: E402
 from nemo_rl.data_plane.schema import (  # noqa: E402
+    AGENT_NAME_TAG,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
     SAMPLER_TOPK_FIELDS,
@@ -689,6 +692,58 @@ def test_finalize_group_does_not_share_a_prompt_that_carries_loss(
     tags = finalized.meta.tags
     assert [tag[PROMPT_LENGTH_TAG] for tag in tags] == [staged[0][1].prompt_len, 0]
     assert tags[1][PROMPT_HASH_TAG] == prompt_hash([])
+
+
+def test_finalize_group_stamps_agent_and_prompt_tags_together(tq_client, partitions):
+    """With grpo.agent_overrides, a row carries the agent tag and both prompt tags.
+
+    The driver plans one tree from the prompt tags, and each row keeps its agent tag.
+    """
+    agent = "rubric_judge_agent"
+    group_id = "grp_agent_and_prompt_tags"
+    rollout_ids = [f"{group_id}_g{index}" for index in range(3)]
+    receipts = []
+    rows = []
+    for rollout_id in rollout_ids:
+        receipt, row = _stage_fixture(
+            tq_client, "worked_example", rollout_id=rollout_id
+        )
+        receipt["capture_key"] = rollout_id
+        receipts.append(receipt)
+        rows.append(row)
+    finalized = _finalizer(tq_client, stamp_agent_names=True).finalize_group(
+        group_id,
+        rollout_ids,
+        receipts,
+        [1.0, 0.0, 1.0],
+        mask_sample=[False] * 3,
+        fallback_weight_version=9,
+        prompt_idx=3,
+        reward_log_contexts=[RewardLogContext(agent, None)] * 3,
+    )
+
+    meta = finalized.meta
+    assert meta is not None
+    assert [tag[AGENT_NAME_TAG] for tag in meta.tags] == [agent] * 3
+    assert [tag[PROMPT_LENGTH_TAG] for tag in meta.tags] == [
+        row.prompt_len for row in rows
+    ]
+    assert len({tag[PROMPT_HASH_TAG] for tag in meta.tags}) == 1
+
+    (shard,) = shard_meta_for_dp(
+        meta,
+        dp_world=1,
+        sequence_packing_args={
+            "algorithm": "modified_first_fit_decreasing",
+            "sequence_length_pad_multiple": 1,
+            "max_tokens_per_microbatch": 256,
+            "share_prefixes": True,
+            "bound_by_full_length": False,
+        },
+    )
+    assert sorted(shard.sample_ids) == sorted(meta.sample_ids)
+    assert list(shard.extra_info[SHARED_PREFIX_TREE_IDS]) == [0, 0, 0]
+    assert [tag[AGENT_NAME_TAG] for tag in shard.tags] == [agent] * 3
 
 
 # ---------------------------------------------------------------------------
