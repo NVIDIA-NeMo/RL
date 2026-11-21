@@ -40,11 +40,13 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
     RolloutCheckpointConfig,
+    RolloutRecoveryConfig,
     TokenCaptureConfig,
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.models.generation.vllm.config import VllmConfig, VllmSpecificArgs
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
 
 
@@ -215,9 +217,17 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
             "sampler": {"name": "windowed", "max_staleness_versions": 1},
             "stall_watchdog": {"interval_s": 30},
         },
-        "checkpointing": {"checkpoint_dir": "/run/one/checkpoints"},
+        "checkpointing": CheckpointingConfig.model_construct(
+            checkpoint_dir="/run/one/checkpoints"
+        ),
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 120},
-        "rollout_recovery": {"target_level": "turn", "gym_prepare_timeout_s": 300.0},
+        "rollout_recovery": {
+            "target_level": "prefix",
+            "gym_prepare_timeout_s": 300.0,
+            "prefix_write_max_rows": 256,
+            "prefix_write_max_tokens": 4_194_304,
+            "prefix_read_max_rows": 256,
+        },
         "cluster": {"num_nodes": 2},
         "logger": LoggerConfig(log_dir="/run/one"),
     }
@@ -245,11 +255,16 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
             **base["async_rl"],
             "stall_watchdog": {"interval_s": 5},
         },
-        "checkpointing": {"checkpoint_dir": "/run/two/checkpoints"},
+        "checkpointing": CheckpointingConfig.model_construct(
+            checkpoint_dir="/run/two/checkpoints"
+        ),
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 300},
         "rollout_recovery": {
             **base["rollout_recovery"],
             "gym_prepare_timeout_s": 900.0,
+            "prefix_write_max_rows": 64,
+            "prefix_write_max_tokens": 1_048_576,
+            "prefix_read_max_rows": 1,
         },
         "cluster": {"num_nodes": 8},
         "logger": LoggerConfig(log_dir="/run/two"),
@@ -362,6 +377,7 @@ def test_builtin_fingerprint_exclusions_reference_declared_config_fields() -> No
         ("policy", "generation"): _fields(VllmConfig),
         ("policy", "generation", "vllm_cfg"): _fields(VllmSpecificArgs),
         ("rollout_checkpointing",): _fields(RolloutCheckpointConfig),
+        ("rollout_recovery",): _fields(RolloutRecoveryConfig),
         ("token_capture",): _fields(TokenCaptureConfig),
     }
     for excluded_path in snapshot_manifest._BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS:

@@ -1,6 +1,6 @@
 ---
 name: review-pr-team
-description: Agent-team-based parallel code review for NVIDIA-NeMo/RL pull requests. Spawns specialized agents (RL expert, submodule experts, bug finder, design reviewer, test agent, devil's advocate, comment reviewer) that coordinate via shared task list and direct messaging. Leader orchestrates, collates ALL findings, and presents to user for approval before posting.
+description: Deep parallel review of NVIDIA-NeMo/RL pull requests using Claude Code agent teams or Codex collaboration agents. Coordinates specialist, adversarial, and comment-editing passes, then presents all surviving findings for approval before staging a pending GitHub review. Use for /review-pr-team, $review-pr-team, or a requested team review with a PR number.
 when_to_use: Deep multi-agent review of a PR; '/review-pr-team <number>'; 'team review PR', 'thorough parallel review'. Requires CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1.
 argument-hint: "<pr-number>"
 allowed-tools:
@@ -23,9 +23,11 @@ Review a pull request using a coordinated team of specialized agents.
 
 **Repo**: `NVIDIA-NeMo/RL`
 
-**Requires**: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` must be set — agent teams (teammate spawning, shared task list, `SendMessage`) are an experimental Claude Code feature.
+**Requires (Claude Code)**: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` must be set — agent teams (teammate spawning, shared task list, `SendMessage`) are an experimental Claude Code feature.
 
-**Sandbox**: Always pass `dangerouslyDisableSandbox: true` on every Bash tool call in this skill. The sandbox's bubblewrap (bwrap) container fails to initialize in worktree/container environments with `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`, breaking ALL commands — not just network-dependent ones like `gh`. Do NOT attempt any Bash call in sandbox mode first; it will fail and waste a round-trip.
+**Sandbox (Claude Code)**: Always pass `dangerouslyDisableSandbox: true` on every Bash tool call in this skill. The sandbox's bubblewrap (bwrap) container fails to initialize in worktree/container environments with `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`, breaking ALL commands — not just network-dependent ones like `gh`. Do NOT attempt any Bash call in sandbox mode first; it will fail and waste a round-trip.
+
+**Codex**: invoke as `$review-pr-team <pr-number>`. Read [Codex runtime](runtime/codex.md) before Phase 0; it maps the tool names used below (`Agent`, `TaskCreate`, `TaskList`, `TaskUpdate`, `SendMessage`, `AskUserQuestion`) to Codex operations and covers GitHub access without `gh`. The Claude Code requirement and sandbox setting above do not apply in Codex. Claude Code follows the remaining workflow as written. Codex applies the runtime adapter to its execution and dispatched prompts; review criteria remain shared.
 
 ---
 
@@ -116,7 +118,7 @@ This ensures review comments can point authors to the established pattern rather
 ### 1.4 Read root context
 
 - Read `CLAUDE.md` from repo root
-- Read all `.claude/skills/*/SKILL.md` files (except `review-pr` and `review-pr-team`)
+- Read all `.claude/skills/*/SKILL.md` files (except `review-pr-team`)
 - Read every `references/*.md` file in this skill's own directory. These are the shared review lessons for this repo, grouped by theme. A rule marked ★ has come up three or more times; list those first when you pass the lessons on. A rule that ends with `Details: [name](details/name.md)` has a full lesson behind it, with the steps, commands and repo maps the one-line rule leaves out. Keep those links when you pass the lessons on, and tell every agent to read the detail file whenever its rule applies to what it is checking.
 - Read every `skills/contributing/references/*.md` and treat each rule as a finding checklist, the same as this skill's own references. A rule that ends with `Review Details: [name](...)` has a review lesson behind it, and one that ends with `Contributing Details:` has an author how-to under `skills/contributing/references/details/`; tell every agent to read the linked file whenever the rule applies.
 - Then glob `~/.claude/review-memory/RL/*.md` and read EVERY match. This is the optional, machine-local store of lessons that are not in `references/` yet. It may be empty or absent; an empty glob is fine. New lessons are written here in Phase 6. A memory's `count` is how many times its pattern has shown up in reviewed PRs; list the ones with count 2 or more first.
@@ -140,7 +142,7 @@ Start the repo's own lint/format/type suite in the background early, so results 
 uv run --group dev pre-commit run --all-files
 ```
 
-Do NOT run `ruff`/`pyrefly` directly — `pre-commit` runs the repo's pinned hook versions and config, and calling the tools directly can use the wrong versions/args and produce misleading results. Fallback only when `pre-commit` cannot run at all: run the pinned version with `uvx ruff@<version from .pre-commit-config.yaml>` and run every ruff hook the config lists (plain `ruff check` misses `I001`). When collating, attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`); `--all-files` also surfaces pre-existing issues unrelated to this PR — don't report those. Also flag any NEW source file in the diff that isn't added to `pyrefly.toml` `project-includes` (untracked files silently escape type-checking).
+Do NOT run `ruff`/`pyrefly` directly — `pre-commit` runs the repo's pinned hook versions and config, and calling the tools directly can use the wrong versions/args and produce misleading results. Fallback only when `pre-commit` cannot run at all: run the pinned version with `uvx ruff@<version from .pre-commit-config.yaml>` and run every ruff hook the config lists (plain `ruff check` misses `I001`). When collating, attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`); `--all-files` also surfaces pre-existing issues unrelated to this PR — don't report those. Also flag any new entry the diff adds to `pyrefly-baseline.json` (new errors should be fixed, not baselined).
 
 ### 1.6 Teams are MANDATORY — never substitute plain subagents
 
@@ -1127,7 +1129,7 @@ After all Wave 2 agents complete:
      corrected code here
      ```
      ````
-7. Incorporate linter results from the background `pre-commit` run (§1.5b) — attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`), and flag any new source file missing from `pyrefly.toml`
+7. Incorporate linter results from the background `pre-commit` run (§1.5b) — attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`), and flag any new entry the diff adds to `pyrefly-baseline.json` (new errors should be fixed, not baselined)
 8. Incorporate comment-reviewer's thread response drafts
 9. Incorporate test-agent's verified test suggestions
 

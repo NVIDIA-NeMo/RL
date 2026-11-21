@@ -29,6 +29,7 @@ policy:
 env:
   should_use_nemo_gym: true       # Enables NeMo Gym integration
   nemo_gym:
+    truncate_noncontiguous_episodes: false
     # NeMo Gym config paths and settings
     config_paths:
       - resources_servers/math/configs/math.yaml
@@ -40,6 +41,8 @@ logger:
     # result payloads can produce many large W&B Table artifacts.
     log_nemo_gym_full_result_tables: false
 ```
+
+`env.nemo_gym.truncate_noncontiguous_episodes` defaults to `false`, so a token-prefix discontinuity raises an error. When set to `true`, NeMo RL stops at the first trainable turn whose prompt does not preserve the tokens already seen, drops that turn and the remaining tail, and keeps the preceding contiguous prefix with the episode reward. This option cannot be used with `policy.router_replay.enabled: true` or `token_capture.enabled: true`. Truncation applies only to the legacy token-echo path; token-capture receipt mode bypasses that path and retains its own integrity checks. Every legacy result includes a boolean `noncontiguous_truncated` flag; its per-agent `{agent_name}/noncontiguous_truncated/mean` metric reports the fraction of episodes whose non-contiguous tail was dropped.
 
 When `log_nemo_gym_full_result_tables` is `false`, NeMo RL does not construct the per-agent `full_result` Tables. This prevents those payloads from entering the async replay buffer and avoids uploading them to W&B. Numeric per-agent rollout metrics are unaffected. Set the flag to `true` only when the complete Gym result payloads are needed for a short debugging run.
 
@@ -106,11 +109,11 @@ See [Data Format Translation](#data-format-translation) for the field layout of 
 }
 ```
 
-`task_input` must contain `responses_create_params`, because NeMo RL writes the policy's `temperature`, `top_p`, and `max_output_tokens` there. A taskset whose rows lack it fails on its first batch.
+NeMo RL passes `task_input` to the Environment Server unchanged and sends the policy's sampling values beside the task, as described under **Data flow**. The Environment Servers `single_agent_turn`, `single_agent_turn_legacy` and `harbor` apply the values, and `legacy_agent` passes the row on to its agent. Tasksets routed to `single_agent_turn` or `single_agent_turn_legacy` still need `responses_create_params` in `task_input`, because the Environment Server reads it. Gym refuses an episode at admission when its Environment Server does not apply the values.
 
 Rollout metrics for these rows are named after the taskset instead of an agent, for example `openmathreasoning/truncation_rate`.
 
-Taskset names are also the keys for per-environment settings. For materialized rows, use `task_id.taskset` as the key in `on_policy_distillation.teacher_model_by_agent_name`, `grpo.length_penalty.agent_overrides`, and `rollout_recovery.task_source_target_level_overrides`. Length and recovery overrides may be sparse: unmatched tasksets keep the configured defaults. Teacher selection uses `default_teacher_alias` when configured, unless `strict_agent_name_match` requires an explicit match. Recovery ignores agent overrides for materialized rows; flat rows retain agent-over-task-source precedence.
+Taskset names are also the keys for per-environment settings. For materialized rows, use `task_id.taskset` as the key in `on_policy_distillation.teacher_model_by_agent_name`, `grpo.length_penalty.agent_overrides`, `grpo.agent_overrides`, and `rollout_recovery.task_source_target_level_overrides`. Length, GRPO and recovery overrides may be sparse: unmatched tasksets keep the configured defaults. Teacher selection uses `default_teacher_alias` when configured, unless `strict_agent_name_match` requires an explicit match. Recovery ignores agent overrides for materialized rows; flat rows retain agent-over-task-source precedence.
 
 Set these keys in a YAML file, where a key such as `weather:train` needs no quoting. A Hydra command-line override cannot express a key that contains `:`: `++rollout_recovery.task_source_target_level_overrides.weather:train=prompt_group` fails to parse, and `{weather:train: prompt_group}` is read as the key `weather`.
 
@@ -428,7 +431,7 @@ flowchart LR
 - **Responses API** (NeMo Gym): OpenAI Responses API format with `input`, `tools`, and multi-turn conversation
 - **Chat Completions** (vLLM): OpenAI Chat Completions format for the actual inference call
 
-**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and updates `responses_create_params` with generation parameters (`temperature`, `top_p`) at the row's top level or inside `task_input`. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`; the collector wraps each task in an episode request containing `episode_id` and `task`. Materialized tasks carry no Agent reference, so NeMo RL attributes their metrics, teacher selection, and per-key overrides to `task_id.taskset`.
+**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and adds the policy's sampling values for the rollout's phase beside the task, as `_ng_model_sampling`: `temperature` and `top_p` (or `val_temperature` and `val_top_p` for validation), and `max_new_tokens` as `max_output_tokens`. Gym carries them to the trained agent's model calls that go through Gym's model servers, and Gym's model server applies them, keeping a smaller output limit the call asks for. On the vLLM backend, calls that Gym marks as untrained keep their own sampling, for example an LLM judge that a resources server calls through Gym's server client. The vLLM HTTP server checks the trained agent's calls against the train or validation values and skips the calls Gym marks with `x-ng-sampling: null`. Recipes cannot set `sampling_overrides` on `policy_model`; NeMo RL itself pins only `logprobs` and `top_logprobs` there, for score centering. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`; the collector wraps each task in an episode request containing `episode_id`, `task` and `model_sampling`. Materialized tasks carry no Agent reference, so NeMo RL attributes their metrics, teacher selection, and per-key overrides to `task_id.taskset`.
 
 The Agent sends Responses API requests to the Model Server, which translates Responses API ↔ Chat Completions (converting message formats, extracting reasoning content, attaching token IDs). NeMo RL validates materialized-task episode replies and extracts successful results before the usual result processing. Token IDs, logprobs, and rewards then populate the final Result.
 

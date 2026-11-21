@@ -33,10 +33,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
-    GDPOAdvantageEstimator,
-    GRPOAdvantageEstimator,
-    OPDAdvantageEstimator,
-    ReinforcePlusPlusAdvantageEstimator,
+    create_advantage_estimator,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -47,7 +44,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
     ClippedPGLossFn,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, make_objective_reduction
 from nemo_rl.algorithms.metric_utils import (
     GRAD_NORM_KEY,
     LOSS_KEY,
@@ -221,7 +218,7 @@ def _maybe_restore_async_replay_buffer_checkpoint(
     replay_buffer: Any,
     checkpoint_path: str,
     *,
-    load_replay_buffer: bool | None,
+    load_replay_buffer: bool,
     num_prompts_per_step: int,
     current_training_step: int,
     max_age_steps: int,
@@ -240,7 +237,7 @@ def _maybe_restore_async_replay_buffer_checkpoint(
         The restore metadata from ``load_from_path``, or ``None`` when the
         restore was skipped or no checkpoint file exists.
     """
-    if load_replay_buffer is False:
+    if not load_replay_buffer:
         print(
             "📦 Skipping replay buffer restore (checkpointing.load_replay_buffer=false)"
         )
@@ -380,6 +377,25 @@ _REWARD_PENALTY_FLAGS = (
 )
 
 
+class AgentOverrideConfig(BaseModel, extra="forbid"):
+    """Per-environment GRPO settings for one attribution key (``grpo.agent_overrides``).
+
+    The key is the rows' attribution key, as in ``grpo.length_penalty.agent_overrides``:
+    the NeMo-Gym agent name for flat rows, the ``task_id.taskset`` for materialized
+    task rows. An unset field (None) inherits the run-wide value. Applied by the
+    SingleController advantage stage to the rows of that key's prompt groups, so a
+    multi-environment run can treat e.g. a judge-graded environment differently
+    from pass/fail ones.
+    """
+
+    # Overrides grpo.overlong_filtering: True leaves this environment's truncated
+    # rows out of the loss, False trains them at their reward.
+    overlong_filtering: Optional[bool] = None
+    # Overrides grpo.adv_estimator.normalize_rewards: whether this environment's
+    # group advantages are divided by the group's reward standard deviation.
+    normalize_rewards: Optional[bool] = None
+
+
 class GRPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
@@ -427,6 +443,12 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
     async_grpo: AsyncGRPOConfig | None = Field(default_factory=AsyncGRPOConfig)
     overlong_filtering: bool = False
+    # Per-environment settings keyed by the rows' attribution key, as in
+    # grpo.length_penalty.agent_overrides: the Gym agent name for flat rows
+    # (e.g. rubric_judge_agent), the task_id.taskset for materialized task rows
+    # (e.g. "rubric_judge:train"). See AgentOverrideConfig.
+    # SingleController with token capture only: the legacy ``setup()`` rejects it.
+    agent_overrides: dict[str, AgentOverrideConfig] | None = None
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool = False
@@ -460,6 +482,60 @@ class GRPOConfig(BaseModel, extra="allow"):
     # training rollout rewards (binary single-reward envs only); see
     # docs/guides/length-penalty.md. None/absent disables the feature.
     length_penalty: Optional[LengthPenaltyConfig] = None
+
+    @model_validator(mode="after")
+    def _validate_agent_overrides(self) -> "GRPOConfig":
+        overrides = self.agent_overrides
+        if overrides is None:
+            return self
+        if not overrides:
+            raise ValueError(
+                "grpo.agent_overrides must name at least one attribution key "
+                "(or be null)"
+            )
+        for agent, override in overrides.items():
+            if not isinstance(agent, str) or not agent:
+                raise ValueError(
+                    "grpo.agent_overrides keys must be non-empty attribution keys"
+                )
+            if (
+                override.overlong_filtering is None
+                and override.normalize_rewards is None
+            ):
+                raise ValueError(
+                    f"grpo.agent_overrides.{agent} sets nothing; set "
+                    "overlong_filtering and/or normalize_rewards"
+                )
+            if (
+                override.normalize_rewards is not None
+                and self.adv_estimator.name != "grpo"
+            ):
+                raise ValueError(
+                    f"grpo.agent_overrides.{agent}.normalize_rewards needs "
+                    f"grpo.adv_estimator.name 'grpo', got {self.adv_estimator.name!r}"
+                )
+            if (
+                override.overlong_filtering not in (None, self.overlong_filtering)
+                and self.use_dynamic_sampling
+                and self.masked_reward_policy == "exclude"
+            ):
+                # Dynamic sampling picks its voters with the run-wide
+                # overlong_filtering, so it would keep or drop this key's
+                # groups by the wrong rows.
+                raise ValueError(
+                    f"grpo.agent_overrides.{agent}.overlong_filtering differs from "
+                    "grpo.overlong_filtering, which grpo.use_dynamic_sampling with "
+                    "masked_reward_policy 'exclude' does not support"
+                )
+        return self
+
+    def agent_override_value(
+        self, agent_name: Optional[str], field_name: str, default: bool
+    ) -> bool:
+        """Return ``field_name`` for ``agent_name``, falling back to ``default``."""
+        override = (self.agent_overrides or {}).get(agent_name or "")
+        value = getattr(override, field_name, None) if override is not None else None
+        return default if value is None else bool(value)
 
 
 @dataclass
@@ -638,10 +714,13 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
             "loss_fn.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
         )
     loss = master_config.loss_fn
-    if not loss.force_on_policy_ratio or not loss.token_level_loss:
+    if (
+        not loss.force_on_policy_ratio
+        or loss.resolved_normalization != "global_token_mean"
+    ):
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires force_on_policy_ratio=true "
-            "and token_level_loss=true"
+            "and normalization=global_token_mean (legacy token_level_loss=true)"
         )
     # Without the policy-logprob pass, KL-in-reward would have no policy logprobs.
     if loss.use_kl_in_reward or (ppo is None and algo.adv_estimator.name != "grpo"):
@@ -654,6 +733,19 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires ppo.ppo_epochs=1, got "
             f"ppo.ppo_epochs={ppo.ppo_epochs}"
+        )
+    # The loss cannot remove rejected rows from statistics already computed.
+    if ppo is None and algo.masked_reward_policy == "exclude":
+        raise ValueError(
+            "grpo.masked_reward_policy=exclude is incompatible with "
+            "loss_fn.seq_logprob_error_in_loss=true. Set masked_reward_policy=include "
+            "or seq_logprob_error_in_loss=false to filter before advantage calculation."
+        )
+    if ppo is not None and ppo.adv_estimator.normalize_advantages:
+        raise ValueError(
+            "ppo.adv_estimator.normalize_advantages=true is incompatible with "
+            "loss_fn.seq_logprob_error_in_loss=true. Set normalize_advantages=false "
+            "or seq_logprob_error_in_loss=false to normalize over the filtered batch."
         )
     policy = master_config.policy
     if "megatron_cfg" not in policy or not policy["megatron_cfg"]["enabled"]:
@@ -770,6 +862,13 @@ def setup(
         raise ValueError(
             "Score centering and policy.generation.sampler_replay.enabled require SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
         )
+    megatron_cfg = policy_config.get("megatron_cfg")
+    make_objective_reduction(loss_config.resolved_normalization).validate_setup(
+        trainer="grpo",
+        algorithm="grpo",
+        megatron_enabled=megatron_cfg is not None and megatron_cfg["enabled"],
+        on_policy_distillation=opd_module.is_opd_enabled(master_config),
+    )
     env_configs = master_config.env
     data_config = master_config.data
     grpo_config = master_config.grpo
@@ -777,7 +876,7 @@ def setup(
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
 
-    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
+    checkpointing_pretrained = checkpointing_config.pretrained_checkpoint
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
@@ -849,6 +948,13 @@ def setup(
             "This entry point never reads it, so leaving it enabled here would "
             "silently train the sampled-token top-k objective instead of the "
             "full-vocabulary reverse KL."
+        )
+    if grpo_config.agent_overrides:
+        raise NotImplementedError(
+            "grpo.agent_overrides is applied by the SingleController advantage "
+            "stage (examples/run_grpo_single_controller.py); this path does not "
+            "apply it. Use the run-wide grpo.overlong_filtering / "
+            "grpo.adv_estimator.normalize_rewards here, or the SingleController path."
         )
 
     # Set seed for all random number generators
@@ -1829,8 +1935,8 @@ def setup(
             )
             vllm_reserve_time = time.perf_counter() - vllm_reserve_t0
             print(
-                f"  ✓ Reserved {len(deferred_vllm.dp_openai_server_base_urls)} vLLM server URLs: "
-                f"{deferred_vllm.dp_openai_server_base_urls}",
+                f"  ✓ Reserved {len(deferred_vllm.client_base_urls)} vLLM server URLs: "
+                f"{deferred_vllm.client_base_urls}",
                 flush=True,
             )
 
@@ -1844,7 +1950,7 @@ def setup(
             def init_nemo_gym():
                 """Spin up NeMo Gym servers with the pre-assigned vLLM URLs."""
                 return _spinup_nemo_gym(
-                    deferred_vllm.dp_openai_server_base_urls,
+                    deferred_vllm.client_base_urls,
                     generation_config["model_name"],
                     policy_api_key=deferred_vllm.http_server_api_key,
                 )
@@ -2785,7 +2891,7 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
 
 def _apply_async_sample_masks(
     repeated_batch: BatchedDataDict[DatumSpec],
-    overlong_filtering: bool,
+    overlong_filtering: bool | torch.Tensor,
     timer: Optional[Timer] = None,
 ) -> tuple[dict[str, int], int]:
     """Zero loss_multiplier for masked async rows and attribute each mask once.
@@ -2799,7 +2905,9 @@ def _apply_async_sample_masks(
     Args:
         repeated_batch: Training batch; ``loss_multiplier`` is updated in place.
         overlong_filtering: Whether truncated rows are masked. When enabled,
-            ``truncated`` is required, as in the sync path.
+            ``truncated`` is required, as in the sync path. A boolean tensor of
+            one entry per row instead masks only the truncated rows whose entry
+            is True (``grpo.agent_overrides``).
         timer: Optional timer. The overlong and mask_sample steps keep their
             historical ``overlong_filter`` / ``mask_sample_filter`` labels.
 
@@ -2817,6 +2925,17 @@ def _apply_async_sample_masks(
         )
     batch_size = loss_multiplier.numel()
     eligible = loss_multiplier != 0
+    overlong_rows: Optional[torch.Tensor] = None
+    if isinstance(overlong_filtering, torch.Tensor):
+        overlong_rows = overlong_filtering.reshape(-1).to(
+            device=eligible.device, dtype=torch.bool
+        )
+        if overlong_rows.numel() != batch_size:
+            raise ValueError(
+                f"overlong_filtering has {overlong_rows.numel()} rows; "
+                f"expected {batch_size}"
+            )
+        overlong_filtering = bool(overlong_rows.any().item())
     sample_mask_metrics = {
         "num_masked_seqs_by_loss_multiplier": int((~eligible).sum().item()),
         "num_masked_seqs_by_overlong_filtering": 0,
@@ -2872,6 +2991,8 @@ def _apply_async_sample_masks(
                     f"expected {batch_size}"
                 )
             candidate_mask = candidate_mask.to(device=eligible.device, dtype=torch.bool)
+            if field_name == "truncated" and overlong_rows is not None:
+                candidate_mask = candidate_mask & overlong_rows
             if field_name == "mask_sample":
                 num_mask_sample_filtered = int(candidate_mask.sum().item())
             newly_masked = eligible & candidate_mask
@@ -3074,7 +3195,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
         master_config: The master configuration dictionary.
 
     Returns:
-        An advantage estimator instance (GRPO, GDPO, or ReinforcePlusPlus).
+        An advantage estimator instance (GRPO, GDPO, OPD, or ReinforcePlusPlus).
 
     Raises:
         ValueError: If the advantage estimator name is not recognized.
@@ -3085,17 +3206,9 @@ def _create_advantage_estimator(master_config: MasterConfig):
     adv_estimator_config = grpo_config.adv_estimator
 
     adv_estimator_name = adv_estimator_config.name
-    if adv_estimator_name == "gdpo":
-        adv_estimator = GDPOAdvantageEstimator(adv_estimator_config, loss_config)
-        print("  ✓ Using GDPO advantage estimator (multi-reward)")
-    elif adv_estimator_name == "grpo":
-        adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
-        print("  ✓ Using GRPO advantage estimator")
-    elif adv_estimator_name == "opd":
+    if adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
         opd_module.assert_trust_region_supported(master_config)
-        adv_estimator = OPDAdvantageEstimator(adv_estimator_config, loss_config)
-        print("  ✓ Using OPD advantage estimator")
         # Warn if loss_fn is not configured per MOPD paper recommendations.
         if not loss_config.disable_ppo_ratio:
             warnings.warn(
@@ -3110,14 +3223,8 @@ def _create_advantage_estimator(master_config: MasterConfig):
                 "OPD recommends loss_fn.truncated_importance_sampling_type: 'icepop' "
                 "(hard gate, MOPD Eq. 8)"
             )
-    elif adv_estimator_name == "reinforce_plus_plus":
-        adv_estimator = ReinforcePlusPlusAdvantageEstimator(
-            adv_estimator_config, loss_config
-        )
-        print("  ✓ Using Reinforce++ advantage estimator")
-    else:
-        raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
-
+    adv_estimator = create_advantage_estimator(adv_estimator_config, loss_config)
+    print(f"  ✓ Using {adv_estimator_name} advantage estimator")
     return adv_estimator
 
 
@@ -3579,7 +3686,7 @@ def _grpo_train_impl(
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -3678,7 +3785,7 @@ def _grpo_train_impl(
             "See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details."
         )
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     while (
         max_num_epochs is None or current_epoch < max_num_epochs
@@ -4534,8 +4641,7 @@ def _grpo_train_impl(
                     is_last_step
                     # Early stop saves the final state like a last step.
                     or early_stop_message is not None
-                    or (total_steps + 1) % master_config.checkpointing["save_period"]
-                    == 0
+                    or (total_steps + 1) % master_config.checkpointing.save_period == 0
                     or (
                         ft_save_period is not None
                         and (total_steps + 1) % ft_save_period == 0
@@ -4545,7 +4651,7 @@ def _grpo_train_impl(
                 should_save_by_timeout = timeout.check_save()
 
                 memory_tracker.snapshot_start_of_stage("Checkpointing", dir())
-                if master_config.checkpointing["enabled"] and (
+                if master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     policy.prepare_for_training()
@@ -4562,7 +4668,7 @@ def _grpo_train_impl(
                     grpo_save_state.consumed_samples = consumed_samples
                     _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
@@ -5327,7 +5433,7 @@ def async_grpo_train(
     _tracer = _telemetry.tracer if _telemetry is not None else None
     training_wall_start = time.perf_counter()
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -5413,7 +5519,7 @@ def async_grpo_train(
         replay_buffer_restore_metadata = _maybe_restore_async_replay_buffer_checkpoint(
             replay_buffer,
             last_checkpoint_path,
-            load_replay_buffer=master_config.checkpointing.get("load_replay_buffer"),
+            load_replay_buffer=master_config.checkpointing.load_replay_buffer,
             num_prompts_per_step=num_prompts_per_step,
             current_training_step=step,
             max_age_steps=max_trajectory_age_steps,
@@ -5746,7 +5852,7 @@ def async_grpo_train(
         init_total_s = timer.stop(INIT_TOTAL_CATEGORY)
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     # Main training loop
     try:
@@ -6235,13 +6341,13 @@ def async_grpo_train(
                 is_last_step = step + 1 == max_num_steps
                 should_save_by_step = (
                     is_last_step
-                    or (step + 1) % master_config.checkpointing["save_period"] == 0
+                    or (step + 1) % master_config.checkpointing.save_period == 0
                     or (ft_save_period is not None and (step + 1) % ft_save_period == 0)
                 )
                 # Checked pre-validation so the wake-deferral below can see it.
                 # A crossing during refit/validation is caught by the lookahead in check_save.
                 should_save_by_timeout = timeout.check_save()
-                will_save_checkpoint = master_config.checkpointing["enabled"] and (
+                will_save_checkpoint = master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 )
                 # An early stop (known only after validation) also saves.
@@ -6372,7 +6478,7 @@ def async_grpo_train(
                             stop_at_validation_metric,
                         )
                         saving_this_step = will_save_checkpoint or (
-                            master_config.checkpointing["enabled"]
+                            master_config.checkpointing.enabled
                             and early_stop_message is not None
                         )
                         # Save-bound steps need the GPUs for checkpointing,
@@ -6503,7 +6609,7 @@ def async_grpo_train(
                     grpo_save_state.consumed_samples = consumed_samples
                     _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics

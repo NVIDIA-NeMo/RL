@@ -116,7 +116,7 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    config = MasterConfig(**config)
+    config = MasterConfig.model_validate(config)
     # Keep the processor, dataset and vLLM MediaIO on one frame-count contract.
     # Without this, vLLM's VideoMediaIO silently falls back to 32 frames even
     # when a video recipe requests (and caches) 64 frames.
@@ -145,10 +145,8 @@ def main() -> None:
 
     config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
     print(f"📊 Using log directory: {config.logger.log_dir}")
-    if config.checkpointing["enabled"]:
-        print(
-            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
-        )
+    if config.checkpointing.enabled:
+        print(f"📊 Using checkpoint directory: {config.checkpointing.checkpoint_dir}")
 
     # Must precede init_ray() so the resolved NEMO_RL_OTEL_* env is snapshotted
     # into the Ray runtime_env and inherited by every worker -- including the

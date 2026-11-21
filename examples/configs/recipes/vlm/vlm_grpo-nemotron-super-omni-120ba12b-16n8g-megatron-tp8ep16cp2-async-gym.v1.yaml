@@ -142,6 +142,7 @@ env:
     structured_outputs_environment_server: null
     gui_coordinate_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -149,6 +150,7 @@ env:
             name: gui_coordinate_simple_agent
     string_match_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:

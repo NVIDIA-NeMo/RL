@@ -51,6 +51,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.rollout_checkpointing.inventory import (
     capture_reward_settings,
+    list_staging_keys,
     validate_replay_inventory,
     validate_rollout_recovery_inventory,
 )
@@ -335,7 +336,7 @@ class RolloutRestorer(_UsesRolloutParts):
             buffer_state, dp_client=self._dp_client, partition_id=self._partition_id
         )
 
-        if self._master_config.checkpointing.get("load_replay_buffer") is False:
+        if not self._master_config.checkpointing.load_replay_buffer:
             # Validate and load the native snapshot before discarding it. This keeps
             # replay-free resume fail-closed: a mismatched/corrupt checkpoint must
             # not silently turn into a different training stream.
@@ -444,15 +445,22 @@ class RolloutRestorer(_UsesRolloutParts):
                     for group_id, rows in parsed_state.finalizer_rewards_by_group.items()
                     if group_id in canonical_group_ids
                 }
+                staging_keys: frozenset[str] = frozenset()
                 if self._master_config.token_capture.enabled:
+                    staging_partition = (
+                        self._master_config.token_capture.staging_partition
+                    )
+                    # Both checks run under this cut, so TQ cannot change between them.
+                    staging_keys = await list_staging_keys(
+                        self._dp_client, staging_partition
+                    )
                     # Validate saved custody before restart normalization can discard it.
                     await validate_rollout_recovery_inventory(
                         cut,
                         dp_client=self._dp_client,
                         recovery_ledger=self._rollout_recovery_ledger,
-                        staging_partition=(
-                            self._master_config.token_capture.staging_partition
-                        ),
+                        staging_partition=staging_partition,
+                        actual_staging_keys=staging_keys,
                         replay_metadata=canonical_state,
                         clear_unreferenced=False,
                         additional_expected_staging_keys=set(restored.staging_keys),
@@ -466,9 +474,8 @@ class RolloutRestorer(_UsesRolloutParts):
                         cut,
                         dp_client=self._dp_client,
                         recovery_ledger=self._rollout_recovery_ledger,
-                        staging_partition=(
-                            self._master_config.token_capture.staging_partition
-                        ),
+                        staging_partition=staging_partition,
+                        actual_staging_keys=staging_keys,
                         replay_metadata=canonical_state,
                         clear_unreferenced=True,
                         additional_expected_staging_keys=set(restored.staging_keys),
