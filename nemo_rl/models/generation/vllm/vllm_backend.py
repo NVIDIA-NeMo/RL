@@ -2154,6 +2154,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         weight = None
         weights = None
         deferred_weights = None
+        deferred_load = None
         native_lora_tensors: dict[str, torch.Tensor] = {}
         native_lora_refit = self._native_lora_refit_settings() is not None
 
@@ -2191,6 +2192,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         break
 
                     deferred_weights = None
+                    deferred_load = None
                     batch_keys = None
                     batch_error = None
                     try:
@@ -2230,6 +2232,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                             collect_native_lora(native_lora_tensors, weights)
                         elif load_after_ack:
                             deferred_weights, weights = weights, None
+                            deferred_load = load_weights
                         else:
                             load_weights(weights)
                     except Exception as error:
@@ -2272,8 +2275,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
                     if deferred_weights is not None:
+                        assert deferred_load is not None
                         try:
-                            load_weights(deferred_weights)
+                            deferred_load(deferred_weights)
                         except Exception as error:
                             batch_error = error
                             logger.exception(

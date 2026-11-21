@@ -1529,6 +1529,18 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "grpo.length_penalty requires env.should_use_nemo_gym=true on SingleController"
         )
 
+    if (
+        master_config.grpo is not None
+        and master_config.grpo.agent_overrides is not None
+        and not master_config.token_capture.enabled
+    ):
+        raise ValueError(
+            "grpo.agent_overrides requires token_capture.enabled=true on "
+            "SingleController: only the token-capture finalizer tags rows with "
+            "their attribution key, so without it every row keeps the run-wide "
+            "settings"
+        )
+
     # An enabled one here describes shaping this run does not do. length_penalty is
     # implemented for GRPO, so it only appears here for PPO; overlong_filtering is
     # applied in the advantage stage from the raw completion flags in the TransferQueue.

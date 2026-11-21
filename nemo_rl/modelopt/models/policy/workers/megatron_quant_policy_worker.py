@@ -197,14 +197,15 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         # Each materialized export group is one collective-complete conversion
         # task. Rendezvous on CPU before advancing so rank-local consumers cannot
         # make policy ranks enter the next model-parallel task out of order.
-        self._real_quant_refit_sync_group = (
-            torch.distributed.new_group(
+        self._real_quant_refit_sync_group: torch.distributed.ProcessGroup | None = None
+        if self._use_real_quant_refit() and torch.distributed.get_world_size() > 1:
+            sync_group = torch.distributed.new_group(
                 backend="gloo",
                 timeout=timedelta(milliseconds=MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS),
             )
-            if self._use_real_quant_refit() and torch.distributed.get_world_size() > 1
-            else None
-        )
+            # Every rank joins, so new_group never returns NON_GROUP_MEMBER here.
+            assert isinstance(sync_group, torch.distributed.ProcessGroup)
+            self._real_quant_refit_sync_group = sync_group
 
         if hasattr(self, "reference_state_dict"):
             for name, item in self.model.state_dict().items():

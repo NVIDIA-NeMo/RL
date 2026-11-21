@@ -575,13 +575,16 @@ def setup(
         from nemo_rl.modelopt.utils import prepare_real_quant_generation_config
 
         student_policy = init_student_policy()
-        prepare_real_quant_generation_config(student_policy, generation_config)
+        prepare_real_quant_generation_config(
+            student_policy, cast(VllmConfig, generation_config)
+        )
         if colocated_inference:
             student_policy.offload_after_refit()
 
     if backend == "megatron":
         student_generation = None
     elif backend == "vllm":
+        generation_config = cast(VllmConfig, generation_config)
         if enable_nemo_gym:
             deferred_vllm = VllmGeneration(
                 cluster=inference_cluster,

@@ -17,12 +17,16 @@
 from __future__ import annotations
 
 import copy
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from nemo_rl.models.generation.vllm.config import VllmConfig
+    from nemo_rl.models.policy import PolicyConfig
 
 MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS = 600_000
 
 
-def validate_real_quant_policy_config(policy_config: dict[str, Any]) -> None:
+def validate_real_quant_policy_config(policy_config: PolicyConfig) -> None:
     """Validate static policy requirements for real-quant rollout."""
     if not policy_config.get("megatron_cfg", {}).get("enabled", False):
         raise ValueError(
@@ -35,7 +39,9 @@ def validate_real_quant_policy_config(policy_config: dict[str, Any]) -> None:
         )
 
 
-def prepare_real_quant_generation_config(policy: Any, generation_config: dict) -> None:
+def prepare_real_quant_generation_config(
+    policy: Any, generation_config: VllmConfig
+) -> None:
     """Inject the policy-produced canonical ModelOpt config into vLLM config."""
     policy_config = policy.cfg
     validate_real_quant_policy_config(policy_config)
