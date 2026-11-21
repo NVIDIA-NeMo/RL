@@ -17,7 +17,6 @@ import pytest
 
 from nemo_rl.experience.mask_sample_rules import (
     MaskSampleRule,
-    apply_mask_sample_rules,
     mask_rule_metrics,
     mask_rule_step_metrics,
     matching_rules,
@@ -93,30 +92,6 @@ def test_matching_is_type_strict_and_missing_fields_never_match():
         "eval_incomplete",
         "harness_unfinished",
     ]
-
-
-def test_apply_sets_the_env_mask_flag_only_on_match():
-    rules = parse_mask_sample_rules({"mask_sample_rules": RULES_CFG})
-    clean = {"evaluation_completed": True, "opencode_finished": True, "reward": 1.0}
-    assert apply_mask_sample_rules(clean, rules) == []
-    assert "instance_config" not in clean  # untouched
-
-    flagged = {"evaluation_completed": False, "reward": 0.0}
-    assert apply_mask_sample_rules(flagged, rules) == ["eval_incomplete"]
-    assert flagged["instance_config"] == {"mask_sample": True}
-
-    # An existing instance_config is extended, not replaced; a non-dict one is replaced.
-    existing = {"opencode_finished": False, "instance_config": {"keep": 1}}
-    apply_mask_sample_rules(existing, rules)
-    assert existing["instance_config"] == {"keep": 1, "mask_sample": True}
-    odd = {"opencode_finished": False, "instance_config": None}
-    apply_mask_sample_rules(odd, rules)
-    assert odd["instance_config"] == {"mask_sample": True}
-
-    # No rules -> nothing happens, even for responses that would match.
-    untouched = {"evaluation_completed": False}
-    assert apply_mask_sample_rules(untouched, ()) == []
-    assert untouched == {"evaluation_completed": False}
 
 
 def test_metrics_report_a_rate_for_every_configured_rule():

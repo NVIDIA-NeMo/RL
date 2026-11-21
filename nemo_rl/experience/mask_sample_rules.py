@@ -59,8 +59,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from nemo_rl.data_plane.schema import MASK_SAMPLE
-
 ENV_MASK_SAMPLE_RULES_KEY = "mask_sample_rules"
 _SCALAR_TYPES = (bool, int, float, str, type(None))
 
@@ -154,24 +152,6 @@ def matching_rules(
         found, value = _lookup(full_result, rule.field)
         if found and _matches(value, rule.equals):
             matched.append(rule.name)
-    return matched
-
-
-def apply_mask_sample_rules(
-    full_result: dict[str, Any], rules: Sequence[MaskSampleRule]
-) -> list[str]:
-    """Set ``instance_config.mask_sample`` on ``full_result`` when a rule matches.
-
-    Returns the names of the matching rules (empty when none match or ``rules``
-    is empty, in which case ``full_result`` is not touched).
-    """
-    matched = matching_rules(full_result, rules)
-    if matched:
-        instance_config = full_result.get("instance_config")
-        if not isinstance(instance_config, dict):
-            instance_config = {}
-            full_result["instance_config"] = instance_config
-        instance_config[MASK_SAMPLE] = True
     return matched
 
 
