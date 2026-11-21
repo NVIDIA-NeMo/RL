@@ -321,7 +321,7 @@ def test_footer_cli_requires_reviewed_head(
     assert rid.main(["footer", "--pr", "1", "--head", live]) == 0
     out = capsys.readouterr().out
     assert "kind=self harness=codex/v model=gpt-6-astra effort=high" in out
-    assert f"head={live} -->" in out
+    assert out.rstrip().endswith(f"reviewed={live[:7]}`")
 
 
 def test_same_session_reads_subagent_transcripts(tmp_path: Path) -> None:
@@ -382,9 +382,8 @@ def test_missing_gh_stops_with_install_hint(monkeypatch: pytest.MonkeyPatch) -> 
 def test_footer_marker() -> None:
     ident = rid.Identity("claude-code", "2.1.330", "claude-opus-5-5", "medium", None)
     out = rid.footer(ident=ident, kind="self", head="67e151b702a9ff81")
-    visible, marker = out.splitlines()
-    assert visible.startswith("_Self-review: Claude Code 2.1.330 · claude-opus-5-5")
-    assert marker == (
-        "<!-- nemo-rl-review: kind=self harness=claude-code/2.1.330 model=claude-opus-5-5 "
-        f"effort=medium skill_rev={rid.skill_revision()} head=67e151b702a9ff81 -->"
+    assert out == (
+        "`nemo-rl-review: kind=self harness=claude-code/2.1.330 model=claude-opus-5-5 "
+        f"effort=medium review-pr-team=v{rid.skill_revision()} reviewed=67e151b`"
     )
+    assert "<!--" not in out and "\n" not in out
