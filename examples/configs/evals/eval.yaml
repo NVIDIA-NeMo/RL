@@ -58,7 +58,6 @@ data:
 env:
   math:
     num_workers: 8
-    stop_strings: null
     verifier_type: "math"  # key into the environment's worker classes
     math_verify_impl: "hf_math_verify"
 

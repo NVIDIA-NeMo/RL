@@ -43,7 +43,6 @@ from nemo_rl.environments.utils import chunk_list_to_workers
 
 class VLMEnvConfig(BaseModel, extra="allow"):
     num_workers: int
-    stop_strings: Optional[list[str]] = None  # Default stop strings for this env
     reward_functions: list[dict[str, Any]]  # list of reward functions and their weights
 
 

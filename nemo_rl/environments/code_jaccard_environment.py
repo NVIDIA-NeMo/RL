@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional, TypedDict, Union
+from typing import Any, TypedDict, Union
 
 import ray
 import torch
@@ -30,7 +30,6 @@ from nemo_rl.environments.utils import chunk_list_to_workers
 
 class CodeJaccardEnvConfig(BaseModel, extra="allow"):
     num_workers: int
-    stop_strings: Optional[list[str]] = None  # Default stop strings for this env
 
 
 class CodeJaccardEnvironmentMetadata(TypedDict):

@@ -16,7 +16,7 @@ import io
 import itertools
 import logging
 import re
-from typing import Any, Optional, TypedDict, Union
+from typing import Any, TypedDict, Union
 
 import ray
 import torch
@@ -42,8 +42,7 @@ from nemo_rl.evals import answer_parsing
 
 
 class MathEnvConfig(BaseModel, extra="allow"):
-    num_workers: int
-    stop_strings: Optional[list[str]] = None  # Default stop strings for this env
+    num_workers: int = 8
     # Key into the environment's WORKER_CLASS_DICT.
     verifier_type: str = "math"
     math_verify_impl: str = "hf_math_verify"
