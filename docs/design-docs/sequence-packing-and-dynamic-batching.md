@@ -377,9 +377,13 @@ class SequencePackingArgs(TypedDict):
     algorithm: str                     # Packing algorithm name
     microbatch_order: NotRequired[Literal["packer", "largest_first"]]
     sequence_length_pad_multiple: int  # CP/TP alignment factor
+    share_prefixes: NotRequired[bool]  # Run each prompt once per forward
+    bound_by_full_length: NotRequired[bool]  # With share_prefixes: count the prompt in every row
 ```
 
 `microbatch_order` controls only the execution order of bins already assigned to each data-parallel rank. `packer` (and an omitted value for backward compatibility) preserves the packer's order. `largest_first` executes each rank's bins by nonincreasing padded-token count, allowing smaller microbatches to reuse allocator segments established by the largest shape. It does not change bin contents, rank assignment, or total padded tokens.
+
+`share_prefixes` runs a prompt once per forward for the rows of a prompt group that start with it. It is set with `policy.sequence_packing.share_prefixes` and is off when omitted. `bound_by_full_length` says whether the token budget counts the prompt in every row or once. `TQPolicy` adds both keys for each logprob dispatch and each train dispatch, and `bound_by_full_length` must be present whenever `share_prefixes` is true. [Shared-prefix execution for GRPO](shared-prefix-execution.md) lists the requirements.
 
 ## Integration with Training Pipeline
 

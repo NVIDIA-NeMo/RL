@@ -1,180 +1,220 @@
 # Shared-prefix execution for GRPO (experimental)
 
-GRPO generates several completions for each prompt. Conventional policy execution reads that prompt again for every completion when it computes log probabilities and trains. Shared-prefix execution stores the prompt once per packed unit and gives each completion its own suffix. A logical GRPO group may span several packed units, so a prompt is not necessarily computed only once across all of its completions.
+GRPO generates several completions for each prompt. With ordinary sequence packing, the policy runs that prompt again for every completion when it computes log probabilities and when it trains. Shared-prefix execution is a sequence-packing option that runs the prompt once per forward for the rows that start with it.
 
-The feature is opt-in and targets text-only Megatron hybrid attention/Mamba models. The dense path remains the default (`mode: disabled`). The feature does not change the GRPO objective, add completions or speed up rollout generation.
+The option is `policy.sequence_packing.share_prefixes`, and it is off unless it is set to `true`. It targets single-controller GRPO with a text-only hybrid model on the Megatron backend. A hybrid model is a model that Megatron Bridge builds through `HybridModelProvider`. The option does not change the GRPO objective, the sampled completions or rollout generation.
 
 ## Terms
 
-- A *group* is the set of rollout rows generated from one prompt. Its identity comes from the row's `GROUP_ID_TAG`.
-- A *star* stores `[prompt, completion_1, ..., completion_G]` once for rows whose prompt token IDs are identical.
-- A *forest* packs several independent stars into one forward.
-- A *dense fallback* is a row that cannot share a prefix. It runs as an ordinary packed row.
-- An *execution unit* is one model forward: a star, a forest or a dense bin.
-- *M* is the TP/CP padding quantum: 1 at TP1/CP1, 2×CP at TP1 with CP>1, and 2×TP×CP at TP>1.
+- A *group* is the set of rows generated from one prompt. The row tag `GROUP_ID_TAG` identifies it.
+- A *tree* is one prompt followed by the completions of the rows that start with it. It is a one-level prefix tree. The Megatron-LM type is `SharedPrefixTree`.
+- A *pack* is one forward that holds several trees and runs each prompt once. The Megatron-LM type is `SharedPrefixPack`.
+- A *dense bin* is one forward of ordinary sequence packing, in which every row carries its own prompt.
+- A *forward* is one model call on one microbatch. It is either a pack or a dense bin.
+- The *packed length* of a tree counts the prompt once and every completion once. The *full length* counts the prompt in every row.
+- The *padding multiple* is `policy.make_sequence_length_divisible_by`. Every row and every pack is padded to a multiple of it.
 
-## Implementation ownership
-
-Megatron-LM owns the reusable packing in `megatron.rl`. That covers tree layouts, group sharding, execution plans, tensor materialization, TP/CP geometry, real-row alignment and dense-bin reconstruction. Megatron-LM also owns model execution through `HybridModel.forward(..., shared_prefix_layout=...)`. Its `docs/developer/shared_prefix.md` describes the model contract.
-
-NeMo RL translates `BatchedDataDict` fields and the policy configuration into that API. It transports row metadata and coordinates worker execution. `nemo_rl.data.packing.shared_prefix_metadata` keeps only the row-metadata field names and `with_prompt_length_tags`. Modules that plan or run shared units, such as driver-side sharding and the Megatron worker, import `megatron.rl` directly and lazily, only on shared-prefix paths. NeMo RL does not re-export it. The dense paths of `nemo_rl.models.megatron.data` and `nemo_rl.models.megatron.train` import no `megatron.rl` module.
-
-The driver and the model workers both need a Megatron-LM build that contains `megatron.rl`. The driver needs it because configuration validation and data-parallel sharding run there. Launch with the Megatron extra, for example `uv run --extra mcore`. Without it, configuration validation raises an `ImportError` that names this requirement.
-
-Prompt boundaries come from the rollout, not from padded tokens. The rollout reassembler writes each row's prompt length as a data-plane column, which is why token capture is required. `TQPolicy` turns that column into row tags for planning.
-
-`PackedTreeLayout` in Megatron-LM stores physical token spans, logical lengths and parent node indices. Current packing emits only stars and forests. The descriptor can describe deeper trees, but the model backend rejects them. A group with one completion, such as a PPO rollout, keeps its source row and runs densely.
-
-## Execution contract
-
-- Rows share a prefix only when they have the same group identity and identical prompt token IDs. Other rows become dense fallbacks. Without `pack_groups`, each execution slot is one forward, so a row that cannot share, such as a reassembler placeholder with prompt length 0, makes its whole slot dense. With `pack_groups`, the other rows of that slot keep their star and only that row runs dense. An aligned dense training bin (`training_dense_bins`) is also one forward: rows without a sibling run in it as single-row forest roots, but a row with an empty prompt or completion keeps the whole bin dense.
-- Each completion attends to its prompt and its own causal history. Sibling completions cannot attend to each other.
-- The Mamba backend forks the recurrent state at a scan-chunk boundary. It replays the remaining prompt tail per branch and supplies each branch's convolution halo. Branch gradients accumulate into the shared prefix. Not every kernel reads each prompt token only once.
-- Megatron defaults to the ragged Mamba backend (`ragged_state_fork`) at every topology. No environment variable is needed. `NRL_SP_MAMBA_IMPL` remains a Megatron-side override for diagnostics; see the Megatron documentation for its values.
-- A star holds at most 16 completions (`MAX_SHARED_PREFIX_BRANCHES`). A larger group is split evenly; for example, 17 rows become stars of 9 and 8.
-- Logical-to-physical maps restore completion logprobs to their original rows and positions. That includes the first completion token, whose predecessor is the last prompt token.
-- Data-parallel alignment splits real rows. It never adds dummy training examples. TP/CP layouts keep causal positions and exclude physical padding from losses.
-- Dense fallback bins honor `sequence_packing.max_sequences_per_bin`. Star and forest units are not row-capped, because one forward holds every sibling.
-- MoE expert-bias counts follow the dense packed convention. Per-branch padding is excluded with the HybridEP flex dispatcher, and with any dispatcher while expert-bias updates are live. Otherwise it counts, as in a dense packed forward.
-- MTP runs on the dense expanded rows with its existing heads. MTP prefix sharing is out of scope. Each loss group is normalized as a packed dense forward of that group would be, using CP-local token counts at CP>1.
-- `bypass_evaluation_mtp` passes `compute_mtp_loss=False` to every logprob forward.
-- `uniform_router_gating` runs the MoE router's forward GEMM in MCore's fixed row blocks in every policy forward, including Megatron's checkpoint recomputation. Routing scores then do not depend on how rows are packed. The router's backward GEMMs are unchanged, so router gradients can still depend on packing. MCore restores the scope only in `tensor_parallel.checkpoint` and `CheckpointWithoutOutput`, not in `te_checkpoint`, which it uses with FP8/FP4 recompute (shared modes reject FP8/FP4; the `dense` control does not).
-- `match_logprob_training_layout` makes logprob forwards use training's sharding weights, token budget and execution plan. A different layout in one phase can change numerical results even at identical weights.
-- Matched layouts alone do not make logprob and training forwards bit-identical. Exact equality also needs deterministic algorithms and the same MoE top-k ordering. MCore sorts top-k results only when gradients are enabled, so a no-grad logprob forward can combine experts in a different order than the training forward.
+A tree is a prefix tree: its rows start with the same tokens. It is not the call tree that `nemo_rl/environments/call_selection.py` reads from parent links. A pack is unrelated to forest training (`token_capture.forest_training`), in which one rollout owns several rows.
 
 ## Configuration
 
-Merge this fragment into a validated text-only Megatron hybrid GRPO recipe. It is not a complete launcher. It is the configuration used for the reported measurements, and every flag in it is experimental. The token budget is illustrative; size it for the model and hardware.
+Add one key to the sequence-packing block of a single-controller GRPO recipe for a text-only hybrid model. The fragment shows the key next to the settings it depends on. The token budgets are illustrative.
 
 ```yaml
 policy:
-  shared_prefix_training:
-    mode: train
-    pack_groups: true
-    align_data_parallel: true
-    training_dense_bins: true
-    match_logprob_training_layout: true
-    bypass_evaluation_mtp: true
   sequence_packing:
     enabled: true
     algorithm: modified_first_fit_decreasing
     train_mb_tokens: 32768
     logprob_mb_tokens: 32768
-  make_sequence_length_divisible_by: 16  # a multiple of M = 2 * TP * CP
+    share_prefixes: true
+  make_sequence_length_divisible_by: 16  # a multiple of 2 * TP * CP
   megatron_cfg:
     enabled: true
-    pipeline_model_parallel_size: 1
     tensor_model_parallel_size: 2
     context_parallel_size: 4
     sequence_parallel: true
-    cuda_graph_impl: none
-    fp8_cfg:
-      enabled: false
   generation:
     top_p: 1.0
     top_k: null
-  quant_cfg: null
+data_plane:
+  enabled: true
+token_capture:
+  enabled: true
 ```
 
-Run it with the single-controller launcher, for example `uv run --extra mcore python examples/run_grpo_single_controller.py --config <recipe>.yaml`. The recipe needs `data_plane.enabled: true` and `token_capture.enabled: true`. Standard GRPO setup rejects the `logprobs` and `train` modes, because it does not produce group identities or prompt lengths.
+Run the recipe with the single-controller launcher:
 
-The commented block in `examples/configs/grpo_math_1B_megatron_single_controller.yaml` lists every key at its default.
+```sh
+uv run examples/run_grpo_single_controller.py --config <recipe>.yaml
+```
 
-### Modes and flag rules
+`examples/run_grpo.py` rejects the key at setup, because that launcher does not write the row tags that planning reads. The other launchers do not check the key. A run with one of them packs densely when the key is `true`. A Megatron worker of such a run still runs the model check at setup.
 
-- `disabled` keeps the existing packing and model execution.
-- `dense` is a comparison control. It keeps conventional packing but allows `uniform_router_gating` and `bypass_evaluation_mtp`.
-- `logprobs` shares prefixes in policy and reference logprob forwards only.
-- `train` shares prefixes in logprob forwards and in training.
+`examples/configs/recipes/llm/grpo-nano-v2-12b-1n8g-megatron-single-controller-token_capture-shared-prefix.yaml` is a complete recipe.
 
-These rules are checked when the configuration is loaded:
+On-policy distillation teachers and the inference-only policy of non-colocated Megatron generation copy the policy config. They set the key to `false` in their copy, so they always pack densely. A value model also packs densely.
 
-- Unknown keys under `policy.shared_prefix_training` are rejected.
-- `disabled` and `dense` reject every execution flag that differs from its default. `uniform_router_gating` and `bypass_evaluation_mtp` are the exceptions in `dense`.
-- `pack_dense_fallbacks` and `evaluation_packing` each require `pack_groups`.
-- `merge_dense_fallbacks` requires `pack_dense_fallbacks`.
-- `align_data_parallel` requires `pack_groups`, and rejects `merge_dense_fallbacks`. With it, `evaluation_packing` also requires `bypass_evaluation_mtp`.
-- `preserve_training_prefixes_during_alignment` requires `align_data_parallel`.
-- `training_dense_bins` requires `mode: train`, `pack_groups` and `align_data_parallel`.
-- `match_logprob_training_layout` and `training_shard_work_weights` require `mode: train`. `evaluation_packing` has no effect with `match_logprob_training_layout` and is rejected.
-- Work weights must be nonnegative with a positive sum.
-- `repack_groups` is deprecated. It is still accepted in every mode, but it warns and has no effect.
+## How it works
 
-The driver assigns complete prompt groups to data-parallel ranks and checks that every row fits one forward after padding. Each worker then plans its own forwards. It splits each of its groups into execution slots under the stage's token budget and the 16-completion branch limit (`repack_groups` used to select this local split), or, with `training_dense_bins`, packs whole rows into dense bins and shares prompts inside each bin. Forward counts can therefore differ between data-parallel ranks, so at data-parallel size greater than one every shared mode requires `pack_groups` and `align_data_parallel`; `Policy` checks this before it allocates workers.
+The rollout reassembler tags every row. The driver plans the forwards of every data-parallel rank from those tags. Each Megatron worker builds the packs of its plan. The table lists where each part lives.
 
-### Other requirements
+| Module | Role |
+|---|---|
+| `nemo_rl/experience/rollout_reassembler.py` | Stamps the prompt length and the prompt hash on every row. |
+| `nemo_rl/data/packing/shared_prefix/row_metadata.py` | Names of the row tags, the plan entry and the batch columns; `UNSHARED_ROW`; `prompt_hash`. |
+| `nemo_rl/data/packing/shared_prefix/plan.py` | `plan_shared_prefix_shards`, the planner. Pure Python. |
+| `nemo_rl/data_plane/preshard.py` | `shard_meta_for_dp` calls the planner and ships the plan to each rank. |
+| `nemo_rl/models/policy/shared_prefix.py` | `validate_shared_prefix_config`, the config check, and `bound_by_full_length`, the budget rule. |
+| `nemo_rl/models/megatron/shared_prefix/setup.py` | `validate_shared_prefix_model`, the model check at worker setup. |
+| `nemo_rl/models/megatron/shared_prefix/microbatches.py` | Builds the model inputs of one pack. `SharedPrefixParams` is the counterpart of `PackedSeqParams`. |
+| `nemo_rl/models/megatron/shared_prefix/logprobs.py` | Turns the logits of a pack into per-row logprobs and into the loss input. |
+| Megatron-LM, `megatron.core.datasets.shared_prefix` | The tree and pack types, and `build_shared_prefix_inputs`, which builds one pack's tensors. |
+| Megatron-LM, `megatron.core.models.hybrid.shared_prefix` | `validate_shared_prefix_config`, which holds the model rules, and the model forward of a pack, which `HybridModel.forward(..., shared_prefix_layout=...)` calls. |
 
-The `logprobs` and `train` modes also require the following. Policy and single-controller setup check them before policy workers are allocated, except where noted.
+The planner and the config check import no Megatron-LM module, so the driver plans without a Megatron-LM install. Only `nemo_rl/models/megatron/shared_prefix/` imports the Megatron-LM shared-prefix modules, and it imports them from `megatron.core`.
 
-- The Megatron backend with `megatron.rl` importable in the driver.
-- `policy.sequence_packing.enabled` with a deterministic algorithm (not `first_fit_shuffle`) and no `pair_grouping_key`.
-- An explicit `policy.make_sequence_length_divisible_by` that is a multiple of M. Both `train_mb_tokens` and `logprob_mb_tokens` must be multiples of it.
-- `policy.generation.top_p: 1.0` and `top_k` disabled (`null`, `0` or `-1`). Shared logprob extraction does not support top-k/top-p filtering. Temperature scaling is supported.
-- `token_capture.enabled: true`.
-- `token_capture.forest_training: false`. Forest training publishes segment rows and execution-padding rows, which are not shared-prefix completions.
-- `loss_fn.score_centering: false` in `train` mode. Shared training units pass already-extracted logprobs to the loss, so it cannot gather the policy logprobs at the sampler's top-k ids. `logprobs` mode trains densely, so this check does not apply there.
-- `loss_fn.seq_logprob_error_in_loss: false` in `train` mode. The in-loss filter writes its per-row keep flags back in microbatch row order, which shared training units do not keep.
-- `async_rl.rollout_failure.max_skipped_prompts: 0` and `max_consecutive_dropped_prompts: 0`, and `token_capture.min_valid_fraction_per_group` unset. A dropped prompt can leave a step that no longer splits into complete data-parallel groups. A drop that no setting controls (a structural finalizer drop, or a shortfall restored from a checkpoint) and that leaves a step target that is not a multiple of the data-parallel size stops the run at the next chunk selection, before another chunk trains. A shortfall that keeps the target aligned closes the step short, as in dense mode.
-- `grpo.num_prompts_per_step` a multiple of the policy data-parallel size, because complete groups are assigned to data-parallel ranks. The controller checks this before the first training chunk.
-- A `TQPolicy`. Other policies raise `NotImplementedError` at construction.
-- No streaming PPO (`async_rl.min_groups_for_streaming_train` below `ppo.num_prompts_per_step`). Streaming PPO aligns chunks to both models' layouts through the same sampler keyword, and the two alignments are not combined.
-- No `weight_fifo` sampler with streaming training (`async_rl.min_groups_for_streaming_train` below `num_prompts_per_step`). That sampler selects from one weight version at a time. A version can be left with fewer ready groups than the data-parallel size, and the step would never fill.
+### 1. The rollout reassembler tags every row
 
-The controller passes the data-parallel size to the sampler's `select` as `group_multiple`, the keyword streaming PPO also uses. Custom samplers must accept it and return a multiple of it. A selection that is not a multiple stops the run before the chunk trains.
+The rollout reassembler stamps two row tags on every row it writes. `PROMPT_LENGTH_TAG` is the number of prompt tokens at the start of the row. `PROMPT_HASH_TAG` is a hash of those tokens. The reassembler writes the tags whether or not the option is on, and it writes no extra data-plane column.
 
-On-policy distillation teachers always run with `mode: disabled`, because teacher dispatches are not group-sharded. So does the inference-only policy of non-colocated Megatron generation, which never trains.
+The prompt length is 0 for a placeholder row, for a row without a verified prompt, and for a row whose `token_mask` is nonzero inside its prompt. A row with prompt length 0 never shares.
 
-### Rejected configurations
+### 2. The driver plans every rank's forwards
 
-The policy configuration rejects these settings in shared modes:
+When the option is on, `TQPolicy._packing_args` adds two entries to the sequence-packing arguments of each logprob dispatch and each train dispatch: `share_prefixes` and `bound_by_full_length` (see [Token budget](#token-budget)). `shard_meta_for_dp` reads them. When every row of the dispatch carries both tags, it calls `plan_shared_prefix_shards`. Otherwise it packs densely, as it does without the option. A dispatch that holds rows from a data-plane checkpoint written before the tags existed therefore runs dense.
 
-- PEFT/LoRA, `policy.router_replay`, pipeline parallelism, training CUDA graphs, FP8, and `quant_cfg` (FP4 and other ModelOpt training quantization).
-- `policy.megatron_cfg.zero_train_gen_mismatch` and `batch_invariant_mode`, in every mode except `disabled`. In `logprobs` and `train` modes the trainer shares prefixes while generation runs dense, so train/generation parity cannot hold. In `dense` mode, `uniform_router_gating` changes only the trainer's router arithmetic, so these flags are rejected there too.
-- `moe_hybridep_prepad_packed_inputs` with the HybridEP flex dispatcher.
+The planner reads four values per row: the length, the group, the prompt length and the prompt hash. It does no data-plane I/O. It plans one global batch at a time, as dense packing does, with these rules:
 
-Worker setup resolves the model provider and rejects these model settings:
+- Two rows share a prompt when they have the same group, the same prompt length and the same prompt hash, and the prompt is shorter than the row. Two groups with the same prompt do not share. A prompt that differs in one token does not share.
+- A tree holds at most 16 rows (`MAX_TREE_ROWS`). A larger set of rows is split evenly. For example, 17 rows become trees of 9 and 8 rows. The rows of one prompt are also split when they do not fit the token budget of one forward.
+- A row that shares with no other row runs in a dense bin.
+- A pack holds trees up to the token budget of the stage. A dense bin holds rows up to the same budget.
+- Every rank runs the same number of packs and the same number of dense bins, and it runs its packs first. The forward at a given index therefore has the same kind on every rank. The two kinds can run different collectives, so ranks must not mix them at one index (see [Token budget](#token-budget)).
+- The number of packs is rounded up to a multiple of the number of ranks, and so is the number of dense bins. The planner adds no dummy rows to reach these counts.
+- When there are fewer trees than packs, the planner halves the largest tree that has at least 4 rows. When no tree can be halved, the smallest tree stops sharing, and its rows run in dense bins.
+- When there are fewer dense rows than dense bins, the smallest tree also stops sharing.
+- The forwards of one kind are dealt longest first to the rank that has the fewest tokens so far.
 
-- Any provider other than Megatron Bridge's `HybridModelProvider`.
-- TP=1 with sequence parallelism, or TP>1 without it.
-- Full recomputation other than `recompute_method: uniform` with one layer, and selective recomputation of `core_attn`.
-- Nonzero attention or hidden dropout, sliding-window attention, multi-latent attention, non-vanilla softmax, fine-grained activation offloading, QK-clip and maximum-logit statistics.
-- Position embeddings other than RoPE or none.
-- MoE load balancing other than `none`, `aux_loss`, `seq_aux_loss` or `global_aux_loss`, and a nonzero auxiliary-loss coefficient.
-- A non-null `moe_z_loss_coeff` or `moe_input_jitter_eps`. Set them through `policy.megatron_cfg.model_overrides`.
-- Expert capacity or per-rank capacity token dropping, and forced load balancing or forced biased routing.
-- A Megatron build without the capability tokens for the resolved TP/CP/SP topology, explicit physical padding, and, when used, full recomputation, MTP, expert bias or positionless attention. The tokens identify implemented code paths; they are not evidence that a topology was qualified.
+Each rank's `KVBatchMeta` carries its plan in `extra_info`. Three entries are the ones dense packing already ships: `MICRO_BATCH_INDICES`, `MICRO_BATCH_LENGTHS` and `ELEM_COUNTS_PER_GB`. One entry is new: `SHARED_PREFIX_TREE_IDS` holds one integer per row of the rank. The integer is the row's tree within its forward, or `UNSHARED_ROW` (-1) for a row of a dense bin. The rows of a tree are contiguous.
 
-Worker setup also checks `uniform_router_gating` and `bypass_evaluation_mtp` in every mode, including `dense`. The first needs MCore's fixed-row router blocks, and the second needs a PP1 `HybridModel`. The microbatch iterator rejects dynamic batching, prepacked inputs and models that own packing, MTP masking or CP slicing. The Megatron stack validator adds its own guards, for example hash routing and a contiguous CP layout for Mamba.
+### 3. The worker builds each pack
 
-### Runtime behavior
+The worker fetches its rows through the same path as dense packing. The Megatron worker then adds two batch columns from the plan and the row tags: `SHARED_PREFIX_TREE_IDS` and `SHARED_PREFIX_PROMPT_LENGTHS`. The columns travel with every microbatch slice.
 
-Each worker plans its execution units, then all model-world ranks agree on forward counts in one collective. A planning failure on one rank travels in that collective, so every rank raises instead of hanging. The worker times this under the `shared_prefix_execution_planning` timer label, which includes the agreement wait.
+The microbatch iterator looks at the tree ids of each slice:
 
-## Scope and validation
+- All ids are `UNSHARED_ROW`: the slice is a dense bin. It runs through the ordinary packed path, unchanged.
+- All ids are 0 or greater: the slice is a pack. The builder in `microbatches.py` calls Megatron-LM's `build_shared_prefix_inputs`, which lays out each prompt once, followed by the completions of its tree. The pack is padded to the padding multiple.
+- Anything else raises.
 
-The supported scope is the guarded hybrid model path with PP=1, TP with sequence parallelism, CP, no training CUDA graphs, no FP8/FP4 training and no PEFT. Multimodal models and other backends are out of scope.
+The driver matched prompts by length and hash only. `build_shared_prefix_inputs` compares the prompt tokens of the rows of each tree and raises if they differ.
 
-NeMo RL tests in this repository:
+In a pack, each completion attends to its prompt and to its own earlier tokens. It cannot attend to a sibling completion or to another tree. Megatron-LM's `docs/developer/shared_prefix.md` describes the model side.
 
-- `tests/unit/models/megatron/test_shared_prefix_logprob_oracle.py` compares shared logprobs, loss and gradients with dense rows through the worker's entry points. It uses a table-lookup model whose logits depend only on causal history, so a correct consumer must match dense exactly. Cases cover stars, forests, a group split past the branch limit, dense bins, and placeholders that run dense while their siblings share, with and without temperature. The TP1/CP1 cases need one GPU. The TP1/CP2, TP2/CP1 and TP2/CP2 variants need up to four: `CUDA_VISIBLE_DEVICES=0,1,2,3 pytest --mcore-only tests/unit/models/megatron/test_shared_prefix_logprob_oracle.py -k distributed`.
-- `tests/unit/models/megatron/test_megatron_imports_without_shared_prefix.py` checks that the default Megatron path imports without `megatron.rl`.
-- `tests/unit/data_plane/test_shared_prefix_preshard.py`, `tests/unit/single_controller/test_shared_prefix_controller.py`, `tests/unit/models/policy/test_shared_prefix_config.py`, `test_shared_prefix_stage_weights.py`, `test_megatron_worker_shared_prefix.py` and `tests/unit/models/megatron/test_shared_prefix_setup_capability.py` cover sharding, the train pump, configuration rules, dispatch plumbing, worker gating and setup checks.
+### 4. Logprobs are copied back and the loss runs per row
 
-Megatron-LM tests compare the shared HybridModel forward and backward with the dense rows it replaces, at TP1/CP1, TP2/SP/CP2 and TP1/CP4. They use an FP32 dense reference with MoE top-k choices replayed from a fixed table. The shared BF16 error must stay within 1.25× of the dense BF16 error. At TP/CP, the shared-versus-dense gap must stay within 1.5× of the TP1/CP1 gap.
+`logprobs.py` turns the logits of a pack into next-token logprobs for every row. The logprobs of the prompt are computed once per tree and copied to every row of the tree. The logprob of a row's first completion token is read at the last prompt position.
 
-Most of these tests need the `megatron.rl` packing library, and the logprob oracle also needs MCore's `megatron.core.models.hybrid.shared_prefix`, so they skip when the installed Megatron-LM does not contain the shared-prefix stack. Until the Megatron Bridge pin includes it, CI therefore does not exercise the shared path. After the pin bump, run the Megatron lane with `NRL_REQUIRE_MEGATRON_RL_SHARED_PREFIX=1`, which makes `--mcore-only` fail instead of skip when either module is missing.
+The loss then runs per row on those logprobs, with each row's own mask, advantage and ratio. No row owns the shared tokens. In the backward pass, the gradients of all rows of a tree add up in its one prompt. `microbatches.py` raises if `token_mask` is nonzero inside the shared prompt of any row, so a shared token never carries loss.
 
-No functional single-controller GRPO test for this feature exists yet. Training quality has not been qualified on this revision.
+Each worker writes its results back under each row's own key. The order of the rows within a rank therefore does not matter, and nothing restores it.
 
-### Dense-versus-shared gradient differences
+## Token budget
 
-Shared and dense execution are different but equally valid arithmetic, so their BF16 gradients differ. An earlier comparison reported a 13.9% relative L2 difference on a sampled subset of gradient entries, against about 1% repeat variation. A repeat measures only run-to-run nondeterminism, so it is the wrong baseline.
+Each forward is limited by the token budget of its stage, as in dense packing: `logprob_mb_tokens` for a logprob pass and `train_mb_tokens` for training.
 
-Single-GPU (TP1/CP1) measurements on small random-init hybrid models explain the difference:
+- A dense bin counts every row at its padded length.
+- A pack counts every tree at its packed length.
+- Exception: a training pack counts every tree at its full length when multi-token prediction (MTP) may run. MTP processes every row with its own copy of the prompt.
 
-- In FP32 with IEEE GEMMs, each shared layer matches dense to about 1e-7.
-- With MoE routing replayed, shared and dense are equally close to an FP32 reference: 1.96% each for a 28-layer model.
-- With routing replayed, the shared-versus-dense gap (2.34%) is close to the gap between two dense runs with different packing layouts (2.05%). The gap shrinks about 8× in FP16, which matches the ratio of the two formats' rounding steps.
-- With natural routing, BF16 rounding flips MoE top-k choices, which inflates every comparison. Two dense runs with different packing layouts then differ by 6.4%, more than a dense repeat (5.4%).
+The driver decides this per stage with `bound_by_full_length`:
 
-The difference is therefore BF16 rounding amplified by MoE top-k flips. The right baseline is dense versus dense with a different packing layout, or distance to a high-precision reference, with routing replayed and measured over the whole gradient. This comparison has not been repeated on a full-size model at the production TP/CP topology.
+| Stage | Length a tree is counted at |
+|---|---|
+| Logprob pass | Packed length. |
+| Training, `policy.megatron_cfg.mtp_num_layers: 0` | Packed length. |
+| Training, any other value, or the key absent | Full length. An absent key leaves the number of MTP layers to the checkpoint, so the driver assumes that MTP runs. |
+
+When trees are counted at full length, sharing lowers the tokens that each training forward runs. It does not lower the number of training forwards.
+
+A logprob pass runs the model in evaluation mode. In that mode Megatron-LM skips the MTP block in a pack, and it runs the MTP block in a dense bin, as it does without the option. For a model with MTP layers, a logprob pass therefore does MTP work for the rows of dense bins and none for the rows of packs. The logprobs do not use the MTP output. This difference between the two kinds of forward is why every rank runs the same kind at the same index. Skipping MTP in dense evaluation forwards is not part of this feature.
+
+## Requirements and rejected configurations
+
+The option needs every item below. A config that misses one is rejected at setup.
+
+The launcher:
+
+- The single-controller launcher, `examples/run_grpo_single_controller.py`. Its setup requires `data_plane.enabled: true` for every run. `examples/run_grpo.py` raises when the key is `true`. The other launchers do not check the key and pack densely (see [Configuration](#configuration)).
+
+Checked once on the driver by `validate_shared_prefix_config`, before any worker starts. Each rule is one error that names the key to change:
+
+- `token_capture.enabled: true`. Only the rollout reassembler writes the two row tags.
+- `policy.sequence_packing.enabled: true` and `policy.dynamic_batching.enabled: false`.
+- `policy.sequence_packing.pair_grouping_key` and `policy.sequence_packing.max_sequences_per_bin` unset. The planner applies neither.
+- `policy.megatron_cfg.enabled: true`. Other backends do not build packs.
+- `policy.megatron_cfg.pipeline_model_parallel_size: 1`.
+- `policy.megatron_cfg.peft.enabled: false`.
+- `policy.megatron_cfg.use_fused_linear_logprobs: false`.
+- `policy.megatron_cfg.moe_hybridep_prepad_packed_inputs: false`. That setting runs a collective for every dense bin and none for a pack.
+- `policy.megatron_cfg.zero_train_gen_mismatch: false` and `policy.megatron_cfg.batch_invariant_mode: false`. Generation runs every row in full, so a pack cannot reproduce its arithmetic exactly.
+- `policy.generation.top_p: 1.0` and `policy.generation.top_k: null`. Logprobs of a pack are not filtered by top-k or top-p.
+- `policy.router_replay.enabled: false`.
+- `policy.is_vlm: false`.
+- `policy.draft.enabled: false`.
+- `loss_fn.score_centering: false` and `on_policy_distillation.full.enabled: false`. A pack gives the loss next-token logprobs, not logits over the vocabulary.
+- `loss_fn.seq_logprob_error_in_loss: false`.
+- `loss_fn.positive_example_nll_weight: 0`. That term is a mean over the tokens of one loss call. A dense bin without `fuse_loss` calls the loss once per row, and a pack calls it once per forward, so the same rows would give a different term in a pack.
+
+Checked on each Megatron worker at setup by `validate_shared_prefix_model`, because these rules need the built model config:
+
+- The model comes from Megatron Bridge's `HybridModelProvider`.
+- The model takes the packed, context-parallel-sharded inputs that the worker builds. A model that packs its own sequences, or slices its own inputs for context parallelism, is rejected.
+- The model settings pass Megatron-LM's `validate_shared_prefix_config`, which owns the model rules. The driver check repeats two of them, the pipeline-parallel size and batch-invariant mode, so that they fail before a worker starts.
+- `policy.make_sequence_length_divisible_by` is a padding multiple that Megatron-LM accepts for packs at the model's TP and CP sizes (`resolve_shared_prefix_padding_multiple`).
+- A model with MTP layers has `calculate_per_token_loss` enabled. Megatron-LM requires it in the training forward of a pack, and this check fails earlier.
+- The built model has no MTP layers when `policy.megatron_cfg.mtp_num_layers: 0` makes the driver count training packs at packed length.
+
+## Forest training
+
+Forest training (`token_capture.forest_training: true`) is supported. In forest training the reassembler writes one row per selected path of a rollout, so the groups of a step have different row counts. The planner accepts any row count per group.
+
+- The prompt of a row is the prompt of the first model call on its path.
+- Rows of one group share when that prompt has the same length and the same tokens. These are the first rows of the rollouts and the rows that branch under the same first call.
+- A row that starts after a context rewrite, such as a compaction, has a different prompt. It runs in a dense bin unless another row of the group starts with the same rewritten prompt.
+- The rows of an invalid rollout and the execution-padding rows have prompt length 0. They run in dense bins and carry no loss.
+- Advantages are computed per rollout on the driver before packing, so each rollout keeps one advantage.
+- Rows that branch below the prompt share only the prompt. The tokens of the calls they have in common still run once per row.
+
+## What is not supported
+
+- Sharing past the prompt. Rows with the same first assistant turn, or branch rows with the same parent call, share only the prompt.
+- Sharing across groups.
+- Sharing inside MTP. MTP runs on every row in full.
+- Backends other than Megatron, Megatron models that are not hybrid models, and multimodal models.
+- Every setting that [Requirements and rejected configurations](#requirements-and-rejected-configurations) rejects.
+- FLOPs and MFU metrics that follow the packed length. They count every row at its full length, so they overstate the work of a run that shares prompts.
+- Warm-up of pack forwards. The synthetic first training pass (`async_rl.trainer_warmup`) runs dense bins only.
+
+## How to test
+
+Most unit tests of the feature are in files under `tests/unit/` whose name contains `shared_prefix`.
+
+- The driver-side tests need neither Megatron-LM nor a GPU. They cover the planner (`tests/unit/data/packing/`), the plan that `shard_meta_for_dp` ships (`tests/unit/data_plane/`), the config rules (`tests/unit/models/policy/`), the `examples/run_grpo.py` guard (`tests/unit/algorithms/`), and a training step that loses a prompt group (`tests/unit/single_controller/`).
+- The tests of the row tags that the rollout reassembler writes, including the rows of forest training, carry the `nemo_gym` marker (`tests/unit/data_plane/`, `tests/unit/experience/`).
+- The Megatron-side tests carry the `mcore` marker and run in the Megatron lanes. They cover the pack microbatches, the logprobs, the worker setup check and the worker's batch columns.
+- `tests/unit/models/megatron/test_shared_prefix_logprob_oracle.py` compares the logprobs, the loss and the gradients of packs with those of the dense rows they replace. It uses a table-lookup model whose logits depend only on causal history, so a correct implementation must match dense exactly. One case has the row shapes of forest training. It needs one GPU, and its TP and CP variants need up to four:
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run --extra mcore --group test pytest --mcore-only tests/unit/models/megatron/test_shared_prefix_logprob_oracle.py
+```
+
+The Megatron lane scripts (`tests/unit/L0_Unit_Tests_Megatron_*.sh`) export `NRL_REQUIRE_SHARED_PREFIX_TESTS=1`. With it, a `--mcore-only` run fails when the installed Megatron-LM lacks the shared-prefix modules. The oracle then fails instead of skipping when it has no GPU, and so do its TP 2 and CP 2 variants when they have fewer than two GPUs. The variant with TP 2 and CP 2 together needs four GPUs. It skips in a lane that has fewer.
+
+A pair of test-suite scripts runs the feature end to end on one node with Nemotron-Nano-12B-v2. The two runs differ only in `policy.sequence_packing.share_prefixes`, and a fixed few-shot block makes the prompt most of each row:
+
+- `tests/test_suites/llm/grpo-nano-v2-12b-1n8g-megatron-single-controller-token_capture.sh` is the dense arm. It checks `token_mult_prob_error`, the reward at step 30 against a floor, and that no rollout became a placeholder row.
+- `tests/test_suites/llm/grpo-nano-v2-12b-1n8g-megatron-single-controller-token_capture-shared-prefix.sh` is the shared arm. It runs the checks of the dense arm. It then checks that `timing/train/policy_and_reference_logprobs` and `timing/train/policy_training` stay below 0.8 times the dense arm's medians.
+
+Both scripts are listed in `tests/test_suites/disabled.txt`, so the nightly suite does not run them. The reward floor and the two dense medians are values in the scripts, taken from a run of the dense arm. A script fails after training while one of its values is empty.
