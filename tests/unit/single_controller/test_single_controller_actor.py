@@ -3756,6 +3756,132 @@ def test_run_pumps_snapshots_generation_before_dispatch(
     assert events == ["snapshot", "dispatch"]
 
 
+class _RowDataPlane(_NoOpDataPlane):
+    """Rows keyed by sample id, so each chunk's advantage stage reads its own."""
+
+    def __init__(self, rows: dict[str, dict[str, torch.Tensor]]) -> None:
+        self.rows = rows
+
+    def get_samples(self, *, sample_ids, select_fields, **kwargs) -> TensorDict:
+        del kwargs
+        return TensorDict(
+            {
+                name: torch.stack([self.rows[sid][name] for sid in sample_ids])
+                for name in select_fields
+            },
+            batch_size=[len(sample_ids)],
+        )
+
+    def put_samples(self, *, sample_ids, fields, **kwargs) -> None:
+        del kwargs
+        for row, sid in enumerate(sample_ids):
+            for name in fields.keys():
+                self.rows[sid][name] = fields[name][row].clone()
+
+
+def test_train_pump_logs_row_stats_once_per_step_and_resets_them(
+    monkeypatch,
+) -> None:
+    """Two steps of two one-group chunks: each step logs only its own rows."""
+    # (reward, mask_sample flag, sequence length) per row, one list per group.
+    groups = [
+        [(1.0, False, 30), (0.0, True, 8)],  # step 1: mixed only via the masked row
+        [(1.0, False, 20), (1.0, False, 8)],  # step 1: all pass
+        [(0.0, False, 8), (0.0, False, 8)],  # step 2: all fail
+        [(1.0, False, 8), (0.0, False, 8)],  # step 2: mixed
+    ]
+    rows: dict[str, dict[str, torch.Tensor]] = {}
+    metas = []
+    for group, members in enumerate(groups):
+        sample_ids = [f"g{group}-{member}" for member in range(len(members))]
+        for sid, (reward, flagged, length) in zip(sample_ids, members):
+            rows[sid] = {
+                "total_reward": torch.tensor(reward),
+                "token_mask": torch.tensor([0.0, 1.0, 1.0]),
+                "sample_mask": torch.tensor(1.0),
+                "mask_sample": torch.tensor(flagged),
+                "truncated": torch.tensor(False),
+                "input_lengths": torch.tensor(length),
+            }
+        metas.append(
+            KVBatchMeta(
+                partition_id="rollout_data",
+                task_name="train",
+                sample_ids=sample_ids,
+                fields=[],
+                sequence_lengths=[3] * len(members),
+                # The per-group value the step-pooled metric must replace.
+                extra_info={
+                    ROLLOUT_METRICS: [{"mask_rules/eval_incomplete_reward_mean": 9.0}]
+                },
+                tags=[
+                    {"weight_version": 0, GROUP_ID_TAG: f"group-{group}"}
+                    for _ in members
+                ],
+            )
+        )
+
+    ctrl = _train_pump_controller(sampler=_SequenceSampler(metas))
+    algo = GRPOConfig(
+        num_prompts_per_step=2,
+        num_generations_per_prompt=2,
+        max_num_steps=2,
+        seq_logprob_error_threshold=None,
+    )
+    ctrl._master_config.grpo = ctrl._algo_cfg = algo
+    ctrl._advantage_estimator = _MaskRecordingAdvantageEstimator()
+    ctrl._dp_client = _RowDataPlane(rows)
+    _stamp_advantage_stage_config(ctrl)
+    ctrl._max_total_sequence_length = 32
+    ctrl._rollout_manager.pop_mask_rule_metrics = MagicMock(
+        side_effect=[
+            {
+                "mask_rules/rollouts_seen": 4.0,
+                "mask_rules/eval_incomplete_reward_mean": 0.0,
+            },
+            {},
+        ]
+    )
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+
+    assert ctrl._train_steps == 2
+    step_1, step_2 = (
+        call.args[0]
+        for call in ctrl._logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    )
+    # Step 1: the flagged row does not train but still votes (include).
+    assert step_1["masking/rows"] == 4.0
+    assert step_1["masking/env_flag_rows"] == 1.0
+    assert step_1["masking/trained_rows"] == 3.0
+    assert step_1["masking/reinstated_rows"] == 1.0
+    assert step_1["masking/groups"] == 2.0
+    assert step_1["groups/count"] == 2.0
+    assert step_1["groups/mixed_count"] == 1.0
+    # Two of the three trained rows sit in the all-pass group.
+    assert step_1["groups/zero_advantage_sample_frac"] == pytest.approx(2 / 3)
+    assert step_1["gen_tokens/mean"] == 2.0
+    # Only the 30-token row is above 90 % of max_total_sequence_length (32).
+    assert step_1["seq_len/frac_above_90pct_ctx"] == pytest.approx(1 / 3)
+    # The step-pooled rule metrics replace the per-group aggregate.
+    assert step_1["mask_rules/rollouts_seen"] == 4.0
+    assert step_1["mask_rules/eval_incomplete_reward_mean"] == 0.0
+    # Step 2 starts from empty accumulators: nothing is carried over from step 1.
+    assert step_2["masking/rows"] == 4.0
+    assert step_2["masking/env_flag_rows"] == 0.0
+    assert step_2["masking/trained_rows"] == 4.0
+    assert step_2["masking/groups"] == 2.0
+    assert step_2["groups/count"] == 2.0
+    assert step_2["groups/mixed_count"] == 1.0
+    assert step_2["seq_len/frac_above_90pct_ctx"] == 0.0
+    assert "mask_rules/rollouts_seen" not in step_2
+    assert ctrl._rollout_manager.pop_mask_rule_metrics.call_count == 2
+
+
 @pytest.mark.parametrize("dies_in", [None, "get_step_metrics"])
 def test_train_pump_collects_generation_metrics_at_step_boundaries(
     monkeypatch, dies_in
