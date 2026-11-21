@@ -19,7 +19,7 @@ grpo:
     overlong_buffer_length: 1024
     max_response_length: 2048
 loss_fn:
-  token_level_loss: false
+  normalization: sequence_mean
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
   truncated_importance_sampling_type: tis
