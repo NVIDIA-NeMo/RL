@@ -324,6 +324,52 @@ def test_footer_cli_requires_reviewed_head(
     assert f"head={live} -->" in out
 
 
+def test_same_session_reads_subagent_transcripts(tmp_path: Path) -> None:
+    project = tmp_path / ".claude/projects/-repo"
+    _write(
+        project / "sid1.jsonl",
+        [
+            {
+                "type": "assistant",
+                "cwd": "/repo",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "a1",
+                            "name": "Agent",
+                            "input": {"prompt": "edit"},
+                        }
+                    ]
+                },
+            }
+        ],
+    )
+    _write(
+        project / "sid1/subagents/agent-1.jsonl",
+        [
+            {
+                "type": "assistant",
+                "cwd": "/repo",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "s1",
+                            "name": "Edit",
+                            "input": {"file_path": "/repo/nemo_rl/a.py"},
+                        }
+                    ]
+                },
+            }
+        ],
+    )
+    ident = rid.detect({"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "sid1"}, tmp_path)
+    assert rid.same_session_evidence(ident.transcript, ["nemo_rl/a.py"], "/repo") == [
+        "edited nemo_rl/a.py"
+    ]
+
+
 def test_missing_gh_stops_with_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
     def no_gh(*args, **kwargs):
         raise FileNotFoundError("gh")

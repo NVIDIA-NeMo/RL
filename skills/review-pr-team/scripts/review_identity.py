@@ -244,7 +244,9 @@ def same_session_evidence(
     """Lines of evidence that this session edited the PR's files or committed in this repo."""
     if transcript is None:
         return []
-    rows = list(_jsonl(transcript))
+    # Subagents (Agent tool, forks) log their tool calls in <sid>/subagents/, not in <sid>.jsonl.
+    subagents = sorted((transcript.with_suffix("") / "subagents").glob("*.jsonl"))
+    rows = [row for path in [transcript, *subagents] for row in _jsonl(path)]
     pr_set = set(pr_files)
     evidence = []
 
