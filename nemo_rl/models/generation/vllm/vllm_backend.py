@@ -2324,6 +2324,69 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             raise RefitAborted(aborted)
         return result
 
+    def _update_weights_from_collective_with_reload(
+        self, preparer: _ReloadWeightPreparer
+    ) -> None:
+        """Receive collective weights through vLLM's native layerwise reload API.
+
+        The collective counterpart of ``_update_weights_via_ipc_zmq_with_reload``.
+        """
+        assert self.state_dict_info is not None
+        # One buffer, as for native layerwise refit below: the preparer's copies
+        # must finish before the next broadcast refills the receive buffer.
+        received = packed_broadcast_consumer(
+            iterator=iter(self.state_dict_info.items()),
+            group=self.model_update_group,
+            src=0,
+            post_unpack_func=None,
+            return_iterator=True,
+            num_buffers=1,
+        )
+        assert received is not None
+        weight_iterator: Iterator[tuple[str, torch.Tensor]] = received
+        exhausted = False
+
+        def iter_prepared_weights() -> Iterator[tuple[str, torch.Tensor]]:
+            nonlocal exhausted
+            for weight in weight_iterator:
+                yield from preparer.process([weight])
+            exhausted = True
+            preparer.finish()
+
+        prepared_iterator = iter_prepared_weights()
+        try:
+            preparer.reset()
+            self._reload_model_runner_weights(
+                weights_iterator=prepared_iterator,
+                is_checkpoint_format=True,
+            )
+            if not exhausted:
+                raise RuntimeError(
+                    "vLLM reload_weights returned before exhausting the "
+                    "collective weight iterator"
+                )
+            torch.accelerator.synchronize()
+        except Exception:
+            try:
+                prepared_iterator.close()
+            except Exception:
+                logger.exception("Failed to close the collective reload iterator")
+            if not exhausted:
+                # Receive the remaining broadcasts so the sender is not left
+                # blocked in NCCL by a receiver that stopped participating.
+                try:
+                    for _ in weight_iterator:
+                        pass
+                except Exception:
+                    logger.exception(
+                        "Failed to drain the collective sender after reload failure"
+                    )
+            raise
+        finally:
+            close_weight_iterator = getattr(weight_iterator, "close", None)
+            if close_weight_iterator is not None:
+                close_weight_iterator()
+
     def _update_weights_from_collective(self, refit_with_reload_api: bool) -> bool:
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
@@ -2354,7 +2417,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 torch.cuda.empty_cache()
                 return True
 
-            if refit_with_reload_api:
+            preparer = self._get_reload_weight_preparer()
+            if preparer is not None:
+                self._update_weights_from_collective_with_reload(preparer)
+            elif refit_with_reload_api:
                 weight_iterator = packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
                     group=self.model_update_group,

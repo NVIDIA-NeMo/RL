@@ -855,35 +855,18 @@ def _patched_gym_token_capture(finalizer_actors, *, router_replay: bool = False)
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
-    @pytest.mark.parametrize("colocated", [False, True])
-    def test_nvfp4_pertoken_rejected_before_setup_factories(
-        self, patched_factories: dict[str, Any], colocated: bool
+    def test_nvfp4_pertoken_normalized_as_validated_grpo_entry_point(
+        self, patched_factories: dict[str, Any]
     ) -> None:
-        mc = _make_master_config(colocated=colocated, megatron_enabled=True)
+        mc = _make_master_config(megatron_enabled=True)
         mc.policy["generation"]["nvfp4_pertoken_rollout"] = {"enabled": True}
 
-        with pytest.raises(
-            ValueError,
-            match="SingleController does not support generation.nvfp4_pertoken_rollout",
-        ):
+        with patch.object(
+            sc_setup_mod, "normalize_nvfp4_pertoken_policy_config"
+        ) as normalize:
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        for factory in (
-            "setup_response_data",
-            "_build_clusters",
-            "_build_generation",
-            "_build_trainer",
-        ):
-            patched_factories[factory].assert_not_called()
-
-    @pytest.mark.parametrize("rollout", [None, {"enabled": False}])
-    def test_nvfp4_pertoken_off_preserves_single_controller_validation(
-        self, rollout: dict[str, bool] | None
-    ) -> None:
-        mc = _make_master_config()
-        if rollout is not None:
-            mc.policy["generation"]["nvfp4_pertoken_rollout"] = rollout
-        validate_single_controller_config(mc)
+        normalize.assert_called_once_with(mc.policy, entry_point="single_controller")
 
     def test_materializes_native_lora_before_build_factories(self, patched_factories):
         mc = _make_master_config()

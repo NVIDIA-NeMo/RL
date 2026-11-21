@@ -1933,6 +1933,112 @@ def test_native_collective_refit_uses_one_transport_buffer(monkeypatch):
     assert observed_num_buffers == 1
 
 
+class _RecordingPreparer:
+    def __init__(self, fail_on: str | None = None) -> None:
+        self.fail_on = fail_on
+        self.events: list[str] = []
+
+    def reset(self) -> None:
+        self.events.append("reset")
+
+    def process(self, weights):
+        for name, _ in weights:
+            if name == self.fail_on:
+                raise RuntimeError("preparer failed")
+            self.events.append(name)
+        return [(f"prepared.{name}", weight.clone()) for name, weight in weights]
+
+    def finish(self) -> None:
+        self.events.append("finish")
+
+
+def _make_collective_reload_extension(monkeypatch, vllm_backend, preparer):
+    ext, _ = _make_collective_update_extension(vllm_backend)
+    ext.state_dict_info = {name: object() for name in ("model.a", "model.b", "model.c")}
+    ext._get_reload_weight_preparer = lambda: preparer
+    ext._weight_update_errors_are_fatal = lambda: True
+    received: list[str] = []
+    consumer_kwargs: dict = {}
+
+    def consume(*, iterator, group, src, post_unpack_func, **kwargs):
+        consumer_kwargs.update(kwargs)
+
+        def weights():
+            for name, _ in iterator:
+                received.append(name)
+                yield name, torch.ones(2)
+
+        return weights()
+
+    monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", consume)
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _config: contextlib.nullcontext()
+    )
+    return ext, received, consumer_kwargs
+
+
+@pytest.mark.vllm
+def test_collective_refit_with_preparer_uses_native_reload(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    preparer = _RecordingPreparer()
+    ext, received, consumer_kwargs = _make_collective_reload_extension(
+        monkeypatch, vllm_backend, preparer
+    )
+    loaded: list[str] = []
+
+    def reload_weights(*, weights_iterator, is_checkpoint_format):
+        assert is_checkpoint_format is True
+        loaded.extend(name for name, _ in weights_iterator)
+
+    ext.model_runner.reload_weights = reload_weights
+
+    assert ext.update_weights_from_collective() is True
+    assert consumer_kwargs == {"return_iterator": True, "num_buffers": 1}
+    assert preparer.events == ["reset", "model.a", "model.b", "model.c", "finish"]
+    assert loaded == ["prepared.model.a", "prepared.model.b", "prepared.model.c"]
+
+
+@pytest.mark.vllm
+def test_collective_refit_with_preparer_drains_sender_on_failure(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    preparer = _RecordingPreparer(fail_on="model.b")
+    ext, received, _ = _make_collective_reload_extension(
+        monkeypatch, vllm_backend, preparer
+    )
+    ext.model_runner.reload_weights = lambda *, weights_iterator, **_: list(
+        weights_iterator
+    )
+
+    with pytest.raises(RuntimeError, match="preparer failed"):
+        ext.update_weights_from_collective()
+
+    # Every broadcast is still received, so the sender is not left blocked.
+    assert received == ["model.a", "model.b", "model.c"]
+    assert "finish" not in preparer.events
+
+
+@pytest.mark.vllm
+def test_collective_refit_with_preparer_rejects_partial_reload(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    preparer = _RecordingPreparer()
+    ext, received, _ = _make_collective_reload_extension(
+        monkeypatch, vllm_backend, preparer
+    )
+    ext.model_runner.reload_weights = lambda *, weights_iterator, **_: next(
+        iter(weights_iterator)
+    )
+
+    with pytest.raises(RuntimeError, match="before exhausting"):
+        ext.update_weights_from_collective()
+    assert received == ["model.a", "model.b", "model.c"]
+
+
 @pytest.mark.vllm
 def test_sparse_delta_refit_rejected_for_native_trtllm_backend():
     from nemo_rl.models.generation.vllm import vllm_backend
