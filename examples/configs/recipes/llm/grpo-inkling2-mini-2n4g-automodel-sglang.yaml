@@ -1,0 +1,53 @@
+# Inkling 2 Mini (looped Inkling2: 24 layers, layers 6-17 run 3x, 128 experts) GRPO:
+# Automodel policy + SGLang BF16 rollouts, colocated on TWO 4-GPU GB200 nodes (8 GPUs).
+#
+# Same precision story as Inkling 2 Small (grpo-inkling2-8n4g-automodel-sglang): the
+# release packs routed experts as NVFP4/MXFP8, Automodel dequantizes them to BF16
+# training weights and SGLang serves the same BF16 experts, so refit is a plain BF16
+# copy (quantization.scheme: bf16).
+#
+# Checkpoint views:
+#   policy.model_name        the release directory itself. Mini's Automodel recipes load
+#                            it directly with dequantize_base_checkpoint: true, so no
+#                            text-only view is needed.
+#   sglang_cfg.model_path    SGLang view whose hf_quant_config.json lists the experts as
+#                            BF16 (tools/inkling2/make_sglang_bf16_view.py); SGLang starts
+#                            with load_format: dummy and the first refit fills every weight.
+#
+# SGLang needs Mini's own build (model_type inkling2_loop); see tools/inkling2/launch_slurm.sh
+# SGLANG_OVERRIDE. Automodel needs the looped-Inkling2 PR (HuiyingLi/Automodel-day0#13).
+#
+# Layout: ~27B params. Training uses EP8 across both nodes and SGLang runs two TP4/EP4
+# engines (one per node). EP4 across two nodes (FSDP over an extra data-parallel dim)
+# failed in the first backward pass with an activation-checkpoint recompute mismatch, so
+# keep expert_parallel_size equal to the GPU count. One node also works for short runs
+# (the smoke recipe): set cluster.num_nodes=1, expert_parallel_size=4, num_gpus=4.
+defaults: grpo-inkling2-8n4g-automodel-sglang.yaml
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  max_num_steps: 500
+  val_period: 10
+checkpointing:
+  checkpoint_dir: results/grpo-inkling2-mini-2n4g-automodel-sglang
+policy:
+  model_name: /path/to/inkling2-mini-release
+  dequantize_base_checkpoint: true
+  train_global_batch_size: 256
+  automodel_cfg:
+    # 128 experts / 8 ranks = 16 experts per GPU.
+    expert_parallel_size: 8
+  generation:
+    sglang_cfg:
+      model_path: /path/to/inkling2-mini-sglang-bf16
+      tp_size: 4
+      ep_size: 4
+      mem_fraction_static: 0.6
+      sglang_server_config:
+        num_gpus: 8
+logger:
+  log_dir: logs/grpo-inkling2-mini-2n4g-automodel-sglang
+  wandb:
+    name: grpo-inkling2-mini-2n4g-automodel-sglang
+cluster:
+  num_nodes: 2

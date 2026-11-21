@@ -103,10 +103,12 @@ from nemo_rl.utils.timer import Timer
 
 
 # Inkling2 tensors the release stores (and SGLang's loader expects) in FP32: the
-# attention-residual queries and the MoE router bias.
+# attention-residual queries and the MoE router bias, plus (Inkling 2 Mini) the two
+# cross-pass message queries of the looped layers.
 _INKLING2_FP32_HF_KEY = re.compile(
     r"model\.llm\.(?:attn_res\.(?:attn|mlp)_queries\.\d+|attn_res\.output_query"
-    r"|layers\.\d+\.mlp\.gate\.bias)"
+    r"|layers\.\d+\.mlp\.gate\.bias"
+    r"|middle_cycle_cross_pass_(?:kv_)?queries)"
 )
 # Matches what ``_maybe_adapt_tensor_to_hf`` asks other adapters to exclude.
 _EXTRA_STATE_KEY = re.compile(r".*_extra_state.*")
@@ -735,11 +737,12 @@ class AutomodelPolicyWorkerImpl(
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Initialize checkpoint manager now that distributed is set up
-        # Inkling2: async DCP staging copied an already-invalidated storage after the
-        # timeout save ("copy_() on an invalid python storage"), so save synchronously.
+        # Inkling2 (Small: inkling2_model, Mini: inkling2_loop): async DCP staging copied
+        # an already-invalidated storage after the timeout save ("copy_() on an invalid
+        # python storage"), so save synchronously.
         requires_synchronous_checkpoint = getattr(
             runtime_config.model_config, "model_type", None
-        ) in ("deepseek_v4", "inkling2_model")
+        ) in ("deepseek_v4", "inkling2_model", "inkling2_loop")
         automodel_cfg = config["automodel_cfg"]
         checkpoint_config = build_checkpoint_config(
             automodel_cfg,

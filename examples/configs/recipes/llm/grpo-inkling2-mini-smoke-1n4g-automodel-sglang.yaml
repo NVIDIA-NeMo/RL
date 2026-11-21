@@ -1,0 +1,35 @@
+# Short ONE-node smoke test of grpo-inkling2-mini-2n4g-automodel-sglang: 3 steps, small
+# batch, no validation, no checkpoint. Checks the policy load, the first (dummy-load) refit,
+# train/serve logprob agreement and the looped model's rollouts before a long run.
+defaults: grpo-inkling2-mini-2n4g-automodel-sglang.yaml
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_num_steps: 3
+  val_period: 0
+cluster:
+  num_nodes: 1
+policy:
+  automodel_cfg:
+    expert_parallel_size: 4  # 128 experts / 4 ranks
+  train_global_batch_size: 32
+  max_total_sequence_length: 1024
+  generation:
+    max_new_tokens: 512
+    sglang_cfg:
+      context_length: 1024
+      sglang_server_config:
+        num_gpus: 4
+data:
+  max_input_seq_length: 512
+  train:
+    dataset_name: OpenMathInstruct-2
+  validation: null
+  default:
+    prompt_file: examples/prompts/cot.txt
+env:
+  math:
+    math_verify_impl: hf_math_verify
+logger:
+  log_dir: logs/grpo-inkling2-mini-smoke-1n4g-automodel-sglang
+  wandb_enabled: false

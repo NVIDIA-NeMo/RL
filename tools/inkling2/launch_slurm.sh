@@ -19,6 +19,8 @@
 #   ACCOUNT=<acct> CONTAINER=<image.sqsh> WORKDIR=<dir> bash tools/inkling2/launch_slurm.sh proxy
 #   ... launch_slurm.sh full        # SGLang, 16 nodes (does not fit; see the 16n recipe)
 #   ... launch_slurm.sh full32      # SGLang, 32 nodes, EP64 + HybridEP in 16-node rack segments
+#   ... launch_slurm.sh mini-smoke  # Inkling 2 Mini, SGLang BF16, 1 node, 3-step smoke test
+#   ... launch_slurm.sh mini        # Inkling 2 Mini, SGLang BF16, 2 nodes (EP8)
 #   ... launch_slurm.sh vllm-tiny   # vLLM MXFP8, 1 node, tiny checkpoint smoke test
 #   ... launch_slurm.sh vllm-full   # vLLM MXFP8, 16 nodes, colocated (untested: has not completed a run)
 #   ... launch_slurm.sh vllm-async  # vLLM MXFP8, 24 nodes: 16 training + 8 generation
@@ -35,6 +37,9 @@
 # Optional: PARTITION (batch), QOS_OVERRIDE / TIME_OVERRIDE (per-mode QOS/time limit),
 # EXTRA_OVERRIDES='key=value ...' (config overrides), DATA_MOUNTS='src:dst,...',
 # AM_OVERRIDE=/path/nemo_automodel (mount another Automodel source tree),
+# SGLANG_OVERRIDE=/path/python/sglang (mount another SGLang package over the image's; it
+# must contain sglang/_version.py, which a source checkout lacks),
+# NODES_OVERRIDE=N (Slurm node count; pair with cluster.num_nodes=N),
 # SEGMENT_OVERRIDE=16 (Slurm segment size), SECRETS_FILE (shell file sourced in a
 # subshell for WANDB_API_KEY and HF_TOKEN only; never echoed).
 #
@@ -43,7 +48,7 @@
 # one checkpoint SAVE_MARGIN_MIN (default 10) minutes before its time limit (or at
 # SAVE_BY_OVERRIDE, DD:HH:MM:SS from job start), then exits.
 set -euo pipefail
-MODE=${1:?proxy|full|full32|vllm-tiny|vllm-full|vllm-async}
+MODE=${1:?proxy|full|full32|mini-smoke|mini|vllm-tiny|vllm-full|vllm-async}
 : "${ACCOUNT:?set ACCOUNT}" "${CONTAINER:?set CONTAINER}" "${WORKDIR:?set WORKDIR}"
 PARTITION=${PARTITION:-batch}
 RL=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)  # NeMo RL tree: nemo_rl mount, recipes, ray.sub
@@ -72,6 +77,15 @@ case $MODE in
     SEGMENT=16
     EXTRA="logger.wandb_enabled=true logger.wandb.name=grpo-inkling2-32n4g-gb200-automodel-sglang-$STAMP"
     ;;
+  mini-smoke)
+    RECIPE=$RECIPES/grpo-inkling2-mini-smoke-1n4g-automodel-sglang.yaml
+    NODES=1; QOS=interactive; TIME=01:00:00; EXTRA=""
+    ;;
+  mini)
+    RECIPE=$RECIPES/grpo-inkling2-mini-2n4g-automodel-sglang.yaml
+    NODES=2; QOS=normal; TIME=04:00:00
+    EXTRA="logger.wandb_enabled=true logger.wandb.name=grpo-inkling2-mini-2n4g-automodel-sglang-$STAMP"
+    ;;
   vllm-tiny)
     RECIPE=$RECIPES/grpo-inkling2-tiny-1n4g-automodel-vllm-mxfp8.yaml
     NODES=1; QOS=interactive; TIME=01:00:00; EXTRA=""
@@ -89,8 +103,9 @@ case $MODE in
   *) echo "unknown mode $MODE" >&2; exit 2 ;;
 esac
 QOS=${QOS_OVERRIDE:-$QOS}; TIME=${TIME_OVERRIDE:-$TIME}
+NODES=${NODES_OVERRIDE:-$NODES}  # also set cluster.num_nodes (and SGLang num_gpus) through EXTRA_OVERRIDES
 AM=${AM_OVERRIDE:-$AM}; SEGMENT=${SEGMENT_OVERRIDE:-$SEGMENT}
-case $MODE in proxy|vllm-tiny) LONG_RUN=false ;; *) LONG_RUN=true ;; esac
+case $MODE in proxy|vllm-tiny|mini-smoke) LONG_RUN=false ;; *) LONG_RUN=true ;; esac
 if $LONG_RUN; then CKPT_DIR=$WORKDIR/checkpoints/$MODE; else CKPT_DIR=$OUT/ckpt; fi
 CKPT_DIR=${CKPT_DIR_OVERRIDE:-$CKPT_DIR}
 # checkpoint_must_save_by (DD:HH:MM:SS from job start) = time limit - SAVE_MARGIN_MIN.
@@ -106,6 +121,9 @@ SAVE_BY=$(printf '%02d:%02d:%02d:%02d' $((save_by/86400)) $((save_by%86400/3600)
 SAVE_BY=${SAVE_BY_OVERRIDE:-$SAVE_BY}  # e.g. SAVE_BY_OVERRIDE=00:01:30:00 (DD:HH:MM:SS)
 EXTRA="$EXTRA checkpointing.checkpoint_must_save_by=$SAVE_BY"
 MOUNTS="$WORKDIR:$WORKDIR,$RL/nemo_rl:/opt/nemo-rl/nemo_rl,$AM:/opt/nemo-rl/3rdparty/Automodel-workspace/Automodel/nemo_automodel"
+# The image installs SGLang non-editable in the SGLang worker venv (Python 3.13).
+SGLANG_SITE=/opt/ray_venvs/nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker/lib/python3.13/site-packages/sglang
+[[ -n "${SGLANG_OVERRIDE:-}" ]] && MOUNTS="$MOUNTS,$SGLANG_OVERRIDE:$SGLANG_SITE"
 [[ -n "${DATA_MOUNTS:-}" ]] && MOUNTS="$MOUNTS,$DATA_MOUNTS"
 EXTRA="$EXTRA ${EXTRA_OVERRIDES:-}"  # e.g. EXTRA_OVERRIDES='grpo.val_period=2 grpo.max_num_steps=4'
 
