@@ -131,6 +131,31 @@ def test_not_accepted(kwargs: dict, main_rev: int, reason: str) -> None:
     assert len(desc) <= 140
 
 
+def test_round_trip_with_review_identity_footer() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "review_identity",
+        REPO_ROOT / "skills/review-pr-team/scripts/review_identity.py",
+    )
+    rid = importlib.util.module_from_spec(spec)
+    sys.modules["review_identity"] = rid
+    spec.loader.exec_module(rid)
+    ident = rid.Identity("claude-code", "2.1.330", "claude-opus-5-5", "medium", None)
+    line = rid.footer(ident=ident, kind="self", head="3672697ab12cd34ef")
+
+    fields = check.parse_marker(f"Review body.\n\n{line}\n")
+    assert fields == {
+        "kind": "self",
+        "harness": "claude-code/2.1.330",
+        "model": "claude-opus-5-5",
+        "effort": "medium",
+        "review-pr-team": f"v{rid.skill_revision()}",
+        "reviewed": "3672697",
+    }
+    review = check.Review(1, "alice", f"Review body.\n\n{line}\n", "t")
+    main_rev = rid.skill_revision()
+    assert run([review], [], main_rev=main_rev) == ("success", "Resolved (0 threads)")
+
+
 def test_footer_without_revision_is_not_accepted() -> None:
     body = "`nemo-rl-review: kind=self harness=claude-code/2.1.330 model=claude-opus-5-5 effort=medium`"
     review = check.Review(1, "alice", body, "t")
