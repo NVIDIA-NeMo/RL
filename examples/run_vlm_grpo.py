@@ -75,7 +75,7 @@ def main() -> None:
 
         config = OmegaConf.to_container(config, resolve=True)
         check_outdated_config(config)
-        config = MasterConfig(**config)
+        config = MasterConfig.model_validate(config)
         # Materialize the video sampling contract before constructing the
         # processor or vLLM workers.  In particular, this overrides vLLM
         # VideoMediaIO's independent 32-frame default for 64-frame recipes.

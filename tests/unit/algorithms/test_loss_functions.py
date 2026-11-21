@@ -16,6 +16,7 @@ import pickle
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import (
@@ -28,9 +29,10 @@ from nemo_rl.algorithms.loss import (
     NLLLossFn,
     prepare_loss_input,
 )
+from nemo_rl.algorithms.loss.clipped_pg import clipped_pg_diagnostic_metrics
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
-from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.algorithms.utils import calculate_kl
 from nemo_rl.algorithms.x_token.loss_utils import (
     build_exact_token_map,
     chunk_average_log_probs,
@@ -42,6 +44,7 @@ from nemo_rl.distributed.model_utils import (
     cp_shift_next,
     vocab_parallel_gather_columns,
 )
+from nemo_rl.utils.tensor_ops import masked_mean
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
@@ -673,6 +676,52 @@ def test_clipped_pg_loss_tokenless_rows_are_not_survivors(seq_logprob_error_in_l
         assert metrics["seq_logprob_error_valid_seqs"] == 0
 
 
+def _clipped_pg_diagnostics(
+    ratios: torch.Tensor, mask: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    logprobs = torch.zeros_like(ratios)
+    return clipped_pg_diagnostic_metrics(
+        curr_logprobs=logprobs,
+        prev_logprobs=logprobs,
+        generation_logprobs=logprobs,
+        ratios=ratios,
+        ratios_clamped=ratios.clamp(0.8, 1.2),
+        mask=mask,
+        global_valid_toks=torch.tensor(1.0),
+        reference_policy_kl_type="k3",
+    )
+
+
+def test_clipped_pg_diagnostics_take_an_empty_microbatch() -> None:
+    """A rank whose microbatch is only a failed rollout's empty placeholder row
+    gets zero-size ratios; min/max must not raise on them."""
+    empty = torch.zeros(1, 0)
+
+    metrics = _clipped_pg_diagnostics(empty, empty)
+
+    assert metrics["probs_ratio_min"].item() == float("inf")
+    assert metrics["probs_ratio_max"].item() == float("-inf")
+    assert metrics["probs_ratio_clamped_min"].item() == float("inf")
+    assert metrics["probs_ratio_clamped_max"].item() == float("-inf")
+
+
+def test_clipped_pg_diagnostics_min_max_follow_the_mask() -> None:
+    ratios = torch.tensor([[0.5, 1.1, 3.0, 9.0]])
+    mask = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
+
+    metrics = _clipped_pg_diagnostics(ratios, mask)
+
+    assert metrics["probs_ratio_min"].item() == pytest.approx(0.5)
+    assert metrics["probs_ratio_max"].item() == pytest.approx(3.0)
+    assert metrics["probs_ratio_clamped_min"].item() == pytest.approx(0.8)
+    assert metrics["probs_ratio_clamped_max"].item() == pytest.approx(1.2)
+
+    # A fully masked microbatch yields the same sentinels as an empty one.
+    masked_out = _clipped_pg_diagnostics(ratios, torch.zeros_like(mask))
+    assert masked_out["probs_ratio_min"].item() == float("inf")
+    assert masked_out["probs_ratio_max"].item() == float("-inf")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_clipped_pg_loss_top_p_support_mismatch_backward():
     data, _, _, _ = _setup_clipped_pg_test_data(seq_len=3, vocab_size=4, device="cuda")
@@ -815,6 +864,15 @@ def test_clipped_pg_loss_force_on_policy_ratio_ignores_prev_logprobs():
     # Both should produce identical loss and ratios since prev_logprobs is ignored
     torch.testing.assert_close(loss_1, loss_2)
     assert metrics_1["probs_ratio"] == metrics_2["probs_ratio"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "setting", ["reference_policy_kl_type", "truncated_importance_sampling_type"]
+)
+def test_clipped_pg_loss_config_rejects_unknown_types(setting):
+    """An unknown KL or truncated-IS type fails when the config is built."""
+    with pytest.raises(ValidationError, match="literal_error"):
+        ClippedPGLossConfig(**{setting: "unknown"})
 
 
 @pytest.mark.parametrize(
@@ -3069,9 +3127,9 @@ class TestMetricNormalizationAdvertisement:
 
     def test_default_grpo_config(self):
         norms = ClippedPGLossFn(ClippedPGLossConfig()).metric_normalizations
-        # token_level_loss=True default → gradient normalizer is TOKENS
-        assert norms["loss"] is MetricNormalizer.TOKENS
-        assert norms["kl_penalty"] is MetricNormalizer.TOKENS
+        # loss/KL follow the objective reduction's divisor
+        assert norms["loss"] is MetricNormalizer.LOSS_DIVISOR
+        assert norms["kl_penalty"] is MetricNormalizer.LOSS_DIVISOR
         assert norms["sampling_importance_ratio"] is MetricNormalizer.TOKENS
         for key in (
             "probs_ratio",
@@ -3099,8 +3157,8 @@ class TestMetricNormalizationAdvertisement:
                 use_importance_sampling_correction=True,
             )
         ).metric_normalizations
-        assert norms["loss"] is MetricNormalizer.SEQUENCES
-        assert norms["kl_penalty"] is MetricNormalizer.SEQUENCES
+        assert norms["loss"] is MetricNormalizer.LOSS_DIVISOR
+        assert norms["kl_penalty"] is MetricNormalizer.LOSS_DIVISOR
         assert norms["sampling_importance_ratio"] is MetricNormalizer.SEQUENCES
         # the always-token diagnostics do NOT follow loss_type
         assert norms["token_mult_prob_error"] is MetricNormalizer.TOKENS
@@ -3119,7 +3177,7 @@ class TestMetricNormalizationAdvertisement:
                 truncated_importance_sampling_ratio_min=0.5,
             )
         ).metric_normalizations
-        assert norms["loss"] is MetricNormalizer.TOKENS
+        assert norms["loss"] is MetricNormalizer.LOSS_DIVISOR
         assert norms["is_oob_ratio"] is MetricNormalizer.SEQUENCES
 
     def test_tis_under_sequence_level_loss_stays_tokens(self):
@@ -3133,7 +3191,7 @@ class TestMetricNormalizationAdvertisement:
                 truncated_importance_sampling_ratio=2.0,
             )
         ).metric_normalizations
-        assert norms["loss"] is MetricNormalizer.SEQUENCES
+        assert norms["loss"] is MetricNormalizer.LOSS_DIVISOR
         assert norms["is_oob_ratio"] is MetricNormalizer.TOKENS
 
     def test_nll_loss_advertises_counts_as_none(self):
@@ -3203,12 +3261,9 @@ class TestMetricNormalizationAdvertisement:
         torch.testing.assert_close(full_loss, minimal_loss)
         assert "gen_kl_error" in full_metrics
         assert "gen_kl_error" not in minimal_metrics
-        grad_normalizer = (
-            MetricNormalizer.TOKENS if token_level_loss else MetricNormalizer.SEQUENCES
-        )
         expected_normalizations = {
-            "loss": grad_normalizer,
-            "kl_penalty": grad_normalizer,
+            "loss": MetricNormalizer.LOSS_DIVISOR,
+            "kl_penalty": MetricNormalizer.LOSS_DIVISOR,
             "num_valid_samples": MetricNormalizer.NONE,
             "policy_support_excluded_tokens": MetricNormalizer.NONE,
             "positive_nll_loss": MetricNormalizer.NONE,
@@ -3326,7 +3381,8 @@ class TestMetricNormalizationAdvertisement:
         }
 
 
-def test_split_rescale_matches_sync_normalization():
+@pytest.mark.parametrize("token_level_loss", [True, False])
+def test_split_rescale_matches_sync_normalization(token_level_loss):
     """Metric parity of split-API rescale vs sync normalization.
 
     Sync path: the loss runs per microbatch with the TRUE global valid
@@ -3334,12 +3390,12 @@ def test_split_rescale_matches_sync_normalization():
     loss runs per microbatch with placeholder global_valid_*=1 (raw sums)
     and the trainer rescales the summed fragments by the advertised
     denominator at finish. The two must agree for every advertised metric
-    (PR #2683 review, F-TESTGAP — metric half; uses seq-mask-tis + token
-    level loss so the flag-keyed F-SEQ metrics are exercised too).
+    (PR #2683 review, F-TESTGAP — metric half; uses seq-mask-tis so the
+    flag-keyed F-SEQ metrics are exercised too).
     """
     torch.manual_seed(1234)
     cfg = ClippedPGLossConfig(
-        token_level_loss=True,
+        token_level_loss=token_level_loss,
         use_importance_sampling_correction=True,
         truncated_importance_sampling_type="seq-mask-tis",
         truncated_importance_sampling_ratio=1.5,
@@ -3386,11 +3442,20 @@ def test_split_rescale_matches_sync_normalization():
             raw_totals[key] = raw_totals.get(key, 0.0) + value
 
     norms = loss_fn.metric_normalizations
+    # Per microbatch: rows 0-2 kept (5 + 7 + 7 response tokens), row 3 dropped.
+    assert total_toks.item() == 38.0
+    assert total_seqs.item() == 6.0
+    denominators = {
+        MetricNormalizer.TOKENS: 38.0,
+        MetricNormalizer.SEQUENCES: 6.0,
+        # The gradient divides by valid tokens or valid sequences.
+        MetricNormalizer.LOSS_DIVISOR: 38.0 if token_level_loss else 6.0,
+    }
     for key, kind in norms.items():
         if kind is MetricNormalizer.NONE:
             continue  # extrema/counts: identical fragments in both styles
-        denom = total_toks if kind is MetricNormalizer.TOKENS else total_seqs
-        assert raw_totals[key] / denom.item() == pytest.approx(
+        denom = denominators[kind]
+        assert raw_totals[key] / denom == pytest.approx(
             sync_totals[key], rel=1e-5, abs=1e-7
         ), f"metric {key!r} (normalizer={kind}) diverges between sync and split"
     # counts pass through unchanged in both styles

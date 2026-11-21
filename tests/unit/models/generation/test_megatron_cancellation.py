@@ -35,6 +35,8 @@ def _client():
     client = object.__new__(InferenceClient)
     client.next_request_id = 0
     client.completion_futures = {}
+    client.abort_futures = {}
+    client._pending_source_requests = set()
     client.request_submission_times = {}
     client.aborted_request_ids = set()
     client.streams = {}

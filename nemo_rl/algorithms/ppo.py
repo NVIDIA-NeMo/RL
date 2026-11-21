@@ -28,8 +28,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
     GAEConfig,
-    GeneralizedAdvantageEstimator,
-    RawRewardAdvantageEstimator,
+    create_advantage_estimator,
 )
 from nemo_rl.algorithms.grpo import (
     RewardScalingConfig,
@@ -48,7 +47,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
     ClippedPGLossFn,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, make_objective_reduction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
 from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX
 from nemo_rl.algorithms.reward_functions import (
@@ -369,6 +368,10 @@ def setup(
     # Extract individual configs for easier access
     policy_config = master_config.policy
     value_config = master_config.value
+    if value_config.get("dedicated"):
+        raise ValueError(
+            "value.dedicated=true requires the SingleController PPO entrypoint"
+        )
     generation_config = master_config.policy["generation"]
     env_configs = master_config.env
     loss_config: ClippedPGLossConfig = master_config.loss_fn
@@ -376,6 +379,13 @@ def setup(
         raise ValueError(
             "Score centering and policy.generation.sampler_replay.enabled require SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy PPO trainer does not capture sampler tensors."
         )
+    megatron_cfg = policy_config.get("megatron_cfg")
+    make_objective_reduction(loss_config.resolved_normalization).validate_setup(
+        trainer="ppo",
+        algorithm="ppo",
+        megatron_enabled=megatron_cfg is not None and megatron_cfg["enabled"],
+        on_policy_distillation=False,
+    )
     ppo_config = master_config.ppo
     data_config = master_config.data
     logger_config = master_config.logger
@@ -1264,20 +1274,13 @@ def _create_advantage_estimator(master_config: MasterConfig):
     adv_estimator_config = ppo_config.adv_estimator
 
     adv_estimator_name = adv_estimator_config.name
+    adv_estimator = create_advantage_estimator(adv_estimator_config, loss_config)
     if adv_estimator_name == "gae":
-        adv_estimator = GeneralizedAdvantageEstimator(adv_estimator_config, loss_config)
         gae_lambda = adv_estimator_config.gae_lambda
         gae_gamma = adv_estimator_config.gae_gamma
         print(f"  ✓ Using GAE advantage estimator (λ={gae_lambda}, γ={gae_gamma})")
     elif adv_estimator_name == "raw_reward":
-        adv_estimator = RawRewardAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using raw reward advantage estimator (no value model, no baselines)")
-    else:
-        raise ValueError(
-            f"Invalid adv_estimator name for PPO: {adv_estimator_name!r}. "
-            f"PPO only supports 'gae' or 'raw_reward'."
-        )
-
     return adv_estimator
 
 

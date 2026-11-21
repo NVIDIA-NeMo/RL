@@ -153,6 +153,8 @@ class RolloutReassemblerActorConfig:
     # media rows in this geometry for groups without media), ``None`` otherwise.
     media_columns: Optional[MediaColumnSpec]
     top_logprobs: int
+    # grpo.agent_overrides is set: stamp rows with their agent name.
+    stamp_agent_names: bool = False
     reward_penalty_config: RewardPenaltyConfig | None = None
     length_penalty_config: LengthPenaltyConfig | None = None
     effort_config: EffortLevelsConfig | None = None
@@ -200,6 +202,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             tokenizer=tokenizer,
             thinking_tags=config.thinking_tags,
             top_logprobs=config.top_logprobs,
+            stamp_agent_names=config.stamp_agent_names,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

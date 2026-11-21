@@ -33,10 +33,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
-    GDPOAdvantageEstimator,
-    GRPOAdvantageEstimator,
-    OPDAdvantageEstimator,
-    ReinforcePlusPlusAdvantageEstimator,
+    create_advantage_estimator,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -47,7 +44,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
     ClippedPGLossFn,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, make_objective_reduction
 from nemo_rl.algorithms.metric_utils import (
     GRAD_NORM_KEY,
     LOSS_KEY,
@@ -395,6 +392,25 @@ DEFAULT_POLICY_FAILURE_KINDS = (
 )
 
 
+class AgentOverrideConfig(BaseModel, extra="forbid"):
+    """Per-environment GRPO settings for one attribution key (``grpo.agent_overrides``).
+
+    The key is the rows' attribution key, as in ``grpo.length_penalty.agent_overrides``:
+    the NeMo-Gym agent name for flat rows, the ``task_id.taskset`` for materialized
+    task rows. An unset field (None) inherits the run-wide value. Applied by the
+    SingleController advantage stage to the rows of that key's prompt groups, so a
+    multi-environment run can treat e.g. a judge-graded environment differently
+    from pass/fail ones.
+    """
+
+    # Overrides grpo.overlong_filtering: True leaves this environment's truncated
+    # rows out of the loss, False trains them at their reward.
+    overlong_filtering: Optional[bool] = None
+    # Overrides grpo.adv_estimator.normalize_rewards: whether this environment's
+    # group advantages are divided by the group's reward standard deviation.
+    normalize_rewards: Optional[bool] = None
+
+
 class GRPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
@@ -456,6 +472,12 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
     async_grpo: AsyncGRPOConfig | None = Field(default_factory=AsyncGRPOConfig)
     overlong_filtering: bool = False
+    # Per-environment settings keyed by the rows' attribution key, as in
+    # grpo.length_penalty.agent_overrides: the Gym agent name for flat rows
+    # (e.g. rubric_judge_agent), the task_id.taskset for materialized task rows
+    # (e.g. "rubric_judge:train"). See AgentOverrideConfig.
+    # SingleController with token capture only: the legacy ``setup()`` rejects it.
+    agent_overrides: dict[str, AgentOverrideConfig] | None = None
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool = False
@@ -489,6 +511,60 @@ class GRPOConfig(BaseModel, extra="allow"):
     # training rollout rewards (binary single-reward envs only); see
     # docs/guides/length-penalty.md. None/absent disables the feature.
     length_penalty: Optional[LengthPenaltyConfig] = None
+
+    @model_validator(mode="after")
+    def _validate_agent_overrides(self) -> "GRPOConfig":
+        overrides = self.agent_overrides
+        if overrides is None:
+            return self
+        if not overrides:
+            raise ValueError(
+                "grpo.agent_overrides must name at least one attribution key "
+                "(or be null)"
+            )
+        for agent, override in overrides.items():
+            if not isinstance(agent, str) or not agent:
+                raise ValueError(
+                    "grpo.agent_overrides keys must be non-empty attribution keys"
+                )
+            if (
+                override.overlong_filtering is None
+                and override.normalize_rewards is None
+            ):
+                raise ValueError(
+                    f"grpo.agent_overrides.{agent} sets nothing; set "
+                    "overlong_filtering and/or normalize_rewards"
+                )
+            if (
+                override.normalize_rewards is not None
+                and self.adv_estimator.name != "grpo"
+            ):
+                raise ValueError(
+                    f"grpo.agent_overrides.{agent}.normalize_rewards needs "
+                    f"grpo.adv_estimator.name 'grpo', got {self.adv_estimator.name!r}"
+                )
+            if (
+                override.overlong_filtering not in (None, self.overlong_filtering)
+                and self.use_dynamic_sampling
+                and self.masked_reward_policy == "exclude"
+            ):
+                # Dynamic sampling picks its voters with the run-wide
+                # overlong_filtering, so it would keep or drop this key's
+                # groups by the wrong rows.
+                raise ValueError(
+                    f"grpo.agent_overrides.{agent}.overlong_filtering differs from "
+                    "grpo.overlong_filtering, which grpo.use_dynamic_sampling with "
+                    "masked_reward_policy 'exclude' does not support"
+                )
+        return self
+
+    def agent_override_value(
+        self, agent_name: Optional[str], field_name: str, default: bool
+    ) -> bool:
+        """Return ``field_name`` for ``agent_name``, falling back to ``default``."""
+        override = (self.agent_overrides or {}).get(agent_name or "")
+        value = getattr(override, field_name, None) if override is not None else None
+        return default if value is None else bool(value)
 
 
 @dataclass
@@ -667,10 +743,13 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
             "loss_fn.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
         )
     loss = master_config.loss_fn
-    if not loss.force_on_policy_ratio or not loss.token_level_loss:
+    if (
+        not loss.force_on_policy_ratio
+        or loss.resolved_normalization != "global_token_mean"
+    ):
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires force_on_policy_ratio=true "
-            "and token_level_loss=true"
+            "and normalization=global_token_mean (legacy token_level_loss=true)"
         )
     # Without the policy-logprob pass, KL-in-reward would have no policy logprobs.
     if loss.use_kl_in_reward or (ppo is None and algo.adv_estimator.name != "grpo"):
@@ -683,6 +762,19 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires ppo.ppo_epochs=1, got "
             f"ppo.ppo_epochs={ppo.ppo_epochs}"
+        )
+    # The loss cannot remove rejected rows from statistics already computed.
+    if ppo is None and algo.masked_reward_policy == "exclude":
+        raise ValueError(
+            "grpo.masked_reward_policy=exclude is incompatible with "
+            "loss_fn.seq_logprob_error_in_loss=true. Set masked_reward_policy=include "
+            "or seq_logprob_error_in_loss=false to filter before advantage calculation."
+        )
+    if ppo is not None and ppo.adv_estimator.normalize_advantages:
+        raise ValueError(
+            "ppo.adv_estimator.normalize_advantages=true is incompatible with "
+            "loss_fn.seq_logprob_error_in_loss=true. Set normalize_advantages=false "
+            "or seq_logprob_error_in_loss=false to normalize over the filtered batch."
         )
     policy = master_config.policy
     if "megatron_cfg" not in policy or not policy["megatron_cfg"]["enabled"]:
@@ -799,6 +891,13 @@ def setup(
         raise ValueError(
             "Score centering and policy.generation.sampler_replay.enabled require SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
         )
+    megatron_cfg = policy_config.get("megatron_cfg")
+    make_objective_reduction(loss_config.resolved_normalization).validate_setup(
+        trainer="grpo",
+        algorithm="grpo",
+        megatron_enabled=megatron_cfg is not None and megatron_cfg["enabled"],
+        on_policy_distillation=opd_module.is_opd_enabled(master_config),
+    )
     env_configs = master_config.env
     data_config = master_config.data
     grpo_config = master_config.grpo
@@ -878,6 +977,13 @@ def setup(
             "This entry point never reads it, so leaving it enabled here would "
             "silently train the sampled-token top-k objective instead of the "
             "full-vocabulary reverse KL."
+        )
+    if grpo_config.agent_overrides:
+        raise NotImplementedError(
+            "grpo.agent_overrides is applied by the SingleController advantage "
+            "stage (examples/run_grpo_single_controller.py); this path does not "
+            "apply it. Use the run-wide grpo.overlong_filtering / "
+            "grpo.adv_estimator.normalize_rewards here, or the SingleController path."
         )
 
     # Set seed for all random number generators
@@ -1858,8 +1964,8 @@ def setup(
             )
             vllm_reserve_time = time.perf_counter() - vllm_reserve_t0
             print(
-                f"  ✓ Reserved {len(deferred_vllm.dp_openai_server_base_urls)} vLLM server URLs: "
-                f"{deferred_vllm.dp_openai_server_base_urls}",
+                f"  ✓ Reserved {len(deferred_vllm.client_base_urls)} vLLM server URLs: "
+                f"{deferred_vllm.client_base_urls}",
                 flush=True,
             )
 
@@ -1873,7 +1979,7 @@ def setup(
             def init_nemo_gym():
                 """Spin up NeMo Gym servers with the pre-assigned vLLM URLs."""
                 return _spinup_nemo_gym(
-                    deferred_vllm.dp_openai_server_base_urls,
+                    deferred_vllm.client_base_urls,
                     generation_config["model_name"],
                     policy_api_key=deferred_vllm.http_server_api_key,
                 )
@@ -2814,7 +2920,7 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
 
 def _apply_async_sample_masks(
     repeated_batch: BatchedDataDict[DatumSpec],
-    overlong_filtering: bool,
+    overlong_filtering: bool | torch.Tensor,
     timer: Optional[Timer] = None,
 ) -> tuple[dict[str, int], int]:
     """Zero loss_multiplier for masked async rows and attribute each mask once.
@@ -2828,7 +2934,9 @@ def _apply_async_sample_masks(
     Args:
         repeated_batch: Training batch; ``loss_multiplier`` is updated in place.
         overlong_filtering: Whether truncated rows are masked. When enabled,
-            ``truncated`` is required, as in the sync path.
+            ``truncated`` is required, as in the sync path. A boolean tensor of
+            one entry per row instead masks only the truncated rows whose entry
+            is True (``grpo.agent_overrides``).
         timer: Optional timer. The overlong and mask_sample steps keep their
             historical ``overlong_filter`` / ``mask_sample_filter`` labels.
 
@@ -2846,6 +2954,17 @@ def _apply_async_sample_masks(
         )
     batch_size = loss_multiplier.numel()
     eligible = loss_multiplier != 0
+    overlong_rows: Optional[torch.Tensor] = None
+    if isinstance(overlong_filtering, torch.Tensor):
+        overlong_rows = overlong_filtering.reshape(-1).to(
+            device=eligible.device, dtype=torch.bool
+        )
+        if overlong_rows.numel() != batch_size:
+            raise ValueError(
+                f"overlong_filtering has {overlong_rows.numel()} rows; "
+                f"expected {batch_size}"
+            )
+        overlong_filtering = bool(overlong_rows.any().item())
     sample_mask_metrics = {
         "num_masked_seqs_by_loss_multiplier": int((~eligible).sum().item()),
         "num_masked_seqs_by_overlong_filtering": 0,
@@ -2901,6 +3020,8 @@ def _apply_async_sample_masks(
                     f"expected {batch_size}"
                 )
             candidate_mask = candidate_mask.to(device=eligible.device, dtype=torch.bool)
+            if field_name == "truncated" and overlong_rows is not None:
+                candidate_mask = candidate_mask & overlong_rows
             if field_name == "mask_sample":
                 num_mask_sample_filtered = int(candidate_mask.sum().item())
             newly_masked = eligible & candidate_mask
@@ -3139,7 +3260,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
         master_config: The master configuration dictionary.
 
     Returns:
-        An advantage estimator instance (GRPO, GDPO, or ReinforcePlusPlus).
+        An advantage estimator instance (GRPO, GDPO, OPD, or ReinforcePlusPlus).
 
     Raises:
         ValueError: If the advantage estimator name is not recognized.
@@ -3150,17 +3271,9 @@ def _create_advantage_estimator(master_config: MasterConfig):
     adv_estimator_config = grpo_config.adv_estimator
 
     adv_estimator_name = adv_estimator_config.name
-    if adv_estimator_name == "gdpo":
-        adv_estimator = GDPOAdvantageEstimator(adv_estimator_config, loss_config)
-        print("  ✓ Using GDPO advantage estimator (multi-reward)")
-    elif adv_estimator_name == "grpo":
-        adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
-        print("  ✓ Using GRPO advantage estimator")
-    elif adv_estimator_name == "opd":
+    if adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
         opd_module.assert_trust_region_supported(master_config)
-        adv_estimator = OPDAdvantageEstimator(adv_estimator_config, loss_config)
-        print("  ✓ Using OPD advantage estimator")
         # Warn if loss_fn is not configured per MOPD paper recommendations.
         if not loss_config.disable_ppo_ratio:
             warnings.warn(
@@ -3175,14 +3288,8 @@ def _create_advantage_estimator(master_config: MasterConfig):
                 "OPD recommends loss_fn.truncated_importance_sampling_type: 'icepop' "
                 "(hard gate, MOPD Eq. 8)"
             )
-    elif adv_estimator_name == "reinforce_plus_plus":
-        adv_estimator = ReinforcePlusPlusAdvantageEstimator(
-            adv_estimator_config, loss_config
-        )
-        print("  ✓ Using Reinforce++ advantage estimator")
-    else:
-        raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
-
+    adv_estimator = create_advantage_estimator(adv_estimator_config, loss_config)
+    print(f"  ✓ Using {adv_estimator_name} advantage estimator")
     return adv_estimator
 
 
