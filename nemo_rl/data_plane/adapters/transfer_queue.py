@@ -270,7 +270,7 @@ class _StagingPoolRegistry:
 
     def _build(self, client: Any) -> _NativeStagingPool:
         # Deferred: mooncake.store is a compiled extension, absent without the wheel.
-        from mooncake.store import BufferPool  # pyrefly: ignore[import-error]
+        from mooncake.store import BufferPool  # pyrefly: ignore[missing-import]
 
         pool_bytes = self._n_slots * self._max_bytes
         if client.local_buffer_size < pool_bytes:
