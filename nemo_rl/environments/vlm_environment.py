@@ -152,7 +152,7 @@ class VLMEnvironment(EnvironmentInterface):
         """Runs a step in the vlm environment.
 
         Args:
-            message_log: list[list[dict[str, str]]]. A batch of OpenAI-API-like message logs that represent interactions with the VLM.
+            message_log_batch: list[list[dict[str, str]]]. A batch of OpenAI-API-like message logs that represent interactions with the VLM.
             metadata: list[VLMEnvironmentMetadata]. The grader will use the 'ground_truth' key to evaluate correctness.
 
         Returns:

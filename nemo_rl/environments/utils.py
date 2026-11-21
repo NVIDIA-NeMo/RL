@@ -69,7 +69,7 @@ def chunk_list_to_workers(to_chunk: list[Any], num_workers: int) -> list[list[An
     and the remaining workers will have empty lists.
 
     Args:
-        list: The list to be chunked.
+        to_chunk: The list to be chunked.
         num_workers: The number of workers to distribute the list to.
 
     Returns:
