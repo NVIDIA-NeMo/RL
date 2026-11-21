@@ -15,6 +15,9 @@
 
 States (shown in the status description):
   No self-review           the author has not published a review made by review-pr-team
+  Self-review found without the review-pr-team footer
+                           the author has a non-empty review but none with a kind=self footer
+                           (empty-body reviews, which thread replies create, don't count)
   Not accepted: <reason>   the review's footer names a harness/model/effort or skill
                            revision that skills/review-pr-team/self-review-policy.json rejects
   Not resolved: N of M     some self-review threads have no reply or are not resolved
@@ -92,7 +95,9 @@ def not_accepted_reason(
         return "no skill revision in the footer"
     rev = int(match.group(1))
     if main_rev - rev > policy["max_revision_lag"]:
-        return f"review-pr-team rev {rev} is too old (main is {main_rev}); update the skill"
+        return (
+            f"review-pr-team v{rev} is too old (main is v{main_rev}); update the skill"
+        )
     return None
 
 
@@ -112,6 +117,12 @@ def evaluate(
         if r.author == author and (parse_marker(r.body) or {}).get("kind") == "self"
     ]
     if not own:
+        if any(r.author == author and r.body.strip() for r in reviews):
+            return (
+                "failure",
+                "Self-review found without the review-pr-team footer — rerun "
+                f"/review-pr-team {pr_number} in a fresh Claude Code or Codex session",
+            )
         return (
             "failure",
             f"No self-review — run /review-pr-team {pr_number} in a fresh Claude Code or Codex session",

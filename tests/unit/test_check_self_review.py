@@ -95,10 +95,10 @@ def test_parse_marker_ignores_non_footers(body: str) -> None:
         [check.Review(1, "bob", marker(), "t")],
         # Someone else's review that quotes the author's footer line.
         [check.Review(1, "bob", "Re your review:\n" + marker(), "t")],
-        # Author's review without a marker (e.g. a plain comment review).
-        [check.Review(1, "alice", "LGTM", "t")],
-        # An expert review by the author is not a self-review.
-        [check.Review(1, "alice", marker(kind="expert"), "t")],
+        # A plain review from someone else.
+        [check.Review(1, "bob", "LGTM", "t")],
+        # Only empty-body author reviews: replying to a review thread creates these.
+        [check.Review(1, "alice", "", "t"), check.Review(2, "alice", "  \n", "t")],
     ],
 )
 def test_no_self_review(reviews) -> None:
@@ -110,6 +110,41 @@ def test_no_self_review(reviews) -> None:
 
 
 @pytest.mark.parametrize(
+    "reviews",
+    [
+        # Only a plain author review.
+        [check.Review(1, "alice", "LGTM", "t")],
+        # An author review with a footer that isn't kind=self.
+        [check.Review(1, "alice", marker(kind="expert"), "t")],
+        # A plain review next to empty-body thread replies.
+        [
+            check.Review(1, "alice", "", "t"),
+            check.Review(2, "alice", "Looks good", "t"),
+        ],
+    ],
+)
+def test_review_without_footer(reviews) -> None:
+    state, desc = run(reviews, [])
+    assert state == "failure"
+    assert desc == (
+        "Self-review found without the review-pr-team footer — rerun "
+        "/review-pr-team 7 in a fresh Claude Code or Codex session"
+    )
+    assert len(desc) <= 140
+
+
+def test_later_plain_review_does_not_hide_the_footer_review() -> None:
+    footer_review = check.Review(1, "alice", marker(), "2026-01-01")
+    plain = check.Review(2, "alice", "One more note.", "2026-02-01")
+    assert run([footer_review, plain], []) == ("success", "Resolved (0 threads)")
+    # The footer review is still the one evaluated: its threads count.
+    assert run([footer_review, plain], [check.Thread(False, 1, 1)]) == (
+        "failure",
+        "Not resolved: 1 of 1 threads open or unanswered",
+    )
+
+
+@pytest.mark.parametrize(
     ("kwargs", "main_rev", "reason"),
     [
         ({"model": "claude-sonnet-5-5"}, 2, "model claude-sonnet-5-5 is not allowed"),
@@ -118,7 +153,11 @@ def test_no_self_review(reviews) -> None:
         ({"rev": "vx"}, 2, "no skill revision in the footer"),
         # The number needs its "v".
         ({"rev": "2"}, 2, "no skill revision in the footer"),
-        ({"rev": "v2"}, 6, "rev 2 is too old"),
+        (
+            {"rev": "v2"},
+            6,
+            "review-pr-team v2 is too old (main is v6); update the skill",
+        ),
         ({"harness": "codex/0.167.2", "model": "gpt-5.6-sol"}, 2, "model gpt-5.6-sol"),
     ],
 )
