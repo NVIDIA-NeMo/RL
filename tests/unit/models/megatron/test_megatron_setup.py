@@ -4804,6 +4804,8 @@ class TestSetupModelAndOptimizer:
 class TestSetupReferenceModelState:
     """Tests for setup_reference_model_state function."""
 
+    @pytest.mark.parametrize("peft_enabled", [False, True])
+    @patch("nemo_rl.models.megatron.setup._create_peft_pre_wrap_hook")
     @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
     @patch("nemo_rl.models.megatron.setup.init_checkpointing_context")
     @patch("nemo_rl.models.megatron.setup.GlobalState")
@@ -4821,6 +4823,8 @@ class TestSetupReferenceModelState:
         mock_global_state,
         mock_init_ckpt_context,
         mock_pg_collection,
+        mock_create_peft_pre_wrap_hook: MagicMock,
+        peft_enabled: bool,
         capsys,
     ):
         """Test setup_reference_model_state when checkpoint exists."""
@@ -4836,8 +4840,12 @@ class TestSetupReferenceModelState:
         # Create mock model with state dict
         mock_model = MagicMock()
         mock_model.state_dict.return_value = {
-            "layer1.weight": torch.tensor([1.0, 2.0]),
-            "layer1.bias": torch.tensor([0.1]),
+            "layer1.weight": torch.nn.Parameter(
+                torch.tensor([1.0, 2.0]), requires_grad=False
+            ),
+            "layer1.adapter.weight": torch.nn.Parameter(torch.tensor([3.0])),
+            "expert_bias": torch.tensor([0.1]),
+            "_extra_state": {"step": 4},
         }
         mock_get_model.return_value = [mock_model]
 
@@ -4846,6 +4854,17 @@ class TestSetupReferenceModelState:
         config = {
             "megatron_cfg": {
                 "freeze_moe_router": False,
+                "peft": {
+                    "enabled": peft_enabled,
+                    "dim": 8,
+                    "alpha": 16,
+                    "target_modules": [],
+                    "exclude_modules": [],
+                    "dropout": 0.0,
+                    "dropout_position": "pre",
+                    "a2a_experimental": False,
+                    "lora_dtype": None,
+                },
             }
         }
 
@@ -4856,18 +4875,28 @@ class TestSetupReferenceModelState:
         )
 
         # Verify checkpoint was loaded
-        mock_load_checkpoint.assert_called_once()
+        assert mock_load_checkpoint.call_count == int(not peft_enabled)
 
         # Verify model was set to eval mode
         mock_model.eval.assert_called_once()
 
         # Verify state dict is returned
         assert isinstance(result, dict)
-        assert "layer1.weight" in result
-        assert "layer1.bias" in result
+        assert ("layer1.weight" in result) == (not peft_enabled)
+        assert "layer1.adapter.weight" in result
+        assert "expert_bias" in result
+        assert result["_extra_state"] == {"step": 4}
+        mock_model.state_dict.assert_called_once_with(keep_vars=True)
 
         # Verify tensors are on CPU
-        assert result["layer1.weight"].device.type == "cpu"
+        adapter = result["layer1.adapter.weight"]
+        assert adapter.device.type == "cpu"
+        assert not adapter.requires_grad
+        torch.testing.assert_close(adapter, torch.tensor([3.0]))
+        assert (
+            adapter.data_ptr()
+            != mock_model.state_dict.return_value["layer1.adapter.weight"].data_ptr()
+        )
 
         captured = capsys.readouterr()
         assert "Reference model loaded" in captured.out
