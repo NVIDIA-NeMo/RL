@@ -1427,52 +1427,47 @@ async def run_sample_multi_turn_rollout(
 
         turn_count += 1
 
-        # Generate response for this sample using async generation
-        try:
-            turn_multimodal_data = sample_multimodal_data
-            if turn > 0 and "vllm_content" in sample_multimodal_data:
-                turn_multimodal_data = dict(sample_multimodal_data)
-                turn_multimodal_data["vllm_content"] = None
+        # A failed turn propagates and fails the batch rather than returning a partial rollout.
+        turn_multimodal_data = sample_multimodal_data
+        if turn > 0 and "vllm_content" in sample_multimodal_data:
+            turn_multimodal_data = dict(sample_multimodal_data)
+            turn_multimodal_data["vllm_content"] = None
 
-            (
-                updated_message_log,
-                generated_tokens,
-                input_lengths,
-                gen_metrics,
-            ) = await async_generate_response_for_sample_turn(
-                policy_generation,
-                current_message_log,
-                current_stop_strings,
-                tokenizer,
-                max_seq_len,
-                greedy=greedy,
-                sample_multimodal_data=turn_multimodal_data,
-                deduplicate_multimodal_data=deduplicate_multimodal_data,
+        (
+            updated_message_log,
+            generated_tokens,
+            input_lengths,
+            gen_metrics,
+        ) = await async_generate_response_for_sample_turn(
+            policy_generation,
+            current_message_log,
+            current_stop_strings,
+            tokenizer,
+            max_seq_len,
+            greedy=greedy,
+            sample_multimodal_data=turn_multimodal_data,
+            deduplicate_multimodal_data=deduplicate_multimodal_data,
+        )
+        current_message_log = updated_message_log
+
+        # Check if response was truncated (hit max_tokens without stop token)
+        response_truncated = gen_metrics.pop("_response_truncated", None)
+        if response_truncated is not None and response_truncated[0]:
+            truncated = True
+
+        # Update token counts
+        gen_token_count = len(generated_tokens)
+        assistant_token_count += gen_token_count
+        token_count += gen_token_count
+        turn_gen_tokens.append(gen_token_count)
+        turn_input_tokens.append(int(input_lengths))
+        turn_total_tokens.append(int(input_lengths) + gen_token_count)
+        # Per-worker load accounting
+        if "gen_leader_worker_idx" in gen_metrics:
+            worker_idx = int(gen_metrics["gen_leader_worker_idx"])
+            per_worker_token_counts[worker_idx] = (
+                per_worker_token_counts.get(worker_idx, 0) + gen_token_count
             )
-            current_message_log = updated_message_log
-
-            # Check if response was truncated (hit max_tokens without stop token)
-            response_truncated = gen_metrics.pop("_response_truncated", None)
-            if response_truncated is not None and response_truncated[0]:
-                truncated = True
-
-            # Update token counts
-            gen_token_count = len(generated_tokens)
-            assistant_token_count += gen_token_count
-            token_count += gen_token_count
-            turn_gen_tokens.append(gen_token_count)
-            turn_input_tokens.append(int(input_lengths))
-            turn_total_tokens.append(int(input_lengths) + gen_token_count)
-            # Per-worker load accounting
-            if "gen_leader_worker_idx" in gen_metrics:
-                worker_idx = int(gen_metrics["gen_leader_worker_idx"])
-                per_worker_token_counts[worker_idx] = (
-                    per_worker_token_counts.get(worker_idx, 0) + gen_token_count
-                )
-
-        except Exception as e:
-            print(f"Error generating response for sample {sample_idx}: {e}")
-            break
 
         # Create single-sample batch for environment interaction
         sample_batch = BatchedDataDict[DatumSpec](
