@@ -213,15 +213,16 @@ class TestVllmRemoteSparseWeightSynchronizer:
         assert sync._targets == []
         assert sync._overwrite_names == []
 
-    def test_fails_before_transfer_when_kv_cache_invalidation_fails(self, mock_ray):
-        policy = MagicMock()
-        generation = MagicMock()
-        generation.invalidate_kv_cache.return_value = False
-        sync = VllmRemoteSparseWeightSynchronizer(policy, generation, transport="s3")
+    def test_sync_weights_does_not_invalidate_kv_cache(self, mock_ray):
+        sync, _policy, generation = _remote_sparse_sync(
+            mock_ray,
+            "s3",
+            [{"payloads": 0, "changed_elements": 0, "total_elements": 1}],
+        )
 
-        with pytest.raises(RuntimeError, match="KV cache invalidation failed"):
-            sync.sync_weights()
-        policy.worker_group.run_all_workers_multiple_data.assert_not_called()
+        sync.sync_weights()
+
+        generation.invalidate_kv_cache.assert_not_called()
 
     def test_initializes_streams_commits_and_updates_baseline(
         self, mock_ray, post, capsys
