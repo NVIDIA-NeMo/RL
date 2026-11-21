@@ -97,6 +97,13 @@ def resolve_generation_class(
 ) -> type[GenerationInterface]:
     """Map `generation_config` to its GenerationInterface class."""
     backend = generation_config["backend"]
+    if generation_config.get("dynamo") and backend not in ("vllm", "megatron"):
+        raise ValueError(
+            "policy.generation.dynamo=true serves vLLM workers or Megatron "
+            f"prefill/decode engines through Dynamo and does not apply to "
+            f"backend={backend!r}. Set policy.generation.backend=vllm or "
+            "policy.generation.backend=megatron, or remove policy.generation.dynamo."
+        )
     if backend == "vllm":
         from nemo_rl.models.generation.vllm import VllmGeneration
 
@@ -160,11 +167,12 @@ def configure_generation_config(
             "extend the training worker instead."
         )
 
-    if dynamo_enabled(config) and config["backend"] != "vllm":
+    if dynamo_enabled(config) and config["backend"] not in ("vllm", "megatron"):
         raise ValueError(
-            "policy.generation.dynamo=true serves NeMo RL's vLLM workers through "
-            f"Dynamo and does not apply to backend={config['backend']!r}. Set "
-            "policy.generation.backend=vllm, or remove policy.generation.dynamo."
+            "policy.generation.dynamo=true serves NeMo RL's vLLM workers or "
+            "Megatron prefill/decode engines through Dynamo and does not apply to "
+            f"backend={config['backend']!r}. Set policy.generation.backend=vllm or "
+            "policy.generation.backend=megatron, or remove policy.generation.dynamo."
         )
     if config.get("dynamo_cfg") is not None and not dynamo_enabled(config):
         raise ValueError(
