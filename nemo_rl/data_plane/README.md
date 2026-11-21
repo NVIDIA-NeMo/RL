@@ -352,7 +352,7 @@ Each DP rank's `_fetch` would otherwise pad to its slice's local max, so two ran
 That breaks any collective that assumes cross-rank shape uniformity (mcore MoE all-to-all, CP, etc.). The data plane handles this with a single per-batch cap minted on the driver:
 
 * `TQPolicy._stamp_pad_seqlen(meta)` runs before every fan-out (`train_from_meta`, `_logprob_dispatch`, `read_from_dataplane`).
-  Idempotent — sets `meta.extra_info["global_forward_pad_seqlen"]` to `round_up(max(meta.sequence_lengths), max(pad_to_multiple, sequence_length_round))` on first call, no-op on subsequent calls.
+  Idempotent — sets `meta.extra_info["global_forward_pad_seqlen"]` to `round_up(max(meta.sequence_lengths), lcm(make_sequence_length_divisible_by, pad_to_multiple, sequence_length_round))` on first call, no-op on subsequent calls. The consuming model's configured alignment applies even when rollout metadata omits `pad_to_multiple` (for example, AutoModel HybridEP requires aligned token counts). Pre-placed training metadata uses the same constraints.
 * `shard_meta_for_dp` propagates `extra_info` to every per-rank meta via `dict(meta.extra_info)` — so all ranks see the same target.
 * Worker `_fetch` and driver `read_columns` both pass `pad_to_seqlen = meta.extra_info["global_forward_pad_seqlen"]` into `codec.materialize`, which right-pads the seq dim to that absolute target. All DP ranks within a step therefore return columns at one identical seq dim.
 

@@ -16,6 +16,46 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 `run_grpo_single_controller.py` mirrors `run_grpo.py` for config loading — the same YAML files apply — but requires a few settings the legacy path does not. The default exemplar lives at [examples/configs/grpo_math_1B_megatron_single_controller.yaml](../../examples/configs/grpo_math_1B_megatron_single_controller.yaml); the PPO one at [examples/configs/ppo_math_1B_megatron_single_controller.yaml](../../examples/configs/ppo_math_1B_megatron_single_controller.yaml).
 
+### AutoModel full-batch baseline
+
+AutoModel supports the initial text GRPO baseline: dense and MoE full-parameter FSDP2, TP=CP=1, fixed microbatches, disaggregated async vLLM, `in_order` at any `max_lookahead_versions`, and a streaming threshold equal to `grpo.num_prompts_per_step`.
+Packing, dynamic batching, CPU offload, HSDP, LoRA, draft training, VLM, PPO, distillation, dynamic sampling, and token capture are not enabled in this stage.
+Both prompt-drop budgets must be zero. Explicit unsupported settings fail at
+setup; the worker also rejects unsupported model properties before training.
+
+Expert parallelism uses the existing AutoModel MoE path; SC does not impose
+EP=1. Configure `policy.automodel_cfg.expert_parallel_size` and a compatible
+dispatcher for the model and allocated training GPUs. The same full-batch
+lifecycle and gradient clipping operate on AutoModel's expert mesh.
+
+One full-batch dispatch still runs multiple backend forward/backward passes.
+The optimizer and scheduler advance once, in `finish_train_step`; abort clears
+pending gradients without an update. The existing synchronous AutoModel training
+path retains its broader configuration support.
+
+Run the checkpoint/resume integration smoke on two GPUs:
+
+```bash
+bash tests/functional/automodel_sc_full_batch_smoke.sh
+```
+
+The script uses the Qwen2.5-1.5B SC recipe with one training GPU and one rollout
+GPU. It saves after step 1 and resumes through step 4. Append normal config
+overrides for a local model path or W&B logging; set the `EXP_DIR` environment variable to a fresh parent directory to choose where both launches write logs and checkpoints.
+
+For numerical parity, run the fixed-data test in the AutoModel environment:
+
+```bash
+uv run --extra automodel python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  tests/functional/automodel_sc_full_batch_parity.py \
+  --model /path/to/gemma-4-E2B-it --output /path/to/parity-results \
+  --source-sha "$(git rev-parse HEAD)"
+```
+
+See the [AutoModel full-batch design](../design-docs/automodel-single-controller-full-batch.md)
+for the lifecycle, numerical primitives, forward-padding contract, and training
+comparison curves.
+
 ### Mandatory settings
 
 1. **Enable the TransferQueue data plane** (required — the entrypoint refuses to start otherwise):
@@ -489,7 +529,8 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   A group in which no rollout carried media (an all-text prompt in a mixed dataset) is published with empty media rows in the partition's pinned pixel dtype and patch width, so its keys can share a train fetch with media keys.
   Compaction, mixed image/video conversations, native audio, video token pruning, static tiling (`image_num_patches`), other processor families, and `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo Gym rollouts; multimodal/VLM MOPD is not yet supported. See [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
-- Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
+- Train backend: Megatron supports the configurations described in this guide.
+  AutoModel is limited to the [full-batch baseline](#automodel-full-batch-baseline); the streaming and broader sampler options elsewhere in this guide do not apply to AutoModel yet.
 - Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). vLLM generation can also serve through Dynamo (`policy.generation.dynamo: true`); see [Dynamo serving](dynamo-generation.md). SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, but each critic epoch must contain exactly `value.train_global_batch_size` samples in either value-training mode, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.

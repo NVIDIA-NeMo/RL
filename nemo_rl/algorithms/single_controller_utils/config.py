@@ -1970,6 +1970,83 @@ def validate_grpo_chunk_cap_alignment(
         )
 
 
+def _validate_automodel_single_controller_config(master_config: MasterConfig) -> None:
+    """Fail before allocating workers for unsupported AutoModel SC combinations."""
+    policy = master_config.policy
+    automodel = policy.get("automodel_cfg")
+    if automodel is None or not automodel["enabled"]:
+        return
+    automodel = cast(AutomodelConfig, automodel)
+    algo_cfg = algo_config(master_config)
+    async_cfg = master_config.async_rl
+    sampler = async_cfg.sampler
+    generation = policy["generation"]
+    lora = automodel.get("lora_cfg")
+    draft = policy.get("draft")
+    # The worker accepts only a complete batch, so anything that can close a step
+    # short (dynamic-sampling replacement at data exhaustion, drop budgets, finalizer
+    # drops of captured groups) is rejected here rather than failing mid-run.
+    unsupported = {
+        "ppo": is_ppo_run(master_config),
+        "on_policy_distillation.enabled": opd_module.is_opd_enabled(master_config),
+        "grpo.use_dynamic_sampling": algo_cfg.use_dynamic_sampling,
+        "token_capture.enabled": master_config.token_capture.enabled,
+        "async_rl.sampler.name": not isinstance(sampler, InOrderSamplerConfig),
+        "async_rl.sampler.warmup_lookahead_versions": (
+            isinstance(sampler, InOrderSamplerConfig)
+            and sampler.warmup_lookahead_versions is not None
+        ),
+        "async_rl.min_groups_for_streaming_train": (
+            async_cfg.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step
+        ),
+        "async_rl.rollout_failure.max_skipped_prompts": bool(
+            async_cfg.rollout_failure.max_skipped_prompts
+        ),
+        "async_rl.rollout_failure.max_consecutive_dropped_prompts": bool(
+            async_cfg.rollout_failure.max_consecutive_dropped_prompts
+        ),
+        "policy.generation.backend": generation["backend"] != "vllm",
+        "policy.generation.colocated.enabled": generation["colocated"]["enabled"],
+        "policy.generation.vllm_cfg.async_engine": (
+            generation["backend"] == "vllm"
+            and not cast(VllmConfig, generation)["vllm_cfg"]["async_engine"]
+        ),
+        "policy.sequence_packing.enabled": policy["sequence_packing"]["enabled"],
+        "policy.dynamic_batching.enabled": policy["dynamic_batching"]["enabled"],
+        "policy.automodel_cfg.tensor_parallel_size": (
+            automodel["tensor_parallel_size"] != 1
+        ),
+        "policy.automodel_cfg.context_parallel_size": (
+            automodel["context_parallel_size"] != 1
+        ),
+        "policy.automodel_cfg.dp_replicate_size": (
+            automodel.get("dp_replicate_size") not in (None, 1)
+        ),
+        "policy.automodel_cfg.cpu_offload": automodel["cpu_offload"],
+        "policy.automodel_cfg.custom_parallel_plan": (
+            automodel.get("custom_parallel_plan") is not None
+        ),
+        "policy.automodel_cfg.sequence_parallel": automodel["sequence_parallel"],
+        "policy.automodel_cfg.lora_cfg.enabled": lora is not None and lora["enabled"],
+        "policy.is_vlm": bool(policy.get("is_vlm")),
+        "policy.tokenizer.use_processor": bool(
+            policy["tokenizer"].get("use_processor")
+        ),
+        "policy.draft.enabled": draft is not None and draft.enabled,
+        "policy.quant_cfg": policy.get("quant_cfg") is not None,
+        "policy.precision": policy["precision"] not in ("bfloat16", "float32"),
+    }
+    rejected = [key for key, is_unsupported in unsupported.items() if is_unsupported]
+    if rejected:
+        raise ValueError(
+            "AutoModel SC supports text GRPO on in_order sampling, full-batch "
+            "streaming, no prompt drops, disaggregated async vLLM, fixed "
+            "microbatches, FSDP2 with "
+            "TP=CP=1, and unquantized bf16/fp32 full-parameter training. "
+            f"Unsupported: {', '.join(rejected)}"
+        )
+
+
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
@@ -1991,6 +2068,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         seq_logprob_error_in_loss=loss_config.seq_logprob_error_in_loss,
     )
     _validate_algo_settings(master_config)
+    _validate_automodel_single_controller_config(master_config)
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
@@ -2126,18 +2204,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "See docs/guides/sampler-replay.md#head-size-and-top-p"
             )
 
-        automodel_cfg = master_config.policy.get("automodel_cfg")
-        if automodel_cfg is not None and automodel_cfg["enabled"]:
-            enabled_automodel_cfg = cast(AutomodelConfig, automodel_cfg)
-            if (
-                enabled_automodel_cfg["tensor_parallel_size"] > 1
-                or enabled_automodel_cfg["context_parallel_size"] > 1
-            ):
-                raise ValueError(
-                    "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
-                    "support Automodel only with tensor_parallel_size=1 and "
-                    "context_parallel_size=1; use Megatron for TP/CP"
-                )
         megatron_cfg = master_config.policy.get("megatron_cfg") or {}
         if megatron_cfg.get("enabled") and megatron_cfg.get(
             "use_fused_linear_logprobs"
