@@ -1,0 +1,79 @@
+diff --git a/src/megatron/bridge/models/conversion/mapping_registry.py b/src/megatron/bridge/models/conversion/mapping_registry.py
+index f4d89b9d..5fa21f52 100644
+--- a/src/megatron/bridge/models/conversion/mapping_registry.py
++++ b/src/megatron/bridge/models/conversion/mapping_registry.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import copy
+ import os
+ import re
+ from typing import List, Optional
+@@ -106,8 +107,20 @@ class MegatronMappingRegistry:
+                 if isinstance(mapping, AutoMapping):
+                     new_mapping = AutoMapping(new_megatron_param, mapping.hf_param, mapping.permute_dims)
+                 else:
+-                    print(f"Unrecognized mapping type for {mapping.megatron_param} -> {mapping.hf_param}")
+-                    break
++                    # Generic fallback: shallow-clone the original mapping and
++                    # override `megatron_param`. This handles wrapper subclasses
++                    # like `_MTPFlatteningMapping` that resolve into AutoMapping
++                    # at runtime — without it, separate-LN aliases for MTP
++                    # would be silently dropped and hundreds of MTP tensors
++                    # go missing on Megatron→HF export (see issue #2774).
++                    new_mapping = copy.copy(mapping)
++                    new_mapping.megatron_param = new_megatron_param
++                    # Wrappers that cache wildcard counts must recompute, since
++                    # the new megatron_param may have a different wildcard count.
++                    if hasattr(new_mapping, "_megatron_wc"):
++                        new_mapping._megatron_wc = MegatronParamMapping._count_wildcard_groups(
++                            new_megatron_param
++                        )
+                 extra_mappings.append(new_mapping)
+                 existing_names.add(new_megatron_param)
+                 break
+diff --git a/src/megatron/bridge/models/nemotronh/nemotron_h_bridge.py b/src/megatron/bridge/models/nemotronh/nemotron_h_bridge.py
+index 8a42abc7..4b123989 100644
+--- a/src/megatron/bridge/models/nemotronh/nemotron_h_bridge.py
++++ b/src/megatron/bridge/models/nemotronh/nemotron_h_bridge.py
+@@ -186,14 +186,33 @@ class _MTPFlatteningQKVMapping(MegatronParamMapping[Dict[str, torch.Tensor]]):
+         self._hf_wc = MegatronParamMapping._count_wildcard_groups(q)  # q/k/v share pattern structure here
+ 
+     def resolve(self, captures: Tuple[str, ...]) -> MegatronParamMapping:
+-        # Expect captures from Megatron lookup: (outer, inner)
+-        if len(captures) < 2:
+-            raise ValueError(f"Expected (outer, inner) captures for MTP QKV mapping, got {captures}")
+-        outer = int(captures[0])
+-        inner = int(captures[1])
++        # `captures` may come from either side:
++        #   * Megatron lookup -> 2 captures (outer, inner) matching the
++        #     `mtp.layers.*.mtp_model_layer.layers.*` pattern.
++        #   * HF reverse lookup of q/k/v -> 1 capture (flat) matching
++        #     `mtp.layers.*.mixer.{q,k,v}_proj.weight`.
++        # Disambiguate by length and unflatten when needed (see issue #2774).
++        if len(captures) == self._megatron_wc:
++            if len(captures) < 2:
++                raise ValueError(
++                    f"Expected (outer, inner) captures for MTP QKV mapping (megatron side), got {captures}"
++                )
++            outer = int(captures[0])
++            inner = int(captures[1])
++            megatron_captures: Tuple[str, ...] = captures
++        elif len(captures) == self._hf_wc:
++            flat_in = int(captures[0])
++            outer = flat_in // self._mtp_layers_per_block
++            inner = flat_in % self._mtp_layers_per_block
++            megatron_captures = (str(outer), str(inner))
++        else:
++            raise ValueError(
++                f"Expected {self._megatron_wc} (megatron side) or {self._hf_wc} "
++                f"(hf side) captures for MTP QKV mapping, got {captures}"
++            )
+         flat = outer * self._mtp_layers_per_block + inner
+ 
+-        resolved_megatron = _replace_wildcards(self.megatron_param, captures)
++        resolved_megatron = _replace_wildcards(self.megatron_param, megatron_captures)
+         resolved_q = _replace_wildcards(self.hf_param["q"], (str(flat),))
+         resolved_k = _replace_wildcards(self.hf_param["k"], (str(flat),))
+         resolved_v = _replace_wildcards(self.hf_param["v"], (str(flat),))
