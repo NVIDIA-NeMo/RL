@@ -18,8 +18,117 @@ from pydantic import ValidationError
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    GAEConfig,
+    GeneralizedAdvantageEstimator,
     OPDAdvantageEstimator,
+    ReinforcePlusPlusAdvantageEstimator,
 )
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
+
+
+@pytest.mark.parametrize("estimator_name", ["reinforce_plus_plus", "gae"])
+@pytest.mark.parametrize("use_kl", [False, True])
+@pytest.mark.parametrize(
+    "kl_type,clamps,expected_kl",
+    [
+        ("k1", {}, [[0, 2, 5, 10], [1, 4, 10, 10]]),
+        (
+            "k1",
+            {"kl_input_clamp_value": 2.0, "kl_output_clamp_value": None},
+            [[0, 2, 2, 2], [1, 2, 2, 2]],
+        ),
+        (
+            "k1",
+            {"kl_input_clamp_value": None, "kl_output_clamp_value": 3.0},
+            [[0, 2, 3, 3], [1, 3, 3, 3]],
+        ),
+        (
+            "k1",
+            {"kl_input_clamp_value": None, "kl_output_clamp_value": None},
+            [[0, 2, 5, 30], [1, 4, 15, 60]],
+        ),
+        (
+            "k2",
+            {"kl_input_clamp_value": 2.0, "kl_output_clamp_value": None},
+            [[0, 2, 2, 2], [0.5, 2, 2, 2]],
+        ),
+        (
+            "k2",
+            {"kl_input_clamp_value": None, "kl_output_clamp_value": 3.0},
+            [[0, 2, 3, 3], [0.5, 3, 3, 3]],
+        ),
+        (
+            "k3",
+            {"kl_input_clamp_value": 2.0, "kl_output_clamp_value": None},
+            [
+                [0, 1.1353353, 1.1353353, 1.1353353],
+                [0.36787944, 1.1353353, 1.1353353, 1.1353353],
+            ],
+        ),
+        (
+            "k3",
+            {"kl_input_clamp_value": None, "kl_output_clamp_value": 3.0},
+            [[0, 1.1353353, 3, 3], [0.36787944, 3, 3, 3]],
+        ),
+    ],
+    ids=[
+        "k1-defaults",
+        "k1-input-clamp",
+        "k1-output-clamp",
+        "k1-unclamped",
+        "k2-input-clamp",
+        "k2-output-clamp",
+        "k3-input-clamp",
+        "k3-output-clamp",
+    ],
+)
+def test_reward_kl_clamps_reach_public_advantages(
+    estimator_name: str,
+    use_kl: bool,
+    kl_type: str,
+    clamps: dict[str, float | None],
+    expected_kl: list[list[float]],
+) -> None:
+    """Nondefault clamps must change reward KL before normalization or GAE."""
+    loss_config = ClippedPGLossConfig(
+        use_kl_in_reward=use_kl,
+        reference_policy_kl_penalty=0.5,
+        reference_policy_kl_type=kl_type,
+        **clamps,
+    )
+    policy = -torch.ones(2, 4)
+    reference = policy - torch.tensor([[0, 2, 5, 30], [1, 4, 15, 60]])
+    mask = torch.ones_like(policy)
+    rewards = torch.tensor([1.0, 2.0])
+    # Fixed numerical expectations avoid calling calculate_kl as the oracle.
+    token_rewards = -0.5 * torch.tensor(expected_kl) if use_kl else torch.zeros(2, 4)
+    kwargs = dict(logprobs_policy=policy, logprobs_reference=reference)
+
+    if estimator_name == "gae":
+        estimator = GeneralizedAdvantageEstimator(
+            GAEConfig(gae_lambda=1.0, gae_gamma=1.0, normalize_advantages=False),
+            loss_config,
+        )
+        advantages, returns = estimator.compute_advantage(
+            torch.arange(2), rewards, mask, values=torch.zeros(2, 4), **kwargs
+        )
+        token_rewards[:, -1] += rewards
+        expected = token_rewards.flip(1).cumsum(1).flip(1)
+        torch.testing.assert_close(returns, expected)
+    else:
+        estimator = ReinforcePlusPlusAdvantageEstimator(
+            AdvEstimatorConfig(name="reinforce_plus_plus", minus_baseline=False),
+            loss_config,
+        )
+        advantages = estimator.compute_advantage(
+            torch.arange(2), rewards, mask, **kwargs
+        )
+        expected = token_rewards + rewards.unsqueeze(-1)
+        expected = (expected - expected.mean()) * expected.var(unbiased=False).clamp(
+            min=1e-8
+        ).rsqrt()
+
+    torch.testing.assert_close(advantages, expected)
 
 
 def _make_estimator(alpha=1.0, subtract_global_baseline=False):
