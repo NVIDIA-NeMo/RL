@@ -54,6 +54,10 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
 )
+from nemo_rl.algorithms.loss.interfaces import (
+    ObjectiveReduction,
+    make_objective_reduction,
+)
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -80,13 +84,37 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
-from nemo_rl.data_plane.schema import INPUT_IDS, INPUT_LENGTHS
+from nemo_rl.data_plane.schema import (
+    DP_TRAIN_FIELDS,
+    INPUT_IDS,
+    INPUT_LENGTHS,
+    SAMPLER_TOPK_FIELDS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 
 if TYPE_CHECKING:
     # Annotation-only: importing ppo at runtime here would close a cycle
     # back through the controller.
     from nemo_rl.algorithms.ppo import PPOConfig
+
+
+def _train_fields_for_step(
+    *,
+    policy_logprobs_required: bool,
+    reference_logprobs_required: bool,
+    sampler_head_required: bool,
+) -> tuple[str, ...]:
+    """Return only the data-plane columns produced for this train step."""
+    fields = tuple(
+        field
+        for field in DP_TRAIN_FIELDS
+        if (policy_logprobs_required or field != "prev_logprobs")
+        and (reference_logprobs_required or field != "reference_policy_logprobs")
+    )
+    if sampler_head_required:
+        fields += SAMPLER_TOPK_FIELDS
+    return fields
 
 
 @dataclass(frozen=True)
@@ -102,6 +130,7 @@ class AdvantageStageConfig:
     opd_full_enabled: bool
     message_level_advantage_penalties_enabled: bool
     shardable: bool
+    objective_reduction: ObjectiveReduction
     # Where the per-step training dump writes, or None when it is disabled.
     # The stage owns the dump because it is the only place that still holds
     # the untruncated tensors: the controller stopped fetching them when the
@@ -155,6 +184,9 @@ class AdvantageStageConfig:
             shardable=not create_advantage_estimator(
                 algo_cfg.adv_estimator, loss_cfg
             ).requires_global_batch,
+            objective_reduction=make_objective_reduction(
+                loss_cfg.resolved_normalization
+            ),
             # Use the resolved logger config shared by controller and pool.
             train_data_dump_dir=(
                 master_config.logger.log_dir
@@ -204,6 +236,16 @@ class AdvantageStageConfig:
                 ]
             )
         return list(dict.fromkeys(fields))
+
+    def train_fields(self, master_config: Any) -> tuple[str, ...]:
+        """Return the data-plane columns a train step reads."""
+        return _train_fields_for_step(
+            policy_logprobs_required=self.policy_logprobs_required,
+            reference_logprobs_required=self.reference_logprobs_required,
+            # Score centering and sampler replay both read the captured head.
+            sampler_head_required=master_config.loss_fn.score_centering
+            or sampler_replay_enabled(master_config.policy["generation"]),
+        )
 
 
 @dataclass(frozen=True)
@@ -739,6 +781,19 @@ class AdvantageComputer:
         if not torch.equal(final_sample_mask, sample_mask):
             fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
         new_fields = [adv_cfg.output_field]
+        extra_fields = cfg.objective_reduction.prepare_batch(
+            sample_ids=meta.sample_ids,
+            token_mask=token_mask,
+            sample_mask=final_sample_mask,
+            # PPO's num_generations_per_prompt is a sampling knob, not a group
+            # guarantee, and no reduction groups responses under PPO.
+            expected_group_size=(
+                None if cfg.is_ppo else cfg.algo.num_generations_per_prompt
+            ),
+            group_indices=prompt_ids.squeeze(-1),
+        )
+        fields_to_put.update(extra_fields)
+        new_fields.extend(extra_fields)
         if returns is not None:
             fields_to_put[adv_cfg.returns_field] = returns
             new_fields.append(adv_cfg.returns_field)

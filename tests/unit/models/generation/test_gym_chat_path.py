@@ -44,16 +44,13 @@ pytest.importorskip("vllm")
 pytest.importorskip("nemo_gym.token_id_capture.staging")
 
 import httpx  # noqa: E402
-from dynamo.llm.exceptions import HttpError  # noqa: E402
+from dynamo.llm.exceptions import HttpError, InvalidArgument  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
     GenerationCutInventory,
     GenerationCutPrefix,
 )
 from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter  # noqa: E402
-from nemo_gym.token_id_capture.external_capture import (  # noqa: E402
-    split_dynamo_capture_refusal,
-)
 from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER  # noqa: E402
 from nemo_gym.token_id_capture.replay import (  # noqa: E402
     replay_context,
@@ -79,6 +76,9 @@ from vllm.v1.engine.input_processor import InputProcessor  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     ChainPrefixCache,
     StagedPrefix,
+)
+from nemo_rl.models.generation.dynamo.managed_runtime import (  # noqa: E402
+    ChatProcessorOptions,
 )
 from nemo_rl.models.generation.dynamo.vllm import chat_engine  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm.adapter import (  # noqa: E402
@@ -253,7 +253,7 @@ class _Engine:
         self.errored = False
         self._kit = kit
         self._refuse = refuse
-        self.runs: list[tuple[list[int], Any, Any]] = []
+        self.runs: list[tuple[list[int], Any, Any, Any]] = []
         # The reasoning_ended each run was handed.
         self.reasoning_ended: list[Optional[bool]] = []
         # How many of REPLY's tokens the prompt already ends with: a call
@@ -266,7 +266,8 @@ class _Engine:
         # As the worker's engine client does before it submits the call.
         take_reasoning_ended(sampling_params, kwargs)
         prompt_token_ids = list(prompt["prompt_token_ids"])
-        self.runs.append((prompt_token_ids, sampling_params, _media(prompt)))
+        salt = prompt.get("cache_salt")
+        self.runs.append((prompt_token_ids, sampling_params, _media(prompt), salt))
         self.reasoning_ended.append(kwargs.get("reasoning_ended"))
         if self._refuse is not None and self._refuse[0] == "running":
             raise self._refuse[1]
@@ -278,11 +279,17 @@ class _Engine:
             return
         reply_ids = self._kit.ids(REPLY)[self.resumed :]
         logprobs = None
-        if sampling_params.logprobs is not None:
+        if sampling_params.num_logprobs is not None:
             decode = self._kit.tokenizer.decode
+            # The tokens a logprob_token_ids call asks for, at every position.
+            asked = {
+                token_id: Logprob(-3.0, 3, decode([token_id]))
+                for token_id in sampling_params.logprob_token_ids or ()
+            }
             # The sampled token, and the runner-up a top_logprobs > 0 call sees.
             logprobs = [
                 {
+                    **asked,
                     token_id: Logprob(-0.5, 1, decode([token_id])),
                     token_id + 1: Logprob(-2.0, 2, decode([token_id + 1])),
                 }
@@ -391,7 +398,7 @@ class _Outcome:
     # None when the client went away: nobody is answered.
     status: Optional[int]
     reply: dict[str, Any]
-    runs: list[tuple[list[int], Any, Any]]
+    runs: list[tuple[list[int], Any, Any, Any]]
     staged: list[tuple[Any, Any]]
     failed: list[str] = field(default_factory=list)
     # The capture call Gym is told was refused before it was staged, if any.
@@ -495,12 +502,20 @@ class _Router:
 class _Context:
     def __init__(self, stopped: bool) -> None:
         self._stopped = stopped
+        self.response_headers: dict[str, str] = {}
 
     def id(self) -> str:
         return "chatcmpl-0"
 
     def is_stopped(self) -> bool:
         return self._stopped
+
+    def trace_headers(self) -> None:
+        return None
+
+    def set_response_header(self, name: str, value: str) -> bool:
+        self.response_headers[name] = value
+        return True
 
 
 class SimpleItem:
@@ -521,8 +536,17 @@ async def _dynamo(
     request["nvext"] = {
         "annotations": [GYM_EXTRAS_ANNOTATION_PREFIX + json.dumps(extras)]
     }
-    capture = chat_engine._CaptureSource()
+    capture = chat_engine._CaptureSource(
+        ChatProcessorOptions(
+            render_workers=1,
+            ray_address="",
+            capture_file="",
+            chat_settings_file=None,
+        )
+    )
     capture._prefix_cache = host._chain_prefix
+    # The frontend's request context, which carries the response headers.
+    context = _Context(stopped)
     engine = chat_engine.NemoRLChatEngine(
         pool=kit.pool,
         routed_engine=_Router(
@@ -534,17 +558,18 @@ async def _dynamo(
         capture=capture,
     )
     try:
-        (chunk,) = [chunk async for chunk in engine.generate(request, None)]
-    except HttpError as error:
-        message, acknowledged = split_dynamo_capture_refusal(error.message)
+        (chunk,) = [chunk async for chunk in engine.generate(request, context)]
+    except (HttpError, InvalidArgument) as error:
+        # Dynamo answers InvalidArgument with HTTP 400 and its message.
+        refused = isinstance(error, InvalidArgument)
         return _Outcome(
             # The frontend's answer to a client that went away reaches nobody.
-            None if stopped else error.code,
-            {"error": message},
+            None if stopped else (400 if refused else error.code),
+            {"error": str(error) if refused else error.message},
             host.llm.runs,
             sink.staged,
             failed,
-            acknowledged,
+            context.response_headers.get(CAPTURE_REFUSAL_HEADER),
         )
     return _Outcome(
         200,
@@ -961,6 +986,17 @@ CASES = [
         mode="text",
         kit="router_replay",
     ),
+    _Case("cache_salt", fields={"cache_salt": "tenant-a"}),
+    # vLLM's token-level fields, which the frontend hands over as the client
+    # sent them: the engine samples with them as it does natively.
+    _Case(
+        "token_level_fields",
+        fields={
+            "stop_token_ids": [7],
+            "allowed_token_ids": [1, 2, 3],
+            "logprob_token_ids": [5, 9],
+        },
+    ),
 ]
 
 
@@ -1023,9 +1059,10 @@ def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(kits, case) 
         assert native.acknowledged == dynamo.acknowledged == acknowledged
         return
     # The engine ran the same prompt, media and SamplingParams.
-    ((native_prompt, native_params, native_media),) = native.runs
-    ((dynamo_prompt, dynamo_params, dynamo_media),) = dynamo.runs
+    ((native_prompt, native_params, native_media, native_salt),) = native.runs
+    ((dynamo_prompt, dynamo_params, dynamo_media, dynamo_salt),) = dynamo.runs
     assert dynamo_prompt == native_prompt
+    assert dynamo_salt == native_salt
     _assert_same_media(dynamo_media, native_media)
     assert (native_media is not None) == (case.kit == "vlm")
     assert dynamo_params == native_params
@@ -1226,7 +1263,7 @@ def test_a_call_cut_at_a_checkpoint_resumes_to_the_uninterrupted_reply(
     # Each path in a task of its own, as each request has on a server: a
     # finished prefix is marked in a context variable.
     whole = asyncio.run(_native(kit, *_host(kit, {}, 0), body, measure=False))
-    ((prompt, params, _),) = whole.runs
+    ((prompt, params, _, _),) = whole.runs
     ((whole_record, _),) = whole.staged
     records, continuation = _cut_call(
         kit, prompt, saved, output_limit=params.max_tokens
@@ -1252,8 +1289,8 @@ def test_a_call_cut_at_a_checkpoint_resumes_to_the_uninterrupted_reply(
 
     assert (native.status, dynamo.status) == (200, 200), (native.reply, dynamo.reply)
     # The engine ran the saved rows as its prompt, with the budget that is left.
-    ((native_prompt, native_params, _),) = native.runs
-    ((dynamo_prompt, dynamo_params, _),) = dynamo.runs
+    ((native_prompt, native_params, _, _),) = native.runs
+    ((dynamo_prompt, dynamo_params, _, _),) = dynamo.runs
     assert native_prompt == dynamo_prompt == prompt + reply_ids[:resumed]
     assert dynamo_params == native_params
     if resumed < len(reply_ids):

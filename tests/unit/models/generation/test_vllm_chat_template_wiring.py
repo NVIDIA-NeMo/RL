@@ -975,18 +975,15 @@ def test_restored_call_reaches_the_engine_with_the_remaining_budget(
         "_resolve_admission_prefix",
         lambda self, admission: list(conversation),
     )
-    monkeypatch.setattr(
-        NoPrefixRecovery,
-        "resolve_restore",
-        lambda self, admission, prefix: (
-            admission,
-            _ResolvedGenerationCut(
-                snapshot=SimpleNamespace(token_ids_delta=delta, token_mask_delta=mask),
-                routed_experts=routes,
-                sampler_topk=sampler_topk,
-            ),
-        ),
-    )
+
+    async def resolve_restore(self, admission, prefix):
+        return admission, _ResolvedGenerationCut(
+            snapshot=SimpleNamespace(token_ids_delta=delta, token_mask_delta=mask),
+            routed_experts=routes,
+            sampler_topk=sampler_topk,
+        )
+
+    monkeypatch.setattr(NoPrefixRecovery, "resolve_restore", resolve_restore)
     begin = MagicMock()
     monkeypatch.setattr(VllmAsyncGenerationWorkerImpl, "_begin_request_capture", begin)
     renderers, _, _ = _build_server(monkeypatch, {}, app=app)

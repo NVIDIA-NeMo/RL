@@ -67,12 +67,23 @@ class MegatronDynamoFrontendArgs(BaseModel, extra="forbid"):
     router_mode: Literal[
         "round-robin",
         "random",
-        "power-of-two",
         "kv",
         "least-loaded",
         "device-aware-weighted",
     ] = "kv"
+    # Most sessions the affinity table holds; a new one past it gets HTTP 529.
+    # Every frontend holds the whole fleet's sessions, so size it for all of them.
+    session_affinity_max_entries: PositiveInt = 16_777_216
+    # Frontends, spread round-robin over the generation nodes, each with its own
+    # router. More than one adds --router-replica-sync, so every router sees the
+    # requests the others have in flight; each router still picks the prefill
+    # and the decode engine for its own requests.
+    num_frontends: PositiveInt = 1
     extra_cli_args: list[str] = Field(default_factory=list)
+    # Extra environment for every frontend, for settings Dynamo reads only from
+    # the environment, e.g. DYN_TCP_LISTEN_BACKLOG. It may not set a variable
+    # the runtime manages.
+    extra_env: dict[str, str] = Field(default_factory=dict)
 
 
 class MegatronDynamoCfg(BaseModel, extra="forbid"):
