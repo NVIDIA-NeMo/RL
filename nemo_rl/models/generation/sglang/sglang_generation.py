@@ -15,7 +15,7 @@
 import asyncio
 import logging
 import os
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
@@ -87,16 +87,16 @@ class SGLangGeneration(GenerationInterface):
         Fleet health tracks a worker group's shards, which SGLang does not have.
         SGLang workers cannot abort a refit, so a refit deadline is refused too.
         """
+        generation_config = cast(SGLangConfig, master_config.policy["generation"])
         fault_tolerance = SGLangFaultToleranceConfig.model_validate(
-            master_config.policy["generation"]["sglang_cfg"][
-                "sglang_fault_tolerance_config"
-            ]
+            generation_config["sglang_cfg"]["sglang_fault_tolerance_config"]
         )
         if fault_tolerance.use_fault_tolerance:
             raise NotImplementedError(
                 "SGLang fault tolerance is not supported on the SingleController: "
                 "set policy.generation.sglang_cfg.sglang_fault_tolerance_config."
-                "use_fault_tolerance to false."
+                "use_fault_tolerance to false. Support is tracked in "
+                "https://github.com/NVIDIA-NeMo/RL/issues/5354."
             )
         if master_config.async_rl.generation_fleet_health.enabled:
             raise ValueError(
@@ -104,12 +104,11 @@ class SGLangGeneration(GenerationInterface):
                 "policy.generation.backend='sglang'. Set "
                 "async_rl.generation_fleet_health.enabled=false."
             )
-        if master_config.async_rl.generation_fleet_health.refit_timeout_s is not None:
-            raise ValueError(
-                "async_rl.generation_fleet_health.refit_timeout_s must be null with "
-                "policy.generation.backend='sglang'; SGLang workers cannot enforce a "
-                "refit deadline."
-            )
+        # The SGLang synchronizers never reach the check in
+        # ``update_weights_from_collective``, so this is the only one on this path.
+        reject_unenforceable_refit_deadline(
+            "SGLang", master_config.async_rl.generation_fleet_health.refit_timeout_s
+        )
 
     def __init__(
         self,
