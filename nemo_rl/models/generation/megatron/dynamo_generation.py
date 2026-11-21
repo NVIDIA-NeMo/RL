@@ -28,6 +28,7 @@ import copy
 import dataclasses
 import functools
 import logging
+import random
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -1121,12 +1122,13 @@ class MegatronDynamoGeneration(GenerationInterface):
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
-        """Post the batch to the frontend, one request per prompt; yield the assembled batch."""
+        """Post the batch to a frontend, one request per prompt; yield the assembled batch."""
         if len(data["input_ids"]) == 0:
             return
         output = await generate_through_frontend(
             self.cfg,
-            frontend_url=self.dp_openai_server_base_urls[0] or "",
+            # Every frontend routes to the whole fleet; spread the batches.
+            frontend_url=random.choice(self._dynamo_frontend_urls),
             data=data,
             greedy=greedy,
             request_timeout_s=self._dynamo_cfg.request_timeout_s,

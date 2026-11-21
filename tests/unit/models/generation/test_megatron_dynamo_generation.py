@@ -1778,11 +1778,21 @@ def test_rollouts_go_through_the_frontend(env, monkeypatch):
     async def collect():
         return [item async for item in generation.generate_async(data)]
 
+    # Each batch goes to one of the frontends, picked at random.
+    picks = iter(["http://10.0.0.2:1313/v1"])
+    monkeypatch.setattr(
+        generation_module.random,
+        "choice",
+        lambda urls: (
+            urls == ("http://10.0.0.1:1313/v1", "http://10.0.0.2:1313/v1")
+            and next(picks)
+        ),
+    )
     ((index, output),) = asyncio.run(collect())
     assert index == 0
     assert output["output_ids"].tolist() == [[1, 2, 3, 8]]
     assert output["gen_leader_worker_idx"] == [0]
-    assert requests[0][0] == "http://10.0.0.1:3000/v1/completions"
+    assert requests[0][0] == "http://10.0.0.2:1313/v1/completions"
     assert requests[0][2] is None, "request_timeout_s defaults to no deadline"
     with pytest.raises(NotImplementedError, match="NeMo-Gym"):
         generation.setup_token_capture({}, "staging")  # type: ignore[arg-type]
