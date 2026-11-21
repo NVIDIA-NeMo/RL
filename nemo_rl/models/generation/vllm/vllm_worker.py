@@ -838,7 +838,7 @@ class BaseVllmGenerationWorker:
     def llm(self):
         return self.llm
 
-    def is_alive(self):
+    def is_alive(self) -> bool:
         """Check if the worker is alive."""
         return True
 

@@ -550,6 +550,8 @@ class SingleControllerActor:
         # therefore degrades to the documented off state rather than to a broken one.
         self._gen_fleet = getattr(actor_args, "fleet_monitor", None)
         self._generation_router = getattr(actor_args, "generation_router", None)
+        # The fleet probe and a refit both push the serving set; one at a time.
+        self._serving_shards_push_lock = asyncio.Lock()
         self._finalizer_actors = list(actor_args.finalizer_actors)
         for actor in (*self._finalizer_actors, *self._advantage_actors):
             self._trainer.add_data_plane_snapshot_source(actor)
@@ -4077,9 +4079,13 @@ class SingleControllerActor:
                 # Pushed here rather than on the watchdog's clock so a membership change
                 # reaches the router at detection speed.
                 await self._push_router_membership()
+                # Not while a refit recovers: every shard is out of service there,
+                # paused, and the refit pushes the set it ends with before resuming.
+                if not self._recovering_from_refit:
+                    await self._push_serving_shards()
             except Exception as error:  # noqa: BLE001 - best-effort, retried next tick
                 print(
-                    f"fleet probe: router update failed, retrying next tick: "
+                    f"fleet probe: membership update failed, retrying next tick: "
                     f"{type(error).__name__}: {error}",
                     flush=True,
                 )
@@ -4178,6 +4184,29 @@ class SingleControllerActor:
                 self._gen_fleet.serving_base_urls()
             )
         )
+
+    async def _push_serving_shards(self) -> None:
+        """Tell the generation backend which shards are in service.
+
+        Native dispatch reads the fleet selector on every request and needs
+        nothing. A backend behind its own router, vLLM behind Dynamo's frontends,
+        takes a shard out of that router when it leaves service and back in when
+        it returns. Each push carries the whole set, so a shard that one push
+        misses is picked up by the next.
+        """
+        if self._gen_fleet is None:
+            return
+        async with self._serving_shards_push_lock:
+            await asyncio.to_thread(
+                self._gen.set_serving_shards,
+                set(self._gen_fleet.serving_shards()),
+                quarantined_shards={
+                    shard.dp_shard_idx
+                    for shard in self._gen_fleet.snapshot()
+                    if shard.state in (ShardState.DEAD, ShardState.RETIRED)
+                },
+                timeout_s=self._async_cfg.generation_fleet_health.probe_timeout_s,
+            )
 
     async def _drain_router_failures(self) -> None:
         """Fold the router's observed backend outcomes into the fleet ledger.
@@ -5262,6 +5291,17 @@ class SingleControllerActor:
             # promoted inside its window, and everything below this must still run on
             # both paths.
             self._record_refit_landed(participants)
+
+        # Before resuming, so a shard this refit returned to service takes requests
+        # from the first one after. A failure must not leave the engines paused.
+        try:
+            await self._push_serving_shards()
+        except Exception as error:  # noqa: BLE001 - best-effort, the next probe retries
+            print(
+                "  _sync_weights: could not push the serving shards, the next fleet "
+                f"probe retries: {type(error).__name__}: {error}",
+                flush=True,
+            )
 
         paused_calls: list[dict[str, Any]] = []
         if generation_paused_for_refit and self._master_config.token_capture.enabled:

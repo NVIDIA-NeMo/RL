@@ -33,7 +33,7 @@ from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from dynamo._core import Context, fetch_model
+from dynamo._core import Context, Endpoint, fetch_model
 from dynamo.common.backend import (
     EngineConfig,
     GenerateChunk,
@@ -87,10 +87,17 @@ class DynamoEngineAdapter(LLMEngine):
         # The worker's index in its group; rollouts report it, as
         # generate_async results do.
         self._leader_worker_idx = leader_worker_idx
+        # The Dynamo endpoint serving this engine, once the Worker hands it over;
+        # it takes the engine in and out of the frontends' routing.
+        self.endpoint: Optional[Endpoint] = None
 
     @classmethod
     async def from_args(cls, argv=None):
         raise NotImplementedError("constructed in-process by the generation worker")
+
+    async def on_endpoint_ready(self, endpoint: Endpoint) -> None:
+        """Keep the endpoint; the Worker registers it with discovery after this."""
+        self.endpoint = endpoint
 
     def _handlers(self) -> dict[str, RequestHandler]:
         """The request kinds served, keyed by the annotation prefix that marks them."""

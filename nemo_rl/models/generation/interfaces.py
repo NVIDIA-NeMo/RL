@@ -612,6 +612,28 @@ class GenerationInterface(ABC):
         line would be worse than the missing log line.
         """
 
+    def set_serving_shards(
+        self,
+        serving_shards: set[int],
+        *,
+        quarantined_shards: set[int],
+        timeout_s: float,
+    ) -> None:
+        """Tell the backend which data-parallel shards fleet health has in service.
+
+        A no-op by default: a backend that dispatches its own requests asks the
+        fleet selector on every request. One behind an external router, such as
+        vLLM served through Dynamo's frontends, takes shards in and out of that
+        router here. Called on every fleet probe and after a refit returns shards
+        to service; it must not raise over one unresponsive shard.
+
+        Args:
+            serving_shards: Every shard that may be handed requests.
+            quarantined_shards: Shards out of service for good unless restarted;
+                the backend may kill one that does not leave the router.
+            timeout_s: How long to wait for the shards to confirm.
+        """
+
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Whether the generation backend requires KV cache scales synchronization."""
