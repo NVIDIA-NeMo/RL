@@ -14,12 +14,13 @@
 """Who is running this review, and may it count as a self-review?
 
 Reads facts, not the model's own claim: harness and version from environment variables,
-model and effort from the harness's session transcript, the skill revision from the
+model from the harness's session transcript, effort from Claude's CLAUDE_EFFORT
+environment variable or Codex's transcript, and the skill revision from the
 REVISION file next to this copy of the skill.
 
-    review_identity.py preflight --pr N   # exit 2: this session wrote the PR's code
-                                          # exit 3: self-review with a harness/model/effort not allowed
-    review_identity.py footer --pr N      # the review-body footer: visible line + hidden marker
+    review_identity.py preflight --pr N             # exit 2: this session wrote the PR's code
+                                                    # exit 3: self-review with a harness/model/effort not allowed
+    review_identity.py footer --pr N --head SHA     # the review-body footer: visible line + hidden marker
 
 Standard library only, and runs on the older system `python3` some harnesses use (e.g. Codex).
 `gh` is used to read the PR.
@@ -32,6 +33,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -45,6 +47,12 @@ MARKER = "nemo-rl-review"
 CLAUDE_EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 # Codex writes patches inside code text, where line breaks may be a literal "\n".
 _PATCH_FILE = re.compile(r"\*\*\* (?:Update|Add|Delete) File: ([^\s\\'\"]+)")
+_PATCH_BODY = re.compile(r"\*\*\* Begin Patch.*?(?:\*\*\* End Patch|$)", re.S)
+_JS_STRING = re.compile(r"\"((?:[^\"\\]|\\.)*)\"|'((?:[^'\\]|\\.)*)'|`([^`]*)`")
+_JS_WORKDIR = re.compile(r"\b(?:workdir|cwd)\b\s*[:=]\s*[\"'`]([^\"'`]+)")
+_SHELL_SEPARATORS = {"&&", "||", ";", "|", "&", "(", ")"}
+_REDIRECTS = {">", ">>", ">|", "&>", "&>>"}
+_GIT_OPTS_WITH_VALUE = {"-c", "--git-dir", "--work-tree", "--namespace"}
 
 
 @dataclass
@@ -127,44 +135,170 @@ def not_allowed_reason(ident: Identity) -> str | None:
     return None
 
 
+def _resolve(base: str | None, target: str) -> str | None:
+    """`target` as an absolute normalized path, or None if it is relative and `base` is unknown."""
+    target = os.path.expanduser(target)
+    if os.path.isabs(target):
+        return os.path.normpath(target)
+    return os.path.normpath(os.path.join(base, target)) if base else None
+
+
+def _repo_path(path: str, cwd: str | None, repo_root: str) -> str | None:
+    """`path` relative to `repo_root`, or None if it lies outside the repo."""
+    full = _resolve(cwd, path)
+    root = os.path.normpath(repo_root)
+    if full is None or (full != root and not full.startswith(root.rstrip("/") + "/")):
+        return None
+    return os.path.relpath(full, root)
+
+
+def _written_files(prog: str, args: list[str]) -> list[str]:
+    """Files a `tee`, `cp`, `mv`, `install`, `sed -i` or `perl -i` command writes."""
+    operands, in_place, has_script_opt, skip = [], False, False, False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg in ("-e", "-f", "--expression", "--file"):
+            has_script_opt = skip = True
+        elif arg.startswith("--"):
+            in_place = in_place or arg.startswith("--in-place")
+        elif arg.startswith("-") and len(arg) > 1:
+            in_place = in_place or "i" in arg[1:]
+        else:
+            operands.append(arg)
+    if prog == "tee":
+        return operands
+    if prog in ("cp", "mv", "install"):
+        return operands[-1:]
+    if prog in ("sed", "perl") and in_place:
+        return operands if has_script_opt else operands[1:]
+    return []
+
+
+def _shell_actions(
+    command: str, cwd: str | None, repo_root: str
+) -> tuple[list[str], bool]:
+    """Repo-relative files a shell command writes, and whether it runs git commit/push in the repo."""
+    lexer = shlex.shlex(
+        command.replace("\n", " ; "), posix=True, punctuation_chars=True
+    )
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:  # Unbalanced quotes: the shell would not have run it either.
+        return [], False
+    segments: list[list[str]] = [[]]
+    for tok in tokens:
+        if tok in _SHELL_SEPARATORS:
+            segments.append([])
+        else:
+            segments[-1].append(tok)
+    writes, committed = [], False
+    for words in segments:
+        args, targets, i = [], [], 0
+        while i < len(words):
+            if words[i] in _REDIRECTS and i + 1 < len(words):
+                targets.append(words[i + 1])
+                i += 2
+            else:
+                args.append(words[i])
+                i += 1
+        while args and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", args[0]):
+            args.pop(0)  # VAR=value prefixes
+        prog = os.path.basename(args[0]) if args else ""
+        targets += _written_files(prog, args[1:])
+        writes += [p for p in (_repo_path(t, cwd, repo_root) for t in targets) if p]
+        if prog == "cd":
+            target = args[1] if len(args) > 1 else "-"
+            cwd = None if target == "-" else _resolve(cwd, target)
+        elif prog == "git":
+            git_dir, j = cwd, 1
+            while j < len(args) and args[j].startswith("-"):
+                if args[j] == "-C" and j + 1 < len(args):
+                    git_dir = _resolve(git_dir, args[j + 1])
+                j += 2 if args[j] == "-C" or args[j] in _GIT_OPTS_WITH_VALUE else 1
+            if (
+                j < len(args)
+                and args[j] in ("commit", "push")
+                and git_dir is not None
+                and _repo_path(git_dir, None, repo_root) is not None
+            ):
+                committed = True
+    return writes, committed
+
+
+def _js_strings(code: str) -> list[str]:
+    """String literals in Codex's code-mode tool input, with common escapes undone."""
+    out = []
+    for m in _JS_STRING.finditer(code):
+        s = next(g for g in m.groups() if g is not None)
+        for esc, ch in (("\\n", "\n"), ('\\"', '"'), ("\\'", "'"), ("\\\\", "\\")):
+            s = s.replace(esc, ch)
+        out.append(s)
+    return out
+
+
 def same_session_evidence(
     transcript: Path | None, pr_files: list[str], repo_root: str
 ) -> list[str]:
     """Lines of evidence that this session edited the PR's files or committed in this repo."""
     if transcript is None:
         return []
+    rows = list(_jsonl(transcript))
+    pr_set = set(pr_files)
     evidence = []
 
-    def touches(path: str) -> str | None:
-        return next((f for f in pr_files if path == f or path.endswith("/" + f)), None)
+    def record(writes: list[str], committed: bool) -> None:
+        evidence.extend(f"edited {p}" for p in writes if p in pr_set)
+        if committed:
+            evidence.append("ran git commit/push in this repo")
 
-    for row in _jsonl(transcript):
+    failed = {  # Claude Code tool calls whose result was an error
+        block.get("tool_use_id")
+        for row in rows
+        if row.get("type") == "user"
+        for block in (row.get("message") or {}).get("content") or []
+        if isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and block.get("is_error")
+    }
+    codex_cwd = None
+    for row in rows:
         if row.get("type") == "assistant":  # Claude Code
-            cwd = row.get("cwd", "")
+            cwd = row.get("cwd") or None
             for block in (row.get("message") or {}).get("content") or []:
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                if (
+                    not isinstance(block, dict)
+                    or block.get("type") != "tool_use"
+                    or block.get("id") in failed
+                ):
                     continue
                 args = block.get("input") or {}
-                if block.get("name") in CLAUDE_EDIT_TOOLS and (
-                    hit := touches(args.get("file_path", ""))
-                ):
-                    evidence.append(f"edited {hit}")
-                if block.get("name") == "Bash" and re.search(
-                    r"\bgit (commit|push)\b", args.get("command", "")
-                ):
-                    if cwd.startswith(repo_root):
-                        evidence.append("ran git commit/push in this repo")
+                if block.get("name") in CLAUDE_EDIT_TOOLS:
+                    path = args.get("file_path") or args.get("notebook_path") or ""
+                    record([_repo_path(path, cwd, repo_root) or ""], False)
+                if block.get("name") == "Bash":
+                    record(*_shell_actions(args.get("command", ""), cwd, repo_root))
         payload = row.get("payload") or {}
+        if row.get("type") == "turn_context":  # Codex
+            codex_cwd = payload.get("cwd") or codex_cwd
         if (
             row.get("type") == "response_item"
             and payload.get("type") == "custom_tool_call"
         ):  # Codex
             text = payload.get("input") or ""
-            for path in _PATCH_FILE.findall(text):
-                if hit := touches(path):
-                    evidence.append(f"edited {hit}")
-            if re.search(r"\bgit (commit|push)\b", text) and repo_root in text:
-                evidence.append("ran git commit/push in this repo")
+            record(
+                [
+                    _repo_path(p, codex_cwd, repo_root) or ""
+                    for p in _PATCH_FILE.findall(text)
+                ],
+                False,
+            )
+            code = _PATCH_BODY.sub("", text)
+            workdir = _JS_WORKDIR.search(code)
+            shell_dir = _resolve(codex_cwd, workdir.group(1)) if workdir else codex_cwd
+            for literal in _js_strings(code):
+                record(*_shell_actions(literal, shell_dir, repo_root))
     return sorted(set(evidence))
 
 
@@ -197,7 +331,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("command", choices=["preflight", "footer"])
     parser.add_argument("--pr", type=int, required=True)
+    parser.add_argument(
+        "--head", help="footer only: the full SHA of the commit you reviewed"
+    )
     args = parser.parse_args(argv)
+    if args.command == "footer" and not re.fullmatch(r"[0-9a-f]{40}", args.head or ""):
+        parser.error("footer needs --head with the full SHA of the reviewed commit")
 
     pr = _pr(args.pr)
     me = _gh("api", "user", "--jq", ".login").strip()
@@ -205,7 +344,12 @@ def main(argv: list[str] | None = None) -> int:
     ident = detect()
 
     if args.command == "footer":
-        print(footer(ident=ident, kind=kind, head=pr["headRefOid"]))
+        if args.head != pr["headRefOid"]:
+            parser.error(
+                f"the PR head is now {pr['headRefOid']}, not the reviewed {args.head}; "
+                "review the new head before writing a footer"
+            )
+        print(footer(ident=ident, kind=kind, head=args.head))
         return 0
 
     print(
