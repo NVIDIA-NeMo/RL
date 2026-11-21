@@ -31,7 +31,10 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.clipped_pg import clipped_pg_diagnostic_metrics
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
-from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    CrossTokenizerDistillationLossConfig,
+    CrossTokenizerDistillationLossFn,
+)
 from nemo_rl.algorithms.utils import calculate_kl
 from nemo_rl.algorithms.x_token.loss_utils import (
     build_exact_token_map,
@@ -2710,30 +2713,32 @@ def _write_ct_projection(tmp_path):
     return str(path)
 
 
-def _ct_loss_cfg(projection_path, *, gold_loss):
-    # Per-teacher metadata as ``setup`` injects it: parallel lists, one entry
+def _ct_loss_fn(projection_path, *, gold_loss, teacher_weights=(1.0,)):
+    # Per-teacher metadata as ``setup`` passes it: parallel lists, one entry
     # per teacher (here a single teacher).
-    return {
-        "gold_loss": gold_loss,
-        "xtoken_loss": False,
-        "temperature": _CT_TEMPERATURE,
-        "vocab_topk": 4,
-        "uncommon_topk": 8192,
-        "reverse_kl": False,
-        "exact_token_match_only": False,
-        "kl_loss_weight": 1.0,
-        "ce_loss_scale": 1.0,
-        "dynamic_loss_scaling": False,
-        "kd_loss_mode": "sum",
-        "alpha": 1.0,
-        "normalize_teacher_by_vocab": False,
-        "student_vocab_size": _CT_V_STUDENT,
-        "projection_matrix_paths": [projection_path],
-        "teacher_vocab_sizes": [_CT_V_TEACHER],
-        "teacher_weights": [1.0],
-        "teacher_gold_loss": [None],
-        "teacher_xtoken_loss": [None],
-    }
+    return CrossTokenizerDistillationLossFn(
+        CrossTokenizerDistillationLossConfig(
+            gold_loss=gold_loss,
+            xtoken_loss=False,
+            temperature=_CT_TEMPERATURE,
+            vocab_topk=4,
+            uncommon_topk=8192,
+            reverse_kl=False,
+            exact_token_match_only=False,
+            kl_loss_weight=1.0,
+            ce_loss_scale=1.0,
+            dynamic_loss_scaling=False,
+            kd_loss_mode="sum",
+            alpha=1.0,
+            normalize_teacher_by_vocab=False,
+        ),
+        student_vocab_size=_CT_V_STUDENT,
+        projection_matrix_paths=[projection_path],
+        teacher_vocab_sizes=[_CT_V_TEACHER],
+        teacher_weights=list(teacher_weights),
+        teacher_gold_loss=[None],
+        teacher_xtoken_loss=[None],
+    )
 
 
 def _ct_gold_data(student_chunk_id, teacher_chunk_id, pair_valid, sample_mask):
@@ -2779,7 +2784,7 @@ def test_cross_tokenizer_gold_loss_matches_reference(tmp_path):
     """
     torch.manual_seed(0)
     path = _write_ct_projection(tmp_path)
-    loss_fn = CrossTokenizerDistillationLossFn(_ct_loss_cfg(path, gold_loss=True))
+    loss_fn = _ct_loss_fn(path, gold_loss=True)
 
     student_chunk_id = torch.tensor([[0, 0, 1]], dtype=torch.long)
     teacher_chunk_id = torch.tensor([[0, 0, 1]], dtype=torch.long)
@@ -2839,7 +2844,7 @@ def test_cross_tokenizer_gold_loss_all_samples_masked_is_zero(tmp_path):
     """sample_mask all-zero -> zero loss and zero valid chunks (the gold path
     consults sample_mask, not just the geometric chunk mask)."""
     path = _write_ct_projection(tmp_path)
-    loss_fn = CrossTokenizerDistillationLossFn(_ct_loss_cfg(path, gold_loss=True))
+    loss_fn = _ct_loss_fn(path, gold_loss=True)
 
     student_chunk_id = torch.tensor([[0, 0, 1]], dtype=torch.long)
     data = _ct_gold_data(
@@ -2866,27 +2871,24 @@ def test_cross_tokenizer_gold_loss_all_samples_masked_is_zero(tmp_path):
 
 def test_cross_tokenizer_mismatched_per_teacher_lists_raises(tmp_path):
     """Unequal-length per-teacher lists fail loudly at construction."""
-    cfg = _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
     # Two weights but a single entry in every other per-teacher list.
-    cfg["teacher_weights"] = [1.0, 1.0]
     with pytest.raises(ValueError, match="per-teacher lists must be equal length"):
-        CrossTokenizerDistillationLossFn(cfg)
+        _ct_loss_fn(
+            _write_ct_projection(tmp_path), gold_loss=False, teacher_weights=[1.0, 1.0]
+        )
 
 
-def test_normalize_teacher_by_vocab_rejected_outside_sum_mode(tmp_path):
+def test_normalize_teacher_by_vocab_rejected_outside_sum_mode():
     """normalize_teacher_by_vocab is a no-op outside sum mode, so reject it there."""
-    cfg = _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
-    cfg["kd_loss_mode"] = "averaged_logits"
-    cfg["normalize_teacher_by_vocab"] = True
     with pytest.raises(ValueError, match="normalize_teacher_by_vocab"):
-        CrossTokenizerDistillationLossFn(cfg)
+        CrossTokenizerDistillationLossConfig(
+            kd_loss_mode="averaged_logits", normalize_teacher_by_vocab=True
+        )
 
 
 def test_cross_tokenizer_ce_uniform_logits_equals_log_vocab(tmp_path):
     """_compute_ce on uniform logits equals log(V_student) per valid token."""
-    loss_fn = CrossTokenizerDistillationLossFn(
-        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
-    )
+    loss_fn = _ct_loss_fn(_write_ct_projection(tmp_path), gold_loss=False)
     b, t_s = 1, 5
     logits = torch.zeros(b, t_s, _CT_V_STUDENT)  # uniform -> CE == log(V)
     data = BatchedDataDict(
@@ -2904,9 +2906,7 @@ def test_cross_tokenizer_ce_uniform_logits_equals_log_vocab(tmp_path):
 def test_cross_tokenizer_ce_respects_sample_mask(tmp_path):
     """A masked sample must not contribute to _compute_ce: the B=2 result with
     sample 1 masked equals the CE over sample 0 alone."""
-    loss_fn = CrossTokenizerDistillationLossFn(
-        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
-    )
+    loss_fn = _ct_loss_fn(_write_ct_projection(tmp_path), gold_loss=False)
     b, t_s = 2, 5
     torch.manual_seed(0)
     logits = torch.randn(b, t_s, _CT_V_STUDENT)
@@ -2940,9 +2940,7 @@ def test_cross_tokenizer_prepare_loss_input_partitions_canonical_ce(
     tmp_path, monkeypatch
 ):
     """Automodel CP assigns one disjoint canonical CE window to each rank."""
-    loss_fn = CrossTokenizerDistillationLossFn(
-        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
-    )
+    loss_fn = _ct_loss_fn(_write_ct_projection(tmp_path), gold_loss=False)
     full_logprobs = torch.tensor([[-1.0, -2.0, -3.0]], requires_grad=True)
     token_mask = torch.tensor([[1.0, 1.0, 0.0, 1.0]])
     cp_group = object()
@@ -2986,9 +2984,7 @@ def test_cross_tokenizer_prepare_loss_input_rejects_nondivisible_cp_window(
     tmp_path, monkeypatch
 ):
     """Automodel CP rejects canonical CE windows that cannot partition evenly."""
-    loss_fn = CrossTokenizerDistillationLossFn(
-        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
-    )
+    loss_fn = _ct_loss_fn(_write_ct_projection(tmp_path), gold_loss=False)
     next_token_logprobs = torch.tensor(
         [[-1.0, -2.0, -3.0, -4.0, -5.0]], requires_grad=True
     )
@@ -3025,9 +3021,7 @@ def test_cross_tokenizer_precomputed_ce_reduces_partitioned_cp_window(
     tmp_path, monkeypatch
 ):
     """Precomputed CE sums CP-window values while preserving local gradients."""
-    loss_fn = CrossTokenizerDistillationLossFn(
-        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
-    )
+    loss_fn = _ct_loss_fn(_write_ct_projection(tmp_path), gold_loss=False)
     data = BatchedDataDict({"sample_mask": torch.ones(1)})
     next_token_logprobs = torch.tensor([[-1.0, -2.0]], requires_grad=True)
     next_token_mask = torch.ones_like(next_token_logprobs)
@@ -3065,9 +3059,7 @@ def test_cross_tokenizer_precomputed_ce_reduces_partitioned_cp_window(
 
 def test_cross_tokenizer_partitioned_cp_ce_matches_cp1_value_and_gradient(tmp_path):
     """Summed CP2 CE windows are numerically identical to the CP1 full CE."""
-    loss_fn = CrossTokenizerDistillationLossFn(
-        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
-    )
+    loss_fn = _ct_loss_fn(_write_ct_projection(tmp_path), gold_loss=False)
     data = BatchedDataDict(
         {
             "token_mask": torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]]),
