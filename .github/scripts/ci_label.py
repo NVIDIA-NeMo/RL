@@ -14,7 +14,8 @@
 """Pick a PR's CI:* label from its changed files, and keep only maintainers' overrides.
 
 Rules (first match wins):
-  CI:L1    any dependency or container file, or a 3rdparty/ submodule bump
+  CI:L1    any dependency or container file (including the docker/ .sh and .py
+           build helpers), or a 3rdparty/ submodule bump
   CI:docs  every file is docs, skill text, or a .github/ file the main CI run
            does not read
   CI:Lfast everything else
@@ -44,6 +45,8 @@ L1_GLOBS = (
     "*/uv.lock",
     "Dockerfile*",
     "*/Dockerfile*",
+    "docker/*.sh",
+    "docker/*.py",
     "3rdparty/*",
 )
 DOCS_GLOBS = (

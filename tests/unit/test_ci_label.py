@@ -42,6 +42,10 @@ _spec.loader.exec_module(ci_label)
         (["uv.lock", "docs/x.md"], "CI:L1"),
         (["3rdparty/Gym-workspace/Gym"], "CI:L1"),
         (["docker/Dockerfile"], "CI:L1"),
+        (["docker/install_mooncake.sh"], "CI:L1"),
+        (["docker/prune_uv_cache.py"], "CI:L1"),
+        (["docker/dynamo/install.sh"], "CI:L1"),
+        (["docker/README.md"], "CI:docs"),
         ([], "CI:Lfast"),
     ],
 )

@@ -52,7 +52,7 @@ Every PR **must** have exactly one `CI:*` label — the quality-check job stays 
 
 | Changed files | Label |
 |---------------|-------|
-| Any `pyproject.toml`, `uv.lock`, `Dockerfile*` or `3rdparty/**` | `CI:L1` |
+| Any `pyproject.toml`, `uv.lock`, `Dockerfile*`, `docker/**.sh`, `docker/**.py` or `3rdparty/**` | `CI:L1` |
 | Only `*.md`, `docs/**`, `skills/**`, or `.github/**` files the main CI run doesn't read | `CI:docs` |
 | Anything else | `CI:Lfast` |
 
