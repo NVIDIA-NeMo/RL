@@ -56,6 +56,7 @@ from nemo_rl.algorithms.grpo import (
     _initial_grpo_save_state,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import (
@@ -66,6 +67,7 @@ from nemo_rl.algorithms.single_controller import (
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
     AdvantageStageConfig,
+    _train_fields_for_step,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -95,6 +97,7 @@ from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     GROUP_ID_TAG,
+    GROUP_TOKEN_MEAN_WEIGHT,
     ROLLOUT_METRICS,
     SAMPLER_TOPK_FIELDS,
 )
@@ -120,12 +123,12 @@ from tests.unit.single_controller._rollout_checkpoints import (
 
 
 def test_train_fields_add_the_sampler_topk_for_score_centering():
-    without = single_controller._train_fields_for_step(
+    without = _train_fields_for_step(
         policy_logprobs_required=True,
         reference_logprobs_required=False,
         sampler_head_required=False,
     )
-    with_topk = single_controller._train_fields_for_step(
+    with_topk = _train_fields_for_step(
         policy_logprobs_required=True,
         reference_logprobs_required=False,
         sampler_head_required=True,
@@ -258,6 +261,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         restored_from_rollout_snapshot=False,
         ppo_group_multiple=1,
         ppo_min_remaining_groups=0,
+        trainer_warmup_kwargs=None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -562,6 +566,7 @@ def _stamp_advantage_stage_config(
         opd_full_enabled=opd_full_enabled,
         message_level_advantage_penalties_enabled=penalties_enabled,
         shardable=shardable,
+        objective_reduction=make_objective_reduction("global_token_mean"),
         train_data_dump_dir=str(dump.log_dir) if dump is not None else None,
         # The dumps installed here are JsonDebugWriters, so the stage writes JSONL.
         debug_writer=DebugWriterConfig(target="json"),
@@ -907,6 +912,41 @@ def test_reference_logprobs_required_only_when_kl_enabled(
     assert (
         "reference_policy_logprobs" in controller._train_fields
     ) is expected_reference_required
+
+
+@pytest.mark.parametrize("normalization", ["global_token_mean", "group_token_mean"])
+def test_train_fields_carry_the_reducer_columns(
+    monkeypatch, tmp_path, normalization
+) -> None:
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    master_config = MasterConfig.model_construct(
+        data_plane=_data_plane_config(),
+        policy={
+            "train_global_batch_size": 8,
+            "generation": {
+                "top_k": None,
+                "top_p": 1.0,
+                "colocated": {"enabled": False},
+            },
+        },
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=2,
+            num_generations_per_prompt=4,
+            skip_reference_policy_logprobs_calculation=False,
+        ),
+        loss_fn=ClippedPGLossConfig(normalization=normalization),
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=1,
+            max_buffered_rollouts=4,
+        ),
+        logger=LoggerConfig.model_construct(),
+        env={},
+        checkpointing=_checkpointing_config(tmp_path),
+    )
+    controller = _init_controller(master_config, _actor_args_for_init())
+    assert (GROUP_TOKEN_MEAN_WEIGHT in controller._train_fields) is (
+        normalization == "group_token_mean"
+    )
 
 
 @pytest.mark.parametrize("with_critic", [True, False], ids=["ppo", "grpo"])
@@ -2635,7 +2675,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
-    ctrl._train_fields = single_controller._train_fields_for_step(
+    ctrl._train_fields = _train_fields_for_step(
         policy_logprobs_required=False,
         reference_logprobs_required=False,
         sampler_head_required=False,
@@ -2649,6 +2689,7 @@ def _train_pump_controller(*, sampler) -> object:
     attach_rollout_checkpointing(ctrl)
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
+    ctrl._trainer_warmup_task = None
     ctrl._is_ppo = False
     ctrl._streaming_ppo = False
     ctrl._value_dedicated = False
@@ -3508,7 +3549,7 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
         reference_logprobs_required = stage_cfg.reference_logprobs_required
     ctrl._policy_logprobs_required = policy_logprobs_required
     ctrl._reference_logprobs_required = reference_logprobs_required
-    ctrl._train_fields = single_controller._train_fields_for_step(
+    ctrl._train_fields = _train_fields_for_step(
         policy_logprobs_required=policy_logprobs_required,
         reference_logprobs_required=reference_logprobs_required,
         sampler_head_required=False,
@@ -3693,6 +3734,7 @@ def test_run_pumps_snapshots_generation_before_dispatch(
     )
     ctrl._trainer_version = 0
     ctrl._rollout_restorer = SimpleNamespace(restore=AsyncMock(return_value=False))
+    ctrl._trainer_warmup_kwargs = None
     events = []
 
     def snapshot() -> None:

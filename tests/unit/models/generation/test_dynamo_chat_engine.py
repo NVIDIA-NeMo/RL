@@ -28,9 +28,15 @@ pytestmark = pytest.mark.vllm
 pytest.importorskip("dynamo._core")
 pytest.importorskip("vllm")
 
-from dynamo.llm.exceptions import HttpError, InvalidArgument  # noqa: E402
+from dynamo.llm.exceptions import (  # noqa: E402
+    HttpError,
+    InvalidArgument,
+    RoutedEngineError,
+)
 
-from nemo_rl.models.generation.dynamo import managed_runtime  # noqa: E402
+from nemo_rl.models.generation.dynamo.managed_runtime import (  # noqa: E402
+    ChatProcessorOptions,
+)
 from nemo_rl.models.generation.dynamo.vllm import chat_engine  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm.render_pool import (  # noqa: E402
     RenderedCall,
@@ -140,11 +146,22 @@ class _Router:
             if isinstance(self.error, Exception):
                 raise self.error
             if self.error is not None:
-                # Dynamo's binding raises an engine's error frame as a ValueError.
+                # An engine error Dynamo did not classify reaches us as a ValueError.
                 raise ValueError(self.error)
             yield _Item({"token_ids": [10], "engine_data": self.engine_data})
 
         return stream()
+
+
+class _Context:
+    """Dynamo's request context: keeps the response headers the engine sets."""
+
+    def __init__(self) -> None:
+        self.response_headers: dict[str, str] = {}
+
+    def set_response_header(self, name: str, value: str) -> bool:
+        self.response_headers[name] = value
+        return True
 
 
 class _Capture:
@@ -189,7 +206,17 @@ def _call(extras: dict | None = None, **fields) -> dict:
     }
 
 
-def _serve(pool, router, request, capture=None) -> list[dict]:
+def _options(chat_settings_file: str | None = None) -> dict:
+    """The chat processor config Dynamo hands the provider, as parsed JSON."""
+    return ChatProcessorOptions(
+        render_workers=3,
+        ray_address="10.0.0.1:6379",
+        capture_file="/chat/capture.pkl",
+        chat_settings_file=chat_settings_file,
+    )._asdict()
+
+
+def _serve(pool, router, request, capture=None, context=None) -> list[dict]:
     engine = chat_engine.NemoRLChatEngine(
         pool=pool,
         routed_engine=router,
@@ -198,7 +225,9 @@ def _serve(pool, router, request, capture=None) -> list[dict]:
     )
 
     async def run():
-        return [chunk async for chunk in engine.generate(request, None)]
+        return [
+            chunk async for chunk in engine.generate(request, context or _Context())
+        ]
 
     return asyncio.run(run())
 
@@ -242,12 +271,15 @@ def test_a_gym_call_is_rendered_spliced_and_routed_with_its_capture_plan() -> No
         _call(
             {"required_prefix_token_ids": PREFIX},
             chat_template_args={"enable_thinking": True},
+            stop_token_ids=[7],
         ),
     )
 
     # The worker renders the call without Dynamo's None fields, with the
     # profile's exact sampling and Gym's extras as the native request fields.
     (body,) = pool.bodies
+    # A vLLM token-level field the frontend passes through is rendered as sent.
+    assert body["stop_token_ids"] == [7]
     assert body["messages"][0]["content"][1] == {
         "type": "image_url",
         "image_url": {"url": "u"},
@@ -373,10 +405,10 @@ def test_gym_calls_nemo_rl_cannot_serve_are_refused_with_a_400(
     router = _Router()
     request_fields = {"extras": {}, **request_fields}
 
-    with pytest.raises(HttpError, match=error) as refused:
+    # Dynamo answers InvalidArgument with HTTP 400 and its message.
+    with pytest.raises(InvalidArgument, match=error):
         _serve(pool, router, _call(**request_fields))
 
-    assert refused.value.code == 400
     assert router.requests == []
 
 
@@ -398,9 +430,7 @@ def test_an_untrained_callers_call_keeps_its_own_sampling() -> None:
 def test_a_call_refused_before_it_runs_acknowledges_its_capture_to_gym(
     captured, refused_by
 ) -> None:
-    from nemo_gym.token_id_capture.external_capture import (
-        split_dynamo_capture_refusal,
-    )
+    from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER
     from vllm.exceptions import VLLMValidationError
 
     pool = _Pool(_rendered())
@@ -419,14 +449,15 @@ def test_a_call_refused_before_it_runs_acknowledges_its_capture_to_gym(
             }
         }
     extras = {"ng_capture": TOKEN_IN} if captured else {}
+    context = _Context()
 
-    with pytest.raises(HttpError) as refused:
-        _serve(pool, router, _call(extras))
+    with pytest.raises(InvalidArgument, match="maximum context length"):
+        _serve(pool, router, _call(extras), context=context)
 
-    # Gym reads the acknowledgement off the message, as natively off the header.
-    message, refused_call = split_dynamo_capture_refusal(refused.value.message)
-    assert (refused.value.code, "maximum context length" in message) == (400, True)
-    assert refused_call == (TOKEN_IN["model_call_id"] if captured else None)
+    # Gym reads the acknowledgement off the header, as from the native server.
+    assert context.response_headers == (
+        {CAPTURE_REFUSAL_HEADER: TOKEN_IN["model_call_id"]} if captured else {}
+    )
 
 
 @pytest.mark.parametrize(
@@ -468,16 +499,12 @@ def test_an_engine_that_does_not_serve_the_call_fails_it(router, status, message
     assert failed.value.code == status
 
 
-def test_dynamos_frontend_still_builds_its_entrypoint_by_the_name_nemo_rl_wraps():
-    import dynamo.frontend.main as frontend_main
+def test_an_engine_error_dynamo_classified_keeps_its_status() -> None:
+    router = _Router(error=RoutedEngineError("worker gone"))
 
-    # frontend.main() swaps this module global for one that adds NeMo RL's
-    # chat_engine_factory; if Dynamo stops reading it there, Dynamo's own
-    # preprocessor serves chat and every NeMo-Gym call is refused.
-    assert "EntrypointArgs" in frontend_main.async_main.__code__.co_names
-    # It swaps this one to serve NeMo-Gym's generation cuts from the frontend's
-    # runtime; if Dynamo stops reading it there, every cut gets a 404.
-    assert "DistributedRuntime" in frontend_main.async_main.__code__.co_names
+    # Raised as it came: the frontend answers with the status the error maps to.
+    with pytest.raises(RoutedEngineError, match="worker gone"):
+        _serve(_Pool(_rendered()), router, _call({}))
 
 
 def test_only_nemo_rls_engines_are_served() -> None:
@@ -488,9 +515,7 @@ def test_only_nemo_rls_engines_are_served() -> None:
     )
 
     async def build():
-        return await chat_engine.ChatEngineFactory().chat_engine_factory(
-            0, model, _Router()
-        )
+        return await chat_engine.provider(None, _options())(0, model, _Router())
 
     with pytest.raises(RuntimeError, match="without NeMo RL's chat settings"):
         asyncio.run(build())
@@ -513,7 +538,6 @@ def test_render_workers_start_at_registration_only_where_chat_is_served(
             started.append(self._workers)
 
     monkeypatch.setattr(chat_engine, "RenderPool", _StartedPool)
-    monkeypatch.setenv(chat_engine.RENDER_WORKERS_ENV, "3")
     # NeMo-Gym needs the flag, and the native worker starts its server on it.
     generation = {**GENERATION, "vllm_cfg": {"expose_http_server": exposes_chat}}
     spec = {"engine_args": {}, "generation": generation}
@@ -524,7 +548,8 @@ def test_render_workers_start_at_registration_only_where_chat_is_served(
     )
 
     async def register() -> None:
-        await chat_engine.ChatEngineFactory().chat_engine_factory(0, model, _Router())
+        # No chat settings file: the run serves no chat, so launch starts none.
+        await chat_engine.provider(None, _options())(0, model, _Router())
         # The start runs in the background; registration never waits for it.
         await asyncio.gather(*(asyncio.all_tasks() - {asyncio.current_task()}))
 
@@ -568,9 +593,7 @@ def test_registration_keeps_render_workers_built_from_the_same_settings(
 
     monkeypatch.setattr(chat_engine, "RenderPool", _Pool)
     monkeypatch.setattr(chat_engine, "weight_free_model_path", early_model_dir)
-    monkeypatch.setenv(chat_engine.RENDER_WORKERS_ENV, "3")
     settings_file = tmp_path / "chat_settings.json"
-    monkeypatch.setenv(managed_runtime.CHAT_SETTINGS_FILE_ENV, str(settings_file))
     generation = {
         **GENERATION,
         "model_name": "model",
@@ -594,11 +617,11 @@ def test_registration_keeps_render_workers_built_from_the_same_settings(
     )
 
     async def launch_then_register() -> None:
-        factory = chat_engine.ChatEngineFactory()
-        factory.start_render_workers()
+        # Dynamo calls the provider at launch, on the frontend's loop.
+        chat_engine_factory = chat_engine.provider(None, _options(str(settings_file)))
         while sent_early is not None and not pools[0].built:
             await asyncio.sleep(0.01)
-        await factory.chat_engine_factory(0, model, _Router())
+        await chat_engine_factory(0, model, _Router())
 
     asyncio.run(launch_then_register())
 

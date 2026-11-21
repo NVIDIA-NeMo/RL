@@ -9,24 +9,42 @@ BASE_TEST=$SCRIPT_DIR/grpo_dp_single_controller.sh
 # simple / mooncake_cpu / nixl, or a variant of one:
 #   simple_placed   simple with SimpleStorageUnits pinned (storage_unit_placement=all)
 #   mooncake_units  mooncake_cpu with CPU storage units as the only memory owners
-#   nixl_ssd        nixl with its units' SSD tier on
-# mooncake_cpu and nixl_ssd save and restore with values on SSD (a run holds
-# up to ~400 KB, so each sets a limit below that) and fail unless SSD was used.
+#   mooncake_gdr    mooncake_cpu with GDR clients (use_gdr=true), SSD under pressure
+#   nixl_ssd        nixl with its units' SSD tier under memory pressure
+# The mooncake_cpu and nixl SSD tiers are on by default and spill only under
+# memory pressure. mooncake_units and nixl run the defaults (path: null, the
+# node's NVMe) and fail if anything was spilled; mooncake_cpu and nixl_ssd set
+# a memory limit below the ~400 KB a run holds, with an explicit path under the
+# test dir, and fail unless SSD was used across save and restore.
 VARIANT=${1:-simple}
 VARIANT_OVERRIDES=()
 # check_metrics.py expressions run on both phases' metrics.
 VARIANT_CHECKS=()
+# 1: Mooncake SSD offload must write files under SSD_DIR during the run.
+EXPECT_SSD_FILES=0
 case "$VARIANT" in
     simple) BACKEND=simple; TEST_NAME=grpo_dp_single_controller_tq_recovery ;;
-    mooncake_cpu)
+    mooncake_cpu|mooncake_gdr)
         BACKEND=mooncake_cpu
         TEST_NAME=grpo_dp_mooncake_tq_recovery
+        if [[ "$VARIANT" == "mooncake_gdr" ]]; then
+            TEST_NAME=grpo_dp_mooncake_gdr_tq_recovery
+            # Policy workers are CUDA clients: their puts take the GDR path.
+            VARIANT_OVERRIDES=(data_plane.mooncake_cpu.use_gdr=true)
+        fi
         SSD_DIR=$SCRIPT_DIR/$TEST_NAME/ssd
+        EXPECT_SSD_FILES=1
         # Offload past 1e-6 of the clients' 4 GiB segments: a few KB each.
-        VARIANT_OVERRIDES=(
-            data_plane.mooncake_cpu.ssd_offload.enabled=true
+        VARIANT_OVERRIDES+=(
             data_plane.mooncake_cpu.ssd_offload.path="$SSD_DIR"
             data_plane.mooncake_cpu.ssd_offload.offload_threshold=0.000001
+        )
+        # The master's counters the single controller logs every step
+        # (mooncake_ssd_offload.step_metrics): offload rounds ran, and no
+        # SSD copy was deleted for space.
+        VARIANT_CHECKS=(
+            'max(data["data_plane/mooncake/offload_rounds_total"]) > 0'
+            'max(data["data_plane/mooncake/disk_evictions_total"]) == 0'
         )
         ;;
     simple_placed)
@@ -38,21 +56,29 @@ case "$VARIANT" in
         BACKEND=mooncake_cpu
         TEST_NAME=grpo_dp_mooncake_units_tq_recovery
         VARIANT_OVERRIDES=(data_plane.mooncake_cpu.storage_unit_segment_size=4294967296)
+        # Default SSD offload, memory not under pressure: nothing moves to SSD.
+        VARIANT_CHECKS=(
+            'max(data["data_plane/mooncake/offload_rounds_total"]) == 0'
+            'max(data["data_plane/mooncake/disk_evictions_total"]) == 0'
+        )
         ;;
     nixl)
         BACKEND=nixl
         TEST_NAME=grpo_dp_nixl_tq_recovery
-        # Per-step unit metrics the driver logs (tq_nixl.unit_metrics).
-        VARIANT_CHECKS=('max(data["data_plane/nixl/retired_mb_sum"]) == 0')
+        # Per-step unit metrics the driver logs (tq_nixl.unit_metrics). The
+        # default SSD tier is on but the put area is not full: no spill.
+        VARIANT_CHECKS=(
+            'max(data["data_plane/nixl/retired_mb_sum"]) == 0'
+            'max(data["data_plane/nixl/ssd_spills_sum"]) == 0'
+        )
         ;;
     nixl_ssd)
         BACKEND=nixl
         TEST_NAME=grpo_dp_nixl_ssd_tq_recovery
         SSD_DIR=$SCRIPT_DIR/$TEST_NAME/ssd
-        # 256 KiB slab per unit: a 128 KiB put area and a 128 KiB SSD IO area.
+        # 128 KiB put area per unit, plus a 128 KiB SSD IO area pinned beside it.
         VARIANT_OVERRIDES=(
-            data_plane.nixl.unit_slab_bytes=262144
-            data_plane.nixl.ssd.enabled=true
+            data_plane.nixl.unit_slab_bytes=131072
             data_plane.nixl.ssd.path="$SSD_DIR"
             data_plane.nixl.ssd.staging_bytes=131072
         )
@@ -99,7 +125,7 @@ if [[ "$BACKEND" == "mooncake_cpu" ]]; then
     )
 fi
 
-if [[ "$VARIANT" == "mooncake_cpu" ]]; then
+if (( EXPECT_SSD_FILES )); then
     # Offload files are deleted once their keys are cleared, so record the
     # peak count while both phases run (not Mooncake's .lock).
     SSD_PEAK=$TEST_DIR/ssd_peak
@@ -171,13 +197,37 @@ if [[ "$BACKEND" == "mooncake_cpu" ]]; then
     test -s "$CHECKPOINT_DIR/step_2/data_plane/mooncake_storage/manifest.json"
 fi
 
-if [[ "$VARIANT" == "mooncake_cpu" ]]; then
+if (( EXPECT_SSD_FILES )); then
     PEAK=$(cat "$SSD_PEAK")
     if (( PEAK == 0 )); then
         echo "FAIL: Mooncake SSD offload never wrote a file under $SSD_DIR" >&2
         exit 1
     fi
     echo "✓ Mooncake SSD offload held up to $PEAK file(s) across save and restore"
+fi
+
+if [[ "$VARIANT" == "mooncake_units" ]]; then
+    # path: null -> each owner writes under the node's NVMe default
+    # (local_disk.default_ssd_dir: /raid when mounted and writable, else /tmp).
+    # The owners' lines reach the run log through Ray.
+    if ! grep -Eq "SSD offload for this process under /(raid|tmp)/nrl_mooncake_ssd_offload-[0-9]+/" "$PHASE1_LOG"; then
+        echo "FAIL: no Mooncake owner used the default offload directory" >&2
+        exit 1
+    fi
+    echo "✓ Mooncake owners use the default NVMe offload directory"
+fi
+
+if [[ "$VARIANT" == "mooncake_gdr" ]]; then
+    # The adapter logs this once per CUDA client whose tensor PUT took the GDR
+    # path; without it the run silently used the CPU path (workers' lines
+    # reach the run log through Ray).
+    for PHASE in phase1 phase2; do
+        if ! grep -q "TransferQueue GDR tensor PUT active" "$TEST_DIR/$PHASE.log"; then
+            echo "FAIL: no client used GDR in $PHASE" >&2
+            exit 1
+        fi
+    done
+    echo "✓ GDR clients put through GPU memory while SSD offload ran"
 fi
 
 # Hash guard: rows were checked, and no process logged a mismatch or a guard
