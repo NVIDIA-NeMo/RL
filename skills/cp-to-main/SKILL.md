@@ -75,9 +75,10 @@ Run from the NeMo-RL checkout. `$GITHUB_TOKEN` (`public_repo` scope) must be set
    ```
    POST `/repos/NVIDIA-NeMo/RL/pulls` with `"base": "main"`, `"head": "<user>/cp-<N>-main"`.
    - Title: `cp: cherry-pick #<N> - <original title verbatim>`.
-   - Body, one line:
+   - Body: the PR template, filled per the [pr-description](../pr-description/SKILL.md) skill. Leave the review box unticked for the user. Under "What and why", one line:
      - Clean: `manually cp #<N> from <rel> into main since the auto cherry-pick did not land.`
      - Conflict: `manually cp #<N> from <rel> into main since the auto cherry-pick had a conflict in `<file>` (<why>).`
+   - Proof: `N/A: cherry-pick of #<N>.` Upstream: `None`, unless the original needed one.
 
 8. **Labels + CI.** Copy the original's `CI:*` labels (`POST /issues/<pr>/labels`). Do not copy release labels (`r0.8.0`, ...) or the bot's `cherry-pick` label. Then post `/ok to test <full head sha>` as an issue comment.
 

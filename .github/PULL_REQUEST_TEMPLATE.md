@@ -17,7 +17,7 @@
 <details><summary>PR commands and CI</summary>
 
 - CI label, exactly one:
-  - `CI:Lfast`: the default for most PRs. Runs a fast test subset on the main container.
+  - `CI:Lfast`: the default for most PRs. Runs a fast test subset.
   - `CI:L1`: dependency or container changes (`pyproject.toml`, `uv.lock`, `Dockerfile`) or broad core changes. Builds a new image and runs unit and functional tests.
   - `CI:docs`: docs-only changes. Runs doc tests only.
 - `/ok to test <full-commit-sha>`: start CI for that commit. Post again after each push.

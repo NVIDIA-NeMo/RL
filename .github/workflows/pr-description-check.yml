@@ -45,9 +45,10 @@ jobs:
           fi
 
           # Read the live description, so re-running an old job sees the current text.
-          # Drop HTML comments and fenced code, so neither can tick the box or add a heading.
+          # Replace code (fenced, unclosed fences, inline) first, then drop HTML comments,
+          # so neither can tick the box, add a heading, or hide a real one.
           body=$(gh pr view "$PR_NUMBER" -R "$REPO" --json body --jq '.body // ""' \
-            | perl -0pe 's/<!--.*?-->//gs; s/^\s*(```|~~~).*?^\s*\1[^\n]*$//gms')
+            | perl -0pe 's/^[ \t]*(`{3,}|~{3,}).*?(?:^[ \t]*\1[^\n]*$|\z)/[code]/gms; s/`[^`\n]*`/[code]/g; s/<!--.*?-->//gs')
 
           # Keep the box text and headings in sync with PULL_REQUEST_TEMPLATE.md and skills/pr-description.
           box='I, the PR author, have personally reviewed every line of this PR'
@@ -62,7 +63,8 @@ jobs:
           for heading in "What and why" "Convergence / perf / functionality proof" "Needs upstream changes"; do
             grep -qiE "^#{1,6}\s+$heading\s*$" <<<"$body" || problems+=("Missing heading: \"## $heading\"")
           done
-          what_and_why=$(perl -0ne 'print $1 if /^#{1,6}\s+What and why\s*\n(.*?)(?=^#{1,6}\s|\z)/msi' <<<"$body")
+          # Subsections belong to this section; stop only at a peer or parent heading.
+          what_and_why=$(perl -0ne 'print $2 if /^(#{1,6})\s+What and why\s*\n(.*?)(?=^(?!\1#)#{1,6}\s|\z)/msi' <<<"$body")
           if grep -qiE "^#{1,6}\s+What and why\s*$" <<<"$body" && [[ -z "${what_and_why//[[:space:]]/}" ]]; then
             problems+=('Empty section: "## What and why"')
           fi
