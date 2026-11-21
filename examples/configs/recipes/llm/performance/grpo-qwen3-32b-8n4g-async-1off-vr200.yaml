@@ -1,0 +1,16 @@
+defaults: ./grpo-qwen3-32b-8n4g-async-1off.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-32b-8n4g-async-1off-vr200
+policy:
+  logprob_chunk_size: 4096
+  generation:
+    refit_transport: null
+  megatron_cfg:
+    defer_fp32_logits: true
+  sequence_packing:
+    fuse_loss: true
+    train_mb_tokens: 12288
+logger:
+  log_dir: logs/grpo-qwen3-32b-8n4g-async-1off-vr200
+  wandb:
+    name: grpo-qwen3-32b-8n4g-async-1off-vr200

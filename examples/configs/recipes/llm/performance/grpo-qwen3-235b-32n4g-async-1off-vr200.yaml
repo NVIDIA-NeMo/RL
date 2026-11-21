@@ -1,0 +1,21 @@
+defaults: ./grpo-qwen3-235b-32n4g-async-1off.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-235b-32n4g-async-1off-vr200
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    # Recompute the attention core and retain other activations.
+    recompute_granularity: selective
+    recompute_modules: [core_attn]
+    env_vars:
+      NRL_REFIT_BUFFER_MEMORY_RATIO: "0.02"
+  generation:
+    # Match the measured collective refit and packed-buffer target.
+    refit_transport: null
+    vllm_cfg:
+      env_vars:
+        NRL_REFIT_BUFFER_MEMORY_RATIO: "0.02"
+logger:
+  log_dir: logs/grpo-qwen3-235b-32n4g-async-1off-vr200
+  wandb:
+    name: grpo-qwen3-235b-32n4g-async-1off-vr200

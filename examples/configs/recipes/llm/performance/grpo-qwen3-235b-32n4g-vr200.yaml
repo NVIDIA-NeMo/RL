@@ -1,0 +1,12 @@
+defaults: ./grpo-qwen3-235b-32n4g.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-235b-32n4g-vr200
+policy:
+  megatron_cfg:
+    # Recompute the attention core and retain other activations.
+    recompute_granularity: selective
+    recompute_modules: [core_attn]
+logger:
+  log_dir: logs/grpo-qwen3-235b-32n4g-vr200
+  wandb:
+    name: grpo-qwen3-235b-32n4g-vr200

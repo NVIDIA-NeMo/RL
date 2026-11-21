@@ -1,0 +1,18 @@
+defaults: ./grpo-qwen3-32b-4n4g.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-32b-4n4g-vr200
+policy:
+  logprob_chunk_size: 4096
+  make_sequence_length_divisible_by: 2
+  megatron_cfg:
+    defer_fp32_logits: true
+    pipeline_model_parallel_size: 2
+    sequence_parallel: false
+    tensor_model_parallel_size: 1
+  sequence_packing:
+    fuse_loss: true
+    train_mb_tokens: 8192
+logger:
+  log_dir: logs/grpo-qwen3-32b-4n4g-vr200
+  wandb:
+    name: grpo-qwen3-32b-4n4g-vr200
