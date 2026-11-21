@@ -39,6 +39,7 @@ from nemo_rl.experience.rollout_recovery import (
     _owned_staging_key,
     _receipt_staging_keys,
 )
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
@@ -148,7 +149,10 @@ class RolloutReassemblerActorConfig:
     # media rows in this geometry for groups without media), ``None`` otherwise.
     media_columns: Optional[MediaColumnSpec]
     top_logprobs: int
+    # grpo.agent_overrides is set: stamp rows with their agent name.
+    stamp_agent_names: bool = False
     reward_penalty_config: RewardPenaltyConfig | None = None
+    length_penalty_config: LengthPenaltyConfig | None = None
     effort_config: EffortLevelsConfig | None = None
     # Policy tokenizer and resolved think tags, set only when
     # penalize_malformed_think_tag needs to decode generations.
@@ -189,10 +193,12 @@ class RolloutReassemblerActor:  # pragma: no cover
             capture_media=config.capture_media,
             media_columns=config.media_columns,
             reward_penalty_config=config.reward_penalty_config,
+            length_penalty_config=config.length_penalty_config,
             effort_config=config.effort_config,
             tokenizer=tokenizer,
             thinking_tags=config.thinking_tags,
             top_logprobs=config.top_logprobs,
+            stamp_agent_names=config.stamp_agent_names,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

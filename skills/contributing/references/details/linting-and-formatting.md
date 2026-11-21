@@ -100,7 +100,7 @@ def make_complex(x, y):
 
 Annotate new functions and methods — both parameters and return type. When you add a parameter to an existing signature, type it, and **match the type already used at the call site** (don't leave a new arg untyped while the caller already declares it, e.g. `def __init__(self, teacher_worker_groups=None)` when the caller passes `teacher_worker_groups: Optional[dict[str, Any]]`).
 
-When you add a new module under a type-checked area, **add it to `pyrefly.toml` `project-includes`**. `pyrefly` checks an explicit allow-list of files, so a new file that isn't listed silently escapes type-checking and its annotations are never verified.
+`pyrefly` checks every file under `nemo_rl`, `examples`, `docs` and `tools`, plus `docker/*.py`; a new module needs no registration. Errors that already existed are recorded in `pyrefly-baseline.json` and are not reported, so the pre-commit hook fails only on **new** errors, in new and existing files alike. **Fix a new error instead of adding it to the baseline.** When your change removes baselined errors, drop their entries with `uv run --group dev pyrefly check --prune-baseline`.
 
 ## Imports
 

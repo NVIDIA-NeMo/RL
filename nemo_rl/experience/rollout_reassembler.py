@@ -52,6 +52,7 @@ from nemo_rl.data.captured_media import (
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
+    AGENT_NAME_TAG,
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
@@ -96,6 +97,10 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
     encoded_route_plan_size_bytes,
     validate_route_plan,
+)
+from nemo_rl.utils.length_penalty import (
+    LengthPenaltyConfig,
+    apply_group_length_penalties_from_inputs,
 )
 
 if TYPE_CHECKING:
@@ -399,6 +404,7 @@ class RolloutReassembler:
         pad_token_id: int,
         max_seq_len: int,
         reward_penalty_config: RewardPenaltyConfig | None = None,
+        length_penalty_config: LengthPenaltyConfig | None = None,
         effort_config: EffortLevelsConfig | None = None,
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
@@ -407,8 +413,13 @@ class RolloutReassembler:
         tokenizer: Any = None,
         thinking_tags: Sequence[str] | None = None,
         top_logprobs: int = 0,
+        stamp_agent_names: bool = False,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
+        # grpo.agent_overrides: stamp each published row's tag with its group's
+        # NeMo-Gym agent so the advantage stage can apply per-agent settings.
+        self._stamp_agent_names = bool(stamp_agent_names)
+        self._length_penalty_config = length_penalty_config
         # Decodes generations for the malformed-think-tag string check.
         self._tokenizer = tokenizer
         self._thinking_tags = thinking_tags
@@ -947,6 +958,7 @@ class RolloutReassembler:
             )
             mask_sample = logical.mask_sample
         _rollouts_ms = (time.perf_counter() - _group_t0) * 1000.0
+        length_metrics = self._apply_length_penalty(rows, checks_by_rollout)
         valid_rows = [row for row in rows if row.valid]
         staging_keys = (
             logical.staging_keys
@@ -1102,6 +1114,8 @@ class RolloutReassembler:
             for _, slot, row in reward_rows
             if row.valid
         ]
+        for name, value in length_metrics.items():
+            metrics[f"finalize/{name}_sum"] = value * len(reward_observations)
         # Truncated rollouts among the reward observations, pooled into
         # termination rates like the penalty counts; receipt-side rates only
         # saw a placeholder truncated=False.
@@ -1131,10 +1145,16 @@ class RolloutReassembler:
             else list(range(len(rows))),
             log_contexts,
         )
+        slot_agent_names = (
+            [c.agent_name if c is not None else None for c in log_contexts]
+            if self._stamp_agent_names
+            else None
+        )
         finalized = self._publish_rows(
             group_id,
             rows,
             rollout_ids,
+            slot_agent_names=slot_agent_names,
             mask_sample=mask_sample,
             fallback_weight_version=fallback_weight_version,
             prompt_idx=prompt_idx,
@@ -1150,8 +1170,48 @@ class RolloutReassembler:
             canonical_sample_ids=canonical_sample_ids,
             loss_multiplier=loss_multiplier,
         )
+        # Length metrics are already pooled in finalize/length_penalty/*_sum.
+        # Keep them separate from token metrics.
         finalized.token_metrics = token_metrics
         return finalized
+
+    def _apply_length_penalty(
+        self,
+        rows: list[FinalizedRollout],
+        checks: tuple[RewardChecks | None, ...],
+    ) -> dict[str, float]:
+        """Adjust each verified rollout once before publishing any rows.
+
+        Ordinary and non-Forest token capture only: Forest training together with
+        grpo.length_penalty is rejected at config validation.
+        """
+        config = self._length_penalty_config
+        if config is None:
+            return {}
+        valid_indices = [index for index, row in enumerate(rows) if row.valid]
+        if not valid_indices:
+            return {}
+        inputs, rewards, generated, bypass = [], [], [], []
+        for index in valid_indices:
+            evidence = checks[index]
+            if evidence is None or evidence.length_penalty is None:
+                raise ValueError(
+                    "length penalty requires saved rollout length metadata; restart rollouts"
+                )
+            inputs.append(evidence.length_penalty)
+            rewards.append(rows[index].reward)
+            generated.append(sum(rows[index].token_mask))
+            bypass.append(evidence.low_effort)
+        adjusted, metrics = apply_group_length_penalties_from_inputs(
+            inputs,
+            rewards,
+            generated_lengths=[int(value) for value in generated],
+            low_effort=bypass,
+            config=config,
+        )
+        for index, reward in zip(valid_indices, adjusted, strict=True):
+            rows[index] = replace(rows[index], reward=reward)
+        return metrics
 
     def _truncated_flags(
         self, rows: Sequence[FinalizedRollout], logical: Optional[_LogicalRows]
@@ -1171,6 +1231,7 @@ class RolloutReassembler:
         rows: list[FinalizedRollout],
         rollout_ids: list[str],
         *,
+        slot_agent_names: Optional[list[Optional[str]]] = None,
         mask_sample: list[bool],
         fallback_weight_version: int,
         prompt_idx: int,
@@ -1411,6 +1472,20 @@ class RolloutReassembler:
                 raise ValueError("Forest publication IDs differ from the cleanup plan")
             for tag, owner_tag in zip(tags, logical.tags, strict=True):
                 tag.update(owner_tag)
+        if slot_agent_names is not None:
+            # grpo.agent_overrides: each row's tag names its rollout's agent
+            # (Forest rows by logical slot). Rows without one, e.g. execution
+            # padding, take the group's agent: a prompt group has one agent.
+            group_agent = next((name for name in slot_agent_names if name), None)
+            for index, tag in enumerate(tags):
+                slot = tag.get("logical_slot") if logical is not None else index
+                name = (
+                    slot_agent_names[slot]
+                    if slot is not None and 0 <= slot < len(slot_agent_names)
+                    else None
+                ) or group_agent
+                if name is not None:
+                    tag[AGENT_NAME_TAG] = name
         _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
         _put_t0 = time.perf_counter()
         self._call_dp(

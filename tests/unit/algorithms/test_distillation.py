@@ -35,6 +35,7 @@ from nemo_rl.algorithms.loss import DistillationLossConfig, DistillationLossFn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
 
 
@@ -180,12 +181,12 @@ def mock_components():
             },
             "logger": LoggerConfig.model_construct(num_val_samples_to_print=5),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
-            "checkpointing": {
-                "enabled": False,
-                "checkpoint_must_save_by": None,
-                "save_period": 10,
-                "metric_name": None,
-            },
+            "checkpointing": CheckpointingConfig.model_construct(
+                enabled=False,
+                checkpoint_must_save_by=None,
+                save_period=10,
+                metric_name=None,
+            ),
         }
     )
 
@@ -284,10 +285,10 @@ def test_ft_save_period_triggers_periodic_saves(mock_components):
     cfg = mock_components["master_config"]
     cfg.distillation.max_num_steps = 5
     cfg.distillation.val_period = 0
-    cfg.checkpointing["enabled"] = True
-    cfg.checkpointing["save_period"] = 100  # only the final step would save
-    cfg.checkpointing["ft_save_period"] = 2
-    cfg.checkpointing["metric_name"] = None
+    cfg.checkpointing.enabled = True
+    cfg.checkpointing.save_period = 100  # only the final step would save
+    cfg.checkpointing.ft_save_period = 2
+    cfg.checkpointing.metric_name = None
 
     checkpointer = mock_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
@@ -458,8 +459,8 @@ def test_exit_on_timeout(mock_components, capsys, tmp_path):
     """Test that training loop exits when timeout is reached"""
     # Set max steps to large number
     mock_components["master_config"].distillation.max_num_steps = 100
-    mock_components["master_config"].checkpointing["enabled"] = True
-    mock_components["master_config"].checkpointing["metric_name"] = None
+    mock_components["master_config"].checkpointing.enabled = True
+    mock_components["master_config"].checkpointing.metric_name = None
     mock_components["checkpointer"].init_tmp_checkpoint.return_value = str(
         tmp_path / "tmp_step"
     )
@@ -1004,7 +1005,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
             ),
             "data": {"shuffle": False},
             "logger": LoggerConfig.model_construct(),  # Config extraction requires this key
-            "checkpointing": {},  # Config extraction requires this key
+            "checkpointing": CheckpointingConfig.model_construct(),  # Config extraction requires this key
             "cluster": ClusterConfig(
                 num_nodes=1,  # Single node
                 gpus_per_node=8,
@@ -1156,7 +1157,7 @@ def test_distillation_setup_non_colocated_smoke(
             ),
             "data": {"shuffle": False},
             "logger": LoggerConfig.model_construct(),
-            "checkpointing": {},
+            "checkpointing": CheckpointingConfig.model_construct(),
             "cluster": ClusterConfig(num_nodes=2, gpus_per_node=8),
         }
     )
@@ -1256,6 +1257,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         "num_gpu_nodes": 1,
         "invalid_tool_call_patterns": ["bad_call"],
         "thinking_tags": ["<think>"],
+        "truncate_noncontiguous_episodes": True,
         "config_paths": ["gym.yaml"],
     }
 
@@ -1314,7 +1316,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
                 "nemo_gym": nemo_gym_config,
             },
             "logger": LoggerConfig.model_construct(),
-            "checkpointing": {},
+            "checkpointing": CheckpointingConfig.model_construct(),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=1),
         }
     )
@@ -1345,7 +1347,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         def __init__(self, cluster, config, defer_model_load=False):
             self.cfg = config
             self.defer_model_load = defer_model_load
-            self.dp_openai_server_base_urls = ["http://reserved-vllm"]
+            self.client_base_urls = ["http://reserved-vllm"]
             # The per-job bearer token the real class generates when the
             # recipe requires one; Gym's model server must receive it.
             self.http_server_api_key = "k"
@@ -1439,7 +1441,7 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
         data={"train": {}},
         env={"should_use_nemo_gym": True, "nemo_gym": {}},
         logger=LoggerConfig(log_dir="/tmp/logs"),
-        checkpointing={"enabled": False},
+        checkpointing=CheckpointingConfig.model_construct(enabled=False),
         cluster={},
     )
 
@@ -1464,7 +1466,7 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
         patch.object(runner, "load_config", return_value=master_config.model_dump()),
         patch.object(runner, "parse_hydra_overrides", side_effect=lambda cfg, _: cfg),
         patch.object(runner, "OmegaConf") as mock_omegaconf,
-        patch.object(runner, "MasterConfig", return_value=master_config),
+        patch.object(runner.MasterConfig, "model_validate", return_value=master_config),
         patch.object(runner, "get_next_experiment_dir", return_value="/tmp/logs/exp"),
         patch.object(runner, "get_tokenizer", return_value=tokenizer),
         patch.object(
@@ -1556,7 +1558,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
             ),
             "data": {"shuffle": False},
             "logger": LoggerConfig.model_construct(),  # Config extraction requires this key
-            "checkpointing": {},  # Config extraction requires this key
+            "checkpointing": CheckpointingConfig.model_construct(),  # Config extraction requires this key
             "cluster": ClusterConfig(
                 num_nodes=2,  # Multi-node
                 gpus_per_node=8,
