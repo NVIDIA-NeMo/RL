@@ -3,7 +3,7 @@
 # Reference this file from a NeMo-RL YAML config via:
 #
 #     policy:
-#       quant_cfg: "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml"
+#       quant_cfg: "/absolute/path/to/nvfp4_a16_mlp_only.yaml"
 #
 # This recipe uses ModelOpt's standard PTQ recipe layout (see
 # ``modelopt_recipes/general/ptq/`` in the NVIDIA/Model-Optimizer repo:

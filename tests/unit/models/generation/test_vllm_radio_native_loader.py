@@ -148,7 +148,7 @@ def _load_weights_fn(radio: Path):
     def default_weight_loader(param, weight):
         param.data.copy_(weight)
 
-    namespace = {"default_weight_loader": default_weight_loader}
+    namespace = {"default_weight_loader": default_weight_loader, "torch": torch}
     exec(compile(ast.fix_missing_locations(module), str(radio), "exec"), namespace)
     return namespace["load_weights"]
 

@@ -41,7 +41,8 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # also produce very large token_mult_prob_error from a single long outlier, so
 # the multi-step Qwen3 performance tests keep ownership of that metric.
 # ModelOpt can add disabled quantizers; check both workers without fixing the count.
-grep -qE "Worker_TP[0-9]+.*[1-9][0-9]* TensorQuantizers found in model" "$RUN_LOG"
+# vLLM 0.33's Ray executor logs its workers as RayWorkerProc; older executors use Worker_TP<n>.
+grep -qE "(RayWorkerProc|Worker_TP[0-9]+).*[1-9][0-9]* TensorQuantizers found in model" "$RUN_LOG"
 # The Megatron worker only runs mtq.print_quant_summary ("N TensorQuantizers found in
 # model") when it quantizes from scratch; when the cached quantized checkpoint
 # (<model>_modelopt_<cfg-hash>) exists it restores instead and only ModelOpt's

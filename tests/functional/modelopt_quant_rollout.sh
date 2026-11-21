@@ -49,10 +49,12 @@ run_quant_rollout_case() {
     fi
     local megatron_cache_dir="$megatron_cache_root/$case_name-$quant_cfg_hash"
     local real_quant_override=()
+    local generation_quant_cfg=$quant_cfg
     shift 6
 
     if [[ "$real_quant" == "true" ]]; then
         real_quant_override+=(++policy.generation.real_quant=true)
+        generation_quant_cfg=null
     fi
 
     rm -rf "$EXP_DIR/$case_name"
@@ -67,7 +69,7 @@ run_quant_rollout_case() {
         policy.model_name=$model_name \
         policy.tokenizer.name=$model_name \
         policy.quant_cfg=$quant_cfg \
-        policy.generation.quant_cfg=$quant_cfg \
+        policy.generation.quant_cfg=$generation_quant_cfg \
         policy.quant_calib_size=4 \
         policy.quant_batch_size=1 \
         policy.quant_sequence_length=128 \
