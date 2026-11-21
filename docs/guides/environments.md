@@ -65,6 +65,64 @@ if multi_rewards is not None:
 ```
 For instance, when running `examples/configs/gdpo_math_1B.yaml`, the batch will contain `reward/correctness`, `reward/integer`, and `reward/format`. More details can be found in `HFMultiRewardVerifyWorker`. Users can implement their own multi-reward environments by returning a dict from `step()` with keys using the `reward/` prefix.
 
+## VLM Environment
+
+The VLM Environment combines one or more weighted reward functions. It includes
+the built-in `format`, `exact_alnum`, `math_expr`, `bbox_giou`, and `geo3k`
+rewards. Custom reward functions can also be loaded from an importable Python
+module or a Python file without modifying NeMo RL.
+
+A custom reward callable receives the ground truth and model response and returns
+`(score, is_correct)`. Set `is_correct` to `None` when the reward does not
+measure correctness. Keyword arguments configured under `reward_functions` are
+passed to the callable after the two positional arguments.
+
+```python
+# my_project/rewards.py
+def concise_answer_reward(
+    ground_truth: str,
+    response: str,
+    max_characters: int,
+) -> tuple[float, bool | None]:
+    del ground_truth
+    return float(len(response) <= max_characters), None
+```
+
+Register the callable under a unique name, then select it in the existing
+weighted `reward_functions` list:
+
+```yaml
+env:
+  my-vlm-task:
+    num_workers: 8
+    custom_reward_functions:
+    - name: concise_answer
+      module: my_project.rewards
+      function: concise_answer_reward
+    reward_functions:
+    - name: exact_alnum
+      weight: 0.8
+    - name: concise_answer
+      weight: 0.2
+      kwargs:
+        max_characters: 256
+```
+
+For a standalone script, replace `module` with `file`:
+
+```yaml
+    custom_reward_functions:
+    - name: concise_answer
+      file: /shared/research/rewards.py
+      function: concise_answer_reward
+```
+
+Set exactly one of `module` or `file` per custom reward. Custom names cannot
+replace built-in rewards or another custom reward. Because verification runs in
+Ray workers, modules and files—and any dependencies they import—must be available
+in the VLM worker environment on every node. On multi-node jobs, use an installed
+package or a shared absolute file path.
+
 ## Code Environment
 
 The Code Environment is designed for code generation and execution tasks. It provides a sandboxed environment for executing Python code and evaluating the results.
