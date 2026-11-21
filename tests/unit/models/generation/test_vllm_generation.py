@@ -907,6 +907,55 @@ async def test_worker_shutdown_cleans_up_an_unavailable_pool(monkeypatch) -> Non
     assert worker.llm is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_serves_http", [True, False])
+async def test_worker_http_start_follows_owner_serving_setting(
+    owner_serves_http: bool,
+) -> None:
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._init_frontend_state()
+    worker.cfg = {"vllm_cfg": {"http_api_owner_serves_http": owner_serves_http}}
+    listener = MagicMock()
+    worker._reserved_socket = listener
+    worker._reserved_node_ip = "10.0.0.1"
+    worker._reserved_port = 8123
+    pool = MultiAPIServerPool(worker, 2)
+    pool.command = AsyncMock()
+    worker._api_server_pool = pool
+    worker._setup_vllm_server = MagicMock(
+        return_value=("thread", "http://10.0.0.1:8123/v1", "server")
+    )
+
+    await worker._start_http_serving()
+
+    pool.command.assert_awaited_once_with("start")
+    assert worker.base_url == "http://10.0.0.1:8123/v1"
+    if owner_serves_http:
+        worker._setup_vllm_server.assert_called_once_with()
+        assert (worker.server_thread, worker.http_server) == ("thread", "server")
+        listener.close.assert_not_called()
+    else:
+        worker._setup_vllm_server.assert_not_called()
+        assert worker.server_thread is None and worker.http_server is None
+        listener.close.assert_called_once_with()
+        assert worker._reserved_socket is None
+
+
+@pytest.mark.asyncio
+async def test_worker_without_a_pool_serves_http_itself() -> None:
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._init_frontend_state()
+    worker.cfg = {"vllm_cfg": {}}
+    worker._setup_vllm_server = MagicMock(
+        return_value=("thread", "http://10.0.0.1:8123/v1", "server")
+    )
+
+    await worker._start_http_serving()
+
+    worker._setup_vllm_server.assert_called_once_with()
+    assert worker.base_url == "http://10.0.0.1:8123/v1"
+
+
 @pytest.mark.parametrize("timeout_s", [None, 0.25])
 def test_vllm_generation_broadcasts_native_refit_pause_and_resume(
     monkeypatch: pytest.MonkeyPatch,

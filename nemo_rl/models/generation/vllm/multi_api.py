@@ -201,6 +201,18 @@ class MultiAPIServerPool:
             if parent_thread is not None:
                 parent_thread.join(timeout=1)
 
+    def release_owner_listener(self) -> str:
+        """Close the owner's copy of the shared listener when it serves no HTTP.
+
+        Returns:
+            The URL the child frontends serve.
+        """
+        owner = self.owner
+        base_url = f"http://{owner._reserved_node_ip}:{owner._reserved_port}/v1"
+        owner._reserved_socket.close()
+        owner._reserved_socket = None
+        return base_url
+
     async def command(self, name: str, *args: Any) -> list[Any]:
         """Serialize a control operation and wait for every child acknowledgement.
 

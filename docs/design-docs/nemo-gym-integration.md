@@ -57,6 +57,7 @@ Set `policy.generation.vllm_cfg.http_api_server_count` to run several HTTP front
 | Configuration key | Default | Purpose |
 |---|---|---|
 | `policy.generation.vllm_cfg.http_api_server_count` | `1` | Positive integer specifying the number of frontend processes per shared engine. |
+| `policy.generation.vllm_cfg.http_api_owner_serves_http` | `true` | Whether the owning worker also serves HTTP requests. Requires a count greater than one when `false`. |
 
 ```yaml
 policy:
@@ -80,6 +81,8 @@ Counts greater than one require:
 - `async_rl.generation_fleet_health.enabled: false` on the SingleController path.
 
 Use multiple frontends when CPU-side HTTP handling, chat-template rendering, or tokenization limits throughput. Additional frontends consume CPU and host memory; they share GPU inference capacity. A count of one keeps the single-frontend construction path.
+
+The owning worker also receives refit and control calls, and by default it serves its share of the HTTP requests on the same event loop. Set `http_api_owner_serves_http: false` to leave every request to the other frontends: a count of `8` then gives seven serving frontends, and the owning worker's event loop stays free for refit.
 
 See the [TP2 SingleController example with token capture](../../examples/configs/recipes/llm/grpo-qwen3-0.6b-1n8g-megatron-vllm-tp2-single-controller-gym-api8.yaml).
 

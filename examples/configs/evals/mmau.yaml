@@ -20,6 +20,7 @@ generation:
   stop_strings: null
   vllm_cfg:
     http_api_server_count: 1 # Positive process count; values >1 require async_engine: true and expose_http_server: true.
+    http_api_owner_serves_http: true # false keeps HTTP off the engine-owning worker; requires http_api_server_count > 1.
     async_engine: false
     precision: "bfloat16"
     tensor_parallel_size: 1

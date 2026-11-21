@@ -165,6 +165,19 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                 listeners.cleanup.assert_called_once_with()
                 launch.engine_manager.shutdown.assert_called_once_with()
 
+    def test_owner_listener_release_returns_served_url(self):
+        listener = Mock()
+        owner = SimpleNamespace(
+            _reserved_socket=listener,
+            _reserved_node_ip="10.0.0.1",
+            _reserved_port=8123,
+        )
+        pool = module.MultiAPIServerPool(owner, 2)
+
+        self.assertEqual(pool.release_owner_listener(), "http://10.0.0.1:8123/v1")
+        listener.close.assert_called_once_with()
+        self.assertIsNone(owner._reserved_socket)
+
     def test_spawn_target_does_not_capture_pool(self):
         pool = module.MultiAPIServerPool(threading.Lock(), 2)
         with patch.dict(sys.modules, {module.__name__: module}):

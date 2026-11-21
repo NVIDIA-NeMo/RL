@@ -130,6 +130,9 @@ class VllmSpecificArgs(TypedDict):
     # Positive frontend process count sharing one engine and socket; 1
     # keeps a single frontend. Multiple processes require async HTTP serving.
     http_api_server_count: NotRequired[int]
+    # False keeps HTTP off the engine-owning worker, so its event loop only
+    # handles refit and control calls; the other frontends serve every request.
+    http_api_owner_serves_http: NotRequired[bool]
     # Require `Authorization: Bearer <key>` on the exposed server's OpenAI routes
     # (/v1/* and /tokenize). VllmGeneration generates one random key per job, hands
     # it to the workers, and exposes it as `http_server_api_key` for the NeMo-Gym
@@ -360,6 +363,10 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
     api_server_count = vllm_cfg.get("http_api_server_count", 1)
     if api_server_count < 1:
         raise ValueError("http_api_server_count must be a positive integer")
+    if api_server_count == 1 and not vllm_cfg.get("http_api_owner_serves_http", True):
+        raise ValueError(
+            "http_api_owner_serves_http=false requires http_api_server_count > 1"
+        )
     if api_server_count > 1:
         if not (vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")):
             raise ValueError(

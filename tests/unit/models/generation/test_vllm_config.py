@@ -270,6 +270,17 @@ def test_async_actor_settings_reject_invalid_api_server_count(count: int) -> Non
         )
 
 
+@pytest.mark.parametrize("count", [None, 1])
+def test_async_actor_settings_require_frontends_when_owner_serves_no_http(
+    count: int | None,
+) -> None:
+    vllm_cfg: dict = {"http_api_owner_serves_http": False}
+    if count is not None:
+        vllm_cfg["http_api_server_count"] = count
+    with pytest.raises(ValueError, match="http_api_owner_serves_http=false requires"):
+        validate_vllm_async_actor_settings(cast(VllmConfig, {"vllm_cfg": vllm_cfg}))
+
+
 @pytest.mark.parametrize(
     "settings",
     [
@@ -297,6 +308,13 @@ def test_async_actor_settings_require_async_http_for_multiple_frontends(
             "async_engine": True,
             "expose_http_server": True,
         },
+        {
+            "http_api_server_count": 8,
+            "http_api_owner_serves_http": False,
+            "async_engine": True,
+            "expose_http_server": True,
+        },
+        {"http_api_owner_serves_http": True},
         {"flat_logprobs": False, "output_loop_yield_budget_ms": None},
         {
             "flat_logprobs": True,
