@@ -56,24 +56,57 @@ default, leaves every code path exactly as before.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any
+from typing import Any, Union
+
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 
 ENV_MASK_SAMPLE_RULES_KEY = "mask_sample_rules"
-_SCALAR_TYPES = (bool, int, float, str, type(None))
 
 
-@dataclass(frozen=True)
-class MaskSampleRule:
+class MaskSampleRule(BaseModel, extra="forbid", frozen=True):
     """Mask a sample when ``field`` in the Gym response equals ``equals``."""
 
-    name: str
-    field: str
-    equals: Any
+    # Dotted path into the Gym response.
+    field: StrictStr
+    # Strict, so ``false`` stays a bool and ``0`` an int (see ``_matches``).
+    equals: Union[StrictBool, StrictInt, StrictFloat, StrictStr, None]
+    # Defaults to ``field`` with "." replaced by "_".
+    name: StrictStr = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_name(cls, data: Any) -> Any:
+        if (
+            isinstance(data, Mapping)
+            and data.get("name") is None
+            and isinstance(data.get("field"), str)
+        ):
+            return {**data, "name": data["field"].replace(".", "_")}
+        return data
+
+    @field_validator("field")
+    @classmethod
+    def _check_dotted_path(cls, field: str) -> str:
+        if not field.strip() or field != field.strip():
+            raise ValueError("field must be a non-empty dotted path")
+        return field
 
     @property
     def metric_key(self) -> str:
         return f"mask_rules/{self.name}_rate"
+
+
+_MASK_SAMPLE_RULES_ADAPTER = TypeAdapter(tuple[MaskSampleRule, ...])
 
 
 def parse_mask_sample_rules(
@@ -83,47 +116,13 @@ def parse_mask_sample_rules(
     raw = (env_config or {}).get(ENV_MASK_SAMPLE_RULES_KEY)
     if raw is None:
         return ()
-    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
-        raise ValueError(
-            f"env.{ENV_MASK_SAMPLE_RULES_KEY} must be a list of rules, got {type(raw).__name__}"
-        )
-    rules: list[MaskSampleRule] = []
-    for index, entry in enumerate(raw):
-        if not isinstance(entry, Mapping):
-            raise ValueError(
-                f"env.{ENV_MASK_SAMPLE_RULES_KEY}[{index}] must be a mapping, got {type(entry).__name__}"
-            )
-        field = entry.get("field")
-        if not isinstance(field, str) or not field.strip() or field != field.strip():
-            raise ValueError(
-                f"env.{ENV_MASK_SAMPLE_RULES_KEY}[{index}].field must be a non-empty dotted path"
-            )
-        if "equals" not in entry:
-            raise ValueError(
-                f"env.{ENV_MASK_SAMPLE_RULES_KEY}[{index}] needs an `equals` value"
-            )
-        equals = entry["equals"]
-        if not isinstance(equals, _SCALAR_TYPES):
-            raise ValueError(
-                f"env.{ENV_MASK_SAMPLE_RULES_KEY}[{index}].equals must be a scalar, got {type(equals).__name__}"
-            )
-        unknown = set(entry) - {"name", "field", "equals"}
-        if unknown:
-            raise ValueError(
-                f"env.{ENV_MASK_SAMPLE_RULES_KEY}[{index}] has unknown keys: {sorted(unknown)}"
-            )
-        name = entry.get("name") or field.replace(".", "_")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError(
-                f"env.{ENV_MASK_SAMPLE_RULES_KEY}[{index}].name must be a non-empty string"
-            )
-        rules.append(MaskSampleRule(name=name, field=field, equals=equals))
+    rules = _MASK_SAMPLE_RULES_ADAPTER.validate_python(raw)
     names = [rule.name for rule in rules]
     if len(set(names)) != len(names):
         raise ValueError(
             f"env.{ENV_MASK_SAMPLE_RULES_KEY} has duplicate rule names: {names}"
         )
-    return tuple(rules)
+    return rules
 
 
 def _lookup(result: Mapping[str, Any], dotted: str) -> tuple[bool, Any]:

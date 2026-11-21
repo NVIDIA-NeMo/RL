@@ -40,9 +40,13 @@ def test_parse_absent_none_or_empty_means_no_rules():
 def test_parse_reads_rules_and_defaults_the_name():
     rules = parse_mask_sample_rules({"mask_sample_rules": RULES_CFG})
     assert rules == (
-        MaskSampleRule("eval_incomplete", "evaluation_completed", False),
-        MaskSampleRule("harness_unfinished", "opencode_finished", False),
-        MaskSampleRule("verify_status", "verify.status", "timeout"),
+        MaskSampleRule(
+            name="eval_incomplete", field="evaluation_completed", equals=False
+        ),
+        MaskSampleRule(
+            name="harness_unfinished", field="opencode_finished", equals=False
+        ),
+        MaskSampleRule(name="verify_status", field="verify.status", equals="timeout"),
     )
     assert rules[0].metric_key == "mask_rules/eval_incomplete_rate"
 
