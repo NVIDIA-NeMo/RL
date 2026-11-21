@@ -62,7 +62,7 @@ When `hf_config_overrides` are present, NeMo RL's Megatron setup:
 2. Computes a stable hash over `hf_config_overrides` and appends it to the converted-checkpoint directory name (`<model>__hfovr_<hash>`). Different override sets therefore produce separate cached checkpoints and will not collide.
 3. Re-imports the HF model into Megatron format if no cached checkpoint at that path exists.
 
-The same `hf_config_overrides` are also propagated to vLLM during generation, so the rollout engine applies the identical YaRN settings as the trainer.
+The same `hf_config_overrides` are also propagated to vLLM during generation, so the rollout engine applies the identical YaRN settings as the trainer. They are merged into `policy.generation.vllm_kwargs.hf_overrides`: keys set only on the generation side are kept, and setting the same key to different values in both places raises an error at setup, so set YaRN keys only in `policy.hf_config_overrides`.
 
 ## Forcing a Fresh Conversion
 
