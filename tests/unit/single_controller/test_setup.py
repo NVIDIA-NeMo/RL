@@ -108,6 +108,7 @@ from nemo_rl.utils.config import (
     load_config,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig, WandbConfig
 
 # Captured at import, before the patched_factories fixture swaps it for a mock.
@@ -638,6 +639,70 @@ def test_generation_top_logprobs_requires_capture():
         validate_single_controller_config(mc)
     mc.token_capture.enabled = True
     validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize("token_capture", [False, True])
+def test_gdpo_accepts_rollouts_with_and_without_token_capture(token_capture):
+    mc = _make_master_config(megatron_enabled=True)
+    mc.grpo.adv_estimator = AdvEstimatorConfig(name="gdpo")
+    mc.token_capture.enabled = token_capture
+    validate_single_controller_config(mc)
+
+
+def test_gdpo_rejects_reward_shaping():
+    mc = _make_master_config(megatron_enabled=True)
+    mc.grpo.adv_estimator = AdvEstimatorConfig(name="gdpo")
+    mc.grpo.reward_shaping = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_length=512,
+        overlong_buffer_penalty=1,
+        max_response_length=4096,
+    )
+    with pytest.raises(NotImplementedError, match="reward_shaping.enabled=false"):
+        validate_single_controller_config(mc)
+
+
+def test_gdpo_rejects_length_penalty():
+    mc = _make_master_config(megatron_enabled=True, env={"should_use_nemo_gym": True})
+    mc.policy["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+    mc.grpo.adv_estimator = AdvEstimatorConfig(name="gdpo")
+    mc.grpo.length_penalty = LengthPenaltyConfig()
+    with pytest.raises(NotImplementedError, match="Remove grpo.length_penalty"):
+        validate_single_controller_config(mc)
+
+
+def test_gdpo_rejects_reward_penalties():
+    mc = _make_master_config(megatron_enabled=True, env={"should_use_nemo_gym": True})
+    mc.policy["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+    mc.grpo.adv_estimator = AdvEstimatorConfig(name="gdpo")
+    mc.reward_penalties = RewardPenaltyConfig(penalize_empty_final_answer=True)
+    with pytest.raises(NotImplementedError, match="reward_penalties.penalize_"):
+        validate_single_controller_config(mc)
+
+
+def test_gdpo_rejects_effort_shaping():
+    mc = _make_master_config(
+        megatron_enabled=True,
+        env={
+            "should_use_nemo_gym": True,
+            "nemo_gym": {
+                "effort_levels": {"low_weight": 1.0, "low_string": "<budget>"}
+            },
+        },
+    )
+    mc.policy["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+    mc.grpo.adv_estimator = AdvEstimatorConfig(name="gdpo")
+    with pytest.raises(NotImplementedError, match="env.nemo_gym.effort_levels"):
+        validate_single_controller_config(mc)
 
 
 def test_token_capture_top_logprobs_rejects_megatron_generation():

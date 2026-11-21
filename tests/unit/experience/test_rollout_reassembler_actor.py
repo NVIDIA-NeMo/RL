@@ -119,6 +119,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         execution_row_multiple=1,
         reward_checks=None,
         reward_log_contexts=None,
+        reward_components=None,
     )
 
 
@@ -233,6 +234,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "attribution_key",
         "reward_checks",
         "reward_log_contexts",
+        "reward_components",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",
@@ -426,3 +428,17 @@ def test_reward_checks_remain_metadata_only_and_reach_finalizer():
     )
     actor.finalize(request)
     assert actor._finalizer.finalize_group.call_args.kwargs["reward_checks"] == [checks]
+
+
+def test_reward_components_remain_metadata_only_and_reach_finalizer():
+    components = {"reward/correctness": 1.0, "reward/format": 0.5}
+    request = replace(_request(), reward_components=(components,))
+    assert_metadata_only(request)
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    actor._finalizer = MagicMock()
+    actor._finalizer.finalize_group.return_value = FinalizedGroup(
+        None, 4, 4, [], dropped=True
+    )
+    actor.finalize(request)
+    forwarded = actor._finalizer.finalize_group.call_args.kwargs["reward_components"]
+    assert forwarded == [components]

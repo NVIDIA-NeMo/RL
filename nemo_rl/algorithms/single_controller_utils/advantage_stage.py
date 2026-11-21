@@ -81,6 +81,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     squeeze_trailing_unit_dim,
     tensor_field,
 )
+from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
@@ -447,6 +448,19 @@ class AdvantageComputer:
                 "Forest logical owners require the standard GRPO estimator"
             )
         input_fields = cfg.input_fields()
+        repeated_batch_fields = list(adv_cfg.repeated_batch_fields)
+        if not cfg.is_ppo and cfg.algo.adv_estimator.name == "gdpo":
+            component_fields = get_gdpo_reward_component_keys(
+                dict.fromkeys(meta.fields or [])
+            )
+            if len(component_fields) < 2:
+                raise ValueError(
+                    "GDPO requires multiple reward/<name> columns in the rollout payload"
+                )
+            repeated_batch_fields = list(
+                dict.fromkeys([*repeated_batch_fields, *component_fields])
+            )
+            input_fields = list(dict.fromkeys([*input_fields, *component_fields]))
         if logical and adv_cfg.prompt_ids_field not in input_fields:
             input_fields.append(adv_cfg.prompt_ids_field)
 
@@ -478,9 +492,13 @@ class AdvantageComputer:
             tensor_field(data, adv_cfg.reward_field)
         ).float()
         # Scale before baselines/metrics; keep DataPlane rewards raw for replay.
-        rewards = scale_rewards(
-            BatchedDataDict({"total_reward": rewards}), cfg.algo.reward_scaling
-        )["total_reward"]
+        repeated_batch = BatchedDataDict({"total_reward": rewards})
+        for field_name in repeated_batch_fields:
+            repeated_batch[field_name] = squeeze_trailing_unit_dim(
+                tensor_field(data, field_name)
+            )
+        repeated_batch = scale_rewards(repeated_batch, cfg.algo.reward_scaling)
+        rewards = repeated_batch["total_reward"]
         token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
@@ -670,13 +688,7 @@ class AdvantageComputer:
             participation = sample_mask
         advantage_valid_mask = _binary_participation(participation)
 
-        repeated_batch: dict[str, torch.Tensor] = {
-            "total_reward": rewards,
-        }
-        for field_name in adv_cfg.repeated_batch_fields:
-            repeated_batch[field_name] = squeeze_trailing_unit_dim(
-                tensor_field(data, field_name)
-            )
+        repeated_batch["total_reward"] = rewards
 
         kwargs: dict[str, torch.Tensor] = {}
         if cfg.policy_logprobs_required:

@@ -41,8 +41,11 @@ from typing import (
 )
 
 import ray
+import torch
+from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
+from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
@@ -1643,12 +1646,65 @@ class TQReplayBuffer:
         async with self._data_plane_checkpoint_barrier.mutation(
             "group_removals"
         ) as cut:
+            await self._fill_missing_reward_components_unlocked(cut, claim_group_ids)
             return await self._remove_groups_unlocked(
                 cut,
                 claim_group_ids,
                 clear_data_plane=False,
                 retain_training_claims=True,
             )
+
+    async def _fill_missing_reward_components_unlocked(
+        self, cut: DataPlaneMutationCut, group_ids: list[str]
+    ) -> None:
+        """Give every group each ``reward/<name>`` column any of ``group_ids`` has.
+
+        A prompt group writes only the reward components its own completions
+        carry, while a train step fetches the columns of all its groups from
+        every row. This writes float32 zeros for the columns a group lacks and
+        adds them to that group's metadata. Columns a group already has keep
+        their values, and groups without any component column stay as they are.
+
+        Args:
+            cut: Live mutation cut owned by the caller.
+            group_ids: Stable IDs of the groups claimed together.
+        """
+        cut.require_live()
+        metas = {
+            group_id: self.meta_list[self._group_ids.index(group_id)]
+            for group_id in group_ids
+            if group_id in self._group_ids
+        }
+        component_fields = get_gdpo_reward_component_keys(
+            dict.fromkeys(
+                field
+                for meta in metas.values()
+                if meta is not None
+                for field in (meta.fields or [])
+            )
+        )
+        for group_id, meta in metas.items():
+            if meta is None:
+                continue
+            missing = [
+                field for field in component_fields if field not in (meta.fields or [])
+            ]
+            if not missing:
+                continue
+            await call_data_plane(
+                self._dp_client,
+                "put_samples",
+                sample_ids=meta.sample_ids,
+                partition_id=meta.partition_id,
+                fields=TensorDict(
+                    {
+                        field: torch.zeros(meta.size, dtype=torch.float32)
+                        for field in missing
+                    },
+                    batch_size=[meta.size],
+                ),
+            )
+            self.meta_list[self._group_ids.index(group_id)] = meta.with_fields(missing)
 
     def training_owned_replay_groups(self) -> list[TQReplayGroupMetadata]:
         """Return metadata for canonical rows owned by the open train step."""

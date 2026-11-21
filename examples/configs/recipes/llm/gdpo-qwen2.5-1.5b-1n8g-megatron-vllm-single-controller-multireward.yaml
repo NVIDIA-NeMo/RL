@@ -1,0 +1,25 @@
+defaults: ../../gdpo_math_1B_megatron_single_controller.yaml
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_num_steps: 30
+policy:
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  generation:
+    colocated:
+      resources:
+        gpus_per_node: 4
+async_rl:
+  sampler:
+    max_lookahead_versions: 0
+  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+checkpointing:
+  checkpoint_dir: results/gdpo-qwen2.5-1.5b-1n8g-megatron-vllm-single-controller-multireward
+cluster:
+  gpus_per_node: 8
+logger:
+  log_dir: logs/gdpo-qwen2.5-1.5b-1n8g-megatron-vllm-single-controller-multireward
+  wandb:
+    project: nemo-rl
+    name: gdpo-qwen2.5-1.5b-1n8g-megatron-vllm-single-controller-multireward

@@ -1166,6 +1166,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
                     for attempt in sibling["attempts"]:
                         attempt.pop("reward_checks", None)
                         attempt.pop("reward_log_context", None)
+                        attempt.pop("reward_components", None)
                         attempt.pop("logical_selection", None)
                         attempt.pop("gym_instance_id")
                         attempt.pop("gym_attempt")

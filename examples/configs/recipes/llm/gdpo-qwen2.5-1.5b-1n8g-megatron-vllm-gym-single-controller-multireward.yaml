@@ -1,0 +1,90 @@
+defaults: ../../grpo_math_1B_megatron_single_controller.yaml
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_num_steps: 10
+  adv_estimator:
+    name: gdpo
+    use_leave_one_out_baseline: false
+    reward_weights:
+    - 1.0
+    - 0.5
+    - 0.25
+policy:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  tokenizer:
+    name: Qwen/Qwen2.5-1.5B-Instruct
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  max_total_sequence_length: 2048
+  megatron_cfg:
+    optimizer:
+      min_lr: 5.0e-06
+  generation:
+    max_new_tokens: 256
+    colocated:
+      resources:
+        gpus_per_node: 4
+    vllm_cfg:
+      expose_http_server: true
+      max_model_len: 2048
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+async_rl:
+  sampler:
+    max_lookahead_versions: 0
+  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+checkpointing:
+  checkpoint_dir: results/gdpo-qwen2.5-1.5b-1n8g-megatron-vllm-gym-single-controller-multireward
+cluster:
+  gpus_per_node: 8
+data:
+  _override_: true
+  max_input_seq_length: null
+  shuffle: true
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/example_tool_call_multireward/data/example.jsonl
+  validation:
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/example_tool_call_multireward/data/example.jsonl
+  default:
+    processor: nemo_gym_data_processor
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    dataset_name: NemoGymDataset
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    is_trajectory_collection: false
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/example_tool_call_multireward/configs/example_tool_call_multireward.yaml
+    example_tool_call_multireward_environment_server:
+      environment_servers:
+        _delete_key: single_agent_turn_legacy
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: example_tool_call_multireward_simple_agent
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: false
+logger:
+  log_dir: logs/gdpo-qwen2.5-1.5b-1n8g-megatron-vllm-gym-single-controller-multireward
+  wandb:
+    project: nemo-rl
+    name: gdpo-qwen2.5-1.5b-1n8g-megatron-vllm-gym-single-controller-multireward
