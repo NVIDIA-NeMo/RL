@@ -35,10 +35,10 @@ Tests are organized into levels of increasing scope and cost:
 
 ## Triggering CI on Pull Requests
 
-1. **Apply a CI label** to your PR: `CI:docs`, `CI:L0`, `CI:L1`, `CI:L2`, or `CI:Lfast`. Use `CI:docs` for docs-only changes. Otherwise use `CI:Lfast` by default, including for new features and bug fixes; use `CI:L1` only for a large refactor, broad changes to core code, or dependency changes.
+1. **The CI label is set for you.** On PRs to `main`, the `Set CI label` workflow picks `CI:docs`, `CI:Lfast` or `CI:L1` from the changed files (rules in `skills/cicd/SKILL.md`). Only repo maintainers can change it, for example to `CI:L1` for a large refactor or broad changes to core code; ask one if the label is wrong.
 2. **Comment** `/ok to test <commit-sha>` — a bot will acknowledge with a thumbs-up and start CI.
    - If you are an external contributor, you will need an internal NVIDIA developer to comment this on your PR to trigger CI.
-3. The **`Skip CICD`** label bypasses tests entirely (except on `main`/merge-group).
+3. The **`Skip CICD`** label bypasses tests entirely (except on `main`/merge-group). Only repo maintainers can set it.
 
 ## Required Checks
 

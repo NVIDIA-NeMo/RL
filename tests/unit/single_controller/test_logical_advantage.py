@@ -28,7 +28,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
-from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.grpo import AgentOverrideConfig, GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
 from nemo_rl.algorithms.single_controller import SingleControllerActor
@@ -673,6 +673,50 @@ def test_overlong_filter_flag_is_respected_for_all_owner_segments(filtering):
     ctrl = _controller(meta, data, grpo={"overlong_filtering": filtering})
     asyncio.run(ctrl._advantage_stage(meta))
     assert data["sample_mask"].tolist() == ([0, 0, 1] if filtering else [1, 1, 1])
+
+
+def test_agent_overrides_apply_to_whole_forest_owners():
+    """grpo.agent_overrides on Forest owners: each group comes out as a run with
+    its agent's settings run-wide, and a truncated segment drops its whole owner
+    only for the agent that filters."""
+
+    def run(overlong: bool, normalize: bool, overrides=None):
+        meta, data = _batch(
+            [
+                ("a", [(0.0, 2), (1.0, 2), (3.0, 1)]),
+                ("b", [(0.0, 1), (2.0, 1), (5.0, 1)]),
+            ]
+        )
+        for tag in meta.tags:
+            tag["agent_name"] = "graded" if tag["dispatch_group_id"] == "a" else "other"
+        data["truncated"][1] = True  # second segment of owner a_g0
+        data["truncated"][6] = True  # owner b_g1
+        grpo = {
+            "overlong_filtering": overlong,
+            "adv_estimator": AdvEstimatorConfig(
+                normalize_rewards=normalize, use_leave_one_out_baseline=False
+            ),
+            "agent_overrides": overrides,
+        }
+        asyncio.run(_controller(meta, data, grpo=grpo)._advantage_stage(meta))
+        return data["advantages"], data["sample_mask"]
+
+    mixed_adv, mixed_mask = run(
+        False,
+        True,
+        {
+            "graded": AgentOverrideConfig(
+                overlong_filtering=True, normalize_rewards=False
+            )
+        },
+    )
+    graded_adv, graded_mask = run(True, False)
+    other_adv, other_mask = run(False, True)
+    torch.testing.assert_close(mixed_adv[:5], graded_adv[:5])
+    torch.testing.assert_close(mixed_mask[:5], graded_mask[:5])
+    torch.testing.assert_close(mixed_adv[5:], other_adv[5:])
+    torch.testing.assert_close(mixed_mask[5:], other_mask[5:])
+    assert mixed_mask.tolist() == [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
 
 @pytest.mark.parametrize("filter_field", ["sample_mask", "mask_sample", "truncated"])
