@@ -21,7 +21,7 @@ env:
       responses_api_agents:
         opencode_agent:
           model: ${policy.model_name}
-          context_window: ${add:${policy.max_total_sequence_length},${mul:-1,${policy.generation.max_new_tokens}}}
+          context_window: ${policy.max_total_sequence_length}
           max_output_tokens: ${policy.generation.max_new_tokens}
 
 logger:

@@ -72,9 +72,8 @@ configs_dir = Path(
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
-# Every shipped config tree. Configs outside examples/configs receive only the
-# outdated-config and local-path checks; their manifests and templates
-# may lack the training schema or contain unset environment interpolations.
+# Every shipped config tree. Training configs and MM-coding recipes get full
+# schema checks. Other manifests and templates get local-path and outdated checks.
 repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
 full_config_files = config_files + [
     path
@@ -363,9 +362,7 @@ def _check_zero_train_gen_kl(config: DictConfig) -> None:
 
 
 @pytest.mark.parametrize("config_file", full_config_files)
-def test_shipped_config(
-    config_file: str, subtests: pytest.Subtests, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_shipped_config(config_file: str, subtests: pytest.Subtests) -> None:
     """Load each shipped config once and report each applicable check separately."""
     # Check for local paths first, before loading the config.
     with subtests.test(check="local_paths"):
@@ -376,20 +373,6 @@ def test_shipped_config(
     ).parent == repo_root / "examples/nemo_gym/mm_coding" and Path(
         config_file
     ).name.startswith("mm_coding_")
-    if coding_recipe:
-        monkeypatch.setenv(
-            "MM_CODING_BASE_CONFIG",
-            str(
-                repo_root
-                / "examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml"
-            ),
-        )
-        # Dummy paths resolve the recipe schema; this test never opens training data.
-        monkeypatch.setenv("MM_CODING_MAX_NEW_TOKENS", "8192")
-        monkeypatch.setenv("MM_CODING_TRAIN_DATA", "/path/to/mm-coding-train.jsonl")
-        monkeypatch.setenv(
-            "MM_CODING_VALIDATION_DATA", "/path/to/mm-coding-validation.jsonl"
-        )
     # Load the config
     config = load_config_with_inheritance(config_file)
 
@@ -397,7 +380,7 @@ def test_shipped_config(
     with subtests.test(check="outdated_config"):
         _check_outdated_config(config_file, deepcopy(config))
 
-    # Check each applicable check separately if the config is in examples/configs.
+    # Training configs and MM-coding overlays share the full schema checks.
     if config_file in config_files or coding_recipe:
         with subtests.test(check="required_keys"):
             _check_required_keys(config_file, deepcopy(config))

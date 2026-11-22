@@ -609,20 +609,20 @@ def test_registering_live_partition_preserves_typed_rows_through_real_client(
         batch_size=[1],
     )
     tq_client.put_samples(keys, partition, fields=original)
-    puts = MagicMock(wraps=tq_adapter.tq.kv_batch_put)
-    monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", puts)
+    native_put = tq_adapter.tq.kv_batch_put
     # Both clients have no warmed-field cache, as happens after native restore
     # and when the learner client is deserialized into another process.
     for client in [tq_client, pickle.loads(pickle.dumps(tq_client))]:
+        puts = MagicMock(wraps=native_put)
+        monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", puts)
         client.register_partition(partition, ["ids", "keep", "pending"], 1, ["read"])
+        assert [set(call.kwargs["fields"].keys()) for call in puts.call_args_list] == [
+            {"pending"}
+        ]
         actual = client.get_samples(keys, partition, ["ids", "keep"])
         assert torch.equal(actual["ids"], original["ids"])
         assert torch.equal(actual["keep"], original["keep"])
         assert client.list_sample_ids(partition) == keys
-    assert all(
-        {"ids", "keep"}.isdisjoint(call.kwargs["fields"].keys())
-        for call in puts.call_args_list
-    ), "Registration must not send placeholders for existing typed columns"
     tq_client.clear_samples(None, partition)
 
 

@@ -17,6 +17,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -56,15 +57,14 @@ def test_adapter_preserves_original_input_bytes_and_hides_gold(
         ground_truth="PRIVATE_REFERENCE_SOURCE",
         references=[] if benchmark == "mmsvg_text2svg" else [str(path)],
     )
-    row = adapter.gym_row(
-        task, reference_root=tmp_path, split="train", max_output_tokens=8192
-    )
+    row = adapter.gym_row(task, reference_root=tmp_path, split="train")
     content = row["responses_create_params"]["input"][0]["content"]
     assert content[0]["text"] == task.prompt
     assert "PRIVATE_REFERENCE_SOURCE" not in json.dumps(row["responses_create_params"])
     assert row["task"]["ground_truth"] == task.ground_truth
     assert row["task"]["semantic_prompt"] == task.semantic_prompt
-    assert row["responses_create_params"]["max_output_tokens"] == 8192
+    assert "max_output_tokens" not in row["responses_create_params"]
+    assert "problem_id" not in row
     if task.references:
         assert (
             base64.b64decode(content[1]["image_url"].split(",", 1)[1])
@@ -83,52 +83,12 @@ def test_adapter_rejects_eval_split_and_outside_root(tmp_path: Path) -> None:
         benchmark="mmsvg_text2svg", task_id="1", prompt="task"
     )
     with pytest.raises(ValueError, match="approved"):
-        adapter.gym_row(
-            task, reference_root=tmp_path, split="test", max_output_tokens=8192
-        )
+        adapter.gym_row(task, reference_root=tmp_path, split="test")
     image_task = adapter.ExperimentTask(
         benchmark="chart2code", task_id="2", prompt="task", references=["/etc/passwd"]
     )
     with pytest.raises(ValueError, match="reference_root"):
-        adapter.gym_row(
-            image_task, reference_root=tmp_path, split="train", max_output_tokens=8192
-        )
-
-
-def test_single_rows_materialize_without_eval_indexes_or_cross_benchmark_collisions(
-    tmp_path: Path,
-) -> None:
-    materialize = pytest.importorskip(
-        "nemo_gym.data.task_materialization"
-    ).materialize_task
-    from nemo_gym.server_runtime import SingleAgentTurnTaskInput
-
-    image = tmp_path / "reference.png"
-    Image.new("RGB", (16, 16), "red").save(image)
-    rows = [
-        adapter.gym_row(
-            adapter.ExperimentTask(
-                benchmark=benchmark,
-                task_id="shared-source-id",
-                prompt="original task",
-                references=[] if benchmark == "mmsvg_text2svg" else [str(image)],
-            ),
-            reference_root=tmp_path,
-            split="train",
-            max_output_tokens=8192,
-        )
-        for benchmark in ("chart2code", "mmsvg_text2svg")
-    ]
-    tasks = [materialize(row, taskset="coding") for row in rows]
-    assert tasks[0]["task_id"] != tasks[1]["task_id"]
-    for row, task in zip(rows, tasks):
-        assert materialize(row | {"_ng_rollout_index": 17}, taskset="coding") == task
-        parsed = SingleAgentTurnTaskInput.model_validate(task["task_input"])
-        assert parsed.task_data["task"] == row["task"]
-        assert (
-            parsed.responses_create_params.input[0].content[0]["text"]
-            == "original task"
-        )
+        adapter.gym_row(image_task, reference_root=tmp_path, split="train")
 
 
 def test_duplicate_tasks_leave_no_partial_output(tmp_path: Path) -> None:
@@ -141,7 +101,6 @@ def test_duplicate_tasks_leave_no_partial_output(tmp_path: Path) -> None:
             output,
             reference_root=tmp_path,
             split="train",
-            max_output_tokens=8192,
         )
     assert not output.exists()
 
@@ -157,7 +116,6 @@ def test_export_does_not_replace_an_existing_dataset(tmp_path: Path) -> None:
             output,
             reference_root=tmp_path,
             split="train",
-            max_output_tokens=8192,
         )
     assert output.read_bytes() == b"original"
 
@@ -213,9 +171,9 @@ def test_multi_rows_have_private_task_envelope_and_file_instructions(tmp_path, h
         task,
         reference_root=tmp_path,
         split="train",
-        max_output_tokens=8192,
         selected=harness,
     )
+    assert "max_output_tokens" not in row["task_input"]["responses_create_params"]
     assert row["task_id"]["taskset"] == f"mm-coding:{harness}"
     assert row["task_id"]["task_id"] == "mmsvg_text2svg:1"
     assert row["task_input"]["task_data"]["task"]["ground_truth"] == "PRIVATE_GOLD"
@@ -265,7 +223,6 @@ def test_existing_source_jsonl_is_retargeted_without_reusing_old_agent_prompt(
             output,
             reference_root=tmp_path,
             split="train",
-            max_output_tokens=8192,
             input_format="legacy-row",
             mode=mode,
         )
@@ -333,7 +290,7 @@ def test_runtime_guard_detects_missing_session_api(monkeypatch):
     monkeypatch.setattr(guard.importlib.util, "find_spec", find)
     assert guard.check_runtime() == ["nemo_gym.server_runtime.sandbox_lending"]
     monkeypatch.setattr("sys.argv", ["check_mm_coding_runtime"])
-    with pytest.raises(SystemExit, match="Check the RL Gym pin"):
+    with pytest.raises(SystemExit, match="Gym #6091"):
         guard.main()
 
 
@@ -406,7 +363,6 @@ def test_legacy_image_drift_is_refused_without_partial_dataset(tmp_path):
             output,
             reference_root=tmp_path,
             split="train",
-            max_output_tokens=8192,
             input_format="legacy-row",
         )
     assert not output.exists()
@@ -422,19 +378,17 @@ def test_deferred_harness_cannot_silently_become_opencode(tmp_path, harness):
             task,
             reference_root=tmp_path,
             split="train",
-            max_output_tokens=8192,
             selected=harness,
         )
     with pytest.raises(ValueError, match="unique supported harnesses"):
         adapter.select_route(task, mode="multi", harnesses=(harness,))
 
 
+@pytest.mark.nemo_gym
 @pytest.mark.parametrize("selected", ["single", "opencode"])
 def test_training_reader_and_processor_preserve_materialized_rows(tmp_path, selected):
-    # Gym is optional in the CPU lane; the joint integration runtime executes this.
-    materialize = pytest.importorskip(
-        "nemo_gym.data.task_materialization"
-    ).materialize_task
+    from nemo_gym.data.task_materialization import materialize_task as materialize
+
     from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
     from nemo_rl.data.processors import nemo_gym_data_processor
     from nemo_rl.environments.nemo_gym import get_nemo_gym_route_name
@@ -448,7 +402,6 @@ def test_training_reader_and_processor_preserve_materialized_rows(tmp_path, sele
         ),
         reference_root=tmp_path,
         split="train",
-        max_output_tokens=8192,
         selected=selected,
     )
     data_path = tmp_path / "train.jsonl"
@@ -457,11 +410,15 @@ def test_training_reader_and_processor_preserve_materialized_rows(tmp_path, sele
     datum = nemo_gym_data_processor(dataset.dataset[0], None, None, None, idx=0)
     assert datum["extra_env_info"] == row
     actual = (
-        materialize(datum["extra_env_info"], taskset="coding")
+        materialize(datum["extra_env_info"], taskset="coding", task_index=0)
         if selected == "single"
         else datum["extra_env_info"]
     )
-    expected = materialize(row, taskset="coding") if selected == "single" else row
+    expected = (
+        materialize(row, taskset="coding", task_index=0)
+        if selected == "single"
+        else row
+    )
     route = get_nemo_gym_route_name(
         datum["extra_env_info"],
         {"mm-coding:opencode": "mm_coding_opencode_environment"},
@@ -501,14 +458,6 @@ def test_acceptance_guard_rejects_unsupported_runtime_combinations(
     assert spec is not None and spec.loader is not None
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
-    base = (
-        ROOT
-        / "examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml"
-    )
-    monkeypatch.setenv("MM_CODING_BASE_CONFIG", str(base))
-    monkeypatch.setenv("MM_CODING_TRAIN_DATA", str(tmp_path / "train.jsonl"))
-    monkeypatch.setenv("MM_CODING_VALIDATION_DATA", str(tmp_path / "validation.jsonl"))
-    monkeypatch.setenv("MM_CODING_MAX_NEW_TOKENS", "8192")
     config_path = tmp_path / "invalid.yaml"
     OmegaConf.save(
         OmegaConf.create(
@@ -531,3 +480,124 @@ def test_acceptance_guard_rejects_unsupported_runtime_combinations(
     assert json.loads(capsys.readouterr().out)["compatible"]
     with pytest.raises(ValueError, match=error):
         guard.check_training_config(config_path)
+
+
+@pytest.mark.parametrize("mode", ["single", "multi", "mixed"])
+def test_composed_recipe_loads_only_prepared_training_and_validation_rows(
+    tmp_path, monkeypatch, mode
+):
+    from omegaconf import OmegaConf
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from nemo_rl.data.datasets.response_datasets import DATASET_REGISTRY
+    from nemo_rl.data.utils import setup_response_data
+    from nemo_rl.utils.config import load_config_with_inheritance
+
+    class UnexpectedMathDataset:
+        def __init__(self, **kwargs):
+            raise AssertionError("Must not load an inherited math dataset")
+
+    monkeypatch.setitem(DATASET_REGISTRY, "OpenMathInstruct-2", UnexpectedMathDataset)
+    split_rows = {}
+    for split in ("train", "validation"):
+        rows = [
+            adapter.gym_row(
+                adapter.ExperimentTask(
+                    benchmark="mmsvg_text2svg",
+                    task_id=f"{split}-{i}",
+                    prompt=f"{split} circle {i}",
+                ),
+                reference_root=tmp_path,
+                split=split,
+                selected="single"
+                if mode == "single" or (mode == "mixed" and i == 0)
+                else "opencode",
+            )
+            for i in range(2)
+        ]
+        path = tmp_path / f"{split}.jsonl"
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        monkeypatch.setenv(
+            "MM_CODING_TRAIN_DATA" if split == "train" else "MM_CODING_VALIDATION_DATA",
+            str(path),
+        )
+        split_rows[split] = rows
+    config = load_config_with_inheritance(EXAMPLE / f"mm_coding_{mode}.yaml")
+    data = OmegaConf.to_container(config.data, resolve=True)
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+        unk_token="[UNK]",
+    )
+    train, validation = setup_response_data(tokenizer, deepcopy(data))
+    assert [train[i]["extra_env_info"] for i in range(len(train))] == split_rows[
+        "train"
+    ]
+    assert validation is not None
+    assert [
+        validation[i]["extra_env_info"] for i in range(len(validation))
+    ] == split_rows["validation"]
+
+
+def test_export_rejects_long_task_id_without_publishing_partial_rows(tmp_path):
+    source, output = tmp_path / "tasks.jsonl", tmp_path / "rows.jsonl"
+    source.write_text(
+        json.dumps(
+            {"benchmark": "mmsvg_text2svg", "task_id": "valid", "prompt": "draw"}
+        )
+        + "\n"
+        + json.dumps(
+            {"benchmark": "mmsvg_text2svg", "task_id": "x" * 257, "prompt": "draw"}
+        )
+        + "\n"
+    )
+    with pytest.raises(ValidationError, match="256"):
+        adapter.export(source, output, reference_root=tmp_path, split="train")
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        (["token_capture.enabled=false"], "token_capture.enabled=true"),
+        (["policy.generation.backend=megatron"], "vLLM generation"),
+        (["checkpointing.metric_name=accuracy"], "must start with"),
+    ],
+)
+def test_runtime_check_validates_training_cli_overrides(monkeypatch, overrides, error):
+    spec = importlib.util.spec_from_file_location(
+        "check_mm_coding_runtime", EXAMPLE / "check_mm_coding_runtime.py"
+    )
+    assert spec is not None and spec.loader is not None
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    monkeypatch.setattr(guard, "check_runtime", lambda **kwargs: [])
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "check_mm_coding_runtime",
+            "--mode",
+            "mixed",
+            "--config",
+            str(EXAMPLE / "mm_coding_mixed.yaml"),
+            *overrides,
+        ],
+    )
+    with pytest.raises(ValueError, match=error):
+        guard.main()
+
+
+def test_runtime_check_rejects_overrides_without_a_recipe(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "check_mm_coding_runtime", EXAMPLE / "check_mm_coding_runtime.py"
+    )
+    assert spec is not None and spec.loader is not None
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    monkeypatch.setattr(
+        "sys.argv", ["check_mm_coding_runtime", "token_capture.enabled=false"]
+    )
+    with pytest.raises(SystemExit) as error:
+        guard.main()
+    assert error.value.code == 2

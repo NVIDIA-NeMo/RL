@@ -32,7 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ExperimentTask(BaseModel):
-    """The prepared task format produced by nemo-rl-mm-coding."""
+    """Task prompt, optional reference image and verifier-owned grading metadata."""
 
     model_config = ConfigDict(extra="forbid")
     benchmark: Literal[
@@ -42,7 +42,7 @@ class ExperimentTask(BaseModel):
         "image2struct_latex",
         "design2code_full",
     ]
-    task_id: str = Field(min_length=1)
+    task_id: str = Field(min_length=1, max_length=256)
     prompt: str = Field(min_length=1)
     references: list[str] = Field(default_factory=list)
     semantic_prompt: str = ""
@@ -171,7 +171,6 @@ def gym_row(
     *,
     reference_root: Path,
     split: Literal["train", "validation", "example"],
-    max_output_tokens: int,
     selected: str = "single",
 ) -> dict:
     """Preserve the task prompt and input image without exposing the reference source."""
@@ -181,8 +180,6 @@ def gym_row(
         raise ValueError(
             "Choose an approved train/validation split; held-out evaluation data is not training input"
         )
-    if not 1 <= max_output_tokens <= 131072:
-        raise ValueError("max_output_tokens must be between 1 and 131072")
     content = [{"type": "input_text", "text": task.prompt}]
     metadata = {
         "benchmark": task.benchmark,
@@ -224,9 +221,7 @@ def gym_row(
                 "detail": "auto",
             }
         )
-    if selected != "single":
-        # The resource-owned sandbox receives the same reference bytes; no private grade data enters the prompt.
-        if task.references:
+        if selected != "single":
             content.append(
                 {
                     "type": "input_text",
@@ -235,6 +230,8 @@ def gym_row(
                     + ". Inspect it with your image tool before solving.",
                 }
             )
+    if selected != "single":
+        # The resource-owned sandbox receives the same reference bytes; no private grade data enters the prompt.
         artifact = ARTIFACTS[task.benchmark]
         system_prompt = (
             f"Solve the user's task in /workspace. Save your final answer to /workspace/{artifact}. "
@@ -258,14 +255,12 @@ def gym_row(
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": content},
                     ],
-                    "max_output_tokens": max_output_tokens,
                     "temperature": 1.0,
                     "tools": [],
                 },
             },
         }
     return {
-        "problem_id": f"{task.benchmark}:{task.task_id}",
         "agent_ref": {
             "type": "responses_api_agents",
             "name": "mm_coding_training_simple_agent",
@@ -273,7 +268,6 @@ def gym_row(
         "task": metadata,
         "responses_create_params": {
             "input": [{"role": "user", "content": content}],
-            "max_output_tokens": max_output_tokens,
             "temperature": 1.0,
             "tools": [],
         },
@@ -286,7 +280,6 @@ def export(
     *,
     reference_root: Path,
     split: Literal["train", "validation", "example"],
-    max_output_tokens: int,
     input_format: Literal["task", "legacy-row"] = "task",
     mode: str = "single",
     seed: int = 42,
@@ -321,7 +314,6 @@ def export(
                         task,
                         reference_root=reference_root,
                         split=split,
-                        max_output_tokens=max_output_tokens,
                         selected=select_route(
                             task, mode=mode, seed=seed, epoch=epoch, harnesses=harnesses
                         ),
@@ -354,7 +346,6 @@ def main() -> None:
     parser.add_argument(
         "--split", choices=["train", "validation", "example"], required=True
     )
-    parser.add_argument("--max-output-tokens", type=int, default=8192)
     parser.add_argument(
         "--input-format", choices=["task", "legacy-row"], default="task"
     )
@@ -376,7 +367,6 @@ def main() -> None:
         args.output,
         reference_root=args.reference_root,
         split=args.split,
-        max_output_tokens=args.max_output_tokens,
         input_format=args.input_format,
         mode=args.mode,
         seed=args.seed,

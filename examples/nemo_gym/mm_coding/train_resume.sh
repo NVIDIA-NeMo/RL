@@ -13,31 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Run inside an approved GPU allocation with the documented actor environments.
+# Run inside an existing GPU allocation with the documented actor environments.
 set -euo pipefail
 umask 077
 
 : "${MM_CODING_BASE_CONFIG:?Provide an absolute path to the validated Megatron/vLLM base config}"
-: "${MM_CODING_MAX_NEW_TOKENS:?Set the output budget used to prepare the rows}"
-: "${MM_CODING_TRAIN_DATA:?Provide the approved training split}"
+: "${MM_CODING_MAX_NEW_TOKENS:?Set the generation output budget}"
+: "${MM_CODING_TRAIN_DATA:?Provide the training split}"
 : "${MM_CODING_VALIDATION_DATA:?Provide the disjoint validation split}"
 : "${MM_CODING_REFERENCE_ROOT:?Provide the original image root}"
 : "${MM_CODING_ACCEPTANCE_ROOT:?Provide a new, empty output directory}"
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-repo_root=$(realpath "${script_dir}/../..")
+repo_root=$(realpath "${script_dir}/../../..")
 cd "${repo_root}"
 if [[ -e "${MM_CODING_ACCEPTANCE_ROOT}" ]]; then
     echo "Refusing to overwrite an earlier acceptance attempt" >&2
     exit 2
 fi
 mkdir -p "${MM_CODING_ACCEPTANCE_ROOT}"
-save_steps=${MM_CODING_SAVE_STEPS:-3}
-if [[ ! "${save_steps}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "MM_CODING_SAVE_STEPS must be a positive integer" >&2
-    exit 2
-fi
-resume_steps=$((save_steps + 1))
+# One total keeps Megatron train_iters and the saved scheduler state compatible.
+total_steps=4
 mode=${1:?Choose single, multi or mixed with matching adapted data}
 shift
 case "${mode}" in single|multi|mixed) ;; *) echo "Unknown mode: ${mode}" >&2; exit 2 ;; esac
@@ -51,11 +47,8 @@ if [[ -e "${checkpoint_dir}" || -L "${checkpoint_dir}" ]]; then
 fi
 mkdir -p -- "$(dirname -- "${checkpoint_dir}")"
 mkdir -- "${checkpoint_dir}"
-uv run --no-sync python examples/nemo_gym/mm_coding/check_mm_coding_runtime.py \
-    --mode "${mode}" --config "examples/nemo_gym/mm_coding/mm_coding_${mode}.yaml" > "${output}/runtime-check.json"
-common=(
-    examples/run_grpo_single_controller.py
-    --config "examples/nemo_gym/mm_coding/mm_coding_${mode}.yaml"
+recipe="examples/nemo_gym/mm_coding/mm_coding_${mode}.yaml"
+overrides=(
     "checkpointing.checkpoint_dir=${checkpoint_dir}"
     checkpointing.enabled=true
     checkpointing.save_period=1
@@ -66,11 +59,19 @@ common=(
     logger.wandb_enabled=false
     "$@"
 )
+uv run --extra nemo_gym python examples/nemo_gym/mm_coding/check_mm_coding_runtime.py \
+    --mode "${mode}" --config "${recipe}" "${overrides[@]}" > "${output}/runtime-check.json"
+common=(examples/run_grpo_single_controller.py --config "${recipe}" "${overrides[@]}")
 # These are separate interpreter/driver processes. Both phases use the same split and checkpoint root.
 uv run --no-sync python "${common[@]}" \
-    "grpo.max_num_steps=${save_steps}" "logger.log_dir=${output}/save" > "${output}/save.log" 2>&1
+    "grpo.max_num_steps=${total_steps}" checkpointing.checkpoint_must_save_by=00:00:00:01 \
+    "logger.log_dir=${output}/save" > "${output}/save.log" 2>&1
+if ! grep -q "Timeout has been reached, stopping training early" "${output}/save.log"; then
+    echo "Run 1 did not stop after its first saved step" >&2
+    exit 1
+fi
 # Use the native inspector: Megatron embeds optimizer state in its weights checkpoint.
-uv run --no-sync python - "${checkpoint_dir}/step_${save_steps}" <<'CHECKPOINT'
+uv run --no-sync python - "${checkpoint_dir}/step_1" <<'CHECKPOINT'
 import sys
 from nemo_rl.utils.checkpoint import CheckpointManager
 weights, optimizer = CheckpointManager.get_resume_paths(sys.argv[1])
@@ -78,8 +79,13 @@ assert weights is not None and weights.is_dir(), "Missing policy weights"
 assert optimizer is not None, "Missing native optimizer state"
 CHECKPOINT
 uv run --no-sync python "${common[@]}" \
-    "grpo.max_num_steps=${resume_steps}" "logger.log_dir=${output}/resume" > "${output}/resume.log" 2>&1
-uv run --no-sync python - "${checkpoint_dir}/step_${resume_steps}" <<'CHECKPOINT'
+    "grpo.max_num_steps=${total_steps}" checkpointing.checkpoint_must_save_by=null \
+    "logger.log_dir=${output}/resume" > "${output}/resume.log" 2>&1
+if ! grep -q "Restoring dataloader state from checkpoint" "${output}/resume.log"; then
+    echo "Run 2 did not restore the step_1 checkpoint" >&2
+    exit 1
+fi
+uv run --no-sync python - "${checkpoint_dir}/step_${total_steps}" <<'CHECKPOINT'
 import sys
 from nemo_rl.utils.checkpoint import CheckpointManager
 weights, optimizer = CheckpointManager.get_resume_paths(sys.argv[1])

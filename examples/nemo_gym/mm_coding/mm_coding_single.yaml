@@ -4,13 +4,11 @@ defaults:
 - ${oc.env:MM_CODING_BASE_CONFIG}
 grpo:
   async_grpo: null
-  deduplicate_multimodal_data: false
   val_at_start: false
   val_period: 0
 checkpointing:
   checkpoint_dir: results/grpo-mm-coding-single
   metric_name: null
-  save_period: 1
   save_data_plane: true
 token_capture:
   enabled: true
@@ -32,8 +30,12 @@ data:
   num_workers: 0
   use_multiple_dataloader: false
   train:
+    _override_: true
+    dataset_name: NemoGymDataset
     data_path: ${oc.env:MM_CODING_TRAIN_DATA}
   validation:
+    _override_: true
+    dataset_name: NemoGymDataset
     data_path: ${oc.env:MM_CODING_VALIDATION_DATA}
   default:
     dataset_name: NemoGymDataset

@@ -19,7 +19,9 @@ import importlib
 import importlib.util
 import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any, cast
 
 REQUIRED_MODULES = (
     "nemo_gym.core",
@@ -52,8 +54,8 @@ def check_runtime(
     return missing
 
 
-def check_training_config(config_path: Path) -> None:
-    """Validate the resolved learner/generator before launching model workers."""
+def check_training_config(config_path: Path, overrides: Sequence[str] = ()) -> None:
+    """Validate the training configuration, including command-line overrides."""
     # Actor discovery does not need the optional training dependencies.
     from omegaconf import OmegaConf
 
@@ -62,14 +64,19 @@ def check_training_config(config_path: Path) -> None:
         validate_single_controller_config,
     )
     from nemo_rl.utils.config import (
-        load_config_with_inheritance,
+        load_config,
+        parse_hydra_overrides,
         register_omegaconf_resolvers,
     )
+    from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
     register_omegaconf_resolvers()
-    config = MasterConfig.model_validate(
-        OmegaConf.to_container(load_config_with_inheritance(config_path), resolve=True)
-    )
+    loaded = load_config(config_path)
+    if overrides:
+        loaded = parse_hydra_overrides(loaded, list(overrides))
+    resolved = cast(dict[str, Any], OmegaConf.to_container(loaded, resolve=True))
+    check_outdated_config(resolved)
+    config = MasterConfig.model_validate(resolved)
     if (
         not config.policy["megatron_cfg"]["enabled"]
         or config.policy["automodel_cfg"]["enabled"]
@@ -103,10 +110,12 @@ def main() -> None:
     parser.add_argument(
         "--config", type=Path, help="Resolved MM-coding training recipe"
     )
-    args = parser.parse_args()
+    args, overrides = parser.parse_known_args()
+    if overrides and args.config is None:
+        parser.error(f"unrecognized arguments: {' '.join(overrides)}")
     if args.config is not None:
         with contextlib.redirect_stdout(sys.stderr):
-            check_training_config(args.config)
+            check_training_config(args.config, overrides)
     missing = check_runtime(mode=args.mode, harnesses=tuple(args.harnesses))
     print(
         json.dumps(
@@ -121,8 +130,8 @@ def main() -> None:
     if missing:
         raise SystemExit(
             "Install the public Gym MM-coding revision and its dependencies in the driver, "
-            "Gym actor, generation actor and component environments. Check the RL Gym pin: it may "
-            "predate these APIs. OpenCode multi/mixed also needs Gym's harness-note token-capture "
+            "Gym actor, generation actor and component environments. The Gym revision must contain the MM-coding environment from "
+            "Gym #6091. OpenCode multi/mixed also needs Gym's harness-note token-capture "
             "fix (upstream PR #5833 or its merged successor). Re-run this check with the dataset's "
             "--mode and --harnesses in every runtime before allocating GPUs."
         )
