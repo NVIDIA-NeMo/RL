@@ -1641,4 +1641,6 @@ After all agents confirm shutdown, you're done. There is **no `TeamDelete` step*
 
 ## Skill revision
 
-`REVISION` (next to this file) holds an integer. Bump it by exactly one in any PR that changes files under `skills/review-pr-team/`, and only then; a CI check (added in the next PR of this stack) will enforce this. Never change it in a local copy: local edits are fine, but they keep the number they were copied at. Self-reviews publish the number in the footer as `review-pr-team=v<REVISION>` (for example `review-pr-team=v1`), and that check will accept one only if it is within `max_revision_lag` (in `self-review-policy.json`) of `main`'s.
+`REVISION` (next to this file) holds an integer. Bump it by exactly one over the PR's base in any PR that changes files under `skills/review-pr-team/`, and only then; a CI check enforces this. Never change it in a local copy: local edits are fine, but they keep the number they were copied at. Self-reviews publish the number in the footer as `review-pr-team=v<REVISION>` (for example `review-pr-team=v1`), and the self-review check accepts one only if it is within `max_revision_lag` (in `self-review-policy.json`) of `main`'s.
+
+The footer format, `self-review-policy.json` and `REVISION` are read by `.github/scripts/check_self_review.py`; change them together.
