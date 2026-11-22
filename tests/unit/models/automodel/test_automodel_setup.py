@@ -2528,8 +2528,8 @@ class TestMaybeSetForceHf:
         assert "force_hf" not in kwargs
 
     def test_qwen2_auto_sets_force_hf(self):
-        """Qwen2's CombinedProjectionStateDictAdapter lacks convert_single_tensor_to_hf,
-        so force_hf should be auto-set when not explicitly configured."""
+        """Qwen2 is in _DEFAULT_FORCE_HF_ARCHS, so force_hf should be auto-set when
+        not explicitly configured."""
         from nemo_automodel._transformers.registry import ModelRegistry
 
         if "Qwen2ForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
@@ -2541,7 +2541,7 @@ class TestMaybeSetForceHf:
         assert kwargs.get("force_hf") is True
 
     def test_llama_auto_sets_force_hf(self):
-        """Llama also uses CombinedProjectionStateDictAdapter."""
+        """Llama is also in _DEFAULT_FORCE_HF_ARCHS."""
         from nemo_automodel._transformers.registry import ModelRegistry
 
         if "LlamaForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
@@ -2552,8 +2552,9 @@ class TestMaybeSetForceHf:
         _maybe_set_force_hf(kwargs, config)
         assert kwargs.get("force_hf") is True
 
-    def test_qwen2_explicit_false_raises(self):
-        """When force_hf is explicitly False and adapter is incompatible, raise."""
+    def test_qwen2_explicit_false_honoured(self):
+        """An explicit force_hf=False selects the custom implementation, which has no
+        state_dict_adapter to check."""
         from nemo_automodel._transformers.registry import ModelRegistry
 
         if "Qwen2ForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
@@ -2561,8 +2562,8 @@ class TestMaybeSetForceHf:
 
         kwargs = {"force_hf": False}
         config = self._make_config("Qwen2ForCausalLM")
-        with pytest.raises(RuntimeError, match="force_hf=False"):
-            _maybe_set_force_hf(kwargs, config)
+        _maybe_set_force_hf(kwargs, config)
+        assert kwargs["force_hf"] is False
 
     def test_compatible_adapter_no_change(self):
         """Models with adapters that implement convert_single_tensor_to_hf should
