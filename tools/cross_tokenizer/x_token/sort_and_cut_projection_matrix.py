@@ -18,7 +18,7 @@ import re
 import torch
 import tqdm
 
-from tools.x_token.utils import sinkhorn_one_dim
+from tools.cross_tokenizer.x_token.utils import sinkhorn_one_dim
 
 
 def parse_arguments() -> argparse.Namespace:

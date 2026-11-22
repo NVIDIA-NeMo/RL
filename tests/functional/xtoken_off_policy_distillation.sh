@@ -31,7 +31,7 @@ cd $PROJECT_ROOT
 # constructs a usable matrix from tokenizer surface forms directly.
 STUDENT_MODEL=meta-llama/Llama-3.2-1B
 TEACHER_MODEL=Qwen/Qwen3-1.7B
-uv run python -m tools.x_token.minimal_projection_via_multitoken \
+uv run python -m tools.cross_tokenizer.x_token.minimal_projection_via_multitoken \
     --student-model $STUDENT_MODEL \
     --teacher-model $TEACHER_MODEL \
     --top-k 4 \
@@ -47,7 +47,7 @@ uv run python -m tools.x_token.minimal_projection_via_multitoken \
 # to a single teacher; teacher knobs target teachers.0 (the one teacher). Only
 # overrides that DIFFER from the exemplar are set here.
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
-    $PROJECT_ROOT/examples/run_xtoken_off_policy_distillation.py \
+    $PROJECT_ROOT/examples/run_cross_tokenizer_distillation.py \
     teachers.0.model_name=$TEACHER_MODEL \
     teachers.0.tokenizer.name=$TEACHER_MODEL \
     cluster.gpus_per_node=2 \

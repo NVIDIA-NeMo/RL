@@ -286,8 +286,8 @@ class TokenAligner:
         projection_matrix_path: Path retained on the aligner for downstream
             callers (e.g. the loss fn) that materialize the projection on
             their training device via
-            :func:`nemo_rl.algorithms.x_token.loss_utils.get_sparse_projection_matrix`
-            or :func:`nemo_rl.algorithms.x_token.loss_utils.get_topk_projection`.
+            :func:`nemo_rl.algorithms.cross_tokenizer.loss_utils.get_sparse_projection_matrix`
+            or :func:`nemo_rl.algorithms.cross_tokenizer.loss_utils.get_topk_projection`.
     """
 
     def __init__(
@@ -540,7 +540,7 @@ class TokenAligner:
         (rather than trimming a contiguous span) keeps this correct under either
         left- or right-padding. A pair whose tokens are entirely padding on
         one side then has size 0 there and is dropped by
-        :func:`nemo_rl.algorithms.x_token.loss_utils.valid_chunk_mask`; a pair
+        :func:`nemo_rl.algorithms.cross_tokenizer.loss_utils.valid_chunk_mask`; a pair
         straddling the real/pad boundary shrinks to its real tokens.
         """
         if student_attention_mask is not None:
@@ -1050,7 +1050,7 @@ class TokenAligner:
 
 # =====================================================================
 # Module-level helpers: canonicalization + flexible string comparison.
-# These are reused by ``tools/x_token/`` projection-prep CLIs, so they
+# These are reused by ``tools/cross_tokenizer/x_token/`` projection-prep CLIs, so they
 # stay at module scope rather than living on ``TokenAligner``.
 # =====================================================================
 
@@ -1059,7 +1059,7 @@ def canonical_token(token: str, *, enabled: bool = True) -> str:
     """Return a canonical representation of a tokenizer token.
 
     Public helper consumed by the alignment pipeline AND by the
-    projection-prep CLIs in ``tools/x_token/``. The ``enabled`` flag is
+    projection-prep CLIs in ``tools/cross_tokenizer/x_token/``. The ``enabled`` flag is
     a passthrough toggle: when ``False`` the input is returned unchanged
     (lets CLI call sites gate canonicalization via a single flag without
     branching at every site).

@@ -23,8 +23,8 @@ import pytest
 import torch
 from transformers import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms.cross_tokenizer.token_aligner import TokenAligner
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
 from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,

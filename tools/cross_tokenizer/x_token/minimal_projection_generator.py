@@ -18,7 +18,7 @@ import torch
 from tqdm.auto import tqdm
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
-from tools.x_token.utils import (
+from tools.cross_tokenizer.x_token.utils import (
     clean_model_name_for_filename,
     project_token_likelihoods,
     sinkhorn_one_dim,
@@ -317,7 +317,7 @@ if __name__ == "__main__":
 
         # Apply canonicalization if requested
         if args.use_canonicalization:
-            from nemo_rl.algorithms.x_token.token_aligner import canonical_token
+            from nemo_rl.algorithms.cross_tokenizer.token_aligner import canonical_token
 
             print("Applying token canonicalization before embedding generation...")
             decoded_tokens_student = [

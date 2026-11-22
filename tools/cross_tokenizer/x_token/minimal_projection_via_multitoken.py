@@ -21,8 +21,8 @@ import torch
 import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
-from nemo_rl.algorithms.x_token.token_aligner import canonical_token
-from tools.x_token.utils import (
+from nemo_rl.algorithms.cross_tokenizer.token_aligner import canonical_token
+from tools.cross_tokenizer.x_token.utils import (
     clean_model_name_for_filename,
     sinkhorn_one_dim,
 )

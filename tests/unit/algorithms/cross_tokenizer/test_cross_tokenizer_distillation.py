@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for ``nemo_rl/algorithms/xtoken_off_policy_distillation.py``.
+"""Unit tests for ``nemo_rl/algorithms/cross_tokenizer_distillation.py``.
 
 Mirrors the style of ``tests/unit/algorithms/test_distillation.py``:
 a single ``mock_xtoken_components`` fixture builds all the Ray/policy/
@@ -43,9 +43,8 @@ from omegaconf import OmegaConf
 from pydantic import ValidationError
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-import nemo_rl.algorithms.xtoken_off_policy_distillation as xt_mod
-from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
-from nemo_rl.algorithms.xtoken_off_policy_distillation import (
+import nemo_rl.algorithms.cross_tokenizer_distillation as xt_mod
+from nemo_rl.algorithms.cross_tokenizer_distillation import (
     MasterConfig,
     TeacherConfig,
     _default_off_policy_distillation_save_state,
@@ -54,6 +53,9 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     validate,
     xtoken_non_student_seq_keys,
     xtoken_off_policy_distillation_train,
+)
+from nemo_rl.algorithms.loss.cross_tokenizer.x_token import (
+    CrossTokenizerDistillationLossFn,
 )
 from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
@@ -561,9 +563,7 @@ def test_ft_save_period_triggers_periodic_saves(mock_xtoken_components):
     c.master_config.checkpointing.metric_name = None
     c.checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
 
-    with patch(
-        "nemo_rl.algorithms.xtoken_off_policy_distillation.save_dataloader_state"
-    ):
+    with patch("nemo_rl.algorithms.cross_tokenizer_distillation.save_dataloader_state"):
         _run_train(c)
 
     # ft_save_period=2 -> steps 2, 4; save_period=100 contributes only the last step (5).
@@ -594,9 +594,7 @@ def test_exit_on_timeout(mock_xtoken_components, capsys, tmp_path):
     )
 
     with (
-        patch(
-            "nemo_rl.algorithms.xtoken_off_policy_distillation.save_dataloader_state"
-        ),
+        patch("nemo_rl.algorithms.cross_tokenizer_distillation.save_dataloader_state"),
         patch.object(xt_mod, "TimeoutChecker") as mock_timeout_class,
     ):
         mock_timeout_instance = MagicMock()
@@ -1046,7 +1044,7 @@ def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path(monkeypatch):
 
     fn._compute_teacher_kd = _fallback
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.loss_functions.same_tokenizer_full_vocab_kl",
+        "nemo_rl.algorithms.loss.cross_tokenizer.x_token.same_tokenizer_full_vocab_kl",
         _fast_path,
     )
 
@@ -1085,7 +1083,7 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
         return torch.tensor(1.23)
 
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.loss_functions.same_tokenizer_full_vocab_kl",
+        "nemo_rl.algorithms.loss.cross_tokenizer.x_token.same_tokenizer_full_vocab_kl",
         _fast_path,
     )
     fn._compute_teacher_kd = MagicMock(

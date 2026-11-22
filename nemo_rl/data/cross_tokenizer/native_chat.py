@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Tuple
 
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.x_token.token_aligner import (
+from nemo_rl.algorithms.cross_tokenizer.token_aligner import (
     NativeAlignmentPart,
     NativeAlignmentRegions,
 )

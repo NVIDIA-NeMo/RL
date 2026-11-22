@@ -483,12 +483,12 @@ sbatch \
 
 We support off-policy distillation between a student and a teacher that **do not share a tokenizer** (cross-tokenizer, or "x-token", distillation) — for example, distilling a `Qwen/Qwen3-4B` teacher into a `meta-llama/Llama-3.2-1B` student. The reference recipe trains on the ungated, CC-BY-4.0 [Nemotron-Pretraining-Specialized-v1.1](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1) corpus (`Nemotron-Pretraining-Formal-Logic` subset).
 
-You can read about the details of the x-token distillation implementation [here](docs/guides/xtoken-off-policy-distillation.md) and [here](https://arxiv.org/abs/2605.21699), including how the (student, teacher) projection matrix is built and how the loss modes work.
+You can read about the details of the x-token distillation implementation [here](docs/guides/cross-tokenizer-distillation.md) and [here](https://arxiv.org/abs/2605.21699), including how the (student, teacher) projection matrix is built and how the loss modes work.
 
 Before launching a run, build the projection matrix for your (student, teacher) tokenizer pair:
 
 ```sh
-./tools/x_token/build_projection_matrix.sh \
+./tools/cross_tokenizer/x_token/build_projection_matrix.sh \
   --student-model meta-llama/Llama-3.2-1B \
   --teacher-model Qwen/Qwen3-4B \
   --runtime-top-k 4 \
@@ -503,14 +503,14 @@ Before launching a run, build the projection matrix for your (student, teacher) 
 To run x-token distillation on a single node using `meta-llama/Llama-3.2-1B` as the student and `Qwen/Qwen3-4B` as the teacher:
 
 ```sh
-uv run python examples/run_xtoken_off_policy_distillation.py \
+uv run python examples/run_cross_tokenizer_distillation.py \
   teachers.0.aligner.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
 ```
 
 By default, this uses the configuration in `examples/configs/xtoken_off_policy_distillation.yaml`. The projection matrix path (per teacher) is the only required override. You can customize other parameters with command-line overrides. For example:
 
 ```sh
-uv run python examples/run_xtoken_off_policy_distillation.py \
+uv run python examples/run_cross_tokenizer_distillation.py \
   teachers.0.aligner.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
   policy.model_name="meta-llama/Llama-3.2-1B" \
   teachers.0.model_name="Qwen/Qwen3-4B" \
@@ -523,7 +523,7 @@ uv run python examples/run_xtoken_off_policy_distillation.py \
 # Run from the root of NeMo RL repo
 NUM_ACTOR_NODES=2
 
-COMMAND="uv run ./examples/run_xtoken_off_policy_distillation.py --config examples/configs/xtoken_off_policy_distillation.yaml teachers.0.aligner.projection_matrix_path='cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt' cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/xtoken_distill_2nodes' logger.wandb_enabled=True logger.wandb.name='xtoken-distill-2nodes'" \
+COMMAND="uv run ./examples/run_cross_tokenizer_distillation.py --config examples/configs/xtoken_off_policy_distillation.yaml teachers.0.aligner.projection_matrix_path='cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt' cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/xtoken_distill_2nodes' logger.wandb_enabled=True logger.wandb.name='xtoken-distill-2nodes'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \

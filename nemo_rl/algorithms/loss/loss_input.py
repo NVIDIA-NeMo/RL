@@ -18,6 +18,9 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from nemo_rl.algorithms.cross_tokenizer.loss_utils import (
+    prepare_xtoken_cross_tokenizer_loss_input,
+)
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
@@ -28,9 +31,6 @@ from nemo_rl.algorithms.loss.utils import (
     _pack_input_ids,
     map_teacher_logits_to_draft_vocab,
     reconstruct_opd_full_teacher_logits,
-)
-from nemo_rl.algorithms.x_token.loss_utils import (
-    prepare_xtoken_cross_tokenizer_loss_input,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (

@@ -11,14 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for ``nemo_rl/algorithms/x_token/utils.py`` (CPU-only)."""
+"""Unit tests for ``nemo_rl/algorithms/cross_tokenizer/utils.py`` (CPU-only)."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
-from nemo_rl.algorithms.x_token.utils import (
+from nemo_rl.algorithms.cross_tokenizer.utils import (
     assert_teacher_student_batch_grid,
     assert_xtoken_ipc_node_local,
     pad_distillation_val_batch,

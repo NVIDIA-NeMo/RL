@@ -14,15 +14,15 @@
 # limitations under the License.
 
 # Single entrypoint that chains the three projection-prep CLIs under
-# tools/x_token/ to produce a runtime projection matrix from a
-# (student, teacher) tokenizer pair. See docs/guides/xtoken-off-policy-distillation.md
+# tools/cross_tokenizer/x_token/ to produce a runtime projection matrix from a
+# (student, teacher) tokenizer pair. See docs/guides/cross-tokenizer-distillation.md
 # for the underlying steps.
 
 set -euo pipefail
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-# Move to repo root so `uv run python -m tools.x_token.*` resolves.
-cd "${SCRIPT_DIR}/../.."
+# Move to repo root so `uv run python -m tools.cross_tokenizer.x_token.*` resolves.
+cd "${SCRIPT_DIR}/../../.."
 
 STUDENT=""
 TEACHER=""
@@ -99,7 +99,7 @@ if [[ -z "$STUDENT" || -z "$TEACHER" ]]; then
   exit 2
 fi
 
-# Mirror tools/x_token/utils.py::clean_model_name_for_filename so the
+# Mirror tools/cross_tokenizer/x_token/utils.py::clean_model_name_for_filename so the
 # wrapper can predict intermediate filenames without spawning Python.
 clean_name() {
   local name="$1" cleaned
@@ -157,11 +157,11 @@ fi
 if $USE_CANONICALIZATION; then
   step2_args+=(--use-canonicalization)
 fi
-uv run python -m tools.x_token.minimal_projection_via_multitoken "${step2_args[@]}"
+uv run python -m tools.cross_tokenizer.x_token.minimal_projection_via_multitoken "${step2_args[@]}"
 
 if ! $SKIP_EXACT_MAP; then
   echo "[2/3] reapply_exact_map (-> ${STEP3_OUT}) ..."
-  uv run python -m tools.x_token.reapply_exact_map \
+  uv run python -m tools.cross_tokenizer.x_token.reapply_exact_map \
     --student-model "$STUDENT" \
     --teacher-model "$TEACHER" \
     --initial-projection-path "$STEP2_OUT"
@@ -170,7 +170,7 @@ else
 fi
 
 echo "[3/3] sort_and_cut_projection_matrix (-> ${FINAL_OUTPUT}) ..."
-uv run python -m tools.x_token.sort_and_cut_projection_matrix \
+uv run python -m tools.cross_tokenizer.x_token.sort_and_cut_projection_matrix \
   --initial-projection-path "$STEP4_IN" \
   --top_k "$RUNTIME_TOP_K" \
   --output_path "$FINAL_OUTPUT"

@@ -199,6 +199,27 @@
     },
     {
       "column": 27,
+      "path": "examples/run_cross_tokenizer_distillation.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `dict[DictKeyType, Any] | list[Any] | str | Any | None` is not assignable to parameter `config` with type `dict[str, Any]` in function `nemo_rl.utils.outdated_config_checks.check_outdated_config`",
+      "severity": "error"
+    },
+    {
+      "column": 5,
+      "path": "examples/run_cross_tokenizer_distillation.py",
+      "name": "bad-unpacking",
+      "concise_description": "Cannot unpack tuple[AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset], AllTaskProcessedDataset | None] | tuple[AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset], AllTaskProcessedDataset | None, dict[str, EnvironmentInterface[Unknown]], dict[str, EnvironmentInterface[Unknown]]] (of size 4) into 2 values",
+      "severity": "error"
+    },
+    {
+      "column": 62,
+      "path": "examples/run_cross_tokenizer_distillation.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset]` is not assignable to parameter `train_dataset` with type `AllTaskProcessedDataset` in function `nemo_rl.algorithms.cross_tokenizer_distillation.setup`",
+      "severity": "error"
+    },
+    {
+      "column": 27,
       "path": "examples/run_distillation.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `dict[DictKeyType, Any] | list[Any] | str | Any | None` is not assignable to parameter `config` with type `dict[str, Any]` in function `nemo_rl.utils.outdated_config_checks.check_outdated_config`",
@@ -485,27 +506,6 @@
       "severity": "error"
     },
     {
-      "column": 27,
-      "path": "examples/run_xtoken_off_policy_distillation.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dict[DictKeyType, Any] | list[Any] | str | Any | None` is not assignable to parameter `config` with type `dict[str, Any]` in function `nemo_rl.utils.outdated_config_checks.check_outdated_config`",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "examples/run_xtoken_off_policy_distillation.py",
-      "name": "bad-unpacking",
-      "concise_description": "Cannot unpack tuple[AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset], AllTaskProcessedDataset | None] | tuple[AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset], AllTaskProcessedDataset | None, dict[str, EnvironmentInterface[Unknown]], dict[str, EnvironmentInterface[Unknown]]] (of size 4) into 2 values",
-      "severity": "error"
-    },
-    {
-      "column": 62,
-      "path": "examples/run_xtoken_off_policy_distillation.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset]` is not assignable to parameter `train_dataset` with type `AllTaskProcessedDataset` in function `nemo_rl.algorithms.xtoken_off_policy_distillation.setup`",
-      "severity": "error"
-    },
-    {
       "column": 31,
       "path": "nemo_rl/__init__.py",
       "name": "bad-argument-type",
@@ -594,6 +594,111 @@
       "path": "nemo_rl/algorithms/async_utils/staleness_sampler.py",
       "name": "bad-override",
       "concise_description": "Class member `InOrderSampler.requires_single_weight_batch` overrides parent class `_GatedSampler` in an inconsistent manner",
+      "severity": "error"
+    },
+    {
+      "column": 9,
+      "path": "nemo_rl/algorithms/cross_tokenizer/loss_utils.py",
+      "name": "bad-override",
+      "concise_description": "Class member `Fp32SparseMM.backward` overrides parent class `Function` in an inconsistent manner",
+      "severity": "error"
+    },
+    {
+      "column": 20,
+      "path": "nemo_rl/algorithms/cross_tokenizer/loss_utils.py",
+      "name": "unbound-name",
+      "concise_description": "`student_seq_start` may be uninitialized",
+      "severity": "error"
+    },
+    {
+      "column": 60,
+      "path": "nemo_rl/algorithms/cross_tokenizer/loss_utils.py",
+      "name": "unbound-name",
+      "concise_description": "`student_seq_len` may be uninitialized",
+      "severity": "error"
+    },
+    {
+      "column": 33,
+      "path": "nemo_rl/algorithms/cross_tokenizer/loss_utils.py",
+      "name": "unbound-name",
+      "concise_description": "`cp_rank` may be uninitialized",
+      "severity": "error"
+    },
+    {
+      "column": 17,
+      "path": "nemo_rl/algorithms/cross_tokenizer/loss_utils.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | None` is not assignable to parameter `x` with type `Tensor` in function `nemo_rl.distributed.model_utils.cp_shift_next`",
+      "severity": "error"
+    },
+    {
+      "column": 17,
+      "path": "nemo_rl/algorithms/cross_tokenizer/loss_utils.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | None` is not assignable to parameter `x` with type `Tensor` in function `nemo_rl.distributed.model_utils.cp_shift_next`",
+      "severity": "error"
+    },
+    {
+      "column": 49,
+      "path": "nemo_rl/algorithms/cross_tokenizer_distillation.py",
+      "name": "bad-typed-dict-key",
+      "concise_description": "TypedDict `AutomodelConfigDisabled` does not have key `context_parallel_size`",
+      "severity": "error"
+    },
+    {
+      "column": 42,
+      "path": "nemo_rl/algorithms/cross_tokenizer_distillation.py",
+      "name": "bad-typed-dict-key",
+      "concise_description": "TypedDict `AutomodelConfigDisabled` does not have key `context_parallel_size`",
+      "severity": "error"
+    },
+    {
+      "column": 49,
+      "path": "nemo_rl/algorithms/cross_tokenizer_distillation.py",
+      "name": "bad-typed-dict-key",
+      "concise_description": "TypedDict `AutomodelConfigDisabled` does not have key `tensor_parallel_size`",
+      "severity": "error"
+    },
+    {
+      "column": 49,
+      "path": "nemo_rl/algorithms/cross_tokenizer_distillation.py",
+      "name": "bad-typed-dict-key",
+      "concise_description": "TypedDict `AutomodelConfigDisabled` does not have key `context_parallel_size`",
+      "severity": "error"
+    },
+    {
+      "column": 44,
+      "path": "nemo_rl/algorithms/cross_tokenizer_distillation.py",
+      "name": "bad-typed-dict-key",
+      "concise_description": "TypedDict `AutomodelConfigDisabled` does not have key `tensor_parallel_size`",
+      "severity": "error"
+    },
+    {
+      "column": 44,
+      "path": "nemo_rl/algorithms/cross_tokenizer_distillation.py",
+      "name": "bad-typed-dict-key",
+      "concise_description": "TypedDict `AutomodelConfigDisabled` does not have key `context_parallel_size`",
+      "severity": "error"
+    },
+    {
+      "column": 48,
+      "path": "nemo_rl/algorithms/cross_tokenizer_distillation.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `dict[str, int | list[bool | None] | list[str | None] | list[float] | list[int] | object]` is not assignable to parameter `cfg` with type `CrossTokenizerDistillationLossConfig` in function `nemo_rl.algorithms.loss.cross_tokenizer.x_token.CrossTokenizerDistillationLossFn.__init__`",
+      "severity": "error"
+    },
+    {
+      "column": 29,
+      "path": "nemo_rl/algorithms/cross_tokenizer_distillation.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `OffPolicyDistillationSaveState`",
+      "severity": "error"
+    },
+    {
+      "column": 48,
+      "path": "nemo_rl/algorithms/cross_tokenizer_distillation.py",
+      "name": "bad-assignment",
+      "concise_description": "`dict[str, float | list[float]]` is not assignable to `dict[str, float]`",
       "severity": "error"
     },
     {
@@ -1689,6 +1794,132 @@
       "severity": "error"
     },
     {
+      "column": 9,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "bad-override",
+      "concise_description": "Class member `CrossTokenizerDistillationLossFn.__call__` overrides parent class `LossFunction` in an inconsistent manner",
+      "severity": "error"
+    },
+    {
+      "column": 23,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | None` is not assignable to parameter `input_ids` with type `Tensor` in function `nemo_rl.algorithms.cross_tokenizer.loss_utils.next_token_accuracy`",
+      "severity": "error"
+    },
+    {
+      "column": 24,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | None` is not assignable to parameter `token_mask` with type `Tensor` in function `nemo_rl.algorithms.cross_tokenizer.loss_utils.next_token_accuracy`",
+      "severity": "error"
+    },
+    {
+      "column": 16,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "bad-return",
+      "concise_description": "Returned type `tuple[bool | None, bool | None]` is not assignable to declared return type `tuple[bool, bool]`",
+      "severity": "error"
+    },
+    {
+      "column": 23,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "unbound-name",
+      "concise_description": "`temp_weight` may be uninitialized",
+      "severity": "error"
+    },
+    {
+      "column": 39,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | None` is not assignable to parameter `tensor` with type `DTensor | Tensor` in function `nemo_rl.distributed.model_utils.to_local_if_dtensor`",
+      "severity": "error"
+    },
+    {
+      "column": 46,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | None` is not assignable to parameter `tensor` with type `DTensor | Tensor` in function `nemo_rl.distributed.model_utils.to_local_if_dtensor`",
+      "severity": "error"
+    },
+    {
+      "column": 42,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "unbound-name",
+      "concise_description": "`temp_weight` may be uninitialized",
+      "severity": "error"
+    },
+    {
+      "column": 13,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `str | None` is not assignable to parameter `path` with type `PathLike[Unknown] | str` in function `nemo_rl.algorithms.cross_tokenizer.loss_utils.get_sparse_projection_matrix`",
+      "severity": "error"
+    },
+    {
+      "column": 26,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "unsupported-operation",
+      "concise_description": "`&` is not supported between `Tensor` and `None`",
+      "severity": "error"
+    },
+    {
+      "column": 29,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | None` is not assignable to parameter `chunk_id` with type `Tensor` in function `nemo_rl.algorithms.cross_tokenizer.loss_utils.chunk_average_log_probs`",
+      "severity": "error"
+    },
+    {
+      "column": 31,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | None` is not assignable to parameter `chunk_id` with type `Tensor` in function `nemo_rl.algorithms.cross_tokenizer.loss_utils.chunk_average_log_probs`",
+      "severity": "error"
+    },
+    {
+      "column": 62,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | Unknown | None` is not assignable to parameter `pair_valid` with type `Tensor` in function `nemo_rl.algorithms.cross_tokenizer.loss_utils.valid_chunk_mask`",
+      "severity": "error"
+    },
+    {
+      "column": 13,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `str | None` is not assignable to parameter `path` with type `PathLike[Unknown] | str` in function `nemo_rl.algorithms.cross_tokenizer.loss_utils.build_exact_token_map`",
+      "severity": "error"
+    },
+    {
+      "column": 32,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | None` is not assignable to parameter `chunk_id` with type `Tensor` in function `nemo_rl.algorithms.cross_tokenizer.loss_utils.chunk_average_log_probs`",
+      "severity": "error"
+    },
+    {
+      "column": 32,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | None` is not assignable to parameter `chunk_id` with type `Tensor` in function `nemo_rl.algorithms.cross_tokenizer.loss_utils.chunk_average_log_probs`",
+      "severity": "error"
+    },
+    {
+      "column": 57,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | None` is not assignable to parameter `pair_valid` with type `Tensor` in function `nemo_rl.algorithms.cross_tokenizer.loss_utils.valid_chunk_mask`",
+      "severity": "error"
+    },
+    {
+      "column": 34,
+      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable",
+      "severity": "error"
+    },
+    {
       "column": 21,
       "path": "nemo_rl/algorithms/loss/loss_functions.py",
       "name": "invalid-type-var",
@@ -2057,132 +2288,6 @@
       "path": "nemo_rl/algorithms/loss/loss_functions.py",
       "name": "bad-override",
       "concise_description": "Class member `MseValueLossFn.__call__` overrides parent class `LossFunction` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "bad-override",
-      "concise_description": "Class member `CrossTokenizerDistillationLossFn.__call__` overrides parent class `LossFunction` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "column": 23,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `input_ids` with type `Tensor` in function `nemo_rl.algorithms.x_token.loss_utils.next_token_accuracy`",
-      "severity": "error"
-    },
-    {
-      "column": 24,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `token_mask` with type `Tensor` in function `nemo_rl.algorithms.x_token.loss_utils.next_token_accuracy`",
-      "severity": "error"
-    },
-    {
-      "column": 16,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[bool | None, bool | None]` is not assignable to declared return type `tuple[bool, bool]`",
-      "severity": "error"
-    },
-    {
-      "column": 23,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "unbound-name",
-      "concise_description": "`temp_weight` may be uninitialized",
-      "severity": "error"
-    },
-    {
-      "column": 39,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `tensor` with type `DTensor | Tensor` in function `nemo_rl.distributed.model_utils.to_local_if_dtensor`",
-      "severity": "error"
-    },
-    {
-      "column": 46,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `tensor` with type `DTensor | Tensor` in function `nemo_rl.distributed.model_utils.to_local_if_dtensor`",
-      "severity": "error"
-    },
-    {
-      "column": 42,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "unbound-name",
-      "concise_description": "`temp_weight` may be uninitialized",
-      "severity": "error"
-    },
-    {
-      "column": 13,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `str | None` is not assignable to parameter `path` with type `PathLike[Unknown] | str` in function `nemo_rl.algorithms.x_token.loss_utils.get_sparse_projection_matrix`",
-      "severity": "error"
-    },
-    {
-      "column": 26,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "unsupported-operation",
-      "concise_description": "`&` is not supported between `Tensor` and `None`",
-      "severity": "error"
-    },
-    {
-      "column": 29,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `chunk_id` with type `Tensor` in function `nemo_rl.algorithms.x_token.loss_utils.chunk_average_log_probs`",
-      "severity": "error"
-    },
-    {
-      "column": 31,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `chunk_id` with type `Tensor` in function `nemo_rl.algorithms.x_token.loss_utils.chunk_average_log_probs`",
-      "severity": "error"
-    },
-    {
-      "column": 62,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | Unknown | None` is not assignable to parameter `pair_valid` with type `Tensor` in function `nemo_rl.algorithms.x_token.loss_utils.valid_chunk_mask`",
-      "severity": "error"
-    },
-    {
-      "column": 13,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `str | None` is not assignable to parameter `path` with type `PathLike[Unknown] | str` in function `nemo_rl.algorithms.x_token.loss_utils.build_exact_token_map`",
-      "severity": "error"
-    },
-    {
-      "column": 32,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `chunk_id` with type `Tensor` in function `nemo_rl.algorithms.x_token.loss_utils.chunk_average_log_probs`",
-      "severity": "error"
-    },
-    {
-      "column": 32,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `chunk_id` with type `Tensor` in function `nemo_rl.algorithms.x_token.loss_utils.chunk_average_log_probs`",
-      "severity": "error"
-    },
-    {
-      "column": 57,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `pair_valid` with type `Tensor` in function `nemo_rl.algorithms.x_token.loss_utils.valid_chunk_mask`",
-      "severity": "error"
-    },
-    {
-      "column": 34,
-      "path": "nemo_rl/algorithms/loss/loss_functions.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable",
       "severity": "error"
     },
     {
@@ -2820,111 +2925,6 @@
       "path": "nemo_rl/algorithms/single_controller_utils/setup.py",
       "name": "bad-typed-dict-key",
       "concise_description": "TypedDict `MegatronConfigDisabled` does not have key `train_iters`",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/algorithms/x_token/loss_utils.py",
-      "name": "bad-override",
-      "concise_description": "Class member `Fp32SparseMM.backward` overrides parent class `Function` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "column": 20,
-      "path": "nemo_rl/algorithms/x_token/loss_utils.py",
-      "name": "unbound-name",
-      "concise_description": "`student_seq_start` may be uninitialized",
-      "severity": "error"
-    },
-    {
-      "column": 60,
-      "path": "nemo_rl/algorithms/x_token/loss_utils.py",
-      "name": "unbound-name",
-      "concise_description": "`student_seq_len` may be uninitialized",
-      "severity": "error"
-    },
-    {
-      "column": 33,
-      "path": "nemo_rl/algorithms/x_token/loss_utils.py",
-      "name": "unbound-name",
-      "concise_description": "`cp_rank` may be uninitialized",
-      "severity": "error"
-    },
-    {
-      "column": 17,
-      "path": "nemo_rl/algorithms/x_token/loss_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `x` with type `Tensor` in function `nemo_rl.distributed.model_utils.cp_shift_next`",
-      "severity": "error"
-    },
-    {
-      "column": 17,
-      "path": "nemo_rl/algorithms/x_token/loss_utils.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `x` with type `Tensor` in function `nemo_rl.distributed.model_utils.cp_shift_next`",
-      "severity": "error"
-    },
-    {
-      "column": 49,
-      "path": "nemo_rl/algorithms/xtoken_off_policy_distillation.py",
-      "name": "bad-typed-dict-key",
-      "concise_description": "TypedDict `AutomodelConfigDisabled` does not have key `context_parallel_size`",
-      "severity": "error"
-    },
-    {
-      "column": 42,
-      "path": "nemo_rl/algorithms/xtoken_off_policy_distillation.py",
-      "name": "bad-typed-dict-key",
-      "concise_description": "TypedDict `AutomodelConfigDisabled` does not have key `context_parallel_size`",
-      "severity": "error"
-    },
-    {
-      "column": 49,
-      "path": "nemo_rl/algorithms/xtoken_off_policy_distillation.py",
-      "name": "bad-typed-dict-key",
-      "concise_description": "TypedDict `AutomodelConfigDisabled` does not have key `tensor_parallel_size`",
-      "severity": "error"
-    },
-    {
-      "column": 49,
-      "path": "nemo_rl/algorithms/xtoken_off_policy_distillation.py",
-      "name": "bad-typed-dict-key",
-      "concise_description": "TypedDict `AutomodelConfigDisabled` does not have key `context_parallel_size`",
-      "severity": "error"
-    },
-    {
-      "column": 44,
-      "path": "nemo_rl/algorithms/xtoken_off_policy_distillation.py",
-      "name": "bad-typed-dict-key",
-      "concise_description": "TypedDict `AutomodelConfigDisabled` does not have key `tensor_parallel_size`",
-      "severity": "error"
-    },
-    {
-      "column": 44,
-      "path": "nemo_rl/algorithms/xtoken_off_policy_distillation.py",
-      "name": "bad-typed-dict-key",
-      "concise_description": "TypedDict `AutomodelConfigDisabled` does not have key `context_parallel_size`",
-      "severity": "error"
-    },
-    {
-      "column": 48,
-      "path": "nemo_rl/algorithms/xtoken_off_policy_distillation.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dict[str, int | list[bool | None] | list[str | None] | list[float] | list[int] | object]` is not assignable to parameter `cfg` with type `CrossTokenizerDistillationLossConfig` in function `nemo_rl.algorithms.loss.loss_functions.CrossTokenizerDistillationLossFn.__init__`",
-      "severity": "error"
-    },
-    {
-      "column": 29,
-      "path": "nemo_rl/algorithms/xtoken_off_policy_distillation.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `OffPolicyDistillationSaveState`",
-      "severity": "error"
-    },
-    {
-      "column": 48,
-      "path": "nemo_rl/algorithms/xtoken_off_policy_distillation.py",
-      "name": "bad-assignment",
-      "concise_description": "`dict[str, float | list[float]]` is not assignable to `dict[str, float]`",
       "severity": "error"
     },
     {
@@ -8997,6 +8997,55 @@
       "severity": "error"
     },
     {
+      "column": 17,
+      "path": "tools/cross_tokenizer/x_token/minimal_projection_generator.py",
+      "name": "unsupported-delete",
+      "concise_description": "Invalid target for `del`",
+      "severity": "error"
+    },
+    {
+      "column": 47,
+      "path": "tools/cross_tokenizer/x_token/minimal_projection_via_multitoken.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `defaultdict[tuple[int, Unknown], float]`",
+      "severity": "error"
+    },
+    {
+      "column": 43,
+      "path": "tools/cross_tokenizer/x_token/minimal_projection_via_multitoken.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `Tensor`",
+      "severity": "error"
+    },
+    {
+      "column": 47,
+      "path": "tools/cross_tokenizer/x_token/minimal_projection_via_multitoken.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `defaultdict[tuple[int, Unknown], float]`",
+      "severity": "error"
+    },
+    {
+      "column": 35,
+      "path": "tools/cross_tokenizer/x_token/minimal_projection_via_multitoken.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `defaultdict[tuple[int, Unknown], float]`",
+      "severity": "error"
+    },
+    {
+      "column": 35,
+      "path": "tools/cross_tokenizer/x_token/minimal_projection_via_multitoken.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `defaultdict[tuple[int, Unknown], float]`",
+      "severity": "error"
+    },
+    {
+      "column": 28,
+      "path": "tools/cross_tokenizer/x_token/minimal_projection_via_multitoken.py",
+      "name": "unbound-name",
+      "concise_description": "`match_indices_student` may be uninitialized",
+      "severity": "error"
+    },
+    {
       "column": 25,
       "path": "tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.py",
       "name": "unsupported-operation",
@@ -9092,55 +9141,6 @@
       "path": "tools/refit_verifier.py",
       "name": "bad-typed-dict-key",
       "concise_description": "TypedDict `GenerationConfig` does not have key `sglang_cfg`",
-      "severity": "error"
-    },
-    {
-      "column": 17,
-      "path": "tools/x_token/minimal_projection_generator.py",
-      "name": "unsupported-delete",
-      "concise_description": "Invalid target for `del`",
-      "severity": "error"
-    },
-    {
-      "column": 47,
-      "path": "tools/x_token/minimal_projection_via_multitoken.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `defaultdict[tuple[int, Unknown], float]`",
-      "severity": "error"
-    },
-    {
-      "column": 43,
-      "path": "tools/x_token/minimal_projection_via_multitoken.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `Tensor`",
-      "severity": "error"
-    },
-    {
-      "column": 47,
-      "path": "tools/x_token/minimal_projection_via_multitoken.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `defaultdict[tuple[int, Unknown], float]`",
-      "severity": "error"
-    },
-    {
-      "column": 35,
-      "path": "tools/x_token/minimal_projection_via_multitoken.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `defaultdict[tuple[int, Unknown], float]`",
-      "severity": "error"
-    },
-    {
-      "column": 35,
-      "path": "tools/x_token/minimal_projection_via_multitoken.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `defaultdict[tuple[int, Unknown], float]`",
-      "severity": "error"
-    },
-    {
-      "column": 28,
-      "path": "tools/x_token/minimal_projection_via_multitoken.py",
-      "name": "unbound-name",
-      "concise_description": "`match_indices_student` may be uninitialized",
       "severity": "error"
     }
   ]

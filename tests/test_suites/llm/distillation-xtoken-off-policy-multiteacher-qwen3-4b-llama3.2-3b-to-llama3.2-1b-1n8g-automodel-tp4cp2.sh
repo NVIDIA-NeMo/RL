@@ -27,7 +27,7 @@ PROJ_DIR=$EXP_DIR/projection
 mkdir -p $PROJ_DIR
 PROJ_PATH=$PROJ_DIR/xtoken_nightly_special.pt
 if [[ ! -f $PROJ_PATH ]]; then
-  uv run python -m tools.x_token.minimal_projection_via_multitoken \
+  uv run python -m tools.cross_tokenizer.x_token.minimal_projection_via_multitoken \
       --student-model $STUDENT_MODEL \
       --teacher-model $TEACHER0_MODEL \
       --top-k 4 \
@@ -44,7 +44,7 @@ fi
 # loss mode (kd_loss_mode=sum), and batch/seq sizes live in the recipe YAML.
 # Only teacher0's projection path is injected here; teacher1 keeps the recipe's
 # null projection (same-vocab => direct per-position KL, no projection).
-uv run examples/run_xtoken_off_policy_distillation.py \
+uv run examples/run_cross_tokenizer_distillation.py \
     --config $CONFIG_PATH \
     distillation.max_num_steps=$MAX_STEPS \
     teachers.0.aligner.projection_matrix_path=$PROJ_PATH \

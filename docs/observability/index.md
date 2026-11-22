@@ -62,7 +62,7 @@ Keeping the settings in the config file is what makes a run's telemetry reproduc
 
 The instrumented entry points — those in the table below, plus `examples/run_sft_v2.py` — call `init_telemetry_driver(config, algorithm="<algo>")` **before** `init_ray()` (so the resolved `NEMO_RL_OTEL_*` settings are snapshotted into the Ray `runtime_env` and inherited by every worker) and `shutdown_telemetry()` from a `finally` block wrapping the whole run, so buffered spans are flushed even when the run fails.
 
-Not every entry point is wired up: `run_eval.py`, `run_grpo_sliding_puzzle.py`, `run_vlm_grpo.py`, `run_vlm_mpo.py`, `run_vlm_sft.py` and `run_xtoken_off_policy_distillation.py` emit nothing today. A run launched through one of those produces no spans and no metrics, whatever `telemetry.enabled` says.
+Not every entry point is wired up: `run_eval.py`, `run_grpo_sliding_puzzle.py`, `run_vlm_grpo.py`, `run_vlm_mpo.py`, `run_vlm_sft.py` and `run_cross_tokenizer_distillation.py` emit nothing today. A run launched through one of those produces no spans and no metrics, whatever `telemetry.enabled` says.
 
 | Algorithm | Entry point | Representative spans |
 |---|---|---|

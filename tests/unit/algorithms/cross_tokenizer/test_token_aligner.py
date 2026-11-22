@@ -29,12 +29,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from nemo_rl.algorithms.x_token import token_aligner as ta
-from nemo_rl.algorithms.x_token.loss_utils import (
+from nemo_rl.algorithms.cross_tokenizer import token_aligner as ta
+from nemo_rl.algorithms.cross_tokenizer.loss_utils import (
     chunk_average_log_probs,
     valid_chunk_mask,
 )
-from nemo_rl.algorithms.x_token.token_aligner import (
+from nemo_rl.algorithms.cross_tokenizer.token_aligner import (
     AlignmentBatch,
     AlignmentPair,
     TokenAligner,

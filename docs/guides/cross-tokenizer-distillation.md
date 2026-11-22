@@ -1,8 +1,8 @@
-# Cross-Tokenizer (X-Token) Off-Policy Distillation
+# Cross-Tokenizer Distillation
 
-NeMo RL supports off-policy distillation between a student and a teacher that **do not share a tokenizer** — for example, distilling a Qwen3-4B teacher into a Llama-3.2-1B student. Cross-tokenizer ("x-token") distillation handles the vocabulary mismatch by routing student logits through a precomputed **projection matrix** that maps each student token to the teacher tokens it most plausibly corresponds to, projecting the student into the teacher's vocab space so the two distributions can be compared.
+NeMo RL supports off-policy distillation between a student and a teacher that **do not share a tokenizer** — for example, distilling a Qwen3-4B teacher into a Llama-3.2-1B student. The two models split the same text into different tokens, so their next-token distributions cover different vocabularies and cannot be compared directly.
 
-Tokenizer vocabularies overlap only partially, which is what makes the projection necessary. The table below reports the pairwise overlap (intersection divided by the smaller vocabulary, on canonical token forms) across several model tokenizers; the off-diagonal entries sit well below `1.0` — that shared-vocabulary gap is exactly what the projection matrix bridges.
+Tokenizer vocabularies overlap only partially. The table below reports the pairwise overlap (intersection divided by the smaller vocabulary, on canonical token forms) across several model tokenizers; the off-diagonal entries sit well below `1.0` — that shared-vocabulary gap is what cross-tokenizer distillation bridges.
 
 | Model | Mistral-NeMo-Minitron-8B | Qwen3-8B-Base | Llama-3.2-1B | gemma-3-4b-it | OLMo2-8B-SuperBPE-t160k | gpt-oss-20b |
 |---|---:|---:|---:|---:|---:|---:|
@@ -13,12 +13,14 @@ Tokenizer vocabularies overlap only partially, which is what makes the projectio
 | OLMo2-8B-SuperBPE-t160k | 0.4215 | 0.4103 | 0.4980 | 0.4918 | 1.0000 | 0.3657 |
 | gpt-oss-20b | 0.7591 | 0.6462 | 0.7977 | 0.6545 | 0.3657 | 1.0000 |
 
-This guide explains how to:
+## X-Token
+
+X-Token handles the vocabulary mismatch by routing student logits through a precomputed projection matrix. This section explains how to:
 
 1. Create the projection matrix from a (student, teacher) tokenizer pair.
 2. Launch a distillation with the projection matrix.
 
-## How it works
+### How it works
 
 A full run has two phases. The three prep steps are *offline data prep* — small CLI tools you run once per (student, teacher) pair — and the result is a single `.pt` file. The final step is the actual distillation training loop.
 
@@ -46,7 +48,7 @@ A full run has two phases. The three prep steps are *offline data prep* — smal
                                              ▼  projection_matrix.pt
                         ┌────────────────────────────────────────────────────┐
                         │  4. examples/                                      │
-                        │     run_xtoken_off_policy_distillation.py          │
+                        │     run_cross_tokenizer_distillation.py            │
                         │     — align student & teacher tokens, then         │
                         │       teacher forward + student forward,           │
                         │       then x-token KD loss                         │
@@ -59,22 +61,22 @@ The projection matrix is a sparse `[V_student, top_k]` tensor that the training-
 
 Each row of the matrix holds the weights `W_{s,t}` that distribute a student token `s ∈ V_S` over the teacher tokens `t ∈ V_T` it corresponds to. Tokens shared by both vocabularies map 1-to-1 (e.g., `_the`, `_cat`, `_run`), while a student token that the teacher splits into pieces spreads its weight across those pieces (e.g., `201` → `2`, `0`, `1`). Rows are trimmed to the runtime `top_k` in Step 3, so low-weight tail entries are dropped (hatched cell).
 
-## Quickstart — single command
+### Quickstart — single command
 
-For the typical case, `tools/x_token/build_projection_matrix.sh` chains the prep steps with auto-derived intermediate paths:
+For the typical case, `tools/cross_tokenizer/x_token/build_projection_matrix.sh` chains the prep steps with auto-derived intermediate paths:
 
 ```bash
-./tools/x_token/build_projection_matrix.sh \
+./tools/cross_tokenizer/x_token/build_projection_matrix.sh \
     --student-model meta-llama/Llama-3.2-1B \
     --teacher-model Qwen/Qwen3-4B \
     --runtime-top-k 4
 ```
 
-The wrapper writes the final matrix to `cross_tokenizer_data/projection_matrix_<student>_<teacher>_top<N>.pt` (override with `--final-output`). Further tweaks to step 1 defaults can be configured using `--no-{scale-trick,reverse-pass,special-token-mapping}`. Run `./tools/x_token/build_projection_matrix.sh --help` for the full list of options.
+The wrapper writes the final matrix to `cross_tokenizer_data/projection_matrix_<student>_<teacher>_top<N>.pt` (override with `--final-output`). Further tweaks to step 1 defaults can be configured using `--no-{scale-trick,reverse-pass,special-token-mapping}`. Run `./tools/cross_tokenizer/x_token/build_projection_matrix.sh --help` for the full list of options.
 
 The per-step recipes below are for advanced customization (non-default weight thresholds, hand-picked intermediate filenames, etc.).
 
-## Backend and scope
+### Backend and scope
 
 - **Automodel only.** Set `policy.automodel_cfg.enabled=true`. The Megatron policy worker is not wired for cross-tokenizer distillation.
 - **Teacher logits travel via CUDA IPC**, so student and teacher policies must be colocated on the same node. No remote-Ray transport for x-token logits.
@@ -102,12 +104,12 @@ The per-step recipes below are for advanced customization (non-default weight th
 
 Future work will ease these requirements — we are actively working on improving cross-tokenizer distillation support.
 
-## Step 1 — Build multi-token mappings
+### Step 1 — Build multi-token mappings
 
 Many student tokens (e.g., `"12"`) tokenize into multiple teacher tokens (e.g., `"1"`, `"2"`). `minimal_projection_via_multitoken.py` walks the student vocab, re-tokenizes each token with the teacher tokenizer, and adds weighted entries to the projection. With `--enable-reverse-pass` it also does the symmetric teacher → student walk.
 
 ```bash
-uv run python -m tools.x_token.minimal_projection_via_multitoken \
+uv run python -m tools.cross_tokenizer.x_token.minimal_projection_via_multitoken \
     --student-model "meta-llama/Llama-3.2-1B" \
     --teacher-model "Qwen/Qwen3-4B" \
     --top-k 32 \
@@ -120,12 +122,12 @@ Output: `cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_3
 
 Pass `--num-examples 50` to print a sample of student→teacher mappings after the matrix is built — useful for spot-checking that special tokens, numerals, and punctuation map to sensible teacher tokens.
 
-## Step 2 — Reapply exact-token map
+### Step 2 — Reapply exact-token map
 
 Tokenizers built with a similar algorithm (for example, BPE) typically share a sizable set of identical tokens — common punctuation, single ASCII characters, and frequent subwords. `reapply_exact_map.py` pins those overlapping tokens to 1-to-1 mappings with weight 1.0, overwriting whatever Step 1 produced for them.
 
 ```bash
-uv run python -m tools.x_token.reapply_exact_map \
+uv run python -m tools.cross_tokenizer.x_token.reapply_exact_map \
     --student-model "meta-llama/Llama-3.2-1B" \
     --teacher-model "Qwen/Qwen3-4B" \
     --initial-projection-path cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_32_double_special.pt
@@ -133,23 +135,23 @@ uv run python -m tools.x_token.reapply_exact_map \
 
 Output is written next to the input as `<basename>_exact_map_remapped.pt`.
 
-## Step 3 — Sort and trim to runtime `top_k`
+### Step 3 — Sort and trim to runtime `top_k`
 
 We observe the projection map is very sparse — each student token maps to at most 4–5 teacher tokens. This step sorts each row by weight, trims to the chosen runtime `top_k`, and stores the result as a sparse `[V_student, top_k]` representation (per-row indices plus weights). That sparse format avoids materializing a computationally expensive dense projection matrix of size `[student_vocab, teacher_vocab]` during distillation.
 
 ```bash
-uv run python -m tools.x_token.sort_and_cut_projection_matrix \
+uv run python -m tools.cross_tokenizer.x_token.sort_and_cut_projection_matrix \
     --initial-projection-path cross_tokenizer_data/projection_map_Llama-3.2_to_Qwen3_multitoken_top_32_double_special_exact_map_remapped.pt \
     --top_k 4 \
     --output_path cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
 ```
 
-## Step 4 — Launch x-token distillation
+### Step 4 — Launch x-token distillation
 
-The training entrypoint is `examples/run_xtoken_off_policy_distillation.py` with the exemplar config at `examples/configs/xtoken_off_policy_distillation.yaml`. The exemplar defaults to Llama-3.2-1B (student) ← Qwen3-4B (teacher) and the P-KL loss mode. For data it points `data.train.data_files` at the ungated, CC-BY-4.0 NVIDIA **Nemotron-Pretraining-Specialized-v1.1** corpus (`Nemotron-Pretraining-Formal-Logic` subset) by dataset id + `data.train.subset`, so the recipe runs out of the box with no auth or extra setup (and from the HF cache under `HF_HUB_OFFLINE=1`). The `projection_matrix_path` below points at the `cross_tokenizer_data/` directory that Steps 1–3 create, so run those first (or the `build_projection_matrix.sh` wrapper). Override paths via Hydra CLI:
+The training entrypoint is `examples/run_cross_tokenizer_distillation.py` with the exemplar config at `examples/configs/xtoken_off_policy_distillation.yaml`. The exemplar defaults to Llama-3.2-1B (student) ← Qwen3-4B (teacher) and the P-KL loss mode. For data it points `data.train.data_files` at the ungated, CC-BY-4.0 NVIDIA **Nemotron-Pretraining-Specialized-v1.1** corpus (`Nemotron-Pretraining-Formal-Logic` subset) by dataset id + `data.train.subset`, so the recipe runs out of the box with no auth or extra setup (and from the HF cache under `HF_HUB_OFFLINE=1`). The `projection_matrix_path` below points at the `cross_tokenizer_data/` directory that Steps 1–3 create, so run those first (or the `build_projection_matrix.sh` wrapper). Override paths via Hydra CLI:
 
 ```bash
-uv run python examples/run_xtoken_off_policy_distillation.py \
+uv run python examples/run_cross_tokenizer_distillation.py \
     --config examples/configs/xtoken_off_policy_distillation.yaml \
     teachers.0.aligner.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
     cluster.gpus_per_node=8 \
@@ -158,7 +160,7 @@ uv run python examples/run_xtoken_off_policy_distillation.py \
 
 The exemplar config keeps each teacher's `aligner.projection_matrix_path` as `null`, so the projection matrix must always be supplied at the CLI (per teacher, e.g. `teachers.0.aligner.projection_matrix_path=...`) — this keeps the config reusable across (student, teacher) pairs. `data.train.data_files` and `data.train.subset` already point at the default NVIDIA corpus described above; override them only to train on your own `.arrow`/`.parquet`/`.json`/`.txt` corpus. Set both, since a file path requires `subset` to be null: `data.train.data_files=/path/glob/*.arrow data.train.subset=null`.
 
-### Text and chat batches
+#### Text and chat batches
 
 Both exemplar configs declare a typed top-level `collator` block:
 
@@ -179,7 +181,7 @@ The OpenAI adapter prepends a zero when it inserts a system message.
 
 The configuration class supplies defaults. Packing multiple examples per row remains unsupported; keep `num_packed_rows=1`. Text tokenization uses `add_special_tokens=False`. Chat rows exceeding either the student's or any teacher's context limit are rejected instead of independently truncating their conversations.
 
-### Native reasoning and tool conversations
+#### Native reasoning and tool conversations
 
 Native alignment supports the Nano/Qwen ChatML layouts with explicit reasoning, answer, tool-call, and end-of-turn regions. Literal ChatML turn delimiters inside source content or schemas are rejected as ambiguous; embedded tool/think markup inside tool arguments is supported. Other layouts fail with an error; the Llama text exemplars are not native-chat recipes. Enable it explicitly:
 
@@ -226,7 +228,7 @@ bash tests/functional/xtoken_native_chat.sh
 The chat scenario is functional coverage, not a nightly convergence benchmark.
 DP alignment, native student-only SFT, sequence packing, and backend/loss changes are outside this port.
 
-### Loss-mode knobs
+#### Loss-mode knobs
 
 `loss_fn` has two flags that pick between three behaviors:
 
@@ -243,10 +245,10 @@ Other relevant fields:
 - `loss_fn.uncommon_topk` — cap on the L1 uncommon-tail sort in the gold path (defaults to 8192).
 - `loss_fn.reverse_kl` — compute `KL(student || teacher)` instead of `KL(teacher || student)`.
 
-## Results — 100-step multi-teacher run
+### Results — 100-step multi-teacher run
 
 ```bash
-uv run python examples/run_xtoken_off_policy_distillation.py \
+uv run python examples/run_cross_tokenizer_distillation.py \
     --config examples/configs/xtoken_multiteacher_off_policy_distillation.yaml \
     teachers.0.aligner.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_phi-mini_top4.pt \
     cluster.gpus_per_node=8 \
@@ -263,7 +265,7 @@ Config: global batch 96, micro-batch 1, sequence length 2048, 100 steps, 2 nodes
 - **CE loss** falls from ≈0.75 to ≈0.35.
 - **Top-1 accuracy** rises from ≈0.82 to ≈0.91.
 
-### Downstream evaluation
+#### Downstream evaluation
 
 Benchmark scores of the distilled student against the undistilled `meta-llama/Llama-3.2-1B` base model:
 
@@ -272,7 +274,7 @@ Benchmark scores of the distilled student against the undistilled `meta-llama/Ll
 | MMLU | 32.05 | 40.24 |
 | GSM8K | 5.69 | 5.76 |
 
-### Throughput and memory
+#### Throughput and memory
 
 Measured on the same run (per training step, micro-batch 1, sequence length 2048, with the two teachers forwarded serially):
 
@@ -288,18 +290,18 @@ Each teacher's full-vocab logits stay on-node: the producer publishes a rank-lev
 
 | Stage | Tool | Default output |
 |---|---|---|
-| Build multi-token | `tools/x_token/minimal_projection_via_multitoken.py` | `<output_dir>/projection_map_<student>_to_<teacher>_multitoken_top_<N>_double[_special].pt` |
-| Reapply exact map | `tools/x_token/reapply_exact_map.py` | `<input>_exact_map_remapped.pt` |
-| Sort and trim | `tools/x_token/sort_and_cut_projection_matrix.py` | `<input_dir>/<basename>_top_<N>_sorted[_preservelast].pt` (or `--output_path`) |
-| Train | `examples/run_xtoken_off_policy_distillation.py` | per the run's `logger.log_dir` and `checkpointing.checkpoint_dir` |
+| Build multi-token | `tools/cross_tokenizer/x_token/minimal_projection_via_multitoken.py` | `<output_dir>/projection_map_<student>_to_<teacher>_multitoken_top_<N>_double[_special].pt` |
+| Reapply exact map | `tools/cross_tokenizer/x_token/reapply_exact_map.py` | `<input>_exact_map_remapped.pt` |
+| Sort and trim | `tools/cross_tokenizer/x_token/sort_and_cut_projection_matrix.py` | `<input_dir>/<basename>_top_<N>_sorted[_preservelast].pt` (or `--output_path`) |
+| Train | `examples/run_cross_tokenizer_distillation.py` | per the run's `logger.log_dir` and `checkpointing.checkpoint_dir` |
 
 ## Related
 
 Listed in the order they run during a training step:
 
 - Config exemplar: [`examples/configs/xtoken_off_policy_distillation.yaml`](../../examples/configs/xtoken_off_policy_distillation.yaml)
-- Trainer module: `nemo_rl/algorithms/xtoken_off_policy_distillation.py`
+- Trainer module: `nemo_rl/algorithms/cross_tokenizer_distillation.py`
 - KD data processor: `nemo_rl/data/processors.py::kd_data_processor`
 - Cross-tokenizer collator: `nemo_rl/data/cross_tokenizer/cross_tokenizer_collate.py::CrossTokenizerCollator`
-- Token alignment: `nemo_rl/algorithms/x_token/token_aligner.py::TokenAligner`
-- Loss implementation: `nemo_rl/algorithms/loss/loss_functions.py::CrossTokenizerDistillationLossFn`
+- Token alignment: `nemo_rl/algorithms/cross_tokenizer/token_aligner.py::TokenAligner`
+- Loss implementation: `nemo_rl/algorithms/loss/cross_tokenizer/x_token.py::CrossTokenizerDistillationLossFn`
