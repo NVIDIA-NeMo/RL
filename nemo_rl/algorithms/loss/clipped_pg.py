@@ -151,7 +151,8 @@ def clipped_pg_actor_objective(
         ratios = (curr_logprobs - curr_logprobs.detach()).exp()
         ratios_clamped = ratios
     elif not disable_ppo_ratio:
-        log_ratios = curr_logprobs - prev_logprobs
+        # Cap the log ratio so exp() cannot overflow on very stale samples.
+        log_ratios = (curr_logprobs - prev_logprobs).clamp(max=20.0)
         if sequence_level_importance_ratios:
             seq_ratio = masked_mean(log_ratios, token_mask, dim=-1).unsqueeze(-1).exp()
             ratios = seq_ratio.expand(-1, advantages.shape[1])
