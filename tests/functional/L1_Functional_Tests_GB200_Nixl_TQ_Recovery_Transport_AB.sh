@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # GPU_COUNT=2
-# Isolate UCX device selection, not SSD, with the native NIXL recovery case.
+# Compare the driver default with a fixed fabric port in the native recovery case.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
@@ -72,16 +72,17 @@ printf 'trial\tmode\tucx_net_devices\texit_code\tstarted_utc\tended_utc\n' > "$R
 FAILED=0
 TRIAL=0
 # Two repetitions per mode reduce order effects. SSD stays enabled in every trial.
-for MODE in all single single all; do
+for MODE in default single single default; do
     TRIAL=$((TRIAL + 1))
-    if [[ "$MODE" == all ]]; then
-        export UCX_NET_DEVICES=all
+    if [[ "$MODE" == default ]]; then
+        unset UCX_NET_DEVICES
     else
         export UCX_NET_DEVICES="$SINGLE_DEVICE"
     fi
+    REQUESTED_DEVICES=${UCX_NET_DEVICES:-driver-default}
     STARTED=$(date -u +%FT%TZ)
     printf '\n=== NIXL transport trial %s: mode=%s UCX_NET_DEVICES=%s start=%s ===\n' \
-        "$TRIAL" "$MODE" "$UCX_NET_DEVICES" "$STARTED"
+        "$TRIAL" "$MODE" "$REQUESTED_DEVICES" "$STARTED"
     # Preserve the first failure and still measure the other mode.
     set +e
     uv run --no-sync bash "$SCRIPT_DIR/grpo_dp_nixl_tq_recovery.sh" nixl \
@@ -90,7 +91,7 @@ for MODE in all single single all; do
     set -e
     ENDED=$(date -u +%FT%TZ)
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$TRIAL" "$MODE" "$UCX_NET_DEVICES" "$STATUS" "$STARTED" "$ENDED" | tee -a "$RESULT_DIR/results.tsv"
+        "$TRIAL" "$MODE" "$REQUESTED_DEVICES" "$STATUS" "$STARTED" "$ENDED" | tee -a "$RESULT_DIR/results.tsv"
     if (( STATUS != 0 )); then
         FAILED=1
     fi
