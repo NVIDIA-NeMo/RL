@@ -1089,7 +1089,7 @@ def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path(monkeypatch):
 
     fn._compute_teacher_kd = _fallback
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.cross_tokenizer.x_token.same_tokenizer_full_vocab_kl",
+        "nemo_rl.algorithms.loss.cross_tokenizer.base.same_tokenizer_full_vocab_kl",
         _fast_path,
     )
 
@@ -1128,7 +1128,7 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
         return torch.tensor(1.23)
 
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.cross_tokenizer.x_token.same_tokenizer_full_vocab_kl",
+        "nemo_rl.algorithms.loss.cross_tokenizer.base.same_tokenizer_full_vocab_kl",
         _fast_path,
     )
     fn._compute_teacher_kd = MagicMock(
@@ -1138,6 +1138,7 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
     logits = torch.zeros(2, 10, 32)
     teacher_full = {0: logits.clone(), 1: logits.clone()}
     align, global_valid_toks = MagicMock(), torch.tensor(20.0)
+    align.student_kd_token_mask = None
 
     kd, metrics = fn._averaged_logits_kd(
         logits,
@@ -1394,6 +1395,7 @@ def test_select_teacher_picks_lowest_ce_teacher(better):
     align = SimpleNamespace(
         student_input_ids=input_ids,
         student_token_mask=torch.ones(1, seqlen),
+        student_kd_token_mask=None,
     )
     aligns_by_idx = {0: align, 1: align}
 

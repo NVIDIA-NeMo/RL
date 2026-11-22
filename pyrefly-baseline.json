@@ -1822,34 +1822,6 @@
       "severity": "error"
     },
     {
-      "column": 23,
-      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
-      "name": "unbound-name",
-      "concise_description": "`temp_weight` may be uninitialized",
-      "severity": "error"
-    },
-    {
-      "column": 39,
-      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `tensor` with type `DTensor | Tensor` in function `nemo_rl.distributed.model_utils.to_local_if_dtensor`",
-      "severity": "error"
-    },
-    {
-      "column": 46,
-      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `tensor` with type `DTensor | Tensor` in function `nemo_rl.distributed.model_utils.to_local_if_dtensor`",
-      "severity": "error"
-    },
-    {
-      "column": 42,
-      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
-      "name": "unbound-name",
-      "concise_description": "`temp_weight` may be uninitialized",
-      "severity": "error"
-    },
-    {
       "column": 13,
       "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
       "name": "bad-argument-type",

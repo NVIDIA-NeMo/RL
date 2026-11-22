@@ -3043,7 +3043,7 @@ def test_cross_tokenizer_precomputed_ce_reduces_partitioned_cp_window(
         return value
 
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.cross_tokenizer.x_token.group_all_reduce_sum_with_grad",
+        "nemo_rl.algorithms.loss.cross_tokenizer.base.group_all_reduce_sum_with_grad",
         reduce_sum,
     )
 

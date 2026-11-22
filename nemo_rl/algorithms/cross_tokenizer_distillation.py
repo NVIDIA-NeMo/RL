@@ -50,6 +50,9 @@ from nemo_rl.algorithms.cross_tokenizer.utils import (
     assert_xtoken_ipc_node_local,
     pad_distillation_val_batch,
 )
+from nemo_rl.algorithms.loss.cross_tokenizer.base import (
+    CrossTokenizerDistillationLossFn,
+)
 from nemo_rl.algorithms.loss.cross_tokenizer.x_token import (
     XTokenLossConfig,
     XTokenLossFn,
@@ -89,7 +92,7 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 # alignment_student_chunk_id is [B, T_s] and DOES follow the student-seq
 # invariant, so it is NOT listed.
 def xtoken_non_student_seq_keys(
-    loss_fn: "XTokenLossFn",
+    loss_fn: "CrossTokenizerDistillationLossFn",
 ) -> frozenset[str]:
     """Build the set of ``train_data`` keys whose dim 1 is NOT the student seq axis.
 
@@ -277,7 +280,7 @@ def setup(
     list[Policy],  # teachers
     StatefulDataLoader,
     Optional[StatefulDataLoader],
-    XTokenLossFn,
+    CrossTokenizerDistillationLossFn,
     Logger,
     CheckpointManager,
     OffPolicyDistillationSaveState,
@@ -588,7 +591,7 @@ def setup(
 
 def export_teacher_logits_and_pack(
     teacher_policies: list[Policy],
-    loss_fn: XTokenLossFn,
+    loss_fn: CrossTokenizerDistillationLossFn,
     batch: BatchedDataDict[Any],
     teacher_mbs: list[int],
     *,
@@ -668,7 +671,7 @@ def xtoken_off_policy_distillation_train(
     teacher_policies: list[Policy],
     dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],
-    loss_fn: XTokenLossFn,
+    loss_fn: CrossTokenizerDistillationLossFn,
     logger: Logger,
     checkpointer: CheckpointManager,
     off_policy_distillation_state: OffPolicyDistillationSaveState,
@@ -987,7 +990,7 @@ def validate(
     student_policy: Policy,
     teacher_policies: list[Policy],
     val_dataloader: StatefulDataLoader,
-    loss_fn: XTokenLossFn,
+    loss_fn: CrossTokenizerDistillationLossFn,
     master_config: MasterConfig,
     skip_keys: frozenset[str],
     timer: Optional[Timer] = None,
