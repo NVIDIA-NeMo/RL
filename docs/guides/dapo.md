@@ -78,6 +78,8 @@ grpo:
 - **`dynamic_sampling_max_gen_batches`**: Maximum number of batches to be used for accumulating nonzero standard deviation prompts.
 - **`reward_scaling`**: When enabled, clamps each reward in the batch to [source_min, source_max] and linearly rescales it to [target_min, target_max]. Defaults: source_min=0.0, source_max=1.0, target_min=0.0, target_max=1.0.
 - **`reward_shaping`**: When enabled, applies the overlong penalty mechanism described in the Reward Shaping section above. Responses whose total generated assistant-turn length exceeds `max_response_length - overlong_buffer_length` receive penalties proportional to their excess length, helping to reduce reward noise and stabilize training.
+  - **`clamp_overlong_penalty`** (default `false`): floors the overlong penalty at `-overlong_buffer_penalty`. A single-turn response cannot exceed `max_response_length`, but a multi-turn response length is the sum of all assistant turns, so without the floor the penalty keeps growing past the buffer and can outweigh the task reward.
+  - **`combine_stop_properly_and_overlong`** (default `false`): when `stop_properly_penalty_coef` is set, the overlong settings are ignored by default. Set this to `true` to scale truncated rows by `stop_properly_penalty_coef` first and then apply the overlong penalty; the overlong settings are then validated as well.
 
 > [!NOTE]
 > When dynamic sampling is enabled, monitor the `filtered_reward` metric to track the average reward of the prompts with std > 0.
