@@ -86,7 +86,11 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         "to_container",
         lambda *_args, **_kwargs: {},
     )
-    monkeypatch.setattr(run_grpo_single_controller, "MasterConfig", lambda **_: config)
+    monkeypatch.setattr(
+        run_grpo_single_controller,
+        "MasterConfig",
+        SimpleNamespace(model_validate=lambda _: config),
+    )
     monkeypatch.setattr(run_grpo_single_controller, "init_ray", lambda: None)
     monkeypatch.setattr(
         run_grpo_single_controller,

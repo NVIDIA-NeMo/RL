@@ -54,6 +54,10 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
 )
+from nemo_rl.algorithms.loss.interfaces import (
+    ObjectiveReduction,
+    make_objective_reduction,
+)
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -81,6 +85,7 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.schema import (
+    AGENT_NAME_TAG,
     DP_TRAIN_FIELDS,
     INPUT_IDS,
     INPUT_LENGTHS,
@@ -113,6 +118,49 @@ def _train_fields_for_step(
     return fields
 
 
+def agent_override_rows(
+    algo: Any, tags: Optional[list[dict[str, Any]]], num_rows: int
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], list[Optional[str]]]:
+    """Per-row overlong-filtering and reward-normalization switches.
+
+    Returns (overlong_rows, normalize_rows, row_agents). Both tensors are None
+    when ``grpo.agent_overrides`` is unset, so the run-wide flags apply
+    unchanged; otherwise each row takes its agent's override or the run-wide
+    value. ``normalize_rows`` stays None when no override sets
+    ``normalize_rewards``.
+    """
+    overrides = getattr(algo, "agent_overrides", None)
+    if not overrides:
+        return None, None, [None] * num_rows
+    row_agents: list[Optional[str]] = (
+        [tag.get(AGENT_NAME_TAG) for tag in tags]
+        if tags is not None
+        else [None] * num_rows
+    )
+    if len(row_agents) != num_rows:
+        raise ValueError(f"row tags cover {len(row_agents)} rows; expected {num_rows}")
+    overlong_rows = torch.tensor(
+        [
+            algo.agent_override_value(
+                agent, "overlong_filtering", algo.overlong_filtering
+            )
+            for agent in row_agents
+        ],
+        dtype=torch.bool,
+    )
+    normalize_rows = None
+    if any(o.normalize_rewards is not None for o in overrides.values()):
+        default = algo.adv_estimator.normalize_rewards
+        normalize_rows = torch.tensor(
+            [
+                algo.agent_override_value(agent, "normalize_rewards", default)
+                for agent in row_agents
+            ],
+            dtype=torch.bool,
+        )
+    return overlong_rows, normalize_rows, row_agents
+
+
 @dataclass(frozen=True)
 class AdvantageStageConfig:
     """Everything the stage reads off the controller, fixed at setup time."""
@@ -126,6 +174,7 @@ class AdvantageStageConfig:
     opd_full_enabled: bool
     message_level_advantage_penalties_enabled: bool
     shardable: bool
+    objective_reduction: ObjectiveReduction
     # Where the per-step training dump writes, or None when it is disabled.
     # The stage owns the dump because it is the only place that still holds
     # the untruncated tensors: the controller stopped fetching them when the
@@ -179,6 +228,9 @@ class AdvantageStageConfig:
             shardable=not create_advantage_estimator(
                 algo_cfg.adv_estimator, loss_cfg
             ).requires_global_batch,
+            objective_reduction=make_objective_reduction(
+                loss_cfg.resolved_normalization
+            ),
             # Use the resolved logger config shared by controller and pool.
             train_data_dump_dir=(
                 master_config.logger.log_dir
@@ -476,9 +528,36 @@ class AdvantageComputer:
                 "mask_sample": mask_sample,
             }
         )
-        sample_mask_metrics, num_mask_sample_filtered = _apply_async_sample_masks(
-            mask_batch, overlong_filtering=cfg.algo.overlong_filtering
+        overlong_rows, normalize_rows, row_agents = agent_override_rows(
+            cfg.algo, meta.tags, len(meta.sample_ids)
         )
+        sample_mask_metrics, num_mask_sample_filtered = _apply_async_sample_masks(
+            mask_batch,
+            overlong_filtering=(
+                overlong_rows
+                if overlong_rows is not None
+                else cfg.algo.overlong_filtering
+            ),
+        )
+        if overlong_rows is not None:
+            # One key per configured agent in every record: the step reduction
+            # sums records key by key.
+            filtered = truncated & overlong_rows & (owner_sample_mask != 0)
+            for agent in cfg.algo.agent_overrides:
+                sample_mask_metrics[
+                    f"num_masked_seqs_by_overlong_filtering/{agent}"
+                ] = int(
+                    sum(
+                        1
+                        for row_agent, row_filtered in zip(
+                            row_agents, filtered.tolist(), strict=True
+                        )
+                        if row_agent == agent and row_filtered
+                    )
+                )
+            sample_mask_metrics["num_rows_without_agent_tag"] = sum(
+                1 for agent in row_agents if agent is None
+            )
         final_sample_mask = mask_batch["loss_multiplier"]
 
         owner_batch = None
@@ -635,11 +714,15 @@ class AdvantageComputer:
                 advantage_valid_mask[owned_rows],
                 reduce="amax",
             )
+            owner_kwargs: dict[str, torch.Tensor] = {}
+            if normalize_rows is not None:
+                owner_kwargs["normalize_rows"] = normalize_rows[rows]
             owner_advantages = self._advantage_estimator.compute_advantage(
                 prompt_ids=owner_batch.group_ids,
                 rewards=rewards[rows],
                 mask=owner_batch.valid_mask.unsqueeze(-1),
                 valid_mask=owner_participation,
+                **owner_kwargs,
             )
             if (
                 owner_advantages.shape != (len(rows), 1)
@@ -657,6 +740,8 @@ class AdvantageComputer:
                 -1
             ).expand_as(mask) * final_sample_mask.unsqueeze(-1)
         elif has_valid_training_tokens:
+            if normalize_rows is not None:
+                kwargs["normalize_rows"] = normalize_rows
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
@@ -773,6 +858,19 @@ class AdvantageComputer:
         if not torch.equal(final_sample_mask, sample_mask):
             fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
         new_fields = [adv_cfg.output_field]
+        extra_fields = cfg.objective_reduction.prepare_batch(
+            sample_ids=meta.sample_ids,
+            token_mask=token_mask,
+            sample_mask=final_sample_mask,
+            # PPO's num_generations_per_prompt is a sampling knob, not a group
+            # guarantee, and no reduction groups responses under PPO.
+            expected_group_size=(
+                None if cfg.is_ppo else cfg.algo.num_generations_per_prompt
+            ),
+            group_indices=prompt_ids.squeeze(-1),
+        )
+        fields_to_put.update(extra_fields)
+        new_fields.extend(extra_fields)
         if returns is not None:
             fields_to_put[adv_cfg.returns_field] = returns
             new_fields.append(adv_cfg.returns_field)

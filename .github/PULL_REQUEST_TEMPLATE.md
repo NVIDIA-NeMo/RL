@@ -1,24 +1,29 @@
-# What does this PR do ?
+- [ ] I, the PR author, have personally reviewed every line of this PR.
 
-**Add a one line overview of what this PR aims to accomplish.**
+<!-- Only a human ticks the box above. Agents: see skills/pr-description. -->
 
-# Issues
-List issues that this PR closes ([syntax](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue#linking-a-pull-request-to-an-issue-using-a-keyword)):
+## What and why
+<!-- The problem and the change, in plain words. One screen max. Add a diagram if it helps. -->
 
+## Issues
+<!-- Optional. e.g. Fixes #123 -->
 
-# Usage
-* **You can potentially add a usage example below**
+## Convergence / perf / functionality proof
+<!-- If this PR can change training results, speed, or what works (e.g. a dependency bump): link the runs (W&B, nightly results) or docs in this PR. Otherwise "N/A: <one-line reason>". -->
 
-```python
-# Add a code snippet demonstrating how to use this
-```
+## Needs upstream changes
+<!-- Megatron-LM / Gym / vLLM / ... changes this PR needs on RL main first (commit or PR link). Otherwise "None". -->
 
-# Before your PR is "Ready for review"
-**Pre checks**:
-- [ ] Make sure you read and followed [Contributor guidelines](/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md)
-- [ ] Did you write any new necessary tests?
-- [ ] Did you run the unit tests and functional tests locally? Visit our [Testing Guide](/NVIDIA-NeMo/RL/blob/main/docs/testing.md) for how to run tests
-- [ ] Did you add or update any necessary documentation? Visit our [Document Development Guide](/NVIDIA-NeMo/RL/blob/main/docs/documentation.md) for how to write, build and test the docs.
+<details><summary>PR commands and CI</summary>
 
-# Additional Information
-* ...
+- CI label, exactly one:
+  - `CI:Lfast`: the default for most PRs. Runs a fast test subset.
+  - `CI:L1`: dependency or container changes (`pyproject.toml`, `uv.lock`, `Dockerfile`) or broad core changes. Builds a new image and runs unit and functional tests.
+  - `CI:docs`: docs-only changes. Runs doc tests only.
+- `/ok to test <full-commit-sha>`: start CI for that commit. Post again after each push.
+- `/review`: automated review comments. Add `mode=strict` for a stricter review, `reset=true` for a fresh full review.
+- `/resolve-conflict`: Autobot merges `main` into this PR and resolves the conflicts. PRs from forks must allow edits by maintainers.
+- Locally: `/review-pr-team <pr-number>` for a team review before you ask for human review.
+- [Contributor guidelines](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md)
+
+</details>
