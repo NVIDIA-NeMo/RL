@@ -154,6 +154,26 @@ def matching_rules(
     return matched
 
 
+def copy_rule_fields(
+    source: Mapping[str, Any], target: dict[str, Any], fields: Sequence[str]
+) -> None:
+    """Copy the scalar at each dotted ``field`` of ``source`` into ``target``.
+
+    The nesting is kept, so ``matching_rules`` gives the same answer on
+    ``target`` as on ``source``. A missing or non-scalar value is skipped:
+    ``equals`` is a scalar, so no rule can match it.
+    """
+    for field in fields:
+        found, value = _lookup(source, field)
+        if not found or not isinstance(value, (bool, int, float, str, type(None))):
+            continue
+        *parents, leaf = field.split(".")
+        node = target
+        for part in parents:
+            node = node.setdefault(part, {})
+        node[leaf] = value
+
+
 def mask_rule_step_metrics(
     counts: Mapping[str, int],
     rules: Sequence[MaskSampleRule],

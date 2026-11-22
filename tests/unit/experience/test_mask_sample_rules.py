@@ -17,6 +17,7 @@ import pytest
 
 from nemo_rl.experience.mask_sample_rules import (
     MaskSampleRule,
+    copy_rule_fields,
     mask_rule_metrics,
     mask_rule_step_metrics,
     matching_rules,
@@ -96,6 +97,25 @@ def test_matching_is_type_strict_and_missing_fields_never_match():
         "eval_incomplete",
         "harness_unfinished",
     ]
+
+
+def test_copied_rule_fields_match_like_the_full_response():
+    rules = parse_mask_sample_rules({"mask_sample_rules": RULES_CFG})
+    source = {
+        "evaluation_completed": False,
+        "verify": {"status": "timeout", "log": "long text"},
+        "opencode_finished": {"not": "a scalar"},
+        "response": {"output": ["dropped"]},
+    }
+    target = {"reward": 0.0, "instance_config": {"mask_sample": False}}
+    copy_rule_fields(source, target, [rule.field for rule in rules])
+    assert target == {
+        "reward": 0.0,
+        "instance_config": {"mask_sample": False},
+        "evaluation_completed": False,
+        "verify": {"status": "timeout"},
+    }
+    assert matching_rules(target, rules) == matching_rules(source, rules)
 
 
 def test_metrics_report_a_rate_for_every_configured_rule():

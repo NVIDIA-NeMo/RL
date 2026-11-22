@@ -126,6 +126,10 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
 )
+from nemo_rl.experience.mask_sample_rules import (
+    copy_rule_fields,
+    parse_mask_sample_rules,
+)
 from nemo_rl.models.generation.dynamo.config import (
     dynamo_enabled,
 )
@@ -741,6 +745,9 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
+    # Dotted fields of env.mask_sample_rules, derived by the actor builder. Forest
+    # results keep them beside the top-level scalars so the rules still match.
+    mask_sample_rule_fields: NotRequired[tuple[str, ...]]
     # Internal checkpoint topology. These are derived by the actor builder,
     # never read from user YAML.
     checkpoint_instance: GymCheckpointInstance
@@ -2283,6 +2290,10 @@ Depending on your data shape, you may want to change these values."""
         full_result["instance_config"] = {
             "mask_sample": result["instance_config"]["mask_sample"]
         }
+        # env.mask_sample_rules may read nested fields the filter above drops.
+        rule_fields = self.cfg.get("mask_sample_rule_fields")
+        if rule_fields:
+            copy_rule_fields(result, full_result, rule_fields)
         return {
             "message_log": [],
             "input_message_log": [],
@@ -3079,9 +3090,14 @@ def build_nemo_gym_config(
         ),
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+        mask_sample_rule_fields=_mask_sample_rule_fields(env_configs),
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     )
+
+
+def _mask_sample_rule_fields(env_configs: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(rule.field for rule in parse_mask_sample_rules(env_configs))
 
 
 def _apply_dynamo_dialect(nemo_gym_dict: dict[str, Any], *, frontends: int) -> None:
@@ -3130,6 +3146,7 @@ def _build_gym_actor_config(
     checkpoint_instance: GymCheckpointInstance,
     turn_checkpointing_enabled: bool,
     generation_prefix_cuts_enabled: bool,
+    mask_sample_rule_fields: tuple[str, ...],
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
@@ -3256,6 +3273,7 @@ def _build_gym_actor_config(
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=instance_token_capture,
+        mask_sample_rule_fields=mask_sample_rule_fields,
         checkpoint_instance=checkpoint_instance,
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         **port_range,
@@ -3578,6 +3596,7 @@ def build_nemo_gym_actors(
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
     plan = parse_shard_plan(nemo_gym_dict)
+    mask_sample_rule_fields = _mask_sample_rule_fields(env_configs)
 
     if plan is None:
         return _build_single_gym_actor(
@@ -3589,6 +3608,7 @@ def build_nemo_gym_actors(
             use_fastokens=use_fastokens,
             turn_checkpointing_enabled=turn_checkpointing_enabled,
             generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+            mask_sample_rule_fields=mask_sample_rule_fields,
             token_capture=token_capture,
             policy_api_key=policy_api_key,
         )
@@ -3603,6 +3623,7 @@ def build_nemo_gym_actors(
         use_fastokens=use_fastokens,
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+        mask_sample_rule_fields=mask_sample_rule_fields,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
         pg_ready_timeout=pg_ready_timeout,
@@ -3620,6 +3641,7 @@ def _build_single_gym_actor(
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
     generation_prefix_cuts_enabled: bool,
+    mask_sample_rule_fields: tuple[str, ...],
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
 ) -> NemoGymShardSet:
@@ -3636,6 +3658,7 @@ def _build_single_gym_actor(
         ),
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+        mask_sample_rule_fields=mask_sample_rule_fields,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     )
@@ -3686,6 +3709,7 @@ def _build_sharded_gym_actors(
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
     generation_prefix_cuts_enabled: bool,
+    mask_sample_rule_fields: tuple[str, ...],
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float,
@@ -3776,6 +3800,7 @@ def _build_sharded_gym_actors(
                     ),
                     turn_checkpointing_enabled=turn_checkpointing_enabled,
                     generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+                    mask_sample_rule_fields=mask_sample_rule_fields,
                     token_capture=token_capture,
                     policy_api_key=policy_api_key,
                 )
