@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from typing import Any, NotRequired, Optional, TypedDict, cast
 
 import numpy as np
@@ -114,6 +115,40 @@ def xtoken_non_student_seq_keys(
             keys.add(f"alignment_{i}_pair_is_correct")
             keys.add(f"alignment_{i}_teacher_chunk_id")
     return frozenset(keys)
+
+
+# Per-microbatch metrics that are *intensive* — rates, ratios, per-chunk
+# averages, and global-batch constants replicated onto every microbatch. Their
+# per-step value is the mean over the flat per-(microbatch, DP rank) list;
+# everything else is an *extensive* per-microbatch contribution (loss shares
+# normalized by a global denominator, counts) whose per-step value is the sum.
+MEAN_REDUCED_MB_METRICS = frozenset(
+    {
+        "lr",
+        "wd",
+        "global_valid_seqs",
+        "global_valid_toks",
+        "accuracy",
+        "proj_accuracy",
+        "kl_loss_scale",
+        # Gold-loss path: per-mb local chunk average.
+        "kl_common",
+        "l1_uncommon",
+        # Per-microbatch teacher weights and selected-teacher index.
+        "weight",
+        "selected_teacher",
+    }
+)
+
+# Per-teacher metrics are suffixed ``_t{i}`` by the loss fn's aggregation.
+_TEACHER_METRIC_SUFFIX = re.compile(r"_t\d+$")
+
+
+def reduce_mb_metric(key: str, values: Any) -> float:
+    """Reduce one metric's per-(microbatch, DP rank) list to its per-step scalar."""
+    if _TEACHER_METRIC_SUFFIX.sub("", key) in MEAN_REDUCED_MB_METRICS:
+        return float(np.mean(values))
+    return float(np.sum(values))
 
 
 # ===============================================================================
@@ -625,6 +660,15 @@ def export_teacher_logits_and_pack(
     return BatchedDataDict(train_data)
 
 
+def _restore_student_between_teacher_state(
+    student_policy: Policy,
+    master_config: MasterConfig,
+) -> None:
+    """Restore the configured student residency between teacher forwards."""
+    if master_config.policy["offload_optimizer_for_logprob"]:
+        student_policy.offload_before_refit()
+
+
 def xtoken_off_policy_distillation_train(
     student_policy: Policy,
     teacher_policies: list[Policy],
@@ -655,6 +699,15 @@ def xtoken_off_policy_distillation_train(
     val_at_end = distill_cfg["val_at_end"]
     max_epochs = distill_cfg["max_num_epochs"]
     max_steps = distill_cfg["max_num_steps"]
+    offload_student_optimizer_after_step = bool(
+        master_config.policy["offload_optimizer_for_logprob"]
+    )
+    if offload_student_optimizer_after_step:
+        print(
+            "Student post-step optimizer offload enabled: optimizer state is "
+            "offloaded before the next teacher pass while model shards remain resident.",
+            flush=True,
+        )
     # Per-teacher export MBS (each teacher's own train MBS) and the
     # non-student-seq keys the worker's check_sequence_dim must skip
     # (teacher-count-dependent, so built from the loss fn).
@@ -723,6 +776,12 @@ def xtoken_off_policy_distillation_train(
                             teacher_policy.release_ipc_buffer()
                         raise
 
+                if offload_student_optimizer_after_step:
+                    with timer.time("student_optimizer_offload"):
+                        _restore_student_between_teacher_state(
+                            student_policy, master_config
+                        )
+
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
                     and (current_step + 1 == len(dataloader))
@@ -759,20 +818,7 @@ def xtoken_off_policy_distillation_train(
                 # the gold-loss path emits kl_common/l1_uncommon. Either set
                 # may be present — reduce both via the same rules.
                 for k, v in metrics.items():
-                    if k in {
-                        "lr",
-                        "wd",
-                        "global_valid_seqs",
-                        "global_valid_toks",
-                        "accuracy",
-                        "proj_accuracy",
-                        "kl_loss_scale",
-                        "kl_common",
-                        "l1_uncommon",
-                    }:
-                        metrics[k] = float(np.mean(v))
-                    else:
-                        metrics[k] = float(np.sum(v))
+                    metrics[k] = reduce_mb_metric(k, v)
                 if "global_valid_toks" in metrics:
                     total_valid_tokens += int(metrics["global_valid_toks"])
 
@@ -839,6 +885,9 @@ def xtoken_off_policy_distillation_train(
                             ckpt_path,
                             wait_fn=student_policy.finalize_async_save,
                         )
+                    _restore_student_between_teacher_state(
+                        student_policy, master_config
+                    )
 
             # ===== Logging =====
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
@@ -1004,6 +1053,7 @@ def validate(
                     eval_mode=True,
                     check_dim_skip_keys=skip_keys,
                 )
+                _restore_student_between_teacher_state(student_policy, master_config)
             except Exception:
                 for teacher_policy in teacher_policies:
                     teacher_policy.release_ipc_buffer()
