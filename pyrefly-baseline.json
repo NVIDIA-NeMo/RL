@@ -681,10 +681,10 @@
       "severity": "error"
     },
     {
-      "column": 48,
+      "column": 28,
       "path": "nemo_rl/algorithms/cross_tokenizer_distillation.py",
       "name": "bad-argument-type",
-      "concise_description": "Argument `dict[str, int | list[bool | None] | list[str | None] | list[float] | list[int] | object]` is not assignable to parameter `cfg` with type `CrossTokenizerDistillationLossConfig` in function `nemo_rl.algorithms.loss.cross_tokenizer.x_token.CrossTokenizerDistillationLossFn.__init__`",
+      "concise_description": "Argument `dict[str, int | list[bool | None] | list[str | None] | list[float] | list[int] | object]` is not assignable to parameter `cfg` with type `XTokenLossConfig` in function `nemo_rl.algorithms.loss.cross_tokenizer.x_token.XTokenLossFn.__init__`",
       "severity": "error"
     },
     {
@@ -1797,7 +1797,7 @@
       "column": 9,
       "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
       "name": "bad-override",
-      "concise_description": "Class member `CrossTokenizerDistillationLossFn.__call__` overrides parent class `LossFunction` in an inconsistent manner",
+      "concise_description": "Class member `XTokenLossFn.__call__` overrides parent class `LossFunction` in an inconsistent manner",
       "severity": "error"
     },
     {

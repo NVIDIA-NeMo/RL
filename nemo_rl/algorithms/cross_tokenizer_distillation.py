@@ -51,8 +51,8 @@ from nemo_rl.algorithms.cross_tokenizer.utils import (
     pad_distillation_val_batch,
 )
 from nemo_rl.algorithms.loss.cross_tokenizer.x_token import (
-    CrossTokenizerDistillationLossConfig,
-    CrossTokenizerDistillationLossFn,
+    XTokenLossConfig,
+    XTokenLossFn,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
@@ -89,7 +89,7 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 # alignment_student_chunk_id is [B, T_s] and DOES follow the student-seq
 # invariant, so it is NOT listed.
 def xtoken_non_student_seq_keys(
-    loss_fn: "CrossTokenizerDistillationLossFn",
+    loss_fn: "XTokenLossFn",
 ) -> frozenset[str]:
     """Build the set of ``train_data`` keys whose dim 1 is NOT the student seq axis.
 
@@ -250,7 +250,7 @@ class TeacherConfig(BaseModel, extra="allow"):
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig  # student
     teachers: list[TeacherConfig] = Field(min_length=1)
-    loss_fn: CrossTokenizerDistillationLossConfig
+    loss_fn: XTokenLossConfig
     data: DataConfig
     collator: CrossTokenizerCollatorConfig = Field(
         default_factory=CrossTokenizerCollatorConfig
@@ -277,7 +277,7 @@ def setup(
     list[Policy],  # teachers
     StatefulDataLoader,
     Optional[StatefulDataLoader],
-    CrossTokenizerDistillationLossFn,
+    XTokenLossFn,
     Logger,
     CheckpointManager,
     OffPolicyDistillationSaveState,
@@ -562,7 +562,7 @@ def setup(
         "teacher_gold_loss": [t.gold_loss for t in teachers],
         "teacher_xtoken_loss": [t.xtoken_loss for t in teachers],
     }
-    loss_fn = CrossTokenizerDistillationLossFn(loss_config)
+    loss_fn = XTokenLossFn(loss_config)
 
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
@@ -588,7 +588,7 @@ def setup(
 
 def export_teacher_logits_and_pack(
     teacher_policies: list[Policy],
-    loss_fn: CrossTokenizerDistillationLossFn,
+    loss_fn: XTokenLossFn,
     batch: BatchedDataDict[Any],
     teacher_mbs: list[int],
     *,
@@ -668,7 +668,7 @@ def xtoken_off_policy_distillation_train(
     teacher_policies: list[Policy],
     dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],
-    loss_fn: CrossTokenizerDistillationLossFn,
+    loss_fn: XTokenLossFn,
     logger: Logger,
     checkpointer: CheckpointManager,
     off_policy_distillation_state: OffPolicyDistillationSaveState,
@@ -987,7 +987,7 @@ def validate(
     student_policy: Policy,
     teacher_policies: list[Policy],
     val_dataloader: StatefulDataLoader,
-    loss_fn: CrossTokenizerDistillationLossFn,
+    loss_fn: XTokenLossFn,
     master_config: MasterConfig,
     skip_keys: frozenset[str],
     timer: Optional[Timer] = None,

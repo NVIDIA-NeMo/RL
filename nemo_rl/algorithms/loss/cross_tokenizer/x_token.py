@@ -47,7 +47,7 @@ from nemo_rl.utils.tensor_ops import masked_mean
 # =====================================================================
 
 
-class CrossTokenizerDistillationLossConfig(TypedDict):
+class XTokenLossConfig(TypedDict):
     """Config for cross-tokenizer distillation loss.
 
     Attributes:
@@ -136,7 +136,7 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
     teacher_xtoken_loss: NotRequired[list[Optional[bool]]]
 
 
-class CrossTokenizerDistillationLossDataDict(TypedDict):
+class XTokenLossDataDict(TypedDict):
     """Student-side keys are fixed; teacher-side keys are teacher-indexed.
 
     Only the student keys below are static. Each teacher ``i`` contributes a
@@ -163,7 +163,7 @@ class CrossTokenizerDistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
 
 
-class CrossTokenizerDistillationLossFn(LossFunction):
+class XTokenLossFn(LossFunction):
     """Cross-tokenizer distillation loss.
 
     Mode is selected by the ``(gold_loss, xtoken_loss)`` flags:
@@ -209,7 +209,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             localized chunk alignment; same-tok: thin, student fields only).
 
     Inputs (via ``data: BatchedDataDict``):
-        See :class:`CrossTokenizerDistillationLossDataDict`.
+        See :class:`XTokenLossDataDict`.
 
     Returns:
         ``(loss, metrics)``. Aggregate metrics: ``loss``, ``kl_loss`` (the
@@ -222,7 +222,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     loss_type = LossType.TOKEN_LEVEL
     input_type = LossInputType.DISTILLATION_CROSS_TOKENIZER
 
-    def __init__(self, cfg: CrossTokenizerDistillationLossConfig):
+    def __init__(self, cfg: XTokenLossConfig):
         if cfg["xtoken_loss"] and not cfg["gold_loss"]:
             raise ValueError(
                 "xtoken_loss=True requires gold_loss=True; xtoken_loss is "
@@ -315,7 +315,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
     def __call__(
         self,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        data: BatchedDataDict[XTokenLossDataDict],
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
         logits: torch.Tensor,
@@ -454,7 +454,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         self,
         i: int,
         student_logits_contig: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        data: BatchedDataDict[XTokenLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
         global_valid_toks: torch.Tensor,
@@ -560,7 +560,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     def _sum_kd(
         self,
         student_logits_contig: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        data: BatchedDataDict[XTokenLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
         global_valid_toks: torch.Tensor,
@@ -629,7 +629,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     def _averaged_logits_kd(
         self,
         student_logits_contig: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        data: BatchedDataDict[XTokenLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
         global_valid_toks: torch.Tensor,
@@ -725,7 +725,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     def _select_teacher_kd(
         self,
         student_logits_contig: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        data: BatchedDataDict[XTokenLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
         global_valid_toks: torch.Tensor,
@@ -819,7 +819,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
     def _compute_dynamic_weights(
         self,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        data: BatchedDataDict[XTokenLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
         *,
@@ -1283,7 +1283,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     def _compute_ce(
         self,
         logits: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        data: BatchedDataDict[XTokenLossDataDict],
         global_valid_toks: torch.Tensor,
         *,
         student_next_token_logprobs: Optional[torch.Tensor] = None,

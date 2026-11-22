@@ -570,7 +570,7 @@ Two notes on the table:
 | `PreferenceLossFn` / `DPOLossFn` | DPO, RM | Sequence-level |
 | `DistillationLossFn` | On-policy distillation | Token-level |
 | `MseValueLossFn` | PPO critic | Token-level |
-| `CrossTokenizerDistillationLossFn` | Cross-tokenizer distillation | Token-level |
+| `XTokenLossFn` | X-Token distillation | Token-level |
 | `DraftCrossEntropyLossFn` | Eagle3 draft training | Token-level |
 
 #### How metrics are normalized

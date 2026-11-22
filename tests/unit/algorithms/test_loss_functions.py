@@ -39,7 +39,7 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.clipped_pg import clipped_pg_diagnostic_metrics
 from nemo_rl.algorithms.loss.cross_tokenizer.x_token import (
-    CrossTokenizerDistillationLossFn,
+    XTokenLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.algorithms.utils import calculate_kl
@@ -2679,7 +2679,7 @@ def test_distillation_loss_fn_call():
 
 
 # ---------------------------------------------------------------------------
-# CrossTokenizerDistillationLossFn — CPU synthetic-tensor coverage for the
+# XTokenLossFn — CPU synthetic-tensor coverage for the
 # gold path (KL on the exact-mapped common partition + L1 on the uncommon
 # tail) and the next-token CE term. Unlike the DistillationLossFn tests
 # above, these run on CPU: the gold and CE paths use no GPU-pinned ops, and
@@ -2783,7 +2783,7 @@ def test_cross_tokenizer_gold_loss_matches_reference(tmp_path):
     """
     torch.manual_seed(0)
     path = _write_ct_projection(tmp_path)
-    loss_fn = CrossTokenizerDistillationLossFn(_ct_loss_cfg(path, gold_loss=True))
+    loss_fn = XTokenLossFn(_ct_loss_cfg(path, gold_loss=True))
 
     student_chunk_id = torch.tensor([[0, 0, 1]], dtype=torch.long)
     teacher_chunk_id = torch.tensor([[0, 0, 1]], dtype=torch.long)
@@ -2843,7 +2843,7 @@ def test_cross_tokenizer_gold_loss_all_samples_masked_is_zero(tmp_path):
     """sample_mask all-zero -> zero loss and zero valid chunks (the gold path
     consults sample_mask, not just the geometric chunk mask)."""
     path = _write_ct_projection(tmp_path)
-    loss_fn = CrossTokenizerDistillationLossFn(_ct_loss_cfg(path, gold_loss=True))
+    loss_fn = XTokenLossFn(_ct_loss_cfg(path, gold_loss=True))
 
     student_chunk_id = torch.tensor([[0, 0, 1]], dtype=torch.long)
     data = _ct_gold_data(
@@ -2874,7 +2874,7 @@ def test_cross_tokenizer_mismatched_per_teacher_lists_raises(tmp_path):
     # Two weights but a single entry in every other per-teacher list.
     cfg["teacher_weights"] = [1.0, 1.0]
     with pytest.raises(ValueError, match="per-teacher lists must be equal length"):
-        CrossTokenizerDistillationLossFn(cfg)
+        XTokenLossFn(cfg)
 
 
 def test_normalize_teacher_by_vocab_rejected_outside_sum_mode(tmp_path):
@@ -2883,12 +2883,12 @@ def test_normalize_teacher_by_vocab_rejected_outside_sum_mode(tmp_path):
     cfg["kd_loss_mode"] = "averaged_logits"
     cfg["normalize_teacher_by_vocab"] = True
     with pytest.raises(ValueError, match="normalize_teacher_by_vocab"):
-        CrossTokenizerDistillationLossFn(cfg)
+        XTokenLossFn(cfg)
 
 
 def test_cross_tokenizer_ce_uniform_logits_equals_log_vocab(tmp_path):
     """_compute_ce on uniform logits equals log(V_student) per valid token."""
-    loss_fn = CrossTokenizerDistillationLossFn(
+    loss_fn = XTokenLossFn(
         _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
     )
     b, t_s = 1, 5
@@ -2908,7 +2908,7 @@ def test_cross_tokenizer_ce_uniform_logits_equals_log_vocab(tmp_path):
 def test_cross_tokenizer_ce_respects_sample_mask(tmp_path):
     """A masked sample must not contribute to _compute_ce: the B=2 result with
     sample 1 masked equals the CE over sample 0 alone."""
-    loss_fn = CrossTokenizerDistillationLossFn(
+    loss_fn = XTokenLossFn(
         _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
     )
     b, t_s = 2, 5
@@ -2944,7 +2944,7 @@ def test_cross_tokenizer_prepare_loss_input_partitions_canonical_ce(
     tmp_path, monkeypatch
 ):
     """Automodel CP assigns one disjoint canonical CE window to each rank."""
-    loss_fn = CrossTokenizerDistillationLossFn(
+    loss_fn = XTokenLossFn(
         _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
     )
     full_logprobs = torch.tensor([[-1.0, -2.0, -3.0]], requires_grad=True)
@@ -2990,7 +2990,7 @@ def test_cross_tokenizer_prepare_loss_input_rejects_nondivisible_cp_window(
     tmp_path, monkeypatch
 ):
     """Automodel CP rejects canonical CE windows that cannot partition evenly."""
-    loss_fn = CrossTokenizerDistillationLossFn(
+    loss_fn = XTokenLossFn(
         _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
     )
     next_token_logprobs = torch.tensor(
@@ -3029,7 +3029,7 @@ def test_cross_tokenizer_precomputed_ce_reduces_partitioned_cp_window(
     tmp_path, monkeypatch
 ):
     """Precomputed CE sums CP-window values while preserving local gradients."""
-    loss_fn = CrossTokenizerDistillationLossFn(
+    loss_fn = XTokenLossFn(
         _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
     )
     data = BatchedDataDict({"sample_mask": torch.ones(1)})
@@ -3069,7 +3069,7 @@ def test_cross_tokenizer_precomputed_ce_reduces_partitioned_cp_window(
 
 def test_cross_tokenizer_partitioned_cp_ce_matches_cp1_value_and_gradient(tmp_path):
     """Summed CP2 CE windows are numerically identical to the CP1 full CE."""
-    loss_fn = CrossTokenizerDistillationLossFn(
+    loss_fn = XTokenLossFn(
         _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
     )
     data = BatchedDataDict(

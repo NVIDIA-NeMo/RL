@@ -304,4 +304,4 @@ Listed in the order they run during a training step:
 - KD data processor: `nemo_rl/data/processors.py::kd_data_processor`
 - Cross-tokenizer collator: `nemo_rl/data/cross_tokenizer/cross_tokenizer_collate.py::CrossTokenizerCollator`
 - Token alignment: `nemo_rl/algorithms/cross_tokenizer/token_aligner.py::TokenAligner`
-- Loss implementation: `nemo_rl/algorithms/loss/cross_tokenizer/x_token.py::CrossTokenizerDistillationLossFn`
+- Loss implementation: `nemo_rl/algorithms/loss/cross_tokenizer/x_token.py::XTokenLossFn`
