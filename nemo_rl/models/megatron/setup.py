@@ -60,6 +60,7 @@ from megatron.bridge.training.setup import (
 )
 from megatron.bridge.training.state import GlobalState, TrainState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
+from megatron.bridge.training.utils.checkpoint_utils import is_hf_checkpoint_dir
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
@@ -673,6 +674,17 @@ def _get_hf_config_overrides_hash(overrides: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
 
 
+def _use_megatron_fsdp(config: PolicyConfig) -> bool:
+    """Return whether the Megatron-Core FSDP data-parallel path is enabled.
+
+    ``use_custom_fsdp`` was the name exposed by older NeMo RL configs, but
+    Megatron-Core has renamed that flag to ``use_megatron_fsdp``. Honor the
+    legacy spelling as a fallback for existing recipes.
+    """
+    ddp_cfg = config.get("megatron_cfg", {}).get("distributed_data_parallel_config", {})
+    return bool(ddp_cfg.get("use_megatron_fsdp", ddp_cfg.get("use_custom_fsdp", False)))
+
+
 def _resolve_iter_dir_from_root(
     path: str,
     not_found_msg: str,
@@ -975,6 +987,23 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
 
     # Existing HF path: cfg["model_name"] is an HF model name or local HF checkpoint.
     hf_model_name = config["model_name"]
+
+    # Megatron-FSDP parameters are DTensors and cannot be initialized from the
+    # ordinary cached torch_dist conversion.  Bridge supports loading HF weights
+    # directly into the FSDP shards, so resolve the local HF snapshot and use it
+    # as the pretrained source instead of creating/reusing a torch_dist cache.
+    if _use_megatron_fsdp(config):
+        if os.path.isdir(hf_model_name):
+            hf_snapshot_path = hf_model_name
+        else:
+            from huggingface_hub import snapshot_download
+
+            hf_snapshot_path = snapshot_download(
+                repo_id=hf_model_name,
+                local_files_only=os.getenv("HF_HUB_OFFLINE") == "1",
+            )
+        return hf_model_name, hf_snapshot_path, True
+
     hf_config_overrides = config.get("hf_config_overrides", {}) or {}
 
     hf_model_subdir = hf_model_name
@@ -1027,13 +1056,23 @@ def setup_model_config(
     """
     pretrained_ckpt = config.get("pretrained_checkpoint")
     fmt = pretrained_ckpt["format"] if pretrained_ckpt is not None else None
+    use_megatron_fsdp = _use_megatron_fsdp(config)
     validate_router_replay_config(config)
 
-    derive_provider_from_hf = fmt == "megatron_lm" or (
-        skip_weight_load and fmt != "megatron_bridge"
+    derive_provider_from_hf = (
+        fmt == "megatron_lm"
+        or (fmt is None and use_megatron_fsdp)
+        or (skip_weight_load and fmt != "megatron_bridge")
     )
 
     if derive_provider_from_hf:
+        # For megatron_lm format: build the model config from the HF architecture.
+        # pretrained_path has already been resolved to a specific iter dir by
+        # validate_model_paths, so no conversion step is needed. Megatron-FSDP
+        # follows the same model-config route because its weights are loaded
+        # directly from the HF snapshot rather than a torch_dist conversion.
+        # Refit-fed policies also derive architecture from HF because they never
+        # load the source checkpoint's serialized provider.
         from transformers import AutoConfig
 
         hf_config_overrides = config.get("hf_config_overrides", {}) or {}
@@ -1181,6 +1220,7 @@ def setup_model_config(
         optimizer_path,
         load_main_params_from_ckpt,
         ckpt_cfg=None if skip_weight_load else config["megatron_cfg"].get("checkpoint"),
+        use_megatron_fsdp=use_megatron_fsdp,
     )
 
     # Validate training configuration
@@ -2127,6 +2167,7 @@ def _create_checkpoint_config(
     optimizer_path: Optional[str],
     load_main_params_from_ckpt: bool = False,
     ckpt_cfg: Optional[dict[str, Any]] = None,
+    use_megatron_fsdp: bool = False,
 ) -> CheckpointConfig:
     """Create checkpoint configurations.
 
@@ -2157,6 +2198,10 @@ def _create_checkpoint_config(
         load_rng=weights_path is not None,
         load_main_params_from_ckpt=load_main_params_from_ckpt,
     )
+    if use_megatron_fsdp:
+        # Megatron-FSDP checkpoints use DTensor/DCP and are not interchangeable
+        # with the ordinary Megatron torch_dist format.
+        kwargs["ckpt_format"] = "fsdp_dtensor"
     # Forward checkpoint knobs only when explicitly set in YAML; otherwise Megatron
     # Bridge's own CheckpointConfig defaults apply (the exemplar configs own the
     # values). async_save is presence-checked exactly like the sibling Bridge knobs
@@ -2281,7 +2326,9 @@ def _create_megatron_config(
             "overlap_param_gather=false."
         )
 
+    use_megatron_fsdp = _use_megatron_fsdp(config)
     dist_cfg = DistributedInitConfig()
+    dist_cfg.use_megatron_fsdp = use_megatron_fsdp
     # Bridge creates the model-parallel groups (TP/PP/DP/CP/EP) with an explicit
     # timeout from this field, so it must match the default group's timeout.
     timeout_minutes = _distributed_timeout_minutes(config)
@@ -2290,6 +2337,15 @@ def _create_megatron_config(
     if "use_gloo_process_groups" in config["megatron_cfg"]:
         dist_cfg.use_gloo_process_groups = config["megatron_cfg"][
             "use_gloo_process_groups"
+        ]
+
+    ddp_config = cast(MegatronConfig, config["megatron_cfg"])[
+        "distributed_data_parallel_config"
+    ]
+    optional_ddp_kwargs: dict[str, Any] = {}
+    if "reduce_scatter_with_fp32_accumulation" in ddp_config:
+        optional_ddp_kwargs["reduce_scatter_with_fp32_accumulation"] = ddp_config[
+            "reduce_scatter_with_fp32_accumulation"
         ]
 
     return ConfigContainer(
@@ -2315,6 +2371,7 @@ def _create_megatron_config(
             # we need to set average_in_collective=False with calculate_per_token_loss=T
             # otherwise, mcore throws an assertion error.
             average_in_collective=False,  # Required with calculate_per_token_loss=True
+            use_megatron_fsdp=use_megatron_fsdp,
             use_distributed_optimizer=config["megatron_cfg"]["optimizer"][
                 "use_distributed_optimizer"
             ],
@@ -2323,6 +2380,7 @@ def _create_megatron_config(
             ]["data_parallel_sharding_strategy"],
             reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf_for_mxfp8_param_ag,
             fp8_param_gather=fp8_param_enabled,
+            **optional_ddp_kwargs,
         ),
         scheduler=SchedulerConfig(**config["megatron_cfg"]["scheduler"]),
         dataset=None,
@@ -2644,7 +2702,10 @@ def setup_model_and_optimizer(
     )
     pretrained_checkpoint_exists = (
         megatron_cfg.checkpoint.pretrained_checkpoint is not None
-        and checkpoint_exists(megatron_cfg.checkpoint.pretrained_checkpoint)
+        and (
+            checkpoint_exists(megatron_cfg.checkpoint.pretrained_checkpoint)
+            or is_hf_checkpoint_dir(megatron_cfg.checkpoint.pretrained_checkpoint)
+        )
     )
     preload_policy_from_pretrained_for_draft = (
         draft_enabled
@@ -2836,6 +2897,7 @@ def setup_model_and_optimizer(
     model = get_model(
         megatron_cfg.model,
         megatron_cfg.ddp,
+        use_megatron_fsdp=megatron_cfg.dist.use_megatron_fsdp,
         use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
         overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
         data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
@@ -2989,6 +3051,12 @@ def handle_model_import(
         # megatron_bridge: user-supplied checkpoint is already in bridge format.
         # megatron_lm: bridge loads the checkpoint directly (no conversion needed).
         # validate_model_paths() already confirmed both exist, so nothing to do.
+        return
+
+    # Megatron-FSDP is initialized directly from the local HuggingFace
+    # snapshot by Bridge's checkpoint loader.  There is no intermediate
+    # torch_dist conversion to create (or force-recreate).
+    if _use_megatron_fsdp(config):
         return
 
     force_reconvert = config["megatron_cfg"].get("force_reconvert_from_hf", False)

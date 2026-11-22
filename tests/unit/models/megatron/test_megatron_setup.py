@@ -203,6 +203,36 @@ class TestValidateModelPaths:
         assert pretrained_path == f"{tmp_path}/meta-llama/Llama-3.2-1B"
         assert pt_checkpoint_exists is False
 
+    def test_megatron_fsdp_uses_local_hf_snapshot(self, monkeypatch):
+        """Megatron-FSDP initializes from HF instead of a torch_dist cache."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+
+        config = {
+            "model_name": "meta-llama/Llama-3.1-8B",
+            "megatron_cfg": {
+                "distributed_data_parallel_config": {
+                    "use_megatron_fsdp": True,
+                }
+            },
+        }
+
+        with patch(
+            "huggingface_hub.snapshot_download", return_value="/hf/snapshot"
+        ) as mock_snapshot_download:
+            hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+                config
+            )
+
+        mock_snapshot_download.assert_called_once_with(
+            repo_id="meta-llama/Llama-3.1-8B",
+            local_files_only=False,
+        )
+        assert hf_model_name == "meta-llama/Llama-3.1-8B"
+        assert pretrained_path == "/hf/snapshot"
+        assert pt_checkpoint_exists is True
+
     def test_model_name_is_local_path(self, tmp_path):
         """Test with a local path as model name."""
         from nemo_rl.models.megatron.setup import validate_model_paths
@@ -3201,6 +3231,19 @@ class TestCreateCheckpointConfig:
         assert config.load_rng is resume_weights
         assert config.load_optim is resume_optimizer
 
+    def test_megatron_fsdp_uses_fsdp_dtensor_format(self, tmp_path):
+        """Megatron-FSDP saves and resumes through its required DCP format."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            use_megatron_fsdp=True,
+        )
+
+        assert checkpoint_config.ckpt_format == "fsdp_dtensor"
+
     def test_missing_ckpt_cfg_defaults_to_sync_save(self, tmp_path):
         """An absent checkpoint block keeps Megatron Bridge's default (sync save).
 
@@ -3617,6 +3660,111 @@ class TestCreateMegatronConfigGlooProcessGroups:
             dist_config.use_gloo_process_groups
             == DistributedInitConfig().use_gloo_process_groups
         )
+
+    def test_optimizer_dtype_strings_are_normalized(self):
+        """Precision-aware optimizer dtype overrides reach MCore as torch dtypes."""
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        config = _megatron_config()
+        config["megatron_cfg"]["optimizer"].update(
+            {
+                "params_dtype": "bfloat16",
+                "main_grads_dtype": "torch.bfloat16",
+                "main_params_dtype": "float32",
+                "exp_avg_dtype": "bfloat16",
+                "exp_avg_sq_dtype": "bfloat16",
+            }
+        )
+
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer"),
+            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+            patch(
+                "nemo_rl.models.megatron.setup.OptimizerConfig"
+            ) as mock_optimizer_config,
+            patch("nemo_rl.models.megatron.setup.DistributedDataParallelConfig"),
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+            )
+
+        optimizer_kwargs = mock_optimizer_config.call_args.kwargs
+        assert optimizer_kwargs["params_dtype"] is torch.bfloat16
+        assert optimizer_kwargs["main_grads_dtype"] is torch.bfloat16
+        assert optimizer_kwargs["main_params_dtype"] is torch.float32
+        assert optimizer_kwargs["exp_avg_dtype"] is torch.bfloat16
+        assert optimizer_kwargs["exp_avg_sq_dtype"] is torch.bfloat16
+
+    def test_fp32_accumulating_reduce_scatter_is_forwarded(self):
+        """The optional mixed-precision reduce-scatter reaches MCore DDP."""
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        config = _megatron_config()
+        config["megatron_cfg"]["distributed_data_parallel_config"][
+            "reduce_scatter_with_fp32_accumulation"
+        ] = True
+
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer"),
+            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+            patch("nemo_rl.models.megatron.setup.OptimizerConfig"),
+            patch(
+                "nemo_rl.models.megatron.setup.DistributedDataParallelConfig"
+            ) as mock_ddp_config,
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+            )
+
+        assert (
+            mock_ddp_config.call_args.kwargs["reduce_scatter_with_fp32_accumulation"]
+            is True
+        )
+
+    def test_megatron_fsdp_is_forwarded_to_dist_and_ddp(self):
+        """The NeMo RL flag must select Bridge's Megatron-FSDP wrapper."""
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        config = _megatron_config()
+        config["megatron_cfg"]["distributed_data_parallel_config"][
+            "use_megatron_fsdp"
+        ] = True
+
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_container,
+            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+            patch("nemo_rl.models.megatron.setup.OptimizerConfig"),
+            patch(
+                "nemo_rl.models.megatron.setup.DistributedDataParallelConfig"
+            ) as mock_ddp,
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+            )
+
+        assert mock_container.call_args.kwargs["dist"].use_megatron_fsdp is True
+        assert mock_ddp.call_args.kwargs["use_megatron_fsdp"] is True
 
 
 @pytest.mark.mcore
@@ -4450,6 +4598,40 @@ class TestSetupModelConfig:
         }
         assert model_cfg.masked_softmax_fusion is True
 
+    def test_megatron_fsdp_builds_model_config_from_hf(self, request):
+        """Direct HF initialization avoids reading a torch_dist run_config."""
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+
+        mock_provider = MagicMock()
+        mock_provider.to_megatron_provider.return_value = self._make_model_cfg_mock()
+        config = {
+            "tokenizer": {"name": "pinned-tokenizer-snapshot"},
+            "megatron_cfg": {
+                "distributed_data_parallel_config": {
+                    "use_megatron_fsdp": True,
+                }
+            },
+        }
+
+        with (
+            patch("transformers.AutoConfig.from_pretrained") as mock_ac,
+            patch("nemo_rl.models.megatron.setup.AutoBridge") as mock_ab,
+        ):
+            mock_ab.from_hf_config.return_value = mock_provider
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path="/hf/snapshot",
+            )
+
+        mock_ac.assert_called_once_with("test-model", trust_remote_code=True)
+        mock_ab.from_hf_config.assert_called_once_with(mock_ac.return_value)
+        mock_provider.to_megatron_provider.return_value.finalize.assert_called_once_with()
+
     def test_megatron_lm_no_overrides_calls_autoconfig_without_extra_kwargs(
         self, request
     ):
@@ -4850,6 +5032,9 @@ class TestSetupModelAndOptimizer:
         # Verify get_model was called (the mixed_precision_wrapper should be CustomFloat16Module)
         mock_get_model.assert_called_once()
         call_kwargs = mock_get_model.call_args[1]
+        assert (
+            call_kwargs["use_megatron_fsdp"] is mock_megatron_cfg.dist.use_megatron_fsdp
+        )
         hooks = call_kwargs.get("pre_wrap_hook", [])
         assert [hook.__name__ for hook in hooks] == [
             "freeze_moe_router",
