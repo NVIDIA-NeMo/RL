@@ -158,8 +158,13 @@ def _patch_qwen_vl_vision_key_mapping() -> None:
     if getattr(_orig, "_nrl_vision_patch", False):
         return
 
-    def _patched_get_combined_key_mapping(model_type, model_key_mapping=None):
-        result = _orig(model_type, model_key_mapping)
+    def _patched_get_combined_key_mapping(
+        model_type, model_key_mapping=None, *, model=None
+    ):
+        result = _orig(model_type, model_key_mapping, model=model)
+        # A callable result already applies the scoped submodel renames in order.
+        if callable(result):
+            return result
         if model_type in _vision_nested:
             result = dict(result or {})
             if not any(str(t).startswith("model.visual") for t in result.values()):
