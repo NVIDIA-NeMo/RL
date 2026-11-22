@@ -140,7 +140,8 @@ policy:
 grpo:
   calculate_advantages_on_gpu: false
 loss_fn:
-  token_level_loss: true
+  token_level_loss: null
+  normalization: global_token_mean
   sequence_level_importance_ratios: false
 async_rl:
   rollout_failure:

@@ -194,6 +194,11 @@ run_prefix_recovery_phases \
     "restore each prefix and its routes, then finish each suffix" \
     R3_CMD "$@"
 
+# The cuts went through the write pipeline and its writer actor, not a
+# fallback path.
+grep -q "generation-prefix write pipeline started" "${PHASE1_LOG}"
+grep -q "prefix_writer event=ready" "${PHASE1_LOG}"
+
 # A missing route row would otherwise fall back to Megatron's own router.
 if grep -q "R3 router replay fallback:" "${PHASE2_LOG}"; then
     echo "[ERROR] router replay fell back to Megatron's router for some tokens"

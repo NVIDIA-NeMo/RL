@@ -14,13 +14,11 @@
 
 # Phase control shared by the prefix-recovery functional tests. Source it after
 # setting SCRIPT_DIR, PROJECT_ROOT and TEST_DIR; a test starts phase one in its
-# own process group and keeps its PID in PHASE1_PID. A test that also runs
-# behind Dynamo keeps the log phase one writes in PHASE1_RUN_LOG. The
-# reference-free tests (router replay, Omni) also run both phases and their
-# checks through the functions at the end.
+# own process group and keeps its PID in PHASE1_PID. The reference-free tests
+# (router replay, Omni) also run both phases and their checks through the
+# functions at the end.
 
 PHASE1_PID=""
-PHASE1_RUN_LOG=""
 
 # Hard-kill phase one and wait until its controller can no longer write
 # snapshots.
@@ -41,17 +39,6 @@ stop_phase1() {
         fi
         sleep 1
     done
-    # Behind Dynamo, the kill orphans etcd, NATS and the frontend: they run in
-    # their own sessions. Each carries phase one's DYN_NAMESPACE in its environment.
-    local namespace="" pid
-    if [[ -n "${PHASE1_RUN_LOG}" ]]; then
-        namespace=$(grep -aoE "'DYN_NAMESPACE': '[^']+'" "${PHASE1_RUN_LOG}" | head -1 | cut -d"'" -f4 || true)
-    fi
-    if [[ -n "${namespace}" ]]; then
-        for pid in $(grep -lsxz "DYN_NAMESPACE=${namespace}" /proc/[0-9]*/environ | cut -d/ -f3 || true); do
-            kill -KILL "${pid}" 2>/dev/null || true
-        done
-    fi
 }
 
 # Recover exactly the selected prefix: keep only the selected snapshot and no
@@ -179,8 +166,6 @@ run_prefix_recovery_phases() {
     shift 3
 
     echo "=== Phase 1: ${phase1_banner} ==="
-    # stop_phase1 reads it to clean up phase one's Dynamo services.
-    PHASE1_RUN_LOG=${PHASE1_LOG}
     command -v setsid >/dev/null
     setsid env \
         SC_GYM_RECOVERY_TEST_EVENTS="${PHASE1_EVENTS}" \

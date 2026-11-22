@@ -46,7 +46,6 @@ from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple, Union
 import torch
 from torch.distributed.tensor import DTensor
 
-from nemo_rl.algorithms.utils import masked_mean
 from nemo_rl.distributed.model_utils import (
     cp_shift_next,
     get_logprobs_from_vocab_parallel_logits,
@@ -56,6 +55,7 @@ from nemo_rl.distributed.model_utils import (
     vocab_parallel_full_log_softmax,
     vocab_parallel_gather_columns,
 )
+from nemo_rl.utils.tensor_ops import masked_mean
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
