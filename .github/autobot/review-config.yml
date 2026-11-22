@@ -10,3 +10,4 @@ approval:
   enabled: true
   eligible_teams:
     - automation
+    - rl_autobot_approvers
