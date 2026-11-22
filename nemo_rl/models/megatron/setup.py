@@ -642,11 +642,17 @@ def validate_and_set_config(
         skip_weight_load=skip_weight_load,
     )
 
-    final_padded_vocab_size = calculate_padded_vocab_size(
-        megatron_cfg.model.vocab_size,
-        megatron_cfg.model.make_vocab_size_divisible_by,
-        config["megatron_cfg"]["tensor_model_parallel_size"],
-    )
+    model_vocab_size = int(megatron_cfg.model.vocab_size)
+    if megatron_cfg.model.should_pad_vocab:
+        final_padded_vocab_size = calculate_padded_vocab_size(
+            model_vocab_size,
+            megatron_cfg.model.make_vocab_size_divisible_by,
+            megatron_cfg.model.tensor_model_parallel_size,
+        )
+    else:
+        # Match ModelProvider.provide(): an unpadded output head uses the raw
+        # configured vocabulary even when a larger divisible size exists.
+        final_padded_vocab_size = model_vocab_size
 
     return RuntimeConfig(
         megatron_cfg,
@@ -2386,7 +2392,11 @@ def _create_megatron_config(
         dataset=None,
         tokenizer=TokenizerConfig(
             tokenizer_type="HuggingFaceTokenizer",
-            tokenizer_model=hf_model_name,
+            # The model source and tokenizer source are intentionally independent.
+            # In particular, qualification jobs may load a converted Megatron
+            # checkpoint by its stable model id while pinning tokenization to an
+            # exact local HuggingFace snapshot.
+            tokenizer_model=config["tokenizer"]["name"],
         ),
     )
 
@@ -3413,7 +3423,7 @@ def finalize_megatron_setup(
 
     tokenizer_config = TokenizerConfig(
         tokenizer_type="HuggingFaceTokenizer",
-        tokenizer_model=hf_model_name,
+        tokenizer_model=config["tokenizer"]["name"],
         hf_tokenizer_kwargs={
             "trust_remote_code": True,
             "use_fast": True,

@@ -3604,7 +3604,11 @@ def _megatron_config(**megatron_overrides: Any) -> dict[str, Any]:
         "train_iters": 10,
     }
     megatron_cfg.update(megatron_overrides)
-    return {"megatron_cfg": megatron_cfg, "train_global_batch_size": 8}
+    return {
+        "megatron_cfg": megatron_cfg,
+        "tokenizer": {"name": "pinned-tokenizer-snapshot"},
+        "train_global_batch_size": 8,
+    }
 
 
 def _dist_config_passed_to_container(config: dict[str, Any]) -> Any:
@@ -3640,6 +3644,33 @@ def _dist_config_passed_to_container(config: dict[str, Any]) -> Any:
 @pytest.mark.mcore
 class TestCreateMegatronConfigGlooProcessGroups:
     """Tests for use_gloo_process_groups plumbing in _create_megatron_config."""
+
+    def test_backend_tokenizer_uses_configured_tokenizer_snapshot(self):
+        """Backend tokenization must not silently fall back to the model id."""
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        config = _megatron_config()
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer"),
+            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+            patch("nemo_rl.models.megatron.setup.OptimizerConfig"),
+            patch("nemo_rl.models.megatron.setup.DistributedDataParallelConfig"),
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig") as mock_tokenizer,
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="mutable-model-id",
+                dtype=torch.bfloat16,
+            )
+
+        mock_tokenizer.assert_called_once_with(
+            tokenizer_type="HuggingFaceTokenizer",
+            tokenizer_model="pinned-tokenizer-snapshot",
+        )
 
     @pytest.mark.parametrize("value", [True, False])
     def test_explicit_value_is_forwarded(self, value):
@@ -3918,7 +3949,11 @@ class TestCreateMegatronConfigOptimizerFp8Recipe:
         }
         if fp8_cfg is not None:
             megatron_cfg["fp8_cfg"] = fp8_cfg
-        return {"megatron_cfg": megatron_cfg, "train_global_batch_size": 8}
+        return {
+            "megatron_cfg": megatron_cfg,
+            "tokenizer": {"name": "pinned-tokenizer-snapshot"},
+            "train_global_batch_size": 8,
+        }
 
     @staticmethod
     def _optimizer_passed_to_container(
@@ -4010,6 +4045,7 @@ class TestCreateMegatronConfigFP8Buffers:
                 },
                 "train_iters": 10,
             },
+            "tokenizer": {"name": "pinned-tokenizer-snapshot"},
             "train_global_batch_size": 8,
         }
         with (
@@ -4072,6 +4108,7 @@ class TestCreateMegatronConfigOptimizerOffload:
                 },
                 "train_iters": 10,
             },
+            "tokenizer": {"name": "pinned-tokenizer-snapshot"},
             "train_global_batch_size": 8,
         }
 
@@ -4172,6 +4209,9 @@ class TestValidateAndSetConfig:
         ) as mock_setup_model_config:
             mock_megatron_cfg = MagicMock()
             mock_megatron_cfg.model.vocab_size = 32000
+            mock_megatron_cfg.model.make_vocab_size_divisible_by = 128
+            mock_megatron_cfg.model.tensor_model_parallel_size = 2
+            mock_megatron_cfg.model.should_pad_vocab = True
             mock_setup_model_config.return_value = (mock_megatron_cfg, MagicMock())
 
             with patch(
@@ -4190,6 +4230,88 @@ class TestValidateAndSetConfig:
                 assert runtime_config.is_generation_colocated is colocated
                 assert runtime_config.offload_optimizer_for_refit is True
                 assert os.environ.get("NCCL_CUMEM_ENABLE") == expected_cumem
+
+    def test_unpadded_model_uses_raw_vocab_size(self):
+        """Runtime output geometry must match an unpadded model head."""
+        from nemo_rl.models.megatron.setup import validate_and_set_config
+
+        config = {
+            "precision": "bfloat16",
+            "megatron_cfg": {
+                "optimizer": {"optimizer_cpu_offload": False},
+                "tensor_model_parallel_size": 2,
+            },
+            "offload_optimizer_for_logprob": False,
+            "offload_optimizer_for_refit": True,
+        }
+        mock_megatron_cfg = MagicMock()
+        mock_megatron_cfg.model.vocab_size = 151936
+        mock_megatron_cfg.model.make_vocab_size_divisible_by = 128
+        mock_megatron_cfg.model.tensor_model_parallel_size = 2
+        mock_megatron_cfg.model.should_pad_vocab = False
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup.setup_model_config",
+                return_value=(mock_megatron_cfg, mock_megatron_cfg.model),
+            ),
+            patch(
+                "nemo_rl.models.megatron.setup.calculate_padded_vocab_size",
+                return_value=152064,
+            ) as mock_calculate_padded_vocab_size,
+        ):
+            runtime_config = validate_and_set_config(
+                config=config,
+                rank=0,
+                hf_model_name="test-model",
+                pretrained_path="/path/to/model",
+                weights_path=None,
+                optimizer_path=None,
+            )
+
+        mock_calculate_padded_vocab_size.assert_not_called()
+        assert runtime_config.final_padded_vocab_size == 151936
+
+    def test_padded_model_uses_calculated_vocab_size(self):
+        """Runtime output geometry must include requested vocabulary padding."""
+        from nemo_rl.models.megatron.setup import validate_and_set_config
+
+        config = {
+            "precision": "bfloat16",
+            "megatron_cfg": {
+                "optimizer": {"optimizer_cpu_offload": False},
+                "tensor_model_parallel_size": 2,
+            },
+            "offload_optimizer_for_logprob": False,
+            "offload_optimizer_for_refit": True,
+        }
+        mock_megatron_cfg = MagicMock()
+        mock_megatron_cfg.model.vocab_size = 151936
+        mock_megatron_cfg.model.make_vocab_size_divisible_by = 128
+        mock_megatron_cfg.model.tensor_model_parallel_size = 2
+        mock_megatron_cfg.model.should_pad_vocab = True
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup.setup_model_config",
+                return_value=(mock_megatron_cfg, mock_megatron_cfg.model),
+            ),
+            patch(
+                "nemo_rl.models.megatron.setup.calculate_padded_vocab_size",
+                return_value=152064,
+            ) as mock_calculate_padded_vocab_size,
+        ):
+            runtime_config = validate_and_set_config(
+                config=config,
+                rank=0,
+                hf_model_name="test-model",
+                pretrained_path="/path/to/model",
+                weights_path=None,
+                optimizer_path=None,
+            )
+
+        mock_calculate_padded_vocab_size.assert_called_once_with(151936, 128, 2)
+        assert runtime_config.final_padded_vocab_size == 152064
 
 
 @pytest.mark.mcore
@@ -5199,6 +5321,7 @@ class TestFinalizeMegatronSetup:
         mock_auto_bridge.from_hf_pretrained.return_value = mock_bridge
 
         config = {
+            "tokenizer": {"name": "pinned-tokenizer-snapshot"},
             "megatron_cfg": {
                 "tensor_model_parallel_size": 2,
                 "optimizer": {
@@ -5207,7 +5330,7 @@ class TestFinalizeMegatronSetup:
                 "distributed_data_parallel_config": {
                     "overlap_param_gather": False,
                 },
-            }
+            },
         }
 
         result = finalize_megatron_setup(
@@ -5231,6 +5354,8 @@ class TestFinalizeMegatronSetup:
         mock_get_model_config.assert_called_once_with(mock_model)
         assert mock_update_model_config.call_args.args[1] is runtime_model_config
         mock_build_tokenizer.assert_called_once()
+        tokenizer_config = mock_build_tokenizer.call_args.args[0]
+        assert tokenizer_config.tokenizer_model == "pinned-tokenizer-snapshot"
         mock_auto_bridge.from_hf_pretrained.assert_called_once_with(
             "test-model", trust_remote_code=True
         )
