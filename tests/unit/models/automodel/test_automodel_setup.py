@@ -1184,6 +1184,50 @@ class TestSetupModelAndOptimizer:
         # Verify config= is NOT passed (avoids duplicate arg for custom models)
         assert "config" not in call_kwargs
 
+    @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    @patch("nemo_rl.models.automodel.setup.get_class")
+    def test_setup_model_freezes_parameter_patterns(
+        self,
+        mock_get_class,
+        mock_get_rank,
+        mock_lambda_lr,
+        mock_config,
+        mock_runtime_config,
+        mock_distributed_context,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+    ):
+        """Parameters whose names contain a freeze pattern get no optimizer state."""
+        mock_get_rank.return_value = 0
+        model = torch.nn.Module()
+        model.mtp = torch.nn.Linear(2, 2)
+        model.layer0 = torch.nn.Linear(2, 2)
+        model.config = SimpleNamespace(pad_token_id=0)
+        mock_runtime_config.model_class.from_pretrained.return_value = model
+        mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
+        mock_optimizer_cls = MagicMock()
+        mock_get_class.return_value = mock_optimizer_cls
+        mock_config["freeze_parameter_patterns"] = ["mtp", "layer[0]"]
+
+        setup_model_and_optimizer(
+            config=mock_config,
+            tokenizer=mock_tokenizer,
+            runtime_config=mock_runtime_config,
+            distributed_context=mock_distributed_context,
+            checkpoint_manager=mock_checkpoint_manager,
+            is_vlm=False,
+            init_optimizer=True,
+        )
+
+        assert not any(param.requires_grad for param in model.mtp.parameters())
+        # Patterns are literal substrings, not regular expressions.
+        assert all(param.requires_grad for param in model.layer0.parameters())
+        optimizer_params = list(mock_optimizer_cls.call_args.args[0])
+        assert {id(param) for param in optimizer_params} == {
+            id(param) for param in model.layer0.parameters()
+        }
+
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     def test_restore_from_without_lora_enabled_raises(
         self,

@@ -778,6 +778,12 @@ class PolicyConfig(TypedDict):
     max_total_sequence_length: int
     # This sets the clipping norm for the AutomodelPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
+    # Supported by the Automodel and Megatron backends.
+    # Freeze (requires_grad=False) any parameter whose name contains one of these
+    # substrings. Use for submodules that never receive gradients (e.g. the
+    # nemotron_h multi-token-prediction head, ["mtp"], during distillation) to keep
+    # optimizer save/load symmetric and avoid checkpoint-resume key mismatches.
+    freeze_parameter_patterns: NotRequired[list[str] | None]
     refit_buffer_size_gb: NotRequired[float | int]
     # Run the policy offload lifecycle before non-colocated refit.
     offload_policy_before_refit: bool

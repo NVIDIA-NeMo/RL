@@ -998,6 +998,28 @@ def setup_model_and_optimizer(
     if is_tied_lm_head:
         model.tie_weights()
 
+    # Freeze parameters matching the configured substrings. A submodule that never
+    # receives gradients (e.g. the nemotron_h `mtp.*` head during distillation, where
+    # loss flows only through lm_head) still has requires_grad=True by default, so the
+    # optimizer expects state for it on resume but none was saved -> "Missing key in
+    # checkpoint state_dict: optim.state.mtp...". Setting requires_grad=False makes
+    # save/load symmetric. Default [] -> no-op.
+    freeze_patterns = config.get("freeze_parameter_patterns") or []
+    if freeze_patterns:
+        n_matched = 0
+        n_frozen = 0
+        for name, param in model.named_parameters():
+            if any(pat in name for pat in freeze_patterns):
+                n_matched += 1
+                if param.requires_grad:
+                    param.requires_grad_(False)
+                    n_frozen += 1
+        if rank == 0:
+            print(
+                f"Freeze patterns matched {n_matched} parameters; newly froze "
+                f"{n_frozen}: freeze_parameter_patterns={list(freeze_patterns)}"
+            )
+
     # CPU offload if needed
     if cpu_offload:
         # Move buffers to CPU for FSDP modules
