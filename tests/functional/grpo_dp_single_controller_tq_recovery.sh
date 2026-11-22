@@ -66,15 +66,16 @@ case "$VARIANT" in
     nixl|nixl_no_ssd)
         BACKEND=nixl
         TEST_NAME=grpo_dp_nixl_tq_recovery
+        VARIANT_CHECKS=('max(data["data_plane/nixl/retired_mb_sum"]) == 0')
         if [[ "$VARIANT" == "nixl_no_ssd" ]]; then
             TEST_NAME=grpo_dp_nixl_no_ssd_tq_recovery
             VARIANT_OVERRIDES=(data_plane.nixl.ssd.enabled=false)
+            # The adapter emits SSD counters only when the tier is enabled.
+            VARIANT_CHECKS+=('"data_plane/nixl/ssd_spills_sum" not in data')
+        else
+            # The default put area should not fill during this test.
+            VARIANT_CHECKS+=('max(data["data_plane/nixl/ssd_spills_sum"]) == 0')
         fi
-        # Neither variant fills the put area, so neither should spill.
-        VARIANT_CHECKS=(
-            'max(data["data_plane/nixl/retired_mb_sum"]) == 0'
-            'max(data["data_plane/nixl/ssd_spills_sum"]) == 0'
-        )
         ;;
     nixl_ssd)
         BACKEND=nixl
