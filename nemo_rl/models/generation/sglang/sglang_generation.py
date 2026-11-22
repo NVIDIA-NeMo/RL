@@ -15,7 +15,7 @@
 import asyncio
 import logging
 import os
-from typing import Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import ray
 import torch
@@ -57,6 +57,9 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -74,6 +77,18 @@ class SGLangGeneration(GenerationInterface):
     TODO: one sglang router(router ip, router port) --> different server group(eg: PD, different tp size, ...; each server group multiple engines/servsers with same settings)
     router + [[p, ..., p] [d, ..., d]] or router + [[tp = 2, ... tp = 2], ..., [tp = 8, ..., tp = 8]]
     """
+
+    @classmethod
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Reject config the SGLang generation backend cannot honor."""
+        # Every SGLang refit invalidates the KV cache (_SGLangWeightSynchronizer._refit).
+        if not master_config.async_rl.recompute_kv_cache_after_weight_updates:
+            raise ValueError(
+                "async_rl.recompute_kv_cache_after_weight_updates=false is not "
+                "supported with policy.generation.backend='sglang': every SGLang "
+                "refit invalidates the KV cache, so KV entries from the previous "
+                "weights are never kept. Set the flag to true."
+            )
 
     def __init__(
         self,

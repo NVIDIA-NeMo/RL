@@ -82,8 +82,10 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
         self._stale = True
         if self._generation.pause_generation_mode == "in_place":
             raise ValueError(
-                "pause_generation_mode='in_place' is unsafe for weight refit because "
-                "it preserves KV cache entries created by the previous weights."
+                "pause_generation_mode='in_place' does not work with weight refit: "
+                "it keeps KV cache entries created by the previous weights, and the "
+                "SGLang refit always recomputes them "
+                "(async_rl.recompute_kv_cache_after_weight_updates=true)."
             )
 
     @property

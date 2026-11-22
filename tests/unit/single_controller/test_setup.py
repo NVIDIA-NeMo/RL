@@ -1930,6 +1930,7 @@ class TestSetup:
             ("buffer_capacity", ValueError, "required capacity"),
             ("megatron_automodel_trainer", ValueError, "megatron_cfg.enabled"),
             ("megatron_recompute_mismatch", ValueError, "kv_cache_management_mode"),
+            ("sglang_recompute_opt_out", ValueError, "backend='sglang'"),
             ("megatron_fleet_health", NotImplementedError, "generation_fleet_health"),
             (
                 "megatron_colocated_min_groups",
@@ -2008,6 +2009,9 @@ class TestSetup:
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=True
             )
+            mc.async_rl.recompute_kv_cache_after_weight_updates = False
+        elif invalid_case == "sglang_recompute_opt_out":
+            mc = _make_master_config(colocated=False, backend="sglang")
             mc.async_rl.recompute_kv_cache_after_weight_updates = False
         elif invalid_case == "megatron_fleet_health":
             mc = _make_master_config(
