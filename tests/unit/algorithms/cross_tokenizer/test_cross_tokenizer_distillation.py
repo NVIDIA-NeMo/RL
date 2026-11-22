@@ -50,6 +50,7 @@ from nemo_rl.algorithms.cross_tokenizer_distillation import (
     TeacherConfig,
     _default_off_policy_distillation_save_state,
     export_teacher_logits_and_pack,
+    reduce_mb_metric,
     setup,
     validate,
     xtoken_non_student_seq_keys,
@@ -173,6 +174,7 @@ def _make_master_config(
                 "make_sequence_length_divisible_by": 8,
                 "train_global_batch_size": 1,
                 "train_micro_batch_size": 1,
+                "offload_optimizer_for_logprob": False,
                 "tokenizer": {"name": "student-tok"},
             },
             "teachers": [
@@ -617,6 +619,47 @@ def test_exit_on_timeout(mock_xtoken_components, capsys, tmp_path):
 
     captured = capsys.readouterr()
     assert "Timeout reached, stopping training early." in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Training loop: student optimizer offload and per-step metric reduction
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("offload", [True, False], ids=["offload", "resident"])
+def test_student_optimizer_offloaded_after_each_step(mock_xtoken_components, offload):
+    """``policy.offload_optimizer_for_logprob`` moves the student optimizer off
+    the GPU after every optimizer step, before the next teacher forward."""
+    c = mock_xtoken_components
+    c.master_config.distillation["max_num_steps"] = 3
+    c.master_config.policy["offload_optimizer_for_logprob"] = offload
+
+    _run_train(c)
+
+    calls = [
+        name
+        for name, _, _ in c.student_policy.mock_calls
+        if name in ("train", "offload_before_refit")
+    ]
+    step = ["train", "offload_before_refit"] if offload else ["train"]
+    assert calls == step * 3
+
+
+@pytest.mark.parametrize(
+    "key,expected",
+    [
+        ("weight_t0", 0.5),
+        ("selected_teacher", 0.5),
+        ("kl_common", 0.5),
+        ("proj_accuracy_t1", 0.5),
+        ("kl_loss", 2.0),
+        ("kl_loss_t0", 2.0),
+    ],
+)
+def test_reduce_mb_metric_averages_rates_and_sums_loss_shares(key, expected):
+    """Rates, per-chunk averages and teacher weights are averaged over the
+    per-(microbatch, DP rank) list; loss shares are summed."""
+    assert reduce_mb_metric(key, [0.25, 0.75, 0.25, 0.75]) == pytest.approx(expected)
 
 
 # ---------------------------------------------------------------------------
