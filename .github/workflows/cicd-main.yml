@@ -91,7 +91,7 @@ jobs:
     steps:
       - name: Get PR info
         id: get-pr-info
-        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Checkout
@@ -99,16 +99,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get PR info for manual dispatch
-        id: dispatch-pr-info
-        if: github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/pull-request/')
-        uses: ./.github/actions/pr-info
-
       - name: Determine base and head references
         id: base-head-ref
         env:
           IS_PULL_REQUEST_REF: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
-          PR_INFO_JSON: ${{ (steps.dispatch-pr-info.outputs.pr-info || steps.get-pr-info.outputs.pr-info) }}
+          PR_INFO_JSON: ${{ steps.get-pr-info.outputs.pr-info }}
         run: |
           cache_scope=""
           if [[ "$IS_PULL_REQUEST_REF" == "true" && -n "$PR_INFO_JSON" ]]; then
@@ -319,7 +314,7 @@ jobs:
 
   org-member-pre-flight:
     needs: [ephemeral-runner-routing]
-    uses: ./.github/workflows/_cicd_preflight.yml
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
     with:
       default_runner_prefix: ${{ vars.DEFAULT_H100_RUNNER }}
       non_nvidia_runner_prefix: ${{ needs.ephemeral-runner-routing.outputs.runner_label_base }}
@@ -1166,16 +1161,11 @@ jobs:
     steps:
       - name: Get PR info
         id: get-pr-info
-        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/pull-request/')
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
-      - name: Get PR info for manual dispatch
-        id: dispatch-pr-info
-        if: github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/pull-request/')
-        uses: ./.github/actions/pr-info
 
       - name: Download coverage reports of current branch
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
@@ -1219,8 +1209,8 @@ jobs:
           verbose: true
           flags: ${{ matrix.flag }}
           # Copied PR branches run on push, so upload-coverage needs explicit PR metadata.
-          override_pr: ${{ fromJSON((steps.dispatch-pr-info.outputs.pr-info || steps.get-pr-info.outputs.pr-info) || '{}').number || '' }}
-          commit_parent: ${{ fromJSON((steps.dispatch-pr-info.outputs.pr-info || steps.get-pr-info.outputs.pr-info) || '{}').base.sha || '' }}
+          override_pr: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || '' }}
+          commit_parent: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha || '' }}
 
       - name: Upload artifacts
         if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}
