@@ -106,6 +106,7 @@ from nemo_rl.models.generation.prefix_recovery.state import (  # noqa: E402
     _FrozenCut,
     _RequestCaptureState,
 )
+from nemo_rl.models.generation.prefix_recovery.write_pipeline import PREFIX_WRITE_LIMITS
 from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
     GENERATION_CUT_ROUTE as RL_GENERATION_CUT_ROUTE,
 )
@@ -226,6 +227,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> VllmAsyncGenerationWorkerImp
     """A real worker's token-capture state, minus the engine."""
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker._init_token_capture_state()
+    worker.cfg = {"vllm_cfg": {}}
     worker.is_model_owner = is_model_owner
     worker._http_engine_client = None
     worker._api_server_pool = None
@@ -280,6 +282,7 @@ def _cuts(
             prefix_write_max_rows=batch_size or 256,
             prefix_write_max_tokens=batch_max_tokens or 4_194_304,
             prefix_read_max_rows=read_max_rows or 256,
+            write_limits=PREFIX_WRITE_LIMITS,
         )
     )
     worker._prefix_recovery = recovery
@@ -302,9 +305,11 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client, *, staging_partition, capture_media, media_pixel_dtype=None: (
-            sink
-        ),
+        lambda dp_client,
+        *,
+        staging_partition,
+        capture_media,
+        media_pixel_dtype=None: sink,
     )
     worker = _fake_worker()
 
@@ -355,9 +360,11 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client, *, staging_partition, capture_media, media_pixel_dtype=None: (
-            sink
-        ),
+        lambda dp_client,
+        *,
+        staging_partition,
+        capture_media,
+        media_pixel_dtype=None: sink,
     )
     worker = _fake_worker()
     asyncio.run(
@@ -1176,10 +1183,11 @@ def test_flush_is_not_queued_behind_a_running_cut():
         stale_cut_running = threading.Event()
         release_stale_cut = threading.Event()
         try:
-            # A cut still holding the control thread, as a stale one would.
-            stale_cut = asyncio.get_running_loop().run_in_executor(
-                recovery._control_executor,
-                lambda: (stale_cut_running.set(), release_stale_cut.wait(10)),
+            # A cut still holding the pipeline's write thread, as a stale one would.
+            stale_cut = asyncio.wrap_future(
+                recovery._pipeline._writers.submit(
+                    lambda: (stale_cut_running.set(), release_stale_cut.wait(10))
+                )
             )
             assert await asyncio.to_thread(stale_cut_running.wait, 5)
             await asyncio.wait_for(
@@ -1911,6 +1919,7 @@ def _record_cut_constraints(state, sampling_params) -> None:
             router_replay=False,
             sampler_top_k=0,
             **_PREFIX_BATCH_LIMITS,
+            write_limits=PREFIX_WRITE_LIMITS,
         )
     ).on_sampling_params(object(), sampling_params)
 
@@ -4301,13 +4310,13 @@ def test_omni_capture_setup_rejects_video_pruning(
         with pytest.raises(ValueError, match="video token pruning"):
             asyncio.run(
                 VllmAsyncGenerationWorkerImpl.setup_token_capture(
-                    worker, {}, **kwargs, **_PREFIX_BATCH_LIMITS
+                    worker, {"impl": "local"}, **kwargs, **_PREFIX_BATCH_LIMITS
                 )
             )
     else:
         spec = asyncio.run(
             VllmAsyncGenerationWorkerImpl.setup_token_capture(
-                worker, {}, **kwargs, **_PREFIX_BATCH_LIMITS
+                worker, {"impl": "local"}, **kwargs, **_PREFIX_BATCH_LIMITS
             )
         )
         # The engine's model dtype and the HF patch size, as pinned on the sink.
@@ -4512,6 +4521,8 @@ class _BatchPrefixSink(_MemorySink):
         super().__init__()
         self.batches: list[list[int]] = []
         self.fail_after_write = False
+        # Fails every write of more than one row, so rows retry one at a time.
+        self.fail_multi_row = False
         self.before_write = lambda: None
 
     def stage_generation_prefix_batch(
@@ -4525,7 +4536,7 @@ class _BatchPrefixSink(_MemorySink):
             chunk_sequences=chunk_sequences,
             attachments=attachments,
         )
-        if self.fail_after_write:
+        if self.fail_after_write or (self.fail_multi_row and len(records) > 1):
             # Like TQTokenSink after a failed put: discard the batch, then raise.
             self.clear(keys)
             raise RuntimeError("injected batch transport failure after writes")
@@ -4739,12 +4750,14 @@ def test_worker_batch_call_without_output_limit_fails_alone():
 
 def test_worker_batch_past_deadline_fails_calls_not_yet_written(monkeypatch):
     from nemo_rl.models.generation.prefix_recovery import recovery as recovery_module
+    from nemo_rl.models.generation.prefix_recovery import write_pipeline
 
     recovery, sink, states, inventory = _batch_worker_fixture([2, 3, 4], batch_size=2)
     clock = {"now": 0.0}
-    monkeypatch.setattr(
-        recovery_module, "time", SimpleNamespace(monotonic=lambda: clock["now"])
-    )
+    # The cut and the write pipeline both compare the deadline to this clock.
+    fake_time = SimpleNamespace(monotonic=lambda: clock["now"])
+    monkeypatch.setattr(recovery_module, "time", fake_time)
+    monkeypatch.setattr(write_pipeline, "time", fake_time)
 
     def expire_during_first_write():
         clock["now"] = 10.0

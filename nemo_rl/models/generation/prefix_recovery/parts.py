@@ -28,6 +28,9 @@ from nemo_rl.models.generation.prefix_recovery.state import (
 
 if TYPE_CHECKING:
     from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+    from nemo_rl.models.generation.prefix_recovery.write_pipeline import (
+        PrefixWriteLimits,
+    )
 
 
 @dataclass(frozen=True)
@@ -68,3 +71,5 @@ class PrefixRecoveryParts:
     prefix_write_max_tokens: int
     # Most rows per TQ read at restore; 1 reads each restore on its own.
     prefix_read_max_rows: int
+    # Bounds of the write pipeline cut rows go through.
+    write_limits: PrefixWriteLimits
