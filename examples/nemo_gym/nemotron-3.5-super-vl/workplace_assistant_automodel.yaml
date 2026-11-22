@@ -18,7 +18,7 @@
 # automodel recipe) and CP2. See docs/guides/models/nemotron/nemotron-3.5-super-vl.md.
 #
 # Requirements:
-#   - Automodel r0.6.0 @ b916107a5 or later (the submodule pin on main).
+#   - Automodel 41f926247 or later (the submodule pin on main).
 #   - Stock vLLM 0.33.0 (pyproject pin): registers NemotronH_Omni_Reasoning_V3 and
 #     ships the nemotron_v3 reasoning parser and qwen3_coder tool parser the chat
 #     template needs (<think> blocks, <tool_call><function=...> calls).

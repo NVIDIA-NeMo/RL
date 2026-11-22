@@ -6,7 +6,7 @@ defaults: ../../vlm_grpo_3B.yaml
 # sized for 4-GPU GB200 nodes (16 nodes x 4 GPUs, train EP4, vLLM TP4/EP4).
 #
 # Requirements: see docs/guides/models/nemotron/nemotron-3.5-super-vl.md
-#   - Automodel r0.6.0 @ b916107a5 or later (the submodule pin on main).
+#   - Automodel 41f926247 or later (the submodule pin on main).
 #   - Stock vLLM 0.33.0 (pyproject pin) plus NeMo RL's vLLM source patches:
 #     the RADIO final vision LayerNorm (_patch_vllm_radio_final_layernorm) and
 #     the transformers-native RADIO weight-name loader
