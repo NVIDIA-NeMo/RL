@@ -285,6 +285,7 @@ class NixlEndpoint:
                     raise ValueError("descriptor lengths differ")
         errs: list[TransferError | None] = [None for _ in ops]
         live: dict[int, tuple[Any, Any, Any]] = {}  # op index -> (h, ldesc, rdesc)
+        started = time.monotonic()
         try:
             for i, (op, local, remote, remote_agent) in enumerate(ops):
                 errs[i] = self._post(i, op, local, remote, remote_agent, live)
@@ -295,13 +296,24 @@ class NixlEndpoint:
                         state = self.agent.check_xfer_state(live[i][0])
                     except Exception as e:  # noqa: BLE001
                         errs[i] = self._fail(
-                            i, ops[i], live, f"{type(e).__name__}: {e}", e
+                            i,
+                            ops[i],
+                            live,
+                            f"check_xfer_state after {time.monotonic() - started:.3f}s "
+                            f"in batch: {type(e).__name__}: {e}",
+                            e,
                         )
                         continue
                     if state == "DONE":
                         self._done(live.pop(i))
                     elif state != "PROC":
-                        errs[i] = self._fail(i, ops[i], live, f"ended in state {state}")
+                        errs[i] = self._fail(
+                            i,
+                            ops[i],
+                            live,
+                            f"check_xfer_state after {time.monotonic() - started:.3f}s "
+                            f"in batch: ended in state {state}",
+                        )
                 if live and time.monotonic() > deadline:
                     for i in list(live):
                         errs[i] = self._fail(
@@ -321,10 +333,16 @@ class NixlEndpoint:
         # NIXL_ERR_BACKEND, ...) from any of these calls. Surface all of them as
         # TransferError. The stores report it as retryable (TransferFailed ->
         # DataPlaneTransferFailed) unless the unit is confirmed dead.
+        started = time.monotonic()
         try:
             h = self.agent.initialize_xfer(op, ldesc, rdesc, remote_agent)
         except Exception as e:  # noqa: BLE001 - NIXL binding errors have no common base
-            err = TransferError(f"{op} to {remote_agent}: {type(e).__name__}: {e}")
+            err = TransferError(
+                f"{op} to {remote_agent}: initialize_xfer after "
+                f"{time.monotonic() - started:.3f}s: {type(e).__name__}: {e}; "
+                f"local_agent={self.name} descriptors={len(local)} "
+                f"bytes={sum(n for _, n in local)} in_flight=False"
+            )
             err.__cause__ = e
             return err
         # From here on the transfer may be posted. Anything short of DONE leaves
@@ -334,6 +352,8 @@ class NixlEndpoint:
         # zero-copy put check them). A failed WRITE's destination is remote;
         # the caller retires it on the unit.
         live[i] = (h, ldesc, rdesc)
+        initialized_s = time.monotonic() - started
+        started = time.monotonic()
         try:
             state = self.agent.transfer(h)
         except Exception as e:  # noqa: BLE001
@@ -341,14 +361,19 @@ class NixlEndpoint:
                 i,
                 (op, local, remote, remote_agent),
                 live,
-                f"{type(e).__name__}: {e}",
+                f"transfer after {time.monotonic() - started:.3f}s "
+                f"(initialize_xfer={initialized_s:.3f}s): {type(e).__name__}: {e}",
                 e,
             )
         if state == "DONE":
             self._done(live.pop(i))
         elif state != "PROC":
             return self._fail(
-                i, (op, local, remote, remote_agent), live, f"ended in state {state}"
+                i,
+                (op, local, remote, remote_agent),
+                live,
+                f"transfer after {time.monotonic() - started:.3f}s "
+                f"(initialize_xfer={initialized_s:.3f}s): ended in state {state}",
             )
         return None
 
@@ -356,7 +381,11 @@ class NixlEndpoint:
         """Retain transfer ``i`` (it may still run) and return its error."""
         op, local, _, remote_agent = op_args
         self._retain(live.pop(i), local)
-        err = TransferError(f"{op} to {remote_agent}: {why}", in_flight=True)
+        err = TransferError(
+            f"{op} to {remote_agent}: {why}; local_agent={self.name} "
+            f"descriptors={len(local)} bytes={sum(n for _, n in local)} in_flight=True",
+            in_flight=True,
+        )
         err.__cause__ = cause
         return err
 

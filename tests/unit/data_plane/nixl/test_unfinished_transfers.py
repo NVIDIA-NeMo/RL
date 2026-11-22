@@ -93,6 +93,53 @@ def test_transfer_that_never_posted_is_not_in_flight():
     assert ep.unfinished == [] and ep.unfinished_handles == []
 
 
+class _BoundaryFailureAgent(_StuckAgent):
+    def __init__(self, boundary: str) -> None:
+        super().__init__()
+        self.boundary = boundary
+        self.error = RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
+
+    def initialize_xfer(self, op, ldesc, rdesc, remote_agent):
+        if self.boundary == "initialize_xfer":
+            raise self.error
+        return super().initialize_xfer(op, ldesc, rdesc, remote_agent)
+
+    def transfer(self, h):
+        if self.boundary == "transfer":
+            raise self.error
+        return super().transfer(h)
+
+    def check_xfer_state(self, h):
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "boundary", ["initialize_xfer", "transfer", "check_xfer_state"]
+)
+def test_failure_context_identifies_the_native_boundary_without_releasing_memory(
+    boundary, graveyard
+):
+    agent = _BoundaryFailureAgent(boundary)
+    ep = _endpoint(agent)
+    local = [(1000, 8), (2000, 16)]
+    with pytest.raises(TransferError) as error:
+        ep.transfer("READ", local, [(3000, 8), (4000, 16)], "peer")
+    message = str(error.value)
+    assert "READ to peer" in message
+    assert f"{boundary} after " in message
+    assert "local_agent=ep descriptors=2 bytes=24" in message
+    assert "NIXL_ERR_REMOTE_DISCONNECT" in message
+    posted = boundary != "initialize_xfer"
+    assert error.value.in_flight is posted
+    assert f"in_flight={posted}" in message
+    assert error.value.__cause__ is agent.error
+    assert agent.released == 0
+    assert ep.unfinished == (local if posted else [])
+    assert graveyard.bytes == (24 if posted else 0)
+    if boundary == "transfer":
+        assert "initialize_xfer=" in message
+
+
 class _DoneAgent(_StuckAgent):
     def transfer(self, h):
         return "DONE"
