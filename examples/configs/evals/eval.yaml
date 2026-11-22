@@ -58,6 +58,8 @@ data:
 env:
   math:
     num_workers: 8
+    verifier_type: "math"  # key into the environment's worker classes
+    math_verify_impl: "hf_math_verify"
 
 cluster:
   gpus_per_node: 1

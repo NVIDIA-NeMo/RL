@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional, TypedDict, Union
+from typing import Any, TypedDict, Union
 
 import ray
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -27,9 +28,8 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.environments.utils import chunk_list_to_workers
 
 
-class CodeJaccardEnvConfig(TypedDict):
+class CodeJaccardEnvConfig(BaseModel, extra="allow"):
     num_workers: int
-    stop_strings: Optional[list[str]]  # Default stop strings for this env
 
 
 class CodeJaccardEnvironmentMetadata(TypedDict):
@@ -148,9 +148,10 @@ class CodeJaccardVerifyWorker:
 class CodeJaccardEnvironment(EnvironmentInterface[CodeJaccardEnvironmentMetadata]):
     """Environment for evaluating code responses using Jaccard similarity."""
 
-    def __init__(self, cfg: CodeJaccardEnvConfig):
-        self.cfg = cfg
-        self.num_workers = cfg["num_workers"]
+    def __init__(self, cfg: CodeJaccardEnvConfig | dict[str, Any]):
+        # MasterConfig.env is a plain dict, so validate where it is consumed.
+        self.cfg = CodeJaccardEnvConfig.model_validate(cfg)
+        self.num_workers = self.cfg.num_workers
 
         # Create worker pool
         self.workers = [
