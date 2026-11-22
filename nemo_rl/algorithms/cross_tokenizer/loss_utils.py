@@ -505,6 +505,11 @@ class LocalizedAlignment:
     # next-token-accuracy metric and the same-tokenizer KD path.
     student_input_ids: Optional[torch.Tensor] = None
     student_token_mask: Optional[torch.Tensor] = None
+    # Filled post-construction for a cross-tokenizer teacher: this CP rank's
+    # contiguous teacher input ids and token mask. Left ``None`` for a
+    # same-tokenizer teacher.
+    teacher_input_ids: Optional[torch.Tensor] = None
+    teacher_token_mask: Optional[torch.Tensor] = None
 
 
 def localize_alignment(
@@ -1322,6 +1327,22 @@ def prepare_xtoken_cross_tokenizer_loss_input(
             align.teacher_chunk_id = cp_shift_next(
                 align.teacher_chunk_id, cp_group, fill=-1
             )
+            # localize_alignment keeps the first teacher_seq_len positions.
+            teacher_seq_len = teacher_full_logits.shape[1]
+            teacher_seq_start = 0
+        # Teacher input ids and token mask for the same contiguous teacher window
+        # as the teacher logits and teacher_chunk_id.
+        teacher_window = slice(teacher_seq_start, teacher_seq_start + teacher_seq_len)
+        teacher_ids_full = data.get(f"teacher_{i}_input_ids")
+        if teacher_ids_full is not None:
+            align.teacher_input_ids = to_local_if_dtensor(teacher_ids_full)[
+                :, teacher_window
+            ]
+        teacher_mask_full = data.get(f"teacher_{i}_token_mask")
+        if teacher_mask_full is not None:
+            align.teacher_token_mask = to_local_if_dtensor(teacher_mask_full)[
+                :, teacher_window
+            ]
         align.student_input_ids = student_input_ids
         align.student_token_mask = student_token_mask
         aligns_by_idx[i] = align
