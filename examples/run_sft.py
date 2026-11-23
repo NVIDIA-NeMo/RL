@@ -209,7 +209,7 @@ def main(is_vlm: bool = False):
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    config = MasterConfig(**config)
+    config = MasterConfig.model_validate(config)
     print("Applied CLI overrides")
 
     # Print config

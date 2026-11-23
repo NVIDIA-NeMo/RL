@@ -133,7 +133,7 @@ def test_generic_launchers_reject_nemo_gym_configs(
         "parse_args": lambda: (Namespace(config="config.yaml"), []),
         "load_config": lambda _: {},
         "check_outdated_config": lambda _: None,
-        "MasterConfig": lambda **_: config,
+        "MasterConfig": SimpleNamespace(model_validate=lambda _: config),
         "log_container_init_timing": lambda: None,
         "get_next_experiment_dir": lambda log_dir: log_dir,
         "maybe_configure_data_plane_env": lambda _: calls.append("data_plane_env"),

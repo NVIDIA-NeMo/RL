@@ -152,6 +152,10 @@ if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
             EXTRA_CHECKS+=('min(data["train/finalize/routed_experts_row_coverage"]) == 1')
         fi
     fi
+    if [[ "$*" == *trainer_warmup.enabled=true* ]]; then
+        grep "Trainer warm-up (rank 0):" "$RUN_LOG" | grep -vq "'skipped'" \
+            || { echo "trainer warm-up did not run"; exit 1; }
+    fi
 
     if [[ "${SC_TEST_CONTEXT_COMPACTION:-0}" == "1" ]]; then
         # Eight logical rollouts per step. More valid rows requires a context

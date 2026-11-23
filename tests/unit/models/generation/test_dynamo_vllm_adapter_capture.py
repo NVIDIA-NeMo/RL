@@ -529,14 +529,11 @@ def test_a_restored_media_call_is_checked_against_its_cuts_tensor_digests(
     llm = _FakeLLM([_output([*image, 20], _completion([21], "stop"))])
     host = _capturing_host(llm)
     host._capture_media = host._hash_captured_media = True
-    monkeypatch.setattr(
-        host._prefix_recovery,
-        "resolve_restore",
-        lambda admission, prefix_token_ids: (
-            admission,
-            _ResolvedGenerationCut(snapshot=saved),
-        ),
-    )
+
+    async def resolve_restore(admission, prefix_token_ids):
+        return admission, _ResolvedGenerationCut(snapshot=saved)
+
+    monkeypatch.setattr(host._prefix_recovery, "resolve_restore", resolve_restore)
     # What vLLM's processor made of the image the re-sent call carries.
     tensors = dict(saved_media.tensors)
     if changed:

@@ -165,6 +165,7 @@ def test_worker_collects_separate_frontend_snapshots(multiple_frontends: bool) -
     worker = SimpleNamespace(
         get_data_plane_snapshot=Mock(return_value=owner),
         _api_server_pool=pool if multiple_frontends else None,
+        _prefix_writer=None,
     )
     snapshots = asyncio.run(
         VllmAsyncGenerationWorkerImpl.get_data_plane_snapshots(worker)

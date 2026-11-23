@@ -15,10 +15,11 @@ import contextlib
 import io
 import logging
 from functools import partial
-from typing import Any, Callable, List, NotRequired, Optional, TypedDict
+from typing import Any, Callable, Optional, TypedDict
 
 import ray
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
@@ -40,10 +41,9 @@ from nemo_rl.environments.rewards import (
 from nemo_rl.environments.utils import chunk_list_to_workers
 
 
-class VLMEnvConfig(TypedDict):
+class VLMEnvConfig(BaseModel, extra="allow"):
     num_workers: int
-    stop_strings: NotRequired[Optional[list[str]]]  # Default stop strings for this env
-    reward_functions: List[dict[str, Any]]  # list of reward functions and their weights
+    reward_functions: list[dict[str, Any]]  # list of reward functions and their weights
 
 
 @contextlib.contextmanager
@@ -63,7 +63,7 @@ class VLMVerifyWorker:
         # this is a simple reward function that rewards the agent for correct answer and correct format
         reward_functions = []
         # loop over all configs
-        for reward_func_cfg in cfg["reward_functions"]:
+        for reward_func_cfg in cfg.reward_functions:
             # get name and weight
             reward_func_name: str = reward_func_cfg["name"]
             reward_func_weight: float = reward_func_cfg["weight"]
@@ -128,13 +128,14 @@ class VLMEnvironmentMetadata(TypedDict):
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)
 class VLMEnvironment(EnvironmentInterface):
-    def __init__(self, cfg: VLMEnvConfig):
-        self.cfg = cfg
-        self.num_workers = cfg["num_workers"]
+    def __init__(self, cfg: VLMEnvConfig | dict[str, Any]):
+        # MasterConfig.env is a plain dict, so validate where it is consumed.
+        self.cfg = VLMEnvConfig.model_validate(cfg)
+        self.num_workers = self.cfg.num_workers
         self.workers = [
             VLMVerifyWorker.options(  # type: ignore # (decorated with @ray.remote)
                 runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
-            ).remote(cfg)
+            ).remote(self.cfg)
             for _ in range(self.num_workers)
         ]
 

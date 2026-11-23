@@ -107,7 +107,7 @@ CASE_CONFIGS: dict[str, dict[str, Any]] = {
         "reference_policy_kl_penalty": 0.0,
         "use_importance_sampling_correction": True,
         "sequence_level_importance_ratios": True,
-        "token_level_loss": False,
+        "normalization": "sequence_mean",
     },
     "vapo_mixed_rewards": {
         "reference_policy_kl_penalty": 0.0,
@@ -178,7 +178,17 @@ def _run_case(
         gradient_inputs.append(curr_logprobs_unfiltered)
         gradient_names.append("curr_logprobs_unfiltered")
 
-    loss_fn = loss_cls(config_cls(**config))
+    constructor_config = dict(config)
+    if (
+        "normalization" in constructor_config
+        and "normalization" not in config_cls.model_fields
+    ):
+        # The pinned golden source predates loss_fn.normalization and would
+        # ignore it as an extra field; pass the equivalent legacy alias.
+        constructor_config["token_level_loss"] = (
+            constructor_config.pop("normalization") == "global_token_mean"
+        )
+    loss_fn = loss_cls(config_cls(**constructor_config))
     global_valid_seqs = data["sample_mask"].sum()
     global_valid_toks = (
         data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)

@@ -288,6 +288,9 @@ class _TokenCaptureSetup:
     generation_prefix_cuts_enabled: bool
     generation_cut_control_token: str | None
     generation_cut_control_timeout_s: float | None
+    prefix_write_max_rows: int
+    prefix_write_max_tokens: int
+    prefix_read_max_rows: int
 
 
 class VllmGeneration(GenerationInterface):
@@ -1614,6 +1617,9 @@ class VllmGeneration(GenerationInterface):
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
+        prefix_write_max_rows: int,
+        prefix_write_max_tokens: int,
+        prefix_read_max_rows: int,
     ) -> "Optional[MediaColumnSpec]":
         """Install ledger-authoritative token capture in every DP-leader worker.
 
@@ -1637,6 +1643,9 @@ class VllmGeneration(GenerationInterface):
             generation_prefix_cuts_enabled,
             generation_cut_control_token,
             generation_cut_control_timeout_s,
+            prefix_write_max_rows,
+            prefix_write_max_tokens,
+            prefix_read_max_rows,
         )
         futures = self._fan_out("setup_token_capture", **asdict(setup))
         self._token_capture_media = agreed_media_columns(ray.get(futures))

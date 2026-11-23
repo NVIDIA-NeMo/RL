@@ -37,6 +37,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     AdvEstimatorConfig,
+    AgentOverrideConfig,
     AsyncGRPOConfig,
     GRPOConfig,
     MasterConfig,
@@ -666,7 +667,7 @@ def test_trainers_dynamic_sampling_honors_masked_reward_policy(
 
     with ExitStack() as stack:
         if use_tq:
-            cfg.data_plane = {"enabled": True}
+            cfg.data_plane = {"enabled": True, "backend": "simple"}
             stack.enter_context(mock_sync_grpo_infrastructure(components["policy"]))
             grpo_sync_mod.SyncRolloutActor.options.return_value.remote.return_value.rollout_to_tq.remote.return_value = (
                 meta,
@@ -1576,7 +1577,7 @@ def test_multimodal_dedup_rejects_unqualified_transfer_paths(
     # Data plane + NeMo-Gym stays rejected: ``grpo_train_sync`` never calls
     # ``attach_initial_nemo_gym_image_payloads``, so the run would silently
     # train on the media a Gym dataset omits from ``extra_env_info``.
-    master_config.data_plane = {"enabled": True}
+    master_config.data_plane = {"enabled": True, "backend": "simple"}
     with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
         with pytest.raises(NotImplementedError, match="NeMo-Gym"):
             _validate_multimodal_dedup_capability(master_config)
@@ -1597,7 +1598,7 @@ def test_multimodal_dedup_rejects_unqualified_transfer_paths(
     # blocked by a multimodal validator.
     master_config.grpo.deduplicate_multimodal_data = False
     master_config.policy["generation"]["backend"] = "sglang"
-    master_config.data_plane = {"enabled": True}
+    master_config.data_plane = {"enabled": True, "backend": "simple"}
     with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
         _validate_multimodal_dedup_capability(master_config)
 
@@ -4431,6 +4432,24 @@ def test_setup_rejects_disaggregation_without_nemo_gym_before_side_effects(
     mock_logger.assert_not_called()
 
 
+def test_setup_rejects_agent_overrides_before_side_effects(mock_grpo_components):
+    """Only the SingleController advantage stage applies grpo.agent_overrides."""
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.agent_overrides = {
+        "rubric_judge_agent": AgentOverrideConfig(overlong_filtering=True)
+    }
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(NotImplementedError, match="grpo.agent_overrides"),
+    ):
+        setup(master_config, MagicMock(), MagicMock(), None)
+
+    mock_logger.assert_not_called()
+
+
 def test_setup_restores_adaptive_ppo_clip_state_from_checkpoint(
     mock_grpo_components, monkeypatch
 ):
@@ -6366,7 +6385,7 @@ def test_periodic_validation_starts_at_configured_step(
     with ExitStack() as stack:
         validate_target = "nemo_rl.algorithms.grpo.validate"
         if train_func is grpo_train_sync:
-            master_config.data_plane = {"enabled": True}
+            master_config.data_plane = {"enabled": True, "backend": "simple"}
             stack.enter_context(
                 mock_sync_grpo_infrastructure(mock_grpo_components["policy"])
             )
@@ -6429,7 +6448,7 @@ def _enter_stop_test_mocks(
 ):
     """Enter per-trainer infrastructure mocks; returns the validate patch target."""
     if train_func is grpo_train_sync:
-        master_config.data_plane = {"enabled": True}
+        master_config.data_plane = {"enabled": True, "backend": "simple"}
         stack.enter_context(
             mock_sync_grpo_infrastructure(mock_grpo_components["policy"])
         )
@@ -8678,7 +8697,7 @@ def test_resolve_logprob_skip_flags(kw, expected):
 
 def test_single_forward_sync_dataplane_skips_logprob_dispatch(mock_grpo_components):
     config = mock_grpo_components["master_config"]
-    config.data_plane = {"enabled": True}
+    config.data_plane = {"enabled": True, "backend": "simple"}
     config.loss_fn.seq_logprob_error_in_loss = True
     config.grpo.seq_logprob_error_threshold = 2.0
     config.grpo.skip_reference_policy_logprobs_calculation = True
@@ -8717,7 +8736,7 @@ def test_grpo_train_sync_applies_length_penalty_to_training_rollouts(
     import nemo_rl.algorithms.grpo_sync as grpo_sync_module
 
     config = mock_grpo_components["master_config"]
-    config.data_plane = {"enabled": True}
+    config.data_plane = {"enabled": True, "backend": "simple"}
     config.grpo.max_num_steps = 1
     config.grpo.val_period = 0
     config.grpo.val_at_start = False
@@ -8962,7 +8981,7 @@ def test_grpo_train_sync_logs_data_plane_metrics_before_committing_the_step(
     )
 
     master_config = mock_grpo_components["master_config"]
-    master_config.data_plane = {"enabled": True}
+    master_config.data_plane = {"enabled": True, "backend": "simple"}
     master_config.grpo.max_num_steps = 1
     master_config.grpo.val_period = 0
     master_config.grpo.val_at_start = False
@@ -9033,7 +9052,7 @@ def test_tq_rollout_and_trainer_masked_rewards(
     """Exercise real actor payloads, driver statistics, and estimator inputs."""
     components = mock_grpo_components
     cfg = components["master_config"]
-    cfg.data_plane = {"enabled": True}
+    cfg.data_plane = {"enabled": True, "backend": "simple"}
     cfg.grpo.max_num_steps = 1
     cfg.grpo.val_period = 0
     cfg.grpo.num_generations_per_prompt = 4
@@ -9314,7 +9333,7 @@ def test_tq_include_kl_in_reward_sees_real_logprobs_of_masked_rows(
     """
     components = mock_grpo_components
     cfg = components["master_config"]
-    cfg.data_plane = {"enabled": True}
+    cfg.data_plane = {"enabled": True, "backend": "simple"}
     cfg.grpo.max_num_steps = 1
     cfg.grpo.val_period = 0
     cfg.grpo.num_generations_per_prompt = 4
@@ -9398,7 +9417,7 @@ def test_tq_env_baseline_site_uses_the_statistics_mask(
     """
     components = mock_grpo_components
     cfg = components["master_config"]
-    cfg.data_plane = {"enabled": True}
+    cfg.data_plane = {"enabled": True, "backend": "simple"}
     cfg.grpo.max_num_steps = 1
     cfg.grpo.val_period = 0
     cfg.grpo.num_generations_per_prompt = 4
@@ -9473,7 +9492,7 @@ def test_tq_pct_diagnostics_use_the_statistics_mask(
     """
     components = mock_grpo_components
     cfg = components["master_config"]
-    cfg.data_plane = {"enabled": True}
+    cfg.data_plane = {"enabled": True, "backend": "simple"}
     cfg.grpo.max_num_steps = 1
     cfg.grpo.val_period = 0
     cfg.grpo.num_generations_per_prompt = 4
@@ -9557,7 +9576,7 @@ def test_tq_forwards_should_mask_flagged_samples(
     """
     components = mock_grpo_components
     cfg = components["master_config"]
-    cfg.data_plane = {"enabled": True}
+    cfg.data_plane = {"enabled": True, "backend": "simple"}
     cfg.env = {"should_mask_flagged_samples": mask_flagged}
     cfg.grpo.max_num_steps = 1
     cfg.grpo.val_period = 0
@@ -9666,7 +9685,7 @@ def test_trainers_never_let_over_length_prompts_vote(
     estimator = MagicMock(wraps=grpo_mod._create_advantage_estimator(cfg))
     policy_mock = components["policy"]
     if train_func is grpo_train_sync:
-        cfg.data_plane = {"enabled": True}
+        cfg.data_plane = {"enabled": True, "backend": "simple"}
         cfg.grpo.max_num_steps = 1
         cfg.grpo.val_period = 0
         cfg.grpo.num_generations_per_prompt = 2
