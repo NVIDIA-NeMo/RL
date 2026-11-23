@@ -48,6 +48,7 @@ COMPILER_DIRS = {
     "FLASHINFER_WORKSPACE_BASE": "flashinfer",
     "CUDA_CACHE_PATH": "cuda",
     "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": "fa4_cute",
+    "CUTE_DSL_CACHE_DIR": "cute_dsl",
 }
 # Compiler settings one cache type's workers take from NRL_<TYPE>_<VAR>.
 TUNING_VARS = (
