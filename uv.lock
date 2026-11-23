@@ -4428,6 +4428,8 @@ automodel = [
     { name = "transformers", version = "5.12.1", source = { registry = "https://pypi.org/simple" } },
 ]
 mcore = [
+    { name = "ai-dynamo" },
+    { name = "ai-dynamo-runtime" },
     { name = "apache-tvm-ffi", version = "0.1.12", source = { registry = "https://pypi.org/simple" } },
     { name = "causal-conv1d" },
     { name = "cupy-cuda13x" },
@@ -4565,7 +4567,9 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=0.26" },
+    { name = "ai-dynamo", marker = "extra == 'mcore'", specifier = "==1.8.0.dev20261117" },
     { name = "ai-dynamo", marker = "extra == 'vllm'", specifier = "==1.8.0.dev20261117" },
+    { name = "ai-dynamo-runtime", marker = "extra == 'mcore'", specifier = "==1.8.0.dev20261117" },
     { name = "ai-dynamo-runtime", marker = "extra == 'vllm'", specifier = "==1.8.0.dev20261117" },
     { name = "apache-tvm-ffi", marker = "extra == 'automodel'", specifier = "==0.1.11" },
     { name = "apache-tvm-ffi", marker = "extra == 'mcore'", specifier = "==0.1.12" },
