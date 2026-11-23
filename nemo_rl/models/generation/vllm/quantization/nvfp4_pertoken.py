@@ -22,7 +22,7 @@ refit transport remain BF16.
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType, new_class
+from types import MappingProxyType
 from typing import Any, Literal, Optional, cast
 
 import torch
@@ -520,45 +520,6 @@ class NvFp4PerTokenQuantizer:
         )
 
 
-class _HostCapturedRoutingMixin:
-    """Report no in-kernel routing capture so vLLM binds it to the router."""
-
-    def supports_routing_replay_capture(self) -> bool:
-        return False
-
-
-_HOST_CAPTURED_EXPERTS_CLS: dict[type, type] = {}
-
-
-def host_captured_experts_cls(experts_cls: type) -> type:
-    """Return ``experts_cls`` with in-kernel routed-experts capture disabled.
-
-    For a monolithic kernel that reports ``supports_routing_replay_capture``,
-    vLLM gives the layer a ``RoutedExpertsSink`` and the FlashInfer launch fills
-    ``routing_replay_out`` itself. The per-token launch has not been validated
-    with a replay buffer attached. Reporting no in-kernel capture makes
-    NeMo-RL's binder fallback (``patches._patch_vllm_routed_experts_capture_router_fallback``)
-    attach the capture to the layer's router, where
-    ``patches._patch_vllm_moe_routed_experts_capture`` fires ``select_experts``
-    on the monolithic branch.
-    Non-monolithic experts classes already capture through the router and are
-    returned unchanged. The subclass keeps the original name as a suffix
-    because vLLM logs and duck-types on ``type(...).__name__``.
-    """
-    is_monolithic = getattr(experts_cls, "is_monolithic", None)
-    if not callable(is_monolithic) or not is_monolithic():
-        return experts_cls
-    cached = _HOST_CAPTURED_EXPERTS_CLS.get(experts_cls)
-    if cached is None:
-        cached = new_class(
-            f"HostCaptured{experts_cls.__name__}",
-            (_HostCapturedRoutingMixin, experts_cls),
-            exec_body=lambda namespace: namespace.update(__module__=__name__),
-        )
-        _HOST_CAPTURED_EXPERTS_CLS[experts_cls] = cached
-    return cached
-
-
 class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
     """W4A4 MoE: pre-quantized weights, per-token dynamic activation scales.
 
@@ -591,10 +552,8 @@ class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
                 f"{NVFP4_PER_TOKEN_METHOD} requires the FlashInfer TRT-LLM MoE "
                 f"backend, got {self.nvfp4_backend}."
             )
-        # The per-token kernel is not validated with a routing replay buffer,
-        # so routed-experts capture goes through the router, not the kernel.
-        assert self.experts_cls is not None
-        self.experts_cls = host_captured_experts_cls(self.experts_cls)
+        # Router replay keeps vLLM's in-kernel capture: its layer-owned
+        # RoutedExpertsSink survives the per-refit kernel rebuild below.
 
     def process_weights_after_loading(self, layer) -> None:
         """Finalize reload-format weights for dynamic per-token activation FP4.
