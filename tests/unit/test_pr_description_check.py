@@ -65,6 +65,8 @@ WHAT_EMPTY = (
         ),
         # A code block alone is content.
         FILLED.replace("Fix the loss scale.\n", ""),
+        # Descriptions edited in GitHub's web editor have CRLF line endings.
+        FILLED.replace("\n", "\r\n"),
     ],
 )
 def test_passes(body: str) -> None:
@@ -76,6 +78,10 @@ def test_passes(body: str) -> None:
     [
         ("", "Review box missing"),
         (FILLED.replace("[x]", "[ ]"), "Review box not ticked"),
+        (
+            FILLED.replace("[x]", "[ ]").replace("\n", "\r\n"),
+            "Review box not ticked",
+        ),
         (
             FILLED.replace("## Needs upstream changes\n", ""),
             'Missing heading: "## Needs upstream changes"',

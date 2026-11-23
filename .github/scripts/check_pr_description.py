@@ -58,7 +58,9 @@ def is_bot(*, author: str, author_type: str) -> bool:
 
 
 def normalize(body: str) -> str:
-    text = _FENCE.sub("[code]", body or "")
+    # GitHub's web editor saves CRLF line endings, and `$` does not match before `\r`.
+    text = (body or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = _FENCE.sub("[code]", text)
     text = _INLINE_CODE.sub("[code]", text)
     return _COMMENT.sub("", text)
 
