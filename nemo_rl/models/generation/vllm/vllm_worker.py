@@ -47,6 +47,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
+    VllmRole,
     parse_nvfp4_pertoken_rollout,
     validate_nvfp4_pertoken_model,
     vllm_fp32_lm_head_enabled,
@@ -315,7 +316,9 @@ def _resolve_disagg_engine(
     without per-worker init kwargs. ``{}`` for uniform runs, which carry no map
     at all, and for the non-owner workers of a TP group, which build no engine.
     """
-    engine_roles = cfg["vllm_cfg"].get("_engine_roles")
+    engine_roles = cast(
+        dict[str, dict[str, Any]] | None, cfg["vllm_cfg"].get("_engine_roles")
+    )
     if not engine_roles or bundle_indices is None:
         return {}
     if bundle_pg_idx is None:
@@ -971,7 +974,9 @@ class BaseVllmGenerationWorker:
         entry = self._disagg_engine
         llm_kwargs["kv_transfer_config"] = KVTransferConfig(
             **vllm_kv_transfer_config_for_role(
-                self.cfg, self._disagg_role, engine_id=entry["engine_id"]
+                self.cfg,
+                cast(VllmRole, self._disagg_role),
+                engine_id=entry["engine_id"],
             )
         )
         kv_events_port = entry.get("kv_events_port")
