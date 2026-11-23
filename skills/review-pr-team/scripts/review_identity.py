@@ -379,15 +379,21 @@ def _gh(*args: str) -> str:
 
 
 def _login() -> str | None:
-    """The reviewer's GitHub login, or None when the token can't read `GET /user`.
+    """The reviewer's GitHub login, or None for a bot app token.
 
-    App tokens, such as the one Autobot reviews with, can't read it, and that is how an
-    automated review shows up here. It can never be a self-review.
+    App tokens, such as the one Autobot reviews with, get HTTP 403 on `GET /user`: there is no
+    user behind them, so the review can never be a self-review. Any other failure (not logged
+    in, network, rate limit) is a broken setup and stops the review.
     """
     try:
-        return _gh("api", "user", "--jq", ".login").strip() or None
-    except subprocess.CalledProcessError:
-        return None
+        return _gh("api", "user", "--jq", ".login").strip()
+    except subprocess.CalledProcessError as e:
+        if "HTTP 403" in (e.stderr or ""):
+            return None
+        sys.exit(
+            "Could not read your GitHub user with `gh api user`:\n"
+            f"{(e.stderr or '').strip()}\nRun `gh auth status` (or `gh auth login`) and retry."
+        )
 
 
 def _pr(pr: int) -> dict:
@@ -443,7 +449,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(
-        f"Review kind: {kind} ({me or 'automated reviewer'}); {ident.label()}, model {ident.model}, effort {ident.effort}; "
+        f"Review kind: {kind} ({me or 'bot-app-token'}); {ident.label()}, model {ident.model}, effort {ident.effort}; "
         f"review-pr-team rev {skill_revision()}"
     )
     repo_root = subprocess.run(
@@ -469,7 +475,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 3
     if ident.transcript is None and me is None:
-        print("OK (automated reviewer)")
+        print("OK (bot-app-token)")
     elif ident.transcript is None:
         print(
             "WARNING: no session log found, so same-session edits could not be checked"
