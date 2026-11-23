@@ -401,7 +401,8 @@ def _gather_tp_gate_up_weight(
 ) -> tuple[Tensor, Tensor]:
     shards = _all_gather_tp_shards(local_fused_weight)
     if len(shards) == 1 and local_fused_weight.shape[0] == 2 * ffn_hidden_size:
-        return local_fused_weight.split([ffn_hidden_size, ffn_hidden_size], dim=0)
+        gate, up = local_fused_weight.split([ffn_hidden_size, ffn_hidden_size], dim=0)
+        return gate, up
 
     tp_world_size = len(shards)
     if ffn_hidden_size % tp_world_size != 0:

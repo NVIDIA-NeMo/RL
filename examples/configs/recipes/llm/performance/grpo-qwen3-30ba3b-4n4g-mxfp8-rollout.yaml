@@ -26,6 +26,7 @@ policy:
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     expert_model_parallel_size: 16
+    moe_router_dtype: fp32
     sequence_parallel: false
     moe_grouped_gemm: true
     moe_token_dispatcher_type: flex

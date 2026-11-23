@@ -101,6 +101,7 @@ from nemo_rl.data.utils import save_dataloader_state
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.observability import (
+    backend_health_metrics,
     log_step_metrics,
     metrics_never_fail_the_step,
 )
@@ -425,20 +426,25 @@ def _compute_seq_logprob_error_metrics(
 
 
 def _log_data_plane_metrics(
-    policy: Any, logger: Logger, step: int, total_step_time: float
+    policy: Any, logger: Logger, step: int, total_step_time: float, backend: str
 ) -> None:
     """Log this step's data-plane cost. Never raises.
 
     On by default, so this runs every step of every recipe.
     """
     with metrics_never_fail_the_step(step):
-        _log_data_plane_metrics_impl(policy, logger, step, total_step_time)
+        _log_data_plane_metrics_impl(policy, logger, step, total_step_time, backend)
 
 
 def _log_data_plane_metrics_impl(
-    policy: Any, logger: Logger, step: int, total_step_time: float
+    policy: Any, logger: Logger, step: int, total_step_time: float, backend: str
 ) -> None:
-    """Log this step's data-plane cost. No-op unless observability is enabled.
+    """Log this step's data-plane cost.
+
+    The backend's own counters (nixl unit memory and SSD spills, Mooncake
+    memory use and SSD offload) are logged whatever the observability setting,
+    and the first spill or offload of a run logs its warning from there; the
+    per-op cost below needs observability on.
 
     The policy computes both the metrics and the scope they cover, because
     the baselines they are differenced against belong with the client whose
@@ -450,6 +456,10 @@ def _log_data_plane_metrics_impl(
     rollout actor (registered via ``add_data_plane_snapshot_source``), so
     ``kv_first_write`` is in these totals.
     """
+    health = backend_health_metrics(backend)
+    if health:
+        prefix, backend_metrics = health
+        logger.log_metrics(backend_metrics, step, prefix=prefix)
     get_metrics = getattr(policy, "get_data_plane_step_metrics", None)
     if not callable(get_metrics):
         return  # not a data-plane policy
@@ -1565,7 +1575,13 @@ def grpo_train_sync(
             # Before the step_finished=True log below, which commits the step:
             # anything logged against a committed step is dropped by wandb, so
             # these series were computed, printed, and silently discarded.
-            _log_data_plane_metrics(policy, logger, total_steps + 1, total_time)
+            _log_data_plane_metrics(
+                policy,
+                logger,
+                total_steps + 1,
+                total_time,
+                master_config.data_plane["backend"],
+            )
             logger.log_metrics(
                 timing_metrics,
                 total_steps + 1,

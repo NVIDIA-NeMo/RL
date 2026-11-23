@@ -3,6 +3,8 @@
 # decode. It compares an uninterrupted reference run with a hard-kill/restore
 # run, where the restored attempt must reuse the exact durable prefix and
 # generate only the remaining suffix before the rollout is finalized/trained.
+# Cut rows always go through the prefix write pipeline and, on TransferQueue,
+# its writer actor; the run checks that both started.
 
 set -eou pipefail
 
@@ -151,9 +153,10 @@ COMMON_OVERRIDES=(
     ++async_rl.stall_watchdog.interval_s=10
     ++async_rl.stall_watchdog.stall_timeout_s=600
     ++async_rl.stall_watchdog.stall_action=abort
-    # Each run dumps its trained rows (train_data_step*.jsonl in its log dir)
+    # Each run dumps its trained rows (train_data_step*.jsonl in its log dir, so the json writer)
     # for the parity comparison.
     ++async_rl.log_full_train_data=true
+    ++async_rl.debug_writer.target=json
     grpo.seed=1234
     grpo.num_prompts_per_step="$NUM_PROMPTS"
     grpo.num_generations_per_prompt="$NUM_GENERATIONS"
@@ -217,6 +220,9 @@ uv run --directory "$PROJECT_ROOT" --no-sync python "$SNAPSHOT_HELPER" select \
 
 stop_phase1
 cp "$BASE_RUN_LOG" "$PHASE1_LOG"
+# The selected snapshot holds cut rows, so they went through these paths.
+grep -q "generation-prefix write pipeline started" "$PHASE1_LOG"
+grep -q "prefix_writer event=ready" "$PHASE1_LOG"
 restore_selected_snapshot "$SELECTION_FILE" "$SELECTED_BACKUP" "$CHECKPOINT_DIR"
 
 # Avoid cutting the replacement request again while verifying that it consumes
@@ -248,6 +254,7 @@ grep -Fq "Selected rollout recovery snapshot: $SNAPSHOT_DIR" "$PHASE2_LOG"
 grep -q "Native TQ checkpoint restored and validated" "$PHASE2_LOG"
 grep -q "Loaded .* unfinished rollout group(s)" "$PHASE2_LOG"
 grep -q "generation prefix restored:" "$PHASE2_LOG"
+grep -q "generation_prefix_read_batch keys=" "$PHASE2_LOG"
 grep -q "train step $PHASE2_STEPS/$PHASE2_STEPS" "$PHASE2_LOG"
 
 uv run --directory "$PROJECT_ROOT" --no-sync tests/json_dump_tb_logs.py \
