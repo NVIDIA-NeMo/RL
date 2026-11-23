@@ -16,7 +16,9 @@ from typing import Optional
 
 import torch
 
-from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.algorithms.loss.interfaces import ObjectiveReduction
+from nemo_rl.algorithms.utils import calculate_kl
+from nemo_rl.utils.tensor_ops import masked_max, masked_mean, masked_min
 
 
 def materialize_scalar_metrics(
@@ -105,9 +107,6 @@ def clipped_pg_diagnostic_metrics(
         global_normalization_factor=global_valid_toks,
     )
 
-    valid_mask = mask.bool()
-    inf = torch.full_like(ratios, float("inf"))
-    neg_inf = torch.full_like(ratios, float("-inf"))
     return {
         "probs_ratio": masked_mean(
             ratios, mask, global_normalization_factor=global_valid_toks
@@ -115,12 +114,10 @@ def clipped_pg_diagnostic_metrics(
         "probs_ratio_clamped": masked_mean(
             ratios_clamped, mask, global_normalization_factor=global_valid_toks
         ),
-        "probs_ratio_min": torch.where(valid_mask, ratios, inf).min(),
-        "probs_ratio_max": torch.where(valid_mask, ratios, neg_inf).max(),
-        "probs_ratio_clamped_min": torch.where(valid_mask, ratios_clamped, inf).min(),
-        "probs_ratio_clamped_max": torch.where(
-            valid_mask, ratios_clamped, neg_inf
-        ).max(),
+        "probs_ratio_min": masked_min(ratios, mask),
+        "probs_ratio_max": masked_max(ratios, mask),
+        "probs_ratio_clamped_min": masked_min(ratios_clamped, mask),
+        "probs_ratio_clamped_max": masked_max(ratios_clamped, mask),
         "gen_kl_error": gen_kl_error,
         "policy_kl_error": policy_kl_error,
         "js_divergence_error": js_divergence_error,
@@ -137,8 +134,7 @@ def clipped_pg_actor_objective(
     mask: torch.Tensor,
     sample_mask: torch.Tensor,
     importance_weights: Optional[torch.Tensor],
-    global_valid_toks: torch.Tensor,
-    global_valid_seqs: torch.Tensor,
+    objective_denominator: torch.Tensor,
     ratio_clip_min: float,
     ratio_clip_max: float,
     ratio_clip_c: float,
@@ -146,7 +142,8 @@ def clipped_pg_actor_objective(
     force_on_policy_ratio: bool,
     sequence_level_importance_ratios: bool,
     use_cispo: bool,
-    token_level_loss: bool,
+    reduction: ObjectiveReduction,
+    per_response_weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute and reduce the actor objective in one compilable region."""
     if force_on_policy_ratio:
@@ -181,14 +178,12 @@ def clipped_pg_actor_objective(
     actor_values = (
         clip_loss if importance_weights is None else importance_weights * clip_loss
     )
-    if token_level_loss:
-        actor_loss = masked_mean(
-            actor_values, mask, global_normalization_factor=global_valid_toks
-        )
-    else:
-        actor_loss = masked_mean(
-            masked_mean(actor_values, token_mask, dim=-1),
-            sample_mask,
-            global_normalization_factor=global_valid_seqs,
-        )
+    actor_loss = reduction.reduce(
+        actor_values,
+        token_mask=token_mask,
+        sample_mask=sample_mask,
+        mask=mask,
+        denominator=objective_denominator,
+        per_response_weights=per_response_weights,
+    )
     return actor_loss, ratios, ratios_clamped

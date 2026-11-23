@@ -102,7 +102,7 @@ def main():
         config = OmegaConf.merge(config, override_conf)
 
     config = OmegaConf.to_container(config, resolve=True)
-    config = MasterConfig(**config)
+    config = MasterConfig.model_validate(config)
     print("Applied CLI overrides")
 
     # Print config

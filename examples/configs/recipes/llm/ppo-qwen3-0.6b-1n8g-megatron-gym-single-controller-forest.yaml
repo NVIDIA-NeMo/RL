@@ -13,7 +13,6 @@ loss_fn:
 checkpointing:
   enabled: true
   checkpoint_dir: results/ppo-qwen3-0.6b-1n8g-megatron-gym-single-controller-forest
-  metric_name: val:accuracy
   keep_top_k: 3
   checkpoint_must_save_by: 00:03:30:00
 policy:

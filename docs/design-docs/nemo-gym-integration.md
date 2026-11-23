@@ -113,7 +113,7 @@ NeMo RL passes `task_input` to the Environment Server unchanged and sends the po
 
 Rollout metrics for these rows are named after the taskset instead of an agent, for example `openmathreasoning/truncation_rate`.
 
-Taskset names are also the keys for per-environment settings. For materialized rows, use `task_id.taskset` as the key in `on_policy_distillation.teacher_model_by_agent_name`, `grpo.length_penalty.agent_overrides`, and `rollout_recovery.task_source_target_level_overrides`. Length and recovery overrides may be sparse: unmatched tasksets keep the configured defaults. Teacher selection uses `default_teacher_alias` when configured, unless `strict_agent_name_match` requires an explicit match. Recovery ignores agent overrides for materialized rows; flat rows retain agent-over-task-source precedence.
+Taskset names are also the keys for per-environment settings. For materialized rows, use `task_id.taskset` as the key in `on_policy_distillation.teacher_model_by_agent_name`, `grpo.length_penalty.agent_overrides`, `grpo.agent_overrides`, and `rollout_recovery.task_source_target_level_overrides`. Length, GRPO and recovery overrides may be sparse: unmatched tasksets keep the configured defaults. Teacher selection uses `default_teacher_alias` when configured, unless `strict_agent_name_match` requires an explicit match. Recovery ignores agent overrides for materialized rows; flat rows retain agent-over-task-source precedence.
 
 Set these keys in a YAML file, where a key such as `weather:train` needs no quoting. A Hydra command-line override cannot express a key that contains `:`: `++rollout_recovery.task_source_target_level_overrides.weather:train=prompt_group` fails to parse, and `{weather:train: prompt_group}` is read as the key `weather`.
 

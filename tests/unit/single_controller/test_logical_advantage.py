@@ -31,8 +31,9 @@ from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
-from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.grpo import AgentOverrideConfig, GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
@@ -187,6 +188,9 @@ def _controller(
         opd_full_enabled=False,
         message_level_advantage_penalties_enabled=ctrl._message_level_advantage_penalties_enabled,
         shardable=True,
+        objective_reduction=make_objective_reduction(
+            ctrl._master_config.loss_fn.resolved_normalization
+        ),
         train_data_dump_dir=None,
     )
     ctrl._advantage_computer = AdvantageComputer(
@@ -684,6 +688,50 @@ def test_overlong_filter_flag_is_respected_for_all_owner_segments(filtering):
     assert data["sample_mask"].tolist() == ([0, 0, 1] if filtering else [1, 1, 1])
 
 
+def test_agent_overrides_apply_to_whole_forest_owners():
+    """grpo.agent_overrides on Forest owners: each group comes out as a run with
+    its agent's settings run-wide, and a truncated segment drops its whole owner
+    only for the agent that filters."""
+
+    def run(overlong: bool, normalize: bool, overrides=None):
+        meta, data = _batch(
+            [
+                ("a", [(0.0, 2), (1.0, 2), (3.0, 1)]),
+                ("b", [(0.0, 1), (2.0, 1), (5.0, 1)]),
+            ]
+        )
+        for tag in meta.tags:
+            tag["agent_name"] = "graded" if tag["dispatch_group_id"] == "a" else "other"
+        data["truncated"][1] = True  # second segment of owner a_g0
+        data["truncated"][6] = True  # owner b_g1
+        grpo = {
+            "overlong_filtering": overlong,
+            "adv_estimator": AdvEstimatorConfig(
+                normalize_rewards=normalize, use_leave_one_out_baseline=False
+            ),
+            "agent_overrides": overrides,
+        }
+        asyncio.run(_controller(meta, data, grpo=grpo)._advantage_stage(meta))
+        return data["advantages"], data["sample_mask"]
+
+    mixed_adv, mixed_mask = run(
+        False,
+        True,
+        {
+            "graded": AgentOverrideConfig(
+                overlong_filtering=True, normalize_rewards=False
+            )
+        },
+    )
+    graded_adv, graded_mask = run(True, False)
+    other_adv, other_mask = run(False, True)
+    torch.testing.assert_close(mixed_adv[:5], graded_adv[:5])
+    torch.testing.assert_close(mixed_mask[:5], graded_mask[:5])
+    torch.testing.assert_close(mixed_adv[5:], other_adv[5:])
+    torch.testing.assert_close(mixed_mask[5:], other_mask[5:])
+    assert mixed_mask.tolist() == [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+
 @pytest.mark.parametrize("filter_field", ["sample_mask", "mask_sample", "truncated"])
 @pytest.mark.parametrize("ordinary", [False, True])
 def test_masked_owner_is_excluded_from_baseline_and_loss(filter_field, ordinary):
@@ -862,6 +910,7 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
         ({"invalid_tool_call_advantage": -5.0}, {}),
         ({"malformed_thinking_advantage": 0.0}, {}),
         ({}, {"token_level_loss": False}),
+        ({}, {"normalization": "sequence_mean"}),
         ({}, {"sequence_level_importance_ratios": True}),
         ({}, {"truncated_importance_sampling_type": "seq-mask-tis"}),
         ({}, {"use_kl_in_reward": True}),
@@ -901,6 +950,9 @@ def _ppo_controller(meta, data, **gae):
         message_level_advantage_penalties_enabled=False,
         opd_full_enabled=False,
         shardable=False,
+        objective_reduction=make_objective_reduction(
+            ctrl._master_config.loss_fn.resolved_normalization
+        ),
         train_data_dump_dir=None,
     )
     ctrl._advantage_computer = AdvantageComputer(

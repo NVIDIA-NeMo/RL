@@ -24,7 +24,7 @@ import time
 import types
 import warnings
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -56,6 +56,7 @@ from nemo_rl.models.generation.interfaces import (
     sampler_replay_enabled,
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
+from nemo_rl.models.generation.prefix_recovery.write_pipeline import PREFIX_WRITE_LIMITS
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS,
@@ -1793,9 +1794,13 @@ def _generation_cut_route(
     worker, _, app = _setup_fake_vllm_app(monkeypatch)
     cuts = []
 
-    def checkpoint_cut(inventory, *, deadline):
+    def submit(inventory, *, deadline):
         cuts.append((inventory, deadline))
-        return types.SimpleNamespace(model_dump=lambda mode: {"acked": inventory})
+        receipt: Future = Future()
+        receipt.set_result(
+            types.SimpleNamespace(model_dump=lambda mode: {"acked": inventory})
+        )
+        return receipt
 
     if enabled:
         recovery = PrefixRecovery(
@@ -1812,9 +1817,14 @@ def _generation_cut_route(
                 prefix_row_extras=lambda state: None,
                 router_replay=False,
                 sampler_top_k=0,
+                prefix_write_max_rows=256,
+                prefix_write_max_tokens=4_194_304,
+                prefix_read_max_rows=256,
+                write_limits=PREFIX_WRITE_LIMITS,
             )
         )
-        recovery.checkpoint_cut = checkpoint_cut
+        # Every cut goes through the write pipeline; record what it is handed.
+        recovery._pipeline.submit = submit
         worker._prefix_recovery = recovery
     else:
         worker._prefix_recovery = NoPrefixRecovery()
@@ -3351,7 +3361,7 @@ def _dynamo_master_config(
     ("settings", "error"),
     [
         ({}, None),
-        ({"router": True}, "routes the whole fleet behind one URL"),
+        ({"router": True}, "each of which routes to the whole fleet"),
         ({"fleet_health": True}, "Disable fleet health"),
         # Gym's replies need the engine's tokenizer; NeMo RL's rollouts do not.
         ({"gym": True, "skip_tokenizer_init": True}, "skip_tokenizer_init"),
@@ -3460,7 +3470,7 @@ def test_vllm_dynamo_rollouts_go_through_the_frontend(monkeypatch):
         "_pad_token_id": 0,
         "vllm_cfg": {"max_model_len": 16},
     }
-    generation.dynamo_frontend_url = "http://frontend/v1"
+    generation.dynamo_frontend_urls = ("http://frontend-0/v1", "http://frontend-1/v1")
     data = BatchedDataDict(
         {
             "input_ids": torch.tensor([[5, 6, 0]]),
@@ -3471,13 +3481,18 @@ def test_vllm_dynamo_rollouts_go_through_the_frontend(monkeypatch):
     # The frontend request carries token IDs only, so media prompts stay native.
     media = BatchedDataDict({**data, "vllm_content": [None]})
     assert generation._dynamo_serves(data) and not generation._dynamo_serves(media)
-    # NeMo-Gym is pointed at the frontend too.
-    assert generation.client_base_urls == ["http://frontend/v1"]
+    # NeMo-Gym is pointed at every frontend.
+    assert generation.client_base_urls == [
+        "http://frontend-0/v1",
+        "http://frontend-1/v1",
+    ]
 
     _, output = asyncio.run(anext(generation.generate_async(data, greedy=True)))
 
     ((url, payload, timeout_s),) = requests
-    assert (url, timeout_s) == ("http://frontend/v1/completions", None)
+    # A rollout goes to one of them.
+    assert url in {f"{base}/completions" for base in generation.dynamo_frontend_urls}
+    assert timeout_s is None
     # The unpadded prompt; the engine samples it from the generation config, and
     # the frontend's own stop rules never end the stream before the engine does.
     assert payload["prompt"] == [5, 6]

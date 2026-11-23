@@ -1466,7 +1466,7 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
         patch.object(runner, "load_config", return_value=master_config.model_dump()),
         patch.object(runner, "parse_hydra_overrides", side_effect=lambda cfg, _: cfg),
         patch.object(runner, "OmegaConf") as mock_omegaconf,
-        patch.object(runner, "MasterConfig", return_value=master_config),
+        patch.object(runner.MasterConfig, "model_validate", return_value=master_config),
         patch.object(runner, "get_next_experiment_dir", return_value="/tmp/logs/exp"),
         patch.object(runner, "get_tokenizer", return_value=tokenizer),
         patch.object(
