@@ -29,6 +29,7 @@ from nemo_rl.data.multimodal_utils import (
     CACHED_VIDEO_FRAME_MANIFEST_MAGIC,
     CACHED_VIDEO_FRAME_MANIFEST_MIME,
 )
+from nemo_rl.models.generation.vllm.config import VllmConfig, resolve_vllm_video_config
 
 VideoSamplingStyle = Literal["nemotron_vl"]
 
@@ -516,6 +517,21 @@ def _load_video_frames_torchcodec_with_metadata(
         sampling_style=sampling_style,
     )
     return frames, metadata
+
+
+def register_vllm_video_loader(generation_config: VllmConfig) -> None:
+    """Register NeMo RL's video loader when ``vllm_cfg.video`` is set.
+
+    Called by every process that decodes the videos of chat calls: the vLLM
+    engine, and with Dynamo the frontend's render workers, whose pixels the
+    engine then runs.
+    """
+    video_config = resolve_vllm_video_config(generation_config)
+    if video_config is not None:
+        register_torchcodec_vllm_video_loader(
+            sampling_style=video_config.sampling_style,
+            temporal_patch_size=video_config.temporal_patch_size,
+        )
 
 
 def register_torchcodec_vllm_video_loader(

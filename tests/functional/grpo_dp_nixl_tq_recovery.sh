@@ -1,6 +1,6 @@
 #!/bin/bash
-# Run native TQ recovery with the nixl backend. Pass nixl_ssd to turn the
-# units' SSD tier on.
+# Run native TQ recovery with the nixl backend. The units' SSD tier is on by
+# default; pass nixl_ssd for a put area so small that every step spills.
 
 set -eou pipefail
 
@@ -18,7 +18,26 @@ if ! rdma_device_available; then
     exit 0
 fi
 
-# HPC-X's NCCL net plugin breaks NIXL's UCX (docs/design-docs/nixl-data-plane.md).
-export NCCL_NET_PLUGIN=${NCCL_NET_PLUGIN:-none}
+# This two-GPU case stays on one node; clients and CPU units need the same RoCE rail.
+# Leave explicit selections and InfiniBand jobs alone, including diagnostic "all".
+if [[ -z "${UCX_NET_DEVICES:-}" ]]; then
+    PROJECT_ROOT=$(realpath "$SCRIPT_DIR/../..")
+    UCX_DEVICE=$(cd "$PROJECT_ROOT" && uv run --no-sync python - <<'PYDEVICE'
+from nemo_rl.data_plane.adapters.transfer_queue_env import fabric_is_roce_only, rdma_rails
+
+if fabric_is_roce_only():
+    rails = rdma_rails()
+    if not rails:
+        raise RuntimeError("No active fabric rail for the NIXL recovery test")
+    print(f"{rails[0]}:1")
+PYDEVICE
+    )
+    if [[ -n "$UCX_DEVICE" ]]; then
+        ibv_devinfo -d "${UCX_DEVICE%:*}" -i "${UCX_DEVICE##*:}" \
+            || echo "[WARN] ibv_devinfo failed for $UCX_DEVICE" >&2
+        export UCX_NET_DEVICES="$UCX_DEVICE"
+        echo "NIXL recovery test: UCX_NET_DEVICES=$UCX_NET_DEVICES"
+    fi
+fi
 
 exec bash "$SCRIPT_DIR/grpo_dp_single_controller_tq_recovery.sh" "${1:-nixl}"

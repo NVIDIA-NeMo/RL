@@ -126,7 +126,9 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
 )
-from nemo_rl.models.generation.dynamo.config import dynamo_enabled
+from nemo_rl.models.generation.dynamo.config import (
+    dynamo_enabled,
+)
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -495,12 +497,6 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         return False
 
     generation_config = master_config.policy["generation"]
-    if dynamo_enabled(generation_config):
-        raise ValueError(
-            "policy.generation.dynamo=true does not serve NeMo-Gym rollouts yet. "
-            "Set policy.generation.dynamo=false to run this NeMo-Gym config on "
-            "NeMo RL's vLLM servers."
-        )
     assert should_use_async_rollouts(generation_config), (
         "❌ Error: In order to use NeMo-Gym, you must use a generation "
         "backend with `async_engine: true`!"
@@ -817,9 +813,11 @@ def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
         return "vllm_worker"
     if generation_backend == "megatron":
         return "megatron_worker"
+    if generation_backend == "dynamo":
+        return "dynamo_worker"
     raise ValueError(
         "token_capture.enabled requires setup-derived generation_backend to be "
-        f"'vllm' or 'megatron'; got {generation_backend!r}"
+        f"'vllm', 'megatron' or 'dynamo'; got {generation_backend!r}"
     )
 
 
@@ -1246,6 +1244,7 @@ class NemoGym(EnvironmentInterface):
         self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
+        from nemo_gym.config import MODEL_CALL_SAMPLING_BLOCK
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import (
             HEAD_SERVER_KEY_NAME,
@@ -1347,6 +1346,38 @@ Depending on your data shape, you may want to change these values."""
             "port": self.head_server_port,
         }
 
+        # Gym applies each row's _ng_model_sampling to these servers' calls and
+        # refuses one without them: policy_model, servers that _copy it, and any
+        # the recipe lists. Resources servers keep their own sampling.
+        sampling_block = dict(
+            initial_global_config_dict.get(MODEL_CALL_SAMPLING_BLOCK) or {}
+        )
+        required = [_POLICY_SERVER_NAME] + [
+            name
+            for name, block in initial_global_config_dict.items()
+            if isinstance(block, Mapping) and block.get("_copy") == _POLICY_SERVER_NAME
+        ]
+        for name in sampling_block.get("required_model_servers") or []:
+            if name not in required:
+                required.append(name)
+        initial_global_config_dict[MODEL_CALL_SAMPLING_BLOCK] = {
+            **sampling_block,
+            "required_model_servers": required,
+        }
+        policy_model_server = (
+            (initial_global_config_dict.get(_POLICY_SERVER_NAME) or {})
+            .get("responses_api_models", {})
+            .get("vllm_model", {})
+        )
+        if policy_model_server.get("sampling_overrides"):
+            raise ValueError(
+                f"env.nemo_gym.{_POLICY_SERVER_NAME} sets sampling_overrides, but the "
+                "agent NeMo-RL trains samples with policy.generation: temperature and "
+                "top_p, val_temperature and val_top_p for validation, and "
+                "max_new_tokens. Remove sampling_overrides; to pin an untrained "
+                "agent such as a judge, give it a model server of its own."
+            )
+
         # Ledger-authoritative token capture: enable external staging in the
         # policy model server (via the policy_model global-config override
         # block the env yamls already use) and disable the legacy token echo.
@@ -1367,7 +1398,8 @@ Depending on your data shape, you may want to change these values."""
             )
             policy_overrides["return_token_id_information"] = False
             if (
-                _external_staging_backend(token_capture) == "vllm_worker"
+                _external_staging_backend(token_capture)
+                in ("vllm_worker", "dynamo_worker")
                 and token_capture.get("top_logprobs", 0) > 0
             ):
                 policy_overrides.setdefault("sampling_overrides", {}).update(
@@ -2965,6 +2997,12 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
 
+    if dynamo_enabled(generation_config):
+        # Gym's policy model calls the Dynamo frontend in Gym's Dynamo dialect.
+        # Each actor applies it to its own composed config (_apply_dynamo_dialect),
+        # so it never becomes a policy_model overlay that a shard must claim.
+        config.env.setdefault("nemo_gym", {})["dynamo_dialect"] = True
+
     # For VLM runs, plumb the tokenizer config into the gym env config so the
     # NemoGym actor can reconstruct the processor inside itself (needed for
     # multi-turn multimodal postprocessing).
@@ -3046,6 +3084,42 @@ def build_nemo_gym_config(
     )
 
 
+def _apply_dynamo_dialect(nemo_gym_dict: dict[str, Any], *, frontends: int) -> None:
+    """Point Gym's `policy_model` server in one NemoGym actor's config at the Dynamo frontend.
+
+    The frontend takes token data in nvext instead of vLLM's request extensions.
+    With more than one frontend, Gym moves a failing frontend's sessions to the others.
+    Applied to the actor's composed config (a shard's overrides included), so
+    settings the user wrote there win. Sets ``policy_model`` on ``nemo_gym_dict``
+    in place, so pass a per-actor copy; the nested policy_model levels are
+    copied, so dicts shared with the user's config are not mutated.
+    """
+    policy_model = dict(nemo_gym_dict.get("policy_model") or {})
+    models = dict(policy_model.get("responses_api_models") or {})
+    vllm_model = dict(models.get("vllm_model") or {})
+    # Gym puts the keys of both blocks on every request as top-level fields.
+    for block in ("extra_body", "sampling_overrides"):
+        fields = vllm_model.get(block) or {}
+        if "bad_words" in fields:
+            raise ValueError(
+                f"vllm_model.{block}.bad_words is not supported with "
+                "policy.generation.dynamo=true: the Dynamo frontend answers every "
+                "request carrying it with HTTP 400."
+            )
+    vllm_model["dynamo_frontend"] = True
+    # The frontend reads `reasoning` as another name for `reasoning_content` and
+    # refuses an echoed assistant turn that carries both, Gym's default.
+    vllm_model.setdefault("reasoning_field", "reasoning_content")
+    if frontends > 1:
+        # Nothing restarts a dead frontend, and Gym retries a refused connection
+        # without limit by default: the calls of its sessions would never return.
+        vllm_model.setdefault("route_around_failing_endpoints", True)
+        vllm_model.setdefault("endpoint_connection_retry_timeout_s", 60.0)
+    models["vllm_model"] = vllm_model
+    policy_model["responses_api_models"] = models
+    nemo_gym_dict["policy_model"] = policy_model
+
+
 def _build_gym_actor_config(
     nemo_gym_dict: dict[str, Any],
     *,
@@ -3093,6 +3167,8 @@ def _build_gym_actor_config(
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    if nemo_gym_dict.pop("dynamo_dialect", False):
+        _apply_dynamo_dialect(nemo_gym_dict, frontends=len(base_urls))
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
         key: value
@@ -3915,9 +3991,25 @@ def spinup_nemo_gym_actor(
     ).sole_handle()
 
 
+def collect_dataset_agent_names(datasets: Mapping[str, Any]) -> dict[str, set[str]]:
+    """Map each split to the route names its rows reference; needs no shard.
+
+    A split this scan cannot resolve, such as one with taskset rows, whose
+    routes only the running Gym stack knows, is left for the coverage check.
+    """
+    agent_names: dict[str, set[str]] = {}
+    for split, dataset in datasets.items():
+        try:
+            agent_names[split] = _iter_dataset_agent_names(dataset)
+        except ValueError:
+            continue
+    return agent_names
+
+
 def validate_dataset_agent_coverage(
     shard_set: NemoGymShardSet,
     datasets: Mapping[str, Any],
+    agent_names: Optional[Mapping[str, set[str]]] = None,
 ) -> None:
     """Fail at setup if any row names a route no shard hosts.
 
@@ -3938,6 +4030,8 @@ def validate_dataset_agent_coverage(
             built at setup; an unsharded set is asked for its entries here.
         datasets: Split name to dataset, for the error message. ``None`` values
             and datasets without gym rows are skipped.
+        agent_names: ``collect_dataset_agent_names`` of these datasets, if
+            already scanned. Splits it lacks are scanned here.
 
     Raises:
         ShardSetupError: A split references routes no shard hosts.
@@ -3955,15 +4049,18 @@ def validate_dataset_agent_coverage(
             )
         )
     for split, dataset in datasets.items():
-        try:
-            referenced = _iter_dataset_agent_names(
-                dataset,
-                shard_set.environment_server_routes,
-            )
-        except ValueError as error:
-            raise ShardSetupError(
-                f"The {split} dataset failed NeMo-Gym validation: {error}"
-            ) from error
+        if agent_names is not None and split in agent_names:
+            referenced = agent_names[split]
+        else:
+            try:
+                referenced = _iter_dataset_agent_names(
+                    dataset,
+                    shard_set.environment_server_routes,
+                )
+            except ValueError as error:
+                raise ShardSetupError(
+                    f"The {split} dataset failed NeMo-Gym validation: {error}"
+                ) from error
         unhosted = sorted(referenced - hosted)
         if unhosted:
             raise ShardSetupError(

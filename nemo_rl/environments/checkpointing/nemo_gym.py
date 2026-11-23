@@ -28,13 +28,12 @@ import contextlib
 import time
 import uuid
 import warnings
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
-from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.environments.checkpointing.interfaces import RestoredEnvironmentRollouts
 from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointEpisode
 from nemo_rl.environments.gym_checkpoint_coordinator import (
@@ -51,7 +50,6 @@ from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
-    from nemo_rl.data_plane.interfaces import DataPlaneClient
     from nemo_rl.experience.rollout_manager import RolloutManager
     from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
     from nemo_rl.models.generation.interfaces import GenerationInterface
@@ -117,7 +115,6 @@ def build_gym_environment_checkpoint(
     *,
     env_handles: dict[str, Any],
     rollout_manager: RolloutManager,
-    dp_client: DataPlaneClient,
     generation: Optional[GenerationInterface] = None,
 ) -> GymEnvironmentCheckpoint:
     """Build the Gym checkpoint and close Gym dispatch through its admission gate.
@@ -125,16 +122,6 @@ def build_gym_environment_checkpoint(
     ``generation`` is required with prefix recovery: its workers delete ended
     calls' generation chunk rows before each snapshot.
     """
-    staging_partition = master_config.token_capture.staging_partition
-
-    async def list_staging_keys() -> list[str]:
-        return await call_data_plane(
-            dp_client,
-            "list_sample_ids",
-            offload_sync=True,
-            partition_id=staging_partition,
-        )
-
     obsolete_cut_rows: Optional[ObsoleteGenerationCutRows] = None
     if master_config.rollout_recovery.generation_prefix_cuts_enabled:
         if generation is None:
@@ -153,7 +140,6 @@ def build_gym_environment_checkpoint(
         ),
         ledger=rollout_manager.recovery_ledger,
         rollout_manager=rollout_manager,
-        list_staging_keys=list_staging_keys,
         allow_restart_only_servers=(
             master_config.rollout_recovery.allow_restart_only_gym_servers
         ),
@@ -179,7 +165,9 @@ class GymEnvironmentSnapshot:
     def restarted_rollouts(self) -> int:
         return sum(len(episodes) for episodes in self.commit.manifest.restarts.values())
 
-    async def check_against_cut(self, cut: DataPlaneMutationCut) -> frozenset[str]:
+    async def check_against_cut(
+        self, cut: DataPlaneMutationCut, tq_staging_keys: frozenset[str]
+    ) -> frozenset[str]:
         """Require Gym ownership and referenced staging rows to match this cut.
 
         Gym may have exported episodes RL dropped while it was prepared: it
@@ -190,7 +178,8 @@ class GymEnvironmentSnapshot:
 
         Returns the staging rows the saved manifest keeps, which the TQ capture
         must hold. ``commit`` still names the dropped episodes' rows, so callers
-        must use these instead.
+        must use these instead. ``tq_staging_keys`` is TQ's staging listing
+        under ``cut``.
         """
         cut.require_live()
         checkpoint, commit = self.checkpoint, self.commit
@@ -249,10 +238,7 @@ class GymEnvironmentSnapshot:
         expected_staging_keys = frozenset(
             key for keys in staging_keys.values() for key in keys
         )
-        if not expected_staging_keys:
-            return expected_staging_keys
-        actual_staging_keys = set(await checkpoint._list_staging_keys())
-        missing = sorted(expected_staging_keys - actual_staging_keys)
+        missing = sorted(expected_staging_keys - tq_staging_keys)
         if missing:
             raise RuntimeError(
                 "Gym checkpoint references staging rows missing from live TQ state: "
@@ -282,7 +268,6 @@ class GymEnvironmentCheckpoint:
         *,
         ledger: RolloutRecoveryLedger,
         rollout_manager: Any,
-        list_staging_keys: Callable[[], Awaitable[Iterable[str]]],
         allow_restart_only_servers: bool = False,
         obsolete_cut_rows: Optional[ObsoleteGenerationCutRows] = None,
     ) -> None:
@@ -292,8 +277,6 @@ class GymEnvironmentCheckpoint:
             coordinator: Talks to every Gym deployment's checkpoint participants.
             ledger: RL's record of which Gym episodes it owns.
             rollout_manager: Pauses rollout deadlines while Gym is parked.
-            list_staging_keys: Returns the token-capture staging rows TQ holds,
-                to check the ones the committed episodes reference still exist.
             allow_restart_only_servers: Accept Gym servers whose rollouts start
                 over after a crash, with a warning, instead of refusing them.
             obsolete_cut_rows: Deletes ended calls' generation chunk rows
@@ -302,7 +285,6 @@ class GymEnvironmentCheckpoint:
         self.coordinator = coordinator
         self._ledger = ledger
         self._rollout_manager = rollout_manager
-        self._list_staging_keys = list_staging_keys
         self._allow_restart_only_servers = allow_restart_only_servers
         self._obsolete_cut_rows = obsolete_cut_rows
         # Separate from the data-plane barrier: it pauses only Gym /run
