@@ -173,7 +173,16 @@ COPY --from=nemo-rl . /opt/nemo-rl
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-RUN UV_LINK_MODE=symlink uv sync --locked --inexact $UV_NO_INSTALL_PACKAGES
+RUN <<"EOF" bash -exu
+UV_LINK_MODE=symlink uv sync --locked --inexact $UV_NO_INSTALL_PACKAGES
+# Ray's dashboard serves its static assets (main.js/main.css) with aiohttp's
+# follow_symlinks=False, so the symlinked install above 404s and the dashboard
+# never loads (NVIDIA-NeMo/RL#1476). Reinstall just Ray as real files, after
+# the last uv sync that can touch it: --no-deps keeps the churn to Ray itself.
+RAY_VERSION=$(grep -A1 '^name = "ray"$' uv.lock | grep 'version =' | sed 's/version = "\(.*\)"/\1/')
+test -n "${RAY_VERSION}" || { echo "ray version not found in uv.lock" >&2; exit 1; }
+uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" --link-mode=copy --force-reinstall --no-deps "ray[default]==${RAY_VERSION}"
+EOF
 # NOTICES.txt file points to where the OSS source code is archived
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
