@@ -577,6 +577,10 @@ override-dependencies = [
   # megatron-bridge[ssm] pins mamba-ssm==2.3.1 for its patched Docker sdist build; we build
   # mamba-ssm from the git rev in [tool.uv.sources] instead.
   "mamba-ssm==2.3.2.post1",
+  # flash-linear-attention < 0.6.0 has a non-deterministic chunk_gated_delta_rule
+  # forward on Blackwell (sm100), so Megatron logprob/train passes disagree and GRPO
+  # collapses on GDN models such as Qwen3.5 (#5173, fla-org/flash-linear-attention#1229).
+  "flash-linear-attention>=0.6.0",
   # megatron-core still pins lens v0.2.0 in its own [tool.uv.sources]; without an
   # override the two git URLs are a hard conflict, since the workspace resolves a
   # single nemo-lens. The rev here is lens main past v0.3.0, which we need for
