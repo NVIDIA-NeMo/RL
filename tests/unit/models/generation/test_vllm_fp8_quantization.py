@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.metadata
 import os
 import types
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from typing import Literal
 
 import pytest
 import torch
+from packaging.version import Version
 
 pytestmark = pytest.mark.vllm
 
@@ -2584,11 +2586,14 @@ def test_process_fp8_moe_preserves_storage_and_loaders(
 
     fp8_module.process_weights_after_loading_moe(method, layer)
     if change_layout != "none":
-        # On a layout change vLLM keeps the parameter object and gives it new
-        # storage; later refits must then reuse that storage.
+        # On a layout change vLLM keeps the parameter object; later refits must
+        # then reuse its storage. vLLM 0.33 always rebinds to new storage. From
+        # 0.34 a smaller converted tensor is copied into the existing storage.
+        rebinds_storage = Version(importlib.metadata.version("vllm")) < Version("0.34")
         for name, param in params.items():
             assert getattr(layer, name) is param
-            assert param.data_ptr() != pointers[name]
+            if rebinds_storage:
+                assert param.data_ptr() != pointers[name]
         pointers = {name: param.data_ptr() for name, param in params.items()}
     for _ in range(2):
         fp8_module.process_weights_after_loading_moe(method, layer)
