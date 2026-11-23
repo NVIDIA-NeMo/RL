@@ -27,6 +27,7 @@ policy:
     expert_model_parallel_size: 8
     sequence_parallel: false
   generation:
+    refit_transport: nccl_reshard
     colocated:
       enabled: false
       resources:

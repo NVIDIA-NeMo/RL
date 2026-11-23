@@ -23,6 +23,34 @@ from megatron.core.transformer.moe.moe_utils import (
     reduce_aux_losses_tracker_across_ranks,
 )
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.utils import unwrap_model
+
+from nemo_rl.data.multimodal_utils import (
+    chunks_accept_media_token_validity_mask,
+    media_placeholder_token_id_from_chunks,
+)
+
+
+def _unwrapped_chunks(model: Any) -> list[Any]:
+    """Return model chunks after removing distributed/module wrappers."""
+    unwrapped = unwrap_model(model)
+    return list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+
+
+def model_slices_context_parallel_inputs(model: Any) -> bool:
+    """Whether the model consumes full THD input and slices CP after embedding."""
+    return any(
+        bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
+        for chunk in _unwrapped_chunks(model)
+    )
+
+
+def model_media_placeholder_token_id(model: Any) -> Optional[int]:
+    """Return the media token only when the model explicitly accepts its mask."""
+    chunks = _unwrapped_chunks(model)
+    if not chunks_accept_media_token_validity_mask(chunks):
+        return None
+    return media_placeholder_token_id_from_chunks(chunks)
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
@@ -319,3 +347,54 @@ def get_mtp_metrics(loss_scale: float = 1.0) -> dict[str, Any]:
 
         MTPLossLoggingHelper.clean_metrics_in_tracker()
     return metrics
+
+
+def clear_transient_megatron_caches(model: torch.nn.Module) -> None:
+    """Release GPU tensors that outlive a step and pin memory across an offload.
+
+    - RotaryEmbedding's ``@lru_cache(maxsize=32)`` keeps one GPU sin/cos tensor per
+      unique (max_seq_len, offset, packed_seq). With training and logprob passes at
+      different sequence lengths it fills quickly and anchors large CUDA segments.
+    - MoE token dispatchers are plain Python objects (not ``nn.Module``), reached
+      through the ``token_dispatcher`` attribute of the MoE layers, and keep
+      persistent routing tensors. When the MLP runs under activation recompute,
+      the checkpoint (``te_checkpoint`` under fp8/fp4,
+      ``tensor_parallel.checkpoint`` otherwise) recomputes the forward with grad
+      enabled and stores ``dispatcher.probs`` with a ``grad_fn``, closing a
+      reference cycle ``checkpoint backward -> ctx.run_function=mlp ->
+      mlp.token_dispatcher.probs -> probs.grad_fn -> ...``. Nulling the attributes
+      frees both the routing tensors and the checkpoint context's saved tensors.
+
+    Both steps are best effort: a Megatron version without these attributes is
+    left untouched.
+
+    Args:
+        model: The Megatron model (or model chunk) whose caches are released.
+    """
+    try:
+        from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+            RotaryEmbedding,
+        )
+
+        RotaryEmbedding.forward.cache_clear()
+    except Exception:
+        pass
+
+    try:
+        for module in model.modules():
+            if not hasattr(module, "token_dispatcher"):
+                continue
+            dispatcher = module.token_dispatcher
+            if dispatcher is None:
+                continue
+            for attr in (
+                "probs",  # AllToAll + AllGather
+                "routing_map",  # AllToAll
+                "reversed_local_input_permutation_mapping",  # AllToAll
+                "local_probs",  # AllGather
+                "local_map",  # AllGather
+            ):
+                if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
+                    setattr(dispatcher, attr, None)
+    except Exception:
+        pass

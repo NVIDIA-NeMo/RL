@@ -43,6 +43,10 @@ RAY_CLUSTER_SOURCE_ATTR = "rl.ray.cluster_source"
 RAY_CLUSTER_EXTERNAL = "attached_external"
 RAY_CLUSTER_REUSED_LOCAL = "reused_local"
 RAY_CLUSTER_STARTED_LOCAL = "started_local"
+# See nemo_rl.distributed.ray_worker_setup.
+_WORKER_PROCESS_SETUP_HOOK = (
+    "nemo_rl.distributed.ray_worker_setup.ray_worker_process_setup"
+)
 
 
 class ClusterConfig(BaseModel, extra="allow"):
@@ -150,11 +154,10 @@ def uv_py_executable(extras: Sequence[str]) -> str:
 #                                                 allocation: metadata server, master RPC,
 #                                                 master metrics)
 #   [1202, 1300) SingleController gen. router    (driver-local allocation)
-#   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation)
+#   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation), and the
+#                Dynamo frontends' HTTP endpoints on the generation nodes
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
 #   [3000, 4999) Shared NeMo RL generation range (policy.generation.port_range_low/high)
-#     [3000, 4000) Dynamo frontend/token-wrapper HTTP endpoints
-#     [4000, 4100) Dynamo worker system endpoints (node-local free-port selection)
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
 #   6000         NeMo-Skills sandbox Nginx       (NEMO_SKILLS_SANDBOX_PORT; ray.sub starts one
 #                                                 sidecar per allocated node, driver included)
@@ -173,10 +176,6 @@ DEFAULT_GENERATION_PORT_RANGE_LOW = 3000
 DEFAULT_GENERATION_PORT_RANGE_HIGH = 4999
 DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW = 1313
 DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH = 1400
-DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW = 3000
-DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH = 4000
-DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW = 4000
-DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH = 4100
 DEFAULT_GYM_PORT_RANGE_LOW = 5000
 DEFAULT_GYM_PORT_RANGE_HIGH = 5999
 # vLLM TP/DP rendezvous ports.  Each engine gets PORTS_PER_ENGINE ports starting
@@ -466,6 +465,11 @@ def _init_ray(log_dir: Optional[str] = None) -> str:
 
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
+        # A module path, not the function: Ray rewrites a callable hook's
+        # runtime_env entry to its bare name, so a nested ray.init (vLLM's
+        # EngineCore at TP>1) sees a hook that no longer matches and refuses
+        # to connect.
+        "worker_process_setup_hook": _WORKER_PROCESS_SETUP_HOOK,
     }
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
@@ -1129,6 +1133,16 @@ class RayVirtualCluster:
         )
         return [pg for pg in self._node_placement_groups if pg.bundle_specs]
 
+    def get_node_ids(self) -> list[str]:
+        """The distinct Ray nodes this cluster's placement groups occupy, in order."""
+        return list(
+            dict.fromkeys(
+                node_id
+                for pg in self.get_placement_groups()
+                for node_id in placement_group_table(pg)["bundles_to_node_id"].values()
+            )
+        )
+
     def world_size(self) -> int:
         return self._world_size
 
@@ -1372,3 +1386,27 @@ class RayVirtualCluster:
         user calls shutdown().
         """
         self.shutdown()
+
+
+def reserve_disjoint_clusters(
+    train_cluster: RayVirtualCluster, value_cluster: RayVirtualCluster
+) -> None:
+    """Reserve training clusters and reject overlapping physical nodes."""
+    train_cluster.get_placement_groups()
+    value_cluster.get_placement_groups()
+    train_addresses = {
+        address
+        for address, _ in train_cluster.get_available_addresses_and_ports_batch(
+            [(node_index, 0) for node_index in range(train_cluster.node_count())]
+        )
+    }
+    value_addresses = {
+        address
+        for address, _ in value_cluster.get_available_addresses_and_ports_batch(
+            [(node_index, 0) for node_index in range(value_cluster.node_count())]
+        )
+    }
+    if shared_nodes := train_addresses & value_addresses:
+        raise RuntimeError(
+            f"Dedicated policy and value clusters share physical nodes: {shared_nodes}"
+        )

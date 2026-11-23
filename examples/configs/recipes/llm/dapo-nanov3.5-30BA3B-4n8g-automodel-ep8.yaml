@@ -1,5 +1,5 @@
 defaults: ../../grpo_math_1B.yaml
-# Nano v3.5 (NemotronH + MTP) DAPO-512 on the automodel (DTensor v2) backend.
+# Nano v3.5 (NemotronH + MTP) DAPO-512 on the Automodel backend.
 # The checkpoint's mtp.* tensors / num_nextn_predict_layers=1 are ignored
 # end-to-end with no code changes, provided:
 #   - automodel_cfg.automodel_kwargs.force_hf is NOT set

@@ -1,8 +1,6 @@
 # Direct Preference Optimization in NeMo RL
 
-[Direct Preference Optimization (DPO)](https://arxiv.org/pdf/2305.18290) is an RL-free alignment algorithm that operates on preference data. Given a prompt and a pair of chosen and rejected responses, DPO aims
-to increase the probability of the chosen response and decrease the probability of the rejected response relative to a frozen reference model. The actor is initialized using the reference model. For more details, refer to the
-[DPO paper](https://arxiv.org/pdf/2305.18290).
+[Direct Preference Optimization (DPO)](https://arxiv.org/pdf/2305.18290) is an RL-free alignment algorithm that operates on preference data. Given a prompt and a pair of chosen and rejected responses, DPO aims to increase the probability of the chosen response and decrease the probability of the rejected response relative to a frozen reference model. The actor is initialized using the reference model. For more details, refer to the [DPO paper](https://arxiv.org/pdf/2305.18290).
 
 ## Launch a DPO Run
 
@@ -28,7 +26,7 @@ uv run examples/run_dpo.py \
     logger.wandb.name="dpo-dev-8-gpu"
 ```
 
-**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `hf auth login` as well for Llama models.
 
 ## Datasets
 
@@ -181,12 +179,7 @@ Your JSONL files should contain one JSON object per line with the following stru
 
 ### Custom datasets defined outside NeMo RL
 
-If you want to plug in a preference dataset class that lives outside the
-`nemo_rl` package (so you don't have to edit the built-in registry), set
-`dataset_name` to a fully qualified dotted import path. The dispatcher
-will import the module and resolve the class. The class must accept the
-same kwargs as the built-in datasets (i.e. the full data config) and
-implement `set_task_spec`.
+If you want to plug in a preference dataset class that lives outside the `nemo_rl` package (so you don't have to edit the built-in registry), set `dataset_name` to a fully qualified dotted import path. The dispatcher will import the module and resolve the class. The class must accept the same kwargs as the built-in datasets (i.e. the full data config) and implement `set_task_spec`.
 
 ```yaml
 data:
@@ -194,8 +187,7 @@ data:
     dataset_name: my_pkg.my_module.MyPreferenceDataset  # importable from PYTHONPATH
 ```
 
-The class must be importable — install it as a package or add its
-parent directory to `PYTHONPATH` before launching training.
+The class must be importable — install it as a package or add its parent directory to `PYTHONPATH` before launching training.
 
 Please note:
 - If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.

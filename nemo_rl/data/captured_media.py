@@ -22,13 +22,46 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
+from nemo_rl.experience.route_assembly import verify_route_fragment_integrity
+
 if TYPE_CHECKING:
+    from nemo_rl.data_plane.tq_token_sink import FetchedStagedCall, StagedMediaTensors
     from nemo_rl.models.generation.openai_server_utils import PrefixSplice
+
+# HF processor class name -> media capture family. The driver picks the family
+# from the run's processor and passes it to the serving workers, which only
+# confirm that the engine built the matching processor. This answers a different
+# question from multimodal_utils.uses_image_placeholder (does the processor
+# expand image placeholders in __call__), so the two lists are kept apart.
+#   "omni":    Nemotron VL / Omni (vLLM's dynamic-resolution tiler)
+#   "pixtral": Mistral3 (vLLM's Mistral3 / Pixtral processor)
+_MEDIA_CAPTURE_FAMILY_BY_PROCESSOR: dict[str, str] = {
+    "NemotronNanoVLV2Processor": "omni",
+    "NemotronH_Nano_Omni_Reasoning_V3Processor": "omni",
+    "NemotronH_Omni_Reasoning_V3Processor": "omni",
+    "NemotronH_Super_Omni_Reasoning_V3Processor": "omni",
+    "PixtralProcessor": "pixtral",
+}
+MEDIA_CAPTURE_FAMILIES = frozenset(_MEDIA_CAPTURE_FAMILY_BY_PROCESSOR.values())
+
+
+def media_capture_family(processor: Any) -> str | None:
+    """Return the media capture family for a run's HF processor.
+
+    Args:
+        processor: The run's HF processor.
+
+    Returns:
+        ``"omni"`` or ``"pixtral"``, or ``None`` when token capture cannot stage
+        this processor's media.
+    """
+    return _MEDIA_CAPTURE_FAMILY_BY_PROCESSOR.get(type(processor).__name__)
 
 
 class MediaCaptureRejected(ValueError):
@@ -36,7 +69,7 @@ class MediaCaptureRejected(ValueError):
 
     ``code`` is a stable, machine-readable reason surfaced in the HTTP 400
     body and the worker log. ``retained_media_changed`` marks a retained
-    image or video whose geometry or placeholder tokens differ from the
+    image or video whose geometry, placeholder tokens, or processed pixels differ from the
     staged occurrence (e.g. vLLM re-tiled it under a tighter token budget);
     every other capture-time validation failure uses ``media_capture_rejected``.
     """
@@ -135,10 +168,146 @@ class CapturedMediaItem:
 
 @dataclass(frozen=True)
 class CapturedMedia:
-    """New placeholder metadata and owned tensors for the common staging sink."""
+    """New placeholder metadata and owned tensors for the common staging sink.
+
+    ``tensor_digests`` fingerprints ``tensors`` (see ``media_tensor_digests``)
+    when generation-prefix cuts are on. A media bundle restored from a prefix
+    row carries the staged digests and no tensors.
+    """
 
     items: tuple[CapturedMediaItem, ...]
     tensors: dict[str, torch.Tensor] | None
+    tensor_digests: dict[str, dict[str, Any]] | None = None
+
+
+# Generation-prefix extras key for the call's tensor digests. Prefix rows store
+# these instead of the pixels: a restore reprocesses the media anyway and only
+# has to prove it produced the bytes the interrupted call staged.
+MEDIA_TENSOR_DIGESTS_FIELD = "media_tensor_digests"
+
+
+def media_tensor_digests(
+    tensors: Mapping[str, torch.Tensor] | None,
+) -> dict[str, dict[str, Any]]:
+    """Fingerprint each media tensor by its dtype, shape, and raw bytes."""
+    digests: dict[str, dict[str, Any]] = {}
+    for name, value in sorted((tensors or {}).items()):
+        tensor = value.detach().cpu().contiguous()
+        raw = tensor.reshape(-1).view(torch.uint8).numpy()
+        digests[name] = {
+            "dtype": str(tensor.dtype),
+            "shape": list(tensor.shape),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    return digests
+
+
+def verify_restored_media(captured: CapturedMedia, restored: CapturedMedia) -> None:
+    """Require reprocessed media to match what an interrupted call staged.
+
+    Args:
+        captured: The media just reprocessed from the resumed request.
+        restored: The items and tensor digests read from the call's first
+            generation-prefix row.
+
+    Raises:
+        MediaCaptureRejected: ``retained_media_changed`` when the items or
+            any tensor's dtype, shape, or bytes differ.
+    """
+    current = captured.tensor_digests or {}
+    staged = restored.tensor_digests or {}
+    if captured.items != restored.items or current != staged:
+        # Name what differs, so a rejection can be triaged from the log.
+        changed = sorted(
+            name
+            for name in current.keys() | staged.keys()
+            if current.get(name) != staged.get(name)
+        )
+        raise MediaCaptureRejected(
+            "Restored generation media differs from reprocessed input "
+            f"(items equal: {captured.items == restored.items}; "
+            f"changed tensors: {changed})",
+            code="retained_media_changed",
+        )
+
+
+def verified_media_items(call: FetchedStagedCall) -> tuple[CapturedMediaItem, ...]:
+    """Authenticate a vLLM call's new occurrences before using their layout.
+
+    Token/lineage verification stays with the shared capture verifier. Extras
+    have a separate commitment, including routes when present, which their
+    media consumer must check even when route replay is disabled.
+    """
+    # Gym is optional outside captured-rollout paths.
+    from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+    from nemo_gym.token_id_capture.staging.digest import compute_extras_digest
+
+    snapshot = call.snapshot
+    if call.routed_len:
+        integrity = (
+            call.fragment is not None
+            and verify_route_fragment_integrity(
+                call.fragment,
+                extras_digest_version=snapshot.extras_digest_version,
+                expected_extras_digest=snapshot.extras_digest,
+            )
+            and json.loads(call.fragment.extras_metadata_json) == call.extras
+        )
+    else:
+        integrity = compute_extras_digest(call.extras) == snapshot.extras_digest
+    if not integrity:
+        raise MediaCaptureRejected("Media extras commitment mismatch")
+    spans = (call.extras or {}).get(MEDIA_SPANS_FIELD)
+    if not isinstance(spans, list) or any(
+        not isinstance(value, dict) for value in spans
+    ):
+        raise MediaCaptureRejected("Missing or malformed captured media spans")
+    items = tuple(CapturedMediaItem.from_dict(value) for value in spans)
+    if bool(items) != call.media_present:
+        raise MediaCaptureRejected("Media presence disagrees with captured occurrences")
+    modalities = {item.modality for item in items}
+    if len(modalities) > 1 or call.media_has_frames != (modalities == {"video"}):
+        raise MediaCaptureRejected(
+            "Media frame flags disagree with captured occurrences"
+        )
+    carry_len = next(
+        (i for i, mask in enumerate(snapshot.token_mask_delta) if mask == 1.0),
+        snapshot.delta_len,
+    )
+    prompt_tokens = snapshot.token_ids_delta[:carry_len]
+    previous_end = snapshot.prev_len
+    for item in items:
+        if (
+            item.placeholder_offset < previous_end
+            or item.end > snapshot.prev_len + carry_len
+        ):
+            raise MediaCaptureRejected("Media span lies outside the new carried prompt")
+        if item.modality == "image" and len(item.imgs_sizes) != 1:
+            raise MediaCaptureRejected(
+                "Image occurrence must have exactly one geometry"
+            )
+        item.verify_tokens(prompt_tokens, origin=snapshot.prev_len)
+        previous_end = item.end
+    return items
+
+
+def verify_media_geometry(
+    items: tuple[CapturedMediaItem, ...], media: StagedMediaTensors
+) -> None:
+    """Bind the validated tensor bundle to authenticated occurrence geometry."""
+    sizes = [list(size) for item in items for size in item.imgs_sizes]
+    if media.imgs_sizes.tolist() != sizes:
+        raise MediaCaptureRejected(
+            "Media tensor geometry disagrees with captured occurrences"
+        )
+    expected_frames = [
+        len(item.imgs_sizes) for item in items if item.modality == "video"
+    ]
+    actual_frames = media.num_frames.tolist() if media.num_frames is not None else []
+    if actual_frames != expected_frames:
+        raise MediaCaptureRejected(
+            "Media frame counts disagree with captured occurrences"
+        )
 
 
 @dataclass(frozen=True)
@@ -251,6 +420,38 @@ def _processed_omni_tensors(
     return pack_images(pixels, sizes, patch_size=patch_size), sizes
 
 
+def _processed_pixtral_tensors(
+    data: dict[str, Any],
+    modality: str,
+    *,
+    patch_size: int,
+    pixel_dtype: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack one Pixtral image (vLLM's Mistral3 processor) in Omni's patch layout.
+
+    vLLM's Mistral3 processor keeps one ``pixel_values`` tensor per image,
+    already cropped to the image's processed size, so the geometry is the
+    tensor's own ``[H, W]``. The processor emits float32 and the engine casts
+    to the model dtype inside the vision tower, so the pixels are cast to
+    ``pixel_dtype`` (the staging column's pinned dtype) here instead of being
+    staged in a second dtype. The packed layout is the one
+    ``nemo_rl.data.multimodal_utils._patchify_segments`` produces.
+    """
+    if modality != "image":
+        raise MediaCaptureRejected("Pixtral token capture supports images only")
+    pixels = data.get("pixel_values")
+    if not isinstance(pixels, torch.Tensor) or pixels.ndim != 3 or pixels.shape[0] != 3:
+        raise MediaCaptureRejected(
+            "Pixtral image capture requires processed [3, H, W] pixels"
+        )
+    if pixels.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise MediaCaptureRejected("Unsupported processed pixel dtype")
+    if pixel_dtype is not None and pixels.dtype != pixel_dtype:
+        pixels = pixels.to(pixel_dtype)
+    sizes = torch.tensor([list(pixels.shape[-2:])], dtype=torch.int32)
+    return pack_images(pixels.unsqueeze(0), sizes, patch_size=patch_size), sizes
+
+
 def capture_processed_media(
     engine_prompt: dict[str, Any],
     *,
@@ -259,8 +460,26 @@ def capture_processed_media(
     splice: PrefixSplice | None = None,
     image_token_id: int | None = None,
     patch_size: int | None = None,
+    retained_tensors: tuple[StagedMediaTensors, ...] | None = None,
+    media_family: str = "omni",
+    cast_pixel_dtype: torch.dtype | None = None,
+    spatial_merge_size: int | None = None,
 ) -> CapturedMedia:
-    """Remap vLLM placeholders and snapshot per-call media in Megatron's layout."""
+    """Validate retained media and capture only newly appended occurrences.
+
+    Framework-owned continuations also compare processed tensors with their
+    staged predecessors before reusing them in a shared training segment.
+
+    ``media_family`` is ``"omni"`` (Nemotron Omni dynamic tiler) or
+    ``"pixtral"`` (vLLM's Mistral3 / Pixtral processor). Pixtral images are
+    rows of image tokens, each row ended by a break token and the last by an
+    end token, so an image has one embedding run per row;
+    ``spatial_merge_size`` lets the embedding count be checked against the
+    image geometry. ``cast_pixel_dtype`` (Pixtral only) is the staging
+    column's pinned pixel dtype.
+    """
+    if media_family not in MEDIA_CAPTURE_FAMILIES:
+        raise MediaCaptureRejected(f"Unsupported media family {media_family!r}")
     tokens = engine_prompt["prompt_token_ids"]
     placeholders = engine_prompt.get("mm_placeholders") or {}
     kwargs = engine_prompt.get("mm_kwargs") or {}
@@ -308,7 +527,14 @@ def capture_processed_media(
         previous_end = span.offset + span.length
         data = item.get_data()
         assert patch_size is not None
-        patches, sizes = _processed_omni_tensors(data, modality, patch_size=patch_size)
+        if media_family == "pixtral":
+            patches, sizes = _processed_pixtral_tensors(
+                data, modality, patch_size=patch_size, pixel_dtype=cast_pixel_dtype
+            )
+        else:
+            patches, sizes = _processed_omni_tensors(
+                data, modality, patch_size=patch_size
+            )
         if pixel_dtype is not None and pixel_dtype != patches.dtype:
             raise MediaCaptureRejected("Media tensor dtypes changed within a call")
         pixel_dtype = patches.dtype
@@ -331,7 +557,31 @@ def capture_processed_media(
                 ):
                     raise MediaCaptureRejected("Invalid image embedding mask")
                 positions = span.is_embed.nonzero().flatten().tolist()
-            if not positions or positions != list(
+            if media_family == "pixtral":
+                if image_token_id is None:
+                    raise MediaCaptureRejected(
+                        "Pixtral image capture requires the image token ID"
+                    )
+                if span.is_embed is None:
+                    positions = [
+                        i
+                        for i, token in enumerate(local_tokens)
+                        if token == image_token_id
+                    ]
+                if not positions or local_tokens[positions[0]] != image_token_id:
+                    raise MediaCaptureRejected("Invalid media embedding tokens")
+                if spatial_merge_size is not None:
+                    height, width = (int(v) for v in sizes.reshape(-1, 2)[0].tolist())
+                    cell = patch_size * spatial_merge_size
+                    if (
+                        height % cell
+                        or width % cell
+                        or len(positions) != (height // cell) * (width // cell)
+                    ):
+                        raise MediaCaptureRejected(
+                            "Image embedding count disagrees with the image geometry"
+                        )
+            elif not positions or positions != list(
                 range(positions[0], positions[-1] + 1)
             ):
                 raise MediaCaptureRejected(
@@ -394,8 +644,52 @@ def capture_processed_media(
         raise MediaCaptureRejected("Rendered prefix dropped captured media")
     tensors = None
     if packed:
-        # Retained items come first (sorted by offset, none cross prev_len), so
-        # this call's new media is everything after them.
+        if retained_tensors is not None:
+            assert patch_size is not None
+            full = {
+                "imgs": torch.cat(packed, dim=1),
+                "imgs_sizes": torch.cat(sizes_parts, dim=0),
+            }
+            if occurrences[0][1] == "video":
+                full["num_frames"] = torch.tensor(frame_counts, dtype=torch.int32)
+            # Existing TQ media bundles are ordered along the accepted chain.
+            # Compare without concatenating another copy of historical pixels.
+            offsets = {name: 0 for name in full}
+            for part in retained_tensors:
+                for name, current in full.items():
+                    previous = getattr(part, name)
+                    if previous is None:
+                        raise MediaCaptureRejected(
+                            "Retained media tensor fields changed"
+                        )
+                    axis = 1 if name == "imgs" else 0
+                    length = previous.shape[axis]
+                    start = offsets[name]
+                    actual = current.narrow(axis, start, length).detach().cpu()
+                    if actual.dtype != previous.dtype or not torch.equal(
+                        actual, previous
+                    ):
+                        raise MediaCaptureRejected(
+                            "Retained processed media changed",
+                            code="retained_media_changed",
+                        )
+                    offsets[name] += length
+            frame_count = sum(len(item.imgs_sizes) for item in retained)
+            patch_count = sum(
+                h * w // (patch_size * patch_size)
+                for item in retained
+                for h, w in item.imgs_sizes
+            )
+            if offsets["imgs_sizes"] != frame_count or offsets["imgs"] != patch_count:
+                raise MediaCaptureRejected(
+                    "Retained media tensors do not cover the captured prefix"
+                )
+            if "num_frames" in offsets and offsets["num_frames"] != len(retained):
+                raise MediaCaptureRejected(
+                    "Retained video tensors do not cover the captured prefix"
+                )
+        # Retained occurrences precede all new ones. Reuse the foundation's
+        # per-occurrence slicing rather than infer boundaries from packed data.
         new = slice(len(retained), None)
         if packed[new]:
             delta = {

@@ -108,8 +108,6 @@ from nemo_rl.environments.code_jaccard_environment import CodeJaccardEnvironment
 
 env_config = {
     "num_workers": 2,
-    # Optional default stop strings (unused in scoring but available for consistency)
-    "stop_strings": None,
 }
 
 code_jaccard_env = CodeJaccardEnvironment.remote(env_config)
@@ -117,14 +115,12 @@ code_jaccard_env = CodeJaccardEnvironment.remote(env_config)
 
 ### Configuration
 - `num_workers` (int): Number of parallel verification workers.
-- `stop_strings` (list[str] | None): Optional default stop strings (propagated downstream; not required for scoring).
 
 ### Sample GRPO Config
 ```yaml
 env:
   code_jaccard:
     num_workers: 2
-    stop_strings: null
 data:
   env_name: code_jaccard
 ```
@@ -185,6 +181,30 @@ See [examples/run_grpo.py](../../examples/run_grpo.py) with [examples/configs/gr
 ```bash
 uv run examples/run_grpo.py --config examples/configs/grpo_rm_1B.yaml
 ```
+
+## NeMo Gym Code Generation Sandbox
+
+NeMo Gym's `code_gen` environment runs each candidate program's tests in a fresh OpenSandbox sandbox. Recipes that load `code_gen` also load Gym's OpenSandbox provider config (`nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml`), which reads three variables from the launch environment:
+
+| Variable | Purpose |
+|---|---|
+| `CODE_GEN_SANDBOX_IMAGE` | The `code_gen` verifier image each sandbox runs. Gym's [`code_gen` README](https://github.com/NVIDIA-NeMo/Gym/blob/main/resources_servers/code_gen/README.md) shows how to build it. If unset, `code_gen` stops at startup with `sandbox_config.image is required for code verification`. |
+| `OPENSANDBOX_DOMAIN` | The OpenSandbox endpoint, for example `https://opensandbox.example.com`. If unset, the provider uses an in-cluster address that works only inside the OpenSandbox Kubernetes cluster. |
+| `OPENSANDBOX_API_KEY` | Your OpenSandbox access key. If unset, the config fails to load. Only NeMo Gym reads it, so it stays out of the configuration NeMo RL logs. |
+
+To run without OpenSandbox, for example for a local test, remove the `opensandbox.yaml` entry from `env.nemo_gym.config_paths` and grade `code_gen` with Gym's local provider:
+
+```yaml
+env:
+  nemo_gym:
+    code_gen:
+      resources_servers:
+        code_gen:
+          sandbox_provider: {local: {}}
+          sandbox_config: {image: local}
+```
+
+The local provider runs the model's code directly on the host, without isolation. Use it only for tests.
 
 ## Registering Custom Environments
 

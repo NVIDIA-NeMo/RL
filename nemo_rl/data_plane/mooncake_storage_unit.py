@@ -27,6 +27,7 @@ that into one Ray node ID per unit, round-robin over those nodes.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from collections.abc import Mapping, Sequence
@@ -37,6 +38,7 @@ from ray.util.placement_group import placement_group_table
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
+from nemo_rl.data_plane.adapters import mooncake_ssd_offload
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.interfaces import backend_config, storage_unit_placement
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -46,11 +48,13 @@ logger = logging.getLogger(__name__)
 
 # A unit hard-pinned to a node with no free CPU would otherwise wait forever.
 _UNIT_STARTUP_TIMEOUT_S = 600
+# Teardown deletes a directory; anything slower means the unit is busy.
+_UNIT_CLOSE_TIMEOUT_S = 60.0
 
 
 @ray.remote(num_cpus=1, num_gpus=0, max_restarts=0, max_task_retries=0)
 class MooncakeStorageUnit:  # pragma: no cover
-    """Own a Mooncake segment and serve checkpoint commands; nothing else."""
+    """Own a Mooncake segment; serve checkpoint and teardown commands."""
 
     def __init__(self, dp_config: DataPlaneConfig) -> None:
         self._dp_client = build_data_plane_client(
@@ -58,6 +62,10 @@ class MooncakeStorageUnit:  # pragma: no cover
             bootstrap=False,
             segment_size=backend_config(dp_config).storage_unit_segment_size,
         )
+
+    def close(self) -> None:
+        """End-of-run teardown; see :func:`stop_storage_units`."""
+        mooncake_ssd_offload.remove_dir()
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """Run an owner-local checkpoint command; return metadata, never payloads."""
@@ -169,3 +177,28 @@ def start_storage_units(
             f"{e}. Each unit needs 1 free CPU on its node."
         ) from e
     return units
+
+
+async def stop_storage_units(units: Sequence[Any]) -> None:
+    """Counterpart of :func:`start_storage_units`: run every unit's teardown.
+
+    Ray stops the units with SIGTERM, and Mooncake's SIGTERM handler exits
+    without running Python exit hooks, so a unit cleans up only when asked.
+    Bounded and never raises: teardown must not hang or mask the run's own
+    outcome (a unit still busy with a checkpoint command is skipped).
+    """
+    if not units:
+        return
+    tasks = [asyncio.ensure_future(unit.close.remote()) for unit in units]
+    done, pending = await asyncio.wait(tasks, timeout=_UNIT_CLOSE_TIMEOUT_S)
+    for task in pending:
+        task.cancel()
+    if pending:
+        logger.warning(
+            "%d storage unit(s) did not finish teardown within %ss",
+            len(pending),
+            _UNIT_CLOSE_TIMEOUT_S,
+        )
+    for task in done:
+        if task.exception() is not None:
+            logger.warning("storage-unit teardown failed: %s", task.exception())

@@ -16,10 +16,12 @@
 import os
 from typing import Any, Optional
 
+from nemo_rl.models.generation.vllm.speculator_runtime import SPECULATOR_TYPES
+
 # Speculative methods whose drafter is co-trained by the trainer and refit
 # through the ``draft.*`` weight stream (dspark/dflash block drafters and the
 # eagle3 TTT drafter). MTP is co-trained too but streams without the prefix.
-COTRAINED_SPECULATIVE_METHODS = ("dspark", "dflash", "eagle3")
+COTRAINED_SPECULATIVE_METHODS = SPECULATOR_TYPES
 
 # Env flag that requests disable_draft_module_sharing() at import time in
 # every process that resolves vllm_backend.py (the driver actor and any
@@ -150,7 +152,7 @@ def _draft_owns_speculator(model_runner: Any, method: Optional[str]) -> bool:
         return True
 
 
-def _expected_draft_keys(draft_model: Any, method: str) -> set[str]:
+def _expected_draft_keys(draft_model: Any, method: str, target_model: Any) -> set[str]:
     """Expected incoming ``draft.*`` keys derived from the drafter's layout.
 
     Inverts the drafter ``load_weights`` name handling shared by
@@ -160,16 +162,18 @@ def _expected_draft_keys(draft_model: Any, method: str) -> set[str]:
     ``draft_id_to_target_id``), and fused parameters load from their
     stacked components (qkv_proj <- q/k/v_proj, gate_up_proj <-
     gate/up_proj). Parameters the loader never feeds from the stream (see
-    _DRAFT_SKIPPED_KEY_SUBSTRINGS) are excluded.
+    _DRAFT_SKIPPED_KEY_SUBSTRINGS) are excluded, and so are parameters the
+    drafter shares with the target model, which the target refit updates.
     """
     fused_expansions = {
         "qkv_proj": ("q_proj", "k_proj", "v_proj"),
         "gate_up_proj": ("gate_proj", "up_proj"),
     }
     skipped = _DRAFT_SKIPPED_KEY_SUBSTRINGS[method]
+    target_param_ids = {id(param) for param in target_model.parameters()}
     expected: set[str] = set()
-    for name, _ in draft_model.named_parameters():
-        if any(s in name for s in skipped):
+    for name, param in draft_model.named_parameters():
+        if id(param) in target_param_ids or any(s in name for s in skipped):
             continue
         if name == "draft_id_to_target_id":
             expected.add("draft.d2t")
@@ -236,7 +240,7 @@ def _validate_draft_refit_info(
         # against the vLLM parameter layout only applies to the
         # Automodel full stream.
         return
-    expected = _expected_draft_keys(draft_model, method)
+    expected = _expected_draft_keys(draft_model, method, model_runner.model)
     skipped = _DRAFT_SKIPPED_KEY_SUBSTRINGS[method]
     missing = expected - provided
     unexpected = {

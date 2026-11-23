@@ -40,17 +40,34 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt, model_validator
+from pydantic import (
+    AllowInfNan,
+    BaseModel,
+    Field,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    model_validator,
+)
 from tensordict import TensorDict
 
+from nemo_rl.data_plane.checkpoint import CheckpointCapture
+from nemo_rl.data_plane.local_disk import default_ssd_dir
+
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
+# Default SSD-tier directories, under the node's NVMe (local_disk.default_ssd_dir).
+MOONCAKE_SSD_DIRNAME = "nrl_mooncake_ssd_offload"
+NIXL_SSD_DIRNAME = "nrl_nixl_ssd"
+SIMPLE_SSD_DIRNAME = "nrl_simple_ssd_offload"
 
 
 class SsdOffloadConfig(BaseModel, extra="allow"):
     """TQ SimpleStorage SSD offload: large field values live on node-local SSD.
 
     Each storage unit writes under ``path`` on its own node, so no shared
-    filesystem is needed. Values whose encoded size is ``>= threshold_bytes``
+    filesystem is needed; ``path: null`` is the node's NVMe
+    (``local_disk.default_ssd_dir``, resolved on the driver since TQ creates
+    the directory in its own actor). Values whose encoded size is ``>= threshold_bytes``
     go to SSD; smaller ones stay in host memory. The data is temporary:
     ``tq.close()`` removes it, and a run that dies without closing leaves its
     ``<path>/transfer_queue_ssd_offload/<run_id>`` directory behind.
@@ -61,20 +78,24 @@ class SsdOffloadConfig(BaseModel, extra="allow"):
     """
 
     enabled: bool = False
-    path: str | None = None  # absolute; required when enabled
+    path: str | None = None  # absolute; null: the node's NVMe (dir())
     threshold_bytes: PositiveInt = 1048576  # 1 MiB
 
     @model_validator(mode="after")
-    def _require_absolute_path_when_enabled(self) -> "SsdOffloadConfig":
+    def _require_absolute_path(self) -> "SsdOffloadConfig":
         # Storage actors resolve a relative path against their own cwd, which
         # differs per node/process, so it would not be one node-local dir.
-        if self.enabled and not (self.path and Path(self.path).is_absolute()):
+        if self.path is not None and not Path(self.path).is_absolute():
             raise ValueError(
-                "data_plane.simple.ssd_offload.enabled=true requires "
-                "data_plane.simple.ssd_offload.path to be an absolute "
-                f"node-local SSD directory, got {self.path!r}."
+                "data_plane.simple.ssd_offload.path must be an absolute "
+                "node-local SSD directory, or null for the node's NVMe; got "
+                f"{self.path!r}."
             )
         return self
+
+    def dir(self) -> str:
+        """The offload directory: ``path``, or the NVMe default (picked on the driver)."""
+        return self.path or default_ssd_dir(SIMPLE_SSD_DIRNAME)
 
 
 class SimpleStorageConfig(BaseModel, extra="allow"):
@@ -95,6 +116,59 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
     # placement over every Ray node.
     storage_unit_placement: list[str] | Literal["all"] | None = None
     ssd_offload: SsdOffloadConfig = Field(default_factory=SsdOffloadConfig)
+    # Retain an in-memory cut and persist it after rollout dispatch resumes.
+    async_checkpoint: bool = False
+    # RPC wait budget for each retained-view persist/release operation.
+    checkpoint_io_timeout_s: Annotated[PositiveFloat, AllowInfNan(False)] = 600.0
+
+    @model_validator(mode="after")
+    def _validate_async_checkpoint(self) -> "SimpleStorageConfig":
+        if self.async_checkpoint and self.ssd_offload.enabled:
+            raise ValueError(
+                "SimpleStorage async_checkpoint does not support SSD offload"
+            )
+        return self
+
+
+class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
+    """Mooncake SSD offload: segment owners spill DRAM to node-local SSD.
+
+    Once memory use across all segments passes ``offload_threshold`` (a share
+    of their total), Mooncake moves objects to the SSD of the process owning
+    them, under its own subdirectory of ``path`` (node-local, absolute).
+    Offload runs in every segment owner: the storage units when they are on,
+    otherwise every client with a segment (see
+    ``nemo_rl.data_plane.adapters.mooncake_ssd_offload``).
+    Size ``path`` for about (segment owners on the node) x (peak data
+    offloaded at once): owners delete the files of cleared keys every 30 s.
+    Operation, cleanup and the full-disk data-loss risk are described under
+    "Mooncake SSD offload" in nemo_rl/data_plane/README.md.
+
+    On by default: data stays in memory while there is room and spills only
+    past ``offload_threshold``. The first spill logs a warning, since reads of
+    spilled objects go through the SSD. ``path: null`` (the default) is the
+    node's NVMe: ``/raid/nrl_mooncake_ssd_offload-<uid>`` when the node mounts
+    ``/raid``, else ``/tmp/nrl_mooncake_ssd_offload-<uid>``
+    (``local_disk.default_ssd_dir``). Either must be a disk, not a RAM-backed
+    tmpfs.
+    """
+
+    enabled: bool = True
+    path: str | None = None  # absolute; null: the node's NVMe (dir())
+    offload_threshold: Annotated[float, Field(gt=0, le=1)] = 0.8
+
+    @model_validator(mode="after")
+    def _require_absolute_path(self) -> "MooncakeSsdOffloadConfig":
+        if self.path is not None and not Path(self.path).is_absolute():
+            raise ValueError(
+                "data_plane.mooncake_cpu.ssd_offload.path must be an absolute "
+                f"node-local SSD directory, or null for the node's NVMe; got {self.path!r}."
+            )
+        return self
+
+    def dir(self) -> str:
+        """The offload directory on this node: ``path``, or the NVMe default."""
+        return self.path or default_ssd_dir(MOONCAKE_SSD_DIRNAME)
 
 
 class MooncakeCpuConfig(BaseModel, extra="allow"):
@@ -121,6 +195,17 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     HBM capacity of that buffer per active GDR client. CPU-only clients keep
     using the registered host-buffer path.
 
+    ``gdr_keep_teacher_payload_on_gpu`` only matters for MOPD with
+    ``use_gdr: true``. When true, each teacher keeps what it writes to the data
+    plane on the GPU until the PUT: its logprobs and, with full-vocabulary MOPD,
+    its hidden-state or logits payload. The GDR PUT then copies them GPU to GPU
+    into its staging buffer instead of GPU -> CPU -> GPU. The cost is teacher
+    GPU memory: each teacher holds its share of one prompt group's outputs until
+    the PUT, which for a full-vocabulary payload is tokens x hidden (or
+    vocabulary) size x payload dtype bytes, and briefly about twice that while
+    it is joined and packed. Set it to false to copy them to CPU first, which
+    was the behavior before this option. It is ignored without ``use_gdr``.
+
     Every RDMA rail on the host is offered to mooncake (see ``rdma_devices``).
     That is only safe with ``MC_ENABLE_DEST_DEVICE_AFFINITY=1``, which pins each
     transfer's peer rail to the local one by name; on a rail-isolated RoCE
@@ -139,6 +224,7 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     staging_buffer_size: int = 536870912  # 512 MiB per pool slot
     use_gdr: bool = False
     gdr_staging_buffer_mb: PositiveInt = 1024
+    gdr_keep_teacher_payload_on_gpu: bool = True
     # >0: only CPU MooncakeStorageUnit actors own Mooncake memory (this many
     # bytes each); every other process is a client and off the save path.
     storage_unit_segment_size: NonNegativeInt = 0
@@ -147,6 +233,129 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     # Clusters whose nodes host units: "all" or a list of names (train,
     # inference, teacher:<name>).
     storage_unit_placement: list[str] | Literal["all"] = "all"
+    ssd_offload: MooncakeSsdOffloadConfig = Field(
+        default_factory=MooncakeSsdOffloadConfig
+    )
+
+    def owned_segment_size(self, segment_size: int | None) -> int:
+        """Bytes of Mooncake memory a process owns.
+
+        ``segment_size`` is what the process asked for (a storage unit's size,
+        or 0 for a client that owns nothing); ``None`` takes the controller's
+        default, which is 0 for every client once storage units are on.
+        """
+        if segment_size is not None:
+            return segment_size
+        return 0 if self.storage_unit_segment_size else self.global_segment_size
+
+
+class NixlSsdConfig(BaseModel, extra="forbid"):
+    """SSD tier of the nixl storage units (see ``tq_nixl.ssd_config``).
+
+    A put the unit's put area cannot take goes to a file under ``path``
+    (node-local, absolute) through an IO area of ``staging_bytes`` (default a
+    quarter of ``unit_slab_bytes``) that the unit pins beside its slab, so the
+    put area keeps its configured size: with the tier on a unit holds
+    ``unit_slab_bytes + staging_bytes`` of pinned memory.
+    A spilled put is acknowledged once its bytes are in the IO area; the file
+    write runs behind the ack on the unit's ``io_threads`` file-I/O threads,
+    which also read spilled blobs back. One thread moves about 2.5 GB/s on
+    NVMe, so a workload that spills a large share of every step needs several.
+
+    On by default: a put spills only when the unit's put area is full, and the
+    driver logs a warning at the first spill of a run (reads of spilled blobs
+    wait for the SSD). ``path: null`` (the default) is the node's NVMe:
+    ``/raid/nrl_nixl_ssd-<uid>`` when the node mounts ``/raid``, else
+    ``/tmp/nrl_nixl_ssd-<uid>`` (``local_disk.default_ssd_dir``). Either must
+    be a disk, not a RAM-backed tmpfs.
+    """
+
+    enabled: bool = True
+    path: str | None = None  # absolute; null: the node's NVMe (dir())
+    staging_bytes: PositiveInt | None = (
+        None  # pinned beside the slab; None: unit_slab_bytes // 4
+    )
+    pickup_s: float = 10.0
+    io_threads: PositiveInt = 4
+
+    @model_validator(mode="after")
+    def _require_absolute_path(self) -> "NixlSsdConfig":
+        if self.path is not None and not Path(self.path).is_absolute():
+            raise ValueError(
+                "data_plane.nixl.ssd.path must be an absolute node-local SSD "
+                f"directory, or null for the node's NVMe; got {self.path!r}."
+            )
+        return self
+
+
+class NixlAgentConfig(BaseModel, extra="forbid"):
+    """The NIXL agent every nixl client and unit creates."""
+
+    backend_name: str = "UCX"
+    backend_init_params: dict[str, Any] = Field(default_factory=dict)
+
+
+class NixlStoreConfig(BaseModel, extra="allow"):
+    """Sizing and placement for ``backend="nixl"``. Ignored otherwise.
+
+    The NIXL data plane (``nemo_rl.data_plane.nixl``) is a TransferQueue storage
+    backend. Storage lives in CPU ``NixlStorageUnit`` actors that own one
+    registered DRAM slab each; trainer / vLLM / controller processes are clients
+    that move bytes with one-sided NIXL RDMA and send small control messages
+    (alloc / release) to units over ZMQ. Ray only starts the units.
+
+    Transport: RDMA only. Clients and units refuse to start unless ``UCX_TLS``
+    is an explicit RDMA list (default ``rc,cuda_copy,cuda_ipc,self,sm``, the
+    NIXL refit's list) and ``UCX_NET_DEVICES`` names RDMA devices; NIXL's UCX
+    backend honours those env vars over its own params.
+
+    Unit placement, as in SimpleStorage or the Mooncake storage units:
+    ``storage_unit_placement`` picks the nodes (``all``: every alive GPU node,
+    or a list of clusters, ``train`` / ``inference``); ``num_storage_units``
+    round-robins units over them (``None``: one per node), or
+    ``storage_units_per_node`` puts that many on each of them. One unit per
+    node is enough: a unit's CPU only serves small control calls while RDMA
+    moves the bytes, and 2x the units measured no faster at 86 nodes. With
+    ``numa="auto"`` the k-th unit on a multi-socket node is pinned (CPUs + slab
+    memory) to socket ``k % sockets``; single-socket nodes are unaffected.
+    """
+
+    num_storage_units: PositiveInt | None = None
+    storage_units_per_node: PositiveInt | None = None
+    storage_unit_placement: list[Literal["train", "inference"]] | Literal["all"] = "all"
+    # Explicit unit nodes; when unset, _init_tq resolves storage_unit_placement.
+    node_ids: list[str] | None = None
+    unit_slab_bytes: int = (
+        17179869184  # 16 GiB put area; 20 GiB pinned with the default SSD tier
+    )
+    # A put over this is split at key boundaries; None: a quarter of the put
+    # area (the slab).
+    max_blob_bytes: PositiveInt | None = None
+    numa: Literal["auto", "off"] = "auto"
+    # Client registered-buffer pool: base buffers plus kept-registered oversize ones.
+    client_staging_bytes: int = 1073741824  # 1 GiB per base buffer
+    client_staging_buffers: PositiveInt = 2
+    client_pool_max_bytes: int = 4294967296  # oversize buffers kept registered
+    # Put path: zero-copy (register the caller's memory) inside this window,
+    # parallel copy into a pooled buffer above parallel_copy_min_bytes.
+    zero_copy_min_bytes: int = 1048576
+    zero_copy_max_bytes: int = 33554432
+    parallel_copy_min_bytes: int = 16777216
+    # read_pin_s must be >= transfer_timeout_s + lease_margin_s (checked at
+    # start): a read pins its blobs for read_pin_s.
+    # None: exactly that sum, so raising the transfer timeout raises the pin.
+    read_pin_s: float | None = None
+    transfer_timeout_s: float = 120.0
+    lease_margin_s: float = 30.0
+    # Deadline of one put / get, bounding all of its waits; None: 2x transfer.
+    op_timeout_s: float | None = None
+    # Unfinished NIXL transfers may retain this much memory before the
+    # process refuses further transfers (DataPlaneFatal).
+    graveyard_max_bytes: int = 4294967296
+    # Debug: report non-finite floats and all-False masks on put and get.
+    debug_check_finite: bool = False
+    ssd: NixlSsdConfig = Field(default_factory=NixlSsdConfig)
+    nixl: NixlAgentConfig = Field(default_factory=NixlAgentConfig)
 
 
 class DataPlaneConfig(TypedDict):
@@ -178,16 +387,17 @@ class DataPlaneConfig(TypedDict):
 
     enabled: bool
     impl: Literal["transfer_queue"]
-    backend: Literal["simple", "mooncake_cpu"]
+    backend: Literal["simple", "mooncake_cpu", "nixl"]
     claim_meta_poll_interval_s: float
     simple: NotRequired[SimpleStorageConfig]
     mooncake_cpu: NotRequired[MooncakeCpuConfig]
+    nixl: NotRequired[NixlStoreConfig]
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
 
 
-_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple", "mooncake_cpu"})
+_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple", "mooncake_cpu", "nixl"})
 
 
 def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
@@ -205,6 +415,7 @@ def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
 _BACKEND_MODELS: dict[str, type[BaseModel]] = {
     "simple": SimpleStorageConfig,
     "mooncake_cpu": MooncakeCpuConfig,
+    "nixl": NixlStoreConfig,
 }
 
 
@@ -223,6 +434,11 @@ def backend_config(cfg: DataPlaneConfig) -> Any:
     if isinstance(nested, BaseModel):
         nested = nested.model_dump(exclude_unset=True)
     return _BACKEND_MODELS[backend].model_validate(nested)
+
+
+def gdr_enabled(cfg: DataPlaneConfig) -> bool:
+    """Return whether the selected TransferQueue backend requests GDR."""
+    return cfg["backend"] == "mooncake_cpu" and bool(backend_config(cfg).use_gdr)
 
 
 def storage_unit_placement(cfg: DataPlaneConfig) -> list[str] | Literal["all"] | None:
@@ -465,7 +681,7 @@ class DataPlaneClient(ABC):
 
     The methods are split into three groups by intent. Argument order
     mirrors the underlying ``transfer_queue`` API 1:1 so a future adapter
-    (e.g. ``nv-dataplane``) is a thin pass-through too.
+    (e.g. the NIXL data plane) is a thin pass-through too.
 
     A. *Task-mediated* — used by stages that wait for upstream production
        via the per-task consumer counter:
@@ -618,6 +834,11 @@ class DataPlaneClient(ABC):
         most expensive shape the wire can take. Callers must name what
         they read.
 
+        Every requested field must exist on every requested row, or the
+        backend raises. Callers reading rows that carry different fields
+        (e.g. image and text samples) split the request by row set, as
+        :func:`nemo_rl.data_plane.column_io.fetch_columns` does for media.
+
         Args:
             sample_ids: Uids to fetch.
             partition_id: Partition the samples live in.
@@ -639,8 +860,8 @@ class DataPlaneClient(ABC):
             partition_id: Partition whose stored keys should be listed.
 
         Returns:
-            Stable, sorted sample IDs. An unknown or empty partition returns
-            an empty list.
+            The sample IDs, in no particular order. An unknown or empty
+            partition returns an empty list.
         """
 
     @abstractmethod
@@ -673,6 +894,21 @@ class DataPlaneClient(ABC):
         """
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
+
+    def capture_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> CheckpointCapture | None:
+        """Retain a stable checkpoint view under the caller's mutation barrier.
+
+        The caller may resume mutations before persisting the returned handle,
+        but must release it after writes settle, including on failure. Return
+        None to request the synchronous save_checkpoint path instead. Raise
+        CheckpointReleaseError when a failed capture cannot release its view.
+        """
+        return None
 
     @abstractmethod
     def save_checkpoint(

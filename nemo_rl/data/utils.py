@@ -15,7 +15,6 @@
 import os
 from typing import Any, Callable, Optional, Union, cast
 
-import torch
 import yaml
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -36,6 +35,12 @@ from nemo_rl.data.interfaces import (
 from nemo_rl.data.processors import preference_preprocessor
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
+from nemo_rl.utils.path_utils import (
+    load_checkpoint_object,
+    open_path,
+    path_exists,
+    save_checkpoint_object,
+)
 
 
 def get_train_dataset_name(data_config: DataConfig) -> Optional[str]:
@@ -61,6 +66,22 @@ def get_train_dataset_name(data_config: DataConfig) -> Optional[str]:
     return None
 
 
+def save_dataloader_state(
+    dataloader_state: Any,
+    checkpoint_path: str | os.PathLike[str],
+    suffix: str = "",
+) -> None:
+    """Save a dataloader state to ``{checkpoint_path}/train_dataloader{suffix}.pt``.
+
+    Counterpart of :func:`load_dataloader_state`; works for local paths and
+    ``msc://`` checkpoint locations, so algorithms share one save path.
+    """
+    save_checkpoint_object(
+        dataloader_state,
+        os.path.join(checkpoint_path, f"train_dataloader{suffix}.pt"),
+    )
+
+
 def load_dataloader_state(
     dataloader: Any,
     checkpoint_path: str,
@@ -83,13 +104,13 @@ def load_dataloader_state(
     read out of the sibling ``config.yaml`` so every existing checkpoint is
     automatically compatible.
     """
-    saved_state = torch.load(
+    saved_state = load_checkpoint_object(
         os.path.join(checkpoint_path, f"train_dataloader{suffix}.pt")
     )
 
     config_path = os.path.join(checkpoint_path, "config.yaml")
-    if os.path.exists(config_path):
-        with open(config_path) as f:
+    if path_exists(config_path):
+        with open_path(config_path) as f:
             saved_config = yaml.safe_load(f) or {}
         saved_name = get_train_dataset_name(saved_config.get("data"))
         current_name = get_train_dataset_name(data_config)
