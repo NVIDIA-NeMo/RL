@@ -117,6 +117,7 @@ checkpointing:
   save_period: 10
   checkpoint_must_save_by: null
   save_optimizer: true
+  publish_hooks: []
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"

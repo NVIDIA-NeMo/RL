@@ -31,6 +31,7 @@ checkpointing:
   save_period: 50
   checkpoint_must_save_by: null
   save_optimizer: true
+  publish_hooks: []
 
 policy:
   model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16

@@ -53,8 +53,8 @@ class CheckpointStorage(Protocol):
         """Create and return the directory the checkpoint for ``step`` is written into."""
         ...
 
-    def publish(self, path: str | os.PathLike[str]) -> None:
-        """Make the directory returned by ``begin`` visible to ``published_steps``."""
+    def publish(self, path: str | os.PathLike[str]) -> str:
+        """Make the directory returned by ``begin`` visible to ``published_steps``; return its path."""
         ...
 
     def published_steps(self) -> list[tuple[int, str]]:
@@ -77,7 +77,7 @@ class LocalStorage:
         save_dir.mkdir(parents=True, exist_ok=True)
         return Path(os.path.abspath(save_dir))
 
-    def publish(self, path: str | os.PathLike[str]) -> None:
+    def publish(self, path: str | os.PathLike[str]) -> str:
         """Rename tmp_step_N to step_N.
 
         If step_N already exists (defensive guard for edge cases, e.g. resuming
@@ -95,6 +95,7 @@ class LocalStorage:
                 rmtree(old_path)
         else:
             os.rename(tmp_path, final_path)
+        return str(final_path)
 
     def published_steps(self) -> list[tuple[int, str]]:
         steps = [
@@ -121,10 +122,11 @@ class MscStorage:
         save_dir.mkdir(parents=True, exist_ok=True)
         return str(save_dir)
 
-    def publish(self, path: str | os.PathLike[str]) -> None:
+    def publish(self, path: str | os.PathLike[str]) -> str:
         # Publish only after all worker saves (including async completion) succeed.
         with open_path(str(path) + "/_SUCCESS", "w") as stream:
             json.dump({"version": 1}, stream)
+        return str(path)
 
     def published_steps(self) -> list[tuple[int, str]]:
         # List step prefixes only, then probe each marker, so the cost scales

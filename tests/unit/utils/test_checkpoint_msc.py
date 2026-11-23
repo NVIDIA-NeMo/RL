@@ -96,6 +96,17 @@ def test_failed_async_writer_never_publishes(manager):
     assert manager.get_latest_checkpoint_path() is None
 
 
+def test_publish_hooks_receive_the_msc_uri(manager):
+    published = []
+    manager._publish_hooks = [lambda **kwargs: published.append(kwargs)]
+    checkpoint = manager.init_tmp_checkpoint(1, {"step": 1})
+
+    manager.finalize_checkpoint(checkpoint)
+
+    assert checkpoint.startswith("msc://")
+    assert published == [{"step": 1, "path": checkpoint}]
+
+
 def test_existing_checkpoint_cannot_be_overwritten(manager):
     checkpoint = manager.init_tmp_checkpoint(1, {"step": 1})
     manager.finalize_checkpoint(checkpoint)

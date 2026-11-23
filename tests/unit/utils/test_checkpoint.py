@@ -1448,3 +1448,68 @@ def test_a_non_numeric_staging_name_costs_only_the_span_label(
 
     assert (checkpoint_dir / "step_final").exists()
     assert not staged.exists()
+
+
+published_by_hook: list[dict] = []
+
+
+def _record_publish(**kwargs):
+    published_by_hook.append(kwargs)
+
+
+def _failing_publish(**kwargs):
+    raise RuntimeError("event API down")
+
+
+@pytest.fixture
+def hooked_manager(checkpoint_config):
+    published_by_hook.clear()
+    checkpoint_config.publish_hooks = [f"{__name__}._record_publish"]
+    return CheckpointManager(checkpoint_config)
+
+
+def test_publish_hooks_see_published_step(checkpoint_config, checkpoint_dir):
+    published_by_hook.clear()
+    checkpoint_config.publish_hooks = [
+        f"{__name__}._failing_publish",
+        f"{__name__}._record_publish",
+    ]
+    manager = CheckpointManager(checkpoint_config)
+
+    with pytest.warns(UserWarning, match="event API down"):
+        manager.finalize_checkpoint(manager.init_tmp_checkpoint(1, {}))
+        manager.begin_finalization(manager.init_tmp_checkpoint(2, {}))
+        manager.shutdown()
+
+    assert published_by_hook == [
+        {"step": 1, "path": str(checkpoint_dir / "step_1")},
+        {"step": 2, "path": str(checkpoint_dir / "step_2")},
+    ]
+
+
+def test_publish_hooks_wait_for_async_write(hooked_manager):
+    written = threading.Event()
+    hooked_manager.begin_finalization(
+        hooked_manager.init_tmp_checkpoint(1, {}), wait_fn=written.wait
+    )
+    time.sleep(0.05)
+    assert published_by_hook == []
+
+    written.set()
+    hooked_manager.finalize_pending()
+    assert [hook["step"] for hook in published_by_hook] == [1]
+
+
+@pytest.mark.parametrize("failing", ["write", "publish"])
+def test_publish_hooks_skip_failed_checkpoint(hooked_manager, failing):
+    wait_fn = MagicMock(side_effect=OSError("shard write failed"))
+    if failing == "publish":
+        wait_fn = None
+        hooked_manager._storage.publish = MagicMock(side_effect=OSError("no rename"))
+    hooked_manager.begin_finalization(
+        hooked_manager.init_tmp_checkpoint(1, {}), wait_fn=wait_fn
+    )
+
+    with pytest.raises(RuntimeError, match="finalization failed"):
+        hooked_manager.finalize_pending()
+    assert published_by_hook == []
