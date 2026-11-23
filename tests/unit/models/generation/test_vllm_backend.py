@@ -2104,6 +2104,21 @@ def test_collective_refit_with_preparer_retry_after_failed_reload(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_collective_refit_preparer_wins_over_reload_api_flag(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    preparer = _RecordingPreparer()
+    ext, _, _ = _make_collective_reload_extension(monkeypatch, vllm_backend, preparer)
+    loaded: list[str] = []
+    ext.model_runner.reload_weights = lambda *, weights_iterator, **_: loaded.extend(
+        name for name, _ in weights_iterator
+    )
+
+    assert ext.update_weights_from_collective(refit_with_reload_api=True) is True
+    assert loaded == ["prepared.model.a", "prepared.model.b", "prepared.model.c"]
+
+
+@pytest.mark.vllm
 def test_sparse_delta_refit_rejected_for_native_trtllm_backend():
     from nemo_rl.models.generation.vllm import vllm_backend
 

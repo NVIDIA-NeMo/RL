@@ -99,6 +99,7 @@ uv run examples/run_grpo_single_controller.py \
 
 The recipe trains on 4 nodes and serves rollouts from the other 4. Validation is not available on SingleController yet, so the recipe turns it off.
 The recipe is on-policy (`in_order`, zero lookahead). `in_order` with lookahead 1 and `windowed` with staleness 1 were also run; `ready_first` and `weight_fifo` were not. In-flight rollouts pause across each quantized refit.
+Checkpoint save and resume have not been run on SingleController (the test scripts turn checkpointing off), and neither has vLLM TP>1.
 
 ## Validated Configuration
 
