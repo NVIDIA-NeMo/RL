@@ -124,7 +124,7 @@ FLOPS_TEED_METRICS = (
         TOTAL_FLOPS_KEY,
         "rl.flops.per_step",
         unit="{FLOP}",
-        description="FLOPs in one training step, summed over ranks.",
+        description="FLOPs in one training step's last optimizer epoch, summed over ranks.",
     ),
 )
 

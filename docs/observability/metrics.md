@@ -36,16 +36,18 @@ Each row uses the same key constant as its logging site, so a rename cannot leav
 | `rl.flops.utilization` | ratio, 0–1 | `train_fp_utilization` | the same six loops, when the device's peak is known |
 | `rl.flops.per_step` | FLOP | `total_flops` | SFT v2 and the Single-Controller, which forward the worker's raw per-step count rather than deriving a rate |
 
-The first two are rates over an elapsed time, so they need a denominator. The v1 loops prefer the CUDA-synchronized `train_elapsed_seconds` the Megatron worker records over the driver-side `policy_training` timer, which stops when the Ray future is submitted rather than when the GPU is done — plotting against the driver timer overstates throughput.
+The first two are rates over an elapsed time, so they need a denominator, and the loops do not agree on which one. GRPO, GRPO-sync and PPO prefer the CUDA-synchronized `train_elapsed_seconds` and fall back to the driver-side `policy_training` timer; SFT, DPO and distillation always divide by `policy_training`. Only the Megatron worker reports `train_elapsed_seconds`, so every loop falls back on the other backends. `policy_training` is measured on the driver around the blocking dispatch, so it also covers submission and result collection. Read either as a trend, but do not compare the two series across loops or backends as though they shared a denominator.
 
 `rl.flops.utilization` is the model FLOP utilization: achieved TFLOPS over `get_theoretical_tflops()` for the device and dtype. TF32 and the various reduced precisions have different peaks, so the denominator follows the run's dtype.
+
+`rl.flops.per_step` is the last optimizer epoch's count rather than the step's total. Multi-epoch PPO overwrites the policy result each epoch, so the series undercounts by about `ppo_epochs` — see the `TODO(#2625)` in `nemo_rl/algorithms/single_controller.py`. It is exact at `ppo_epochs = 1`, which covers GRPO and every single-epoch recipe.
 
 ### Gaps are expected, and are not zeros
 
 None of the three is a counter, and a step that produced no number reports nothing rather than zero. Three reasons a step is absent:
 
 - The backend does not track FLOPs, so `total_flops` never reaches the results dict.
-- Sequence packing is on, which makes the v1 loops skip the block entirely (`print_performance_metrics` gates on `not packing_enabled`): the formula bills padded sequence length, which packing is precisely designed to eliminate, so the figure would be wrong rather than merely approximate.
+- Sequence packing is on. The formula bills padded sequence length, which packing exists to eliminate, so the figure would be wrong rather than merely approximate. Two independent guards drop it: `print_performance_metrics` gates on `not packing_enabled` for GRPO, GRPO-sync and PPO, and the Megatron worker skips its FLOP estimate outright, which is the only reason SFT, DPO and distillation stay silent — they carry no gate of their own. The `FLOPTracker` path has no packing check either; no shipped recipe pairs the two today, so nothing guards that combination.
 - The device's theoretical peak is unknown, which drops `rl.flops.utilization` but keeps `rl.flops.per_gpu`.
 
 Treat a gap as "not measured". A dashboard that fills forward or sums across the gap is reading something the run did not claim.
