@@ -23,7 +23,6 @@ from hydra._internal.config_loader_impl import ConfigLoaderImpl
 from hydra.core.override_parser.overrides_parser import OverridesParser
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
-
 if TYPE_CHECKING:
     from nemo_rl.models.generation.vllm.config import VllmConfig
     from nemo_rl.models.policy import PolicyConfig
