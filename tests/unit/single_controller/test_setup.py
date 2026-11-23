@@ -5304,6 +5304,33 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
         mock_gate.assert_called_once()
 
 
+@pytest.mark.parametrize("mode", ["single", "multi", "mixed"])
+def test_mm_coding_capture_setup_accepts_inherited_visual_base(patched_factories, mode):
+    class _ReachedSeedInitialization(Exception):
+        pass
+
+    repo_root = Path(__file__).resolve().parents[3]
+    recipe = repo_root / f"examples/nemo_gym/mm_coding/mm_coding_{mode}.yaml"
+    register_omegaconf_resolvers()
+    config = MasterConfig.model_validate(
+        OmegaConf.to_container(load_config(recipe), resolve=True)
+    )
+    with (
+        patch.object(sc_setup_mod, "media_capture_family", return_value="omni"),
+        patch.object(
+            sc_setup_mod, "set_seed", side_effect=_ReachedSeedInitialization
+        ) as seed,
+        pytest.raises(_ReachedSeedInitialization),
+    ):
+        setup_single_controller(
+            config, MagicMock(pad_token_id=0), processor=MagicMock(name="processor")
+        )
+
+    seed.assert_called_once()
+    patched_factories["setup_response_data"].assert_not_called()
+    patched_factories["_build_clusters"].assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("processor_name", "message"),
     [

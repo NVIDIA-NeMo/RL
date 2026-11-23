@@ -18,7 +18,6 @@ set -euo pipefail
 umask 077
 
 : "${MM_CODING_BASE_CONFIG:?Provide an absolute path to the validated Megatron/vLLM base config}"
-: "${MM_CODING_MAX_NEW_TOKENS:?Set the generation output budget}"
 : "${MM_CODING_TRAIN_DATA:?Provide the training split}"
 : "${MM_CODING_VALIDATION_DATA:?Provide the disjoint validation split}"
 : "${MM_CODING_REFERENCE_ROOT:?Provide the original image root}"

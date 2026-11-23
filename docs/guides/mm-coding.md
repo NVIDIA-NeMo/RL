@@ -28,17 +28,26 @@ Rows carry no output-token limit. Both routes use the run's `policy.generation.m
 
 ## Compose a recipe
 
-Set an absolute path to a validated Megatron/vLLM model recipe. It supplies the model, processor, precision, parallelism, sampling and allocation settings. Choose the matching MM-coding overlay: `mm_coding_single.yaml`, `mm_coding_multi.yaml` or `mm_coding_mixed.yaml` under `examples/nemo_gym/mm_coding/`.
+Set an absolute path to a validated Megatron/vLLM model recipe. It supplies the model, processor, precision, parallelism, sampling and allocation settings. Choose the matching MM-coding overlay: `mm_coding_single.yaml`, `mm_coding_multi.yaml` or `mm_coding_mixed.yaml` under `examples/nemo_gym/mm_coding/`. The overlays set the following length budgets; size the model runtime and allocation for them before launch.
+
+| Budget | Default | Contents |
+| --- | --- | --- |
+| `policy.generation.max_new_tokens` | 32,768 | Maximum output for each model call. |
+| `policy.max_total_sequence_length` | 65,536 | Input, image tokens, retained multi-turn history and output. |
+| `policy.generation.vllm_cfg.max_model_len` | `${policy.max_total_sequence_length}` | The generation server's total context. |
 
 ```bash
 export MM_CODING_BASE_CONFIG=/absolute/path/to/your-megatron-vllm.yaml
 export MM_CODING_TRAIN_DATA=/absolute/path/to/coding/train.jsonl
 export MM_CODING_VALIDATION_DATA=/absolute/path/to/coding/validation.jsonl
 export MM_CODING_REFERENCE_ROOT=/absolute/path/to/coding/assets
-export MM_CODING_MAX_NEW_TOKENS=16384
+# Optional: the recipe uses this output limit when the variable is unset.
+export MM_CODING_MAX_NEW_TOKENS=32768
 ```
 
-The output budget must leave input space within `policy.max_total_sequence_length`. Multi and mixed set OpenCode's context window to that full sequence length and its output limit to `policy.generation.max_new_tokens`. Single allows two images per request; OpenCode allows 32 to retain reference and preview images. The overlays use SingleController token capture and preserve Gym's reward and infrastructure masking behavior.
+The output budget must leave input space within `policy.max_total_sequence_length`. vLLM caps each call's output to the remaining context. Multi and mixed set OpenCode's context window to that full sequence length and its output limit to `policy.generation.max_new_tokens`. A 32,768-token output limit does not guarantee that every call has that much context left. Single allows two images per request; OpenCode allows 32 to retain reference and preview images. The overlays use SingleController token capture, disable multimodal deduplication because captured rows carry their own media, and preserve Gym's reward and infrastructure masking behavior.
+
+Override the native fields on both the preflight and training commands for a different budget. For example, a shorter smoke can use `policy.max_total_sequence_length=16384 policy.generation.max_new_tokens=8192`; the server and OpenCode context limits follow the total sequence length. Passing a short smoke does not validate the default 32,768/65,536-token budget or checkpoint recovery.
 
 ## Install the Gym environment
 

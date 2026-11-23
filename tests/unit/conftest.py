@@ -263,11 +263,11 @@ def _mm_coding_recipe_env() -> Iterator[None]:
             "examples/configs/recipes/vlm",
             "vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml",
         ),
-        "MM_CODING_MAX_NEW_TOKENS": "16384",
         "MM_CODING_TRAIN_DATA": "/path/to/mm-coding-train.jsonl",
         "MM_CODING_VALIDATION_DATA": "/path/to/mm-coding-validation.jsonl",
     }
     with pytest.MonkeyPatch.context() as patcher:
+        patcher.delenv("MM_CODING_MAX_NEW_TOKENS", raising=False)
         for name, value in values.items():
             patcher.setenv(name, value)
         yield

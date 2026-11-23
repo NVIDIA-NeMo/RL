@@ -441,7 +441,12 @@ def test_training_reader_and_processor_preserve_materialized_rows(tmp_path, sele
     [
         ({"policy": {"generation": {"backend": "sglang"}}}, "vLLM generation"),
         (
-            {"policy": {"generation": {"max_new_tokens": 24576}}},
+            {
+                "policy": {
+                    "max_total_sequence_length": 32768,
+                    "generation": {"max_new_tokens": 32768},
+                }
+            },
             "Reserve input context",
         ),
         ({"token_capture": {"enabled": False}}, "token_capture.enabled=true"),
