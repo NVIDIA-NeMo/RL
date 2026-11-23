@@ -30,6 +30,7 @@ from nemo_rl.distributed.virtual_cluster import (
     get_reordered_bundle,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.models.generation.disagg_layout import Role
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -40,6 +41,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.sglang.config import (
     SGLangConfig,
     SGLangFaultToleranceConfig,
+    SglangSpecificArgs,
     disagg_transport_env,
     resolve_sglang_disagg_config,
     resolve_sglang_disagg_layout,
@@ -312,7 +314,10 @@ class SGLangGeneration(GenerationInterface):
             return self.sglang_cfg
         return {
             **self.sglang_cfg,
-            "sglang_cfg": sglang_role_engine_config(self.sglang_cfg, spec.role),
+            "sglang_cfg": cast(
+                SglangSpecificArgs,
+                sglang_role_engine_config(self.sglang_cfg, spec.role),
+            ),
         }
 
     def _engine_groups(self, order: tuple[str, ...]) -> list[list]:
@@ -500,12 +505,14 @@ class SGLangGeneration(GenerationInterface):
         for rank, engine in local_all_engines:
             spec = local_specs[rank]
             router_ip, router_port = self._router_endpoints[spec.router]
-            init_kwargs = dict(
+            init_kwargs: dict[str, Any] = dict(
                 addr_and_ports[rank], router_ip=router_ip, router_port=router_port
             )
             if disaggregated:
                 init_kwargs["disagg_server_kwargs"] = sglang_disagg_server_kwargs(
-                    spec.role, self._pd_cfg, self._bootstrap_ports.get(spec.index)
+                    cast(Role, spec.role),
+                    self._pd_cfg,
+                    self._bootstrap_ports.get(spec.index),
                 )
             init_handles.append(engine.init.remote(**init_kwargs))
         return init_handles, port_cursors

@@ -14,6 +14,7 @@
 
 import ipaddress
 import logging
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import ray
@@ -152,7 +153,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 
 def _allocate_disagg_engine_addr_and_ports(
     *,
-    specs: list["SGLangEngineSpec"],
+    specs: Sequence["SGLangEngineSpec"],
     local_all_engines: list[tuple[int, Any]],
     rank_offset: int = 0,
     sglang_dp_size: int,
