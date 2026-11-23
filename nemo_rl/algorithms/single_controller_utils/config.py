@@ -1993,7 +1993,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         raise ValueError(
             "ModelOpt real-quant rollout is not supported by SingleController: "
             "setup requires policy-first initialization. Use the non-streaming "
-            "GRPO or distillation entrypoint."
+            "GRPO or distillation entrypoint. Tracked in "
+            "https://github.com/NVIDIA-NeMo/RL/issues/5415."
         )
     if master_config.loss_fn.seq_logprob_error_in_loss:
         _validate_seq_logprob_error_in_loss(master_config)
