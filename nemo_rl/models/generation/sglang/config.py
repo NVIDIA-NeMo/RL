@@ -64,7 +64,9 @@ class SglangQuantizationConfig(TypedDict, total=False):
     # Number of decoder layers at each edge to keep in high precision.
     num_layers_at_start_in_bf16: int
     num_layers_at_end_in_bf16: int
+    # Preconverted MXFP8 checkpoint directory visible to every rollout worker.
     converted_model_path: str
+    # Shared directory for MXFP8 checkpoints keyed by local source and precision policy.
     cache_root: str
 
 

@@ -31,6 +31,8 @@
 # turns on <persistent_dir>.lock (stale after 10 min); a busy lock skips the pass,
 # except the last one, which waits up to 2 min. The cached files are content- or
 # hash-addressed, so merging entries from several nodes and jobs is safe.
+# torch.compile's per-rank shape profiles (*/dynamo/code_state_*) are left out:
+# they only fit together, and the Megatron workers save them as complete sets.
 # sidecar runs writeback every interval_s seconds (default 60) and once more after
 # stop_file appears.
 #
@@ -79,7 +81,7 @@ writeback() {
   mark="$(mktemp "${src}.sending.XXXXXX")"
   touch -d "@$(( $(date +%s) - $(min_age) * 60 ))" "${mark}"
   list="$(mktemp)"
-  (cd "${src}" && find . -type f -mmin "+$(min_age)" "${newer[@]}") >"${list}"
+  (cd "${src}" && find . -type f -mmin "+$(min_age)" "${newer[@]}" -not -path '*/dynamo/code_state_*') >"${list}"
   if [[ ! -s "${list}" ]]; then
     mv "${mark}" "${src}.sent"
     rm -f "${list}"

@@ -22,6 +22,7 @@ hour three of a run.
 
 import warnings
 from typing import get_args
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
@@ -38,13 +39,17 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     FleetHealthConfig,
     GenerationRouterConfig,
     MasterConfig,
+    RefitActorConfig,
     RolloutFailureConfig,
     TokenCaptureConfig,
     WatchdogConfig,
     logprob_passes_required,
     validate_single_controller_config,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
+from nemo_rl.algorithms.single_controller_utils.setup import (
+    _build_retry_policy,
+    setup_single_controller,
+)
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
@@ -173,6 +178,40 @@ def test_streaming_uses_the_estimator_batch_requirement(monkeypatch) -> None:
 
     cfg.async_rl.min_groups_for_streaming_train = cfg.grpo.num_prompts_per_step
     validate_single_controller_config(cfg)
+
+
+def test_refit_actor_accepted_with_non_colocated_nccl_refit() -> None:
+    validate_single_controller_config(
+        _master_config(refit_actor=RefitActorConfig(enabled=True))
+    )
+
+
+def test_refit_actor_rejected_with_colocated_generation() -> None:
+    # Megatron is the one backend the SingleController runs colocated.
+    cfg = _master_config(refit_actor=RefitActorConfig(enabled=True))
+    cfg.policy["generation"] = {"backend": "megatron", "colocated": {"enabled": True}}
+    with pytest.raises(ValueError, match="non-colocated"):
+        validate_single_controller_config(cfg)
+
+
+def test_refit_actor_rejected_with_non_nccl_refit_transport() -> None:
+    cfg = _master_config(refit_actor=RefitActorConfig(enabled=True))
+    cfg.policy["generation"]["refit_transport"] = "nixl"
+    with pytest.raises(ValueError, match="NCCL refit transports"):
+        validate_single_controller_config(cfg)
+
+
+def test_group_token_mean_requires_megatron_before_setup() -> None:
+    cfg = _master_config()
+    cfg.loss_fn.normalization = "group_token_mean"
+    cfg.policy["megatron_cfg"] = {"enabled": True}
+    validate_single_controller_config(cfg)
+    cfg.policy["megatron_cfg"]["enabled"] = False
+    # Missing setup fields must not hide this compatibility error.
+    with pytest.raises(
+        ValueError, match="group_token_mean requires SingleController GRPO"
+    ):
+        setup_single_controller(cfg, MagicMock(pad_token_id=0))
 
 
 class TestRolloutFailureValidation:

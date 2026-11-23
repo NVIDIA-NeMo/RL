@@ -41,15 +41,43 @@ class GenerationCutBackend(Protocol):
         ...
 
 
+async def answer_generation_cut(
+    backend: GenerationCutBackend,
+    *,
+    authorization: str | None,
+    inventory: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    """Answer one generation-cut call with its HTTP status and JSON body.
+
+    Shared by every server of the route: the worker's FastAPI app, and the
+    Dynamo frontend's route (``dynamo/vllm/generation_cut.py``). ``inventory`` is
+    the call's JSON body, Gym's ``GenerationCutInventory``.
+    """
+    # Deferred: nemo_gym is an optional extra.
+    from nemo_gym._checkpoint.generation_cut import GenerationCutInventory
+
+    expected = backend.control_token
+    supplied = (
+        authorization.removeprefix("Bearer ")
+        if authorization is not None and authorization.startswith("Bearer ")
+        else ""
+    )
+    if expected is None:
+        return 404, {"detail": "generation-prefix cuts are disabled"}
+    if not secrets.compare_digest(supplied, expected):
+        return 401, {"detail": "invalid control bearer"}
+    receipt = await backend.run_cut(GenerationCutInventory.model_validate(inventory))
+    return 200, receipt.model_dump(mode="json")
+
+
 def register_generation_cut_route(
     app: FastAPI, recovery: Callable[[], GenerationCutBackend]
 ) -> None:
-    """Serve Gym's generation-cut call from the host's cut backend.
+    """Serve Gym's generation-cut call from the worker's prefix recovery.
 
     ``recovery`` returns the worker's current ``PrefixRecovery`` or
-    ``NoPrefixRecovery``, or the Dynamo frontend's fan-out to its engines. It
-    is a callable because the server starts before ``setup_token_capture``
-    builds the recovery object.
+    ``NoPrefixRecovery``. It is a callable because the server starts before
+    ``setup_token_capture`` builds the recovery object.
     """
 
     @app.post(GENERATION_CUT_ROUTE)
@@ -58,21 +86,9 @@ def register_generation_cut_route(
         authorization: str | None = Header(default=None),
     ):
         """Persist one checkpoint's frozen active-call prefixes to TQ."""
-        from nemo_gym._checkpoint.generation_cut import GenerationCutInventory
-
-        current = recovery()
-        expected = current.control_token
-        supplied = (
-            authorization.removeprefix("Bearer ")
-            if authorization is not None and authorization.startswith("Bearer ")
-            else ""
+        status, body = await answer_generation_cut(
+            recovery(), authorization=authorization, inventory=inventory
         )
-        if expected is None:
-            raise HTTPException(
-                status_code=404, detail="generation-prefix cuts are disabled"
-            )
-        if not secrets.compare_digest(supplied, expected):
-            raise HTTPException(status_code=401, detail="invalid control bearer")
-        typed_inventory = GenerationCutInventory.model_validate(inventory)
-        receipt = await current.run_cut(typed_inventory)
-        return receipt.model_dump(mode="json")
+        if status != 200:
+            raise HTTPException(status_code=status, detail=body["detail"])
+        return body

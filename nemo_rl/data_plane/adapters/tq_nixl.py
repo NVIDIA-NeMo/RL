@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import sys
 import threading
@@ -90,6 +91,9 @@ from nemo_rl.data_plane.nixl_storage_unit import NixlStorageUnit, split_key
 
 BACKEND_NAME = "NixlStore"
 DEFAULT_NAMESPACE = "nemo_rl_nixl"
+
+
+log = logging.getLogger(__name__)
 
 
 def _as_dict(cfg: Any) -> dict[str, Any]:
@@ -138,11 +142,15 @@ def check_timeouts(cfg: dict[str, Any]) -> tuple[float, float, float]:
 def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
     """Unit kwargs for the SSD tier, or None when ``ssd.enabled`` is off.
 
-    ``ssd: {enabled, path, staging_bytes, pickup_s}``: when a unit's put area cannot
-    take a put, the put goes to a file under ``path`` (node-local NVMe) from birth,
-    through an IO area of ``staging_bytes`` carved from the slab; reads of such
-    blobs are staged back into the same area. Data already in the put area never
-    moves.
+    ``ssd: {enabled, path, staging_bytes, pickup_s, io_threads}``: when a unit's put area cannot
+    take a put, the put goes to a file under ``path`` (node-local NVMe; null:
+    each unit picks ``/raid`` or ``/tmp`` on its own node, see
+    ``local_disk.default_ssd_dir``) from birth,
+    through an IO area of ``staging_bytes`` the unit pins beside its slab (the
+    put area keeps its configured size; a unit holds ``unit_slab_bytes +
+    staging_bytes``); reads of such blobs are staged back into the same area,
+    by ``io_threads`` file-I/O threads per unit. Data already in the put area
+    never moves.
 
     Contract: data is read roughly oldest first (the ``weight_fifo``,
     ``in_order`` and ``ready_first`` samplers), so the oldest data stays in RAM
@@ -156,10 +164,8 @@ def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
     slab = int(cfg["unit_slab_bytes"])
     staging = int(ssd["staging_bytes"] or slab // 4)
     pickup_s = float(ssd["pickup_s"])
-    if not 0 < staging < slab:
-        raise ValueError(
-            f"NixlStore ssd.staging_bytes={staging} must be in (0, unit_slab_bytes={slab})"
-        )
+    if staging <= 0:
+        raise ValueError(f"NixlStore ssd.staging_bytes={staging} must be > 0")
     if pickup_s < 2 * BUSY_RETRY_MAX_S:
         # A reader polls a pending blob every <= BUSY_RETRY_MAX_S; a staged copy
         # must not become evictable between two of its polls (design §4.2).
@@ -167,9 +173,11 @@ def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
             f"NixlStore ssd.pickup_s={pickup_s} must be >= {2 * BUSY_RETRY_MAX_S}"
         )
     return {
-        "ssd_dir": ssd["path"],
+        "ssd_enabled": True,
+        "ssd_dir": ssd["path"],  # None: each unit picks its node's NVMe
         "staging_bytes": staging,
         "pickup_s": pickup_s,
+        "io_threads": int(ssd["io_threads"]),
     }
 
 
@@ -317,11 +325,11 @@ class NixlKVClient(StorageKVClient):
             cfg["debug_check_finite"] or os.environ.get("NVDP_CHECK_FINITE") == "1"
         )
         ssd = ssd_config(cfg)
-        # A blob is one region of one unit's put area (the slab minus SSD
-        # staging); a put bigger than max_blob_bytes is split at key
-        # boundaries into several blobs, so it fits a unit with room to spare.
+        # A blob is one region of one unit's put area (the slab; the SSD
+        # tier's IO area is pinned beside it); a put bigger than
+        # max_blob_bytes is split at key boundaries into several blobs, so it
+        # fits a unit with room to spare.
         area = int(cfg["unit_slab_bytes"])
-        area -= ssd["staging_bytes"] if ssd else 0
         self.max_blob_bytes = int(cfg["max_blob_bytes"] or area // 4)
         self.store = UnitSlabStore(
             self.ep,
@@ -678,11 +686,30 @@ class NixlKVClient(StorageKVClient):
             self.ep.close()
 
 
+_warned_spill = False  # one warning per driver process, at the first spill
+
+
+def _warn_on_first_spill(metrics: dict[str, float]) -> None:
+    """The first spill means the units' RAM is full: say so once, with the remedy."""
+    global _warned_spill
+    if _warned_spill or metrics["ssd_spills_sum"] == 0:
+        return
+    _warned_spill = True
+    log.warning(
+        "nixl storage units spilled %d blob(s), %.1f MiB, to SSD: their put area "
+        "(data_plane.nixl.unit_slab_bytes) is full, so the data plane is under "
+        "memory pressure. Reads of spilled blobs wait for the SSD. Raise "
+        "unit_slab_bytes or num_storage_units to keep the data in memory.",
+        int(metrics["ssd_spills_sum"]),
+        metrics["ssd_spilled_mb_sum"],
+    )
+
+
 def unit_metrics() -> dict[str, float]:
     """Unit health summed over the units, for the driver to log every step.
 
-    ``retired_mb_sum`` / ``retired_mb_max``, plus ``ssd_spills_sum`` with the
-    SSD tier on. Retired memory is lost to WRITEs that may still land, gone until the unit
+    ``retired_mb_sum`` / ``retired_mb_max``, plus ``ssd_spills_sum`` and
+    ``ssd_spilled_mb_sum`` with the SSD tier on. Retired memory is lost to WRITEs that may still land, gone until the unit
     restarts: a rising line is a slow leak. Read through this process's TQ
     client; ``{}`` when it has no nixl client.
     """
@@ -699,6 +726,10 @@ def unit_metrics() -> dict[str, float]:
     out = {"retired_mb_sum": sum(mb), "retired_mb_max": max(mb, default=0.0)}
     if any("spills" in s for s in stats):  # SSD tier on
         out["ssd_spills_sum"] = float(sum(s.get("spills", 0) for s in stats))
+        out["ssd_spilled_mb_sum"] = (
+            sum(s.get("spilled_bytes", 0) for s in stats) / 2**20
+        )
+        _warn_on_first_spill(out)
     return out
 
 

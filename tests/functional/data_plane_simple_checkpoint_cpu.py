@@ -142,6 +142,11 @@ def exercise(directory: Path) -> dict[str, Any]:
             "TransferQueueController", namespace="transfer_queue"
         )
         put(["a", "b", "c"], [1, 2, 3])
+        # The keys-only listing must name exactly what the tagged KV_LIST names.
+        listed_keys = ray.get(controller.nrl_list_keys.remote("capture-test"))
+        assert sorted(listed_keys) == sorted(
+            tq.kv_list(partition_id="capture-test")["capture-test"]
+        )
         path = directory / "committed"
         captured = capture_simple_checkpoint(
             path, num_storage_units=2, timeout_s=60.0, metadata={"step": 7}

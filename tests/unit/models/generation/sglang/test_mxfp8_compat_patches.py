@@ -14,6 +14,9 @@
 
 """Compat-patch integrity and canonical scale restoration before hot reload."""
 
+import ast
+import shutil
+from importlib.metadata import distribution
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +29,7 @@ from nemo_rl.models.generation.sglang.utils import patches
 @pytest.mark.parametrize(
     "patcher",
     [
+        patches._patch_sglang_qwen_mxfp8_inputs,
         patches._patch_sglang_non_gated_fp8_moe,
         patches._patch_sglang_mxfp8_moe_scale_layout,
         patches._patch_sglang_mxfp8_moe_hidden_size,
@@ -51,6 +55,58 @@ def test_upstream_anchor_drift_does_not_overwrite_files(tmp_path, monkeypatch, p
             path.read_text() == "# Upstream implementation with incompatible anchors.\n"
         )
         assert not list(path.parent.glob("*.tmp"))
+
+
+def test_qwen_mxfp8_cast_preserves_activations_before_quantization(
+    tmp_path, monkeypatch
+):
+    projections = {
+        "qwen3": ("qkv_proj", "hidden_states"),
+        "qwen2": ("gate_up_proj", "x"),
+    }
+    for model, (projection, activation) in projections.items():
+        (tmp_path / f"{model}.py").write_text(
+            f"class Layer:\n    def forward(self, {activation}):\n"
+            "        if (\n"
+            "            should_force_bfloat16_dense_tensor_math()\n"
+            f"            or {activation}.dtype != self.{projection}.weight.dtype\n"
+            "        ):\n"
+            f"            {activation} = {activation}.to(self.{projection}.weight.dtype)\n"
+            f"        return {activation}\n"
+        )
+    monkeypatch.setattr(
+        patches, "_get_sglang_file", lambda path: str(tmp_path / Path(path).name)
+    )
+    patches._patch_sglang_qwen_mxfp8_inputs()
+    for model, (projection, _) in projections.items():
+        scope = {"should_force_bfloat16_dense_tensor_math": lambda: False}
+        exec((tmp_path / f"{model}.py").read_text(), scope)
+        layer = scope["Layer"]()
+        values = torch.tensor([1.0625, 1.1875], dtype=torch.float32)
+        for compute_dtype in (torch.float16, torch.bfloat16):
+            setattr(
+                layer,
+                projection,
+                SimpleNamespace(
+                    weight=SimpleNamespace(dtype=torch.float8_e4m3fn),
+                    params_dtype=compute_dtype,
+                    quant_method=SimpleNamespace(use_mxfp8=True),
+                ),
+            )
+            for inputs in (values, values.to(compute_dtype)):
+                torch.testing.assert_close(
+                    layer.forward(inputs), values.to(compute_dtype)
+                )
+        setattr(
+            layer,
+            projection,
+            SimpleNamespace(
+                weight=SimpleNamespace(dtype=torch.bfloat16),
+                params_dtype=torch.float16,
+                quant_method=SimpleNamespace(),
+            ),
+        )
+        torch.testing.assert_close(layer.forward(values), values.bfloat16())
 
 
 @pytest.mark.parametrize("rows", [33, 128])
@@ -114,3 +170,89 @@ def test_partial_scale_patch_is_rejected_before_write(tmp_path: Path, monkeypatc
         patches._patch_sglang_mxfp8_moe_scale_layout()
 
     assert source.read_text() == original
+
+
+@pytest.mark.sglang
+def test_installed_sglang_patches_preserve_hidden_padding_during_refit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relative_paths = (
+        "srt/models/qwen3.py",
+        "srt/models/qwen2.py",
+        "srt/layers/quantization/fp8.py",
+        "srt/layers/moe/moe_runner/flashinfer_trtllm.py",
+        "srt/layers/moe/fused_moe_triton/layer.py",
+    )
+    files = {}
+    installed_sglang = distribution("sglang")
+    for relative_path in relative_paths:
+        destination = tmp_path / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(
+            installed_sglang.locate_file(f"sglang/{relative_path}"), destination
+        )
+        files[relative_path] = destination
+    monkeypatch.setattr(patches, "_get_sglang_file", lambda path: str(files[path]))
+
+    patchers = (
+        patches._patch_sglang_qwen_mxfp8_inputs,
+        patches._patch_sglang_non_gated_fp8_moe,
+        patches._patch_sglang_mxfp8_moe_scale_layout,
+        patches._patch_sglang_mxfp8_moe_hidden_size,
+    )
+    for patcher in patchers:
+        patcher()
+    patched_sources = {path: path.read_bytes() for path in files.values()}
+    for patcher in patchers:
+        patcher()
+    assert {path: path.read_bytes() for path in files.values()} == patched_sources
+
+    helper_names = {
+        "_pad_mxfp8_moe_hidden_size_for_flashinfer_trtllm",
+        "_narrow_mxfp8_hidden_padding_for_load",
+    }
+    helpers = []
+    for path in files.values():
+        tree = ast.parse(path.read_text())
+        helpers.extend(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        )
+    assert {helper.name for helper in helpers} == helper_names
+    namespace = {"torch": torch, "logger": patches.logger}
+    exec(
+        compile(ast.Module(body=helpers, type_ignores=[]), "<helpers>", "exec"),
+        namespace,
+    )
+
+    original = (
+        torch.full((2, 32, 2688), 0.5, dtype=torch.bfloat16),
+        torch.full((2, 32, 84), 120, dtype=torch.uint8),
+        torch.full((2, 2688, 32), 0.25, dtype=torch.bfloat16),
+        torch.full((2, 2688, 1), 121, dtype=torch.uint8),
+    )
+    pad = namespace["_pad_mxfp8_moe_hidden_size_for_flashinfer_trtllm"]
+    *padded, hidden_size = pad(*original)
+    assert hidden_size == 2816
+    loader = SimpleNamespace(
+        use_flashinfer_trtllm_moe=True, quant_method=SimpleNamespace(use_mxfp8=True)
+    )
+    narrow = namespace["_narrow_mxfp8_hidden_padding_for_load"]
+    for source, target, shard_id in zip(original, padded, ("w1", "w1", "w2", "w2")):
+        pointer = target.data_ptr()
+        for value in (2, 3):
+            loaded = torch.full_like(source[0], value)
+            view, loaded = narrow(loader, target[0], loaded, shard_id)
+            view.copy_(loaded)
+            assert target.data_ptr() == pointer
+            torch.testing.assert_close(view, loaded, rtol=0, atol=0)
+            padding = (
+                target[0, :, source.shape[2] :]
+                if shard_id == "w1"
+                else target[0, source.shape[1] :, :]
+            )
+            assert torch.all(padding == (1 if source.dtype == torch.uint8 else 0))
+        torch.testing.assert_close(
+            target[1, : source.shape[1], : source.shape[2]], source[1], rtol=0, atol=0
+        )

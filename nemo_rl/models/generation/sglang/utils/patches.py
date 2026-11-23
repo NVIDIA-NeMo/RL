@@ -109,6 +109,40 @@ def _patch_sglang_transformers_compat_bootstrap() -> None:
     logger.info("Patched Transformers compatibility bootstrap in %s.", file_to_patch)
 
 
+def _patch_sglang_qwen_mxfp8_inputs() -> None:
+    """Keep Qwen activations in the compute dtype until FlashInfer quantizes them.
+
+    SGLang 3003d70f casts Qwen3 attention and its shared Qwen2 MLP input
+    to the projection weight dtype. A serialized MXFP8 weight stores FP8
+    values, while the activation quantizer requires FP16 or BF16 inputs.
+    """
+    for model, projection, activation in (
+        ("qwen3", "self.qkv_proj", "hidden_states"),
+        ("qwen2", "self.gate_up_proj", "x"),
+    ):
+        path = _get_sglang_file(f"srt/models/{model}.py")
+        with open(path) as f:
+            content = f.read()
+        guard = (
+            "        if (\n"
+            "            should_force_bfloat16_dense_tensor_math()\n"
+            f"            or {activation}.dtype != {projection}.weight.dtype\n"
+            "        ):\n"
+        )
+        replacement = (
+            f'        if getattr({projection}.quant_method, "use_mxfp8", False):\n'
+            f"            {activation} = {activation}.to({projection}.params_dtype)\n"
+            + guard.replace("if (", "elif (", 1)
+        )
+        if replacement in content:
+            continue
+        if content.count(guard) != 1:
+            raise RuntimeError(
+                f"SGLang MXFP8 activation cast anchor mismatch in {path}"
+            )
+        _write_and_verify(path, content.replace(guard, replacement, 1), replacement)
+
+
 def _patch_sglang_non_gated_fp8_moe() -> None:
     """Backport sglang#36097 for MXFP8/NVFP4 non-gated MoE models.
 
@@ -978,6 +1012,7 @@ def _apply_sglang_compat_patches() -> None:
     # Keep while nemo_rl.transformers_compat installs any patch; the torch-FX helper outlives Transformers 5.13.
     _patch_sglang_transformers_compat_bootstrap()
     _patch_sglang_safe_unpickler()
+    _patch_sglang_qwen_mxfp8_inputs()
     _patch_sglang_non_gated_fp8_moe()
     _patch_sglang_mxfp8_moe_scale_layout()
     _patch_sglang_mxfp8_moe_hidden_size()

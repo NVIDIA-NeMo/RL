@@ -21,8 +21,8 @@ from typing import Any
 import pytest
 
 from nemo_rl.models.generation.sglang.mxfp8_setup import (
-    _hash_qualified_save_dir,
     ensure_mxfp8_checkpoint,
+    mxfp8_cache_path,
 )
 
 
@@ -168,27 +168,26 @@ def test_cache_path_changes_with_skip_policy_and_is_stable(tmp_path: Path) -> No
     _write_json(source / "config.json", {"num_hidden_layers": 2})
     cache_root = tmp_path / "cache"
     first_policy = {
+        "cache_root": str(cache_root),
         "scheme": "mxfp8",
         "extra_high_precision_layers_hf": ["model.layers.0.mlp"],
     }
     second_policy = {
+        "cache_root": str(cache_root),
         "scheme": "mxfp8",
         "extra_high_precision_layers_hf": ["model.layers.1.mlp"],
     }
 
-    first = _hash_qualified_save_dir(
+    first = mxfp8_cache_path(
         model_dir=str(source),
-        cache_root=str(cache_root),
         quantization_cfg=first_policy,
     )
-    first_again = _hash_qualified_save_dir(
+    first_again = mxfp8_cache_path(
         model_dir=str(source),
-        cache_root=str(cache_root),
         quantization_cfg=first_policy,
     )
-    second = _hash_qualified_save_dir(
+    second = mxfp8_cache_path(
         model_dir=str(source),
-        cache_root=str(cache_root),
         quantization_cfg=second_policy,
     )
 
@@ -206,9 +205,8 @@ def test_identical_policy_reuses_preconverted_cache(tmp_path: Path) -> None:
         "cache_root": str(cache_root),
     }
     checkpoint = Path(
-        _hash_qualified_save_dir(
+        mxfp8_cache_path(
             model_dir=str(source),
-            cache_root=str(cache_root),
             quantization_cfg=config,
         )
     )
@@ -223,9 +221,17 @@ def test_identical_policy_reuses_preconverted_cache(tmp_path: Path) -> None:
         model_path=str(source),
         quantization_cfg=dict(config),
     )
+    linked_source = tmp_path / "source-link"
+    linked_source.symlink_to(source, target_is_directory=True)
     second = ensure_mxfp8_checkpoint(
-        model_path=str(source),
-        quantization_cfg=dict(config),
+        model_path=str(linked_source),
+        quantization_cfg={
+            **config,
+            "extra_high_precision_layers_hf": [],
+            "modules_to_not_convert": [],
+            "num_layers_at_start_in_bf16": 0,
+            "num_layers_at_end_in_bf16": 0,
+        },
     )
 
     assert first == second == str(checkpoint)
