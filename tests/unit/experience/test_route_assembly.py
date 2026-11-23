@@ -23,9 +23,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-pytest.importorskip("nemo_gym.token_id_capture.staging")
+pytest.importorskip("nemo_gym.models.token_capture.staging")
 
-from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
+from nemo_gym.models.token_capture.staging.digest import (  # noqa: E402
     EXTRAS_DIGEST_VERSION,
     compute_extras_digest,
 )

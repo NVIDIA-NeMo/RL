@@ -31,7 +31,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
+nemo_gym = pytest.importorskip("nemo_gym.models.token_capture.staging")
 
 # The request-metadata keys the Megatron chat endpoint writes for the prompt
 # preparer; the tests below play that endpoint.
@@ -41,10 +41,10 @@ from megatron.core.inference.inference_request import (  # noqa: E402
     PREFIX_MEDIA_COUNT_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
 )
-from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
+from nemo_gym.models.token_capture.staging.protocols import (  # noqa: E402
     StagingSink as TokenSinkProtocol,
 )
-from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
+from nemo_gym.models.token_capture.staging.protocols import (  # noqa: E402
     StagingSource as TokenSourceProtocol,
 )
 
@@ -98,7 +98,7 @@ def test_gym_staging_package_is_importable_in_the_nemo_gym_lane():
     """The --nemo-gym-only lane installs the extra; a missing staging package
     means the Gym pin moved off the capture branch and every capture test
     below has silently degraded to a skip."""
-    import nemo_gym.token_id_capture.staging  # noqa: F401
+    import nemo_gym.models.token_capture.staging  # noqa: F401
 
 
 class _RecordingClient:
@@ -381,7 +381,7 @@ def test_tq_sink_source_passes_gym_golden_vectors():
     fixtures; this catches drift in Gym's digest scheme that
     token_capture_test_fixtures.py cannot, since it computes its expected
     digests by calling Gym's own digest functions."""
-    from nemo_gym.token_id_capture.staging.conformance import assert_golden_vectors
+    from nemo_gym.models.token_capture.staging.conformance import assert_golden_vectors
 
     assert_golden_vectors()
 
@@ -457,7 +457,7 @@ def test_fetch_for_finalization_is_small_typed_and_identity_preserving(
     assert fetched[0].routed_len == 0
     assert fetched[0].fragment is None
     # The snapshot is a normally validated base model, never model_construct'd.
-    from nemo_gym.token_id_capture.staging.records import StagedCallBaseSnapshot
+    from nemo_gym.models.token_capture.staging.records import StagedCallBaseSnapshot
 
     assert type(fetched[0].snapshot) is StagedCallBaseSnapshot
     assert not hasattr(fetched[0].snapshot, "extras")
@@ -1335,7 +1335,7 @@ def test_fetch_prefix_chains_counts_media_items_from_columns(
         "num_frames": torch.tensor([3], dtype=torch.int32),
     }
     # Stage three roots through Gym's capture core: one still, one text, one video.
-    from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
+    from nemo_gym.models.token_capture.staging.capture import RolloutTokenCapture
 
     capture = RolloutTokenCapture(sink=sink, weight_version_fn=lambda: 0)
     for call_id, media in (("c1", still), ("c2", None), ("c3", video)):

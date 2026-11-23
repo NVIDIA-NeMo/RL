@@ -29,7 +29,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from nemo_gym.token_id_capture.staging.records import CallRecord
+    from nemo_gym.models.token_capture.staging.records import CallRecord
 
 type SelectionPolicy = Callable[
     [list[CallRecord], dict[str, Any]], tuple[list[CallRecord], str | None]
@@ -41,7 +41,7 @@ def _output_items(
 ) -> tuple[list[dict[str, Any]], dict[int, str | None]]:
     """Normalize ordinary output, retaining envelope boundaries and identities."""
     # Gym is optional; resolving policies must also work in non-Gym config tools.
-    from nemo_gym.responses_converter import _RESPONSE_OUTPUT_BOUNDARY_TYPES
+    from nemo_gym.models.chat_completions_converter import _RESPONSE_OUTPUT_BOUNDARY_TYPES
 
     responses = result.get("responses") or [result.get("response") or {}]
     sessions = {(r.get("metadata") or {}).get("session_id") for r in responses}
@@ -113,7 +113,7 @@ def select_captured_calls(
     exponential search over possible transcript interpretations.
     """
     # Defer the optional Gym dependency until the policy is executed.
-    from nemo_gym.token_id_capture.completion import output_item_fingerprint
+    from nemo_gym.models.token_capture.completion import output_item_fingerprint
 
     by_response: dict[str, CallRecord] = {r.response_id: r for r in records}
     by_call: dict[str, CallRecord] = {r.model_call_id: r for r in records}
@@ -286,7 +286,7 @@ def select_all_captured(
 ) -> tuple[list[CallRecord], str | None]:
     """Include all calls except unusable, unscored leaves, retaining attribution."""
     # Defer the optional Gym dependency until the policy is executed.
-    from nemo_gym.token_id_capture.staging import resolve_terminal
+    from nemo_gym.models.token_capture.staging import resolve_terminal
 
     attribution = resolve_terminal(
         records,

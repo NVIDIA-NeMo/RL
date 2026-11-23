@@ -311,7 +311,7 @@ def _prepare_materialized_nemo_gym_rows(
     taskset without inspecting the Environment Server's agents.
     """
     # Gym is an optional worker dependency, unavailable in the training driver.
-    from nemo_gym.episode_types import TaskId
+    from nemo_gym.core.episode_types import TaskId
     from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
 
     for row in rows:
@@ -384,7 +384,7 @@ def _normalize_nemo_gym_episode_result(
         return reply
 
     # Gym is only installed in the rollout worker's optional environment.
-    from nemo_gym.episode_types import BaseEpisodeResponse, EpisodeFailure
+    from nemo_gym.core.episode_types import BaseEpisodeResponse, EpisodeFailure
     from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
 
     # Environment protocols may extend EpisodeFailure (single_agent_turn adds
@@ -629,11 +629,11 @@ def _gym_failure_row_error(
     # optional extra that rows which ran must not need.
     if "_ng_failure_class" not in result:
         return None
-    from nemo_gym._checkpoint.errors import AdmissionClosedError
+    from nemo_gym.server_runtime._checkpoint.errors import AdmissionClosedError
 
     # Gym's own set, private but part of the row format this already reads, so a
     # class Gym adds there is not mistaken for a row that ran.
-    from nemo_gym.rollout_collection import (
+    from nemo_gym.rollouts.rollout_collection import (
         _NO_RESULT_FAILURE_CLASSES,
         ENVIRONMENT_SERVER_FAILURE_CLASS,
         NG_FAILURE_CLASS_KEY,
@@ -1245,8 +1245,8 @@ class NemoGym(EnvironmentInterface):
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.config import MODEL_CALL_SAMPLING_BLOCK
-        from nemo_gym.rollout_collection import RolloutCollectionHelper
-        from nemo_gym.server_utils import (
+        from nemo_gym.rollouts.rollout_collection import RolloutCollectionHelper
+        from nemo_gym.server_runtime.base_server import (
             HEAD_SERVER_KEY_NAME,
             BaseServerConfig,
             ServerClient,
@@ -1417,7 +1417,7 @@ Depending on your data shape, you may want to change these values."""
                 # per-rollout capture ledger. Every uvicorn worker builds its
                 # own handle over the same root, so token-in ancestry remains
                 # valid when consecutive calls land on different workers.
-                "lineage_store": ("nemo_gym.token_id_capture.lineage:FileLineageStore"),
+                "lineage_store": ("nemo_gym.models.token_capture.lineage:FileLineageStore"),
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
                 "external_staging_backend": _external_staging_backend(token_capture),
@@ -1509,7 +1509,7 @@ Depending on your data shape, you may want to change these values."""
     def _control_client(self):
         """Gym ServerClient resolving servers by name from the head server."""
         if self._server_client is None:
-            from nemo_gym.server_utils import ServerClient
+            from nemo_gym.server_runtime.base_server import ServerClient
 
             self._server_client = ServerClient.load_from_global_config(
                 self.head_server_config
@@ -1692,7 +1692,7 @@ Depending on your data shape, you may want to change these values."""
                 "list_entries() needs a running Gym stack; call _spinup() first."
             )
 
-        from nemo_gym.global_config import get_global_config_dict
+        from nemo_gym.config.global_config import get_global_config_dict
         from omegaconf import DictConfig
 
         resolved = get_global_config_dict()
@@ -1730,7 +1730,7 @@ Depending on your data shape, you may want to change these values."""
             return dict(self._environment_server_routes)
 
         # Gym is installed only in the actor's runtime environment.
-        from nemo_gym.global_config import get_global_config_dict
+        from nemo_gym.config.global_config import get_global_config_dict
 
         resolved = get_global_config_dict()
         routes = resolved.get("environment_server_routes")
@@ -2152,9 +2152,9 @@ Depending on your data shape, you may want to change these values."""
     async def _postprocess_captured_history(self, row: dict, result: dict) -> dict:
         """Select capture paths while retaining the scored terminal's identity."""
         # Optional Gym dependencies remain confined to the Gym adapter.
+        from nemo_gym.models.token_capture import UNCOMMITTED_CALL_REASON
+        from nemo_gym.models.token_capture.staging.records import RolloutManifest
         from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
-        from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
-        from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
         from nemo_rl.environments.call_selection import resolve_selection_policy
         from nemo_rl.experience.rollout_reassembler import (
@@ -2356,10 +2356,10 @@ Depending on your data shape, you may want to change these values."""
         from cleanup ownership.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
-        from nemo_gym.token_id_capture.staging import resolve_terminal
-        from nemo_gym.token_id_capture.staging.records import CallRecord
-        from nemo_gym.token_id_capture.staging.terminal import select_terminal_call
+        from nemo_gym.models.token_capture import UNCOMMITTED_CALL_REASON
+        from nemo_gym.models.token_capture.staging import resolve_terminal
+        from nemo_gym.models.token_capture.staging.records import CallRecord
+        from nemo_gym.models.token_capture.staging.terminal import select_terminal_call
 
         records = [dict(record) for record in manifest.get("records") or []]
         failures = list(manifest.get("failures") or [])

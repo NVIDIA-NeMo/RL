@@ -27,7 +27,7 @@ import torch
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+from nemo_gym.models.token_capture.staging.records import RolloutReceipt
 
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler

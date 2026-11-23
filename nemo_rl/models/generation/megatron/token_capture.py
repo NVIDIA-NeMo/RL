@@ -201,8 +201,8 @@ class TQMegatronPromptPreparer:
         if offload_params is None:
             return RequestPromptPreparationResult(prompt=prompt)
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture import NG_CAPTURE_FIELD
-        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+        from nemo_gym.models.token_capture import NG_CAPTURE_FIELD
+        from nemo_gym.models.token_capture.staging.records import CaptureAdmission
 
         capture_payload = offload_params.get(NG_CAPTURE_FIELD)
         if capture_payload is None:
@@ -457,10 +457,10 @@ class TQMegatronTokenStager:
         expected_route_dims: tuple[int, int] | None = None,
     ) -> None:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture.adapters.megatron import (
+        from nemo_gym.models.token_capture.adapters.megatron import (
             MegatronCaptureAdapter,
         )
-        from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
+        from nemo_gym.models.token_capture.staging.capture import RolloutTokenCapture
 
         # Gym's adapter validates the offloaded payload's prompt/generated ids
         # and log probs; _stage_admitted reads them through it.
@@ -536,7 +536,7 @@ class TQMegatronTokenStager:
         if not isinstance(uid, str) or not uid:
             raise ValueError("MInf request UID must be a non-empty string")
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture import NG_CAPTURE_FIELD
+        from nemo_gym.models.token_capture import NG_CAPTURE_FIELD
 
         capture_payload = (offload_params or {}).get(NG_CAPTURE_FIELD)
         if capture_payload is None:
@@ -544,7 +544,7 @@ class TQMegatronTokenStager:
         call = None
         try:
             # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-            from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+            from nemo_gym.models.token_capture.staging.records import CaptureAdmission
 
             admission = CaptureAdmission.model_validate(capture_payload)
             call = self._capture.begin_call(
@@ -645,7 +645,7 @@ class TQMegatronTokenStager:
         from megatron.core.inference.inference_request import (
             RequestPayloadStageResult,
         )
-        from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD
+        from nemo_gym.models.token_capture import NG_COMMIT_COORDS_FIELD
 
         return RequestPayloadStageResult(
             response_metadata={

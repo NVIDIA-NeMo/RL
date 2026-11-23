@@ -210,7 +210,7 @@ def pytest_collection_modifyitems(config, items):
     if run_nemo_gym_only:
         # Validate that nemo_gym is available
         try:
-            from nemo_gym import config_types  # noqa: F401
+            from nemo_gym.config import config_types  # noqa: F401
         except ImportError:
             raise ImportError(
                 "Cannot run nemo_gym tests: nemo_gym is not available.\n"

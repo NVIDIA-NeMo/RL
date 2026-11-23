@@ -50,7 +50,7 @@ pytestmark = pytest.mark.nemo_gym
 @pytest.mark.parametrize("gym_attempt", [0, 1, 17])
 def test_rollout_capture_key_matches_gym_episode_identity(gym_attempt: int) -> None:
     """Fail loudly if the string form RL gives a Gym episode drifts from Gym's codec."""
-    from nemo_gym.episode_types import EpisodeId
+    from nemo_gym.core.episode_types import EpisodeId
 
     group = PromptGroupRecoveryRecord(
         group_id="group-7",
@@ -173,7 +173,7 @@ class _NoResourceSessions:
 
 
 def _stateless_resources() -> dict[str, Any]:
-    from nemo_gym._checkpoint.resources import ResourcesParticipant
+    from nemo_gym.server_runtime._checkpoint.resources import ResourcesParticipant
 
     return {"tools": ResourcesParticipant(_NoResourceSessions(), "stateless")}
 
@@ -195,11 +195,11 @@ def _in_process_gym(
     """
     import httpx
     from fastapi import FastAPI
-    from nemo_gym._checkpoint.agent import AgentSessionParticipant
-    from nemo_gym._checkpoint.control import install_participant
-    from nemo_gym._checkpoint.model import PolicyModelParticipant
-    from nemo_gym.server_utils import BaseServerConfig, ServerClient
-    from nemo_gym.token_id_capture.lineage import FileLineageStore
+    from nemo_gym.models._checkpoint import PolicyModelParticipant
+    from nemo_gym.models.token_capture.lineage import FileLineageStore
+    from nemo_gym.server_runtime._checkpoint.agent import AgentSessionParticipant
+    from nemo_gym.server_runtime._checkpoint.control import install_participant
+    from nemo_gym.server_runtime.base_server import BaseServerConfig, ServerClient
     from omegaconf import OmegaConf
 
     class _Reply:
@@ -285,7 +285,7 @@ def test_adapter_drives_gyms_real_participants_through_save_and_restore(
     tmp_path: Path,
 ) -> None:
     """Fail if a reply Gym's participants build stops matching what RL reads."""
-    from nemo_gym.episode_types import EpisodeId
+    from nemo_gym.core.episode_types import EpisodeId
 
     episode = GymCheckpointEpisode("rollout-1", 0)
     checkpoint_root = tmp_path / "checkpoint"
@@ -385,7 +385,7 @@ async def _retired_rollouts(adapter: GymCheckpointAdapter) -> dict[str, int]:
 
 def test_a_rollout_gym_cannot_capture_is_reported_as_a_restart(tmp_path: Path) -> None:
     """RL reads the restarts of Gym's real coordination and leaves them out."""
-    from nemo_gym._checkpoint.agent import RestartOnlyAgentParticipant
+    from nemo_gym.server_runtime._checkpoint.agent import RestartOnlyAgentParticipant
 
     restart = GymCheckpointEpisode("rollout-1", 0)
 
@@ -431,7 +431,7 @@ def test_a_rollout_gym_cannot_capture_is_reported_as_a_restart(tmp_path: Path) -
 
 
 def test_prepare_summary_sums_gym_generation_cut_counts() -> None:
-    from nemo_gym._checkpoint.coordination import PrepareResult
+    from nemo_gym.server_runtime._checkpoint.coordination import PrepareResult
 
     def reply(counts: dict[str, int]) -> dict:
         return {"phase": "prepared", "report": {"ready": True, "counts": counts}}
@@ -459,7 +459,7 @@ def test_prepare_summary_sums_gym_generation_cut_counts() -> None:
 
 
 def test_two_adapters_keep_their_clients_and_participants_isolated(monkeypatch) -> None:
-    from nemo_gym._checkpoint import coordination
+    from nemo_gym.server_runtime._checkpoint import coordination
 
     client_a = object()
     client_b = object()
@@ -500,7 +500,7 @@ def test_two_adapters_keep_their_clients_and_participants_isolated(monkeypatch) 
 
 def _commit_model_reply(monkeypatch, model_reply: dict[str, object]):
     """Commit two agent /run episodes with the given policy-model reply."""
-    from nemo_gym._checkpoint import coordination
+    from nemo_gym.server_runtime._checkpoint import coordination
 
     client = object()
     participants = SimpleNamespace(
@@ -597,7 +597,7 @@ def test_staging_keys_gym_does_not_attribute_fail_the_commit(
 
 def _commit_with_agent_session(monkeypatch, *, own_run_episode_ids: list[str]):
     """Commit one agent session, as Gym's agent participant replies for it."""
-    from nemo_gym._checkpoint import coordination
+    from nemo_gym.server_runtime._checkpoint import coordination
 
     client = object()
     participants = SimpleNamespace(
@@ -672,7 +672,7 @@ def test_adapter_rejects_a_run_episode_the_agent_did_not_export(monkeypatch) -> 
 
 def _commit_replies(monkeypatch, members: list[tuple[str, str]], replies: dict):
     """Commit ``rollout-1`` against hand-written replies from ``members``."""
-    from nemo_gym._checkpoint import coordination
+    from nemo_gym.server_runtime._checkpoint import coordination
 
     client = object()
     participants = SimpleNamespace(
@@ -750,7 +750,7 @@ def test_adapter_rejects_a_run_episode_two_agents_claim(monkeypatch) -> None:
 
 def test_adapter_refuses_environment_server_participants(monkeypatch) -> None:
     """Commits assume an agent owns every episode; an environment server would own its own."""
-    from nemo_gym._checkpoint import coordination
+    from nemo_gym.server_runtime._checkpoint import coordination
 
     client = object()
     participants = SimpleNamespace(
@@ -785,7 +785,7 @@ class TestRestoreRequiresTheCommittedParticipants:
     def _adapter(
         monkeypatch, live: dict[str, str]
     ) -> tuple[GymCheckpointAdapter, AsyncMock]:
-        from nemo_gym._checkpoint import coordination
+        from nemo_gym.server_runtime._checkpoint import coordination
 
         restore = AsyncMock(
             return_value={name: {"source_checkpoint_id": "save-1"} for name in live}
@@ -841,7 +841,7 @@ class TestRestoreRequiresTheCommittedParticipants:
 
 
 def test_adapter_rejects_restore_from_another_checkpoint(monkeypatch) -> None:
-    from nemo_gym._checkpoint import coordination
+    from nemo_gym.server_runtime._checkpoint import coordination
 
     client = object()
     participants = _participants(client, "actor-a")
@@ -900,7 +900,7 @@ def test_a_failed_checkpoint_control_call_crosses_ray_typed(
     monkeypatch, operation: str
 ) -> None:
     """Gym's CoordinationError cannot be pickled and reaches RL untyped."""
-    from nemo_gym._checkpoint import coordination
+    from nemo_gym.server_runtime._checkpoint import coordination
 
     failure = coordination.CoordinationError(
         operation, {"actor-a-agent": "HTTP 409 deadline_exceeded"}
@@ -943,8 +943,8 @@ def test_a_failed_checkpoint_control_call_crosses_ray_typed(
 
 def test_adapter_names_the_restart_only_servers_gym_reports(tmp_path: Path) -> None:
     """Name the participants whose discovered checkpoint mode is restart_only."""
-    from nemo_gym._checkpoint.agent import RestartOnlyAgentParticipant
-    from nemo_gym._checkpoint.resources import ResourcesParticipant
+    from nemo_gym.server_runtime._checkpoint.agent import RestartOnlyAgentParticipant
+    from nemo_gym.server_runtime._checkpoint.resources import ResourcesParticipant
 
     async def exercise() -> list[str]:
         adapter, _, _ = _in_process_gym(

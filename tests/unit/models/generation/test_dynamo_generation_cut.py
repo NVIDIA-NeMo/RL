@@ -26,7 +26,7 @@ import pytest
 
 pytest.importorskip("nemo_gym")
 
-from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
+from nemo_gym.server_runtime._checkpoint.generation_cut import (  # noqa: E402
     GenerationCutInventory,
     GenerationCutPrefix,
     GenerationCutPrefixAck,
@@ -237,7 +237,7 @@ def test_loading_the_route_imports_gym_and_keeps_an_unset_hf_home_unset(
         # Building the route checks that Dynamo accepts its timeout and body limit.
         "(route,) = routes()\n"
         f"assert (route.method, route.path) == ('POST', {GENERATION_CUT_ROUTE!r})\n"
-        "assert 'nemo_gym._checkpoint.generation_cut' in sys.modules\n"
+        "assert 'nemo_gym.server_runtime._checkpoint.generation_cut' in sys.modules\n"
         "assert 'HF_HOME' not in os.environ\n"
     )
     env = {name: value for name, value in os.environ.items() if name != "HF_HOME"}

@@ -11,12 +11,12 @@ or LogicalCCResult. It deliberately refuses ambiguous call partitions.
 from collections import defaultdict
 from typing import Any
 
-from nemo_gym.token_id_capture.fingerprint import (
+from nemo_gym.models.token_capture.fingerprint import (
     FINGERPRINT_VERSION,
     _is_assistant_authored,
     assistant_fingerprint,
 )
-from nemo_gym.token_id_capture.staging.records import CallRecord
+from nemo_gym.models.token_capture.staging.records import CallRecord
 
 from nemo_rl.environments.nemo_gym import (
     _detect_invalid_tool_call_and_malformed_thinking,

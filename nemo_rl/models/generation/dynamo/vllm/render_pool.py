@@ -244,7 +244,7 @@ class _Worker:
         admission = None
         if chat.ng_capture is not None:
             # Deferred: only captured calls need it, and capture already imports nemo_gym.
-            from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+            from nemo_gym.models.token_capture.staging.records import CaptureAdmission
 
             admission = CaptureAdmission.model_validate(chat.ng_capture)
         rendered = self.loop.run_until_complete(

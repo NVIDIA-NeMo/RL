@@ -415,9 +415,9 @@ def _stub_gym_spinup(run_helper):
     cli.RunHelper = lambda: run_helper
     config = types.ModuleType("nemo_gym.config")
     config.MODEL_CALL_SAMPLING_BLOCK = "model_call_sampling"
-    rollout_collection = types.ModuleType("nemo_gym.rollout_collection")
+    rollout_collection = types.ModuleType("nemo_gym.rollouts.rollout_collection")
     rollout_collection.RolloutCollectionHelper = MagicMock
-    server_utils = types.ModuleType("nemo_gym.server_utils")
+    server_utils = types.ModuleType("nemo_gym.server_runtime.base_server")
     server_utils.HEAD_SERVER_KEY_NAME = "head_server"
     server_utils.BaseServerConfig = MagicMock
     server_utils.ServerClient = MagicMock
@@ -428,8 +428,8 @@ def _stub_gym_spinup(run_helper):
                 "nemo_gym": types.ModuleType("nemo_gym"),
                 "nemo_gym.cli": cli,
                 "nemo_gym.config": config,
-                "nemo_gym.rollout_collection": rollout_collection,
-                "nemo_gym.server_utils": server_utils,
+                "nemo_gym.rollouts.rollout_collection": rollout_collection,
+                "nemo_gym.server_runtime.base_server": server_utils,
             },
         ),
         patch.object(nemo_gym_mod, "_get_node_ip_local", return_value="10.0.0.1"),
@@ -443,7 +443,7 @@ def _stub_gym_spinup(run_helper):
 @pytest.mark.nemo_gym
 @pytest.mark.parametrize("forest_training", [False, True])
 def test_spinup_passes_parent_resolution_to_gym(forest_training, tmp_path, monkeypatch):
-    from nemo_gym.token_id_capture.config import TokenIdCaptureConfig
+    from nemo_gym.models.token_capture.config import TokenIdCaptureConfig
 
     monkeypatch.setenv("NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN", "test-control")
     cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
@@ -863,12 +863,12 @@ def test_nemo_gym_shutdown_before_spinup_is_a_noop():
 
 @contextmanager
 def _stub_gym_resolved_config(resolved):
-    """Stand in for nemo_gym.global_config, which lives in the actor's venv."""
+    """Stand in for nemo_gym.config.global_config, which lives in the actor's venv."""
     package = types.ModuleType("nemo_gym")
-    module = types.ModuleType("nemo_gym.global_config")
+    module = types.ModuleType("nemo_gym.config.global_config")
     module.get_global_config_dict = MagicMock(return_value=resolved)
     with patch.dict(
-        sys.modules, {"nemo_gym": package, "nemo_gym.global_config": module}
+        sys.modules, {"nemo_gym": package, "nemo_gym.config.global_config": module}
     ):
         yield module.get_global_config_dict
 
@@ -1446,7 +1446,7 @@ def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs
 @pytest.mark.nemo_gym
 def test_checkpoint_lease_grace_follows_the_control_timeout(detected_uv_dirs):
     """A lost resume reopens Gym after three control timeouts; Gym accepts it."""
-    from nemo_gym._checkpoint.settings import CheckpointSettings
+    from nemo_gym.server_runtime._checkpoint.settings import CheckpointSettings
 
     cluster = _FakeGymCluster()
     with _patched_cluster(cluster):

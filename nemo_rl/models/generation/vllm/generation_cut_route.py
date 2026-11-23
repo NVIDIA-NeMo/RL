@@ -22,7 +22,7 @@ from typing import Any, Protocol
 
 from fastapi import FastAPI, Header, HTTPException
 
-# Gym owns this route (nemo_gym._checkpoint.generation_cut.GENERATION_CUT_ROUTE),
+# Gym owns this route (nemo_gym.server_runtime._checkpoint.generation_cut.GENERATION_CUT_ROUTE),
 # but nemo_gym is an optional extra. A drifted copy would 404 every cut, which Gym
 # treats as "regenerate", so test_generation_cut_route_matches_gym pins it.
 GENERATION_CUT_ROUTE = "/ng-control/v1/generation-cut"
@@ -54,7 +54,7 @@ async def answer_generation_cut(
     the call's JSON body, Gym's ``GenerationCutInventory``.
     """
     # Deferred: nemo_gym is an optional extra.
-    from nemo_gym._checkpoint.generation_cut import GenerationCutInventory
+    from nemo_gym.server_runtime._checkpoint.generation_cut import GenerationCutInventory
 
     expected = backend.control_token
     supplied = (

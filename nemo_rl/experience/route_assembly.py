@@ -173,7 +173,7 @@ def verify_route_fragment_integrity(
 ) -> bool:
     """Rebuild the staged extras envelope and verify the receipt-bound digest."""
     # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-    from nemo_gym.token_id_capture.staging.digest import (
+    from nemo_gym.models.token_capture.staging.digest import (
         EXTRAS_DIGEST_VERSION,
         compute_extras_digest,
     )
@@ -229,7 +229,7 @@ def execute_route_plan(
         ``(None, reason)`` with a reason from the shared vocabulary.
     """
     # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-    from nemo_gym.token_id_capture.staging.routes import classify_route_span
+    from nemo_gym.models.token_capture.staging.routes import classify_route_span
 
     if canonical_len != plan.expected_token_length:
         return None, ROUTE_FAILURE_CANONICAL_LENGTH

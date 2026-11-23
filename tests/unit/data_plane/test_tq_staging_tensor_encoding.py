@@ -21,7 +21,7 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-pytest.importorskip("nemo_gym.token_id_capture.staging")
+pytest.importorskip("nemo_gym.models.token_capture.staging")
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQTokenSink,

@@ -42,19 +42,19 @@ import numpy as np
 import pytest
 import torch
 
-nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
+nemo_gym = pytest.importorskip("nemo_gym.models.token_capture.staging")
 
-from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
+from nemo_gym.server_runtime._checkpoint.generation_cut import (  # noqa: E402
     GENERATION_CUT_ROUTE,
     GenerationCutInventory,
     GenerationCutPrefix,
     GenerationCutPrefixAck,
 )
-from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
+from nemo_gym.models.token_capture.staging.capture import (  # noqa: E402
     CaptureError,
     RolloutTokenCapture,
 )
-from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
+from nemo_gym.models.token_capture.staging.records import (  # noqa: E402
     CaptureAdmission,
     StagedCallBaseSnapshot,
     StagedCallRecord,
@@ -1402,7 +1402,7 @@ def _single_call_inventory(
 
 def _worker_with_capture(sink: _MemorySink):
     """A real worker, minus the engine, with in-memory token capture."""
-    from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
+    from nemo_gym.models.token_capture.adapters.vllm import VLLMCaptureAdapter
 
     worker = _fake_worker()
     worker._capture_sink = sink
@@ -4492,7 +4492,7 @@ def test_request_capture_text_call_in_media_run_stages_without_attachments():
 
 @pytest.mark.parametrize("prev_len", [0, 3])
 def test_route_delta_preserves_actual_predecessor_tail(prev_len):
-    from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
+    from nemo_gym.models.token_capture.adapters.vllm import VLLMCaptureAdapter
 
     routes = torch.arange(7, dtype=torch.int16).reshape(7, 1, 1)
     payload = {
@@ -4649,7 +4649,7 @@ def test_worker_failed_puts_fail_their_calls_and_roll_back():
 
 
 def test_worker_batch_ack_failure_fails_only_its_call(monkeypatch):
-    from nemo_gym._checkpoint import generation_cut
+    from nemo_gym.server_runtime._checkpoint import generation_cut
 
     recovery, sink, states, inventory = _batch_worker_fixture([2, 3, 4])
     original = generation_cut.GenerationCutPrefixAck
@@ -4676,7 +4676,7 @@ def test_worker_batch_ack_failure_fails_only_its_call(monkeypatch):
 
 
 def test_worker_batch_interruption_clears_rows_no_call_received(monkeypatch):
-    from nemo_gym._checkpoint import generation_cut
+    from nemo_gym.server_runtime._checkpoint import generation_cut
 
     class _Interrupted(BaseException):
         pass

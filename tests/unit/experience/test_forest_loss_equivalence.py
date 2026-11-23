@@ -20,8 +20,8 @@ from torch.nn.utils.rnn import pad_sequence
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym.token_id_capture.staging.capture import ActiveCall, RolloutTokenCapture
-from nemo_gym.token_id_capture.staging.records import CommitCoords
+from nemo_gym.models.token_capture.staging.capture import ActiveCall, RolloutTokenCapture
+from nemo_gym.models.token_capture.staging.records import CommitCoords
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource

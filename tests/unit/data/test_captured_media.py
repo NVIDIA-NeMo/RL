@@ -22,14 +22,14 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-pytest.importorskip("nemo_gym.token_id_capture.staging")
+pytest.importorskip("nemo_gym.models.token_capture.staging")
 
-from nemo_gym.token_id_capture.adapters.vllm import (
+from nemo_gym.models.token_capture.adapters.vllm import (
     MEDIA_SPANS_FIELD,
     VLLMCaptureAdapter,
 )
-from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
-from nemo_gym.token_id_capture.staging.records import (
+from nemo_gym.models.token_capture.staging.capture import RolloutTokenCapture
+from nemo_gym.models.token_capture.staging.records import (
     CallRecord,
     CaptureAdmission,
     RolloutReceipt,
@@ -998,7 +998,7 @@ def test_media_tensor_digests_fingerprint_dtype_shape_and_bytes():
 def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(
     dp, monkeypatch, with_routed_experts
 ):
-    from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
+    from nemo_gym.models.token_capture.adapters.vllm import VLLMCaptureAdapter
 
     def forbidden_codec(*args, **kwargs):
         pytest.fail("captured routes must remain tensors alongside media")
@@ -1612,7 +1612,7 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     from aiohttp import ClientResponseError
     from fastapi import FastAPI
     from httpx import ASGITransport, AsyncClient
-    from nemo_gym.server_utils import SimpleServer
+    from nemo_gym.server_runtime.base_server import SimpleServer
 
     from nemo_rl.environments.nemo_gym import GymTransportError, _typed_gym_failure
     from tests.unit.models.generation.test_vllm_chat_template_wiring import (

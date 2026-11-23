@@ -20,9 +20,9 @@ from collections import Counter
 import pytest
 import torch
 
-nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
+nemo_gym = pytest.importorskip("nemo_gym.models.token_capture.staging")
 
-from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
+from nemo_gym.models.token_capture.staging.digest import (  # noqa: E402
     compute_extras_digest,
 )
 

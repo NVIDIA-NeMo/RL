@@ -430,7 +430,7 @@ def test_an_untrained_callers_call_keeps_its_own_sampling() -> None:
 def test_a_call_refused_before_it_runs_acknowledges_its_capture_to_gym(
     captured, refused_by
 ) -> None:
-    from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER
+    from nemo_gym.models.token_capture.protocols import CAPTURE_REFUSAL_HEADER
     from vllm.exceptions import VLLMValidationError
 
     pool = _Pool(_rendered())

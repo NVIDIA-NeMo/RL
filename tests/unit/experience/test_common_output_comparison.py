@@ -14,14 +14,14 @@ import torch
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym.openai_utils import (
+from nemo_gym.client.openai_client import (
     NeMoGymAsyncOpenAI,
 )
-from nemo_gym.token_id_capture.fingerprint import (
+from nemo_gym.models.token_capture.fingerprint import (
     FINGERPRINT_VERSION,
     assistant_fingerprint,
 )
-from nemo_gym.token_id_capture.staging.records import CallRecord
+from nemo_gym.models.token_capture.staging.records import CallRecord
 
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler

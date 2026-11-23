@@ -19,8 +19,8 @@ from tensordict import TensorDict
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym.openai_utils import NeMoGymAsyncOpenAI
-from nemo_gym.token_id_capture.staging.records import RolloutManifest, StageResult
+from nemo_gym.client.openai_client import NeMoGymAsyncOpenAI
+from nemo_gym.models.token_capture.staging.records import RolloutManifest, StageResult
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler

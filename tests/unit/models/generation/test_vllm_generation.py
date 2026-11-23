@@ -1829,12 +1829,12 @@ def _generation_cut_route(
     else:
         worker._prefix_recovery = NoPrefixRecovery()
     # nemo_gym is an optional extra; the route only uses it to type the inventory.
-    generation_cut = types.ModuleType("nemo_gym._checkpoint.generation_cut")
+    generation_cut = types.ModuleType("nemo_gym.server_runtime._checkpoint.generation_cut")
     generation_cut.GenerationCutInventory = types.SimpleNamespace(
         model_validate=lambda inventory: ("typed", inventory)
     )
     monkeypatch.setitem(
-        sys.modules, "nemo_gym._checkpoint.generation_cut", generation_cut
+        sys.modules, "nemo_gym.server_runtime._checkpoint.generation_cut", generation_cut
     )
     return _route_handler(app, GENERATION_CUT_ROUTE), cuts
 
@@ -1928,8 +1928,8 @@ async def test_plain_value_error_context_overflow_returns_http_400(monkeypatch):
 async def test_context_refusal_acknowledges_unstaged_capture(
     monkeypatch, validation_error
 ):
-    from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER
-    from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
+    from nemo_gym.models.token_capture.protocols import CAPTURE_REFUSAL_HEADER
+    from nemo_gym.models.token_capture.staging.capture import RolloutTokenCapture
 
     worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
     message = "Input length (129) exceeds model's maximum context length (128)."

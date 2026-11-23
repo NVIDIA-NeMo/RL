@@ -35,13 +35,13 @@ import numpy as np
 import pytest
 import torch
 
-nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
+nemo_gym = pytest.importorskip("nemo_gym.models.token_capture.staging")
 
-from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
+from nemo_gym.models.token_capture.staging.digest import (  # noqa: E402
     compute_extras_digest,
     compute_staging_digest,
 )
-from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
+from nemo_gym.models.token_capture.staging.records import (  # noqa: E402
     CallRecord,
     RolloutReceipt,
     StagedCallRecord,
@@ -1261,7 +1261,7 @@ def test_deferred_chain_hash_corruption_rejects_the_row(
 ):
     """The deferred path now recomputes parent-chain and cumulative hashes
     (previously skipped by RL's local metadata-only linearizer)."""
-    from nemo_gym.token_id_capture.staging.digest import compute_chain_hash
+    from nemo_gym.models.token_capture.staging.digest import compute_chain_hash
 
     from tests.unit.data_plane.token_capture_test_fixtures import (
         _manifest,
@@ -1293,7 +1293,7 @@ def test_deferred_chain_hash_corruption_rejects_the_row(
         parent_chain_hash=compute_chain_hash(None, [99, 98]),
         cumulative_prefix=root.token_ids_delta,
     )
-    from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+    from nemo_gym.models.token_capture.staging.records import RolloutReceipt
 
     receipt = RolloutReceipt(
         capture_key=rollout_id,
@@ -2027,7 +2027,7 @@ def test_staged_penalties_match_non_capture_all_flags(
 def test_effort_uses_terminal_call_with_carries_and_abandoned_branch(
     tq_client, partitions, generations, raw_reward
 ):
-    from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+    from nemo_gym.models.token_capture.staging.records import RolloutReceipt
 
     from nemo_rl.experience.reward_penalties import compute_reward_checks
     from nemo_rl.experience.rollouts import EffortLevelsConfig, _apply_effort_shaping

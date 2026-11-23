@@ -481,12 +481,12 @@ class RolloutReassembler:
         substitutes a placeholder.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture.staging.rebuild import (
+        from nemo_gym.models.token_capture.staging.rebuild import (
             RebuildError,
             ReceiptVerificationError,
             verify_and_linearize,
         )
-        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+        from nemo_gym.models.token_capture.staging.records import RolloutReceipt
 
         def rejected(reason: str, staging_keys: list[str]) -> FinalizedRollout:
             return FinalizedRollout(
@@ -1047,7 +1047,7 @@ class RolloutReassembler:
         # Literal and skip the None member.
         from typing import Literal, get_args, get_origin
 
-        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+        from nemo_gym.models.token_capture.staging.records import RolloutReceipt
 
         terminal_selection_methods = tuple(
             method
@@ -1545,7 +1545,7 @@ class RolloutReassembler:
     ) -> list[list[SegmentReceipt]]:
         """Plan paths to selected leaves using committed capture parents."""
         # Capture wire types are optional outside this finalization path.
-        from nemo_gym.token_id_capture.staging.records import (
+        from nemo_gym.models.token_capture.staging.records import (
             CallRecord,
             RolloutReceipt,
         )
@@ -1696,7 +1696,7 @@ class RolloutReassembler:
         No publication or cleanup happens before this method completes.
         """
         # Optional Gym dependency; ordinary/non-Gym import paths remain unchanged.
-        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+        from nemo_gym.models.token_capture.staging.records import RolloutReceipt
 
         n = len(rollout_ids)
         if not n or len(logical_segments) != n:

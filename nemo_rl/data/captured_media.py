@@ -239,8 +239,8 @@ def verified_media_items(call: FetchedStagedCall) -> tuple[CapturedMediaItem, ..
     media consumer must check even when route replay is disabled.
     """
     # Gym is optional outside captured-rollout paths.
-    from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
-    from nemo_gym.token_id_capture.staging.digest import compute_extras_digest
+    from nemo_gym.models.token_capture.adapters.vllm import MEDIA_SPANS_FIELD
+    from nemo_gym.models.token_capture.staging.digest import compute_extras_digest
 
     snapshot = call.snapshot
     if call.routed_len:

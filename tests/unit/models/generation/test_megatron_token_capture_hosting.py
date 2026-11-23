@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
+nemo_gym = pytest.importorskip("nemo_gym.models.token_capture.staging")
 # megatron_worker imports megatron.core at module level; skip when it is absent.
 pytest.importorskip("megatron.core")
 

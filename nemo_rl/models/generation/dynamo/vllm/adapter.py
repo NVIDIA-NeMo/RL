@@ -229,7 +229,7 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         """
         del annotation, context
         # Deferred: Gym is optional outside framework-owned capture.
-        from nemo_gym._checkpoint.generation_cut import GenerationCutInventory
+        from nemo_gym.server_runtime._checkpoint.generation_cut import GenerationCutInventory
 
         extra_args = request.get("extra_args") or {}
         inventory = GenerationCutInventory.model_validate(extra_args[INVENTORY_KEY])
@@ -523,7 +523,7 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
     async def _stage(self, chat: Any, final_output: Any) -> GymCallResult:
         """Stage a captured call from this process, in one TQ write."""
         # Deferred: only captured calls reach here, and capture already imports nemo_gym.
-        from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD
+        from nemo_gym.models.token_capture import NG_COMMIT_COORDS_FIELD
 
         if self._host._capture_top_logprobs:
             # Off the loop, as natively: the sampler top-k scales with the

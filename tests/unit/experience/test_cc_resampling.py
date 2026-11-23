@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym.token_id_capture.staging.records import RolloutManifest
+from nemo_gym.models.token_capture.staging.records import RolloutManifest
 
 from tests.unit.experience.test_cc_cpu_pipeline import pipeline  # noqa: F401
 from tests.unit.experience.test_forest_dispatch import _env

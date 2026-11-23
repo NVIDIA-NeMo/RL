@@ -1377,7 +1377,7 @@ def test_validate_reward_components_match_scalar():
 
 @pytest.mark.nemo_gym
 def test_nemo_gym_stub_module():
-    from nemo_gym import config_types
+    from nemo_gym.config import config_types
 
     print(
         f"NeMo-Gym test successfully run! NeMo-Gym config_types module: {config_types}"
@@ -2597,8 +2597,8 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
     from unittest.mock import MagicMock
 
     import nemo_gym.cli as gym_cli
-    import nemo_gym.rollout_collection as gym_rollout_collection
-    import nemo_gym.server_utils as gym_server_utils
+    import nemo_gym.rollouts.rollout_collection as gym_rollout_collection
+    import nemo_gym.server_runtime.base_server as gym_server_utils
     from omegaconf import OmegaConf
 
     import nemo_rl.environments.nemo_gym as nemo_gym_mod
@@ -2649,7 +2649,7 @@ def _fake_gym_run_helper(monkeypatch, gym_mod, gym_cli, gym_rollout_collection):
     """Capture the global config `_spinup` hands to Gym, without starting one."""
     from unittest.mock import MagicMock
 
-    import nemo_gym.server_utils as gym_server_utils
+    import nemo_gym.server_runtime.base_server as gym_server_utils
     from omegaconf import OmegaConf
 
     started = []
@@ -2678,7 +2678,7 @@ def _fake_gym_run_helper(monkeypatch, gym_mod, gym_cli, gym_rollout_collection):
 def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkeypatch):
     """The telemetry block is added only when this actor exports, merged with the user's."""
     import nemo_gym.cli as gym_cli
-    import nemo_gym.rollout_collection as gym_rollout_collection
+    import nemo_gym.rollouts.rollout_collection as gym_rollout_collection
 
     import nemo_rl.environments.nemo_gym as nemo_gym_mod
 
@@ -2742,7 +2742,7 @@ def test_spinup_forwards_job_identity_to_gym_servers(monkeypatch):
     from types import SimpleNamespace as NS
 
     import nemo_gym.cli as gym_cli
-    import nemo_gym.rollout_collection as gym_rollout_collection
+    import nemo_gym.rollouts.rollout_collection as gym_rollout_collection
     from nemo.lens import derive_nv_dl_run_uuid
     from nemo.lens.resources.attributes import parse_otel_resource_attributes
     from nemo.lens.semconv import NV_DL_RUN_UUID
@@ -2824,8 +2824,8 @@ def test_spinup_keeps_score_centering_on_the_required_policy_model(
     from unittest.mock import MagicMock
 
     import nemo_gym.cli as gym_cli
-    import nemo_gym.rollout_collection as gym_rollout_collection
-    import nemo_gym.server_utils as gym_server_utils
+    import nemo_gym.rollouts.rollout_collection as gym_rollout_collection
+    import nemo_gym.server_runtime.base_server as gym_server_utils
     from omegaconf import OmegaConf
     from responses_api_models.vllm_model.app import VLLMModel, VLLMModelConfig
 
@@ -2896,8 +2896,8 @@ def test_spinup_has_gym_apply_policy_sampling_to_the_trained_agents_calls(
     from unittest.mock import MagicMock
 
     import nemo_gym.cli as gym_cli
-    import nemo_gym.rollout_collection as gym_rollout_collection
-    import nemo_gym.server_utils as gym_server_utils
+    import nemo_gym.rollouts.rollout_collection as gym_rollout_collection
+    import nemo_gym.server_runtime.base_server as gym_server_utils
     from omegaconf import OmegaConf
 
     import nemo_rl.environments.nemo_gym as nemo_gym_mod

@@ -36,14 +36,14 @@ from nemo_rl.experience.failures import (
 )
 from nemo_rl.experience.rollouts import _prepare_nemo_gym_rows
 
-gym_episode = pytest.importorskip("nemo_gym.episode_types")
-gym_config = pytest.importorskip("nemo_gym.global_config")
+gym_episode = pytest.importorskip("nemo_gym.core.episode_types")
+gym_config = pytest.importorskip("nemo_gym.config.global_config")
 gym_resources = pytest.importorskip("nemo_gym.base_resources_server")
-gym_rollouts = pytest.importorskip("nemo_gym.rollout_collection")
-gym_server = pytest.importorskip("nemo_gym.server_utils")
-gym_openai = pytest.importorskip("nemo_gym.openai_utils")
+gym_rollouts = pytest.importorskip("nemo_gym.rollouts.rollout_collection")
+gym_server = pytest.importorskip("nemo_gym.server_runtime.base_server")
+gym_openai = pytest.importorskip("nemo_gym.client.openai_client")
 gym_protocol = pytest.importorskip("nemo_gym.single_agent_turn_types")
-gym_completion = pytest.importorskip("nemo_gym.token_id_capture.completion")
+gym_completion = pytest.importorskip("nemo_gym.models.token_capture.completion")
 
 pytestmark = pytest.mark.nemo_gym
 

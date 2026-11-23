@@ -33,26 +33,26 @@ pytestmark = [pytest.mark.nemo_gym, pytest.mark.vllm]
 pytest.importorskip("dynamo._core")
 pytest.importorskip("vllm")
 # The vLLM lanes import this module without the nemo_gym extra.
-pytest.importorskip("nemo_gym.token_id_capture.staging")
+pytest.importorskip("nemo_gym.models.token_capture.staging")
 
 from dynamo.llm.exceptions import InvalidArgument  # noqa: E402
-from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
+from nemo_gym.server_runtime._checkpoint.generation_cut import (  # noqa: E402
     GenerationCutInventory,
     GenerationCutPrefix,
 )
-from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD  # noqa: E402
-from nemo_gym.token_id_capture.adapters.vllm import (  # noqa: E402
+from nemo_gym.models.token_capture import NG_COMMIT_COORDS_FIELD  # noqa: E402
+from nemo_gym.models.token_capture.adapters.vllm import (  # noqa: E402
     MEDIA_SPANS_FIELD,
     VLLMCaptureAdapter,
 )
-from nemo_gym.token_id_capture.replay import (  # noqa: E402
+from nemo_gym.models.token_capture.replay import (  # noqa: E402
     replay_context,
     summarize_replay,
 )
-from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
+from nemo_gym.models.token_capture.staging.capture import (  # noqa: E402
     RolloutTokenCapture,
 )
-from nemo_gym.token_id_capture.staging.records import CaptureAdmission  # noqa: E402
+from nemo_gym.models.token_capture.staging.records import CaptureAdmission  # noqa: E402
 from vllm.multimodal.inputs import PlaceholderRange  # noqa: E402
 
 from nemo_rl.data.captured_media import (  # noqa: E402
