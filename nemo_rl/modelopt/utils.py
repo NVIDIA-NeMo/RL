@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from nemo_rl.models.generation.vllm.config import VllmConfig
@@ -27,8 +27,10 @@ MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS = 600_000
 
 
 def validate_real_quant_policy_config(policy_config: PolicyConfig) -> None:
-    """Validate static policy requirements for real-quant rollout."""
-    if not policy_config.get("megatron_cfg", {}).get("enabled", False):
+    """Reject unsupported real-quant combinations before any worker is allocated."""
+    if not (
+        "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
+    ):
         raise ValueError(
             "policy.generation.real_quant=true requires "
             "policy.megatron_cfg.enabled=true; DTensor real-quant export is unsupported"
@@ -36,6 +38,36 @@ def validate_real_quant_policy_config(policy_config: PolicyConfig) -> None:
     if not policy_config.get("quant_cfg"):
         raise ValueError(
             "policy.quant_cfg must be set when policy.generation.real_quant=true"
+        )
+    generation_config = cast("VllmConfig", policy_config["generation"])
+    vllm_cfg = generation_config["vllm_cfg"]
+    vllm_kwargs = generation_config.get("vllm_kwargs") or {}
+    speculative_config = vllm_kwargs.get("speculative_config") or {}
+    if speculative_config.get("num_speculative_tokens", 0):
+        raise ValueError(
+            "policy.generation.real_quant=true does not support speculative "
+            "decoding: native real-quant refit never refits the drafter"
+        )
+    if vllm_cfg["kv_cache_dtype"] != "auto":
+        raise ValueError(
+            "policy.generation.real_quant=true requires "
+            "generation.vllm_cfg.kv_cache_dtype=auto"
+        )
+    if vllm_cfg["precision"] == "fp8":
+        raise ValueError(
+            "policy.generation.real_quant=true cannot use "
+            "generation.vllm_cfg.precision=fp8; the policy-produced "
+            "quantization_config is the only quantization source"
+        )
+    if generation_config.get("refit_transport") is not None:
+        raise ValueError(
+            "policy.generation.real_quant=true requires the default CUDA-IPC or "
+            "collective refit; generation.refit_transport must be null"
+        )
+    if vllm_cfg.get("load_format", "dummy") != "dummy":
+        raise ValueError(
+            "policy.generation.real_quant=true requires "
+            "generation.vllm_cfg.load_format=dummy"
         )
 
 

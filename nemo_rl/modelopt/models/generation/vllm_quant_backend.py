@@ -57,8 +57,13 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             )
 
     def _is_real_quant_model(self) -> bool:
-        quantization = self.model_runner.vllm_config.model_config.quantization
-        return bool(quantization and str(quantization).startswith("modelopt"))
+        # vLLM appends this extension to the selected worker class, which is
+        # RealQuantWorker exactly when real-quant rollout is configured.
+        from nemo_rl.modelopt.models.generation.vllm_quant_patch import (
+            RealQuantWorker,
+        )
+
+        return isinstance(self, RealQuantWorker)
 
     def _uses_native_layerwise_refit(self, transport: WeightUpdateTransport) -> bool:
         if self._is_real_quant_model():

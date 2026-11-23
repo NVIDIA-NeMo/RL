@@ -425,6 +425,8 @@ def test_composed_native_vision_refit(
             else vllm_backend.VllmInternalWorkerExtension
         )
         ext = worker_cls.__new__(worker_cls)
+        if real_quant:
+            ext._is_real_quant_model = lambda: True
         ext.model_runner, ext.model_config = runner, config
         ext.device = torch.device(device)
         ext.model_update_group = object()

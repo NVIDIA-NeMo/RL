@@ -2384,6 +2384,7 @@ def test_real_quant_mxfp8_collective_reload_preserves_canonical_tensors(
     ext, _ = _make_collective_update_extension(
         vllm_backend, extension_cls=VllmQuantInternalWorkerExtension
     )
+    ext._is_real_quant_model = lambda: True
     ext.model_runner.vllm_config.model_config.quantization = "modelopt_mxfp8"
     ext.model_runner.vllm_config.quant_config = ModelOptMxFp8Config.from_config(
         {"quant_method": "modelopt", "quant_algo": "MXFP8", "ignore": []}

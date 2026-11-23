@@ -726,10 +726,29 @@ def test_configure_real_quant_requires_policy_config():
         )
 
 
+def _real_quant_policy_cfg(**overrides):
+    """Minimal policy config that passes the static real-quant checks."""
+    cfg = {
+        "quant_cfg": "FP8_DEFAULT_CFG",
+        "megatron_cfg": {"enabled": True},
+        "generation": {
+            "real_quant": True,
+            "refit_transport": None,
+            "vllm_cfg": {
+                "kv_cache_dtype": "auto",
+                "precision": "bfloat16",
+                "load_format": "dummy",
+            },
+        },
+    }
+    cfg.update(overrides)
+    return cfg
+
+
 def test_prepare_real_quant_generation_config_copies_policy_config():
     quantization_config = {"quant_method": "modelopt", "quant_algo": "FP8"}
     policy = types.SimpleNamespace(
-        cfg={"quant_cfg": "FP8_DEFAULT_CFG", "megatron_cfg": {"enabled": True}},
+        cfg=_real_quant_policy_cfg(),
         get_real_quantization_config=lambda: quantization_config,
     )
     generation_config = {"vllm_kwargs": {"hf_overrides": {"trust_remote_code": True}}}
@@ -745,7 +764,7 @@ def test_prepare_real_quant_generation_config_copies_policy_config():
 
 def test_prepare_real_quant_generation_config_rejects_conflict():
     policy = types.SimpleNamespace(
-        cfg={"quant_cfg": "FP8_DEFAULT_CFG", "megatron_cfg": {"enabled": True}},
+        cfg=_real_quant_policy_cfg(),
         get_real_quantization_config=lambda: {
             "quant_method": "modelopt",
             "quant_algo": "FP8",
@@ -766,14 +785,42 @@ def test_prepare_real_quant_generation_config_rejects_conflict():
         modelopt_utils.prepare_real_quant_generation_config(policy, generation_config)
 
 
+def _with_generation(**changes):
+    cfg = _real_quant_policy_cfg()
+    for key, value in changes.items():
+        if key in ("kv_cache_dtype", "precision", "load_format"):
+            cfg["generation"]["vllm_cfg"][key] = value
+        else:
+            cfg["generation"][key] = value
+    return cfg
+
+
 @pytest.mark.parametrize(
     ("policy_config", "error"),
     [
+        (_real_quant_policy_cfg(megatron_cfg={"enabled": False}), "megatron_cfg"),
+        (_real_quant_policy_cfg(quant_cfg=None), "policy.quant_cfg"),
         (
-            {"quant_cfg": "FP8_DEFAULT_CFG", "megatron_cfg": {"enabled": False}},
-            "megatron_cfg",
+            _with_generation(
+                vllm_kwargs={
+                    "speculative_config": {"method": "mtp", "num_speculative_tokens": 2}
+                }
+            ),
+            "speculative decoding",
         ),
-        ({"quant_cfg": None, "megatron_cfg": {"enabled": True}}, "policy.quant_cfg"),
+        (_with_generation(kv_cache_dtype="fp8"), "kv_cache_dtype=auto"),
+        (_with_generation(precision="fp8"), "precision=fp8"),
+        (_with_generation(refit_transport="nixl"), "refit_transport must be null"),
+        (_with_generation(load_format="auto"), "load_format=dummy"),
+    ],
+    ids=[
+        "dtensor",
+        "no-quant-cfg",
+        "speculative",
+        "kv-cache-dtype",
+        "fp8-precision",
+        "refit-transport",
+        "load-format",
     ],
 )
 def test_prepare_real_quant_generation_config_validates_policy(policy_config, error):
@@ -784,6 +831,14 @@ def test_prepare_real_quant_generation_config_validates_policy(policy_config, er
 
     with pytest.raises(ValueError, match=error):
         modelopt_utils.prepare_real_quant_generation_config(policy, {})
+
+
+def test_validate_real_quant_policy_config_allows_disabled_speculation():
+    modelopt_utils.validate_real_quant_policy_config(
+        _with_generation(
+            vllm_kwargs={"speculative_config": {"num_speculative_tokens": 0}}
+        )
+    )
 
 
 @pytest.mark.parametrize("llm_kwargs", [{}, {"moe_backend": "flashinfer_trtllm"}])
@@ -956,34 +1011,36 @@ def test_modelopt_refit_info_routes_legacy_fp8_config(
     assert result is (None if real_quant else expected_names)
 
 
-@pytest.mark.parametrize(
-    ("quantization", "expected"),
-    [
-        ("modelopt", True),
-        ("modelopt_fp4", True),
-        ("modelopt_mxfp8", True),
-        ("modelopt_mixed", True),
-        ("fp8", False),
-        (None, False),
-    ],
-)
-def test_real_quant_model_detection_uses_native_vllm_method(
-    monkeypatch, quantization, expected
+@pytest.mark.parametrize("quantization", ["modelopt_mxfp8", "modelopt_fp4", None])
+@pytest.mark.parametrize("real_quant_worker", [True, False])
+def test_real_quant_model_detection_follows_worker_class(
+    monkeypatch, quantization, real_quant_worker
 ):
     backend = _import_vllm_quant_backend(monkeypatch)
-    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    patch_module = types.ModuleType(
+        "nemo_rl.modelopt.models.generation.vllm_quant_patch"
+    )
+    patch_module.RealQuantWorker = type("RealQuantWorker", (), {})
+    monkeypatch.setitem(sys.modules, patch_module.__name__, patch_module)
+    bases = (backend.VllmQuantInternalWorkerExtension,)
+    if real_quant_worker:
+        bases += (patch_module.RealQuantWorker,)
+    # vLLM appends the extension to the selected worker class; a fake-quant run
+    # with vllm_cfg.precision=fp8 still reports a ModelOpt quantization method.
+    extension = object.__new__(type("Worker", bases, {}))
     extension.model_runner = types.SimpleNamespace(
         vllm_config=types.SimpleNamespace(
             model_config=types.SimpleNamespace(quantization=quantization)
         )
     )
 
-    assert extension._is_real_quant_model() is expected
+    assert extension._is_real_quant_model() is real_quant_worker
 
 
 def test_real_quant_load_uses_canonical_hf_loader(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension._is_real_quant_model = lambda: True
     extension.device = torch.device("cuda:0")
     extension.model_runner = types.SimpleNamespace(
         vllm_config=types.SimpleNamespace(
