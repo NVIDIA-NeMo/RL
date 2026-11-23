@@ -46,6 +46,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
+from nemo_rl.utils.nvml import ensure_torch_cuda_arch_list
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
 from nemo_rl.utils.timer import Timer
 
@@ -67,6 +68,11 @@ def main() -> None:
     """Main entry point."""
     main_start = time.perf_counter()
     log_container_init_timing()
+
+    # Default TORCH_CUDA_ARCH_LIST from the local GPU before init_ray(),
+    # so the value is picked up into the Ray runtime_env and inherited by
+    # workers. Never overrides a value the user already set.
+    ensure_torch_cuda_arch_list()
 
     rl_init_timer = Timer(context={"worker": "driver"})
 

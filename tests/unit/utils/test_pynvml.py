@@ -16,6 +16,8 @@ from unittest.mock import MagicMock, patch
 
 from nemo_rl.utils.nvml import (
     _resolve_device_id,
+    ensure_torch_cuda_arch_list,
+    get_device_compute_capability,
     log_gpu_memory_diagnostics,
 )
 
@@ -94,3 +96,47 @@ def test_log_gpu_memory_diagnostics_extra_context(mock_pynvml, capfd):
         label="ctx-label", worker_type="TestWorker", extra_context="my_custom_info=42"
     )
     assert "my_custom_info=42" in capfd.readouterr().out
+
+
+@patch("nemo_rl.utils.nvml.pynvml")
+def test_get_device_compute_capability(mock_pynvml):
+    mock_pynvml.nvmlDeviceGetCudaComputeCapability.return_value = (8, 0)
+    assert get_device_compute_capability() == (8, 0)
+    mock_pynvml.nvmlDeviceGetHandleByIndex.assert_called_once_with(0)
+
+
+@patch("nemo_rl.utils.nvml.pynvml")
+def test_get_device_compute_capability_returns_none_on_nvml_error(mock_pynvml):
+    mock_pynvml.nvmlInit.side_effect = Exception("NVML not available")
+    assert get_device_compute_capability() is None
+
+
+@patch("nemo_rl.utils.nvml.pynvml")
+def test_get_device_compute_capability_returns_none_for_invalid_value(mock_pynvml):
+    mock_pynvml.nvmlDeviceGetCudaComputeCapability.return_value = (0, 0)
+    assert get_device_compute_capability() is None
+
+
+@patch("nemo_rl.utils.nvml.get_device_compute_capability")
+def test_ensure_torch_cuda_arch_list_keeps_user_value(mock_detect):
+    with patch.dict(os.environ, {"TORCH_CUDA_ARCH_LIST": "9.0"}):
+        ensure_torch_cuda_arch_list()
+        assert os.environ["TORCH_CUDA_ARCH_LIST"] == "9.0"
+    mock_detect.assert_not_called()
+
+
+@patch("nemo_rl.utils.nvml.get_device_compute_capability", return_value=(8, 0))
+def test_ensure_torch_cuda_arch_list_defaults_from_local_gpu(mock_detect, capfd):
+    with patch.dict(os.environ, {}, clear=True):
+        ensure_torch_cuda_arch_list()
+        assert os.environ["TORCH_CUDA_ARCH_LIST"] == "8.0"
+    assert "'8.0'" in capfd.readouterr().out
+
+
+@patch("nemo_rl.utils.nvml.get_device_compute_capability", return_value=None)
+def test_ensure_torch_cuda_arch_list_warns_without_gpu(mock_detect, capfd):
+    with patch.dict(os.environ, {}, clear=True):
+        ensure_torch_cuda_arch_list()
+        assert "TORCH_CUDA_ARCH_LIST" not in os.environ
+    out = capfd.readouterr().out
+    assert "TORCH_CUDA_ARCH_LIST" in out and "8.0" in out
