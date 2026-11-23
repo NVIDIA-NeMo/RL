@@ -27,6 +27,8 @@
 #   --build-arg BUILD_DYNAMO=1
 # Optional: drop the uv cache from the image (smaller, but no offline `uv run --extra`):
 #   --build-arg STRIP_UV_CACHE=1
+# Optional: install packages over the locked ones in the worker venvs that carry the vllm extra:
+#   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 # Global so every stage's uv cache mount id (BASE_IMAGE-UV_VERSION-HYBRID_EP_MULTINODE)
@@ -752,7 +754,10 @@ RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallo
 # Comma-separated exact pins, so the value survives build systems that pass it unquoted.
 # uv.lock cannot express this per extra: the base project also requires torch, so a second
 # torch index for the vllm extra conflicts with it in the same resolution fork. The venvs
-# then no longer match uv.lock, so a later `uv sync` or `uv run --extra vllm` reverts them.
+# then no longer match uv.lock: anything that rebuilds them from the lock (a `uv sync`,
+# `uv run --extra vllm`, NRL_FORCE_REBUILD_VENVS=true, or a different NEMO_RL_VENV_DIR)
+# gets the locked packages back. Every venv with the vllm extra is changed, not only the
+# vLLM engines (see nemo_rl/distributed/actor_environments.py).
 ARG VLLM_VENV_PACKAGE_OVERRIDES=
 ARG VLLM_VENV_PACKAGE_OVERRIDES_INDEX=https://download.pytorch.org/whl/cu134
 RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
@@ -793,6 +798,7 @@ if [[ -n "${VLLM_VENV_PACKAGE_OVERRIDES:-}" ]]; then
     # --no-config: pyproject.toml's override-dependencies would pin these back.
     # unsafe-best-match: the override index mirrors only some NVIDIA wheels, so each
     # package must be free to come from whichever index has the requested version.
+    IFS=, read -ra vllm_venv_overrides <<< "${VLLM_VENV_PACKAGE_OVERRIDES}"
     while IFS=$'\t' read -r venv_name stage extras; do
         if [[ " $extras " != *" vllm "* ]]; then
             continue
@@ -802,7 +808,7 @@ if [[ -n "${VLLM_VENV_PACKAGE_OVERRIDES:-}" ]]; then
             --default-index https://pypi.org/simple \
             --index "${VLLM_VENV_PACKAGE_OVERRIDES_INDEX}" \
             --index-strategy unsafe-best-match \
-            ${VLLM_VENV_PACKAGE_OVERRIDES//,/ }
+            "${vllm_venv_overrides[@]}"
         "${NEMO_RL_VENV_DIR}/${venv_name}/bin/python" -c \
             'import torch, vllm; print("vllm venv override:", vllm.__version__, torch.__version__, torch.version.cuda)'
     done < /opt/actor_venvs.tsv

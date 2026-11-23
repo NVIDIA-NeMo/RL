@@ -76,6 +76,21 @@ When these build arguments are set, the corresponding `uv sync --extra` commands
 > [!NOTE]
 > If you skip vLLM, SGLang, or TRT-LLM during the build but later try to use those backends at runtime, the dependencies will be fetched and built on-demand. This may add significant setup time on first use.
 
+## Overriding Packages in the vLLM Worker Venvs
+
+`VLLM_VENV_PACKAGE_OVERRIDES` installs the listed packages over the locked ones in every worker venv that carries the `vllm` extra. It is empty by default. Use it to try the vLLM wheel on a torch built for a newer CUDA toolkit than the one `uv.lock` pins, which the lock cannot express for a single extra:
+
+```sh
+docker buildx build -f docker/Dockerfile \
+    --build-arg VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27 \
+    --tag <registry>/nemo-rl:latest \
+    .
+```
+
+The value is a comma-separated list of exact pins. Packages come from PyPI and from `VLLM_VENV_PACKAGE_OVERRIDES_INDEX` (default: the PyTorch cu134 index).
+
+The overridden venvs no longer match `uv.lock`. Anything that rebuilds them from the lock restores the locked packages: `uv sync`, `uv run --extra vllm`, `NRL_FORCE_REBUILD_VENVS=true`, or a `NEMO_RL_VENV_DIR` that points away from the prebuilt venvs.
+
 ## Stripping the uv Cache
 
 By default, the release image keeps `uv`'s download cache (`/opt/nemo_rl_cache/uv`) on disk. This lets the image's unprivileged runtime user re-run `uv run --extra <backend>` fully offline, since every wheel it could need is already cached in the image. The tradeoff is a larger image.
