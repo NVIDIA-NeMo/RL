@@ -45,7 +45,9 @@ def _run(monkeypatch, capsys, user_login):
     monkeypatch.setattr(ri, "_gh", _fake_gh(user_login))
     monkeypatch.setattr(ri, "_pr", lambda pr: PR)
     real_detect = ri.detect
-    monkeypatch.setattr(ri, "detect", lambda: real_detect(env={}, home=Path("/nonexistent")))
+    monkeypatch.setattr(
+        ri, "detect", lambda: real_detect(env={}, home=Path("/nonexistent"))
+    )
     code = ri.main(["preflight", "--pr", "1"])
     return code, capsys.readouterr().out
 
