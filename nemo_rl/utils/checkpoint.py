@@ -227,9 +227,11 @@ class CheckpointingConfig(BaseModel, extra="allow"):
             and mooncake_cpu backends; no backend-specific checkpoint switch is needed.
         load_replay_buffer (bool): Whether async GRPO or SingleController restores
             replay-buffer state when resuming from a checkpoint. When False, a
-            frontier-aligned async resume or a SingleController native TQ resume
-            regenerates the buffered prompt groups on the current policy instead
-            of reusing completed groups.
+            frontier-aligned async resume or a single-dataloader SingleController
+            native TQ resume regenerates the buffered prompt groups on the current
+            policy instead of reusing completed groups. Checkpointed SingleController
+            runs with multiple dataloaders require both save_data_plane and
+            load_replay_buffer to be True.
     """
 
     enabled: bool
