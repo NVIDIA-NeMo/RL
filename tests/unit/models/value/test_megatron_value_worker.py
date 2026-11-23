@@ -1414,3 +1414,42 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
                 torch.distributed.destroy_process_group()
     finally:
         resumed.shutdown()
+
+
+def test_megatron_value_move_optimizer_offloads_into_pinned_destination(monkeypatch):
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    source = MagicMock(spec=torch.Tensor)
+    source.is_cuda = True
+    destination = MagicMock(spec=torch.Tensor)
+    destination.is_cuda = False
+    resident = torch.tensor(1)
+    state = {0: {"exp_avg": source, "step": resident}}
+    events = []
+
+    def allocate(value, **kwargs):
+        assert value is source
+        assert kwargs == {"device": "cpu", "pin_memory": True}
+        events.append("allocate")
+        return destination
+
+    def copy(value, *, non_blocking):
+        assert value is source
+        assert non_blocking is False
+        assert state[0]["exp_avg"] is source
+        events.append("copy")
+
+    destination.copy_.side_effect = copy
+    monkeypatch.setattr(torch, "empty_like", allocate)
+    worker = object.__new__(MegatronValueWorkerImpl)
+    worker.optimizer = SimpleNamespace(_get_state=lambda: state)
+
+    worker.move_optimizer("cpu")
+    worker.move_optimizer("cpu")
+
+    assert events == ["allocate", "copy"]
+    assert state[0]["exp_avg"] is destination
+    assert state[0]["step"] is resident
+    source.to.assert_not_called()

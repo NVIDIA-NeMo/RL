@@ -657,8 +657,8 @@ def _collect_local_refit_hf_names(conversion_tasks: Iterable[Any]) -> set[str]:
     """Return HF names whose Bridge tasks expose safe direct local views.
 
     Every task contributing to a grouped HF tensor must provide local specs.
-    Mappings that need transpose, interleave, or other grouped-export transforms
-    return no specs and therefore stay on the normal Bridge conversion path.
+    Canonical local views do not include grouped destination transposition;
+    those mappings must stay on the normal Bridge conversion path.
 
     The result is expert-parallel invariant. Bridge conversion tasks are
     EP-local -- each EP rank only enumerates its own ``experts.N.*`` -- while the
@@ -670,7 +670,9 @@ def _collect_local_refit_hf_names(conversion_tasks: Iterable[Any]) -> set[str]:
     for task in conversion_tasks:
         if task is None:
             continue
-        has_local_views = bool(task.local_hf_param_specs())
+        has_local_views = bool(task.local_hf_param_specs()) and not getattr(
+            task.mapping, "transpose_on_export", False
+        )
         for name in task.hf_param_names:
             support_by_name[name] = support_by_name.get(name, True) and has_local_views
 
@@ -3382,7 +3384,10 @@ class MegatronPolicyWorkerImpl(
         On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         ## disable overlap param gather when swapping weights
-        if self.should_disable_forward_pre_hook:
+        reenable_forward_pre_hook = (
+            self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled()
+        )
+        if reenable_forward_pre_hook:
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
@@ -3438,7 +3443,7 @@ class MegatronPolicyWorkerImpl(
                 torch.cuda.empty_cache()
 
             ## re-enable overlap param gather after weight swap
-            if self.should_disable_forward_pre_hook:
+            if reenable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")
@@ -4973,15 +4978,17 @@ class MegatronPolicyWorkerImpl(
         self.model = self.move_model(
             self.model, "cuda", move_grads=uses_mxfp8_shared_buffer
         )
-        if (
-            uses_mxfp8_shared_buffer
-            and not keep_train_buffers
-            and self.optimizer is not None
-        ):
-            # reload_from_cpu() zeros the shared storage. Restage optimizer
-            # masters before a logprob forward gathers parameters from it.
-            self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
         self.model.eval()
+
+        # Packed logprob shards can require different numbers of forwards on
+        # different DP ranks, so their forwards cannot run DP collectives. Do
+        # the one required parameter gather before releasing any train buffer.
+        # During an open split train step, parameters are already gathered and
+        # the accumulated gradients must not be zeroed.
+        if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
+            self._disable_forward_pre_hook_until_next_train_step(
+                param_sync=not keep_train_buffers
+            )
 
         if not keep_train_buffers and not uses_mxfp8_shared_buffer:
             # offload grads to cpu
@@ -5277,6 +5284,15 @@ class MegatronPolicyWorkerImpl(
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()
 
+        # Forced refit sync marks BF16 buckets as dispatched. After replacing
+        # their storage, the next forward must start a new parameter-gather epoch.
+        if (
+            self.should_disable_forward_pre_hook
+            and isinstance(self.model, DistributedDataParallel)
+            and not keep_shared_buffer
+        ):
+            self.model.reset_param_sync_dispatch_state()
+
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
         print(
@@ -5342,7 +5358,13 @@ class MegatronPolicyWorkerImpl(
                     # Move the tensor to device and update the state dictionary
                     if device == "cpu":
                         if v.is_cuda:
-                            state[k] = v.to("cpu")
+                            # Avoid pageable-host staging during CUDA offload.
+                            # Publish the state only after its copy has completed.
+                            destination = torch.empty_like(
+                                v, device="cpu", pin_memory=True
+                            )
+                            destination.copy_(v, non_blocking=False)
+                            state[k] = destination
                     elif device == "cuda":
                         if not v.is_cuda:
                             state[k] = v.to("cuda")
@@ -5428,7 +5450,11 @@ class MegatronPolicyWorkerImpl(
             if not is_training:
                 self.model.eval()
 
-            if self.should_disable_forward_pre_hook:
+            reenable_forward_pre_hook = (
+                self.should_disable_forward_pre_hook
+                and self._forward_pre_hook_enabled()
+            )
+            if reenable_forward_pre_hook:
                 self.disable_forward_pre_hook()
             if self.scheduler is not None:
                 # Megatron-Bridge copies consumed_train_samples into scheduler.num_steps
@@ -5459,7 +5485,7 @@ class MegatronPolicyWorkerImpl(
                     ckpt_cfg=self.mcore_state.cfg.checkpoint,
                     blocking=True,
                 )
-            if self.should_disable_forward_pre_hook:
+            if reenable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
             if not is_training:
