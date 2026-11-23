@@ -169,6 +169,7 @@ def sft_processor(
         add_eos_token=add_eos,
         add_generation_prompt=add_generation_prompt,
         tools=datum_dict.get("tools", None),  # Pass tools from data if present
+        chat_template_kwargs=datum_dict.get("chat_template_kwargs"),
     )
 
     length = sum(len(m["token_ids"]) for m in message_log)

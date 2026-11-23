@@ -462,6 +462,17 @@ Without `use_preserving_dataset: true`, the loader would incorrectly add:
 
 This corrupts your training data and can lead to models generating invalid tool calls. The `PreservingDataset` mode maintains the exact structure of each tool call.
 
+#### Per-Sample Chat Template Arguments
+
+`policy.tokenizer.chat_template_kwargs` applies to every sample. To mix samples that need different template arguments, such as thinking and non-thinking conversations or different reasoning efforts, a sample can set its own `chat_template_kwargs`, which overrides the configured values for that sample only:
+
+```json
+{"messages": [...], "chat_template_kwargs": {"enable_thinking": false}}
+{"messages": [...], "chat_template_kwargs": {"reasoning_effort": "low"}}
+```
+
+Keys a sample does not set keep their configured values. The model's chat template must read each variable.
+
 
 ## Evaluate the Trained Model
 

@@ -117,6 +117,8 @@ class OpenAIFormatDataset(RawDataset):
         - When use_preserving_dataset=True, the dataset preserves the exact structure
           of each sample without None-filling for missing keys, which is useful for
           heterogeneous tool argument schemas.
+        - A sample may set "chat_template_kwargs" (e.g. {"enable_thinking": false}) to
+          override the configured chat template variables for that sample only.
     """
 
     def __init__(
@@ -203,5 +205,7 @@ class OpenAIFormatDataset(RawDataset):
             result["message_loss_mask"] = message_loss_mask
         if self.tool_key and self.tool_key in data:
             result["tools"] = data[self.tool_key]
+        if data.get("chat_template_kwargs") is not None:
+            result["chat_template_kwargs"] = data["chat_template_kwargs"]
 
         return result
