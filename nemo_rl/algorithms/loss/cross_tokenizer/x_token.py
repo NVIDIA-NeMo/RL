@@ -302,8 +302,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         self.num_teachers = len(self.projection_matrix_paths)
         # The materialized projection matrix and the derived exact-map
         # partition both live in process-local caches in
-        # ``x_token.loss_utils`` (see ``get_sparse_projection_matrix``,
-        # ``get_topk_projection``, ``build_exact_token_map``), not on
+        # ``nemo_rl.algorithms.cross_tokenizer.loss_utils`` (see
+        # ``get_sparse_projection_matrix``, ``get_topk_projection``,
+        # ``build_exact_token_map``), not on
         # this instance. That keeps the driver-side ``loss_fn`` free of
         # any large CUDA tensors and lets multiple loss instances on
         # the same worker share one load.
