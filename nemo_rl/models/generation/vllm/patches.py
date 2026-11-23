@@ -445,6 +445,13 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
     branch or adding a native-name mapping branch) still take the required
     edit, where matching the whole body as one snippet would silently no-op.
 
+    The required edit gives every LayerScale parameter the checkpoint did not
+    supply the configured identity factor instead of dummy-init noise. On 0.33
+    that is ``config.initializer_factor`` for ``ls{1,2}``; on 0.34 it is
+    ``config.layerscale_value`` for ``layer_scale{1,2}.lambda1``. Both default
+    to 1.0 when the config omits them. Folded checkpoints, which carry no
+    LayerScale tensors at all, depend on it.
+
     Refit calls ``load_weights`` once per size-limited batch, so names loaded
     by any earlier call are remembered on the module and never re-filled.
 
@@ -472,14 +479,7 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
 """
     skip_new = ""
 
-    # Edit 2 (required): give every LayerScale parameter the checkpoint did not
-    # supply the configured identity factor instead of dummy-init noise.
-    # RadioConfig defaults initializer_factor=1.0, and getattr keeps this safe
-    # for configs that omit it. This is the edit that matters for the folded
-    # checkpoints we train on, which contain no ls1/ls2 tensors whatsoever.
-    # vLLM 0.34: the LayerScale modules are ``layer_scale{1,2}.lambda1`` and the
-    # identity value is ``config.layerscale_value`` (``RadioLayerScale`` uses it
-    # for its own init).
+    # Edit 2 (required): fill missing LayerScale weights using the identity field for each loader layout.
     old_snippet_034 = """        return loaded
 
     def _extract_final(

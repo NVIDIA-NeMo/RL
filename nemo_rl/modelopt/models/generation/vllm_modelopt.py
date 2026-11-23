@@ -108,7 +108,14 @@ def _canonicalize_nvfp4_scale_(scale: torch.Tensor) -> None:
 
 
 def _vllm_retires_unused_input_scales() -> bool:
-    """True when vLLM retires weight-only MoE input scales itself (0.34+)."""
+    """True when vLLM retires weight-only MoE input scales itself (0.34+).
+
+    W4A16 checkpoints carry no activation scales. vLLM 0.33's Marlin converter
+    accepts ``None`` for them and removes the attributes. From 0.34 the
+    weight-only path marks the placeholder parameters retired after loading, so
+    they must stay registered; ``weight_loader_numel = 0`` then tells layerwise
+    reload not to wait for tensors a refit never sends.
+    """
     return Version(importlib.metadata.version("vllm")) >= Version("0.34")
 
 
@@ -257,10 +264,7 @@ def register_nemo_modelopt_nvfp4() -> None:
                 **extra_weight_attrs,
             )
             if _vllm_retires_unused_input_scales():
-                # vLLM 0.34 retires these placeholders itself after loading
-                # (getattr(layer, name).retired = True), so they must stay
-                # registered. W4A16 refits never send them: tell layerwise
-                # reload they load zero elements so it does not wait for them.
+                # Keep 0.34 placeholders registered, but exclude their absent checkpoint elements.
                 layer.w13_input_scale.weight_loader_numel = 0
                 layer.w2_input_scale.weight_loader_numel = 0
             else:
@@ -278,12 +282,7 @@ def register_nemo_modelopt_nvfp4() -> None:
                 # export remains our concern.
                 _canonicalize_nvfp4_scale_(layer.w13_weight_scale)
                 _canonicalize_nvfp4_scale_(layer.w2_weight_scale)
-            # W4A16 checkpoint metadata deliberately omits activation scales so
-            # layerwise reload never waits for tensors that do not exist. On
-            # vLLM 0.33 the native Marlin converter accepts None and removes
-            # these attributes; from 0.34 the weight-only path retires the
-            # placeholder params itself (getattr(layer, name).retired = True),
-            # so they must stay registered.
+            # vLLM 0.33 needs None scales; 0.34 retires the registered placeholders.
             if not _vllm_retires_unused_input_scales():
                 layer.w13_input_scale = None
                 layer.w2_input_scale = None
