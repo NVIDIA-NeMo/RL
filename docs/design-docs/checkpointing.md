@@ -129,5 +129,5 @@ def checkpoint_ready(*, step: int, path: str) -> None:
 ```
 
 - **When:** after `step_N` is published (renamed locally, or `_SUCCESS` written on `msc://`), never for a failed write or publication. `path` is the published directory and may be an `msc://` URI.
-- **Where:** in config order, on the thread that publishes the checkpoint; for async saves that is the background finalization thread, which the next save and training exit wait for. Keep hooks bounded (use timeouts) so they cannot stall training.
+- **Where:** in config order, on the thread that publishes the checkpoint. Every built-in training loop publishes on the background finalization thread (inside the controller actor under SingleController and SFT v2), which the next save and training exit wait for. Keep hooks bounded (use timeouts) so they cannot stall training.
 - **Failures:** an exception is reported as a warning and the checkpoint stays published. Calls are not retried or replayed, and retention (`keep_top_k`) may later delete a step a hook was told about.

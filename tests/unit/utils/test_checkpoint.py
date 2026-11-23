@@ -1476,8 +1476,9 @@ def test_publish_hooks_see_published_step(checkpoint_config, checkpoint_dir):
     ]
     manager = CheckpointManager(checkpoint_config)
 
-    with pytest.warns(UserWarning, match="event API down"):
+    with pytest.warns(UserWarning, match="failed for step 1: .*event API down"):
         manager.finalize_checkpoint(manager.init_tmp_checkpoint(1, {}))
+    with pytest.warns(UserWarning, match="failed for step 2: .*event API down"):
         manager.begin_finalization(manager.init_tmp_checkpoint(2, {}))
         manager.shutdown()
 
@@ -1485,6 +1486,13 @@ def test_publish_hooks_see_published_step(checkpoint_config, checkpoint_dir):
         {"step": 1, "path": str(checkpoint_dir / "step_1")},
         {"step": 2, "path": str(checkpoint_dir / "step_2")},
     ]
+
+
+def test_unresolvable_publish_hook_fails_at_startup(checkpoint_config):
+    checkpoint_config.publish_hooks = [f"{__name__}._no_such_hook"]
+
+    with pytest.raises(ImportError, match="_no_such_hook"):
+        CheckpointManager(checkpoint_config)
 
 
 def test_publish_hooks_wait_for_async_write(hooked_manager):
