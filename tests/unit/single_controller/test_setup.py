@@ -855,18 +855,58 @@ def _patched_gym_token_capture(finalizer_actors, *, router_replay: bool = False)
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
-    def test_nvfp4_pertoken_normalized_as_validated_grpo_entry_point(
-        self, patched_factories: dict[str, Any]
+    @pytest.mark.parametrize(
+        ("algorithm", "entry_point"),
+        [
+            ("grpo", "single_controller"),
+            ("disabled_distillation", "single_controller"),
+            ("distillation", "single_controller_distillation"),
+            ("ppo", "single_controller_ppo"),
+        ],
+    )
+    def test_nvfp4_pertoken_entry_point_names_the_algorithm(
+        self, patched_factories: dict[str, Any], algorithm: str, entry_point: str
     ) -> None:
-        mc = _make_master_config(megatron_enabled=True)
-        mc.policy["generation"]["nvfp4_pertoken_rollout"] = {"enabled": True}
+        """Only plain GRPO is validated; PPO and enabled distillation must warn."""
 
-        with patch.object(
-            sc_setup_mod, "normalize_nvfp4_pertoken_policy_config"
-        ) as normalize:
+        class _ReachedNormalization(Exception):
+            pass
+
+        mc = _make_master_config(
+            megatron_enabled=True,
+            env={"should_use_nemo_gym": algorithm == "distillation"},
+        )
+        mc.policy["generation"]["nvfp4_pertoken_rollout"] = {"enabled": True}
+        if algorithm == "ppo":
+            mc.ppo = PPOConfig.model_construct(**dict(mc.grpo))
+            mc.grpo = None
+            mc.value = {"megatron_cfg": {"enabled": True}, "train_global_batch_size": 8}
+            mc.value_loss_fn = MseValueLossConfig()
+        elif algorithm == "distillation":
+            mc.grpo.adv_estimator = AdvEstimatorConfig(name="opd")
+            mc.on_policy_distillation = OnPolicyDistillationConfig(
+                enabled=True,
+                teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+                default_teacher_alias="teacher",
+                non_colocated_teachers={"enabled": True},
+            )
+        elif algorithm == "disabled_distillation":
+            mc.on_policy_distillation = OnPolicyDistillationConfig(enabled=False)
+
+        # Stop setup at the call: the builders must not have run before it.
+        with (
+            patch.object(
+                sc_setup_mod,
+                "normalize_nvfp4_pertoken_policy_config",
+                side_effect=_ReachedNormalization,
+            ) as normalize,
+            pytest.raises(_ReachedNormalization),
+        ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        normalize.assert_called_once_with(mc.policy, entry_point="single_controller")
+        normalize.assert_called_once_with(mc.policy, entry_point=entry_point)
+        for factory in ("_build_clusters", "_build_generation", "_build_trainer"):
+            patched_factories[factory].assert_not_called()
 
     def test_materializes_native_lora_before_build_factories(self, patched_factories):
         mc = _make_master_config()

@@ -308,6 +308,68 @@ def test_teacher_worker_group_drops_the_student_pretrained_checkpoint(monkeypatc
     assert policy_config["pretrained_checkpoint"]["path"] == "/ckpt/sft"
 
 
+def test_teacher_worker_group_drops_the_student_nvfp4_rollout_block(monkeypatch):
+    """A BF16 teacher must not inherit the student's per-token NVFP4 rollout flag."""
+    import nemo_rl.distributed.worker_groups as worker_groups
+    from nemo_rl.models.policy.teacher_worker_group import (
+        TeacherConfig,
+        TeacherWorkerGroup,
+    )
+
+    captured = {}
+
+    class FakeWorkerBuilder:
+        def __init__(self, worker_path, cfg, **kwargs):
+            del worker_path, kwargs
+            captured["cfg"] = cfg
+
+    class FakeWorkerGroup:
+        def __init__(self, cluster, worker_builder, **kwargs):
+            del cluster, worker_builder, kwargs
+
+    monkeypatch.setattr(worker_groups, "RayWorkerBuilder", FakeWorkerBuilder)
+    monkeypatch.setattr(worker_groups, "RayWorkerGroup", FakeWorkerGroup)
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    policy_config = {
+        "model_name": "/ckpt/student",
+        "generation": {
+            "max_new_tokens": 16,
+            "nvfp4_pertoken_rollout": {"enabled": True},
+        },
+        "megatron_cfg": {"enabled": True},
+        "automodel_cfg": {"enabled": False},
+        "sequence_packing": {"enabled": False},
+        "dynamic_batching": {"enabled": False},
+    }
+    teacher_config = TeacherConfig(
+        alias="teacher",
+        model_name="/ckpt/teacher",
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        num_nodes=1,
+        gpus_per_node=1,
+        precision="bf16",
+        micro_batch_size=1,
+        megatron_cfg_overrides={},
+    )
+
+    teacher = TeacherWorkerGroup(
+        teacher_config,
+        cluster,
+        policy_config,
+        MagicMock(),
+        teacher_index=0,
+    )
+
+    assert captured["cfg"]["generation"] == {"max_new_tokens": 16}
+    assert teacher.cfg["generation"] == {"max_new_tokens": 16}
+    # The student's own config is left alone.
+    assert policy_config["generation"]["nvfp4_pertoken_rollout"] == {"enabled": True}
+
+
 def _disable_opd_full(teacher) -> None:
     """Set the opd_full attributes to the state __init__ gives them when off.
 

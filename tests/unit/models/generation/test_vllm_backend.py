@@ -2040,6 +2040,70 @@ def test_collective_refit_with_preparer_rejects_partial_reload(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_collective_refit_with_preparer_retry_after_failed_reload(monkeypatch):
+    """A refit retried on the same worker must not reuse half-loaded layers."""
+    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        finalize_layerwise_reload,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    class _TimesTen(QuantizeMethodBase):
+        """Kernel format differs from checkpoint format, like a real quant method."""
+
+        def create_weights(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def apply(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def process_weights_after_loading(self, layer):
+            for param in layer.parameters():
+                param.data.mul_(10)
+
+    model = torch.nn.Module()
+    for layer_name in ("a", "b"):
+        layer = torch.nn.Module()
+        for index in range(2):
+            layer.register_parameter(
+                f"p{index}", torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+            )
+        layer.quant_method = _TimesTen()
+        model.add_module(layer_name, layer)
+    record_metadata_for_reloading(model)
+    names = [name for name, _ in model.named_parameters()]
+
+    def reload_weights(*, weights_iterator, is_checkpoint_format):
+        # The checkpoint-format body of vLLM's reload_weights.
+        assert is_checkpoint_format is True
+        initialize_layerwise_reload(model)
+        for name, tensor in weights_iterator:
+            param = model.get_parameter(name.removeprefix("prepared."))
+            getattr(param, "weight_loader", default_weight_loader)(param, tensor)
+        finalize_layerwise_reload(model, None)
+
+    failing = _RecordingPreparer(fail_on=names[1])
+    ext, _, _ = _make_collective_reload_extension(monkeypatch, vllm_backend, failing)
+    ext.state_dict_info = {name: object() for name in names}
+    ext.model_runner.model = model
+    ext.model_runner.reload_weights = reload_weights
+
+    with pytest.raises(RuntimeError, match="preparer failed"):
+        ext.update_weights_from_collective()
+
+    ext._get_reload_weight_preparer = lambda: _RecordingPreparer()
+    assert ext.update_weights_from_collective() is True
+
+    # Every tensor in the stream is ones(2); the quant method scales it once.
+    for name, param in model.named_parameters():
+        assert torch.equal(param, torch.full((2,), 10.0)), name
+
+
+@pytest.mark.vllm
 def test_sparse_delta_refit_rejected_for_native_trtllm_backend():
     from nemo_rl.models.generation.vllm import vllm_backend
 

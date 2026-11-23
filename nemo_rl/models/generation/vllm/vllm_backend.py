@@ -267,8 +267,9 @@ class _IPCWeightManifest:
 class _ReloadWeightPreparer(Protocol):
     """Turn transport batches into reload-safe checkpoint tensors.
 
-    Tensors returned by ``process`` must not reference the source IPC buffer,
-    because it is released as soon as the batch is acknowledged.
+    Tensors returned by ``process`` must not reference the transport's receive
+    buffer (IPC allocation or collective receive buffer), because it is reused
+    for the next batch.
     """
 
     def reset(self) -> None: ...
@@ -2381,6 +2382,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     logger.exception(
                         "Failed to drain the collective sender after reload failure"
                     )
+            # A failed reload skips vLLM's finalize. Reset its per-layer state so
+            # a retry on this worker does not reuse the half-loaded layers.
+            try:
+                _abort_layerwise_reload(self.model_runner.model)
+            except Exception:
+                logger.exception("Failed to reset the layerwise reload state")
             raise
         finally:
             close_weight_iterator = getattr(weight_iterator, "close", None)
