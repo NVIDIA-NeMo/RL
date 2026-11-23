@@ -25,8 +25,8 @@ NeMo RL extension points:
 | Actor | Project | Key pins |
 | --- | --- | --- |
 | Driver | `research/speechlm_gspo` (root workspace member) | root `uv.lock` |
-| Policy, ASR reward | `envs/policy` | Speech `079e48770`, Automodel `752a71eb`, transformers 5.18.0, TransformerEngine 2.19.0, Torch 2.13.0 |
-| vLLM generation | `envs/generation` | NeMo RL `vllm` extra (vLLM 0.33.0, Torch 2.14.0, transformers 5.16.1) and Speech `079e48770` |
+| Policy, ASR reward | `envs/policy` | Speech `ab47d17de`, Automodel `752a71eb`, transformers 5.18.0, TransformerEngine 2.19.0, Torch 2.13.0 |
+| vLLM generation | `envs/generation` | NeMo RL `vllm` extra (vLLM 0.33.0, Torch 2.14.0, transformers 5.16.1) and Speech `ab47d17de` |
 
 Speech and Automodel main require transformers and TransformerEngine versions
 outside the root lock, so `envs/` carry their own locks. Their Torch, CUDA

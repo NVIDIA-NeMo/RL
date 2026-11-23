@@ -46,6 +46,9 @@ override-dependencies = [
   "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "nvidia-nccl-cu13==2.30.7",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
+  # nixl 1.3.0's nixl_ep fails to load with Torch 2.14; after the Speech plugin
+  # loads, vLLM's probe of it aborts the worker in ld.so.
+  "nixl==1.5.2; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "opencv-python-headless; sys_platform == 'never'",
   "av; sys_platform == 'never'",
   "aisimulate; sys_platform == 'never'",
@@ -64,7 +67,7 @@ override-dependencies = [
 [tool.uv.sources]
 nemo-rl = { path = "../../../..", editable = true }
 speechlm-gspo = { path = "../..", editable = true }
-nemo-toolkit = { git = "https://github.com/NVIDIA-NeMo/Speech.git", rev = "079e48770098a4cffcf542a4bc974cafc84502a3" }
+nemo-toolkit = { git = "https://github.com/NVIDIA-NeMo/Speech.git", rev = "ab47d17de7953fe1182ce1cbaab12a34fdf474f7" }
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 triton = { index = "pytorch-cu130" }

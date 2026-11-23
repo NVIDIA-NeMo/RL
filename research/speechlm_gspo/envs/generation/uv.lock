@@ -22,6 +22,7 @@ overrides = [
     { name = "kubernetes", marker = "sys_platform == 'never'" },
     { name = "llguidance", specifier = ">=1.7.0,<1.8.0" },
     { name = "nemo-lens", extras = ["sdk", "aiohttp"], git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=4d045c03186b90afdc815db46b671f6a21bc7e98" },
+    { name = "nixl", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==1.5.2" },
     { name = "numpy", specifier = ">=2.1.0,<2.5" },
     { name = "nvidia-cublas", marker = "sys_platform != 'darwin'", specifier = "==13.5.1.27" },
     { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin'", specifier = "==9.26.0.51" },
@@ -72,34 +73,36 @@ wheels = [
 
 [[package]]
 name = "ai-dynamo"
-version = "1.5.1"
+version = "1.8.0.dev20261117"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ai-dynamo-runtime" },
     { name = "aiohttp" },
+    { name = "certifi" },
     { name = "msgspec" },
     { name = "prometheus-client" },
     { name = "pyzmq" },
+    { name = "redis" },
     { name = "tqdm" },
     { name = "transformers" },
     { name = "typing-extensions" },
     { name = "zstandard" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cb/19/bc00c468b1d8093abafa7f3ab88362d12cfe06f9be2e65baf0ef03d370d1/ai_dynamo-1.5.1-py3-none-any.whl", hash = "sha256:86d21cb7fbebbf1c3d0933303729b1be222ad0fb4a50b17a03316165d33377b1", size = 3512837, upload-time = "2026-10-07T05:08:09.942Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/7f/69ae9a91b91bdc6c9a326486f252d2e29526818fdb327f15a9ce466e945d/ai_dynamo-1.8.0.dev20261117-py3-none-any.whl", hash = "sha256:23386f5538c441d412c47568ea8e4ca0b845b7b7f2f946aca51ffee47d7d7425", size = 5273261, upload-time = "2026-11-17T11:32:37.919Z" },
 ]
 
 [[package]]
 name = "ai-dynamo-runtime"
-version = "1.5.1"
+version = "1.8.0.dev20261117"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
     { name = "uvloop" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1e/63/f1cde7bb2d74aebc954251fe40ee093298f0975d6f22c47f1f3c66b11949/ai_dynamo_runtime-1.5.1-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:88e5580daf32056dbe2da9d4189ddd2f4e4cc2472ddfebdd19412d223ac4a596", size = 65897955, upload-time = "2026-10-07T05:08:55.817Z" },
-    { url = "https://files.pythonhosted.org/packages/df/05/777f6f79e8c9359d259cf500ec62fcaf6bd9ce148d3bf47910ec02d996e3/ai_dynamo_runtime-1.5.1-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:b5297625a4f407b3871e3039a53f49e09102d67039fc1339349802038b84ec3e", size = 67290732, upload-time = "2026-10-07T05:09:45.438Z" },
+    { url = "https://files.pythonhosted.org/packages/45/7d/b66068294c486500420fc0e9bda2c578c1fa504b0a898f6fd16cb60007f1/ai_dynamo_runtime-1.8.0.dev20261117-cp311-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:5cf75c9ceda32e638d6986a25b9d3b5ab163a6e80faaf0fcec7188c2ad2dc3bb", size = 84888795, upload-time = "2026-11-17T11:34:00.931Z" },
+    { url = "https://files.pythonhosted.org/packages/40/39/7a96952f3ad68c44c993e93875720bd2bf46ad4008fea93febb3d7795ef0/ai_dynamo_runtime-1.8.0.dev20261117-cp311-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:82fa1e218d63365e74ea85692c0933116fe8b330578aaf3df44a0cbe4fbf26fe", size = 86257163, upload-time = "2026-11-17T11:34:32.366Z" },
 ]
 
 [[package]]
@@ -2277,7 +2280,7 @@ wheels = [
 
 [[package]]
 name = "nccl-extensions"
-version = "0.2.0"
+version = "0.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cuda-core" },
@@ -2287,8 +2290,8 @@ dependencies = [
     { name = "packaging" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/71/99/77f2bddf5a42c6e79a1b77d954994355f06a0375bb1079bf1e590c9e0cdb/nccl_extensions-0.2.0-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ea1c5d9e38355ec48668be8dab483dcb7afbbdcd71015afbd21c49993c2dc052", size = 24757293, upload-time = "2026-11-12T07:26:46.642Z" },
-    { url = "https://files.pythonhosted.org/packages/49/d6/9e1af79949865799bfb4a1f01eb488738b6435ee5c2e2814c76d88ce590e/nccl_extensions-0.2.0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1dcd4aff2d85216b6410048b09b2599e1c20d03fbd063d8a428e7ba5a0168114", size = 25124532, upload-time = "2026-11-12T07:27:06.385Z" },
+    { url = "https://files.pythonhosted.org/packages/90/8b/0d98ca96c8625af88d834230b34115fac032ed69eb84c8bde7c38b956d16/nccl_extensions-0.1.0-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3678bce16864064a9f8774ec69f5c023cb2cbcd91db60a7f98e7c87fd4f18a50", size = 22265222, upload-time = "2026-09-02T15:39:12.533Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/66/0f0a3fe84ffdf6ddfb13c01a036ea370519204820cc8c53303f479c43a09/nccl_extensions-0.1.0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3328dc1cfeed0ddf37caac00be8c49b3e4f727dce0e7980f8831696165619a4f", size = 22564580, upload-time = "2026-09-02T15:39:32.862Z" },
 ]
 
 [[package]]
@@ -2345,6 +2348,7 @@ dependencies = [
     { name = "mlflow" },
     { name = "mooncake-transfer-engine-cuda13" },
     { name = "multi-storage-client", extra = ["boto3"] },
+    { name = "nccl-extensions" },
     { name = "nccl4py" },
     { name = "nemo-lens", extra = ["aiohttp", "sdk"] },
     { name = "ninja" },
@@ -2388,6 +2392,7 @@ dependencies = [
 vllm = [
     { name = "ai-dynamo" },
     { name = "ai-dynamo-runtime" },
+    { name = "apache-tvm-ffi" },
     { name = "cuda-python" },
     { name = "flashinfer-cubin" },
     { name = "flashinfer-jit-cache" },
@@ -2412,8 +2417,12 @@ vllm = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=0.26" },
-    { name = "ai-dynamo", marker = "extra == 'vllm'", specifier = "==1.5.1" },
-    { name = "ai-dynamo-runtime", marker = "extra == 'vllm'", specifier = "==1.5.1" },
+    { name = "ai-dynamo", marker = "extra == 'vllm'", specifier = "==1.8.0.dev20261117" },
+    { name = "ai-dynamo-runtime", marker = "extra == 'vllm'", specifier = "==1.8.0.dev20261117" },
+    { name = "apache-tvm-ffi", marker = "extra == 'automodel'", specifier = "==0.1.11" },
+    { name = "apache-tvm-ffi", marker = "extra == 'mcore'", specifier = "==0.1.12" },
+    { name = "apache-tvm-ffi", marker = "extra == 'sglang'", specifier = "==0.1.11" },
+    { name = "apache-tvm-ffi", marker = "extra == 'vllm'", specifier = "==0.1.11" },
     { name = "awscrt", specifier = ">=0.35.0" },
     { name = "blobfile" },
     { name = "causal-conv1d", marker = "extra == 'automodel'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" },
@@ -2429,23 +2438,31 @@ requires-dist = [
     { name = "fastokens", specifier = ">=0.2.0" },
     { name = "flash-attn", marker = "extra == 'automodel'", specifier = "==2.8.1" },
     { name = "flash-attn", marker = "extra == 'mcore'", specifier = "==2.8.1" },
-    { name = "flash-attn-4", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mcore')", specifier = "==4.0.0b19" },
+    { name = "flash-attn-4", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mcore')", specifier = "==4.0.0b27" },
     { name = "flash-mla", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mcore')", git = "https://github.com/deepseek-ai/FlashMLA?rev=b7643bd54521f563b839b98289b5cd048c062ba2" },
-    { name = "flashinfer-cubin", marker = "extra == 'mcore'", specifier = "==0.6.18.post1", index = "https://flashinfer.ai/whl/" },
+    { name = "flashinfer-cubin", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/" },
     { name = "flashinfer-cubin", marker = "extra == 'sglang'", specifier = "==0.6.14", index = "https://flashinfer.ai/whl/" },
     { name = "flashinfer-cubin", marker = "extra == 'vllm'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/" },
-    { name = "flashinfer-jit-cache", marker = "extra == 'mcore'", specifier = "==0.6.18.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache", marker = "extra == 'sglang'", specifier = "==0.6.14", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache", marker = "extra == 'vllm'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm100a", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm100a", marker = "extra == 'vllm'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm103a", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm103a", marker = "extra == 'vllm'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm110a", marker = "platform_machine == 'aarch64' and extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm110a", marker = "platform_machine == 'aarch64' and extra == 'vllm'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm120f", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm120f", marker = "extra == 'vllm'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm121a", marker = "platform_machine == 'aarch64' and extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm121a", marker = "platform_machine == 'aarch64' and extra == 'vllm'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm80", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm80", marker = "extra == 'vllm'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm89", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm89", marker = "extra == 'vllm'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
+    { name = "flashinfer-jit-cache-sm90a", marker = "extra == 'mcore'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm90a", marker = "extra == 'vllm'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
-    { name = "flashinfer-python", marker = "extra == 'mcore'", specifier = "==0.6.18.post1" },
+    { name = "flashinfer-python", marker = "extra == 'mcore'", specifier = "==0.7.2.post1" },
     { name = "flashinfer-python", marker = "extra == 'sglang'", specifier = "==0.6.14" },
     { name = "flashinfer-python", marker = "extra == 'vllm'", specifier = "==0.7.2.post1" },
     { name = "hydra-core" },
@@ -2460,6 +2477,7 @@ requires-dist = [
     { name = "mlflow", specifier = ">=3.13.0" },
     { name = "mooncake-transfer-engine-cuda13", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==0.3.13.post1" },
     { name = "multi-storage-client", extras = ["boto3"], specifier = ">=0.50" },
+    { name = "nccl-extensions", marker = "sys_platform != 'darwin'", specifier = "==0.1.0" },
     { name = "nccl4py", marker = "sys_platform != 'darwin'" },
     { name = "nemo-automodel", extras = ["moe"], marker = "extra == 'automodel'", editable = "../../../../3rdparty/Automodel-workspace/Automodel" },
     { name = "nemo-gym", marker = "extra == 'nemo-gym'", editable = "../../../../3rdparty/Gym-workspace/Gym" },
@@ -2471,14 +2489,17 @@ requires-dist = [
     { name = "numpy" },
     { name = "nv-grouped-gemm", marker = "extra == 'automodel'", git = "https://github.com/fanshiqing/grouped_gemm?tag=v1.1.4.post7" },
     { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin'", specifier = "==9.26.0.51" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mcore')", specifier = "==4.6.2" },
+    { name = "nvidia-cudnn-frontend", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'automodel') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'automodel')", specifier = "==1.25.0" },
+    { name = "nvidia-cudnn-frontend", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'sglang') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'sglang')", specifier = "==1.25.0" },
+    { name = "nvidia-cudnn-frontend", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'trtllm') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'trtllm')", specifier = "==1.25.0" },
+    { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mcore')", specifier = "==4.8.0" },
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'vllm'", specifier = "==4.8.0" },
     { name = "nvidia-cutlass-dsl-libs-base", marker = "extra == 'trtllm'", specifier = "==4.8.0.dev0" },
     { name = "nvidia-cutlass-dsl-libs-core", marker = "extra == 'trtllm'", specifier = "==4.8.0.dev0" },
     { name = "nvidia-cutlass-dsl-libs-cu12", marker = "extra == 'trtllm'", specifier = "==4.8.0.dev0" },
     { name = "nvidia-cutlass-dsl-libs-cu13", marker = "extra == 'trtllm'", specifier = "==4.8.0.dev0" },
     { name = "nvidia-ml-py" },
-    { name = "nvidia-modelopt", marker = "extra == 'modelopt'", git = "https://github.com/NVIDIA/Model-Optimizer?rev=43fd41a58d52c4e6e5dec1d1ff5989ecc737ae1a" },
+    { name = "nvidia-modelopt", marker = "extra == 'modelopt'", git = "https://github.com/NVIDIA/Model-Optimizer?rev=cc4b76d74625b42cca1967118628b25ed326a3d1" },
     { name = "nvidia-nvshmem-cu13", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = ">=3.6.5" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'nvrx'", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?tag=v0.7.0" },
     { name = "nvshmem4py-cu13", marker = "extra == 'mcore'", specifier = ">=0.2.1" },
@@ -2490,6 +2511,7 @@ requires-dist = [
     { name = "plotly" },
     { name = "pybase64" },
     { name = "pyzmq" },
+    { name = "quack-kernels", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mcore')", specifier = ">=0.6.5" },
     { name = "ray", extras = ["default"], specifier = ">=2.58.0" },
     { name = "rich" },
     { name = "sentencepiece" },
@@ -2504,11 +2526,13 @@ requires-dist = [
     { name = "tensordict" },
     { name = "tensorrt-llm", marker = "extra == 'trtllm'", directory = "../../../../3rdparty/TensorRT-LLM-workspace" },
     { name = "tiktoken" },
-    { name = "tilelang", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = ">=0.1.9,<0.1.13" },
-    { name = "tilelang", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mcore')", specifier = "==0.1.9" },
+    { name = "tilelang", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = ">=0.1.9,<0.1.14" },
+    { name = "tilelang", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'automodel'", specifier = "==0.1.12" },
+    { name = "tilelang", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mcore')", specifier = "==0.1.13" },
+    { name = "tilelang", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'sglang') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'sglang')", specifier = "==0.1.11" },
+    { name = "tilelang", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'trtllm'", specifier = "==0.1.12" },
     { name = "tilelang", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'vllm') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'vllm')", specifier = "==0.1.12" },
     { name = "tilelang", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'automodel'", specifier = "==0.1.11" },
-    { name = "tilelang", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'sglang'", specifier = "==0.1.11" },
     { name = "tilelang", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'trtllm'", specifier = "==0.1.9" },
     { name = "timm" },
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = ">=2.11,<2.15", index = "https://download.pytorch.org/whl/cu130" },
@@ -2565,7 +2589,7 @@ build = [
 ]
 dev = [
     { name = "pre-commit", specifier = ">=4.2.0" },
-    { name = "pyrefly", specifier = "==0.24.2" },
+    { name = "pyrefly", specifier = "==1.4.0" },
     { name = "ruff", specifier = "==0.9.9" },
     { name = "types-pyyaml" },
     { name = "types-requests" },
@@ -2595,8 +2619,8 @@ test = [
 
 [[package]]
 name = "nemo-toolkit"
-version = "3.1.0+079e48770"
-source = { git = "https://github.com/NVIDIA-NeMo/Speech.git?rev=079e48770098a4cffcf542a4bc974cafc84502a3#079e48770098a4cffcf542a4bc974cafc84502a3" }
+version = "3.1.0+ab47d17de7"
+source = { git = "https://github.com/NVIDIA-NeMo/Speech.git?rev=ab47d17de7953fe1182ce1cbaab12a34fdf474f7#ab47d17de7953fe1182ce1cbaab12a34fdf474f7" }
 dependencies = [
     { name = "aistore" },
     { name = "cuda-bindings" },
@@ -2624,7 +2648,6 @@ asr = [
     { name = "librosa" },
     { name = "lightning" },
     { name = "nv-one-logger-core" },
-    { name = "nv-one-logger-pytorch-lightning-integration" },
     { name = "nv-one-logger-training-telemetry" },
     { name = "omegaconf" },
     { name = "packaging" },
@@ -2664,40 +2687,40 @@ wheels = [
 
 [[package]]
 name = "nixl"
-version = "1.3.0"
+version = "1.5.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "nixl-cu12" },
     { name = "nixl-cu13" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fa/a8/1e956af6efd181f44d0a94bfc9d883f1b19788467357018fbffe1fbe7a2d/nixl-1.3.0-py3-none-any.whl", hash = "sha256:000e2852040bce7863420c98f2c8ca675dc24066099c746fdbfe2bed3593ec9e", size = 10297, upload-time = "2026-06-15T23:22:51.093Z" },
+    { url = "https://files.pythonhosted.org/packages/07/25/670a0913285e12d3682520ecb10e50fb4fc01cbbb107e192a6666b6f5731/nixl-1.5.2-py3-none-any.whl", hash = "sha256:e4ef5e16f60be11622030e23333387bd73101102fc9f62efa1c99021d51550a6", size = 11806, upload-time = "2026-10-29T19:48:26.861Z" },
 ]
 
 [[package]]
 name = "nixl-cu12"
-version = "1.3.0"
+version = "1.5.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/36/f8/9ac816a23a35da5c79ce1e1da80933a013112073a00f4da52eb576a3ee68/nixl_cu12-1.3.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:9a275d532ddb45ecdc5af00f7f47f8945a027d9a1c7a3184d688e151764da2dc", size = 49104015, upload-time = "2026-06-15T23:17:23.474Z" },
-    { url = "https://files.pythonhosted.org/packages/cf/1a/2c11c42f71c0acf164c953291ec28297caeab02f571d9a97e7eca2034b3b/nixl_cu12-1.3.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:60eef38ee2b62957de8ba7d3178618b8bb099663bfd111cb19174b5010c7bd77", size = 50558141, upload-time = "2026-06-15T23:15:00.616Z" },
+    { url = "https://files.pythonhosted.org/packages/de/59/b2b4776d3e3b879b403d51bc312cba7f7bbda47ca3764675f646171fad73/nixl_cu12-1.5.2-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:deb477622a1e82326030d658563340c1e36102d6c6241f9689912ef540028aa4", size = 66932281, upload-time = "2026-10-29T19:47:12.454Z" },
+    { url = "https://files.pythonhosted.org/packages/d5/d0/530d7357df5c4fa664bb417d83a08c4f0658e60f07b235bd866f822295a2/nixl_cu12-1.5.2-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:dd9301bc09038d543c14e8dc77f915d7c57294e4f722febc03ff56643611db2e", size = 68655754, upload-time = "2026-10-29T19:44:14.509Z" },
 ]
 
 [[package]]
 name = "nixl-cu13"
-version = "1.3.0"
+version = "1.5.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ea/ff/9f462e977a40128c088bdc698ab855635caa5d7511fca245365ebf5d5e45/nixl_cu13-1.3.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:7c42f8546cfbe4595669212d4bbf596590f61494f0ae1a3bfbd3fb4fe4abf84f", size = 43678469, upload-time = "2026-06-15T23:21:58.728Z" },
-    { url = "https://files.pythonhosted.org/packages/67/96/d01c466193e88fcc4afeb2dc29ff35512b4af497db7a2e76e95f3f75b821/nixl_cu13-1.3.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:2363d3922402f7f3b7302254c3b44cc71520e5ad6a9dc43898fa59a6ee0620a3", size = 45134021, upload-time = "2026-06-15T23:19:50.763Z" },
+    { url = "https://files.pythonhosted.org/packages/00/d9/1ba9016611e3f9d773ed55fbf37fc6bb92c0d0dac6386f37e7228c76cdd1/nixl_cu13-1.5.2-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:ac83c16b59aa0027c0604ad636bd5b8a172512db09af73038be8fefdb3eca16c", size = 75548014, upload-time = "2026-10-29T19:46:56.288Z" },
+    { url = "https://files.pythonhosted.org/packages/fd/be/e398acacfbd26dba4c720215942681746418b2999013f8a7116744f6a4b8/nixl_cu13-1.5.2-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:f1137c583df7f98997e411f386286c045b7e5c251c08198ce4f55e3f2b464fc5", size = 77375091, upload-time = "2026-10-29T19:43:42.902Z" },
 ]
 
 [[package]]
@@ -2756,22 +2779,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/3b/37/963095797035f371e0db6ea761f5aaccb624fc786af217115b423baeb0e2/nv_one_logger_core-2.3.1.tar.gz", hash = "sha256:cbb2f87604c78b96a302f32d87199902129d76153a73a20f8455a250b3246c1d", size = 52640, upload-time = "2025-10-29T21:11:55.812Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ee/c4/ea91554c4fcbff66057f667690101d7a4b965605741350ac661b03fa6c46/nv_one_logger_core-2.3.1-py3-none-any.whl", hash = "sha256:0c8b77bcdac4daa1ea913bf8d4afd2a057bd5526e3654ac39f67caba157341a6", size = 63066, upload-time = "2025-10-29T21:11:52.753Z" },
-]
-
-[[package]]
-name = "nv-one-logger-pytorch-lightning-integration"
-version = "2.3.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "lightning" },
-    { name = "nv-one-logger-core" },
-    { name = "nv-one-logger-training-telemetry" },
-    { name = "setuptools" },
-    { name = "strenum" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/0c/d0/3475b7ab17d367362f650fb0419e8669f41e63c1018f4a8ac2fbecfd2e85/nv_one_logger_pytorch_lightning_integration-2.3.1.tar.gz", hash = "sha256:b32d99b6a8f02a16538bcade939b0a7edd7249e936aacefe336b5519447340c3", size = 10979, upload-time = "2025-10-29T21:22:10.464Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f0/56/01a55efb365b6864646b4ac941a1d9de66f024e880764510ba5a7a63f62c/nv_one_logger_pytorch_lightning_integration-2.3.1-py3-none-any.whl", hash = "sha256:f92904055fb0082516480cc1e3dd0bb6cedb2b033985ebfd4814b9cbf7da2cb2", size = 9822, upload-time = "2025-10-29T21:22:09.37Z" },
 ]
 
 [[package]]
@@ -4065,6 +4072,15 @@ default = [
 ]
 
 [[package]]
+name = "redis"
+version = "8.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/10/8a/408dd829367bb62972bd5d91bd8cc283c24c8344f80a880d4b3901ce43fd/redis-8.2.0.tar.gz", hash = "sha256:58b1493d83ba8f0e3ffe6bd781194ca5c01c91267ae03d29c1087b0b3c7d79c9", size = 5809579, upload-time = "2026-11-23T08:31:56.692Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ea/8f/98458650cca985032598a59caca0641e7889cf4d536dc12dc032bef7df47/redis-8.2.0-py3-none-any.whl", hash = "sha256:4ff649f10fae5e7e97798fb2a84e84a0a66e98310d75cad2b5a572ce0f9f15a7", size = 732892, upload-time = "2026-11-23T08:31:55.011Z" },
+]
+
+[[package]]
 name = "referencing"
 version = "0.37.0"
 source = { registry = "https://pypi.org/simple" }
@@ -4431,7 +4447,7 @@ build = [
 [package.metadata]
 requires-dist = [
     { name = "nemo-rl", extras = ["vllm"], editable = "../../../../" },
-    { name = "nemo-toolkit", extras = ["asr"], git = "https://github.com/NVIDIA-NeMo/Speech.git?rev=079e48770098a4cffcf542a4bc974cafc84502a3" },
+    { name = "nemo-toolkit", extras = ["asr"], git = "https://github.com/NVIDIA-NeMo/Speech.git?rev=ab47d17de7953fe1182ce1cbaab12a34fdf474f7" },
     { name = "peft", specifier = ">=0.18.1" },
     { name = "speechlm-gspo", editable = "../../" },
 ]
