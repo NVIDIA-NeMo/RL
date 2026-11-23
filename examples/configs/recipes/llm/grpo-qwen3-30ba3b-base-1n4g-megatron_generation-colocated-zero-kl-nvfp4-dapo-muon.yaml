@@ -1,0 +1,26 @@
+# Muon arm of grpo-qwen3-30ba3b-base-1n4g-megatron_generation-colocated-zero-kl-nvfp4-dapo.yaml:
+# the same run with Muon on the linear weights and Adam on the rest, using the Muon settings of
+# the DAPO Qwen2.5-7B run in docs/guides/muon-optimizer.md. dist_muon shards Muon's state
+# itself, so MCore's distributed optimizer and param-gather overlap stay off.
+defaults: grpo-qwen3-30ba3b-base-1n4g-megatron_generation-colocated-zero-kl-nvfp4-dapo.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-1n4g-megatron_generation-colocated-zero-kl-nvfp4-dapo-muon
+policy:
+  megatron_cfg:
+    optimizer:
+      optimizer: dist_muon
+      muon_momentum: 0.9
+      muon_nesterov: false
+      muon_scale_mode: spectral
+      muon_extra_scale_factor: 0.5
+      muon_split_qkv: true
+      muon_num_ns_steps: 5
+      muon_fp32_matmul_prec: medium
+      use_distributed_optimizer: false
+      use_precision_aware_optimizer: false
+    distributed_data_parallel_config:
+      overlap_param_gather: false
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-base-1n4g-megatron_generation-colocated-zero-kl-nvfp4-dapo-muon
+  wandb:
+    name: grpo-qwen3-30ba3b-base-1n4g-megatron_generation-colocated-zero-kl-nvfp4-dapo-muon
