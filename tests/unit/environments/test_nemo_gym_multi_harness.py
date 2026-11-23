@@ -314,7 +314,7 @@ def test_select_depends_only_on_the_group_id():
 
 def test_select_requires_a_group_id():
     with pytest.raises(ValueError, match="prompt-group ID"):
-        _routes(("pi_agent", "swe_pi", 1.0)).select("swe", None)  # type: ignore[arg-type]
+        _routes(("pi_agent", "swe_pi", 1.0)).select("swe", None)
 
 
 def test_routes_state_records_the_selection_rule_and_every_candidate():

@@ -175,12 +175,13 @@ class MultiHarnessRoutes:
             server for _, candidates in self.candidates for _, server, _ in candidates
         )
 
-    def select(self, taskset: str, group_id: str) -> HarnessChoice:
+    def select(self, taskset: str, group_id: str | None) -> HarnessChoice:
         """Choose the harness for one prompt group.
 
         Args:
             taskset: The group's ``task_id.taskset``.
-            group_id: The durable prompt-group ID shared by all its generations.
+            group_id: The durable prompt-group ID shared by all its generations;
+                a row without one is refused.
 
         Returns:
             The selected agent and the Environment Server that runs it.

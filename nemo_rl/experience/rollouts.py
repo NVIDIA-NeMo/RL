@@ -3453,7 +3453,7 @@ def _postprocess_single_nemo_gym_group(
             agent_to_results[agent_name].append(result["full_result"])
             agent_to_sample_metrics[agent_name].append(sample_metrics)
 
-        per_agent_metrics = {}
+        per_agent_metrics: dict[str, Any] = {}
         for agent_name, agent_results in agent_to_results.items():
             agent_sample_metrics = agent_to_sample_metrics[agent_name]
             if group_size:
