@@ -3372,7 +3372,7 @@ class TestMetricNormalizationAdvertisement:
             .float(),
         )
 
-        assert len(stacked_values) == 6
+        assert len(stacked_values) == 7
         assert cpu_calls == 1
 
     @pytest.mark.parametrize("metrics_level", ["full", "minimal"])
