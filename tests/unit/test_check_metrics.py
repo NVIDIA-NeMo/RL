@@ -176,6 +176,13 @@ class TestAllFiniteFunction:
     def test_rejects_non_finite_values(self, invalid):
         assert all_finite({"1": 1.0, "2": invalid}) is False
 
+    def test_requires_each_requested_step(self):
+        metric = {"1": 0.1, "3": 0.3}
+        assert all_finite(metric) is True
+        assert all_finite(metric, required_steps=3) is False
+        metric["2"] = 0.2
+        assert all_finite(metric, required_steps=3) is True
+
     def test_accepts_finite_numeric_strings(self):
         assert all_finite({"1": "1.0", "2": "-2.5"}) is True
 
