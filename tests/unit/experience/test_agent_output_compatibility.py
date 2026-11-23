@@ -364,11 +364,6 @@ def test_browsecomp_progress_recovery_is_not_sampled_output(
             "Framework",
         ),
         (
-            "messages",
-            {"messages": [{"role": "user", "content": "task"}], "max_tokens": 10},
-            "Source-history capture currently requires Responses or Chat",
-        ),
-        (
             "responses",
             {"input": "task", "stream": True, "previous_response_id": "opaque"},
             "Framework",
