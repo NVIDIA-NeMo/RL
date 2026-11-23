@@ -146,7 +146,9 @@ def main() -> None:
             # setup data
             with rl_init_timer.time("data"), setup_span("data"):
                 dataset, val_dataset, task_to_env, val_task_to_env = (
-                    setup_response_data(tokenizer, config.data, config.env)
+                    setup_response_data(
+                        tokenizer, config.data, config.env, validation_as_dict=True
+                    )
                 )
 
             # No child spans here: parallel init runs in threads, which do not

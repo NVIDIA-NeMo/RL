@@ -122,7 +122,7 @@ def main() -> None:
 
     with rl_init_timer.time("data"):
         dataset, val_dataset, task_to_env, val_task_to_env = setup_response_data(
-            processor, config.data, config.env, is_vlm=True
+            processor, config.data, config.env, is_vlm=True, validation_as_dict=True
         )
 
     with rl_init_timer.time("setup"):

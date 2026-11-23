@@ -194,6 +194,163 @@ def test_setup_response_data_skips_all_validation_sources(
     assert val_dataset is None
 
 
+def test_setup_response_data_validation_as_dict_keeps_per_dataset_sets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """validation_as_dict=True returns one dataset per validation source."""
+    merge_calls: list[list[Any]] = []
+
+    def fake_load_response_dataset(config: dict[str, str]) -> SimpleNamespace:
+        name = config["data_path"]
+        return SimpleNamespace(
+            task_name=name,
+            dataset=[f"{name} row"],
+            val_dataset=None,
+            task_spec=object(),
+            processor=object(),
+            preprocessor=None,
+        )
+
+    class FakeProcessedDataset:
+        def __init__(self, dataset: list[str], *args: Any, **kwargs: Any) -> None:
+            self.dataset = dataset
+
+        def __len__(self) -> int:
+            return len(self.dataset)
+
+    monkeypatch.setattr(
+        "nemo_rl.data.utils.load_response_dataset", fake_load_response_dataset
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data.utils.merge_datasets",
+        lambda datasets: merge_calls.append(datasets) or datasets[0],
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data.utils.AllTaskProcessedDataset", FakeProcessedDataset
+    )
+
+    data_config = {
+        "max_input_seq_length": None,
+        "shuffle": False,
+        "train": {"data_path": "train.jsonl"},
+        "validation": [
+            {"data_path": "gsm8k.jsonl"},
+            {"data_path": "math500.jsonl"},
+        ],
+    }
+    _, val_dataset = setup_response_data(
+        None, data_config, env_configs=None, validation_as_dict=True
+    )
+
+    # Only the training merge ran; validation sources were not concatenated.
+    assert merge_calls == [[["train.jsonl row"]]]
+    assert isinstance(val_dataset, dict)
+    assert list(val_dataset) == ["gsm8k.jsonl", "math500.jsonl"]
+    assert val_dataset["gsm8k.jsonl"].dataset == ["gsm8k.jsonl row"]
+    assert val_dataset["math500.jsonl"].dataset == ["math500.jsonl row"]
+
+
+def test_setup_response_data_validation_as_dict_rejects_duplicate_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two validation sources with the same task_name cannot share a prefix."""
+
+    def fake_load_response_dataset(config: dict[str, str]) -> SimpleNamespace:
+        return SimpleNamespace(
+            task_name="same",
+            dataset=["row"],
+            val_dataset=None,
+            task_spec=object(),
+            processor=object(),
+            preprocessor=None,
+        )
+
+    class FakeProcessedDataset:
+        def __init__(self, dataset: list[str], *args: Any, **kwargs: Any) -> None:
+            self.dataset = dataset
+
+        def __len__(self) -> int:
+            return len(self.dataset)
+
+    monkeypatch.setattr(
+        "nemo_rl.data.utils.load_response_dataset", fake_load_response_dataset
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data.utils.merge_datasets", lambda datasets: datasets[0]
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data.utils.AllTaskProcessedDataset", FakeProcessedDataset
+    )
+
+    data_config = {
+        "max_input_seq_length": None,
+        "shuffle": False,
+        "train": {"data_path": "train.jsonl"},
+        "validation": [
+            {"data_path": "a.jsonl"},
+            {"data_path": "b.jsonl"},
+        ],
+    }
+    with pytest.raises(ValueError, match="Duplicate validation task_name 'same'"):
+        setup_response_data(
+            None, data_config, env_configs=None, validation_as_dict=True
+        )
+
+
+def test_setup_response_data_default_merges_validation_datasets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without validation_as_dict, validation sources stay one merged dataset."""
+    merge_calls: list[list[Any]] = []
+
+    def fake_load_response_dataset(config: dict[str, str]) -> SimpleNamespace:
+        name = config["data_path"]
+        return SimpleNamespace(
+            task_name=name,
+            dataset=[f"{name} row"],
+            val_dataset=None,
+            task_spec=object(),
+            processor=object(),
+            preprocessor=None,
+        )
+
+    class FakeProcessedDataset:
+        def __init__(self, dataset: list[str], *args: Any, **kwargs: Any) -> None:
+            self.dataset = dataset
+
+        def __len__(self) -> int:
+            return len(self.dataset)
+
+    monkeypatch.setattr(
+        "nemo_rl.data.utils.load_response_dataset", fake_load_response_dataset
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data.utils.merge_datasets",
+        lambda datasets: merge_calls.append(datasets) or datasets[0],
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data.utils.AllTaskProcessedDataset", FakeProcessedDataset
+    )
+
+    data_config = {
+        "max_input_seq_length": None,
+        "shuffle": False,
+        "train": {"data_path": "train.jsonl"},
+        "validation": [
+            {"data_path": "gsm8k.jsonl"},
+            {"data_path": "math500.jsonl"},
+        ],
+    }
+    _, val_dataset = setup_response_data(None, data_config, env_configs=None)
+
+    assert not isinstance(val_dataset, dict)
+    assert merge_calls == [
+        [["train.jsonl row"]],
+        [["gsm8k.jsonl row"], ["math500.jsonl row"]],
+    ]
+    assert val_dataset.dataset == ["gsm8k.jsonl row"]
+
+
 # ---------------------------------------------------------------------------
 # get_train_dataset_name
 # ---------------------------------------------------------------------------

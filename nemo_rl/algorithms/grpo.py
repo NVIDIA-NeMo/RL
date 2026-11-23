@@ -824,7 +824,7 @@ def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
     dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
-    val_dataset: Optional[AllTaskProcessedDataset],
+    val_dataset: Optional[dict[str, AllTaskProcessedDataset]],
     processor: Optional[AutoProcessor] = None,
     policy_factory: Optional[Callable[..., ColocatablePolicyInterface]] = None,
 ) -> tuple[
@@ -833,7 +833,7 @@ def setup(
     Optional[EnvironmentInterface],
     tuple[RayVirtualCluster, RayVirtualCluster],
     StatefulDataLoader | MultipleDataloaderWrapper,
-    Optional[StatefulDataLoader],
+    Optional[dict[str, StatefulDataLoader]],
     ClippedPGLossFn,
     Logger,
     CheckpointManager,
@@ -1058,22 +1058,28 @@ def setup(
             flush=True,
         )
 
-    # Load validation dataset if provided
-    val_dataloader: Optional[StatefulDataLoader] = None
+    # Load validation dataset if provided. One StatefulDataLoader per dataset
+    # so validate() can emit per-dataset metrics; mirrors the DPO pattern.
+    val_dataloader: Optional[dict[str, StatefulDataLoader]] = None
     # If validation is enabled, load the validation dataloader
     if grpo_config.val_period > 0 or grpo_config.val_at_start or grpo_config.val_at_end:
         assert val_dataset is not None, (
             "Validation dataset is required if validation is enabled"
         )
-        val_dataloader = StatefulDataLoader(
-            val_dataset,
-            batch_size=grpo_config.val_batch_size,
-            shuffle=False,
-            collate_fn=rl_collate_fn,
-            num_workers=data_config["num_workers"],
-        )
+        val_dataloader = {
+            name: StatefulDataLoader(
+                ds,
+                batch_size=grpo_config.val_batch_size,
+                shuffle=False,
+                collate_fn=rl_collate_fn,
+                num_workers=data_config["num_workers"],
+            )
+            for name, ds in val_dataset.items()
+        }
+        total_val_samples = sum(len(ds) for ds in val_dataset.values())
         print(
-            f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples",
+            f"  ✓ Validation dataloader loaded with {total_val_samples} samples"
+            f" across {len(val_dataset)} dataset(s)",
             flush=True,
         )
 
@@ -1194,10 +1200,13 @@ def setup(
             if isinstance(dataset, dict)
             else {"train": dataset}
         )
+        val_splits = (
+            {f"validation[{name}]": split for name, split in val_dataset.items()}
+            if isinstance(val_dataset, dict)
+            else {"validation": val_dataset}
+        )
         try:
-            validate_dataset_agent_coverage(
-                shard_set, {**train_splits, "validation": val_dataset}
-            )
+            validate_dataset_agent_coverage(shard_set, {**train_splits, **val_splits})
         except BaseException:
             shard_set.shutdown()
             raise
@@ -3670,7 +3679,7 @@ def _grpo_train_impl(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
     wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloader: Optional[dict[str, StatefulDataLoader]],
     tokenizer: TokenizerType,
     loss_fn: LossFunction,
     task_to_env: dict[str, EnvironmentInterface],
@@ -3756,8 +3765,7 @@ def _grpo_train_impl(
             processor=processor,
         )
         policy_generation.finish_generation()
-        logger.log_metrics(val_metrics, current_step, prefix="validation")
-        logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
+        # Per-dataset validation metrics are logged inside validate().
         if master_config.grpo.debug_payload_metrics:
             validation_payload_metrics = drain_multimodal_payload_metrics()
             if validation_payload_metrics:
@@ -4525,12 +4533,7 @@ def _grpo_train_impl(
                         processor=processor,
                     )
                     policy_generation.finish_generation()
-                    logger.log_metrics(
-                        validation_timings, total_steps + 1, prefix="timing/validation"
-                    )
-                    logger.log_metrics(
-                        val_metrics, total_steps + 1, prefix="validation"
-                    )
+                    # Per-dataset validation metrics are logged inside validate().
                     if master_config.grpo.debug_payload_metrics:
                         validation_payload_metrics = drain_multimodal_payload_metrics()
                         if validation_payload_metrics:
@@ -4956,7 +4959,7 @@ def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
     wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloader: Optional[dict[str, StatefulDataLoader]],
     tokenizer: TokenizerType,
     loss_fn: LossFunction,
     task_to_env: dict[str, EnvironmentInterface],
@@ -4990,7 +4993,7 @@ def grpo_train(
 
 def validate(
     policy_generation: GenerationInterface,
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloader: Optional[dict[str, StatefulDataLoader]],
     tokenizer,
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
@@ -4998,20 +5001,100 @@ def validate(
     logger: Optional[Logger] = None,
     processor: Optional[AutoProcessor] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Run validation on the validation dataset."""
-    if val_dataloader is None:
-        assert val_dataloader is not None or master_config.grpo.val_period == 0, (
-            "val_dataloader is None, so grpo.val_period must be 0"
+    """Run validation across one or more datasets.
+
+    Each dataset gets its own dataloader and is logged under a
+    `validation-<dataset_name>/` prefix, mirroring the DPO setup. The returned
+    `val_metrics` dict carries the per-dataset entries alongside an `accuracy`
+    macro-mean across datasets so save-state and best-checkpoint selection
+    keep working.
+    """
+    if not val_dataloader:
+        assert master_config.grpo.val_period == 0, (
+            "val_dataloader is empty, so grpo.val_period must be 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
         return {}, {}
 
+    val_metrics: dict[str, Any] = {}
+    validation_timings: dict[str, Any] = {}
+    per_dataset_accuracy: list[float] = []
+    per_dataset_pass_k: list[float] = []
+
+    for dataset_name, dataloader in val_dataloader.items():
+        k_metrics, k_timings = validate_one_dataset(
+            policy_generation,
+            dataloader,
+            tokenizer,
+            val_task_to_env,
+            step=step,
+            master_config=master_config,
+            dataset_name=dataset_name,
+            logger=logger,
+            processor=processor,
+        )
+        prefix = f"validation-{dataset_name}"
+        if logger is not None:
+            logger.log_metrics(k_metrics, step, prefix=prefix)
+            logger.log_metrics(k_timings, step, prefix=f"timing/{prefix}")
+        for metric_name, value in k_metrics.items():
+            val_metrics[f"{prefix}_{metric_name}"] = value
+        for timing_name, value in k_timings.items():
+            validation_timings[f"{prefix}_{timing_name}"] = value
+        if "accuracy" in k_metrics:
+            per_dataset_accuracy.append(k_metrics["accuracy"])
+        if "pass_k" in k_metrics:
+            per_dataset_pass_k.append(k_metrics["pass_k"])
+
+    if per_dataset_accuracy:
+        # Macro-mean across datasets so checkpointing.metric_name='val:accuracy'
+        # keeps working under multi-dataset validation.
+        val_metrics["accuracy"] = sum(per_dataset_accuracy) / len(per_dataset_accuracy)
+    if per_dataset_pass_k:
+        val_metrics["pass_k"] = sum(per_dataset_pass_k) / len(per_dataset_pass_k)
+
+    if validation_timings:
+        total_validation_time = sum(
+            v
+            for k, v in validation_timings.items()
+            if k.endswith("total_validation_time")
+        )
+        if logger is not None:
+            logger.log_metrics(
+                {"total_validation_time": total_validation_time},
+                step,
+                prefix="timing/validation",
+            )
+        validation_timings["total_validation_time"] = total_validation_time
+
+    # Explicit GPU memory cleanup after validation
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return val_metrics, validation_timings
+
+
+def validate_one_dataset(
+    policy_generation: GenerationInterface,
+    val_dataloader: StatefulDataLoader,
+    tokenizer,
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    step: int,
+    master_config: MasterConfig,
+    dataset_name: str,
+    logger: Optional[Logger] = None,
+    processor: Optional[AutoProcessor] = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run validation on one validation dataset and return its metrics and timings."""
     timer = Timer(context={"worker": "validator"})
     with (
         timer.time("total_validation_time"),
         evaluate_span("grpo", **{RL_ITERATION_ATTR: step}),
     ):
-        print(f"▶ Starting validation at step {step}...", flush=True)
+        print(
+            f"▶ Starting validation at step {step} for `{dataset_name}`...",
+            flush=True,
+        )
         # >= 1 is validated in setup().
         val_num_generations_per_prompt = (
             master_config.grpo.val_num_generations_per_prompt
@@ -5024,14 +5107,25 @@ def validate(
 
         max_val_samples = master_config.grpo.max_val_samples
         val_batch_size = master_config.grpo.val_batch_size
-        # Include the partial final batch, then trim it to the prompt cap.
-        max_batches = -(-max_val_samples // val_batch_size)
+        # setup() already built the dataloader with this batch size, so it
+        # must be set by the time validation runs (NeMo-Gym runners set it
+        # to the full validation size before setup).
+        assert val_batch_size is not None, (
+            "grpo.val_batch_size must be set to run validation"
+        )
+        if max_val_samples is None:
+            # None iterates the entire dataloader.
+            max_batches = len(val_dataloader)
+        else:
+            # Include the partial final batch, then trim it to the prompt cap.
+            max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
-            num_left = max_val_samples - batch_idx * val_batch_size
-            if val_batch.size > num_left:
-                val_batch = val_batch.slice(0, num_left)
+            if max_val_samples is not None:
+                num_left = max_val_samples - batch_idx * val_batch_size
+                if val_batch.size > num_left:
+                    val_batch = val_batch.slice(0, num_left)
 
             if val_num_generations_per_prompt > 1:
                 val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
@@ -5186,7 +5280,7 @@ def validate(
     validation_time = timing_metrics.get("total_validation_time", 0)
 
     # Print summary of validation results
-    print("\n📊 Validation Results:")
+    print(f"\n📊 Validation Results for `{dataset_name}`:")
     print(f"    • Accuracy: {accuracy:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
@@ -5202,14 +5296,12 @@ def validate(
             "content": all_message_logs,
             "rewards": total_rewards,
         }
-        logger.log_batched_dict_as_jsonl(val_log_data, f"val_data_step{step}.jsonl")
+        logger.log_batched_dict_as_jsonl(
+            val_log_data, f"val_data_{dataset_name}_step{step}.jsonl"
+        )
 
     # Make sure to reset the timer after validation
     timer.reset()
-
-    # Explicit GPU memory cleanup after validation
-    gc.collect()
-    torch.cuda.empty_cache()
 
     return val_metrics, timing_metrics
 
@@ -5352,7 +5444,7 @@ def async_grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloader: Optional[dict[str, StatefulDataLoader]],
     tokenizer: TokenizerType,
     loss_fn: LossFunction,
     task_to_env: dict[str, EnvironmentInterface],
@@ -5372,7 +5464,7 @@ def async_grpo_train(
         policy: Training policy
         policy_generation: Generation interface
         dataloader: Training data loader
-        val_dataloader: Validation data loader
+        val_dataloader: Per-dataset validation data loaders, keyed by dataset name
         tokenizer: Tokenizer
         loss_fn: Loss function
         task_to_env: Training environments
@@ -5723,8 +5815,7 @@ def async_grpo_train(
             # A colocated engine keeps serving between phases (preserves its
             # KV/prefix cache); the backend makes that call, not the loop.
             policy_generation.finish_generation(release_gpu=False)
-            logger.log_metrics(val_metrics, step, prefix="validation")
-            logger.log_metrics(validation_timings, step, prefix="timing/validation")
+            # Per-dataset validation metrics are logged inside validate().
             if master_config.grpo.debug_payload_metrics:
                 validation_payload_metrics = drain_multimodal_payload_metrics()
                 if validation_payload_metrics:
@@ -6487,10 +6578,7 @@ def async_grpo_train(
                         policy_generation.finish_generation(
                             release_gpu=saving_this_step
                         )
-                        logger.log_metrics(
-                            validation_timings, step + 1, prefix="timing/validation"
-                        )
-                        logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                        # Per-dataset validation metrics are logged inside validate().
                         if master_config.grpo.debug_payload_metrics:
                             validation_payload_metrics = (
                                 drain_multimodal_payload_metrics()

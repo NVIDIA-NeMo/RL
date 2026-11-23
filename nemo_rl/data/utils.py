@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from typing import Any, Callable, Optional, Union, cast
+from typing import Any, Callable, Literal, Optional, Union, cast, overload
 
 import yaml
 from transformers import AutoProcessor, AutoTokenizer
@@ -149,6 +149,7 @@ def _combine_agent_name_source_sets(
 
 
 # TODO: @yukih: unify to setup_data after dataset refactored
+@overload
 def setup_response_data(
     tokenizer: AutoProcessor | AutoTokenizer,
     data_config: DataConfig,
@@ -156,6 +157,30 @@ def setup_response_data(
     is_vlm: bool = False,
     *,
     load_validation: bool = True,
+    validation_as_dict: Literal[True],
+) -> Union[
+    tuple[
+        Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
+        Optional[dict[str, AllTaskProcessedDataset]],
+    ],
+    tuple[
+        Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
+        Optional[dict[str, AllTaskProcessedDataset]],
+        dict[str, EnvironmentInterface],
+        dict[str, EnvironmentInterface],
+    ],
+]: ...
+
+
+@overload
+def setup_response_data(
+    tokenizer: AutoProcessor | AutoTokenizer,
+    data_config: DataConfig,
+    env_configs: Optional[dict[str, Any]] = None,
+    is_vlm: bool = False,
+    *,
+    load_validation: bool = True,
+    validation_as_dict: Literal[False] = False,
 ) -> Union[
     tuple[
         Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
@@ -164,6 +189,28 @@ def setup_response_data(
     tuple[
         Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
         Optional[AllTaskProcessedDataset],
+        dict[str, EnvironmentInterface],
+        dict[str, EnvironmentInterface],
+    ],
+]: ...
+
+
+def setup_response_data(
+    tokenizer: AutoProcessor | AutoTokenizer,
+    data_config: DataConfig,
+    env_configs: Optional[dict[str, Any]] = None,
+    is_vlm: bool = False,
+    *,
+    load_validation: bool = True,
+    validation_as_dict: bool = False,
+) -> Union[
+    tuple[
+        Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
+        Optional[Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]]],
+    ],
+    tuple[
+        Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
+        Optional[Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]]],
         dict[str, EnvironmentInterface],
         dict[str, EnvironmentInterface],
     ],
@@ -182,12 +229,19 @@ def setup_response_data(
         is_vlm: Whether to use VLM training or not.
         load_validation: Whether to load validation data configured directly or
             split from a training dataset.
+        validation_as_dict: Whether to return the validation set as a
+            dict mapping dataset (task) name to its dataset instead of a
+            single merged dataset. GRPO and Distillation pass True so each
+            validation dataset gets its own dataloader and per-dataset
+            metrics; other algorithms keep the merged dataset.
 
     Returns:
         If env_configs is not None:
             A tuple of (train dataset, validation dataset, task to environment, task to validation environment).
         If env_configs is None:
             A tuple of (train dataset, validation dataset).
+        The validation dataset is a dict keyed by dataset name when
+        validation_as_dict is True, and a single merged dataset otherwise.
     """
     # ==========================
     # Setup Environments
@@ -271,16 +325,21 @@ def setup_response_data(
     val_task_data_processors = {}
     val_task_data_preprocessors = {}
     val_task_to_env = {}
-    val_data_list = []
-    val_agent_name_source_sets = []
+    # (task_name, raw dataset, agent_name_sources) pairs preserved in load
+    # order so each validation source can be kept as its own entry when
+    # validation_as_dict is True. Mirrors the pattern DPO uses in its setup.
+    val_data_pairs: list[tuple[str, Any, frozenset[NemoGymSourceIdentity] | None]] = []
 
     # validation dataset from train dataset (when train dataset's split_validation_size > 0)
     if load_validation:
         for data in data_list:
             if hasattr(data, "val_dataset") and data.val_dataset is not None:
-                val_data_list.append(data.val_dataset)
-                val_agent_name_source_sets.append(
-                    getattr(data, "agent_name_sources", None)
+                val_data_pairs.append(
+                    (
+                        data.task_name,
+                        data.val_dataset,
+                        getattr(data, "agent_name_sources", None),
+                    )
                 )
                 print(
                     f"  - Loaded validation dataset {data.task_name} with {len(data.val_dataset)} samples."
@@ -309,9 +368,12 @@ def setup_response_data(
             if "default" in data_config and data_config["default"] is not None:
                 update_single_dataset_config(cfg, data_config["default"])
             val_data = load_response_dataset(cfg)
-            val_data_list.append(val_data.dataset)
-            val_agent_name_source_sets.append(
-                getattr(val_data, "agent_name_sources", None)
+            val_data_pairs.append(
+                (
+                    val_data.task_name,
+                    val_data.dataset,
+                    getattr(val_data, "agent_name_sources", None),
+                )
             )
             print(
                 f"  - Loaded validation dataset {val_data.task_name} with {len(val_data.dataset)} samples."
@@ -328,21 +390,54 @@ def setup_response_data(
                 val_task_to_env[task_name] = envs[cfg["env_name"]]
 
     # merge datasets
-    val_dataset = None
-    if len(val_data_list) > 0:
-        merged_val_data = merge_datasets(val_data_list)
-        val_dataset = AllTaskProcessedDataset(
-            merged_val_data,
-            tokenizer,
-            None,
-            val_task_data_processors,
-            task_data_preprocessors=val_task_data_preprocessors,
-            max_seq_length=data_config["max_input_seq_length"],
-            agent_name_sources=_combine_agent_name_source_sets(
-                val_agent_name_source_sets
-            ),
-        )
-        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
+    val_dataset: Optional[
+        Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]]
+    ] = None
+    if len(val_data_pairs) > 0:
+        if validation_as_dict:
+            seen_names: set[str] = set()
+            for name, _, _ in val_data_pairs:
+                if name in seen_names:
+                    raise ValueError(
+                        f"Duplicate validation task_name '{name}'. Each entry "
+                        "under data.validation must produce a unique task_name "
+                        "so that per-dataset metrics can be reported under a "
+                        "distinct validation-<name>/ prefix."
+                    )
+                seen_names.add(name)
+            val_dataset = {
+                name: AllTaskProcessedDataset(
+                    raw,
+                    tokenizer,
+                    # pyrefly: ignore[bad-argument-type]  Every call site passes None here; the constructor explicitly handles it, the annotation just omits None.
+                    None,
+                    val_task_data_processors,
+                    task_data_preprocessors=val_task_data_preprocessors,
+                    max_seq_length=data_config["max_input_seq_length"],
+                    agent_name_sources=sources,
+                )
+                for name, raw, sources in val_data_pairs
+            }
+            total = sum(len(ds) for ds in val_dataset.values())
+            print(
+                f"  ✓ Validation datasets loaded: {total} samples across "
+                f"{len(val_dataset)} dataset(s)."
+            )
+        else:
+            merged_val_data = merge_datasets([raw for _, raw, _ in val_data_pairs])
+            val_dataset = AllTaskProcessedDataset(
+                merged_val_data,
+                tokenizer,
+                # pyrefly: ignore[bad-argument-type]  Every call site passes None here; the constructor explicitly handles it, the annotation just omits None.
+                None,
+                val_task_data_processors,
+                task_data_preprocessors=val_task_data_preprocessors,
+                max_seq_length=data_config["max_input_seq_length"],
+                agent_name_sources=_combine_agent_name_source_sets(
+                    [sources for _, _, sources in val_data_pairs]
+                ),
+            )
+            print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
 
     if has_envs:
         return dataset, val_dataset, task_to_env, val_task_to_env

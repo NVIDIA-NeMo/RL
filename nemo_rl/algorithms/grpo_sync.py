@@ -276,7 +276,7 @@ def validate_sync(
     *,
     rollout_actor: SyncRolloutActor,
     policy: "TQPolicy",
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloader: Optional[dict[str, StatefulDataLoader]],
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
@@ -285,6 +285,12 @@ def validate_sync(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """TQ-mediated counterpart to :func:`nemo_rl.algorithms.grpo.validate`.
 
+    Each dataset gets its own dataloader and is logged under a
+    `validation-<dataset_name>/` prefix, mirroring the DPO setup. The returned
+    `val_metrics` dict carries the per-dataset entries alongside an `accuracy`
+    macro-mean across datasets so save-state and best-checkpoint selection
+    keep working.
+
     Per-batch: register the val partition → ``rollout_to_tq`` (turn_roles /
     turn_contents returned in ``driver_carry``) → ``policy.finish_step``.
     Caller owns ``policy_generation.prepare_for_generation`` /
@@ -292,13 +298,84 @@ def validate_sync(
     ``finish_generation`` is suppressed so inference state stays warm
     across batches.
     """
-    if val_dataloader is None:
+    if not val_dataloader:
         assert master_config.grpo.val_period == 0, (
-            "val_dataloader is None, so grpo.val_period must be 0"
+            "val_dataloader is empty, so grpo.val_period must be 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
         return {}, {}
 
+    val_metrics: dict[str, Any] = {}
+    validation_timings: dict[str, Any] = {}
+    per_dataset_accuracy: list[float] = []
+
+    for dataset_name, dataloader in val_dataloader.items():
+        # A single dataset keeps the historical "val" partition; with several
+        # datasets each gets its own partition so their states cannot collide.
+        dataset_partition_id = (
+            partition_id
+            if len(val_dataloader) == 1
+            else f"{partition_id}-{dataset_name}"
+        )
+        k_metrics, k_timings = validate_sync_one_dataset(
+            rollout_actor=rollout_actor,
+            policy=policy,
+            val_dataloader=dataloader,
+            val_task_to_env=val_task_to_env,
+            step=step,
+            master_config=master_config,
+            dataset_name=dataset_name,
+            logger=logger,
+            partition_id=dataset_partition_id,
+        )
+        prefix = f"validation-{dataset_name}"
+        if logger is not None:
+            logger.log_metrics(k_metrics, step, prefix=prefix)
+            logger.log_metrics(k_timings, step, prefix=f"timing/{prefix}")
+        for metric_name, value in k_metrics.items():
+            val_metrics[f"{prefix}_{metric_name}"] = value
+        for timing_name, value in k_timings.items():
+            validation_timings[f"{prefix}_{timing_name}"] = value
+        if "accuracy" in k_metrics:
+            per_dataset_accuracy.append(k_metrics["accuracy"])
+
+    if per_dataset_accuracy:
+        # Macro-mean across datasets so checkpointing.metric_name='val:accuracy'
+        # keeps working under multi-dataset validation.
+        val_metrics["accuracy"] = sum(per_dataset_accuracy) / len(per_dataset_accuracy)
+
+    if validation_timings:
+        total_validation_time = sum(
+            v
+            for k, v in validation_timings.items()
+            if k.endswith("total_validation_time")
+        )
+        if logger is not None:
+            logger.log_metrics(
+                {"total_validation_time": total_validation_time},
+                step,
+                prefix="timing/validation",
+            )
+        validation_timings["total_validation_time"] = total_validation_time
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    return val_metrics, validation_timings
+
+
+def validate_sync_one_dataset(
+    *,
+    rollout_actor: SyncRolloutActor,
+    policy: "TQPolicy",
+    val_dataloader: StatefulDataLoader,
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    step: int,
+    master_config: MasterConfig,
+    dataset_name: str,
+    logger: Optional[Logger] = None,
+    partition_id: str = "val",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run TQ-mediated validation on one validation dataset."""
     timer = Timer()
     total_rewards: list[float] = []
     total_length_tokens = 0.0  # per-batch mean length x rollouts
@@ -307,17 +384,31 @@ def validate_sync(
     capture_extras = should_use_nemo_gym(master_config)
 
     with timer.time("total_validation_time"):
-        print(f"▶ Starting validation at step {step}...", flush=True)
+        print(
+            f"▶ Starting validation at step {step} for `{dataset_name}`...",
+            flush=True,
+        )
         max_val_samples = master_config.grpo.max_val_samples
         val_batch_size = master_config.grpo.val_batch_size
-        # Include the partial final batch, then trim it to the prompt cap.
-        max_batches = -(-max_val_samples // val_batch_size)
+        # setup() already built the dataloader with this batch size, so it
+        # must be set by the time validation runs (NeMo-Gym runners set it
+        # to the full validation size before setup).
+        assert val_batch_size is not None, (
+            "grpo.val_batch_size must be set to run validation"
+        )
+        if max_val_samples is None:
+            # None iterates the entire dataloader.
+            max_batches = len(val_dataloader)
+        else:
+            # Include the partial final batch, then trim it to the prompt cap.
+            max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
-            num_left = max_val_samples - batch_idx * val_batch_size
-            if val_batch.size > num_left:
-                val_batch = val_batch.slice(0, num_left)
+            if max_val_samples is not None:
+                num_left = max_val_samples - batch_idx * val_batch_size
+                if val_batch.size > num_left:
+                    val_batch = val_batch.slice(0, num_left)
             n_prompts = int(val_batch.size)
             policy.prepare_val_partition(n_prompts, partition_id=partition_id)
             meta, driver_carry, rollout_metrics, _ = ray.get(
@@ -372,7 +463,7 @@ def validate_sync(
 
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
     print(
-        f"\n📊 Validation Results:\n"
+        f"\n📊 Validation Results for `{dataset_name}`:\n"
         f"    • Accuracy: {accuracy:.4f}\n"
         f"    • Average response length: {avg_length:.1f} tokens\n"
         f"    • Samples processed: {len(total_rewards)}\n"
@@ -383,11 +474,9 @@ def validate_sync(
     if logger is not None:
         logger.log_batched_dict_as_jsonl(
             {"content": all_message_logs, "rewards": total_rewards},
-            f"val_data_step{step}.jsonl",
+            f"val_data_{dataset_name}_step{step}.jsonl",
         )
     timer.reset()
-    gc.collect()
-    torch.cuda.empty_cache()
     return val_metrics, timing_metrics
 
 
@@ -474,7 +563,7 @@ def grpo_train_sync(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
     wrapped_dataloader,
-    val_dataloader: Optional[StatefulDataLoader],
+    val_dataloader: Optional[dict[str, StatefulDataLoader]],
     tokenizer,
     loss_fn: LossFunction,
     task_to_env: dict[str, EnvironmentInterface],
@@ -635,8 +724,7 @@ def grpo_train_sync(
             logger=logger,
         )
         policy_generation.finish_generation()
-        logger.log_metrics(val_metrics, current_step, prefix="validation")
-        logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
+        # Per-dataset validation metrics are logged inside validate_sync().
         stop_message = _validation_early_stop_message(
             val_metrics,
             stop_at_validation_threshold,
@@ -1244,12 +1332,7 @@ def grpo_train_sync(
                         logger=logger,
                     )
                     policy_generation.finish_generation()
-                    logger.log_metrics(
-                        validation_timings, total_steps + 1, prefix="timing/validation"
-                    )
-                    logger.log_metrics(
-                        val_metrics, total_steps + 1, prefix="validation"
-                    )
+                    # Per-dataset validation metrics are logged inside validate_sync().
                     early_stop_message = _validation_early_stop_message(
                         val_metrics,
                         stop_at_validation_threshold,
