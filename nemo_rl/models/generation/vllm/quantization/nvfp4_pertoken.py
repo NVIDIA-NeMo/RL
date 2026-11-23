@@ -286,7 +286,7 @@ class NvFp4PerTokenQuantizer:
         if wrongly_quantized or wrongly_excluded:
             raise RuntimeError(
                 "[nvfp4_pertoken] BF16 boundary did not match the routed-expert "
-                "module names, so rollout precision disagrees with training. "
+                "layer indices, so rollout precision disagrees with training. "
                 f"patterns={boundary_patterns}; layers quantized but expected "
                 f"BF16={[quantized_layers[i] for i in wrongly_quantized]}; "
                 f"layers excluded but expected NVFP4="
@@ -654,9 +654,8 @@ class NvFp4PerTokenConfig(ModelOptNvFp4Config):
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         """Quantize selected RoutedExperts and keep all ordinary linears BF16."""
         if isinstance(layer, RoutedExperts):
-            # These exclusions encode Megatron decoder-layer boundaries, not
-            # architecture-specific module names. NemotronH uses mixer.experts
-            # where Qwen uses mlp.experts; both must honor the same layer index.
+            # Match on the decoder-layer index: the container is mixer.experts
+            # on NemotronH and mlp.experts on Qwen.
             if module_layer_index(prefix) in boundary_layer_indices(
                 self.exclude_modules
             ):

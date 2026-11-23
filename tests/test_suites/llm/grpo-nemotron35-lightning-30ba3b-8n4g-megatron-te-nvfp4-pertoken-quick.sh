@@ -67,7 +67,7 @@ fi
 
 uv run --no-sync tests/check_metrics.py "$JSON_METRICS" \
     'min(data["train/num_valid_samples"]) > 0' \
-    'all_finite(data["train/gen_kl_error"])' \
+    'mean(data["train/gen_kl_error"]) < 0.02' \
     'all_finite(data["train/token_mult_prob_error"])' \
     'all_finite(data["train/loss"])' \
     'all_finite(data["train/grad_norm"])' \

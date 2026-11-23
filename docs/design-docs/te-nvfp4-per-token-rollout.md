@@ -90,7 +90,7 @@ For migration, an explicit `additional_ignore` is accepted only when it uses com
 
 ## Nemotron 3.5 Lightning
 
-Lightning (30B-A3B) has non-gated ReLU² routed experts. Only the routed experts are quantized; Mamba, attention and shared experts stay BF16. Two recipes use 8 nodes × 4 GPUs (TP=2, EP=8): `grpo-nemotron35-lightning-30ba3b-8n4g-megatron-te-nvfp4-pertoken.yaml` and a 20-step `-quick` variant for nightly coverage. Both set `vllm_kwargs.async_scheduling: false`.
+Lightning (30B-A3B) has non-gated ReLU² routed experts. Only the routed experts are quantized; Mamba, attention and shared experts stay BF16. Two recipes use 8 nodes × 4 GPUs (TP=2, EP=8): `grpo-nemotron35-lightning-30ba3b-8n4g-megatron-te-nvfp4-pertoken.yaml` and a 20-step `-quick` variant for nightly coverage. Both set `vllm_kwargs.async_scheduling: false`. At this head only the 20-step `-quick` recipe and the two-step manual check of the full recipe have been run on vLLM 0.33; the full recipe has no convergence run yet, and the 250-step comparison in #4785 used a 48K response budget, CP=2 with sequence packing, and no BF16 boundary layers.
 
 ## Validated Configuration
 

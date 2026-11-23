@@ -5,7 +5,6 @@ grpo:
   num_prompts_per_step: 8
   num_generations_per_prompt: 2
   val_at_start: false
-  val_at_end: false
   val_period: 0
   use_dynamic_sampling: false
   batch_multiplier: 1

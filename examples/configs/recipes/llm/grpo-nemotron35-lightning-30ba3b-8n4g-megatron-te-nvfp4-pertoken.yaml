@@ -32,7 +32,6 @@ policy:
   train_micro_batch_size: 1
   max_total_sequence_length: 22528
   logprob_chunk_size: 2048
-  offload_optimizer_for_logprob: false
   make_sequence_length_divisible_by: 8
   automodel_cfg:
     enabled: false
@@ -43,15 +42,11 @@ policy:
     bias_activation_fusion: false
     tensor_model_parallel_size: 2
     expert_model_parallel_size: 8
-    expert_tensor_parallel_size: 1
     sequence_parallel: true
     activation_checkpointing: true
     defer_fp32_logits: true
     moe_router_dtype: fp32
-    moe_shared_expert_overlap: false
     use_fused_weighted_squared_relu: true
-    mtp_num_layers: 0
-    mtp_loss_scaling_factor: 0.0
     fp4_cfg:
       enabled: true
     first_last_layers_bf16: true
