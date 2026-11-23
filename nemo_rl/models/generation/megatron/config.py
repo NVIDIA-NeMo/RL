@@ -127,6 +127,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
     mamba_inference_ssm_states_dtype: NotRequired[str | None]
     mamba_inference_conv_states_dtype: NotRequired[str | None]
     # GPU budget for cached Mamba states; null disables it (MCore default).
+    # With dynamo: true it applies to prefill engines only; decode engines
+    # never hold one.
     prefix_caching_mamba_gb: NotRequired[float | None]
 
     # Prefix-cache block eviction policy. MCore default: 'lru'.
@@ -203,7 +205,7 @@ class MCoreGenerationConfig(GenerationConfig):
     # the per-role layouts (see megatron.dynamo_config.MegatronDynamoCfg).
     dynamo: NotRequired[bool]
     dynamo_cfg: NotRequired[dict[str, Any]]
-    # Not a user key: the Dynamo engine fleet sets it on each engine's own copy
+    # Not a user key: MegatronDynamoGeneration sets it on each engine's own copy
     # of the config, as TrtllmGeneration injects trtllm_cfg._engine_roles. A
     # worker whose config carries it builds the prefill/decode handoff engine.
     _dynamo_role: NotRequired[Literal["prefill", "decode"]]

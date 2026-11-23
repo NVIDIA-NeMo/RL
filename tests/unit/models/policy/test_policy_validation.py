@@ -522,6 +522,59 @@ def test_policy_constructor_worker_extension_allows_quantization() -> None:
     assert worker_builder.call_args.args[0] == "tests.extensions.CustomPolicyWorker"
 
 
+_MEGATRON_WORKERS = "nemo_rl.models.policy.workers.megatron_policy_worker."
+
+
+def _construct_megatron_policy(config: PolicyConfig) -> tuple[MagicMock, MagicMock]:
+    """Build a Policy with the Ray side mocked; return the worker builder and group mocks."""
+    with (
+        patch("nemo_rl.models.policy.lm_policy.get_hf_config"),
+        patch("nemo_rl.models.policy.lm_policy.FLOPTracker"),
+        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
+        patch.dict("os.environ", {"TORCH_CUDA_ARCH_LIST": "9.0"}),
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+    return worker_builder, worker_group
+
+
+@pytest.mark.parametrize(
+    ("role", "worker_cls"),
+    [
+        (None, "MegatronPolicyWorker"),
+        ("prefill", "MegatronDynamoPolicyWorker"),
+        ("decode", "MegatronDynamoPolicyWorker"),
+    ],
+)
+def test_policy_picks_the_dynamo_worker_from_the_engine_role(
+    role: str | None, worker_cls: str
+) -> None:
+    """An engine config carrying ``generation._dynamo_role`` gets the Dynamo worker."""
+    config = create_megatron_config("test-model", tp=1)
+    config["generation"]["backend"] = "megatron"
+    if role is not None:
+        config["generation"]["_dynamo_role"] = role
+
+    worker_builder, _ = _construct_megatron_policy(config)
+
+    assert worker_builder.call_args.args[0] == _MEGATRON_WORKERS + worker_cls
+
+
+def test_policy_rejects_quantization_on_a_dynamo_engine() -> None:
+    config = create_megatron_config("test-model", tp=1)
+    config["generation"]["backend"] = "megatron"
+    config["generation"]["_dynamo_role"] = "prefill"
+    config["quant_cfg"] = {"algorithm": "fp8"}
+
+    with pytest.raises(ValueError, match="quant_cfg is not supported"):
+        _construct_megatron_policy(config)
+
+
 @pytest.mark.parametrize(
     ("config_updates", "explicit_extension_fqn", "error_match"),
     [
