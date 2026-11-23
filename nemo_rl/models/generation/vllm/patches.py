@@ -1125,34 +1125,88 @@ def _patch_vllm_routed_experts_capture_router_fallback(
     return True
 
 
-def _radio_has_identity_checkpoint(model_config: "ModelConfig") -> bool:
-    """Verify the original checkpoint's optional, absent identity LayerScales."""
-    config = model_config.hf_config
-    vision = getattr(config, "vision_config", None)
+_RADIO_INDEX_FILE = "model.safetensors.index.json"
+
+
+def _immutable_revision(model_config: "ModelConfig") -> str | None:
+    revision = (
+        getattr(model_config.hf_config, "_commit_hash", None) or model_config.revision
+    )
     if (
-        getattr(vision, "model_type", None) != "radio"
-        or getattr(vision, "layerscale_value", None) != 1.0
+        isinstance(revision, str)
+        and len(revision) == 40
+        and all(char in "0123456789abcdefABCDEF" for char in revision)
     ):
+        return revision
+    return None
+
+
+def _is_identity_radio(radio_config: Any) -> bool:
+    # vLLM builds its own RadioConfig and sets ls1/ls2 to initializer_factor.
+    return (
+        getattr(radio_config, "model_type", None) == "radio"
+        and getattr(radio_config, "initializer_factor", None) == 1.0
+    )
+
+
+def uses_identity_radio(model: "torch.nn.Module") -> bool:
+    """Whether the model's vision encoder is a vLLM RADIO with identity LayerScales."""
+    unwrap = getattr(model, "unwrap", None)
+    if callable(unwrap):
+        model = cast("torch.nn.Module", unwrap())
+    radio = getattr(model, "vision_model", None)
+    return _is_identity_radio(getattr(radio, "config", None))
+
+
+def prefetch_radio_checkpoint_index(model_config: "ModelConfig") -> None:
+    """Cache the RADIO checkpoint index on this worker before the first refit.
+
+    Dummy-loaded generation workers never download checkpoint files, so the
+    LayerScale identity check could otherwise miss the index at refit time.
+    """
+    if Path(model_config.model).is_dir():
+        return
+    revision = _immutable_revision(model_config)
+    if revision is None:
+        return
+    from huggingface_hub import hf_hub_download
+
+    try:
+        hf_hub_download(model_config.model, _RADIO_INDEX_FILE, revision=revision)
+    except Exception as error:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Could not cache %s for %s@%s; RADIO refits that omit LayerScales "
+            "will fail: %s",
+            _RADIO_INDEX_FILE,
+            model_config.model,
+            revision,
+            error,
+        )
+
+
+def _radio_has_identity_checkpoint(
+    radio_config: Any, model_config: "ModelConfig"
+) -> bool:
+    """Verify the original checkpoint's optional, absent identity LayerScales."""
+    if not _is_identity_radio(radio_config):
         return False
 
     source = Path(model_config.model)
-    index = source / "model.safetensors.index.json"
+    index = source / _RADIO_INDEX_FILE
     if source.is_dir():
         if not index.is_file():
             return False
     else:
-        revision = getattr(config, "_commit_hash", None) or model_config.revision
-        if (
-            not isinstance(revision, str)
-            or len(revision) != 40
-            or any(char not in "0123456789abcdefABCDEF" for char in revision)
-        ):
+        revision = _immutable_revision(model_config)
+        if revision is None:
             return False
-        # Only inspect an already cached immutable revision; never fetch here.
+        # Read only the cached immutable revision; prepare_refit_info prefetches it.
         from huggingface_hub import try_to_load_from_cache
 
         cached = try_to_load_from_cache(
-            model_config.model, "model.safetensors.index.json", revision=revision
+            model_config.model, _RADIO_INDEX_FILE, revision=revision
         )
         if not isinstance(cached, str):
             return False
@@ -1201,7 +1255,9 @@ def finalize_radio_layerscale_loading(
                 updates.append((full_name, layer, name, info.kernel_tensors[0][name]))
 
     if any(weight is None for _, _, _, weight in updates):
-        if not _radio_has_identity_checkpoint(model_config):
+        if not _radio_has_identity_checkpoint(
+            getattr(radio, "config", None), model_config
+        ):
             raise ValueError(
                 "RADIO refit omitted uninitialized LayerScale weights without a "
                 "verified identity-only checkpoint; export the explicit policy scales"

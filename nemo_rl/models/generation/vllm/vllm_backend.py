@@ -47,7 +47,9 @@ from nemo_rl.models.generation.vllm.lora_utils import (
 )
 from nemo_rl.models.generation.vllm.patches import (
     finalize_radio_layerscale_loading,
+    prefetch_radio_checkpoint_index,
     radio_layerscale_full_reload,
+    uses_identity_radio,
 )
 from nemo_rl.models.generation.vllm.speculator_runtime import (
     DRAFTER_OWNER_ATTRS,
@@ -1049,6 +1051,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             draft_owner_ranks=draft_owner_ranks,
         )
         self._reject_native_refit_of_trtllm_moe_draft()
+        if uses_identity_radio(self.model_runner.model):
+            prefetch_radio_checkpoint_index(self.model_config)
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
         _validate_draft_refit_info(
             self.model_runner,

@@ -69,6 +69,7 @@ def test_prepare_refit_info_builds_common_speculator_manifest(
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
+        model=torch.nn.Module(),
         get_draft_model=lambda: draft_model,
         vllm_config=SimpleNamespace(
             speculative_config=SimpleNamespace(method=speculator_type)

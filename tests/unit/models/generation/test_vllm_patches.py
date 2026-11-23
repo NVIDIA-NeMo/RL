@@ -383,10 +383,78 @@ def test_radio_defaults_never_use_a_stale_base_checkpoint(tmp_path, indexed):
         revision=None,
         hf_config=SimpleNamespace(
             _name_or_path=str(base),
-            vision_config=SimpleNamespace(model_type="radio", layerscale_value=1.0),
+            vision_config=SimpleNamespace(model_type=""),
         ),
     )
-    assert not patches._radio_has_identity_checkpoint(config)
+    assert not patches._radio_has_identity_checkpoint(_IDENTITY_RADIO, config)
+
+
+_IDENTITY_RADIO = SimpleNamespace(model_type="radio", initializer_factor=1.0)
+_REVISION = "e5e9932441de940c9a62185c870ea5bcd4cd24e2"
+
+
+def _write_index(path, *vision_keys):
+    weight_map = {key: "model.safetensors" for key in vision_keys}
+    path.write_text(json.dumps({"weight_map": weight_map}))
+
+
+@pytest.mark.parametrize(
+    "radio_config, ls_key, expected",
+    [
+        (_IDENTITY_RADIO, None, True),
+        (_IDENTITY_RADIO, "vision_model.radio_model.model.blocks.0.ls1", False),
+        (SimpleNamespace(model_type="radio", initializer_factor=0.5), None, False),
+        (SimpleNamespace(model_type=""), None, False),
+    ],
+)
+def test_radio_identity_uses_the_constructed_radio_config(
+    tmp_path, radio_config, ls_key, expected
+):
+    keys = ["vision_model.radio_model.model.blocks.0.attn.qkv.weight"]
+    if ls_key is not None:
+        keys.append(ls_key)
+    _write_index(tmp_path / "model.safetensors.index.json", *keys)
+    # The published checkpoint's remote-code config: empty model_type, no layerscale_value.
+    model_config = SimpleNamespace(
+        model=str(tmp_path),
+        revision=None,
+        hf_config=SimpleNamespace(vision_config=SimpleNamespace(model_type="")),
+    )
+    assert (
+        patches._radio_has_identity_checkpoint(radio_config, model_config) is expected
+    )
+
+
+def test_radio_index_prefetch_fills_an_empty_generation_cache(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    cache: dict[tuple[str, str, str], str] = {}
+    source = tmp_path / "remote-index.json"
+    _write_index(source, "vision_model.radio_model.model.blocks.0.attn.qkv.weight")
+
+    def fake_download(repo_id, filename, *, revision):
+        cache[(repo_id, filename, revision)] = str(source)
+        return str(source)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    monkeypatch.setattr(
+        huggingface_hub,
+        "try_to_load_from_cache",
+        lambda repo_id, filename, *, revision: cache.get((repo_id, filename, revision)),
+    )
+    model_config = SimpleNamespace(
+        model="nvidia/radio-model",
+        revision=None,
+        hf_config=SimpleNamespace(
+            _commit_hash=_REVISION, vision_config=SimpleNamespace(model_type="")
+        ),
+    )
+    model = SimpleNamespace(vision_model=SimpleNamespace(config=_IDENTITY_RADIO))
+
+    assert patches.uses_identity_radio(model)
+    assert not patches._radio_has_identity_checkpoint(_IDENTITY_RADIO, model_config)
+    patches.prefetch_radio_checkpoint_index(model_config)
+    assert patches._radio_has_identity_checkpoint(_IDENTITY_RADIO, model_config)
 
 
 @pytest.mark.vllm

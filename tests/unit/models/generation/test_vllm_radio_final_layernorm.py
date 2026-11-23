@@ -365,9 +365,9 @@ def test_composed_native_vision_refit(
         dtype=torch.bfloat16,
         quantization="modelopt" if real_quant else None,
         architectures=[architecture],
-        hf_config=SimpleNamespace(
-            vision_config=SimpleNamespace(model_type="radio", layerscale_value=1.0)
-        ),
+        # Published Nano-Omni remote-code RADIOConfig: empty model_type and no
+        # layerscale_value; vLLM builds its own RadioConfig for the vision model.
+        hf_config=SimpleNamespace(vision_config=SimpleNamespace(model_type="")),
         multimodal_config=MultiModalConfig(),
     )
     with torch.device(device):
