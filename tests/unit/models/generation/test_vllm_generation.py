@@ -4456,8 +4456,10 @@ def test_vllm_http_server(cluster, tokenizer):
         d.pop("ec_transfer_params", None)
         # vLLM 0.29 added `completion_tokens_details` to UsageInfo.
         d.get("usage", {}).pop("completion_tokens_details", None)
+        # vLLM 0.34 omits `prompt_tokens_details` and `annotations` when they are None.
+        d.get("usage", {}).pop("prompt_tokens_details", None)
         message = d["choices"][0]["message"]
-        for key in ("reasoning", "reasoning_content"):
+        for key in ("reasoning", "reasoning_content", "annotations"):
             message.pop(key, None)
         message.pop("generation_log_probs", None)
 

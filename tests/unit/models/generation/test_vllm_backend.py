@@ -4916,10 +4916,19 @@ def test_prepare_reload_weight_iterator_drops_tied_aliases(monkeypatch):
 @pytest.mark.vllm
 def test_vllm_exposes_the_tied_embedding_detector_the_refit_filter_relies_on():
     """If upstream renames it, `_tied_embedding_aliases` silently returns {} and
-    tied-embedding refits regress to the 0.29 alias assertion."""
+    tied-embedding refits regress to the 0.29 alias assertion.
+
+    vLLM 0.34 removed the alias assertion itself (`_check_skipped_aliases`) but
+    still skips the aliases through the same detector, so only the detector is
+    required there.
+    """
+    from importlib.metadata import version
+
+    from packaging.version import Version
     from vllm.model_executor.models.utils import (  # noqa: F401
         AutoWeightsLoader,
         _get_tied_embedding_params,
     )
 
-    assert hasattr(AutoWeightsLoader, "_check_skipped_aliases")
+    if Version(version("vllm")) < Version("0.34"):
+        assert hasattr(AutoWeightsLoader, "_check_skipped_aliases")

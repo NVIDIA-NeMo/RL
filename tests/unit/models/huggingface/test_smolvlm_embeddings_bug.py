@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import torch
+import transformers
+from packaging.version import Version
 from torch import nn
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -166,8 +168,12 @@ def test_smolvlm_embeddings_differ_from_reference():
             pixel_values=pixel_values, patch_attention_mask=patch_attention_mask
         )
 
-    # Assert outputs differ due to the upstream bug
     are_equal = torch.allclose(out_buggy.float(), out_ref.float(), atol=0, rtol=0)
+    if Version(transformers.__version__) >= Version("5.22.0"):
+        # Fixed upstream by 5.22.0 (the vllm and base environments).
+        assert are_equal, "SmolVLM vision embeddings regressed from the reference"
+        return
+    # The mcore and automodel environments pin an older transformers with the bug.
     assert not are_equal, (
         "If this fails, that means the upstream bug has been fixed. You can close this issue: https://github.com/huggingface/transformers/issues/41190"
     )
