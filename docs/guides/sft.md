@@ -80,8 +80,17 @@ All of these datasets are downloaded from HuggingFace and preprocessed on-the-fl
 We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with JSONL-formatted response datasets for loading datasets from local path or Hugging Face. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
 ```yaml
 data:
-  # other data settings, see `examples/configs/sft.yaml` for more details
-  ...
+  # Required top-level data settings. `setup_data` in `examples/run_sft.py`
+  # reads these directly (and the SFT dataloader setup reads `shuffle` and
+  # `num_workers`), so a config without them fails with
+  # `KeyError: 'add_bos'` after the datasets have loaded. See
+  # `examples/configs/sft.yaml` for the full list of data settings.
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  add_bos: true
+  add_eos: true
+  add_generation_prompt: false
+  shuffle: true
+  num_workers: 1
   # dataset settings
   train:
     # this dataset will override input_key and use the default values for other vars
