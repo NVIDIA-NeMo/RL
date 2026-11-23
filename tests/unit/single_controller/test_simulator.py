@@ -32,6 +32,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     RefitActorConfig,
     TokenCaptureConfig,
+    TrainerWarmupConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.simulator import (
     NoOpTrainer,
@@ -281,6 +282,12 @@ def test_validate_rejects_the_training_data_dump() -> None:
 def test_validate_rejects_the_refit_actor() -> None:
     async_rl = AsyncRLConfig(refit_actor=RefitActorConfig(enabled=True))
     with pytest.raises(NotImplementedError, match="refit_actor"):
+        validate_simulator_config(_master_config(async_rl=async_rl), SimulatorConfig())
+
+
+def test_validate_rejects_the_trainer_warmup() -> None:
+    async_rl = AsyncRLConfig(trainer_warmup=TrainerWarmupConfig(enabled=True))
+    with pytest.raises(NotImplementedError, match="trainer_warmup"):
         validate_simulator_config(_master_config(async_rl=async_rl), SimulatorConfig())
 
 

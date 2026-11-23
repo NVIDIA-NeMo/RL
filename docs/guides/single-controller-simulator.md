@@ -85,7 +85,7 @@ Without a dedicated head, the Ray head node has GPUs and hosts a vLLM rank next 
 - Dynamo serving (`policy.generation.dynamo: true`), which is not validated under the simulator's refit lifecycle yet.
 - Checkpointing and on-policy distillation.
 - Trainer-side initial weights: `checkpointing.pretrained_checkpoint`, `policy.pretrained_checkpoint` and `megatron_cfg.peft.restore_from`. The engine serves `policy.model_name`, so point it at an HF-exported checkpoint.
-- `async_rl.log_full_train_data` and `async_rl.refit_actor.enabled`.
+- `async_rl.log_full_train_data`, `async_rl.refit_actor.enabled` and `async_rl.trainer_warmup.enabled`.
 - `token_capture.defer_routed_experts_to_policy` and `token_capture.forest_training`.
 - Refittable fp8 KV caches and adaptive-ppo-clip.
 - Online quantization (`precision: fp8`, `nvfp4_pertoken_rollout`, `quant_cfg`, `real_quant`): those quantize at refit, which this run has none of.

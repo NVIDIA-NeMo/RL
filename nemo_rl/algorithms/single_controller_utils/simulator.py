@@ -228,7 +228,7 @@ def validate_simulator_config(
             f"vllm_cfg.kv_cache_dtype={kv_cache_dtype!r} calibrates its KV scales "
             "on the trainer at every refit, which rollout_only has no trainer for."
         )
-    megatron = master_config.policy.get("megatron_cfg")
+    megatron = cast(Optional[dict[str, Any]], master_config.policy.get("megatron_cfg"))
     if megatron is not None and megatron["enabled"]:
         peft = megatron.get("peft")
         if (
@@ -281,6 +281,11 @@ def validate_simulator_config(
         raise NotImplementedError(
             "async_rl.refit_actor.enabled moves a real weight transfer into its "
             "own actor; rollout_only has no transfer to move."
+        )
+    if master_config.async_rl.trainer_warmup.enabled:
+        raise NotImplementedError(
+            "async_rl.trainer_warmup.enabled runs a synthetic training pass on the "
+            "trainer, which rollout_only does not have."
         )
     refit_timeout_s = master_config.async_rl.generation_fleet_health.refit_timeout_s
     if refit_timeout_s is not None and settings.refit_time_s >= refit_timeout_s:
