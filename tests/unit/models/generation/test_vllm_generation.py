@@ -3536,7 +3536,7 @@ def test_vllm_dynamo_rejects_per_sample_output_caps(monkeypatch):
         "_pad_token_id": 0,
         "vllm_cfg": {"max_model_len": 16},
     }
-    generation.dynamo_frontend_url = "http://frontend/v1"
+    generation.dynamo_frontend_urls = ("http://frontend/v1",)
     data = {"input_ids": torch.tensor([[5, 6, 0]]), "input_lengths": torch.tensor([2])}
 
     # A capped row would lose its cap at the frontend, so it is rejected before sending.
