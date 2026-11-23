@@ -38,10 +38,10 @@ def ssd_sys(ray_cluster, tmp_path_factory):
     import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
 
     root = str(tmp_path_factory.mktemp("ssd"))
-    conf = make_tq_conf(num_units=1, slab_bytes=8 * MiB, namespace="nvdp-ssd")
+    conf = make_tq_conf(num_units=1, slab_bytes=4 * MiB, namespace="nvdp-ssd")
     nixl = conf.backend.NixlStore
     nixl.op_timeout_s = 60.0
-    # 4 MiB for puts, 4 MiB staging: a 1 MiB value per blob, three staged at once.
+    # 4 MiB put area, 4 MiB IO area beside it: a 1 MiB value per blob, three staged at once.
     nixl.ssd = {"enabled": True, "path": root, "staging_bytes": 4 * MiB}
     tq.init(conf)
     yield tq, conf, root

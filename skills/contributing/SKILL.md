@@ -58,6 +58,10 @@ Update stuff
 Fix bug
 ```
 
+## PR Description
+
+Write and update the PR description with the [`pr-description`](../pr-description/SKILL.md) skill. Never tick the "I, the PR author, have personally reviewed every line of this PR." box; only the human author may.
+
 ## Commit Sign-off
 
 All commits must be signed off with `-s`:
