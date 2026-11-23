@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import subprocess
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Iterator
@@ -24,6 +25,7 @@ import nemo_rl.utils.venvs as venv_module
 from nemo_rl.utils.venvs import (
     add_hf_modules_cache_to_pythonpath,
     create_local_venv,
+    link_python_config,
     make_actor_runtime_env,
 )
 from tests.unit.conftest import TEST_ASSETS_DIR
@@ -57,6 +59,122 @@ def test_create_local_venv():
             # Verify the command executed successfully (return code 0)
             assert result.returncode == 0, f"Failed to import sphinx: {result.stderr}"
             assert "Sphinx package is installed" in result.stdout
+
+
+def _venv_python_extension_suffix(python: str) -> str:
+    result = subprocess.run(
+        [
+            python,
+            "-c",
+            "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def test_link_python_config_links_interpreter_config(tmp_path: Path) -> None:
+    """The venv's python3-config must report the venv interpreter's own suffix.
+
+    `uv venv` never links python3-config into a venv, but Megatron-LM's
+    dataset-helper Makefile calls it during compile_helpers()
+    (NVIDIA-NeMo/RL#3109). The link must resolve next to the venv's own
+    interpreter -- the system python3-config reports the system Python's
+    suffix, which does not match.
+    """
+    interpreter = Path(sys.executable).resolve(strict=True)
+    python_config = interpreter.parent / "python3-config"
+    if not python_config.is_file():
+        pytest.skip(f"interpreter {interpreter} ships no python3-config")
+
+    venv_bin = tmp_path / "bin"
+    venv_bin.mkdir()
+    (venv_bin / "python").symlink_to(sys.executable)
+
+    link_python_config(str(tmp_path))
+
+    link = venv_bin / "python3-config"
+    assert link.is_symlink(), "python3-config was not linked into the venv"
+    assert link.resolve(strict=True) == python_config.resolve(strict=True)
+    assert subprocess.run(
+        [str(link), "--extension-suffix"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip() == _venv_python_extension_suffix(sys.executable)
+
+
+def test_link_python_config_replaces_stale_link(tmp_path: Path) -> None:
+    """Re-linking a venv (e.g. `uv venv --allow-existing`) refreshes the link."""
+    interpreter = Path(sys.executable).resolve(strict=True)
+    python_config = interpreter.parent / "python3-config"
+    if not python_config.is_file():
+        pytest.skip(f"interpreter {interpreter} ships no python3-config")
+
+    venv_bin = tmp_path / "bin"
+    venv_bin.mkdir()
+    (venv_bin / "python").symlink_to(sys.executable)
+    (venv_bin / "python3-config").symlink_to("/nonexistent/python3-config")
+
+    link_python_config(str(tmp_path))
+
+    assert (venv_bin / "python3-config").resolve(strict=True) == python_config.resolve(
+        strict=True
+    )
+
+
+def test_link_python_config_noops_without_config(tmp_path: Path) -> None:
+    """A base interpreter without python3-config leaves the venv untouched."""
+    venv_bin = tmp_path / "bin"
+    venv_bin.mkdir()
+    fake_interpreter = tmp_path / "python"
+    fake_interpreter.write_text("#!/bin/sh\nexec true\n")
+    (venv_bin / "python").symlink_to(fake_interpreter)
+
+    link_python_config(str(tmp_path))
+
+    assert not (venv_bin / "python3-config").exists()
+    assert not (venv_bin / "python3-config").is_symlink()
+
+
+def test_create_local_venv_links_python_config(tmp_path: Path) -> None:
+    """create_local_venv leaves a working python3-config in the venv it builds."""
+    interpreter = Path(sys.executable).resolve(strict=True)
+    python_config = interpreter.parent / "python3-config"
+    if not python_config.is_file():
+        pytest.skip(f"interpreter {interpreter} ships no python3-config")
+
+    def fake_run(cmd, **kwargs):
+        # Stand in for `uv venv`: create the venv skeleton with a python
+        # symlink to this test process's interpreter. The `uv sync` / `uv run`
+        # calls are no-ops here; link_python_config runs between them.
+        if cmd[:2] == ["uv", "venv"]:
+            venv_bin = Path(cmd[-1]) / "bin"
+            venv_bin.mkdir(parents=True, exist_ok=True)
+            (venv_bin / "python").symlink_to(sys.executable)
+        return MagicMock(returncode=0)
+
+    with (
+        patch.dict(os.environ, {"NEMO_RL_VENV_DIR": str(tmp_path)}),
+        patch.object(venv_module.subprocess, "run", side_effect=fake_run),
+    ):
+        venv_python = create_local_venv(
+            py_executable="uv run --group docs",
+            venv_name="test_venv_python_config",
+        )
+
+    link = tmp_path / "test_venv_python_config" / "bin" / "python3-config"
+    assert venv_python == str(tmp_path / "test_venv_python_config" / "bin" / "python")
+    assert link.is_symlink(), "python3-config was not linked into the venv"
+    assert link.resolve(strict=True) == python_config.resolve(strict=True)
+    assert subprocess.run(
+        [str(link), "--extension-suffix"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip() == _venv_python_extension_suffix(sys.executable)
 
 
 def test_add_hf_modules_cache_to_pythonpath():

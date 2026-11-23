@@ -415,6 +415,28 @@ while IFS=$'\t' read -r venv_name stage extras; do
     UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --frozen $extras --no-install-project
 done < /opt/actor_venvs.tsv
 
+# Megatron-LM's dataset-helper Makefile shells out to `python3-config
+# --extension-suffix` during compile_helpers(), but `uv venv` only links
+# python/python3 into a venv's bin/ -- the companion python3-config stays
+# next to the base interpreter. Without it every Megatron worker fails to
+# build the C++ helpers and rank 0 exits before NCCL init
+# (NVIDIA-NeMo/RL#3109). Link the uv-managed interpreter's python3-config
+# into the main venv and every worker venv built above. The system
+# python3-config is not a substitute: it reports the system Python's
+# extension suffix, which does not match the venv interpreter (3.13 here).
+# A stray symlink in bin/ survives later `uv sync` / `uv run` calls, and
+# the release stage's prefetch_venvs.py re-links it through
+# nemo_rl.utils.venvs.link_python_config for any venv rebuilt at runtime.
+for venv_path in "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"/*; do
+    if [[ ! -d "${venv_path}" ]]; then
+        continue
+    fi
+    python_config="$(dirname "$(readlink -f "${venv_path}/bin/python")")/python3-config"
+    if [[ -f "${python_config}" ]]; then
+        ln -sf "${python_config}" "${venv_path}/bin/python3-config"
+    fi
+done
+
 # Patch Mooncake libraries in the layer that creates the cache and venvs.
 bash /usr/local/libexec/install_mooncake.sh "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" "${UV_CACHE_DIR}"
 
