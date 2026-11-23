@@ -497,7 +497,7 @@ class NvFp4PerTokenQuantizer:
             )
         missing: dict[str, list[tuple[str, str]]] = {}
         for target_id, target in self._targets.items():
-            target_missing = sorted(
+            target_missing: list[tuple[str, str]] = sorted(
                 target.expected_roles - self._seen_roles.get(target_id, set())
             )
             if target_missing:

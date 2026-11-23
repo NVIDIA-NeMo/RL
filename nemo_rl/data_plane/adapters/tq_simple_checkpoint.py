@@ -35,7 +35,7 @@ import pickle
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -204,7 +204,7 @@ class SimpleCheckpointCapture(CheckpointCapture):
         finally:
             self._operation_lock.release()
 
-    def persist(self) -> None:
+    def persist(self, *, extra_metadata: Mapping[str, Any] | None = None) -> None:
         with self._operation() as deadline:
             if self._released:
                 raise RuntimeError("Cannot persist a released checkpoint capture")
@@ -213,6 +213,13 @@ class SimpleCheckpointCapture(CheckpointCapture):
                     "persist() is single-attempt: release the capture, discard the "
                     "checkpoint directory and capture again"
                 )
+            extra = dict(extra_metadata or {})
+            repeated = sorted(extra.keys() & self.metadata.keys())
+            if repeated:
+                raise ValueError(f"extra_metadata repeats captured keys: {repeated!r}")
+            metadata = {**self.metadata, **extra}
+            # Fail before any write on metadata the marker could not record.
+            json.dumps(metadata)
             self._persist_started = True
             refs = self._persist_refs
             try:
@@ -236,9 +243,7 @@ class SimpleCheckpointCapture(CheckpointCapture):
             ).write_text(json.dumps(self.storage_info, indent=2))
             # Publication markers must never outlive an unfinished shard write.
             (self.checkpoint_dir / "metadata.json").write_text(
-                json.dumps(
-                    {"storage_saved": True, "user_metadata": self.metadata}, indent=2
-                )
+                json.dumps({"storage_saved": True, "user_metadata": metadata}, indent=2)
             )
             LOGGER.info(
                 "simple_snapshot persisted total_bytes=%d controller_bytes=%d",
