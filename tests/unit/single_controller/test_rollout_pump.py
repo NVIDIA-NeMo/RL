@@ -65,6 +65,8 @@ from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
     RolloutRecoveryState,
+    build_rollout_recovery_state,
+    parse_rollout_recovery_state,
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
@@ -1086,6 +1088,145 @@ class TestBorrowFromALaterStep:
         assert buffer.target_step_list == [1], "no group was moved off the lender"
         assert ctrl._batch_promotions == {}
         assert ctrl._rollout_runtime.batch_shortfall == {0: 1}, "step 0 shrinks instead"
+
+    @staticmethod
+    def _eof_controller(*, exhausted: bool = True):
+        buffer = _RecordingBuffer(target_step_list=[1], ready_list=[True])
+        ctrl = _pump_controller(
+            _ScriptedRolloutManager([]),
+            [],
+            buffer=buffer,
+            dynamic_sampling_max_replacements=2,
+        )
+        ctrl._dataloader_exhausted = exhausted
+        return ctrl, buffer
+
+    def test_a_filtered_drop_at_eof_borrows_without_a_spare(self):
+        """No spare is left to repay the loan, so the lender closes short instead."""
+        ctrl, buffer = self._eof_controller()
+
+        _, charged_step = ctrl._substitute_dropped_group(None, None, 0, filtered=True)
+
+        assert buffer.target_step_list == [0], "step 0 closes on the finished group"
+        assert charged_step == 1
+        assert ctrl._batch_promotions == {0: 1}
+        assert ctrl._rollout_runtime.batch_shortfall == {1: 1}
+        assert ctrl._rollout_runtime.steps_allowed_short == {1}
+
+    @pytest.mark.parametrize(("exhausted", "filtered"), [(False, True), (True, False)])
+    def test_other_drops_without_a_spare_still_shrink_in_place(
+        self, exhausted: bool, filtered: bool
+    ):
+        """Mid-run a spare is still coming; a failed group may not close short."""
+        ctrl, buffer = self._eof_controller(exhausted=exhausted)
+
+        ctrl._substitute_dropped_group(None, None, 0, filtered=filtered)
+
+        assert buffer.target_step_list == [1]
+        assert ctrl._batch_promotions == {}
+        assert ctrl._rollout_runtime.batch_shortfall == {0: 1}
+
+    def test_the_eof_borrow_survives_a_checkpoint_round_trip(self):
+        """The receiver owns the moved group and the lender owns the hole after restore."""
+        ctrl, buffer = self._eof_controller()
+        ctrl._rollout_runtime.sampler_stamps_target_steps = True
+
+        ctrl._substitute_dropped_group(None, None, 0, filtered=True)
+        runtime = ctrl._rollout_runtime
+        restored = parse_rollout_recovery_state(
+            build_rollout_recovery_state(
+                RolloutRecoveryLedger(),
+                batch_shortfall=dict(runtime.batch_shortfall),
+                steps_allowed_short=set(runtime.steps_allowed_short),
+                sampler_stamps_target_steps=runtime.sampler_stamps_target_steps,
+            )
+        )
+
+        assert buffer.target_step_list == [0]
+        assert restored.batch_shortfall == {1: 1}
+        assert restored.steps_allowed_short == {1}
+
+
+class TestConsolidateExhaustedSteps:
+    """Once rollout settles, finished groups fill the earliest steps first."""
+
+    @staticmethod
+    def _controller(
+        target_steps: list[int],
+        shortfall: dict[int, int],
+        *,
+        trainer_version: int = 0,
+        stamps: bool = True,
+    ):
+        buffer = _RecordingBuffer(target_step_list=target_steps)
+        ctrl = _pump_controller(
+            _ScriptedRolloutManager([]),
+            [],
+            num_prompts_per_step=2,
+            buffer=buffer,
+            trainer_version=trainer_version,
+            dynamic_sampling_max_replacements=2,
+        )
+        ctrl._rollout_runtime.sampler_stamps_target_steps = stamps
+        ctrl._rollout_runtime.batch_shortfall = dict(shortfall)
+        return ctrl, buffer
+
+    def test_holes_move_to_the_last_step_and_empty_steps_disappear(self):
+        ctrl, buffer = self._controller([0, 1, 2, 2], {0: 1, 1: 1})
+
+        ctrl._consolidate_exhausted_steps()
+
+        assert sorted(buffer.target_step_list) == [0, 0, 1, 1]
+        assert ctrl._rollout_runtime.batch_shortfall == {}, (
+            "step 2 lent both groups and is no longer a step"
+        )
+        assert ctrl._rollout_runtime.steps_allowed_short == set()
+        assert ctrl._batch_promotions == {0: 1, 1: 1}
+
+    def test_at_most_one_short_tail_remains_and_it_may_close_short(self):
+        ctrl, buffer = self._controller([0, 1, 2], {0: 1, 1: 1, 2: 1})
+
+        ctrl._consolidate_exhausted_steps()
+
+        assert sorted(buffer.target_step_list) == [0, 0, 1]
+        assert ctrl._rollout_runtime.batch_shortfall == {1: 1}
+        assert ctrl._rollout_runtime.steps_allowed_short == {1}, (
+            "the tail closes short; below the floor the pump skips it and ends"
+        )
+
+    def test_the_open_step_stays_the_tail_without_buffered_groups(self):
+        """Groups the open step already claimed have left the buffer lists."""
+        ctrl, buffer = self._controller([], {3: 1}, trainer_version=3)
+
+        ctrl._consolidate_exhausted_steps()
+
+        assert buffer.target_step_list == []
+        assert ctrl._rollout_runtime.batch_shortfall == {3: 1}
+        assert ctrl._rollout_runtime.steps_allowed_short == {3}
+
+    def test_a_sampler_without_stamps_is_left_alone(self):
+        ctrl, buffer = self._controller([1], {0: 1}, stamps=False)
+
+        ctrl._consolidate_exhausted_steps()
+
+        assert buffer.target_step_list == [1]
+        assert ctrl._rollout_runtime.batch_shortfall == {0: 1}
+
+    @pytest.mark.parametrize("dynamic_sampling", [False, True])
+    def test_the_pump_consolidates_before_announcing_exhaustion(
+        self, dynamic_sampling: bool
+    ):
+        ctrl, _ = self._controller([], {})
+        ctrl._dynamic_sampling_enabled = dynamic_sampling
+        seen_exhausted: list[bool] = []
+        ctrl._consolidate_exhausted_steps = MagicMock(
+            side_effect=lambda: seen_exhausted.append(ctrl._rollout_exhausted.is_set())
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert seen_exhausted == ([False] if dynamic_sampling else [])
+        assert ctrl._rollout_exhausted.is_set()
 
 
 class TestTakeReplacement:

@@ -2739,6 +2739,16 @@ def test_train_pump_stops_after_rollout_exhaustion_and_buffer_drain() -> None:
     assert ctrl._train_steps == 0
 
 
+def test_train_pump_publishes_the_pending_save_when_the_buffer_drains() -> None:
+    """Ending on a drained buffer must not leave the final save unpublished."""
+    ctrl = _train_pump_controller(sampler=_EmptySampler())
+    ctrl._finish_pending_save = AsyncMock()
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    ctrl._finish_pending_save.assert_awaited_once_with(blocking=True)
+
+
 def test_train_pump_fails_if_rollout_exhausts_during_partial_step() -> None:
     meta = KVBatchMeta(
         partition_id="rollout_data",
@@ -3443,6 +3453,42 @@ def test_data_exhausted_step_with_no_groups_skips_without_opening_optimizer(
     assert ctrl._consumed_samples == 0
     assert ctrl._train_steps == ctrl._trainer_version == 1
     assert ctrl._logger.log_metrics.call_args_list[0].args[0]["skipped_step"] == 1
+
+
+def test_a_short_final_tail_is_skipped_saved_and_ends_the_run(monkeypatch) -> None:
+    """The consolidated tail below the floor: no optimizer update, a final save, done."""
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=_one_group_tags(1),
+    )
+    ctrl = _train_pump_controller(sampler=_SequenceSampler([meta]))
+    ctrl._algo_cfg.max_num_steps = 3
+    ctrl._master_config.checkpointing = CheckpointingConfig.model_construct(
+        enabled=True, save_period=10
+    )
+    ctrl._rollout_runtime.steps_allowed_short.add(0)
+    ctrl._rollout_runtime.batch_shortfall[0] = 1
+    ctrl._trainer.abort_train_step = MagicMock()
+    ctrl._trainer.finish_train_step = MagicMock(return_value={})
+    ctrl._save_checkpoint = AsyncMock()
+    ctrl._finish_pending_save = AsyncMock()
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    ctrl._trainer.abort_train_step.assert_called_once()
+    ctrl._trainer.finish_train_step.assert_not_called()
+    assert ctrl._train_steps == 1, "the tail is the last step; nothing is skipped after"
+    ctrl._save_checkpoint.assert_awaited_once()
+    assert ctrl._save_checkpoint.await_args.kwargs["is_final_checkpoint"] is True
+    ctrl._finish_pending_save.assert_awaited_once_with(blocking=True)
+    assert ctrl._buffer_capacity._value == 3, "the tail's group was released"
 
 
 def test_train_pump_prunes_stamps_older_than_the_step_that_just_closed(

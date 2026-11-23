@@ -2309,6 +2309,9 @@ class SingleControllerActor:
         if inflight:
             await asyncio.gather(*inflight, return_exceptions=True)
 
+        if self._dynamic_sampling_enabled:
+            async with self._dispatch_reservation("prompt_reservations"):
+                self._consolidate_exhausted_steps()
         self._rollout_exhausted.set()
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
 
@@ -2615,6 +2618,57 @@ class SingleControllerActor:
             return
         self._rollout_runtime.steps_allowed_short.add(target_step)
 
+    def _consolidate_exhausted_steps(self) -> None:
+        """Pack finished groups into the earliest untrained steps once rollout settles.
+
+        Each hole is filled from the furthest step that still holds a finished group,
+        so every step before the last one with groups is whole and at most one step
+        closes short. That tail may close below the floor like any data-exhausted step:
+        the train pump skips it without an optimizer update and the run ends. A step
+        left without groups is no longer a step, so the pump ends instead of skipping
+        it. Synchronous, so the stamps and the shortfall move in one checkpoint cut.
+        """
+        runtime = self._rollout_runtime
+        if not runtime.sampler_stamps_target_steps:
+            return
+        first_step = max(self._step_assembler.assembling_version, self._trainer_version)
+        moved = 0
+        for step in sorted(s for s in runtime.batch_shortfall if s >= first_step):
+            while runtime.batch_shortfall.get(step, 0) > 0:
+                lender_step = self._buffer.promote_ready_group(to_target_step=step)
+                if lender_step is None:
+                    break
+                runtime.batch_shortfall[step] -= 1
+                if runtime.batch_shortfall[step] == 0:
+                    del runtime.batch_shortfall[step]
+                runtime.batch_shortfall[lender_step] = (
+                    runtime.batch_shortfall.get(lender_step, 0) + 1
+                )
+                self._batch_promotions[step] = self._batch_promotions.get(step, 0) + 1
+                moved += 1
+        # Groups the open step already claimed have left the buffer lists.
+        tail_step = max(
+            [
+                first_step,
+                *(
+                    target
+                    for target in self._buffer.target_step_list
+                    if target is not None and target >= first_step
+                ),
+            ]
+        )
+        for step in [s for s in runtime.batch_shortfall if s > tail_step]:
+            del runtime.batch_shortfall[step]
+            runtime.steps_allowed_short.discard(step)
+        if tail_step in runtime.batch_shortfall:
+            runtime.steps_allowed_short.add(tail_step)
+        if moved:
+            print(
+                f"  dataloader exhausted: moved {moved} finished group(s) into earlier "
+                f"steps; target_step={tail_step} is the last step",
+                flush=True,
+            )
+
     def _promote_into_step(self, target_step: Optional[int]) -> Optional[int]:
         """Fill a dropped step from a later step's finished work, and name the lender.
 
@@ -2624,8 +2678,10 @@ class SingleControllerActor:
         due a training step later and has the slack to absorb the wait. The same prompt
         is generated either way.
 
-        Only ever reached with a spare already in hand, which is what makes the borrow
-        safe to take: an unrepaid loan is the same hole one step later.
+        Reached with a spare in hand, which makes the borrow safe to take: an unrepaid
+        loan is the same hole one step later. The one exception is a filtered group
+        after the dataloader is exhausted, where no spare is left and the hole moves to
+        the lender, which may close short like any other data-exhausted step.
 
         Returns None -- leaving the caller filling the dropped step directly -- when
         nothing is stamped so no step is stranded, when the trainer has already moved
@@ -2636,7 +2692,7 @@ class SingleControllerActor:
         until this step trains.
 
         Returns:
-            The step that lent the group, which the caller now owes a rollout, or None.
+            The step that lent the group, which now owes the hole, or None.
         """
         if target_step is None:
             return None
@@ -2650,8 +2706,7 @@ class SingleControllerActor:
         )
         print(
             f"  target_step={target_step}: filled the dropped group by promoting a "
-            f"finished group from target_step={lender_step}; the spare prompt is "
-            "dispatched to repay that step instead",
+            f"finished group from target_step={lender_step}",
             flush=True,
         )
         return lender_step
@@ -2669,12 +2724,13 @@ class SingleControllerActor:
         Call inside the cut that removed the dropped group, so no snapshot sees the
         group gone without its replacement. A finished group from a later step fills
         the dropped step when one exists, and the spare is then generated for that
-        lender.
+        lender. A filtered group dropped after the dataloader is exhausted borrows
+        without a spare: the lender is credited short instead of the dropped step.
 
         Args:
             cut: The cut the group was removed in; ``None`` when nothing is recorded.
             replacement: The spare already taken from its pool, or ``None`` if there
-                was none, which credits ``target_step`` short.
+                was none, which credits ``target_step`` (or its lender) short.
             target_step: The step the dropped group was stamped for.
             filtered: Whether the group was dropped by dynamic-sampling filtering
                 rather than a rollout failure. A filtered group that closes its step
@@ -2685,6 +2741,11 @@ class SingleControllerActor:
             or without a spare) and the step the spare is generated for.
         """
         if replacement is None:
+            # Nothing repays this loan, so the hole moves to the furthest step instead.
+            if filtered and self._dataloader_exhausted:
+                lender_step = self._promote_into_step(target_step)
+                if lender_step is not None:
+                    target_step = lender_step
             self._step_assembler.credit_shortfall(target_step, allow_short=filtered)
             return None, target_step
         # Attempted only now that a spare is in hand, because the borrow is a debt
@@ -2998,6 +3059,8 @@ class SingleControllerActor:
                                         "buffer drained",
                                         flush=True,
                                     )
+                                    # Publish the final save, as the loop's own exit does.
+                                    await self._finish_pending_save(blocking=True)
                                     return
                                 if self._sampler.closes_short_at_exhaustion:
                                     # At EOF, later groups cannot fill these slots.
