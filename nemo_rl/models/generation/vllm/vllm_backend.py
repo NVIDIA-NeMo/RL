@@ -736,9 +736,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if not getattr(self, "_nrl_layerwise_reload_active", False):
             return self.model_runner.model.load_weights(weights=weights)
 
-        # Native loaders may retain inputs or views until a later batch completes
-        # the layer. Own each input before loading so transport buffers can be
-        # reused without rescanning every module's pending loader arguments.
+        # Native loaders may keep views until a later batch completes the layer;
+        # own each input so transport buffers can be reused.
         owned_weights = ((name, tensor.clone()) for name, tensor in weights)
         return self.model_runner.model.load_weights(weights=owned_weights)
 

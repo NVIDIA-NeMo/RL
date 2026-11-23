@@ -194,9 +194,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         self._pre_load_checkpoint_hook = self._restore_modelopt_state_pre_load
         super().__init__(config, *args, **kwargs)
 
-        # Each materialized export group is one collective-complete conversion
-        # task. Rendezvous on CPU before advancing so rank-local consumers cannot
-        # make policy ranks enter the next model-parallel task out of order.
+        # Rendezvous on CPU after each export group so every policy rank enters
+        # the next model-parallel task in the same order.
         self._real_quant_refit_sync_group: torch.distributed.ProcessGroup | None = None
         if self._use_real_quant_refit() and torch.distributed.get_world_size() > 1:
             sync_group = torch.distributed.new_group(

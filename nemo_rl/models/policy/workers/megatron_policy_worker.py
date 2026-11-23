@@ -4988,11 +4988,8 @@ class MegatronPolicyWorkerImpl(
         )
         self.model.eval()
 
-        # Packed logprob shards can require different numbers of forwards on
-        # different DP ranks, so their forwards cannot run DP collectives. Do
-        # the one required parameter gather before releasing any train buffer.
-        # During an open split train step, parameters are already gathered and
-        # the accumulated gradients must not be zeroed.
+        # Packed logprob shards run uneven forward counts per DP rank, so gather
+        # parameters once here instead of in per-forward DP collectives.
         if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
             self._disable_forward_pre_hook_until_next_train_step(
                 param_sync=not keep_train_buffers

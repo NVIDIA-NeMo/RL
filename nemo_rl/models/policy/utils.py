@@ -635,9 +635,8 @@ def stream_weights_via_ipc_zmq_impl(
 
         for item in params_generator:
             if item is None:
-                # The grouped producer may synchronize before its next group.
-                # Drain this group first so producer and consumer cannot wait on
-                # opposite sides of that synchronization.
+                # Drain this group before the producer's next-group sync so the
+                # two sides never wait on opposite sides of it.
                 if param_names:
                     await_recv = send_buffer_group_overlap(
                         current_buffer, param_names, used_bytes, await_recv

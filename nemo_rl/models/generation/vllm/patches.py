@@ -876,8 +876,8 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
 
 def _patch_vllm_nano_vl_projector_loader(logger) -> None:
     """Backport hook-aware Nano Nemotron VL projector loading."""
-    # TODO: Remove when vLLM #61287 is merged and main pins a fixed version.
-    # https://github.com/vllm-project/vllm/pull/61287
+    # vLLM 0.33.0 still writes mlp1 through default_weight_loader, which native
+    # layerwise reload drops; the same fix in vLLM #61287 was closed unmerged.
     file_to_patch = _get_vllm_file("model_executor/models/nano_nemotron_vl.py")
     old_snippet = """                param = adapter_dict[trimmed_name]
                 with torch.no_grad():

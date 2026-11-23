@@ -287,9 +287,8 @@ def _process_moe_reload(
         if scale is not None:
             layer.register_buffer(f"_nrl_{name}", scale)
     if reloading:
-        # Native copy-back updates the registered scales, including our two
-        # reciprocals. Keep the kernel that references that original storage;
-        # a newly built kernel would retain temporary postprocessing tensors.
+        # Keep the kernel bound to the scale storage native copy-back updates;
+        # a rebuilt kernel would hold temporary postprocessing tensors.
         quant_method.moe_quant_config = previous_config
         quant_method.moe_kernel = previous_kernel
 
@@ -328,9 +327,8 @@ def _preserve_moe_reload_scales(model: torch.nn.Module) -> None:
                 continue
         else:
             continue
-        # Install after cold loading: checkpoint metadata excludes these derived
-        # buffers. Persistent buffers participate in native reload copy-back;
-        # nonpersistent buffers absent from the checkpoint would be skipped.
+        # Checkpoints lack these derived scales; persistent buffers make native
+        # reload copy them back.
         for name in ("a1_gscale", "a2_gscale"):
             scale = getattr(method.moe_quant_config, name)
             if scale is not None:
