@@ -654,15 +654,19 @@ class MegatronGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        media_family: str | None = None,
         top_logprobs: int = 0,
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
+        prefix_write_max_rows: int,
+        prefix_write_max_tokens: int,
+        prefix_read_max_rows: int,
     ) -> "Optional[MediaColumnSpec]":
         """Install MInf's canonical prompt and completion capture hooks.
 
         Returns the media column spec the coordinators pinned (``None`` for
-        text-only capture).
+        text-only capture). MInf captures Omni media only.
         """
         if top_logprobs != 0:
             raise NotImplementedError(
@@ -671,6 +675,10 @@ class MegatronGeneration(GenerationInterface):
         if generation_prefix_cuts_enabled:
             raise NotImplementedError(
                 "generation-prefix recovery is not implemented for Megatron inference"
+            )
+        if capture_media and media_family != "omni":
+            raise NotImplementedError(
+                f"Megatron generation captures Omni media only; got {media_family!r}"
             )
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(

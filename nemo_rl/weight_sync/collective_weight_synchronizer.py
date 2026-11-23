@@ -185,6 +185,17 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
     def is_stale(self) -> bool:
         return self._stale
 
+    @property
+    def built_membership(self) -> Optional[RefitMembership]:
+        """Membership the communicators were last built over; None before the first build."""
+        return self._built_membership
+
+    def rebind_generation(self, generation: Any) -> None:
+        """Use a new copy of the generation and apply the current membership to it."""
+        self._generation = generation
+        if self._built_membership is not None:
+            generation.set_refit_membership(self._built_membership)
+
     def _desired_membership(
         self, absent_shards: Sequence[int], train_world_size: int
     ) -> Optional[RefitMembership]:

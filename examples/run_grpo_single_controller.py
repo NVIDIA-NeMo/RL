@@ -116,7 +116,7 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    config = MasterConfig(**config)
+    config = MasterConfig.model_validate(config)
     # Keep the processor, dataset and vLLM MediaIO on one frame-count contract.
     # Without this, vLLM's VideoMediaIO silently falls back to 32 frames even
     # when a video recipe requests (and caches) 64 frames.
