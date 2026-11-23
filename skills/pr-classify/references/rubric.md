@@ -36,6 +36,7 @@ When is it `high`? Any of these:
 - **Rollout-checkpoint recovery at a large size**, e.g. ~850 lines restoring router-replay state across prefixes (#4612).
 
 At least `medium`:
+- A small change to an existing loss's math, e.g. clamping a ratio before `exp`, is `medium`. It is `high` only at about 200+ source lines, or when it changes what the loss counts or skips.
 - Overlap, async or thread-pool perf features are `medium`, not `high`, unless another `high` rule also matches (#5154).
 - Fixes to how training-step metrics are counted or windowed (#5155).
 - Refactors of a few hundred source lines, e.g. ~670 lines extracting refit parameter-spec collection (#4764). With that size, a bad design would be rejected, so a human must check it.
@@ -139,7 +140,7 @@ What evidence should the PR show (W&B runs, nightlies, benchmarks)?
 
 - **Dependency upgrades: all three** (#5005, #5195, #4852).
 - **Every perf change needs `perf`**, even small or launcher-only ones (#5026, #4713). Perf includes memory (#5036). Scaling out serving needs `perf` to show no loss, not a gain (#5115).
-- **A new loss, loss term or algorithm variant needs `convergence` only** (#4750, #5006, #5013). A convergence run also shows it works, so do not add `functionality`.
+- **A new loss, loss term or algorithm variant needs `convergence` only** (#4750, #5006, #5013). A convergence run also shows it works, so do not add `functionality`. The same holds for a fix or tweak to an existing loss.
 - **Skip-work optimizations whose speed gain is obvious need `convergence` only** (#5080, #4670). Masking, advantage or loss optimizations whose gain must be shown need `convergence + perf` (#5130).
 - **Low precision:** a new or rewritten path needs `functionality + convergence` (#3638). A perf change to a working path needs `convergence + perf` (#3294).
 - **Core recovery, recovery of extra state, router replay, pausing and resuming engines:** `functionality + convergence` (#4500, #4583, #4307, #3929). Convergence shows it still learns the same, or that it helps.
@@ -150,5 +151,5 @@ What evidence should the PR show (W&B runs, nightlies, benchmarks)?
 - **`functionality` only:** metric-counting fixes (#5155), equivalent refactors (#5192), first-time support (#5201), large subsystem moves (#5011), fixes for plain functional failures (#5147), launcher limits (#5058), tests-only PRs (#4507), telemetry features (#4925), a non-trivial feature in an existing subsystem (#5056).
 - **A nightly fix needs `functionality`**: show the nightly passes (#4788). A linter or type-checker upgrade also needs `functionality`: show the new gate passes (#5298).
 - **Perf changes in the data plane need `functionality + perf`** (#4769): show it still returns the same data.
-- **`none`:** CI-only changes, including changes to test thresholds or checks (#4933, #5055); config construction refactors such as `model_validate` (#5306); pure reverts (#5302).
+- **`none`:** docs-only changes; CI-only changes, including changes to test thresholds or checks (#4933, #5055); config construction refactors such as `model_validate` (#5306); pure reverts (#5302).
 - If you cannot tell whether extra runs are warranted: `unknown`.
