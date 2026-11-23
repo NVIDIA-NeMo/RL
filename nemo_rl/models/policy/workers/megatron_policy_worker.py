@@ -1923,6 +1923,8 @@ class MegatronPolicyWorkerImpl(
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
+        if "logprobs" not in reference_logprobs:
+            return return_data
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
 
@@ -2848,9 +2850,11 @@ class MegatronPolicyWorkerImpl(
             if run_logprobs:
                 t = time.perf_counter()
                 self.prepare_for_lp_inference()
-                logprobs = self.get_logprobs(data=data, require_router_replay=False)[
-                    "logprobs"
-                ]
+                # Every rank trains on these logprobs; the host-copy path returns
+                # them only on the model-parallel replica leader.
+                logprobs = self.get_logprobs(
+                    data=data, require_router_replay=False, keep_on_gpu=True
+                )["logprobs"].to(data["input_ids"].device)
                 # As in a real step: the ratio to these logprobs starts at one.
                 if logprobs.shape == data["input_ids"].shape:
                     for name in (
@@ -2998,6 +3002,10 @@ class MegatronPolicyWorkerImpl(
 
         if keep_on_gpu:
             return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs)
+        # Only the model-parallel replica leader is consumed by the driver.
+        if not self._is_replica_leader():
+            return BatchedDataDict[LogprobOutputSpec]()
+
         # TODO: @nan: will remove in the future
         cpu_logprobs = torch.empty_like(
             logprobs,

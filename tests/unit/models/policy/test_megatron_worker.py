@@ -7143,6 +7143,58 @@ class TestWarmupFirstPass:
             assert tracker.states[name] is g
             assert torch.equal(g.get_state(), saved[name])
 
+    @pytest.mark.parametrize("is_leader", [True, False])
+    def test_logprob_pass_feeds_every_model_parallel_rank(self, monkeypatch, is_leader):
+        import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+        def get_logprobs(*, data, require_router_replay, keep_on_gpu=False):
+            # Mirrors get_logprobs: only the replica leader gets the host copy.
+            if not keep_on_gpu and not is_leader:
+                return {}
+            return {"logprobs": torch.full(data["input_ids"].shape, -0.5)}
+
+        seen = {}
+        worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+        worker.cfg = {
+            "max_total_sequence_length": 32,
+            "make_sequence_length_divisible_by": 1,
+            "megatron_cfg": {"empty_unused_memory_level": 0},
+        }
+        worker.model = MagicMock(name="model")
+        worker.timer = MagicMock(name="step_timer")
+        worker._trainer_warmup_skip_reason = lambda: None
+        worker._apply_packing_prep = lambda data: data
+        worker.prepare_for_lp_inference = MagicMock()
+        worker.get_logprobs = get_logprobs
+        worker.prepare_for_training = MagicMock()
+        worker.begin_train_step = MagicMock()
+        worker.train_microbatch = MagicMock(
+            side_effect=lambda data: seen.update(prev=data["prev_logprobs"].clone())
+        )
+        worker.abort_train_step = MagicMock()
+        monkeypatch.setattr(
+            worker_module, "get_cuda_rng_tracker", lambda: _GeneratorRngTracker({})
+        )
+        monkeypatch.setattr(worker_module, "get_model_config", MagicMock())
+        monkeypatch.setattr(worker_module, "reset_model_temporary_tensors", MagicMock())
+        monkeypatch.setattr(worker_module, "clear_aux_losses_tracker", MagicMock())
+        monkeypatch.setattr(worker_module, "MTPLossLoggingHelper", MagicMock())
+        monkeypatch.setattr(
+            torch.cuda, "get_rng_state", lambda: torch.zeros(8, dtype=torch.uint8)
+        )
+        monkeypatch.setattr(torch.cuda, "set_rng_state", lambda state: None)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+        summary = worker.warmup_first_pass(
+            MagicMock(name="loss_fn"),
+            train_fields=("input_ids", "input_lengths", "sample_mask", "prev_logprobs"),
+            run_logprobs=True,
+            seqlens=[16],
+        )
+
+        assert "logprobs_s" in summary
+        assert torch.all(seen["prev"] == -0.5)
+
     @pytest.mark.parametrize(
         ("attrs", "reason"),
         [
