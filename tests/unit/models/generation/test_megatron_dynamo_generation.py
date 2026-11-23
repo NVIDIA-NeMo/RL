@@ -17,6 +17,8 @@
 import asyncio
 import copy
 import pickle
+import threading
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
 
@@ -94,6 +96,10 @@ class _FakeRay:
 
     def get(self, item, timeout=None):
         self.get_timeouts.append(timeout)
+        # Ray raises at timeout 0 unless the value is already there, which a
+        # call just issued never is.
+        if timeout is not None and timeout <= 0:
+            raise GetTimeoutError(f"no time left (timeout={timeout})")
         return self._resolve(item)
 
     def _resolve(self, item):
@@ -179,9 +185,13 @@ class _FakeEngine:
         self.short = _SHORT.get(self.name, self.name)
         self.env = env
         self.alive = True
+        # The probe raises RayActorError, as Ray does for a dead actor.
+        self.actor_dead = False
+        self.coordinator = None
         self.fail_shutdown = False
         self.unclean_shutdown = False
         self.fail_calls = False
+        self.reject_attestation = False
         self.shutdown_calls = 0
         # (rank, parent_event_address) per attach_dynamo_events call.
         self.attached: list[tuple[int, str]] = []
@@ -189,9 +199,11 @@ class _FakeEngine:
         self.endpoint_kwargs = None
         # What rank zero's dynamo_endpoint_error reports; None while serving.
         self.endpoint_error = None
-        # Refit fakes: rank zero's calls land in the log. ``faults`` maps a
-        # worker method to an exception, or "hang".
+        # Refit fakes: rank zero's calls land in the log. ``faults`` maps a worker method to an exception, or "hang", or (for
+        # an endpoint method) "disconnected", which raises from ``.remote()``.
         self.faults: dict[str, object] = {}
+        # Every method rank zero was called with, in call order.
+        self.calls: list[str] = []
         (width,) = kwargs["cluster"].kwargs["bundle_ct_per_node_list"]
         workers = [_FakeWorker(self.short, rank) for rank in range(width)]
         self.worker_group = SimpleNamespace(
@@ -202,16 +214,29 @@ class _FakeEngine:
         self.log.append(f"engine {self.name} up")
 
     def call(self, rank: int, method: str, kwargs: dict) -> _Ref:
+        if rank == 0:
+            self.calls.append(method)
         if method == "is_alive":
+            if self.actor_dead:
+                return _Ref(error=ray.exceptions.RayActorError())
             return _Ref(self.alive)
         if method in (
             "start_dynamo_endpoint",
             "attach_dynamo_events",
+            "dynamo_endpoint_metadata",
             "stop_dynamo_endpoint",
+            "confirm_decode_terminated",
+            "dynamo_coordinator_address",
             "dynamo_endpoint_error",
         ):
-            if self.faults.get(method) == "hang":
+            fault = self.faults.get(method)
+            if fault == "disconnected":
+                # Ray gone: issuing the call raises, as after ray.shutdown().
+                raise AttributeError("'Worker' object has no attribute 'core_worker'")
+            if fault == "hang":
                 return _Ref(hang=True)
+            if fault is not None:
+                return _Ref(error=fault)
             try:
                 return _Ref(getattr(self, f"_{method}")(rank, **kwargs))
             except Exception as error:
@@ -284,6 +309,11 @@ class _FakeEngine:
             self.log.append(f"attach {self.name}")
         return True
 
+    def _dynamo_endpoint_metadata(self, rank):
+        if self.fail_calls:
+            raise ray.exceptions.RayActorError()
+        return self.metadata
+
     def _stop_dynamo_endpoint(self, rank):
         assert rank == 0
         if self.fail_calls:
@@ -293,6 +323,21 @@ class _FakeEngine:
     def _dynamo_endpoint_error(self, rank):
         assert rank == 0
         return self.endpoint_error
+
+    def _confirm_decode_terminated(
+        self, rank, *, coordinator_addresses, owner, timeout_s
+    ):
+        assert rank == 0
+        if self.fail_calls:
+            raise RuntimeError(f"engine {self.name} is gone")
+        self.log.append(
+            f"confirm {self.name} {owner} {coordinator_addresses} {timeout_s}"
+        )
+        return not self.reject_attestation
+
+    def _dynamo_coordinator_address(self, rank):
+        assert rank == 0
+        return self.coordinator
 
     def shutdown(self):
         self.shutdown_calls += 1
@@ -365,6 +410,8 @@ class _Env:
         self.fail_engine_at = None
         self.fail_endpoint_at = None
         self.ray = _FakeRay()
+        # Every generation built here; torn down by close().
+        self.generations: list[MegatronDynamoGeneration] = []
 
         def make_cluster(**kwargs):
             cluster = _FakeCluster(self, kwargs)
@@ -387,6 +434,9 @@ class _Env:
 
         # The per-engine MegatronGeneration is looked up by name at build time.
         monkeypatch.setattr(generation_module, "MegatronGeneration", make_engine)
+        # One build at a time keeps the fakes' engine order (and
+        # fail_engine_at) deterministic; the concurrent build has its own test.
+        monkeypatch.setattr(MegatronDynamoGeneration, "_engine_build_concurrency", 1)
         monkeypatch.setattr(generation_module, "RayVirtualCluster", make_cluster)
         monkeypatch.setattr(generation_module, "cluster_node_ip", _NodeIpTask())
         monkeypatch.setattr(generation_module, "ray", self.ray)
@@ -416,11 +466,13 @@ class _Env:
             node_resource_constraints=None,
         )
         cluster.update(cluster_overrides)
-        return MegatronDynamoGeneration(
+        generation = MegatronDynamoGeneration(
             config=policy,  # type: ignore[arg-type]
             tokenizer="tok",  # type: ignore[arg-type]
             cluster=SimpleNamespace(**cluster),  # type: ignore[arg-type]
         )
+        self.generations.append(generation)
+        return generation
 
     def started(self, **kwargs) -> MegatronDynamoGeneration:
         """A built generation object with the start-up log cleared."""
@@ -438,13 +490,46 @@ class _Env:
         return runtime
 
     def refit_timeouts(self) -> list:
-        """Timeouts of the gets the refit path made (liveness probes excluded)."""
+        """Timeouts of every bounded get since they were last cleared.
+
+        Liveness probes are included: the pin wait probes every engine on each
+        poll that finds pins, and the first resume's readiness wait probes them
+        too.
+        """
         return [t for t in self.ray.get_timeouts if t is not None]
+
+    def close(self) -> None:
+        """Tear every generation down while this env's fakes are the ones it reaches.
+
+        One left to the GC would run ``__del__`` -> ``shutdown()`` during a
+        later test, against that test's engines and log.
+        """
+        for generation in self.generations:
+            generation.shutdown()
 
 
 @pytest.fixture
 def env(monkeypatch):
-    return _Env(monkeypatch, _NODES)
+    env = _Env(monkeypatch, _NODES)
+    yield env
+    env.close()
+
+
+# One replica of two prefill and two decode engines, TP 2 each.
+_TWO_PREFILL_NODES = ["10.0.0.1", "10.0.0.1", "10.0.0.2", "10.0.0.2"]
+
+
+def _two_prefill_config() -> dict:
+    config = _megatron_config()
+    config["disaggregation"]["num_prefill_engines"] = 2
+    return config
+
+
+@pytest.fixture
+def env2(monkeypatch):
+    env = _Env(monkeypatch, _TWO_PREFILL_NODES)
+    yield env
+    env.close()
 
 
 def _with_role(policy_config: dict, role: str) -> dict:
@@ -491,11 +576,13 @@ def test_builds_one_cluster_and_engine_per_role(env):
     assert generation.get_inference_world_size() == 6
     assert generation.num_engines == 3
     assert generation.expected_components() == {"prefill": 1, "backend": 2}
-    # Engines first, then the runtime from their environment, as for vLLM. No
+    # Every engine's cluster is placed before any engine is built; then the
+    # engines, then the runtime from their environment, as for vLLM. No
     # endpoint yet: the engines have no weights until the first refit.
     expected_log = []
     for name in _IDS:
-        expected_log += [f"cluster {name} up", f"placement {name}", f"engine {name} up"]
+        expected_log += [f"cluster {name} up", f"placement {name}"]
+    expected_log += [f"engine {name} up" for name in _IDS]
     assert env.log == expected_log + ["runtime up"] and env.endpoints == []
     assert env.runtime.frontend_python == "/venvs/mcore/bin/python"
     assert env.runtime.model_name == "Qwen/Qwen3-0.6B"
@@ -754,10 +841,52 @@ def test_too_few_pinned_nodes_for_the_engines_is_rejected(
     assert env.log == []
 
 
-def test_start_failure_tears_down_what_exists(env):
+@pytest.mark.parametrize("concurrency", [2, 8])
+def test_engines_built_concurrently_keep_the_refit_rank_order(
+    env, monkeypatch, concurrency
+):
+    monkeypatch.setattr(
+        MegatronDynamoGeneration, "_engine_build_concurrency", concurrency
+    )
+    release = threading.Event()
+    started: list[str] = []
+    make_engine = generation_module.MegatronGeneration
+
+    def slow_first_engine(**kwargs):
+        # The first engine finishes last, so completion order is not launch order.
+        name = kwargs["name_prefix"]
+        started.append(name)
+        if name == "dynamo_prefill-0":
+            assert release.wait(timeout=5)
+        elif len(started) >= min(concurrency, len(_IDS)):
+            release.set()
+        return make_engine(**kwargs)
+
+    slow_first_engine.init_cluster_placement_groups = (
+        make_engine.init_cluster_placement_groups
+    )
+    monkeypatch.setattr(generation_module, "MegatronGeneration", slow_first_engine)
+
+    generation = env.generation()
+
+    assert [r.instance_id for r in generation.engine_records] == _IDS
+    assert [r.role for r in generation.engine_records] == _ROLES
+
+
+def test_a_failed_build_round_submits_no_more_engines(env, monkeypatch):
+    monkeypatch.setattr(MegatronDynamoGeneration, "_engine_build_concurrency", 2)
+    env.fail_engine_at = 0
+    with pytest.raises(RuntimeError, match="failed to start"):
+        env.generation()
+    # The first round held prefill-0 (failed) and decode-0; decode-1 never ran.
+    assert "engine decode-1 up" not in env.log
+    assert "cluster decode-1 down" in env.log
+
+
+def test_start_failure_tears_down_what_exists(env, caplog):
     # The third engine fails to come up.
     env.fail_engine_at = 2
-    with pytest.raises(RuntimeError, match="failed to start"):
+    with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="failed to start"):
         env.generation()
     down = [line for line in env.log if line.endswith(" down")]
     assert set(down) == {
@@ -767,10 +896,13 @@ def test_start_failure_tears_down_what_exists(env):
         "cluster decode-0 down",
         "cluster decode-1 down",
     }
+    # Decode first, then prefill.
     assert [line for line in env.log if line.startswith("stop-endpoint")] == [
-        "stop-endpoint prefill-0",
         "stop-endpoint decode-0",
+        "stop-endpoint prefill-0",
     ]
+    # Engines without a record are not mistaken for a broken set.
+    assert "prefill coordinator addresses" not in caplog.text
     # No service was started for engines that never came up.
     assert env.runtimes == []
 
@@ -779,8 +911,8 @@ def test_engine_split_across_nodes_is_rejected(env):
     env.bundle_nodes[1] = ["10.0.0.1", "10.0.0.2"]
     with pytest.raises(RuntimeError, match=r"decode-0 spans multiple nodes"):
         env.generation()
-    # Rejected before the engine's workers exist.
-    assert [engine.name for engine in env.engines] == ["prefill-0"]
+    # Rejected while placing clusters, before any engine's workers exist.
+    assert env.engines == []
     assert "cluster decode-0 down" in env.log
 
 
@@ -805,9 +937,14 @@ def test_rejects_colocation_and_a_cluster_that_does_not_fit_the_replica(env):
     assert env.log == [] and env.runtimes == []
 
 
-_ENGINES_DOWN = [
-    line for name in _IDS for line in (f"stop-endpoint {name}", f"engine {name} down")
+_COORDINATOR = "tcp://10.0.0.1:5555"
+_DECODE_STOPS = [
+    "stop-endpoint decode-0",
+    "engine decode-0 down",
+    "stop-endpoint decode-1",
+    "engine decode-1 down",
 ]
+_PREFILL_STOP = ["stop-endpoint prefill-0", "engine prefill-0 down"]
 _CLUSTERS_DOWN = [
     "cluster prefill-0 down",
     "cluster decode-0 down",
@@ -815,50 +952,106 @@ _CLUSTERS_DOWN = [
 ]
 
 
+def _confirm(owner: str) -> str:
+    return f"confirm prefill-0 {owner} ['{_COORDINATOR}'] {_CONTROL_TIMEOUT_S}"
+
+
 @pytest.mark.parametrize(
-    ("faults", "expected_log", "errors"),
+    ("coordinator", "faults", "expected_log", "warnings"),
     [
-        pytest.param({}, _ENGINES_DOWN + _CLUSTERS_DOWN, [], id="clean"),
-        # A failed endpoint stop, engine stop or unclean stop is logged; the
-        # teardown continues.
+        # Decode engines stop first; the prefill engine's rank zero attests the
+        # stopped decode owners before it stops itself; the services stop last.
         pytest.param(
+            True,
+            {},
+            _DECODE_STOPS
+            + [_confirm("owner-decode-0"), _confirm("owner-decode-1")]
+            + _PREFILL_STOP
+            + _CLUSTERS_DOWN,
+            [],
+            id="clean",
+        ),
+        pytest.param(
+            False,
+            {},
+            _DECODE_STOPS + _PREFILL_STOP + _CLUSTERS_DOWN,
+            [
+                "No prefill coordinator address could be read; decode owners "
+                "['owner-decode-0', 'owner-decode-1'] are not attested as terminated"
+            ],
+            id="no_prefill_coordinator",
+        ),
+        # Ray is gone, so issuing the owner or address reads raises outright;
+        # every engine, cluster and the runtime still stop, unattested.
+        pytest.param(
+            True,
+            {"d0": {"faults": {"dynamo_endpoint_metadata": "disconnected"}}},
+            _DECODE_STOPS + _PREFILL_STOP + _CLUSTERS_DOWN,
+            ["Could not read the decode engines' handoff owners"],
+            id="owner_reads_cannot_be_issued",
+        ),
+        pytest.param(
+            True,
+            {"p0": {"faults": {"dynamo_coordinator_address": "disconnected"}}},
+            _DECODE_STOPS + _PREFILL_STOP + _CLUSTERS_DOWN,
+            ["Could not read prefill coordinator addresses"],
+            id="address_reads_cannot_be_issued",
+        ),
+        # The attester's endpoint calls raise and decode-0 fails to stop at all.
+        pytest.param(
+            True,
             {
                 "p0": {"fail_calls": True},
-                "d0": {"fail_shutdown": True},
-                "d1": {"unclean_shutdown": True},
+                "d0": {"fail_calls": True, "fail_shutdown": True},
             },
-            [
-                "engine prefill-0 down",
-                "stop-endpoint decode-0",
-                "stop-endpoint decode-1",
-                "engine decode-1 down",
-            ]
+            ["stop-endpoint decode-1", "engine decode-1 down", "engine prefill-0 down"]
             + _CLUSTERS_DOWN,
             [
                 "Could not stop a Megatron engine's Dynamo endpoint",
                 "Could not stop a Megatron engine",
-                "did not shut down cleanly",
+                "Could not read the handoff owner of decode-0",
+                "Could not attest decode owner owner-decode-1 termination",
             ],
             id="continues_past_failures",
         ),
+        # Only cleanly stopped decode engines are attested; a refused
+        # attestation is logged, not raised.
+        pytest.param(
+            True,
+            {"d0": {"unclean_shutdown": True}, "p0": {"reject_attestation": True}},
+            _DECODE_STOPS
+            + [_confirm("owner-decode-1")]
+            + _PREFILL_STOP
+            + _CLUSTERS_DOWN,
+            [
+                "did not shut down cleanly",
+                "Decode engine decode-0 did not stop cleanly",
+                "did not accept decode owner owner-decode-1",
+            ],
+            id="attests_only_clean_stops",
+        ),
     ],
 )
-def test_shutdown_stops_every_endpoint_and_engine_then_its_cluster_then_the_runtime(
-    env, caplog, faults, expected_log, errors
+def test_shutdown_stops_decode_attests_owners_then_prefill_then_the_runtime(
+    env, caplog, coordinator, faults, expected_log, warnings
 ):
     generation = env.started()
     _start_endpoints(generation)
+    if coordinator:
+        env.engine("p0").coordinator = _COORDINATOR
+    assert generation._prefill_coordinator_addresses() == (
+        {0: _COORDINATOR} if coordinator else {}
+    )
     for short, flags in faults.items():
         vars(env.engine(short)).update(flags)
     env.log.clear()
 
-    with caplog.at_level("ERROR"):
+    with caplog.at_level("WARNING"):
         assert generation.shutdown() is True
 
-    # Engines (endpoint, then policy), their clusters, then the services.
     assert env.log == expected_log + ["runtime down"]
-    for error in errors:
-        assert error in caplog.text
+    for warning in warnings:
+        assert warning in caplog.text
     assert generation.engine_records == [] and generation.num_engines == 0
     assert generation.expected_components() == {}
     env.log.clear()
@@ -870,20 +1063,78 @@ def test_shutdown_bounds_every_endpoint_call_and_still_stops_the_engines(env, ca
     """A hung endpoint call is cut off at the control timeout; the engine still stops."""
     generation = env.started()
     _start_endpoints(generation)
+    env.engine("p0").coordinator = _COORDINATOR
+    env.engine("d1").faults["dynamo_endpoint_metadata"] = "hang"
     env.engine("d1").faults["stop_dynamo_endpoint"] = "hang"
+    env.engine("p0").faults["confirm_decode_terminated"] = "hang"
     env.log.clear()
     env.ray.get_timeouts.clear()
 
-    with caplog.at_level("ERROR"):
+    with caplog.at_level("WARNING"):
         assert generation.shutdown() is True
 
     assert [line for line in env.log if line.startswith("engine ")] == [
-        "engine prefill-0 down",
         "engine decode-0 down",
         "engine decode-1 down",
+        "engine prefill-0 down",
     ]
-    assert "Could not stop a Megatron engine's Dynamo endpoint" in caplog.text
-    assert env.ray.get_timeouts == [_CONTROL_TIMEOUT_S] * len(_IDS)
+    assert "Decode engine decode-1 did not stop cleanly" in caplog.text
+    assert "Could not read the handoff owner of decode-1" in caplog.text
+    # decode-0 stopped cleanly; the attestation of its owner hung and was cut
+    # off at the bound.
+    assert "Could not attest decode owner owner-decode-0 termination" in caplog.text
+    assert all(0 < t <= _CONTROL_TIMEOUT_S + 10.0 for t in env.ray.get_timeouts)
+    assert _CONTROL_TIMEOUT_S + 10.0 in env.ray.get_timeouts
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["hang", ray.exceptions.RayActorError()],
+    ids=["address_read_times_out", "address_read_fails"],
+)
+def test_shutdown_attests_through_the_prefill_engines_that_answered(
+    env2, caplog, fault
+):
+    """One prefill engine's unreadable address keeps no other from releasing pins."""
+    generation = env2.generation(_two_prefill_config(), world_size=8)
+    _start_endpoints(generation)
+    second = "tcp://10.0.0.2:5555"
+    env2.engine("p0").coordinator = _COORDINATOR
+    env2.engine("prefill-1").coordinator = second
+    env2.engine("p0").faults["dynamo_coordinator_address"] = fault
+    env2.log.clear()
+
+    with caplog.at_level("WARNING"):
+        assert generation.shutdown() is True
+
+    # prefill-1 answered, so its rank zero attests both stopped decode owners
+    # to its own coordinator; prefill-0 still stops normally.
+    assert env2.log == [
+        *_DECODE_STOPS,
+        f"confirm prefill-1 owner-decode-0 ['{second}'] {_CONTROL_TIMEOUT_S}",
+        f"confirm prefill-1 owner-decode-1 ['{second}'] {_CONTROL_TIMEOUT_S}",
+        "stop-endpoint prefill-0",
+        "engine prefill-0 down",
+        "stop-endpoint prefill-1",
+        "engine prefill-1 down",
+        "cluster prefill-0 down",
+        "cluster prefill-1 down",
+        "cluster decode-0 down",
+        "cluster decode-1 down",
+        "runtime down",
+    ]
+    assert "Could not read the coordinator address of prefill-0" in caplog.text
+
+
+def test_shutdown_asks_no_prefill_engine_without_a_decode_owner(env):
+    """Before the first refit starts the endpoints there is no owner to attest."""
+    generation = env.started()
+    env.engine("p0").coordinator = _COORDINATOR
+
+    assert generation.shutdown() is True
+
+    assert "dynamo_coordinator_address" not in env.engine("p0").calls
+    assert env.log == _DECODE_STOPS + _PREFILL_STOP + _CLUSTERS_DOWN + ["runtime down"]
 
 
 # ---------------------------------------------------------------------------
@@ -975,8 +1226,22 @@ def test_check_alive_names_the_engine_whose_endpoint_stopped(env):
         match=r"stopped serving: decode-1: RuntimeError\('adapter failed'\)",
     ):
         generation.check_alive()
-    # Both the liveness probe and the endpoint check are bounded.
-    assert env.ray.get_timeouts == [_CONTROL_TIMEOUT_S] * 2
+    timeouts = env.ray.get_timeouts
+    assert len(timeouts) == 4
+    # One deadline spans the three probes and the endpoint check, so every
+    # later call gets strictly less of it.
+    assert all(0 < t < _CONTROL_TIMEOUT_S for t in timeouts)
+    assert timeouts == sorted(timeouts, reverse=True)
+
+
+def test_check_alive_counts_a_dead_actor_as_dead(env):
+    """A dead actor raises on the probe rather than answering False."""
+    generation = env.started()
+    env.engine("d0").actor_dead = True
+    env.engine("d1").actor_dead = True
+    with pytest.raises(RuntimeError, match="died: decode-0, decode-1") as raised:
+        generation.check_alive()
+    assert isinstance(raised.value.__cause__, ray.exceptions.RayActorError)
 
 
 def test_first_resume_starts_the_endpoints_and_awaits_the_frontend(env):
@@ -989,8 +1254,9 @@ def test_first_resume_starts_the_endpoints_and_awaits_the_frontend(env):
     env.log.clear()
     generation.resume_after_refit()
     # The first resume is the engines' startup: the refit built them, so their
-    # endpoints start now, and the frontend must list both components.
-    assert env.log == [f"{name}.resume" for name in _NAMES] + [
+    # endpoints start now, and the frontend must list both components. Every
+    # engine resumes in one wave, in record order.
+    assert env.log == _RESUMED + [
         line
         for name, role in zip(_IDS, _ROLES)
         for line in (f"endpoint {name} {role}", f"attach {name}")
@@ -998,7 +1264,7 @@ def test_first_resume_starts_the_endpoints_and_awaits_the_frontend(env):
     assert env.runtime.waits == [{"prefill": 1, "backend": 2}]
     env.log.clear()
     generation.resume_after_refit()
-    assert env.log == [f"{name}.resume" for name in _NAMES]
+    assert env.log == _RESUMED
     assert env.runtime.waits == [{"prefill": 1, "backend": 2}], "awaited once"
 
 
@@ -1049,8 +1315,13 @@ def test_pickled_copy_awaits_the_frontend_over_http(env, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The refit side: fan-out, rank placement, suspend and resume
+# The refit side: fan-out, rank placement, ordered pause, one-wave resume
 # ---------------------------------------------------------------------------
+
+
+# Every engine resumes in one wave, in record order: the kv_cache refit phase
+# already woke them all at once, and persist-mode engines need no role order.
+_RESUMED = [f"{name}.resume" for name in _NAMES]
 
 
 def test_records_hold_only_worker_handles_never_the_generation(env):
@@ -1096,9 +1367,15 @@ def test_pickled_copy_drives_the_engines_but_owns_none(env):
     clone._dynamo_fleet_ready = True  # the readiness wait is covered below
     clone.suspend_for_refit()
     clone.resume_after_refit()
-    assert env.log == [f"{name}.suspend" for name in _NAMES] + [
-        f"{name}.resume" for name in _NAMES
-    ]
+    assert (
+        env.log
+        == [
+            "p0.suspend",
+            "d0.suspend",
+            "d1.suspend",
+        ]
+        + _RESUMED
+    )
     # The leader's liveness is read through the same handles.
     assert clone.shard_liveness_ref(1).value is True
 
@@ -1156,12 +1433,194 @@ def test_collective_fans_out_in_record_order_with_rank_prefixes(
         generation.prepare_refit_info(None)
 
 
-def test_refit_sequence_runs_every_phase_on_every_engine(env):
+# The two fleet shapes of the P/D A/B run, on 8 inference GPUs: arm C is one
+# prefill and three decode engines at TP 2; arm C2 is one prefill engine at TP 2
+# and six decode engines at TP 1.
+_ARMS = {
+    "tp2_tp2": dict(decode_tp=2, num_decode=3, widths=(2, 2, 2, 2)),
+    "tp2_tp1": dict(decode_tp=1, num_decode=6, widths=(2, 1, 1, 1, 1, 1, 1)),
+}
+_TRAIN_WORLD_SIZE = 16
+
+
+def _native_refit_config(*, decode_tp: int, num_decode: int) -> dict[str, Any]:
+    """A P/D generation config on the native MCore refit, as the A/B run sets it."""
+    generation = _with_layout(
+        {"tensor_model_parallel_size": 2}, {"tensor_model_parallel_size": decode_tp}
+    )
+    generation["refit_transport"] = "mcore"
+    generation["disaggregation"]["num_decode_engines"] = num_decode
+    generation["mcore_generation_config"].update(
+        refit_backend="nccl", refit_execution_batch_bytes=None
+    )
+    return generation
+
+
+@pytest.fixture
+def arm_fleet(monkeypatch, arm) -> Iterator[tuple[_Env, MegatronDynamoGeneration]]:
+    """A started fleet of one arm, one engine per fake node."""
+    shape = _ARMS[arm]
+    nodes = [f"10.0.1.{index}" for index in range(len(shape["widths"]))]
+    arm_env = _Env(monkeypatch, nodes)
+    generation = arm_env.started(
+        generation_config=_native_refit_config(
+            decode_tp=shape["decode_tp"], num_decode=shape["num_decode"]
+        ),
+        world_size=sum(shape["widths"]),
+    )
+    yield arm_env, generation
+    arm_env.close()
+
+
+def _offsets(widths: tuple[int, ...]) -> list[int]:
+    """Each engine starts after the trainers and the engines before it."""
+    return [_TRAIN_WORLD_SIZE + sum(widths[:index]) for index in range(len(widths))]
+
+
+@pytest.mark.parametrize("arm", list(_ARMS))
+def test_engine_rank_offsets_follow_each_engines_own_width(arm, arm_fleet):
+    _, generation = arm_fleet
+    widths = _ARMS[arm]["widths"]
+    assert generation.shard_widths == widths
+    assert generation.engine_rank_offsets(_TRAIN_WORLD_SIZE) == _offsets(widths)
+    # The ranks the engines cover are exactly the refit group after the trainers.
+    covered = [
+        offset + rank
+        for offset, width in zip(_offsets(widths), widths, strict=True)
+        for rank in range(width)
+    ]
+    assert covered == list(range(_TRAIN_WORLD_SIZE, _TRAIN_WORLD_SIZE + sum(widths)))
+
+
+@pytest.mark.parametrize("arm", list(_ARMS))
+def test_native_refit_joins_and_receives_on_every_engine_at_its_offset(arm, arm_fleet):
+    arm_env, generation = arm_fleet
+    widths = _ARMS[arm]["widths"]
+    world_size = _TRAIN_WORLD_SIZE + sum(widths)
+    shorts = [engine.short for engine in arm_env.engines]
+    assert generation.uses_native_refit
+    # A pickled copy (the SingleController actor's) picks the same transport.
+    assert pickle.loads(pickle.dumps(generation)).uses_native_refit
+
+    # Nothing to prepare: the native refit moves Megatron shards, not HF tensors.
+    assert generation.prepare_refit_info(None) is None
+    assert arm_env.log == []
+
+    futures = generation.init_collective(
+        "10.0.0.9", 1234, world_size, train_world_size=_TRAIN_WORLD_SIZE
+    )
+    assert len(futures) == sum(widths)
+    assert arm_env.log == [
+        f"{short}.mcore_init(ws={world_size},off={offset},backend=nccl,batch=None)"
+        for short, offset in zip(shorts, _offsets(widths), strict=True)
+    ]
+    arm_env.log.clear()
+
+    futures = generation.update_weights_from_collective(None)
+    assert len(futures) == sum(widths)
+    assert arm_env.log == [f"{short}.swap(source=False)" for short in shorts]
+    arm_env.log.clear()
+
+    # The native transfer cannot be aborted; refuse a deadline before any
+    # engine enters it.
+    with pytest.raises(NotImplementedError, match="cannot enforce a refit deadline"):
+        generation.update_weights_from_collective(5.0)
+    assert arm_env.log == []
+
+
+def test_packed_refit_stays_the_default_transport(env):
+    generation = env.started()
+    assert not generation.uses_native_refit
+
+
+@pytest.mark.parametrize("arm", list(_ARMS))
+def test_megatron_synchronizer_drives_the_native_refit_over_the_fleet(
+    monkeypatch, arm, arm_fleet
+):
+    """The Megatron weight synchronizer's native path, end to end over the fakes."""
+    from nemo_rl.weight_sync import megatron_weight_synchronizer
+
+    arm_env, generation = arm_fleet
+    monkeypatch.setattr(megatron_weight_synchronizer, "ray", arm_env.ray)
+    widths = _ARMS[arm]["widths"]
+    shorts = [engine.short for engine in arm_env.engines]
+    prefill, decode = shorts[0], shorts[1:]
+
+    policy = SimpleNamespace(
+        init_calls=[],
+        init_collective_mcore_generation=lambda *args, **kwargs: (
+            policy.init_calls.append((args, kwargs)) or []
+        ),
+        swap_weights_via_reshard=lambda *, is_source: (
+            arm_env.log.append(f"train.swap(source={is_source})") or []
+        ),
+    )
+    train_cluster = SimpleNamespace(
+        get_master_address_and_port=lambda: ("10.0.0.9", 1234),
+        world_size=lambda: _TRAIN_WORLD_SIZE,
+    )
+    inference_cluster = SimpleNamespace(world_size=lambda: sum(widths))
+    synchronizer = megatron_weight_synchronizer.MegatronWeightSynchronizer(
+        policy,
+        generation,
+        colocated=False,
+        train_cluster=train_cluster,
+        inference_cluster=inference_cluster,
+        refit_timeout_s=None,
+    )
+    world_size = _TRAIN_WORLD_SIZE + sum(widths)
+
+    synchronizer.init_communicator()
+    # The trainers take ranks 0 .. T-1 and build the same plan at the same time.
+    assert policy.init_calls == [
+        (
+            ("10.0.0.9", 1234, world_size),
+            dict(
+                rank_offset=0,
+                refit_execution_batch_bytes=None,
+                refit_backend="nccl",
+            ),
+        )
+    ]
+    assert arm_env.log == [
+        f"{short}.mcore_init(ws={world_size},off={offset},backend=nccl,batch=None)"
+        for short, offset in zip(shorts, _offsets(widths), strict=True)
+    ]
+    arm_env.log.clear()
+
+    synchronizer.sync_weights()
+    expected = (
+        # Prefill is suspended before decode, with no wait for its handoff pins.
+        [f"{prefill}.suspend"]
+        + [f"{short}.suspend" for short in decode]
+        + [f"{short}.prepare_for_generation(['weights'])" for short in shorts]
+        # Every engine is waiting to receive before the trainers send.
+        + [f"{short}.swap(source=False)" for short in shorts]
+        + ["train.swap(source=True)"]
+        + [f"{short}.prepare_for_generation(['kv_cache'])" for short in shorts]
+        # Every engine resumes in one wave, in record order.
+        + [f"{short}.resume" for short in shorts]
+    )
+    # What follows is the first resume starting the engines' endpoints.
+    assert arm_env.log[: len(expected)] == expected
+    assert not any(".update" in entry or ".init(" in entry for entry in arm_env.log)
+    assert not synchronizer.is_stale
+
+
+def test_refit_sequence_suspends_prefill_then_decode(env):
     """The Megatron weight synchronizer's sequence, phase by phase."""
     generation = env.started()
     log = env.log
     generation.suspend_for_refit()
-    assert log == [f"{name}.suspend" for name in _NAMES]
+    # Prefill is suspended straight away: the refit never waits for decode to
+    # pull the KV blocks prefill pins for handoffs, so neither the pins nor
+    # the engines' liveness are read.
+    assert log == ["p0.suspend", "d0.suspend", "d1.suspend"]
+    assert not any(
+        method in engine.calls
+        for engine in env.engines
+        for method in ("pause_for_refit", "pinned_handoff_block_count", "is_alive")
+    )
     log.clear()
     generation.prepare_for_generation(tags=["weights"])
     generation.prepare_for_generation(tags=["kv_cache"])
@@ -1172,23 +1631,31 @@ def test_refit_sequence_runs_every_phase_on_every_engine(env):
     ]
     log.clear()
     generation.resume_after_refit()
-    assert log[: len(_NAMES)] == [f"{name}.resume" for name in _NAMES]
+    assert log[: len(_NAMES)] == _RESUMED
     # Every wait on an engine is bounded by the control timeout.
     assert all(t <= _CONTROL_TIMEOUT_S for t in env.refit_timeouts())
 
 
-@pytest.mark.parametrize("engine", ["p0", "d1"], ids=["prefill", "decode"])
-def test_a_failed_suspend_resumes_every_engine(env, engine):
+@pytest.mark.parametrize(
+    ("engine", "method", "restored"),
+    [
+        ("p0", "suspend_for_refit", ["p0.resume"]),
+        ("d1", "suspend_for_refit", _RESUMED),
+    ],
+    ids=["prefill_suspend", "decode_suspend"],
+)
+def test_any_suspend_failure_resumes_every_engine_it_reached(
+    env, engine, method, restored
+):
     generation = env.started()
-    env.engine(engine).faults["suspend_for_refit"] = ConnectionError("engine gone")
+    env.engine(engine).faults[method] = ConnectionError("engine gone")
     with pytest.raises(ConnectionError, match="engine gone") as caught:
         generation.suspend_for_refit()
     instance_id = env.engine(engine).name
     assert f"failed on engine {instance_id}" in "".join(caught.value.__notes__)
-    # The suspend was sent to every engine, so every engine is put back.
-    assert [entry for entry in env.log if entry.endswith(".resume")] == [
-        f"{name}.resume" for name in _NAMES
-    ]
+    # Every engine the suspend reached is resumed, in record order, as after a
+    # refit.
+    assert [entry for entry in env.log if entry.endswith(".resume")] == restored
 
 
 def test_a_hung_engine_call_times_out_and_the_engines_are_resumed(env):
@@ -1199,14 +1666,12 @@ def test_a_hung_engine_call_times_out_and_the_engines_are_resumed(env):
     assert "suspend_for_refit failed on engine decode-0" in "".join(
         caught.value.__notes__
     )
-    assert [entry for entry in env.log if entry.endswith(".resume")] == [
-        f"{name}.resume" for name in _NAMES
-    ]
+    assert [entry for entry in env.log if entry.endswith(".resume")] == _RESUMED
     # The suspend waits share one deadline no longer than timeout_s; the
     # restore that follows gets a fresh control-timeout deadline.
     timeouts = env.refit_timeouts()
     suspend_waits = timeouts[: -len(_NAMES)]
-    assert suspend_waits and all(t <= 0.5 for t in suspend_waits)
+    assert suspend_waits and all(0 < t < 0.5 for t in suspend_waits)
 
 
 def test_failed_restore_is_reported_on_the_original_error(env):
@@ -1227,9 +1692,7 @@ def test_resume_attempts_every_engine_and_reports_all_failures(env):
         generation.resume_after_refit()
     assert "decode-1" not in str(caught.value) and "prefill-0" not in str(caught.value)
     # The failure does not stop the other engines from resuming.
-    assert [entry for entry in env.log if entry.endswith(".resume")] == [
-        f"{name}.resume" for name in _NAMES
-    ]
+    assert [entry for entry in env.log if entry.endswith(".resume")] == _RESUMED
 
 
 @pytest.mark.parametrize(
