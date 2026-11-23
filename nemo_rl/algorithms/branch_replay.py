@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
@@ -299,13 +300,26 @@ def turn_runs(mask_row: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(np.flatnonzero(d == 1).tolist(), np.flatnonzero(d == -1).tolist()))
 
 
+_ATTEMPT_SUFFIX = re.compile(r"_a[0-9a-f]{32}$")
+
+
+def training_row_id(gym_rollout_id: str) -> str:
+    """``{group}_g{i}_a{attempt uuid}`` -> ``{group}_g{i}``; an id without the attempt suffix is returned as is."""
+    return _ATTEMPT_SUFFIX.sub("", gym_rollout_id)
+
+
 class BranchReplayRuntime:
     def __init__(self, config: BranchReplayConfig, replay_dir: str):
         self.config = config
         self.dir = Path(replay_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.selector = BranchSelector(config)
-        # Replay rollouts dispatched and not yet trained: rollout id -> the branch point they restart from.
+        # A rollout has two ids.  Gym knows it by the id of its current attempt, ``{group}_g{i}_a{attempt uuid}``:
+        # the model server names the recording, plan and replay log after it.  The training step knows it by the
+        # training row id ``{group}_g{i}``.  Dispatch records the attempt id of every rollout; the training step
+        # looks the files up through it and uses it as the source id of a branch point.
+        self._gym_id: dict[str, str] = {}
+        # Replay rollouts dispatched and not yet trained: training row id -> the branch point they restart from.
         self.in_flight: dict[str, BranchPoint] = {}
         self._lock = threading.Lock()
         self._dispatch = Counter()
@@ -329,6 +343,10 @@ class BranchReplayRuntime:
         except OSError:
             pass
 
+    def _remove_rollout_files(self, gym_id: str) -> None:
+        for path in (self._plan(gym_id), self._replay_log(gym_id), self._calls(gym_id)):
+            self._remove(path)
+
     def _recorded_calls(self, rollout_id: str) -> Optional[set[int]]:
         try:
             with open(self._calls(rollout_id), encoding="utf-8") as f:
@@ -343,9 +361,16 @@ class BranchReplayRuntime:
         Takes the task's pending branch point, if any, and turns this rollout into a replay by writing its plan.
         The point is remembered on ``sample`` so that a re-dispatch of the same sample replays the same point.
         """
-        if not task:
-            return None
+        row_id = training_row_id(rollout_id)
         with self._lock:
+            # A retry of the same rollout runs under a new attempt id: drop what the previous attempt left.
+            previous_id = self._gym_id.get(row_id)
+            if previous_id is not None and previous_id != rollout_id:
+                self._remove_rollout_files(previous_id)
+            self._gym_id[row_id] = rollout_id
+            self.in_flight.pop(row_id, None)
+            if not task:
+                return None
             point: Optional[BranchPoint] = None
             remembered = sample.get("_branch_point") if isinstance(sample, dict) else None
             if isinstance(remembered, BranchPoint):
@@ -369,7 +394,7 @@ class BranchReplayRuntime:
             os.replace(tmp, self._plan(rollout_id))
             if isinstance(sample, dict):
                 sample["_branch_point"] = point
-            self.in_flight[rollout_id] = point
+            self.in_flight[row_id] = point
             self._dispatch["replay"] += 1
             return point
 
@@ -393,7 +418,12 @@ class BranchReplayRuntime:
         with self._lock:
             for i, sample_id in enumerate(sample_ids):
                 row = debug_rows[i] if i < len(debug_rows) else {}
-                if int(row.get("trace_in_rollout_idx", 0)) != 0 or bool(row.get("is_empty_rollout", False)):
+                if int(row.get("trace_in_rollout_idx", 0)) != 0:
+                    continue
+                gym_id = self._gym_id.pop(sample_id, sample_id)
+                if bool(row.get("is_empty_rollout", False)):
+                    self.in_flight.pop(sample_id, None)
+                    self._remove_rollout_files(gym_id)
                     continue
                 info = row.get("rollout_info") or {}
                 if isinstance(info, (list, tuple)):
@@ -407,19 +437,18 @@ class BranchReplayRuntime:
                         replay_rewards.append(float(rewards[i] > 0.5))
                         replay_generated_turns.append(len(runs))
                     try:
-                        with open(self._replay_log(sample_id), encoding="utf-8") as f:
+                        with open(self._replay_log(gym_id), encoding="utf-8") as f:
                             entries = [json.loads(line) for line in f if line.strip()]
                         if entries:
                             replay_matches.append(float(np.mean([bool(e.get("context_match")) for e in entries])))
                     except OSError:
                         pass
-                    for path in (self._plan(sample_id), self._replay_log(sample_id), self._calls(sample_id)):
-                        self._remove(path)
+                    self._remove_rollout_files(gym_id)
                     self._remove(self._calls(replay_point.rollout_id))
                     continue
                 if trained[i] <= 0 or not runs:
                     # A masked rollout is not a source and says nothing new about the task's pending point.
-                    self._remove(self._calls(sample_id))
+                    self._remove(self._calls(gym_id))
                     continue
                 task = str(info.get("instance_id") or "")
                 first = np.array([values[i][a] for a, _ in runs], dtype=np.float64)
@@ -429,7 +458,7 @@ class BranchReplayRuntime:
                 point = self.selector.screen(
                     RolloutTurns(
                         task=task,
-                        rollout_id=sample_id,
+                        rollout_id=gym_id,
                         step=int(step),
                         solved=bool(rewards[i] > 0.5),
                         first=first,
@@ -444,7 +473,7 @@ class BranchReplayRuntime:
                 if previous is not None and (point is None or previous.rollout_id != point.rollout_id):
                     self._remove(self._calls(previous.rollout_id))
                 if point is None:
-                    self._remove(self._calls(sample_id))
+                    self._remove(self._calls(gym_id))
             metrics = self.selector.step_metrics()
             total = max(sum(self._dispatch.values()), 1)
             for key in ("normal", "replay", "source_recording_missing", "source_recording_misaligned"):
