@@ -1257,6 +1257,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         "num_gpu_nodes": 1,
         "invalid_tool_call_patterns": ["bad_call"],
         "thinking_tags": ["<think>"],
+        "truncate_noncontiguous_episodes": True,
         "config_paths": ["gym.yaml"],
     }
 
@@ -1346,7 +1347,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         def __init__(self, cluster, config, defer_model_load=False):
             self.cfg = config
             self.defer_model_load = defer_model_load
-            self.dp_openai_server_base_urls = ["http://reserved-vllm"]
+            self.client_base_urls = ["http://reserved-vllm"]
             # The per-job bearer token the real class generates when the
             # recipe requires one; Gym's model server must receive it.
             self.http_server_api_key = "k"
@@ -1465,7 +1466,7 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
         patch.object(runner, "load_config", return_value=master_config.model_dump()),
         patch.object(runner, "parse_hydra_overrides", side_effect=lambda cfg, _: cfg),
         patch.object(runner, "OmegaConf") as mock_omegaconf,
-        patch.object(runner, "MasterConfig", return_value=master_config),
+        patch.object(runner.MasterConfig, "model_validate", return_value=master_config),
         patch.object(runner, "get_next_experiment_dir", return_value="/tmp/logs/exp"),
         patch.object(runner, "get_tokenizer", return_value=tokenizer),
         patch.object(

@@ -22,10 +22,12 @@ hour three of a run.
 
 import warnings
 from typing import get_args
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
 
+from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     CustomSamplerConfig,
     SamplerConfig,
@@ -37,13 +39,17 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     FleetHealthConfig,
     GenerationRouterConfig,
     MasterConfig,
+    RefitActorConfig,
     RolloutFailureConfig,
     TokenCaptureConfig,
     WatchdogConfig,
     logprob_passes_required,
     validate_single_controller_config,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
+from nemo_rl.algorithms.single_controller_utils.setup import (
+    _build_retry_policy,
+    setup_single_controller,
+)
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
@@ -123,6 +129,89 @@ def test_single_forward_threshold_requires_a_threshold() -> None:
     cfg.grpo.seq_logprob_error_threshold = None
     with pytest.raises(ValueError, match="requires seq_logprob_error_threshold"):
         validate_single_controller_config(cfg)
+
+
+@pytest.mark.parametrize("min_groups", [1, 8])
+def test_in_loss_filter_rejects_excluded_reward_statistics(min_groups: int) -> None:
+    cfg = _single_forward_config()
+    cfg.async_rl.min_groups_for_streaming_train = min_groups
+    cfg.grpo.masked_reward_policy = "exclude"
+
+    with pytest.raises(ValueError, match="masked_reward_policy.*exclude"):
+        validate_single_controller_config(cfg)
+
+
+@pytest.mark.parametrize("masked_reward_policy", ["include", "exclude"])
+def test_separate_filter_preserves_reward_policy(masked_reward_policy: str) -> None:
+    cfg = _single_forward_config()
+    cfg.loss_fn.seq_logprob_error_in_loss = False
+    cfg.grpo.masked_reward_policy = masked_reward_policy
+
+    validate_single_controller_config(cfg)
+    assert logprob_passes_required(cfg, cfg.grpo) == (True, False)
+
+
+def test_reinforce_plus_plus_requires_full_batch_statistics() -> None:
+    cfg = _master_config()
+    cfg.grpo.adv_estimator.name = "reinforce_plus_plus"
+    cfg.async_rl.min_groups_for_streaming_train = 2
+
+    with pytest.raises(ValueError, match="reinforce_plus_plus.*min_groups"):
+        validate_single_controller_config(cfg)
+
+    cfg.async_rl.min_groups_for_streaming_train = cfg.grpo.num_prompts_per_step
+    validate_single_controller_config(cfg)
+
+
+def test_streaming_uses_the_estimator_batch_requirement(monkeypatch) -> None:
+    """Changing an estimator's requirement must not need a new name check."""
+    monkeypatch.setattr(
+        GRPOAdvantageEstimator,
+        "requires_global_batch",
+        property(lambda self: True),
+        raising=False,
+    )
+    cfg = _master_config()
+    cfg.async_rl.min_groups_for_streaming_train = 2
+    with pytest.raises(ValueError, match="requires.*min_groups"):
+        validate_single_controller_config(cfg)
+
+    cfg.async_rl.min_groups_for_streaming_train = cfg.grpo.num_prompts_per_step
+    validate_single_controller_config(cfg)
+
+
+def test_refit_actor_accepted_with_non_colocated_nccl_refit() -> None:
+    validate_single_controller_config(
+        _master_config(refit_actor=RefitActorConfig(enabled=True))
+    )
+
+
+def test_refit_actor_rejected_with_colocated_generation() -> None:
+    # Megatron is the one backend the SingleController runs colocated.
+    cfg = _master_config(refit_actor=RefitActorConfig(enabled=True))
+    cfg.policy["generation"] = {"backend": "megatron", "colocated": {"enabled": True}}
+    with pytest.raises(ValueError, match="non-colocated"):
+        validate_single_controller_config(cfg)
+
+
+def test_refit_actor_rejected_with_non_nccl_refit_transport() -> None:
+    cfg = _master_config(refit_actor=RefitActorConfig(enabled=True))
+    cfg.policy["generation"]["refit_transport"] = "nixl"
+    with pytest.raises(ValueError, match="NCCL refit transports"):
+        validate_single_controller_config(cfg)
+
+
+def test_group_token_mean_requires_megatron_before_setup() -> None:
+    cfg = _master_config()
+    cfg.loss_fn.normalization = "group_token_mean"
+    cfg.policy["megatron_cfg"] = {"enabled": True}
+    validate_single_controller_config(cfg)
+    cfg.policy["megatron_cfg"]["enabled"] = False
+    # Missing setup fields must not hide this compatibility error.
+    with pytest.raises(
+        ValueError, match="group_token_mean requires SingleController GRPO"
+    ):
+        setup_single_controller(cfg, MagicMock(pad_token_id=0))
 
 
 class TestRolloutFailureValidation:
