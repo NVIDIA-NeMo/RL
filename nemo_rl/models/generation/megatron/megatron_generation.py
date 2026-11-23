@@ -24,6 +24,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.held_port import RemoteHeldPortReservation
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -37,9 +38,6 @@ from nemo_rl.models.generation.megatron.config import (
     merged_inference_megatron_cfg,
 )
 from nemo_rl.models.generation.megatron.dynamo_config import (
-    disaggregation_cfg,
-    dynamo_enabled,
-    engine_widths,
     replica_width,
     validate_megatron_dynamo_generation,
 )
@@ -83,9 +81,7 @@ class MegatronGeneration(GenerationInterface):
         summed, as for TRT-LLM disaggregation.
         """
         if dynamo_enabled(config["generation"]):
-            return replica_width(
-                disaggregation_cfg(config["generation"]), engine_widths(config)
-            )
+            return replica_width(config)
         if config["generation"]["colocated"]["enabled"]:
             # Placement must satisfy both the resident training layout and any
             # dedicated inference layout built on those same ranks.
@@ -523,8 +519,8 @@ class MegatronGeneration(GenerationInterface):
         workers = self.worker_group.workers
         ranked_workers: list[tuple[Any, int, int]] = []
         for shard_idx, rank_prefix in active.shard_prefixes.items():
-            worker_start = active.worker_offset(shard_idx)
-            for local_rank in range(active.workers_per_shard[shard_idx]):
+            worker_start = shard_idx * active.workers_per_shard
+            for local_rank in range(active.workers_per_shard):
                 worker_idx = worker_start + local_rank
                 if worker_idx >= len(workers):
                     raise RuntimeError(

@@ -612,9 +612,7 @@ def test_build_clusters_sizes_megatron_dynamo_replicas_from_the_engine_layouts(
     )
 
     master_config = _make_master_config(backend="megatron", megatron_enabled=True)
-    generation = _megatron_config(
-        dynamo_cfg={"prefill_engine": prefill, "decode_engine": decode}
-    )
+    generation = _megatron_config(prefill_engine=prefill, decode_engine=decode)
     generation["mcore_generation_config"]["tensor_model_parallel_size"] = shared_tp
     generation["colocated"] = {
         "enabled": False,

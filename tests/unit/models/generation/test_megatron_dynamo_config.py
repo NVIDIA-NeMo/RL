@@ -17,22 +17,20 @@
 from types import SimpleNamespace
 
 import pytest
-from pydantic import ValidationError
 
 from nemo_rl.models.generation import (
     configure_generation_config,
     resolve_generation_class,
 )
+from nemo_rl.models.generation.disagg_layout import plan_engines, resolve_disagg_layout
+from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
 from nemo_rl.models.generation.megatron.dynamo_config import (
-    MegatronDynamoCfg,
-    disaggregation_cfg,
-    dynamo_enabled,
-    engine_roles,
     engine_width,
     engine_widths,
-    megatron_dynamo_cfg,
     replica_width,
+    role_overrides,
     validate_megatron_dynamo_generation,
 )
 
@@ -52,8 +50,11 @@ MEGATRON_POLICY = {
 }
 
 
-def _megatron_config(**overrides) -> dict:
-    """A ``backend: megatron`` generation config serving P/D engines behind Dynamo."""
+def _megatron_config(prefill_engine=None, decode_engine=None, **overrides) -> dict:
+    """A ``backend: megatron`` generation config serving P/D engines behind Dynamo.
+
+    ``prefill_engine`` / ``decode_engine`` go into ``mcore_generation_config``.
+    """
     config = {
         "backend": "megatron",
         "dynamo": True,
@@ -72,6 +73,12 @@ def _megatron_config(**overrides) -> dict:
         },
         "colocated": {"enabled": False},
     }
+    for key, value in (
+        ("prefill_engine", prefill_engine),
+        ("decode_engine", decode_engine),
+    ):
+        if value is not None:
+            config["mcore_generation_config"][key] = value
     config.update(overrides)
     return config
 
@@ -109,37 +116,22 @@ def test_dynamo_enabled_reads_the_flag(generation_cfg, expected) -> None:
     assert dynamo_enabled(generation_cfg) is expected
 
 
-def test_dynamo_cfg_defaults_and_rejects_unknown_keys() -> None:
-    cfg = megatron_dynamo_cfg({})
-    assert cfg == MegatronDynamoCfg()
-    assert cfg.frontend_args.router_mode == "kv" and cfg.request_timeout_s is None
-    assert cfg.frontend_args.num_frontends == 1 and cfg.frontend_args.extra_env == {}
-    assert cfg.role_overrides("prefill") == {} and cfg.role_overrides("decode") == {}
-    with pytest.raises(ValidationError, match="extra_forbidden"):
-        megatron_dynamo_cfg({"dynamo_cfg": {"engine": "megatron"}})
-    with pytest.raises(ValidationError, match="extra_forbidden"):
-        megatron_dynamo_cfg(
-            {"dynamo_cfg": {"decode_engine": {"context_parallel_size": 2}}}
+def test_role_overrides_are_empty_by_default() -> None:
+    config = _megatron_config()
+    assert role_overrides(config, "prefill") == {}
+    assert role_overrides(config, "decode") == {}
+
+
+def test_role_layouts_never_reach_megatron_cfg() -> None:
+    policy = _policy(
+        _megatron_config(
+            prefill_engine={"tensor_model_parallel_size": 4},
+            decode_engine={"tensor_model_parallel_size": 1},
         )
-
-
-def test_frontend_args_reject_power_of_two_and_zero_frontends() -> None:
-    # Dynamo 1.8 dropped the power-of-two router.
-    with pytest.raises(ValidationError, match="literal_error"):
-        megatron_dynamo_cfg(
-            {"dynamo_cfg": {"frontend_args": {"router_mode": "power-of-two"}}}
-        )
-    with pytest.raises(ValidationError, match="greater_than"):
-        megatron_dynamo_cfg({"dynamo_cfg": {"frontend_args": {"num_frontends": 0}}})
-
-
-@pytest.mark.parametrize("size", [0, -2])
-@pytest.mark.parametrize(
-    "key", ["tensor_model_parallel_size", "pipeline_model_parallel_size"]
-)
-def test_engine_layout_overrides_must_be_positive(key, size) -> None:
-    with pytest.raises(ValidationError, match="greater_than"):
-        megatron_dynamo_cfg({"dynamo_cfg": {"prefill_engine": {key: size}}})
+    )
+    merged = merged_inference_megatron_cfg(policy)  # type: ignore[arg-type]
+    assert "prefill_engine" not in merged and "decode_engine" not in merged
+    assert merged["tensor_model_parallel_size"] == 2
 
 
 @pytest.mark.parametrize("backend", ["sglang", "trtllm", "dynamo"])
@@ -169,13 +161,27 @@ def test_engines_take_their_width_from_the_policy_layout() -> None:
     policy["generation"]["mcore_generation_config"]["tensor_model_parallel_size"] = 4
     widths = engine_widths(policy)
     assert widths == {"prefill": 4, "decode": 4}
-    disaggregation = disaggregation_cfg(policy["generation"])
-    assert replica_width(disaggregation, widths) == 12
-    assert (
-        engine_roles(disaggregation, 24, widths) == ["prefill", "decode", "decode"] * 2
+    assert replica_width(policy) == 12
+    layout = resolve_disagg_layout(policy["generation"])
+    roles, engine_gpus, replicas = plan_engines(
+        24,
+        layout=layout,
+        aggregated_width=4,
+        prefill_width=4,
+        decode_width=4,
+        backend_cfg_key="mcore_generation_config",
     )
-    with pytest.raises(ValueError, match="not a multiple of one replica's 12 GPUs"):
-        engine_roles(disaggregation, 16, widths)
+    assert roles == ["prefill", "decode", "decode"] * 2
+    assert engine_gpus == [4] * 6 and replicas == 2
+    with pytest.raises(ValueError, match="replica width 12 GPUs"):
+        plan_engines(
+            16,
+            layout=layout,
+            aggregated_width=4,
+            prefill_width=4,
+            decode_width=4,
+            backend_cfg_key="mcore_generation_config",
+        )
 
 
 @pytest.mark.parametrize(
@@ -199,23 +205,23 @@ def test_prefill_and_decode_may_differ_in_layout(
     prefill, decode, expected_widths, roles_for_gpus
 ) -> None:
     """Each role's width is the shared layout with its own overrides applied."""
-    generation = _megatron_config(
-        dynamo_cfg={"prefill_engine": prefill, "decode_engine": decode}
-    )
-    cfg = megatron_dynamo_cfg(generation)
-    assert cfg.role_overrides("prefill") == prefill
-    assert cfg.role_overrides("decode") == decode
+    generation = _megatron_config(prefill_engine=prefill, decode_engine=decode)
+    assert role_overrides(generation, "prefill") == prefill
+    assert role_overrides(generation, "decode") == decode
     policy = _policy(generation)
     widths = engine_widths(policy)
     assert widths == expected_widths
-    disaggregation = disaggregation_cfg(generation)
     replica = expected_widths["prefill"] + 2 * expected_widths["decode"]
-    assert replica_width(disaggregation, widths) == replica
-    assert engine_roles(disaggregation, roles_for_gpus, widths) == [
-        "prefill",
-        "decode",
-        "decode",
-    ] * (roles_for_gpus // replica)
+    assert replica_width(policy) == replica
+    roles, _, _ = plan_engines(
+        roles_for_gpus,
+        layout=resolve_disagg_layout(generation),
+        aggregated_width=1,
+        prefill_width=widths["prefill"],
+        decode_width=widths["decode"],
+        backend_cfg_key="mcore_generation_config",
+    )
+    assert roles == ["prefill", "decode", "decode"] * (roles_for_gpus // replica)
 
 
 @pytest.mark.parametrize(
@@ -238,7 +244,7 @@ def test_prefill_and_decode_may_differ_in_layout(
         pytest.param(
             {"tensor_model_parallel_size": 4, "expert_model_parallel_size": 2},
             {"tensor_model_parallel_size": 1},
-            r"decode engines .*dynamo_cfg\.decode_engine",
+            r"decode engines .*mcore_generation_config\.decode_engine",
             id="decode_override_too_narrow",
         ),
         # Expert TP counts toward the expert grid too, and PP multiplies both grids.
@@ -257,7 +263,7 @@ def test_prefill_and_decode_may_differ_in_layout(
 )
 def test_engine_width_must_hold_the_expert_parallel_grid(layout, decode, match) -> None:
     """MCore needs the engine's ranks divisible by ETP x EP x PP; refuse otherwise."""
-    generation = _megatron_config(dynamo_cfg={"decode_engine": decode})
+    generation = _megatron_config(decode_engine=decode)
     generation["mcore_generation_config"].update(layout)
     policy = _policy(generation)
 
