@@ -113,7 +113,11 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         ),
     )
     monkeypatch.setattr(entrypoint_utils, "load_config", load_config)
-    monkeypatch.setattr(entrypoint_utils, "MasterConfig", lambda **_: config)
+    monkeypatch.setattr(
+        entrypoint_utils,
+        "MasterConfig",
+        SimpleNamespace(model_validate=lambda _: config),
+    )
     monkeypatch.setattr(entrypoint_utils, "init_ray", lambda: None)
     monkeypatch.setattr(entrypoint_utils, "get_tokenizer", lambda _: "tokenizer")
     monkeypatch.setattr(

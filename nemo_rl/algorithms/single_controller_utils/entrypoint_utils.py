@@ -141,7 +141,7 @@ def _load_config(
     if simulator is not None:
         # After the CLI overrides, so the simulator's node and step counts win over the recipe.
         apply_simulator_overrides(raw_config, simulator)
-    master_config = MasterConfig(**raw_config)
+    master_config = MasterConfig.model_validate(raw_config)
     # Keep the processor, dataset and vLLM MediaIO on one frame-count contract.
     # Without this, vLLM's VideoMediaIO silently falls back to 32 frames even
     # when a video recipe requests (and caches) 64 frames.

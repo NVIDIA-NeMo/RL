@@ -135,9 +135,9 @@ async def resolve_restored_call(
     """
     if serving_admission.generation_cut is None:
         return serving_admission, None
-    # Off-loop: the saved rows are a blocking TQ read.
-    resolved_admission, resolved = await asyncio.to_thread(
-        host._prefix_recovery.resolve_restore, serving_admission, prefix_token_ids
+    # On the serving loop, so restores arriving together share one TQ read.
+    resolved_admission, resolved = await host._prefix_recovery.resolve_restore(
+        serving_admission, prefix_token_ids
     )
     if resolved is None:
         return resolved_admission, None
