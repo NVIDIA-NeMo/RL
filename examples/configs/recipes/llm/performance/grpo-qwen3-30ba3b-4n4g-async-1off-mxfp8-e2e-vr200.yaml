@@ -1,0 +1,35 @@
+defaults: ./grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout.yaml
+grpo:
+  max_num_steps: 10
+policy:
+  train_micro_batch_size: 8
+  logprob_batch_size: 16
+  logprob_chunk_size: 1024
+  sequence_packing:
+    # Cap the packed policy microbatch independently of the nominal sequence count.
+    train_mb_tokens: 20480
+  megatron_cfg:
+    expert_model_parallel_size: 4
+    empty_unused_memory_level: 0
+    defer_fp32_logits: true
+    reuse_logits_storage: true
+    te_precision_config_file: examples/te_precision/qwen3_routed_experts_mxfp8.yaml
+    fp8_cfg:
+      enabled: true
+      fp8_recipe: mxfp8
+    model_overrides:
+      moe_use_grouped_tensor: true
+    env_vars:
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "4"
+  generation:
+    stop_token_ids: [151645]
+    vllm_kwargs:
+      max_num_seqs: 256
+      kernel_config:
+        enable_jit_warmup: false
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-e2e-vr200
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-e2e-vr200
+  wandb:
+    name: grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-e2e-vr200

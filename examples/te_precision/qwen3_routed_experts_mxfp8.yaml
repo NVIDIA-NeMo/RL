@@ -1,0 +1,31 @@
+# Match Qwen3's MXFP8 rollout precision in both Megatron forwards.
+# Expert weights stay in BF16 for optimization and refit.
+configs:
+  bf16:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe: {}
+  mxfp8:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe: &routed_expert_recipe
+      fp8_quantization_recipe: mxfp8
+      fp8_format: e4m3
+      fp8_param: false
+      override_quantized_autocast: true
+      override_nonquantized_autocast: true
+    evaluation_recipe: *routed_expert_recipe
+matchers:
+  linear_fc1:
+    type: glob
+    config: mxfp8
+    enabled: true
+    pattern: "*.mlp.experts.*linear_fc1"
+  linear_fc2:
+    type: glob
+    config: mxfp8
+    enabled: true
+    pattern: "*.mlp.experts.*linear_fc2"
+  default:
+    type: glob
+    config: bf16
+    enabled: true
+    pattern: "*"
