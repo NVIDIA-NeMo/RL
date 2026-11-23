@@ -344,7 +344,7 @@ async def _round_trip(
     # only when the sampler says it can restore one.
     sidecar = (
         buf_a.metadata_state_dict(saved_capacity=CAPACITY)
-        if sampler_a.supports_buffer_checkpoint
+        if sampler_a.capabilities.supports_buffer_checkpoint
         else None
     )
     recovery_ledger_a = RolloutRecoveryLedger()
@@ -407,7 +407,7 @@ async def _round_trip(
     sampler_b = create_sampler(buf_b, sampler_config(sampler_name, scenario.lag))
 
     # Mirrors RolloutRestorer._restore_replay_buffer.
-    if sidecar is not None and sampler_b.supports_buffer_checkpoint:
+    if sidecar is not None and sampler_b.capabilities.supports_buffer_checkpoint:
         await buf_b.load_state_dict(
             sidecar,
             max_groups=CAPACITY,

@@ -837,5 +837,5 @@ class TestADropBudgetIsAcceptedUnderEverySampler:
                 target="tests.unit.single_controller.test_sampler_interface:NoDropAccounting"
             )
         )
-        with pytest.raises(ValueError, match="missing the required"):
+        with pytest.raises(TypeError, match="capabilities = SamplerCapabilities"):
             validate_single_controller_config(cfg)

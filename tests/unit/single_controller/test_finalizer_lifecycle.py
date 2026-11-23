@@ -162,8 +162,10 @@ def _controller(actor: object) -> Any:
     # Default to a stamped, pooled sampler: filtered drops draw a spare, and a lost
     # group is charged to its own stamped step (matching these tests' expectations).
     ctrl._sampler = SimpleNamespace(
-        uses_pooled_replacements=True,
-        requires_shortfall_reconciliation=False,
+        capabilities=SimpleNamespace(
+            uses_pooled_replacements=True,
+            requires_shortfall_reconciliation=False,
+        ),
         charge_step_for_lost_group=(
             lambda *, target_step, assembling_version: target_step
         ),

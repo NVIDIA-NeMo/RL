@@ -287,14 +287,14 @@ class RolloutRestorer(_UsesRolloutParts):
         metadata_path = os.path.join(self._resume.path, REPLAY_BUFFER_METADATA_FILENAME)
         if (
             os.path.exists(metadata_path)
-            and not self._sampler.supports_buffer_checkpoint
+            and not self._sampler.capabilities.supports_buffer_checkpoint
         ):
             raise RuntimeError(
                 "The checkpoint contains native replay state, but the configured "
                 f"sampler {self._async_cfg.sampler.name!r} does not support "
                 "replay-buffer recovery"
             )
-        if not self._sampler.supports_buffer_checkpoint:
+        if not self._sampler.capabilities.supports_buffer_checkpoint:
             return 0
         if not os.path.exists(metadata_path):
             # Setup already rejected a legacy replay file and warned that the

@@ -569,34 +569,6 @@
       "severity": "error"
     },
     {
-      "column": 5,
-      "path": "nemo_rl/algorithms/async_utils/staleness_sampler.py",
-      "name": "bad-override",
-      "concise_description": "Class member `WindowedSampler.requires_single_weight_batch` overrides parent class `BaseSampler` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/algorithms/async_utils/staleness_sampler.py",
-      "name": "bad-override",
-      "concise_description": "Class member `ReadyFirstSampler.requires_single_weight_batch` overrides parent class `_GatedSampler` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/algorithms/async_utils/staleness_sampler.py",
-      "name": "bad-override",
-      "concise_description": "Class member `WeightFifoSampler.requires_single_weight_batch` overrides parent class `_GatedSampler` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "column": 5,
-      "path": "nemo_rl/algorithms/async_utils/staleness_sampler.py",
-      "name": "bad-override",
-      "concise_description": "Class member `InOrderSampler.requires_single_weight_batch` overrides parent class `_GatedSampler` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
       "column": 25,
       "path": "nemo_rl/algorithms/distillation.py",
       "name": "bad-argument-type",

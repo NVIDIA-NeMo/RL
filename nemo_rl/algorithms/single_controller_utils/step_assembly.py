@@ -184,7 +184,7 @@ class StepAssembler:
             self._mark_step_allowed_short(charged_step)
         assembly = self._step_assembly
         if (
-            self._sampler.requires_shortfall_reconciliation
+            self._sampler.capabilities.requires_shortfall_reconciliation
             and assembly is not None
             and assembly.selection_credits is not None
         ):

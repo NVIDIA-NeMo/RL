@@ -28,9 +28,11 @@ loop in one object, injected into both pumps:
     knobs, so those consumers can't drift out of sync with the sampler.
   - drop accounting (``charge_step_for_lost_group`` plus the
     ``uses_pooled_replacements`` / ``closes_short_at_exhaustion`` /
-    ``requires_shortfall_reconciliation`` flags): what losing a prompt group for
-    good costs under this policy, i.e. which step it is charged to and whether a
-    spare pool replaces it.
+    ``requires_shortfall_reconciliation`` capabilities): what losing a prompt
+    group for good costs under this policy, i.e. which step it is charged to and
+    whether a spare pool replaces it.
+  - ``capabilities`` (one ``SamplerCapabilities`` per class): the static facts
+    setup reads before construction and the controller reads at runtime.
 
 ``PromptGroupSampler`` is the interface; ``WindowedSampler`` /
 ``ReadyFirstSampler`` / ``WeightFifoSampler`` / ``InOrderSampler`` are the
@@ -45,6 +47,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import dataclasses
 import importlib
 from typing import (
     Annotated,
@@ -70,17 +73,50 @@ from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 _GATE_POLL_SECONDS = 0.005
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class SamplerCapabilities:
+    """Static facts about a sampler policy, declared once per sampler class.
+
+    Every field is required, so a partial declaration fails where the class is
+    defined. Setup reads the class's declaration before constructing the
+    sampler; the controller reads the same object at runtime.
+    """
+
+    # Completed buffered groups can be restored safely.
+    supports_buffer_checkpoint: bool
+    # Selected groups remain owned until the train step commits. False keeps the
+    # legacy remove-on-selection behavior, which rules out periodic snapshots.
+    supports_training_claims: bool
+    # Selection needs a complete batch from one weight version, so setup rejects
+    # drop budgets and dynamic sampling, whose replacements may carry newer weights.
+    requires_single_weight_batch: bool
+    # Dropped groups are replaced from a dedicated spare pool.
+    uses_pooled_replacements: bool
+    # The last step may close on the groups left once the data runs out.
+    closes_short_at_exhaustion: bool
+    # A loss charged during an awaited selection must be reconciled: true for
+    # policies that charge against the assembling cursor (it can move while
+    # selection awaits its claim), false for ones that stamp a fixed target step.
+    requires_shortfall_reconciliation: bool
+
+    def __post_init__(self) -> None:
+        for field in dataclasses.fields(self):
+            value = getattr(self, field.name)
+            if not isinstance(value, bool):
+                raise TypeError(
+                    f"SamplerCapabilities.{field.name} must be a bool, got {value!r}"
+                )
+
+
 @runtime_checkable
 class PromptGroupSampler(Protocol):
     """Staleness policy shared by the SC rollout and train pumps.
 
     Implement this (or subclass ``BaseSampler``) to add a custom sampling
     algorithm; point ``async_rl.sampler`` at ``module:ClassName`` to load it.
-    A custom sampler that supports replay recovery must explicitly declare
-    ``supports_buffer_checkpoint = True``. It must additionally declare
-    ``supports_training_claims = True`` before periodic rollout snapshots may
-    be enabled; omitting that optional capability preserves the legacy
-    remove-on-selection behavior.
+    A custom sampler declares ``capabilities = SamplerCapabilities(...)`` in its
+    own class body; it does not inherit a built-in policy's declaration, so a
+    subclass that keeps one says so with ``dataclasses.replace``.
     """
 
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
@@ -152,24 +188,8 @@ class PromptGroupSampler(Protocol):
         """True when the policy admits zero staleness (sync mode)."""
         ...
 
-    supports_buffer_checkpoint: ClassVar[bool]
-    """Whether completed buffered groups can be restored safely."""
-
-    supports_training_claims: ClassVar[bool]
-    """Whether selected groups remain owned until the train step commits."""
-
-    uses_pooled_replacements: ClassVar[bool]
-    """Whether dropped groups are replaced from a dedicated spare pool."""
-
-    closes_short_at_exhaustion: ClassVar[bool]
-    """Whether the last step may close on the groups left once the data runs out."""
-
-    requires_shortfall_reconciliation: ClassVar[bool]
-    """Whether a loss charged during an awaited selection must be reconciled.
-
-    True for policies that charge against the assembling cursor (it can move while
-    selection awaits its claim); False for policies that stamp a fixed target step.
-    """
+    capabilities: ClassVar[SamplerCapabilities]
+    """Static capability flags; see ``SamplerCapabilities``."""
 
     def charge_step_for_lost_group(
         self, *, target_step: Optional[int], assembling_version: int
@@ -218,16 +238,8 @@ class BaseSampler(abc.ABC):
     select-finalize / weight-window-evict helpers.
     """
 
-    supports_buffer_checkpoint: ClassVar[bool] = False
-    supports_training_claims: ClassVar[bool] = True
-
-    # Drop-accounting defaults, right for a gated sampler that does not stamp.
-    uses_pooled_replacements: ClassVar[bool] = True
-    closes_short_at_exhaustion: ClassVar[bool] = False
-
-    # Streaming/gated policies charge against the moving assembling cursor, so a loss
-    # that raced an awaited selection is reconciled once the result is known.
-    requires_shortfall_reconciliation: ClassVar[bool] = True
+    # Each concrete policy declares its own.
+    capabilities: ClassVar[SamplerCapabilities]
 
     def __init__(self, buffer: TQReplayBuffer) -> None:
         self._buffer = buffer
@@ -272,16 +284,6 @@ class BaseSampler(abc.ABC):
                 f"dispatch_index must be at least -1, got {dispatch_index}"
             )
         self._dispatch_index = dispatch_index
-
-    @property
-    @abc.abstractmethod
-    def requires_single_weight_batch(self) -> bool:
-        """Whether selection needs a complete batch from one weight version.
-
-        Concrete policies declare a boolean class attribute so setup can reject
-        incompatible drop policies before constructing the sampler.
-        """
-        ...
 
     # ── rollout-pump side ────────────────────────────────────────────────
     @abc.abstractmethod
@@ -424,14 +426,17 @@ class WindowedSampler(BaseSampler):
     freshest-first.
     """
 
-    # Ungated restored groups are ordinary in-window candidates.
-    supports_buffer_checkpoint: ClassVar[bool] = True
-    requires_single_weight_batch: ClassVar[bool] = False
-
-    # Rollout never stops producing, so a lost group is made up by later ones: no spare
-    # pool is needed, and only the tail of the data can leave a step short.
-    uses_pooled_replacements: ClassVar[bool] = False
-    closes_short_at_exhaustion: ClassVar[bool] = True
+    capabilities: ClassVar[SamplerCapabilities] = SamplerCapabilities(
+        # Ungated restored groups are ordinary in-window candidates.
+        supports_buffer_checkpoint=True,
+        supports_training_claims=True,
+        requires_single_weight_batch=False,
+        # Rollout never stops producing, so a lost group is made up by later ones: no
+        # spare pool is needed, and only the tail of the data can leave a step short.
+        uses_pooled_replacements=False,
+        closes_short_at_exhaustion=True,
+        requires_shortfall_reconciliation=True,
+    )
 
     def __init__(
         self,
@@ -604,9 +609,17 @@ class ReadyFirstSampler(_GatedSampler):
     rollout is ever discarded.
     """
 
-    # Committed groups retain start_weight, which is sufficient for selection.
-    supports_buffer_checkpoint: ClassVar[bool] = True
-    requires_single_weight_batch: ClassVar[bool] = False
+    capabilities: ClassVar[SamplerCapabilities] = SamplerCapabilities(
+        # Committed groups retain start_weight, which is sufficient for selection.
+        supports_buffer_checkpoint=True,
+        supports_training_claims=True,
+        requires_single_weight_batch=False,
+        uses_pooled_replacements=True,
+        closes_short_at_exhaustion=False,
+        # Charged against the moving assembling cursor, so a loss that raced an
+        # awaited selection is reconciled once the result is known.
+        requires_shortfall_reconciliation=True,
+    )
 
     def __init__(
         self,
@@ -656,15 +669,21 @@ class WeightFifoSampler(_GatedSampler):
     that weight's batch to fill. Evict uses the weight window (default).
     """
 
-    # Committed groups retain start_weight, which is sufficient for selection.
-    supports_buffer_checkpoint: ClassVar[bool] = True
-    requires_single_weight_batch: ClassVar[bool] = True
-    # A replacement is dispatched at whatever the weight version is once the original
-    # was given up on. Unless the trainer has not moved since, that is a newer version
-    # than the bucket the replacement is meant to fill, and select -- which waits on the
-    # oldest in-window bucket alone -- then waits on a bucket nothing can top up. A pool
-    # that only works when the timing happens to line up is not one worth having.
-    uses_pooled_replacements: ClassVar[bool] = False
+    capabilities: ClassVar[SamplerCapabilities] = SamplerCapabilities(
+        # Committed groups retain start_weight, which is sufficient for selection.
+        supports_buffer_checkpoint=True,
+        supports_training_claims=True,
+        requires_single_weight_batch=True,
+        # A replacement is dispatched at whatever the weight version is once the
+        # original was given up on. Unless the trainer has not moved since, that is a
+        # newer version than the bucket the replacement is meant to fill, and select --
+        # which waits on the oldest in-window bucket alone -- then waits on a bucket
+        # nothing can top up. A pool that only works when the timing happens to line
+        # up is not one worth having.
+        uses_pooled_replacements=False,
+        closes_short_at_exhaustion=False,
+        requires_shortfall_reconciliation=True,
+    )
 
     def __init__(self, buffer: TQReplayBuffer, *, max_staleness_versions: int) -> None:
         super().__init__(buffer, gate_window=max_staleness_versions)
@@ -723,16 +742,18 @@ class InOrderSampler(_GatedSampler):
     capacity is sized for the peak of the two.
     """
 
-    # Committed groups retain target_step, which is sufficient for selection.
-    # The controller checkpoints the exact dispatch cursor separately.
-    supports_buffer_checkpoint: ClassVar[bool] = True
-    requires_single_weight_batch: ClassVar[bool] = False
-
-    uses_pooled_replacements: ClassVar[bool] = True
-    closes_short_at_exhaustion: ClassVar[bool] = False
-
-    # in_order stamps each group's fixed target step, so a loss needs no reconciliation.
-    requires_shortfall_reconciliation: ClassVar[bool] = False
+    capabilities: ClassVar[SamplerCapabilities] = SamplerCapabilities(
+        # Committed groups retain target_step, which is sufficient for selection.
+        # The controller checkpoints the exact dispatch cursor separately.
+        supports_buffer_checkpoint=True,
+        supports_training_claims=True,
+        requires_single_weight_batch=False,
+        uses_pooled_replacements=True,
+        closes_short_at_exhaustion=False,
+        # in_order stamps each group's fixed target step, so a loss needs no
+        # reconciliation.
+        requires_shortfall_reconciliation=False,
+    )
 
     def __init__(
         self,
@@ -860,12 +881,9 @@ class CustomSamplerConfig(BaseModel, extra="allow"):
     name: Literal["custom"] = "custom"
     # "module:ClassName" of a PromptGroupSampler defined outside this repo.
     # Extra keys are forwarded to the constructor (after ``buffer``). The
-    # target class must declare a boolean ``supports_buffer_checkpoint`` class
-    # attribute so setup can validate recovery requirements before allocating
-    # cluster resources. Periodic rollout snapshots additionally require an
-    # explicit boolean ``supports_training_claims = True`` declaration.
-    # Dynamic sampling and nonzero drop budgets require a boolean
-    # ``requires_single_weight_batch = False`` class declaration.
+    # target class must declare ``capabilities = SamplerCapabilities(...)`` in
+    # its own class body so setup can validate it before allocating cluster
+    # resources.
     target: str
 
 
@@ -944,109 +962,51 @@ def sampler_supports_transactional_admission(cfg: SamplerConfig) -> bool:
     return issubclass(_sampler_class_for_config(cfg), TransactionalAdmissionSampler)
 
 
-def sampler_requires_single_weight_batch(cfg: SamplerConfig) -> bool:
-    """Read the resolved policy's selection requirement without constructing it.
-
-    Custom subclasses inherit their selection policy's declaration. Missing or
-    instance-only declarations fail before a run can enable filtering or drops.
-    """
-    sampler_cls = _sampler_class_for_config(cfg)
-    capability = getattr(sampler_cls, "requires_single_weight_batch", None)
-    if not isinstance(capability, bool):
-        raise TypeError(
-            f"{sampler_cls.__name__}.requires_single_weight_batch must be a "
-            f"boolean class attribute, got {capability!r}"
-        )
-    return capability
-
-
-def sampler_uses_pooled_replacements(cfg: SamplerConfig) -> bool:
-    """Whether the configured sampler replaces lost groups from a spare pool.
-
-    Reads the resolved class without constructing it. Every sampler declares the
-    member: built-ins as a ClassVar, custom samplers enforced by
-    ``require_drop_accounting_members`` during config validation, which runs
-    before this reader, so the attribute is always present.
-    """
-    sampler_cls = _sampler_class_for_config(cfg)
-    return sampler_cls.uses_pooled_replacements
-
-
-def sampler_supports_buffer_checkpoint(cfg: SamplerConfig) -> bool:
-    """Return a sampler class's static replay-checkpoint capability.
+def sampler_capabilities(cfg: SamplerConfig) -> SamplerCapabilities:
+    """Return the configured sampler class's capabilities without constructing it.
 
     Custom classes are imported but not instantiated, allowing setup to fail
     before allocating cluster resources or triggering constructor side effects.
-    """
-    sampler_cls = _sampler_class_for_config(cfg)
-
-    if isinstance(cfg, CustomSamplerConfig):
-        # A custom subclass must opt in explicitly instead of inheriting a
-        # built-in sampler's capability declaration accidentally.
-        capability = sampler_cls.__dict__.get("supports_buffer_checkpoint", False)
-    else:
-        capability = getattr(sampler_cls, "supports_buffer_checkpoint", None)
-    if not isinstance(capability, bool):
-        raise TypeError(
-            f"{sampler_cls.__name__}.supports_buffer_checkpoint must be a "
-            f"boolean class attribute, got {capability!r}"
-        )
-    return capability
-
-
-def sampler_supports_training_claims(cfg: SamplerConfig) -> bool:
-    """Return whether selection transfers rows into training ownership.
-
-    Built-in samplers use :meth:`TQReplayBuffer.claim_for_training`. Custom
-    samplers retain the legacy local-removal contract unless they explicitly
-    opt in, so enabling periodic snapshots cannot silently assume ownership
-    metadata that the sampler never created.
+    A custom class must declare its own ``capabilities``: a built-in policy's
+    declaration may not hold for a subclass that overrides its behavior.
     """
     sampler_cls = _sampler_class_for_config(cfg)
     if isinstance(cfg, CustomSamplerConfig):
-        capability = sampler_cls.__dict__.get("supports_training_claims", False)
+        capabilities = sampler_cls.__dict__.get("capabilities")
     else:
-        capability = getattr(sampler_cls, "supports_training_claims", None)
-    if not isinstance(capability, bool):
+        capabilities = sampler_cls.capabilities
+    if not isinstance(capabilities, SamplerCapabilities):
         raise TypeError(
-            f"{sampler_cls.__name__}.supports_training_claims must be a "
-            f"boolean class attribute, got {capability!r}"
+            f"{sampler_cls.__name__} must declare "
+            "`capabilities = SamplerCapabilities(...)` in its own class body (not "
+            f"in __init__, which runs after this check), got {capabilities!r}. It "
+            "replaces the separate supports_buffer_checkpoint, "
+            "supports_training_claims, requires_single_weight_batch, "
+            "uses_pooled_replacements, closes_short_at_exhaustion and "
+            "requires_shortfall_reconciliation class attributes. To keep a built-in "
+            "policy's flags, use dataclasses.replace(<BuiltinSampler>.capabilities, ...)."
         )
-    return capability
+    return capabilities
 
 
 def require_drop_accounting_members(cfg: SamplerConfig) -> None:
-    """Reject a custom sampler that omits a drop-accounting class attribute.
+    """Reject a custom sampler the async SC loop cannot charge drops against.
 
-    Dynamic sampling (and nonzero drop budgets) read these members directly off the
-    sampler. A custom class that leaves any out — or sets them only in ``__init__``,
-    which is invisible to this pre-construction check — fails here rather than silently
-    getting gated defaults. Built-in samplers are skipped.
+    The controller reads the sampler's capabilities and calls
+    ``charge_step_for_lost_group`` on every async SC run, so a custom class that
+    lacks either fails here, before construction, rather than mid-run.
     """
+    sampler_capabilities(cfg)
     if not isinstance(cfg, CustomSamplerConfig):
         return
     sampler_cls = _custom_sampler_class(cfg)
-    missing = [m for m in _DROP_ACCOUNTING_MEMBERS if not hasattr(sampler_cls, m)]
-    if not missing:
-        return
-    raise ValueError(
-        f"{sampler_cls.__name__} is used with dynamic sampling but is missing the "
-        f"required drop-accounting class attribute(s) {missing}. Declare them as class "
-        "attributes (not in __init__, which runs after this check): "
-        "uses_pooled_replacements and closes_short_at_exhaustion (bool), "
-        "requires_shortfall_reconciliation (bool), and charge_step_for_lost_group "
-        "(method). A gated sampler that stamps no step typically uses "
-        "uses_pooled_replacements=True, closes_short_at_exhaustion=False; a "
-        "windowed-style producer uses False/True."
-    )
-
-
-_DROP_ACCOUNTING_MEMBERS = (
-    "uses_pooled_replacements",
-    "closes_short_at_exhaustion",
-    "requires_shortfall_reconciliation",
-    "charge_step_for_lost_group",
-)
+    if not callable(getattr(sampler_cls, "charge_step_for_lost_group", None)):
+        raise ValueError(
+            f"{sampler_cls.__name__} must define the method "
+            "charge_step_for_lost_group(*, target_step, assembling_version), which "
+            "returns the step a permanently lost group is charged to, or None. "
+            "Subclass BaseSampler to inherit the gated default."
+        )
 
 
 def create_sampler(
@@ -1088,16 +1048,15 @@ def create_sampler(
             warmup_lookahead_versions=cfg.warmup_lookahead_versions,
         )
     elif isinstance(cfg, CustomSamplerConfig):
-        sampler_supports_buffer_checkpoint(cfg)
+        sampler_capabilities(cfg)
         sampler = sampler_cls(buffer, **(cfg.model_extra or {}))
         if not isinstance(sampler, PromptGroupSampler):
             raise TypeError(
                 f"{cfg.target} does not implement the PromptGroupSampler "
                 f"interface (needs admit/select/evict/should_abort_inflight, "
                 f"dispatch_index, set_dispatch_index, restore_dispatch_index, "
-                f"is_on_policy, supports_buffer_checkpoint, "
-                f"required_buffer_capacity; periodic rollout snapshots also "
-                f"require supports_training_claims=True)"
+                f"is_on_policy, capabilities, charge_step_for_lost_group, "
+                f"required_buffer_capacity)"
             )
     else:
         raise ValueError(f"unknown sampler config {type(cfg).__name__}")

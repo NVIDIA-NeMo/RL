@@ -611,7 +611,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     "full trainer checkpoint still owns streamed training rows: "
                     f"groups={[group['group_id'] for group in training_owned_groups]!r}"
                 )
-            if snapshot or self._sampler.supports_buffer_checkpoint:
+            if snapshot or self._sampler.capabilities.supports_buffer_checkpoint:
                 replay_metadata = self._buffer.metadata_state_dict(
                     saved_capacity=self._async_cfg.max_buffered_rollouts,
                     additional_groups=training_owned_groups,

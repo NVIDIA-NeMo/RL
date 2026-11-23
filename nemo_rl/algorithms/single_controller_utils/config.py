@@ -37,8 +37,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     SamplerConfig,
     require_drop_accounting_members,
     required_buffer_capacity_for_config,
-    sampler_requires_single_weight_batch,
-    sampler_uses_pooled_replacements,
+    sampler_capabilities,
 )
 from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
@@ -1334,7 +1333,10 @@ def _validate_failure_settings(
     )
 
     # Replacements may use newer weights, leaving the original weight bucket short.
-    if drop_budget and sampler_requires_single_weight_batch(async_config.sampler):
+    if (
+        drop_budget
+        and sampler_capabilities(async_config.sampler).requires_single_weight_batch
+    ):
         raise ValueError(
             f"async_rl.sampler.name={sampler_name!r} cannot honour the drop budget "
             f"(max_skipped_prompts={failure_config.max_skipped_prompts}, "
@@ -1370,7 +1372,7 @@ def _validate_failure_settings(
 
     if (
         failure_config.on_dropped_prompt == "replace"
-        and not sampler_uses_pooled_replacements(async_config.sampler)
+        and not sampler_capabilities(async_config.sampler).uses_pooled_replacements
     ):
         warnings.warn(
             "async_rl.rollout_failure.on_dropped_prompt='replace' does nothing "
@@ -1635,7 +1637,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             )
         # Reached only for GRPO (PPO is rejected above); name the key accordingly.
         algo_prefix = "grpo"
-        if sampler_requires_single_weight_batch(async_config.sampler):
+        if sampler_capabilities(async_config.sampler).requires_single_weight_batch:
             raise ValueError(
                 "grpo.use_dynamic_sampling cannot be combined with "
                 f"async_rl.sampler.name={async_config.sampler.name!r}: the resolved sampler "
@@ -2007,8 +2009,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
 
-    # The sampler's drop-accounting members are read on the async SC path regardless
-    # of dynamic sampling, so a custom sampler missing one must fail validation here.
+    # The sampler's capabilities and drop charging are read on the async SC path
+    # regardless of dynamic sampling, so a custom sampler missing either fails here.
     require_drop_accounting_members(async_config.sampler)
 
     if async_config.refit_actor.enabled:
