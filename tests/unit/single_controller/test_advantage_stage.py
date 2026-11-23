@@ -1669,6 +1669,13 @@ class TestAgentOverrides:
         assert f"num_masked_seqs_by_overlong_filtering/{self.OTHER}" not in metrics
         assert metrics["num_masked_seqs_by_overlong_filtering"] == 1
         assert metrics["num_rows_without_agent_tag"] == 0
+        # masking/* attributes the row to overlong filtering, not to the seq-logprob check.
+        masking = new_masking_stats_accumulator()
+        assert mixed_outcome.masking_stats is not None
+        merge_stats_accumulator(masking, mixed_outcome.masking_stats)
+        masking_metrics = reduce_masking_stats(masking)
+        assert masking_metrics["masking/truncated_masked_rows"] == 1.0
+        assert masking_metrics["masking/seq_logprob_error_rows"] == 0.0
 
     def test_overrides_with_the_opposite_run_wide_settings(self) -> None:
         """The reverse direction: the run filters and does not normalize; one agent

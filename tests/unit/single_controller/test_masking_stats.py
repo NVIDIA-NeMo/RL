@@ -48,6 +48,8 @@ def test_breakdown_counts_every_mask_source_once():
         mask_sample=mask_sample,
         truncated=truncated,
         overlong_filtering=True,
+        # Env flag and overlong filtering masked rows 2-4; the seq-logprob check then dropped 5.
+        pre_seq_error_sample_mask=torch.tensor([1, 1, 0, 0, 0, 1, 1, 1.0]),
         final_sample_mask=final,
         baseline_mask=baseline,
     )
@@ -88,6 +90,7 @@ def test_truncation_only_counts_as_masked_when_filtering_is_on():
     accumulate_masking_stats(
         acc,
         overlong_filtering=False,
+        pre_seq_error_sample_mask=torch.ones(2),
         final_sample_mask=torch.ones(2),
         baseline_mask=torch.ones(2),
         **common,
@@ -98,6 +101,30 @@ def test_truncation_only_counts_as_masked_when_filtering_is_on():
     )
     assert out["masking/masked_rows"] == 0 and out["masking/reinstated_rows"] == 0
     assert "masking/reward_mean_masked" not in out
+
+
+def test_reasons_follow_per_row_overlong_and_the_seq_error_mask():
+    """Per-agent overlong flags are honoured; a row without response tokens is no seq-logprob drop."""
+    acc = new_masking_stats_accumulator()
+    # Rows: 0 truncated, its agent filters overlong; 1 truncated, its agent does not;
+    # 2 has no response tokens; 3 dropped by the seq-logprob check.
+    accumulate_masking_stats(
+        acc,
+        prompt_ids=torch.tensor([1, 1, 1, 1]),
+        rewards=torch.zeros(4),
+        sample_mask=torch.ones(4),
+        mask_sample=torch.zeros(4, dtype=torch.bool),
+        truncated=torch.tensor([True, True, False, False]),
+        overlong_filtering=torch.tensor([True, False, False, False]),
+        pre_seq_error_sample_mask=torch.tensor([0.0, 1.0, 0.0, 1.0]),
+        final_sample_mask=torch.tensor([0.0, 1.0, 0.0, 0.0]),
+        baseline_mask=torch.ones(4),
+    )
+    out = reduce_masking_stats(acc)
+    assert out["masking/truncated_rows"] == 2
+    assert out["masking/truncated_masked_rows"] == 1
+    assert out["masking/seq_logprob_error_rows"] == 1
+    assert out["masking/masked_rows"] == 3
 
 
 def test_groups_with_fewer_than_two_trained_rows_and_multi_chunk_ids():
@@ -114,6 +141,7 @@ def test_groups_with_fewer_than_two_trained_rows_and_multi_chunk_ids():
             mask_sample=torch.tensor([False, True, True]),
             truncated=torch.zeros(3, dtype=torch.bool),
             overlong_filtering=False,
+            pre_seq_error_sample_mask=final,
             final_sample_mask=final,
             baseline_mask=final,
         )

@@ -24,14 +24,15 @@ placeholder rows are reported but do not dilute the fractions.
 * ``masking/env_flag_rows`` / ``_frac``: rows flagged ``mask_sample`` by the
   environment or by ``env.mask_sample_rules``.
 * ``masking/truncated_rows`` / ``_frac``: rows whose sequence hit the length
-  limit, whether or not ``grpo.overlong_filtering`` masks them;
-  ``masking/truncated_masked_rows``: those actually masked for it (and not
-  already env-flagged).
+  limit, whether or not ``grpo.overlong_filtering`` (or the row's
+  ``grpo.agent_overrides`` entry) masks them; ``masking/truncated_masked_rows``:
+  those actually masked for it (and not already env-flagged).
 * ``masking/seq_logprob_error_rows``: rows the sequence-logprob-error check
   dropped after the other masks.
 * ``masking/masked_rows`` / ``masked_frac``: rows with tokens that ended up
-  with no gradient, for any reason; ``masking/trained_rows`` / ``trained_frac``:
-  rows that train.
+  with no gradient, for any reason, including rows with no response tokens,
+  which have no reason count of their own; ``masking/trained_rows`` /
+  ``trained_frac``: rows that train.
 * ``masking/baseline_rows``: rows whose reward enters the group baseline/std;
   ``masking/reinstated_rows``: masked rows that still vote there, which
   ``grpo.masked_reward_policy: include`` (the default) allows.
@@ -61,6 +62,7 @@ MASKING_STATS_KEYS: tuple[str, ...] = (
     "env_flag",
     "truncated",
     "truncated_masked",
+    "seq_error_dropped",
     "final_mask",
     "baseline_mask",
 )
@@ -78,11 +80,16 @@ def accumulate_masking_stats(
     sample_mask: torch.Tensor,
     mask_sample: torch.Tensor,
     truncated: torch.Tensor,
-    overlong_filtering: bool,
+    overlong_filtering: bool | torch.Tensor,
+    pre_seq_error_sample_mask: torch.Tensor,
     final_sample_mask: torch.Tensor,
     baseline_mask: torch.Tensor,
 ) -> None:
-    """Append one chunk (all tensors moved to CPU, rows keyed by prompt group)."""
+    """Append one chunk (all tensors moved to CPU, rows keyed by prompt group).
+
+    ``overlong_filtering`` is the value the stage masked rows with: the run-wide
+    flag, or one entry per row under ``grpo.agent_overrides``.
+    """
     batch = rewards.shape[0]
     if batch == 0:
         return
@@ -97,10 +104,13 @@ def accumulate_masking_stats(
     acc["delivered"].append(sample_mask.detach().float().reshape(batch).cpu())
     acc["env_flag"].append(env_flag.cpu())
     acc["truncated"].append(trunc.cpu())
-    acc["truncated_masked"].append(
-        (trunc & ~env_flag).cpu()
-        if overlong_filtering
-        else torch.zeros(batch, dtype=torch.bool)
+    overlong = torch.as_tensor(overlong_filtering, dtype=torch.bool).cpu()
+    acc["truncated_masked"].append(trunc.cpu() & ~env_flag.cpu() & overlong)
+    acc["seq_error_dropped"].append(
+        (
+            (pre_seq_error_sample_mask.detach().reshape(batch) > 0)
+            & (final_sample_mask.detach().reshape(batch) == 0)
+        ).cpu()
     )
     acc["final_mask"].append(final_sample_mask.detach().float().reshape(batch).cpu())
     acc["baseline_mask"].append(baseline_mask.detach().float().reshape(batch).cpu())
@@ -122,8 +132,7 @@ def reduce_masking_stats(acc: dict[str, list[torch.Tensor]]) -> dict[str, float]
     trained = torch.cat(acc["final_mask"]) > 0
     in_baseline = torch.cat(acc["baseline_mask"]) > 0
     masked = has_tokens & ~trained
-    # Dropped by the seq-logprob check = masked but neither env-flagged nor truncation-masked.
-    seq_logprob_dropped = masked & ~env_flag & ~truncated_masked
+    seq_logprob_dropped = torch.cat(acc["seq_error_dropped"]) & has_tokens
     reinstated = in_baseline & ~trained
 
     rows = int(rewards.numel())

@@ -549,13 +549,11 @@ class AdvantageComputer:
         overlong_rows, normalize_rows, row_agents = agent_override_rows(
             cfg.algo, meta.tags, len(meta.sample_ids)
         )
+        overlong_filtering = (
+            overlong_rows if overlong_rows is not None else cfg.algo.overlong_filtering
+        )
         sample_mask_metrics, num_mask_sample_filtered = _apply_async_sample_masks(
-            mask_batch,
-            overlong_filtering=(
-                overlong_rows
-                if overlong_rows is not None
-                else cfg.algo.overlong_filtering
-            ),
+            mask_batch, overlong_filtering=overlong_filtering
         )
         if overlong_rows is not None:
             # One key per configured agent in every record: the step reduction
@@ -805,7 +803,8 @@ class AdvantageComputer:
             sample_mask=sample_mask,
             mask_sample=mask_sample,
             truncated=truncated,
-            overlong_filtering=bool(cfg.algo.overlong_filtering),
+            overlong_filtering=overlong_filtering,
+            pre_seq_error_sample_mask=pre_seq_error_sample_mask,
             final_sample_mask=final_sample_mask,
             baseline_mask=advantage_valid_mask,
         )
