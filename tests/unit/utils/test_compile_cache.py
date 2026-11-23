@@ -152,6 +152,11 @@ def test_seed_copies_once_per_node_from_the_type_dir(caches, monkeypatch):
 
 
 def test_engine_folder_is_filled_from_the_node_copy(caches, monkeypatch):
+    monkeypatch.setattr(
+        compile_cache,
+        "_vllm_patches",
+        lambda: {"_patch_vllm_compile_cache_per_device": lambda logger: None},
+    )
     (caches / "shared/vllm/vllm/torch_compile_cache").mkdir(parents=True)
     (caches / "shared/vllm/vllm/torch_compile_cache/entry").write_text("compiled")
     engine = compile_cache.vllm_engine_dir(0)

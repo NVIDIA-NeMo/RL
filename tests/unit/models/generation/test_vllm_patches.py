@@ -390,6 +390,25 @@ def test_moe_routed_experts_patch_anchor_still_matches_installed_vllm(
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize(
+    "relative_source", ["compilation/decorators.py", "compilation/backends.py"]
+)
+def test_compile_cache_per_device_patch_anchor_still_matches_installed_vllm(
+    tmp_path, monkeypatch, relative_source
+):
+    """If vLLM renames its per-rank cache folders, the patch must fail here, not in a job."""
+    copied = write_unpatched_copy(
+        relative_source, "_patch_vllm_compile_cache_per_device", tmp_path / "src.py"
+    )
+    # The patch visits both files; the second visit sees the copy already patched.
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    patches._patch_vllm_compile_cache_per_device(logging.getLogger(__name__))
+    content = copied.read_text()
+    assert "_dev{torch.cuda.current_device()}" in content
+    ast.parse(content)
+
+
+@pytest.mark.vllm
 def test_glm_decoder_sp_moe_patch_is_idempotent(patched_glm_dsa_source, monkeypatch):
     before = patched_glm_dsa_source.read_text()
     monkeypatch.setattr(
