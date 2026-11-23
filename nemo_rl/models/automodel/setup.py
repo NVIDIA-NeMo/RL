@@ -972,8 +972,16 @@ def setup_model_and_optimizer(
     # Compute model metadata after from_pretrained
     model_state_dict_keys = list(model.state_dict().keys())
     is_moe_model = any(["expert" in key for key in model_state_dict_keys])
+    # force_hf means the HF implementation was loaded even though the architecture
+    # has a custom entry in ModelRegistry, so the registry lookup alone would
+    # misreport it as non-HF. That matters for the autocast gate below: an HF MoE
+    # model needs autocast to reconcile the fp32 activations produced by
+    # MixedPrecisionPolicy(output_dtype=float32) with its bf16 params, and without
+    # it the first unwrapped matmul raises "expected mat1 and mat2 to have the same
+    # dtype, float != c10::BFloat16" at lm_head.
     is_hf_model = (
-        model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
+        automodel_kwargs.get("force_hf", False)
+        or model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
     )
     # Autocast is disabled for custom MoE models (non-HF) to avoid numerical issues
     autocast_enabled = not (is_moe_model and not is_hf_model)

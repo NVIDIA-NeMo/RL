@@ -236,6 +236,7 @@ class AutomodelConfig(TypedDict):
 
 class SequencePackingConfigDisabled(TypedDict):
     enabled: Literal[False]
+    fuse_loss: NotRequired[bool]
 
 
 class SequencePackingConfig(TypedDict):
@@ -244,6 +245,7 @@ class SequencePackingConfig(TypedDict):
     # Not required because some algorithms like SFT don't calculate log probs
     logprob_mb_tokens: NotRequired[int]
     algorithm: str
+    sequence_length_round: NotRequired[int]
     # Preserve the packer's order (or omit for backward compatibility), or
     # execute each DP rank's assigned bins largest-first for allocator reuse.
     microbatch_order: NotRequired[Literal["packer", "largest_first"]]
