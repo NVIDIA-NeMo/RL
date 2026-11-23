@@ -54,7 +54,12 @@ def check_runtime(
     return missing
 
 
-def check_training_config(config_path: Path, overrides: Sequence[str] = ()) -> None:
+def check_training_config(
+    config_path: Path,
+    overrides: Sequence[str] = (),
+    *,
+    expected_checkpoint_dir: Path | None = None,
+) -> None:
     """Validate the training configuration, including command-line overrides."""
     # Actor discovery does not need the optional training dependencies.
     from omegaconf import OmegaConf
@@ -77,6 +82,13 @@ def check_training_config(config_path: Path, overrides: Sequence[str] = ()) -> N
     resolved = cast(dict[str, Any], OmegaConf.to_container(loaded, resolve=True))
     check_outdated_config(resolved)
     config = MasterConfig.model_validate(resolved)
+    if expected_checkpoint_dir is not None and (
+        Path(config.checkpointing.checkpoint_dir).resolve()
+        != expected_checkpoint_dir.resolve()
+    ):
+        raise ValueError(
+            "Use MM_CODING_CHECKPOINT_ROOT to change the helper checkpoint directory"
+        )
     if (
         not config.policy["megatron_cfg"]["enabled"]
         or config.policy["automodel_cfg"]["enabled"]
@@ -84,12 +96,13 @@ def check_training_config(config_path: Path, overrides: Sequence[str] = ()) -> N
         raise ValueError("MM-coding acceptance requires a Megatron learner")
     if config.policy["generation"]["backend"] != "vllm":
         raise ValueError("MM-coding acceptance requires vLLM generation")
-    if (
-        config.policy["generation"]["max_new_tokens"]
-        >= config.policy["max_total_sequence_length"]
+    if not (
+        0
+        < config.policy["generation"]["max_new_tokens"]
+        < config.policy["max_total_sequence_length"]
     ):
         raise ValueError(
-            "Reserve input context: max_new_tokens must be below max_total_sequence_length"
+            "Reserve input context: max_new_tokens must be positive and below max_total_sequence_length"
         )
     if not config.token_capture.enabled:
         raise ValueError("MM-coding acceptance requires token_capture.enabled=true")
@@ -110,12 +123,23 @@ def main() -> None:
     parser.add_argument(
         "--config", type=Path, help="Resolved MM-coding training recipe"
     )
+    parser.add_argument(
+        "--expected-checkpoint-dir",
+        type=Path,
+        help="Require the resolved checkpoint directory to match the helper's guarded path",
+    )
     args, overrides = parser.parse_known_args()
+    if args.expected_checkpoint_dir is not None and args.config is None:
+        parser.error("--expected-checkpoint-dir requires --config")
     if overrides and args.config is None:
         parser.error(f"unrecognized arguments: {' '.join(overrides)}")
     if args.config is not None:
         with contextlib.redirect_stdout(sys.stderr):
-            check_training_config(args.config, overrides)
+            check_training_config(
+                args.config,
+                overrides,
+                expected_checkpoint_dir=args.expected_checkpoint_dir,
+            )
     missing = check_runtime(mode=args.mode, harnesses=tuple(args.harnesses))
     print(
         json.dumps(

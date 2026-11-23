@@ -54,12 +54,15 @@ overrides=(
     checkpointing.save_optimizer=true
     checkpointing.save_data_plane=true
     checkpointing.load_replay_buffer=true
+    # Keep small splits from exhausting before the fourth step.
+    "grpo.max_num_epochs=${total_steps}"
     async_rl.log_full_train_data=true
     logger.wandb_enabled=false
     "$@"
 )
 uv run --extra nemo_gym python examples/nemo_gym/mm_coding/check_mm_coding_runtime.py \
-    --mode "${mode}" --config "${recipe}" "${overrides[@]}" > "${output}/runtime-check.json"
+    --mode "${mode}" --config "${recipe}" "${overrides[@]}" \
+    --expected-checkpoint-dir "${checkpoint_dir}" > "${output}/runtime-check.json"
 common=(examples/run_grpo_single_controller.py --config "${recipe}" "${overrides[@]}")
 # These are separate interpreter/driver processes. Both phases use the same split and checkpoint root.
 uv run --no-sync python "${common[@]}" \

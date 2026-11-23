@@ -449,6 +449,14 @@ def test_training_reader_and_processor_preserve_materialized_rows(tmp_path, sele
             },
             "Reserve input context",
         ),
+        (
+            {"policy": {"generation": {"max_new_tokens": 0}}},
+            "max_new_tokens must be positive",
+        ),
+        (
+            {"policy": {"generation": {"max_new_tokens": -1}}},
+            "max_new_tokens must be positive",
+        ),
         ({"token_capture": {"enabled": False}}, "token_capture.enabled=true"),
     ],
 )
@@ -568,6 +576,8 @@ def test_export_rejects_long_task_id_without_publishing_partial_rows(tmp_path):
         (["token_capture.enabled=false"], "token_capture.enabled=true"),
         (["policy.generation.backend=megatron"], "vLLM generation"),
         (["checkpointing.metric_name=accuracy"], "must start with"),
+        (["policy.generation.max_new_tokens=0"], "must be positive"),
+        (["policy.generation.max_new_tokens=-1"], "must be positive"),
     ],
 )
 def test_runtime_check_validates_training_cli_overrides(monkeypatch, overrides, error):
@@ -593,16 +603,112 @@ def test_runtime_check_validates_training_cli_overrides(monkeypatch, overrides, 
         guard.main()
 
 
-def test_runtime_check_rejects_overrides_without_a_recipe(monkeypatch):
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["token_capture.enabled=false"],
+        ["--expected-checkpoint-dir", "/tmp/checkpoints"],
+    ],
+)
+def test_runtime_check_rejects_overrides_without_a_recipe(
+    monkeypatch: pytest.MonkeyPatch, arguments: list[str]
+) -> None:
     spec = importlib.util.spec_from_file_location(
         "check_mm_coding_runtime", EXAMPLE / "check_mm_coding_runtime.py"
     )
     assert spec is not None and spec.loader is not None
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
-    monkeypatch.setattr(
-        "sys.argv", ["check_mm_coding_runtime", "token_capture.enabled=false"]
-    )
+    monkeypatch.setattr("sys.argv", ["check_mm_coding_runtime", *arguments])
     with pytest.raises(SystemExit) as error:
         guard.main()
     assert error.value.code == 2
+
+
+@pytest.mark.parametrize("mode", ["single", "multi", "mixed"])
+@pytest.mark.parametrize(
+    "override",
+    [
+        "checkpointing.checkpoint_dir={other}",
+        "++checkpointing.checkpoint_dir={other}",
+        "checkpointing={{checkpoint_dir:{other}}}",
+        "+checkpointing={{checkpoint_dir:{other}}}",
+        "++checkpointing={{checkpoint_dir:{other}}}",
+        "checkpointing.checkpoint_dir=${{oc.env:MM_CODING_TEST_OTHER_CHECKPOINT}}",
+    ],
+)
+def test_runtime_check_rejects_resolved_checkpoint_redirection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, override: str
+) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "check_mm_coding_runtime", EXAMPLE / "check_mm_coding_runtime.py"
+    )
+    assert spec is not None and spec.loader is not None
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    guarded, other = tmp_path / "guarded", tmp_path / "other"
+    other.mkdir()
+    (other / "step_7").mkdir()
+    monkeypatch.setenv("MM_CODING_TEST_OTHER_CHECKPOINT", str(other))
+    overrides = [
+        f"checkpointing.checkpoint_dir={guarded}",
+        override.format(other=other),
+    ]
+    with pytest.raises(ValueError, match="Use MM_CODING_CHECKPOINT_ROOT"):
+        guard.check_training_config(
+            EXAMPLE / f"mm_coding_{mode}.yaml",
+            overrides,
+            expected_checkpoint_dir=guarded,
+        )
+    assert (other / "step_7").is_dir()
+    monkeypatch.setattr(guard, "check_runtime", lambda **kwargs: [])
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "check_mm_coding_runtime",
+            "--mode",
+            mode,
+            "--config",
+            str(EXAMPLE / f"mm_coding_{mode}.yaml"),
+            "--expected-checkpoint-dir",
+            str(other),
+            *overrides,
+            "--expected-checkpoint-dir",
+            str(guarded),
+        ],
+    )
+    with pytest.raises(ValueError, match="Use MM_CODING_CHECKPOINT_ROOT"):
+        guard.main()
+
+
+@pytest.mark.parametrize("mode", ["single", "multi", "mixed"])
+def test_runtime_check_compares_normalized_checkpoint_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "check_mm_coding_runtime", EXAMPLE / "check_mm_coding_runtime.py"
+    )
+    assert spec is not None and spec.loader is not None
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    guarded = tmp_path / "guarded"
+    guarded.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(guarded, target_is_directory=True)
+    monkeypatch.setattr(guard, "check_runtime", lambda **kwargs: [])
+    for equivalent in (guarded / ".." / "guarded", alias):
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "check_mm_coding_runtime",
+                "--mode",
+                mode,
+                "--config",
+                str(EXAMPLE / f"mm_coding_{mode}.yaml"),
+                f"checkpointing.checkpoint_dir={equivalent}",
+                "checkpointing.save_period=2",
+                "--expected-checkpoint-dir",
+                str(guarded),
+            ],
+        )
+        guard.main()
