@@ -179,7 +179,7 @@ LossNormalization = Literal["global_token_mean", "sequence_mean", "group_token_m
 class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- Loss type ---
     disable_ppo_ratio: bool = False
-    # Defaults to global_token_mean when unset.
+    # None selects global_token_mean.
     # group_token_mean requires SingleController GRPO with Megatron.
     normalization: LossNormalization | None = None
     # If True, apply the off-policy importance-sampling correction at the
@@ -276,7 +276,7 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
 
     @property
     def resolved_normalization(self) -> LossNormalization:
-        """Return the configured normalization or the default reduction."""
+        """Return the selected mode, treating None as global_token_mean."""
         return self.normalization or "global_token_mean"
 
 

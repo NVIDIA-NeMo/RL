@@ -462,18 +462,17 @@ There are three choices:
 - **`normalization: sequence_mean`** — average within each response first, then average those per-response values. Every *response* counts the same regardless of length.
 - **`normalization: group_token_mean`** — average all valid response tokens within each prompt group, then average groups equally. See [Equal prompt-group token means](#equal-prompt-group-token-means) for supported training paths.
 
-Leave `normalization` unset or set it to `null` to use global token averaging.
-Set an explicit value to override the parent recipe's reduction.
+By default, the loss uses `global_token_mean`.
+Child recipes inherit their parent's `normalization` setting; set another value to override it, or `null` to restore global token averaging.
 
 ```yaml
 loss_fn:
   normalization: sequence_mean
 ```
 
-Bootstrap snapshot fingerprints include the serialized configuration.
-Changes to the selector syntax or schema across code versions can invalidate a snapshot even when the resolved averaging is equivalent.
-To resume a bootstrap snapshot saved before the loss selector was removed, use the NeMo-RL version and configuration that wrote it.
-Let the resumed run save a trainer checkpoint before upgrading.
+> **Upgrading an interrupted run:** If your run has a bootstrap rollout snapshot but no trainer checkpoint, resume with the original NeMo-RL version and config.
+> Save a trainer checkpoint, then upgrade NeMo-RL and migrate the config.
+> Removing `token_level_loss` can make the new version reject an older bootstrap snapshot.
 
 Writing $\ell_{i,t}$ for the per-token objective of token $t$ in response $o_i$ — the quantity inside the expectation in the formula above — $|o_i|$ for the number of unmasked tokens in that response, and $N$ for the number of valid responses:
 
@@ -544,7 +543,7 @@ Throughout, $r_{i,t} = \frac{\pi_\theta(o_{i,t})}{\pi_{\theta_{\text{old}}}(o_{i
 | Algorithm | `normalization: global_token_mean` | `normalization: sequence_mean` |
 | --- | --- | --- |
 | **GRPO / PPO / DAPO** | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ |
-| **CISPO** (`use_cispo: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \text{sg}\big(\text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}})\big) A_i \log \pi_\theta(o_{i,t})$ | Not available — rejected at construction time, because CISPO is defined per token. |
+| **CISPO** (`use_cispo: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \text{sg}\big(\text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}})\big) A_i \log \pi_\theta(o_{i,t})$ | Not supported by this implementation; the loss constructor rejects `sequence_mean`. |
 | **GSPO** (`sequence_level_importance_ratios: true`) | Not available — rejected at construction time, because the sequence-level ratio is mutually exclusive with token-level reduction. | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(s_i A_i,\ \text{clip}(s_i, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$, where $s_i = \Big(\frac{\pi_\theta(o_i)}{\pi_{\theta_{\text{old}}}(o_i)}\Big)^{1/\lvert o_i\rvert}$ |
 | **REINFORCE / RLOO** (`disable_ppo_ratio: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t A_i \log \pi_\theta(o_{i,t})$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t A_i \log \pi_\theta(o_{i,t})$ |
 
@@ -555,7 +554,8 @@ Two notes on the table:
 
 #### Losses that do not expose this parameter
 
-`normalization` configures `ClippedPGLossConfig`. Other losses define their normalization as a class attribute.
+Use `loss_fn.normalization` to choose how the GRPO/PPO policy loss is averaged.
+This setting does not affect other losses, such as SFT or DPO; their averaging rules are fixed and listed below.
 
 | Loss function | Used by | Normalization |
 | --- | --- | --- |
