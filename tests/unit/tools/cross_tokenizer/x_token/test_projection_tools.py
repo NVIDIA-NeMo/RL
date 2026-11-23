@@ -580,3 +580,6 @@ class TestBuildProjectionMatrixShDryRun:
             cwd, command = line.split("|", 1)
             assert Path(cwd).resolve() == REPO_ROOT
             assert command.startswith("run python -m tools.cross_tokenizer.x_token.")
+            # `python -m` resolves the module from the cwd, so it must exist there.
+            module = command.removeprefix("run python -m ").split()[0]
+            assert (REPO_ROOT / f"{module.replace('.', '/')}.py").is_file(), module
