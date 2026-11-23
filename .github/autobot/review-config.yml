@@ -24,5 +24,3 @@ pr-grade:
       multi: true
   check: "Autobot PR classify #{number}"
   human_labels_win: true
-  # Temporary: only PRs with this label are graded while we test.
-  required_label: classify-test
