@@ -378,6 +378,18 @@ def _gh(*args: str) -> str:
         )
 
 
+def _login() -> str | None:
+    """The reviewer's GitHub login, or None when the token can't read `GET /user`.
+
+    App tokens, such as the one Autobot reviews with, can't read it, and that is how an
+    automated review shows up here. It can never be a self-review.
+    """
+    try:
+        return _gh("api", "user", "--jq", ".login").strip() or None
+    except subprocess.CalledProcessError:
+        return None
+
+
 def _pr(pr: int) -> dict:
     info = json.loads(
         _gh("pr", "view", str(pr), "-R", REPO, "--json", "author,headRefOid")
@@ -417,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("footer needs --head with the full SHA of the reviewed commit")
 
     pr = _pr(args.pr)
-    me = _gh("api", "user", "--jq", ".login").strip()
+    me = _login()
     kind = "self" if me == pr["author"]["login"] else "expert"
     ident = detect()
 
@@ -431,7 +443,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(
-        f"Review kind: {kind} ({me}); {ident.label()}, model {ident.model}, effort {ident.effort}; "
+        f"Review kind: {kind} ({me or 'automated reviewer'}); {ident.label()}, model {ident.model}, effort {ident.effort}; "
         f"review-pr-team rev {skill_revision()}"
     )
     repo_root = subprocess.run(
@@ -456,7 +468,9 @@ def main(argv: list[str] | None = None) -> int:
             f"Run /review-pr-team {args.pr} in a fresh Claude Code or Codex session with an allowed model."
         )
         return 3
-    if ident.transcript is None:
+    if ident.transcript is None and me is None:
+        print("OK (automated reviewer)")
+    elif ident.transcript is None:
         print(
             "WARNING: no session log found, so same-session edits could not be checked"
         )
