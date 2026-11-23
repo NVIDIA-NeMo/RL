@@ -3555,7 +3555,6 @@ def test_worker_initialization_preserves_only_restored_rng(
             "maybe_enable_msc",
             "make_empty_cache_best_effort_under_expandable_segments",
             "enable_batch_invariant_mode",
-            "apply_transformer_engine_patch",
             "init_telemetry_worker",
             "router_replay_enabled",
             "maybe_preinit_nixl_checkpoint_engine",

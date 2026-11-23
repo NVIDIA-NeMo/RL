@@ -1227,7 +1227,6 @@ def _init_v2_worker_mocked(
     """
     call_log = []
 
-    monkeypatch.setattr(worker_mod, "apply_transformer_engine_patch", lambda: None)
     monkeypatch.setattr(worker_mod.ray, "get_gpu_ids", lambda: [0])
     monkeypatch.setattr(
         "nemo_rl.distributed.numa_utils.bind_to_gpu_numa", lambda gpu_id: None

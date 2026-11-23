@@ -249,9 +249,6 @@ def test_value_worker_sets_seed_before_model_setup(monkeypatch):
     distributed_manager.tp_size = 1
     distributed_manager.cp_size = 1
 
-    monkeypatch.setattr(
-        automodel_value_worker, "apply_transformer_engine_patch", lambda: None
-    )
     monkeypatch.setattr(automodel_value_worker.ray, "get_gpu_ids", lambda: [0])
     monkeypatch.setattr(numa_utils, "bind_to_gpu_numa", lambda _: None)
     monkeypatch.setattr(automodel_value_worker, "init_telemetry_worker", lambda: None)

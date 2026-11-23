@@ -52,7 +52,6 @@ from nemo_rl.models.automodel.train import (
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
-from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
 from nemo_rl.models.value.utils import right_shift_values
@@ -109,9 +108,6 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
 
         Note: Value models don't need a reference model since they don't compute KL divergence.
         """
-        # Apply patches
-        apply_transformer_engine_patch()
-
         from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
 
         # Pin to this worker's GPU-local CPUs/memory before model load; FSDP's
