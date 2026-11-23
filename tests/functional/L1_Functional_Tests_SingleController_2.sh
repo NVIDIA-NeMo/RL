@@ -106,6 +106,8 @@ run_test      env REFIT_TRANSPORT=nccl_reshard uv run --no-sync bash ./tests/fun
 # chance -- it both passed and wedged on consecutive runs of identical code. This is the
 # only test that reliably exercises the abort-and-rebuild path.
 run_test      env KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
+# The same mid-refit kill with the refit run in a separate RefitActor.
+run_test      env KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh async_rl.refit_actor.enabled=true
 # ...and the same mid-refit kill on the RESHARD transport, which is a different abort.
 #
 # The two are not interchangeable. The collective path aborts one communicator; reshard

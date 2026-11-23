@@ -75,6 +75,7 @@ from nemo_rl.models.automodel.router_replay import (
     validate_automodel_router_replay_config,
 )
 from nemo_rl.models.automodel.utils import resolve_model_class
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import (
     LoRAConfig,
@@ -319,6 +320,7 @@ def validate_and_prepare_config(
             top_k=generation_cfg["top_k"],
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
+            sampler_replay=sampler_replay_enabled(generation_cfg),
         )
 
     # Explicitly set NCCL_CUMEM_ENABLE for non-colocated refit.
@@ -336,6 +338,9 @@ def validate_and_prepare_config(
     if precision not in STRING_TO_DTYPE:
         raise ValueError(f"Unknown precision: {precision}")
     dtype = STRING_TO_DTYPE[precision]
+    fsdp_output_dtype = config["automodel_cfg"].get("fsdp_output_dtype", "float32")
+    if fsdp_output_dtype not in STRING_TO_DTYPE:
+        raise ValueError(f"Unknown FSDP output dtype: {fsdp_output_dtype}")
 
     # Get other configuration values
     cpu_offload = config["automodel_cfg"]["cpu_offload"]
@@ -515,6 +520,7 @@ def setup_distributed(
     # Extract configuration values
     dtype = runtime_config.dtype
     cpu_offload = runtime_config.cpu_offload
+    fsdp_output_dtype = config["automodel_cfg"].get("fsdp_output_dtype", "float32")
 
     # Extract parallelization config
     tp_size = config["automodel_cfg"].get("tensor_parallel_size", 1)
@@ -543,7 +549,7 @@ def setup_distributed(
         mp_policy=MixedPrecisionPolicy(
             param_dtype=dtype,
             reduce_dtype=torch.float32,
-            output_dtype=torch.float32,
+            output_dtype=STRING_TO_DTYPE[fsdp_output_dtype],
         ),
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
         activation_checkpointing=config["automodel_cfg"]["activation_checkpointing"],

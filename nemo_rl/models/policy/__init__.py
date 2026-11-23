@@ -214,6 +214,13 @@ class AutomodelConfig(TypedDict):
     cpu_offload: bool
     custom_parallel_plan: NotRequired[str | None]
     defer_fsdp_grad_sync: NotRequired[bool]
+    # AutoModel FSDP2 output precision (default float32). Master weights/reductions
+    # remain FP32. BF16 can reduce residual-stream memory; peak savings depend on
+    # the recipe. Unchunked logprobs still materialize full FP32 logits.
+    # Opting out of float32 lowers precision in three places:
+    # value/RM losses (LossInputType.LOGIT is not upcast), in-place temperature
+    # scaling when temperature != 1.0, and moe_parallelizer.lm_head_precision.
+    fsdp_output_dtype: NotRequired[Literal["float32", "bfloat16", "float16"]]
     # MoE parallelizer config
     moe_parallelizer: NotRequired[MoEParallelizerOptions]
     # Model config

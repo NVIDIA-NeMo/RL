@@ -648,6 +648,20 @@ class TestTimeoutChecker:
         assert checker.check_save() is True
         assert checker.would_save() is False
 
+    @patch("time.time", return_value=110.0)
+    def test_seconds_until_save_counts_down_to_the_deadline(self, _mock_time):
+        with patch.dict("os.environ", {"NRL_JOB_START_EPOCH": "100"}, clear=True):
+            checker = TimeoutChecker(timeout="00:00:00:30")
+        assert checker.seconds_until_save() == 20.0
+
+        with patch("time.time", return_value=135.0):
+            assert checker.seconds_until_save() == -5.0
+            assert checker.check_save() is True
+            assert checker.seconds_until_save() is None
+
+    def test_seconds_until_save_without_a_deadline(self):
+        assert TimeoutChecker(timeout=None).seconds_until_save() is None
+
     def test_fit_last_save_time_enabled(self):
         # Create a TimeoutChecker with a 3-second timeout and enable fit_last_save_time logic
         checker = TimeoutChecker(timeout="00:00:00:03", fit_last_save_time=True)

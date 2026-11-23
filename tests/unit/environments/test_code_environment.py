@@ -31,10 +31,7 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B"
 
-cfg: CodeEnvConfig = {
-    "num_workers": 2,
-    "terminate_on_evaluation": True,
-}
+cfg = CodeEnvConfig(num_workers=2, terminate_on_evaluation=True)
 
 # Define basic vLLM test config
 basic_vllm_test_config: VllmConfig = {

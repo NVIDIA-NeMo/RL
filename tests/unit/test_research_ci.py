@@ -74,7 +74,7 @@ def test_research_runners_sync_before_tests(
     ]
     expected = []
     for project in projects:
-        expected.append(f"{project}|sync --locked --inexact --group test")
+        expected.append(f"{project}|sync --locked --group test")
         if fail_sync:
             break
         test_command = (

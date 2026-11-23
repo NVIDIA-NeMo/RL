@@ -34,9 +34,9 @@ legacy value makes them readable by both versions, and is a no-op for a
 consumer already on 2.13. The expandable-segment format did change, so ``'e'``
 handles -- what the trainer emits under
 ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` -- are left alone; they
-still open on a same-torch consumer (vLLM, and TRT-LLM since the 1.3.0rc28
-bump moved that venv to 2.13) and trip torch's version check on a torch 2.11
-one (sglang).
+open on TRT-LLM (same torch 2.13) and on vLLM (torch 2.14, which writes the
+same handle version and ``'e'`` layout as 2.13 -- recheck when either torch
+moves), and trip torch's version check on a torch 2.11 one (sglang).
 """
 
 from typing import Any

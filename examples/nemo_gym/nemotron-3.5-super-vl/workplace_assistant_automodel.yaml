@@ -19,7 +19,7 @@
 #
 # Requirements:
 #   - Automodel r0.6.0 @ b916107a5 or later (the submodule pin on main).
-#   - Stock vLLM 0.29.0 (pyproject pin): registers NemotronH_Omni_Reasoning_V3 and
+#   - Stock vLLM 0.33.0 (pyproject pin): registers NemotronH_Omni_Reasoning_V3 and
 #     ships the nemotron_v3 reasoning parser and qwen3_coder tool parser the chat
 #     template needs (<think> blocks, <tool_call><function=...> calls).
 #   - NeMo Gym venvs for workplace_assistant (prebaked under NEMO_GYM_VENV_DIR, or

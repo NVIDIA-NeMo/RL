@@ -28,8 +28,9 @@ from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
-from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.grpo import AgentOverrideConfig, GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
@@ -174,6 +175,9 @@ def _controller(
         opd_full_enabled=False,
         message_level_advantage_penalties_enabled=ctrl._message_level_advantage_penalties_enabled,
         shardable=True,
+        objective_reduction=make_objective_reduction(
+            ctrl._master_config.loss_fn.resolved_normalization
+        ),
         train_data_dump_dir=None,
     )
     ctrl._advantage_computer = AdvantageComputer(
@@ -358,6 +362,87 @@ def test_deduplicates_unequal_segments_without_pooling_identical_prompts_across_
     assert reward_partial.weighted_total == 2
     assert reward_partial.weight == 4
     assert data["advantages"].count_nonzero() == 0
+
+
+@pytest.mark.parametrize("reorder", [False, True])
+@pytest.mark.parametrize("mask_owner", [False, True])
+@pytest.mark.parametrize("actor_count", [0, 2])
+def test_forest_reward_scaling_before_owner_baseline(
+    reorder: bool, mask_owner: bool, actor_count: int
+) -> None:
+    meta, data = _batch(
+        [
+            ("a", [(-1.0, 3), (0.5, 1), (4.0, 2)]),
+            ("b", [(-1.0, 1), (0.5, 2), (4.0, 1)]),
+        ],
+        padding=True,
+    )
+    if mask_owner:
+        data["mask_sample"][0] = True
+    order = [0, 1, 2, 3, 4, 5, 10, 6, 7, 8, 9]
+    if reorder:
+        order.reverse()
+    meta, data = meta.subset(order), data[order]
+    raw_rewards = data["total_reward"].clone()
+    ctrl = _controller(
+        meta,
+        data,
+        grpo={
+            "reward_scaling": {
+                "enabled": True,
+                "source_min": 0.0,
+                "source_max": 2.0,
+                "target_min": -1.0,
+                "target_max": 1.0,
+            }
+        },
+    )
+    validate_forest_objective(ctrl._algo_cfg, ctrl._master_config.loss_fn)
+    store = _RowStore(
+        {
+            sid: {name: data[name][i].clone() for name in data.keys()}
+            for i, sid in enumerate(meta.sample_ids)
+        }
+    )
+    computer = AdvantageComputer(
+        store,
+        config=ctrl._advantage_stage_config,
+        advantage_estimator=ctrl._advantage_estimator,
+    )
+    ctrl._advantage_computer = computer
+    ctrl._advantage_actors = [_InlineActor(computer) for _ in range(actor_count)]
+    ctrl._available_advantage_actors = asyncio.Queue()
+    for actor in ctrl._advantage_actors:
+        ctrl._available_advantage_actors.put_nowait(actor)
+    scaled = torch.tensor([-1.0, -0.5, 1.0])
+    for _ in range(2):
+        ctrl._step_log_dict.clear()
+        _, valid = asyncio.run(ctrl._advantage_stage(meta))
+        assert valid
+        output = store.get_samples(
+            sample_ids=meta.sample_ids,
+            select_fields=["advantages", "total_reward", "sample_mask"],
+        )
+        torch.testing.assert_close(output["total_reward"], raw_rewards)
+        for row, tag in enumerate(meta.tags):
+            filtered = mask_owner and tag["dispatch_group_id"] == "a"
+            slot = tag["logical_slot"]
+            keep = slot is not None and not (filtered and slot == 0)
+            baseline = scaled[1:].mean() if filtered else scaled.mean()
+            expected = float(scaled[slot] - baseline) if keep else 0.0
+            torch.testing.assert_close(
+                output["advantages"][row], torch.full((3,), expected)
+            )
+            assert output["sample_mask"][row].item() == float(keep)
+        partials = ctrl._step_log_dict["reward_partials"]
+        assert sum(p.weight for p in partials) == (5 if mask_owner else 6)
+        assert sum(p.weighted_total for p in partials) == pytest.approx(
+            0.0 if mask_owner else -1.0
+        )
+    if actor_count:
+        assert sorted(
+            size for actor in ctrl._advantage_actors for size in actor.calls
+        ) == [4, 4, 7, 7]
 
 
 @pytest.mark.parametrize("padding", [False, True])
@@ -590,6 +675,50 @@ def test_overlong_filter_flag_is_respected_for_all_owner_segments(filtering):
     assert data["sample_mask"].tolist() == ([0, 0, 1] if filtering else [1, 1, 1])
 
 
+def test_agent_overrides_apply_to_whole_forest_owners():
+    """grpo.agent_overrides on Forest owners: each group comes out as a run with
+    its agent's settings run-wide, and a truncated segment drops its whole owner
+    only for the agent that filters."""
+
+    def run(overlong: bool, normalize: bool, overrides=None):
+        meta, data = _batch(
+            [
+                ("a", [(0.0, 2), (1.0, 2), (3.0, 1)]),
+                ("b", [(0.0, 1), (2.0, 1), (5.0, 1)]),
+            ]
+        )
+        for tag in meta.tags:
+            tag["agent_name"] = "graded" if tag["dispatch_group_id"] == "a" else "other"
+        data["truncated"][1] = True  # second segment of owner a_g0
+        data["truncated"][6] = True  # owner b_g1
+        grpo = {
+            "overlong_filtering": overlong,
+            "adv_estimator": AdvEstimatorConfig(
+                normalize_rewards=normalize, use_leave_one_out_baseline=False
+            ),
+            "agent_overrides": overrides,
+        }
+        asyncio.run(_controller(meta, data, grpo=grpo)._advantage_stage(meta))
+        return data["advantages"], data["sample_mask"]
+
+    mixed_adv, mixed_mask = run(
+        False,
+        True,
+        {
+            "graded": AgentOverrideConfig(
+                overlong_filtering=True, normalize_rewards=False
+            )
+        },
+    )
+    graded_adv, graded_mask = run(True, False)
+    other_adv, other_mask = run(False, True)
+    torch.testing.assert_close(mixed_adv[:5], graded_adv[:5])
+    torch.testing.assert_close(mixed_mask[:5], graded_mask[:5])
+    torch.testing.assert_close(mixed_adv[5:], other_adv[5:])
+    torch.testing.assert_close(mixed_mask[5:], other_mask[5:])
+    assert mixed_mask.tolist() == [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+
 @pytest.mark.parametrize("filter_field", ["sample_mask", "mask_sample", "truncated"])
 @pytest.mark.parametrize("ordinary", [False, True])
 def test_masked_owner_is_excluded_from_baseline_and_loss(filter_field, ordinary):
@@ -763,12 +892,12 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
     [
         ({"adv_estimator": {"name": "gdpo"}}, {}),
         ({"use_dynamic_sampling": True}, {}),
-        ({"reward_scaling": {"enabled": True}}, {}),
-        ({"reward_shaping": {"enabled": True}}, {}),
+        ({"reward_shaping": {"enabled": True, "stop_properly_penalty_coef": 0.5}}, {}),
         ({"calculate_advantages_on_gpu": True}, {}),
         ({"invalid_tool_call_advantage": -5.0}, {}),
         ({"malformed_thinking_advantage": 0.0}, {}),
         ({}, {"token_level_loss": False}),
+        ({}, {"normalization": "sequence_mean"}),
         ({}, {"sequence_level_importance_ratios": True}),
         ({}, {"truncated_importance_sampling_type": "seq-mask-tis"}),
         ({}, {"use_kl_in_reward": True}),

@@ -79,6 +79,7 @@ from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
@@ -586,6 +587,7 @@ def validate_and_set_config(
             top_k=generation_cfg["top_k"],
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
+            sampler_replay=sampler_replay_enabled(generation_cfg),
         )
 
     # Setup data types
@@ -977,7 +979,9 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
 
     hf_model_subdir = hf_model_name
     if os.path.exists(hf_model_name):
-        hf_model_subdir = f"model_{hf_model_subdir.replace('/', '_')}"
+        # Key by the resolved path so that symlinked spellings of one checkpoint
+        # share a conversion.
+        hf_model_subdir = f"model_{os.path.realpath(hf_model_name).replace('/', '_')}"
 
     if hf_config_overrides:
         overrides_hash = _get_hf_config_overrides_hash(hf_config_overrides)

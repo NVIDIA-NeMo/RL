@@ -37,6 +37,7 @@ def test_replace_prefix_tokens_empty_model_prefix_returns_template():
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
+        eos_token_id=tokenizer.eos_token_id,
     )
     assert result == template_token_ids
 
@@ -60,22 +61,7 @@ def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
             model_prefix_token_ids=model_prefix_token_ids,
             template_prefix_token_ids=template_prefix_token_ids,
             template_token_ids=template_token_ids,
-        )
-
-
-def test_replace_prefix_tokens_tokenizer_without_eos_raises():
-    """A tokenizer that has no EOS token cannot locate the splice boundary."""
-
-    class _T:
-        eos_token_id = None
-
-    tokenizer = _T()
-    with pytest.raises(AssertionError):
-        replace_prefix_tokens(
-            tokenizer=tokenizer,
-            model_prefix_token_ids=[1],
-            template_prefix_token_ids=[1, 2],
-            template_token_ids=[1, 2],
+            eos_token_id=tokenizer.eos_token_id,
         )
 
 
@@ -189,6 +175,7 @@ def test_replace_prefix_tokens_uses_last_eos_in_template_prefix():
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
+        eos_token_id=tokenizer.eos_token_id,
     )
     assert result == [100, 2, 77, 88]
 
@@ -216,6 +203,7 @@ def test_replace_prefix_tokens_qwen3_think_shift_picks_assistant_eos_not_user_eo
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
+        eos_token_id=tokenizer.eos_token_id,
     )
 
     assert result == [11, 12, 99, 99, 99, 55, 2, 70, 71, 2, 40, 41]

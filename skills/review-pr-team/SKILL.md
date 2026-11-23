@@ -1,6 +1,6 @@
 ---
 name: review-pr-team
-description: Agent-team-based parallel code review for NVIDIA-NeMo/RL pull requests. Spawns specialized agents (RL expert, submodule experts, bug finder, design reviewer, test agent, devil's advocate, comment reviewer) that coordinate via shared task list and direct messaging. Leader orchestrates, collates ALL findings, and presents to user for approval before posting.
+description: Deep parallel review of NVIDIA-NeMo/RL pull requests using Claude Code agent teams or Codex collaboration agents. Coordinates specialist, adversarial, and comment-editing passes, then presents all surviving findings for approval before staging a pending GitHub review. Use for /review-pr-team, $review-pr-team, or a requested team review with a PR number.
 when_to_use: Deep multi-agent review of a PR; '/review-pr-team <number>'; 'team review PR', 'thorough parallel review'. Requires CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1.
 argument-hint: "<pr-number>"
 allowed-tools:
@@ -23,9 +23,11 @@ Review a pull request using a coordinated team of specialized agents.
 
 **Repo**: `NVIDIA-NeMo/RL`
 
-**Requires**: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` must be set — agent teams (teammate spawning, shared task list, `SendMessage`) are an experimental Claude Code feature.
+**Requires (Claude Code)**: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` must be set — agent teams (teammate spawning, shared task list, `SendMessage`) are an experimental Claude Code feature.
 
-**Sandbox**: Always pass `dangerouslyDisableSandbox: true` on every Bash tool call in this skill. The sandbox's bubblewrap (bwrap) container fails to initialize in worktree/container environments with `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`, breaking ALL commands — not just network-dependent ones like `gh`. Do NOT attempt any Bash call in sandbox mode first; it will fail and waste a round-trip.
+**Sandbox (Claude Code)**: Always pass `dangerouslyDisableSandbox: true` on every Bash tool call in this skill. The sandbox's bubblewrap (bwrap) container fails to initialize in worktree/container environments with `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`, breaking ALL commands — not just network-dependent ones like `gh`. Do NOT attempt any Bash call in sandbox mode first; it will fail and waste a round-trip.
+
+**Codex**: invoke as `$review-pr-team <pr-number>`. Read [Codex runtime](runtime/codex.md) before Phase 0; it maps the tool names used below (`Agent`, `TaskCreate`, `TaskList`, `TaskUpdate`, `SendMessage`, `AskUserQuestion`) to Codex operations and covers GitHub access without `gh`. The Claude Code requirement and sandbox setting above do not apply in Codex. Claude Code follows the remaining workflow as written. Codex applies the runtime adapter to its execution and dispatched prompts; review criteria remain shared.
 
 ---
 
@@ -38,6 +40,20 @@ gh pr view $PRNUM --repo NVIDIA-NeMo/RL --json number
 ```
 
 If invalid, ask the user for a valid PR number.
+
+### 0.1 Preflight: who is reviewing (MANDATORY, before anything else)
+
+Run this skill's own copy of the identity script (the one next to this file, never another copy). This script needs the GitHub CLI `gh`, logged in, in both Claude Code and Codex. In Codex it is the only step that does; the rest can use the HTTP path in [Codex runtime](runtime/codex.md). If `gh` is missing, the script says so and exits; ask the user to install `gh` and run `gh auth login`.
+
+```bash
+python3 <this skill's directory>/scripts/review_identity.py preflight --pr $PRNUM
+```
+
+- **Exit 2 — STOP.** This session wrote code in this PR (its transcript shows edits to the PR's files, by an edit tool or by a shell command, or a commit/push in this repo). A review from the session that wrote the code is biased. Do not review and do not post anything. Tell the user: "Open a fresh Claude Code or Codex session and run /review-pr-team $PRNUM there."
+- **Exit 3 — STOP.** The user is the PR author, so this is a self-review, and the harness, model or effort is not on the allow-list (`self-review-policy.json`; e.g. Sonnet, or effort below medium). Do not review. Show the script's message and tell the user to rerun in a fresh session with an allowed model.
+- **Exit 0** — continue. Remember the printed review kind (`self` or `expert`) for Phase 3. If it printed `WARNING: no session log found, so same-session edits could not be checked` instead of `OK`, the script could not find this session's log (for example, history saving is off), so it could not check for edits. Tell the user, and continue only if they confirm this session did not write the PR. A self-review cannot get here: without a log the model is unknown, so it already stopped with exit 3.
+
+Self-reviews will be read by a CI check (added in the next PR of this stack), so they must come from this repo's copy of the skill at a recent revision (see **Skill revision** at the end of this file).
 
 ---
 
@@ -116,7 +132,7 @@ This ensures review comments can point authors to the established pattern rather
 ### 1.4 Read root context
 
 - Read `CLAUDE.md` from repo root
-- Read all `.claude/skills/*/SKILL.md` files (except `review-pr` and `review-pr-team`)
+- Read all `.claude/skills/*/SKILL.md` files (except `review-pr-team`)
 - Read every `references/*.md` file in this skill's own directory. These are the shared review lessons for this repo, grouped by theme. A rule marked ★ has come up three or more times; list those first when you pass the lessons on. A rule that ends with `Details: [name](details/name.md)` has a full lesson behind it, with the steps, commands and repo maps the one-line rule leaves out. Keep those links when you pass the lessons on, and tell every agent to read the detail file whenever its rule applies to what it is checking.
 - Read every `skills/contributing/references/*.md` and treat each rule as a finding checklist, the same as this skill's own references. A rule that ends with `Review Details: [name](...)` has a review lesson behind it, and one that ends with `Contributing Details:` has an author how-to under `skills/contributing/references/details/`; tell every agent to read the linked file whenever the rule applies.
 - Then glob `~/.claude/review-memory/RL/*.md` and read EVERY match. This is the optional, machine-local store of lessons that are not in `references/` yet. It may be empty or absent; an empty glob is fine. New lessons are written here in Phase 6. A memory's `count` is how many times its pattern has shown up in reviewed PRs; list the ones with count 2 or more first.
@@ -140,7 +156,7 @@ Start the repo's own lint/format/type suite in the background early, so results 
 uv run --group dev pre-commit run --all-files
 ```
 
-Do NOT run `ruff`/`pyrefly` directly — `pre-commit` runs the repo's pinned hook versions and config, and calling the tools directly can use the wrong versions/args and produce misleading results. Fallback only when `pre-commit` cannot run at all: run the pinned version with `uvx ruff@<version from .pre-commit-config.yaml>` and run every ruff hook the config lists (plain `ruff check` misses `I001`). When collating, attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`); `--all-files` also surfaces pre-existing issues unrelated to this PR — don't report those. Also flag any NEW source file in the diff that isn't added to `pyrefly.toml` `project-includes` (untracked files silently escape type-checking).
+Do NOT run `ruff`/`pyrefly` directly — `pre-commit` runs the repo's pinned hook versions and config, and calling the tools directly can use the wrong versions/args and produce misleading results. Fallback only when `pre-commit` cannot run at all: run the pinned version with `uvx ruff@<version from .pre-commit-config.yaml>` and run every ruff hook the config lists (plain `ruff check` misses `I001`). When collating, attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`); `--all-files` also surfaces pre-existing issues unrelated to this PR — don't report those. Also flag any new entry the diff adds to `pyrefly-baseline.json` (new errors should be fixed, not baselined).
 
 ### 1.6 Teams are MANDATORY — never substitute plain subagents
 
@@ -163,10 +179,8 @@ The delivery failure is real, mechanical, and fixable. Do not let it push you of
 
 So a nudge saying "report back" produces an idle notification with no content — the agent answered into the void. Phrase it as a tool instruction, verbatim:
 
-> Your report never reached me. When you are resumed by a message, your final assistant
-> text is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
-> `SendMessage(to="team-lead", summary="...", message="<your full findings>")`. Do NOT
-> just write the text as your answer — call the tool.
+> Your report never reached me. When you are resumed by a message, your final assistant text is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
+> `SendMessage(to="team-lead", summary="...", message="<your full findings>")`. Do NOT just write the text as your answer — call the tool.
 
 On PR #3292 all six teammates were silent through two rounds of ordinary nudging; after one message phrased that way, all six delivered within minutes.
 
@@ -697,8 +711,13 @@ Tasks:
 3. For threads needing a response, talk to rl-expert and relevant submodule experts
    via SendMessage to get technical context before drafting
 4. All responses MUST include permalink references so the user can follow the rationale
+5. Only when Phase 0.1 printed `Review kind: expert`: find the author's self-review, the latest
+   review whose body contains `nemo-rl-review: kind=self`. For each of its resolved threads, check
+   whether the reply ("fixed", "won't fix", anything) holds up against the current code. A thread
+   brushed off without a real fix or a reason you agree with becomes a finding ("Reopening (C<n> of
+   the self-review): …"), anchored on the same line.
 
-Report: list of (thread_comment_id, action, draft_reply_text, permalinks)
+Report: list of (thread_comment_id, action, draft_reply_text, permalinks), plus any task-5 findings
 ```
 
 ### `devil-advocate`
@@ -1091,8 +1110,7 @@ This is the single most common way this skill produces churn. The failure mode i
 
 If devil-advocate has gone idle without reporting, do NOT interpret that as "no objections." Send the explicit-tool-call nudge — a resumed agent's final assistant text is not delivered to the leader, so a silent agent is usually one that never called the tool, not one with nothing to say:
 
-> Your verdicts never reached me. When you are resumed by a message, your final assistant text
-> is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
+> Your verdicts never reached me. When you are resumed by a message, your final assistant text is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
 > `SendMessage(to="team-lead", summary="devil-advocate verdicts", message="<full verdict list>")`.
 
 Only after that nudge has ALSO failed may you proceed, and then you MUST say so in the preview ("devil-advocate did not report; findings below carry only the leader's verification").
@@ -1130,18 +1148,19 @@ After all Wave 2 agents complete:
      corrected code here
      ```
      ````
-7. Incorporate linter results from the background `pre-commit` run (§1.5b) — attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`), and flag any new source file missing from `pyrefly.toml`
+7. Incorporate linter results from the background `pre-commit` run (§1.5b) — attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`), and flag any new entry the diff adds to `pyrefly-baseline.json` (new errors should be fixed, not baselined)
 8. Incorporate comment-reviewer's thread response drafts
 9. Incorporate test-agent's verified test suggestions
 
 ---
 
+### Expert review: the author's self-review threads
+
+`comment-reviewer` re-checks them in Wave 1 (task 5 in its spec), so reopened threads go through devil-advocate and comment-editor like any other finding.
+
 ## Phase 4: Preview & Confirm
 
-> **Precondition check before you write a single line of this preview:** has `devil-advocate`
-> delivered its verdicts via SendMessage? If not, go back to the Phase 3 hard gate. Do not
-> present findings and do not offer staging. A preview built on un-challenged findings is how
-> a review gets staged, deleted, and re-staged.
+> **Precondition check before you write a single line of this preview:** has `devil-advocate` delivered its verdicts via SendMessage? If not, go back to the Phase 3 hard gate. Do not present findings and do not offer staging. A preview built on un-challenged findings is how a review gets staged, deleted, and re-staged.
 
 #### Comment IDs: C1, C2, C3 … — never reused
 
@@ -1330,7 +1349,19 @@ REFUSING TO POST (1 failure)
 
 Do NOT include `event` — omitting it creates a PENDING review.
 
-Add `_Generated by Claude Code_` at the end of the review body.
+End the review body with the identity footer, generated right before you stage (it records the reviewed commit):
+
+```bash
+python3 <this skill's directory>/scripts/review_identity.py footer --pr $PRNUM --head $HEAD_SHA
+```
+
+`$HEAD_SHA` is the full SHA recorded in Phase 1, the commit you reviewed. If the PR head has moved since, the script stops without printing a footer; review the new head first.
+
+It prints one line, a code span such as:
+
+`nemo-rl-review: kind=self harness=claude-code/2.1.330 model=claude-opus-5-5 effort=medium review-pr-team=v1 reviewed=3672697`
+
+The keys always come in this order: `kind` (`self` or `expert`), `harness` (name/version), `model`, `effort`, `review-pr-team` (`v` plus the `REVISION` number), `reviewed` (7-character head SHA). **You MUST end the review body with this exact line, unedited. Without it the CI `Self-review` check (added in the next PR of this stack) does not count the review.** Never write or edit it by hand. It replaces the old `_Generated by Claude Code_` line.
 
 **CRITICAL — All actionable findings MUST be inline comments, not body text.** The review body is the right place for general context: PR summary, merge conflict notes, overall impressions, agent count, and non-actionable observations. But every **actionable finding** (bugs, guideline violations, test gaps, doc issues) — even those about files not in the diff — MUST be posted as an inline comment tied to the most relevant file:line. Actionable items buried in the review body are easy to miss and hard to track as resolved.
 
@@ -1351,7 +1382,7 @@ Use Python `json.dump` to generate the review JSON — this avoids shell escapin
 cat <<'REVIEW_JSON' > "$TMPDIR/review.json"
 {
   "commit_id": "$HEAD_SHA",
-  "body": "<brief summary — merge conflict note, agent count, etc.>\n\n_Generated by Claude Code_",
+  "body": "<brief summary — merge conflict note, agent count, etc.>\n\n<identity footer: the line from review_identity.py footer>",
   "comments": [
     {"path": "<file>", "line": <line>, "side": "RIGHT", "body": "[`<file>:<line>`](<permalink>)\n\n<comment with evidence permalinks>"},
     ...
@@ -1479,7 +1510,9 @@ If user picks "Cancel": re-read the live review, then delete only the comments t
 
 ### Step 2: Submit the review via API after user confirms "Publish"
 
-Only after explicit "Publish" confirmation, submit the PENDING review programmatically:
+Only after explicit "Publish" confirmation, submit the PENDING review programmatically.
+
+First, read the pending review back (`gh api repos/NVIDIA-NeMo/RL/pulls/$PRNUM/reviews/$REVIEW_ID --jq .body`) and check that the body's last line starts with `` `nemo-rl-review: ``. If it does not, stop: put the footer back (Step 1) before publishing.
 
 ```bash
 gh api repos/NVIDIA-NeMo/RL/pulls/$PRNUM/reviews/$REVIEW_ID/events \
@@ -1603,3 +1636,11 @@ SendMessage(to="<agent-name>", message={"type": "shutdown_request"})
 ```
 
 After all agents confirm shutdown, you're done. There is **no `TeamDelete` step** (that tool was removed). The team config directory is cleaned up automatically when the session ends; the task-list directory persists locally so a resumed session keeps its tasks (governed by `cleanupPeriodDays`). Sending each teammate a `shutdown_request` is still the graceful way to free their contexts before you finish.
+
+---
+
+## Skill revision
+
+`REVISION` (next to this file) holds an integer. Bump it by exactly one over the PR's base in any PR that changes files under `skills/review-pr-team/`, and only then; a CI check enforces this. Never change it in a local copy: local edits are fine, but they keep the number they were copied at. Self-reviews publish the number in the footer as `review-pr-team=v<REVISION>` (for example `review-pr-team=v1`), and the self-review check accepts one only if it is within `max_revision_lag` (in `self-review-policy.json`) of `main`'s.
+
+The footer format, `self-review-policy.json` and `REVISION` are read by `.github/scripts/check_self_review.py`; change them together.
