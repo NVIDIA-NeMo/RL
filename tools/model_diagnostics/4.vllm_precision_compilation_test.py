@@ -40,7 +40,7 @@ def environment(env_vars):
         # Environment variables are restored here
     """
     # Store original values
-    original_values = {}
+    original_values: dict[str, str | None] = {}
     for key in env_vars:
         if key in os.environ:
             original_values[key] = os.environ[key]

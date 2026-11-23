@@ -82,7 +82,7 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    config = MasterConfig(**config)
+    config = MasterConfig.model_validate(config)
     print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
@@ -109,7 +109,7 @@ def main() -> None:
     # We assert here since this is right after the final config has been materialized.
     assert should_use_nemo_gym(config)
 
-    # NeMo-Gym environment needs to get dp_openai_server_base_urls from
+    # NeMo-Gym environment needs to get client_base_urls from
     # student_generation, so we don't setup env here.
     print("\n▶ Setting up data...")
     train_dataset, val_dataset = setup_response_data(

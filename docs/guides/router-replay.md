@@ -148,3 +148,7 @@ When fallback is used, the vLLM worker emits a `R3 router replay fallback:` warn
 Fallback should normally be absent or rare; frequent warnings mean a meaningful share of token routes used the policy's normal router instead of replay.
 
 The generation backend also computes `r3/routed_experts_fallback_token_route_fraction`, but no training loop currently forwards it to the metric logger, so do not rely on it in dashboards or gates.
+
+### Prefix-Level Rollout Recovery
+
+Router replay works with the Single-Controller `prefix` recovery target; no extra setting is needed. A resumed rollout trains its restored prefix with the expert routes it was sampled with. See [Periodic rollout snapshots](./single-controller.md#periodic-rollout-snapshots) in the Single-Controller guide for the full rules.
