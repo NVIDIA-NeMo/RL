@@ -51,6 +51,7 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # Router replay across a prefix cut, behind Dynamo: each restored call must stage its saved routes.
 # The tiny DeepSeek model adds a second routing layout to the native run's Qwen3-MoE build.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_router_replay_prefix_recovery_single_controller_1n2g.sh ++policy.generation.dynamo=true policy.model_name=silence09/DeepSeek-R1-Small-2layers policy.tokenizer.name=silence09/DeepSeek-R1-Small-2layers
+# grpo_dynamo_pd_megatron_single_controller.sh joins once the Megatron-LM pin includes megatron/inference/integrations/dynamo.
 
 cd "${PROJECT_ROOT}/tests"
 if compgen -G ".coverage*" > /dev/null; then
