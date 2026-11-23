@@ -18,7 +18,7 @@ import traceback
 import warnings
 from datetime import timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, cast
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Literal, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -888,7 +888,7 @@ def _check_weight_sync_results(results: list) -> None:
 def iter_named_tensor_buckets(
     params_generator: Iterable[tuple[str, torch.Tensor]],
     buffer_size_bytes: int,
-) -> "Iterable[list[tuple[str, torch.Tensor]]]":
+) -> Iterator[list[tuple[str, torch.Tensor]]]:
     """Group ``(name, tensor)`` pairs into buckets of at most ``buffer_size_bytes``.
 
     Waits on async DTensor redistributes (``.wait()``) before sizing, so the
@@ -903,7 +903,7 @@ def iter_named_tensor_buckets(
 def iter_named_tensor_group_buckets(
     named_tensor_groups: Iterable[Iterable[tuple[str, torch.Tensor]]],
     buffer_size_bytes: int,
-) -> "Iterable[list[tuple[str, torch.Tensor]]]":
+) -> Iterator[list[tuple[str, torch.Tensor]]]:
     """Bucket tensor groups without splitting companions from one source tensor."""
     if buffer_size_bytes <= 0:
         raise ValueError(f"buffer_size_bytes must be positive, got {buffer_size_bytes}")
