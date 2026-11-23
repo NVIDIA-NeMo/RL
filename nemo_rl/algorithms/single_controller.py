@@ -3334,6 +3334,7 @@ class SingleControllerActor:
                     sample_lags.extend(
                         version_during_step - t["weight_version"]
                         for t in train_meta.tags  # type: ignore
+                        if not forest_training or t["segment_index"] == 0
                     )
 
                     groups_dispatched += num_groups
@@ -3873,7 +3874,7 @@ class SingleControllerActor:
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
             lag = max(sample_lags, default=0)
-            step_metrics["weight_version_lag"] = lag
+            step_metrics["weight_version_lag_max"] = lag
             if sample_lags:
                 step_metrics["weight_version_lag_mean"] = statistics.fmean(sample_lags)
                 percentiles = (
